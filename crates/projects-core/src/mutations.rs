@@ -85,6 +85,39 @@ pub struct SeedImportRequest {
     pub payload: SeedPayload,
     #[serde(default)]
     pub actor: Option<String>,
+    /// Seed-time guard (room ruling, #workspace-projects-design): roots that
+    /// are $HOME itself or an ancestor of the XDG config/data homes are
+    /// excluded from the import by default. Such bindings are observation
+    /// debris (a session whose cwd was $HOME), and a registered $HOME root
+    /// would containment-swallow every unregistered path under it. Off-switch
+    /// exists for stress runs only.
+    #[serde(default = "default_true")]
+    pub exclude_home_scoped: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// True when `root` is the user's home directory or an ancestor of the XDG
+/// config/data homes (which includes `/` and `/Users/<name>` style prefixes).
+fn is_home_scoped(root: &str) -> bool {
+    let Ok(home) = std::env::var("HOME") else {
+        return false;
+    };
+    let home = home.trim_end_matches('/');
+    if home.is_empty() {
+        return false;
+    }
+    let root_trimmed = root.trim_end_matches('/');
+    if root_trimmed == home {
+        return true;
+    }
+    // Ancestor-of-XDG-homes check: the XDG homes live under $HOME, so any
+    // strict ancestor of them is either $HOME (caught above) or an ancestor
+    // of $HOME itself.
+    let root_with_sep = format!("{root_trimmed}/");
+    home.starts_with(&root_with_sep) || root_trimmed.is_empty()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -411,8 +444,13 @@ impl RegistryStore {
         // mutations where existence-at-registration rejects. The journal payload
         // records survivors only, so rebuild never depends on disk state.
         let mut missing: Vec<SeedPair> = Vec::new();
+        let mut home_scoped: Vec<SeedPair> = Vec::new();
         let mut surviving = Vec::with_capacity(req.payload.pairs.len());
         for mut pair in std::mem::take(&mut req.payload.pairs) {
+            if req.exclude_home_scoped && is_home_scoped(&pair.canonical_root) {
+                home_scoped.push(pair);
+                continue;
+            }
             // Seeds are historically OBSERVED path strings, not caller input:
             // the module canonicalizes them itself (case drift on APFS, symlink
             // components). I6's strict canonical-input equality applies to live
@@ -430,6 +468,11 @@ impl RegistryStore {
         }
         req.payload.pairs = surviving;
         missing.sort_by(|a, b| {
+            a.mc_identity
+                .cmp(&b.mc_identity)
+                .then(a.canonical_root.cmp(&b.canonical_root))
+        });
+        home_scoped.sort_by(|a, b| {
             a.mc_identity
                 .cmp(&b.mc_identity)
                 .then(a.canonical_root.cmp(&b.canonical_root))
@@ -458,6 +501,7 @@ impl RegistryStore {
         self.mutation("seed_import",key.clone().as_deref(),move|tx|{
             let now=now_unix_millis(); let mut report=Vec::new(); let mut groups:BTreeMap<String,Vec<SeedPair>>=BTreeMap::new();
             for p in &missing {report.push(SeedReportEntry{kind:"skipped".into(),mc_identity:Some(p.mc_identity.clone()),canonical_root:Some(p.canonical_root.clone()),project_id:None,owner_project_id:None,new_project_id:None,roots:None,reason:Some("missing".into())});}
+            for p in &home_scoped {report.push(SeedReportEntry{kind:"skipped".into(),mc_identity:Some(p.mc_identity.clone()),canonical_root:Some(p.canonical_root.clone()),project_id:None,owner_project_id:None,new_project_id:None,roots:None,reason:Some("home_scoped".into())});}
             let mut by_root:BTreeMap<String,Vec<SeedPair>>=BTreeMap::new(); for p in &req.payload.pairs {by_root.entry(p.canonical_root.clone()).or_default().push(p.clone());}
             for (root, rows) in &by_root { let has_git=rows.iter().any(|p|p.identity_class.as_deref()==Some("git")||p.mc_identity.starts_with("git:")); let mut identities=BTreeSet::new(); for p in rows {if has_git&&p.identity_class.as_deref()==Some("dir"){report.push(SeedReportEntry{kind:"identity_class_precedence".into(),mc_identity:Some(p.mc_identity.clone()),canonical_root:Some(root.clone()),project_id:None,owner_project_id:None,new_project_id:None,roots:None,reason:Some("git identity wins".into())});}else{identities.insert(p.mc_identity.clone());}} if identities.len()>1 {for id in identities {report.push(SeedReportEntry{kind:"conflicted".into(),mc_identity:Some(id),canonical_root:Some(root.clone()),project_id:None,owner_project_id:None,new_project_id:None,roots:None,reason:Some("one root observed under multiple identities".into())});}} else if let Some(id)=identities.into_iter().next(){groups.entry(id).or_default().extend(rows.iter().filter(|p|!has_git||p.identity_class.as_deref()!=Some("dir")).cloned());}}
             let mut changed=false;
@@ -1082,6 +1126,63 @@ mod adversarial_tests {
     }
 
     #[test]
+    fn seed_import_home_guard_excludes_by_default_and_flag_disables() {
+        let home = std::env::var("HOME").unwrap();
+        let f = Fixture::new("seed-home");
+        let live = f.dir("normal-project");
+        let build = |exclude: bool| SeedImportRequest {
+            source: "mc".into(),
+            request_key: None,
+            actor: None,
+            exclude_home_scoped: exclude,
+            payload: SeedPayload {
+                pairs: vec![
+                    SeedPair {
+                        canonical_root: home.clone(),
+                        mc_identity: "dir:home".into(),
+                        identity_class: Some("dir".into()),
+                        ..Default::default()
+                    },
+                    SeedPair {
+                        canonical_root: live.clone(),
+                        mc_identity: "git:cccc".into(),
+                        identity_class: Some("git".into()),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+        };
+        // Default: $HOME row skips with home_scoped provenance, normal row mints.
+        let out = f.store.seed_import(build(true)).unwrap();
+        let v = result(&out);
+        let entries = v["report"].as_array().unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e["kind"] == "skipped" && e["reason"] == "home_scoped"),
+            "$HOME root must skip with home_scoped provenance"
+        );
+        assert!(f.store.resolve(&live).is_ok());
+        let gone = f.store.resolve_project_id(&seed_id("dir:home")).unwrap();
+        assert!(gone.gone, "$HOME group must not mint under the guard");
+        // Contrastive: guard off (stress runs) imports the row.
+        let f2 = Fixture::new("seed-home-off");
+        let out2 = f2.store.seed_import(build(false)).unwrap();
+        let v2 = result(&out2);
+        assert!(
+            !v2["report"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["reason"] == "home_scoped"),
+            "guard off must not skip"
+        );
+        let minted = f2.store.resolve_project_id(&seed_id("dir:home")).unwrap();
+        assert!(!minted.gone, "guard off mints the $HOME project");
+    }
+
+    #[test]
     fn seed_import_skips_dead_roots_with_provenance() {
         let f = Fixture::new("seed-dead");
         let live = f.dir("alive");
@@ -1092,6 +1193,7 @@ mod adversarial_tests {
                 source: "mc".into(),
                 request_key: None,
                 actor: None,
+                exclude_home_scoped: true,
                 payload: SeedPayload {
                     pairs: vec![
                         SeedPair {
