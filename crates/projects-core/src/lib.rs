@@ -18,6 +18,9 @@ use cortexkit_store::{open_sqlite, Migration, SqliteStore, StorageDescriptor, St
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Serialize;
 
+mod mutations;
+pub use mutations::*;
+
 const MIGRATION_NAMESPACE: &str = "projects";
 
 /// The complete v1 projection schema. Mutations use [`RegistryStore::apply_entry`]
@@ -29,7 +32,8 @@ CREATE TABLE registry_journal (
     payload_json TEXT,
     actor TEXT,
     request_key TEXT UNIQUE NULL,
-    created_at INTEGER
+    created_at INTEGER,
+    response_json TEXT NULL
 );
 
 CREATE TABLE workspace (
@@ -547,6 +551,7 @@ pub enum RegistryError {
     Store(StoreError),
     Database(String),
     Path(String),
+    Domain { code: String, message: String },
 }
 
 impl fmt::Display for RegistryError {
@@ -555,11 +560,18 @@ impl fmt::Display for RegistryError {
             Self::Store(error) => write!(f, "{error}"),
             Self::Database(error) => write!(f, "database: {error}"),
             Self::Path(error) => write!(f, "path: {error}"),
+            Self::Domain { code, message } => write!(f, "{code}: {message}"),
         }
     }
 }
 
 impl std::error::Error for RegistryError {}
+
+impl From<rusqlite::Error> for RegistryError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Database(error.to_string())
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

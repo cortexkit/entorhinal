@@ -15,7 +15,10 @@ use std::{
 
 use async_trait::async_trait;
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
-use projects_core::{RegistryError, RegistryStore};
+use projects_core::{
+    AssignWorkspaceRequest, RegisterRequest, RegistryError, RegistryStore, RemoveRequest,
+    SeedImportRequest, UpgradeImplicitRequest,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use subc_client_rs::{HandlerOutcome, HealthReport, HealthStatus, ModuleHandler, RequestCtx};
@@ -78,7 +81,10 @@ impl ProjectsHandler {
             message: "projects storage is not ready".to_string(),
         })?;
         operation(store).map_err(|error| HandlerError {
-            code: "storage_error".to_string(),
+            code: match &error {
+                RegistryError::Domain { code, .. } => code.clone(),
+                _ => "storage_error".to_string(),
+            },
             message: error.to_string(),
         })
     }
@@ -110,15 +116,13 @@ impl ModuleHandler for ProjectsHandler {
             "resolve_project_id" => self.resolve_project_id(request.params),
             "enumerate" => self.enumerate(request.params),
             "journal_tail" => self.journal_tail(request.params),
-            "register" | "assign_workspace" | "upgrade_implicit" | "remove" | "seed_import" => {
-                Err(HandlerError {
-                    code: "unimplemented".to_string(),
-                    message: format!(
-                        "mutation '{}' is reserved for a later skeleton step",
-                        request.method
-                    ),
-                })
-            }
+            "register" => self.register(request.params),
+            "assign_workspace" => self.assign_workspace(request.params),
+            "upgrade_implicit" => self.upgrade_implicit(request.params),
+            "remove" => self.remove(request.params),
+            "seed_import" => self.seed_import(request.params),
+            "verify" => self.verify(),
+            "rebuild" => self.rebuild(),
             _ => Err(HandlerError {
                 code: "unknown_method".to_string(),
                 message: format!(
@@ -227,6 +231,37 @@ impl ProjectsHandler {
         self.record_query(reply.generation, &self.health.journal_tail_count);
         encode_result(reply)
     }
+
+    fn register(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
+        let req = serde_json::from_value::<RegisterRequest>(params).map_err(invalid_params)?;
+        self.with_store(|s| s.register(req))
+    }
+    fn assign_workspace(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
+        let req =
+            serde_json::from_value::<AssignWorkspaceRequest>(params).map_err(invalid_params)?;
+        self.with_store(|s| s.assign_workspace(req))
+    }
+    fn upgrade_implicit(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
+        let req =
+            serde_json::from_value::<UpgradeImplicitRequest>(params).map_err(invalid_params)?;
+        self.with_store(|s| s.upgrade_implicit(req))
+    }
+    fn remove(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
+        let req = serde_json::from_value::<RemoveRequest>(params).map_err(invalid_params)?;
+        self.with_store(|s| s.remove(req))
+    }
+    fn seed_import(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
+        let req = serde_json::from_value::<SeedImportRequest>(params).map_err(invalid_params)?;
+        self.with_store(|s| s.seed_import(req))
+    }
+    fn verify(&self) -> Result<Vec<u8>, HandlerError> {
+        let reply = self.with_store(|s| s.verify())?;
+        encode_result(reply)
+    }
+    fn rebuild(&self) -> Result<Vec<u8>, HandlerError> {
+        let generation = self.with_store(|s| s.rebuild())?;
+        encode_result(json!({"generation":generation}))
+    }
 }
 
 #[derive(Debug)]
@@ -299,6 +334,8 @@ fn manifest() -> ModuleManifest {
                 management_operation("upgrade_implicit", ManagementOperationKind::Mutate),
                 management_operation("remove", ManagementOperationKind::Mutate),
                 management_operation("seed_import", ManagementOperationKind::Mutate),
+                management_operation("verify", ManagementOperationKind::Query),
+                management_operation("rebuild", ManagementOperationKind::Mutate),
             ],
             config_schema: json!({"type": "object"}),
             observability: Vec::new(),
