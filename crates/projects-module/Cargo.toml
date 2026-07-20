@@ -1,0 +1,24 @@
+[package]
+name = "projects-module"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "The ck-projects supervised subc module."
+
+[[bin]]
+name = "ck-projects"
+path = "src/main.rs"
+
+[dependencies]
+projects-core = { path = "../projects-core" }
+cortexkit-store-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+subc-client-rs = { workspace = true }
+subc-protocol = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+subc-core = { workspace = true }
+subc-transport = { workspace = true }

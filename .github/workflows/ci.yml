@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (ubuntu)
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: ck-projects
+    steps:
+      - name: Checkout ck-projects
+        uses: actions/checkout@v5
+        with:
+          path: ck-projects
+
+      # The module path-depends on the sibling subc wire crates and the commons
+      # storage/path crates. The default token is scoped to ck-projects, so the
+      # cortexkit-ci GitHub App supplies read access to both private siblings.
+      - name: Mint cross-repo read token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.CK_CI_APP_ID }}
+          private-key: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
+          owner: cortexkit
+          repositories: subconscious,commons
+
+      - name: Checkout subconscious
+        uses: actions/checkout@v5
+        with:
+          repository: cortexkit/subconscious
+          path: subconscious
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Checkout commons
+        uses: actions/checkout@v5
+        with:
+          repository: cortexkit/commons
+          path: commons
+          token: ${{ steps.app-token.outputs.token }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --all-targets

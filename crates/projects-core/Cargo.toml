@@ -1,0 +1,15 @@
+[package]
+name = "projects-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Pure domain and journal-spine store for the ck-projects registry."
+
+[dependencies]
+blake3 = { workspace = true }
+cortexkit-paths = { workspace = true }
+cortexkit-store = { workspace = true }
+cortexkit-store-types = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
