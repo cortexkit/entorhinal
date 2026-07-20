@@ -413,15 +413,19 @@ impl RegistryStore {
         let mut missing: Vec<SeedPair> = Vec::new();
         let mut surviving = Vec::with_capacity(req.payload.pairs.len());
         for mut pair in std::mem::take(&mut req.payload.pairs) {
-            match canonical(&pair.canonical_root) {
-                Ok(canonical_root) => {
-                    pair.canonical_root = canonical_root;
+            // Seeds are historically OBSERVED path strings, not caller input:
+            // the module canonicalizes them itself (case drift on APFS, symlink
+            // components). I6's strict canonical-input equality applies to live
+            // mutations only.
+            match ProjectRootId::from_path(&pair.canonical_root) {
+                Ok(id) => {
+                    pair.canonical_root = id.to_string();
                     surviving.push(pair);
                 }
-                Err(RegistryError::Domain { ref code, .. }) if code == "root_not_found" => {
+                Err(IdentityError::NonExistentPath { .. }) => {
                     missing.push(pair);
                 }
-                Err(error) => return Err(error),
+                Err(error) => return Err(domain("not_canonical", error.to_string())),
             }
         }
         req.payload.pairs = surviving;
