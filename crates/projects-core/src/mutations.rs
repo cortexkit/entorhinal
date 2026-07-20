@@ -406,9 +406,30 @@ impl RegistryStore {
         if req.source != "mc" {
             return Err(domain("invalid_source", &req.source));
         }
-        for pair in &mut req.payload.pairs {
-            pair.canonical_root = canonical(&pair.canonical_root)?;
+        // Seeds import HISTORICAL topology: roots that no longer exist on disk
+        // are skipped with per-root provenance (spec §10 rule 1), unlike live
+        // mutations where existence-at-registration rejects. The journal payload
+        // records survivors only, so rebuild never depends on disk state.
+        let mut missing: Vec<SeedPair> = Vec::new();
+        let mut surviving = Vec::with_capacity(req.payload.pairs.len());
+        for mut pair in std::mem::take(&mut req.payload.pairs) {
+            match canonical(&pair.canonical_root) {
+                Ok(canonical_root) => {
+                    pair.canonical_root = canonical_root;
+                    surviving.push(pair);
+                }
+                Err(RegistryError::Domain { ref code, .. }) if code == "root_not_found" => {
+                    missing.push(pair);
+                }
+                Err(error) => return Err(error),
+            }
         }
+        req.payload.pairs = surviving;
+        missing.sort_by(|a, b| {
+            a.mc_identity
+                .cmp(&b.mc_identity)
+                .then(a.canonical_root.cmp(&b.canonical_root))
+        });
         req.payload.pairs.sort_by(|a, b| {
             a.mc_identity
                 .cmp(&b.mc_identity)
@@ -432,6 +453,7 @@ impl RegistryStore {
             serde_json::to_value(&req).map_err(|e| domain("encode_failed", e.to_string()))?;
         self.mutation("seed_import",key.clone().as_deref(),move|tx|{
             let now=now_unix_millis(); let mut report=Vec::new(); let mut groups:BTreeMap<String,Vec<SeedPair>>=BTreeMap::new();
+            for p in &missing {report.push(SeedReportEntry{kind:"skipped".into(),mc_identity:Some(p.mc_identity.clone()),canonical_root:Some(p.canonical_root.clone()),project_id:None,owner_project_id:None,new_project_id:None,roots:None,reason:Some("missing".into())});}
             let mut by_root:BTreeMap<String,Vec<SeedPair>>=BTreeMap::new(); for p in &req.payload.pairs {by_root.entry(p.canonical_root.clone()).or_default().push(p.clone());}
             for (root, rows) in &by_root { let has_git=rows.iter().any(|p|p.identity_class.as_deref()==Some("git")||p.mc_identity.starts_with("git:")); let mut identities=BTreeSet::new(); for p in rows {if has_git&&p.identity_class.as_deref()==Some("dir"){report.push(SeedReportEntry{kind:"identity_class_precedence".into(),mc_identity:Some(p.mc_identity.clone()),canonical_root:Some(root.clone()),project_id:None,owner_project_id:None,new_project_id:None,roots:None,reason:Some("git identity wins".into())});}else{identities.insert(p.mc_identity.clone());}} if identities.len()>1 {for id in identities {report.push(SeedReportEntry{kind:"conflicted".into(),mc_identity:Some(id),canonical_root:Some(root.clone()),project_id:None,owner_project_id:None,new_project_id:None,roots:None,reason:Some("one root observed under multiple identities".into())});}} else if let Some(id)=identities.into_iter().next(){groups.entry(id).or_default().extend(rows.iter().filter(|p|!has_git||p.identity_class.as_deref()!=Some("dir")).cloned());}}
             let mut changed=false;
@@ -1053,6 +1075,58 @@ mod adversarial_tests {
                 .unwrap_err(),
             "workspace_conflict",
         );
+    }
+
+    #[test]
+    fn seed_import_skips_dead_roots_with_provenance() {
+        let f = Fixture::new("seed-dead");
+        let live = f.dir("alive");
+        let dead = format!("{}/long-gone-worktree", f.root.display());
+        let out = f
+            .store
+            .seed_import(SeedImportRequest {
+                source: "mc".into(),
+                request_key: None,
+                actor: None,
+                payload: SeedPayload {
+                    pairs: vec![
+                        SeedPair {
+                            canonical_root: live.clone(),
+                            mc_identity: "git:aaaa".into(),
+                            identity_class: Some("git".into()),
+                            ..Default::default()
+                        },
+                        SeedPair {
+                            canonical_root: dead.clone(),
+                            mc_identity: "git:aaaa".into(),
+                            identity_class: Some("git".into()),
+                            ..Default::default()
+                        },
+                        SeedPair {
+                            canonical_root: format!("{dead}-2"),
+                            mc_identity: "git:bbbb".into(),
+                            identity_class: Some("git".into()),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+        let v = result(&out);
+        let entries = v["report"].as_array().unwrap();
+        let skipped: Vec<_> = entries
+            .iter()
+            .filter(|e| e["kind"] == "skipped" && e["reason"] == "missing")
+            .collect();
+        assert_eq!(skipped.len(), 2, "both dead roots skip with provenance");
+        // The all-dead identity mints nothing; the survivor identity minted with its live root.
+        assert!(f.store.resolve(&live).is_ok());
+        let gone = f.store.resolve_project_id(&seed_id("git:bbbb")).unwrap();
+        assert!(gone.gone, "all-dead group must not mint a project");
+        // Journal payload records survivors only: rebuild works with dead paths still absent.
+        f.store.rebuild().unwrap();
+        assert!(f.store.resolve(&live).is_ok());
     }
 
     #[test]
