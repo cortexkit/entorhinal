@@ -5,6 +5,7 @@
 //! `subc-client-rs` owns the HELLO, HELLO_ACK, route binding, health control, and
 //! frame lifecycle. This binary only supplies the manifest and domain handler.
 
+use std::collections::BTreeMap;
 use std::{
     path::PathBuf,
     sync::{
@@ -53,11 +54,29 @@ struct HealthGauges {
     enumerate_count: AtomicU64,
     journal_tail_count: AtomicU64,
     last_operation_ms: AtomicI64,
+    liveness_batches: AtomicU64,
+    liveness_gaps: AtomicU64,
+    liveness_sessions: AtomicU64,
+}
+
+/// Volatile liveness state fed by `projects.session_liveness` batches. Never
+/// journaled (I8 forbids liveness in the topology journal); it exists to
+/// annotate enumerate answers and to feed future GC-candidacy signals, so a
+/// wrong, late, or absent feed can never corrupt topology.
+#[derive(Default)]
+struct LivenessState {
+    /// Last accepted per-emitter sequence number; None until first contact.
+    last_seq: Option<u64>,
+    /// True when a dropped batch was detected and no snapshot has rebased yet.
+    stale: bool,
+    /// session_id -> (state, canonical_root, last_activity_ms).
+    sessions: BTreeMap<String, (String, String, i64)>,
 }
 
 struct ProjectsHandler {
     store: Arc<Mutex<Option<RegistryStore>>>,
     health: Arc<HealthGauges>,
+    liveness: Arc<Mutex<LivenessState>>,
 }
 
 impl ProjectsHandler {
@@ -65,6 +84,7 @@ impl ProjectsHandler {
         Self {
             store: Arc::new(Mutex::new(None)),
             health: Arc::new(HealthGauges::default()),
+            liveness: Arc::new(Mutex::new(LivenessState::default())),
         }
     }
 
@@ -121,6 +141,7 @@ impl ModuleHandler for ProjectsHandler {
             "upgrade_implicit" => self.upgrade_implicit(request.params),
             "remove" => self.remove(request.params),
             "seed_import" => self.seed_import(request.params),
+            "projects.session_liveness" => self.session_liveness(request.params),
             "verify" => self.verify(),
             "rebuild" => self.rebuild(),
             _ => Err(HandlerError {
@@ -200,7 +221,85 @@ impl ModuleHandler for ProjectsHandler {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LivenessBatch {
+    seq: u64,
+    #[serde(default)]
+    snapshot: bool,
+    #[serde(default)]
+    sessions: Vec<LivenessSession>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LivenessSession {
+    session_id: String,
+    canonical_root: String,
+    state: String,
+    #[serde(default)]
+    last_activity_ms: i64,
+    // project_id_hint intentionally ignored for state: the registry re-resolves
+    // canonical_root at read time; the hint is a producer fast-path only.
+}
+
 impl ProjectsHandler {
+    /// Ingest a `projects.session_liveness` batch (push-on-transition +
+    /// snapshot-on-reconnect, pinned in #workspace-projects-design). A seq gap
+    /// marks the volatile state stale until the next snapshot rebases it; the
+    /// reply carries `snapshotRequested` so the emitter can resend cheaply.
+    fn session_liveness(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
+        let batch = serde_json::from_value::<LivenessBatch>(params).map_err(invalid_params)?;
+        let mut state = self
+            .liveness
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let gap = if batch.snapshot {
+            state.sessions.clear();
+            state.stale = false;
+            false
+        } else {
+            let expected = state.last_seq.map(|s| s.wrapping_add(1));
+            let gap = expected.is_some_and(|e| batch.seq != e);
+            if gap {
+                state.stale = true;
+                self.health.liveness_gaps.fetch_add(1, Ordering::Relaxed);
+            }
+            gap
+        };
+        state.last_seq = Some(batch.seq);
+
+        for session in batch.sessions {
+            if session.state == "gone" {
+                state.sessions.remove(&session.session_id);
+            } else {
+                state.sessions.insert(
+                    session.session_id,
+                    (
+                        session.state,
+                        session.canonical_root,
+                        session.last_activity_ms,
+                    ),
+                );
+            }
+        }
+        let tracked = state.sessions.len() as u64;
+        drop(state);
+
+        self.health.liveness_batches.fetch_add(1, Ordering::Relaxed);
+        self.health
+            .liveness_sessions
+            .store(tracked, Ordering::Relaxed);
+        serde_json::to_vec(&json!({
+            "result": { "accepted": true, "snapshotRequested": gap, "tracked": tracked }
+        }))
+        .map_err(|error| HandlerError {
+            code: "encode_failed".to_string(),
+            message: error.to_string(),
+        })
+    }
+
     fn resolve(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
         let params = serde_json::from_value::<ResolveParams>(params).map_err(invalid_params)?;
         let reply = self.with_store(|store| store.resolve(&params.canonical_root))?;
@@ -336,6 +435,9 @@ fn manifest() -> ModuleManifest {
                 management_operation("seed_import", ManagementOperationKind::Mutate),
                 management_operation("verify", ManagementOperationKind::Query),
                 management_operation("rebuild", ManagementOperationKind::Mutate),
+                // Volatile liveness ingestion — never journaled, feeds enumerate
+                // annotations only (ALF's producer per #workspace-projects-design).
+                management_operation("projects.session_liveness", ManagementOperationKind::Mutate),
             ],
             config_schema: json!({"type": "object"}),
             observability: Vec::new(),
@@ -394,6 +496,55 @@ fn unix_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn session_liveness_gap_detection_and_snapshot_rebase() {
+        let handler = ProjectsHandler::new();
+        let call = |h: &ProjectsHandler, v: serde_json::Value| h.session_liveness(v);
+        // Snapshot establishes the baseline at seq 10.
+        let r = call(
+            &handler,
+            json!({"seq": 10, "snapshot": true, "sessions": [
+            {"sessionId": "s1", "canonicalRoot": "/tmp/a", "state": "active"}]}),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_slice(&r).unwrap();
+        assert_eq!(v["result"]["snapshotRequested"], false);
+        assert_eq!(v["result"]["tracked"], 1);
+        // Contiguous transition batch: accepted, no gap.
+        let r = call(
+            &handler,
+            json!({"seq": 11, "sessions": [
+            {"sessionId": "s2", "canonicalRoot": "/tmp/b", "state": "idle"}]}),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_slice(&r).unwrap();
+        assert_eq!(v["result"]["snapshotRequested"], false);
+        assert_eq!(v["result"]["tracked"], 2);
+        // Dropped batch (seq 12 lost): gap detected, snapshot requested.
+        let r = call(
+            &handler,
+            json!({"seq": 13, "sessions": [
+            {"sessionId": "s1", "canonicalRoot": "/tmp/a", "state": "gone"}]}),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_slice(&r).unwrap();
+        assert_eq!(
+            v["result"]["snapshotRequested"], true,
+            "gap must request a snapshot"
+        );
+        assert_eq!(v["result"]["tracked"], 1, "gone still applies");
+        assert_eq!(handler.health.liveness_gaps.load(Ordering::Relaxed), 1);
+        // Snapshot rebases: stale clears, seq resets legally.
+        let r = call(
+            &handler,
+            json!({"seq": 1, "snapshot": true, "sessions": []}),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_slice(&r).unwrap();
+        assert_eq!(v["result"]["snapshotRequested"], false);
+        assert_eq!(v["result"]["tracked"], 0);
+    }
 
     #[test]
     fn manifest_declares_the_projects_surface_and_all_skeleton_mutations() {
