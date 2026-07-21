@@ -99,25 +99,44 @@ fn default_true() -> bool {
     true
 }
 
-/// True when `root` is the user's home directory or an ancestor of the XDG
-/// config/data homes (which includes `/` and `/Users/<name>` style prefixes).
+/// True when `root` is the user's home directory, an ancestor of it, or an
+/// ancestor-or-equal of an XDG config/data home. The XDG homes are consulted
+/// explicitly: when XDG_CONFIG_HOME or XDG_DATA_HOME points outside $HOME
+/// (containerized setups, custom layouts), a root containing them is still
+/// observation debris, not a project.
 fn is_home_scoped(root: &str) -> bool {
-    let Ok(home) = std::env::var("HOME") else {
-        return false;
-    };
-    let home = home.trim_end_matches('/');
-    if home.is_empty() {
-        return false;
-    }
+    is_home_scoped_against(
+        root,
+        std::env::var("HOME").ok().as_deref(),
+        std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
+        std::env::var("XDG_DATA_HOME").ok().as_deref(),
+    )
+}
+
+/// Env-injected core of the guard, so tests exercise relocated-XDG layouts
+/// without process-global env mutation (which races parallel tests).
+fn is_home_scoped_against(
+    root: &str,
+    home: Option<&str>,
+    xdg_config: Option<&str>,
+    xdg_data: Option<&str>,
+) -> bool {
     let root_trimmed = root.trim_end_matches('/');
-    if root_trimmed == home {
+    if root_trimmed.is_empty() {
+        // Filesystem root contains everything, including the homes.
         return true;
     }
-    // Ancestor-of-XDG-homes check: the XDG homes live under $HOME, so any
-    // strict ancestor of them is either $HOME (caught above) or an ancestor
-    // of $HOME itself.
-    let root_with_sep = format!("{root_trimmed}/");
-    home.starts_with(&root_with_sep) || root_trimmed.is_empty()
+    let ancestor_or_equal = |target: &str| -> bool {
+        let target = target.trim_end_matches('/');
+        if target.is_empty() {
+            return false;
+        }
+        root_trimmed == target || target.starts_with(&format!("{root_trimmed}/"))
+    };
+    [home, xdg_config, xdg_data]
+        .into_iter()
+        .flatten()
+        .any(ancestor_or_equal)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -225,11 +244,13 @@ fn append(
     Ok(tx.last_insert_rowid())
 }
 
-fn cached(tx: &Transaction<'_>, key: Option<&str>) -> rusqlite::Result<Option<Vec<u8>>> {
+fn cached(tx: &Transaction<'_>, op: &str, key: Option<&str>) -> rusqlite::Result<Option<Vec<u8>>> {
+    // The op is part of the lookup: a request_key reused across DIFFERENT op
+    // kinds must not serve the other op's cached reply as this op's result.
     key.and_then(|key| {
         tx.query_row(
-            "SELECT response_json FROM registry_journal WHERE request_key=?1",
-            [key],
+            "SELECT response_json FROM registry_journal WHERE request_key=?1 AND op=?2",
+            [key, op],
             |r| r.get::<_, Option<String>>(0),
         )
         .optional()
@@ -245,48 +266,78 @@ fn wire(value: Value) -> Result<Vec<u8>, RegistryError> {
 }
 
 impl RegistryStore {
-    fn mutation<F>(&self, _op: &str, key: Option<&str>, action: F) -> Result<Vec<u8>, RegistryError>
+    fn mutation<F>(&self, op: &str, key: Option<&str>, action: F) -> Result<Vec<u8>, RegistryError>
     where
         F: FnOnce(&Transaction<'_>) -> Result<Action, RegistryError>,
     {
-        let out = self
-            .db
-            .with_conn_fenced(|tx| -> rusqlite::Result<Result<Vec<u8>, RegistryError>> {
-                if let Some(blob) = cached(tx, key)? {
-                    return Ok(Ok(blob));
+        // Domain errors must ABORT the transaction, never commit around it:
+        // with_conn_fenced commits on any Ok, so returning a domain error as
+        // Ok(Err(_)) would commit whatever the action closure wrote before
+        // failing (a journal row without its projection, or a row with NULL
+        // response_json that then poisons request_key idempotency). The error
+        // is stashed outside the closure and a rusqlite error is returned as
+        // a rollback sentinel; the stash wins on the way out.
+        let domain_error = std::cell::RefCell::new(None::<RegistryError>);
+        let out = self.db.with_conn_fenced(|tx| -> rusqlite::Result<Vec<u8>> {
+            let mut fail = |e: RegistryError| -> rusqlite::Error {
+                *domain_error.borrow_mut() = Some(e);
+                rusqlite::Error::QueryReturnedNoRows
+            };
+            if let Some(blob) = cached(tx, op, key)? {
+                return Ok(blob);
+            }
+            // request_key is globally UNIQUE in the journal. A key that
+            // exists under a DIFFERENT op is a caller bug: serving the
+            // other op's reply would be silent corruption, and letting the
+            // append hit the constraint would surface a raw database
+            // error. Refuse with a typed domain error instead.
+            if let Some(key) = key {
+                if let Some(other) = tx
+                    .query_row(
+                        "SELECT op FROM registry_journal WHERE request_key=?1",
+                        [key],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()?
+                {
+                    if other != op {
+                        return Err(fail(domain(
+                            "request_key_reused_across_ops",
+                            format!("request_key is already bound to op '{other}'"),
+                        )));
+                    }
                 }
-                let action = match action(tx) {
-                    Ok(a) => a,
-                    Err(e) => return Ok(Err(e)),
-                };
-                let generation = action.seq.unwrap_or(tx.query_row(
-                    "SELECT COALESCE(MAX(seq),0) FROM registry_journal",
-                    [],
-                    |r| r.get(0),
-                )?);
-                let mut value = action.value;
-                if let Value::Object(ref mut map) = value {
-                    map.insert("generation".to_string(), json!(generation));
-                    map.insert("noop".to_string(), json!(!action.changed));
-                }
-                let blob = match wire(value) {
-                    Ok(v) => v,
-                    Err(e) => return Ok(Err(e)),
-                };
-                if action.changed {
-                    tx.execute(
-                        "UPDATE registry_journal SET payload_json=?1,response_json=?2 WHERE seq=?3",
-                        params![
-                            serde_json::to_string(&action.payload).unwrap(),
-                            String::from_utf8_lossy(&blob).to_string(),
-                            action.seq.unwrap()
-                        ],
-                    )?;
-                }
-                Ok(Ok(blob))
-            })
-            .map_err(RegistryError::Store)?;
-        out
+            }
+            let action = action(tx).map_err(&mut fail)?;
+            let generation = action.seq.unwrap_or(tx.query_row(
+                "SELECT COALESCE(MAX(seq),0) FROM registry_journal",
+                [],
+                |r| r.get(0),
+            )?);
+            let mut value = action.value;
+            if let Value::Object(ref mut map) = value {
+                map.insert("generation".to_string(), json!(generation));
+                map.insert("noop".to_string(), json!(!action.changed));
+            }
+            let blob = wire(value).map_err(&mut fail)?;
+            if action.changed {
+                tx.execute(
+                    "UPDATE registry_journal SET payload_json=?1,response_json=?2 WHERE seq=?3",
+                    params![
+                        serde_json::to_string(&action.payload).unwrap(),
+                        String::from_utf8_lossy(&blob).to_string(),
+                        action.seq.unwrap()
+                    ],
+                )?;
+            }
+            Ok(blob)
+        });
+        match out {
+            Ok(blob) => Ok(blob),
+            Err(store_error) => Err(domain_error
+                .into_inner()
+                .unwrap_or(RegistryError::Store(store_error))),
+        }
     }
 
     pub fn register(&self, mut req: RegisterRequest) -> Result<Vec<u8>, RegistryError> {
@@ -1309,5 +1360,152 @@ mod adversarial_tests {
         assert!(kinds.contains(&"identity_class_precedence"));
         assert!(kinds.contains(&"alias_occupied"));
         assert!(kinds.contains(&"multi_workspace"));
+    }
+}
+
+#[cfg(test)]
+mod audit_fix_tests {
+    use super::tests::Fixture;
+    use super::*;
+
+    /// Audit finding (glm C1 / grok c3): a domain error surfaced by the action
+    /// closure must ROLL BACK the whole transaction. with_conn_fenced commits
+    /// on any Ok, so the old Ok(Err(_)) shape would have committed partial
+    /// writes. Contrastive: the failing register (root conflict) must leave
+    /// the journal length and generation untouched.
+    #[test]
+    fn domain_error_rolls_back_instead_of_committing_partial_state() {
+        let f = Fixture::new("rollback");
+        let store = &f.store;
+        let root_a = f.dir("a");
+        let root_b = f.dir("b");
+        store
+            .register(RegisterRequest {
+                project_id: Some("p1".into()),
+                name: "one".into(),
+                roots: vec![root_a.clone()],
+                derived_root_parents: vec![],
+                workspace_id: None,
+                request_key: None,
+                actor: None,
+            })
+            .unwrap();
+        let generation_before = store.generation().unwrap();
+        // Second project claiming p1's root: domain error root_conflict.
+        let err = store
+            .register(RegisterRequest {
+                project_id: Some("p2".into()),
+                name: "two".into(),
+                roots: vec![root_a.clone()],
+                derived_root_parents: vec![],
+                workspace_id: None,
+                request_key: Some("rk-conflict".into()),
+                actor: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, RegistryError::Domain { ref code, .. } if code == "root_conflict"));
+        // Nothing committed: generation unchanged, no journal row carries the
+        // failed request_key, and p2 does not exist.
+        assert_eq!(store.generation().unwrap(), generation_before);
+        let resolved = store.resolve_project_id("p2");
+        assert!(
+            resolved.is_err() || resolved.unwrap().gone,
+            "failed register must not mint the project"
+        );
+        // The failed request_key must not be poisoned: a corrected retry with
+        // the same key succeeds rather than serving a cached NULL.
+        store
+            .register(RegisterRequest {
+                project_id: Some("p2".into()),
+                name: "two".into(),
+                roots: vec![root_b],
+                derived_root_parents: vec![],
+                workspace_id: None,
+                request_key: Some("rk-conflict".into()),
+                actor: None,
+            })
+            .unwrap();
+    }
+
+    /// Audit finding (glm C15): request_key idempotency must be scoped to the
+    /// op kind — the same key on a DIFFERENT op must not serve the first op's
+    /// cached reply.
+    #[test]
+    fn request_key_cache_is_op_scoped() {
+        let f = Fixture::new("opscope");
+        let store = &f.store;
+        let root_a = f.dir("a");
+        let blob = store
+            .register(RegisterRequest {
+                project_id: Some("p1".into()),
+                name: "one".into(),
+                roots: vec![root_a],
+                derived_root_parents: vec![],
+                workspace_id: None,
+                request_key: Some("shared-key".into()),
+                actor: None,
+            })
+            .unwrap();
+        let registered: serde_json::Value = serde_json::from_slice(&blob).unwrap();
+        assert_eq!(registered["result"]["projectId"], "p1");
+        // Same request_key, different op: typed refusal — never the other
+        // op's cached reply (silent corruption) and never a raw UNIQUE
+        // constraint error.
+        let err = store
+            .assign_workspace(AssignWorkspaceRequest {
+                project_id: "p1".into(),
+                workspace_id: "w1".into(),
+                workspace_name: None,
+                request_key: Some("shared-key".into()),
+                actor: None,
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, RegistryError::Domain { ref code, .. } if code == "request_key_reused_across_ops"),
+            "cross-op key reuse must refuse typed, got: {err}"
+        );
+        // Contrastive: SAME op with the same key replays the cached reply.
+        let replay = store
+            .register(RegisterRequest {
+                project_id: Some("ignored".into()),
+                name: "ignored".into(),
+                roots: vec![],
+                derived_root_parents: vec![],
+                workspace_id: None,
+                request_key: Some("shared-key".into()),
+                actor: None,
+            })
+            .unwrap();
+        let replayed: serde_json::Value = serde_json::from_slice(&replay).unwrap();
+        assert_eq!(
+            replayed["result"], registered["result"],
+            "same-op replay must serve the cached reply byte-for-byte"
+        );
+    }
+
+    /// Audit finding (sol C4): the home guard's contract is XDG-aware. An
+    /// explicitly relocated XDG home outside $HOME must still be guarded.
+    #[test]
+    fn home_guard_consults_relocated_xdg_homes() {
+        let check = |root: &str| {
+            is_home_scoped_against(root, Some("/Users/u"), Some("/srv/xdg/config"), None)
+        };
+        // Ancestor-or-equal of the relocated XDG config home: guarded.
+        assert!(check("/srv/xdg"));
+        assert!(check("/srv/xdg/config"));
+        // Unrelated path outside both trees: admitted.
+        assert!(!check("/srv/projects/app"));
+        // $HOME and its ancestors remain guarded; filesystem root always.
+        assert!(check("/Users/u"));
+        assert!(check("/Users"));
+        assert!(check("/"));
+        // A CHILD of the XDG home is not an ancestor: admitted (matches the
+        // $HOME semantics where only home itself and ancestors guard).
+        assert!(!is_home_scoped_against(
+            "/srv/xdg/config/app",
+            Some("/Users/u"),
+            Some("/srv/xdg/config"),
+            None
+        ));
     }
 }

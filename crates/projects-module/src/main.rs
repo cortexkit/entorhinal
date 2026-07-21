@@ -216,6 +216,9 @@ impl ModuleHandler for ProjectsHandler {
                 "enumerateCount": self.health.enumerate_count.load(Ordering::Relaxed),
                 "journalTailCount": self.health.journal_tail_count.load(Ordering::Relaxed),
                 "lastOperationMs": self.health.last_operation_ms.load(Ordering::Relaxed),
+                "livenessBatches": self.health.liveness_batches.load(Ordering::Relaxed),
+                "livenessGaps": self.health.liveness_gaps.load(Ordering::Relaxed),
+                "livenessSessions": self.health.liveness_sessions.load(Ordering::Relaxed),
             })),
         }
     }
@@ -255,19 +258,21 @@ impl ProjectsHandler {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        let gap = if batch.snapshot {
+        if batch.snapshot {
             state.sessions.clear();
             state.stale = false;
-            false
         } else {
             let expected = state.last_seq.map(|s| s.wrapping_add(1));
-            let gap = expected.is_some_and(|e| batch.seq != e);
-            if gap {
+            if expected.is_some_and(|e| batch.seq != e) {
                 state.stale = true;
                 self.health.liveness_gaps.fetch_add(1, Ordering::Relaxed);
             }
-            gap
-        };
+        }
+        // Request a snapshot until one actually rebases us: staleness is a
+        // LATCH, not a per-batch flag. If only the freshly-detected gap
+        // answered true, a lost snapshot re-emit would leave the state stale
+        // forever while every later contiguous delta reported clean.
+        let snapshot_requested = state.stale;
         state.last_seq = Some(batch.seq);
 
         for session in batch.sessions {
@@ -292,7 +297,7 @@ impl ProjectsHandler {
             .liveness_sessions
             .store(tracked, Ordering::Relaxed);
         serde_json::to_vec(&json!({
-            "result": { "accepted": true, "snapshotRequested": gap, "tracked": tracked }
+            "result": { "accepted": true, "snapshotRequested": snapshot_requested, "tracked": tracked }
         }))
         .map_err(|error| HandlerError {
             code: "encode_failed".to_string(),
@@ -317,9 +322,39 @@ impl ProjectsHandler {
 
     fn enumerate(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
         let params = serde_json::from_value::<EnumerateParams>(params).map_err(invalid_params)?;
-        let reply = self.with_store(|store| store.enumerate(params.workspace_id.as_deref()))?;
+        let mut reply = self.with_store(|store| store.enumerate(params.workspace_id.as_deref()))?;
+        self.annotate_liveness(&mut reply);
         self.record_query(reply.generation, &self.health.enumerate_count);
         encode_result(reply)
+    }
+
+    /// Join the volatile liveness map onto enumerate results: a project's
+    /// last_route_activity_ms is the newest activity among live sessions whose
+    /// canonical_root falls inside one of the project's roots. This is the
+    /// consumer the liveness feed exists for; without it the accepted batches
+    /// would annotate nothing.
+    fn annotate_liveness(&self, reply: &mut projects_core::EnumerateReply) {
+        let state = self
+            .liveness
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.sessions.is_empty() {
+            return;
+        }
+        for project in &mut reply.projects {
+            let newest = state
+                .sessions
+                .values()
+                .filter(|(_, root, _)| {
+                    project.roots.iter().any(|project_root| {
+                        root == project_root
+                            || root.starts_with(&format!("{}/", project_root.trim_end_matches('/')))
+                    })
+                })
+                .map(|(_, _, activity)| *activity)
+                .max();
+            project.last_route_activity_ms = newest;
+        }
     }
 
     fn journal_tail(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
@@ -333,25 +368,49 @@ impl ProjectsHandler {
 
     fn register(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
         let req = serde_json::from_value::<RegisterRequest>(params).map_err(invalid_params)?;
-        self.with_store(|s| s.register(req))
+        self.record_mutation(self.with_store(|s| s.register(req)))
     }
     fn assign_workspace(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
         let req =
             serde_json::from_value::<AssignWorkspaceRequest>(params).map_err(invalid_params)?;
-        self.with_store(|s| s.assign_workspace(req))
+        self.record_mutation(self.with_store(|s| s.assign_workspace(req)))
     }
     fn upgrade_implicit(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
         let req =
             serde_json::from_value::<UpgradeImplicitRequest>(params).map_err(invalid_params)?;
-        self.with_store(|s| s.upgrade_implicit(req))
+        self.record_mutation(self.with_store(|s| s.upgrade_implicit(req)))
     }
     fn remove(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
         let req = serde_json::from_value::<RemoveRequest>(params).map_err(invalid_params)?;
-        self.with_store(|s| s.remove(req))
+        self.record_mutation(self.with_store(|s| s.remove(req)))
     }
     fn seed_import(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
         let req = serde_json::from_value::<SeedImportRequest>(params).map_err(invalid_params)?;
-        self.with_store(|s| s.seed_import(req))
+        self.record_mutation(self.with_store(|s| s.seed_import(req)))
+    }
+
+    /// Refresh the health generation gauge from a mutation's wire reply, which
+    /// carries the post-mutation generation. Without this the gauge reports
+    /// the pre-mutation generation until the next query-side op runs.
+    fn record_mutation(
+        &self,
+        result: Result<Vec<u8>, HandlerError>,
+    ) -> Result<Vec<u8>, HandlerError> {
+        if let Ok(blob) = &result {
+            if let Ok(value) = serde_json::from_slice::<Value>(blob) {
+                if let Some(generation) = value
+                    .get("result")
+                    .and_then(|r| r.get("generation"))
+                    .and_then(Value::as_i64)
+                {
+                    self.health.generation.store(generation, Ordering::Relaxed);
+                }
+            }
+            self.health
+                .last_operation_ms
+                .store(unix_millis(), Ordering::Relaxed);
+        }
+        result
     }
     fn verify(&self) -> Result<Vec<u8>, HandlerError> {
         let reply = self.with_store(|s| s.verify())?;
@@ -535,6 +594,21 @@ mod tests {
         );
         assert_eq!(v["result"]["tracked"], 1, "gone still applies");
         assert_eq!(handler.health.liveness_gaps.load(Ordering::Relaxed), 1);
+        // THE LATCH (audit C1): a contiguous delta arriving while state is
+        // still stale must KEEP requesting the snapshot. Before the fix this
+        // read false (gap was per-batch), so one lost snapshot re-emit left
+        // the state stale forever with every later reply reading clean.
+        let r = call(
+            &handler,
+            json!({"seq": 14, "sessions": [
+            {"sessionId": "s3", "canonicalRoot": "/tmp/c", "state": "active"}]}),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_slice(&r).unwrap();
+        assert_eq!(
+            v["result"]["snapshotRequested"], true,
+            "stale state must keep requesting a snapshot on contiguous deltas"
+        );
         // Snapshot rebases: stale clears, seq resets legally.
         let r = call(
             &handler,
@@ -544,6 +618,51 @@ mod tests {
         let v: Value = serde_json::from_slice(&r).unwrap();
         assert_eq!(v["result"]["snapshotRequested"], false);
         assert_eq!(v["result"]["tracked"], 0);
+        // And post-rebase deltas read clean again.
+        let r = call(&handler, json!({"seq": 2, "sessions": []})).unwrap();
+        let v: Value = serde_json::from_slice(&r).unwrap();
+        assert_eq!(v["result"]["snapshotRequested"], false);
+    }
+
+    #[test]
+    fn enumerate_annotation_joins_liveness_by_root_containment() {
+        let handler = ProjectsHandler::new();
+        handler
+            .session_liveness(json!({"seq": 1, "snapshot": true, "sessions": [
+                {"sessionId": "s1", "canonicalRoot": "/w/proj/sub", "state": "active", "lastActivityMs": 500},
+                {"sessionId": "s2", "canonicalRoot": "/w/proj", "state": "idle", "lastActivityMs": 900},
+                {"sessionId": "s3", "canonicalRoot": "/elsewhere", "state": "active", "lastActivityMs": 999}]}))
+            .unwrap();
+        let mut reply = projects_core::EnumerateReply {
+            generation: 1,
+            workspaces: vec![],
+            projects: vec![
+                projects_core::ProjectView {
+                    project_id: "p1".into(),
+                    name: "p1".into(),
+                    roots: vec!["/w/proj".into()],
+                    implicit: false,
+                    ref_kind: "local".into(),
+                    device_fingerprint: None,
+                    last_route_activity_ms: None,
+                },
+                projects_core::ProjectView {
+                    project_id: "p2".into(),
+                    name: "p2".into(),
+                    roots: vec!["/w/other".into()],
+                    implicit: false,
+                    ref_kind: "local".into(),
+                    device_fingerprint: None,
+                    last_route_activity_ms: None,
+                },
+            ],
+        };
+        handler.annotate_liveness(&mut reply);
+        // p1 gets the NEWEST activity among sessions inside its root (s1
+        // strictly under, s2 exactly at) and never /elsewhere's.
+        assert_eq!(reply.projects[0].last_route_activity_ms, Some(900));
+        // No live session touches p2: annotation stays None, not zero.
+        assert_eq!(reply.projects[1].last_route_activity_ms, None);
     }
 
     #[test]

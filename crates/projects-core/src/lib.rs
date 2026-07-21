@@ -23,7 +23,9 @@ pub use mutations::*;
 
 const MIGRATION_NAMESPACE: &str = "projects";
 
-/// The complete v1 projection schema. Mutations use [`RegistryStore::apply_entry`]
+/// The complete v1 projection schema. Production mutations write through
+/// [`RegistryStore`]'s fenced mutation path in mutations.rs (journal append +
+/// projection writes in one transaction); [`RegistryStore::apply_entry`]
 /// so the journal append and projection update share one transaction.
 pub const V1_SCHEMA: &str = r#"
 CREATE TABLE registry_journal (
