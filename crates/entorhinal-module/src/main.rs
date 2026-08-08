@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! The supervised `ck-projects` module.
+//! The supervised `ck-entorhinal` module.
 //!
 //! `subc-client-rs` owns the HELLO, HELLO_ACK, route binding, health control, and
 //! frame lifecycle. This binary only supplies the manifest and domain handler.
@@ -16,7 +16,7 @@ use std::{
 
 use async_trait::async_trait;
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
-use projects_core::{
+use entorhinal_core::{
     AssignWorkspaceRequest, RegisterRequest, RegistryError, RegistryStore, RemoveRequest,
     SeedImportRequest, UpgradeImplicitRequest,
 };
@@ -46,7 +46,7 @@ const DEFAULT_STORAGE_NAMESPACE: &str = "default";
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if std::env::args().any(|argument| argument == "--version") {
-        println!("ck-projects {}", env!("CARGO_PKG_VERSION"));
+        println!("ck-entorhinal {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
 
@@ -196,7 +196,7 @@ impl ModuleHandler for ProjectsHandler {
                 *guard = Some(store);
             }
             Err(error) => {
-                eprintln!("[ck-projects] {error}");
+                eprintln!("[ck-entorhinal] {error}");
                 self.health.store_ready.store(false, Ordering::Relaxed);
                 self.health.store_failed.store(true, Ordering::Relaxed);
                 *guard = None;
@@ -342,7 +342,7 @@ impl ProjectsHandler {
     /// canonical_root falls inside one of the project's roots. This is the
     /// consumer the liveness feed exists for; without it the accepted batches
     /// would annotate nothing.
-    fn annotate_liveness(&self, reply: &mut projects_core::EnumerateReply) {
+    fn annotate_liveness(&self, reply: &mut entorhinal_core::EnumerateReply) {
         let state = self
             .liveness
             .lock()
@@ -544,8 +544,8 @@ fn fallback_storage_descriptor() -> StorageDescriptor {
                 .filter(|value| !value.is_empty())
                 .map(|home| PathBuf::from(home).join(".local/share"))
         })
-        .unwrap_or_else(|| std::env::temp_dir().join("ck-projects-data"));
-    let path = sqlite_store_path(&data_home.to_string_lossy(), "ck-projects");
+        .unwrap_or_else(|| std::env::temp_dir().join("ck-entorhinal-data"));
+    let path = sqlite_store_path(&data_home.to_string_lossy(), "ck-entorhinal");
     StorageDescriptor {
         module_id: MODULE_ID.to_string(),
         storage_namespace: DEFAULT_STORAGE_NAMESPACE.to_string(),
@@ -642,11 +642,11 @@ mod tests {
                 {"sessionId": "s2", "canonicalRoot": "/w/proj", "state": "idle", "lastActivityMs": 900},
                 {"sessionId": "s3", "canonicalRoot": "/elsewhere", "state": "active", "lastActivityMs": 999}]}))
             .unwrap();
-        let mut reply = projects_core::EnumerateReply {
+        let mut reply = entorhinal_core::EnumerateReply {
             generation: 1,
             workspaces: vec![],
             projects: vec![
-                projects_core::ProjectView {
+                entorhinal_core::ProjectView {
                     project_id: "p1".into(),
                     name: "p1".into(),
                     roots: vec!["/w/proj".into()],
@@ -655,7 +655,7 @@ mod tests {
                     device_fingerprint: None,
                     last_route_activity_ms: None,
                 },
-                projects_core::ProjectView {
+                entorhinal_core::ProjectView {
                     project_id: "p2".into(),
                     name: "p2".into(),
                     roots: vec!["/w/other".into()],
@@ -690,7 +690,7 @@ mod tests {
 
     #[test]
     fn version_probe_is_not_a_subc_connection_attempt() {
-        assert_eq!(env!("CARGO_PKG_NAME"), "projects-module");
+        assert_eq!(env!("CARGO_PKG_NAME"), "entorhinal-module");
         assert_eq!(
             subc_protocol::session::MODULE_CONTROL_OP_HEALTH_CHECK,
             "health.check"

@@ -176,6 +176,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "entorhinal-core"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "cortexkit-paths 0.1.1",
+ "cortexkit-store",
+ "cortexkit-store-types",
+ "rusqlite",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "entorhinal-module"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cortexkit-store-types",
+ "entorhinal-core",
+ "serde",
+ "serde_json",
+ "subc-client-rs",
+ "subc-core",
+ "subc-protocol",
+ "subc-transport",
+ "tokio",
+]
+
+[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -414,35 +443,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "projects-core"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "cortexkit-paths 0.1.1",
- "cortexkit-store",
- "cortexkit-store-types",
- "rusqlite",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "projects-module"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "cortexkit-store-types",
- "projects-core",
- "serde",
- "serde_json",
- "subc-client-rs",
- "subc-core",
- "subc-protocol",
- "subc-transport",
- "tokio",
 ]
 
 [[package]]

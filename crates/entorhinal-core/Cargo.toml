@@ -1,9 +1,9 @@
 [package]
-name = "projects-core"
+name = "entorhinal-core"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Pure domain and journal-spine store for the ck-projects registry."
+description = "Pure domain and journal-spine store for the ck-entorhinal registry."
 
 [dependencies]
 blake3 = { workspace = true }

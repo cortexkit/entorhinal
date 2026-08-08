@@ -20,15 +20,15 @@ jobs:
     timeout-minutes: 20
     defaults:
       run:
-        working-directory: ck-projects
+        working-directory: entorhinal
     steps:
-      - name: Checkout ck-projects
+      - name: Checkout entorhinal
         uses: actions/checkout@v5
         with:
-          path: ck-projects
+          path: entorhinal
 
       # The module path-depends on the sibling subc wire crates and the commons
-      # storage/path crates. The default token is scoped to ck-projects, so the
+      # storage/path crates. The default token is scoped to entorhinal, so the
       # cortexkit-ci GitHub App supplies read access to both private siblings.
       - name: Mint cross-repo read token
         id: app-token

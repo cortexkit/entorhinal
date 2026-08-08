@@ -4,7 +4,7 @@
 //!
 //! The test is ignored by default because it builds the sibling `ck-subc` binary
 //! and starts loopback processes. Run it explicitly with:
-//! `cargo test -p projects-module --test real_daemon_e2e -- --ignored --nocapture`.
+//! `cargo test -p entorhinal-module --test real_daemon_e2e -- --ignored --nocapture`.
 
 use std::{
     path::{Path, PathBuf},
@@ -55,7 +55,7 @@ fn subconscious_root() -> PathBuf {
 
 fn unique_temp_dir(label: &str) -> PathBuf {
     let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("ck-projects-{label}-{}-{id}", std::process::id()))
+    std::env::temp_dir().join(format!("ck-entorhinal-{label}-{}-{id}", std::process::id()))
 }
 
 fn build_subc_core() -> PathBuf {
@@ -77,7 +77,7 @@ fn build_subc_core() -> PathBuf {
 
 async fn start_real_daemon() -> RealDaemon {
     let daemon_bin = build_subc_core();
-    let module_bin = PathBuf::from(env!("CARGO_BIN_EXE_ck-projects"));
+    let module_bin = PathBuf::from(env!("CARGO_BIN_EXE_ck-entorhinal"));
     let root = unique_temp_dir("real-daemon");
     let config_dir = root.join("config/cortexkit");
     let runtime_dir = root.join("runtime");

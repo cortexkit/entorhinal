@@ -780,7 +780,7 @@ mod tests {
     impl TestStore {
         fn new(label: &str) -> Self {
             let root = std::env::temp_dir().join(format!(
-                "ck-projects-{label}-{}-{}",
+                "ck-entorhinal-{label}-{}-{}",
                 std::process::id(),
                 TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
             ));

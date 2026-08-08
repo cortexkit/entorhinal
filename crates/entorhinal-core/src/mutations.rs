@@ -728,7 +728,7 @@ pub(crate) mod tests {
     impl Fixture {
         pub(crate) fn new(label: &str) -> Self {
             let root = std::env::temp_dir().join(format!(
-                "ck-projects-mutations-{label}-{}-{}",
+                "ck-entorhinal-mutations-{label}-{}-{}",
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));

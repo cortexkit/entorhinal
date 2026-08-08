@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/projects-core", "crates/projects-module"]
+members = ["crates/entorhinal-core", "crates/entorhinal-module"]
 
 # During local development this workspace is nested under the subconscious checkout.
 # The production repository uses the sibling checkout layout in CI.

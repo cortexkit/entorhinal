@@ -1,16 +1,16 @@
 [package]
-name = "projects-module"
+name = "entorhinal-module"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "The ck-projects supervised subc module."
+description = "The ck-entorhinal supervised subc module."
 
 [[bin]]
-name = "ck-projects"
+name = "ck-entorhinal"
 path = "src/main.rs"
 
 [dependencies]
-projects-core = { path = "../projects-core" }
+entorhinal-core = { path = "../entorhinal-core" }
 cortexkit-store-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
