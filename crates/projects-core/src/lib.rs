@@ -21,6 +21,14 @@ use serde::Serialize;
 mod mutations;
 pub use mutations::*;
 
+// The schema-migration namespace, NOT the module id, and deliberately left as
+// "projects" while the module id moved to "entorhinal".
+//
+// This value is recorded in the store's own migration ledger, so changing it
+// makes an existing database look unmigrated and re-runs migration 1 against
+// tables that already exist. It is unsafe to change once any store exists, and
+// changing it here would buy nothing: it is never seen outside the database
+// file. A consumer dials the module id; nothing dials this.
 const MIGRATION_NAMESPACE: &str = "projects";
 
 /// The complete v1 projection schema. Production mutations write through

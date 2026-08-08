@@ -31,7 +31,16 @@ use subc_protocol::{
     ModuleHelloAckBody, PROTOCOL_VERSION,
 };
 
-const MODULE_ID: &str = "projects";
+// The id the daemon serves this module under, and the LAST of three names to be
+// reconciled: the repo and binary became `entorhinal` in the fleet rename wave
+// while this constant stayed `projects`, so a consumer that guessed either of
+// the other two dialled a module that does not exist.
+//
+// Changed before first run, deliberately. The daemon derives the module's store
+// path from this id, so the first launch mints a directory and the rename stops
+// being free from then on -- it becomes a data migration. This module has never
+// been deployed, which is the only reason a one-line change is sufficient.
+const MODULE_ID: &str = "entorhinal";
 const DEFAULT_STORAGE_NAMESPACE: &str = "default";
 
 #[tokio::main]
@@ -668,7 +677,7 @@ mod tests {
     #[test]
     fn manifest_declares_the_projects_surface_and_all_skeleton_mutations() {
         let value = serde_json::to_value(manifest()).expect("manifest serializes");
-        assert_eq!(value["module_id"], "projects");
+        assert_eq!(value["module_id"], "entorhinal");
         assert_eq!(value["trust_tier"], "first_party");
         let operations = value["provides"][0]["operations"].as_array().unwrap();
         assert!(operations

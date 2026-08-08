@@ -24,7 +24,13 @@ use tokio::{
     time::{sleep, Instant},
 };
 
-const MODULE_ID: &str = "projects";
+// Must match the module's own MODULE_ID. This test spawns a real daemon and
+// dials the module by this name, so a stale value here does not fail loudly --
+// it dials a module that does not exist, which is the same unknown_module shape
+// the rename was fixing. The half-renamed pair is the hazard: renaming the
+// module and leaving its e2e test pinned to the old name yields a test that
+// exercises nothing.
+const MODULE_ID: &str = "entorhinal";
 const START_TIMEOUT: Duration = Duration::from_secs(15);
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 const SUBCONSCIOUS_RELATIVE_TO_CRATE: &str = "../../../subconscious";
