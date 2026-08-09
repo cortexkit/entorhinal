@@ -52,6 +52,18 @@ pub struct Command {
 /// answered without connecting to anything, and it is the same parse-then-act
 /// split the daemon binary uses.
 pub fn parse(arguments: &[String]) -> Invocation {
+    // A supervised spawn is NOT empty argv. subc launches module-mode children as
+    // `<program> [configured args] --subc <connection-file-path>` (supervise.rs
+    // SUBC_ARG), so the shape that reaches the module is a bare `--subc <path>`
+    // with no verb. Treating empty argv as the only serving path sent every
+    // supervised spawn into the usage branch, which printed help and EXITED 0 --
+    // and the daemon logged "supervised module exited cleanly", because from its
+    // side that is exactly what happened.
+    //
+    // The discriminator is therefore "no verb, and a connection file was given":
+    // the daemon always supplies one, and an operator invoking a verb always has
+    // one. Empty argv is kept as Module too so a hand-run child behaves the same,
+    // but it is no longer the condition being relied on.
     if arguments.is_empty() {
         return Invocation::Module;
     }
@@ -88,7 +100,9 @@ pub fn parse(arguments: &[String]) -> Invocation {
     }
 
     match verb {
-        // A bare invocation with only flags is a question, not a mistake.
+        // No verb WITH a connection file is the supervisor's spawn shape: serve.
+        None if connection.is_some() => Invocation::Module,
+        // No verb and nothing to connect to is a question, not a mistake.
         None => Invocation::Report(usage()),
         Some(verb) => Invocation::Command(Command {
             verb,
@@ -185,9 +199,23 @@ fn build(command: &Command) -> Result<(String, Value), String> {
             .cloned()
             .ok_or_else(|| format!("{} needs {what}\n\n{}", command.verb, usage()))
     };
-    // Directories are resolved against the operator's shell before they are
-    // sent, because the registry canonicalizes what it is given and a relative
-    // path would canonicalize against the DAEMON's working directory.
+    // Directories are CANONICALIZED against the operator's shell before they are
+    // sent. Two separate reasons, and only the first was obvious:
+    //
+    // 1. A relative path has to be resolved here, because the registry resolves
+    //    what it is given against the DAEMON's working directory, not the
+    //    operator's.
+    // 2. The registry REFUSES a non-canonical path outright (`not_canonical`).
+    //    On macOS /tmp is a symlink to /private/tmp, so an absolute path that
+    //    the operator can `cd` into is still rejected -- making absolute
+    //    necessary but not sufficient. Sending it verbatim turns an ordinary
+    //    path into a refusal the operator cannot act on, since nothing about
+    //    the path they typed looks wrong.
+    //
+    // Falls back to the lexically-joined path when the directory does not exist
+    // yet: canonicalize() requires existence, and a clear refusal from the
+    // registry about a missing directory is better than one from here about a
+    // failed syscall.
     let absolute = |value: &str| -> Result<String, String> {
         let path = Path::new(value);
         let joined = if path.is_absolute() {
@@ -197,7 +225,8 @@ fn build(command: &Command) -> Result<(String, Value), String> {
                 .map_err(|error| format!("resolve '{value}': {error}"))?
                 .join(path)
         };
-        Ok(joined.to_string_lossy().to_string())
+        let resolved = std::fs::canonicalize(&joined).unwrap_or(joined);
+        Ok(resolved.to_string_lossy().to_string())
     };
 
     Ok(match command.verb.as_str() {
@@ -298,9 +327,41 @@ fn call(connection: &Path, method: &str, params: Value) -> Result<Value, (u8, St
                 }
                 other => (EXIT_TRANSPORT, format!("call: {other}")),
             })?;
-        serde_json::from_slice(&bytes)
-            .map_err(|error| (EXIT_TRANSPORT, format!("decode response: {error}")))
+        let envelope: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| (EXIT_TRANSPORT, format!("decode response: {error}")))?;
+        unwrap_result(envelope)
     })
+}
+
+/// Strip the `{"result": ...}` wrapper the registry puts on every reply.
+///
+/// FAILS LOUD when the wrapper is absent rather than passing the envelope
+/// through. Returning it unwrapped would make every field lookup miss by one
+/// level, and a miss renders as a legitimate empty answer -- `list` printed
+/// "no projects registered" against a registry holding a project, which is a
+/// confident wrong answer rather than a visible error. A contract violation
+/// should look like one.
+fn unwrap_result(envelope: Value) -> Result<Value, (u8, String)> {
+    match envelope {
+        Value::Object(mut map) => map.remove("result").ok_or_else(|| {
+            let keys: Vec<&str> = map.keys().map(String::as_str).collect();
+            (
+                EXIT_TRANSPORT,
+                format!(
+                    "registry reply has no 'result' envelope (keys: {})",
+                    if keys.is_empty() {
+                        "none".to_string()
+                    } else {
+                        keys.join(", ")
+                    }
+                ),
+            )
+        }),
+        other => Err((
+            EXIT_TRANSPORT,
+            format!("registry reply is not an object: {other}"),
+        )),
+    }
 }
 
 fn render(command: &Command, value: &Value) {
@@ -334,9 +395,30 @@ fn render(command: &Command, value: &Value) {
             println!("\n{} project(s)", projects.len());
         }
         "resolve" => {
+            // Field names are the REGISTRY's, not this renderer's guesses.
+            // `projectName` was read as `name` here and rendered as "-" against
+            // a project that has one -- absence and a wrong key look identical
+            // on screen, which is why the verb-to-field mapping is pinned by a
+            // test against the module's own schema rather than by memory.
             println!("project:   {}", text(&value["projectId"]));
-            println!("name:      {}", text(&value["name"]));
+            println!("name:      {}", text(&value["projectName"]));
             println!("workspace: {}", text(&value["workspaceId"]));
+            // AN IMPLICIT PROJECT IS NOT A REGISTERED ONE. The registry always
+            // answers `resolve` -- an unregistered directory gets a derived id
+            // with `via: "implicit"` and nothing stored behind it. Rendered
+            // without this line, that is indistinguishable from a registered
+            // project whose name happens to be unset, so an operator checking
+            // whether a directory is registered would read "yes" from a reply
+            // that means "no".
+            if value["via"].as_str() == Some("implicit") {
+                println!("status:    NOT REGISTERED (derived id; nothing stored)");
+            }
+            // `gone` marks a project whose root no longer exists. Rendering it
+            // only when true keeps the common case quiet, and silence here
+            // means the root was present rather than that nothing was checked.
+            if value["gone"].as_bool() == Some(true) {
+                println!("root:      GONE (registered directory no longer exists)");
+            }
         }
         _ => println!(
             "{}",
@@ -365,11 +447,49 @@ mod tests {
         parse(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>())
     }
 
-    /// Empty argv is the ONLY path that serves. This is the property that keeps
-    /// a mistyped operator command from claiming the module's identity.
+    /// The result envelope is stripped, and its ABSENCE fails loud.
+    ///
+    /// Found by driving a real registry: every renderer read one level too
+    /// high, so `list` printed "no projects registered" against a store holding
+    /// a project. That is the dangerous shape -- a missed lookup renders as a
+    /// legitimate empty answer rather than as an error, so nothing about the
+    /// output says the reply was misread.
     #[test]
-    fn only_empty_argv_runs_as_the_module() {
-        assert!(matches!(parse_of(&[]), Invocation::Module));
+    fn result_envelope_is_stripped_and_its_absence_is_loud() {
+        let wrapped = json!({ "result": { "projects": [ { "projectId": "pj-1" } ] } });
+        let inner = unwrap_result(wrapped).expect("wrapped reply must unwrap");
+        assert_eq!(inner["projects"][0]["projectId"], "pj-1");
+
+        // Absence must not degrade into passing the envelope through: that is
+        // exactly how the original defect rendered as an empty registry.
+        let bare = json!({ "projects": [] });
+        let error = unwrap_result(bare).expect_err("a reply without the envelope must refuse");
+        assert_eq!(error.0, EXIT_TRANSPORT);
+        assert!(
+            error.1.contains("no 'result' envelope"),
+            "refusal must name the missing envelope, got: {}",
+            error.1
+        );
+        // It also names what WAS there, so an operator can tell a contract
+        // change from a transport fault.
+        assert!(
+            error.1.contains("projects"),
+            "refusal must name the keys it saw, got: {}",
+            error.1
+        );
+    }
+
+    /// NO OPERATOR INVOCATION REACHES MODULE MODE.
+    ///
+    /// This is the property that keeps a mistyped command from claiming the
+    /// module's identity against the daemon and sitting there looking healthy.
+    /// It was originally written as "only empty argv serves", which was a
+    /// stronger claim than the property needed AND was wrong -- the supervisor
+    /// spawns with `--subc <path>`, so that rule sent every real spawn into the
+    /// usage branch. The property that matters is about VERBS AND FLAGS, not
+    /// about argv being empty.
+    #[test]
+    fn no_operator_invocation_reaches_module_mode() {
         for argv in [
             vec!["--help"],
             vec!["-h"],
@@ -377,6 +497,11 @@ mod tests {
             vec!["list"],
             vec!["--nonsense"],
             vec!["typo-verb"],
+            // With a connection file too: a verb still never serves, which is
+            // what stops `ck entorhinal list --subc <path>` from starting a
+            // second module instance.
+            vec!["list", "--subc", "/tmp/conn.json"],
+            vec!["typo-verb", "--subc", "/tmp/conn.json"],
         ] {
             assert!(
                 !matches!(parse_of(&argv), Invocation::Module),
@@ -413,6 +538,25 @@ mod tests {
             Invocation::Refuse(text) => assert!(text.contains("needs a path")),
             _ => panic!("a flag missing its value must refuse"),
         }
+    }
+
+    /// The supervisor's spawn shape must reach the serving path.
+    ///
+    /// subc spawns module children as `--subc <connection-file>` with no verb.
+    /// An earlier version treated ONLY empty argv as Module, so every supervised
+    /// spawn fell into the usage branch, printed help and exited 0 -- and the
+    /// daemon reported "exited cleanly", which is true and useless. Asserts the
+    /// real shape rather than the one that was easy to imagine.
+    #[test]
+    fn supervisor_spawn_shape_reaches_the_module_path() {
+        assert!(matches!(
+            parse_of(&["--subc", "/tmp/conn.json"]),
+            Invocation::Module
+        ));
+        // Empty argv stays module mode too, so a hand-run child behaves the
+        // same as a supervised one. Flags with no verb are a question instead.
+        assert!(matches!(parse_of(&[]), Invocation::Module));
+        assert!(matches!(parse_of(&["--json"]), Invocation::Report(_)));
     }
 
     /// Asking for help and being refused must not share an exit status.
@@ -461,30 +605,123 @@ mod tests {
         assert_eq!(build(&cmd(&["verify"])).unwrap().0, "verify");
     }
 
-    /// Relative directories are resolved against the OPERATOR's shell.
+    /// The RENDERER's field names come from the REGISTRY'S OWN REPLY TYPE.
     ///
-    /// The registry canonicalizes what it is handed, and it runs in the
-    /// daemon's working directory — so sending a relative path would register a
-    /// different directory than the operator named, silently and plausibly.
+    /// The request half was pinned from the start; the response half was not,
+    /// and a renderer reading `name` where the reply carries `projectName`
+    /// printed "-" for a project that has one. THAT IS THE DANGEROUS DIRECTION:
+    /// a wrong key and a genuinely absent value render identically, so the
+    /// screen cannot distinguish "the registry had nothing to say" from "I
+    /// asked the wrong question".
+    ///
+    /// The fixture is SERIALIZED FROM `entorhinal_core::ResolveReply` rather
+    /// than hand-written, so it carries whatever that type actually emits. A
+    /// hand-written one would encode my belief about the shape -- which is the
+    /// belief that was wrong in the first place -- and would keep passing after
+    /// a field rename on the producer side.
     #[test]
-    fn directories_are_absolute_before_they_are_sent() {
-        let cmd = Command {
-            verb: "resolve".to_string(),
-            connection: None,
-            args: vec![".".to_string()],
-            json: false,
-        };
-        let (_, params) = build(&cmd).unwrap();
-        let sent = params["canonicalRoot"].as_str().unwrap();
+    fn resolve_renders_the_reply_types_own_field_names() {
+        let reply = serde_json::to_value(entorhinal_core::ResolveReply {
+            project_id: "pj-1".to_string(),
+            workspace_id: Some("ws-1".to_string()),
+            project_name: Some("the-name".to_string()),
+            via: "root".to_string(),
+            gone: false,
+            generation: 2,
+            canonical_root: Some("/tmp/x".to_string()),
+        })
+        .unwrap();
+
+        // Every key the renderer reads must exist on the real reply.
+        for key in ["projectId", "projectName", "workspaceId", "gone"] {
+            assert!(
+                !reply[key].is_null(),
+                "renderer reads '{key}', which ResolveReply does not emit"
+            );
+        }
+        // And the values must be the ones a reader would see, not merely present.
+        assert_eq!(reply["projectName"], "the-name");
+        assert_eq!(reply["projectId"], "pj-1");
+
+        // The registry ALWAYS answers resolve: an unregistered directory comes
+        // back with a derived id and `via: "implicit"`. The renderer keys on
+        // that field, so pin it from the same producer type -- rendered without
+        // it, "not registered" is indistinguishable from a registered project
+        // with no name, and an operator asking "is this directory registered?"
+        // reads yes from a reply that means no.
+        let implicit = serde_json::to_value(entorhinal_core::ResolveReply {
+            project_id: "pj-implicit1-deadbeef".to_string(),
+            workspace_id: None,
+            project_name: None,
+            via: "implicit".to_string(),
+            gone: false,
+            generation: 2,
+            canonical_root: Some("/tmp/x".to_string()),
+        })
+        .unwrap();
+        assert_eq!(implicit["via"], "implicit");
         assert!(
-            Path::new(sent).is_absolute(),
-            "sent a relative path: {sent}"
+            implicit["projectName"].is_null(),
+            "an implicit reply must carry no name; otherwise the renderer's \
+             registered-vs-implicit distinction is not the one being tested"
         );
+    }
+
+    /// Directories are CANONICAL, not merely absolute, before they are sent.
+    ///
+    /// Two separate failures are covered, and the second is why the earlier
+    /// version of this test was not enough:
+    ///
+    /// 1. A relative path must resolve against the OPERATOR's shell. The
+    ///    registry resolves what it is handed in the DAEMON's working
+    ///    directory, so sending it relative would register a different
+    ///    directory than the operator named, silently and plausibly.
+    /// 2. The registry REFUSES a non-canonical root outright. On macOS the
+    ///    temp dir reaches through a symlink, so a perfectly ordinary absolute
+    ///    path an operator can `cd` into is still rejected -- absolute was
+    ///    necessary and not sufficient, and asserting only absoluteness could
+    ///    not see it.
+    #[test]
+    fn directories_are_canonical_before_they_are_sent() {
+        let sent_for = |value: &str| -> String {
+            let command = Command {
+                verb: "resolve".to_string(),
+                connection: None,
+                args: vec![value.to_string()],
+                json: false,
+            };
+            build(&command).unwrap().1["canonicalRoot"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        // (1) relative resolves against the operator's cwd, canonically.
+        let dot = sent_for(".");
+        assert!(Path::new(&dot).is_absolute(), "sent a relative path: {dot}");
         assert_eq!(
-            Path::new(sent),
-            std::env::current_dir().unwrap().join("."),
+            Path::new(&dot),
+            std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap(),
             "resolved against something other than the operator's cwd"
         );
+
+        // (2) an absolute path through a symlinked ancestor is canonicalized.
+        let dir = std::env::temp_dir().join(format!("ent-canon-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let given = dir.to_string_lossy().to_string();
+        let canonical = std::fs::canonicalize(&dir).unwrap();
+        assert_eq!(
+            Path::new(&sent_for(&given)),
+            canonical,
+            "sent path must be canonical, not just absolute"
+        );
+        // Non-vacuity: leg (2) only discriminates where the temp dir actually
+        // goes through a symlink. Where it does not, say so rather than
+        // passing as though the stronger property had been tested.
+        if Path::new(&given) == canonical {
+            eprintln!("note: temp dir is already canonical on this host; leg (2) ran weak");
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A verb missing its arguments is a usage error, not a call with a hole in
