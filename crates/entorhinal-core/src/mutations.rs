@@ -411,7 +411,88 @@ impl RegistryStore {
         let actor = req.actor.clone().unwrap_or_else(|| "module".into());
         let payload =
             serde_json::to_value(&req).map_err(|e| domain("encode_failed", e.to_string()))?;
-        self.mutation("assign_workspace",key.clone().as_deref(),move|tx|{ let now=now_unix_millis(); if tx.query_row("SELECT 1 FROM project WHERE project_id=?1",[&req.project_id],|r|r.get::<_,i64>(0)).optional()?.is_none(){return Err(domain("not_found",&req.project_id)); }; if let Some(old)=tx.query_row("SELECT workspace_id FROM project_workspace WHERE project_id=?1",[&req.project_id],|r|r.get::<_,String>(0)).optional()? {if old==req.workspace_id{return Ok(Action{changed:false,seq:None,value:json!({"projectId":req.project_id,"workspaceId":old}),payload});} return Err(domain("workspace_conflict",format!("project is already in workspace {old}")));} let seq=append(tx,"assign_workspace",&payload,&actor,key.as_deref(),now)?; tx.execute("INSERT OR IGNORE INTO workspace(workspace_id,name,created_at,updated_at) VALUES(?1,?2,?3,?3)",params![&req.workspace_id,req.workspace_name.clone().unwrap_or_else(||req.workspace_id.clone()),now])?; tx.execute("INSERT INTO project_workspace(project_id,workspace_id) VALUES(?1,?2)",[&req.project_id,&req.workspace_id])?; tx.execute("INSERT INTO workspace_member(workspace_id,ref_kind,device_fingerprint,project_id) VALUES(?1,'local','',?2)",[&req.workspace_id,&req.project_id])?; Ok(Action{changed:true,seq:Some(seq),value:json!({"projectId":req.project_id,"workspaceId":req.workspace_id}),payload}) })
+        // A PROJECT CAN BE MOVED BETWEEN WORKSPACES.
+        //
+        // This used to refuse a second assignment with `workspace_conflict`,
+        // which left a user who filed a project in the wrong workspace with no
+        // way to correct it.
+        //
+        // Whatever this does must be mirrored in the `"assign_workspace"` arm of
+        // `replay()`: the tables are a projection of the journal, so a move that
+        // the live path applies and replay does not would silently REVERT the
+        // next time anything calls `rebuild()`. Nothing fails in that case --
+        // the move simply disappears -- so the replay test is the one that
+        // matters.
+        self.mutation(
+            "assign_workspace",
+            key.clone().as_deref(),
+            move |tx| {
+                let now = now_unix_millis();
+                if tx
+                    .query_row(
+                        "SELECT 1 FROM project WHERE project_id=?1",
+                        [&req.project_id],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .optional()?
+                    .is_none()
+                {
+                    return Err(domain("not_found", &req.project_id));
+                };
+                let current = tx
+                    .query_row(
+                        "SELECT workspace_id FROM project_workspace WHERE project_id=?1",
+                        [&req.project_id],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()?;
+                // Re-assigning to the same workspace stays a no-op and appends
+                // NOTHING to the journal. Recording it would grow the journal on
+                // repeated calls and make every rebuild replay work that changes
+                // no state.
+                if current.as_deref() == Some(req.workspace_id.as_str()) {
+                    return Ok(Action {
+                        changed: false,
+                        seq: None,
+                        value: json!({"projectId":req.project_id,"workspaceId":req.workspace_id}),
+                        payload,
+                    });
+                }
+                let seq = append(
+                    tx,
+                    "assign_workspace",
+                    &payload,
+                    &actor,
+                    key.as_deref(),
+                    now,
+                )?;
+                tx.execute("INSERT OR IGNORE INTO workspace(workspace_id,name,created_at,updated_at) VALUES(?1,?2,?3,?3)",params![&req.workspace_id,req.workspace_name.clone().unwrap_or_else(||req.workspace_id.clone()),now])?;
+                // The old membership row is REMOVED, not merely superseded.
+                // workspace_member carries UNIQUE(ref_kind, device_fingerprint,
+                // project_id), so for a local ref exactly one row per project can
+                // exist -- leaving the old one would make the insert below fail
+                // outright rather than merely leaving the project listed under
+                // its former workspace.
+                if let Some(old) = current.as_deref() {
+                    tx.execute(
+                        "DELETE FROM workspace_member WHERE workspace_id=?1 AND ref_kind='local' AND device_fingerprint='' AND project_id=?2",
+                        [old, req.project_id.as_str()],
+                    )?;
+                }
+                tx.execute(
+                    "INSERT INTO project_workspace(project_id,workspace_id) VALUES(?1,?2)
+                     ON CONFLICT(project_id) DO UPDATE SET workspace_id=excluded.workspace_id",
+                    [&req.project_id, &req.workspace_id],
+                )?;
+                tx.execute("INSERT INTO workspace_member(workspace_id,ref_kind,device_fingerprint,project_id) VALUES(?1,'local','',?2)",[&req.workspace_id,&req.project_id])?;
+                Ok(Action {
+                    changed: true,
+                    seq: Some(seq),
+                    value: json!({"projectId":req.project_id,"workspaceId":req.workspace_id}),
+                    payload,
+                })
+            },
+        )
     }
 
     pub fn upgrade_implicit(
@@ -610,8 +691,35 @@ fn replay(tx: &Transaction<'_>, op: &str, v: Value, now: i64) -> rusqlite::Resul
             let r: AssignWorkspaceRequest = serde_json::from_value(v)
                 .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
             tx.execute("INSERT OR IGNORE INTO workspace(workspace_id,name,created_at,updated_at) VALUES(?1,?1,?2,?2)",params![r.workspace_id,now])?;
+            // REPLAY MUST CONVERGE ON THE LAST ENTRY, NOT THE FIRST.
+            //
+            // These were `INSERT OR IGNORE`, which was correct only while a
+            // second assignment was refused. Now that a project can move,
+            // ignoring a conflict would keep the EARLIEST workspace: replaying
+            // assign(P,A) then assign(P,B) would leave P in A, so a rebuilt
+            // store would silently disagree with the live tables and the move
+            // would revert with nothing reporting a failure.
+            //
+            // Mirrors the live path in `assign_workspace`, including removing
+            // the stale membership row -- UNIQUE(ref_kind, device_fingerprint,
+            // project_id) means the insert below would otherwise fail on the
+            // second assignment and abort the whole rebuild.
+            let previous = tx
+                .query_row(
+                    "SELECT workspace_id FROM project_workspace WHERE project_id=?1",
+                    [&r.project_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(old) = previous.as_deref() {
+                tx.execute(
+                    "DELETE FROM workspace_member WHERE workspace_id=?1 AND ref_kind='local' AND device_fingerprint='' AND project_id=?2",
+                    [old, r.project_id.as_str()],
+                )?;
+            }
             tx.execute(
-                "INSERT OR IGNORE INTO project_workspace VALUES(?1,?2)",
+                "INSERT INTO project_workspace(project_id,workspace_id) VALUES(?1,?2)
+                 ON CONFLICT(project_id) DO UPDATE SET workspace_id=excluded.workspace_id",
                 params![r.project_id, r.workspace_id],
             )?;
             tx.execute(
@@ -875,6 +983,77 @@ pub(crate) mod tests {
                 })
                 .unwrap_err(),
             "not_found",
+        );
+    }
+
+    /// A project filed in the wrong workspace can be moved to another one.
+    ///
+    /// Asserts the move BOTH ways round: present under the new workspace AND
+    /// absent from the old. Only the first half would pass if the old
+    /// membership row were left behind, and a project listed under two
+    /// workspaces is the shape that makes `enumerate` lie.
+    #[test]
+    fn assign_workspace_moves_between_workspaces() {
+        let f = Fixture::new("assign_move");
+        let root = f.dir("root");
+        register(&f, "p", root);
+        for ws in ["w1", "w2"] {
+            f.store
+                .assign_workspace(AssignWorkspaceRequest {
+                    project_id: "p".into(),
+                    workspace_id: ws.into(),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        assert_eq!(f.store.enumerate(Some("w2")).unwrap().projects.len(), 1);
+        assert_eq!(
+            f.store.enumerate(Some("w1")).unwrap().projects.len(),
+            0,
+            "project still listed under the workspace it was moved out of"
+        );
+    }
+
+    /// THE LOAD-BEARING ONE: a rebuild must land on the LAST assignment.
+    ///
+    /// The tables are a projection of the journal, so a move the live path
+    /// applies and `replay()` does not would revert on the next `rebuild()`
+    /// with nothing reporting a failure -- the move would simply be gone.
+    ///
+    /// It asserts through BOTH read surfaces because they read different
+    /// tables that the replay arm writes separately: `resolve` reads
+    /// `project_workspace`, `enumerate` reads `workspace_member`. Asserting
+    /// only through `enumerate` would leave the `project_workspace` write
+    /// unchecked, and the two can disagree.
+    #[test]
+    fn assign_workspace_replay_converges_on_last_assignment() {
+        let f = Fixture::new("assign_replay");
+        let root = f.dir("root");
+        register(&f, "p", root.clone());
+        for ws in ["w1", "w2"] {
+            f.store
+                .assign_workspace(AssignWorkspaceRequest {
+                    project_id: "p".into(),
+                    workspace_id: ws.into(),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        f.store.rebuild().unwrap();
+        assert_eq!(
+            f.store.resolve(&root).unwrap().workspace_id.as_deref(),
+            Some("w2"),
+            "rebuild did not converge on the last assignment"
+        );
+        assert_eq!(
+            f.store.enumerate(Some("w2")).unwrap().projects.len(),
+            1,
+            "rebuild left the project out of its current workspace"
+        );
+        assert_eq!(
+            f.store.enumerate(Some("w1")).unwrap().projects.len(),
+            0,
+            "rebuild left the project under its former workspace"
         );
     }
 
@@ -1164,15 +1343,31 @@ mod adversarial_tests {
                 ..Default::default()
             })
             .unwrap();
-        code(
-            f.store
-                .assign_workspace(AssignWorkspaceRequest {
-                    project_id: "foreign".into(),
-                    workspace_id: "w2".into(),
-                    ..Default::default()
-                })
-                .unwrap_err(),
-            "workspace_conflict",
+        // A SECOND ASSIGNMENT MOVES THE PROJECT; it does not violate I2.
+        //
+        // This asserted `workspace_conflict` and was named for I2, but refusing
+        // a move never enforced I2 -- the primary key on project_workspace
+        // does, and it holds equally after a move because the project still
+        // belongs to exactly one workspace. The refusal was a separate
+        // immutability rule that I2 did not require, and it left a user who
+        // filed a project in the wrong workspace with no way to correct it.
+        //
+        // The spec's "I2 is never auto-resolved by preference" is scoped to
+        // seed_import, where one project is claimed by several workspaces at
+        // once and the importer has no basis to choose. An explicit
+        // assign_workspace is the operator stating the preference, which is the
+        // case that clause exists to defer to.
+        f.store
+            .assign_workspace(AssignWorkspaceRequest {
+                project_id: "foreign".into(),
+                workspace_id: "w2".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            f.store.enumerate(Some("w2")).unwrap().projects.len(),
+            1,
+            "explicit re-assignment must move the project"
         );
     }
 
