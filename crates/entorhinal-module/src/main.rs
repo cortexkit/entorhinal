@@ -43,13 +43,43 @@ use subc_protocol::{
 const MODULE_ID: &str = "entorhinal";
 const DEFAULT_STORAGE_NAMESPACE: &str = "default";
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if std::env::args().any(|argument| argument == "--version") {
-        println!("ck-entorhinal {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
-    }
+mod cli;
 
+// PARSE ARGV BEFORE ACTING ON IT.
+//
+// `ck` dispatches an unknown domain to `ck-<domain>` on PATH, so `ck entorhinal
+// list` arrives here as argv. Serving is therefore reachable ONLY from empty
+// argv, which is how the supervisor spawns it; anything else is answered and
+// exits. Without the split, a mistyped operator command would fall through to
+// `serve`, claim the module's identity against the daemon, and sit there
+// looking healthy while doing nothing the operator asked for.
+fn main() -> std::process::ExitCode {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    match cli::parse(&arguments) {
+        cli::Invocation::Report(text) => {
+            println!("{text}");
+            std::process::ExitCode::SUCCESS
+        }
+        // Refusals go to stderr and exit nonzero. A mistyped flag that exits 0
+        // reports success for a command that never ran, which any wrapper
+        // checking the status code would believe.
+        cli::Invocation::Refuse(text) => {
+            eprintln!("{text}");
+            std::process::ExitCode::from(64)
+        }
+        cli::Invocation::Command(command) => cli::run(command),
+        cli::Invocation::Module => match serve_module() {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("ck-entorhinal: {error}");
+                std::process::ExitCode::FAILURE
+            }
+        },
+    }
+}
+
+#[tokio::main]
+async fn serve_module() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     subc_client_rs::serve(manifest(), ProjectsHandler::new()).await?;
     Ok(())
 }
