@@ -1,10 +1,16 @@
-//! Operator surface for the registry: `ck entorhinal <verb>`.
+//! Operator surface for the registry: `ck projects <verb>` and
+//! `ck workspaces <verb>`.
 //!
-//! This lives in the module binary rather than a sibling `-admin` binary
-//! because `ck` dispatches an unknown domain to `ck-<domain>` on PATH, so
-//! `ck entorhinal list` lands here whatever we do. Splitting the operator verbs
-//! into a second binary would leave the module binary receiving those arguments
-//! and — before this module existed — starting a daemon in response to them.
+//! One binary, three names. `ck` dispatches unknown domains to `ck-<domain>`
+//! on PATH, and `ck-projects` / `ck-workspaces` are symlinks to this module
+//! binary; argv[0] selects the face. The module id (entorhinal) is
+//! infrastructure and never part of the operator vocabulary -- a user thinks
+//! in projects and workspaces, not in the anatomy of the module serving them.
+//!
+//! The verbs live in the module binary rather than a sibling `-admin` binary
+//! because a second binary would leave this one receiving misdirected
+//! arguments and — before this module existed — starting a daemon in response
+//! to them.
 //!
 //! The module is the DEFAULT and empty argv is the only way to reach it, which
 //! is how the supervisor spawns it. Anything else is parsed before it can act:
@@ -20,6 +26,36 @@ use serde_json::{json, Value};
 const EXIT_TRANSPORT: u8 = 2;
 const EXIT_REFUSED: u8 = 3;
 const EXIT_USAGE: u8 = 64;
+
+/// Which name this binary was invoked under. The face decides the verb
+/// vocabulary and the help text; the wire behind them is shared.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Face {
+    /// `ck-projects`: the project registry verbs.
+    Projects,
+    /// `ck-workspaces`: workspace listing and project placement.
+    Workspaces,
+    /// `ck-entorhinal`: the supervised module itself. Serves; its only
+    /// operator surface is `--version`/`--help`, which point at the faces.
+    Entorhinal,
+}
+
+/// Resolve the face from argv[0]'s file stem. Unrecognised or absent argv[0]
+/// defaults to the module face: the daemon spawns this binary by its real
+/// path, and a wrapper that renames it should get the serving default, not a
+/// CLI that refuses to serve.
+pub fn face_from_argv0(argv0: Option<&str>) -> Face {
+    let stem = argv0
+        .map(Path::new)
+        .and_then(Path::file_stem)
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("");
+    match stem {
+        "ck-projects" => Face::Projects,
+        "ck-workspaces" => Face::Workspaces,
+        _ => Face::Entorhinal,
+    }
+}
 
 /// What the operator asked for, resolved before anything is opened or dialled.
 pub enum Invocation {
@@ -40,6 +76,7 @@ pub enum Invocation {
 }
 
 pub struct Command {
+    face: Face,
     verb: String,
     connection: Option<PathBuf>,
     args: Vec<String>,
@@ -51,7 +88,7 @@ pub struct Command {
 /// Separating this from execution is what lets `--help` and a bad flag be
 /// answered without connecting to anything, and it is the same parse-then-act
 /// split the daemon binary uses.
-pub fn parse(arguments: &[String]) -> Invocation {
+pub fn parse(face: Face, arguments: &[String]) -> Invocation {
     // A supervised spawn is NOT empty argv. subc launches module-mode children as
     // `<program> [configured args] --subc <connection-file-path>` (supervise.rs
     // SUBC_ARG), so the shape that reaches the module is a bare `--subc <path>`
@@ -65,17 +102,27 @@ pub fn parse(arguments: &[String]) -> Invocation {
     // one. Empty argv is kept as Module too so a hand-run child behaves the same,
     // but it is no longer the condition being relied on.
     if arguments.is_empty() {
-        return Invocation::Module;
+        // Bare `ck projects` / `ck workspaces` is a question about the domain,
+        // answered with its help (the ck convention: verbless domains explain).
+        // Only the module face serves from empty argv.
+        return match face {
+            Face::Entorhinal => Invocation::Module,
+            _ => Invocation::Report(usage(face)),
+        };
     }
     if arguments.iter().any(|a| a == "--version") {
-        return Invocation::Report(format!("ck-entorhinal {}", env!("CARGO_PKG_VERSION")));
+        return Invocation::Report(format!(
+            "{} {}",
+            binary_name(face),
+            env!("CARGO_PKG_VERSION")
+        ));
     }
     // Help is honoured ANYWHERE in the tail, including after a verb, so
     // `ck entorhinal register --help` explains rather than registering. A
     // help flag that only works in first position is one a hurried operator
     // discovers by mutating the registry.
     if arguments.iter().any(|a| a == "--help" || a == "-h") {
-        return Invocation::Report(usage());
+        return Invocation::Report(usage(face));
     }
     // Everything past this point is either a well-formed command or a refusal.
 
@@ -92,7 +139,7 @@ pub fn parse(arguments: &[String]) -> Invocation {
             },
             "--json" => json = true,
             other if other.starts_with('-') => {
-                return Invocation::Refuse(format!("unknown flag '{other}'\n\n{}", usage()));
+                return Invocation::Refuse(format!("unknown flag '{other}'\n\n{}", usage(face)));
             }
             other if verb.is_none() => verb = Some(other.to_string()),
             other => args.push(other.to_string()),
@@ -100,11 +147,15 @@ pub fn parse(arguments: &[String]) -> Invocation {
     }
 
     match verb {
-        // No verb WITH a connection file is the supervisor's spawn shape: serve.
-        None if connection.is_some() => Invocation::Module,
-        // No verb and nothing to connect to is a question, not a mistake.
-        None => Invocation::Report(usage()),
+        // No verb WITH a connection file is the supervisor's spawn shape:
+        // serve -- but only under the module's own name. On a CLI face the
+        // same shape is an operator handing a connection file to a verbless
+        // command, which is a question.
+        None if connection.is_some() && face == Face::Entorhinal => Invocation::Module,
+        // No verb otherwise is a question, not a mistake.
+        None => Invocation::Report(usage(face)),
         Some(verb) => Invocation::Command(Command {
+            face,
             verb,
             connection,
             args,
@@ -113,26 +164,59 @@ pub fn parse(arguments: &[String]) -> Invocation {
     }
 }
 
-pub fn usage() -> String {
-    "\
-ck entorhinal — the workspace/project registry
+fn binary_name(face: Face) -> &'static str {
+    match face {
+        Face::Projects => "ck-projects",
+        Face::Workspaces => "ck-workspaces",
+        Face::Entorhinal => "ck-entorhinal",
+    }
+}
 
-usage: ck entorhinal <verb> [args] [--subc <connection file>] [--json]
+pub fn usage(face: Face) -> String {
+    match face {
+        Face::Projects => "\
+ck projects — the project registry
+
+usage: ck projects <verb> [args] [--subc <connection file>] [--json]
 
   list [workspace]        projects, optionally scoped to one workspace
   resolve <dir>           which project owns a directory
   register <name> <dir>   register a project rooted at a directory
-  workspace <project> <workspace>
-                          put a project in a workspace (moves it if already in another)
   remove <project>        remove a project from the registry
   verify                  check the store against its journal
 
   --subc <path>   daemon connection file; defaults to the usual discovery path
   --json          raw response instead of the rendered form
 
-With no arguments this binary runs as the supervised module, which is how the
-daemon spawns it."
-        .to_string()
+workspace placement lives under 'ck workspaces'"
+            .to_string(),
+        Face::Workspaces => "\
+ck workspaces — group projects into workspaces
+
+usage: ck workspaces <verb> [args] [--subc <connection file>] [--json]
+
+  list                    workspaces known to the registry
+  assign <project> <workspace>
+                          put a project in a workspace (moves it if already in another)
+
+  --subc <path>   daemon connection file; defaults to the usual discovery path
+  --json          raw response instead of the rendered form
+
+projects themselves live under 'ck projects'"
+            .to_string(),
+        Face::Entorhinal => "\
+ck-entorhinal — the registry module (supervised by the subc daemon)
+
+This binary is the module itself; it is not an operator command. The operator
+surface is:
+
+  ck projects      list, register, resolve, remove, verify
+  ck workspaces    list, assign
+
+With no arguments it runs as the supervised module, which is how the daemon
+spawns it."
+            .to_string(),
+    }
 }
 
 pub fn run(command: Command) -> ExitCode {
@@ -197,7 +281,7 @@ fn build(command: &Command) -> Result<(String, Value), String> {
             .args
             .get(index)
             .cloned()
-            .ok_or_else(|| format!("{} needs {what}\n\n{}", command.verb, usage()))
+            .ok_or_else(|| format!("{} needs {what}\n\n{}", command.verb, usage(command.face)))
     };
     // Directories are CANONICALIZED against the operator's shell before they are
     // sent. Two separate reasons, and only the first was obvious:
@@ -229,40 +313,56 @@ fn build(command: &Command) -> Result<(String, Value), String> {
         Ok(resolved.to_string_lossy().to_string())
     };
 
-    Ok(match command.verb.as_str() {
-        "list" => (
+    // The actor recorded in the registry journal is the FACE the operator
+    // used, so journal forensics read the command that ran, not the module
+    // that served it.
+    let actor = binary_name(command.face);
+
+    Ok(match (command.face, command.verb.as_str()) {
+        (Face::Projects, "list") => (
             "enumerate".to_string(),
             match command.args.first() {
                 Some(workspace) => json!({ "workspaceId": workspace }),
                 None => json!({}),
             },
         ),
-        "resolve" => (
+        (Face::Projects, "resolve") => (
             "resolve".to_string(),
             json!({ "canonicalRoot": absolute(&need(0, "a directory")?)? }),
         ),
-        "register" => (
+        (Face::Projects, "register") => (
             "register".to_string(),
             json!({
                 "name": need(0, "a name")?,
                 "roots": [absolute(&need(1, "a directory")?)?],
-                "actor": "ck-entorhinal",
+                "actor": actor,
             }),
         ),
-        "workspace" => (
+        (Face::Projects, "remove") => (
+            "remove".to_string(),
+            json!({ "projectId": need(0, "a project id")?, "actor": actor }),
+        ),
+        (Face::Projects, "verify") => ("verify".to_string(), json!({})),
+        // `list` on the workspaces face is the same enumerate op; the renderer
+        // shows the workspace column of the reply instead of the projects.
+        (Face::Workspaces, "list") => ("enumerate".to_string(), json!({})),
+        (Face::Workspaces, "assign") => (
             "assign_workspace".to_string(),
             json!({
                 "projectId": need(0, "a project id")?,
                 "workspaceId": need(1, "a workspace id")?,
-                "actor": "ck-entorhinal",
+                "actor": actor,
             }),
         ),
-        "remove" => (
-            "remove".to_string(),
-            json!({ "projectId": need(0, "a project id")?, "actor": "ck-entorhinal" }),
-        ),
-        "verify" => ("verify".to_string(), json!({})),
-        other => return Err(format!("unknown verb '{other}'\n\n{}", usage())),
+        // The old spelling teaches its replacement instead of guessing at it:
+        // `workspace` as a projects-verb was the pre-rename surface.
+        (Face::Projects, "workspace") => {
+            return Err(format!(
+                "'workspace' moved: use 'ck workspaces assign <project> <workspace>'\n\n{}",
+                usage(Face::Workspaces)
+            ))
+        }
+        (_, other) => return Err(format!("unknown verb '{other}'\n\n{}", usage(command.face))),
         // NOTE: an unknown verb is refused here rather than at parse time
         // because `run` maps a build error to EXIT_USAGE, so it already exits
         // nonzero. Both routes refuse; only the exit code has to agree.
@@ -372,8 +472,23 @@ fn render(command: &Command, value: &Value) {
         );
         return;
     }
-    match command.verb.as_str() {
-        "list" => {
+    match (command.face, command.verb.as_str()) {
+        (Face::Workspaces, "list") => {
+            let workspaces = value["workspaces"].as_array().cloned().unwrap_or_default();
+            if workspaces.is_empty() {
+                println!("no workspaces");
+                return;
+            }
+            for workspace in &workspaces {
+                println!(
+                    "{:<28} {}",
+                    text(&workspace["workspaceId"]),
+                    text(&workspace["name"])
+                );
+            }
+            println!("\n{} workspace(s)", workspaces.len());
+        }
+        (Face::Projects, "list") => {
             let projects = value["projects"].as_array().cloned().unwrap_or_default();
             if projects.is_empty() {
                 // An empty registry and a filter matching nothing are different
@@ -394,7 +509,7 @@ fn render(command: &Command, value: &Value) {
             }
             println!("\n{} project(s)", projects.len());
         }
-        "resolve" => {
+        (Face::Projects, "resolve") => {
             // Field names are the REGISTRY's, not this renderer's guesses.
             // `projectName` was read as `name` here and rendered as "-" against
             // a project that has one -- absence and a wrong key look identical
@@ -444,7 +559,74 @@ mod tests {
     use super::*;
 
     fn parse_of(args: &[&str]) -> Invocation {
-        parse(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>())
+        parse(
+            Face::Entorhinal,
+            &args.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+        )
+    }
+
+    fn parse_as(face: Face, args: &[&str]) -> Invocation {
+        parse(
+            face,
+            &args.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+        )
+    }
+
+    /// argv[0]'s file stem selects the face; anything unrecognised (including
+    /// a renamed or absent argv[0]) serves as the module, which is the shape a
+    /// supervisor spawn must always reach.
+    #[test]
+    fn face_resolution_follows_argv0() {
+        assert_eq!(
+            face_from_argv0(Some("/usr/local/bin/ck-projects")),
+            Face::Projects
+        );
+        assert_eq!(face_from_argv0(Some("ck-workspaces")), Face::Workspaces);
+        assert_eq!(
+            face_from_argv0(Some("/opt/cortexkit/bin/ck-entorhinal")),
+            Face::Entorhinal
+        );
+        assert_eq!(face_from_argv0(Some("weird-wrapper")), Face::Entorhinal);
+        assert_eq!(face_from_argv0(None), Face::Entorhinal);
+    }
+
+    /// Bare CLI faces explain; only the module face serves from empty argv.
+    /// This is the `ck` convention (verbless domains print their help), and it
+    /// is also what stops `ck projects` from booting a daemon.
+    #[test]
+    fn bare_cli_faces_explain_rather_than_serve() {
+        for face in [Face::Projects, Face::Workspaces] {
+            match parse_as(face, &[]) {
+                Invocation::Report(text) => {
+                    assert!(text.contains("usage:"), "{face:?} bare must print usage")
+                }
+                _ => panic!("{face:?} with empty argv must report, never serve"),
+            }
+        }
+        assert!(matches!(
+            parse_as(Face::Entorhinal, &[]),
+            Invocation::Module
+        ));
+    }
+
+    /// The supervisor's spawn shape (`--subc <path>`, no verb) serves ONLY
+    /// under the module's own name. On a CLI face the same shape is a verbless
+    /// operator question and must not claim the module identity.
+    #[test]
+    fn spawn_shape_serves_only_on_the_module_face() {
+        assert!(matches!(
+            parse_as(Face::Entorhinal, &["--subc", "/tmp/conn.json"]),
+            Invocation::Module
+        ));
+        for face in [Face::Projects, Face::Workspaces] {
+            assert!(
+                !matches!(
+                    parse_as(face, &["--subc", "/tmp/conn.json"]),
+                    Invocation::Module
+                ),
+                "{face:?} must never serve"
+            );
+        }
     }
 
     /// The result envelope is stripped, and its ABSENCE fails loud.
@@ -517,7 +699,7 @@ mod tests {
             vec!["remove", "--help"],
             vec!["register", "name", "/tmp", "-h"],
         ] {
-            match parse_of(&argv) {
+            match parse_as(Face::Projects, &argv) {
                 Invocation::Report(text) => assert!(text.contains("usage:"), "{argv:?}"),
                 _ => panic!("{argv:?} must report usage, not run"),
             }
@@ -579,6 +761,7 @@ mod tests {
     #[test]
     fn verbs_map_to_the_modules_own_method_and_field_names() {
         let cmd = |args: &[&str]| Command {
+            face: Face::Projects,
             verb: args[0].to_string(),
             connection: None,
             args: args[1..].iter().map(|a| a.to_string()).collect(),
@@ -593,10 +776,30 @@ mod tests {
         assert_eq!(method, "enumerate");
         assert_eq!(params["workspaceId"], "w1");
 
-        let (method, params) = build(&cmd(&["workspace", "p1", "w2"])).unwrap();
+        // Workspace placement lives on the workspaces face.
+        let ws = |args: &[&str]| Command {
+            face: Face::Workspaces,
+            verb: args[0].to_string(),
+            connection: None,
+            args: args[1..].iter().map(|a| a.to_string()).collect(),
+            json: false,
+        };
+        let (method, params) = build(&ws(&["assign", "p1", "w2"])).unwrap();
         assert_eq!(method, "assign_workspace");
         assert_eq!(params["projectId"], "p1");
         assert_eq!(params["workspaceId"], "w2");
+        // The actor records the face the operator used, not the module name.
+        assert_eq!(params["actor"], "ck-workspaces");
+
+        let (method, _) = build(&ws(&["list"])).unwrap();
+        assert_eq!(method, "enumerate");
+
+        // The retired projects-face spelling teaches its replacement.
+        let error = build(&cmd(&["workspace", "p1", "w2"])).expect_err("moved verb must refuse");
+        assert!(
+            error.contains("ck workspaces assign"),
+            "the refusal must name the new spelling, got: {error}"
+        );
 
         let (method, params) = build(&cmd(&["remove", "p1"])).unwrap();
         assert_eq!(method, "remove");
@@ -685,6 +888,7 @@ mod tests {
     fn directories_are_canonical_before_they_are_sent() {
         let sent_for = |value: &str| -> String {
             let command = Command {
+                face: Face::Projects,
                 verb: "resolve".to_string(),
                 connection: None,
                 args: vec![value.to_string()],
@@ -729,13 +933,18 @@ mod tests {
     #[test]
     fn missing_arguments_name_what_is_missing() {
         let cases = [
-            (vec!["resolve"], "a directory"),
-            (vec!["register", "only-a-name"], "a directory"),
-            (vec!["workspace", "p1"], "a workspace id"),
-            (vec!["remove"], "a project id"),
+            (Face::Projects, vec!["resolve"], "a directory"),
+            (
+                Face::Projects,
+                vec!["register", "only-a-name"],
+                "a directory",
+            ),
+            (Face::Workspaces, vec!["assign", "p1"], "a workspace id"),
+            (Face::Projects, vec!["remove"], "a project id"),
         ];
-        for (argv, expected) in cases {
+        for (face, argv, expected) in cases {
             let cmd = Command {
+                face,
                 verb: argv[0].to_string(),
                 connection: None,
                 args: argv[1..].iter().map(|a| a.to_string()).collect(),

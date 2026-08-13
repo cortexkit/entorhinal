@@ -543,6 +543,15 @@ impl RegistryStore {
         let roots = statement
             .query_map(params![project_id], |row| row.get(0))?
             .collect::<rusqlite::Result<Vec<String>>>()?;
+        // The same placement `resolve` reports, read from the same table, so
+        // the two surfaces cannot disagree about where a project lives.
+        let workspace_id = conn
+            .query_row(
+                "SELECT workspace_id FROM project_workspace WHERE project_id = ?1",
+                params![project_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
         Ok(ProjectView {
             project_id,
             name,
@@ -550,6 +559,7 @@ impl RegistryStore {
             implicit,
             ref_kind,
             device_fingerprint,
+            workspace_id,
             last_route_activity_ms: None,
         })
     }
@@ -621,6 +631,11 @@ pub struct ProjectView {
     pub ref_kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_fingerprint: Option<String>,
+    /// Workspace this project is placed in; absent when unplaced. Additive for
+    /// consumers joining projects onto workspace rosters (prefrontal's peer
+    /// roster) so membership costs no second per-workspace call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_route_activity_ms: Option<i64>,
 }

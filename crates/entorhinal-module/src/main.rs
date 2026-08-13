@@ -54,8 +54,15 @@ mod cli;
 // `serve`, claim the module's identity against the daemon, and sit there
 // looking healthy while doing nothing the operator asked for.
 fn main() -> std::process::ExitCode {
+    // The user-facing command surface is `ck projects` and `ck workspaces`,
+    // dispatched by `ck` to `ck-projects` / `ck-workspaces` -- both symlinks to
+    // this binary. argv[0] selects the face; the module identity (ck-entorhinal)
+    // never appears in an operator's vocabulary. One binary rather than three
+    // because the faces share every line of transport, rendering, and parse
+    // machinery, and a shared binary cannot drift from itself.
+    let face = cli::face_from_argv0(std::env::args().next().as_deref());
     let arguments: Vec<String> = std::env::args().skip(1).collect();
-    match cli::parse(&arguments) {
+    match cli::parse(face, &arguments) {
         cli::Invocation::Report(text) => {
             println!("{text}");
             std::process::ExitCode::SUCCESS
@@ -683,6 +690,7 @@ mod tests {
                     implicit: false,
                     ref_kind: "local".into(),
                     device_fingerprint: None,
+                    workspace_id: None,
                     last_route_activity_ms: None,
                 },
                 entorhinal_core::ProjectView {
@@ -692,6 +700,7 @@ mod tests {
                     implicit: false,
                     ref_kind: "local".into(),
                     device_fingerprint: None,
+                    workspace_id: None,
                     last_route_activity_ms: None,
                 },
             ],

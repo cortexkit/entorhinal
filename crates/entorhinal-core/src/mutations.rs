@@ -1012,6 +1012,23 @@ pub(crate) mod tests {
             0,
             "project still listed under the workspace it was moved out of"
         );
+        // The unscoped enumerate carries placement per row (the peer-roster
+        // join field): placed projects say where, unplaced say nothing.
+        let all = f.store.enumerate(None).unwrap();
+        let placed = all.projects.iter().find(|p| p.project_id == "p").unwrap();
+        assert_eq!(
+            placed.workspace_id.as_deref(),
+            Some("w2"),
+            "enumerate must carry the project's current workspace"
+        );
+        let unplaced_root = f.dir("unplaced");
+        register(&f, "q", unplaced_root);
+        let all = f.store.enumerate(None).unwrap();
+        let unplaced = all.projects.iter().find(|p| p.project_id == "q").unwrap();
+        assert_eq!(
+            unplaced.workspace_id, None,
+            "an unplaced project must carry NO workspace, not an empty one"
+        );
     }
 
     /// THE LOAD-BEARING ONE: a rebuild must land on the LAST assignment.
