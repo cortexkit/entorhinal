@@ -25,8 +25,8 @@ use serde_json::{json, Value};
 use subc_client_rs::{HandlerOutcome, HealthReport, HealthStatus, ModuleHandler, RequestCtx};
 use subc_protocol::{
     manifest::{
-        Bindings, IdentityBinding, ManagementOperation, ManagementOperationKind, ModuleManifest,
-        ProviderRole, StorageBinding, StorageKind, StorageScope, TrustTier,
+        Bindings, Concurrency, IdentityBinding, ManagementOperation, ManagementOperationKind,
+        ModuleManifest, ProviderRole, StorageBinding, StorageKind, StorageScope, TrustTier,
     },
     ModuleHelloAckBody, PROTOCOL_VERSION,
 };
@@ -547,9 +547,12 @@ fn manifest() -> ModuleManifest {
             config_schema: json!({"type": "object"}),
             observability: Vec::new(),
             identity_scope: Vec::new(),
+            // Registry ops are short SQLite reads/writes serialized behind the
+            // module's own store lock; ModuleManaged matches the pre-field
+            // default the daemon applied while `concurrency` was implicit.
+            concurrency: Concurrency::ModuleManaged,
         }],
         consumes: Vec::new(),
-        scheduled_tasks: Vec::new(),
         bindings: Bindings {
             storage: StorageBinding {
                 kind: StorageKind::Sqlite,
