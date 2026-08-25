@@ -529,20 +529,68 @@ fn manifest() -> ModuleManifest {
         trust_tier: TrustTier::FirstParty,
         provides: vec![ProviderRole::ManagementSurface {
             operations: vec![
-                management_operation("resolve", ManagementOperationKind::Query),
-                management_operation("resolve_project_id", ManagementOperationKind::Query),
-                management_operation("enumerate", ManagementOperationKind::Query),
-                management_operation("journal_tail", ManagementOperationKind::Query),
-                management_operation("register", ManagementOperationKind::Mutate),
-                management_operation("assign_workspace", ManagementOperationKind::Mutate),
-                management_operation("upgrade_implicit", ManagementOperationKind::Mutate),
-                management_operation("remove", ManagementOperationKind::Mutate),
-                management_operation("seed_import", ManagementOperationKind::Mutate),
-                management_operation("verify", ManagementOperationKind::Query),
-                management_operation("rebuild", ManagementOperationKind::Mutate),
+                management_operation(
+                    "resolve",
+                    ManagementOperationKind::Query,
+                    "Resolve a filesystem path to its registered or implicit project identity.",
+                ),
+                management_operation(
+                    "resolve_project_id",
+                    ManagementOperationKind::Query,
+                    "Look up a project by its durable project id and return its registration record.",
+                ),
+                management_operation(
+                    "enumerate",
+                    ManagementOperationKind::Query,
+                    "List all registered projects with workspace assignments and tags.",
+                ),
+                management_operation(
+                    "journal_tail",
+                    ManagementOperationKind::Query,
+                    "Read the newest registry journal entries for operator inspection.",
+                ),
+                management_operation(
+                    "register",
+                    ManagementOperationKind::Mutate,
+                    "Register a project root under a workspace, minting its durable project id.",
+                ),
+                management_operation(
+                    "assign_workspace",
+                    ManagementOperationKind::Mutate,
+                    "Move a registered project to a different workspace.",
+                ),
+                management_operation(
+                    "upgrade_implicit",
+                    ManagementOperationKind::Mutate,
+                    "Promote an implicit (path-derived) project to a registered one, keeping its id.",
+                ),
+                management_operation(
+                    "remove",
+                    ManagementOperationKind::Mutate,
+                    "Remove a project registration; its id stops resolving.",
+                ),
+                management_operation(
+                    "seed_import",
+                    ManagementOperationKind::Mutate,
+                    "Bulk-import registrations from a seed file (operator recovery path).",
+                ),
+                management_operation(
+                    "verify",
+                    ManagementOperationKind::Query,
+                    "Check registry invariants and report inconsistencies without mutating.",
+                ),
+                management_operation(
+                    "rebuild",
+                    ManagementOperationKind::Mutate,
+                    "Rebuild registry projections by replaying the journal (operator recovery path).",
+                ),
                 // Volatile liveness ingestion — never journaled, feeds enumerate
                 // annotations only (ALF's producer per #workspace-projects-design).
-                management_operation("projects.session_liveness", ManagementOperationKind::Mutate),
+                management_operation(
+                    "projects.session_liveness",
+                    ManagementOperationKind::Mutate,
+                    "Ingest session liveness snapshots and deltas from the executive for dead-folder detection.",
+                ),
             ],
             config_schema: json!({"type": "object"}),
             observability: Vec::new(),
@@ -553,6 +601,11 @@ fn manifest() -> ModuleManifest {
             concurrency: Concurrency::ModuleManaged,
         }],
         consumes: Vec::new(),
+        // Capability grammar declarations wait for the fleet owner round: the
+        // cuts draft records entorhinal -> project-registry/v1, but a provides
+        // claim belongs with the reviewed registry entry and corpus, not ahead
+        // of them. None = grammar inactive for this module, deliberately.
+        capabilities: None,
         bindings: Bindings {
             storage: StorageBinding {
                 kind: StorageKind::Sqlite,
@@ -568,10 +621,15 @@ fn manifest() -> ModuleManifest {
     }
 }
 
-fn management_operation(name: &str, kind: ManagementOperationKind) -> ManagementOperation {
+fn management_operation(
+    name: &str,
+    kind: ManagementOperationKind,
+    description: &str,
+) -> ManagementOperation {
     ManagementOperation {
         name: name.to_string(),
         kind,
+        description: Some(description.to_string()),
     }
 }
 
