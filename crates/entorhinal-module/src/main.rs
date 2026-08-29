@@ -606,6 +606,9 @@ fn manifest() -> ModuleManifest {
         // claim belongs with the reviewed registry entry and corpus, not ahead
         // of them. None = grammar inactive for this module, deliberately.
         capabilities: None,
+        // entorhinal declares no self-signals yet: its ops are operator-driven
+        // registry reads/writes, not autonomous signals.
+        self_signals: None,
         // Build provenance is declared by CK_BUILD_* env at build time once the
         // release script injects it; None is the honest value until then — the
         // daemon serves declared_absent rather than a fabricated rev.
