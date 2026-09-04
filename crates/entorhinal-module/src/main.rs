@@ -522,12 +522,25 @@ struct JournalTailParams {
 }
 
 fn manifest() -> ModuleManifest {
-    ModuleManifest {
-        module_id: MODULE_ID.to_string(),
-        module_version: env!("CARGO_PKG_VERSION").to_string(),
-        protocol_ver: PROTOCOL_VERSION,
-        trust_tier: TrustTier::FirstParty,
-        provides: vec![ProviderRole::ManagementSurface {
+    ModuleManifest::builder(
+        MODULE_ID,
+        env!("CARGO_PKG_VERSION"),
+        TrustTier::FirstParty,
+        Bindings {
+            storage: StorageBinding {
+                kind: StorageKind::Sqlite,
+                scope: StorageScope::Project,
+                owns_schema: true,
+            },
+            vault_grants: Vec::new(),
+            identity: IdentityBinding {
+                requires: Vec::new(),
+                optional: Vec::new(),
+            },
+        },
+    )
+    .protocol_ver(PROTOCOL_VERSION)
+    .provides(vec![ProviderRole::ManagementSurface {
             operations: vec![
                 management_operation(
                     "resolve",
@@ -599,33 +612,20 @@ fn manifest() -> ModuleManifest {
             // module's own store lock; ModuleManaged matches the pre-field
             // default the daemon applied while `concurrency` was implicit.
             concurrency: Concurrency::ModuleManaged,
-        }],
-        consumes: Vec::new(),
-        // Capability grammar declarations wait for the fleet owner round: the
-        // cuts draft records entorhinal -> project-registry/v1, but a provides
-        // claim belongs with the reviewed registry entry and corpus, not ahead
-        // of them. None = grammar inactive for this module, deliberately.
-        capabilities: None,
-        // entorhinal declares no self-signals yet: its ops are operator-driven
-        // registry reads/writes, not autonomous signals.
-        self_signals: None,
-        // Build provenance is declared by CK_BUILD_* env at build time once the
-        // release script injects it; None is the honest value until then — the
-        // daemon serves declared_absent rather than a fabricated rev.
-        provenance: None,
-        bindings: Bindings {
-            storage: StorageBinding {
-                kind: StorageKind::Sqlite,
-                scope: StorageScope::Project,
-                owns_schema: true,
-            },
-            vault_grants: Vec::new(),
-            identity: IdentityBinding {
-                requires: Vec::new(),
-                optional: Vec::new(),
-            },
-        },
-    }
+        }])
+    // Capability grammar declarations wait for the fleet owner round: the
+    // cuts draft records entorhinal -> project-registry/v1, but a provides
+    // claim belongs with the reviewed registry entry and corpus, not ahead
+    // of them. None = grammar inactive for this module, deliberately.
+    .capabilities(None)
+    // entorhinal declares no self-signals yet: its ops are operator-driven
+    // registry reads/writes, not autonomous signals.
+    .self_signals(None)
+    // Build provenance is declared by CK_BUILD_* env at build time once the
+    // release script injects it; None is the honest value until then — the
+    // daemon serves declared_absent rather than a fabricated rev.
+    .provenance(None)
+    .build()
 }
 
 fn management_operation(
