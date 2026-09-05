@@ -118,8 +118,20 @@ impl RegistryStore {
     /// apply the namespaced v1 schema exactly once.
     pub fn open(descriptor: &StorageDescriptor) -> Result<Self, RegistryError> {
         let db = open_sqlite(descriptor).map_err(RegistryError::Store)?;
-        db.migrate(MIGRATION_NAMESPACE, &V1_MIGRATIONS)
+        let outcome = db
+            .migrate(MIGRATION_NAMESPACE, &V1_MIGRATIONS)
             .map_err(RegistryError::Store)?;
+        // A store written by a newer binary may hold tables and columns this
+        // one cannot query; serving it would answer nothing while looking up.
+        // The registry has no additive-only guarantee across its chain, so it
+        // refuses rather than guesses.
+        if outcome.store_ahead() {
+            return Err(RegistryError::Database(format!(
+                "registry store is at schema version {}, ahead of this binary's highest migration {}; \
+                 run a binary at or above the store's version",
+                outcome.recorded, outcome.chain_max
+            )));
+        }
         Ok(Self { db })
     }
 
