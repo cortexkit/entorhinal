@@ -768,7 +768,10 @@ mod tests {
     fn manifest_declares_the_projects_surface_and_all_skeleton_mutations() {
         let value = serde_json::to_value(manifest()).expect("manifest serializes");
         assert_eq!(value["module_id"], "entorhinal");
-        assert_eq!(value["trust_tier"], "first_party");
+        // The daemon reads no trust tier or storage binding, so the manifest
+        // declares neither; a fabricated value here would be the wire lying.
+        assert!(value.get("trust_tier").is_none());
+        assert!(value.get("bindings").is_none());
         let operations = value["provides"][0]["operations"].as_array().unwrap();
         assert!(operations
             .iter()
