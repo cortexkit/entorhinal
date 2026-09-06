@@ -25,8 +25,7 @@ use serde_json::{json, Value};
 use subc_client_rs::{HandlerOutcome, HealthReport, HealthStatus, ModuleHandler, RequestCtx};
 use subc_protocol::{
     manifest::{
-        Bindings, Concurrency, IdentityBinding, ManagementOperation, ManagementOperationKind,
-        ModuleManifest, ProviderRole, StorageBinding, StorageKind, StorageScope, TrustTier,
+        Concurrency, ManagementOperation, ManagementOperationKind, ModuleManifest, ProviderRole,
     },
     ModuleHelloAckBody, PROTOCOL_VERSION,
 };
@@ -522,23 +521,7 @@ struct JournalTailParams {
 }
 
 fn manifest() -> ModuleManifest {
-    ModuleManifest::builder(
-        MODULE_ID,
-        env!("CARGO_PKG_VERSION"),
-        TrustTier::FirstParty,
-        Bindings {
-            storage: StorageBinding {
-                kind: StorageKind::Sqlite,
-                scope: StorageScope::Project,
-                owns_schema: true,
-            },
-            vault_grants: Vec::new(),
-            identity: IdentityBinding {
-                requires: Vec::new(),
-                optional: Vec::new(),
-            },
-        },
-    )
+    ModuleManifest::builder(MODULE_ID, env!("CARGO_PKG_VERSION"))
     .protocol_ver(PROTOCOL_VERSION)
     .provides(vec![ProviderRole::ManagementSurface {
             operations: vec![
