@@ -12,6 +12,7 @@ use std::{
         atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
         Arc, Mutex,
     },
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -90,10 +91,22 @@ async fn serve_module() -> Result<(), Box<dyn std::error::Error + Send + Sync>> 
     Ok(())
 }
 
+/// How long a fresh instance keeps retrying a lease that a predecessor still
+/// holds. The lease is a kernel lock released at process exit, so a hold
+/// that outlasts this budget is a second live writer, not an exit in
+/// progress, and is reported as the refusal it is.
+const LEASE_HELD_RETRY_BUDGET: Duration = Duration::from_secs(10);
+const LEASE_HELD_RETRY_FIRST_DELAY: Duration = Duration::from_millis(50);
+const LEASE_HELD_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
+
 #[derive(Default)]
 struct HealthGauges {
     store_ready: AtomicBool,
     store_failed: AtomicBool,
+    /// True while the open is being retried against a lease a predecessor
+    /// still holds; health reports degraded rather than failing, so the
+    /// daemon serves `module_warming` to callers instead of a fault.
+    store_opening: AtomicBool,
     generation: AtomicI64,
     resolve_count: AtomicU64,
     enumerate_count: AtomicU64,
@@ -213,30 +226,36 @@ impl ModuleHandler for ProjectsHandler {
                 .map_err(|error| format!("HELLO_ACK storage descriptor is invalid: {error}")),
             None => Ok(fallback_storage_descriptor()),
         };
-
-        let opened = descriptor.and_then(|descriptor| {
-            RegistryStore::open(&descriptor)
-                .map_err(|error| format!("opening projects storage: {error}"))
-        });
-        let mut guard = self
-            .store
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match opened {
-            Ok(store) => {
-                self.health
-                    .generation
-                    .store(store.generation().unwrap_or(0), Ordering::Relaxed);
-                self.health.store_ready.store(true, Ordering::Relaxed);
-                self.health.store_failed.store(false, Ordering::Relaxed);
-                *guard = Some(store);
-            }
+        let descriptor = match descriptor {
+            Ok(descriptor) => descriptor,
             Err(error) => {
-                eprintln!("[ck-entorhinal] {error}");
-                self.health.store_ready.store(false, Ordering::Relaxed);
-                self.health.store_failed.store(true, Ordering::Relaxed);
-                *guard = None;
+                install_store(&self.store, &self.health, Err(error));
+                return;
             }
+        };
+
+        match RegistryStore::open(&descriptor) {
+            Err(error) if error.is_lease_held() => {
+                // The predecessor is still exiting. Retry off this path so the
+                // HELLO_ACK handler and the health reply stay prompt.
+                eprintln!(
+                    "[ck-entorhinal] opening projects storage: {error}; retrying for up to {}s",
+                    LEASE_HELD_RETRY_BUDGET.as_secs()
+                );
+                self.health.store_opening.store(true, Ordering::Relaxed);
+                let store = Arc::clone(&self.store);
+                let health = Arc::clone(&self.health);
+                tokio::spawn(async move {
+                    let outcome = retry_open_while_lease_held(&descriptor).await;
+                    health.store_opening.store(false, Ordering::Relaxed);
+                    install_store(&store, &health, outcome);
+                });
+            }
+            outcome => install_store(
+                &self.store,
+                &self.health,
+                outcome.map_err(|error| format!("opening projects storage: {error}")),
+            ),
         }
     }
 
@@ -246,14 +265,22 @@ impl ModuleHandler for ProjectsHandler {
         // blocked or the store has failed; only cached atomic gauges are read here.
         let ready = self.health.store_ready.load(Ordering::Relaxed);
         let failed = self.health.store_failed.load(Ordering::Relaxed);
-        let status = if failed || !ready {
+        let opening = self.health.store_opening.load(Ordering::Relaxed);
+        let status = if opening {
+            HealthStatus::Degraded
+        } else if failed || !ready {
             HealthStatus::Failing
         } else {
             HealthStatus::Ok
         };
+        let detail = if opening {
+            Some("projects storage lease is held by an exiting predecessor; retrying".to_string())
+        } else {
+            (!ready).then(|| "projects storage is not ready".to_string())
+        };
         HealthReport {
             status,
-            detail: (!ready).then(|| "projects storage is not ready".to_string()),
+            detail,
             metrics: Some(json!({
                 "storeReady": ready,
                 "generation": self.health.generation.load(Ordering::Relaxed),
@@ -623,6 +650,59 @@ fn management_operation(
     }
 }
 
+/// Publishes an open outcome into the shared store slot and the health gauges.
+fn install_store(
+    store: &Mutex<Option<RegistryStore>>,
+    health: &HealthGauges,
+    outcome: Result<RegistryStore, String>,
+) {
+    let mut guard = store
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match outcome {
+        Ok(opened) => {
+            health
+                .generation
+                .store(opened.generation().unwrap_or(0), Ordering::Relaxed);
+            health.store_ready.store(true, Ordering::Relaxed);
+            health.store_failed.store(false, Ordering::Relaxed);
+            *guard = Some(opened);
+        }
+        Err(error) => {
+            eprintln!("[ck-entorhinal] {error}");
+            health.store_ready.store(false, Ordering::Relaxed);
+            health.store_failed.store(true, Ordering::Relaxed);
+            *guard = None;
+        }
+    }
+}
+
+/// Retries the open with doubling delays while the only obstacle is a lease
+/// a predecessor still holds. Any other error, and a hold that outlasts the
+/// budget, end the retry with that error.
+async fn retry_open_while_lease_held(
+    descriptor: &StorageDescriptor,
+) -> Result<RegistryStore, String> {
+    let started = Instant::now();
+    let mut delay = LEASE_HELD_RETRY_FIRST_DELAY;
+    loop {
+        tokio::time::sleep(delay).await;
+        match RegistryStore::open(descriptor) {
+            Err(error) if error.is_lease_held() && started.elapsed() < LEASE_HELD_RETRY_BUDGET => {
+                delay = (delay * 2).min(LEASE_HELD_RETRY_MAX_DELAY);
+            }
+            outcome => {
+                return outcome.map_err(|error| {
+                    format!(
+                        "opening projects storage after {:.1}s: {error}",
+                        started.elapsed().as_secs_f64()
+                    )
+                })
+            }
+        }
+    }
+}
+
 fn fallback_storage_descriptor() -> StorageDescriptor {
     let data_home = std::env::var_os("XDG_DATA_HOME")
         .filter(|value| !value.is_empty())
@@ -652,6 +732,131 @@ fn unix_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch_descriptor(name: &str) -> (PathBuf, StorageDescriptor) {
+        let dir = std::env::temp_dir().join(format!(
+            "entorhinal-{name}-{}-{}",
+            std::process::id(),
+            unix_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let descriptor = StorageDescriptor {
+            module_id: MODULE_ID.to_string(),
+            storage_namespace: DEFAULT_STORAGE_NAMESPACE.to_string(),
+            isolation: Isolation::Module,
+            backend: StorageBackend::Sqlite {
+                path: dir.join("store.db").to_string_lossy().into_owned(),
+            },
+        };
+        (dir, descriptor)
+    }
+
+    fn hello_ack(descriptor: &StorageDescriptor) -> ModuleHelloAckBody {
+        ModuleHelloAckBody {
+            negotiated_ver: 1,
+            subc_ops: Vec::new(),
+            subc_capabilities: Vec::new(),
+            storage: Some(serde_json::to_value(descriptor).unwrap()),
+        }
+    }
+
+    async fn wait_until_settled(handler: &ProjectsHandler, budget: Duration) -> Duration {
+        let started = Instant::now();
+        while handler.health.store_opening.load(Ordering::Relaxed) {
+            assert!(
+                started.elapsed() < budget,
+                "open did not settle within {budget:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        started.elapsed()
+    }
+
+    // The predecessor shape from the E2E rig: the previous instance still
+    // holds the store's kernel lease while the new one registers. The lease
+    // releases the instant the holder drops, and the open must then succeed
+    // without a restart; health reads degraded, never failing, in between.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_retries_while_a_predecessor_still_holds_the_lease() {
+        let (dir, descriptor) = scratch_descriptor("lease-held-then-released");
+        let predecessor = RegistryStore::open(&descriptor).expect("predecessor opens");
+        let handler = ProjectsHandler::new();
+
+        handler.on_hello_ack(&hello_ack(&descriptor)).await;
+        let during = handler.health().await;
+        assert_eq!(during.status, HealthStatus::Degraded, "{during:?}");
+        assert!(
+            during
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("predecessor"),
+            "{during:?}"
+        );
+        assert!(
+            handler.store.lock().unwrap().is_none(),
+            "no store until the lease is free"
+        );
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(predecessor);
+
+        let settled_after = wait_until_settled(&handler, Duration::from_secs(5)).await;
+        let after = handler.health().await;
+        assert_eq!(after.status, HealthStatus::Ok, "{after:?}");
+        assert!(handler.store.lock().unwrap().is_some());
+        assert!(
+            settled_after < Duration::from_secs(3),
+            "the retry must pick the lease up promptly after release, not at the budget (took {settled_after:?})"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // A hold that outlasts the budget is a second live writer: the refusal
+    // is reported as today, after the budget and not much later.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_gives_up_on_a_lease_held_past_the_budget() {
+        let (dir, descriptor) = scratch_descriptor("lease-held-past-budget");
+        let _other_writer = RegistryStore::open(&descriptor).expect("other writer opens");
+        let handler = ProjectsHandler::new();
+
+        let started = Instant::now();
+        handler.on_hello_ack(&hello_ack(&descriptor)).await;
+        wait_until_settled(&handler, LEASE_HELD_RETRY_BUDGET + Duration::from_secs(3)).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= LEASE_HELD_RETRY_BUDGET,
+            "gave up before the budget: {elapsed:?}"
+        );
+        let after = handler.health().await;
+        assert_eq!(after.status, HealthStatus::Failing, "{after:?}");
+        assert!(handler.store.lock().unwrap().is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // Only the lease is retried. Any other open error is the same fail-once
+    // it always was: no retry task, failing at once.
+    #[tokio::test]
+    async fn a_non_lease_open_error_fails_once_without_retrying() {
+        let (dir, mut descriptor) = scratch_descriptor("unopenable");
+        let blocker = dir.join("not-a-directory");
+        std::fs::write(&blocker, b"file").unwrap();
+        descriptor.backend = StorageBackend::Sqlite {
+            path: blocker.join("store.db").to_string_lossy().into_owned(),
+        };
+        let handler = ProjectsHandler::new();
+
+        let started = Instant::now();
+        handler.on_hello_ack(&hello_ack(&descriptor)).await;
+        assert!(
+            !handler.health.store_opening.load(Ordering::Relaxed),
+            "a non-lease error must not start the retry task"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let after = handler.health().await;
+        assert_eq!(after.status, HealthStatus::Failing, "{after:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[tokio::test]
     async fn session_liveness_gap_detection_and_snapshot_rebase() {

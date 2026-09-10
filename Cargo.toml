@@ -14,6 +14,7 @@ subc-jsonc = { path = "../subconscious/crates/subc-jsonc" }
 cortexkit-paths = { path = "../commons/crates/cortexkit-paths" }
 cortexkit-store = { path = "../commons/crates/cortexkit-store", features = ["sqlite"] }
 cortexkit-store-types = { path = "../commons/crates/cortexkit-store-types" }
+cortexkit-lease = { path = "../commons/crates/cortexkit-lease" }
 blake3 = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

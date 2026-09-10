@@ -597,6 +597,20 @@ impl fmt::Display for RegistryError {
     }
 }
 
+impl RegistryError {
+    /// True when the store could not be opened because another process still
+    /// holds its single-writer lease. The lease is a kernel advisory lock
+    /// released the instant the holder exits, so at startup this means the
+    /// previous instance of this module has not finished exiting yet — a
+    /// condition that clears by itself — and never a store defect.
+    pub fn is_lease_held(&self) -> bool {
+        matches!(
+            self,
+            Self::Store(StoreError::Lease(cortexkit_lease::LeaseError::Held { .. }))
+        )
+    }
+}
+
 impl std::error::Error for RegistryError {}
 
 impl From<rusqlite::Error> for RegistryError {

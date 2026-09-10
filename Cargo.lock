@@ -256,9 +256,10 @@ dependencies = [
 
 [[package]]
 name = "entorhinal-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake3",
+ "cortexkit-lease",
  "cortexkit-paths 0.1.1",
  "cortexkit-store",
  "cortexkit-store-types",
@@ -269,7 +270,7 @@ dependencies = [
 
 [[package]]
 name = "entorhinal-module"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "cortexkit-store-types",
@@ -777,7 +778,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.17.20"
+version = "0.17.24"
 dependencies = [
  "base64",
  "cortexkit-paths 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",

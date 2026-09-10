@@ -1,6 +1,6 @@
 [package]
 name = "entorhinal-core"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 publish = false
 description = "Pure domain and journal-spine store for the ck-entorhinal registry."
@@ -8,6 +8,7 @@ description = "Pure domain and journal-spine store for the ck-entorhinal registr
 [dependencies]
 blake3 = { workspace = true }
 cortexkit-paths = { workspace = true }
+cortexkit-lease = { workspace = true }
 cortexkit-store = { workspace = true }
 cortexkit-store-types = { workspace = true }
 rusqlite = { workspace = true }
