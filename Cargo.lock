@@ -47,6 +47,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "autocfg"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -110,6 +116,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
+name = "chrono"
+version = "0.4.45"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -129,6 +144,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cortexkit-log"
+version = "0.2.0"
+source = "git+https://github.com/cortexkit/commons.git?rev=99736150c6d0c769c1c7479894fba7f07c322a5f#99736150c6d0c769c1c7479894fba7f07c322a5f"
+dependencies = [
+ "chrono",
+ "cortexkit-store-types 0.2.1",
+ "regex",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "cortexkit-paths"
 version = "0.1.1"
 
@@ -143,13 +170,21 @@ name = "cortexkit-store"
 version = "0.2.0"
 dependencies = [
  "cortexkit-lease",
- "cortexkit-store-types",
+ "cortexkit-store-types 0.2.2",
  "rusqlite",
 ]
 
 [[package]]
 name = "cortexkit-store-types"
 version = "0.2.1"
+source = "git+https://github.com/cortexkit/commons.git?rev=99736150c6d0c769c1c7479894fba7f07c322a5f#99736150c6d0c769c1c7479894fba7f07c322a5f"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "cortexkit-store-types"
+version = "0.2.2"
 dependencies = [
  "serde",
 ]
@@ -262,7 +297,7 @@ dependencies = [
  "cortexkit-lease",
  "cortexkit-paths 0.1.1",
  "cortexkit-store",
- "cortexkit-store-types",
+ "cortexkit-store-types 0.2.2",
  "rusqlite",
  "serde",
  "serde_json",
@@ -273,7 +308,7 @@ name = "entorhinal-module"
 version = "0.1.1"
 dependencies = [
  "async-trait",
- "cortexkit-store-types",
+ "cortexkit-store-types 0.2.2",
  "entorhinal-core",
  "serde",
  "serde_json",
@@ -511,6 +546,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "num-traits"
+version = "0.2.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -563,6 +607,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 dependencies = [
  "getrandom",
+]
+
+[[package]]
+name = "regex"
+version = "1.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f020237b6c8eed93db2e2cb53c00c60a8e1bc73da7d073199a1180401450218d"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]
@@ -755,7 +811,7 @@ dependencies = [
 
 [[package]]
 name = "subc-client-rs"
-version = "0.12.1"
+version = "0.15.1"
 dependencies = [
  "async-trait",
  "serde",
@@ -769,7 +825,7 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.11.2"
+version = "0.13.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -778,9 +834,10 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.17.24"
+version = "0.18.4"
 dependencies = [
  "base64",
+ "cortexkit-log",
  "cortexkit-paths 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "ed25519-dalek",
  "fs4",
@@ -811,7 +868,7 @@ dependencies = [
 
 [[package]]
 name = "subc-protocol"
-version = "0.19.0"
+version = "0.21.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -819,7 +876,7 @@ dependencies = [
 
 [[package]]
 name = "subc-transport"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "getrandom",
  "hmac",

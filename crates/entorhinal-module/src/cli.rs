@@ -408,11 +408,16 @@ fn call(connection: &Path, method: &str, params: Value) -> Result<Value, (u8, St
                 subc_protocol::RouteTarget::ManagementSurface {
                     module_id: super::MODULE_ID.to_string(),
                 },
-                subc_protocol::BindIdentity {
-                    project_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
-                    harness: "ck-entorhinal".to_string(),
-                    session: "operator".to_string(),
-                },
+                // `project_id` is deliberately left unset: this is the operator
+                // CLI, which has no registered project to resolve and must not
+                // invent one. Absent means "key on the triple", which is the
+                // honest answer for a caller that binds from whatever directory
+                // the operator happened to be standing in.
+                subc_protocol::BindIdentity::new(
+                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+                    "ck-entorhinal".to_string(),
+                    "operator".to_string(),
+                ),
                 body,
                 subc_client_rs::CallOptions::default(),
             )
