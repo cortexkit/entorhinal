@@ -7,7 +7,7 @@
 
 use std::{
     cmp::Reverse,
-    fmt, fs,
+    fmt,
     path::{Component, Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -788,7 +788,7 @@ fn path_depth(path: &Path) -> usize {
 #[cfg(unix)]
 fn device_id(path: &Path) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
-    fs::metadata(path).ok().map(|metadata| metadata.dev())
+    std::fs::metadata(path).ok().map(|metadata| metadata.dev())
 }
 
 #[cfg(not(unix))]
