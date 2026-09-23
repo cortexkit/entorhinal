@@ -73,6 +73,9 @@ pub enum Invocation {
     Refuse(String),
     /// A verb to run against the daemon.
     Command(Command),
+    /// Print the module manifest as JSON and exit, for offline fleet
+    /// inspection (`ck fleet lint`). Module face only; it connects to nothing.
+    Manifest,
 }
 
 pub struct Command {
@@ -124,6 +127,13 @@ pub fn parse(face: Face, arguments: &[String]) -> Invocation {
             ),
             _ => Invocation::Report(usage(face).lines().next().unwrap_or_default().to_string()),
         };
+    }
+    // `ck fleet lint` reads every module's manifest offline through
+    // `--manifest`, which is how it checks that a capability another module
+    // requires has a provider. Without it, lint cannot see what entorhinal
+    // provides. Module face only: the operator faces are not modules.
+    if arguments.len() == 1 && arguments[0] == "--manifest" && face == Face::Entorhinal {
+        return Invocation::Manifest;
     }
     if arguments.iter().any(|a| a == "--version") {
         return Invocation::Report(format!(

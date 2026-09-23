@@ -26,7 +26,8 @@ use serde_json::{json, Value};
 use subc_client_rs::{HandlerOutcome, HealthReport, HealthStatus, ModuleHandler, RequestCtx};
 use subc_protocol::{
     manifest::{
-        Concurrency, ManagementOperation, ManagementOperationKind, ModuleManifest, ProviderRole,
+        CapabilityDeclarations, Concurrency, ManagementOperation, ManagementOperationKind,
+        ModuleManifest, ProviderRole,
     },
     ModuleHelloAckBody, PROTOCOL_VERSION,
 };
@@ -75,6 +76,16 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::from(64)
         }
         cli::Invocation::Command(command) => cli::run(command),
+        cli::Invocation::Manifest => match serde_json::to_string(&manifest()) {
+            Ok(json) => {
+                println!("{json}");
+                std::process::ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("ck-entorhinal: cannot serialize the manifest: {error}");
+                std::process::ExitCode::FAILURE
+            }
+        },
         cli::Invocation::Module => {
             // Module mode logs through the fleet logger (dated segments under
             // the module's data dir, read by `ck module logs entorhinal`). The
@@ -565,6 +576,9 @@ struct JournalTailParams {
     limit: Option<i64>,
 }
 
+/// The capability identifier entorhinal provides; consumers require it by this name.
+const PROJECT_IDENTITY_CAPABILITY: &str = "project-identity/v1";
+
 fn manifest() -> ModuleManifest {
     ModuleManifest::builder(MODULE_ID, env!("CARGO_PKG_VERSION"))
     .protocol_ver(PROTOCOL_VERSION)
@@ -645,7 +659,6 @@ fn manifest() -> ModuleManifest {
     // cuts draft records entorhinal -> project-registry/v1, but a provides
     // claim belongs with the reviewed registry entry and corpus, not ahead
     // of them. None = grammar inactive for this module, deliberately.
-    .capabilities(None)
     // entorhinal declares no self-signals yet: its ops are operator-driven
     // registry reads/writes, not autonomous signals.
     .self_signals(None)
@@ -653,6 +666,17 @@ fn manifest() -> ModuleManifest {
     // release script injects it; None is the honest value until then — the
     // daemon serves declared_absent rather than a fabricated rev.
     .provenance(None)
+    // The capability other modules declare `required` when they cannot work
+    // without project identity. The daemon holds a module not-ready while a
+    // capability it requires has no registered provider, so this name is what
+    // makes that dependency enforceable. It covers the whole surface above
+    // (resolve, resolve_project_id, enumerate, register and the workspace
+    // operations); a breaking change to that surface moves it to v2.
+    .capabilities(Some(CapabilityDeclarations {
+        provides: vec![PROJECT_IDENTITY_CAPABILITY.to_owned()],
+        requires: Vec::new(),
+        must_never_reach: Vec::new(),
+    }))
     .build()
 }
 
@@ -1002,6 +1026,14 @@ mod tests {
         assert!(operations
             .iter()
             .any(|operation| operation["name"] == "seed_import"));
+        // Consumers declare this `required`, so its spelling is a contract.
+        assert_eq!(
+            value["capabilities"]["provides"],
+            serde_json::json!(["project-identity/v1"])
+        );
+        assert!(subc_protocol::manifest::is_valid_capability_identifier(
+            PROJECT_IDENTITY_CAPABILITY
+        ));
     }
 
     #[test]

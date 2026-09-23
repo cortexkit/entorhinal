@@ -1,6 +1,6 @@
 [package]
 name = "entorhinal-module"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 publish = false
 description = "The ck-entorhinal supervised subc module."
