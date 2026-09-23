@@ -110,6 +110,21 @@ pub fn parse(face: Face, arguments: &[String]) -> Invocation {
             _ => Invocation::Report(usage(face)),
         };
     }
+    // `ck` hands `ck projects ...` to this binary only after `ck-projects
+    // --ck-domain` exits 0 with exactly one headline line within 2 seconds;
+    // without that handshake the dispatcher refuses the command. The answer is
+    // the first line of the face's own help, so the headline cannot drift from
+    // what `ck projects` explains. The module face is not an operator domain,
+    // so it keeps refusing the flag.
+    if arguments.len() == 1 && arguments[0] == "--ck-domain" {
+        return match face {
+            Face::Entorhinal => Invocation::Refuse(
+                "ck-entorhinal is a module, not a ck domain; the domains are ck projects and ck workspaces"
+                    .to_string(),
+            ),
+            _ => Invocation::Report(usage(face).lines().next().unwrap_or_default().to_string()),
+        };
+    }
     if arguments.iter().any(|a| a == "--version") {
         return Invocation::Report(format!(
             "{} {}",
