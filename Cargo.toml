@@ -13,6 +13,12 @@ subc-jsonc = { path = "../subconscious/crates/subc-jsonc" }
 cortexkit-paths = { path = "../commons/crates/cortexkit-paths" }
 cortexkit-store = { path = "../commons/crates/cortexkit-store", features = ["sqlite"] }
 cortexkit-store-types = { path = "../commons/crates/cortexkit-store-types" }
+# By path, like cortexkit-store-types beside it: the logger's default
+# `store-paths` feature links cortexkit-store-types, and two sources for that
+# crate (a path copy here and a git copy through the logger) would be two
+# distinct StorageDescriptor types.
+cortexkit-log = { path = "../commons/crates/cortexkit-log" }
+tracing = "0.1"
 cortexkit-lease = { path = "../commons/crates/cortexkit-lease" }
 blake3 = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }

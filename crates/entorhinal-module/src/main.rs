@@ -75,13 +75,30 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::from(64)
         }
         cli::Invocation::Command(command) => cli::run(command),
-        cli::Invocation::Module => match serve_module() {
-            Ok(()) => std::process::ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("ck-entorhinal: {error}");
-                std::process::ExitCode::FAILURE
+        cli::Invocation::Module => {
+            // Module mode logs through the fleet logger (dated segments under
+            // the module's data dir, read by `ck module logs entorhinal`). The
+            // CLI faces above print to stdout/stderr because that IS their
+            // output. The logger needs SUBC_MODULE_ID from the supervisor's
+            // spawn environment; a hand-launched module has none, and this
+            // stderr line is the only place a refusal can go before a logger
+            // exists.
+            let _logger = match cortexkit_log::init_from_env() {
+                Ok(handle) => handle,
+                Err(error) => {
+                    eprintln!("ck-entorhinal: cannot start the fleet logger: {error}");
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
+            tracing::info!("entorhinal module starting");
+            match serve_module() {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(error) => {
+                    tracing::error!("module exited: {error}");
+                    std::process::ExitCode::FAILURE
+                }
             }
-        },
+        }
     }
 }
 
@@ -238,8 +255,9 @@ impl ModuleHandler for ProjectsHandler {
             Err(error) if error.is_lease_held() => {
                 // The predecessor is still exiting. Retry off this path so the
                 // HELLO_ACK handler and the health reply stay prompt.
-                eprintln!(
-                    "[ck-entorhinal] opening projects storage: {error}; retrying for up to {}s",
+                tracing::warn!(
+                    target: "store",
+                    "opening projects storage: {error}; retrying for up to {}s",
                     LEASE_HELD_RETRY_BUDGET.as_secs()
                 );
                 self.health.store_opening.store(true, Ordering::Relaxed);
@@ -669,7 +687,7 @@ fn install_store(
             *guard = Some(opened);
         }
         Err(error) => {
-            eprintln!("[ck-entorhinal] {error}");
+            tracing::error!(target: "store", "{error}");
             health.store_ready.store(false, Ordering::Relaxed);
             health.store_failed.store(true, Ordering::Relaxed);
             *guard = None;
