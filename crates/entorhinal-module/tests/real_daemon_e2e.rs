@@ -14,9 +14,10 @@ use std::{
 };
 
 use serde_json::Value;
-use subc_core::{read_frame, write_frame, Frame};
+use subc_protocol::Frame;
 use subc_protocol::{BindIdentity, Flags, FrameType, Priority, RouteTarget};
 use subc_transport::{authenticate_client, connection_file};
+use subc_transport::{read_frame, write_frame};
 use tokio::{
     io::AsyncWriteExt,
     net::TcpStream,

@@ -8,7 +8,6 @@ members = ["crates/entorhinal-core", "crates/entorhinal-module"]
 subc-client-rs = { path = "../subconscious/crates/subc-client-rs" }
 subc-protocol = { path = "../subconscious/crates/subc-protocol" }
 subc-transport = { path = "../subconscious/crates/subc-transport" }
-subc-core = { path = "../subconscious/crates/subc-core" }
 subc-jsonc = { path = "../subconscious/crates/subc-jsonc" }
 
 cortexkit-paths = { path = "../commons/crates/cortexkit-paths" }

@@ -20,5 +20,8 @@ subc-protocol = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
-subc-core = { workspace = true }
+# The e2e test spawns the daemon and the module as child processes. This
+# feature used to arrive through subc-core by feature unification; that
+# dependency is gone, so it is declared where it is used.
+tokio = { workspace = true, features = ["process"] }
 subc-transport = { workspace = true }
