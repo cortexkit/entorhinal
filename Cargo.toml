@@ -2,24 +2,20 @@
 resolver = "2"
 members = ["crates/entorhinal-core", "crates/entorhinal-module"]
 
-# During local development this workspace is nested under the subconscious checkout.
-# The production repository uses the sibling checkout layout in CI.
 [workspace.dependencies]
-subc-client-rs = { path = "../subconscious/crates/subc-client-rs" }
-subc-protocol = { path = "../subconscious/crates/subc-protocol" }
-subc-transport = { path = "../subconscious/crates/subc-transport" }
-subc-jsonc = { path = "../subconscious/crates/subc-jsonc" }
+# Every CortexKit dependency comes from crates.io, so a fresh clone builds with
+# no sibling checkouts beside it.
+subc-client-rs = "0.17.0"
+subc-protocol = "0.24.1"
+subc-transport = "0.7.3"
+subc-jsonc = "0.1.1"
 
-cortexkit-paths = { path = "../commons/crates/cortexkit-paths" }
-cortexkit-store = { path = "../commons/crates/cortexkit-store", features = ["sqlite"] }
-cortexkit-store-types = { path = "../commons/crates/cortexkit-store-types" }
-# By path, like cortexkit-store-types beside it: the logger's default
-# `store-paths` feature links cortexkit-store-types, and two sources for that
-# crate (a path copy here and a git copy through the logger) would be two
-# distinct StorageDescriptor types.
-cortexkit-log = { path = "../commons/crates/cortexkit-log" }
+cortexkit-paths = "0.1.1"
+cortexkit-store = { version = "0.2.0", features = ["sqlite"] }
+cortexkit-store-types = "0.2.2"
+cortexkit-log = "0.3.3"
 tracing = "0.1"
-cortexkit-lease = { path = "../commons/crates/cortexkit-lease" }
+cortexkit-lease = "0.1.0"
 blake3 = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

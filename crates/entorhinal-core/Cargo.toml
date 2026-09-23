@@ -2,6 +2,8 @@
 name = "entorhinal-core"
 version = "0.1.1"
 edition = "2021"
+license = "MIT"
+repository = "https://github.com/cortexkit/entorhinal"
 publish = false
 description = "Pure domain and journal-spine store for the ck-entorhinal registry."
 
