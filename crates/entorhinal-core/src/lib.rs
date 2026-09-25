@@ -95,10 +95,21 @@ CREATE TABLE project_alias (
 );
 "#;
 
-const V1_MIGRATIONS: [Migration; 1] = [Migration {
-    version: 1,
-    statements: V1_SCHEMA,
-}];
+/// Migration 2: a workspace may name its root directory. Set only by the
+/// operator through `set_workspace_root`, never derived from member paths, so
+/// NULL means "no root" and a reader must not guess one.
+pub const V2_WORKSPACE_ROOT: &str = "ALTER TABLE workspace ADD COLUMN root TEXT NULL;";
+
+const MIGRATIONS: [Migration; 2] = [
+    Migration {
+        version: 1,
+        statements: V1_SCHEMA,
+    },
+    Migration {
+        version: 2,
+        statements: V2_WORKSPACE_ROOT,
+    },
+];
 
 /// A store opened from the descriptor resolved by subc.
 pub struct RegistryStore {
@@ -119,7 +130,7 @@ impl RegistryStore {
     pub fn open(descriptor: &StorageDescriptor) -> Result<Self, RegistryError> {
         let db = open_sqlite(descriptor).map_err(RegistryError::Store)?;
         let outcome = db
-            .migrate(MIGRATION_NAMESPACE, &V1_MIGRATIONS)
+            .migrate(MIGRATION_NAMESPACE, &MIGRATIONS)
             .map_err(RegistryError::Store)?;
         // A store written by a newer binary may hold tables and columns this
         // one cannot query; serving it would answer nothing while looking up.
@@ -217,6 +228,7 @@ impl RegistryStore {
             Ok(ResolveReply {
                 project_id: implicit_project_id(&canonical_path),
                 workspace_id: None,
+                workspace_root: None,
                 project_name: None,
                 via: "implicit".to_string(),
                 gone: !path_exists,
@@ -280,25 +292,28 @@ impl RegistryStore {
         self.read(|conn| {
             let workspaces = if let Some(workspace_id) = workspace_id {
                 conn.query_row(
-                    "SELECT workspace_id, name FROM workspace WHERE workspace_id = ?1",
+                    "SELECT workspace_id, name, root FROM workspace WHERE workspace_id = ?1",
                     params![workspace_id],
                     |row| {
                         Ok(vec![WorkspaceSummary {
                             workspace_id: row.get(0)?,
                             name: row.get(1)?,
+                            root: row.get(2)?,
                         }])
                     },
                 )
                 .optional()?
                 .unwrap_or_default()
             } else {
-                let mut statement =
-                    conn.prepare("SELECT workspace_id, name FROM workspace ORDER BY workspace_id")?;
+                let mut statement = conn.prepare(
+                    "SELECT workspace_id, name, root FROM workspace ORDER BY workspace_id",
+                )?;
                 let rows = statement
                     .query_map([], |row| {
                         Ok(WorkspaceSummary {
                             workspace_id: row.get(0)?,
                             name: row.get(1)?,
+                            root: row.get(2)?,
                         })
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -480,7 +495,7 @@ impl RegistryStore {
         generation: i64,
     ) -> rusqlite::Result<ResolveReply> {
         let context = conn.query_row(
-            "SELECT p.name, w.workspace_id, w.name
+            "SELECT p.name, w.workspace_id, w.root
              FROM project AS p
              LEFT JOIN project_workspace AS pw ON pw.project_id = p.project_id
              LEFT JOIN workspace AS w ON w.workspace_id = pw.workspace_id
@@ -497,6 +512,7 @@ impl RegistryStore {
         Ok(ResolveReply {
             project_id: project_id.to_string(),
             workspace_id: context.1,
+            workspace_root: context.2,
             project_name: context.0.into(),
             via: via.to_string(),
             gone,
@@ -624,6 +640,10 @@ impl From<rusqlite::Error> for RegistryError {
 pub struct ResolveReply {
     pub project_id: String,
     pub workspace_id: Option<String>,
+    /// The workspace's root directory as the operator set it, or null when the
+    /// project has no workspace or its workspace has no root. Never derived
+    /// from member paths: absent means "no root", not "unknown".
+    pub workspace_root: Option<String>,
     pub project_name: Option<String>,
     pub via: String,
     pub gone: bool,
@@ -645,6 +665,8 @@ pub struct ResolveProjectIdReply {
 pub struct WorkspaceSummary {
     pub workspace_id: String,
     pub name: String,
+    /// Same meaning as `ResolveReply::workspace_root`.
+    pub root: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

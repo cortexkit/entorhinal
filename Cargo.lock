@@ -200,7 +200,7 @@ dependencies = [
 
 [[package]]
 name = "entorhinal-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "cortexkit-lease",
@@ -214,7 +214,7 @@ dependencies = [
 
 [[package]]
 name = "entorhinal-module"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "cortexkit-log",

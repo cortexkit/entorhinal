@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
 use entorhinal_core::{
     AssignWorkspaceRequest, RegisterRequest, RegistryError, RegistryStore, RemoveRequest,
-    SeedImportRequest, UpgradeImplicitRequest,
+    SeedImportRequest, SetWorkspaceRootRequest, UpgradeImplicitRequest,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -224,6 +224,7 @@ impl ModuleHandler for ProjectsHandler {
             "journal_tail" => self.journal_tail(request.params),
             "register" => self.register(request.params),
             "assign_workspace" => self.assign_workspace(request.params),
+            "set_workspace_root" => self.set_workspace_root(request.params),
             "upgrade_implicit" => self.upgrade_implicit(request.params),
             "remove" => self.remove(request.params),
             "seed_import" => self.seed_import(request.params),
@@ -471,6 +472,12 @@ impl ProjectsHandler {
         let req = serde_json::from_value::<RegisterRequest>(params).map_err(invalid_params)?;
         self.record_mutation(self.with_store(|s| s.register(req)))
     }
+    fn set_workspace_root(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
+        let req =
+            serde_json::from_value::<SetWorkspaceRootRequest>(params).map_err(invalid_params)?;
+        self.record_mutation(self.with_store(|s| s.set_workspace_root(req)))
+    }
+
     fn assign_workspace(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
         let req =
             serde_json::from_value::<AssignWorkspaceRequest>(params).map_err(invalid_params)?;
@@ -613,6 +620,11 @@ fn manifest() -> ModuleManifest {
                     "assign_workspace",
                     ManagementOperationKind::Mutate,
                     "Move a registered project to a different workspace.",
+                ),
+                management_operation(
+                    "set_workspace_root",
+                    ManagementOperationKind::Mutate,
+                    "Set or clear a workspace's root directory (operator-set, never derived).",
                 ),
                 management_operation(
                     "upgrade_implicit",

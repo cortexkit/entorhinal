@@ -223,6 +223,9 @@ usage: ck workspaces <verb> [args] [--subc <connection file>] [--json]
   list                    workspaces known to the registry
   assign <project> <workspace>
                           put a project in a workspace (moves it if already in another)
+  set-root <workspace> <directory>
+                          record the workspace's root directory
+  clear-root <workspace>  remove the recorded root
 
   --subc <path>   daemon connection file; defaults to the usual discovery path
   --json          raw response instead of the rendered form
@@ -236,7 +239,7 @@ This binary is the module itself; it is not an operator command. The operator
 surface is:
 
   ck projects      list, register, resolve, remove, verify
-  ck workspaces    list, assign
+  ck workspaces    list, assign, set-root, clear-root
 
 With no arguments it runs as the supervised module, which is how the daemon
 spawns it."
@@ -379,6 +382,22 @@ fn build(command: &Command) -> Result<(String, Value), String> {
                 "actor": actor,
             }),
         ),
+        (Face::Workspaces, "set-root") => (
+            "set_workspace_root".to_string(),
+            json!({
+                "workspaceId": need(0, "a workspace id")?,
+                "root": absolute(&need(1, "a directory")?)?,
+                "actor": actor,
+            }),
+        ),
+        (Face::Workspaces, "clear-root") => (
+            "set_workspace_root".to_string(),
+            json!({
+                "workspaceId": need(0, "a workspace id")?,
+                "root": null,
+                "actor": actor,
+            }),
+        ),
         // The old spelling teaches its replacement instead of guessing at it:
         // `workspace` as a projects-verb was the pre-rename surface.
         (Face::Projects, "workspace") => {
@@ -511,9 +530,10 @@ fn render(command: &Command, value: &Value) {
             }
             for workspace in &workspaces {
                 println!(
-                    "{:<28} {}",
+                    "{:<28} {:<20} {}",
                     text(&workspace["workspaceId"]),
-                    text(&workspace["name"])
+                    text(&workspace["name"]),
+                    text(&workspace["root"])
                 );
             }
             println!("\n{} workspace(s)", workspaces.len());
@@ -548,6 +568,9 @@ fn render(command: &Command, value: &Value) {
             println!("project:   {}", text(&value["projectId"]));
             println!("name:      {}", text(&value["projectName"]));
             println!("workspace: {}", text(&value["workspaceId"]));
+            // Labelled apart from the `root: GONE` line below, which is about
+            // the project's own directory, not its workspace's.
+            println!("ws root:   {}", text(&value["workspaceRoot"]));
             // AN IMPLICIT PROJECT IS NOT A REGISTERED ONE. The registry always
             // answers `resolve` -- an unregistered directory gets a derived id
             // with `via: "implicit"` and nothing stored behind it. Rendered
@@ -814,6 +837,19 @@ mod tests {
             args: args[1..].iter().map(|a| a.to_string()).collect(),
             json: false,
         };
+        let dir = std::env::temp_dir();
+        let canonical = std::fs::canonicalize(&dir).unwrap();
+        let (method, params) = build(&ws(&["set-root", "w1", dir.to_str().unwrap()])).unwrap();
+        assert_eq!(method, "set_workspace_root");
+        assert_eq!(params["workspaceId"], "w1");
+        assert_eq!(params["root"], canonical.to_string_lossy().as_ref());
+        let (method, params) = build(&ws(&["clear-root", "w1"])).unwrap();
+        assert_eq!(method, "set_workspace_root");
+        assert!(
+            params["root"].is_null(),
+            "clear-root must send an explicit null: {params}"
+        );
+
         let (method, params) = build(&ws(&["assign", "p1", "w2"])).unwrap();
         assert_eq!(method, "assign_workspace");
         assert_eq!(params["projectId"], "p1");
@@ -857,6 +893,7 @@ mod tests {
         let reply = serde_json::to_value(entorhinal_core::ResolveReply {
             project_id: "pj-1".to_string(),
             workspace_id: Some("ws-1".to_string()),
+            workspace_root: Some("/tmp/ws".to_string()),
             project_name: Some("the-name".to_string()),
             via: "root".to_string(),
             gone: false,
@@ -866,7 +903,13 @@ mod tests {
         .unwrap();
 
         // Every key the renderer reads must exist on the real reply.
-        for key in ["projectId", "projectName", "workspaceId", "gone"] {
+        for key in [
+            "projectId",
+            "projectName",
+            "workspaceId",
+            "workspaceRoot",
+            "gone",
+        ] {
             assert!(
                 !reply[key].is_null(),
                 "renderer reads '{key}', which ResolveReply does not emit"
@@ -885,6 +928,7 @@ mod tests {
         let implicit = serde_json::to_value(entorhinal_core::ResolveReply {
             project_id: "pj-implicit1-deadbeef".to_string(),
             workspace_id: None,
+            workspace_root: None,
             project_name: None,
             via: "implicit".to_string(),
             gone: false,

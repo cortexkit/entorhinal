@@ -41,6 +41,23 @@ pub struct AssignWorkspaceRequest {
     pub actor: Option<String>,
 }
 
+/// Set or clear a workspace's root directory. `root: null` clears it.
+///
+/// The root is operator-set data, never derived from member paths: prefrontal
+/// reads `<root>/.cortexkit/WORKSPACE.md` as operator text for every member
+/// project, so a guessed root would put text the operator never chose in front
+/// of their agents.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SetWorkspaceRootRequest {
+    pub workspace_id: String,
+    pub root: Option<String>,
+    #[serde(default)]
+    pub request_key: Option<String>,
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct UpgradeImplicitRequest {
@@ -495,6 +512,76 @@ impl RegistryStore {
         )
     }
 
+    pub fn set_workspace_root(
+        &self,
+        req: SetWorkspaceRootRequest,
+    ) -> Result<Vec<u8>, RegistryError> {
+        // Validated before the transaction: the path checks read the
+        // filesystem, and the journal must record exactly the value the
+        // projection holds so `rebuild` reproduces it without re-reading disk.
+        if let Some(root) = req.root.as_deref() {
+            if !Path::new(root).is_absolute() {
+                return Err(domain(
+                    "not_absolute",
+                    format!("workspace root must be an absolute path: {root}"),
+                ));
+            }
+            canonical(root)?;
+            if !Path::new(root).is_dir() {
+                return Err(domain(
+                    "not_a_directory",
+                    format!("workspace root is not a directory: {root}"),
+                ));
+            }
+        }
+        let key = req.request_key.clone();
+        let actor = req.actor.clone().unwrap_or_else(|| "module".into());
+        let payload =
+            serde_json::to_value(&req).map_err(|e| domain("encode_failed", e.to_string()))?;
+        self.mutation("set_workspace_root", key.clone().as_deref(), move |tx| {
+            let now = now_unix_millis();
+            let current = tx
+                .query_row(
+                    "SELECT root FROM workspace WHERE workspace_id=?1",
+                    [&req.workspace_id],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()?;
+            let Some(current) = current else {
+                return Err(domain("not_found", &req.workspace_id));
+            };
+            let value = json!({"workspaceId": req.workspace_id, "root": req.root});
+            // Setting the value it already holds appends nothing, the same rule
+            // `assign_workspace` follows, so repeated calls don't grow the journal.
+            if current == req.root {
+                return Ok(Action {
+                    changed: false,
+                    seq: None,
+                    value,
+                    payload,
+                });
+            }
+            let seq = append(
+                tx,
+                "set_workspace_root",
+                &payload,
+                &actor,
+                key.as_deref(),
+                now,
+            )?;
+            tx.execute(
+                "UPDATE workspace SET root=?1, updated_at=?2 WHERE workspace_id=?3",
+                params![req.root, now, req.workspace_id],
+            )?;
+            Ok(Action {
+                changed: true,
+                seq: Some(seq),
+                value,
+                payload,
+            })
+        })
+    }
+
     pub fn upgrade_implicit(
         &self,
         mut req: UpgradeImplicitRequest,
@@ -678,7 +765,16 @@ fn replay(tx: &Transaction<'_>, op: &str, v: Value, now: i64) -> rusqlite::Resul
             let id = r
                 .project_id
                 .unwrap_or_else(|| mint("register1", &r.name, &r.roots));
-            tx.execute("INSERT OR IGNORE INTO project(project_id,name,implicit,seed_identity,created_at,updated_at) VALUES(?1,?2,0,NULL,?3,?3)",params![id,r.name,now])?;
+            // Mirrors the live `register`, which renames an existing project and
+            // places a new one in its workspace. Replay used to do neither, so a
+            // `rebuild` reverted renames and silently unplaced every project that
+            // was put in a workspace at registration.
+            tx.execute("INSERT INTO project(project_id,name,implicit,seed_identity,created_at,updated_at) VALUES(?1,?2,0,NULL,?3,?3) ON CONFLICT(project_id) DO UPDATE SET name=excluded.name,updated_at=excluded.updated_at",params![id,r.name,now])?;
+            if let Some(w) = &r.workspace_id {
+                tx.execute("INSERT OR IGNORE INTO workspace(workspace_id,name,created_at,updated_at) VALUES(?1,?1,?2,?2)",params![w,now])?;
+                tx.execute("INSERT OR IGNORE INTO project_workspace(project_id,workspace_id) VALUES(?1,?2)",params![id,w])?;
+                tx.execute("INSERT OR IGNORE INTO workspace_member(workspace_id,ref_kind,device_fingerprint,project_id) VALUES(?1,'local','',?2)",params![w,id])?;
+            }
             for root in r.roots {
                 tx.execute("INSERT OR IGNORE INTO project_root(canonical_root,project_id,added_at) VALUES(?1,?2,?3)",params![root,id,now])?;
                 tx.execute("INSERT OR IGNORE INTO project_alias(old_id,project_id,created_at) VALUES(?1,?2,?3)",params![implicit_project_id(&root),id,now])?;
@@ -686,6 +782,17 @@ fn replay(tx: &Transaction<'_>, op: &str, v: Value, now: i64) -> rusqlite::Resul
             for p in r.derived_root_parents {
                 tx.execute("INSERT OR IGNORE INTO derived_root_parent(canonical_parent,project_id) VALUES(?1,?2)",params![p,id])?;
             }
+        }
+        // Mirrors the live `set_workspace_root`. The journal holds the value
+        // that was validated when it was set, so replay never re-reads disk: a
+        // root directory removed since then still rebuilds to what was recorded.
+        "set_workspace_root" => {
+            let r: SetWorkspaceRootRequest = serde_json::from_value(v)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            tx.execute(
+                "UPDATE workspace SET root=?1, updated_at=?2 WHERE workspace_id=?3",
+                params![r.root, now, r.workspace_id],
+            )?;
         }
         "assign_workspace" => {
             let r: AssignWorkspaceRequest = serde_json::from_value(v)
@@ -1719,5 +1826,161 @@ mod audit_fix_tests {
             Some("/srv/xdg/config"),
             None
         ));
+    }
+}
+
+#[cfg(test)]
+mod workspace_root_tests {
+    use super::tests::*;
+    use super::*;
+
+    fn placed_project(f: &Fixture) -> String {
+        let root = f.dir("member");
+        f.store
+            .register(RegisterRequest {
+                project_id: Some("member".into()),
+                name: "member".into(),
+                workspace_id: Some("ws".into()),
+                roots: vec![root.clone()],
+                ..Default::default()
+            })
+            .unwrap();
+        root
+    }
+
+    fn set(f: &Fixture, workspace: &str, root: Option<&str>) -> Result<Vec<u8>, RegistryError> {
+        f.store.set_workspace_root(SetWorkspaceRootRequest {
+            workspace_id: workspace.into(),
+            root: root.map(str::to_string),
+            ..Default::default()
+        })
+    }
+
+    fn journal_len(f: &Fixture) -> i64 {
+        f.store.generation().unwrap()
+    }
+
+    #[test]
+    fn a_set_root_reaches_resolve_and_enumerate_and_clearing_returns_null() {
+        let f = Fixture::new("ws-root-set");
+        let member = placed_project(&f);
+        let before = f.store.resolve(&member).unwrap();
+        assert_eq!(before.workspace_id.as_deref(), Some("ws"));
+        assert_eq!(
+            before.workspace_root, None,
+            "no root until the operator sets one"
+        );
+
+        let root = f.dir("workspace-root");
+        set(&f, "ws", Some(&root)).unwrap();
+        assert_eq!(
+            f.store.resolve(&member).unwrap().workspace_root.as_deref(),
+            Some(root.as_str())
+        );
+        let listed = f.store.enumerate(None).unwrap();
+        assert_eq!(listed.workspaces[0].root.as_deref(), Some(root.as_str()));
+
+        set(&f, "ws", None).unwrap();
+        assert_eq!(f.store.resolve(&member).unwrap().workspace_root, None);
+    }
+
+    /// The key is always on the wire, as null when unset, so a reader can tell
+    /// "this entorhinal has no root to report" from "this entorhinal predates
+    /// the field".
+    #[test]
+    fn the_reply_carries_the_key_even_when_null() {
+        let f = Fixture::new("ws-root-wire");
+        let member = placed_project(&f);
+        let wire = serde_json::to_value(f.store.resolve(&member).unwrap()).unwrap();
+        assert!(
+            wire.as_object().unwrap().contains_key("workspaceRoot"),
+            "{wire}"
+        );
+        assert!(wire["workspaceRoot"].is_null());
+        let listed = serde_json::to_value(f.store.enumerate(None).unwrap()).unwrap();
+        assert!(
+            listed["workspaces"][0]
+                .as_object()
+                .unwrap()
+                .contains_key("root"),
+            "{listed}"
+        );
+    }
+
+    #[test]
+    fn refusals_are_named_and_write_nothing() {
+        let f = Fixture::new("ws-root-refuse");
+        placed_project(&f);
+        let head = journal_len(&f);
+        code(
+            set(&f, "ws", Some("relative/dir")).unwrap_err(),
+            "not_absolute",
+        );
+        code(
+            set(&f, "ws", Some("/definitely/not/here/xyz")).unwrap_err(),
+            "root_not_found",
+        );
+        let file = format!("{}/a-file", f.dir("holder"));
+        std::fs::write(&file, b"x").unwrap();
+        code(set(&f, "ws", Some(&file)).unwrap_err(), "not_a_directory");
+        let root = f.dir("workspace-root");
+        code(
+            set(&f, "no-such-workspace", Some(&root)).unwrap_err(),
+            "not_found",
+        );
+        assert_eq!(
+            journal_len(&f),
+            head,
+            "a refused call must not reach the journal"
+        );
+    }
+
+    #[test]
+    fn setting_the_same_value_appends_nothing() {
+        let f = Fixture::new("ws-root-noop");
+        placed_project(&f);
+        let root = f.dir("workspace-root");
+        set(&f, "ws", Some(&root)).unwrap();
+        let head = journal_len(&f);
+        set(&f, "ws", Some(&root)).unwrap();
+        assert_eq!(journal_len(&f), head);
+    }
+
+    /// The tables are a projection of the journal: a root that the live path
+    /// sets and replay drops would silently vanish on the next `rebuild`.
+    /// Replay must also reproduce the LAST value, and must not re-read disk,
+    /// so a root directory removed after it was set still rebuilds to it.
+    /// Placement made at registration survives a rebuild. Replay of
+    /// `register` used to skip the workspace, so every project placed that way
+    /// came back unplaced, with nothing reporting a failure.
+    #[test]
+    fn rebuild_keeps_a_workspace_placement_made_at_registration() {
+        let f = Fixture::new("ws-register-replay");
+        let member = placed_project(&f);
+        f.store.rebuild().unwrap();
+        assert_eq!(
+            f.store.resolve(&member).unwrap().workspace_id.as_deref(),
+            Some("ws")
+        );
+    }
+
+    #[test]
+    fn rebuild_reproduces_the_last_root_without_rereading_disk() {
+        let f = Fixture::new("ws-root-replay");
+        let member = placed_project(&f);
+        let first = f.dir("first-root");
+        let last = f.dir("last-root");
+        set(&f, "ws", Some(&first)).unwrap();
+        set(&f, "ws", Some(&last)).unwrap();
+        std::fs::remove_dir(&last).unwrap();
+        f.store.rebuild().unwrap();
+        assert_eq!(
+            f.store.resolve(&member).unwrap().workspace_root.as_deref(),
+            Some(last.as_str())
+        );
+
+        set(&f, "ws", None).unwrap();
+        f.store.rebuild().unwrap();
+        assert_eq!(f.store.resolve(&member).unwrap().workspace_root, None);
     }
 }
