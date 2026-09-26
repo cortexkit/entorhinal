@@ -98,7 +98,13 @@ async fn start_real_daemon() -> RealDaemon {
     )
     .expect("write daemon config");
 
+    // All three homes are set on the daemon's own command. The daemon derives
+    // its run directory (logs, terminal journal and the live-children record
+    // its startup orphan sweep acts on) from the data home, not from the
+    // runtime dir, so a test daemon without its own data home reads the
+    // operator's live record and stops every running module.
     let child = Command::new(daemon_bin)
+        .env("XDG_DATA_HOME", root.join("data-home"))
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("XDG_RUNTIME_DIR", &runtime_dir)
         .env("SUBC_PORT", "0")
@@ -241,4 +247,37 @@ async fn real_daemon_supervises_projects_and_routes_resolve() {
     let body: Value = serde_json::from_slice(&response.body).expect("decode resolve reply");
     assert_eq!(body["result"]["via"], "implicit");
     assert_eq!(body["result"]["gone"], false);
+
+    // A route opened with no launch nonce is stamped `Direct` by the daemon,
+    // which is how the operator's `ck` faces connect, and the registry accepts
+    // writes from it. This exercises the whole path the write check depends
+    // on: the principal recorded at bind time and looked up per request.
+    let canonical_root = std::fs::canonicalize(&project_root)
+        .expect("canonicalize query root")
+        .to_string_lossy()
+        .into_owned();
+    let register = Frame::build(
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        channel,
+        epoch,
+        102,
+        serde_json::to_vec(&serde_json::json!({
+            "method": "register",
+            "params": { "name": "e2e-direct-writer", "roots": [canonical_root], "actor": "e2e" }
+        }))
+        .expect("encode register"),
+    )
+    .expect("build register frame");
+    write_frame(&mut consumer, &register)
+        .await
+        .expect("write register");
+    consumer.flush().await.expect("flush register");
+    let response = read_frame_timeout(&mut consumer).await;
+    assert_eq!(
+        response.header.ty,
+        FrameType::Response,
+        "a Direct route must be allowed to write: {}",
+        String::from_utf8_lossy(&response.body)
+    );
 }

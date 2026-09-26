@@ -5,7 +5,7 @@
 //! `subc-client-rs` owns the HELLO, HELLO_ACK, route binding, health control, and
 //! frame lifecycle. This binary only supplies the manifest and domain handler.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::{
     path::PathBuf,
     sync::{
@@ -23,13 +23,16 @@ use entorhinal_core::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use subc_client_rs::{HandlerOutcome, HealthReport, HealthStatus, ModuleHandler, RequestCtx};
+use subc_client_rs::{
+    BindDecision, HandlerOutcome, HealthReport, HealthStatus, ModuleHandler, RequestCtx,
+    RouteBindRequest, RouteHandle,
+};
 use subc_protocol::{
     manifest::{
         CapabilityDeclarations, Concurrency, ManagementOperation, ManagementOperationKind,
         ModuleManifest, ProviderRole,
     },
-    ModuleHelloAckBody, PROTOCOL_VERSION,
+    ModuleHelloAckBody, Principal, PROTOCOL_VERSION,
 };
 
 // The id the daemon serves this module under, and the LAST of three names to be
@@ -163,6 +166,68 @@ struct ProjectsHandler {
     store: Arc<Mutex<Option<RegistryStore>>>,
     health: Arc<HealthGauges>,
     liveness: Arc<Mutex<LivenessState>>,
+    /// The principal the daemon stamped on each route when it was bound. The
+    /// daemon stamps it once, at `route.bind`, never per request, so it is
+    /// recorded here and looked up for every request on that route.
+    route_principals: Mutex<HashMap<RouteKey, Option<Principal>>>,
+}
+
+type RouteKey = (u16, u32);
+
+fn route_key(handle: &RouteHandle) -> RouteKey {
+    (handle.channel, handle.epoch)
+}
+
+/// The one module besides the operator that may change the registry: the
+/// executive registers repositories, records session liveness, and writes the
+/// user's decisions.
+const WRITER_MODULE: &str = "prefrontal-core";
+
+/// Methods that change the registry or the liveness state derived from it.
+const MUTATING_METHODS: &[&str] = &[
+    "register",
+    "assign_workspace",
+    "set_workspace_root",
+    "upgrade_implicit",
+    "remove",
+    "seed_import",
+    "rebuild",
+    "projects.session_liveness",
+];
+
+/// Refuse a mutating method unless the route was opened by the operator
+/// (`Direct`: the `ck` faces) or by the executive.
+///
+/// This stops a module that has no business writing here from changing the
+/// registry by accident or through a bug. Project ids key other modules' state,
+/// so a stray `remove` would cut a project off from it. It is not a security
+/// boundary: any process running as the user can connect as `Direct` or open
+/// the store file itself. A route with no recorded principal is refused rather
+/// than assumed to be the operator.
+fn authorize_write(method: &str, principal: Option<&Principal>) -> Result<(), HandlerError> {
+    if !MUTATING_METHODS.contains(&method) {
+        return Ok(());
+    }
+    match principal {
+        Some(Principal::Direct) => Ok(()),
+        Some(Principal::Reserved { module_id }) if module_id == WRITER_MODULE => Ok(()),
+        other => Err(HandlerError {
+            code: "write_not_permitted".to_string(),
+            message: format!(
+                "'{method}' changes the registry and is accepted only from the operator (ck) or {WRITER_MODULE}; this route was opened by {}",
+                principal_label(other)
+            ),
+        }),
+    }
+}
+
+fn principal_label(principal: Option<&Principal>) -> String {
+    match principal {
+        Some(Principal::Direct) => "direct".to_string(),
+        Some(Principal::Reserved { module_id }) => format!("reserved:{module_id}"),
+        Some(Principal::Unverified) => "unverified".to_string(),
+        None => "an unknown route".to_string(),
+    }
 }
 
 impl ProjectsHandler {
@@ -171,7 +236,18 @@ impl ProjectsHandler {
             store: Arc::new(Mutex::new(None)),
             health: Arc::new(HealthGauges::default()),
             liveness: Arc::new(Mutex::new(LivenessState::default())),
+            route_principals: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn route_principals(&self) -> std::sync::MutexGuard<'_, HashMap<RouteKey, Option<Principal>>> {
+        self.route_principals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn principal_for(&self, key: RouteKey) -> Option<Principal> {
+        self.route_principals().get(&key).cloned().flatten()
     }
 
     fn with_store<T>(
@@ -206,7 +282,7 @@ impl ProjectsHandler {
 
 #[async_trait]
 impl ModuleHandler for ProjectsHandler {
-    async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+    async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
         let request = match serde_json::from_slice::<WireRequest>(&body) {
             Ok(request) => request,
             Err(error) => {
@@ -216,6 +292,14 @@ impl ModuleHandler for ProjectsHandler {
                 }
             }
         };
+
+        let principal = self.principal_for(route_key(&ctx.route_handle()));
+        if let Err(error) = authorize_write(&request.method, principal.as_ref()) {
+            return HandlerOutcome::Error {
+                code: error.code,
+                message: error.message,
+            };
+        }
 
         let result = match request.method.as_str() {
             "resolve" => self.resolve(request.params),
@@ -247,6 +331,16 @@ impl ModuleHandler for ProjectsHandler {
                 message: error.message,
             },
         }
+    }
+
+    async fn on_bind(&self, request: &RouteBindRequest) -> BindDecision {
+        self.route_principals()
+            .insert(route_key(&request.handle), request.principal.clone());
+        BindDecision::accept()
+    }
+
+    async fn on_route_gone(&self, handle: &RouteHandle) {
+        self.route_principals().remove(&route_key(handle));
     }
 
     async fn on_hello_ack(&self, ack: &ModuleHelloAckBody) {
@@ -786,6 +880,81 @@ fn unix_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reserved(module_id: &str) -> Principal {
+        Principal::Reserved {
+            module_id: module_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn writes_are_refused_unless_the_operator_or_the_executive_opened_the_route() {
+        for method in MUTATING_METHODS {
+            assert!(
+                authorize_write(method, Some(&Principal::Direct)).is_ok(),
+                "{method} from direct"
+            );
+            assert!(
+                authorize_write(method, Some(&reserved(WRITER_MODULE))).is_ok(),
+                "{method} from {WRITER_MODULE}"
+            );
+            for refused in [Some(reserved("aft")), Some(Principal::Unverified), None] {
+                let error = authorize_write(method, refused.as_ref())
+                    .expect_err("a write from any other principal must be refused");
+                assert_eq!(
+                    error.code, "write_not_permitted",
+                    "{method} from {refused:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn queries_are_answered_for_every_principal() {
+        for method in [
+            "resolve",
+            "resolve_project_id",
+            "enumerate",
+            "journal_tail",
+            "verify",
+        ] {
+            for principal in [Some(reserved("aft")), Some(Principal::Unverified), None] {
+                assert!(
+                    authorize_write(method, principal.as_ref()).is_ok(),
+                    "{method}"
+                );
+            }
+        }
+    }
+
+    /// A mutation added to the manifest but missing from the write list would
+    /// be callable by anyone. Derive the list's completeness from the manifest
+    /// the module declares, so the two cannot drift apart.
+    #[test]
+    fn every_declared_mutation_is_write_checked() {
+        let manifest = manifest();
+        let mut declared = Vec::new();
+        for role in &manifest.provides {
+            if let ProviderRole::ManagementSurface { operations, .. } = role {
+                declared.extend(
+                    operations
+                        .iter()
+                        .filter(|operation| operation.kind == ManagementOperationKind::Mutate)
+                        .map(|operation| operation.name.clone()),
+                );
+            }
+        }
+        assert!(
+            !declared.is_empty(),
+            "the manifest declares no mutations; the test would pass vacuously"
+        );
+        for name in &declared {
+            assert!(
+                MUTATING_METHODS.contains(&name.as_str()),
+                "declared mutation '{name}' is not write-checked"
+            );
+        }
+    }
 
     fn scratch_descriptor(name: &str) -> (PathBuf, StorageDescriptor) {
         let dir = std::env::temp_dir().join(format!(
