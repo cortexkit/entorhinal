@@ -1,0 +1,28 @@
+{
+  "result": {
+    "bindingStatus": null,
+    "canonicalRoot": "/fixture/plain-folder",
+    "generation": 8,
+    "gone": false,
+    "matchedRoot": "/fixture/plain-folder",
+    "projectId": "pj-plain",
+    "projectName": "pj-plain",
+    "rootRecords": [
+      {
+        "approval": {
+          "journalSeq": null,
+          "state": "unapproved"
+        },
+        "identity": "unverifiable",
+        "incarnation": null,
+        "registrationEpoch": null,
+        "remotes": [],
+        "root": "/fixture/plain-folder"
+      }
+    ],
+    "sourceRoot": null,
+    "via": "root",
+    "workspaceId": null,
+    "workspaceRoot": null
+  }
+}

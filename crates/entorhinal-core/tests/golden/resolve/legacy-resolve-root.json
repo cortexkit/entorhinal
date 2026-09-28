@@ -1,0 +1,12 @@
+{
+  "result": {
+    "canonicalRoot": "/fixture/openai-auth",
+    "generation": 3,
+    "gone": false,
+    "projectId": "pj-openai-auth",
+    "projectName": "openai-auth",
+    "via": "root",
+    "workspaceId": null,
+    "workspaceRoot": null
+  }
+}

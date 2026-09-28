@@ -207,14 +207,14 @@ pub struct VerifyReply {
 }
 
 #[derive(Debug)]
-struct Action {
-    changed: bool,
-    seq: Option<i64>,
-    value: Value,
-    payload: Value,
+pub(crate) struct Action {
+    pub(crate) changed: bool,
+    pub(crate) seq: Option<i64>,
+    pub(crate) value: Value,
+    pub(crate) payload: Value,
 }
 
-fn domain(code: &str, message: impl Into<String>) -> RegistryError {
+pub(crate) fn domain(code: &str, message: impl Into<String>) -> RegistryError {
     RegistryError::Domain {
         code: code.to_string(),
         message: message.into(),
@@ -249,7 +249,7 @@ fn canonical(raw: &str) -> Result<String, RegistryError> {
     }
 }
 
-fn append(
+pub(crate) fn append(
     tx: &Transaction<'_>,
     op: &str,
     payload: &Value,
@@ -283,7 +283,12 @@ fn wire(value: Value) -> Result<Vec<u8>, RegistryError> {
 }
 
 impl RegistryStore {
-    fn mutation<F>(&self, op: &str, key: Option<&str>, action: F) -> Result<Vec<u8>, RegistryError>
+    pub(crate) fn mutation<F>(
+        &self,
+        op: &str,
+        key: Option<&str>,
+        action: F,
+    ) -> Result<Vec<u8>, RegistryError>
     where
         F: FnOnce(&Transaction<'_>) -> Result<Action, RegistryError>,
     {
@@ -624,7 +629,7 @@ impl RegistryStore {
         let actor = req.actor.clone().unwrap_or_else(|| "module".into());
         let payload =
             serde_json::to_value(&req).map_err(|e| domain("encode_failed", e.to_string()))?;
-        self.mutation("remove",key.clone().as_deref(),move|tx|{let now=now_unix_millis(); if let Some(w)=&req.workspace_id {if tx.query_row("SELECT 1 FROM workspace WHERE workspace_id=?1",[w],|r|r.get::<_,i64>(0)).optional()?.is_none(){return Err(domain("not_found",w));} let seq=append(tx,"remove",&payload,&actor,key.as_deref(),now)?; tx.execute("DELETE FROM project_workspace WHERE workspace_id=?1",[w])?; tx.execute("DELETE FROM workspace_member WHERE workspace_id=?1",[w])?; tx.execute("DELETE FROM workspace WHERE workspace_id=?1",[w])?; return Ok(Action{changed:true,seq:Some(seq),value:json!({"workspaceId":w}),payload});} let id=req.project_id.clone().ok_or_else(||domain("invalid_params","projectId is required"))?; if tx.query_row("SELECT 1 FROM project WHERE project_id=?1",[&id],|r|r.get::<_,i64>(0)).optional()?.is_none(){return Err(domain("not_found",id)); }; if let Some(s)=&req.successor_project_id {if s==&id||tx.query_row("SELECT 1 FROM project WHERE project_id=?1",[s],|r|r.get::<_,i64>(0)).optional()?.is_none(){return Err(domain("not_found",s));}} let dropped=tx.query_row("SELECT workspace_id FROM project_workspace WHERE project_id=?1",[&id],|r|r.get::<_,String>(0)).optional()?; let seq=append(tx,"remove",&payload,&actor,key.as_deref(),now)?; if let Some(s)=&req.successor_project_id {tx.execute("UPDATE project_root SET project_id=?1 WHERE project_id=?2",[s,&id])?;tx.execute("UPDATE derived_root_parent SET project_id=?1 WHERE project_id=?2",[s,&id])?;tx.execute("UPDATE project_alias SET project_id=?1 WHERE project_id=?2",[s,&id])?;tx.execute("DELETE FROM project_alias WHERE old_id=?1",[&id])?;tx.execute("INSERT OR REPLACE INTO project_alias(old_id,project_id,created_at) VALUES(?1,?2,?3)",params![&id,s,now])?;} else {tx.execute("DELETE FROM project_root WHERE project_id=?1",[&id])?;tx.execute("DELETE FROM derived_root_parent WHERE project_id=?1",[&id])?;tx.execute("DELETE FROM project_alias WHERE project_id=?1 OR old_id=?1",[&id])?;} tx.execute("DELETE FROM project_workspace WHERE project_id=?1",[&id])?;tx.execute("DELETE FROM workspace_member WHERE ref_kind='local' AND project_id=?1",[&id])?;tx.execute("DELETE FROM project WHERE project_id=?1",[&id])?;Ok(Action{changed:true,seq:Some(seq),value:json!({"projectId":id,"successorProjectId":req.successor_project_id,"droppedWorkspaceId":dropped}),payload}) })
+        self.mutation("remove",key.clone().as_deref(),move|tx|{let now=now_unix_millis(); if let Some(w)=&req.workspace_id {if tx.query_row("SELECT 1 FROM workspace WHERE workspace_id=?1",[w],|r|r.get::<_,i64>(0)).optional()?.is_none(){return Err(domain("not_found",w));} let seq=append(tx,"remove",&payload,&actor,key.as_deref(),now)?; tx.execute("DELETE FROM project_workspace WHERE workspace_id=?1",[w])?; tx.execute("DELETE FROM workspace_member WHERE workspace_id=?1",[w])?; tx.execute("DELETE FROM workspace WHERE workspace_id=?1",[w])?; return Ok(Action{changed:true,seq:Some(seq),value:json!({"workspaceId":w}),payload});} let id=req.project_id.clone().ok_or_else(||domain("invalid_params","projectId is required"))?; if tx.query_row("SELECT 1 FROM project WHERE project_id=?1",[&id],|r|r.get::<_,i64>(0)).optional()?.is_none(){return Err(domain("not_found",id)); }; if let Some(s)=&req.successor_project_id {if s==&id||tx.query_row("SELECT 1 FROM project WHERE project_id=?1",[s],|r|r.get::<_,i64>(0)).optional()?.is_none(){return Err(domain("not_found",s));}} let dropped=tx.query_row("SELECT workspace_id FROM project_workspace WHERE project_id=?1",[&id],|r|r.get::<_,String>(0)).optional()?; let seq=append(tx,"remove",&payload,&actor,key.as_deref(),now)?; super::binding::retire_project_bindings(tx,&id,seq)?; if let Some(s)=&req.successor_project_id {tx.execute("UPDATE project_root SET project_id=?1 WHERE project_id=?2",[s,&id])?;tx.execute("UPDATE derived_root_parent SET project_id=?1 WHERE project_id=?2",[s,&id])?;tx.execute("UPDATE project_alias SET project_id=?1 WHERE project_id=?2",[s,&id])?;tx.execute("DELETE FROM project_alias WHERE old_id=?1",[&id])?;tx.execute("INSERT OR REPLACE INTO project_alias(old_id,project_id,created_at) VALUES(?1,?2,?3)",params![&id,s,now])?;} else {tx.execute("DELETE FROM project_root WHERE project_id=?1",[&id])?;tx.execute("DELETE FROM derived_root_parent WHERE project_id=?1",[&id])?;tx.execute("DELETE FROM project_alias WHERE project_id=?1 OR old_id=?1",[&id])?;} tx.execute("DELETE FROM project_workspace WHERE project_id=?1",[&id])?;tx.execute("DELETE FROM workspace_member WHERE ref_kind='local' AND project_id=?1",[&id])?;tx.execute("DELETE FROM project WHERE project_id=?1",[&id])?;Ok(Action{changed:true,seq:Some(seq),value:json!({"projectId":id,"successorProjectId":req.successor_project_id,"droppedWorkspaceId":dropped}),payload}) })
     }
 }
 
@@ -746,7 +751,7 @@ impl RegistryStore {
     }
 
     pub fn rebuild(&self) -> Result<i64, RegistryError> {
-        self.db.with_conn_fenced(|tx| { tx.execute_batch("DELETE FROM workspace_member; DELETE FROM project_workspace; DELETE FROM project_alias; DELETE FROM derived_root_parent; DELETE FROM project_root; DELETE FROM project; DELETE FROM workspace;")?; let mut stmt=tx.prepare("SELECT op,payload_json,created_at FROM registry_journal ORDER BY seq")?; let rows=stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?; drop(stmt); for (op,payload,now) in rows {let request:Value=serde_json::from_str::<Value>(&payload).ok().and_then(|v|v.get("request").cloned()).unwrap_or_else(||serde_json::from_str(&payload).unwrap()); replay(tx,&op,request,now)?;} tx.query_row("SELECT COALESCE(MAX(seq),0) FROM registry_journal",[],|r|r.get(0)) }).map_err(RegistryError::Store)
+        self.db.with_conn_fenced(|tx| { tx.execute_batch("DELETE FROM workspace_member; DELETE FROM project_workspace; DELETE FROM project_alias; DELETE FROM derived_root_parent; DELETE FROM project_root; DELETE FROM project; DELETE FROM workspace; DELETE FROM root_binding; DELETE FROM retired_binding; DELETE FROM root_approval;")?; let mut stmt=tx.prepare("SELECT seq,op,payload_json,created_at FROM registry_journal ORDER BY seq")?; let rows=stmt.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?; drop(stmt); for (seq,op,payload,now) in rows {let request:Value=serde_json::from_str::<Value>(&payload).ok().and_then(|v|v.get("request").cloned()).unwrap_or_else(||serde_json::from_str(&payload).unwrap()); replay(tx,seq,&op,request,now)?;} tx.query_row("SELECT COALESCE(MAX(seq),0) FROM registry_journal",[],|r|r.get(0)) }).map_err(RegistryError::Store)
     }
 }
 
@@ -757,7 +762,10 @@ fn seed_id(identity: &str) -> String {
     format!("pj-{}", &h.finalize().to_hex()[..16])
 }
 
-fn replay(tx: &Transaction<'_>, op: &str, v: Value, now: i64) -> rusqlite::Result<()> {
+fn replay(tx: &Transaction<'_>, seq: i64, op: &str, v: Value, now: i64) -> rusqlite::Result<()> {
+    if super::binding::replay_binding_op(tx, seq, op, &v)? {
+        return Ok(());
+    }
     match op {
         "register" => {
             let r: RegisterRequest = serde_json::from_value(v)
@@ -889,6 +897,7 @@ fn replay(tx: &Transaction<'_>, op: &str, v: Value, now: i64) -> rusqlite::Resul
                 )?;
                 tx.execute("DELETE FROM workspace WHERE workspace_id=?1", [&workspace])?;
             } else if let Some(id) = r.project_id {
+                super::binding::retire_project_bindings(tx, &id, seq)?;
                 if let Some(successor) = r.successor_project_id {
                     tx.execute(
                         "UPDATE project_root SET project_id=?1 WHERE project_id=?2",

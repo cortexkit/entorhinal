@@ -899,6 +899,7 @@ mod tests {
             gone: false,
             generation: 2,
             canonical_root: Some("/tmp/x".to_string()),
+            root_fields: None,
         })
         .unwrap();
 
@@ -934,6 +935,7 @@ mod tests {
             gone: false,
             generation: 2,
             canonical_root: Some("/tmp/x".to_string()),
+            root_fields: None,
         })
         .unwrap();
         assert_eq!(implicit["via"], "implicit");

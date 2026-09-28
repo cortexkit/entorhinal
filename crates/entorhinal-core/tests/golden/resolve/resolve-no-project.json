@@ -1,0 +1,16 @@
+{
+  "result": {
+    "bindingStatus": null,
+    "canonicalRoot": "/fixture/does-not-exist",
+    "generation": 8,
+    "gone": true,
+    "matchedRoot": null,
+    "projectId": "pj-implicit1-4c1a5354b7413e13",
+    "projectName": null,
+    "rootRecords": [],
+    "sourceRoot": null,
+    "via": "implicit",
+    "workspaceId": null,
+    "workspaceRoot": null
+  }
+}

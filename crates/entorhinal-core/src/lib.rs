@@ -18,7 +18,9 @@ use cortexkit_store::{open_sqlite, Migration, SqliteStore, StorageDescriptor, St
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Serialize;
 
+mod binding;
 mod mutations;
+pub use binding::*;
 pub use mutations::*;
 
 // The schema-migration namespace, NOT the module id, and deliberately left as
@@ -100,7 +102,7 @@ CREATE TABLE project_alias (
 /// NULL means "no root" and a reader must not guess one.
 pub const V2_WORKSPACE_ROOT: &str = "ALTER TABLE workspace ADD COLUMN root TEXT NULL;";
 
-const MIGRATIONS: [Migration; 2] = [
+const MIGRATIONS: [Migration; 3] = [
     Migration {
         version: 1,
         statements: V1_SCHEMA,
@@ -109,11 +111,20 @@ const MIGRATIONS: [Migration; 2] = [
         version: 2,
         statements: V2_WORKSPACE_ROOT,
     },
+    Migration {
+        version: 3,
+        statements: binding::V3_ROOT_BINDINGS,
+    },
 ];
 
 /// A store opened from the descriptor resolved by subc.
 pub struct RegistryStore {
     db: SqliteStore,
+    /// Whether replies carry the root-record fields and walk ancestors. Off,
+    /// every reply is byte-for-byte the pre-multi-root shape, so a consumer
+    /// that cannot read the new fields is never sent them.
+    root_records: bool,
+    ids: binding::IdSource,
 }
 
 impl fmt::Debug for RegistryStore {
@@ -143,7 +154,11 @@ impl RegistryStore {
                 outcome.recorded, outcome.chain_max
             )));
         }
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            root_records: false,
+            ids: binding::IdSource::Random,
+        })
     }
 
     /// Read the journal head. A query never changes this value.
@@ -159,6 +174,19 @@ impl RegistryStore {
 
     /// Read a resolved path using exact-root, containment, then implicit order.
     pub fn resolve(&self, raw_path: &str) -> Result<ResolveReply, RegistryError> {
+        self.resolve_with_binding(raw_path, None)
+    }
+
+    /// Resolve, and when root records are enabled also answer whether the
+    /// execution binding a caller captured is still the live one.
+    pub fn resolve_with_binding(
+        &self,
+        raw_path: &str,
+        binding: Option<&ExecutionBinding>,
+    ) -> Result<ResolveReply, RegistryError> {
+        if self.root_records {
+            return self.resolve_walk(raw_path, binding);
+        }
         let (canonical_path, path_exists) = canonical_query_path(Path::new(raw_path))?;
         let query_path = PathBuf::from(&canonical_path);
         let query_device = if path_exists {
@@ -234,6 +262,7 @@ impl RegistryStore {
                 gone: !path_exists,
                 generation: self.generation_from_connection(conn)?,
                 canonical_root: Some(canonical_path),
+                root_fields: None,
             })
         })
     }
@@ -518,6 +547,7 @@ impl RegistryStore {
             gone,
             generation,
             canonical_root: None,
+            root_fields: None,
         })
     }
 
@@ -580,6 +610,11 @@ impl RegistryStore {
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
+        let root_records = if self.root_records {
+            Some(binding::root_records(conn, &project_id)?)
+        } else {
+            None
+        };
         Ok(ProjectView {
             project_id,
             name,
@@ -589,6 +624,7 @@ impl RegistryStore {
             device_fingerprint,
             workspace_id,
             last_route_activity_ms: None,
+            root_records,
         })
     }
 }
@@ -649,6 +685,9 @@ pub struct ResolveReply {
     pub gone: bool,
     pub generation: i64,
     pub canonical_root: Option<String>,
+    /// Present only when root records are enabled; see [`RootFields`].
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub root_fields: Option<RootFields>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -686,6 +725,10 @@ pub struct ProjectView {
     pub workspace_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_route_activity_ms: Option<i64>,
+    /// Present only when root records are enabled: one record per root, in
+    /// the same order as `roots`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_records: Option<Vec<RootRecord>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -788,7 +831,7 @@ fn lexical_absolute(path: &Path) -> Result<PathBuf, RegistryError> {
     Ok(normalized)
 }
 
-fn path_prefix_or_equal(parent: &Path, query: &Path) -> bool {
+pub(crate) fn path_prefix_or_equal(parent: &Path, query: &Path) -> bool {
     let mut parent_components = parent.components();
     let mut query_components = query.components();
     loop {
@@ -818,7 +861,7 @@ fn device_id(_path: &Path) -> Option<u64> {
     None
 }
 
-fn now_unix_millis() -> i64 {
+pub(crate) fn now_unix_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)

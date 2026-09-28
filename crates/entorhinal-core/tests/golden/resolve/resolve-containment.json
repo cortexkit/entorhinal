@@ -1,0 +1,37 @@
+{
+  "result": {
+    "bindingStatus": null,
+    "canonicalRoot": "/fixture/worktrees/task-1",
+    "generation": 8,
+    "gone": false,
+    "matchedRoot": "/fixture/worktrees/task-1",
+    "projectId": "pj-openai-auth",
+    "projectName": "openai-auth",
+    "rootRecords": [
+      {
+        "approval": {
+          "journalSeq": 7,
+          "state": "approved"
+        },
+        "identity": "bound",
+        "incarnation": {
+          "kind": "token",
+          "value": "0000000000000000000000000000000000000000000000000000000000000005"
+        },
+        "registrationEpoch": "00000000000000000000000000000006",
+        "remotes": [
+          {
+            "name": "origin",
+            "owner": "cortexkit",
+            "repo": "openai-auth"
+          }
+        ],
+        "root": "/fixture/worktrees/task-1"
+      }
+    ],
+    "sourceRoot": "/fixture/openai-auth",
+    "via": "containment",
+    "workspaceId": null,
+    "workspaceRoot": null
+  }
+}

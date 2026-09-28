@@ -1,0 +1,57 @@
+{
+  "result": {
+    "bindingStatus": "active",
+    "canonicalRoot": "/fixture/openai-auth",
+    "generation": 8,
+    "gone": false,
+    "matchedRoot": "/fixture/openai-auth",
+    "projectId": "pj-openai-auth",
+    "projectName": "openai-auth",
+    "rootRecords": [
+      {
+        "approval": {
+          "journalSeq": null,
+          "state": "unapproved"
+        },
+        "identity": "bound",
+        "incarnation": {
+          "kind": "token",
+          "value": "0000000000000000000000000000000000000000000000000000000000000001"
+        },
+        "registrationEpoch": "00000000000000000000000000000002",
+        "remotes": [
+          {
+            "name": "origin",
+            "owner": "cortexkit",
+            "repo": "common-auth"
+          }
+        ],
+        "root": "/fixture/common-auth"
+      },
+      {
+        "approval": {
+          "journalSeq": 7,
+          "state": "approved"
+        },
+        "identity": "bound",
+        "incarnation": {
+          "kind": "token",
+          "value": "0000000000000000000000000000000000000000000000000000000000000005"
+        },
+        "registrationEpoch": "00000000000000000000000000000006",
+        "remotes": [
+          {
+            "name": "origin",
+            "owner": "cortexkit",
+            "repo": "openai-auth"
+          }
+        ],
+        "root": "/fixture/openai-auth"
+      }
+    ],
+    "sourceRoot": null,
+    "via": "root",
+    "workspaceId": null,
+    "workspaceRoot": null
+  }
+}

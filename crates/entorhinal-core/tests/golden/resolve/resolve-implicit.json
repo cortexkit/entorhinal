@@ -1,0 +1,16 @@
+{
+  "result": {
+    "bindingStatus": null,
+    "canonicalRoot": "/fixture/unregistered",
+    "generation": 8,
+    "gone": false,
+    "matchedRoot": null,
+    "projectId": "pj-implicit1-6c9e7e1bb8a2d4f2",
+    "projectName": null,
+    "rootRecords": [],
+    "sourceRoot": null,
+    "via": "implicit",
+    "workspaceId": null,
+    "workspaceRoot": null
+  }
+}

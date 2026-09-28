@@ -200,13 +200,14 @@ dependencies = [
 
 [[package]]
 name = "entorhinal-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "blake3",
  "cortexkit-lease",
  "cortexkit-paths",
  "cortexkit-store",
  "cortexkit-store-types",
+ "getrandom",
  "rusqlite",
  "serde",
  "serde_json",
@@ -214,7 +215,7 @@ dependencies = [
 
 [[package]]
 name = "entorhinal-module"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "cortexkit-log",

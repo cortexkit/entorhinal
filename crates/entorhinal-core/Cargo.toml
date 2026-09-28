@@ -1,6 +1,6 @@
 [package]
 name = "entorhinal-core"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/cortexkit/entorhinal"
@@ -13,6 +13,7 @@ cortexkit-paths = { workspace = true }
 cortexkit-lease = { workspace = true }
 cortexkit-store = { workspace = true }
 cortexkit-store-types = { workspace = true }
+getrandom = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

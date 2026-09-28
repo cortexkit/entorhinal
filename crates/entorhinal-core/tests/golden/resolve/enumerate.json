@@ -1,0 +1,104 @@
+{
+  "result": {
+    "generation": 11,
+    "projects": [
+      {
+        "implicit": false,
+        "name": "pj-lone",
+        "projectId": "pj-lone",
+        "refKind": "local",
+        "rootRecords": [
+          {
+            "approval": {
+              "journalSeq": null,
+              "state": "unapproved"
+            },
+            "identity": "bound",
+            "incarnation": {
+              "kind": "token",
+              "value": "0000000000000000000000000000000000000000000000000000000000000003"
+            },
+            "registrationEpoch": "00000000000000000000000000000007",
+            "remotes": [],
+            "root": "/fixture/lone"
+          }
+        ],
+        "roots": [
+          "/fixture/lone"
+        ]
+      },
+      {
+        "implicit": false,
+        "name": "openai-auth",
+        "projectId": "pj-openai-auth",
+        "refKind": "local",
+        "rootRecords": [
+          {
+            "approval": {
+              "journalSeq": null,
+              "state": "unapproved"
+            },
+            "identity": "replaced",
+            "incarnation": null,
+            "registrationEpoch": null,
+            "remotes": [
+              {
+                "name": "origin",
+                "owner": "cortexkit",
+                "repo": "common-auth"
+              }
+            ],
+            "root": "/fixture/common-auth"
+          },
+          {
+            "approval": {
+              "journalSeq": 7,
+              "state": "approved"
+            },
+            "identity": "bound",
+            "incarnation": {
+              "kind": "token",
+              "value": "0000000000000000000000000000000000000000000000000000000000000005"
+            },
+            "registrationEpoch": "00000000000000000000000000000006",
+            "remotes": [
+              {
+                "name": "origin",
+                "owner": "cortexkit",
+                "repo": "openai-auth"
+              }
+            ],
+            "root": "/fixture/openai-auth"
+          }
+        ],
+        "roots": [
+          "/fixture/common-auth",
+          "/fixture/openai-auth"
+        ]
+      },
+      {
+        "implicit": false,
+        "name": "pj-plain",
+        "projectId": "pj-plain",
+        "refKind": "local",
+        "rootRecords": [
+          {
+            "approval": {
+              "journalSeq": null,
+              "state": "unapproved"
+            },
+            "identity": "unverifiable",
+            "incarnation": null,
+            "registrationEpoch": null,
+            "remotes": [],
+            "root": "/fixture/plain-folder"
+          }
+        ],
+        "roots": [
+          "/fixture/plain-folder"
+        ]
+      }
+    ],
+    "workspaces": []
+  }
+}

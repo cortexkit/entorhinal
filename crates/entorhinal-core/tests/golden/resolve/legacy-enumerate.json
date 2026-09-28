@@ -1,0 +1,36 @@
+{
+  "result": {
+    "generation": 3,
+    "projects": [
+      {
+        "implicit": false,
+        "name": "pj-lone",
+        "projectId": "pj-lone",
+        "refKind": "local",
+        "roots": [
+          "/fixture/lone"
+        ]
+      },
+      {
+        "implicit": false,
+        "name": "openai-auth",
+        "projectId": "pj-openai-auth",
+        "refKind": "local",
+        "roots": [
+          "/fixture/common-auth",
+          "/fixture/openai-auth"
+        ]
+      },
+      {
+        "implicit": false,
+        "name": "pj-plain",
+        "projectId": "pj-plain",
+        "refKind": "local",
+        "roots": [
+          "/fixture/plain-folder"
+        ]
+      }
+    ],
+    "workspaces": []
+  }
+}

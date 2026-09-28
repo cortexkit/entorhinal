@@ -503,7 +503,9 @@ impl ProjectsHandler {
 
     fn resolve(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
         let params = serde_json::from_value::<ResolveParams>(params).map_err(invalid_params)?;
-        let reply = self.with_store(|store| store.resolve(&params.canonical_root))?;
+        let reply = self.with_store(|store| {
+            store.resolve_with_binding(&params.canonical_root, params.execution_binding.as_ref())
+        })?;
         self.record_query(reply.generation, &self.health.resolve_count);
         encode_result(reply)
     }
@@ -564,7 +566,19 @@ impl ProjectsHandler {
 
     fn register(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
         let req = serde_json::from_value::<RegisterRequest>(params).map_err(invalid_params)?;
-        self.record_mutation(self.with_store(|s| s.register(req)))
+        let reply = self.record_mutation(self.with_store(|s| s.register(req)))?;
+        // With root records on, a newly registered root is bound at once, so
+        // it never answers as unbound. Unreadable identity leaves it unbound
+        // and authorizing nothing; the registration itself still stands.
+        self.with_store(|store| {
+            if store.root_records_enabled() {
+                if let Err(error) = store.bind_unbound_roots("entorhinal") {
+                    tracing::warn!(target: "binding", "binding after register failed: {error}");
+                }
+            }
+            Ok(())
+        })?;
+        Ok(reply)
     }
     fn set_workspace_root(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
         let req =
@@ -655,6 +669,10 @@ struct WireRequest {
 struct ResolveParams {
     #[serde(rename = "canonicalRoot", alias = "canonical_root")]
     canonical_root: String,
+    /// What a caller captured about the root an execution was admitted under.
+    /// Answered in `bindingStatus` when root records are enabled.
+    #[serde(default, rename = "executionBinding")]
+    execution_binding: Option<entorhinal_core::ExecutionBinding>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -808,7 +826,8 @@ fn install_store(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     match outcome {
-        Ok(opened) => {
+        Ok(mut opened) => {
+            enable_root_records(&mut opened);
             health
                 .generation
                 .store(opened.generation().unwrap_or(0), Ordering::Relaxed);
@@ -822,6 +841,35 @@ fn install_store(
             health.store_failed.store(true, Ordering::Relaxed);
             *guard = None;
         }
+    }
+}
+
+/// Environment switch for root records (per-root identity, epoch and approval
+/// on resolve and enumerate replies). Off, every reply keeps the legacy shape.
+/// Turn it on only after the consumers that read the new fields are running:
+/// a consumer built before them would otherwise first see them in production.
+const ROOT_RECORDS_ENV: &str = "ENTORHINAL_ROOT_RECORDS";
+
+/// Turn root records on when configured, and bind every registered root that
+/// has no binding yet, so each root's reply carries its checkout identity from
+/// the first request. Binding never approves anything.
+fn enable_root_records(store: &mut RegistryStore) {
+    if std::env::var(ROOT_RECORDS_ENV).as_deref() != Ok("1") {
+        return;
+    }
+    store.set_root_records(true);
+    match store.bind_unbound_roots("entorhinal") {
+        Ok(report) => {
+            let bound = report
+                .iter()
+                .filter(|entry| entry.outcome == "bound")
+                .count();
+            for entry in report.iter().filter(|entry| entry.outcome != "bound") {
+                tracing::warn!(target: "binding", root = %entry.root, outcome = %entry.outcome, "root left unbound");
+            }
+            tracing::info!(target: "binding", bound, unbound = report.len() - bound, "root records enabled");
+        }
+        Err(error) => tracing::error!(target: "binding", "binding unbound roots failed: {error}"),
     }
 }
 
@@ -1171,6 +1219,7 @@ mod tests {
                     device_fingerprint: None,
                     workspace_id: None,
                     last_route_activity_ms: None,
+                    root_records: None,
                 },
                 entorhinal_core::ProjectView {
                     project_id: "p2".into(),
@@ -1181,6 +1230,7 @@ mod tests {
                     device_fingerprint: None,
                     workspace_id: None,
                     last_route_activity_ms: None,
+                    root_records: None,
                 },
             ],
         };

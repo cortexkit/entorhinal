@@ -1,0 +1,31 @@
+{
+  "result": {
+    "bindingStatus": "retired",
+    "canonicalRoot": "/fixture/lone",
+    "generation": 11,
+    "gone": false,
+    "matchedRoot": "/fixture/lone",
+    "projectId": "pj-lone",
+    "projectName": "pj-lone",
+    "rootRecords": [
+      {
+        "approval": {
+          "journalSeq": null,
+          "state": "unapproved"
+        },
+        "identity": "bound",
+        "incarnation": {
+          "kind": "token",
+          "value": "0000000000000000000000000000000000000000000000000000000000000003"
+        },
+        "registrationEpoch": "00000000000000000000000000000007",
+        "remotes": [],
+        "root": "/fixture/lone"
+      }
+    ],
+    "sourceRoot": null,
+    "via": "root",
+    "workspaceId": null,
+    "workspaceRoot": null
+  }
+}
