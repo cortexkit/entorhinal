@@ -229,7 +229,7 @@ fn reserved(id: &str) -> bool {
     })
 }
 
-fn canonical(raw: &str) -> Result<String, RegistryError> {
+pub(crate) fn canonical(raw: &str) -> Result<String, RegistryError> {
     match ProjectRootId::from_path(raw) {
         Ok(id) => {
             let value = id.to_string();
@@ -275,6 +275,10 @@ fn cached(tx: &Transaction<'_>, op: &str, key: Option<&str>) -> rusqlite::Result
     })
     .transpose()
     .map(|v| v.flatten().map(String::into_bytes))
+}
+
+pub(crate) fn wire_value(value: Value) -> Result<Vec<u8>, RegistryError> {
+    wire(value)
 }
 
 fn wire(value: Value) -> Result<Vec<u8>, RegistryError> {
@@ -763,7 +767,9 @@ fn seed_id(identity: &str) -> String {
 }
 
 fn replay(tx: &Transaction<'_>, seq: i64, op: &str, v: Value, now: i64) -> rusqlite::Result<()> {
-    if super::binding::replay_binding_op(tx, seq, op, &v)? {
+    if super::binding::replay_binding_op(tx, seq, op, &v)?
+        || super::binding::replay_root_op(tx, seq, op, &v, now)?
+    {
         return Ok(());
     }
     match op {

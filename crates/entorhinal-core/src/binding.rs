@@ -759,7 +759,7 @@ impl RegistryStore {
         } else {
             "unapprove_root"
         };
-        let root_key = canonical_root.to_string();
+        let root_key = canonical_query_path(Path::new(canonical_root))?.0;
         let actor = actor.to_string();
         self.mutation(op, None, move |tx| {
             let record = root_record(tx, &root_key)?;
@@ -915,6 +915,447 @@ impl RegistryStore {
             };
             Ok(with_fields(reply, None, None, Vec::new()))
         })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AddRootRequest {
+    pub project_id: String,
+    pub root: String,
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoveRootRequest {
+    pub project_id: String,
+    pub root: String,
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+/// Attach a worker container to a root's current approved binding, before any
+/// worktree is created in it. It can never add or replace a root.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachDerivedParentRequest {
+    pub project_id: String,
+    pub root: String,
+    pub incarnation: String,
+    pub registration_epoch: String,
+    pub container: String,
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+/// The registered root that contains `path` or that `path` contains, other
+/// than `path` itself. Roots never nest, so every folder resolves to at most
+/// one registered root.
+fn nested_root(conn: &Connection, path: &str) -> rusqlite::Result<Option<(String, String)>> {
+    let mut statement = conn.prepare("SELECT canonical_root, project_id FROM project_root")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows.into_iter().find(|(root, _)| {
+        root != path
+            && (path_prefix_or_equal(Path::new(root), Path::new(path))
+                || path_prefix_or_equal(Path::new(path), Path::new(root)))
+    }))
+}
+
+/// Another project that already owns one of these GitHub repositories through
+/// one of its roots. Two local clones of one repository are one project.
+fn repository_owner(
+    conn: &Connection,
+    project_id: &str,
+    remotes: &[GitRemote],
+) -> rusqlite::Result<Option<(String, String)>> {
+    if remotes.is_empty() {
+        return Ok(None);
+    }
+    let mut statement =
+        conn.prepare("SELECT canonical_root, project_id FROM project_root WHERE project_id <> ?1")?;
+    let rows = statement
+        .query_map([project_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (root, owner) in rows {
+        for theirs in github_remotes(Path::new(&root)) {
+            if let Some(mine) = remotes
+                .iter()
+                .find(|mine| mine.owner == theirs.owner && mine.repo == theirs.repo)
+            {
+                return Ok(Some((format!("{}/{}", mine.owner, mine.repo), owner)));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn apply_add_root(
+    tx: &Transaction<'_>,
+    request: &AddRootRequest,
+    now: i64,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO project_root (canonical_root, project_id, added_at) VALUES (?1, ?2, ?3)",
+        params![request.root, request.project_id, now],
+    )?;
+    tx.execute(
+        "INSERT OR IGNORE INTO project_alias (old_id, project_id, created_at) VALUES (?1, ?2, ?3)",
+        params![implicit_project_id(&request.root), request.project_id, now],
+    )?;
+    Ok(())
+}
+
+/// Removing a root retires its binding (and approval) and revokes every worker
+/// container attached under it, in the same journal entry.
+fn apply_remove_root(
+    tx: &Transaction<'_>,
+    request: &RemoveRootRequest,
+    seq: i64,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO retired_binding (registration_epoch, canonical_root, project_id, incarnation, reason, retired_seq)
+         SELECT registration_epoch, canonical_root, project_id, incarnation, 'removed', ?2
+         FROM root_binding WHERE canonical_root = ?1",
+        params![request.root, seq],
+    )?;
+    tx.execute(
+        "DELETE FROM root_approval WHERE registration_epoch IN
+         (SELECT registration_epoch FROM root_binding WHERE canonical_root = ?1)",
+        [&request.root],
+    )?;
+    tx.execute(
+        "DELETE FROM root_binding WHERE canonical_root = ?1",
+        [&request.root],
+    )?;
+    tx.execute(
+        "DELETE FROM derived_root_parent WHERE source_root = ?1",
+        [&request.root],
+    )?;
+    tx.execute(
+        "DELETE FROM project_alias WHERE old_id = ?1 AND project_id = ?2",
+        params![implicit_project_id(&request.root), request.project_id],
+    )?;
+    tx.execute(
+        "DELETE FROM project_root WHERE canonical_root = ?1",
+        [&request.root],
+    )?;
+    Ok(())
+}
+
+fn apply_attach(
+    tx: &Transaction<'_>,
+    request: &AttachDerivedParentRequest,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO derived_root_parent (canonical_parent, project_id, source_root, registration_epoch)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![request.container, request.project_id, request.root, request.registration_epoch],
+    )?;
+    Ok(())
+}
+
+/// Replay the root-membership ops. Returns false for ops this module does not
+/// own.
+pub(crate) fn replay_root_op(
+    tx: &Transaction<'_>,
+    seq: i64,
+    op: &str,
+    value: &Value,
+    now: i64,
+) -> rusqlite::Result<bool> {
+    let decode =
+        |error: serde_json::Error| rusqlite::Error::ToSqlConversionFailure(Box::new(error));
+    match op {
+        "add_root" => apply_add_root(
+            tx,
+            &serde_json::from_value(value.clone()).map_err(decode)?,
+            now,
+        )?,
+        "remove_root" => apply_remove_root(
+            tx,
+            &serde_json::from_value(value.clone()).map_err(decode)?,
+            seq,
+        )?,
+        "attach_derived_parent" => {
+            apply_attach(tx, &serde_json::from_value(value.clone()).map_err(decode)?)?
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+impl RegistryStore {
+    /// Add a root to an existing project. Refused when the root belongs to
+    /// another project, nests inside or around any registered root, sits in or
+    /// around a worker container, or names a GitHub repository another project
+    /// already owns. The new root is unbound and unapproved.
+    pub fn add_root(&self, mut request: AddRootRequest) -> Result<Vec<u8>, RegistryError> {
+        request.root = super::mutations::canonical(&request.root)?;
+        let remotes = github_remotes(Path::new(&request.root));
+        let actor = request.actor.clone().unwrap_or_else(|| "module".into());
+        self.mutation("add_root", None, move |tx| {
+            let project = &request.project_id;
+            if tx
+                .query_row(
+                    "SELECT 1 FROM project WHERE project_id = ?1",
+                    [project],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .is_none()
+            {
+                return Err(domain("not_found", project.clone()));
+            }
+            if let Some(owner) = tx
+                .query_row(
+                    "SELECT project_id FROM project_root WHERE canonical_root = ?1",
+                    [&request.root],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                if &owner == project {
+                    let value = json!({"projectId": project, "root": request.root});
+                    return Ok(Action {
+                        changed: false,
+                        seq: None,
+                        value: value.clone(),
+                        payload: value,
+                    });
+                }
+                return Err(domain(
+                    "root_conflict",
+                    format!("{} is a root of {owner}", request.root),
+                ));
+            }
+            if let Some((root, owner)) = nested_root(tx, &request.root)? {
+                return Err(domain(
+                    "root_nested",
+                    format!("{} overlaps {root}, a root of {owner}", request.root),
+                ));
+            }
+            if let Some(container) = containers(tx)?.into_iter().find(|c| {
+                path_prefix_or_equal(Path::new(&c.parent), Path::new(&request.root))
+                    || path_prefix_or_equal(Path::new(&request.root), Path::new(&c.parent))
+            }) {
+                return Err(domain(
+                    "root_overlaps_container",
+                    format!(
+                        "{} overlaps worker container {}",
+                        request.root, container.parent
+                    ),
+                ));
+            }
+            if let Some((repository, owner)) = repository_owner(tx, project, &remotes)? {
+                return Err(domain(
+                    "repository_owned",
+                    format!("{repository} belongs to {owner}"),
+                ));
+            }
+            let payload = serde_json::to_value(&request)
+                .map_err(|error| domain("encode_failed", error.to_string()))?;
+            let now = super::now_unix_millis();
+            let seq = super::mutations::append(tx, "add_root", &payload, &actor, None, now)?;
+            apply_add_root(tx, &request, now)?;
+            Ok(Action {
+                changed: true,
+                seq: Some(seq),
+                value: json!({"projectId": project, "root": request.root}),
+                payload,
+            })
+        })
+    }
+
+    /// Remove one root from a project. The last root cannot be removed this
+    /// way; removing the project is a separate, explicit act.
+    pub fn remove_root(&self, mut request: RemoveRootRequest) -> Result<Vec<u8>, RegistryError> {
+        request.root = canonical_query_path(Path::new(&request.root))?.0;
+        let actor = request.actor.clone().unwrap_or_else(|| "module".into());
+        self.mutation("remove_root", None, move |tx| {
+            let owner = tx
+                .query_row(
+                    "SELECT project_id FROM project_root WHERE canonical_root = ?1",
+                    [&request.root],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            match owner {
+                Some(owner) if owner == request.project_id => {}
+                Some(owner) => {
+                    return Err(domain(
+                        "root_conflict",
+                        format!("{} is a root of {owner}", request.root),
+                    ))
+                }
+                None => {
+                    return Err(domain(
+                        "not_found",
+                        format!("{} is not a registered root", request.root),
+                    ))
+                }
+            }
+            let count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM project_root WHERE project_id = ?1",
+                [&request.project_id],
+                |row| row.get(0),
+            )?;
+            if count <= 1 {
+                return Err(domain(
+                    "last_root",
+                    format!(
+                        "{} is the only root of {}; remove the project instead",
+                        request.root, request.project_id
+                    ),
+                ));
+            }
+            let payload = serde_json::to_value(&request)
+                .map_err(|error| domain("encode_failed", error.to_string()))?;
+            let seq = super::mutations::append(
+                tx,
+                "remove_root",
+                &payload,
+                &actor,
+                None,
+                super::now_unix_millis(),
+            )?;
+            apply_remove_root(tx, &request, seq)?;
+            Ok(Action {
+                changed: true,
+                seq: Some(seq),
+                value: json!({"projectId": request.project_id, "root": request.root}),
+                payload,
+            })
+        })
+    }
+
+    /// Attach a worker container to a root's current binding. The caller names
+    /// the binding it verified; the container is recorded only if that is
+    /// still the root's active, approved binding and the checkout on disk is
+    /// still it. An identical attachment is a no-op.
+    pub fn attach_derived_parent(
+        &self,
+        mut request: AttachDerivedParentRequest,
+    ) -> Result<Vec<u8>, RegistryError> {
+        request.container = super::mutations::canonical(&request.container)?;
+        let actor = request.actor.clone().unwrap_or_else(|| "module".into());
+        self.mutation("attach_derived_parent", None, move |tx| {
+            let value = json!({"projectId": request.project_id, "root": request.root, "container": request.container, "registrationEpoch": request.registration_epoch});
+            let record = root_record(tx, &request.root)?;
+            let owner = tx
+                .query_row("SELECT project_id FROM project_root WHERE canonical_root = ?1", [&request.root], |row| row.get::<_, String>(0))
+                .optional()?;
+            if owner.as_deref() != Some(request.project_id.as_str()) {
+                return Err(domain("binding_stale", format!("{} is not a root of {}", request.root, request.project_id)));
+            }
+            let current = record.registration_epoch.as_deref() == Some(request.registration_epoch.as_str())
+                && record.incarnation.as_ref().map(|i| i.value.as_str()) == Some(request.incarnation.as_str());
+            if !current {
+                let retired = tx
+                    .query_row("SELECT 1 FROM retired_binding WHERE registration_epoch = ?1", [&request.registration_epoch], |row| row.get::<_, i64>(0))
+                    .optional()?
+                    .is_some();
+                return Err(domain(
+                    if retired { "binding_retired" } else { "binding_stale" },
+                    format!("{} is not bound under epoch {}", request.root, request.registration_epoch),
+                ));
+            }
+            if record.approval.state != "approved" {
+                return Err(domain("binding_unapproved", format!("{} is not approved", request.root)));
+            }
+            let existing = containers(tx)?;
+            if let Some(same) = existing.iter().find(|c| c.parent == request.container) {
+                if same.project_id == request.project_id
+                    && same.source_root.as_deref() == Some(request.root.as_str())
+                    && same.epoch.as_deref() == Some(request.registration_epoch.as_str())
+                {
+                    return Ok(Action { changed: false, seq: None, value: value.clone(), payload: value });
+                }
+                return Err(domain("container_foreign", format!("{} is attached to another binding", request.container)));
+            }
+            if let Some(other) = existing.iter().find(|c| {
+                path_prefix_or_equal(Path::new(&c.parent), Path::new(&request.container))
+                    || path_prefix_or_equal(Path::new(&request.container), Path::new(&c.parent))
+            }) {
+                return Err(domain("container_overlaps", format!("{} overlaps container {}", request.container, other.parent)));
+            }
+            let mut roots = tx.prepare("SELECT canonical_root FROM project_root")?;
+            let roots = roots.query_map([], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            if let Some(root) = roots.iter().find(|root| {
+                path_prefix_or_equal(Path::new(root.as_str()), Path::new(&request.container))
+                    || path_prefix_or_equal(Path::new(&request.container), Path::new(root.as_str()))
+            }) {
+                return Err(domain("container_overlaps", format!("{} overlaps registered root {root}", request.container)));
+            }
+            let payload = serde_json::to_value(&request).map_err(|error| domain("encode_failed", error.to_string()))?;
+            let seq = super::mutations::append(tx, "attach_derived_parent", &payload, &actor, None, super::now_unix_millis())?;
+            apply_attach(tx, &request)?;
+            Ok(Action { changed: true, seq: Some(seq), value, payload })
+        })
+    }
+
+    /// Approve (or withdraw) every root of the project a path belongs to. The
+    /// operator approves a project, seeing all of its roots, so approval is
+    /// refused unless every root's checkout is identified: approving a project
+    /// with a root nobody can identify would approve whatever lands there.
+    pub fn set_project_approval(
+        &self,
+        raw_path: &str,
+        actor: &str,
+        approve: bool,
+    ) -> Result<Vec<u8>, RegistryError> {
+        let reply = self.resolve_walk(raw_path, None)?;
+        let fields = reply.root_fields.clone().unwrap_or(RootFields {
+            matched_root: None,
+            source_root: None,
+            root_records: Vec::new(),
+            binding_status: None,
+        });
+        if !matches!(reply.via.as_str(), "root" | "walk") || fields.root_records.is_empty() {
+            return Err(domain(
+                "not_found",
+                format!("{raw_path} is not inside a registered root"),
+            ));
+        }
+        if approve {
+            if let Some(record) = fields.root_records.iter().find(|r| r.identity != "bound") {
+                return Err(domain(
+                    "root_not_bound",
+                    format!(
+                        "{} is {}; nothing is approved",
+                        record.root, record.identity
+                    ),
+                ));
+            }
+        }
+        let mut roots = Vec::new();
+        for record in &fields.root_records {
+            if record.identity != "bound" {
+                continue;
+            }
+            let outcome: Value =
+                serde_json::from_slice(&self.set_approval(&record.root, actor, approve)?)
+                    .map_err(|error| domain("encode_failed", error.to_string()))?;
+            roots.push(json!({
+                "root": record.root,
+                "registrationEpoch": outcome["result"]["registrationEpoch"],
+                "noop": outcome["result"]["noop"],
+            }));
+        }
+        super::mutations::wire_value(json!({"projectId": reply.project_id, "roots": roots}))
+    }
+
+    /// Resolve with root records even when `ENTORHINAL_ROOT_RECORDS` is off.
+    /// `ck projects trust` uses it to show approval; it changes nothing.
+    pub fn trust(&self, raw_path: &str) -> Result<ResolveReply, RegistryError> {
+        self.resolve_walk(raw_path, None)
     }
 }
 
@@ -1140,6 +1581,7 @@ mod tests {
         let root = repo(&f, "alpha", None);
         register(&f, "pj-alpha", root.clone());
         let epoch = bind(&f, &root);
+        f.store.approve_root(&root, "test").unwrap();
         let container = f.dir("worktrees");
         attach(&f, &container, "pj-alpha", &root, &epoch);
         let wt = format!("{container}/task-1");
@@ -1245,17 +1687,32 @@ mod tests {
         }
     }
 
-    /// Record a worker container as attached under a binding, writing the
-    /// same columns the attach operation writes, without going through it.
+    fn token_of(root: &str) -> String {
+        fs::read_to_string(Path::new(root).join(".git").join(INCARNATION_FILE))
+            .unwrap()
+            .trim_end()
+            .to_string()
+    }
+
+    fn attach_request(
+        container: &str,
+        project: &str,
+        source: &str,
+        epoch: &str,
+    ) -> AttachDerivedParentRequest {
+        AttachDerivedParentRequest {
+            project_id: project.into(),
+            root: source.into(),
+            incarnation: token_of(source),
+            registration_epoch: epoch.into(),
+            container: container.into(),
+            actor: None,
+        }
+    }
+
     fn attach(f: &Fixture, container: &str, project: &str, source: &str, epoch: &str) {
         f.store
-            .apply_entry("test_attach", "{}", "test", None, |tx| {
-                tx.execute(
-                    "INSERT INTO derived_root_parent (canonical_parent, project_id, source_root, registration_epoch)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![container, project, source, epoch],
-                )
-            })
+            .attach_derived_parent(attach_request(container, project, source, epoch))
             .unwrap();
     }
 
@@ -1470,5 +1927,319 @@ mod tests {
             &mut mismatches,
         );
         assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+}
+
+#[cfg(test)]
+mod root_membership_tests {
+    use super::*;
+    use crate::mutations::tests::{register, result, Fixture};
+    use crate::{RegisterRequest, RemoveRequest};
+
+    fn repo(f: &Fixture, name: &str, remote: Option<&str>) -> String {
+        let root = f.dir(name);
+        let git = Path::new(&root).join(".git");
+        fs::create_dir_all(&git).unwrap();
+        let mut config = String::new();
+        if let Some(url) = remote {
+            config.push_str(&format!("[remote \"origin\"]\n\turl = {url}\n"));
+        }
+        fs::write(git.join("config"), config).unwrap();
+        root
+    }
+
+    fn store(label: &str) -> Fixture {
+        let mut f = Fixture::new(label);
+        f.store.use_sequential_ids();
+        f.store.set_root_records(true);
+        f
+    }
+
+    fn add(f: &Fixture, project: &str, root: &str) -> Result<Vec<u8>, RegistryError> {
+        f.store.add_root(AddRootRequest {
+            project_id: project.into(),
+            root: root.into(),
+            actor: None,
+        })
+    }
+
+    fn refused(outcome: Result<Vec<u8>, RegistryError>, code: &str) {
+        let error = outcome.expect_err("expected a refusal");
+        assert!(
+            error.to_string().starts_with(code),
+            "expected {code}, got {error}"
+        );
+    }
+
+    fn epoch_of(f: &Fixture, root: &str) -> String {
+        f.store
+            .read(|conn| active_binding(conn, root))
+            .unwrap()
+            .unwrap()
+            .epoch
+    }
+
+    fn token(root: &str) -> String {
+        fs::read_to_string(Path::new(root).join(".git").join(INCARNATION_FILE))
+            .unwrap()
+            .trim_end()
+            .to_string()
+    }
+
+    #[test]
+    fn add_root_joins_a_project_unbound_and_unapproved_and_refuses_what_it_must() {
+        let f = store("add");
+        let home = repo(&f, "home", Some("git@github.com:cortexkit/home.git"));
+        let second = repo(&f, "second", None);
+        let other = repo(&f, "other", Some("git@github.com:cortexkit/shared.git"));
+        register(&f, "pj-home", home.clone());
+        register(&f, "pj-other", other.clone());
+        let joined = result(&add(&f, "pj-home", &second).unwrap());
+        assert_eq!(joined["noop"], false);
+        let reply = f.store.resolve(&second).unwrap();
+        assert_eq!(reply.project_id, "pj-home");
+        let records = &reply.root_fields.unwrap().root_records;
+        assert_eq!(records.len(), 2);
+        let added = records.iter().find(|r| r.root == second).unwrap();
+        assert_eq!(
+            (added.identity, added.approval.state),
+            ("unbound", "unapproved")
+        );
+        assert_eq!(result(&add(&f, "pj-home", &second).unwrap())["noop"], true);
+
+        refused(add(&f, "pj-home", &other), "root_conflict");
+        let inner = format!("{home}/packages/inner");
+        fs::create_dir_all(&inner).unwrap();
+        refused(add(&f, "pj-home", &inner), "root_nested");
+        refused(add(&f, "pj-other", &f.dir("")), "root_nested");
+        let clone = repo(
+            &f,
+            "shared-clone",
+            Some("https://github.com/cortexkit/shared"),
+        );
+        refused(add(&f, "pj-home", &clone), "repository_owned");
+        refused(add(&f, "pj-missing", &repo(&f, "loose", None)), "not_found");
+    }
+
+    #[test]
+    fn remove_root_retires_the_binding_revokes_its_containers_and_keeps_the_last_root() {
+        let f = store("remove-root");
+        let home = repo(&f, "home", None);
+        let second = repo(&f, "second", None);
+        register(&f, "pj-home", home.clone());
+        add(&f, "pj-home", &second).unwrap();
+        f.store.bind_unbound_roots("test").unwrap();
+        f.store.approve_root(&second, "test").unwrap();
+        let epoch = epoch_of(&f, &second);
+        let container = f.dir("containers-second");
+        f.store
+            .attach_derived_parent(AttachDerivedParentRequest {
+                project_id: "pj-home".into(),
+                root: second.clone(),
+                incarnation: token(&second),
+                registration_epoch: epoch.clone(),
+                container: container.clone(),
+                actor: None,
+            })
+            .unwrap();
+        let captured = ExecutionBinding {
+            root: second.clone(),
+            incarnation: token(&second),
+            registration_epoch: epoch,
+        };
+
+        f.store
+            .remove_root(RemoveRootRequest {
+                project_id: "pj-home".into(),
+                root: second.clone(),
+                actor: None,
+            })
+            .unwrap();
+        assert_eq!(f.store.resolve(&second).unwrap().via, "implicit");
+        assert_eq!(
+            f.store.resolve(&container).unwrap().via,
+            "implicit",
+            "the container is revoked with its root"
+        );
+        let reply = f
+            .store
+            .resolve_with_binding(&home, Some(&captured))
+            .unwrap();
+        assert_eq!(reply.root_fields.unwrap().binding_status, Some("retired"));
+        refused(
+            f.store.remove_root(RemoveRootRequest {
+                project_id: "pj-home".into(),
+                root: home.clone(),
+                actor: None,
+            }),
+            "last_root",
+        );
+
+        let before = serde_json::to_string(&f.store.enumerate(None).unwrap()).unwrap();
+        f.store.rebuild().unwrap();
+        assert_eq!(
+            before,
+            serde_json::to_string(&f.store.enumerate(None).unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn project_approval_covers_every_root_and_refuses_an_unidentified_one() {
+        let f = store("approve-project");
+        let home = repo(&f, "home", None);
+        let second = f.dir("no-git-yet");
+        register(&f, "pj-home", home.clone());
+        f.store.bind_unbound_roots("test").unwrap();
+        // A root with no git metadata cannot be identified, so the project is
+        // not approved at all, not even its identifiable root.
+        f.store
+            .add_root(AddRootRequest {
+                project_id: "pj-home".into(),
+                root: second.clone(),
+                actor: None,
+            })
+            .unwrap();
+        refused(
+            f.store.set_project_approval(&second, "test", true),
+            "root_not_bound",
+        );
+        let records = f
+            .store
+            .trust(&home)
+            .unwrap()
+            .root_fields
+            .unwrap()
+            .root_records;
+        assert!(records.iter().all(|r| r.approval.state == "unapproved"));
+
+        f.store
+            .remove_root(RemoveRootRequest {
+                project_id: "pj-home".into(),
+                root: second.clone(),
+                actor: None,
+            })
+            .unwrap();
+        let third = repo(&f, "third", None);
+        f.store
+            .add_root(AddRootRequest {
+                project_id: "pj-home".into(),
+                root: third.clone(),
+                actor: None,
+            })
+            .unwrap();
+        f.store.bind_unbound_roots("test").unwrap();
+        let sub = format!("{third}/src");
+        fs::create_dir_all(&sub).unwrap();
+        let approved = result(&f.store.set_project_approval(&sub, "test", true).unwrap());
+        assert_eq!(approved["roots"].as_array().unwrap().len(), 2);
+        let records = f
+            .store
+            .trust(&home)
+            .unwrap()
+            .root_fields
+            .unwrap()
+            .root_records;
+        assert!(records.iter().all(|r| r.approval.state == "approved"));
+        f.store.set_project_approval(&home, "test", false).unwrap();
+        let records = f
+            .store
+            .trust(&home)
+            .unwrap()
+            .root_fields
+            .unwrap()
+            .root_records;
+        assert!(records.iter().all(|r| r.approval.state == "unapproved"));
+        refused(
+            f.store
+                .set_project_approval(&f.dir("elsewhere"), "test", true),
+            "not_found",
+        );
+    }
+
+    #[test]
+    fn derived_parent_attach_is_epoch_scoped_and_idempotent() {
+        let f = store("attach");
+        let home = repo(&f, "home", None);
+        register(&f, "pj-home", home.clone());
+        let epoch = {
+            f.store.bind_unbound_roots("test").unwrap();
+            epoch_of(&f, &home)
+        };
+        let container = f.dir("containers");
+        let request = |container: &str, epoch: &str| AttachDerivedParentRequest {
+            project_id: "pj-home".into(),
+            root: home.clone(),
+            incarnation: token(&home),
+            registration_epoch: epoch.into(),
+            container: container.into(),
+            actor: None,
+        };
+        refused(
+            f.store.attach_derived_parent(request(&container, &epoch)),
+            "binding_unapproved",
+        );
+        f.store.approve_root(&home, "test").unwrap();
+        assert_eq!(
+            result(
+                &f.store
+                    .attach_derived_parent(request(&container, &epoch))
+                    .unwrap()
+            )["noop"],
+            false
+        );
+        assert_eq!(
+            result(
+                &f.store
+                    .attach_derived_parent(request(&container, &epoch))
+                    .unwrap()
+            )["noop"],
+            true
+        );
+        refused(
+            f.store
+                .attach_derived_parent(request(&container, "0".repeat(32).as_str())),
+            "binding_stale",
+        );
+        let nested = format!("{container}/inner");
+        fs::create_dir_all(&nested).unwrap();
+        refused(
+            f.store.attach_derived_parent(request(&nested, &epoch)),
+            "container_overlaps",
+        );
+        let inside_root = format!("{home}/sub-container");
+        fs::create_dir_all(&inside_root).unwrap();
+        refused(
+            f.store.attach_derived_parent(request(&inside_root, &epoch)),
+            "container_overlaps",
+        );
+
+        // Remove and re-add the unchanged checkout: it keeps its incarnation
+        // token but gets a new registration epoch. The old epoch is retired,
+        // so attaching under it is refused by name.
+        f.store
+            .remove(RemoveRequest {
+                project_id: Some("pj-home".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        f.store
+            .register(RegisterRequest {
+                project_id: Some("pj-home".into()),
+                name: "pj-home".into(),
+                roots: vec![home.clone()],
+                ..Default::default()
+            })
+            .unwrap();
+        f.store.bind_unbound_roots("test").unwrap();
+        f.store.approve_root(&home, "test").unwrap();
+        let fresh = f.dir("containers-2");
+        refused(
+            f.store.attach_derived_parent(request(&fresh, &epoch)),
+            "binding_retired",
+        );
+        let new_epoch = epoch_of(&f, &home);
+        f.store
+            .attach_derived_parent(request(&fresh, &new_epoch))
+            .unwrap();
     }
 }

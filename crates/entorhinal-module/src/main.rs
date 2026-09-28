@@ -193,6 +193,13 @@ const MUTATING_METHODS: &[&str] = &[
     "seed_import",
     "rebuild",
     "projects.session_liveness",
+    "add_root",
+    "remove_root",
+    "attach_derived_parent",
+    "approve_root",
+    "unapprove_root",
+    "approve_project",
+    "unapprove_project",
 ];
 
 /// Refuse a mutating method unless the route was opened by the operator
@@ -313,6 +320,14 @@ impl ModuleHandler for ProjectsHandler {
             "remove" => self.remove(request.params),
             "seed_import" => self.seed_import(request.params),
             "projects.session_liveness" => self.session_liveness(request.params),
+            "add_root" => self.add_root(request.params),
+            "remove_root" => self.remove_root(request.params),
+            "attach_derived_parent" => self.attach_derived_parent(request.params),
+            "approve_root" => self.set_root_approval(request.params, true),
+            "unapprove_root" => self.set_root_approval(request.params, false),
+            "trust" => self.trust(request.params),
+            "approve_project" => self.set_project_approval(request.params, true),
+            "unapprove_project" => self.set_project_approval(request.params, false),
             "verify" => self.verify(),
             "rebuild" => self.rebuild(),
             _ => Err(HandlerError {
@@ -600,6 +615,57 @@ impl ProjectsHandler {
         let req = serde_json::from_value::<RemoveRequest>(params).map_err(invalid_params)?;
         self.record_mutation(self.with_store(|s| s.remove(req)))
     }
+    fn add_root(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
+        let req = serde_json::from_value::<entorhinal_core::AddRootRequest>(params)
+            .map_err(invalid_params)?;
+        let reply = self.record_mutation(self.with_store(|s| s.add_root(req)))?;
+        // As after register: bind at once, so the new root never answers as
+        // unbound while root records are on. Binding never approves.
+        self.with_store(|store| {
+            if store.root_records_enabled() {
+                if let Err(error) = store.bind_unbound_roots("entorhinal") {
+                    tracing::warn!(target: "binding", "binding after add_root failed: {error}");
+                }
+            }
+            Ok(())
+        })?;
+        Ok(reply)
+    }
+    fn remove_root(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
+        let req = serde_json::from_value::<entorhinal_core::RemoveRootRequest>(params)
+            .map_err(invalid_params)?;
+        self.record_mutation(self.with_store(|s| s.remove_root(req)))
+    }
+    fn attach_derived_parent(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
+        let req = serde_json::from_value::<entorhinal_core::AttachDerivedParentRequest>(params)
+            .map_err(invalid_params)?;
+        self.record_mutation(self.with_store(|s| s.attach_derived_parent(req)))
+    }
+    fn set_root_approval(&self, params: Value, approve: bool) -> Result<Vec<u8>, HandlerError> {
+        let req = serde_json::from_value::<RootApprovalParams>(params).map_err(invalid_params)?;
+        let actor = req.actor.unwrap_or_else(|| "operator".to_string());
+        self.record_mutation(self.with_store(|s| {
+            if approve {
+                s.approve_root(&req.root, &actor)
+            } else {
+                s.unapprove_root(&req.root, &actor)
+            }
+        }))
+    }
+    fn set_project_approval(&self, params: Value, approve: bool) -> Result<Vec<u8>, HandlerError> {
+        let req =
+            serde_json::from_value::<ProjectApprovalParams>(params).map_err(invalid_params)?;
+        let actor = req.actor.unwrap_or_else(|| "operator".to_string());
+        self.record_mutation(
+            self.with_store(|s| s.set_project_approval(&req.canonical_root, &actor, approve)),
+        )
+    }
+    fn trust(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
+        let params = serde_json::from_value::<ResolveParams>(params).map_err(invalid_params)?;
+        let reply = self.with_store(|store| store.trust(&params.canonical_root))?;
+        self.record_query(reply.generation, &self.health.resolve_count);
+        encode_result(reply)
+    }
     fn seed_import(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
         let req = serde_json::from_value::<SeedImportRequest>(params).map_err(invalid_params)?;
         self.record_mutation(self.with_store(|s| s.seed_import(req)))
@@ -673,6 +739,21 @@ struct ResolveParams {
     /// Answered in `bindingStatus` when root records are enabled.
     #[serde(default, rename = "executionBinding")]
     execution_binding: Option<entorhinal_core::ExecutionBinding>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectApprovalParams {
+    #[serde(rename = "canonicalRoot")]
+    canonical_root: String,
+    #[serde(default)]
+    actor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RootApprovalParams {
+    root: String,
+    #[serde(default)]
+    actor: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -762,6 +843,46 @@ fn manifest() -> ModuleManifest {
                     "rebuild",
                     ManagementOperationKind::Mutate,
                     "Rebuild registry projections by replaying the journal (operator recovery path).",
+                ),
+                management_operation(
+                    "add_root",
+                    ManagementOperationKind::Mutate,
+                    "Add a root to a registered project; it starts unapproved.",
+                ),
+                management_operation(
+                    "remove_root",
+                    ManagementOperationKind::Mutate,
+                    "Remove one root from a project, retiring its binding and worker containers.",
+                ),
+                management_operation(
+                    "attach_derived_parent",
+                    ManagementOperationKind::Mutate,
+                    "Attach a worker container to a root's current approved binding.",
+                ),
+                management_operation(
+                    "approve_root",
+                    ManagementOperationKind::Mutate,
+                    "Approve a root's current binding for autonomous work.",
+                ),
+                management_operation(
+                    "unapprove_root",
+                    ManagementOperationKind::Mutate,
+                    "Withdraw a root's approval.",
+                ),
+                management_operation(
+                    "approve_project",
+                    ManagementOperationKind::Mutate,
+                    "Approve every root of the project a path belongs to; refused unless all are identified.",
+                ),
+                management_operation(
+                    "unapprove_project",
+                    ManagementOperationKind::Mutate,
+                    "Withdraw approval from every root of the project a path belongs to.",
+                ),
+                management_operation(
+                    "trust",
+                    ManagementOperationKind::Query,
+                    "Show the project a path belongs to and each root's identity and approval.",
                 ),
                 // Volatile liveness ingestion — never journaled, feeds enumerate
                 // annotations only (ALF's producer per #workspace-projects-design).

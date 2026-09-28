@@ -208,6 +208,13 @@ usage: ck projects <verb> [args] [--subc <connection file>] [--json]
   resolve <dir>           which project owns a directory
   register <name> <dir>   register a project rooted at a directory
   remove <project>        remove a project from the registry
+  add-root <project> <dir>
+                          add another root to a project (starts unapproved)
+  remove-root <project> <dir>
+                          remove one root from a project
+  approve <dir>           approve every root of the project owning <dir>
+  unapprove <dir>         withdraw that approval
+  trust <dir>             show each root's identity and approval
   verify                  check the store against its journal
 
   --subc <path>   daemon connection file; defaults to the usual discovery path
@@ -238,7 +245,8 @@ ck-entorhinal — the registry module (supervised by the subc daemon)
 This binary is the module itself; it is not an operator command. The operator
 surface is:
 
-  ck projects      list, register, resolve, remove, verify
+  ck projects      list, register, resolve, remove, add-root, remove-root,
+                   approve, unapprove, trust, verify
   ck workspaces    list, assign, set-root, clear-root
 
 With no arguments it runs as the supervised module, which is how the daemon
@@ -371,6 +379,34 @@ fn build(command: &Command) -> Result<(String, Value), String> {
             json!({ "projectId": need(0, "a project id")?, "actor": actor }),
         ),
         (Face::Projects, "verify") => ("verify".to_string(), json!({})),
+        (Face::Projects, "add-root") => (
+            "add_root".to_string(),
+            json!({
+                "projectId": need(0, "a project id")?,
+                "root": absolute(&need(1, "a directory")?)?,
+                "actor": actor,
+            }),
+        ),
+        (Face::Projects, "remove-root") => (
+            "remove_root".to_string(),
+            json!({
+                "projectId": need(0, "a project id")?,
+                "root": absolute(&need(1, "a directory")?)?,
+                "actor": actor,
+            }),
+        ),
+        (Face::Projects, "approve") => (
+            "approve_project".to_string(),
+            json!({ "canonicalRoot": absolute(&need(0, "a directory")?)?, "actor": actor }),
+        ),
+        (Face::Projects, "unapprove") => (
+            "unapprove_project".to_string(),
+            json!({ "canonicalRoot": absolute(&need(0, "a directory")?)?, "actor": actor }),
+        ),
+        (Face::Projects, "trust") => (
+            "trust".to_string(),
+            json!({ "canonicalRoot": absolute(&need(0, "a directory")?)? }),
+        ),
         // `list` on the workspaces face is the same enumerate op; the renderer
         // shows the workspace column of the reply instead of the projects.
         (Face::Workspaces, "list") => ("enumerate".to_string(), json!({})),
@@ -586,6 +622,32 @@ fn render(command: &Command, value: &Value) {
             // means the root was present rather than that nothing was checked.
             if value["gone"].as_bool() == Some(true) {
                 println!("root:      GONE (registered directory no longer exists)");
+            }
+        }
+        (Face::Projects, "trust") => {
+            println!("project:   {}", text(&value["projectId"]));
+            println!("via:       {}", text(&value["via"]));
+            let records = value["rootRecords"].as_array().cloned().unwrap_or_default();
+            if records.is_empty() {
+                println!("roots:     none (this directory authorizes nothing)");
+            }
+            for record in &records {
+                println!(
+                    "  {}  {}  {}",
+                    text(&record["approval"]["state"]),
+                    text(&record["identity"]),
+                    text(&record["root"])
+                );
+            }
+        }
+        (Face::Projects, "approve" | "unapprove") => {
+            for root in value["roots"].as_array().cloned().unwrap_or_default() {
+                let already = root["noop"].as_bool() == Some(true);
+                println!(
+                    "{}{}",
+                    text(&root["root"]),
+                    if already { "  (unchanged)" } else { "" }
+                );
             }
         }
         _ => println!(
