@@ -1,0 +1,42 @@
+{
+  "binding_retired": {
+    "code": "binding_retired",
+    "message": "epoch 00000000000000000000000000000002 of /fixture/home has been retired"
+  },
+  "binding_stale": {
+    "code": "binding_stale",
+    "message": "/fixture/home is not bound under epoch 00000000000000000000000000000000"
+  },
+  "binding_unapproved": {
+    "code": "binding_unapproved",
+    "message": "/fixture/home is not approved"
+  },
+  "container_foreign": {
+    "code": "container_foreign",
+    "message": "/fixture/worktrees is attached to another binding"
+  },
+  "container_overlaps": {
+    "code": "container_overlaps",
+    "message": "/fixture/worktrees/inner overlaps container /fixture/worktrees"
+  },
+  "incarnation_mismatch": {
+    "code": "incarnation_mismatch",
+    "message": "the incarnation given for /fixture/home is not the bound checkout's"
+  },
+  "root_conflict": {
+    "code": "root_conflict",
+    "message": "/fixture/other is a root of pj-other, not pj-home"
+  },
+  "root_not_found": {
+    "code": "root_not_found",
+    "message": "path does not exist: /fixture/missing-container"
+  },
+  "root_not_registered": {
+    "code": "root_not_registered",
+    "message": "/fixture/nowhere is not a registered root"
+  },
+  "root_replaced": {
+    "code": "root_replaced",
+    "message": "the checkout at /fixture/home is not the one that was bound"
+  }
+}

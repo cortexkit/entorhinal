@@ -1,0 +1,10 @@
+{
+  "result": {
+    "container": "/fixture/worktrees",
+    "generation": 6,
+    "noop": true,
+    "projectId": "pj-home",
+    "registrationEpoch": "00000000000000000000000000000002",
+    "root": "/fixture/home"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "method": "attach_derived_parent",
+  "params": {
+    "actor": "prefrontal-core",
+    "container": "/fixture/worktrees",
+    "incarnation": "0000000000000000000000000000000000000000000000000000000000000001",
+    "projectId": "pj-home",
+    "registrationEpoch": "00000000000000000000000000000002",
+    "root": "/fixture/home"
+  }
+}

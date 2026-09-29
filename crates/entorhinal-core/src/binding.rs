@@ -1252,20 +1252,28 @@ impl RegistryStore {
             let owner = tx
                 .query_row("SELECT project_id FROM project_root WHERE canonical_root = ?1", [&request.root], |row| row.get::<_, String>(0))
                 .optional()?;
-            if owner.as_deref() != Some(request.project_id.as_str()) {
-                return Err(domain("binding_stale", format!("{} is not a root of {}", request.root, request.project_id)));
+            // Each refusal names what failed, in the order a caller would fix
+            // it. Every one of them means "nothing was attached".
+            match owner.as_deref() {
+                Some(owner) if owner == request.project_id => {}
+                Some(owner) => return Err(domain("root_conflict", format!("{} is a root of {owner}, not {}", request.root, request.project_id))),
+                None => return Err(domain("root_not_registered", format!("{} is not a registered root", request.root))),
             }
-            let current = record.registration_epoch.as_deref() == Some(request.registration_epoch.as_str())
-                && record.incarnation.as_ref().map(|i| i.value.as_str()) == Some(request.incarnation.as_str());
-            if !current {
-                let retired = tx
-                    .query_row("SELECT 1 FROM retired_binding WHERE registration_epoch = ?1", [&request.registration_epoch], |row| row.get::<_, i64>(0))
-                    .optional()?
-                    .is_some();
-                return Err(domain(
-                    if retired { "binding_retired" } else { "binding_stale" },
-                    format!("{} is not bound under epoch {}", request.root, request.registration_epoch),
-                ));
+            let retired = tx
+                .query_row("SELECT 1 FROM retired_binding WHERE registration_epoch = ?1", [&request.registration_epoch], |row| row.get::<_, i64>(0))
+                .optional()?
+                .is_some();
+            if retired {
+                return Err(domain("binding_retired", format!("epoch {} of {} has been retired", request.registration_epoch, request.root)));
+            }
+            if record.identity == "replaced" {
+                return Err(domain("root_replaced", format!("the checkout at {} is not the one that was bound", request.root)));
+            }
+            if record.registration_epoch.as_deref() != Some(request.registration_epoch.as_str()) {
+                return Err(domain("binding_stale", format!("{} is not bound under epoch {}", request.root, request.registration_epoch)));
+            }
+            if record.incarnation.as_ref().map(|i| i.value.as_str()) != Some(request.incarnation.as_str()) {
+                return Err(domain("incarnation_mismatch", format!("the incarnation given for {} is not the bound checkout's", request.root)));
             }
             if record.approval.state != "approved" {
                 return Err(domain("binding_unapproved", format!("{} is not approved", request.root)));
@@ -2153,6 +2161,160 @@ mod root_membership_tests {
             f.store
                 .set_project_approval(&f.dir("elsewhere"), "test", true),
             "not_found",
+        );
+    }
+
+    /// Pins the attach contract that callers decode: the request, the success
+    /// and no-op replies, and one refusal per code, each produced by
+    /// `attach_derived_parent` itself. `UPDATE_GOLDENS=1` rewrites the files;
+    /// otherwise each is byte-compared.
+    #[test]
+    fn attach_replies_match_the_committed_goldens() {
+        let f = store("attach-golden");
+        let real = fs::canonicalize(&f.root)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let home = repo(&f, "home", None);
+        let other = repo(&f, "other", None);
+        register(&f, "pj-home", home.clone());
+        register(&f, "pj-other", other.clone());
+        f.store.bind_unbound_roots("test").unwrap();
+        f.store.approve_root(&home, "test").unwrap();
+        let epoch = epoch_of(&f, &home);
+        let container = f.dir("worktrees");
+        let good = AttachDerivedParentRequest {
+            project_id: "pj-home".into(),
+            root: home.clone(),
+            incarnation: token(&home),
+            registration_epoch: epoch.clone(),
+            container: container.clone(),
+            actor: Some("prefrontal-core".into()),
+        };
+        let normalize = |text: String| text.replace(&real, "/fixture");
+        let mut files: Vec<(String, String)> = Vec::new();
+        let pretty = |bytes: &[u8]| {
+            let value: Value = serde_json::from_slice(bytes).unwrap();
+            serde_json::to_string_pretty(&value).unwrap() + "\n"
+        };
+        files.push((
+            "attach-request.json".into(),
+            serde_json::to_string_pretty(
+                &json!({"method": "attach_derived_parent", "params": good}),
+            )
+            .unwrap()
+                + "\n",
+        ));
+        files.push((
+            "attach-ok.json".into(),
+            pretty(&f.store.attach_derived_parent(good.clone()).unwrap()),
+        ));
+        files.push((
+            "attach-noop.json".into(),
+            pretty(&f.store.attach_derived_parent(good.clone()).unwrap()),
+        ));
+
+        let refuse = |request: AttachDerivedParentRequest| -> Value {
+            match f.store.attach_derived_parent(request) {
+                Err(RegistryError::Domain { code, message }) => {
+                    json!({"code": code, "message": message})
+                }
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+        };
+        let with = |edit: &dyn Fn(&mut AttachDerivedParentRequest)| {
+            let mut request = good.clone();
+            request.container = f.dir("worktrees-2");
+            edit(&mut request);
+            request
+        };
+        let mut refusals = serde_json::Map::new();
+        refusals.insert(
+            "root_not_registered".into(),
+            refuse(with(&|r| r.root = format!("{real}/nowhere"))),
+        );
+        refusals.insert(
+            "root_conflict".into(),
+            refuse(with(&|r| r.root = other.clone())),
+        );
+        refusals.insert(
+            "binding_stale".into(),
+            refuse(with(&|r| r.registration_epoch = "0".repeat(32))),
+        );
+        refusals.insert(
+            "incarnation_mismatch".into(),
+            refuse(with(&|r| r.incarnation = "f".repeat(64))),
+        );
+        refusals.insert("container_foreign".into(), {
+            let mut request = good.clone();
+            request.project_id = "pj-other".into();
+            request.root = other.clone();
+            request.incarnation = token(&other);
+            request.registration_epoch = epoch_of(&f, &other);
+            f.store.approve_root(&other, "test").unwrap();
+            refuse(request)
+        });
+        refusals.insert("container_overlaps".into(), {
+            let nested = format!("{container}/inner");
+            fs::create_dir_all(&nested).unwrap();
+            refuse(with(&|r| r.container = nested.clone()))
+        });
+        refusals.insert(
+            "root_not_found".into(),
+            refuse(with(&|r| r.container = format!("{real}/missing-container"))),
+        );
+        refusals.insert("binding_unapproved".into(), {
+            f.store.unapprove_root(&home, "test").unwrap();
+            let refusal = refuse(with(&|_| {}));
+            f.store.approve_root(&home, "test").unwrap();
+            refusal
+        });
+        refusals.insert("root_replaced".into(), {
+            let path = Path::new(&home).join(".git").join(INCARNATION_FILE);
+            let original = fs::read_to_string(&path).unwrap();
+            fs::write(&path, format!("{}\n", "e".repeat(64))).unwrap();
+            let refusal = refuse(with(&|_| {}));
+            fs::write(&path, original).unwrap();
+            refusal
+        });
+        refusals.insert("binding_retired".into(), {
+            f.store
+                .remove(RemoveRequest {
+                    project_id: Some("pj-home".into()),
+                    ..Default::default()
+                })
+                .unwrap();
+            f.store
+                .register(RegisterRequest {
+                    project_id: Some("pj-home".into()),
+                    name: "pj-home".into(),
+                    roots: vec![home.clone()],
+                    ..Default::default()
+                })
+                .unwrap();
+            f.store.bind_unbound_roots("test").unwrap();
+            refuse(with(&|_| {}))
+        });
+        files.push((
+            "attach-refusals.json".into(),
+            serde_json::to_string_pretty(&Value::Object(refusals)).unwrap() + "\n",
+        ));
+
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/attach");
+        let mut mismatches = Vec::new();
+        for (name, text) in files {
+            let text = normalize(text);
+            let path = dir.join(&name);
+            if std::env::var("UPDATE_GOLDENS").as_deref() == Ok("1") {
+                fs::create_dir_all(&dir).unwrap();
+                fs::write(&path, &text).unwrap();
+            } else if fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
+                mismatches.push(name);
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "differ from the producer: {mismatches:?}"
         );
     }
 
