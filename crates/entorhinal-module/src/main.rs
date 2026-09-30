@@ -29,7 +29,8 @@ use subc_client_rs::{
 };
 use subc_protocol::{
     manifest::{
-        CapabilityDeclarations, Concurrency, ManagementOperation, ManagementOperationKind,
+        build_provenance_from_source, BuildGitShaSource, CapabilityDeclarations, Concurrency,
+        GitTreeState, ManagementOperation, ManagementOperationKind, ManifestProvenance,
         ModuleManifest, ProviderRole,
     },
     ModuleHelloAckBody, Principal, PROTOCOL_VERSION,
@@ -907,10 +908,13 @@ fn manifest() -> ModuleManifest {
     // entorhinal declares no self-signals yet: its ops are operator-driven
     // registry reads/writes, not autonomous signals.
     .self_signals(None)
-    // Build provenance is declared by CK_BUILD_* env at build time once the
-    // release script injects it; None is the honest value until then — the
-    // daemon serves declared_absent rather than a fabricated rev.
-    .provenance(None)
+    // Which source commit and wire version this binary is, so `ck provenance
+    // entorhinal` can answer. At HELLO the SDK adds where this process got its
+    // launch nonce: from the pipe the daemon hands over on a file descriptor,
+    // or from the SUBC_LAUNCH_NONCE environment variable. The daemon will stop
+    // setting that variable only once every module reports the pipe, so a
+    // module that declares no provenance holds that step up.
+    .provenance(declared_provenance())
     // The capability other modules declare `required` when they cannot work
     // without project identity. The daemon holds a module not-ready while a
     // capability it requires has no registered provider, so this name is what
@@ -923,6 +927,30 @@ fn manifest() -> ModuleManifest {
         must_never_reach: Vec::new(),
     }))
     .build()
+}
+
+/// Build facts embedded by `build.rs`. A revision from a dirty tree is declined
+/// with a reason, and a build with no git (a source tarball) says so, rather
+/// than declaring a revision that does not describe the running code.
+fn declared_provenance() -> Option<ManifestProvenance> {
+    let source = match (
+        option_env!("ENTORHINAL_BUILD_REV"),
+        option_env!("ENTORHINAL_BUILD_TREE"),
+    ) {
+        (Some(revision), Some(tree)) => BuildGitShaSource::Git {
+            revision,
+            tree_state: if tree == "clean" {
+                GitTreeState::Clean
+            } else {
+                GitTreeState::Dirty
+            },
+        },
+        _ => BuildGitShaSource::NoGitDir,
+    };
+    // `build.rs` only emits a full 40-character hex revision, so a form error
+    // here would be a build-script bug. Declaring nothing is then better than
+    // refusing to start the registry every other module depends on.
+    build_provenance_from_source(source, None, None).ok()
 }
 
 fn management_operation(
@@ -1149,6 +1177,7 @@ mod tests {
             subc_ops: Vec::new(),
             subc_capabilities: Vec::new(),
             storage: Some(serde_json::to_value(descriptor).unwrap()),
+            machine_id: None,
         }
     }
 

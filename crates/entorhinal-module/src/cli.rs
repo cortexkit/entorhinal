@@ -263,6 +263,13 @@ pub fn run(command: Command) -> ExitCode {
     // a plain Direct consumer.
     std::env::remove_var("SUBC_MODULE_ID");
     std::env::remove_var("SUBC_LAUNCH_NONCE");
+    // SUBC_LAUNCH_NONCE_FD names the file descriptor on which the daemon hands a
+    // supervised module its launch nonce. A shell started under a module
+    // inherits the variable but not the descriptor behind it. Removing
+    // SUBC_MODULE_ID above already stops this client presenting an identity;
+    // removing this too means nothing in the process tries to read that
+    // missing descriptor and fails.
+    std::env::remove_var("SUBC_LAUNCH_NONCE_FD");
 
     let (method, params) = match build(&command) {
         Ok(request) => request,

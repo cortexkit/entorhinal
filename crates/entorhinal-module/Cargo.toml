@@ -1,11 +1,12 @@
 [package]
 name = "entorhinal-module"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/cortexkit/entorhinal"
 publish = false
 description = "The ck-entorhinal supervised subc module."
+build = "build.rs"
 
 [[bin]]
 name = "ck-entorhinal"

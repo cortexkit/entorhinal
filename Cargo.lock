@@ -215,7 +215,7 @@ dependencies = [
 
 [[package]]
 name = "entorhinal-module"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "async-trait",
  "cortexkit-log",
@@ -638,14 +638,15 @@ dependencies = [
 
 [[package]]
 name = "subc-client-rs"
-version = "0.17.0"
+version = "0.23.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8d22a2461e8c64528980d82bbee9af2ced1d1e9db1f62fea25bfd95c75c2da5"
+checksum = "99f884562e84ff2b4f79bb80dff6e24b08a0893ed5f15099bb8b26e3b602249a"
 dependencies = [
  "async-trait",
  "serde",
  "serde_json",
  "subc-control",
+ "subc-os",
  "subc-protocol",
  "subc-transport",
  "tokio",
@@ -654,9 +655,9 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.17.1"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c22677ea1ce7bd78e6d94595c031551c9bef10f612c402f3087666202ed6a69"
+checksum = "a04b292ba293c304c9e075413ea90964bc6268a39a0400da34e890f440cc679d"
 dependencies = [
  "serde",
  "serde_json",
@@ -664,10 +665,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "subc-protocol"
-version = "0.24.1"
+name = "subc-os"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b0fb1bc9305afe14d1202970b7e361253dba6108525b356a7e10274436bc80d"
+checksum = "2eaab39470b0164f2f230c8ef0331eff3379f98e15673b2ce1efacb4447acfe5"
+dependencies = [
+ "libc",
+ "rustix",
+]
+
+[[package]]
+name = "subc-protocol"
+version = "0.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa3bfc2ae876e88b0bab4ce6cf803fb2175ba03bc8a079f9cf2d4b45cf970955"
 dependencies = [
  "serde",
  "serde_json",
@@ -675,9 +686,9 @@ dependencies = [
 
 [[package]]
 name = "subc-transport"
-version = "0.7.3"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "060ab59acf3bf0635fc86b6bd609e86465d53d1dfc101d02fce808b17be93e02"
+checksum = "39aa7f389c25fbebc593a2fb4c7bcecf834f887c18c00fe3afd0f1947b073c04"
 dependencies = [
  "getrandom",
  "hmac",
