@@ -1,5 +1,17 @@
 # What "operator approval" can mean for agent identity
 
+> **Superseded on 2026-10-03, the same day it was written.** The owner decided
+> that approval comes from the user through the consent capability (Approve,
+> Approve Always, Deny) for each creation, requested by agents through
+> entorhinal's tools. That replaces the choice this note set out. Its
+> recommendation, a confirmation gate on mint, was wrong even for the system as
+> it stood: `agent.create` already admits agent sessions (self-registration and
+> the primary-operator session), so a human gate on mint would have blocked
+> them. The measurements below are still accurate as a record of how agents had
+> been created. The rules now in force are in the agent-identity spec draft
+> under `.cortexkit/alfonso/drafts/` and in prefrontal's
+> `docs/designs/consent-module.md`.
+
 Written 2026-10-03 by the entorhinal maintainer, for the project owner, who
 decides it. It answers the one question left open in
 `prefrontal/docs/designs/agent-identity-entorhinal.md`.
