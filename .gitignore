@@ -4,6 +4,17 @@ target/
 # Local editor and OS files
 .DS_Store
 
-# Agent working state (context packages, prompts, drafts) -- never source.
-# A committed gather artifact answers searches with another repo's details.
-.cortexkit/
+# Per-run scratch written by the agent tooling: gathered copies of other
+# repositories' files, and the task briefs handed to delegated workers. Neither
+# is source. A committed gather copy makes this repository's code search answer
+# with another repository's details, and a worker brief is already summarized by
+# the commit it produced.
+#
+# The two config files beside these directories are NOT ignored on purpose:
+# .cortexkit/alfonso.jsonc chooses where this repository's delegated workers
+# run, and .cortexkit/WORKER.md is the instruction file every one of them
+# receives. Both change how work is done here, so they are reviewed and
+# versioned like any other config.
+.cortexkit/alfonso/context/
+.cortexkit/alfonso/prompts/
+.cortexkit/magic-context/

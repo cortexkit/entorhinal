@@ -1,0 +1,8 @@
+{
+  // Masons run on Broca, which needs no OpenCode host.
+  "substrates": {
+    "workloads": {
+      "mason": "broca"
+    }
+  }
+}
