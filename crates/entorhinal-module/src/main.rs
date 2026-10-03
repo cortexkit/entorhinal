@@ -163,14 +163,30 @@ struct HealthGauges {
 /// journaled (I8 forbids liveness in the topology journal); it exists to
 /// annotate enumerate answers and to feed future GC-candidacy signals, so a
 /// wrong, late, or absent feed can never corrupt topology.
-#[derive(Default)]
 struct LivenessState {
     /// Last accepted per-emitter sequence number; None until first contact.
     last_seq: Option<u64>,
-    /// True when a dropped batch was detected and no snapshot has rebased yet.
+    /// True until a snapshot has rebased the mirror: from startup, and again
+    /// after a dropped or refused batch.
     stale: bool,
     /// session_id -> (state, canonical_root, last_activity_ms).
     sessions: BTreeMap<String, (String, String, i64)>,
+}
+
+impl Default for LivenessState {
+    /// A mirror that has never received a snapshot is incomplete, so it starts
+    /// stale. The emitter's session set outlives this process: when only this
+    /// module restarts, the emitter keeps sending deltas from its own seq, and
+    /// a mirror that took the first delta as complete would hold only the
+    /// sessions that happened to change since, until every live session
+    /// changed again. Starting stale makes the first reply ask for a snapshot.
+    fn default() -> Self {
+        Self {
+            last_seq: None,
+            stale: true,
+            sessions: BTreeMap::new(),
+        }
+    }
 }
 
 struct ProjectsHandler {
@@ -524,7 +540,9 @@ impl ProjectsHandler {
             }
         } else {
             // First contact: any seq is the baseline, since there is nothing to
-            // be out of order with.
+            // be out of order with. The mirror stays stale until a snapshot
+            // arrives, because a delta says nothing about the sessions that
+            // did not change.
             state.last_seq = Some(batch.seq);
         }
 
@@ -1455,6 +1473,46 @@ mod tests {
         assert!(!requested(
             &call(json!({"seq": 5, "snapshot": true, "sessions": []})).unwrap()
         ));
+    }
+
+    /// A receiver that restarts while the emitter keeps running must ask for a
+    /// snapshot, because the first batch it sees is a delta and its mirror is
+    /// empty. Taking that delta as the whole state leaves every session that
+    /// did not change missing until it changes again.
+    #[test]
+    fn a_fresh_receiver_asks_for_a_snapshot_until_one_arrives() {
+        let handler = ProjectsHandler::new();
+        let call = |v: serde_json::Value| handler.session_liveness(v);
+        let requested = |bytes: &[u8]| -> bool {
+            serde_json::from_slice::<Value>(bytes).unwrap()["result"]["snapshotRequested"]
+                .as_bool()
+                .unwrap()
+        };
+
+        // The emitter is mid-stream: its first batch to this process is a delta.
+        let r = call(json!({"seq": 4200, "sessions": [
+            {"sessionId": "s1", "canonicalRoot": "/tmp/a", "state": "active"}]}))
+        .unwrap();
+        assert!(
+            requested(&r),
+            "a mirror that has never seen a snapshot is incomplete and must ask for one"
+        );
+        assert_eq!(
+            handler.health.liveness_gaps.load(Ordering::Relaxed),
+            0,
+            "first contact is not a gap"
+        );
+
+        // A contiguous delta does not complete the mirror either.
+        let r = call(json!({"seq": 4201, "sessions": []})).unwrap();
+        assert!(requested(&r), "only a snapshot completes the mirror");
+
+        // The snapshot does.
+        let r = call(json!({"seq": 4202, "snapshot": true, "sessions": [
+            {"sessionId": "s1", "canonicalRoot": "/tmp/a", "state": "active"},
+            {"sessionId": "s2", "canonicalRoot": "/tmp/b", "state": "idle"}]}))
+        .unwrap();
+        assert!(!requested(&r));
     }
 
     /// Out-of-order delivery must not resurrect a removed session.
