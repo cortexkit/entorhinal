@@ -305,7 +305,7 @@ impl RegistryStore {
         // a rollback sentinel; the stash wins on the way out.
         let domain_error = std::cell::RefCell::new(None::<RegistryError>);
         let out = self.db.with_conn_fenced(|tx| -> rusqlite::Result<Vec<u8>> {
-            let mut fail = |e: RegistryError| -> rusqlite::Error {
+            let fail = |e: RegistryError| -> rusqlite::Error {
                 *domain_error.borrow_mut() = Some(e);
                 rusqlite::Error::QueryReturnedNoRows
             };
@@ -334,7 +334,7 @@ impl RegistryStore {
                     }
                 }
             }
-            let action = action(tx).map_err(&mut fail)?;
+            let action = action(tx).map_err(fail)?;
             let generation = action.seq.unwrap_or(tx.query_row(
                 "SELECT COALESCE(MAX(seq),0) FROM registry_journal",
                 [],
@@ -345,7 +345,7 @@ impl RegistryStore {
                 map.insert("generation".to_string(), json!(generation));
                 map.insert("noop".to_string(), json!(!action.changed));
             }
-            let blob = wire(value).map_err(&mut fail)?;
+            let blob = wire(value).map_err(fail)?;
             if action.changed {
                 tx.execute(
                     "UPDATE registry_journal SET payload_json=?1,response_json=?2 WHERE seq=?3",
