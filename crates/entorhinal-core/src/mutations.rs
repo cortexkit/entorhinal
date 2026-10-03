@@ -1417,6 +1417,68 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(result(&noassign)["generation"], g + 1);
     }
+
+    /// The generation must never decrease, and must never hand the same value to
+    /// two different states, across a journal replay.
+    ///
+    /// This is an invariant rather than an implementation detail because
+    /// consumers outside this module use the generation to decide whether
+    /// something minted against an earlier identity snapshot is still valid. A
+    /// generation that repeated after a replay would re-validate a stale
+    /// assertion silently: nothing would error, and the holder would speak with
+    /// authority it no longer has. So replay has to preserve the value AND leave
+    /// the next mutation issuing a seq above every value ever issued, which is
+    /// the part a reader cannot verify from `MAX(seq)` alone.
+    #[test]
+    fn generation_never_decreases_or_repeats_across_a_journal_replay() {
+        let f = Fixture::new("generation-replay");
+        let root = f.dir("root");
+        register(&f, "p", root.clone());
+        f.store
+            .assign_workspace(AssignWorkspaceRequest {
+                project_id: "p".into(),
+                workspace_id: "w".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let before = f.store.generation().unwrap();
+        assert!(before > 0, "the fixture must have advanced the generation");
+
+        assert_eq!(
+            f.store.rebuild().unwrap(),
+            before,
+            "replay must not move the generation"
+        );
+        assert_eq!(
+            f.store.generation().unwrap(),
+            before,
+            "the generation after replay must be the one replay reported"
+        );
+
+        // The claim that matters: the next effectful mutation must issue a value
+        // ABOVE everything already issued, so no post-replay state can wear a
+        // generation an earlier state already wore.
+        let after = f
+            .store
+            .assign_workspace(AssignWorkspaceRequest {
+                project_id: "p".into(),
+                workspace_id: "w2".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let next = result(&after)["generation"].as_i64().unwrap();
+        assert!(
+            next > before,
+            "a mutation after replay must advance past every earlier generation, got {next} after {before}"
+        );
+
+        // And a second replay from the longer journal is still stable.
+        assert_eq!(
+            f.store.rebuild().unwrap(),
+            next,
+            "replay must stay stable once the journal has grown"
+        );
+    }
 }
 
 #[cfg(test)]
