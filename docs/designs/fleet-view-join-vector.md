@@ -11,6 +11,22 @@ composes two calls**. This document is the contract that stops three clients
 
 It is read-path only; nothing here depends on the write-gate decision.
 
+## The rule that decides which half a field belongs to
+
+**Entorhinal's half carries only fields that change when identity changes.
+Anything that moves with activity belongs to core.**
+
+This is not a stylistic preference, it is what keeps the unchanged token
+meaningful, and the token is the condition the whole design rests on (see
+below). Identity changes rarely, so a client can hold it for long periods and
+poll only core. Put one activity-shaped field on the identity half and that
+half changes on almost every poll, the token never answers "unchanged", and the
+client re-fetches the full identity set at core's cadence — strictly worse than
+the single fat reply this design replaces.
+
+Apply the rule before adding any field. If the answer is "it changes while the
+agent works", it is core's, however naturally it reads beside a name.
+
 ## What each half owns
 
 Partitioned from `FleetAgentRow` (`prefrontal/crates/prefrontal-core-module/src/fleet_overview.rs:49-84`)
@@ -44,7 +60,7 @@ makes this half self-contained, where core's version of it is not — core build
 | `residence` | `{harness, state, session}`, optional as a whole; see below |
 | `board` | `{statusText?, statusState?, updatedAtMs?}`, optional |
 | `pendingAskCount` | **attributed by agent**, see below; absent is not zero |
-| `latestActivityMs` | optional |
+| `latestActivityMs` | **core-only**: max of board update time and the agent's ask activity |
 
 `pendingAskCount` changes meaning in this move, deliberately. Today core
 attributes asks **by project roots**: with a project that has roots it sums
@@ -63,6 +79,22 @@ counts asks from *any* session working in that project, so today's per-agent
 column can show asks that belong to a different agent. "Asks attributable to
 this agent" is what a per-agent field should mean, and it is what clients will
 get.
+
+`latestActivityMs` **drops project route activity.** Today it is the max of
+project route activity, board update time and ask activity
+(`fleet_overview.rs:408-415`). Route activity is Entorhinal's data after the
+move — it is what the registry derives from the session-liveness feed — but it
+must not ride the identity half, and the client must not take the max across
+halves either: route activity changes on essentially every route, so including
+it would change the identity half on nearly every poll and destroy the unchanged
+token. So the field is core-only, the max of board update time and the agent's
+ask activity.
+
+The loss is small and worth naming precisely: clients use this field for a
+tie-break in attention ordering and to derive a "sleepy" age, and board updates
+plus asks serve both. If per-agent route activity is wanted later it becomes its
+own field on core's half, where core can see routes for the agent's session, or
+a separate cheap op. **Never part of the cached identity set.**
 
 `residence.session` is optional, and **`residence` present with no session means
 "running somewhere this client cannot open"** — the agent is live, but there is
