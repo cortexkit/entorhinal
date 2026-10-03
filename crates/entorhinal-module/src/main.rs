@@ -147,6 +147,16 @@ struct HealthGauges {
     liveness_batches: AtomicU64,
     liveness_gaps: AtomicU64,
     liveness_sessions: AtomicU64,
+    /// Batches refused for carrying a seq at or below the last applied one.
+    /// Separate from `liveness_gaps` on purpose: a gap means "a batch I never
+    /// saw may exist", while this means "a batch arrived out of order". After
+    /// the emitter delivers in seq order this must stay 0 forever, so any
+    /// nonzero value is a producer regression rather than a tolerated event.
+    liveness_dropped_older: AtomicU64,
+    /// Whether the first out-of-order refusal of this incarnation has been
+    /// logged. Refusing quietly would let that regression hide behind a
+    /// counter nobody reads.
+    dropped_older_logged: AtomicBool,
 }
 
 /// Volatile liveness state fed by `projects.session_liveness` batches. Never
@@ -430,6 +440,7 @@ impl ModuleHandler for ProjectsHandler {
                 "lastOperationMs": self.health.last_operation_ms.load(Ordering::Relaxed),
                 "livenessBatches": self.health.liveness_batches.load(Ordering::Relaxed),
                 "livenessGaps": self.health.liveness_gaps.load(Ordering::Relaxed),
+                "livenessDroppedOlder": self.health.liveness_dropped_older.load(Ordering::Relaxed),
                 "livenessSessions": self.health.liveness_sessions.load(Ordering::Relaxed),
             })),
         }
@@ -470,39 +481,96 @@ impl ProjectsHandler {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
+        // Set when the batch is refused for arriving out of order, carrying the
+        // last seq that was applied, for the log line below.
+        let mut dropped_after: Option<u64> = None;
+
         if batch.snapshot {
+            // A snapshot is authoritative and replaces the whole mirror, so it
+            // is accepted whatever its seq says: a restarted emitter legally
+            // rebases to a lower seq. An EMPTY snapshot is information, not a
+            // no-op -- it states the emitter tracks nothing, which is the only
+            // way a mirror still holding sessions whose `gone` was lost can be
+            // emptied again.
             state.sessions.clear();
             state.stale = false;
-        } else {
-            let expected = state.last_seq.map(|s| s.wrapping_add(1));
-            if expected.is_some_and(|e| batch.seq != e) {
+            state.last_seq = Some(batch.seq);
+        } else if let Some(last) = state.last_seq {
+            if batch.seq <= last {
+                // Refuse it instead of applying it. Liveness is latest-wins per
+                // session, so a batch older than one already applied installs
+                // state that was already superseded. The case that bites is a
+                // stale non-`gone` entry landing after the `gone` that removed
+                // the session: it reinserts an entry whose terminal signal is
+                // already spent, and nothing would ever prune it again. That
+                // entry then keeps its project's last_route_activity_ms alive
+                // forever, which is the GC-candidacy signal this feed exists to
+                // produce.
+                //
+                // Ask for a rebase too. Refusing alone would be fail-deaf: an
+                // emitter that restarts its process-lifetime counter and loses
+                // its reconnect snapshot in transit would have every later
+                // delta look older than the pre-restart high-water mark, and
+                // this handler would ignore the feed indefinitely. Requesting a
+                // snapshot makes the refusal recoverable in one round trip.
                 state.stale = true;
-                self.health.liveness_gaps.fetch_add(1, Ordering::Relaxed);
+                dropped_after = Some(last);
+            } else {
+                if batch.seq != last.wrapping_add(1) {
+                    state.stale = true;
+                    self.health.liveness_gaps.fetch_add(1, Ordering::Relaxed);
+                }
+                state.last_seq = Some(batch.seq);
             }
+        } else {
+            // First contact: any seq is the baseline, since there is nothing to
+            // be out of order with.
+            state.last_seq = Some(batch.seq);
         }
+
         // Request a snapshot until one actually rebases us: staleness is a
         // LATCH, not a per-batch flag. If only the freshly-detected gap
         // answered true, a lost snapshot re-emit would leave the state stale
         // forever while every later contiguous delta reported clean.
         let snapshot_requested = state.stale;
-        state.last_seq = Some(batch.seq);
 
-        for session in batch.sessions {
-            if session.state == "gone" {
-                state.sessions.remove(&session.session_id);
-            } else {
-                state.sessions.insert(
-                    session.session_id,
-                    (
-                        session.state,
-                        session.canonical_root,
-                        session.last_activity_ms,
-                    ),
-                );
+        if dropped_after.is_none() {
+            for session in batch.sessions {
+                if session.state == "gone" {
+                    state.sessions.remove(&session.session_id);
+                } else {
+                    state.sessions.insert(
+                        session.session_id,
+                        (
+                            session.state,
+                            session.canonical_root,
+                            session.last_activity_ms,
+                        ),
+                    );
+                }
             }
         }
         let tracked = state.sessions.len() as u64;
         drop(state);
+
+        if let Some(last) = dropped_after {
+            self.health
+                .liveness_dropped_older
+                .fetch_add(1, Ordering::Relaxed);
+            if !self
+                .health
+                .dropped_older_logged
+                .swap(true, Ordering::Relaxed)
+            {
+                tracing::warn!(
+                    target: "liveness",
+                    seq = batch.seq,
+                    last_applied_seq = last,
+                    "refused an out-of-order session_liveness batch and asked for a snapshot; \
+                     the emitter is delivering out of seq order"
+                );
+            }
+        }
 
         self.health.liveness_batches.fetch_add(1, Ordering::Relaxed);
         self.health
@@ -1345,6 +1413,166 @@ mod tests {
         let r = call(&handler, json!({"seq": 2, "sessions": []})).unwrap();
         let v: Value = serde_json::from_slice(&r).unwrap();
         assert_eq!(v["result"]["snapshotRequested"], false);
+    }
+
+    /// Only the `snapshot` marker rebases: a batch that merely happens to list
+    /// every session is still a delta, and staleness must survive it.
+    ///
+    /// Read this test for what it does NOT prove. `snapshot` is optional on the
+    /// wire and defaults to false, so a test writing the key by hand passes
+    /// whether or not any producer sets it. The rebase path has been
+    /// unreachable in production for exactly that reason, with a producer whose
+    /// batch type had no such field, while tests on both sides stayed green.
+    /// Proving a producer marks its snapshots needs a test against that
+    /// producer's serialized output, not against JSON written here.
+    #[test]
+    fn a_batch_that_does_not_say_it_is_a_snapshot_cannot_clear_staleness() {
+        let handler = ProjectsHandler::new();
+        let call = |v: serde_json::Value| handler.session_liveness(v);
+        let requested = |bytes: &[u8]| -> bool {
+            serde_json::from_slice::<Value>(bytes).unwrap()["result"]["snapshotRequested"]
+                .as_bool()
+                .unwrap()
+        };
+
+        call(json!({"seq": 1, "snapshot": true, "sessions": [
+            {"sessionId": "s1", "canonicalRoot": "/tmp/a", "state": "active"}]}))
+        .unwrap();
+        // Skip seq 2, so a batch is genuinely missing and staleness latches.
+        assert!(requested(&call(json!({"seq": 3, "sessions": []})).unwrap()));
+
+        // A full-state resend carrying every tracked session but no `snapshot`
+        // key. However complete it looks, it must not count as a rebase.
+        let r = call(json!({"seq": 4, "sessions": [
+            {"sessionId": "s1", "canonicalRoot": "/tmp/a", "state": "active"}]}))
+        .unwrap();
+        assert!(
+            requested(&r),
+            "a resend without the snapshot marker is a delta, so staleness must persist"
+        );
+
+        // Only the marked batch rebases.
+        assert!(!requested(
+            &call(json!({"seq": 5, "snapshot": true, "sessions": []})).unwrap()
+        ));
+    }
+
+    /// Out-of-order delivery must not resurrect a removed session.
+    ///
+    /// Nothing in the protocol guarantees a producer delivers in seq order: a
+    /// producer that assigns seq and then sends concurrently can have a `gone`
+    /// overtaken by an older batch for the same session. Applying that older
+    /// batch reinserts an entry whose terminal signal is already spent, so
+    /// nothing prunes it again, and the entry keeps its project's
+    /// `last_route_activity_ms` alive forever -- the GC-candidacy signal this
+    /// feed exists to produce. Hence the refusal is the receiver's own
+    /// invariant, not a workaround for one producer's scheduling.
+    #[test]
+    fn an_older_batch_cannot_resurrect_a_session_that_is_already_gone() {
+        let handler = ProjectsHandler::new();
+        let call = |v: serde_json::Value| handler.session_liveness(v);
+        let tracked = |bytes: &[u8]| -> u64 {
+            serde_json::from_slice::<Value>(bytes).unwrap()["result"]["tracked"]
+                .as_u64()
+                .unwrap()
+        };
+
+        call(json!({"seq": 10, "snapshot": true, "sessions": [
+            {"sessionId": "s1", "canonicalRoot": "/tmp/a", "state": "active", "lastActivityMs": 100}]}))
+        .unwrap();
+        let r = call(json!({"seq": 11, "sessions": [
+            {"sessionId": "s1", "canonicalRoot": "/tmp/a", "state": "gone"}]}))
+        .unwrap();
+        assert_eq!(tracked(&r), 0, "gone prunes the entry");
+
+        // The overtaken batch: seq 9, arriving after seq 11 was applied.
+        let r = call(json!({"seq": 9, "sessions": [
+            {"sessionId": "s1", "canonicalRoot": "/tmp/a", "state": "active", "lastActivityMs": 90}]}))
+        .unwrap();
+        assert_eq!(
+            tracked(&r),
+            0,
+            "a batch older than the last applied one must not be applied at all"
+        );
+        assert_eq!(
+            handler
+                .health
+                .liveness_dropped_older
+                .load(Ordering::Relaxed),
+            1,
+            "the refusal must be counted, not silent"
+        );
+        assert_eq!(
+            handler.health.liveness_gaps.load(Ordering::Relaxed),
+            0,
+            "a reorder is not a gap: nothing was missed, so they must not share a counter"
+        );
+
+        // Refusing alone would be fail-deaf, so the refusal asks for a rebase:
+        // otherwise an emitter that restarted its counter and lost its snapshot
+        // would have every later delta look older than the old high-water mark.
+        let r = call(json!({"seq": 12, "sessions": []})).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&r).unwrap()["result"]["snapshotRequested"],
+            true,
+            "a refused batch must leave the state asking to be rebased"
+        );
+
+        // And the rebase is honoured even though its seq goes backwards, which
+        // is what a restarted emitter sends.
+        let r = call(json!({"seq": 1, "snapshot": true, "sessions": [
+            {"sessionId": "s2", "canonicalRoot": "/tmp/b", "state": "active"}]}))
+        .unwrap();
+        assert_eq!(tracked(&r), 1);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&r).unwrap()["result"]["snapshotRequested"],
+            false
+        );
+    }
+
+    /// A snapshot replaces the mirror rather than merging into it, so a session
+    /// the snapshot does not name is gone afterwards.
+    ///
+    /// This is the backstop for a `gone` that is never delivered, which no gap
+    /// detector can recover: if a producer drops that batch and then restarts
+    /// with nothing tracked, its reconnect snapshot is the only remaining
+    /// statement that the session is over. An empty snapshot therefore has to
+    /// be honoured as well, since "I track nothing" is the whole message in
+    /// that case. A producer that suppresses an empty snapshot as a no-op
+    /// disables recovery precisely where it is needed.
+    #[test]
+    fn a_snapshot_replaces_the_mirror_and_an_empty_one_still_counts() {
+        let handler = ProjectsHandler::new();
+        let call = |v: serde_json::Value| handler.session_liveness(v);
+        let tracked = |bytes: &[u8]| -> u64 {
+            serde_json::from_slice::<Value>(bytes).unwrap()["result"]["tracked"]
+                .as_u64()
+                .unwrap()
+        };
+
+        let r = call(json!({"seq": 1, "snapshot": true, "sessions": [
+            {"sessionId": "s1", "canonicalRoot": "/tmp/a", "state": "active"},
+            {"sessionId": "s2", "canonicalRoot": "/tmp/b", "state": "idle"}]}))
+        .unwrap();
+        assert_eq!(tracked(&r), 2);
+
+        // s1 is absent from this snapshot and was never sent as `gone`.
+        let r = call(json!({"seq": 2, "snapshot": true, "sessions": [
+            {"sessionId": "s2", "canonicalRoot": "/tmp/b", "state": "idle"}]}))
+        .unwrap();
+        assert_eq!(
+            tracked(&r),
+            1,
+            "a session the snapshot omits must be dropped, not kept from the previous state"
+        );
+
+        // The empty snapshot: the emitter states it tracks nothing.
+        let r = call(json!({"seq": 3, "snapshot": true, "sessions": []})).unwrap();
+        assert_eq!(
+            tracked(&r),
+            0,
+            "an empty snapshot empties the mirror; it is a statement, not a no-op"
+        );
     }
 
     #[test]
