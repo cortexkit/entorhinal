@@ -31,4 +31,13 @@ No agent-initiated write path exists in this campaign, so nothing here refuses f
 
 R10 Reads are open to every principal, which is how entorhinal admits reads today. Before the cutover marker exists, a resolve of a well-formed but absent agent id returns `unknown`, never `authority_not_cut_over`.
 
-R11 Moving entorhinal to subc-protocol 0.29 is not part of this campaign. That release adds `ScopeAttributes.flow_id` to the daemon's scope stamp, and only a module that decodes stamps must adopt it before stamps carry the field. Nothing in this campaign decodes `ScopeAttributes`, so the upgrade ships with the rest of the fleet's protocol upgrades.
+R11 Moving entorhinal to subc-protocol 0.29 is not part of this campaign: it already shipped on its own. Entorhinal 0.1.14 (commit 192f220) runs subc-protocol 0.29.0 with subc-client-rs 0.26.1, so this campaign starts from those versions and must not move off them.
+
+R12 The deferred list, kept here so nothing drops silently between the two campaigns. The second campaign starts from exactly these items, specified against cingulate's real `consent/v1` interface once it exists:
+- scoped agent tools for the janitor and heads: create workspace, create project, create head, create hire, dispose agent; their request keys, and how each tool's parameters convert to the matching journal op;
+- reading the calling agent from the inbound `ScopeStamp`, including refusing flow-scoped calls;
+- consent: card kind `entorhinal.identity_request`, targeted-carrier routes to cingulate opened only inside a live inbound tool call, the request digest and opaque `binding`, the pending and expiry rules, and the codes `consent_not_bound`, `consent_unavailable`, `consent_route_closed` and `consent_pending`;
+- standing grants: per-workspace scope by default, fleet-wide only as an explicit option, minted only from an answer to a card entorhinal raised, served behind `grants.list`, `grants.revoke`, `grants.would_ask` and `grants.offer`;
+- the per-project cap on live hires, default 10 and operator-changeable, and a head retiring its own hire with a notice and no card;
+- admitting `reserved:callosum` for app-initiated creates. When those ops are exposed to the apps they go into Callosum's `phone` profile only, never `sim`;
+- once SUBC's `ck` gate exists, admitting a gated `Direct` write as the operator's, and removing core's relay ops in a later cut (R3).
