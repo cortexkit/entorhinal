@@ -205,14 +205,56 @@ repository, with test vectors that every provider checks itself against.
 - No automatic sweep: a dormant head from an interrupted create is
   indistinguishable from one created on purpose and not yet started.
 
-**Lifecycle notices.** Rename, retirement and merge are published on the
-existing journal tail, so core and providers follow them without a new channel.
-Merge is a retirement for every purpose outside entorhinal: core revokes a
-merged agent's authored flows exactly as for a disposed one.
+**An identity change feed that consumers pull.** Core resolves agents on almost
+every delivery (peer addressing, room members, board and ask attribution, scope
+registration, wake routing), so it keeps a local read replica of identity and
+never asks entorhinal on those paths; an entorhinal restart must not stop peer
+messages or room posts. Entorhinal serves the feed that replica is built from:
+- **Changes since a cursor,** in journal order, each stamped with
+  `(incarnation, generation)`, with a bounded long-poll so changes arrive
+  promptly.
+- **A full snapshot** with its `(incarnation, generation)`.
+- **An explicit `snapshot_required` answer** when the consumer's incarnation is
+  not the current one, or its cursor is above the current generation (the store
+  was restored), so a consumer never applies changes on top of a history that
+  no longer exists.
 
-**Clean cutover, no coexistence.** This machine is the only install. There is
-no dual-read period and no compatibility layer: one import copies the registry
-from core's store, and core removes its identity tables and ops in the same cut.
+The feed is pulled, not pushed. Entorhinal opens no route to its consumers, so
+it gains no dependency on core, and delivery order is the journal's order by
+construction, which avoids the out-of-order delivery that broke the
+session-liveness feed. Rename, retirement and merge reach core and providers
+through this feed. Merge is a retirement for every purpose outside entorhinal:
+core revokes a merged agent's authored flows exactly as for a disposed one.
+
+Authority checks that must be fresh do not use a replica. They read entorhinal
+directly and fail closed when it cannot answer: the bot-token mint, and anything
+that gates a grant.
+
+**Nothing precludes mirroring identity across machines later.** Identity is
+expected to be mirrored across machines with one leased writer, as claustrum's
+credentials are. Nothing is built for that now, but the design must not rule it
+out:
+- the journal replays on another machine to the same state, so replay never
+  re-mints: a minted id, and every other generated value, is recorded in the
+  journal entry, not regenerated;
+- ids are random;
+- the identity record holds no machine-local value. Agents reference projects
+  by `project_id`, never by a root path.
+
+A replica on another machine is a separate entorhinal process, and every
+process mints its own incarnation at start, so its `(incarnation, generation)`
+pair can never equal this machine's. A claim minted against one machine's
+identity is therefore already distinguishable from one minted against another.
+
+**Clean cutover of authority.** This machine is the only install. There is no
+dual-write period: one import copies the registry from core's store, and in the
+same cut the authority moves to entorhinal and core's identity write ops are
+removed. Core's identity **read** ops are not promised to vanish in the cut. Host
+plugins call some of them on per-session and configuration paths, and removing
+an op a running bundle still calls has caused fleet-wide outages, so core keeps
+serving those reads from its replica until a bundle without them is running,
+checking each removal against the running bundle's decoders. That list is
+core's.
 
 ## acceptance sketch
 
@@ -271,8 +313,15 @@ Each acceptance item below is backed by a test or a command in this repository.
    agent. A one-live-head refusal names the dormant head and its request key.
 9. **The journal records who wrote each identity row.** It holds the attested
    principal and `origin` beside the caller's label.
-10. **Lifecycle notices reach the journal tail.** Rename, retire and merge
-    appear there in a shape a follower can act on.
+10. **The change feed is complete and ordered.** Tests prove:
+    - a consumer that applies the snapshot and then every change reaches the
+      same state as entorhinal;
+    - rename, retire and merge appear in the feed in a shape a follower can act
+      on;
+    - a cursor from another incarnation, or above the current generation,
+      answers `snapshot_required`;
+    - replaying the journal reproduces minted ids rather than generating new
+      ones.
 11. **Entorhinal runs on subc-protocol 0.29.** It decodes stamps carrying
     `flow_id`.
 
@@ -288,10 +337,13 @@ Each acceptance item below is backed by a test or a command in this repository.
   - the seven operator scripts are repointed, with
     `script/disable-nodark-outside-cortexkit.ts` (raw SQL on `agent`) as its own
     item with its own test;
-  - core follows lifecycle notices to revoke flows and remove scopes;
+  - core keeps a local identity replica fed from entorhinal's change feed, and
+    acts on retirements from it (revoking flows, removing scopes);
   - `reserved:entorhinal` is listed as a carrier with
     `destinations: ["cingulate"]`;
-  - core's identity tables and ops are removed in the cut;
+  - in the cut, core's identity tables and write ops are removed; read ops that
+    running host plugins call keep serving from the replica until a bundle
+    without them is running, each removal checked against that bundle;
   - core confirms against its implementation, not only the design, that the
     named-session mint check stays sound once its two reads are in different
     stores.
@@ -315,9 +367,9 @@ Each acceptance item below is backed by a test or a command in this repository.
 2. Callosum exposes entorhinal's identity reads to the phone. The phone build
    with the two-call fleet view is built and uploaded against the vector.
 3. **The cut, in one restart window:** run the import against a snapshot of
-   core's store; verify invariants; place core's build that reads identity from
-   entorhinal and has its identity tables and ops removed; release the phone
-   build.
+   core's store; verify invariants; place core's build that keeps an identity
+   replica fed from entorhinal and has its identity tables and write ops
+   removed; release the phone build.
 4. After the cut: compare the fleet view against the vector, check a bot-token
    mint end to end, and confirm a retirement notice reaches core.
 5. Later, independently: cingulate is bound, after which janitor and head
@@ -336,7 +388,9 @@ Each acceptance item below is backed by a test or a command in this repository.
   keyed by entorhinal's agent id.
 - Card rendering, presence, push, or any part of cingulate.
 - Building `agent.fleet_overview` anywhere. It is deleted, not moved.
-- Any dual-read, proxy or compatibility phase.
+- Any dual-write period, or any phase where core proxies identity to a client
+  per request. Core's read replica is not a proxy: it is how core avoids a
+  cross-module read on its delivery paths.
 
 ## open_questions
 
