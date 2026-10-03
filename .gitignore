@@ -17,4 +17,5 @@ target/
 # versioned like any other config.
 .cortexkit/alfonso/context/
 .cortexkit/alfonso/prompts/
+.cortexkit/alfonso/task-outputs/
 .cortexkit/magic-context/
