@@ -256,6 +256,61 @@ serving those reads from its replica until a bundle without them is running,
 checking each removal against the running bundle's decoders. That list is
 core's.
 
+### Dependencies (other owners; none is an acceptance item here)
+
+- **ALF, core's half:**
+  - residence moves to its own table under today's all-or-nothing group CHECK;
+  - create becomes identity-first then residence, keeping core's caller check;
+  - the bot-token mint reads claims from entorhinal, embeds
+    `(incarnation, generation)`, and refuses when entorhinal cannot answer;
+  - `agent.fleet_overview` is deleted, and core serves its half keyed by
+    `agent_id`, with `pendingAskCount` attributed by agent;
+  - the seven operator scripts are repointed, with
+    `script/disable-nodark-outside-cortexkit.ts` (raw SQL on `agent`) as its own
+    item with its own test;
+  - core keeps a local identity replica fed from entorhinal's change feed, and
+    acts on retirements from it (revoking flows, removing scopes);
+  - `reserved:entorhinal` is listed as a carrier with
+    `destinations: ["cingulate"]`;
+  - in the cut, core's identity tables and write ops are removed; read ops that
+    running host plugins call keep serving from the replica until a bundle
+    without them is running, each removal checked against that bundle;
+  - core confirms against its implementation, not only the design, that the
+    named-session mint check stays sound once its two reads are in different
+    stores.
+- **ALF, cingulate:** `consent/v1` with the opaque `binding`, separate subject
+  and requester fields, and the two error codes. Until it is bound, entorhinal
+  refuses agent-initiated writes, so neither waits for the other.
+- **CKIOS, with the TUI and desktop owners:** the two-call fleet view per the
+  join vector, uploaded against the vector before the cut.
+- **CALLO:** expose entorhinal's identity reads to the phone profile; remove
+  simulators from the mutating and answering profiles. The second gates
+  app-initiated creation only.
+- **SUBC:** subc-protocol 0.29; the `ck` gate that an agent's shell cannot
+  satisfy; review of entorhinal becoming a stamp reader and a carrier.
+
+### Cutover order
+
+1. Entorhinal is placed on 0.29 with the identity store, reads, mutations,
+   tools and import, while core is still authoritative. Its identity store is
+   empty, nothing consumes it yet, and agent-initiated writes refuse
+   `consent_not_bound`.
+2. Callosum exposes entorhinal's identity reads to the phone. The phone build
+   with the two-call fleet view is built and uploaded against the vector.
+3. **The cut, in one restart window:** run the import against a snapshot of
+   core's store; verify invariants; place core's build that keeps an identity
+   replica fed from entorhinal and has its identity tables and write ops
+   removed; release the phone build.
+4. After the cut: compare the fleet view against the vector, check a bot-token
+   mint end to end, and confirm a retirement reaches core through the feed.
+   Measure how long a newly created agent shows as `unknown` in the fleet view
+   (entorhinal knows it, core has no row yet), and write that bound into the
+   join vector so clients do not each choose their own tolerance.
+5. Later, independently: cingulate is bound, after which janitor and head
+   creation work; Callosum's simulator hardening, after which app-initiated
+   creation is admitted; SUBC's `ck` gate, after which `Direct` project writes
+   tighten too.
+
 ## acceptance sketch
 
 Each acceptance item below is backed by a test or a command in this repository.
@@ -325,58 +380,6 @@ Each acceptance item below is backed by a test or a command in this repository.
 11. **Entorhinal runs on subc-protocol 0.29.** It decodes stamps carrying
     `flow_id`.
 
-## dependencies (other owners; none is an acceptance item here)
-
-- **ALF, core's half:**
-  - residence moves to its own table under today's all-or-nothing group CHECK;
-  - create becomes identity-first then residence, keeping core's caller check;
-  - the bot-token mint reads claims from entorhinal, embeds
-    `(incarnation, generation)`, and refuses when entorhinal cannot answer;
-  - `agent.fleet_overview` is deleted, and core serves its half keyed by
-    `agent_id`, with `pendingAskCount` attributed by agent;
-  - the seven operator scripts are repointed, with
-    `script/disable-nodark-outside-cortexkit.ts` (raw SQL on `agent`) as its own
-    item with its own test;
-  - core keeps a local identity replica fed from entorhinal's change feed, and
-    acts on retirements from it (revoking flows, removing scopes);
-  - `reserved:entorhinal` is listed as a carrier with
-    `destinations: ["cingulate"]`;
-  - in the cut, core's identity tables and write ops are removed; read ops that
-    running host plugins call keep serving from the replica until a bundle
-    without them is running, each removal checked against that bundle;
-  - core confirms against its implementation, not only the design, that the
-    named-session mint check stays sound once its two reads are in different
-    stores.
-- **ALF, cingulate:** `consent/v1` with the opaque `binding`, separate subject
-  and requester fields, and the two error codes. Until it is bound, entorhinal
-  refuses agent-initiated writes, so neither waits for the other.
-- **CKIOS, with the TUI and desktop owners:** the two-call fleet view per the
-  join vector, uploaded against the vector before the cut.
-- **CALLO:** expose entorhinal's identity reads to the phone profile; remove
-  simulators from the mutating and answering profiles. The second gates
-  app-initiated creation only.
-- **SUBC:** subc-protocol 0.29; the `ck` gate that an agent's shell cannot
-  satisfy; review of entorhinal becoming a stamp reader and a carrier.
-
-## cutover order
-
-1. Entorhinal is placed on 0.29 with the identity store, reads, mutations,
-   tools and import, while core is still authoritative. Its identity store is
-   empty, nothing consumes it yet, and agent-initiated writes refuse
-   `consent_not_bound`.
-2. Callosum exposes entorhinal's identity reads to the phone. The phone build
-   with the two-call fleet view is built and uploaded against the vector.
-3. **The cut, in one restart window:** run the import against a snapshot of
-   core's store; verify invariants; place core's build that keeps an identity
-   replica fed from entorhinal and has its identity tables and write ops
-   removed; release the phone build.
-4. After the cut: compare the fleet view against the vector, check a bot-token
-   mint end to end, and confirm a retirement notice reaches core.
-5. Later, independently: cingulate is bound, after which janitor and head
-   creation work; Callosum's simulator hardening, after which app-initiated
-   creation is admitted; SUBC's `ck` gate, after which `Direct` project writes
-   tighten too.
-
 ## non-goals
 
 - Flow identity. Flows are an attribute (`ScopeAttributes.flow_id`, set and
@@ -393,8 +396,3 @@ Each acceptance item below is backed by a test or a command in this repository.
   cross-module read on its delivery paths.
 
 ## open_questions
-
-- Does anything bound how long the fleet view's `unknown` state can last, the
-  window where entorhinal knows an agent and core has no row for it? Nothing is
-  measured yet. The bound is measured after the cut and written into the join
-  vector, rather than each client choosing its own tolerance.
