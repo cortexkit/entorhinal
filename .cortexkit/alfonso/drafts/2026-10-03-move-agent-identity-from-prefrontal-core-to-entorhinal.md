@@ -396,3 +396,7 @@ Each acceptance item below is backed by a test or a command in this repository.
   cross-module read on its delivery paths.
 
 ## open_questions
+
+None open. Every question raised during design was settled and is recorded as a
+constraint above; the one remaining unknown, how long the fleet view's `unknown`
+state lasts, is a measurement taken after the cut (cutover order, step 4).
