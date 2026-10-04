@@ -638,8 +638,9 @@ impl ProjectsHandler {
                     target: "liveness",
                     seq = batch.seq,
                     last_applied_seq = last,
-                    "refused an out-of-order session_liveness batch and asked for a snapshot; \
-                     the emitter is delivering out of seq order"
+                    "refused a session_liveness batch at or below the last applied seq and asked \
+                     for a snapshot; either the emitter restarted its counter without sending a \
+                     snapshot first, or it is delivering out of seq order"
                 );
             }
         }
