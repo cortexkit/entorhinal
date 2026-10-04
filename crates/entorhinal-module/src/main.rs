@@ -33,6 +33,7 @@ use subc_protocol::{
         GitTreeState, ManagementOperation, ManagementOperationKind, ManifestProvenance,
         ModuleManifest, ProviderRole,
     },
+    scope::ScopeStamp,
     ModuleHelloAckBody, Principal, PROTOCOL_VERSION,
 };
 
@@ -193,10 +194,27 @@ struct ProjectsHandler {
     store: Arc<Mutex<Option<RegistryStore>>>,
     health: Arc<HealthGauges>,
     liveness: Arc<Mutex<LivenessState>>,
-    /// The principal the daemon stamped on each route when it was bound. The
-    /// daemon stamps it once, at `route.bind`, never per request, so it is
-    /// recorded here and looked up for every request on that route.
-    route_principals: Mutex<HashMap<RouteKey, Option<Principal>>>,
+    /// What the daemon stamped on each route when it was bound. The daemon
+    /// stamps it once, at `route.bind`, never per request, so it is recorded
+    /// here and looked up for every request on that route.
+    route_admissions: Mutex<HashMap<RouteKey, RouteAdmission>>,
+}
+
+/// The parts of a route's bind stamp that decide what the route may do here.
+#[derive(Clone, Default)]
+struct RouteAdmission {
+    principal: Option<Principal>,
+    /// The flow whose scope the route was opened under, if any.
+    flow_id: Option<String>,
+}
+
+impl RouteAdmission {
+    fn from_bind(principal: Option<Principal>, scope: Option<&ScopeStamp>) -> Self {
+        Self {
+            principal,
+            flow_id: scope.and_then(|stamp| stamp.attributes.flow_id.clone()),
+        }
+    }
 }
 
 type RouteKey = (u16, u32);
@@ -255,6 +273,27 @@ fn authorize_write(method: &str, principal: Option<&Principal>) -> Result<(), Ha
     }
 }
 
+/// Refuse a mutating method on a route opened under a flow's scope, whoever
+/// opened it.
+///
+/// A flow acts as its owner agent, and the executive can open a route under a
+/// flow's scope, so that route carries the executive's principal. Admitting it
+/// on the principal alone would let a flow change the registry with authority
+/// granted only to the operator and the executive. No flow needs to write
+/// here, so every mutation on a flow-scoped route refuses. Reads stay open
+/// because they answer every caller alike.
+fn refuse_flow_write(method: &str, flow_id: Option<&str>) -> Result<(), HandlerError> {
+    match flow_id {
+        Some(flow_id) if MUTATING_METHODS.contains(&method) => Err(HandlerError {
+            code: "flow_scope_not_admitted".to_string(),
+            message: format!(
+                "'{method}' changes the registry and is not accepted on a route opened under flow '{flow_id}'"
+            ),
+        }),
+        _ => Ok(()),
+    }
+}
+
 fn principal_label(principal: Option<&Principal>) -> String {
     match principal {
         Some(Principal::Direct) => "direct".to_string(),
@@ -270,18 +309,32 @@ impl ProjectsHandler {
             store: Arc::new(Mutex::new(None)),
             health: Arc::new(HealthGauges::default()),
             liveness: Arc::new(Mutex::new(LivenessState::default())),
-            route_principals: Mutex::new(HashMap::new()),
+            route_admissions: Mutex::new(HashMap::new()),
         }
     }
 
-    fn route_principals(&self) -> std::sync::MutexGuard<'_, HashMap<RouteKey, Option<Principal>>> {
-        self.route_principals
+    fn route_admissions(&self) -> std::sync::MutexGuard<'_, HashMap<RouteKey, RouteAdmission>> {
+        self.route_admissions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn principal_for(&self, key: RouteKey) -> Option<Principal> {
-        self.route_principals().get(&key).cloned().flatten()
+    /// An unknown route gets the empty admission: no principal, which
+    /// `authorize_write` refuses rather than treating as the operator.
+    fn admission_for(&self, key: RouteKey) -> RouteAdmission {
+        self.route_admissions()
+            .get(&key)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Whether a request on this route may run `method`: a flow-scoped route
+    /// may not write at all, and otherwise only the operator and the executive
+    /// may write.
+    fn admit(&self, method: &str, key: RouteKey) -> Result<(), HandlerError> {
+        let admission = self.admission_for(key);
+        refuse_flow_write(method, admission.flow_id.as_deref())?;
+        authorize_write(method, admission.principal.as_ref())
     }
 
     fn with_store<T>(
@@ -327,8 +380,7 @@ impl ModuleHandler for ProjectsHandler {
             }
         };
 
-        let principal = self.principal_for(route_key(&ctx.route_handle()));
-        if let Err(error) = authorize_write(&request.method, principal.as_ref()) {
+        if let Err(error) = self.admit(&request.method, route_key(&ctx.route_handle())) {
             return HandlerOutcome::Error {
                 code: error.code,
                 message: error.message,
@@ -376,13 +428,15 @@ impl ModuleHandler for ProjectsHandler {
     }
 
     async fn on_bind(&self, request: &RouteBindRequest) -> BindDecision {
-        self.route_principals()
-            .insert(route_key(&request.handle), request.principal.clone());
+        self.route_admissions().insert(
+            route_key(&request.handle),
+            RouteAdmission::from_bind(request.principal.clone(), request.scope.as_ref()),
+        );
         BindDecision::accept()
     }
 
     async fn on_route_gone(&self, handle: &RouteHandle) {
-        self.route_principals().remove(&route_key(handle));
+        self.route_admissions().remove(&route_key(handle));
     }
 
     async fn on_hello_ack(&self, ack: &ModuleHelloAckBody) {
@@ -1208,6 +1262,117 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A stamp as the daemon would send it for a route opened under a flow's
+    /// scope, parsed from JSON so the test does not depend on how the protocol
+    /// crate builds one.
+    fn flow_stamp(flow_id: Option<&str>) -> ScopeStamp {
+        let mut attributes = serde_json::Map::new();
+        attributes.insert("agent_id".into(), json!("agent_0123456789abcdef"));
+        if let Some(flow_id) = flow_id {
+            attributes.insert("flow_id".into(), json!(flow_id));
+        }
+        serde_json::from_value(json!({
+            "owner": {"kind": "reserved", "module_id": WRITER_MODULE},
+            "ref": "head:agent_0123456789abcdef",
+            "scope_epoch": 1,
+            "kind": "head",
+            "attributes": attributes,
+            "owner_authorized": true,
+        }))
+        .expect("a stamp the daemon could send")
+    }
+
+    #[test]
+    fn a_bind_records_the_flow_its_scope_belongs_to() {
+        let flow = RouteAdmission::from_bind(
+            Some(reserved(WRITER_MODULE)),
+            Some(&flow_stamp(Some("fl_nightly"))),
+        );
+        assert_eq!(flow.flow_id.as_deref(), Some("fl_nightly"));
+
+        let head =
+            RouteAdmission::from_bind(Some(reserved(WRITER_MODULE)), Some(&flow_stamp(None)));
+        assert_eq!(head.flow_id, None, "a scope without a flow records none");
+
+        let unscoped = RouteAdmission::from_bind(Some(Principal::Direct), None);
+        assert_eq!(unscoped.flow_id, None, "an unscoped route records none");
+    }
+
+    /// The executive can open a route under a flow's scope, so the principal on
+    /// such a route is the executive's own. That must not let the flow write.
+    #[test]
+    fn a_flow_scoped_route_cannot_write_even_with_the_executives_principal() {
+        let admission = RouteAdmission::from_bind(
+            Some(reserved(WRITER_MODULE)),
+            Some(&flow_stamp(Some("fl_nightly"))),
+        );
+        assert!(
+            authorize_write("register", admission.principal.as_ref()).is_ok(),
+            "on the principal alone this write would be admitted, which is the gap"
+        );
+        for method in MUTATING_METHODS {
+            let error = refuse_flow_write(method, admission.flow_id.as_deref())
+                .expect_err("a flow must not change the registry");
+            assert_eq!(error.code, "flow_scope_not_admitted", "{method}");
+        }
+        for method in [
+            "resolve",
+            "resolve_project_id",
+            "enumerate",
+            "journal_tail",
+            "verify",
+        ] {
+            assert!(
+                refuse_flow_write(method, admission.flow_id.as_deref()).is_ok(),
+                "{method} is a read and answers every caller alike"
+            );
+        }
+        for method in MUTATING_METHODS {
+            assert!(
+                refuse_flow_write(method, None).is_ok(),
+                "{method} on a route with no flow is left to authorize_write"
+            );
+        }
+    }
+
+    /// The handler admits through `admit`, so this pins that the flow check is
+    /// actually applied to a bound route, not only that the check exists.
+    #[test]
+    fn the_handler_refuses_a_write_on_a_bound_flow_route() {
+        let handler = ProjectsHandler::new();
+        let flow_route: RouteKey = (7, 1);
+        let head_route: RouteKey = (8, 1);
+        handler.route_admissions().insert(
+            flow_route,
+            RouteAdmission::from_bind(
+                Some(reserved(WRITER_MODULE)),
+                Some(&flow_stamp(Some("fl_nightly"))),
+            ),
+        );
+        handler.route_admissions().insert(
+            head_route,
+            RouteAdmission::from_bind(Some(reserved(WRITER_MODULE)), Some(&flow_stamp(None))),
+        );
+
+        let error = handler
+            .admit("register", flow_route)
+            .expect_err("a flow route must not write");
+        assert_eq!(error.code, "flow_scope_not_admitted");
+        assert!(
+            handler.admit("enumerate", flow_route).is_ok(),
+            "reads stay open"
+        );
+        assert!(
+            handler.admit("register", head_route).is_ok(),
+            "the executive's own scoped route still writes"
+        );
+        assert_eq!(
+            handler.admit("register", (9, 1)).unwrap_err().code,
+            "write_not_permitted",
+            "an unknown route has no principal and is refused"
+        );
     }
 
     /// A mutation added to the manifest but missing from the write list would
