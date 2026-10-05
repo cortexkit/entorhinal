@@ -11,7 +11,7 @@ subc-transport = "0.10.0"
 subc-jsonc = "0.1.1"
 
 cortexkit-paths = "0.1.1"
-cortexkit-store = { version = "0.2.0", features = ["sqlite"] }
+cortexkit-store = { version = "0.2.1", features = ["sqlite"] }
 cortexkit-store-types = "0.2.2"
 cortexkit-log = "0.3.3"
 tracing = "0.1"
