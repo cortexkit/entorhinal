@@ -478,7 +478,8 @@ impl RegistryStore {
         })
     }
 
-    /// Read append-only journal rows after `after_seq`.
+    /// Read project journal rows after `after_seq`. Advance a full page to its
+    /// last seq, or a partial page to generation, passing skipped identity rows.
     pub fn journal_tail(
         &self,
         after_seq: i64,
@@ -486,10 +487,12 @@ impl RegistryStore {
     ) -> Result<JournalTailReply, RegistryError> {
         let limit = limit.clamp(1, 1_000);
         self.read(|conn| {
+            let snapshot = conn.unchecked_transaction()?;
+            let conn = &snapshot;
             let mut statement = conn.prepare(
                 "SELECT seq, op, payload_json, actor, request_key, created_at, principal
                  FROM registry_journal
-                 WHERE seq > ?1
+                  WHERE seq > ?1 AND op NOT LIKE 'agent.%'
                  ORDER BY seq
                  LIMIT ?2",
             )?;

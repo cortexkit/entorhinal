@@ -214,6 +214,16 @@ Entorhinal's half supports an unchanged token in the shape
 `session.transcript_page` already uses. A client sends the token it last
 received; if nothing has changed, the reply says so and carries no rows.
 
+`agent.fleet_identity` takes `{token?}` and replies with `{incarnation,
+generation, token, unchanged, agents?}`. The opaque token is built from the
+process incarnation and the journal head (`generation`). An equal token returns
+`unchanged: true` and omits `agents`; an absent, malformed, or different token
+returns the full identity set with `unchanged: false`. Every journal append
+invalidates it, including project/workspace edits and unrelated operations, not
+only agent identity edits. Every process restart creates a new incarnation and
+invalidates outstanding tokens, even if the journal head is unchanged or an
+older backup was restored.
+
 This is a condition of the design rather than an optimisation. Identity barely
 changes, so with the token a client polls only core's half at its usual cadence
 and asks entorhinal rarely, which makes the split **cheaper** than today's

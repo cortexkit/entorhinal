@@ -2,14 +2,19 @@
 //! residence, personas, wake policies or authority grants.
 
 mod claims;
+mod feed;
+mod fleet;
 pub mod import;
 mod journal;
 mod names;
+mod reads;
 pub mod schema;
 mod store;
 mod validate;
 
 pub use claims::AgentNameClaim;
+pub use feed::{AgentChangesReply, AgentSnapshotReply};
+pub use fleet::avatar_fingerprint;
 pub use journal::{replay_agent_entry, AgentChangeEntry};
 pub use names::*;
 pub use store::{valid_agent_id, AgentMutationError, AgentRow, StoredAgentAvatar};
