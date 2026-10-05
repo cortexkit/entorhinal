@@ -36,7 +36,9 @@ pub(super) fn activated(conn: &Connection) -> rusqlite::Result<bool> {
     )
 }
 
-// These are core's request fields, without its ambient caller/residence inputs.
+// Request bodies for the agent reads: core's field names and casing for the same
+// op, minus the caller-session and residence fields core uses for its own
+// residence checks. Core strips those before relaying, so they are refused here.
 // Source: prefrontal 873870be8 crates/prefrontal-core-module/src/agent_registry_ops.rs:558-601,658-705.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -191,7 +193,10 @@ impl RegistryStore {
                     let projects = conn.prepare("SELECT project_id FROM project_workspace WHERE workspace_id=?1")?
                         .query_map([&request.workspace_id], |r| r.get::<_, String>(0))?
                         .collect::<rusqlite::Result<BTreeSet<_>>>()?;
-                    // Membership and order come from the registry, not runtime reachability.
+                    // A workspace's peers are its live workspace head plus the live heads of
+                    // projects placed in it, ordered by agent id, exactly as core lists them.
+                    // Whether a peer is reachable right now is core's to add: it depends on
+                    // residence, which entorhinal doesn't hold.
                     // Source: prefrontal 873870be8 crates/prefrontal-core-module/src/agent_registry_ops.rs:1450-1464,1585-1626.
                     let peers = all_rows(conn)?.iter().filter(|row| row.status == "live" &&
                         ((row.role == "workspace_head" && row.workspace_id.as_deref() == Some(&request.workspace_id)) ||
@@ -252,8 +257,11 @@ impl RegistryStore {
     }
 }
 
-// Workspace prefixes are strict; a workspace_id hint falls back to foreign
-// matches. Match against stored workspace_id, never current project placement.
+// Resolve a name the way core does, so a lookup gives the same answer before
+// and after the move: a `workspace:` prefix restricts the match to that
+// workspace, while a `workspace_id` hint only prefers it and falls back to
+// matches elsewhere. Matching uses each agent's stored `workspace_id`, which is
+// the namespace its name was claimed in, not where its project sits today.
 // Source: prefrontal 873870be8 crates/prefrontal-core-module/src/agent_registry_ops.rs:1168-1289.
 fn resolve_name(conn: &Connection, request: &NameRequest) -> Result<Value, AgentMutationError> {
     let (prefix, raw_name) = match request.name.split_once('/') {
