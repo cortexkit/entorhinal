@@ -256,8 +256,9 @@ pub(crate) fn append(
     actor: &str,
     key: Option<&str>,
     now: i64,
+    principal: &str,
 ) -> rusqlite::Result<i64> {
-    tx.execute("INSERT INTO registry_journal(op,payload_json,actor,request_key,created_at) VALUES(?1,?2,?3,?4,?5)", params![op, serde_json::to_string(payload).unwrap(), actor, key, now])?;
+    tx.execute("INSERT INTO registry_journal(op,payload_json,actor,request_key,created_at,principal) VALUES(?1,?2,?3,?4,?5,?6)", params![op, serde_json::to_string(payload).unwrap(), actor, key, now, principal])?;
     Ok(tx.last_insert_rowid())
 }
 
@@ -287,6 +288,35 @@ fn wire(value: Value) -> Result<Vec<u8>, RegistryError> {
 }
 
 impl RegistryStore {
+    pub fn register(&self, req: RegisterRequest) -> Result<Vec<u8>, RegistryError> {
+        self.with_principal("entorhinal").register(req)
+    }
+
+    pub fn assign_workspace(&self, req: AssignWorkspaceRequest) -> Result<Vec<u8>, RegistryError> {
+        self.with_principal("entorhinal").assign_workspace(req)
+    }
+
+    pub fn set_workspace_root(
+        &self,
+        req: SetWorkspaceRootRequest,
+    ) -> Result<Vec<u8>, RegistryError> {
+        self.with_principal("entorhinal").set_workspace_root(req)
+    }
+
+    pub fn upgrade_implicit(&self, req: UpgradeImplicitRequest) -> Result<Vec<u8>, RegistryError> {
+        self.with_principal("entorhinal").upgrade_implicit(req)
+    }
+
+    pub fn remove(&self, req: RemoveRequest) -> Result<Vec<u8>, RegistryError> {
+        self.with_principal("entorhinal").remove(req)
+    }
+
+    pub fn seed_import(&self, req: SeedImportRequest) -> Result<Vec<u8>, RegistryError> {
+        self.with_principal("entorhinal").seed_import(req)
+    }
+}
+
+impl super::JournalWriter<'_> {
     pub(crate) fn mutation<F>(
         &self,
         op: &str,
@@ -423,7 +453,7 @@ impl RegistryStore {
             let alias_new= req.roots.iter().any(|r| tx.query_row("SELECT 1 FROM project_alias WHERE old_id=?1",[implicit_project_id(r)],|x|x.get::<_,i64>(0)).optional().unwrap_or(None).is_none()); changed |= alias_new;
             let mut response=json!({"projectId":project_id,"name":req.name,"roots":req.roots,"derivedRootParents":req.derived_root_parents,"warnings":aliases});
             if !changed { return Ok(Action{changed:false,seq:None,value:response,payload}); }
-            let seq=append(tx,"register",&payload,&actor,key.as_deref(),now)?;
+            let seq=append(tx,"register",&payload,&actor,key.as_deref(),now,self.principal)?;
             if existing.is_none() { tx.execute("INSERT INTO project(project_id,name,implicit,seed_identity,created_at,updated_at) VALUES(?1,?2,0,NULL,?3,?3)",params![&project_id,&req.name,now])?; } else { tx.execute("UPDATE project SET name=?1,updated_at=?2 WHERE project_id=?3",params![&req.name,&now,&project_id])?; }
             for root in &req.roots { tx.execute("INSERT OR IGNORE INTO project_root(canonical_root,project_id,added_at) VALUES(?1,?2,?3)",params![root,&project_id,now])?; let old=implicit_project_id(root); let _=tx.execute("INSERT OR IGNORE INTO project_alias(old_id,project_id,created_at) VALUES(?1,?2,?3)",params![old,&project_id,now])?; }
             for parent in &req.derived_root_parents { tx.execute("INSERT OR IGNORE INTO derived_root_parent(canonical_parent,project_id) VALUES(?1,?2)",[parent,&project_id])?; }
@@ -491,6 +521,7 @@ impl RegistryStore {
                     &actor,
                     key.as_deref(),
                     now,
+                    self.principal,
                 )?;
                 tx.execute("INSERT OR IGNORE INTO workspace(workspace_id,name,created_at,updated_at) VALUES(?1,?2,?3,?3)",params![&req.workspace_id,req.workspace_name.clone().unwrap_or_else(||req.workspace_id.clone()),now])?;
                 // The old membership row is REMOVED, not merely superseded.
@@ -577,6 +608,7 @@ impl RegistryStore {
                 &actor,
                 key.as_deref(),
                 now,
+                self.principal,
             )?;
             tx.execute(
                 "UPDATE workspace SET root=?1, updated_at=?2 WHERE workspace_id=?3",
@@ -625,7 +657,7 @@ impl RegistryStore {
         let actor = req.actor.clone().unwrap_or_else(|| "module".into());
         let payload =
             serde_json::to_value(&req).map_err(|e| domain("encode_failed", e.to_string()))?;
-        self.mutation("upgrade_implicit",key.clone().as_deref(),move|tx|{ let now=now_unix_millis(); if let Some(target)=tx.query_row("SELECT project_id FROM project_alias WHERE old_id=?1",[&req.implicit_id],|r|r.get::<_,String>(0)).optional()? {if target!=id{return Err(domain("alias_conflict",target));} let _=target;} let existing=tx.query_row("SELECT name FROM project WHERE project_id=?1",[&id],|r|r.get::<_,String>(0)).optional()?; let mut changed=existing.is_none()||existing.as_ref().is_some_and(|n|n!=&req.name); for r in &req.roots {changed|=tx.query_row("SELECT 1 FROM project_root WHERE canonical_root=?1",[r],|r|r.get::<_,i64>(0)).optional()?.is_none();} changed|=tx.query_row("SELECT project_id FROM project_alias WHERE old_id=?1",[&req.implicit_id],|r|r.get::<_,String>(0)).optional()?.is_none(); if !changed{return Ok(Action{changed:false,seq:None,value:json!({"projectId":id,"oldId":req.implicit_id}),payload});} let seq=append(tx,"upgrade_implicit",&payload,&actor,key.as_deref(),now)?; if existing.is_none(){tx.execute("INSERT INTO project(project_id,name,implicit,seed_identity,created_at,updated_at) VALUES(?1,?2,0,NULL,?3,?3)",params![&id,&req.name,now])?;} else {tx.execute("UPDATE project SET name=?1,updated_at=?2 WHERE project_id=?3",params![&req.name,now,&id])?;} for r in &req.roots{tx.execute("INSERT OR IGNORE INTO project_root(canonical_root,project_id,added_at) VALUES(?1,?2,?3)",params![r,&id,now])?;tx.execute("INSERT OR IGNORE INTO project_alias(old_id,project_id,created_at) VALUES(?1,?2,?3)",params![implicit_project_id(r),&id,now])?;} tx.execute("INSERT OR REPLACE INTO project_alias(old_id,project_id,created_at) VALUES(?1,?2,?3)",params![&req.implicit_id,&id,now])?; if let Some(w)=&req.workspace_id{tx.execute("INSERT OR IGNORE INTO workspace(workspace_id,name,created_at,updated_at) VALUES(?1,?1,?2,?2)",params![w,now])?;tx.execute("INSERT OR IGNORE INTO project_workspace(project_id,workspace_id) VALUES(?1,?2)",[&id,w])?;tx.execute("INSERT OR IGNORE INTO workspace_member(workspace_id,ref_kind,device_fingerprint,project_id) VALUES(?1,'local','',?2)",[w,&id])?;} Ok(Action{changed:true,seq:Some(seq),value:json!({"projectId":id,"oldId":req.implicit_id}),payload}) })
+        self.mutation("upgrade_implicit",key.clone().as_deref(),move|tx|{ let now=now_unix_millis(); if let Some(target)=tx.query_row("SELECT project_id FROM project_alias WHERE old_id=?1",[&req.implicit_id],|r|r.get::<_,String>(0)).optional()? {if target!=id{return Err(domain("alias_conflict",target));} let _=target;} let existing=tx.query_row("SELECT name FROM project WHERE project_id=?1",[&id],|r|r.get::<_,String>(0)).optional()?; let mut changed=existing.is_none()||existing.as_ref().is_some_and(|n|n!=&req.name); for r in &req.roots {changed|=tx.query_row("SELECT 1 FROM project_root WHERE canonical_root=?1",[r],|r|r.get::<_,i64>(0)).optional()?.is_none();} changed|=tx.query_row("SELECT project_id FROM project_alias WHERE old_id=?1",[&req.implicit_id],|r|r.get::<_,String>(0)).optional()?.is_none(); if !changed{return Ok(Action{changed:false,seq:None,value:json!({"projectId":id,"oldId":req.implicit_id}),payload});} let seq=append(tx,"upgrade_implicit",&payload,&actor,key.as_deref(),now,self.principal)?; if existing.is_none(){tx.execute("INSERT INTO project(project_id,name,implicit,seed_identity,created_at,updated_at) VALUES(?1,?2,0,NULL,?3,?3)",params![&id,&req.name,now])?;} else {tx.execute("UPDATE project SET name=?1,updated_at=?2 WHERE project_id=?3",params![&req.name,now,&id])?;} for r in &req.roots{tx.execute("INSERT OR IGNORE INTO project_root(canonical_root,project_id,added_at) VALUES(?1,?2,?3)",params![r,&id,now])?;tx.execute("INSERT OR IGNORE INTO project_alias(old_id,project_id,created_at) VALUES(?1,?2,?3)",params![implicit_project_id(r),&id,now])?;} tx.execute("INSERT OR REPLACE INTO project_alias(old_id,project_id,created_at) VALUES(?1,?2,?3)",params![&req.implicit_id,&id,now])?; if let Some(w)=&req.workspace_id{tx.execute("INSERT OR IGNORE INTO workspace(workspace_id,name,created_at,updated_at) VALUES(?1,?1,?2,?2)",params![w,now])?;tx.execute("INSERT OR IGNORE INTO project_workspace(project_id,workspace_id) VALUES(?1,?2)",[&id,w])?;tx.execute("INSERT OR IGNORE INTO workspace_member(workspace_id,ref_kind,device_fingerprint,project_id) VALUES(?1,'local','',?2)",[w,&id])?;} Ok(Action{changed:true,seq:Some(seq),value:json!({"projectId":id,"oldId":req.implicit_id}),payload}) })
     }
 
     pub fn remove(&self, req: RemoveRequest) -> Result<Vec<u8>, RegistryError> {
@@ -633,7 +665,7 @@ impl RegistryStore {
         let actor = req.actor.clone().unwrap_or_else(|| "module".into());
         let payload =
             serde_json::to_value(&req).map_err(|e| domain("encode_failed", e.to_string()))?;
-        self.mutation("remove",key.clone().as_deref(),move|tx|{let now=now_unix_millis(); if let Some(w)=&req.workspace_id {if tx.query_row("SELECT 1 FROM workspace WHERE workspace_id=?1",[w],|r|r.get::<_,i64>(0)).optional()?.is_none(){return Err(domain("not_found",w));} let seq=append(tx,"remove",&payload,&actor,key.as_deref(),now)?; tx.execute("DELETE FROM project_workspace WHERE workspace_id=?1",[w])?; tx.execute("DELETE FROM workspace_member WHERE workspace_id=?1",[w])?; tx.execute("DELETE FROM workspace WHERE workspace_id=?1",[w])?; return Ok(Action{changed:true,seq:Some(seq),value:json!({"workspaceId":w}),payload});} let id=req.project_id.clone().ok_or_else(||domain("invalid_params","projectId is required"))?; if tx.query_row("SELECT 1 FROM project WHERE project_id=?1",[&id],|r|r.get::<_,i64>(0)).optional()?.is_none(){return Err(domain("not_found",id)); }; if let Some(s)=&req.successor_project_id {if s==&id||tx.query_row("SELECT 1 FROM project WHERE project_id=?1",[s],|r|r.get::<_,i64>(0)).optional()?.is_none(){return Err(domain("not_found",s));}} let dropped=tx.query_row("SELECT workspace_id FROM project_workspace WHERE project_id=?1",[&id],|r|r.get::<_,String>(0)).optional()?; let seq=append(tx,"remove",&payload,&actor,key.as_deref(),now)?; super::binding::retire_project_bindings(tx,&id,seq)?; if let Some(s)=&req.successor_project_id {tx.execute("UPDATE project_root SET project_id=?1 WHERE project_id=?2",[s,&id])?;tx.execute("UPDATE derived_root_parent SET project_id=?1 WHERE project_id=?2",[s,&id])?;tx.execute("UPDATE project_alias SET project_id=?1 WHERE project_id=?2",[s,&id])?;tx.execute("DELETE FROM project_alias WHERE old_id=?1",[&id])?;tx.execute("INSERT OR REPLACE INTO project_alias(old_id,project_id,created_at) VALUES(?1,?2,?3)",params![&id,s,now])?;} else {tx.execute("DELETE FROM project_root WHERE project_id=?1",[&id])?;tx.execute("DELETE FROM derived_root_parent WHERE project_id=?1",[&id])?;tx.execute("DELETE FROM project_alias WHERE project_id=?1 OR old_id=?1",[&id])?;} tx.execute("DELETE FROM project_workspace WHERE project_id=?1",[&id])?;tx.execute("DELETE FROM workspace_member WHERE ref_kind='local' AND project_id=?1",[&id])?;tx.execute("DELETE FROM project WHERE project_id=?1",[&id])?;Ok(Action{changed:true,seq:Some(seq),value:json!({"projectId":id,"successorProjectId":req.successor_project_id,"droppedWorkspaceId":dropped}),payload}) })
+        self.mutation("remove",key.clone().as_deref(),move|tx|{let now=now_unix_millis(); if let Some(w)=&req.workspace_id {if tx.query_row("SELECT 1 FROM workspace WHERE workspace_id=?1",[w],|r|r.get::<_,i64>(0)).optional()?.is_none(){return Err(domain("not_found",w));} let seq=append(tx,"remove",&payload,&actor,key.as_deref(),now,self.principal)?; tx.execute("DELETE FROM project_workspace WHERE workspace_id=?1",[w])?; tx.execute("DELETE FROM workspace_member WHERE workspace_id=?1",[w])?; tx.execute("DELETE FROM workspace WHERE workspace_id=?1",[w])?; return Ok(Action{changed:true,seq:Some(seq),value:json!({"workspaceId":w}),payload});} let id=req.project_id.clone().ok_or_else(||domain("invalid_params","projectId is required"))?; if tx.query_row("SELECT 1 FROM project WHERE project_id=?1",[&id],|r|r.get::<_,i64>(0)).optional()?.is_none(){return Err(domain("not_found",id)); }; if let Some(s)=&req.successor_project_id {if s==&id||tx.query_row("SELECT 1 FROM project WHERE project_id=?1",[s],|r|r.get::<_,i64>(0)).optional()?.is_none(){return Err(domain("not_found",s));}} let dropped=tx.query_row("SELECT workspace_id FROM project_workspace WHERE project_id=?1",[&id],|r|r.get::<_,String>(0)).optional()?; let seq=append(tx,"remove",&payload,&actor,key.as_deref(),now,self.principal)?; super::binding::retire_project_bindings(tx,&id,seq)?; if let Some(s)=&req.successor_project_id {tx.execute("UPDATE project_root SET project_id=?1 WHERE project_id=?2",[s,&id])?;tx.execute("UPDATE derived_root_parent SET project_id=?1 WHERE project_id=?2",[s,&id])?;tx.execute("UPDATE project_alias SET project_id=?1 WHERE project_id=?2",[s,&id])?;tx.execute("DELETE FROM project_alias WHERE old_id=?1",[&id])?;tx.execute("INSERT OR REPLACE INTO project_alias(old_id,project_id,created_at) VALUES(?1,?2,?3)",params![&id,s,now])?;} else {tx.execute("DELETE FROM project_root WHERE project_id=?1",[&id])?;tx.execute("DELETE FROM derived_root_parent WHERE project_id=?1",[&id])?;tx.execute("DELETE FROM project_alias WHERE project_id=?1 OR old_id=?1",[&id])?;} tx.execute("DELETE FROM project_workspace WHERE project_id=?1",[&id])?;tx.execute("DELETE FROM workspace_member WHERE ref_kind='local' AND project_id=?1",[&id])?;tx.execute("DELETE FROM project WHERE project_id=?1",[&id])?;Ok(Action{changed:true,seq:Some(seq),value:json!({"projectId":id,"successorProjectId":req.successor_project_id,"droppedWorkspaceId":dropped}),payload}) })
     }
 }
 
@@ -662,7 +694,7 @@ struct SeedReportEntry {
     reason: Option<String>,
 }
 
-impl RegistryStore {
+impl super::JournalWriter<'_> {
     pub fn seed_import(&self, mut req: SeedImportRequest) -> Result<Vec<u8>, RegistryError> {
         if req.source != "mc" {
             return Err(domain("invalid_source", &req.source));
@@ -746,10 +778,12 @@ impl RegistryStore {
                 if owners.values().collect::<BTreeSet<_>>().len()>1 || (target.is_some() && !owners.is_empty() && !available.is_empty()) {report.push(SeedReportEntry{kind:"identity_split".into(),mc_identity:Some(identity.clone()),canonical_root:None,project_id:None,owner_project_id:None,new_project_id:target.clone(),roots:Some(available.iter().map(|p|p.canonical_root.clone()).collect()),reason:None});}
                 let Some(project)=target else {continue}; if !available.is_empty() || live.is_none() {let name=req.payload.names.get(&identity).cloned().or_else(||rows.first().and_then(|p|p.name.clone())).unwrap_or_else(||Path::new(&rows[0].canonical_root).file_name().map(|x|x.to_string_lossy().into_owned()).unwrap_or_else(||identity.clone())); if live.is_none(){tx.execute("INSERT INTO project(project_id,name,implicit,seed_identity,created_at,updated_at) VALUES(?1,?2,0,?3,?4,?4)",params![project,name,identity,now])?;changed=true;} for p in &available {tx.execute("INSERT OR IGNORE INTO project_root(canonical_root,project_id,added_at) VALUES(?1,?2,?3)",params![p.canonical_root,project,now])?;tx.execute("INSERT OR IGNORE INTO project_alias(old_id,project_id,created_at) VALUES(?1,?2,?3)",params![implicit_project_id(&p.canonical_root),project,now])?;changed=true;} let claims=req.payload.members.iter().filter(|m|m.mc_identity==identity).map(|m|m.workspace_id.clone()).collect::<BTreeSet<_>>(); if claims.len()==1 {let w=claims.iter().next().unwrap();tx.execute("INSERT OR IGNORE INTO project_workspace(project_id,workspace_id) VALUES(?1,?2)",params![project,w])?;tx.execute("INSERT OR IGNORE INTO workspace_member(workspace_id,ref_kind,device_fingerprint,project_id) VALUES(?1,'local','',?2)",params![w,project])?;changed=true;} else if claims.len()>1 {report.push(SeedReportEntry{kind:"multi_workspace".into(),mc_identity:Some(identity.clone()),canonical_root:None,project_id:Some(project.clone()),owner_project_id:None,new_project_id:None,roots:None,reason:Some("detached because export claimed multiple workspaces".into())});}}
             }
-            let value=json!({"report":report}); if !changed {return Ok(Action{changed:false,seq:None,value,payload});} let seq=append(tx,"seed_import",&payload,&actor,key.as_deref(),now)?; Ok(Action{changed:true,seq:Some(seq),value,payload})
+            let value=json!({"report":report}); if !changed {return Ok(Action{changed:false,seq:None,value,payload});} let seq=append(tx,"seed_import",&payload,&actor,key.as_deref(),now,self.principal)?; Ok(Action{changed:true,seq:Some(seq),value,payload})
         })
     }
+}
 
+impl RegistryStore {
     pub fn verify(&self) -> Result<VerifyReply, RegistryError> {
         self.read(|conn| { let mut mismatches=Vec::new(); let local: i64=conn.query_row("SELECT COUNT(*) FROM workspace_member WHERE ref_kind='local'",[],|r|r.get(0))?; let pairs:i64=conn.query_row("SELECT COUNT(*) FROM project_workspace",[],|r|r.get(0))?; let mut stmt=conn.prepare("SELECT wm.workspace_id,wm.project_id FROM workspace_member wm LEFT JOIN project_workspace pw ON pw.workspace_id=wm.workspace_id AND pw.project_id=wm.project_id WHERE wm.ref_kind='local' AND pw.project_id IS NULL")?; for row in stmt.query_map([],|r|Ok(format!("{}:{}",r.get::<_,String>(0)?,r.get::<_,String>(1)?)))? {mismatches.push(row?);} let mut stmt=conn.prepare("SELECT pw.workspace_id,pw.project_id FROM project_workspace pw LEFT JOIN workspace_member wm ON wm.workspace_id=pw.workspace_id AND wm.project_id=pw.project_id AND wm.ref_kind='local' WHERE wm.project_id IS NULL")?; for row in stmt.query_map([],|r|Ok(format!("{}:{}",r.get::<_,String>(0)?,r.get::<_,String>(1)?)))? {mismatches.push(row?);} Ok(VerifyReply{ok:mismatches.is_empty(),local_members:local,project_workspaces:pairs,mismatches,generation:self.generation_from_connection(conn)?}) })
     }

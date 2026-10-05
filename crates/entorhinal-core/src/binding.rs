@@ -628,6 +628,35 @@ impl RegistryStore {
         self.ids = IdSource::Sequence(AtomicU64::new(0));
     }
 
+    pub fn bind_root(&self, canonical_root: &str, actor: &str) -> Result<Vec<u8>, RegistryError> {
+        self.with_principal("entorhinal")
+            .bind_root(canonical_root, actor)
+    }
+
+    pub fn bind_unbound_roots(&self, actor: &str) -> Result<Vec<BindReport>, RegistryError> {
+        self.with_principal("entorhinal").bind_unbound_roots(actor)
+    }
+
+    pub fn approve_root(
+        &self,
+        canonical_root: &str,
+        actor: &str,
+    ) -> Result<Vec<u8>, RegistryError> {
+        self.with_principal("entorhinal")
+            .approve_root(canonical_root, actor)
+    }
+
+    pub fn unapprove_root(
+        &self,
+        canonical_root: &str,
+        actor: &str,
+    ) -> Result<Vec<u8>, RegistryError> {
+        self.with_principal("entorhinal")
+            .unapprove_root(canonical_root, actor)
+    }
+}
+
+impl super::JournalWriter<'_> {
     /// Bind a registered root to the checkout on disk. A root already bound to
     /// the checkout that is there is left alone. A root whose checkout was
     /// replaced gets a new binding; the old epoch is retired as `replaced` and
@@ -691,6 +720,7 @@ impl RegistryStore {
                 &actor,
                 None,
                 super::now_unix_millis(),
+                self.principal,
             )?;
             apply_bind(tx, &payload, seq)?;
             Ok(Action {
@@ -788,8 +818,15 @@ impl RegistryStore {
                 registration_epoch: epoch.clone(),
             })
             .map_err(|error| domain("encode_failed", error.to_string()))?;
-            let seq =
-                super::mutations::append(tx, op, &payload, &actor, None, super::now_unix_millis())?;
+            let seq = super::mutations::append(
+                tx,
+                op,
+                &payload,
+                &actor,
+                None,
+                super::now_unix_millis(),
+                self.principal,
+            )?;
             replay_binding_op(tx, seq, op, &payload)?;
             Ok(Action {
                 changed: true,
@@ -799,7 +836,9 @@ impl RegistryStore {
             })
         })
     }
+}
 
+impl RegistryStore {
     /// Resolve with ancestor walking and root records. Used when root records
     /// are enabled; otherwise `resolve` answers in the legacy shape.
     ///
@@ -1093,6 +1132,34 @@ pub(crate) fn replay_root_op(
 }
 
 impl RegistryStore {
+    pub fn add_root(&self, request: AddRootRequest) -> Result<Vec<u8>, RegistryError> {
+        self.with_principal("entorhinal").add_root(request)
+    }
+
+    pub fn remove_root(&self, request: RemoveRootRequest) -> Result<Vec<u8>, RegistryError> {
+        self.with_principal("entorhinal").remove_root(request)
+    }
+
+    pub fn attach_derived_parent(
+        &self,
+        request: AttachDerivedParentRequest,
+    ) -> Result<Vec<u8>, RegistryError> {
+        self.with_principal("entorhinal")
+            .attach_derived_parent(request)
+    }
+
+    pub fn set_project_approval(
+        &self,
+        raw_path: &str,
+        actor: &str,
+        approve: bool,
+    ) -> Result<Vec<u8>, RegistryError> {
+        self.with_principal("entorhinal")
+            .set_project_approval(raw_path, actor, approve)
+    }
+}
+
+impl super::JournalWriter<'_> {
     /// Add a root to an existing project. Refused when the root belongs to
     /// another project, nests inside or around any registered root, sits in or
     /// around a worker container, or names a GitHub repository another project
@@ -1163,7 +1230,15 @@ impl RegistryStore {
             let payload = serde_json::to_value(&request)
                 .map_err(|error| domain("encode_failed", error.to_string()))?;
             let now = super::now_unix_millis();
-            let seq = super::mutations::append(tx, "add_root", &payload, &actor, None, now)?;
+            let seq = super::mutations::append(
+                tx,
+                "add_root",
+                &payload,
+                &actor,
+                None,
+                now,
+                self.principal,
+            )?;
             apply_add_root(tx, &request, now)?;
             Ok(Action {
                 changed: true,
@@ -1225,6 +1300,7 @@ impl RegistryStore {
                 &actor,
                 None,
                 super::now_unix_millis(),
+                self.principal,
             )?;
             apply_remove_root(tx, &request, seq)?;
             Ok(Action {
@@ -1303,7 +1379,7 @@ impl RegistryStore {
                 return Err(domain("container_overlaps", format!("{} overlaps registered root {root}", request.container)));
             }
             let payload = serde_json::to_value(&request).map_err(|error| domain("encode_failed", error.to_string()))?;
-            let seq = super::mutations::append(tx, "attach_derived_parent", &payload, &actor, None, super::now_unix_millis())?;
+            let seq = super::mutations::append(tx, "attach_derived_parent", &payload, &actor, None, super::now_unix_millis(), self.principal)?;
             apply_attach(tx, &request)?;
             Ok(Action { changed: true, seq: Some(seq), value, payload })
         })
@@ -1359,7 +1435,9 @@ impl RegistryStore {
         }
         super::mutations::wire_value(json!({"projectId": reply.project_id, "roots": roots}))
     }
+}
 
+impl RegistryStore {
     /// Resolve with root records even when `ENTORHINAL_ROOT_RECORDS` is off.
     /// `ck projects trust` uses it to show approval; it changes nothing.
     pub fn trust(&self, raw_path: &str) -> Result<ResolveReply, RegistryError> {

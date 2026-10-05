@@ -103,7 +103,11 @@ CREATE TABLE project_alias (
 /// NULL means "no root" and a reader must not guess one.
 pub const V2_WORKSPACE_ROOT: &str = "ALTER TABLE workspace ADD COLUMN root TEXT NULL;";
 
-const MIGRATIONS: [Migration; 4] = [
+/// Existing journal rows retain NULL; all new writers supply their principal.
+pub const V5_JOURNAL_PRINCIPAL: &str =
+    "ALTER TABLE registry_journal ADD COLUMN principal TEXT NULL;";
+
+const MIGRATIONS: [Migration; 5] = [
     Migration {
         version: 1,
         statements: V1_SCHEMA,
@@ -120,6 +124,10 @@ const MIGRATIONS: [Migration; 4] = [
         version: 4,
         statements: agent::schema::V4_AGENT_IDENTITY,
     },
+    Migration {
+        version: 5,
+        statements: V5_JOURNAL_PRINCIPAL,
+    },
 ];
 
 /// A store opened from the descriptor resolved by subc.
@@ -132,6 +140,22 @@ pub struct RegistryStore {
     ids: binding::IdSource,
 }
 
+/// A borrowed write context carrying the attested principal independently of
+/// the request's actor. Nested writes use the same context, without changing
+/// shared store state or allowing a request to set its principal in the body.
+pub struct JournalWriter<'a> {
+    store: &'a RegistryStore,
+    principal: &'a str,
+}
+
+impl std::ops::Deref for JournalWriter<'_> {
+    type Target = RegistryStore;
+
+    fn deref(&self) -> &Self::Target {
+        self.store
+    }
+}
+
 impl fmt::Debug for RegistryStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RegistryStore")
@@ -141,6 +165,15 @@ impl fmt::Debug for RegistryStore {
 }
 
 impl RegistryStore {
+    /// Attribute writes to a route principal. Calls directly on the store are
+    /// internal writes and record `entorhinal` instead.
+    pub fn with_principal<'a>(&'a self, principal: &'a str) -> JournalWriter<'a> {
+        JournalWriter {
+            store: self,
+            principal,
+        }
+    }
+
     /// Open the descriptor's sqlite database, acquire its single-writer lease, and
     /// apply the namespaced schema chain exactly once.
     pub fn open(descriptor: &StorageDescriptor) -> Result<Self, RegistryError> {
@@ -454,7 +487,7 @@ impl RegistryStore {
         let limit = limit.clamp(1, 1_000);
         self.read(|conn| {
             let mut statement = conn.prepare(
-                "SELECT seq, op, payload_json, actor, request_key, created_at
+                "SELECT seq, op, payload_json, actor, request_key, created_at, principal
                  FROM registry_journal
                  WHERE seq > ?1
                  ORDER BY seq
@@ -469,6 +502,7 @@ impl RegistryStore {
                         actor: row.get(3)?,
                         request_key: row.get(4)?,
                         created_at: row.get(5)?,
+                        principal: row.get(6)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -497,19 +531,13 @@ impl RegistryStore {
         request_key: Option<&str>,
         apply_projection: impl FnOnce(&Transaction<'_>) -> rusqlite::Result<T>,
     ) -> Result<(i64, T), RegistryError> {
-        self.db
-            .with_conn_fenced(|tx| {
-                tx.execute(
-                    "INSERT INTO registry_journal
-                     (op, payload_json, actor, request_key, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![op, payload_json, actor, request_key, now_unix_millis()],
-                )?;
-                let actual_seq = tx.last_insert_rowid();
-                let result = apply_projection(tx)?;
-                Ok((actual_seq, result))
-            })
-            .map_err(RegistryError::Store)
+        self.with_principal("entorhinal").apply_entry(
+            op,
+            payload_json,
+            actor,
+            request_key,
+            apply_projection,
+        )
     }
 
     fn read<T>(
@@ -641,6 +669,39 @@ impl RegistryStore {
     }
 }
 
+impl JournalWriter<'_> {
+    /// Append a row and apply its projection atomically under this principal.
+    pub fn apply_entry<T>(
+        &self,
+        op: &str,
+        payload_json: &str,
+        actor: &str,
+        request_key: Option<&str>,
+        apply_projection: impl FnOnce(&Transaction<'_>) -> rusqlite::Result<T>,
+    ) -> Result<(i64, T), RegistryError> {
+        self.db
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "INSERT INTO registry_journal
+                     (op, payload_json, actor, request_key, created_at, principal)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        op,
+                        payload_json,
+                        actor,
+                        request_key,
+                        now_unix_millis(),
+                        self.principal
+                    ],
+                )?;
+                let actual_seq = tx.last_insert_rowid();
+                let result = apply_projection(tx)?;
+                Ok((actual_seq, result))
+            })
+            .map_err(RegistryError::Store)
+    }
+}
+
 /// A domain failure that can be mapped to a module error without importing subc.
 #[derive(Debug)]
 pub enum RegistryError {
@@ -760,6 +821,9 @@ pub struct JournalEntry {
     pub actor: String,
     pub request_key: Option<String>,
     pub created_at: i64,
+    /// Persisted attribution, kept off the legacy project journal wire shape.
+    #[serde(skip)]
+    pub principal: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -946,6 +1010,142 @@ mod tests {
                 Ok(())
             })
             .expect("insert test project");
+    }
+
+    #[test]
+    fn journal_principal_migration_keeps_legacy_cache_actor_and_projection() {
+        let scratch = TestStore::new("legacy-journal-principal");
+        let descriptor = StorageDescriptor {
+            module_id: "legacy-journal-test".into(),
+            storage_namespace: "test".into(),
+            isolation: cortexkit_store::Isolation::Module,
+            backend: cortexkit_store::StorageBackend::Sqlite {
+                path: scratch
+                    .root
+                    .join("legacy.db")
+                    .to_string_lossy()
+                    .into_owned(),
+            },
+        };
+        let old = RegistryStore::open_with_migrations(&descriptor, &MIGRATIONS[..4]).unwrap();
+        let request = RegisterRequest {
+            project_id: Some("legacy".into()),
+            name: "Legacy".into(),
+            request_key: Some("K".into()),
+            actor: Some("original actor".into()),
+            ..Default::default()
+        };
+        let cached =
+            r#"{"result":{"projectId":"legacy","name":"Legacy","generation":1,"noop":false}}"#;
+        old.db.with_conn_fenced(|tx| {
+            tx.execute(
+                "INSERT INTO registry_journal(op,payload_json,actor,request_key,created_at,response_json)
+                 VALUES('register',?1,'original actor','K',123,?2)",
+                params![serde_json::to_string(&request).unwrap(), cached],
+            )?;
+            tx.execute("INSERT INTO project(project_id,name,implicit,created_at,updated_at) VALUES('legacy','Legacy',0,123,123)", [])?;
+            Ok(())
+        }).unwrap();
+        drop(old);
+
+        let store = RegistryStore::open(&descriptor).unwrap();
+        store
+            .read(|conn| {
+                let columns = conn
+                    .prepare("PRAGMA table_info(registry_journal)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                assert_eq!(
+                    columns,
+                    [
+                        "seq",
+                        "op",
+                        "payload_json",
+                        "actor",
+                        "request_key",
+                        "created_at",
+                        "response_json",
+                        "principal"
+                    ]
+                );
+                Ok(())
+            })
+            .unwrap();
+        let before = serde_json::to_value(store.enumerate(None).unwrap()).unwrap();
+        assert_eq!(
+            store.with_principal("direct").register(request).unwrap(),
+            cached.as_bytes()
+        );
+        assert_eq!(store.generation().unwrap(), 1);
+        store.rebuild().unwrap();
+        assert_eq!(
+            serde_json::to_value(store.enumerate(None).unwrap()).unwrap(),
+            before
+        );
+        let row = store.journal_tail(0, 10).unwrap().entries.remove(0);
+        assert_eq!(row.principal, None);
+        assert_eq!(row.actor, "original actor");
+        assert_eq!(row.request_key.as_deref(), Some("K"));
+        assert_eq!(row.op, "register");
+        drop(store);
+    }
+
+    #[test]
+    fn journal_writer_principal_is_independent_of_actor_and_does_not_leak() {
+        let scratch = TestStore::new("journal-writers");
+        for (index, principal) in ["direct", "reserved:prefrontal-core", "unverified"]
+            .into_iter()
+            .enumerate()
+        {
+            scratch
+                .store
+                .with_principal(principal)
+                .register(RegisterRequest {
+                    project_id: Some(format!("project-{index}")),
+                    name: format!("Project {index}"),
+                    actor: Some("body actor".into()),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        scratch
+            .store
+            .apply_entry("internal", "{}", "internal actor", None, |_| Ok(()))
+            .unwrap();
+        scratch
+            .store
+            .with_principal("reserved:other")
+            .apply_entry("explicit", "{}", "another actor", None, |_| Ok(()))
+            .unwrap();
+        let entries = scratch.store.journal_tail(0, 10).unwrap().entries;
+        assert_eq!(
+            entries
+                .iter()
+                .map(|row| row.principal.as_deref())
+                .collect::<Vec<_>>(),
+            [
+                Some("direct"),
+                Some("reserved:prefrontal-core"),
+                Some("unverified"),
+                Some("entorhinal"),
+                Some("reserved:other")
+            ]
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .take(3)
+                .map(|row| row.actor.as_str())
+                .collect::<Vec<_>>(),
+            ["body actor"; 3]
+        );
+        assert!(
+            serde_json::to_value(&entries[0])
+                .unwrap()
+                .get("principal")
+                .is_none(),
+            "the project journal wire shape stays unchanged"
+        );
     }
 
     #[test]

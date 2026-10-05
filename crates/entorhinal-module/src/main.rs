@@ -201,7 +201,7 @@ struct ProjectsHandler {
 }
 
 /// The parts of a route's bind stamp that decide what the route may do here.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 struct RouteAdmission {
     principal: Option<Principal>,
     /// The flow whose scope the route was opened under, if any.
@@ -331,10 +331,11 @@ impl ProjectsHandler {
     /// Whether a request on this route may run `method`: a flow-scoped route
     /// may not write at all, and otherwise only the operator and the executive
     /// may write.
-    fn admit(&self, method: &str, key: RouteKey) -> Result<(), HandlerError> {
+    fn admit(&self, method: &str, key: RouteKey) -> Result<RouteAdmission, HandlerError> {
         let admission = self.admission_for(key);
         refuse_flow_write(method, admission.flow_id.as_deref())?;
-        authorize_write(method, admission.principal.as_ref())
+        authorize_write(method, admission.principal.as_ref())?;
+        Ok(admission)
     }
 
     fn with_store<T>(
@@ -380,45 +381,7 @@ impl ModuleHandler for ProjectsHandler {
             }
         };
 
-        if let Err(error) = self.admit(&request.method, route_key(&ctx.route_handle())) {
-            return HandlerOutcome::Error {
-                code: error.code,
-                message: error.message,
-            };
-        }
-
-        let result = match request.method.as_str() {
-            "resolve" => self.resolve(request.params),
-            "resolve_project_id" => self.resolve_project_id(request.params),
-            "enumerate" => self.enumerate(request.params),
-            "journal_tail" => self.journal_tail(request.params),
-            "register" => self.register(request.params),
-            "assign_workspace" => self.assign_workspace(request.params),
-            "set_workspace_root" => self.set_workspace_root(request.params),
-            "upgrade_implicit" => self.upgrade_implicit(request.params),
-            "remove" => self.remove(request.params),
-            "seed_import" => self.seed_import(request.params),
-            "projects.session_liveness" => self.session_liveness(request.params),
-            "add_root" => self.add_root(request.params),
-            "remove_root" => self.remove_root(request.params),
-            "attach_derived_parent" => self.attach_derived_parent(request.params),
-            "approve_root" => self.set_root_approval(request.params, true),
-            "unapprove_root" => self.set_root_approval(request.params, false),
-            "trust" => self.trust(request.params),
-            "approve_project" => self.set_project_approval(request.params, true),
-            "unapprove_project" => self.set_project_approval(request.params, false),
-            "verify" => self.verify(),
-            "rebuild" => self.rebuild(),
-            _ => Err(HandlerError {
-                code: "unknown_method".to_string(),
-                message: format!(
-                    "unknown projects method '{}', see the management manifest",
-                    request.method
-                ),
-            }),
-        };
-
-        match result {
+        match self.execute(request, route_key(&ctx.route_handle())) {
             Ok(body) => HandlerOutcome::Response(body),
             Err(error) => HandlerOutcome::Error {
                 code: error.code,
@@ -540,6 +503,43 @@ struct LivenessSession {
 }
 
 impl ProjectsHandler {
+    /// Admission and attribution use the same bind snapshot, including all
+    /// secondary rows appended while handling this request.
+    fn execute(&self, request: WireRequest, key: RouteKey) -> Result<Vec<u8>, HandlerError> {
+        let admission = self.admit(&request.method, key)?;
+        let principal = principal_label(admission.principal.as_ref());
+        match request.method.as_str() {
+            "resolve" => self.resolve(request.params),
+            "resolve_project_id" => self.resolve_project_id(request.params),
+            "enumerate" => self.enumerate(request.params),
+            "journal_tail" => self.journal_tail(request.params),
+            "register" => self.register(request.params, &principal),
+            "assign_workspace" => self.assign_workspace(request.params, &principal),
+            "set_workspace_root" => self.set_workspace_root(request.params, &principal),
+            "upgrade_implicit" => self.upgrade_implicit(request.params, &principal),
+            "remove" => self.remove(request.params, &principal),
+            "seed_import" => self.seed_import(request.params, &principal),
+            "projects.session_liveness" => self.session_liveness(request.params),
+            "add_root" => self.add_root(request.params, &principal),
+            "remove_root" => self.remove_root(request.params, &principal),
+            "attach_derived_parent" => self.attach_derived_parent(request.params, &principal),
+            "approve_root" => self.set_root_approval(request.params, true, &principal),
+            "unapprove_root" => self.set_root_approval(request.params, false, &principal),
+            "trust" => self.trust(request.params),
+            "approve_project" => self.set_project_approval(request.params, true, &principal),
+            "unapprove_project" => self.set_project_approval(request.params, false, &principal),
+            "verify" => self.verify(),
+            "rebuild" => self.rebuild(),
+            _ => Err(HandlerError {
+                code: "unknown_method".to_string(),
+                message: format!(
+                    "unknown projects method '{}', see the management manifest",
+                    request.method
+                ),
+            }),
+        }
+    }
+
     /// Ingest a `projects.session_liveness` batch (push-on-transition +
     /// snapshot-on-reconnect, pinned in #workspace-projects-design). A seq gap
     /// marks the volatile state stale until the next snapshot rebases it; the
@@ -721,15 +721,19 @@ impl ProjectsHandler {
         encode_result(reply)
     }
 
-    fn register(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
+    fn register(&self, params: Value, principal: &str) -> Result<Vec<u8>, HandlerError> {
         let req = serde_json::from_value::<RegisterRequest>(params).map_err(invalid_params)?;
-        let reply = self.record_mutation(self.with_store(|s| s.register(req)))?;
+        let reply =
+            self.record_mutation(self.with_store(|s| s.with_principal(principal).register(req)))?;
         // With root records on, a newly registered root is bound at once, so
         // it never answers as unbound. Unreadable identity leaves it unbound
         // and authorizing nothing; the registration itself still stands.
         self.with_store(|store| {
             if store.root_records_enabled() {
-                if let Err(error) = store.bind_unbound_roots("entorhinal") {
+                if let Err(error) = store
+                    .with_principal(principal)
+                    .bind_unbound_roots("entorhinal")
+                {
                     tracing::warn!(target: "binding", "binding after register failed: {error}");
                 }
             }
@@ -737,35 +741,41 @@ impl ProjectsHandler {
         })?;
         Ok(reply)
     }
-    fn set_workspace_root(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
+    fn set_workspace_root(&self, params: Value, principal: &str) -> Result<Vec<u8>, HandlerError> {
         let req =
             serde_json::from_value::<SetWorkspaceRootRequest>(params).map_err(invalid_params)?;
-        self.record_mutation(self.with_store(|s| s.set_workspace_root(req)))
+        self.record_mutation(
+            self.with_store(|s| s.with_principal(principal).set_workspace_root(req)),
+        )
     }
 
-    fn assign_workspace(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
+    fn assign_workspace(&self, params: Value, principal: &str) -> Result<Vec<u8>, HandlerError> {
         let req =
             serde_json::from_value::<AssignWorkspaceRequest>(params).map_err(invalid_params)?;
-        self.record_mutation(self.with_store(|s| s.assign_workspace(req)))
+        self.record_mutation(self.with_store(|s| s.with_principal(principal).assign_workspace(req)))
     }
-    fn upgrade_implicit(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
+    fn upgrade_implicit(&self, params: Value, principal: &str) -> Result<Vec<u8>, HandlerError> {
         let req =
             serde_json::from_value::<UpgradeImplicitRequest>(params).map_err(invalid_params)?;
-        self.record_mutation(self.with_store(|s| s.upgrade_implicit(req)))
+        self.record_mutation(self.with_store(|s| s.with_principal(principal).upgrade_implicit(req)))
     }
-    fn remove(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
+    fn remove(&self, params: Value, principal: &str) -> Result<Vec<u8>, HandlerError> {
         let req = serde_json::from_value::<RemoveRequest>(params).map_err(invalid_params)?;
-        self.record_mutation(self.with_store(|s| s.remove(req)))
+        self.record_mutation(self.with_store(|s| s.with_principal(principal).remove(req)))
     }
-    fn add_root(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
+    fn add_root(&self, params: Value, principal: &str) -> Result<Vec<u8>, HandlerError> {
         let req = serde_json::from_value::<entorhinal_core::AddRootRequest>(params)
             .map_err(invalid_params)?;
-        let reply = self.record_mutation(self.with_store(|s| s.add_root(req)))?;
+        let reply =
+            self.record_mutation(self.with_store(|s| s.with_principal(principal).add_root(req)))?;
         // As after register: bind at once, so the new root never answers as
         // unbound while root records are on. Binding never approves.
         self.with_store(|store| {
             if store.root_records_enabled() {
-                if let Err(error) = store.bind_unbound_roots("entorhinal") {
+                if let Err(error) = store
+                    .with_principal(principal)
+                    .bind_unbound_roots("entorhinal")
+                {
                     tracing::warn!(target: "binding", "binding after add_root failed: {error}");
                 }
             }
@@ -773,34 +783,52 @@ impl ProjectsHandler {
         })?;
         Ok(reply)
     }
-    fn remove_root(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
+    fn remove_root(&self, params: Value, principal: &str) -> Result<Vec<u8>, HandlerError> {
         let req = serde_json::from_value::<entorhinal_core::RemoveRootRequest>(params)
             .map_err(invalid_params)?;
-        self.record_mutation(self.with_store(|s| s.remove_root(req)))
+        self.record_mutation(self.with_store(|s| s.with_principal(principal).remove_root(req)))
     }
-    fn attach_derived_parent(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
+    fn attach_derived_parent(
+        &self,
+        params: Value,
+        principal: &str,
+    ) -> Result<Vec<u8>, HandlerError> {
         let req = serde_json::from_value::<entorhinal_core::AttachDerivedParentRequest>(params)
             .map_err(invalid_params)?;
-        self.record_mutation(self.with_store(|s| s.attach_derived_parent(req)))
+        self.record_mutation(
+            self.with_store(|s| s.with_principal(principal).attach_derived_parent(req)),
+        )
     }
-    fn set_root_approval(&self, params: Value, approve: bool) -> Result<Vec<u8>, HandlerError> {
+    fn set_root_approval(
+        &self,
+        params: Value,
+        approve: bool,
+        principal: &str,
+    ) -> Result<Vec<u8>, HandlerError> {
         let req = serde_json::from_value::<RootApprovalParams>(params).map_err(invalid_params)?;
         let actor = req.actor.unwrap_or_else(|| "operator".to_string());
         self.record_mutation(self.with_store(|s| {
             if approve {
-                s.approve_root(&req.root, &actor)
+                s.with_principal(principal).approve_root(&req.root, &actor)
             } else {
-                s.unapprove_root(&req.root, &actor)
+                s.with_principal(principal)
+                    .unapprove_root(&req.root, &actor)
             }
         }))
     }
-    fn set_project_approval(&self, params: Value, approve: bool) -> Result<Vec<u8>, HandlerError> {
+    fn set_project_approval(
+        &self,
+        params: Value,
+        approve: bool,
+        principal: &str,
+    ) -> Result<Vec<u8>, HandlerError> {
         let req =
             serde_json::from_value::<ProjectApprovalParams>(params).map_err(invalid_params)?;
         let actor = req.actor.unwrap_or_else(|| "operator".to_string());
-        self.record_mutation(
-            self.with_store(|s| s.set_project_approval(&req.canonical_root, &actor, approve)),
-        )
+        self.record_mutation(self.with_store(|s| {
+            s.with_principal(principal)
+                .set_project_approval(&req.canonical_root, &actor, approve)
+        }))
     }
     fn trust(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
         let params = serde_json::from_value::<ResolveParams>(params).map_err(invalid_params)?;
@@ -808,9 +836,9 @@ impl ProjectsHandler {
         self.record_query(reply.generation, &self.health.resolve_count);
         encode_result(reply)
     }
-    fn seed_import(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
+    fn seed_import(&self, params: Value, principal: &str) -> Result<Vec<u8>, HandlerError> {
         let req = serde_json::from_value::<SeedImportRequest>(params).map_err(invalid_params)?;
-        self.record_mutation(self.with_store(|s| s.seed_import(req)))
+        self.record_mutation(self.with_store(|s| s.with_principal(principal).seed_import(req)))
     }
 
     /// Refresh the health generation gauge from a mutation's wire reply, which
@@ -1431,6 +1459,303 @@ mod tests {
             storage: Some(serde_json::to_value(descriptor).unwrap()),
             machine_id: None,
         }
+    }
+
+    fn execute_on(
+        handler: &ProjectsHandler,
+        key: RouteKey,
+        method: &str,
+        params: Value,
+    ) -> Vec<u8> {
+        handler
+            .execute(
+                WireRequest {
+                    method: method.into(),
+                    params,
+                },
+                key,
+            )
+            .unwrap()
+    }
+
+    fn journal_repo(dir: &std::path::Path, name: &str) -> String {
+        let root = dir.join(name);
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::canonicalize(root)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn requests_attribute_all_project_and_secondary_binding_rows_to_the_bound_principal() {
+        for (principal, expected) in [
+            (Principal::Direct, "direct"),
+            (reserved(WRITER_MODULE), "reserved:prefrontal-core"),
+        ] {
+            let (dir, descriptor) = scratch_descriptor(expected);
+            let dir = std::fs::canonicalize(dir).unwrap();
+            let handler = ProjectsHandler::new();
+            let mut store = RegistryStore::open(&descriptor).unwrap();
+            store.set_root_records(true);
+            *handler.store.lock().unwrap() = Some(store);
+            let key = (71, 1);
+            handler
+                .route_admissions()
+                .insert(key, RouteAdmission::from_bind(Some(principal), None));
+            let root = journal_repo(&dir, "first");
+            let second = journal_repo(&dir, "second");
+            let third = journal_repo(&dir, "third");
+            execute_on(
+                &handler,
+                key,
+                "register",
+                json!({"projectId":"project", "name":"Project", "roots":[root,second], "actor":"request actor", "requestKey":"register-key"}),
+            );
+            execute_on(
+                &handler,
+                key,
+                "add_root",
+                json!({"projectId":"project", "root":third, "actor":null}),
+            );
+            execute_on(
+                &handler,
+                key,
+                "approve_project",
+                json!({"canonicalRoot":root}),
+            );
+            let record = handler
+                .with_store(|s| Ok(s.trust(&root)?.root_fields.unwrap().root_records.remove(0)))
+                .unwrap();
+            let container = dir.join("workers");
+            std::fs::create_dir_all(&container).unwrap();
+            execute_on(
+                &handler,
+                key,
+                "attach_derived_parent",
+                json!({"projectId":"project", "root":root, "incarnation":record.incarnation.unwrap().value, "registrationEpoch":record.registration_epoch.unwrap(), "container":container}),
+            );
+            execute_on(&handler, key, "unapprove_root", json!({"root":root}));
+            execute_on(&handler, key, "approve_root", json!({"root":root}));
+            execute_on(
+                &handler,
+                key,
+                "unapprove_project",
+                json!({"canonicalRoot":root}),
+            );
+            execute_on(
+                &handler,
+                key,
+                "assign_workspace",
+                json!({"projectId":"project", "workspaceId":"team", "workspaceName":"Team"}),
+            );
+            execute_on(
+                &handler,
+                key,
+                "set_workspace_root",
+                json!({"workspaceId":"team", "root":dir}),
+            );
+            execute_on(
+                &handler,
+                key,
+                "upgrade_implicit",
+                json!({"projectId":"project", "implicitId":entorhinal_core::implicit_project_id(&root), "name":"Renamed", "roots":[root]}),
+            );
+            execute_on(
+                &handler,
+                key,
+                "remove_root",
+                json!({"projectId":"project", "root":third}),
+            );
+            let seed = journal_repo(&dir, "seed");
+            execute_on(
+                &handler,
+                key,
+                "seed_import",
+                json!({"source":"mc", "excludeHomeScoped":false, "payload":{"pairs":[{"mcIdentity":"git:seed", "canonicalRoot":seed}]}}),
+            );
+
+            let before = handler.with_store(|s| s.enumerate(None)).unwrap();
+            let rows = handler
+                .with_store(|s| s.journal_tail(0, 100))
+                .unwrap()
+                .entries;
+            assert_eq!(
+                rows.iter().map(|row| row.op.as_str()).collect::<Vec<_>>(),
+                [
+                    "register",
+                    "bind_root",
+                    "bind_root",
+                    "add_root",
+                    "bind_root",
+                    "approve_root",
+                    "approve_root",
+                    "approve_root",
+                    "attach_derived_parent",
+                    "unapprove_root",
+                    "approve_root",
+                    "unapprove_root",
+                    "unapprove_root",
+                    "unapprove_root",
+                    "assign_workspace",
+                    "set_workspace_root",
+                    "upgrade_implicit",
+                    "remove_root",
+                    "seed_import",
+                ]
+            );
+            assert_eq!(rows[0].actor, "request actor");
+            assert_eq!(rows[3].actor, "module");
+            assert_eq!(
+                rows[1].actor, "entorhinal",
+                "secondary binding keeps its existing actor"
+            );
+            for row in &rows {
+                assert_eq!(
+                    row.principal.as_deref(),
+                    Some(expected),
+                    "{} at seq {}",
+                    row.op,
+                    row.seq
+                );
+            }
+            execute_on(&handler, key, "rebuild", json!({}));
+            let after = handler.with_store(|s| s.enumerate(None)).unwrap();
+            assert_eq!(
+                serde_json::to_value(before).unwrap(),
+                serde_json::to_value(after).unwrap()
+            );
+            let rebuilt_rows = handler
+                .with_store(|s| s.journal_tail(0, 100))
+                .unwrap()
+                .entries;
+            assert_eq!(
+                serde_json::to_value(&rows).unwrap(),
+                serde_json::to_value(&rebuilt_rows).unwrap()
+            );
+            assert_eq!(
+                rows.iter().map(|row| &row.principal).collect::<Vec<_>>(),
+                rebuilt_rows
+                    .iter()
+                    .map(|row| &row.principal)
+                    .collect::<Vec<_>>()
+            );
+
+            execute_on(&handler, key, "remove", json!({"workspaceId":"team"}));
+            execute_on(&handler, key, "remove", json!({"projectId":"project"}));
+            let removals = handler
+                .with_store(|s| s.journal_tail(19, 100))
+                .unwrap()
+                .entries;
+            assert_eq!(
+                removals
+                    .iter()
+                    .map(|row| row.op.as_str())
+                    .collect::<Vec<_>>(),
+                ["remove", "remove"]
+            );
+            for row in removals {
+                assert_eq!(row.principal.as_deref(), Some(expected));
+            }
+            drop(handler);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn startup_binding_uses_entorhinal_and_later_request_binding_uses_direct() {
+        let (dir, descriptor) = scratch_descriptor("startup-principal");
+        let handler = ProjectsHandler::new();
+        let store = RegistryStore::open(&descriptor).unwrap();
+        let root = journal_repo(&dir, "before-restart");
+        store
+            .with_principal("reserved:prefrontal-core")
+            .register(RegisterRequest {
+                project_id: Some("project".into()),
+                name: "Project".into(),
+                roots: vec![root],
+                ..Default::default()
+            })
+            .unwrap();
+        drop(store);
+        let mut store = RegistryStore::open(&descriptor).unwrap();
+        store.set_root_records(true);
+        let reports = store.bind_unbound_roots("entorhinal").unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].outcome, "bound");
+        *handler.store.lock().unwrap() = Some(store);
+        let key = (72, 2);
+        handler.route_admissions().insert(
+            key,
+            RouteAdmission::from_bind(Some(Principal::Direct), None),
+        );
+        let added = journal_repo(&dir, "after-restart");
+        execute_on(
+            &handler,
+            key,
+            "add_root",
+            json!({"projectId":"project", "root":added}),
+        );
+        let rows = handler
+            .with_store(|s| s.journal_tail(0, 10))
+            .unwrap()
+            .entries;
+        assert_eq!(
+            rows.iter().map(|row| row.op.as_str()).collect::<Vec<_>>(),
+            ["register", "bind_root", "add_root", "bind_root"]
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.principal.as_deref())
+                .collect::<Vec<_>>(),
+            [
+                Some("reserved:prefrontal-core"),
+                Some("entorhinal"),
+                Some("direct"),
+                Some("direct")
+            ]
+        );
+        drop(handler);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn journal_principal_labels_are_pinned_and_refused_routes_append_nothing() {
+        assert_eq!(principal_label(Some(&Principal::Direct)), "direct");
+        assert_eq!(
+            principal_label(Some(&reserved("another-module"))),
+            "reserved:another-module"
+        );
+        assert_eq!(principal_label(Some(&Principal::Unverified)), "unverified");
+        let (dir, descriptor) = scratch_descriptor("refused-principal");
+        let handler = ProjectsHandler::new();
+        *handler.store.lock().unwrap() = Some(RegistryStore::open(&descriptor).unwrap());
+        for (index, principal) in [
+            None,
+            Some(Principal::Unverified),
+            Some(reserved("another-module")),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let key = (73, index as u32);
+            handler
+                .route_admissions()
+                .insert(key, RouteAdmission::from_bind(principal, None));
+            let error = handler
+                .execute(
+                    WireRequest {
+                        method: "register".into(),
+                        params: json!({"name":"Not admitted"}),
+                    },
+                    key,
+                )
+                .unwrap_err();
+            assert_eq!(error.code, "write_not_permitted");
+            assert_eq!(handler.with_store(|s| s.generation()).unwrap(), 0);
+        }
+        drop(handler);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     async fn wait_until_settled(handler: &ProjectsHandler, budget: Duration) -> Duration {

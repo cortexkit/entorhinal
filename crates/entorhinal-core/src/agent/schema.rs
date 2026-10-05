@@ -399,8 +399,13 @@ mod tests {
         let error =
             RegistryStore::open_with_migrations(&scratch.descriptor, old_chain).unwrap_err();
         assert!(matches!(error, RegistryError::Database(_)));
-        assert_eq!(error.to_string(), "database: registry store is at schema version 4, ahead of this binary's highest migration 3; run a binary at or above the store's version");
-        // Opening with the older chain after migration 4 leaves the agent table
+        let current_version = MIGRATIONS
+            .iter()
+            .map(|migration| migration.version)
+            .max()
+            .unwrap();
+        assert_eq!(error.to_string(), format!("database: registry store is at schema version {current_version}, ahead of this binary's highest migration 3; run a binary at or above the store's version"));
+        // Opening with the older chain after the current migrations leaves the agent table
         // unchanged and readable by the current chain.
         let current = RegistryStore::open(&scratch.descriptor).unwrap();
         current
