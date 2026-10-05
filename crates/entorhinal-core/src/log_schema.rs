@@ -1,7 +1,10 @@
 //! Schema for the optional identity log and machine-local root paths.
 
-/// Migration 7 leaves legacy journal bytes intact and opts every store out of
-/// sharing. Root keys are chosen only when the operator later enables the log.
+/// Migration 7 adds the schema for the optional identity log without turning it
+/// on: existing journal rows are tagged local and keep their bytes, the log
+/// starts `disabled`, and no root key is assigned. Keys are chosen only when an
+/// operator later enables the log. It also moves each workspace's root path into
+/// the machine-local `workspace_root` table.
 pub(crate) const V7_IDENTITY_LOG: &str = r#"
 ALTER TABLE registry_journal ADD COLUMN stream TEXT NOT NULL DEFAULT 'local'
     CHECK(stream IN ('shared','local'));
@@ -71,9 +74,11 @@ WHERE (j.seq IS NOT NULL AND (w.root IS NOT NULL OR json_type(j.request, '$.root
          AND json_extract(s.request, '$.workspaceId') = w.workspace_id
    ));
 
--- Roots from older write paths or hand edits have no replay source. Record only
--- those fallback after-images locally, without rewriting historical rows or
--- changing the journal head of an ordinary store (including an empty store).
+-- A non-null root with no set_workspace_root row (written by an older path or
+-- by hand) has nothing a rebuild could restore it from. For those roots only,
+-- append one local journal row recording each path and timestamp. Earlier rows
+-- are never rewritten, and a store with no such root gets no row at all, so its
+-- journal head doesn't move.
 INSERT INTO registry_journal(op, payload_json, actor, created_at, principal, stream, origin)
 SELECT 'workspace_root.backfill',
        json_object('roots', json_group_array(json_object(
@@ -111,8 +116,9 @@ pub(crate) fn replay_workspace_root_backfill(
 ) -> rusqlite::Result<()> {
     let backfill: WorkspaceRootBackfill = serde_json::from_value(value)
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-    // A migration after-image describes the local path only. Its timestamp must
-    // not overwrite the workspace's independently journaled rename timestamp.
+    // The backfill row records each root's path and when it was set. Restoring it
+    // must leave `workspace.updated_at` alone: that timestamp tracks the
+    // workspace's own renames, which the journal records separately.
     for root in backfill.roots {
         tx.execute(
             "INSERT INTO workspace_root(workspace_id,root,updated_at) VALUES(?1,?2,?3)
@@ -386,8 +392,8 @@ mod tests {
                 SqlValue::Null
             ]
         );
-        // A local root after-image must not touch the shared workspace's own
-        // timestamp, even if the two timestamps no longer happen to be equal.
+        // Restoring a backfilled root must not touch the workspace's own
+        // timestamp, even once the two timestamps no longer happen to be equal.
         store
             .db
             .with_conn_fenced(|tx| {
@@ -420,8 +426,9 @@ mod tests {
         assert!(store.rebuild().unwrap().replay.ok);
         assert_eq!(cells(&store), migrated, "rebuild lost fallback cells");
 
-        // Replay must use the recorded after-image, not the possibly corrupted
-        // live path. The fallback is not an exemption from root verification.
+        // Replay restores the path recorded in the backfill row, not whatever the
+        // live table holds, so a corrupted live path is caught: backfilled roots
+        // are verified like every other root.
         store
             .db
             .with_conn_fenced(|tx| {

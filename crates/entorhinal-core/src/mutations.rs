@@ -1024,9 +1024,11 @@ const DERIVED_TABLES: &[&str] = &[
     "root_approval",
 ];
 
-// Until the log is enabled, setting a root still bumps the workspace timestamp
-// just as it did when the path lived on the workspace row. Replay uses the same
-// projection write so cleared paths retain their own last-setting timestamp too.
+// Setting a workspace's root writes the path and its timestamp to the
+// machine-local `workspace_root` table and, while the log is off, still bumps
+// `workspace.updated_at`, as it did when the path lived on the workspace row.
+// Replay calls this same function, so a rebuilt store matches the live one,
+// including a cleared path keeping the time it was cleared.
 fn set_workspace_root_projection(
     tx: &Transaction<'_>,
     workspace_id: &str,
