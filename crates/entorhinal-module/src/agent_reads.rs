@@ -547,7 +547,7 @@ mod tests {
     }
 
     #[test]
-    fn wal_reads_and_liveness_answer_prewrite_state_within_100ms_while_writer_is_parked() {
+    fn wal_reads_and_liveness_answer_prewrite_state_before_a_parked_writer_is_released() {
         use std::{sync::mpsc, thread, time::Instant};
 
         let f = Fixture::new(true);
@@ -578,8 +578,11 @@ mod tests {
                     store.apply_entry("fixture", "{}", "test", None, |tx| {
                         tx.execute_batch("UPDATE project SET name='uncommitted'; UPDATE agent SET terminal_reason='retired',terminal_at_ms=900; DELETE FROM project_root;")?;
                         parked_tx.send(()).unwrap();
-                        // Bound the park even if a regression makes a reader block.
-                        let _ = release_rx.recv_timeout(Duration::from_secs(2));
+                        // Park until the reads are done. The bound only keeps a
+                        // regression from hanging the suite, and it's far longer
+                        // than any reply wait, so a blocked read can't slip
+                        // through by outlasting the park.
+                        let _ = release_rx.recv_timeout(Duration::from_secs(10));
                         tx.execute_batch("SELECT * FROM missing_rollback_sentinel")
                     })
                 }).unwrap_err();
@@ -592,27 +595,35 @@ mod tests {
                     let _ = reply_tx.send((method, reply, start.elapsed()));
                 }
             });
+            // Every reply must arrive while the writer is still parked: a read
+            // queued behind the writer can't finish until `release_tx` below,
+            // so receiving them all first proves no read waited for it. The
+            // per-reply wait is far under the writer's park, so a loaded
+            // test machine slows a reply without making it look blocked.
             let mut received = Vec::new();
-            let mut prompt = true;
+            let mut all_before_release = true;
             for _ in &expected {
-                match reply_rx.recv_timeout(Duration::from_millis(100)) {
+                match reply_rx.recv_timeout(Duration::from_millis(1_500)) {
                     Ok(reply) => received.push(reply),
                     Err(_) => {
-                        prompt = false;
+                        all_before_release = false;
                         break;
                     }
                 }
             }
             release_tx.send(()).unwrap();
             writer.join().unwrap();
-            (received, prompt)
+            (received, all_before_release)
         });
-        assert!(prompt, "a WAL read waited for the parked writer");
-        for ((method, reply, elapsed), expected) in received.into_iter().zip(expected) {
-            assert!(
-                elapsed < Duration::from_millis(100),
-                "{method} took {elapsed:?}"
-            );
+        let timings = received
+            .iter()
+            .map(|(method, _, elapsed)| format!("{method} {elapsed:?}"))
+            .collect::<Vec<_>>();
+        assert!(
+            prompt,
+            "a WAL read waited for the parked writer; replies before release: {timings:?}"
+        );
+        for ((method, reply, _), expected) in received.into_iter().zip(expected) {
             assert_eq!(reply, expected, "{method} must see only committed state");
         }
     }
