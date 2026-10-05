@@ -776,9 +776,50 @@ fn replay(tx: &Transaction<'_>, seq: i64, op: &str, v: Value, now: i64) -> rusql
         "register" => {
             let r: RegisterRequest = serde_json::from_value(v)
                 .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-            let id = r
-                .project_id
-                .unwrap_or_else(|| mint("register1", &r.name, &r.roots));
+            // Older journal rows record the request, not the resolved id. Infer
+            // ownership from the state replayed so far, just as live register does.
+            let id = if let Some(id) = r.project_id {
+                id
+            } else {
+                let mut owners = BTreeSet::new();
+                for root in &r.roots {
+                    if let Some(owner) = tx
+                        .query_row(
+                            "SELECT project_id FROM project_root WHERE canonical_root=?1",
+                            [root],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()?
+                    {
+                        owners.insert(owner);
+                    }
+                }
+                for parent in &r.derived_root_parents {
+                    if let Some(owner) = tx
+                        .query_row(
+                            "SELECT project_id FROM derived_root_parent WHERE canonical_parent=?1",
+                            [parent],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()?
+                    {
+                        owners.insert(owner);
+                    }
+                }
+                if owners.len() == 1 {
+                    owners.into_iter().next().unwrap()
+                } else if owners.len() > 1 {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(domain(
+                        "project_conflict",
+                        format!(
+                            "conflicting owners: {}",
+                            owners.into_iter().collect::<Vec<_>>().join(",")
+                        ),
+                    ))));
+                } else {
+                    mint("register1", &r.name, &r.roots)
+                }
+            };
             // Mirrors the live `register`, which renames an existing project and
             // places a new one in its workspace. Replay used to do neither, so a
             // `rebuild` reverted renames and silently unplaced every project that
@@ -811,7 +852,7 @@ fn replay(tx: &Transaction<'_>, seq: i64, op: &str, v: Value, now: i64) -> rusql
         "assign_workspace" => {
             let r: AssignWorkspaceRequest = serde_json::from_value(v)
                 .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-            tx.execute("INSERT OR IGNORE INTO workspace(workspace_id,name,created_at,updated_at) VALUES(?1,?1,?2,?2)",params![r.workspace_id,now])?;
+            tx.execute("INSERT OR IGNORE INTO workspace(workspace_id,name,created_at,updated_at) VALUES(?1,?2,?3,?3)",params![r.workspace_id,r.workspace_name.as_ref().unwrap_or(&r.workspace_id),now])?;
             // REPLAY MUST CONVERGE ON THE LAST ENTRY, NOT THE FIRST.
             //
             // These were `INSERT OR IGNORE`, which was correct only while a
@@ -854,38 +895,130 @@ fn replay(tx: &Transaction<'_>, seq: i64, op: &str, v: Value, now: i64) -> rusql
             let id = r
                 .project_id
                 .unwrap_or_else(|| mint("upgrade1", &r.name, &r.roots));
-            tx.execute("INSERT OR IGNORE INTO project(project_id,name,implicit,seed_identity,created_at,updated_at) VALUES(?1,?2,0,NULL,?3,?3)", params![id,r.name,now])?;
+            tx.execute("INSERT INTO project(project_id,name,implicit,seed_identity,created_at,updated_at) VALUES(?1,?2,0,NULL,?3,?3) ON CONFLICT(project_id) DO UPDATE SET name=excluded.name,updated_at=excluded.updated_at", params![id,r.name,now])?;
             for root in r.roots {
                 tx.execute("INSERT OR IGNORE INTO project_root(canonical_root,project_id,added_at) VALUES(?1,?2,?3)",params![root,id,now])?;
                 tx.execute("INSERT OR IGNORE INTO project_alias(old_id,project_id,created_at) VALUES(?1,?2,?3)",params![implicit_project_id(&root),id,now])?;
             }
             tx.execute("INSERT OR REPLACE INTO project_alias(old_id,project_id,created_at) VALUES(?1,?2,?3)",params![r.implicit_id,id,now])?;
+            if let Some(w) = &r.workspace_id {
+                tx.execute("INSERT OR IGNORE INTO workspace(workspace_id,name,created_at,updated_at) VALUES(?1,?1,?2,?2)",params![w,now])?;
+                tx.execute("INSERT OR IGNORE INTO project_workspace(project_id,workspace_id) VALUES(?1,?2)",params![id,w])?;
+                tx.execute("INSERT OR IGNORE INTO workspace_member(workspace_id,ref_kind,device_fingerprint,project_id) VALUES(?1,'local','',?2)",params![w,id])?;
+            }
         }
         "seed_import" => {
             let r: SeedImportRequest = serde_json::from_value(v)
                 .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-            for w in r.payload.workspaces {
-                tx.execute("INSERT OR IGNORE INTO workspace(workspace_id,name,created_at,updated_at) VALUES(?1,?2,?3,?3)",params![w.workspace_id,w.name,now])?;
+            // The payload contains surviving observations, including identities
+            // that live seed_import declined. Reapply those decisions against
+            // replayed state rather than treating every observation as a binding.
+            let mut by_root: BTreeMap<String, Vec<SeedPair>> = BTreeMap::new();
+            for p in r.payload.pairs {
+                by_root.entry(p.canonical_root.clone()).or_default().push(p);
             }
             let mut groups: BTreeMap<String, Vec<SeedPair>> = BTreeMap::new();
-            for p in r.payload.pairs {
-                groups.entry(p.mc_identity.clone()).or_default().push(p);
+            for rows in by_root.values() {
+                let has_git = rows.iter().any(|p| {
+                    p.identity_class.as_deref() == Some("git") || p.mc_identity.starts_with("git:")
+                });
+                let candidates = rows
+                    .iter()
+                    .filter(|p| !has_git || p.identity_class.as_deref() != Some("dir"));
+                let identities = candidates
+                    .clone()
+                    .map(|p| p.mc_identity.clone())
+                    .collect::<BTreeSet<_>>();
+                if identities.len() == 1 {
+                    groups
+                        .entry(identities.into_iter().next().unwrap())
+                        .or_default()
+                        .extend(candidates.cloned());
+                }
+            }
+            for w in r.payload.workspaces {
+                let old = tx
+                    .query_row(
+                        "SELECT name FROM workspace WHERE workspace_id=?1",
+                        [&w.workspace_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                if old.as_deref() != Some(w.name.as_str()) {
+                    tx.execute("INSERT INTO workspace(workspace_id,name,created_at,updated_at) VALUES(?1,?2,?3,?3) ON CONFLICT(workspace_id) DO UPDATE SET name=excluded.name,updated_at=excluded.updated_at",params![w.workspace_id,w.name,now])?;
+                }
             }
             for (identity, rows) in groups {
                 let id = seed_id(&identity);
-                tx.execute("INSERT OR IGNORE INTO project(project_id,name,implicit,seed_identity,created_at,updated_at) VALUES(?1,?2,0,?3,?4,?4)",params![id,r.payload.names.get(&identity).cloned().unwrap_or_else(||identity.clone()),identity,now])?;
-                for p in rows {
+                let live = tx
+                    .query_row(
+                        "SELECT seed_identity FROM project WHERE project_id=?1",
+                        [&id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()?;
+                if let Some(seed) = &live {
+                    if seed.as_deref() != Some(identity.as_str()) {
+                        continue;
+                    }
+                } else if tx
+                    .query_row(
+                        "SELECT project_id FROM project_alias WHERE old_id=?1",
+                        [&id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .is_some()
+                {
+                    continue;
+                }
+                let mut available = Vec::new();
+                for p in &rows {
+                    if tx
+                        .query_row(
+                            "SELECT project_id FROM project_root WHERE canonical_root=?1",
+                            [&p.canonical_root],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()?
+                        .is_none()
+                    {
+                        available.push(p);
+                    }
+                }
+                if available.is_empty() && live.is_some() {
+                    continue;
+                }
+                if live.is_none() {
+                    let name = r
+                        .payload
+                        .names
+                        .get(&identity)
+                        .cloned()
+                        .or_else(|| rows.first().and_then(|p| p.name.clone()))
+                        .unwrap_or_else(|| {
+                            Path::new(&rows[0].canonical_root)
+                                .file_name()
+                                .map(|x| x.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| identity.clone())
+                        });
+                    tx.execute("INSERT INTO project(project_id,name,implicit,seed_identity,created_at,updated_at) VALUES(?1,?2,0,?3,?4,?4)",params![id,name,identity,now])?;
+                }
+                for p in available {
                     tx.execute("INSERT OR IGNORE INTO project_root(canonical_root,project_id,added_at) VALUES(?1,?2,?3)",params![p.canonical_root,id,now])?;
                     tx.execute("INSERT OR IGNORE INTO project_alias(old_id,project_id,created_at) VALUES(?1,?2,?3)",params![implicit_project_id(&p.canonical_root),id,now])?;
                 }
-                for m in r
+                let claims = r
                     .payload
                     .members
                     .iter()
                     .filter(|m| m.mc_identity == identity)
-                {
-                    tx.execute("INSERT OR IGNORE INTO project_workspace(project_id,workspace_id) VALUES(?1,?2)",params![id,m.workspace_id])?;
-                    tx.execute("INSERT OR IGNORE INTO workspace_member(workspace_id,ref_kind,device_fingerprint,project_id) VALUES(?1,'local','',?2)",params![m.workspace_id,id])?;
+                    .map(|m| &m.workspace_id)
+                    .collect::<BTreeSet<_>>();
+                if claims.len() == 1 {
+                    let w = claims.into_iter().next().unwrap();
+                    tx.execute("INSERT OR IGNORE INTO project_workspace(project_id,workspace_id) VALUES(?1,?2)",params![id,w])?;
+                    tx.execute("INSERT OR IGNORE INTO workspace_member(workspace_id,ref_kind,device_fingerprint,project_id) VALUES(?1,'local','',?2)",params![w,id])?;
                 }
             }
         }
@@ -2059,5 +2192,589 @@ mod workspace_root_tests {
         set(&f, "ws", None).unwrap();
         f.store.rebuild().unwrap();
         assert_eq!(f.store.resolve(&member).unwrap().workspace_root, None);
+    }
+}
+
+#[cfg(test)]
+mod project_replay_tests {
+    use super::{tests::*, *};
+    use rusqlite::types::Value as SqlValue;
+
+    fn projection(f: &Fixture) -> BTreeMap<&'static str, Vec<Vec<SqlValue>>> {
+        f.store
+            .db
+            .with_conn(|conn| {
+                let mut tables = BTreeMap::new();
+                for table in [
+                    "project",
+                    "project_root",
+                    "project_alias",
+                    "derived_root_parent",
+                    "project_workspace",
+                    "workspace_member",
+                    "workspace",
+                ] {
+                    let columns = conn
+                        .prepare(&format!("SELECT * FROM {table}"))?
+                        .column_count();
+                    let order = (1..=columns)
+                        .map(|n| n.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let mut stmt =
+                        conn.prepare(&format!("SELECT * FROM {table} ORDER BY {order}"))?;
+                    let rows = stmt
+                        .query_map([], |row| {
+                            (0..columns)
+                                .map(|n| row.get(n))
+                                .collect::<rusqlite::Result<Vec<SqlValue>>>()
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    tables.insert(table, rows);
+                }
+                Ok(tables)
+            })
+            .unwrap()
+    }
+
+    fn assert_rebuild_preserves_projection(f: &Fixture) {
+        // Read the actual tables, including provenance and timestamps, rather
+        // than a resolve reply that could hide an extra project or lost alias.
+        let before = projection(f);
+        let generation = f.store.generation().unwrap();
+        assert_eq!(f.store.rebuild().unwrap(), generation);
+        let after = projection(f);
+        for (table, rows) in before {
+            assert_eq!(rows, after[table], "rebuild changed {table}");
+        }
+        assert!(f.store.verify().unwrap().ok);
+    }
+
+    fn project_names(f: &Fixture) -> BTreeMap<String, String> {
+        f.store
+            .db
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare("SELECT project_id,name FROM project")?;
+                let rows = stmt
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect();
+                rows
+            })
+            .unwrap()
+    }
+
+    fn seed(f: &Fixture, payload: SeedPayload) -> Value {
+        result(
+            &f.store
+                .seed_import(SeedImportRequest {
+                    source: "mc".into(),
+                    payload,
+                    ..Default::default()
+                })
+                .unwrap(),
+        )
+    }
+
+    fn workspace(id: &str, name: &str) -> SeedWorkspace {
+        SeedWorkspace {
+            workspace_id: id.into(),
+            name: name.into(),
+        }
+    }
+
+    fn pair(root: &str, identity: &str) -> SeedPair {
+        SeedPair {
+            canonical_root: root.into(),
+            mc_identity: identity.into(),
+            ..Default::default()
+        }
+    }
+
+    fn has_report(out: &Value, kind: &str) -> bool {
+        out["report"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["kind"] == kind)
+    }
+
+    #[test]
+    fn rebuild_upgrade_creates_project_with_workspace_placement() {
+        let f = Fixture::new("replay-upgrade-workspace");
+        let root = f.dir("root");
+        f.store
+            .upgrade_implicit(UpgradeImplicitRequest {
+                implicit_id: implicit_project_id(&root),
+                name: "Upgraded".into(),
+                workspace_id: Some("w".into()),
+                root: Some(root.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            f.store.resolve(&root).unwrap().workspace_id.as_deref(),
+            Some("w")
+        );
+        assert_rebuild_preserves_projection(&f);
+    }
+
+    #[test]
+    fn rebuild_upgrade_renames_existing_project_without_changing_placement() {
+        let f = Fixture::new("replay-upgrade-rename");
+        let root = f.dir("root");
+        f.store
+            .register(RegisterRequest {
+                project_id: Some("p".into()),
+                name: "Original".into(),
+                roots: vec![root.clone()],
+                workspace_id: Some("w".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        f.store
+            .upgrade_implicit(UpgradeImplicitRequest {
+                implicit_id: implicit_project_id(&root),
+                project_id: Some("p".into()),
+                name: "Renamed".into(),
+                roots: vec![root.clone()],
+                workspace_id: Some("w".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            project_names(&f),
+            BTreeMap::from([("p".into(), "Renamed".into())])
+        );
+        assert_eq!(
+            f.store.resolve(&root).unwrap().workspace_id.as_deref(),
+            Some("w")
+        );
+        assert_rebuild_preserves_projection(&f);
+    }
+
+    #[test]
+    fn rebuild_upgrade_workspace_only_noop_does_not_create_workspace() {
+        let f = Fixture::new("replay-upgrade-noop");
+        let root = f.dir("root");
+        let req = UpgradeImplicitRequest {
+            implicit_id: implicit_project_id(&root),
+            project_id: Some("p".into()),
+            name: "Project".into(),
+            roots: vec![root.clone()],
+            ..Default::default()
+        };
+        f.store.upgrade_implicit(req.clone()).unwrap();
+        let out = result(
+            &f.store
+                .upgrade_implicit(UpgradeImplicitRequest {
+                    workspace_id: Some("w".into()),
+                    ..req
+                })
+                .unwrap(),
+        );
+        assert_eq!(out["noop"], true);
+        assert!(projection(&f)["workspace"].is_empty());
+        assert!(projection(&f)["project_workspace"].is_empty());
+        assert_rebuild_preserves_projection(&f);
+    }
+
+    #[test]
+    fn rebuild_register_root_inferred_rename_keeps_project_id() {
+        let f = Fixture::new("replay-register-owner");
+        let root = f.dir("root");
+        let fresh = f.dir("fresh");
+        register(&f, "p", root.clone());
+        let out = result(
+            &f.store
+                .register(RegisterRequest {
+                    name: "Renamed".into(),
+                    roots: vec![root, fresh],
+                    ..Default::default()
+                })
+                .unwrap(),
+        );
+        assert_eq!(out["projectId"], "p");
+        assert_eq!(
+            project_names(&f),
+            BTreeMap::from([("p".into(), "Renamed".into())])
+        );
+        assert_rebuild_preserves_projection(&f);
+    }
+
+    #[test]
+    fn rebuild_register_derived_parent_inferred_rename_keeps_project_id() {
+        let f = Fixture::new("replay-register-parent");
+        let parent = f.dir("parent");
+        f.store
+            .register(RegisterRequest {
+                project_id: Some("p".into()),
+                name: "Original".into(),
+                derived_root_parents: vec![parent.clone()],
+                ..Default::default()
+            })
+            .unwrap();
+        let out = result(
+            &f.store
+                .register(RegisterRequest {
+                    name: "Renamed".into(),
+                    derived_root_parents: vec![parent],
+                    ..Default::default()
+                })
+                .unwrap(),
+        );
+        assert_eq!(out["projectId"], "p");
+        assert_eq!(
+            project_names(&f),
+            BTreeMap::from([("p".into(), "Renamed".into())])
+        );
+        assert_rebuild_preserves_projection(&f);
+    }
+
+    #[test]
+    fn rebuild_assign_workspace_uses_journaled_workspace_name() {
+        let f = Fixture::new("replay-assign-name");
+        let root = f.dir("root");
+        register(&f, "p", root.clone());
+        f.store
+            .assign_workspace(AssignWorkspaceRequest {
+                project_id: "p".into(),
+                workspace_id: "w".into(),
+                workspace_name: Some("Team".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            projection(&f)["workspace"][0][1],
+            SqlValue::Text("Team".into())
+        );
+        assert_rebuild_preserves_projection(&f);
+    }
+
+    #[test]
+    fn rebuild_seed_renames_workspace_and_preserves_unchanged_workspace_timestamp() {
+        let f = Fixture::new("replay-seed-workspace-name");
+        seed(
+            &f,
+            SeedPayload {
+                workspaces: vec![workspace("w", "Original"), workspace("unchanged", "Same")],
+                ..Default::default()
+            },
+        );
+        // Distinct journal times make a spurious update observable even when
+        // these two seed calls happen within the same clock millisecond.
+        f.store
+            .db
+            .with_conn_fenced(|tx| {
+                tx.execute("UPDATE registry_journal SET created_at=1", [])?;
+                tx.execute("UPDATE workspace SET created_at=1,updated_at=1", [])?;
+                Ok(())
+            })
+            .unwrap();
+        seed(
+            &f,
+            SeedPayload {
+                workspaces: vec![workspace("w", "Renamed"), workspace("unchanged", "Same")],
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            projection(&f)["workspace"][1][1],
+            SqlValue::Text("Renamed".into())
+        );
+        assert_rebuild_preserves_projection(&f);
+    }
+
+    #[test]
+    fn rebuild_seed_project_name_prefers_payload_then_pair_then_root_basename() {
+        let f = Fixture::new("replay-seed-project-names");
+        let named = f.dir("payload-root");
+        let paired = f.dir("pair-root");
+        let unnamed = f.dir("basename");
+        seed(
+            &f,
+            SeedPayload {
+                pairs: vec![
+                    SeedPair {
+                        name: Some("Pair loses".into()),
+                        ..pair(&named, "git:payload")
+                    },
+                    SeedPair {
+                        name: Some("Pair wins".into()),
+                        ..pair(&paired, "git:pair")
+                    },
+                    pair(&unnamed, "git:basename"),
+                ],
+                names: BTreeMap::from([("git:payload".into(), "Payload wins".into())]),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            project_names(&f),
+            BTreeMap::from([
+                (seed_id("git:payload"), "Payload wins".into()),
+                (seed_id("git:pair"), "Pair wins".into()),
+                (seed_id("git:basename"), "basename".into()),
+            ])
+        );
+        assert_rebuild_preserves_projection(&f);
+    }
+
+    #[test]
+    fn rebuild_seed_multi_workspace_stays_unplaced_and_duplicate_claim_is_single() {
+        let f = Fixture::new("replay-seed-multi-workspace");
+        let multi = f.dir("multi");
+        let single = f.dir("single");
+        let out = seed(
+            &f,
+            SeedPayload {
+                pairs: vec![pair(&multi, "git:multi"), pair(&single, "git:single")],
+                workspaces: vec![workspace("w1", "One"), workspace("w2", "Two")],
+                members: vec![
+                    SeedMember {
+                        mc_identity: "git:multi".into(),
+                        workspace_id: "w1".into(),
+                    },
+                    SeedMember {
+                        mc_identity: "git:multi".into(),
+                        workspace_id: "w2".into(),
+                    },
+                    SeedMember {
+                        mc_identity: "git:single".into(),
+                        workspace_id: "w1".into(),
+                    },
+                    SeedMember {
+                        mc_identity: "git:single".into(),
+                        workspace_id: "w1".into(),
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+        assert!(has_report(&out, "multi_workspace"));
+        assert_eq!(f.store.resolve(&multi).unwrap().workspace_id, None);
+        assert_eq!(
+            f.store.resolve(&single).unwrap().workspace_id.as_deref(),
+            Some("w1")
+        );
+        assert_rebuild_preserves_projection(&f);
+    }
+
+    #[test]
+    fn rebuild_seed_alias_occupied_does_not_create_project() {
+        let f = Fixture::new("replay-seed-alias-occupied");
+        let id = seed_id("git:occupied");
+        register(&f, &id, f.dir("old"));
+        register(&f, "successor", f.dir("successor"));
+        f.store
+            .remove(RemoveRequest {
+                project_id: Some(id),
+                successor_project_id: Some("successor".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let out = seed(
+            &f,
+            SeedPayload {
+                pairs: vec![pair(&f.dir("fresh"), "git:occupied")],
+                // An effectful workspace write ensures the skipped observation is
+                // journaled and reaches replay instead of only testing a live noop.
+                workspaces: vec![workspace("w", "Team")],
+                ..Default::default()
+            },
+        );
+        assert!(has_report(&out, "alias_occupied"));
+        assert_eq!(out["noop"], false);
+        assert_eq!(
+            project_names(&f),
+            BTreeMap::from([("successor".into(), "successor".into())])
+        );
+        assert_rebuild_preserves_projection(&f);
+    }
+
+    #[test]
+    fn rebuild_seed_conflicted_root_is_skipped_per_root_not_per_identity() {
+        let f = Fixture::new("replay-seed-conflicted-root");
+        let conflict = f.dir("conflict");
+        let fresh = f.dir("fresh");
+        let out = seed(
+            &f,
+            SeedPayload {
+                pairs: vec![
+                    pair(&conflict, "git:a"),
+                    pair(&conflict, "git:b"),
+                    pair(&fresh, "git:a"),
+                ],
+                ..Default::default()
+            },
+        );
+        assert!(has_report(&out, "conflicted"));
+        assert_eq!(
+            project_names(&f),
+            BTreeMap::from([(seed_id("git:a"), "fresh".into())])
+        );
+        assert_eq!(projection(&f)["project_root"].len(), 1);
+        assert_eq!(projection(&f)["project_root"][0][0], SqlValue::Text(fresh));
+        assert_rebuild_preserves_projection(&f);
+    }
+
+    #[test]
+    fn rebuild_seed_minted_id_occupied_does_not_bind_observation() {
+        let f = Fixture::new("replay-seed-id-occupied");
+        let id = seed_id("git:occupied");
+        register(&f, &id, f.dir("owned"));
+        let out = seed(
+            &f,
+            SeedPayload {
+                pairs: vec![pair(&f.dir("fresh"), "git:occupied")],
+                workspaces: vec![workspace("w", "Team")],
+                ..Default::default()
+            },
+        );
+        assert!(has_report(&out, "conflicted"));
+        assert_eq!(project_names(&f), BTreeMap::from([(id.clone(), id)]));
+        assert_eq!(projection(&f)["project_root"].len(), 1);
+        assert_rebuild_preserves_projection(&f);
+    }
+
+    #[test]
+    fn rebuild_seed_identity_class_precedence_is_per_root() {
+        for (identity, class) in [("git:winner", None), ("opaque-winner", Some("git"))] {
+            let f = Fixture::new("replay-seed-precedence");
+            let mixed = f.dir("mixed");
+            let directory = f.dir("directory");
+            let out = seed(
+                &f,
+                SeedPayload {
+                    pairs: vec![
+                        SeedPair {
+                            identity_class: class.map(String::from),
+                            ..pair(&mixed, identity)
+                        },
+                        SeedPair {
+                            identity_class: Some("dir".into()),
+                            ..pair(&mixed, "dir:loser")
+                        },
+                        SeedPair {
+                            identity_class: Some("dir".into()),
+                            ..pair(&directory, "dir:loser")
+                        },
+                    ],
+                    ..Default::default()
+                },
+            );
+            assert!(has_report(&out, "identity_class_precedence"));
+            assert_eq!(
+                project_names(&f),
+                BTreeMap::from([
+                    (seed_id(identity), "mixed".into()),
+                    (seed_id("dir:loser"), "directory".into()),
+                ])
+            );
+            assert_rebuild_preserves_projection(&f);
+        }
+    }
+
+    #[test]
+    fn rebuild_seed_rejoined_project_without_new_roots_does_not_place_or_rename() {
+        let f = Fixture::new("replay-seed-rejoined");
+        let root = f.dir("root");
+        seed(
+            &f,
+            SeedPayload {
+                pairs: vec![pair(&root, "git:one")],
+                ..Default::default()
+            },
+        );
+        let out = seed(
+            &f,
+            SeedPayload {
+                pairs: vec![SeedPair {
+                    name: Some("Not applied".into()),
+                    ..pair(&root, "git:one")
+                }],
+                workspaces: vec![workspace("w", "Team")],
+                members: vec![SeedMember {
+                    mc_identity: "git:one".into(),
+                    workspace_id: "w".into(),
+                }],
+                ..Default::default()
+            },
+        );
+        assert!(has_report(&out, "rejoined"));
+        assert_eq!(out["noop"], false);
+        assert_eq!(
+            project_names(&f),
+            BTreeMap::from([(seed_id("git:one"), "root".into())])
+        );
+        assert_eq!(f.store.resolve(&root).unwrap().workspace_id, None);
+        assert_rebuild_preserves_projection(&f);
+    }
+
+    #[test]
+    fn rebuild_legacy_request_only_rows_apply_live_rules_without_disk_or_cached_replies() {
+        let f = Fixture::new("replay-legacy-requests");
+        let root = f.dir("root");
+        register(&f, "p", root.clone());
+        f.store
+            .register(RegisterRequest {
+                name: "Inferred rename".into(),
+                roots: vec![root.clone()],
+                ..Default::default()
+            })
+            .unwrap();
+        f.store
+            .upgrade_implicit(UpgradeImplicitRequest {
+                implicit_id: implicit_project_id(&root),
+                project_id: Some("p".into()),
+                name: "Upgraded rename".into(),
+                roots: vec![root.clone()],
+                ..Default::default()
+            })
+            .unwrap();
+        f.store
+            .assign_workspace(AssignWorkspaceRequest {
+                project_id: "p".into(),
+                workspace_id: "w".into(),
+                workspace_name: Some("Team".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let seeded_root = f.dir("seeded");
+        seed(
+            &f,
+            SeedPayload {
+                pairs: vec![SeedPair {
+                    name: Some("Seeded name".into()),
+                    ..pair(&seeded_root, "git:seeded")
+                }],
+                workspaces: vec![workspace("w", "Renamed team")],
+                ..Default::default()
+            },
+        );
+        // Legacy journals contain request bodies, not precomputed projection
+        // decisions. Remove envelopes and cached replies to pin that contract.
+        f.store.db.with_conn_fenced(|tx| {
+            let mut stmt = tx.prepare("SELECT seq,payload_json FROM registry_journal")?;
+            let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(stmt);
+            for (seq, payload) in rows {
+                let value: Value = serde_json::from_str(&payload).unwrap();
+                let request = value.get("request").unwrap_or(&value);
+                tx.execute("UPDATE registry_journal SET payload_json=?1,response_json=NULL WHERE seq=?2",
+                    params![serde_json::to_string(request).unwrap(), seq])?;
+            }
+            Ok(())
+        }).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+        std::fs::remove_dir(&seeded_root).unwrap();
+        assert_eq!(
+            project_names(&f),
+            BTreeMap::from([
+                ("p".into(), "Upgraded rename".into()),
+                (seed_id("git:seeded"), "Seeded name".into()),
+            ])
+        );
+        assert_rebuild_preserves_projection(&f);
     }
 }
