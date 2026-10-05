@@ -416,10 +416,13 @@ mod tests {
                         // only the original columns here, which must be unchanged;
                         // the new column is checked separately to be NULL on every
                         // row written before the migration.
-                        let select = if table == "registry_journal" {
-                            "seq,op,payload_json,actor,request_key,created_at,response_json"
-                        } else {
-                            "*"
+                        let select = match table {
+                            "registry_journal" => {
+                                "seq,op,payload_json,actor,request_key,created_at,response_json"
+                            }
+                            "project_root" => "canonical_root,project_id,added_at",
+                            "workspace" => "workspace_id,name,created_at,updated_at",
+                            _ => "*",
                         };
                         let columns = conn
                             .prepare(&format!("SELECT {select} FROM {table}"))?
@@ -438,6 +441,24 @@ mod tests {
                             .collect::<Result<Vec<_>>>()?;
                         tables.insert(table.into(), rows);
                     }
+                    // The root path moves to a local table in migration 7. Keep
+                    // comparing every original path by workspace id, including
+                    // NULL (either an absent local row or an explicitly clear one).
+                    let has_local_roots = conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='workspace_root' AND type='table')",
+                        [],
+                        |r| r.get::<_, bool>(0),
+                    )?;
+                    let roots_query = if has_local_roots {
+                        "SELECT w.workspace_id,r.root FROM workspace w LEFT JOIN workspace_root r ON r.workspace_id=w.workspace_id ORDER BY w.workspace_id"
+                    } else {
+                        "SELECT workspace_id,root FROM workspace ORDER BY workspace_id"
+                    };
+                    let roots = conn
+                        .prepare(roots_query)?
+                        .query_map([], |r| Ok(vec![r.get::<_, SqlValue>(0)?, r.get::<_, SqlValue>(1)?]))?
+                        .collect::<Result<Vec<_>>>()?;
+                    tables.insert("workspace_root_paths".into(), roots);
                     Ok(tables)
                 })
                 .unwrap()

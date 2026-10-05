@@ -650,7 +650,9 @@ impl super::JournalWriter<'_> {
             let now = now_unix_millis();
             let current = tx
                 .query_row(
-                    "SELECT root FROM workspace WHERE workspace_id=?1",
+                    "SELECT r.root FROM workspace w
+                     LEFT JOIN workspace_root r ON r.workspace_id=w.workspace_id
+                     WHERE w.workspace_id=?1",
                     [&req.workspace_id],
                     |r| r.get::<_, Option<String>>(0),
                 )
@@ -678,10 +680,7 @@ impl super::JournalWriter<'_> {
                 now,
                 self.principal,
             )?;
-            tx.execute(
-                "UPDATE workspace SET root=?1, updated_at=?2 WHERE workspace_id=?3",
-                params![req.root, now, req.workspace_id],
-            )?;
+            set_workspace_root_projection(tx, &req.workspace_id, req.root.as_deref(), now)?;
             Ok(Action {
                 changed: true,
                 seq: Some(seq),
@@ -1015,13 +1014,36 @@ const DERIVED_TABLES: &[&str] = &[
     "project_alias",
     "derived_root_parent",
     "root_owned_remotes",
+    "project_root_key",
     "project_root",
     "project",
+    "workspace_root",
     "workspace",
     "root_binding",
     "retired_binding",
     "root_approval",
 ];
+
+// Until the log is enabled, setting a root still bumps the workspace timestamp
+// just as it did when the path lived on the workspace row. Replay uses the same
+// projection write so cleared paths retain their own last-setting timestamp too.
+fn set_workspace_root_projection(
+    tx: &Transaction<'_>,
+    workspace_id: &str,
+    root: Option<&str>,
+    now: i64,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO workspace_root(workspace_id,root,updated_at) VALUES(?1,?2,?3)
+         ON CONFLICT(workspace_id) DO UPDATE SET root=excluded.root,updated_at=excluded.updated_at",
+        params![workspace_id, root, now],
+    )?;
+    tx.execute(
+        "UPDATE workspace SET updated_at=?1 WHERE workspace_id=?2",
+        params![now, workspace_id],
+    )?;
+    Ok(())
+}
 
 fn delete_and_replay(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     // Historical claims and tombstoned ids are projections too. Defer foreign
@@ -1266,10 +1288,7 @@ fn replay(tx: &Transaction<'_>, seq: i64, op: &str, v: Value, now: i64) -> rusql
         "set_workspace_root" => {
             let r: SetWorkspaceRootRequest = serde_json::from_value(v)
                 .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-            tx.execute(
-                "UPDATE workspace SET root=?1, updated_at=?2 WHERE workspace_id=?3",
-                params![r.root, now, r.workspace_id],
-            )?;
+            set_workspace_root_projection(tx, &r.workspace_id, r.root.as_deref(), now)?;
         }
         "assign_workspace" => {
             let r: AssignWorkspaceRequest = serde_json::from_value(v)
