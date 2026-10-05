@@ -49,7 +49,9 @@ newly effective owned remote currently points to another project's owned repo
 any flow-scoped write. Path resolution failures use the existing `storage_error`
 mapping for path errors. Failures write nothing.
 
-CLI: `ck projects owned-remotes <root> <name>...`; no names owns nothing.
+CLI: `ck projects owned-remotes <root> <name>...` owns exactly those names,
+`--none` owns nothing, and `--default` resets to `origin`. A bare
+`owned-remotes <root>` is refused rather than read as "own nothing".
 `ck projects owned-remotes <root> --default` resets. The CLI prints the resulting
 owned names; `--default` cannot be combined with names.
 

@@ -163,7 +163,9 @@ pub fn parse(face: Face, arguments: &[String]) -> Invocation {
                 None => return Invocation::Refuse("--subc needs a path".to_string()),
             },
             "--json" => json = true,
-            "--default" if face == Face::Projects && verb.as_deref() == Some("owned-remotes") => {
+            "--default" | "--none"
+                if face == Face::Projects && verb.as_deref() == Some("owned-remotes") =>
+            {
                 args.push(argument.clone());
             }
             other if other.starts_with('-') => {
@@ -215,8 +217,10 @@ usage: ck projects <verb> [args] [--subc <connection file>] [--json]
                           add another root to a project (starts unapproved)
   remove-root <project> <dir>
                           remove one root from a project
-  owned-remotes <root> [name ...]
-                          own these remote names (no names means own nothing)
+  owned-remotes <root> <name>...
+                          own exactly these remote names
+  owned-remotes <root> --none
+                          own no remote
   owned-remotes <root> --default
                           reset ownership to origin
   approve <dir>           approve every root of the project owning <dir>
@@ -394,18 +398,33 @@ fn build(command: &Command) -> Result<(String, Value), String> {
         ),
         (Face::Projects, "verify") => ("verify".to_string(), json!({})),
         (Face::Projects, "owned-remotes") => {
-            if command.args.first().is_some_and(|arg| arg == "--default") {
-                return Err("owned-remotes needs a root directory before --default".into());
+            if command
+                .args
+                .first()
+                .is_some_and(|arg| arg == "--default" || arg == "--none")
+            {
+                return Err("owned-remotes needs a root directory before its flag".into());
             }
             let root = absolute(&need(0, "a root directory")?)?;
             let names = &command.args[1..];
-            let remotes = if names.iter().any(|name| name == "--default") {
-                if names.len() != 1 {
-                    return Err("--default cannot be combined with remote names".into());
+            let flag = names.iter().find(|name| name.starts_with("--"));
+            // Owning nothing makes Plexus stop watching the root's repo, so it
+            // must be asked for by name: a bare `owned-remotes <root>`, easy to
+            // type while checking what a root owns, is refused, not read as an
+            // empty set.
+            let remotes = match flag.map(String::as_str) {
+                Some(flag) if names.len() != 1 => {
+                    return Err(format!("{flag} cannot be combined with remote names"))
                 }
-                Value::Null
-            } else {
-                json!(names)
+                Some("--default") => Value::Null,
+                Some(_) => json!([]),
+                None if names.is_empty() => {
+                    return Err(
+                        "name the remotes this root owns, or pass --default (origin) or --none"
+                            .into(),
+                    )
+                }
+                None => json!(names),
             };
             (
                 "set_owned_remotes".to_string(),
@@ -1019,7 +1038,7 @@ mod tests {
         for (tail, expected) in [
             (vec!["origin", "mirror"], json!(["origin", "mirror"])),
             (vec!["--default"], Value::Null),
-            (vec![], json!([])),
+            (vec!["--none"], json!([])),
         ] {
             let mut arguments = vec!["owned-remotes".to_string(), root.clone()];
             arguments.extend(tail.iter().map(|arg| arg.to_string()));
@@ -1046,6 +1065,15 @@ mod tests {
             panic!("parse")
         };
         assert!(build(&command).unwrap_err().contains("cannot be combined"));
+        // A bare root must not silently disown it: owning nothing is `--none`.
+        let Invocation::Command(command) =
+            parse(Face::Projects, &["owned-remotes".into(), root.clone()])
+        else {
+            panic!("parse")
+        };
+        assert!(build(&command)
+            .unwrap_err()
+            .contains("name the remotes this root owns"));
         let Invocation::Command(command) = parse(
             Face::Projects,
             &["owned-remotes".into(), "--default".into()],
