@@ -45,15 +45,17 @@ CREATE TABLE workspace_root (
 );
 -- A later rename updates workspace.updated_at, not the root's timestamp. Use
 -- the latest root-setting journal row, accepting both historical request shapes.
--- A deleted and recreated workspace must not inherit its former local path.
+-- Every non-null path with no setting row is carried, using workspace.updated_at
+-- as its timestamp. A null path is carried only after an explicit journal clear.
+-- A deleted and recreated workspace must not inherit a pre-removal local path.
 WITH requests AS (
     SELECT seq, op, created_at,
            COALESCE(json_extract(payload_json, '$.request'), payload_json) AS request
     FROM registry_journal WHERE op IN ('set_workspace_root','remove')
 )
 INSERT INTO workspace_root(workspace_id, root, updated_at)
-SELECT w.workspace_id, w.root, j.created_at
-FROM workspace w JOIN requests j ON j.seq = (
+SELECT w.workspace_id, w.root, COALESCE(j.created_at, w.updated_at)
+FROM workspace w LEFT JOIN requests j ON j.seq = (
     SELECT MAX(s.seq) FROM requests s
     WHERE s.op = 'set_workspace_root'
       AND json_extract(s.request, '$.workspaceId') = w.workspace_id
@@ -62,9 +64,64 @@ FROM workspace w JOIN requests j ON j.seq = (
           WHERE d.op = 'remove'
             AND json_extract(d.request, '$.workspaceId') = w.workspace_id
       ), 0)
-);
+)
+WHERE (j.seq IS NOT NULL AND (w.root IS NOT NULL OR json_type(j.request, '$.root') = 'null'))
+   OR (w.root IS NOT NULL AND NOT EXISTS (
+       SELECT 1 FROM requests s WHERE s.op = 'set_workspace_root'
+         AND json_extract(s.request, '$.workspaceId') = w.workspace_id
+   ));
+
+-- Roots from older write paths or hand edits have no replay source. Record only
+-- those fallback after-images locally, without rewriting historical rows or
+-- changing the journal head of an ordinary store (including an empty store).
+INSERT INTO registry_journal(op, payload_json, actor, created_at, principal, stream, origin)
+SELECT 'workspace_root.backfill',
+       json_object('roots', json_group_array(json_object(
+           'workspaceId', workspace_id, 'root', root, 'updatedAt', updated_at
+       ))),
+       'migration', MAX(updated_at), 'entorhinal', 'local', 'here'
+FROM (
+    SELECT r.workspace_id, r.root, r.updated_at FROM workspace_root r
+    WHERE r.root IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM registry_journal j WHERE j.op = 'set_workspace_root'
+          AND json_extract(COALESCE(json_extract(j.payload_json, '$.request'), j.payload_json), '$.workspaceId') = r.workspace_id
+    )
+    ORDER BY r.workspace_id
+)
+HAVING COUNT(*) > 0;
 ALTER TABLE workspace DROP COLUMN root;
 "#;
+
+#[derive(serde::Deserialize)]
+struct WorkspaceRootBackfill {
+    roots: Vec<WorkspaceRootAfterImage>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceRootAfterImage {
+    workspace_id: String,
+    root: String,
+    updated_at: i64,
+}
+
+pub(crate) fn replay_workspace_root_backfill(
+    tx: &rusqlite::Transaction<'_>,
+    value: serde_json::Value,
+) -> rusqlite::Result<()> {
+    let backfill: WorkspaceRootBackfill = serde_json::from_value(value)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    // A migration after-image describes the local path only. Its timestamp must
+    // not overwrite the workspace's independently journaled rename timestamp.
+    for root in backfill.roots {
+        tx.execute(
+            "INSERT INTO workspace_root(workspace_id,root,updated_at) VALUES(?1,?2,?3)
+             ON CONFLICT(workspace_id) DO UPDATE SET root=excluded.root,updated_at=excluded.updated_at",
+            rusqlite::params![root.workspace_id, root.root, root.updated_at],
+        )?;
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -253,6 +310,184 @@ mod tests {
             migrated,
             "rebuild did not repair local root cells"
         );
+    }
+
+    #[test]
+    fn v6_unjournaled_workspace_roots_are_carried_and_replay_cleanly() {
+        let f = Fixture::new("log-schema-unjournaled");
+        let descriptor = descriptor(&f);
+        let old = RegistryStore::open_with_migrations(&descriptor, &MIGRATIONS[..6]).unwrap();
+        old.db.with_conn_fenced(|tx| {
+            let entries = [
+                ("register", json!({"projectId":"p","name":"P","workspaceId":"F"}), 10),
+                ("seed_import", json!({"source":"mc","payload":{"workspaces":[{"workspaceId":"F","name":"Renamed"},{"workspaceId":"H","name":"Second fallback"},{"workspaceId":"N","name":"Unset"},{"workspaceId":"L","name":"Logged"},{"workspaceId":"R","name":"Recreated"}]}}), 60),
+                ("set_workspace_root", json!({"workspaceId":"L","root":"/logged"}), 70),
+                ("set_workspace_root", json!({"workspaceId":"R","root":"/deleted"}), 80),
+                ("remove", json!({"workspaceId":"R"}), 90),
+                ("seed_import", json!({"source":"mc","payload":{"workspaces":[{"workspaceId":"R","name":"Recreated"}]}}), 100),
+            ];
+            for (op,payload,now) in entries {
+                tx.execute("INSERT INTO registry_journal(op,payload_json,actor,created_at,principal) VALUES(?1,?2,'operator',?3,'direct')", params![op,payload.to_string(),now])?;
+            }
+            tx.execute_batch("INSERT INTO project(project_id,name,implicit,created_at,updated_at) VALUES('p','P',0,10,10);
+                INSERT INTO workspace(workspace_id,name,created_at,updated_at,root) VALUES
+                    ('F','Renamed',10,60,'/unjournaled'),('H','Second fallback',60,60,'/second'),
+                    ('N','Unset',60,60,NULL),('L','Logged',60,70,'/logged'),('R','Recreated',100,100,'/deleted');
+                INSERT INTO project_workspace(project_id,workspace_id) VALUES('p','F');
+                INSERT INTO workspace_member(workspace_id,ref_kind,device_fingerprint,project_id) VALUES('F','local','','p');")?;
+            Ok(())
+        }).unwrap();
+        assert_eq!(old.generation().unwrap(), 6);
+        drop(old);
+
+        let store = RegistryStore::open(&descriptor).unwrap();
+        let migrated = cells(&store);
+        assert_eq!(
+            migrated["workspace_root"],
+            vec![
+                vec![
+                    SqlValue::Text("F".into()),
+                    SqlValue::Text("/unjournaled".into()),
+                    SqlValue::Integer(60)
+                ],
+                vec![
+                    SqlValue::Text("H".into()),
+                    SqlValue::Text("/second".into()),
+                    SqlValue::Integer(60)
+                ],
+                vec![
+                    SqlValue::Text("L".into()),
+                    SqlValue::Text("/logged".into()),
+                    SqlValue::Integer(70)
+                ],
+            ],
+            "fallback paths must survive, unset and pre-removal paths must not"
+        );
+        assert_eq!(store.generation().unwrap(), 7);
+        let backfill = store.journal_tail(6, 10).unwrap().entries;
+        assert_eq!(backfill.len(), 1);
+        assert_eq!(backfill[0].op, "workspace_root.backfill");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&backfill[0].payload_json).unwrap(),
+            json!({"roots":[
+                {"workspaceId":"F","root":"/unjournaled","updatedAt":60},
+                {"workspaceId":"H","root":"/second","updatedAt":60},
+            ]})
+        );
+        let row = &migrated["registry_journal"][6];
+        assert_eq!(row[4], SqlValue::Null);
+        assert_eq!(
+            &row[8..],
+            &[
+                SqlValue::Text("local".into()),
+                SqlValue::Null,
+                SqlValue::Null,
+                SqlValue::Text("here".into()),
+                SqlValue::Null
+            ]
+        );
+        // A local root after-image must not touch the shared workspace's own
+        // timestamp, even if the two timestamps no longer happen to be equal.
+        store
+            .db
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "UPDATE workspace SET updated_at=777 WHERE workspace_id='F'",
+                    [],
+                )?;
+                super::replay_workspace_root_backfill(
+                    tx,
+                    json!({"roots":[{"workspaceId":"F","root":"/unjournaled","updatedAt":60}]}),
+                )?;
+                assert_eq!(
+                    tx.query_row(
+                        "SELECT updated_at FROM workspace WHERE workspace_id='F'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    777
+                );
+                tx.execute(
+                    "UPDATE workspace SET updated_at=60 WHERE workspace_id='F'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let verified = store.verify().unwrap();
+        assert!(verified.ok, "{verified:?}");
+        assert_eq!(cells(&store), migrated, "verify wrote live cells");
+        assert!(store.rebuild().unwrap().replay.ok);
+        assert_eq!(cells(&store), migrated, "rebuild lost fallback cells");
+
+        // Replay must use the recorded after-image, not the possibly corrupted
+        // live path. The fallback is not an exemption from root verification.
+        store
+            .db
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "UPDATE workspace_root SET root='/corrupt' WHERE workspace_id='F'",
+                    [],
+                )
+            })
+            .unwrap();
+        assert!(!store.verify().unwrap().ok);
+        assert!(!store.rebuild().unwrap().replay.ok);
+        assert_eq!(cells(&store), migrated);
+        drop(store);
+        let reopened = RegistryStore::open(&descriptor).unwrap();
+        assert_eq!(reopened.generation().unwrap(), 7);
+        assert_eq!(cells(&reopened), migrated, "reopen duplicated the backfill");
+        assert!(reopened.verify().unwrap().ok);
+    }
+
+    #[test]
+    fn v6_without_fallback_roots_keeps_generation_and_writes_no_backfill() {
+        for mode in ["empty", "unset", "set"] {
+            let f = Fixture::new("log-schema-no-backfill");
+            let descriptor = descriptor(&f);
+            let old = RegistryStore::open_with_migrations(&descriptor, &MIGRATIONS[..6]).unwrap();
+            old.db.with_conn_fenced(|tx| {
+                if mode != "empty" {
+                    tx.execute("INSERT INTO registry_journal(op,payload_json,actor,created_at) VALUES('register',?1,'operator',10)", [json!({"projectId":"p","name":"P","workspaceId":"W"}).to_string()])?;
+                    tx.execute_batch("INSERT INTO project(project_id,name,implicit,created_at,updated_at) VALUES('p','P',0,10,10);
+                        INSERT INTO workspace(workspace_id,name,created_at,updated_at) VALUES('W','W',10,10);
+                        INSERT INTO project_workspace(project_id,workspace_id) VALUES('p','W');
+                        INSERT INTO workspace_member(workspace_id,ref_kind,device_fingerprint,project_id) VALUES('W','local','','p');")?;
+                }
+                if mode == "set" {
+                    tx.execute("INSERT INTO registry_journal(op,payload_json,actor,created_at) VALUES('set_workspace_root',?1,'operator',20)", [json!({"workspaceId":"W","root":"/ordinary"}).to_string()])?;
+                    tx.execute("UPDATE workspace SET root='/ordinary',updated_at=20 WHERE workspace_id='W'", [])?;
+                }
+                Ok(())
+            }).unwrap();
+            let before = old.journal_tail(0, 100).unwrap();
+            drop(old);
+            let store = RegistryStore::open(&descriptor).unwrap();
+            assert_eq!(
+                store.generation().unwrap(),
+                before.generation,
+                "{mode} moved generation"
+            );
+            assert_eq!(
+                serde_json::to_vec(&store.journal_tail(0, 100).unwrap()).unwrap(),
+                serde_json::to_vec(&before).unwrap(),
+                "{mode} wrote a journal row"
+            );
+            assert!(!store
+                .journal_tail(0, 100)
+                .unwrap()
+                .entries
+                .iter()
+                .any(|row| row.op == "workspace_root.backfill"));
+            assert!(store.verify().unwrap().ok, "{mode}");
+            assert!(store.rebuild().unwrap().replay.ok, "{mode}");
+            assert_eq!(
+                store.generation().unwrap(),
+                before.generation,
+                "{mode} replay moved generation"
+            );
+        }
     }
 
     #[test]

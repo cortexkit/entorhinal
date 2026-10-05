@@ -1213,6 +1213,7 @@ fn replay(tx: &Transaction<'_>, seq: i64, op: &str, v: Value, now: i64) -> rusql
         return Ok(());
     }
     match op {
+        "workspace_root.backfill" => super::log_schema::replay_workspace_root_backfill(tx, v)?,
         "register" => {
             let r: RegisterRequest = serde_json::from_value(v)
                 .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
