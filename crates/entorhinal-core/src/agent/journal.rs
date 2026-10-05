@@ -5,8 +5,10 @@ use serde_json::{json, Value};
 use super::{claims::write_claim, store::write_row, AgentMutationError, AgentNameClaim, AgentRow};
 use crate::mutations::{append, Action};
 
-/// Each entry is a complete after-image and the claims inserted or released by
-/// that operation. Replay must assign recorded values, never mint or increment.
+/// Each journal entry carries the full agent row after the operation and the
+/// claims it inserted or released. Replay restores rows, ids, generations and
+/// claim history exactly from these recorded values, without re-running
+/// validation or drawing new values from the id source.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentChangeEntry {

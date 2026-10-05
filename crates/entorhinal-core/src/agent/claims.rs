@@ -91,8 +91,10 @@ pub(crate) fn claim(
     tx.execute("INSERT INTO agent_name_claim(agent_id,namespace_kind,namespace_key,name_normalization_version,normalized_name,display_name,claimed_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7)",
         params![agent_id,kind,key,name.normalization_version,name.normalized_name,name.stored_name,now])
         .map_err(|error| {
-            // Keep the index refusal typed even if this helper is used without
-            // the preflight collision check.
+            // SQLite's active-name unique-index error for the namespace and
+            // normalized-name columns becomes `name_conflict`. This keeps a
+            // duplicate name from surfacing as a storage error when this helper
+            // runs without the earlier collision check.
             // Source: prefrontal 873870be8 crates/prefrontal-core-store/src/agent_claims.rs:146-172.
             let message = error.to_string();
             if message.contains("agent_name_claim.namespace_kind") && message.contains("agent_name_claim.normalized_name") {

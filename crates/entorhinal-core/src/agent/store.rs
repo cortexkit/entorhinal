@@ -108,7 +108,8 @@ pub struct AgentRow {
 }
 
 impl AgentRow {
-    /// Retired is the stored vocabulary; core's gone object says deleted.
+    /// Stored rows use `retired`, but gone replies use core's `deleted` so
+    /// existing clients see the terminal-state words they already decode.
     /// Source: prefrontal 873870be8 crates/prefrontal-core-module/src/agent_registry_ops.rs:992-1001.
     pub fn gone(&self) -> Option<Value> {
         match self.status.as_str() {
@@ -120,8 +121,11 @@ impl AgentRow {
         }
     }
 
-    /// Preserve core's digest keys while omitting runtime-only fields and adding
-    /// the independent per-agent generation.
+    /// Keep core's digest keys `agent_id`, `name`, `name_version`, `tag`,
+    /// `labels`, `role`, `created_at`, and optional `project_id`/`workspace_id`,
+    /// adding the independent `agent_generation`. Leave out runtime fields
+    /// `persona_ref`, `sleep`, `wake_policy_version`, `residence` and
+    /// `reachability`: the identity store does not own that state.
     /// Source: prefrontal 873870be8 crates/prefrontal-core-module/src/agent_registry_ops.rs:950-989.
     pub fn digest(&self) -> Value {
         let mut value = json!({"agent_id":self.agent_id, "name":self.name,
@@ -196,7 +200,8 @@ impl Role {
     }
 }
 
-// Keep bodies closed before the request-key cache can return a saved reply.
+// Refuse unknown request fields before a cached reply can be returned, so a
+// reused request key cannot smuggle in fields that core would refuse.
 // Source: prefrontal 873870be8 crates/prefrontal-core-module/src/agent_registry_ops.rs:580-628,631-646,685-693,722-732.
 macro_rules! request {
     ($name:ident { $($field:ident : $ty:ty),* $(,)? }) => {
@@ -448,8 +453,9 @@ fn create(
         _ => ("workspace", workspace_id.as_deref().unwrap()),
     };
     claims::check_name(tx, kind, key, &name, None)?;
-    // Let the one-live-head index be the final create check. Its violation is
-    // translated using the occupier, including an imported head's NULL key.
+    // The unique index on a project's live head is the last guard against
+    // creating two heads. Its violation becomes `agent_project_taken`, naming
+    // the existing head and its request key, which may be NULL for an imported head.
     let agent_id = loop {
         let id = format!("agent_{}", store.ids.hex(8)?);
         if load_row(tx, &id)?.is_none() {
@@ -493,9 +499,11 @@ fn create(
 }
 
 impl RegistryStore {
-    /// Run an identity mutation after the module has admitted its route. The
-    /// injected clock is stored; incarnation is attached by the serving layer,
-    /// not persisted in the cache. Call through with_principal for attribution.
+    /// Run an identity mutation after the module has admitted its route. Store
+    /// the supplied timestamp; the serving layer attaches the process
+    /// `incarnation` to replies instead of persisting it in the cache. Call
+    /// through `with_principal` to record the route's verified caller on the
+    /// journal row.
     pub fn agent_mutation(
         &self,
         op: &str,
@@ -514,8 +522,10 @@ impl RegistryStore {
         self.read(|conn| claims::load_claims(conn, id))
     }
 
-    /// Serve stored GitHub identity only for live agents. Read the fleet head
-    /// in the same snapshot as the agent's own generation.
+    /// Serve stored GitHub identity only for live agents. Read the journal's
+    /// current generation in the same snapshot as the agent's generation, so
+    /// the identity and both generation values describe the same committed
+    /// state even when another request is writing concurrently.
     /// Source: prefrontal 873870be8 crates/prefrontal-core-module/src/agent_registry_ops.rs:3342-3354.
     pub fn agent_github_identity(&self, id: &str) -> Result<Vec<u8>, AgentMutationError> {
         let (row, generation) =
@@ -589,8 +599,10 @@ impl JournalWriter<'_> {
                                     placement(tx, row.project_id.as_deref().unwrap())?;
                                 }
                                 let name = normalize_agent_name(&r.name)?;
-                                // Placement is a prerequisite, not the new namespace:
-                                // imported claims may refer to a removed workspace.
+                                // A rename keeps the namespace of the agent's active
+                                // claim. Current project placement is only checked,
+                                // not used to choose the namespace, because an imported
+                                // claim may name a workspace that no longer exists.
                                 // Source: prefrontal 873870be8 crates/prefrontal-core-store/src/agent_claims.rs:248-266.
                                 let active = claims::active_claim(tx, id)?;
                                 claims::check_name(tx, &active.namespace_kind, &active.namespace_key, &name, Some(id))?;
@@ -821,8 +833,10 @@ mod tests {
         assert_eq!(entries(&f).len(), 4);
     }
 
-    // These collision pairs pin independent expected outcomes through creates,
-    // rather than comparing the port's normalizer with itself.
+    // Creating each pair in one namespace must refuse the second name with
+    // `name_conflict`: composed/decomposed Café, Straße/STRASSE, and Alice with
+    // surrounding Unicode whitespace/alice. The expected collisions are fixed
+    // inputs, not values computed by the normalizer under test.
     // Source: prefrontal 873870be8 crates/prefrontal-core-store/src/agent_registry.rs:7582-7616.
     #[test]
     fn nfc_case_fold_and_trim_each_create_claim_collisions() {
@@ -842,7 +856,8 @@ mod tests {
         }
     }
 
-    // Invalid names must remain typed and must never be truncated into claims.
+    // All-whitespace names and names containing 25 characters must be refused
+    // with `invalid_name`, rather than shortened and stored as name claims.
     // Source: prefrontal 873870be8 crates/prefrontal-core-store/src/agent_registry.rs:7618-7634.
     #[test]
     fn invalid_names_are_typed_and_never_truncated() {
@@ -857,7 +872,10 @@ mod tests {
         }
     }
 
-    // Invisible controls refuse at the claim boundary, while Cyrillic survives.
+    // Names containing U+200B (zero-width space), U+202E (right-to-left override)
+    // or U+2060 (word joiner) must be refused before a claim is written, with
+    // the offending codepoint in the error. The Cyrillic name Алиса is accepted
+    // and stored unchanged.
     // Source: prefrontal 873870be8 crates/prefrontal-core-store/src/agent_registry.rs:7636-7661.
     #[test]
     fn invisible_and_bidi_characters_are_refused_at_claim_time_with_the_codepoint() {
@@ -879,9 +897,13 @@ mod tests {
         assert_eq!(row(&f, &id).name, "Алиса");
     }
 
-    // Display normalization, claim versions and durable timestamps are carried.
-    // Persona, wake, residence and machine-binding assertions are intentionally
-    // dropped: those are runtime state, not agent identity.
+    // Creating a name with surrounding spaces and a decomposed accent stores
+    // Café, keeps the tag and empty labels, and preserves the row's name and
+    // normalization versions and creation/update timestamps. Its claim keeps
+    // the display name, normalized name and normalization version. Uppercase
+    // agent ids remain unknown. Persona, wake, residence and
+    // machine-binding assertions from core are dropped because those fields
+    // describe runtime state, not agent identity.
     // Source: prefrontal 873870be8 crates/prefrontal-core-store/src/agent_registry.rs:7733-7763.
     #[test]
     fn create_and_read_agent_rows_validate_and_preserve_display_name() {

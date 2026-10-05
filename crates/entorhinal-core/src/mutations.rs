@@ -391,6 +391,7 @@ impl super::JournalWriter<'_> {
             let mut value = action.value;
             if let Value::Object(ref mut map) = value {
                 map.insert("generation".to_string(), json!(generation));
+                // Agent replies keep core's reply keys, which have no `noop`.
                 if !op.starts_with("agent.") {
                     map.insert("noop".to_string(), json!(!action.changed));
                 }
@@ -812,6 +813,11 @@ impl RegistryStore {
         self.db.with_conn_fenced(|tx| {
             // Historical claims and tombstoned ids are projections too. The
             // journal supplies their original ids and generations on replay.
+            // Defer foreign-key checks until commit: agents referencing other
+            // agents through merged_into or supervisor_agent_id, and their
+            // claims, are deleted and replayed in journal order. Their targets
+            // may not exist until replay finishes, so the references can only
+            // be required to hold at commit.
             tx.execute_batch("PRAGMA defer_foreign_keys=ON; DELETE FROM agent_name_claim; DELETE FROM agent; DELETE FROM workspace_member; DELETE FROM project_workspace; DELETE FROM project_alias; DELETE FROM derived_root_parent; DELETE FROM project_root; DELETE FROM project; DELETE FROM workspace; DELETE FROM root_binding; DELETE FROM retired_binding; DELETE FROM root_approval;")?;
             let mut stmt = tx.prepare("SELECT seq,op,payload_json,created_at FROM registry_journal ORDER BY seq")?;
             let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
