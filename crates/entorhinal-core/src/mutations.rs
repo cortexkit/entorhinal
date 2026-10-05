@@ -3258,8 +3258,10 @@ mod project_replay_tests {
         ] {
             source.execute_batch(migration).unwrap();
         }
-        // Normal create requires placement. Import is the real admission path
-        // for a historical live head whose project is deliberately unplaced.
+        // `agent.create` refuses a head whose project isn't in a workspace, so a
+        // head bound to an unplaced project can only exist by being imported from
+        // core, where it was created before its project lost its placement. Build
+        // one through the real import so these cases cover that state too.
         if !placed {
             source.execute("INSERT INTO agent(agent_id,name,tag,role,project_id,created_at_ms,updated_at_ms) VALUES('agent_16013c86','Head','test','head',?1,10,10)", [project]).unwrap();
             source.execute_batch("INSERT INTO agent_name_claim(agent_id,namespace_kind,namespace_key,normalized_name,display_name,claimed_at_ms) VALUES('agent_16013c86','workspace','historical','head','Head',10)").unwrap();

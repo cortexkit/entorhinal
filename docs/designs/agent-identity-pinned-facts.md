@@ -116,9 +116,9 @@ maps invalid project and workspace ids as follows:
         }
 ```
 
-Id validity is checked before role shape. Both refusals use `invalid_role_shape`,
-but the messages distinguish invalid ids from an invalid combination of role
-and placement. List and peer-roster id filters instead use `invalid_request`.
+Id validity is checked before role shape, as core does, so a request with both
+an invalid id and a role that doesn't fit gets the invalid-id message. Both
+refusals use `invalid_role_shape`, and the message tells them apart. List and peer-roster id filters instead use `invalid_request`.
 
 ## Name normalisation
 

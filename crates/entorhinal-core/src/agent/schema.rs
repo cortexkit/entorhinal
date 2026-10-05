@@ -412,8 +412,10 @@ mod tests {
                         "root_approval",
                         "registry_journal",
                     ] {
-                        // Migration 5 adds principal; all original journal cells must
-                        // survive unchanged, and the new cell must be NULL below.
+                        // Migration 5 adds the journal's `principal` column. Compare
+                        // only the original columns here, which must be unchanged;
+                        // the new column is checked separately to be NULL on every
+                        // row written before the migration.
                         let select = if table == "registry_journal" {
                             "seq,op,payload_json,actor,request_key,created_at,response_json"
                         } else {

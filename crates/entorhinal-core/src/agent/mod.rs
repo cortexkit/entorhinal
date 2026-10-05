@@ -138,8 +138,10 @@ impl AgentRegistryError {
             Self::InvalidName { .. } => "invalid_name",
             Self::InvalidTag => "invalid_tag",
             Self::InvalidLabels { .. } => "invalid_labels",
-            // Core's module maps these store variants to its role-shape wire
-            // code; relay clients see the module's reply, not the store's name.
+            // Clients have always received `invalid_role_shape` for an invalid
+            // project or workspace id on create: core's module translates its
+            // store errors before replying. Core now relays entorhinal's reply
+            // unchanged, so entorhinal returns the code clients already know.
             Self::InvalidProjectId | Self::InvalidWorkspaceId => "invalid_role_shape",
             Self::InvalidGithubIdentity { .. } => "invalid_github_identity",
             Self::InvalidRequest { .. } => "invalid_request",

@@ -5,10 +5,17 @@ use serde_json::{json, Value};
 use super::{claims::write_claim, store::write_row, AgentMutationError, AgentNameClaim, AgentRow};
 use crate::mutations::{append, Action};
 
-/// The marker records authority cutover, not an identity after-image.
+/// The journal op of the one-time row that records entorhinal taking over agent
+/// identity from core (written by the import, also when it imports no agents).
+/// It carries no agent row, so replay keeps it but restores nothing from it, and
+/// the change feed doesn't deliver it.
 pub(crate) const IDENTITY_MARKER_OP: &str = "agent.cutover";
 
-/// Feed inclusion, projection replay and project-journal exclusion must agree.
+/// Every journal op that records an agent row after a change. Three readers
+/// depend on this one list: the change feed delivers exactly these ops, rebuild
+/// replays exactly these into the agent tables, and `journal_tail` hides these
+/// plus the marker from project consumers. If they disagreed, an op could reach
+/// project consumers, vanish from the feed, or be dropped on rebuild.
 pub(crate) const IDENTITY_CHANGE_OPS: &[&str] = &[
     "agent.create",
     "agent.rename",
