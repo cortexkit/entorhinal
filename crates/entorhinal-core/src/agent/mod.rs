@@ -2,6 +2,7 @@
 //! residence, personas, wake policies or authority grants.
 
 mod claims;
+pub mod import;
 mod journal;
 mod names;
 pub mod schema;
