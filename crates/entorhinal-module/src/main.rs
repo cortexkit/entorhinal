@@ -1197,17 +1197,17 @@ fn manifest() -> ModuleManifest {
                     ManagementOperationKind::Query,
                     "Show the project a path belongs to and each root's identity and approval.",
                 ),
-                // Volatile liveness ingestion — never journaled, feeds enumerate
-                // annotations only (ALF's producer per #workspace-projects-design).
+                // Volatile liveness ingestion: never journaled, it only feeds the
+                // dead-folder annotations on enumerate. The executive produces it.
                 management_operation(
                     "projects.session_liveness",
                     ManagementOperationKind::Mutate,
                     "Ingest session liveness snapshots and deltas from the executive for dead-folder detection.",
                 ),
             ].into_iter().chain(agent_reads::READ_METHODS.iter().map(|method| {
-                management_operation(method, ManagementOperationKind::Query, "Read authoritative agent identity.")
+                management_operation(method, ManagementOperationKind::Query, agent_operation_description(method))
             })).chain(agent_ops::MUTATING_METHODS.iter().map(|method| {
-                management_operation(method, ManagementOperationKind::Mutate, "Change agent identity through the executive's operator relay.")
+                management_operation(method, ManagementOperationKind::Mutate, agent_operation_description(method))
             })).collect(),
             config_schema: json!({"type": "object"}),
             observability: Vec::new(),
@@ -1261,6 +1261,33 @@ fn declared_provenance() -> Option<ManifestProvenance> {
     // here would be a build-script bug. Declaring nothing is then better than
     // refusing to start the registry every other module depends on.
     build_provenance_from_source(source, None, None).ok()
+}
+
+/// What each agent operation does, as the daemon's catalog shows it to callers.
+/// The agent methods are listed in `agent_reads` and `agent_ops`; a method
+/// missing here fails the manifest test rather than shipping undescribed.
+fn agent_operation_description(method: &str) -> &'static str {
+    match method {
+        "agent.resolve" => "Look up one agent by id, including retired and merged agents.",
+        "agent.resolve_name" => "Find an agent by name within a workspace or the global namespace.",
+        "agent.list" => "List agents, filtered by role, project or workspace and paged by agent id.",
+        "agent.peer_roster" => "List a workspace's live heads: its workspace head and the heads of its projects.",
+        "agent.avatar_read" => "Read the avatars of up to 64 agents.",
+        "agent.github_identity" => "Read the GitHub identity bound to an agent; it names credentials and holds none.",
+        "agent.fleet_identity" => "List live agents with their project and workspace placement for the fleet view.",
+        "agent.snapshot" => "Read every agent and name claim at one generation, to seed a copy.",
+        "agent.changes" => "Read identity changes after a cursor, optionally waiting up to 25 s for the next one.",
+        "agent.create" => "Create an agent. Accepted only from the executive.",
+        "agent.rename" => "Rename an agent. Accepted only from the executive.",
+        "agent.update_tag" => "Change an agent's tag. Accepted only from the executive.",
+        "agent.set_labels" => "Replace an agent's labels. Accepted only from the executive.",
+        "agent.set_avatar" => "Set an agent's avatar. Accepted only from the executive.",
+        "agent.set_github_identity" => "Bind or clear an agent's GitHub identity. Accepted only from the executive.",
+        "agent.dispose" => "Retire an agent; its id stays reserved. Accepted only from the executive.",
+        "agent.merge" => "Merge one agent into another and retire the source. Accepted only from the executive.",
+        "agent.import" => "Import the executive's agent registry once, at cutover. Accepted only from the executive.",
+        _ => "",
+    }
 }
 
 fn management_operation(
@@ -1391,6 +1418,22 @@ mod tests {
     pub(super) fn reserved(module_id: &str) -> Principal {
         Principal::Reserved {
             module_id: module_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn every_agent_operation_has_its_own_catalog_description() {
+        let mut seen = std::collections::BTreeSet::new();
+        for method in agent_reads::READ_METHODS
+            .iter()
+            .chain(agent_ops::MUTATING_METHODS.iter())
+        {
+            let description = agent_operation_description(method);
+            assert!(!description.is_empty(), "{method} has no description");
+            assert!(
+                seen.insert(description),
+                "{method} repeats another agent operation's description"
+            );
         }
     }
 
