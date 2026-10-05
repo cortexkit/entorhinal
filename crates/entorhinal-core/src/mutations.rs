@@ -3189,6 +3189,8 @@ mod project_replay_tests {
                     "project_workspace",
                     "workspace_member",
                     "workspace",
+                    "agent",
+                    "agent_name_claim",
                 ] {
                     let columns = conn
                         .prepare(&format!("SELECT * FROM {table}"))?
@@ -3217,13 +3219,69 @@ mod project_replay_tests {
         // Read the actual tables, including provenance and timestamps, rather
         // than a resolve reply that could hide an extra project or lost alias.
         let before = projection(f);
+        let fleet = f.store.agent_fleet_identity(None, "replay-test").unwrap();
         let generation = f.store.generation().unwrap();
         assert_eq!(f.store.rebuild().unwrap().generation, generation);
         let after = projection(f);
         for (table, rows) in before {
             assert_eq!(rows, after[table], "rebuild changed {table}");
         }
+        assert_eq!(
+            fleet,
+            f.store.agent_fleet_identity(None, "replay-test").unwrap(),
+            "rebuild changed fleet identity"
+        );
         assert!(f.store.verify().unwrap().ok);
+    }
+
+    fn bind_live_head(f: &Fixture, project: &str) {
+        let placed = f
+            .store
+            .db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM project_workspace WHERE project_id=?1)",
+                    [project],
+                    |r| r.get::<_, bool>(0),
+                )
+            })
+            .unwrap();
+        let path = f.root.join("core-head.db");
+        let source = rusqlite::Connection::open(&path).unwrap();
+        for migration in [
+            include_str!("../tests/fixtures/core-agent-migrations/076_agent_registry.sql"),
+            include_str!("../tests/fixtures/core-agent-migrations/080_agent_github_identity.sql"),
+            include_str!("../tests/fixtures/core-agent-migrations/082_wake_delivery.sql"),
+            include_str!("../tests/fixtures/core-agent-migrations/109_agent_generation.sql"),
+            include_str!("../tests/fixtures/core-agent-migrations/112_agent_avatar.sql"),
+            include_str!("../tests/fixtures/core-agent-migrations/126_agent_labels.sql"),
+        ] {
+            source.execute_batch(migration).unwrap();
+        }
+        // Normal create requires placement. Import is the real admission path
+        // for a historical live head whose project is deliberately unplaced.
+        if !placed {
+            source.execute("INSERT INTO agent(agent_id,name,tag,role,project_id,created_at_ms,updated_at_ms) VALUES('agent_16013c86','Head','test','head',?1,10,10)", [project]).unwrap();
+            source.execute_batch("INSERT INTO agent_name_claim(agent_id,namespace_kind,namespace_key,normalized_name,display_name,claimed_at_ms) VALUES('agent_16013c86','workspace','historical','head','Head',10)").unwrap();
+        }
+        f.store
+            .with_principal("reserved:prefrontal-core")
+            .agent_import(
+                json!({"snapshot_path":path,"request_key":"import-head"}),
+                10,
+            )
+            .unwrap();
+        if placed {
+            f.store.with_principal("reserved:prefrontal-core").agent_mutation("agent.create", json!({"role":"head","project_id":project,"name":"Head","tag":"test","request_key":"create-head"}), 20).unwrap();
+        }
+        let snapshot = f.store.agent_snapshot().unwrap();
+        assert_eq!(snapshot.agents.len(), 1);
+        assert_eq!(snapshot.agents[0].role, "head");
+        assert_eq!(snapshot.agents[0].status, "live");
+        assert_eq!(snapshot.agents[0].project_id.as_deref(), Some(project));
+        assert_eq!(snapshot.claims.len(), 1);
+        let fleet = result(&f.store.agent_fleet_identity(None, "replay-test").unwrap());
+        assert_eq!(fleet["agents"][0]["project"]["id"], project);
     }
 
     fn project_names(f: &Fixture) -> BTreeMap<String, String> {
@@ -3291,6 +3349,7 @@ mod project_replay_tests {
             f.store.resolve(&root).unwrap().workspace_id.as_deref(),
             Some("w")
         );
+        bind_live_head(&f, &f.store.resolve(&root).unwrap().project_id);
         assert_rebuild_preserves_projection(&f);
     }
 
@@ -3325,6 +3384,7 @@ mod project_replay_tests {
             f.store.resolve(&root).unwrap().workspace_id.as_deref(),
             Some("w")
         );
+        bind_live_head(&f, "p");
         assert_rebuild_preserves_projection(&f);
     }
 
@@ -3351,6 +3411,7 @@ mod project_replay_tests {
         assert_eq!(out["noop"], true);
         assert!(projection(&f)["workspace"].is_empty());
         assert!(projection(&f)["project_workspace"].is_empty());
+        bind_live_head(&f, "p");
         assert_rebuild_preserves_projection(&f);
     }
 
@@ -3374,6 +3435,7 @@ mod project_replay_tests {
             project_names(&f),
             BTreeMap::from([("p".into(), "Renamed".into())])
         );
+        bind_live_head(&f, "p");
         assert_rebuild_preserves_projection(&f);
     }
 
@@ -3403,6 +3465,7 @@ mod project_replay_tests {
             project_names(&f),
             BTreeMap::from([("p".into(), "Renamed".into())])
         );
+        bind_live_head(&f, "p");
         assert_rebuild_preserves_projection(&f);
     }
 
@@ -3423,6 +3486,7 @@ mod project_replay_tests {
             projection(&f)["workspace"][0][1],
             SqlValue::Text("Team".into())
         );
+        bind_live_head(&f, "p");
         assert_rebuild_preserves_projection(&f);
     }
 
@@ -3450,6 +3514,11 @@ mod project_replay_tests {
             &f,
             SeedPayload {
                 workspaces: vec![workspace("w", "Renamed"), workspace("unchanged", "Same")],
+                pairs: vec![pair(&f.dir("seed-root"), "git:workspace-name")],
+                members: vec![SeedMember {
+                    mc_identity: "git:workspace-name".into(),
+                    workspace_id: "w".into(),
+                }],
                 ..Default::default()
             },
         );
@@ -3457,6 +3526,7 @@ mod project_replay_tests {
             projection(&f)["workspace"][1][1],
             SqlValue::Text("Renamed".into())
         );
+        bind_live_head(&f, &seed_id("git:workspace-name"));
         assert_rebuild_preserves_projection(&f);
     }
 
@@ -3492,6 +3562,37 @@ mod project_replay_tests {
                 (seed_id("git:basename"), "basename".into()),
             ])
         );
+        bind_live_head(&f, &seed_id("git:payload"));
+        assert_rebuild_preserves_projection(&f);
+    }
+
+    #[test]
+    fn rebuild_seed_multi_workspace_preserves_an_imported_live_head() {
+        let f = Fixture::new("replay-seed-multi-head");
+        let root = f.dir("multi");
+        let out = seed(
+            &f,
+            SeedPayload {
+                pairs: vec![pair(&root, "git:multi")],
+                workspaces: vec![workspace("w1", "One"), workspace("w2", "Two")],
+                members: vec![
+                    SeedMember {
+                        mc_identity: "git:multi".into(),
+                        workspace_id: "w1".into(),
+                    },
+                    SeedMember {
+                        mc_identity: "git:multi".into(),
+                        workspace_id: "w2".into(),
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+        assert!(has_report(&out, "multi_workspace"));
+        assert_eq!(f.store.resolve(&root).unwrap().workspace_id, None);
+        bind_live_head(&f, &seed_id("git:multi"));
+        let fleet = result(&f.store.agent_fleet_identity(None, "replay-test").unwrap());
+        assert!(fleet["agents"][0].get("workspace").is_none());
         assert_rebuild_preserves_projection(&f);
     }
 

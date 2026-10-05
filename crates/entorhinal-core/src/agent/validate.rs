@@ -672,13 +672,14 @@ mod tests {
     // Source: prefrontal 873870be8,
     // crates/prefrontal-core-store/src/agent_registry.rs:33,1237-1256,1363-1395,843-873.
     macro_rules! scope_id_tests {
-        ($empty:ident, $max:ident, $over:ident, $validate:ident, $error:ident, $code:literal) => {
+        ($empty:ident, $max:ident, $over:ident, $validate:ident, $error:ident, $code:literal, $message:literal) => {
             #[test]
             fn $empty() {
                 for input in ["", "\u{3000}\u{00A0}\t"] {
                     let error = $validate(input).unwrap_err();
                     assert_eq!(error, AgentRegistryError::$error);
                     assert_eq!(error.code(), $code);
+                    assert_eq!(error.to_string(), $message);
                 }
             }
 
@@ -695,6 +696,7 @@ mod tests {
                 let error = $validate(&("é/!?".repeat(102) + "xxx")).unwrap_err();
                 assert_eq!(error, AgentRegistryError::$error);
                 assert_eq!(error.code(), $code);
+                assert_eq!(error.to_string(), $message);
             }
         };
     }
@@ -705,7 +707,8 @@ mod tests {
         project_id_513_bytes_refuses,
         validate_project_id,
         InvalidProjectId,
-        "invalid_project_id"
+        "invalid_role_shape",
+        "invalid project_id"
     );
     scope_id_tests!(
         workspace_id_empty_refuses,
@@ -713,6 +716,7 @@ mod tests {
         workspace_id_513_bytes_refuses,
         validate_workspace_id,
         InvalidWorkspaceId,
-        "invalid_workspace_id"
+        "invalid_role_shape",
+        "invalid workspace_id"
     );
 }

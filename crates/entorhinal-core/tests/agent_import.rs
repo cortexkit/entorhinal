@@ -635,25 +635,68 @@ fn carried_fields_and_allowed_legacy_shapes_survive_import_and_rebuild() {
             .collect();
         feed_claims.sort_by_key(|claim| claim["claim_id"].as_i64().unwrap());
         assert_eq!(feed_claims, expected_claims);
-        // Page through the journal one agent entry at a time to check no entry is
+        // Page through the served feed one agent entry at a time to check no entry is
         // skipped or repeated at a page boundary. The cutover marker that ends the
         // import is not an agent entry; the change feed's serving code skips it.
         let mut cursor = head;
+        let mut seen = std::collections::BTreeSet::new();
         for expected_entry in entries {
-            let payload: String = f.destination.query_row("SELECT payload_json FROM registry_journal WHERE op='agent.import' AND seq>?1 ORDER BY seq LIMIT 1", [cursor], |r| r.get(0)).unwrap();
-            let entry: AgentChangeEntry = serde_json::from_value(
-                serde_json::from_str::<Value>(&payload).unwrap()["entry"].clone(),
-            )
-            .unwrap();
-            assert_eq!(entry, expected_entry);
-            cursor = entry.seq;
+            let page = f.store().agent_changes(cursor, Some(1)).unwrap();
+            assert_eq!(page.entries.len(), 1);
+            let entry = &page.entries[0];
+            assert_eq!(*entry, expected_entry);
+            assert!(entry.seq > cursor);
+            assert_eq!(page.cursor, entry.seq);
+            assert!(
+                seen.insert(entry.agent_id.clone()),
+                "feed repeated an imported agent"
+            );
+            cursor = page.cursor;
         }
+        assert_eq!(
+            seen,
+            [A, B, C, D, E, F, LEGACY]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        );
+        let trailing = f.store().agent_changes(cursor, Some(1)).unwrap();
+        assert!(
+            trailing.entries.is_empty(),
+            "cutover marker must not appear in the identity feed"
+        );
+        assert_eq!(trailing.cursor, head + 8);
+        assert_eq!(trailing.generation, head + 8);
+        assert!(f
+            .store()
+            .agent_changes(trailing.cursor, Some(1))
+            .unwrap()
+            .entries
+            .is_empty());
     }
     let create = f.store().agent_mutation("agent.create", json!({"role":"assistant","name":"Reusable","tag":"new","request_key":"reuse-released"}), 1000).unwrap();
     assert_eq!(
         serde_json::from_slice::<Value>(&create).unwrap()["result"]["agent"]["name"],
         "Reusable"
     );
+}
+
+#[test]
+fn every_imported_agent_journal_row_records_the_admitted_principal() {
+    let f = Fixture::new();
+    for (id, name) in [(A, "Alice"), (B, "Bob"), (C, "Carol")] {
+        f.assistant(id, name);
+    }
+    f.import("principal").unwrap();
+    let principals: Vec<String> = f
+        .destination
+        .prepare("SELECT principal FROM registry_journal WHERE op='agent.import' ORDER BY seq")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(principals, vec!["reserved:prefrontal-core"; 3]);
 }
 
 #[test]

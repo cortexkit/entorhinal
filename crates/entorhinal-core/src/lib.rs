@@ -489,13 +489,15 @@ impl RegistryStore {
         self.read(|conn| {
             let snapshot = conn.unchecked_transaction()?;
             let conn = &snapshot;
-            let mut statement = conn.prepare(
+            let mut statement = conn.prepare(&format!(
                 "SELECT seq, op, payload_json, actor, request_key, created_at, principal
                  FROM registry_journal
-                  WHERE seq > ?1 AND op NOT LIKE 'agent.%'
+                  WHERE seq > ?1 AND op NOT IN ({}, '{}')
                  ORDER BY seq
                  LIMIT ?2",
-            )?;
+                agent::change_ops_sql(),
+                agent::IDENTITY_MARKER_OP,
+            ))?;
             let entries = statement
                 .query_map(params![after_seq, limit], |row| {
                     Ok(JournalEntry {

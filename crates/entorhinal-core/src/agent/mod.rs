@@ -15,6 +15,7 @@ mod validate;
 pub use claims::AgentNameClaim;
 pub use feed::{AgentChangesReply, AgentSnapshotReply};
 pub use fleet::avatar_fingerprint;
+pub(crate) use journal::{change_ops_sql, IDENTITY_MARKER_OP};
 pub use journal::{replay_agent_entry, AgentChangeEntry};
 pub use names::*;
 pub use store::{valid_agent_id, AgentMutationError, AgentRow, StoredAgentAvatar};
@@ -137,8 +138,9 @@ impl AgentRegistryError {
             Self::InvalidName { .. } => "invalid_name",
             Self::InvalidTag => "invalid_tag",
             Self::InvalidLabels { .. } => "invalid_labels",
-            Self::InvalidProjectId => "invalid_project_id",
-            Self::InvalidWorkspaceId => "invalid_workspace_id",
+            // Core's module maps these store variants to its role-shape wire
+            // code; relay clients see the module's reply, not the store's name.
+            Self::InvalidProjectId | Self::InvalidWorkspaceId => "invalid_role_shape",
             Self::InvalidGithubIdentity { .. } => "invalid_github_identity",
             Self::InvalidRequest { .. } => "invalid_request",
         }
@@ -163,6 +165,8 @@ impl fmt::Display for AgentRegistryError {
                 write!(f, "invalid_github_identity: invalid {field}")
             }
             Self::InvalidRequest { message } => write!(f, "invalid_request: {message}"),
+            Self::InvalidProjectId => f.write_str("invalid project_id"),
+            Self::InvalidWorkspaceId => f.write_str("invalid workspace_id"),
             _ => f.write_str(self.code()),
         }
     }

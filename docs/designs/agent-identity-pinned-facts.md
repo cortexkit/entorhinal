@@ -100,6 +100,26 @@ decoded as `ProjectsEnumerateResult`. Neither type, nor any nested type, uses
 `808-860`, `899-905`). Core has no decoder for `resolve_project_id`,
 `journal_tail`, `trust` or `verify`.
 
+## Store error names are not wire codes
+
+"Use core's code" means core's module reply, which its relay passes to clients,
+not `AgentRegistryError::code` in the store. At prefrontal `873870be8`,
+`crates/prefrontal-core-module/src/agent_registry_ops.rs`, `registry_error`
+maps invalid project and workspace ids as follows:
+
+```rust
+        AgentRegistryError::InvalidProjectId => {
+            RegistryOpError::new("invalid_role_shape", "invalid project_id")
+        }
+        AgentRegistryError::InvalidWorkspaceId => {
+            RegistryOpError::new("invalid_role_shape", "invalid workspace_id")
+        }
+```
+
+Id validity is checked before role shape. Both refusals use `invalid_role_shape`,
+but the messages distinguish invalid ids from an invalid combination of role
+and placement. List and peer-roster id filters instead use `invalid_request`.
+
 ## Name normalisation
 
 `normalize_agent_name` is at

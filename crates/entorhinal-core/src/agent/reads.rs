@@ -144,6 +144,7 @@ impl RegistryStore {
                         "limit must be 1..=200 and cursor must not be empty",
                     ));
                 }
+                // Core's module reports invalid list id filters as invalid_request, not invalid_role_shape.
                 let project = request
                     .project_id
                     .as_deref()
@@ -183,6 +184,7 @@ impl RegistryStore {
             }
             "agent.peer_roster" => {
                 let request: PeerRequest = decode(params)?;
+                // Core's module also reports invalid peer-roster id filters as invalid_request.
                 validate_workspace_id(&request.workspace_id).map_err(|_| {
                     AgentMutationError::new("invalid_request", "invalid workspace_id")
                 })?;

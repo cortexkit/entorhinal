@@ -5,6 +5,8 @@ use super::{AgentMutationError, NormalizedAgentName};
 
 /// Claim history survives workspace removal: the namespace is an identity
 /// key, not a foreign key to the current workspace table.
+/// This unversioned journal row denies unknown fields. Future fields must be
+/// `Option` with `#[serde(default)]`, or older rows will fail rebuild and feed decoding.
 /// Source: prefrontal 873870be8 crates/prefrontal-core-store/src/agent_claims.rs:248-266.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

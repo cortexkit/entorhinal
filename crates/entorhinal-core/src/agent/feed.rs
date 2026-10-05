@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
-    claims::load_claims, reads::all_rows, AgentChangeEntry, AgentMutationError, AgentNameClaim,
-    AgentRow,
+    change_ops_sql, claims::load_claims, reads::all_rows, AgentChangeEntry, AgentMutationError,
+    AgentNameClaim, AgentRow,
 };
 use crate::RegistryStore;
 
@@ -75,29 +75,48 @@ impl RegistryStore {
         self.read_agent(|conn| {
             let generation = self.generation_from_connection(conn)?;
             if cursor > generation {
-                return Err(AgentMutationError::new("snapshot_required", "cursor is above the journal head"));
+                return Err(AgentMutationError::new(
+                    "snapshot_required",
+                    "cursor is above the journal head",
+                ));
             }
-            let mut statement = conn.prepare(
-                "SELECT seq,op,payload_json FROM registry_journal WHERE seq>?1 AND op IN
-                ('agent.create','agent.rename','agent.update_tag','agent.set_labels',
-                 'agent.set_avatar','agent.set_github_identity','agent.dispose','agent.merge','agent.import')
-                 ORDER BY seq LIMIT ?2")?;
-            let entries = statement.query_map(rusqlite::params![cursor,limit], |r| {
-                let seq: i64 = r.get(0)?;
-                let op: String = r.get(1)?;
-                let payload: String = r.get(2)?;
-                let decode_error = |error: serde_json::Error| rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(error));
-                let payload: Value = serde_json::from_str(&payload).map_err(decode_error)?;
-                let mut entry: AgentChangeEntry = serde_json::from_value(payload.get("entry").cloned().unwrap_or(payload)).map_err(decode_error)?;
-                // The journal owns ordering; a payload must not redirect a cursor.
-                entry.seq = seq;
-                entry.op = op;
-                Ok(entry)
-            })?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut statement = conn.prepare(&format!(
+                "SELECT seq,op,payload_json FROM registry_journal WHERE seq>?1 AND op IN ({})
+                  ORDER BY seq LIMIT ?2",
+                change_ops_sql()
+            ))?;
+            let entries = statement
+                .query_map(rusqlite::params![cursor, limit], |r| {
+                    let seq: i64 = r.get(0)?;
+                    let op: String = r.get(1)?;
+                    let payload: String = r.get(2)?;
+                    let decode_error = |error: serde_json::Error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    };
+                    let payload: Value = serde_json::from_str(&payload).map_err(decode_error)?;
+                    let mut entry: AgentChangeEntry =
+                        serde_json::from_value(payload.get("entry").cloned().unwrap_or(payload))
+                            .map_err(decode_error)?;
+                    // The journal owns ordering; a payload must not redirect a cursor.
+                    entry.seq = seq;
+                    entry.op = op;
+                    Ok(entry)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             let cursor = if entries.len() == limit as usize {
                 entries.last().expect("positive full page").seq
-            } else { generation };
-            Ok(AgentChangesReply { generation,cursor,entries })
+            } else {
+                generation
+            };
+            Ok(AgentChangesReply {
+                generation,
+                cursor,
+                entries,
+            })
         })
     }
 }

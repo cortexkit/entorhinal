@@ -265,8 +265,9 @@ const MUTATING_METHODS: &[&str] = &[
     "agent.import",
 ];
 
-/// Refuse a project/workspace mutating method unless the route was opened by
-/// the operator (`Direct`: the `ck` faces) or by the executive.
+/// Admit project/workspace mutations from the operator (`Direct`: the `ck`
+/// faces) or executive, but identity mutations only from the executive relay.
+/// An agent's shell can connect as Direct, so Direct cannot rewrite identities.
 ///
 /// This stops a module that has no business writing here from changing the
 /// registry by accident or through a bug. Project ids key other modules' state,
@@ -275,7 +276,20 @@ const MUTATING_METHODS: &[&str] = &[
 /// the store file itself. A route with no recorded principal is refused rather
 /// than assumed to be the operator.
 fn authorize_write(method: &str, principal: Option<&Principal>) -> Result<(), HandlerError> {
-    if !MUTATING_METHODS.contains(&method) || agent_ops::MUTATING_METHODS.contains(&method) {
+    if agent_ops::MUTATING_METHODS.contains(&method) {
+        return match principal {
+            Some(Principal::Reserved { module_id }) if module_id == WRITER_MODULE => Ok(()),
+            Some(Principal::Direct) => Err(HandlerError::new(
+                "direct_identity_write_not_admitted",
+                format!("'{method}' must be called through {WRITER_MODULE}'s relay; Direct agent identity writes are not admitted"),
+            )),
+            other => Err(HandlerError::new(
+                "write_not_permitted",
+                format!("'{method}' changes agent identity and is accepted only from reserved:{WRITER_MODULE}; this route was opened by {}", principal_label(other)),
+            )),
+        };
+    }
+    if !MUTATING_METHODS.contains(&method) {
         return Ok(());
     }
     match principal {
@@ -371,25 +385,7 @@ impl ProjectsHandler {
     fn admit(&self, method: &str, key: RouteKey) -> Result<RouteAdmission, HandlerError> {
         let admission = self.admission_for(key);
         refuse_flow_write(method, admission.flow_id.as_deref())?;
-        if agent_ops::MUTATING_METHODS.contains(&method) {
-            match admission.principal.as_ref() {
-                Some(Principal::Reserved { module_id }) if module_id == WRITER_MODULE => (),
-                Some(Principal::Direct) => {
-                    return Err(HandlerError::new(
-                        "direct_identity_write_not_admitted",
-                        format!("'{method}' must be called through {WRITER_MODULE}'s relay; Direct agent identity writes are not admitted"),
-                    ));
-                }
-                other => {
-                    return Err(HandlerError::new(
-                        "write_not_permitted",
-                        format!("'{method}' changes agent identity and is accepted only from reserved:{WRITER_MODULE}; this route was opened by {}", principal_label(other)),
-                    ));
-                }
-            }
-        } else {
-            authorize_write(method, admission.principal.as_ref())?;
-        }
+        authorize_write(method, admission.principal.as_ref())?;
         Ok(admission)
     }
 
@@ -417,7 +413,9 @@ impl ProjectsHandler {
     }
 
     fn record_query(&self, generation: i64, counter: &AtomicU64) {
-        self.health.generation.store(generation, Ordering::Relaxed);
+        self.health
+            .generation
+            .fetch_max(generation, Ordering::Relaxed);
         counter.fetch_add(1, Ordering::Relaxed);
         self.health
             .last_operation_ms
@@ -924,6 +922,7 @@ impl ProjectsHandler {
     /// Refresh the health generation gauge from a mutation's wire reply, which
     /// carries the post-mutation generation. Without this the gauge reports
     /// the pre-mutation generation until the next query-side op runs.
+    /// Cached retries carry an older generation; they must not lower the gauge.
     fn record_mutation(
         &self,
         result: Result<Vec<u8>, HandlerError>,
@@ -935,7 +934,9 @@ impl ProjectsHandler {
                     .and_then(|r| r.get("generation"))
                     .and_then(Value::as_i64)
                 {
-                    self.health.generation.store(generation, Ordering::Relaxed);
+                    self.health
+                        .generation
+                        .fetch_max(generation, Ordering::Relaxed);
                 }
             }
             self.health
@@ -1360,14 +1361,17 @@ mod tests {
 
     #[test]
     fn writes_are_refused_unless_the_operator_or_the_executive_opened_the_route() {
-        for method in MUTATING_METHODS
-            .iter()
-            .filter(|method| !agent_ops::MUTATING_METHODS.contains(method))
-        {
-            assert!(
-                authorize_write(method, Some(&Principal::Direct)).is_ok(),
-                "{method} from direct"
-            );
+        for method in MUTATING_METHODS {
+            let direct = authorize_write(method, Some(&Principal::Direct));
+            if agent_ops::MUTATING_METHODS.contains(method) {
+                assert_eq!(
+                    direct.unwrap_err().code,
+                    "direct_identity_write_not_admitted",
+                    "{method} from direct"
+                );
+            } else {
+                assert!(direct.is_ok(), "{method} from direct");
+            }
             assert!(
                 authorize_write(method, Some(&reserved(WRITER_MODULE))).is_ok(),
                 "{method} from {WRITER_MODULE}"
@@ -1593,6 +1597,47 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .into_owned()
+    }
+
+    #[tokio::test]
+    // Intentionally hold the store lock while checking atomics-only health.
+    #[allow(clippy::await_holding_lock)]
+    async fn cached_mutation_retry_cannot_lower_the_health_generation() {
+        let (dir, descriptor) = scratch_descriptor("health-generation");
+        let handler = ProjectsHandler::new().unwrap();
+        *handler.store.lock().unwrap() = Some(RegistryStore::open(&descriptor).unwrap());
+        let key = (72, 1);
+        handler.route_admissions().insert(
+            key,
+            RouteAdmission::from_bind(Some(Principal::Direct), None),
+        );
+        let first_params = json!({"projectId":"first", "name":"First", "requestKey":"first-key"});
+        let first = execute_on(&handler, key, "register", first_params.clone());
+        let second = execute_on(
+            &handler,
+            key,
+            "register",
+            json!({"projectId":"second", "name":"Second", "requestKey":"second-key"}),
+        );
+        let generation = |bytes: &[u8]| {
+            serde_json::from_slice::<Value>(bytes).unwrap()["result"]["generation"]
+                .as_i64()
+                .unwrap()
+        };
+        assert!(generation(&second) > generation(&first));
+        let retried = execute_on(&handler, key, "register", first_params);
+        assert_eq!(retried, first);
+        // Holding the store mutex cannot block the atomics-only health path.
+        let guard = handler.store.lock().unwrap();
+        let health = handler.health().await.metrics.unwrap();
+        assert_eq!(health["generation"], generation(&second));
+        drop(guard);
+        assert_eq!(
+            handler.with_store(|s| s.generation()).unwrap(),
+            generation(&second)
+        );
+        drop(handler);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

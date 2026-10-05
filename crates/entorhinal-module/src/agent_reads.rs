@@ -891,12 +891,12 @@ mod tests {
             (
                 "agent.create",
                 json!({"role":"head","name":"New","tag":"test","project_id":" ","request_key":"e-project"}),
-                "invalid_project_id",
+                "invalid_role_shape",
             ),
             (
                 "agent.create",
                 json!({"role":"workspace_head","name":"New","tag":"test","workspace_id":" ","request_key":"e-workspace"}),
-                "invalid_workspace_id",
+                "invalid_role_shape",
             ),
             (
                 "agent.create",
@@ -907,7 +907,17 @@ mod tests {
             ("agent.list", json!({"limit":201}), "invalid_cursor"),
             ("agent.list", json!({"cursor":""}), "invalid_cursor"),
         ] {
-            f.fail(method, params, code);
+            let field = if params.get("project_id") == Some(&json!(" ")) {
+                Some("project_id")
+            } else if params.get("workspace_id") == Some(&json!(" ")) {
+                Some("workspace_id")
+            } else {
+                None
+            };
+            let error = f.fail(method, params, code);
+            if let Some(field) = field {
+                assert_eq!(error.message, format!("invalid {field}"));
+            }
         }
         f.ok(
             "agent.dispose",

@@ -83,6 +83,8 @@ pub struct StoredAgentAvatar {
 
 /// The identity snapshot/entry row is deliberately separate from core's digest:
 /// it includes durable metadata and no runtime residence or persona state.
+/// This unversioned journal row denies unknown fields. Future fields must be
+/// `Option` with `#[serde(default)]`, or older rows will fail rebuild and feed decoding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentRow {
@@ -521,27 +523,6 @@ impl RegistryStore {
     pub fn agent_claims(&self, id: &str) -> Result<Vec<AgentNameClaim>, RegistryError> {
         self.read(|conn| claims::load_claims(conn, id))
     }
-
-    /// Serve stored GitHub identity only for live agents. Read the journal's
-    /// current generation in the same snapshot as the agent's generation, so
-    /// the identity and both generation values describe the same committed
-    /// state even when another request is writing concurrently.
-    /// Source: prefrontal 873870be8 crates/prefrontal-core-module/src/agent_registry_ops.rs:3342-3354.
-    pub fn agent_github_identity(&self, id: &str) -> Result<Vec<u8>, AgentMutationError> {
-        let (row, generation) =
-            self.read(|conn| Ok((load_row(conn, id)?, self.generation_from_connection(conn)?)))?;
-        let row = row.ok_or_else(|| {
-            AgentMutationError::new("unknown_agent", format!("unknown agent {id}"))
-        })?;
-        if let Some(gone) = row.gone() {
-            return Err(AgentMutationError::new("gone", "agent is gone").with_detail(gone));
-        }
-        let mut value = json!({"github_identity":row.github_identity,"agent_generation":row.agent_generation,"generation":generation});
-        if let Some(project_id) = row.project_id {
-            value["projectId"] = json!(project_id);
-        }
-        crate::mutations::wire_value(value).map_err(Into::into)
-    }
 }
 
 impl JournalWriter<'_> {
@@ -924,13 +905,20 @@ mod tests {
         assert_eq!(claim.name_normalization_version, 1);
         assert_eq!(f.store.agent_row(&id).unwrap(), Some(created));
         assert_eq!(
-            result(&f.store.agent_github_identity(&id).unwrap())["github_identity"],
+            result(
+                &f.store
+                    .agent_read("agent.github_identity", json!({"agent_id":id}))
+                    .unwrap()
+            )["github_identity"],
             Value::Null
         );
         assert_eq!(f.store.agent_row(&id.to_uppercase()).unwrap(), None);
         assert_eq!(
             f.store
-                .agent_github_identity(&id.to_uppercase())
+                .agent_read(
+                    "agent.github_identity",
+                    json!({"agent_id":id.to_uppercase()})
+                )
                 .unwrap_err()
                 .code,
             "unknown_agent"
@@ -946,10 +934,24 @@ mod tests {
         let mut p = base.clone();
         p["project_id"] = json!("");
         p["name"] = json!("");
-        refuse(&f, "agent.create", p, "invalid_project_id");
+        assert_eq!(
+            refuse(&f, "agent.create", p, "invalid_role_shape").message,
+            "invalid project_id"
+        );
         let mut p = base.clone();
         p["workspace_id"] = json!("");
-        refuse(&f, "agent.create", p, "invalid_workspace_id");
+        assert_eq!(
+            refuse(&f, "agent.create", p, "invalid_role_shape").message,
+            "invalid workspace_id"
+        );
+        for field in ["project_id", "workspace_id"] {
+            let mut p = base.clone();
+            p[field] = json!("x".repeat(513));
+            assert_eq!(
+                refuse(&f, "agent.create", p, "invalid_role_shape").message,
+                format!("invalid {field}")
+            );
+        }
         let mut p = base.clone();
         p["project_id"] = json!("P");
         p["name"] = json!("");
@@ -1517,6 +1519,94 @@ mod tests {
     }
 
     #[test]
+    fn project_and_agent_request_keys_share_one_namespace_without_writes_on_refusal() {
+        for project_first in [true, false] {
+            let f = fixture("shared-project-agent-key");
+            let request = crate::RegisterRequest {
+                project_id: Some("P".into()),
+                name: "Project".into(),
+                request_key: Some("shared-key".into()),
+                ..Default::default()
+            };
+            let agent =
+                json!({"role":"assistant","name":"Agent","tag":"test","request_key":"shared-key"});
+            if project_first {
+                f.store.register(request.clone()).unwrap();
+            } else {
+                f.store
+                    .agent_mutation("agent.create", agent.clone(), 10)
+                    .unwrap();
+            }
+            let before = projection(&f);
+            let persisted = || {
+                f.store
+                    .read(|conn| {
+                        let mut tables = Vec::new();
+                        for table in [
+                            "project",
+                            "project_alias",
+                            "project_root",
+                            "derived_root_parent",
+                            "project_workspace",
+                            "workspace",
+                            "workspace_member",
+                            "registry_journal",
+                        ] {
+                            let columns = conn
+                                .prepare(&format!("SELECT * FROM {table}"))?
+                                .column_count();
+                            let order = (1..=columns)
+                                .map(|n| n.to_string())
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let rows = conn
+                                .prepare(&format!("SELECT * FROM {table} ORDER BY {order}"))?
+                                .query_map([], |r| {
+                                    (0..columns)
+                                        .map(|n| r.get(n))
+                                        .collect::<rusqlite::Result<Vec<rusqlite::types::Value>>>()
+                                })?
+                                .collect::<rusqlite::Result<Vec<_>>>()?;
+                            tables.push(rows);
+                        }
+                        Ok(tables)
+                    })
+                    .unwrap()
+            };
+            let persisted_before = persisted();
+            if project_first {
+                assert_eq!(
+                    f.store
+                        .agent_mutation("agent.create", agent, 20)
+                        .unwrap_err()
+                        .code,
+                    "request_key_reused_across_ops"
+                );
+            } else {
+                match f.store.register(request).unwrap_err() {
+                    RegistryError::Domain { code, .. } => {
+                        assert_eq!(code, "request_key_reused_across_ops")
+                    }
+                    error => panic!("expected typed cross-op refusal, got {error}"),
+                }
+            }
+            assert_eq!(projection(&f), before);
+            assert_eq!(
+                persisted(),
+                persisted_before,
+                "cross-op refusal changed project tables or journal"
+            );
+            assert_eq!(
+                f.store
+                    .agent_row("agent_0000000000000001")
+                    .unwrap()
+                    .is_some(),
+                !project_first
+            );
+        }
+    }
+
+    #[test]
     fn request_keys_cache_original_reply_across_restart_and_reject_cross_op_reuse() {
         let mut f = fixture("agent-cache");
         let create = json!({"role":"assistant","name":"Original","tag":"ok","request_key":"create","actor":"operator"});
@@ -1757,7 +1847,11 @@ mod tests {
                 30 + i as i64,
             );
             let changed = row(&f, &id);
-            let reply = result(&f.store.agent_github_identity(&id).unwrap());
+            let reply = result(
+                &f.store
+                    .agent_read("agent.github_identity", json!({"agent_id":id}))
+                    .unwrap(),
+            );
             assert_eq!(reply["github_identity"], identity);
             assert_eq!(reply["agent_generation"], changed.agent_generation);
             assert_ne!(reply["generation"], reply["agent_generation"]);
@@ -1786,7 +1880,10 @@ mod tests {
             90,
         );
         assert_eq!(
-            f.store.agent_github_identity(&id).unwrap_err().detail,
+            f.store
+                .agent_read("agent.github_identity", json!({"agent_id":id}))
+                .unwrap_err()
+                .detail,
             Some(json!({"reason":"deleted","at":90}))
         );
     }

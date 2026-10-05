@@ -390,6 +390,136 @@ mod tests {
     }
 
     #[test]
+    fn populated_v3_upgrade_preserves_every_projection_and_journal_and_verifies_clean() {
+        use rusqlite::types::Value as SqlValue;
+        use serde_json::json;
+        use std::collections::BTreeMap;
+
+        fn snapshot(store: &RegistryStore) -> BTreeMap<String, Vec<Vec<SqlValue>>> {
+            store
+                .read(|conn| {
+                    let mut tables = BTreeMap::new();
+                    for table in [
+                        "project",
+                        "project_root",
+                        "project_alias",
+                        "derived_root_parent",
+                        "workspace",
+                        "workspace_member",
+                        "project_workspace",
+                        "root_binding",
+                        "retired_binding",
+                        "root_approval",
+                        "registry_journal",
+                    ] {
+                        // Migration 5 adds principal; all original journal cells must
+                        // survive unchanged, and the new cell must be NULL below.
+                        let select = if table == "registry_journal" {
+                            "seq,op,payload_json,actor,request_key,created_at,response_json"
+                        } else {
+                            "*"
+                        };
+                        let columns = conn
+                            .prepare(&format!("SELECT {select} FROM {table}"))?
+                            .column_count();
+                        let order = (1..=columns)
+                            .map(|n| n.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        let rows = conn
+                            .prepare(&format!("SELECT {select} FROM {table} ORDER BY {order}"))?
+                            .query_map([], |r| {
+                                (0..columns)
+                                    .map(|n| r.get(n))
+                                    .collect::<Result<Vec<SqlValue>>>()
+                            })?
+                            .collect::<Result<Vec<_>>>()?;
+                        tables.insert(table.into(), rows);
+                    }
+                    Ok(tables)
+                })
+                .unwrap()
+        }
+
+        let scratch = Scratch::new();
+        let old =
+            RegistryStore::open_with_migrations(&scratch.descriptor, &MIGRATIONS[..3]).unwrap();
+        // Historical SQL uses only the v3 schema. Today's writers require agent
+        // tables and the principal column, which did not exist at this version.
+        // Verification after upgrade independently checks these projections
+        // against the journal's replay rather than trusting the fixture SQL.
+        old.db.with_conn_fenced(|tx| {
+            let entries = [
+                ("register", json!({"projectId":"p","name":"Project P","roots":["/v3/p"],"derivedRootParents":["/v3/derived"],"workspaceId":"w"})),
+                ("register", json!({"projectId":"q","name":"Project Q","roots":["/v3/q"],"workspaceId":"w"})),
+                ("bind_root", json!({"canonicalRoot":"/v3/p","projectId":"p","incarnation":"old-token","registrationEpoch":"old-epoch"})),
+                ("approve_root", json!({"canonicalRoot":"/v3/p","registrationEpoch":"old-epoch"})),
+                ("bind_root", json!({"canonicalRoot":"/v3/p","projectId":"p","incarnation":"new-token","registrationEpoch":"new-epoch","replacedEpoch":"old-epoch"})),
+                ("approve_root", json!({"canonicalRoot":"/v3/p","registrationEpoch":"new-epoch"})),
+                ("bind_root", json!({"canonicalRoot":"/v3/q","projectId":"q","incarnation":"q-token","registrationEpoch":"q-epoch"})),
+                ("approve_root", json!({"canonicalRoot":"/v3/q","registrationEpoch":"q-epoch"})),
+                ("set_workspace_root", json!({"workspaceId":"w","root":"/v3"})),
+            ];
+            for (index, (op, payload)) in entries.into_iter().enumerate() {
+                tx.execute("INSERT INTO registry_journal(op,payload_json,actor,created_at) VALUES(?1,?2,'operator',?3)", params![op,payload.to_string(),(index as i64 + 1)*10])?;
+            }
+            tx.execute_batch("INSERT INTO project VALUES('p','Project P',0,NULL,10,10),('q','Project Q',0,NULL,20,20);
+                INSERT INTO workspace VALUES('w','w',10,90,'/v3');
+                INSERT INTO project_workspace VALUES('p','w'),('q','w');
+                INSERT INTO workspace_member VALUES('w','local','','p'),('w','local','','q');
+                INSERT INTO project_root VALUES('/v3/p','p',10),('/v3/q','q',20);
+                INSERT INTO derived_root_parent VALUES('/v3/derived','p',NULL,NULL);
+                INSERT INTO root_binding VALUES('/v3/p','p','new-token','new-epoch',5),('/v3/q','q','q-token','q-epoch',7);
+                INSERT INTO retired_binding VALUES('old-epoch','/v3/p','p','old-token','replaced',5);
+                INSERT INTO root_approval VALUES('new-epoch',6),('q-epoch',8);")?;
+            for (root, project, now) in [("/v3/p","p",10),("/v3/q","q",20)] {
+                tx.execute("INSERT INTO project_alias VALUES(?1,?2,?3)", params![crate::implicit_project_id(root),project,now])?;
+            }
+            Ok(())
+        }).unwrap();
+        let before = snapshot(&old);
+        for (table, rows) in &before {
+            assert!(!rows.is_empty(), "historical {table} is unpopulated");
+        }
+        drop(old);
+        let upgraded = RegistryStore::open(&scratch.descriptor).unwrap();
+        assert_eq!(
+            snapshot(&upgraded),
+            before,
+            "upgrade changed a pre-existing cell"
+        );
+        upgraded
+            .read(|conn| {
+                for table in ["agent", "agent_name_claim"] {
+                    assert_eq!(
+                        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                            .get::<_, i64>(0))?,
+                        0
+                    );
+                }
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM registry_journal WHERE principal IS NOT NULL",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    0
+                );
+                Ok(())
+            })
+            .unwrap();
+        let verified = upgraded.verify().unwrap();
+        assert!(verified.ok, "{verified:?}");
+        assert!(verified.replay.ok, "{:?}", verified.replay);
+        assert_eq!(verified.generation, 9);
+        assert_eq!(
+            snapshot(&upgraded),
+            before,
+            "verification changed historical rows"
+        );
+    }
+
+    #[test]
     fn binary_without_agent_migration_refuses_migrated_store_as_ahead() {
         let scratch = Scratch::new();
         let old_chain = &MIGRATIONS[..3];
