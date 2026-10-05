@@ -405,8 +405,8 @@ mod tests {
             .max()
             .unwrap();
         assert_eq!(error.to_string(), format!("database: registry store is at schema version {current_version}, ahead of this binary's highest migration 3; run a binary at or above the store's version"));
-        // Opening with the older chain after the current migrations leaves the agent table
-        // unchanged and readable by the current chain.
+        // The refused open by the three-migration binary must not have touched the
+        // store: a binary with every migration still reads the `agent` table as written.
         let current = RegistryStore::open(&scratch.descriptor).unwrap();
         current
             .read(|conn| {

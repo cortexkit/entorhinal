@@ -821,7 +821,9 @@ pub struct JournalEntry {
     pub actor: String,
     pub request_key: Option<String>,
     pub created_at: i64,
-    /// Persisted attribution, kept off the legacy project journal wire shape.
+    /// The principal recorded with this row; NULL for rows written before the
+    /// column existed. Not serialised, so `journal_tail` replies keep the shape
+    /// their existing consumers decode.
     #[serde(skip)]
     pub principal: Option<String>,
 }

@@ -503,8 +503,10 @@ struct LivenessSession {
 }
 
 impl ProjectsHandler {
-    /// Admission and attribution use the same bind snapshot, including all
-    /// secondary rows appended while handling this request.
+    /// The principal saved when this route was bound decides whether the request
+    /// is admitted, and the same value is recorded on every journal row the
+    /// request writes, including the `bind_root` rows a `register` or `add_root`
+    /// appends after its own row. Reading it once means the two can't disagree.
     fn execute(&self, request: WireRequest, key: RouteKey) -> Result<Vec<u8>, HandlerError> {
         let admission = self.admit(&request.method, key)?;
         let principal = principal_label(admission.principal.as_ref());
