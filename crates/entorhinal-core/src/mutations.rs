@@ -464,6 +464,9 @@ impl super::JournalWriter<'_> {
                 for row in rows { let (owner,parent)=row?; if super::path_prefix_or_equal(Path::new(&parent),Path::new(root)) { return Err(domain("root_under_foreign_derived_parent",format!("root {root} is under {parent}, owned by {owner}"))); } }
             }
             if let Some(w) = &req.workspace_id { if let Some(old)=tx.query_row("SELECT workspace_id FROM project_workspace WHERE project_id=?1",[&project_id],|r|r.get::<_,String>(0)).optional()? { if old!=*w { return Err(domain("workspace_conflict",format!("project {project_id} belongs to workspace {old}"))); } } }
+            if req.workspace_id.is_some() {
+                super::agent::ensure_project_attachment_allowed(tx, &project_id)?;
+            }
             let mut aliases=Vec::new();
             for root in &req.roots { let old=implicit_project_id(root); if let Some(target)=tx.query_row("SELECT project_id FROM project_alias WHERE old_id=?1",[&old],|r|r.get::<_,String>(0)).optional()? { if target!=project_id { aliases.push(json!({"oldId":old,"owner":target})); } } }
             let mut changed=existing.is_none();
@@ -535,6 +538,7 @@ impl super::JournalWriter<'_> {
                         payload,
                     });
                 }
+                super::agent::ensure_project_unbound(tx, &req.project_id)?;
                 let seq = append(
                     tx,
                     "assign_workspace",
@@ -678,7 +682,41 @@ impl super::JournalWriter<'_> {
         let actor = req.actor.clone().unwrap_or_else(|| "module".into());
         let payload =
             serde_json::to_value(&req).map_err(|e| domain("encode_failed", e.to_string()))?;
-        self.mutation("upgrade_implicit",key.clone().as_deref(),move|tx|{ let now=now_unix_millis(); if let Some(target)=tx.query_row("SELECT project_id FROM project_alias WHERE old_id=?1",[&req.implicit_id],|r|r.get::<_,String>(0)).optional()? {if target!=id{return Err(domain("alias_conflict",target));} let _=target;} let existing=tx.query_row("SELECT name FROM project WHERE project_id=?1",[&id],|r|r.get::<_,String>(0)).optional()?; let mut changed=existing.is_none()||existing.as_ref().is_some_and(|n|n!=&req.name); for r in &req.roots {changed|=tx.query_row("SELECT 1 FROM project_root WHERE canonical_root=?1",[r],|r|r.get::<_,i64>(0)).optional()?.is_none();} changed|=tx.query_row("SELECT project_id FROM project_alias WHERE old_id=?1",[&req.implicit_id],|r|r.get::<_,String>(0)).optional()?.is_none(); if !changed{return Ok(Action{changed:false,seq:None,value:json!({"projectId":id,"oldId":req.implicit_id}),payload});} let seq=append(tx,"upgrade_implicit",&payload,&actor,key.as_deref(),now,self.principal)?; if existing.is_none(){tx.execute("INSERT INTO project(project_id,name,implicit,seed_identity,created_at,updated_at) VALUES(?1,?2,0,NULL,?3,?3)",params![&id,&req.name,now])?;} else {tx.execute("UPDATE project SET name=?1,updated_at=?2 WHERE project_id=?3",params![&req.name,now,&id])?;} for r in &req.roots{tx.execute("INSERT OR IGNORE INTO project_root(canonical_root,project_id,added_at) VALUES(?1,?2,?3)",params![r,&id,now])?;tx.execute("INSERT OR IGNORE INTO project_alias(old_id,project_id,created_at) VALUES(?1,?2,?3)",params![implicit_project_id(r),&id,now])?;} tx.execute("INSERT OR REPLACE INTO project_alias(old_id,project_id,created_at) VALUES(?1,?2,?3)",params![&req.implicit_id,&id,now])?; if let Some(w)=&req.workspace_id{tx.execute("INSERT OR IGNORE INTO workspace(workspace_id,name,created_at,updated_at) VALUES(?1,?1,?2,?2)",params![w,now])?;tx.execute("INSERT OR IGNORE INTO project_workspace(project_id,workspace_id) VALUES(?1,?2)",[&id,w])?;tx.execute("INSERT OR IGNORE INTO workspace_member(workspace_id,ref_kind,device_fingerprint,project_id) VALUES(?1,'local','',?2)",[w,&id])?;} Ok(Action{changed:true,seq:Some(seq),value:json!({"projectId":id,"oldId":req.implicit_id}),payload}) })
+        self.mutation("upgrade_implicit", key.clone().as_deref(), move |tx| {
+            let now = now_unix_millis();
+            if let Some(target) = tx.query_row("SELECT project_id FROM project_alias WHERE old_id=?1", [&req.implicit_id], |r| r.get::<_, String>(0)).optional()? {
+                if target != id { return Err(domain("alias_conflict", target)); }
+            }
+            let existing = tx.query_row("SELECT name FROM project WHERE project_id=?1", [&id], |r| r.get::<_, String>(0)).optional()?;
+            let mut changed = existing.is_none() || existing.as_ref().is_some_and(|n| n != &req.name);
+            for r in &req.roots {
+                changed |= tx.query_row("SELECT 1 FROM project_root WHERE canonical_root=?1", [r], |r| r.get::<_, i64>(0)).optional()?.is_none();
+            }
+            changed |= tx.query_row("SELECT project_id FROM project_alias WHERE old_id=?1", [&req.implicit_id], |r| r.get::<_, String>(0)).optional()?.is_none();
+            if !changed {
+                return Ok(Action { changed: false, seq: None, value: json!({"projectId":id,"oldId":req.implicit_id}), payload });
+            }
+            if req.workspace_id.is_some() {
+                super::agent::ensure_project_attachment_allowed(tx, &id)?;
+            }
+            let seq = append(tx, "upgrade_implicit", &payload, &actor, key.as_deref(), now, self.principal)?;
+            if existing.is_none() {
+                tx.execute("INSERT INTO project(project_id,name,implicit,seed_identity,created_at,updated_at) VALUES(?1,?2,0,NULL,?3,?3)", params![&id,&req.name,now])?;
+            } else {
+                tx.execute("UPDATE project SET name=?1,updated_at=?2 WHERE project_id=?3", params![&req.name,now,&id])?;
+            }
+            for r in &req.roots {
+                tx.execute("INSERT OR IGNORE INTO project_root(canonical_root,project_id,added_at) VALUES(?1,?2,?3)", params![r,&id,now])?;
+                tx.execute("INSERT OR IGNORE INTO project_alias(old_id,project_id,created_at) VALUES(?1,?2,?3)", params![implicit_project_id(r),&id,now])?;
+            }
+            tx.execute("INSERT OR REPLACE INTO project_alias(old_id,project_id,created_at) VALUES(?1,?2,?3)", params![&req.implicit_id,&id,now])?;
+            if let Some(w) = &req.workspace_id {
+                tx.execute("INSERT OR IGNORE INTO workspace(workspace_id,name,created_at,updated_at) VALUES(?1,?1,?2,?2)", params![w,now])?;
+                tx.execute("INSERT OR IGNORE INTO project_workspace(project_id,workspace_id) VALUES(?1,?2)", [&id,w])?;
+                tx.execute("INSERT OR IGNORE INTO workspace_member(workspace_id,ref_kind,device_fingerprint,project_id) VALUES(?1,'local','',?2)", [w,&id])?;
+            }
+            Ok(Action { changed: true, seq: Some(seq), value: json!({"projectId":id,"oldId":req.implicit_id}), payload })
+        })
     }
 
     pub fn remove(&self, req: RemoveRequest) -> Result<Vec<u8>, RegistryError> {
@@ -686,7 +724,51 @@ impl super::JournalWriter<'_> {
         let actor = req.actor.clone().unwrap_or_else(|| "module".into());
         let payload =
             serde_json::to_value(&req).map_err(|e| domain("encode_failed", e.to_string()))?;
-        self.mutation("remove",key.clone().as_deref(),move|tx|{let now=now_unix_millis(); if let Some(w)=&req.workspace_id {if tx.query_row("SELECT 1 FROM workspace WHERE workspace_id=?1",[w],|r|r.get::<_,i64>(0)).optional()?.is_none(){return Err(domain("not_found",w));} let seq=append(tx,"remove",&payload,&actor,key.as_deref(),now,self.principal)?; tx.execute("DELETE FROM project_workspace WHERE workspace_id=?1",[w])?; tx.execute("DELETE FROM workspace_member WHERE workspace_id=?1",[w])?; tx.execute("DELETE FROM workspace WHERE workspace_id=?1",[w])?; return Ok(Action{changed:true,seq:Some(seq),value:json!({"workspaceId":w}),payload});} let id=req.project_id.clone().ok_or_else(||domain("invalid_params","projectId is required"))?; if tx.query_row("SELECT 1 FROM project WHERE project_id=?1",[&id],|r|r.get::<_,i64>(0)).optional()?.is_none(){return Err(domain("not_found",id)); }; if let Some(s)=&req.successor_project_id {if s==&id||tx.query_row("SELECT 1 FROM project WHERE project_id=?1",[s],|r|r.get::<_,i64>(0)).optional()?.is_none(){return Err(domain("not_found",s));}} let dropped=tx.query_row("SELECT workspace_id FROM project_workspace WHERE project_id=?1",[&id],|r|r.get::<_,String>(0)).optional()?; let seq=append(tx,"remove",&payload,&actor,key.as_deref(),now,self.principal)?; super::binding::retire_project_bindings(tx,&id,seq)?; if let Some(s)=&req.successor_project_id {tx.execute("UPDATE project_root SET project_id=?1 WHERE project_id=?2",[s,&id])?;tx.execute("UPDATE derived_root_parent SET project_id=?1 WHERE project_id=?2",[s,&id])?;tx.execute("UPDATE project_alias SET project_id=?1 WHERE project_id=?2",[s,&id])?;tx.execute("DELETE FROM project_alias WHERE old_id=?1",[&id])?;tx.execute("INSERT OR REPLACE INTO project_alias(old_id,project_id,created_at) VALUES(?1,?2,?3)",params![&id,s,now])?;} else {tx.execute("DELETE FROM project_root WHERE project_id=?1",[&id])?;tx.execute("DELETE FROM derived_root_parent WHERE project_id=?1",[&id])?;tx.execute("DELETE FROM project_alias WHERE project_id=?1 OR old_id=?1",[&id])?;} tx.execute("DELETE FROM project_workspace WHERE project_id=?1",[&id])?;tx.execute("DELETE FROM workspace_member WHERE ref_kind='local' AND project_id=?1",[&id])?;tx.execute("DELETE FROM project WHERE project_id=?1",[&id])?;Ok(Action{changed:true,seq:Some(seq),value:json!({"projectId":id,"successorProjectId":req.successor_project_id,"droppedWorkspaceId":dropped}),payload}) })
+        self.mutation("remove", key.clone().as_deref(), move |tx| {
+            let now = now_unix_millis();
+            if let Some(w) = &req.workspace_id {
+                if tx.query_row("SELECT 1 FROM workspace WHERE workspace_id=?1", [w], |r| r.get::<_, i64>(0)).optional()?.is_none() {
+                    return Err(domain("not_found", w));
+                }
+                super::agent::ensure_workspace_unbound(tx, w)?;
+                let seq = append(tx, "remove", &payload, &actor, key.as_deref(), now, self.principal)?;
+                tx.execute("DELETE FROM project_workspace WHERE workspace_id=?1", [w])?;
+                tx.execute("DELETE FROM workspace_member WHERE workspace_id=?1", [w])?;
+                tx.execute("DELETE FROM workspace WHERE workspace_id=?1", [w])?;
+                return Ok(Action { changed: true, seq: Some(seq), value: json!({"workspaceId":w}), payload });
+            }
+            let id = req.project_id.clone().ok_or_else(|| domain("invalid_params", "projectId is required"))?;
+            if tx.query_row("SELECT 1 FROM project WHERE project_id=?1", [&id], |r| r.get::<_, i64>(0)).optional()?.is_none() {
+                return Err(domain("not_found", id));
+            }
+            if let Some(s) = &req.successor_project_id {
+                if s == &id || tx.query_row("SELECT 1 FROM project WHERE project_id=?1", [s], |r| r.get::<_, i64>(0)).optional()?.is_none() {
+                    return Err(domain("not_found", s));
+                }
+            }
+            // Removing the source also merges its aliases when a successor is
+            // supplied. Refusing every bound source prevents two live heads from
+            // resolving to the successor and keeps existing agents on valid ids.
+            super::agent::ensure_project_unbound(tx, &id)?;
+            let dropped = tx.query_row("SELECT workspace_id FROM project_workspace WHERE project_id=?1", [&id], |r| r.get::<_, String>(0)).optional()?;
+            let seq = append(tx, "remove", &payload, &actor, key.as_deref(), now, self.principal)?;
+            super::binding::retire_project_bindings(tx, &id, seq)?;
+            if let Some(s) = &req.successor_project_id {
+                tx.execute("UPDATE project_root SET project_id=?1 WHERE project_id=?2", [s,&id])?;
+                tx.execute("UPDATE derived_root_parent SET project_id=?1 WHERE project_id=?2", [s,&id])?;
+                tx.execute("UPDATE project_alias SET project_id=?1 WHERE project_id=?2", [s,&id])?;
+                tx.execute("DELETE FROM project_alias WHERE old_id=?1", [&id])?;
+                tx.execute("INSERT OR REPLACE INTO project_alias(old_id,project_id,created_at) VALUES(?1,?2,?3)", params![&id,s,now])?;
+            } else {
+                tx.execute("DELETE FROM project_root WHERE project_id=?1", [&id])?;
+                tx.execute("DELETE FROM derived_root_parent WHERE project_id=?1", [&id])?;
+                tx.execute("DELETE FROM project_alias WHERE project_id=?1 OR old_id=?1", [&id])?;
+            }
+            tx.execute("DELETE FROM project_workspace WHERE project_id=?1", [&id])?;
+            tx.execute("DELETE FROM workspace_member WHERE ref_kind='local' AND project_id=?1", [&id])?;
+            tx.execute("DELETE FROM project WHERE project_id=?1", [&id])?;
+            Ok(Action { changed: true, seq: Some(seq), value: json!({"projectId":id,"successorProjectId":req.successor_project_id,"droppedWorkspaceId":dropped}), payload })
+        })
     }
 }
 
@@ -797,7 +879,31 @@ impl super::JournalWriter<'_> {
             for (identity, rows) in groups { let minted=seed_id(&identity); let occupied_alias=tx.query_row("SELECT project_id FROM project_alias WHERE old_id=?1",[&minted],|r|r.get::<_,String>(0)).optional()?; let live=tx.query_row("SELECT seed_identity FROM project WHERE project_id=?1",[&minted],|r|r.get::<_,Option<String>>(0)).optional()?; let target=if let Some(ref seed)=live {if seed.as_deref()==Some(&identity){report.push(SeedReportEntry{kind:"rejoined".into(),mc_identity:Some(identity.clone()),canonical_root:None,project_id:Some(minted.clone()),owner_project_id:None,new_project_id:None,roots:None,reason:None});Some(minted.clone())}else{report.push(SeedReportEntry{kind:"conflicted".into(),mc_identity:Some(identity.clone()),canonical_root:None,project_id:Some(minted.clone()),owner_project_id:None,new_project_id:None,roots:None,reason:Some("minted id occupied by another project".into())});None}} else if occupied_alias.is_some(){report.push(SeedReportEntry{kind:"alias_occupied".into(),mc_identity:Some(identity.clone()),canonical_root:None,project_id:None,owner_project_id:occupied_alias,new_project_id:None,roots:None,reason:Some("minted id is an alias key".into())});None} else {Some(minted.clone())};
                 let mut available=Vec::new(); let mut owners=BTreeMap::new(); for p in &rows {if let Some(owner)=tx.query_row("SELECT project_id FROM project_root WHERE canonical_root=?1",[&p.canonical_root],|r|r.get::<_,String>(0)).optional()? {owners.insert(p.canonical_root.clone(),owner.clone());report.push(SeedReportEntry{kind:"skipped".into(),mc_identity:Some(identity.clone()),canonical_root:Some(p.canonical_root.clone()),project_id:None,owner_project_id:Some(owner),new_project_id:target.clone(),roots:None,reason:Some("root already registered".into())});}else if target.is_some(){available.push(p.clone());}}
                 if owners.values().collect::<BTreeSet<_>>().len()>1 || (target.is_some() && !owners.is_empty() && !available.is_empty()) {report.push(SeedReportEntry{kind:"identity_split".into(),mc_identity:Some(identity.clone()),canonical_root:None,project_id:None,owner_project_id:None,new_project_id:target.clone(),roots:Some(available.iter().map(|p|p.canonical_root.clone()).collect()),reason:None});}
-                let Some(project)=target else {continue}; if !available.is_empty() || live.is_none() {let name=req.payload.names.get(&identity).cloned().or_else(||rows.first().and_then(|p|p.name.clone())).unwrap_or_else(||Path::new(&rows[0].canonical_root).file_name().map(|x|x.to_string_lossy().into_owned()).unwrap_or_else(||identity.clone())); if live.is_none(){tx.execute("INSERT INTO project(project_id,name,implicit,seed_identity,created_at,updated_at) VALUES(?1,?2,0,?3,?4,?4)",params![project,name,identity,now])?;changed=true;} for p in &available {tx.execute("INSERT OR IGNORE INTO project_root(canonical_root,project_id,added_at) VALUES(?1,?2,?3)",params![p.canonical_root,project,now])?;tx.execute("INSERT OR IGNORE INTO project_alias(old_id,project_id,created_at) VALUES(?1,?2,?3)",params![implicit_project_id(&p.canonical_root),project,now])?;changed=true;} let claims=req.payload.members.iter().filter(|m|m.mc_identity==identity).map(|m|m.workspace_id.clone()).collect::<BTreeSet<_>>(); if claims.len()==1 {let w=claims.iter().next().unwrap();tx.execute("INSERT OR IGNORE INTO project_workspace(project_id,workspace_id) VALUES(?1,?2)",params![project,w])?;tx.execute("INSERT OR IGNORE INTO workspace_member(workspace_id,ref_kind,device_fingerprint,project_id) VALUES(?1,'local','',?2)",params![w,project])?;changed=true;} else if claims.len()>1 {report.push(SeedReportEntry{kind:"multi_workspace".into(),mc_identity:Some(identity.clone()),canonical_root:None,project_id:Some(project.clone()),owner_project_id:None,new_project_id:None,roots:None,reason:Some("detached because export claimed multiple workspaces".into())});}}
+                let Some(project) = target else { continue };
+                if !available.is_empty() || live.is_none() {
+                    let claims = req.payload.members.iter().filter(|m| m.mc_identity == identity).map(|m| m.workspace_id.clone()).collect::<BTreeSet<_>>();
+                    if claims.len() == 1 {
+                        super::agent::ensure_project_attachment_allowed(tx, &project)?;
+                    }
+                    let name = req.payload.names.get(&identity).cloned().or_else(|| rows.first().and_then(|p| p.name.clone())).unwrap_or_else(|| Path::new(&rows[0].canonical_root).file_name().map(|x| x.to_string_lossy().into_owned()).unwrap_or_else(|| identity.clone()));
+                    if live.is_none() {
+                        tx.execute("INSERT INTO project(project_id,name,implicit,seed_identity,created_at,updated_at) VALUES(?1,?2,0,?3,?4,?4)", params![project,name,identity,now])?;
+                        changed = true;
+                    }
+                    for p in &available {
+                        tx.execute("INSERT OR IGNORE INTO project_root(canonical_root,project_id,added_at) VALUES(?1,?2,?3)", params![p.canonical_root,project,now])?;
+                        tx.execute("INSERT OR IGNORE INTO project_alias(old_id,project_id,created_at) VALUES(?1,?2,?3)", params![implicit_project_id(&p.canonical_root),project,now])?;
+                        changed = true;
+                    }
+                    if claims.len() == 1 {
+                        let w = claims.iter().next().unwrap();
+                        tx.execute("INSERT OR IGNORE INTO project_workspace(project_id,workspace_id) VALUES(?1,?2)", params![project,w])?;
+                        tx.execute("INSERT OR IGNORE INTO workspace_member(workspace_id,ref_kind,device_fingerprint,project_id) VALUES(?1,'local','',?2)", params![w,project])?;
+                        changed = true;
+                    } else if claims.len() > 1 {
+                        report.push(SeedReportEntry { kind: "multi_workspace".into(), mc_identity: Some(identity.clone()), canonical_root: None, project_id: Some(project.clone()), owner_project_id: None, new_project_id: None, roots: None, reason: Some("detached because export claimed multiple workspaces".into()) });
+                    }
+                }
             }
             let value=json!({"report":report}); if !changed {return Ok(Action{changed:false,seq:None,value,payload});} let seq=append(tx,"seed_import",&payload,&actor,key.as_deref(),now,self.principal)?; Ok(Action{changed:true,seq:Some(seq),value,payload})
         })
@@ -901,6 +1007,10 @@ fn replay(tx: &Transaction<'_>, seq: i64, op: &str, v: Value, now: i64) -> rusql
             // places a new one in its workspace. Replay used to do neither, so a
             // `rebuild` reverted renames and silently unplaced every project that
             // was put in a workspace at registration.
+            if r.workspace_id.is_some() {
+                super::agent::ensure_project_attachment_allowed(tx, &id)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            }
             tx.execute("INSERT INTO project(project_id,name,implicit,seed_identity,created_at,updated_at) VALUES(?1,?2,0,NULL,?3,?3) ON CONFLICT(project_id) DO UPDATE SET name=excluded.name,updated_at=excluded.updated_at",params![id,r.name,now])?;
             if let Some(w) = &r.workspace_id {
                 tx.execute("INSERT OR IGNORE INTO workspace(workspace_id,name,created_at,updated_at) VALUES(?1,?1,?2,?2)",params![w,now])?;
@@ -950,6 +1060,10 @@ fn replay(tx: &Transaction<'_>, seq: i64, op: &str, v: Value, now: i64) -> rusql
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?;
+            if previous.as_deref() != Some(r.workspace_id.as_str()) {
+                super::agent::ensure_project_unbound(tx, &r.project_id)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            }
             if let Some(old) = previous.as_deref() {
                 tx.execute(
                     "DELETE FROM workspace_member WHERE workspace_id=?1 AND ref_kind='local' AND device_fingerprint='' AND project_id=?2",
@@ -972,6 +1086,10 @@ fn replay(tx: &Transaction<'_>, seq: i64, op: &str, v: Value, now: i64) -> rusql
             let id = r
                 .project_id
                 .unwrap_or_else(|| mint("upgrade1", &r.name, &r.roots));
+            if r.workspace_id.is_some() {
+                super::agent::ensure_project_attachment_allowed(tx, &id)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            }
             tx.execute("INSERT INTO project(project_id,name,implicit,seed_identity,created_at,updated_at) VALUES(?1,?2,0,NULL,?3,?3) ON CONFLICT(project_id) DO UPDATE SET name=excluded.name,updated_at=excluded.updated_at", params![id,r.name,now])?;
             for root in r.roots {
                 tx.execute("INSERT OR IGNORE INTO project_root(canonical_root,project_id,added_at) VALUES(?1,?2,?3)",params![root,id,now])?;
@@ -1094,6 +1212,8 @@ fn replay(tx: &Transaction<'_>, seq: i64, op: &str, v: Value, now: i64) -> rusql
                     .collect::<BTreeSet<_>>();
                 if claims.len() == 1 {
                     let w = claims.into_iter().next().unwrap();
+                    super::agent::ensure_project_attachment_allowed(tx, &id)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
                     tx.execute("INSERT OR IGNORE INTO project_workspace(project_id,workspace_id) VALUES(?1,?2)",params![id,w])?;
                     tx.execute("INSERT OR IGNORE INTO workspace_member(workspace_id,ref_kind,device_fingerprint,project_id) VALUES(?1,'local','',?2)",params![w,id])?;
                 }
@@ -1103,6 +1223,8 @@ fn replay(tx: &Transaction<'_>, seq: i64, op: &str, v: Value, now: i64) -> rusql
             let r: RemoveRequest = serde_json::from_value(v)
                 .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
             if let Some(workspace) = r.workspace_id {
+                super::agent::ensure_workspace_unbound(tx, &workspace)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
                 tx.execute(
                     "DELETE FROM project_workspace WHERE workspace_id=?1",
                     [&workspace],
@@ -1113,6 +1235,8 @@ fn replay(tx: &Transaction<'_>, seq: i64, op: &str, v: Value, now: i64) -> rusql
                 )?;
                 tx.execute("DELETE FROM workspace WHERE workspace_id=?1", [&workspace])?;
             } else if let Some(id) = r.project_id {
+                super::agent::ensure_project_unbound(tx, &id)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
                 super::binding::retire_project_bindings(tx, &id, seq)?;
                 if let Some(successor) = r.successor_project_id {
                     tx.execute(
@@ -1148,6 +1272,552 @@ fn replay(tx: &Transaction<'_>, seq: i64, op: &str, v: Value, now: i64) -> rusql
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod agent_lifecycle_tests {
+    use super::{tests::*, *};
+    use crate::agent::{normalize_agent_name, AgentChangeEntry, AgentNameClaim};
+    use rusqlite::types::Value as SqlValue;
+
+    fn fixture(label: &str) -> Fixture {
+        let mut f = Fixture::new(label);
+        f.store.use_sequential_ids();
+        f.store
+            .apply_entry("agent.cutover", "{}", "module", None, |_| Ok(()))
+            .unwrap();
+        f
+    }
+
+    fn placed(f: &Fixture, project: &str, workspace: Option<&str>) {
+        f.store
+            .with_principal("direct")
+            .register(RegisterRequest {
+                project_id: Some(project.into()),
+                name: project.into(),
+                workspace_id: workspace.map(str::to_owned),
+                ..Default::default()
+            })
+            .unwrap();
+    }
+
+    fn create(
+        f: &Fixture,
+        role: &str,
+        project: Option<&str>,
+        workspace: Option<&str>,
+        name: &str,
+    ) -> String {
+        let value = result(&f.store.with_principal("reserved:prefrontal-core").agent_mutation(
+            "agent.create",
+            json!({"role":role,"project_id":project,"workspace_id":workspace,"name":name,"tag":"test","request_key":format!("create-{name}")}),
+            10,
+        ).unwrap());
+        value["agent"]["agent_id"].as_str().unwrap().into()
+    }
+
+    fn dispose(f: &Fixture, id: &str) {
+        f.store
+            .agent_mutation(
+                "agent.dispose",
+                json!({"agent_id":id,"request_key":format!("dispose-{id}")}),
+                20,
+            )
+            .unwrap();
+    }
+
+    // Journal a full imported row and claim to exercise bindings that normal
+    // create cannot produce: an unplaced project or a different stored workspace.
+    fn import_bound(f: &Fixture, role: &str, project: &str, stored_workspace: &str) -> String {
+        let template = create(f, "assistant", None, None, "Template");
+        let mut row = f.store.agent_row(&template).unwrap().unwrap();
+        row.agent_id = "agent_16013c86".into();
+        row.name = "Imported".into();
+        row.role = role.into();
+        row.project_id = Some(project.into());
+        row.workspace_id = Some(stored_workspace.into());
+        row.request_key = None;
+        let id = row.agent_id.clone();
+        f.store
+            .apply_entry("agent.import", "{}", "test", None, |tx| {
+                let claim_id = tx.query_row(
+                    "SELECT COALESCE(MAX(claim_id),0)+1 FROM agent_name_claim",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let claim = AgentNameClaim {
+                    claim_id,
+                    agent_id: id.clone(),
+                    namespace_kind: "workspace".into(),
+                    namespace_key: stored_workspace.into(),
+                    normalized_name: normalize_agent_name(&row.name).unwrap().normalized_name,
+                    name_normalization_version: 1,
+                    display_name: row.name.clone(),
+                    claimed_at_ms: 10,
+                    released_at_ms: None,
+                };
+                let mut entry = AgentChangeEntry::new("agent.import", row.clone(), vec![claim]);
+                entry.seq =
+                    tx.query_row("SELECT MAX(seq) FROM registry_journal", [], |r| r.get(0))?;
+                let payload = json!({"entry":entry});
+                assert!(crate::agent::replay_agent_entry(
+                    tx,
+                    "agent.import",
+                    &payload
+                )?);
+                tx.execute(
+                    "UPDATE registry_journal SET payload_json=?1 WHERE seq=?2",
+                    params![payload.to_string(), entry.seq],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        id
+    }
+
+    fn projection(f: &Fixture) -> BTreeMap<&'static str, Vec<Vec<SqlValue>>> {
+        f.store
+            .read(|conn| {
+                let mut tables = BTreeMap::new();
+                for table in [
+                    "project",
+                    "project_root",
+                    "project_alias",
+                    "derived_root_parent",
+                    "project_workspace",
+                    "workspace_member",
+                    "workspace",
+                    "agent",
+                    "agent_name_claim",
+                    "registry_journal",
+                    "root_binding",
+                    "retired_binding",
+                    "root_approval",
+                ] {
+                    let columns = conn
+                        .prepare(&format!("SELECT * FROM {table}"))?
+                        .column_count();
+                    let order = (1..=columns)
+                        .map(|n| n.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let rows = conn
+                        .prepare(&format!("SELECT * FROM {table} ORDER BY {order}"))?
+                        .query_map([], |row| {
+                            (0..columns)
+                                .map(|n| row.get(n))
+                                .collect::<rusqlite::Result<Vec<SqlValue>>>()
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    tables.insert(table, rows);
+                }
+                Ok(tables)
+            })
+            .unwrap()
+    }
+
+    fn refused(f: &Fixture, call: impl FnOnce() -> Result<Vec<u8>, RegistryError>) {
+        let before = projection(f);
+        let error = call().unwrap_err();
+        assert!(
+            matches!(&error, RegistryError::Domain { code, .. } if code == "bound_by_live_agent"),
+            "{error}"
+        );
+        assert_eq!(
+            projection(f),
+            before,
+            "refusal changed stored state or journal"
+        );
+    }
+
+    #[test]
+    fn remove_bound_project_refuses_and_writes_nothing() {
+        for role in ["head", "hiree"] {
+            let f = fixture(role);
+            placed(&f, "P", Some("W"));
+            let id = create(&f, role, Some("P"), None, "Bound");
+            refused(&f, || {
+                f.store.remove(RemoveRequest {
+                    project_id: Some("P".into()),
+                    request_key: Some("remove".into()),
+                    ..Default::default()
+                })
+            });
+            dispose(&f, &id);
+            f.store
+                .remove(RemoveRequest {
+                    project_id: Some("P".into()),
+                    request_key: Some("remove".into()),
+                    ..Default::default()
+                })
+                .unwrap();
+            assert_eq!(f.store.agent_row(&id).unwrap().unwrap().status, "retired");
+        }
+    }
+
+    #[test]
+    fn project_merge_by_alias_refuses_two_live_heads() {
+        let f = fixture("merge-heads");
+        placed(&f, "P", Some("W"));
+        placed(&f, "Q", Some("W"));
+        let source = create(&f, "head", Some("P"), None, "Source");
+        let target = create(&f, "head", Some("Q"), None, "Target");
+        let req = RemoveRequest {
+            project_id: Some("P".into()),
+            successor_project_id: Some("Q".into()),
+            request_key: Some("merge".into()),
+            ..Default::default()
+        };
+        refused(&f, || f.store.remove(req.clone()));
+        dispose(&f, &source);
+        f.store.remove(req).unwrap();
+        assert_eq!(
+            f.store
+                .agent_row(&target)
+                .unwrap()
+                .unwrap()
+                .project_id
+                .as_deref(),
+            Some("Q")
+        );
+        assert_eq!(
+            f.store
+                .read(|conn| conn.query_row(
+                    "SELECT project_id FROM project_alias WHERE old_id='P'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                ))
+                .unwrap(),
+            "Q"
+        );
+    }
+
+    #[test]
+    fn remove_bound_workspace_refuses_heads_and_live_hires() {
+        for role in ["workspace_head", "head", "hiree"] {
+            let f = fixture(role);
+            placed(&f, "P", Some("W"));
+            if role == "hiree" {
+                let head = create(&f, "head", Some("P"), None, "RetiredHead");
+                dispose(&f, &head);
+            }
+            let id = if role == "workspace_head" {
+                create(&f, role, None, Some("W"), "Bound")
+            } else {
+                create(&f, role, Some("P"), None, "Bound")
+            };
+            let req = RemoveRequest {
+                workspace_id: Some("W".into()),
+                request_key: Some("remove-w".into()),
+                ..Default::default()
+            };
+            refused(&f, || f.store.remove(req.clone()));
+            dispose(&f, &id);
+            f.store.remove(req).unwrap();
+            assert!(f
+                .store
+                .read(|conn| conn
+                    .query_row(
+                        "SELECT workspace_id FROM project_workspace WHERE project_id='P'",
+                        [],
+                        |r| r.get::<_, String>(0)
+                    )
+                    .optional())
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn stored_workspace_alone_does_not_bind_but_project_placement_does() {
+        for role in ["head", "hiree"] {
+            let f = fixture(role);
+            placed(&f, "P", Some("W2"));
+            placed(&f, "Spare", Some("W1"));
+            let id = import_bound(&f, role, "P", "W1");
+            let row = f.store.agent_row(&id).unwrap();
+            let claims = f.store.agent_claims(&id).unwrap();
+            f.store
+                .remove(RemoveRequest {
+                    workspace_id: Some("W1".into()),
+                    ..Default::default()
+                })
+                .unwrap();
+            assert_eq!(f.store.agent_row(&id).unwrap(), row);
+            assert_eq!(f.store.agent_claims(&id).unwrap(), claims);
+            refused(&f, || {
+                f.store.remove(RemoveRequest {
+                    workspace_id: Some("W2".into()),
+                    ..Default::default()
+                })
+            });
+            let before = projection(&f);
+            f.store.rebuild().unwrap();
+            assert_eq!(projection(&f), before);
+        }
+    }
+
+    #[test]
+    fn assign_workspace_refuses_bound_placement_changes_but_allows_same_workspace() {
+        for role in ["head", "hiree"] {
+            for workspace in [Some("W1"), None] {
+                let f = fixture(role);
+                placed(&f, "P", workspace);
+                if workspace.is_some() {
+                    create(&f, role, Some("P"), None, "Bound");
+                } else {
+                    import_bound(&f, role, "P", "W1");
+                }
+                let req = AssignWorkspaceRequest {
+                    project_id: "P".into(),
+                    workspace_id: "W2".into(),
+                    request_key: Some("move".into()),
+                    ..Default::default()
+                };
+                refused(&f, || {
+                    f.store.with_principal("direct").assign_workspace(req)
+                });
+                if workspace.is_some() {
+                    let before = projection(&f);
+                    let out = result(
+                        &f.store
+                            .assign_workspace(AssignWorkspaceRequest {
+                                project_id: "P".into(),
+                                workspace_id: "W1".into(),
+                                ..Default::default()
+                            })
+                            .unwrap(),
+                    );
+                    assert_eq!(out["noop"], true);
+                    assert_eq!(projection(&f), before);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn register_refuses_attaching_unplaced_bound_projects_but_allows_renames() {
+        for role in ["head", "hiree"] {
+            let f = fixture(role);
+            placed(&f, "P", None);
+            let id = import_bound(&f, role, "P", "W1");
+            let claims = f.store.agent_claims(&id).unwrap();
+            let mut req = RegisterRequest {
+                project_id: Some("P".into()),
+                name: "Renamed".into(),
+                workspace_id: Some("W2".into()),
+                roots: vec![f.dir("new-root")],
+                request_key: Some("register".into()),
+                ..Default::default()
+            };
+            refused(&f, || {
+                f.store.with_principal("direct").register(req.clone())
+            });
+            req.workspace_id = None;
+            f.store.register(req).unwrap();
+            assert_eq!(f.store.agent_claims(&id).unwrap(), claims);
+            let before = projection(&f);
+            f.store.rebuild().unwrap();
+            assert_eq!(projection(&f), before);
+        }
+    }
+
+    #[test]
+    fn upgrade_implicit_refuses_attaching_bound_projects_but_allows_renames() {
+        for role in ["head", "hiree"] {
+            let f = fixture(role);
+            placed(&f, "P", None);
+            let id = import_bound(&f, role, "P", "W1");
+            let claims = f.store.agent_claims(&id).unwrap();
+            let mut req = UpgradeImplicitRequest {
+                implicit_id: "old-id".into(),
+                project_id: Some("P".into()),
+                name: "Renamed".into(),
+                workspace_id: Some("W2".into()),
+                roots: vec![f.dir("new-root")],
+                request_key: Some("upgrade".into()),
+                ..Default::default()
+            };
+            refused(&f, || {
+                f.store
+                    .with_principal("direct")
+                    .upgrade_implicit(req.clone())
+            });
+            req.workspace_id = None;
+            f.store.upgrade_implicit(req).unwrap();
+            assert_eq!(f.store.agent_claims(&id).unwrap(), claims);
+            let before = projection(&f);
+            f.store.rebuild().unwrap();
+            assert_eq!(projection(&f), before);
+        }
+    }
+
+    #[test]
+    fn seed_import_refuses_bound_attachment_and_rolls_back_the_whole_call() {
+        for role in ["head", "hiree"] {
+            let f = fixture(role);
+            let identity = "git:bound";
+            let project = seed_id(identity);
+            let first = SeedPair {
+                canonical_root: f.dir("first"),
+                mc_identity: identity.into(),
+                ..Default::default()
+            };
+            f.store
+                .seed_import(SeedImportRequest {
+                    source: "mc".into(),
+                    payload: SeedPayload {
+                        pairs: vec![first.clone()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            let id = import_bound(&f, role, &project, "W1");
+            let req = SeedImportRequest {
+                source: "mc".into(),
+                request_key: Some("seed".into()),
+                payload: SeedPayload {
+                    pairs: vec![
+                        first,
+                        SeedPair {
+                            canonical_root: f.dir("second"),
+                            mc_identity: identity.into(),
+                            ..Default::default()
+                        },
+                        SeedPair {
+                            canonical_root: f.dir("unrelated"),
+                            mc_identity: "aaa:earlier".into(),
+                            ..Default::default()
+                        },
+                    ],
+                    workspaces: vec![SeedWorkspace {
+                        workspace_id: "W2".into(),
+                        name: "Team".into(),
+                    }],
+                    members: vec![SeedMember {
+                        mc_identity: identity.into(),
+                        workspace_id: "W2".into(),
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            refused(&f, || {
+                f.store.with_principal("direct").seed_import(req.clone())
+            });
+            dispose(&f, &id);
+            f.store.seed_import(req).unwrap();
+            assert_eq!(
+                f.store
+                    .read(|conn| conn.query_row(
+                        "SELECT workspace_id FROM project_workspace WHERE project_id=?1",
+                        [&project],
+                        |r| r.get::<_, String>(0)
+                    ))
+                    .unwrap(),
+                "W2"
+            );
+            let before = projection(&f);
+            f.store.rebuild().unwrap();
+            assert_eq!(projection(&f), before);
+        }
+    }
+
+    #[test]
+    fn all_terminal_agents_allow_operator_moves_and_new_workspace_creation() {
+        let f = fixture("terminal-move");
+        placed(&f, "P", Some("W1"));
+        let head = create(&f, "head", Some("P"), None, "Head");
+        let hire = create(&f, "hiree", Some("P"), None, "Hire");
+        dispose(&f, &head);
+        let target = create(&f, "assistant", None, None, "Target");
+        f.store
+            .agent_mutation(
+                "agent.merge",
+                json!({"agent_id":hire,"into_agent_id":target,"request_key":"merge-hire"}),
+                30,
+            )
+            .unwrap();
+        let claims = f.store.agent_claims(&hire).unwrap();
+        f.store
+            .with_principal("direct")
+            .assign_workspace(AssignWorkspaceRequest {
+                project_id: "P".into(),
+                workspace_id: "New".into(),
+                workspace_name: Some("Team".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(f.store.read(|conn| conn.query_row("SELECT w.workspace_id,w.name FROM workspace w JOIN project_workspace pw USING(workspace_id) WHERE pw.project_id='P'", [], |r| Ok((r.get::<_, String>(0)?,r.get::<_, String>(1)?)))).unwrap(), ("New".into(), "Team".into()));
+        assert_eq!(f.store.agent_claims(&hire).unwrap(), claims);
+        let before = projection(&f);
+        f.store.rebuild().unwrap();
+        assert_eq!(projection(&f), before);
+    }
+
+    #[test]
+    fn rebuild_refuses_historical_ops_that_change_live_bindings_and_rolls_back() {
+        for op in [
+            "register",
+            "assign_workspace",
+            "upgrade_implicit",
+            "seed_import",
+            "remove-project",
+            "remove-workspace",
+        ] {
+            let f = fixture(op);
+            let project = seed_id("git:bound");
+            let root = f.dir("root");
+            let request = match op {
+                "register" => json!({"projectId":project,"name":"Renamed","workspaceId":"W2"}),
+                "assign_workspace" => json!({"projectId":project,"workspaceId":"W2"}),
+                "upgrade_implicit" => {
+                    json!({"implicitId":"old","projectId":project,"name":"Renamed","workspaceId":"W2"})
+                }
+                "seed_import" => {
+                    json!({"source":"mc","payload":{"pairs":[{"canonicalRoot":root,"mcIdentity":"git:bound"}],"workspaces":[{"workspaceId":"W2","name":"Team"}],"members":[{"mcIdentity":"git:bound","workspaceId":"W2"}]}})
+                }
+                "remove-project" => json!({"projectId":project}),
+                "remove-workspace" => json!({"workspaceId":"W1"}),
+                _ => unreachable!(),
+            };
+            if op == "seed_import" {
+                f.store
+                    .seed_import(SeedImportRequest {
+                        source: "mc".into(),
+                        payload: SeedPayload {
+                            pairs: vec![SeedPair {
+                                canonical_root: f.dir("initial"),
+                                mc_identity: "git:bound".into(),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    })
+                    .unwrap();
+            } else {
+                placed(&f, &project, (op == "remove-workspace").then_some("W1"));
+            }
+            import_bound(&f, "head", &project, "W1");
+            let journal_op = if op.starts_with("remove-") {
+                "remove"
+            } else {
+                op
+            };
+            f.store
+                .apply_entry(journal_op, &request.to_string(), "test", None, |_| Ok(()))
+                .unwrap();
+            let before = projection(&f);
+            let error = f.store.rebuild().unwrap_err();
+            assert!(
+                error.to_string().contains("bound_by_live_agent"),
+                "{op}: {error}"
+            );
+            assert_eq!(projection(&f), before, "failed rebuild changed {op} state");
+        }
+    }
 }
 
 #[cfg(test)]

@@ -16,6 +16,73 @@ pub use validate::*;
 
 use std::fmt;
 
+use rusqlite::{Connection, OptionalExtension};
+
+use crate::{mutations::domain, RegistryError};
+
+/// A live agent's project must stay present and in the same workspace so its
+/// identity and name claim keep referring to the same namespace.
+pub(crate) fn ensure_project_unbound(
+    conn: &Connection,
+    project_id: &str,
+) -> Result<(), RegistryError> {
+    let bound: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agent WHERE project_id=?1 AND terminal_reason IS NULL)",
+        [project_id],
+        |row| row.get(0),
+    )?;
+    if bound {
+        return Err(domain(
+            "bound_by_live_agent",
+            format!("project {project_id} is bound by a live agent"),
+        ));
+    }
+    Ok(())
+}
+
+/// Workspace heads bind their own workspace; other agents bind through their
+/// project's current placement, not their stored workspace or historical claim.
+pub(crate) fn ensure_workspace_unbound(
+    conn: &Connection,
+    workspace_id: &str,
+) -> Result<(), RegistryError> {
+    let bound: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agent a WHERE a.terminal_reason IS NULL AND (
+            (a.role='workspace_head' AND a.workspace_id=?1)
+            OR EXISTS(SELECT 1 FROM project_workspace pw
+                      WHERE pw.project_id=a.project_id AND pw.workspace_id=?1)))",
+        [workspace_id],
+        |row| row.get(0),
+    )?;
+    if bound {
+        return Err(domain(
+            "bound_by_live_agent",
+            format!("workspace {workspace_id} is bound by a live agent"),
+        ));
+    }
+    Ok(())
+}
+
+/// Insert-only placement operations can change an unplaced project, but leave
+/// an existing placement alone. Refuse only the attachment that would change it.
+pub(crate) fn ensure_project_attachment_allowed(
+    conn: &Connection,
+    project_id: &str,
+) -> Result<(), RegistryError> {
+    if conn
+        .query_row(
+            "SELECT 1 FROM project_workspace WHERE project_id=?1",
+            [project_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_none()
+    {
+        ensure_project_unbound(conn, project_id)?;
+    }
+    Ok(())
+}
+
 /// Explain whether a name is empty, too long after normalization, or contains a
 /// disallowed code point, so callers can report the specific validation failure.
 /// Source: prefrontal 873870be8,
