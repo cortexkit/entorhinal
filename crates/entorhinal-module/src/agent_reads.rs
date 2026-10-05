@@ -126,10 +126,11 @@ impl ProjectsHandler {
             .store
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let store = guard.as_ref().ok_or_else(|| {
+        let store = guard.as_ref().cloned().ok_or_else(|| {
             HandlerError::new("storage_unavailable", "agent identity storage is not ready")
         })?;
-        read(store).map_err(HandlerError::from)
+        drop(guard);
+        read(&store).map_err(HandlerError::from)
     }
 
     pub(super) fn agent_read(&self, method: &str, params: Value) -> Result<Vec<u8>, HandlerError> {
@@ -543,6 +544,127 @@ mod tests {
             ("trust", json!({"canonicalRoot":root})),
             ("verify", json!({})),
         ]
+    }
+
+    #[test]
+    fn wal_reads_and_liveness_answer_prewrite_state_within_100ms_while_writer_is_parked() {
+        use std::{sync::mpsc, thread, time::Instant};
+
+        let f = Fixture::new(true);
+        let root = f.project("P", Some("W"));
+        let agent = f.create("Alice");
+        let mut requests = read_requests(f.head(), std::path::Path::new(&root));
+        requests.push(("resolve_remote", json!({"owner":"owner","repo":"repo"})));
+        requests.push((
+            "projects.session_liveness",
+            json!({"seq":1,"snapshot":true,"sessions":[]}),
+        ));
+        for (method, params) in &mut requests {
+            if matches!(*method, "agent.resolve" | "agent.github_identity") {
+                *params = json!({"agent_id":agent});
+            }
+        }
+        let expected = requests
+            .iter()
+            .map(|(method, params)| f.ok(method, params.clone()))
+            .collect::<Vec<_>>();
+        let (parked_tx, parked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let (received, prompt) = thread::scope(|scope| {
+            let handler = &f.handler;
+            let writer = scope.spawn(move || {
+                handler.with_store(|store| {
+                    store.apply_entry("fixture", "{}", "test", None, |tx| {
+                        tx.execute_batch("UPDATE project SET name='uncommitted'; UPDATE agent SET terminal_reason='retired',terminal_at_ms=900; DELETE FROM project_root;")?;
+                        parked_tx.send(()).unwrap();
+                        // Bound the park even if a regression makes a reader block.
+                        let _ = release_rx.recv_timeout(Duration::from_secs(2));
+                        tx.execute_batch("SELECT * FROM missing_rollback_sentinel")
+                    })
+                }).unwrap_err();
+            });
+            parked_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            scope.spawn(move || {
+                for (method, params) in requests {
+                    let start = Instant::now();
+                    let reply = success(handler.handle_request(&body(method, params), OPERATOR));
+                    let _ = reply_tx.send((method, reply, start.elapsed()));
+                }
+            });
+            let mut received = Vec::new();
+            let mut prompt = true;
+            for _ in &expected {
+                match reply_rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(reply) => received.push(reply),
+                    Err(_) => {
+                        prompt = false;
+                        break;
+                    }
+                }
+            }
+            release_tx.send(()).unwrap();
+            writer.join().unwrap();
+            (received, prompt)
+        });
+        assert!(prompt, "a WAL read waited for the parked writer");
+        for ((method, reply, elapsed), expected) in received.into_iter().zip(expected) {
+            assert!(
+                elapsed < Duration::from_millis(100),
+                "{method} took {elapsed:?}"
+            );
+            assert_eq!(reply, expected, "{method} must see only committed state");
+        }
+    }
+
+    #[tokio::test]
+    async fn health_reads_only_atomics_while_writer_and_store_slot_are_parked() {
+        use std::{sync::mpsc, thread, time::Instant};
+        use subc_client_rs::ModuleHandler;
+
+        let f = Fixture::new(true);
+        f.project("P", None);
+        let generation = f.head();
+        let (parked_tx, parked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let elapsed = thread::scope(|scope| {
+            let handler = &f.handler;
+            let writer = scope.spawn(move || {
+                handler
+                    .with_store(|store| {
+                        store.apply_entry("fixture", "{}", "test", None, |tx| {
+                            tx.execute("UPDATE project SET name='uncommitted'", [])?;
+                            // Even consulting the read handle would require this
+                            // installation slot; health must use atomics only.
+                            let _slot = handler.store.lock().unwrap();
+                            parked_tx.send(()).unwrap();
+                            let _ = release_rx.recv_timeout(Duration::from_secs(2));
+                            tx.execute_batch("SELECT * FROM missing_rollback_sentinel")
+                        })
+                    })
+                    .unwrap_err();
+            });
+            parked_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let start = Instant::now();
+            // Health has no awaits, store reads or locks. Poll it synchronously
+            // while the writer is known to be inside its uncommitted transaction.
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let health = scope
+                .spawn(move || runtime.block_on(handler.health()))
+                .join()
+                .unwrap();
+            assert_eq!(health.metrics.unwrap()["generation"], generation);
+            let elapsed = start.elapsed();
+            let _ = release_tx.send(());
+            writer.join().unwrap();
+            elapsed
+        });
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "health waited {elapsed:?} for storage"
+        );
     }
 
     #[tokio::test]

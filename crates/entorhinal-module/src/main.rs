@@ -398,12 +398,16 @@ impl ProjectsHandler {
             .store
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let store = guard.as_ref().ok_or_else(|| HandlerError {
+        let store = guard.as_ref().cloned().ok_or_else(|| HandlerError {
             code: "storage_unavailable".to_string(),
             message: "projects storage is not ready".to_string(),
             detail: None,
         })?;
-        operation(store).map_err(|error| HandlerError {
+        // The slot protects installation only. SQLite's writer connection lock
+        // still serializes whole mutation transactions; reads have a separate
+        // connection and must not queue behind a writer holding that lock.
+        drop(guard);
+        operation(&store).map_err(|error| HandlerError {
             code: match &error {
                 RegistryError::Domain { code, .. } => code.clone(),
                 _ => "storage_error".to_string(),

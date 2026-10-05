@@ -9,6 +9,7 @@ use std::{
     cmp::Reverse,
     fmt,
     path::{Component, Path, PathBuf},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -22,6 +23,7 @@ pub mod agent;
 mod binding;
 mod mutations;
 mod ownership;
+mod read_connection;
 pub use binding::*;
 pub use mutations::*;
 pub use ownership::{ResolveRemoteReply, ResolveRemoteStatus, SetOwnedRemotesRequest};
@@ -137,13 +139,15 @@ const MIGRATIONS: [Migration; 6] = [
 ];
 
 /// A store opened from the descriptor resolved by subc.
+#[derive(Clone)]
 pub struct RegistryStore {
-    db: SqliteStore,
+    db: Arc<SqliteStore>,
+    reader: Arc<read_connection::ReadConnection>,
     /// Whether replies carry the root-record fields and walk ancestors. Off,
     /// every reply is byte-for-byte the pre-multi-root shape, so a consumer
     /// that cannot read the new fields is never sent them.
     root_records: bool,
-    ids: binding::IdSource,
+    ids: Arc<binding::IdSource>,
 }
 
 /// A borrowed write context carrying the attested principal independently of
@@ -206,9 +210,10 @@ impl RegistryStore {
             )));
         }
         Ok(Self {
-            db,
+            reader: Arc::new(read_connection::ReadConnection::open(descriptor)?),
+            db: Arc::new(db),
             root_records: false,
-            ids: binding::IdSource::Random,
+            ids: Arc::new(binding::IdSource::Random),
         })
     }
 
@@ -493,8 +498,6 @@ impl RegistryStore {
     ) -> Result<JournalTailReply, RegistryError> {
         let limit = limit.clamp(1, 1_000);
         self.read(|conn| {
-            let snapshot = conn.unchecked_transaction()?;
-            let conn = &snapshot;
             let mut statement = conn.prepare(&format!(
                 "SELECT seq, op, payload_json, actor, request_key, created_at, principal
                  FROM registry_journal
@@ -555,7 +558,7 @@ impl RegistryStore {
         &self,
         query: impl FnOnce(&Connection) -> rusqlite::Result<T>,
     ) -> Result<T, RegistryError> {
-        self.db.with_conn(query).map_err(RegistryError::Store)
+        self.reader.read(query).map_err(RegistryError::from)
     }
 
     fn generation_from_connection(&self, conn: &Connection) -> rusqlite::Result<i64> {

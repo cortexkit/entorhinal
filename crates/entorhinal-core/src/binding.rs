@@ -631,7 +631,7 @@ impl RegistryStore {
 
     #[cfg(test)]
     pub(crate) fn use_sequential_ids(&mut self) {
-        self.ids = IdSource::Sequence(AtomicU64::new(0));
+        self.ids = std::sync::Arc::new(IdSource::Sequence(AtomicU64::new(0)));
     }
 
     pub fn bind_root(&self, canonical_root: &str, actor: &str) -> Result<Vec<u8>, RegistryError> {

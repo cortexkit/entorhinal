@@ -104,12 +104,7 @@ impl RegistryStore {
         &self,
         query: impl FnOnce(&Connection) -> Result<T, AgentMutationError>,
     ) -> Result<T, AgentMutationError> {
-        self.read(|conn| {
-            let tx = conn.unchecked_transaction()?;
-            let result = query(&tx);
-            tx.commit()?;
-            Ok(result)
-        })?
+        self.read(|conn| Ok(query(conn)))?
     }
 
     /// Serve inherited reads and the new resolve shape. The module adds its

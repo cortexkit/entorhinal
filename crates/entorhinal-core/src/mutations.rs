@@ -955,10 +955,10 @@ impl super::JournalWriter<'_> {
 
 impl RegistryStore {
     pub fn verify(&self) -> Result<VerifyReply, RegistryError> {
-        self.read(|conn| {
-            // Keep the live checks and both snapshots in one transaction. On
-            // error Transaction's drop rolls back; success rolls back explicitly.
-            // Verification never commits the temporary replay or its side effects.
+        // Replay deletes and rewrites projections. Copy one committed snapshot
+        // first so those writes never touch the live file or wait for its writer.
+        let conn = self.read(super::read_connection::copy_snapshot)?;
+        (|| -> rusqlite::Result<VerifyReply> {
             let tx = conn.unchecked_transaction()?;
             let mut mismatches = Vec::new();
             let local = tx.query_row(
@@ -989,7 +989,7 @@ impl RegistryStore {
                 generation,
                 replay,
             })
-        })
+        })().map_err(RegistryError::from)
     }
 
     pub fn rebuild(&self) -> Result<RebuildReply, RegistryError> {
