@@ -349,9 +349,14 @@ impl ProjectsHandler {
             .unwrap_or_default()
     }
 
-    /// Whether a request on this route may run `method`: a flow-scoped route
-    /// may not write at all. Agent identity writes must pass through the
-    /// executive's operator relay; project writes keep their Direct admission.
+    /// Whether a request on this route may run `method`. A flow-scoped route may
+    /// not write at all. Project writes are admitted from `Direct` (the `ck`
+    /// faces) or the executive, as before. Agent identity writes are admitted only
+    /// from the executive (`reserved:prefrontal-core`), which relays the
+    /// operator's own changes after checking they come from the operator's
+    /// session. `Direct` is refused for them because every local process,
+    /// including an agent's shell, reaches entorhinal as `Direct`, so admitting
+    /// it would let any agent rewrite agent identity.
     fn admit(&self, method: &str, key: RouteKey) -> Result<RouteAdmission, HandlerError> {
         let admission = self.admission_for(key);
         refuse_flow_write(method, admission.flow_id.as_deref())?;

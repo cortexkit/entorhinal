@@ -1,5 +1,8 @@
-//! Agent mutation serving. Route admission stays in `ProjectsHandler::admit`;
-//! core owns strict request decoding, key caching, cutover and identity rules.
+//! Serves agent identity mutations. Who may call them is decided in
+//! `ProjectsHandler::admit`; this module only routes an admitted request to
+//! `entorhinal-core`, which owns request decoding, request-key caching, the
+//! one-time import that hands agent identity over from core, and every
+//! identity rule.
 
 use std::hash::BuildHasher;
 
@@ -103,8 +106,9 @@ mod tests {
     const A: &str = "agent_0000000000000001";
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    // Import fixtures use the actual core migration chain, not entorhinal's
-    // agent schema. Bad-row cases here do not break foreign-key references.
+    // Import sources are built with core's own migrations, copied byte for byte,
+    // so the handler reads the schema a real core store has. The bad-row cases
+    // here keep every foreign-key reference valid (see the fixture builder below).
     // Source: prefrontal 873870be8 crates/prefrontal-core-store/migrations/
     // 076_agent_registry.sql, 080_agent_github_identity.sql, 082_wake_delivery.sql,
     // 109_agent_generation.sql, 112_agent_avatar.sql, 126_agent_labels.sql.
@@ -143,10 +147,11 @@ mod tests {
                     path: root.join(name).to_string_lossy().into_owned(),
                 },
             };
-            // Obtain a SQLite transaction from the public fixture seam without
-            // adding a module dependency on the storage implementation.
-            // Foreign keys stay on for these FK-valid handler fixtures; broken
-            // references are tested with foreign_keys=OFF in core's agent_import tests.
+            // Build the source through `RegistryStore`'s public API rather than
+            // adding a SQLite dependency to this crate. That API keeps foreign keys
+            // on, which is fine here: these tests prove the request path, and the
+            // broken-reference cases live in entorhinal-core's agent_import tests,
+            // which build sources with foreign keys off.
             let source = RegistryStore::open(&descriptor("snapshot.db")).unwrap();
             source.apply_entry("fixture", "{}", "fixture", None, |tx| {
                 tx.execute_batch("PRAGMA defer_foreign_keys=ON; DROP TABLE agent_name_claim; DROP TABLE agent;")?;
@@ -228,8 +233,9 @@ mod tests {
         }
 
         fn params(&self, method: &str, key: Option<&str>) -> Value {
-            // Request keys, caller/residence removals and actor are the spec's
-            // edits; these remaining fields and casing come from core's structs.
+            // Field names and casing are core's request bodies for the same op.
+            // Entorhinal's differences: a required `request_key`, an optional
+            // `actor`, and no caller or residence fields (core strips those).
             // Source: prefrontal 873870be8 crates/prefrontal-core-module/src/agent_registry_ops.rs:548-732.
             let mut value = match method {
                 "agent.create" => json!({"role":"assistant","name":"Alice","tag":"test"}),
@@ -301,9 +307,10 @@ mod tests {
         }
     }
 
-    // The SDK serve loop performs this exact conversion. A separate decoder
-    // reads its serialized ErrorBody, so structured refusals cannot hide in a
-    // HandlerError or in prose instead of the wire's `detail` field.
+    // Turn a handler outcome into the error body the SDK sends on the wire, the
+    // same conversion its serve loop does, then decode that body independently.
+    // A refusal's structured fields must arrive in `detail`; a test that only
+    // inspected the in-process error could pass while the wire carried prose.
     // Source: subc-client-rs 0.26.1 src/lib.rs, ErrorWithDetail serve arm;
     // docs/designs/agent-identity-pinned-facts.md, "The pinned SDK".
     fn wire_error(outcome: HandlerOutcome) -> ErrorBody {
@@ -572,7 +579,8 @@ mod tests {
             assert_eq!(reply["agent"]["name_version"], 1);
         }
         let id = f.create("Labels", "labels-target");
-        // Core accepts either target spelling, but exactly one non-empty value.
+        // Core's set_labels names its target as either `agent` or `agent_id`, and
+        // exactly one of them must be present and non-empty.
         // Source: prefrontal 873870be8 crates/prefrontal-core-module/src/agent_registry_ops.rs:609-628.
         for target in ["agent", "agent_id"] {
             let body = json!({target:id,"labels":["One"],"request_key":target});
@@ -589,7 +597,8 @@ mod tests {
             body["request_key"] = json!("bad-labels");
             f.refusal(OPERATOR, "agent.set_labels", body, "invalid_request");
         }
-        // No snake_case alias is accepted for core's camelCase avatar request.
+        // Core's set_avatar body is camelCase (`agentId`, `seedOnly`, `type`); the
+        // snake_case spellings are refused as unknown fields, as core refuses them.
         // Source: prefrontal 873870be8 crates/prefrontal-core-module/src/agent_registry_ops.rs:631-646.
         for (field, alias) in [
             ("agentId", "agent_id"),
@@ -673,8 +682,9 @@ mod tests {
             f.params("agent.rename", Some("gone")),
             "gone",
         );
-        // Gone's `deleted` word and millisecond `at` are core's wire shape,
-        // distinct from the snapshot's durable `retired` status.
+        // Replies about a retired agent use core's `gone` object, reason `deleted`
+        // with the time in milliseconds, so existing clients decode it unchanged.
+        // The stored row and the change feed call the same state `retired`.
         // Source: prefrontal 873870be8 crates/prefrontal-core-module/src/agent_registry_ops.rs:992-1001.
         assert_eq!(error.detail, Some(json!({"reason":"deleted","at":NOW})));
         let mut head = f.params("agent.create", Some("head-create"));
