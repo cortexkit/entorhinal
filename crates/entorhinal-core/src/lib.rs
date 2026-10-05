@@ -25,6 +25,8 @@ mod log_schema;
 mod mutations;
 mod ownership;
 mod read_connection;
+pub mod remote_apply;
+pub mod shared_entry;
 pub use binding::*;
 pub use mutations::*;
 pub use ownership::{ResolveRemoteReply, ResolveRemoteStatus, SetOwnedRemotesRequest};
@@ -705,6 +707,12 @@ impl JournalWriter<'_> {
     ) -> Result<(i64, T), RegistryError> {
         self.db
             .with_conn_fenced(|tx| {
+                // Older migration fixtures have no log schema. Production
+                // stores always do; compare inside the same write transaction
+                // used by the lower-level append API as well as domain writes.
+                let has_log: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='identity_log_state')", [], |r| r.get(0))?;
+                let enabled = has_log && tx.query_row("SELECT state='enabled' FROM identity_log_state WHERE id=1", [], |r| r.get::<_,bool>(0))?;
+                let before = if enabled { Some(shared_entry::SharedState::capture(tx)?) } else { None };
                 tx.execute(
                     "INSERT INTO registry_journal
                      (op, payload_json, actor, request_key, created_at, principal)
@@ -720,6 +728,10 @@ impl JournalWriter<'_> {
                 )?;
                 let actual_seq = tx.last_insert_rowid();
                 let result = apply_projection(tx)?;
+                if let Some(before) = before {
+                    let after = shared_entry::SharedState::capture(tx)?;
+                    shared_entry::record_local_entry(tx, op, actual_seq, payload_json, &before, &after)?;
+                }
                 Ok((actual_seq, result))
             })
             .map_err(RegistryError::Store)
