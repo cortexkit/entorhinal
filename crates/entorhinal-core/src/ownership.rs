@@ -303,6 +303,7 @@ mod tests {
             project_id: id.into(),
             root: root.into(),
             actor: None,
+            label: None,
         })
     }
 

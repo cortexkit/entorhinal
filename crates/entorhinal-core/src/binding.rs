@@ -99,6 +99,10 @@ impl IdSource {
 pub struct RootRecord {
     pub root: String,
     pub remotes: Vec<GitRemote>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_key: Option<crate::RootKey>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_key_mismatch: Option<bool>,
     /// Null unless `identity` is `bound`.
     pub incarnation: Option<Incarnation>,
     /// Null unless `identity` is `bound`.
@@ -372,6 +376,10 @@ fn unapproved() -> Approval {
 /// The record for one registered root, with its identity checked against disk.
 fn root_record(conn: &Connection, root: &str) -> rusqlite::Result<RootRecord> {
     let remotes = super::ownership::root_remotes(conn, root)?;
+    let root_key = crate::root_keys::mapped_key(conn, root)?;
+    let root_key_mismatch = root_key
+        .as_ref()
+        .map(|key| crate::root_keys::mismatch(key, &remotes));
     let binding = active_binding(conn, root)?;
     let disk = disk_identity(Path::new(root));
     let (identity, binding) = match (binding, &disk) {
@@ -390,6 +398,8 @@ fn root_record(conn: &Connection, root: &str) -> rusqlite::Result<RootRecord> {
     Ok(RootRecord {
         root: root.to_string(),
         remotes,
+        root_key,
+        root_key_mismatch,
         incarnation: binding.as_ref().map(|bound| Incarnation {
             kind: "token",
             value: bound.incarnation.clone(),
@@ -431,6 +441,8 @@ fn worktree_record(
     let none = |identity| RootRecord {
         root: worktree.to_string(),
         remotes: remotes.clone(),
+        root_key: None,
+        root_key_mismatch: None,
         incarnation: None,
         registration_epoch: None,
         identity,
@@ -454,6 +466,8 @@ fn worktree_record(
     Ok(RootRecord {
         root: worktree.to_string(),
         remotes,
+        root_key: None,
+        root_key_mismatch: None,
         incarnation: Some(Incarnation {
             kind: "token",
             value: bound.incarnation,
@@ -966,6 +980,8 @@ impl RegistryStore {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AddRootRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     pub project_id: String,
     pub root: String,
     #[serde(default)]
@@ -1010,6 +1026,58 @@ fn nested_root(conn: &Connection, path: &str) -> rusqlite::Result<Option<(String
             && (path_prefix_or_equal(Path::new(root), Path::new(path))
                 || path_prefix_or_equal(Path::new(path), Path::new(root)))
     }))
+}
+
+/// Root attachment uses the same path fences as an explicit add_root.
+pub(crate) fn check_root_location(conn: &Connection, root: &str) -> Result<(), RegistryError> {
+    if let Some((nested, owner)) = nested_root(conn, root)? {
+        return Err(domain(
+            "root_nested",
+            format!("{root} overlaps {nested}, a root of {owner}"),
+        ));
+    }
+    if let Some(container) = containers(conn)?.into_iter().find(|c| {
+        path_prefix_or_equal(Path::new(&c.parent), Path::new(root))
+            || path_prefix_or_equal(Path::new(root), Path::new(&c.parent))
+    }) {
+        return Err(domain(
+            "root_overlaps_container",
+            format!("{root} overlaps worker container {}", container.parent),
+        ));
+    }
+    Ok(())
+}
+
+/// A checkout gets a fresh registration epoch, never an inherited approval.
+/// Non-git label roots remain unbound, just like non-git roots added explicitly.
+pub(crate) fn fresh_binding(
+    root: &str,
+    project: &str,
+    ids: &IdSource,
+) -> Result<Option<Value>, RegistryError> {
+    if !Path::new(root).join(".git").exists() {
+        return Ok(None);
+    }
+    let common = git_common_dir(Path::new(root))
+        .map_err(|reason| domain("root_identity_unverifiable", reason))?;
+    let incarnation = match read_token(&common) {
+        DiskIdentity::Token(token) => token,
+        DiskIdentity::NoToken => create_token(&common, &ids.hex(32)?)
+            .map_err(|reason| domain("root_identity_unverifiable", reason))?,
+        DiskIdentity::Unverifiable(reason) => {
+            return Err(domain("root_identity_unverifiable", reason))
+        }
+    };
+    Ok(Some(
+        serde_json::to_value(BindPayload {
+            canonical_root: root.into(),
+            project_id: project.into(),
+            incarnation,
+            registration_epoch: ids.hex(16)?,
+            replaced_epoch: None,
+        })
+        .map_err(|error| domain("encode_failed", error.to_string()))?,
+    ))
 }
 
 /// Another project that already owns one of these GitHub repositories through
@@ -1177,7 +1245,6 @@ impl super::JournalWriter<'_> {
     /// already owns. The new root is unbound and unapproved.
     pub fn add_root(&self, mut request: AddRootRequest) -> Result<Vec<u8>, RegistryError> {
         request.root = super::mutations::canonical(&request.root)?;
-        let remotes = github_remotes(Path::new(&request.root));
         let actor = request.actor.clone().unwrap_or_else(|| "module".into());
         self.mutation("add_root", None, move |tx| {
             let project = &request.project_id;
@@ -1214,24 +1281,10 @@ impl super::JournalWriter<'_> {
                     format!("{} is a root of {owner}", request.root),
                 ));
             }
-            if let Some((root, owner)) = nested_root(tx, &request.root)? {
-                return Err(domain(
-                    "root_nested",
-                    format!("{} overlaps {root}, a root of {owner}", request.root),
-                ));
-            }
-            if let Some(container) = containers(tx)?.into_iter().find(|c| {
-                path_prefix_or_equal(Path::new(&c.parent), Path::new(&request.root))
-                    || path_prefix_or_equal(Path::new(&request.root), Path::new(&c.parent))
-            }) {
-                return Err(domain(
-                    "root_overlaps_container",
-                    format!(
-                        "{} overlaps worker container {}",
-                        request.root, container.parent
-                    ),
-                ));
-            }
+            check_root_location(tx, &request.root)?;
+            let root_key =
+                crate::root_keys::incoming(tx, project, &request.root, request.label.as_deref())?;
+            let remotes = super::ownership::root_remotes(tx, &request.root)?;
             if let Some((repository, owner)) = repository_owner(tx, project, &remotes)? {
                 return Err(domain(
                     "repository_owned",
@@ -1251,6 +1304,9 @@ impl super::JournalWriter<'_> {
                 self.principal,
             )?;
             apply_add_root(tx, &request, now)?;
+            let mut mappings = Vec::new();
+            crate::root_keys::assign(tx, project, &request.root, root_key, now, &mut mappings)?;
+            crate::root_keys::journal_assignments(tx, mappings, &actor, now, self.principal)?;
             Ok(Action {
                 changed: true,
                 seq: Some(seq),
@@ -1260,8 +1316,8 @@ impl super::JournalWriter<'_> {
         })
     }
 
-    /// Remove one root from a project. The last root cannot be removed this
-    /// way; removing the project is a separate, explicit act.
+    /// Remove one local root. With shared identity enabled, the project and its
+    /// keys may still be in use on other machines, even after its last local root.
     pub fn remove_root(&self, mut request: RemoveRootRequest) -> Result<Vec<u8>, RegistryError> {
         request.root = canonical_query_path(Path::new(&request.root))?.0;
         let actor = request.actor.clone().unwrap_or_else(|| "module".into());
@@ -1293,7 +1349,7 @@ impl super::JournalWriter<'_> {
                 [&request.project_id],
                 |row| row.get(0),
             )?;
-            if count <= 1 {
+            if count <= 1 && !super::log_schema::log_enabled(tx)? {
                 return Err(domain(
                     "last_root",
                     format!(
@@ -2057,6 +2113,7 @@ mod root_membership_tests {
             project_id: project.into(),
             root: root.into(),
             actor: None,
+            label: None,
         })
     }
 
@@ -2194,6 +2251,7 @@ mod root_membership_tests {
                 project_id: "pj-home".into(),
                 root: second.clone(),
                 actor: None,
+                label: None,
             })
             .unwrap();
         refused(
@@ -2222,6 +2280,7 @@ mod root_membership_tests {
                 project_id: "pj-home".into(),
                 root: third.clone(),
                 actor: None,
+                label: None,
             })
             .unwrap();
         f.store.bind_unbound_roots("test").unwrap();

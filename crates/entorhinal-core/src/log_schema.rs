@@ -60,6 +60,10 @@ CREATE TABLE project_root_key (
 CREATE UNIQUE INDEX project_root_key_remote ON project_root_key(root_key)
     WHERE kind = 'remote';
 ALTER TABLE project_root ADD COLUMN root_key TEXT NULL;
+ALTER TABLE project_root ADD COLUMN root_key_kind TEXT NULL
+    CHECK(root_key_kind IN ('remote','label'))
+    CHECK((root_key IS NULL AND root_key_kind IS NULL)
+       OR (root_key IS NOT NULL AND root_key_kind IS NOT NULL));
 
 CREATE TABLE workspace_root (
     workspace_id TEXT PRIMARY KEY NOT NULL REFERENCES workspace(workspace_id) ON DELETE CASCADE,

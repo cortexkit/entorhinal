@@ -445,8 +445,8 @@ pub(crate) fn replay_root_keys(tx: &Transaction<'_>, value: Value) -> rusqlite::
             return Err(invalid("unknown root key kind"));
         }
         tx.execute(
-            "UPDATE project_root SET root_key=?1 WHERE canonical_root=?2",
-            [&mapping.root_key, &mapping.canonical_root],
+            "UPDATE project_root SET root_key=?1,root_key_kind=?2 WHERE canonical_root=?3",
+            [&mapping.root_key, &mapping.kind, &mapping.canonical_root],
         )?;
     }
     Ok(())

@@ -13,6 +13,8 @@ use super::{implicit_project_id, now_unix_millis, RegistryError, RegistryStore};
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct RegisterRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     #[serde(default)]
     pub project_id: Option<String>,
     pub name: String,
@@ -440,11 +442,22 @@ impl super::JournalWriter<'_> {
                     )?;
                 }
             }
-            let generation = action.seq.unwrap_or(tx.query_row(
-                "SELECT COALESCE(MAX(seq),0) FROM registry_journal",
-                [],
-                |r| r.get(0),
-            )?);
+            // An enabled root insertion also appends its local assignment row.
+            // Reply generations are always the committed journal head, not the
+            // earlier operation row whose response is cached.
+            let generation = if super::log_schema::log_enabled(tx)? {
+                tx.query_row(
+                    "SELECT COALESCE(MAX(seq),0) FROM registry_journal",
+                    [],
+                    |r| r.get(0),
+                )?
+            } else {
+                action.seq.unwrap_or(tx.query_row(
+                    "SELECT COALESCE(MAX(seq),0) FROM registry_journal",
+                    [],
+                    |r| r.get(0),
+                )?)
+            };
             let mut value = action.value;
             if let Value::Object(ref mut map) = value {
                 map.insert("generation".to_string(), json!(generation));
@@ -505,10 +518,15 @@ impl super::JournalWriter<'_> {
             for parent in &req.derived_root_parents { if let Some(owner) = tx.query_row("SELECT project_id FROM derived_root_parent WHERE canonical_parent=?1",[parent],|r|r.get::<_,String>(0)).optional()? { owners.insert(owner); } }
             let project_id = match req.project_id.clone() { Some(id) => id, None => if owners.len()==1 { owners.iter().next().unwrap().clone() } else if owners.len()>1 { return Err(domain("project_conflict", format!("conflicting owners: {}", owners.into_iter().collect::<Vec<_>>().join(",")))) } else { mint("register1", &req.name, &req.roots) } };
             let existing = tx.query_row("SELECT name FROM project WHERE project_id=?1",[&project_id],|r|r.get::<_,String>(0)).optional()?;
+            if req.project_id.is_none() && owners.is_empty() && existing.is_some() && super::log_schema::log_enabled(tx)? {
+                return Err(domain("project_id_occupied", format!("{project_id}; use attach_root or an explicit project_id")));
+            }
             if req.project_id.is_some() && existing.is_none() && tx.query_row("SELECT project_id FROM project_alias WHERE old_id=?1",[&project_id],|r|r.get::<_,String>(0)).optional()?.is_some() { return Err(domain("project_id_occupied", &project_id)); }
+            let mut chosen = BTreeMap::new();
             for root in &req.roots {
                 if let Some(owner)=tx.query_row("SELECT project_id FROM project_root WHERE canonical_root=?1",[root],|r|r.get::<_,String>(0)).optional()? { if owner!=project_id { return Err(domain("root_conflict",format!("root {root} is owned by {owner}"))); } }
                 if let Some(owner)=tx.query_row("SELECT project_id FROM derived_root_parent WHERE canonical_parent=?1",[root],|r|r.get::<_,String>(0)).optional()? { if owner!=project_id { return Err(domain("root_conflict",format!("root {root} is claimed by {owner}"))); } }
+                chosen.insert(root.clone(), super::root_keys::incoming(tx, &project_id, root, req.label.as_deref())?);
                 let remotes = super::ownership::root_remotes(tx, root)?;
                 if let Some((repository, owner)) = super::binding::repository_owner(tx, &project_id, &remotes)? {
                     return Err(domain("repository_owned", format!("{repository} belongs to {owner}")));
@@ -540,7 +558,14 @@ impl super::JournalWriter<'_> {
             if !changed { return Ok(Action{changed:false,seq:None,value:response,payload}); }
             let seq=append(tx,"register",&payload,&actor,key.as_deref(),now,self.principal)?;
             if existing.is_none() { tx.execute("INSERT INTO project(project_id,name,implicit,seed_identity,created_at,updated_at) VALUES(?1,?2,0,NULL,?3,?3)",params![&project_id,&req.name,now])?; } else { tx.execute("UPDATE project SET name=?1,updated_at=?2 WHERE project_id=?3",params![&req.name,&now,&project_id])?; }
-            for root in &req.roots { tx.execute("INSERT OR IGNORE INTO project_root(canonical_root,project_id,added_at) VALUES(?1,?2,?3)",params![root,&project_id,now])?; let old=implicit_project_id(root); let _=tx.execute("INSERT OR IGNORE INTO project_alias(old_id,project_id,created_at) VALUES(?1,?2,?3)",params![old,&project_id,now])?; }
+            let mut mappings = Vec::new();
+            for root in &req.roots {
+                let root_key = chosen.remove(root).flatten();
+                tx.execute("INSERT OR IGNORE INTO project_root(canonical_root,project_id,added_at) VALUES(?1,?2,?3)",params![root,&project_id,now])?;
+                super::root_keys::assign(tx, &project_id, root, root_key, now, &mut mappings)?;
+                let old=implicit_project_id(root); let _=tx.execute("INSERT OR IGNORE INTO project_alias(old_id,project_id,created_at) VALUES(?1,?2,?3)",params![old,&project_id,now])?;
+            }
+            super::root_keys::journal_assignments(tx, mappings, &actor, now, self.principal)?;
             for parent in &req.derived_root_parents { tx.execute("INSERT OR IGNORE INTO derived_root_parent(canonical_parent,project_id) VALUES(?1,?2)",[parent,&project_id])?; }
             if let Some(w)=&req.workspace_id { tx.execute("INSERT OR IGNORE INTO workspace(workspace_id,name,created_at,updated_at) VALUES(?1,?1,?2,?2)",params![w,now])?; tx.execute("INSERT OR IGNORE INTO project_workspace(project_id,workspace_id) VALUES(?1,?2)",[&project_id,w])?; tx.execute("INSERT OR IGNORE INTO workspace_member(workspace_id,ref_kind,device_fingerprint,project_id) VALUES(?1,'local','',?2)",[w,&project_id])?; }
             response["implicitAliasCollisions"]=json!(aliases); Ok(Action{changed:true,seq:Some(seq),value:response,payload:json!({"request":payload,"implicitAliasCollisions":aliases})})
@@ -736,15 +761,6 @@ impl super::JournalWriter<'_> {
             .project_id
             .clone()
             .unwrap_or_else(|| mint("upgrade1", &req.name, &req.roots));
-        let _register = RegisterRequest {
-            project_id: Some(id.clone()),
-            name: req.name.clone(),
-            workspace_id: req.workspace_id.clone(),
-            roots: req.roots.clone(),
-            derived_root_parents: vec![],
-            request_key: None,
-            actor: req.actor.clone(),
-        };
         let key = req.request_key.clone();
         let actor = req.actor.clone().unwrap_or_else(|| "module".into());
         let payload =
@@ -755,6 +771,13 @@ impl super::JournalWriter<'_> {
                 if target != id { return Err(domain("alias_conflict", target)); }
             }
             let existing = tx.query_row("SELECT name FROM project WHERE project_id=?1", [&id], |r| r.get::<_, String>(0)).optional()?;
+            if req.project_id.is_none() && existing.is_some() && super::log_schema::log_enabled(tx)? {
+                let mut locally_owned = false;
+                for root in &req.roots {
+                    locally_owned |= tx.query_row("SELECT 1 FROM project_root WHERE canonical_root=?1 UNION ALL SELECT 1 FROM derived_root_parent WHERE canonical_parent=?1 LIMIT 1", [root], |r| r.get::<_, i64>(0)).optional()?.is_some();
+                }
+                if !locally_owned { return Err(domain("project_id_occupied", format!("{id}; use attach_root or an explicit project_id"))); }
+            }
             let mut changed = existing.is_none() || existing.as_ref().is_some_and(|n| n != &req.name);
             for r in &req.roots {
                 changed |= tx.query_row("SELECT 1 FROM project_root WHERE canonical_root=?1", [r], |r| r.get::<_, i64>(0)).optional()?.is_none();
@@ -766,16 +789,23 @@ impl super::JournalWriter<'_> {
             if req.workspace_id.is_some() {
                 super::agent::ensure_project_attachment_allowed(tx, &id)?;
             }
+            let mut chosen = Vec::new();
+            for root in &req.roots {
+                chosen.push(super::root_keys::incoming(tx, &id, root, None)?);
+            }
             let seq = append(tx, "upgrade_implicit", &payload, &actor, key.as_deref(), now, self.principal)?;
             if existing.is_none() {
                 tx.execute("INSERT INTO project(project_id,name,implicit,seed_identity,created_at,updated_at) VALUES(?1,?2,0,NULL,?3,?3)", params![&id,&req.name,now])?;
             } else {
                 tx.execute("UPDATE project SET name=?1,updated_at=?2 WHERE project_id=?3", params![&req.name,now,&id])?;
             }
-            for r in &req.roots {
+            let mut mappings = Vec::new();
+            for (r, root_key) in req.roots.iter().zip(chosen) {
                 tx.execute("INSERT OR IGNORE INTO project_root(canonical_root,project_id,added_at) VALUES(?1,?2,?3)", params![r,&id,now])?;
+                super::root_keys::assign(tx, &id, r, root_key, now, &mut mappings)?;
                 tx.execute("INSERT OR IGNORE INTO project_alias(old_id,project_id,created_at) VALUES(?1,?2,?3)", params![implicit_project_id(r),&id,now])?;
             }
+            super::root_keys::journal_assignments(tx, mappings, &actor, now, self.principal)?;
             tx.execute("INSERT OR REPLACE INTO project_alias(old_id,project_id,created_at) VALUES(?1,?2,?3)", params![&req.implicit_id,&id,now])?;
             if let Some(w) = &req.workspace_id {
                 tx.execute("INSERT OR IGNORE INTO workspace(workspace_id,name,created_at,updated_at) VALUES(?1,?1,?2,?2)", params![w,now])?;
@@ -947,6 +977,7 @@ impl super::JournalWriter<'_> {
             serde_json::to_value(&req).map_err(|e| domain("encode_failed", e.to_string()))?;
         self.mutation("seed_import",key.clone().as_deref(),move|tx|{
             let now=now_unix_millis(); let mut report=Vec::new(); let mut groups:BTreeMap<String,Vec<SeedPair>>=BTreeMap::new();
+            let mut mappings = Vec::new();
             for p in &missing {report.push(SeedReportEntry{kind:"skipped".into(),mc_identity:Some(p.mc_identity.clone()),canonical_root:Some(p.canonical_root.clone()),project_id:None,owner_project_id:None,new_project_id:None,roots:None,reason:Some("missing".into())});}
             for p in &home_scoped {report.push(SeedReportEntry{kind:"skipped".into(),mc_identity:Some(p.mc_identity.clone()),canonical_root:Some(p.canonical_root.clone()),project_id:None,owner_project_id:None,new_project_id:None,roots:None,reason:Some("home_scoped".into())});}
             let mut by_root:BTreeMap<String,Vec<SeedPair>>=BTreeMap::new(); for p in &req.payload.pairs {by_root.entry(p.canonical_root.clone()).or_default().push(p.clone());}
@@ -975,7 +1006,9 @@ impl super::JournalWriter<'_> {
                         changed = true;
                     }
                     for p in &available {
+                        let root_key = super::root_keys::incoming(tx, &project, &p.canonical_root, None)?;
                         tx.execute("INSERT OR IGNORE INTO project_root(canonical_root,project_id,added_at) VALUES(?1,?2,?3)", params![p.canonical_root,project,now])?;
+                        super::root_keys::assign(tx, &project, &p.canonical_root, root_key, now, &mut mappings)?;
                         tx.execute("INSERT OR IGNORE INTO project_alias(old_id,project_id,created_at) VALUES(?1,?2,?3)", params![implicit_project_id(&p.canonical_root),project,now])?;
                         changed = true;
                     }
@@ -989,7 +1022,9 @@ impl super::JournalWriter<'_> {
                     }
                 }
             }
-            let value=json!({"report":report}); if !changed {return Ok(Action{changed:false,seq:None,value,payload});} let seq=append(tx,"seed_import",&payload,&actor,key.as_deref(),now,self.principal)?; Ok(Action{changed:true,seq:Some(seq),value,payload})
+            let value=json!({"report":report}); if !changed {return Ok(Action{changed:false,seq:None,value,payload});} let seq=append(tx,"seed_import",&payload,&actor,key.as_deref(),now,self.principal)?;
+            super::root_keys::journal_assignments(tx, mappings, &actor, now, self.principal)?;
+            Ok(Action{changed:true,seq:Some(seq),value,payload})
         })
     }
 }
@@ -1020,6 +1055,7 @@ impl RegistryStore {
                 }
             }
             let generation = self.generation_from_connection(&tx)?;
+            mismatches.extend(super::root_keys::disk_mismatches(&tx)?);
             let replay = replay_and_compare(&tx)?;
             tx.rollback()?;
             Ok(VerifyReply {
@@ -1298,6 +1334,7 @@ fn replay(
         return Ok(());
     }
     match op {
+        "attach_root" => super::root_keys::replay_attach(tx, seq, &v, now)?,
         "root_key.assign" | "root_key.backfill" => super::shared_entry::replay_root_keys(tx, v)?,
         "workspace_root.backfill" => super::log_schema::replay_workspace_root_backfill(tx, v)?,
         "register" => {
@@ -3007,6 +3044,7 @@ mod audit_fix_tests {
                 workspace_id: None,
                 request_key: None,
                 actor: None,
+                label: None,
             })
             .unwrap();
         let generation_before = store.generation().unwrap();
@@ -3020,6 +3058,7 @@ mod audit_fix_tests {
                 workspace_id: None,
                 request_key: Some("rk-conflict".into()),
                 actor: None,
+                label: None,
             })
             .unwrap_err();
         assert!(matches!(err, RegistryError::Domain { ref code, .. } if code == "root_conflict"));
@@ -3042,6 +3081,7 @@ mod audit_fix_tests {
                 workspace_id: None,
                 request_key: Some("rk-conflict".into()),
                 actor: None,
+                label: None,
             })
             .unwrap();
     }
@@ -3063,6 +3103,7 @@ mod audit_fix_tests {
                 workspace_id: None,
                 request_key: Some("shared-key".into()),
                 actor: None,
+                label: None,
             })
             .unwrap();
         let registered: serde_json::Value = serde_json::from_slice(&blob).unwrap();
@@ -3093,6 +3134,7 @@ mod audit_fix_tests {
                 workspace_id: None,
                 request_key: Some("shared-key".into()),
                 actor: None,
+                label: None,
             })
             .unwrap();
         let replayed: serde_json::Value = serde_json::from_slice(&replay).unwrap();

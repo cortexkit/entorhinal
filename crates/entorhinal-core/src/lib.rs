@@ -26,10 +26,12 @@ mod mutations;
 mod ownership;
 mod read_connection;
 pub mod remote_apply;
+mod root_keys;
 pub mod shared_entry;
 pub use binding::*;
 pub use mutations::*;
 pub use ownership::{ResolveRemoteReply, ResolveRemoteStatus, SetOwnedRemotesRequest};
+pub use root_keys::{AttachRootRequest, ResolveRootKeyReply, ResolveRootKeyRequest, RootKey};
 
 // The schema-migration namespace, NOT the module id, and deliberately left as
 // "projects" while the module id moved to "entorhinal".
