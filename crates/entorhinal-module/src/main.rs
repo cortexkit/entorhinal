@@ -49,6 +49,7 @@ use subc_protocol::{
 const MODULE_ID: &str = "entorhinal";
 const DEFAULT_STORAGE_NAMESPACE: &str = "default";
 
+mod agent_ops;
 mod cli;
 
 // PARSE ARGV BEFORE ACTING ON IT.
@@ -198,6 +199,9 @@ struct ProjectsHandler {
     /// stamps it once, at `route.bind`, never per request, so it is recorded
     /// here and looked up for every request on that route.
     route_admissions: Mutex<HashMap<RouteKey, RouteAdmission>>,
+    /// Volatile reply token: never persisted in the request-key cache.
+    incarnation: String,
+    clock: fn() -> i64,
 }
 
 /// The parts of a route's bind stamp that decide what the route may do here.
@@ -245,10 +249,19 @@ const MUTATING_METHODS: &[&str] = &[
     "unapprove_root",
     "approve_project",
     "unapprove_project",
+    "agent.create",
+    "agent.rename",
+    "agent.update_tag",
+    "agent.set_labels",
+    "agent.set_avatar",
+    "agent.set_github_identity",
+    "agent.dispose",
+    "agent.merge",
+    "agent.import",
 ];
 
-/// Refuse a mutating method unless the route was opened by the operator
-/// (`Direct`: the `ck` faces) or by the executive.
+/// Refuse a project/workspace mutating method unless the route was opened by
+/// the operator (`Direct`: the `ck` faces) or by the executive.
 ///
 /// This stops a module that has no business writing here from changing the
 /// registry by accident or through a bug. Project ids key other modules' state,
@@ -257,7 +270,7 @@ const MUTATING_METHODS: &[&str] = &[
 /// the store file itself. A route with no recorded principal is refused rather
 /// than assumed to be the operator.
 fn authorize_write(method: &str, principal: Option<&Principal>) -> Result<(), HandlerError> {
-    if !MUTATING_METHODS.contains(&method) {
+    if !MUTATING_METHODS.contains(&method) || agent_ops::MUTATING_METHODS.contains(&method) {
         return Ok(());
     }
     match principal {
@@ -265,6 +278,7 @@ fn authorize_write(method: &str, principal: Option<&Principal>) -> Result<(), Ha
         Some(Principal::Reserved { module_id }) if module_id == WRITER_MODULE => Ok(()),
         other => Err(HandlerError {
             code: "write_not_permitted".to_string(),
+            detail: None,
             message: format!(
                 "'{method}' changes the registry and is accepted only from the operator (ck) or {WRITER_MODULE}; this route was opened by {}",
                 principal_label(other)
@@ -286,6 +300,7 @@ fn refuse_flow_write(method: &str, flow_id: Option<&str>) -> Result<(), HandlerE
     match flow_id {
         Some(flow_id) if MUTATING_METHODS.contains(&method) => Err(HandlerError {
             code: "flow_scope_not_admitted".to_string(),
+            detail: None,
             message: format!(
                 "'{method}' changes the registry and is not accepted on a route opened under flow '{flow_id}'"
             ),
@@ -305,11 +320,17 @@ fn principal_label(principal: Option<&Principal>) -> String {
 
 impl ProjectsHandler {
     fn new() -> Self {
+        Self::with_runtime(agent_ops::new_incarnation(), unix_millis)
+    }
+
+    fn with_runtime(incarnation: String, clock: fn() -> i64) -> Self {
         Self {
             store: Arc::new(Mutex::new(None)),
             health: Arc::new(HealthGauges::default()),
             liveness: Arc::new(Mutex::new(LivenessState::default())),
             route_admissions: Mutex::new(HashMap::new()),
+            incarnation,
+            clock,
         }
     }
 
@@ -329,12 +350,30 @@ impl ProjectsHandler {
     }
 
     /// Whether a request on this route may run `method`: a flow-scoped route
-    /// may not write at all, and otherwise only the operator and the executive
-    /// may write.
+    /// may not write at all. Agent identity writes must pass through the
+    /// executive's operator relay; project writes keep their Direct admission.
     fn admit(&self, method: &str, key: RouteKey) -> Result<RouteAdmission, HandlerError> {
         let admission = self.admission_for(key);
         refuse_flow_write(method, admission.flow_id.as_deref())?;
-        authorize_write(method, admission.principal.as_ref())?;
+        if agent_ops::MUTATING_METHODS.contains(&method) {
+            match admission.principal.as_ref() {
+                Some(Principal::Reserved { module_id }) if module_id == WRITER_MODULE => (),
+                Some(Principal::Direct) => {
+                    return Err(HandlerError::new(
+                        "direct_identity_write_not_admitted",
+                        format!("'{method}' must be called through {WRITER_MODULE}'s relay; Direct agent identity writes are not admitted"),
+                    ));
+                }
+                other => {
+                    return Err(HandlerError::new(
+                        "write_not_permitted",
+                        format!("'{method}' changes agent identity and is accepted only from reserved:{WRITER_MODULE}; this route was opened by {}", principal_label(other)),
+                    ));
+                }
+            }
+        } else {
+            authorize_write(method, admission.principal.as_ref())?;
+        }
         Ok(admission)
     }
 
@@ -349,6 +388,7 @@ impl ProjectsHandler {
         let store = guard.as_ref().ok_or_else(|| HandlerError {
             code: "storage_unavailable".to_string(),
             message: "projects storage is not ready".to_string(),
+            detail: None,
         })?;
         operation(store).map_err(|error| HandlerError {
             code: match &error {
@@ -356,6 +396,7 @@ impl ProjectsHandler {
                 _ => "storage_error".to_string(),
             },
             message: error.to_string(),
+            detail: None,
         })
     }
 
@@ -371,23 +412,7 @@ impl ProjectsHandler {
 #[async_trait]
 impl ModuleHandler for ProjectsHandler {
     async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
-        let request = match serde_json::from_slice::<WireRequest>(&body) {
-            Ok(request) => request,
-            Err(error) => {
-                return HandlerOutcome::Error {
-                    code: "invalid_request".to_string(),
-                    message: format!("request must be JSON with method and params: {error}"),
-                }
-            }
-        };
-
-        match self.execute(request, route_key(&ctx.route_handle())) {
-            Ok(body) => HandlerOutcome::Response(body),
-            Err(error) => HandlerOutcome::Error {
-                code: error.code,
-                message: error.message,
-            },
-        }
+        self.handle_request(&body, route_key(&ctx.route_handle()))
     }
 
     async fn on_bind(&self, request: &RouteBindRequest) -> BindDecision {
@@ -503,6 +528,25 @@ struct LivenessSession {
 }
 
 impl ProjectsHandler {
+    /// The same envelope/admission/response path serves SUBC and the route seam
+    /// used by tests, without constructing a transport or inventing a principal.
+    fn handle_request(&self, body: &[u8], key: RouteKey) -> HandlerOutcome {
+        let request = match serde_json::from_slice::<WireRequest>(body) {
+            Ok(request) => request,
+            Err(error) => {
+                return HandlerError::new(
+                    "invalid_request",
+                    format!("request must be JSON with method and params: {error}"),
+                )
+                .into_outcome();
+            }
+        };
+        match self.execute(request, key) {
+            Ok(body) => HandlerOutcome::Response(body),
+            Err(error) => error.into_outcome(),
+        }
+    }
+
     /// The principal saved when this route was bound decides whether the request
     /// is admitted, and the same value is recorded on every journal row the
     /// request writes, including the `bind_root` rows a `register` or `add_root`
@@ -532,8 +576,12 @@ impl ProjectsHandler {
             "unapprove_project" => self.set_project_approval(request.params, false, &principal),
             "verify" => self.verify(),
             "rebuild" => self.rebuild(),
+            method if agent_ops::MUTATING_METHODS.contains(&method) => {
+                self.agent_mutation(method, request.params, &principal)
+            }
             _ => Err(HandlerError {
                 code: "unknown_method".to_string(),
+                detail: None,
                 message: format!(
                     "unknown projects method '{}', see the management manifest",
                     request.method
@@ -657,6 +705,7 @@ impl ProjectsHandler {
         .map_err(|error| HandlerError {
             code: "encode_failed".to_string(),
             message: error.to_string(),
+            detail: None,
         })
     }
 
@@ -880,12 +929,38 @@ impl ProjectsHandler {
 struct HandlerError {
     code: String,
     message: String,
+    detail: Option<Value>,
+}
+
+impl HandlerError {
+    fn new(code: &str, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            detail: None,
+        }
+    }
+
+    fn into_outcome(self) -> HandlerOutcome {
+        match self.detail {
+            Some(detail) => HandlerOutcome::ErrorWithDetail {
+                code: self.code,
+                message: self.message,
+                detail,
+            },
+            None => HandlerOutcome::Error {
+                code: self.code,
+                message: self.message,
+            },
+        }
+    }
 }
 
 fn invalid_params(error: serde_json::Error) -> HandlerError {
     HandlerError {
         code: "invalid_params".to_string(),
         message: error.to_string(),
+        detail: None,
     }
 }
 
@@ -893,6 +968,7 @@ fn encode_result<T: serde::Serialize>(result: T) -> Result<Vec<u8>, HandlerError
     serde_json::to_vec(&json!({ "result": result })).map_err(|error| HandlerError {
         code: "encode_failed".to_string(),
         message: error.to_string(),
+        detail: None,
     })
 }
 
@@ -1249,7 +1325,7 @@ fn unix_millis() -> i64 {
 mod tests {
     use super::*;
 
-    fn reserved(module_id: &str) -> Principal {
+    pub(super) fn reserved(module_id: &str) -> Principal {
         Principal::Reserved {
             module_id: module_id.to_string(),
         }
@@ -1257,7 +1333,10 @@ mod tests {
 
     #[test]
     fn writes_are_refused_unless_the_operator_or_the_executive_opened_the_route() {
-        for method in MUTATING_METHODS {
+        for method in MUTATING_METHODS
+            .iter()
+            .filter(|method| !agent_ops::MUTATING_METHODS.contains(method))
+        {
             assert!(
                 authorize_write(method, Some(&Principal::Direct)).is_ok(),
                 "{method} from direct"
@@ -1298,7 +1377,7 @@ mod tests {
     /// A stamp as the daemon would send it for a route opened under a flow's
     /// scope, parsed from JSON so the test does not depend on how the protocol
     /// crate builds one.
-    fn flow_stamp(flow_id: Option<&str>) -> ScopeStamp {
+    pub(super) fn flow_stamp(flow_id: Option<&str>) -> ScopeStamp {
         let mut attributes = serde_json::Map::new();
         attributes.insert("agent_id".into(), json!("agent_0123456789abcdef"));
         if let Some(flow_id) = flow_id {
