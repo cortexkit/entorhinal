@@ -1,0 +1,798 @@
+//! Fail-closed application of verified log envelopes. Replay's compatibility
+//! skips are intentionally not used to decode a received operation.
+
+use rusqlite::{params, Transaction};
+use serde_json::{json, Value};
+
+use crate::{
+    agent::AgentChangeEntry,
+    mutations::{append, domain},
+    shared_entry::{canonical_bytes, decode_error, ProjectEntry},
+    RegistryError, RegistryStore,
+};
+
+pub const ENVELOPE_VERSION: i64 = 1;
+const AGENT_OPS: &[&str] = &[
+    "agent.create",
+    "agent.rename",
+    "agent.update_tag",
+    "agent.set_labels",
+    "agent.set_avatar",
+    "agent.set_github_identity",
+    "agent.dispose",
+    "agent.merge",
+];
+
+/// The log coordinator supplies decoded bytes, not hex, after checking paging
+/// and signatures. This layer independently checks the supported envelope.
+pub struct RemoteEntry {
+    pub position: i64,
+    pub entry_id: String,
+    pub signer: String,
+    pub key_id: String,
+    pub envelope_version: i64,
+    pub kind: String,
+    pub entry: Vec<u8>,
+}
+
+enum Decoded {
+    Project(ProjectEntry),
+    Agent(Box<AgentChangeEntry>),
+}
+
+impl RegistryStore {
+    /// Commit one complete change or assembled snapshot. A failure rolls back
+    /// projection, journal and applied position together. Multipart buffering
+    /// belongs to the coordinator, which must pass only a complete snapshot.
+    pub fn apply_remote_entry(&self, entry: &RemoteEntry) -> Result<i64, RegistryError> {
+        let error = std::cell::RefCell::new(None);
+        let result = self.db.with_conn_fenced(|tx| {
+            apply(tx, entry).inspect_err(|cause| {
+                *error.borrow_mut() = Some(cause.to_string());
+            })
+        });
+        result.map_err(|cause| {
+            domain(
+                "apply_failed",
+                error.into_inner().unwrap_or_else(|| cause.to_string()),
+            )
+        })
+    }
+}
+
+fn apply(tx: &Transaction<'_>, entry: &RemoteEntry) -> rusqlite::Result<i64> {
+    let invalid = |message: &str| {
+        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            message,
+        )))
+    };
+    if entry.envelope_version != ENVELOPE_VERSION {
+        return Err(invalid("unknown envelope_version"));
+    }
+    if !matches!(entry.kind.as_str(), "change" | "snapshot") {
+        return Err(invalid("unknown entry kind"));
+    }
+    let value: Value = serde_json::from_slice(&entry.entry).map_err(decode_error)?;
+    let op = value
+        .get("op")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("missing entry op"))?;
+    let decoded = match (entry.kind.as_str(), op) {
+        ("change", "project.shared") | ("snapshot", "shared.snapshot") => {
+            let project: ProjectEntry = serde_json::from_value(value).map_err(decode_error)?;
+            project.validate(tx)?;
+            Decoded::Project(project)
+        }
+        ("change", op) if AGENT_OPS.contains(&op) => {
+            let agent: AgentChangeEntry = serde_json::from_value(value).map_err(decode_error)?;
+            if agent.agent_id != agent.row.agent_id
+                || agent.agent_generation != agent.row.agent_generation
+            {
+                return Err(invalid("inconsistent agent after-image"));
+            }
+            Decoded::Agent(Box::new(agent))
+        }
+        _ => return Err(invalid("unknown entry op or kind/op mismatch")),
+    };
+    let position: i64 = tx.query_row(
+        "SELECT last_applied_position FROM identity_log_state WHERE id=1",
+        [],
+        |r| r.get(0),
+    )?;
+    if entry.position != position + 1 {
+        return Err(invalid("entry is not the next log position"));
+    }
+    let own: Option<i64> = tx
+        .query_row(
+            "SELECT seq FROM registry_journal WHERE entry_id=?1 AND origin='here'",
+            [&entry.entry_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let seq = if let Some(seq) = own {
+        seq
+    } else {
+        // Bootstrap identities can refer to another identity restored later in
+        // the same snapshot. Validate those references against the final state.
+        tx.execute_batch("PRAGMA defer_foreign_keys=ON;")?;
+        match decoded {
+            Decoded::Project(project) => {
+                if project.op == "shared.snapshot" {
+                    for mut agent in project.agents.clone() {
+                        let agent_seq = append(
+                            tx,
+                            "agent.import",
+                            &json!({}),
+                            "log",
+                            None,
+                            agent.row.updated_at_ms,
+                            "entorhinal",
+                        )?;
+                        agent.seq = agent_seq;
+                        let payload = json!({"entry": agent});
+                        crate::agent::replay_agent_entry(tx, "agent.import", &payload)?;
+                        tx.execute(
+                            "UPDATE registry_journal SET payload_json=?1 WHERE seq=?2",
+                            params![payload.to_string(), agent_seq],
+                        )?;
+                    }
+                    let marked: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM registry_journal WHERE op='agent.cutover')",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    if !marked {
+                        append(
+                            tx,
+                            "agent.cutover",
+                            &json!({}),
+                            "log",
+                            None,
+                            0,
+                            "entorhinal",
+                        )?;
+                    }
+                }
+                let seq = append(tx, &project.op, &json!({}), "log", None, 0, "entorhinal")?;
+                project.apply(tx, seq)?;
+                tag(
+                    tx,
+                    seq,
+                    entry,
+                    &json!({"signer":entry.signer,"key_id":entry.key_id}),
+                )?;
+                seq
+            }
+            Decoded::Agent(mut agent) => {
+                let seq = append(
+                    tx,
+                    &agent.op,
+                    &json!({}),
+                    "log",
+                    None,
+                    agent.row.updated_at_ms,
+                    "entorhinal",
+                )?;
+                agent.seq = seq;
+                let payload = json!({"entry":agent,"signer":entry.signer,"key_id":entry.key_id});
+                crate::agent::replay_agent_entry(tx, &agent.op, &payload)?;
+                // The entry in the local feed carries its local seq; the stored
+                // log bytes remain untouched for audit and deterministic replay.
+                tag(tx, seq, entry, &payload)?;
+                seq
+            }
+        }
+    };
+    tx.execute("UPDATE identity_log_state SET last_applied_position=?1,last_seen_head=MAX(last_seen_head,?1) WHERE id=1", [entry.position])?;
+    tx.execute(
+        "DELETE FROM pending_entry WHERE expected_head < ?1",
+        [entry.position],
+    )?;
+    // Deferred references must be checked here too, not just at commit, so the
+    // caller always receives the same apply_failed refusal for invalid images.
+    if tx.prepare("PRAGMA foreign_key_check")?.exists([])? {
+        return Err(invalid("shared after-image violates a foreign key"));
+    }
+    Ok(seq)
+}
+
+use rusqlite::OptionalExtension;
+
+fn tag(
+    tx: &Transaction<'_>,
+    seq: i64,
+    entry: &RemoteEntry,
+    payload: &Value,
+) -> rusqlite::Result<()> {
+    tx.execute("UPDATE registry_journal SET payload_json=?1,stream='shared',origin='log',entry_id=?2,log_position=?3,entry=?4 WHERE seq=?5", params![String::from_utf8(canonical_bytes(payload)).unwrap(),entry.entry_id,entry.position,entry.entry,seq])?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        mutations::tests::Fixture,
+        shared_entry::{SharedState, TableChanges},
+        *,
+    };
+    use std::{collections::BTreeMap, sync::mpsc, thread, time::Duration};
+
+    fn enable(f: &Fixture) {
+        f.store
+            .apply_entry("identity_log.enable", "{}", "test", None, |tx| {
+                tx.execute("UPDATE identity_log_state SET state='enabled'", [])?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn register(f: &Fixture, id: &str, roots: Vec<String>, workspace: Option<&str>) {
+        f.store
+            .register(RegisterRequest {
+                project_id: Some(id.into()),
+                name: id.into(),
+                roots,
+                workspace_id: workspace.map(str::to_string),
+                ..Default::default()
+            })
+            .unwrap();
+    }
+
+    fn state(f: &Fixture) -> SharedState {
+        f.store.read(SharedState::capture).unwrap()
+    }
+
+    fn envelope(position: i64, value: &impl serde::Serialize, snapshot: bool) -> RemoteEntry {
+        RemoteEntry {
+            position,
+            entry_id: format!("fake-{position}"),
+            signer: "fake-source".into(),
+            key_id: "key".into(),
+            envelope_version: ENVELOPE_VERSION,
+            kind: if snapshot { "snapshot" } else { "change" }.into(),
+            entry: canonical_bytes(value),
+        }
+    }
+
+    fn empty_project() -> ProjectEntry {
+        ProjectEntry {
+            op: "project.shared".into(),
+            tables: BTreeMap::new(),
+            agents: vec![],
+        }
+    }
+
+    fn delta(f: &Fixture, before: SharedState) -> ProjectEntry {
+        f.store
+            .read(|conn| before.project_delta(&SharedState::capture(conn)?, conn))
+            .unwrap()
+    }
+
+    fn append_local(f: &Fixture, op: &str, payload: Value) {
+        f.store
+            .apply_entry(op, &payload.to_string(), "test", None, |tx| {
+                let seq = tx.last_insert_rowid();
+                if op.starts_with("root_key.") {
+                    crate::shared_entry::replay_root_keys(tx, payload.clone())?;
+                } else if !crate::binding::replay_binding_op(tx, seq, op, &payload)?
+                    && !crate::binding::replay_root_op(tx, seq, op, &payload, 0)?
+                {
+                    crate::ownership::replay_ownership_op(tx, op, &payload)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn local_checkout(f: &Fixture) -> (String, String) {
+        let root = f.dir("checkout");
+        let parent = f.dir("parent");
+        register(f, "P", vec![root.clone()], Some("W"));
+        register(f, "S", vec![], None);
+        append_local(
+            f,
+            "bind_root",
+            json!({"canonicalRoot":root,"projectId":"P","incarnation":"inc","registrationEpoch":"epoch"}),
+        );
+        append_local(
+            f,
+            "approve_root",
+            json!({"canonicalRoot":root,"registrationEpoch":"epoch"}),
+        );
+        append_local(
+            f,
+            "attach_derived_parent",
+            json!({"projectId":"P","root":root,"incarnation":"inc","registrationEpoch":"epoch","container":parent}),
+        );
+        append_local(f, "set_owned_remotes", json!({"root":root,"remotes":[]}));
+        let mut image = empty_project();
+        image.tables.insert("project_root_key".into(), TableChanges { upsert:vec![serde_json::from_value(json!({"project_id":"P","kind":"remote","root_key":"owner/repo","created_at":10})).unwrap()], delete:vec![] });
+        f.store
+            .apply_remote_entry(&envelope(1, &image, false))
+            .unwrap();
+        append_local(
+            f,
+            "root_key.backfill",
+            json!({"mappings":[{"canonical_root":root,"kind":"remote","root_key":"owner/repo"}]}),
+        );
+        append_local(
+            f,
+            "root_key.assign",
+            json!({"mappings":[{"canonical_root":root,"kind":"remote","root_key":"owner/repo"}]}),
+        );
+        (root, parent)
+    }
+
+    fn removal(f: &Fixture, successor: bool) -> ProjectEntry {
+        let source = Fixture::new("cascade-source");
+        // Install exactly this machine's shared rows, without any paths or epochs.
+        source
+            .store
+            .apply_remote_entry(&envelope(1, &state(f).snapshot(vec![]), true))
+            .unwrap();
+        let before = state(&source);
+        source
+            .store
+            .remove(RemoveRequest {
+                project_id: Some("P".into()),
+                successor_project_id: successor.then(|| "S".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        delta(&source, before)
+    }
+
+    fn check_rebuild(f: &Fixture) {
+        let verified = f.store.verify().unwrap();
+        assert!(verified.ok, "{verified:?}");
+        let before = image(f);
+        let rebuilt = f.store.rebuild().unwrap();
+        assert!(rebuilt.replay.ok, "{rebuilt:?}");
+        assert_eq!(before, image(f));
+    }
+
+    fn image(f: &Fixture) -> BTreeMap<String, Vec<Vec<rusqlite::types::Value>>> {
+        f.store.read(|conn| {
+            let names = conn.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name <> 'cortexkit_fence' ORDER BY name")?.query_map([],|r| r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            names.into_iter().map(|name| {
+                let mut stmt = conn.prepare(&format!("SELECT * FROM {name}"))?;
+                let count = stmt.column_count();
+                let mut rows = stmt.query_map([],|r| (0..count).map(|i| r.get(i)).collect::<rusqlite::Result<Vec<rusqlite::types::Value>>>())?.collect::<rusqlite::Result<Vec<_>>>()?;
+                rows.sort_by_key(|row| format!("{row:?}"));
+                Ok((name,rows))
+            }).collect()
+        }).unwrap()
+    }
+
+    #[test]
+    fn remote_project_delete_retires_authority_and_deletes_local_dependents() {
+        let f = Fixture::new("remote-delete");
+        let (root, _) = local_checkout(&f);
+        f.store
+            .apply_remote_entry(&envelope(2, &removal(&f, false), false))
+            .unwrap();
+        f.store
+            .read(|conn| {
+                for table in [
+                    "project_root",
+                    "derived_root_parent",
+                    "root_binding",
+                    "root_approval",
+                    "root_owned_remotes",
+                    "project_root_key",
+                    "project_alias",
+                    "project_workspace",
+                    "workspace_member",
+                ] {
+                    let n: i64 =
+                        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
+                    assert_eq!(n, 0, "{table} survived deletion");
+                }
+                let row: (String, String, String) = conn.query_row(
+                    "SELECT canonical_root,project_id,reason FROM retired_binding",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?;
+                assert_eq!(row, (root, "P".into(), "removed".into()));
+                Ok(())
+            })
+            .unwrap();
+        check_rebuild(&f);
+    }
+
+    #[test]
+    fn remote_successor_moves_local_rows_without_binding_or_approval() {
+        let f = Fixture::new("remote-successor");
+        let (root, parent) = local_checkout(&f);
+        f.store
+            .apply_remote_entry(&envelope(2, &removal(&f, true), false))
+            .unwrap();
+        f.store
+            .read(|conn| {
+                for table in [
+                    "project_root",
+                    "derived_root_parent",
+                    "project_root_key",
+                    "project_alias",
+                ] {
+                    let wrong: i64 = conn.query_row(
+                        &format!("SELECT COUNT(*) FROM {table} WHERE project_id <> 'S'"),
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    assert_eq!(wrong, 0, "{table} was not moved");
+                    let n: i64 =
+                        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
+                    assert!(n > 0, "{table} was deleted instead of moved");
+                }
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT root_key FROM project_root WHERE canonical_root=?1",
+                        [&root],
+                        |r| r.get::<_, String>(0)
+                    )?,
+                    "owner/repo"
+                );
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT canonical_parent FROM derived_root_parent",
+                        [],
+                        |r| r.get::<_, String>(0)
+                    )?,
+                    parent
+                );
+                for table in ["root_binding", "root_approval"] {
+                    assert_eq!(
+                        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                            .get::<_, i64>(0))?,
+                        0
+                    );
+                }
+                assert_eq!(
+                    conn.query_row("SELECT reason FROM retired_binding", [], |r| r
+                        .get::<_, String>(0))?,
+                    "removed"
+                );
+                assert_eq!(
+                    conn.query_row("SELECT COUNT(*) FROM root_owned_remotes", [], |r| r
+                        .get::<_, i64>(0))?,
+                    1
+                );
+                Ok(())
+            })
+            .unwrap();
+        check_rebuild(&f);
+    }
+
+    #[test]
+    fn remote_workspace_delete_drops_local_path_and_all_members() {
+        let f = Fixture::new("remote-workspace");
+        register(&f, "P", vec![], Some("W"));
+        let root = f.dir("workspace");
+        f.store
+            .set_workspace_root(SetWorkspaceRootRequest {
+                workspace_id: "W".into(),
+                root: Some(root),
+                ..Default::default()
+            })
+            .unwrap();
+        f.store.db.with_conn_fenced(|tx| {
+            tx.execute("INSERT INTO workspace_member VALUES('W','remote','legacy-device','remote-project')", [])?;
+            Ok(())
+        }).unwrap();
+        let mut image = empty_project();
+        image.tables.insert(
+            "project_workspace".into(),
+            TableChanges {
+                upsert: vec![],
+                delete: vec![serde_json::from_value(json!({"project_id":"P"})).unwrap()],
+            },
+        );
+        image.tables.insert(
+            "workspace".into(),
+            TableChanges {
+                upsert: vec![],
+                delete: vec![serde_json::from_value(json!({"workspace_id":"W"})).unwrap()],
+            },
+        );
+        f.store
+            .apply_remote_entry(&envelope(1, &image, false))
+            .unwrap();
+        register(&f, "Q", vec![], Some("W"));
+        f.store
+            .read(|conn| {
+                assert_eq!(
+                    conn.query_row("SELECT COUNT(*) FROM workspace_root", [], |r| r
+                        .get::<_, i64>(0))?,
+                    0
+                );
+                assert_eq!(
+                    conn.query_row("SELECT project_id FROM workspace_member", [], |r| r
+                        .get::<_, String>(0))?,
+                    "Q"
+                );
+                Ok(())
+            })
+            .unwrap();
+        check_rebuild(&f);
+    }
+
+    #[test]
+    fn remote_apply_rejects_unknown_envelopes_and_constraints_atomically() {
+        let f = Fixture::new("remote-invalid");
+        register(&f, "P", vec![], None);
+        let before = image(&f);
+        let mut cases = vec![];
+        let valid = envelope(1, &empty_project(), false);
+        cases.push(RemoteEntry {
+            envelope_version: 99,
+            ..envelope(1, &empty_project(), false)
+        });
+        cases.push(RemoteEntry {
+            kind: "other".into(),
+            ..envelope(1, &empty_project(), false)
+        });
+        cases.push(envelope(1, &json!({"op":"future.op","tables":{}}), false));
+        cases.push(envelope(
+            1,
+            &json!({"op":"project.shared","tables":{"future_table":{"upsert":[],"delete":[]}}}),
+            false,
+        ));
+        cases.push(envelope(1,&json!({"op":"project.shared","tables":{"workspace":{"upsert":[{"workspace_id":"W","name":"W","created_at":0,"updated_at":0,"root":"/foreign"}],"delete":[]}}}),false));
+        cases.push(envelope(1,&json!({"op":"project.shared","tables":{"project_root_key":{"upsert":[{"project_id":"P","kind":"unknown","root_key":"x","created_at":0}],"delete":[]}}}),false));
+        cases.push(envelope(1,&json!({"op":"project.shared","tables":{"workspace":{"upsert":[{"workspace_id":"W","name":"W","created_at":0,"updated_at":0}],"delete":[]},"project_workspace":{"upsert":[{"project_id":"missing","workspace_id":"W"}],"delete":[]}}}),false));
+        cases.push(envelope(1, &empty_project(), true));
+        for entry in cases {
+            let error = f.store.apply_remote_entry(&entry).unwrap_err();
+            assert!(error.to_string().starts_with("apply_failed"), "{error}");
+            assert_eq!(before, image(&f), "invalid entry applied partially");
+        }
+        f.store.apply_remote_entry(&valid).unwrap();
+        assert_eq!(f.store.generation().unwrap(), 2);
+        check_rebuild(&f);
+    }
+
+    #[test]
+    fn mixed_history_restores_here_entries_remote_projects_and_agent_ops() {
+        let f = Fixture::new("mixed-history");
+        register(&f, "legacy", vec![f.dir("legacy")], Some("W"));
+        enable(&f);
+        let local_root = f.dir("local");
+        register(&f, "local", vec![local_root.clone()], None);
+        // The recorded after-image, not the request, is authoritative for shared
+        // cells. Keep the original request's path for machine-local replay.
+        f.store
+            .db
+            .with_conn_fenced(|tx| {
+                let bytes: Vec<u8> = tx.query_row(
+                    "SELECT entry FROM registry_journal WHERE op='register' AND stream='shared'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let mut stored: ProjectEntry =
+                    serde_json::from_slice(&bytes).map_err(decode_error)?;
+                stored.tables.get_mut("project").unwrap().upsert[0]
+                    .insert("name".into(), json!("after-image"));
+                tx.execute(
+                    "UPDATE project SET name='after-image' WHERE project_id='local'",
+                    [],
+                )?;
+                tx.execute(
+                    "UPDATE registry_journal SET entry=?1 WHERE stream='shared'",
+                    [canonical_bytes(&stored)],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let source = Fixture::new("mixed-source");
+        register(
+            &source,
+            "remote",
+            vec![source.dir("foreign-checkout")],
+            Some("RW"),
+        );
+        // Fake source's agent entries retain their operation names and local
+        // feed cursors even when their source seqs differ.
+        source
+            .store
+            .apply_entry("agent.cutover", "{}", "test", None, |_| Ok(()))
+            .unwrap();
+        source
+            .store
+            .agent_mutation(
+                "agent.create",
+                json!({"request_key":"bootstrap","name":"bootstrap","tag":"tag","role":"assistant"}),
+                50,
+            )
+            .unwrap();
+        let agents = source.store.agent_snapshot().unwrap();
+        let bootstrap =
+            AgentChangeEntry::new("agent.import", agents.agents[0].clone(), agents.claims);
+        let snapshot = state(&source).snapshot(vec![bootstrap]);
+        f.store
+            .apply_remote_entry(&envelope(1, &snapshot, true))
+            .unwrap();
+        let created: Value = serde_json::from_slice(
+            &source
+                .store
+                .agent_mutation(
+                    "agent.create",
+                    json!({"request_key":"create","name":"one","tag":"tag","role":"assistant"}),
+                    100,
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        let id = created["result"]["agent"]["agent_id"].as_str().unwrap();
+        source
+            .store
+            .agent_mutation(
+                "agent.rename",
+                json!({"request_key":"rename","agent_id":id,"name":"two"}),
+                200,
+            )
+            .unwrap();
+        let entries:Vec<AgentChangeEntry> = source.store.read(|conn| conn.prepare("SELECT payload_json FROM registry_journal WHERE request_key IN ('create','rename') ORDER BY seq")?.query_map([],|r| {
+            let payload:String = r.get(0)?;
+            let payload:Value = serde_json::from_str(&payload).map_err(decode_error)?;
+            serde_json::from_value(payload["entry"].clone()).map_err(decode_error)
+        })?.collect()).unwrap();
+        for (i, entry) in entries.iter().enumerate() {
+            f.store
+                .apply_remote_entry(&envelope(i as i64 + 2, entry, false))
+                .unwrap();
+        }
+        let bootstrap_id = snapshot.agents[0].agent_id.clone();
+        f.store
+            .agent_mutation(
+                "agent.rename",
+                json!({"request_key":"here-rename","agent_id":bootstrap_id,"name":"local-agent"}),
+                300,
+            )
+            .unwrap();
+        f.store
+            .db
+            .with_conn_fenced(|tx| {
+                let payload: String = tx.query_row(
+                    "SELECT payload_json FROM registry_journal WHERE request_key='here-rename'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let mut payload: Value = serde_json::from_str(&payload).map_err(decode_error)?;
+                payload["entry"]["row"]["name"] = json!("non-authoritative payload");
+                tx.execute(
+                    "UPDATE registry_journal SET payload_json=?1 WHERE request_key='here-rename'",
+                    [payload.to_string()],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let changes = f.store.agent_changes(0, Some(100)).unwrap();
+        assert_eq!(
+            changes
+                .entries
+                .iter()
+                .map(|entry| entry.op.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "agent.import",
+                "agent.create",
+                "agent.rename",
+                "agent.rename"
+            ]
+        );
+        assert!(changes.entries[0].seq < changes.entries[1].seq);
+        assert_eq!(
+            f.store
+                .resolve(&local_root)
+                .unwrap()
+                .project_name
+                .as_deref(),
+            Some("after-image")
+        );
+        f.store
+            .read(|conn| {
+                assert_eq!(
+                    conn.query_row("SELECT COUNT(*) FROM project_root", [], |r| r
+                        .get::<_, i64>(0))?,
+                    2
+                );
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT project_id FROM workspace_member WHERE workspace_id='RW'",
+                        [],
+                        |r| r.get::<_, String>(0)
+                    )?,
+                    "remote"
+                );
+                Ok(())
+            })
+            .unwrap();
+        check_rebuild(&f);
+    }
+
+    #[test]
+    fn enable_marker_preserves_legacy_workspace_timestamp_then_uses_local_rules() {
+        let f = Fixture::new("replay-marker");
+        register(&f, "P", vec![f.dir("checkout")], Some("W"));
+        let root = f.dir("workspace");
+        f.store
+            .set_workspace_root(SetWorkspaceRootRequest {
+                workspace_id: "W".into(),
+                root: Some(root),
+                ..Default::default()
+            })
+            .unwrap();
+        let legacy = f
+            .store
+            .read(|conn| {
+                conn.query_row(
+                    "SELECT updated_at FROM workspace WHERE workspace_id='W'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+            })
+            .unwrap();
+        enable(&f);
+        let second = f.dir("second-workspace");
+        f.store
+            .set_workspace_root(SetWorkspaceRootRequest {
+                workspace_id: "W".into(),
+                root: Some(second.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        // Distinct deterministic timestamps prevent a same-millisecond update
+        // from accidentally masking the enabled workspace timestamp rule.
+        f.store.db.with_conn_fenced(|tx| {
+            tx.execute("UPDATE registry_journal SET created_at=?1 WHERE op='set_workspace_root' AND seq=(SELECT MAX(seq) FROM registry_journal)",[legacy+50])?;
+            tx.execute("UPDATE workspace_root SET updated_at=?1",[legacy+50])?;
+            Ok(())
+        }).unwrap();
+        let checkout = f.dir("checkout");
+        append_local(&f, "remove_root", json!({"projectId":"P","root":checkout}));
+        f.store.read(|conn| {
+            assert_eq!(conn.query_row("SELECT updated_at FROM workspace",[],|r| r.get::<_,i64>(0))?,legacy);
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM project_root",[],|r| r.get::<_,i64>(0))?,0);
+            assert_eq!(conn.query_row("SELECT stream FROM registry_journal WHERE op='set_workspace_root' ORDER BY seq DESC LIMIT 1",[],|r| r.get::<_,String>(0))?,"local");
+            Ok(())
+        }).unwrap();
+        check_rebuild(&f);
+    }
+
+    #[test]
+    fn verify_shared_history_uses_private_committed_snapshot_without_writer_lock() {
+        let f = Fixture::new("shared-verify-reader");
+        enable(&f);
+        register(&f, "P", vec![], None);
+        let before = image(&f);
+        let (parked, received) = mpsc::channel();
+        let (release, resume) = mpsc::channel();
+        let writer = f.store.clone();
+        let handle = thread::spawn(move || {
+            writer.db.with_conn_fenced(|tx| {
+                tx.execute("UPDATE project SET name='uncommitted'", [])?;
+                parked.send(()).unwrap();
+                resume.recv().unwrap();
+                Err::<(), _>(rusqlite::Error::QueryReturnedNoRows)
+            })
+        });
+        received.recv_timeout(Duration::from_secs(5)).unwrap();
+        let reader = f.store.clone();
+        let (done, result) = mpsc::channel();
+        let verify = thread::spawn(move || done.send(reader.verify()).unwrap());
+        let observed = result.recv_timeout(Duration::from_millis(100));
+        release.send(()).unwrap();
+        assert!(handle.join().unwrap().is_err());
+        verify.join().unwrap();
+        assert!(
+            observed
+                .expect("verify waited for the live writer")
+                .unwrap()
+                .ok
+        );
+        assert_eq!(before, image(&f), "verify wrote the live database");
+    }
+}

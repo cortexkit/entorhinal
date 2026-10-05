@@ -421,7 +421,30 @@ impl super::JournalWriter<'_> {
                     }
                 }
             }
+            let enabled: bool = tx.query_row(
+                "SELECT state='enabled' FROM identity_log_state WHERE id=1",
+                [],
+                |r| r.get(0),
+            )?;
+            let before = if enabled {
+                Some(super::shared_entry::SharedState::capture(tx)?)
+            } else {
+                None
+            };
             let action = action(tx).map_err(fail)?;
+            if let Some(before) = before {
+                let after = super::shared_entry::SharedState::capture(tx)?;
+                if let Some(seq) = action.seq {
+                    super::shared_entry::record_local_entry(
+                        tx,
+                        op,
+                        seq,
+                        &action.payload.to_string(),
+                        &before,
+                        &after,
+                    )?;
+                }
+            }
             let generation = action.seq.unwrap_or(tx.query_row(
                 "SELECT COALESCE(MAX(seq),0) FROM registry_journal",
                 [],
@@ -680,7 +703,18 @@ impl super::JournalWriter<'_> {
                 now,
                 self.principal,
             )?;
-            set_workspace_root_projection(tx, &req.workspace_id, req.root.as_deref(), now)?;
+            let enabled: bool = tx.query_row(
+                "SELECT state='enabled' FROM identity_log_state WHERE id=1",
+                [],
+                |r| r.get(0),
+            )?;
+            set_workspace_root_projection(
+                tx,
+                &req.workspace_id,
+                req.root.as_deref(),
+                now,
+                enabled,
+            )?;
             Ok(Action {
                 changed: true,
                 seq: Some(seq),
@@ -796,12 +830,14 @@ impl super::JournalWriter<'_> {
             let seq = append(tx, "remove", &payload, &actor, key.as_deref(), now, self.principal)?;
             super::binding::retire_project_bindings(tx, &id, seq)?;
             if let Some(s) = &req.successor_project_id {
+                move_root_keys(tx, &id, Some(s))?;
                 tx.execute("UPDATE project_root SET project_id=?1 WHERE project_id=?2", [s,&id])?;
                 tx.execute("UPDATE derived_root_parent SET project_id=?1 WHERE project_id=?2", [s,&id])?;
                 tx.execute("UPDATE project_alias SET project_id=?1 WHERE project_id=?2", [s,&id])?;
                 tx.execute("DELETE FROM project_alias WHERE old_id=?1", [&id])?;
                 tx.execute("INSERT OR REPLACE INTO project_alias(old_id,project_id,created_at) VALUES(?1,?2,?3)", params![&id,s,now])?;
             } else {
+                move_root_keys(tx, &id, None)?;
                 tx.execute("DELETE FROM project_root WHERE project_id=?1", [&id])?;
                 tx.execute("DELETE FROM derived_root_parent WHERE project_id=?1", [&id])?;
                 tx.execute("DELETE FROM project_alias WHERE project_id=?1 OR old_id=?1", [&id])?;
@@ -812,6 +848,21 @@ impl super::JournalWriter<'_> {
             Ok(Action { changed: true, seq: Some(seq), value: json!({"projectId":id,"successorProjectId":req.successor_project_id,"droppedWorkspaceId":dropped}), payload })
         })
     }
+}
+
+fn move_root_keys(tx: &Transaction<'_>, id: &str, successor: Option<&str>) -> rusqlite::Result<()> {
+    if let Some(successor) = successor {
+        // A label can already be present on the successor. Keep that existing
+        // row instead of colliding with its composite primary key.
+        tx.execute("DELETE FROM project_root_key WHERE project_id=?1 AND EXISTS(SELECT 1 FROM project_root_key k WHERE k.project_id=?2 AND k.kind=project_root_key.kind AND k.root_key=project_root_key.root_key)", [id, successor])?;
+        tx.execute(
+            "UPDATE project_root_key SET project_id=?1 WHERE project_id=?2",
+            [successor, id],
+        )?;
+    } else {
+        tx.execute("DELETE FROM project_root_key WHERE project_id=?1", [id])?;
+    }
+    Ok(())
 }
 
 fn mint(domain: &str, name: &str, roots: &[String]) -> String {
@@ -1034,16 +1085,19 @@ fn set_workspace_root_projection(
     workspace_id: &str,
     root: Option<&str>,
     now: i64,
+    enabled: bool,
 ) -> rusqlite::Result<()> {
     tx.execute(
         "INSERT INTO workspace_root(workspace_id,root,updated_at) VALUES(?1,?2,?3)
          ON CONFLICT(workspace_id) DO UPDATE SET root=excluded.root,updated_at=excluded.updated_at",
         params![workspace_id, root, now],
     )?;
-    tx.execute(
-        "UPDATE workspace SET updated_at=?1 WHERE workspace_id=?2",
-        params![now, workspace_id],
-    )?;
+    if !enabled {
+        tx.execute(
+            "UPDATE workspace SET updated_at=?1 WHERE workspace_id=?2",
+            params![now, workspace_id],
+        )?;
+    }
     Ok(())
 }
 
@@ -1055,7 +1109,7 @@ fn delete_and_replay(tx: &Transaction<'_>) -> rusqlite::Result<()> {
         tx.execute(&format!("DELETE FROM {table}"), [])?;
     }
     let mut stmt =
-        tx.prepare("SELECT seq,op,payload_json,created_at FROM registry_journal ORDER BY seq")?;
+        tx.prepare("SELECT seq,op,payload_json,created_at,stream,origin,entry FROM registry_journal ORDER BY seq")?;
     let rows = stmt
         .query_map([], |r| {
             Ok((
@@ -1063,15 +1117,39 @@ fn delete_and_replay(tx: &Transaction<'_>) -> rusqlite::Result<()> {
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
                 r.get::<_, i64>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, Option<Vec<u8>>>(6)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
-    for (seq, op, payload, now) in rows {
+    // Replay mode follows journal order, not today's durable log state. The
+    // private replay mode avoids changing machine-local coordinator state.
+    let mut enabled = false;
+    for (seq, op, payload, now, stream, origin, entry) in rows {
         let value: Value = serde_json::from_str(&payload)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         let request = value.get("request").cloned().unwrap_or(value);
-        replay(tx, seq, &op, request, now)?;
+        if op == "identity_log.enable" {
+            enabled = true;
+            continue;
+        }
+        if origin == "here" && op != "project.shared" && op != "shared.snapshot" {
+            replay(tx, seq, &op, request, now, enabled)?;
+        }
+        if stream == "shared" || op == "project.shared" || op == "shared.snapshot" {
+            let bytes = entry.ok_or_else(|| rusqlite::Error::InvalidQuery)?;
+            let image: Value =
+                serde_json::from_slice(&bytes).map_err(super::shared_entry::decode_error)?;
+            if op.starts_with("agent.") {
+                super::agent::replay_agent_entry(tx, &op, &image)?;
+            } else {
+                let image: super::shared_entry::ProjectEntry =
+                    serde_json::from_value(image).map_err(super::shared_entry::decode_error)?;
+                image.restore(tx, seq, origin == "log")?;
+            }
+        }
     }
     Ok(())
 }
@@ -1204,7 +1282,14 @@ fn seed_id(identity: &str) -> String {
     format!("pj-{}", &h.finalize().to_hex()[..16])
 }
 
-fn replay(tx: &Transaction<'_>, seq: i64, op: &str, v: Value, now: i64) -> rusqlite::Result<()> {
+fn replay(
+    tx: &Transaction<'_>,
+    seq: i64,
+    op: &str,
+    v: Value,
+    now: i64,
+    enabled: bool,
+) -> rusqlite::Result<()> {
     if super::agent::replay_agent_entry(tx, op, &v)? {
         return Ok(());
     }
@@ -1215,6 +1300,7 @@ fn replay(tx: &Transaction<'_>, seq: i64, op: &str, v: Value, now: i64) -> rusql
         return Ok(());
     }
     match op {
+        "root_key.assign" | "root_key.backfill" => super::shared_entry::replay_root_keys(tx, v)?,
         "workspace_root.backfill" => super::log_schema::replay_workspace_root_backfill(tx, v)?,
         "register" => {
             let r: RegisterRequest = serde_json::from_value(v)
@@ -1291,7 +1377,7 @@ fn replay(tx: &Transaction<'_>, seq: i64, op: &str, v: Value, now: i64) -> rusql
         "set_workspace_root" => {
             let r: SetWorkspaceRootRequest = serde_json::from_value(v)
                 .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-            set_workspace_root_projection(tx, &r.workspace_id, r.root.as_deref(), now)?;
+            set_workspace_root_projection(tx, &r.workspace_id, r.root.as_deref(), now, enabled)?;
         }
         "assign_workspace" => {
             let r: AssignWorkspaceRequest = serde_json::from_value(v)
@@ -1496,6 +1582,7 @@ fn replay(tx: &Transaction<'_>, seq: i64, op: &str, v: Value, now: i64) -> rusql
                     .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
                 super::binding::retire_project_bindings(tx, &id, seq)?;
                 if let Some(successor) = r.successor_project_id {
+                    move_root_keys(tx, &id, Some(&successor))?;
                     tx.execute(
                         "UPDATE project_root SET project_id=?1 WHERE project_id=?2",
                         params![successor, id],
@@ -1511,6 +1598,7 @@ fn replay(tx: &Transaction<'_>, seq: i64, op: &str, v: Value, now: i64) -> rusql
                     tx.execute("DELETE FROM project_alias WHERE old_id=?1", [&id])?;
                     tx.execute("INSERT OR REPLACE INTO project_alias(old_id,project_id,created_at) VALUES(?1,?2,?3)", params![id,successor,now])?;
                 } else {
+                    move_root_keys(tx, &id, None)?;
                     tx.execute("DELETE FROM project_root WHERE project_id=?1", [&id])?;
                     tx.execute("DELETE FROM derived_root_parent WHERE project_id=?1", [&id])?;
                     tx.execute(
