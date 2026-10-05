@@ -19,3 +19,11 @@ target/
 .cortexkit/alfonso/prompts/
 .cortexkit/alfonso/task-outputs/
 .cortexkit/magic-context/
+
+# Also scratch: markers the tooling leaves when it copies drafts and specs into a
+# worker's checkout, and one-off reports extracted for a single review. The
+# reviewed specs and the drafts themselves are versioned, because a campaign's
+# slices are cut from them and later readers need the text the work followed.
+.cortexkit/alfonso/**/.hydrated
+.cortexkit/alfonso/.hydrated
+.cortexkit/alfonso/reports/
