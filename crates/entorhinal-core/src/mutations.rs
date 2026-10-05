@@ -421,12 +421,7 @@ impl super::JournalWriter<'_> {
                     }
                 }
             }
-            let enabled: bool = tx.query_row(
-                "SELECT state='enabled' FROM identity_log_state WHERE id=1",
-                [],
-                |r| r.get(0),
-            )?;
-            let before = if enabled {
+            let before = if super::log_schema::log_enabled(tx)? {
                 Some(super::shared_entry::SharedState::capture(tx)?)
             } else {
                 None
@@ -703,11 +698,7 @@ impl super::JournalWriter<'_> {
                 now,
                 self.principal,
             )?;
-            let enabled: bool = tx.query_row(
-                "SELECT state='enabled' FROM identity_log_state WHERE id=1",
-                [],
-                |r| r.get(0),
-            )?;
+            let enabled = super::log_schema::log_enabled(tx)?;
             set_workspace_root_projection(
                 tx,
                 &req.workspace_id,
@@ -1124,8 +1115,10 @@ fn delete_and_replay(tx: &Transaction<'_>) -> rusqlite::Result<()> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
-    // Replay mode follows journal order, not today's durable log state. The
-    // private replay mode avoids changing machine-local coordinator state.
+    // Whether the log was on at each point comes from the journal itself: it
+    // turns on at the `identity_log.enable` row. Reading today's
+    // `identity_log_state` instead would replay rows written before enabling
+    // under the wrong rules. Replay never writes `identity_log_state`.
     let mut enabled = false;
     for (seq, op, payload, now, stream, origin, entry) in rows {
         let value: Value = serde_json::from_str(&payload)
@@ -1139,7 +1132,12 @@ fn delete_and_replay(tx: &Transaction<'_>) -> rusqlite::Result<()> {
             replay(tx, seq, &op, request, now, enabled)?;
         }
         if stream == "shared" || op == "project.shared" || op == "shared.snapshot" {
-            let bytes = entry.ok_or_else(|| rusqlite::Error::InvalidQuery)?;
+            let bytes = entry.ok_or_else(|| {
+                rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("journal row {seq} ({op}) is shared but carries no entry bytes"),
+                )))
+            })?;
             let image: Value =
                 serde_json::from_slice(&bytes).map_err(super::shared_entry::decode_error)?;
             if op.starts_with("agent.") {

@@ -10,8 +10,10 @@ use crate::agent::AgentChangeEntry;
 
 pub type SharedRow = BTreeMap<String, Value>;
 
-/// Parent tables precede their dependents. Identifiers in SQL come exclusively
-/// from this list and the schema, never from a received entry.
+/// The machine-neutral tables a shared entry may change, parents before their
+/// dependents. SQL built here takes table and column names only from this list
+/// and the live schema, never from a received entry, so a malformed entry
+/// can't inject SQL.
 pub const PROJECT_SHARED_TABLES: &[&str] = &[
     "workspace",
     "project",
@@ -33,7 +35,8 @@ pub struct TableChanges {
 pub struct ProjectEntry {
     pub op: String,
     pub tables: BTreeMap<String, TableChanges>,
-    /// Bootstrap agents retain the existing identity after-image format.
+    /// Agents in a bootstrap snapshot, each in the same `AgentChangeEntry`
+    /// format an agent write records, so one decoder serves both.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agents: Vec<AgentChangeEntry>,
 }
@@ -206,12 +209,7 @@ pub(crate) fn record_local_entry(
     before: &SharedState,
     after: &SharedState,
 ) -> rusqlite::Result<()> {
-    let enabled: bool = tx.query_row(
-        "SELECT state='enabled' FROM identity_log_state WHERE id=1",
-        [],
-        |r| r.get(0),
-    )?;
-    if enabled
+    if crate::log_schema::log_enabled(tx)?
         && before != after
         && !matches!(op, "agent.import" | "root_key.assign" | "root_key.backfill")
     {
@@ -297,8 +295,10 @@ impl ProjectEntry {
         cascade: bool,
     ) -> rusqlite::Result<()> {
         self.validate(tx)?;
-        // Defer references only within this transaction; the final state must
-        // still satisfy every constraint. This permits mutually referring agents.
+        // Defer foreign-key checks to the end of this transaction, so rows that
+        // reference each other (for example an agent merged into another agent
+        // in the same entry) can be installed in any order. The final state
+        // must still satisfy every constraint.
         tx.execute_batch("PRAGMA defer_foreign_keys=ON;")?;
         // Install parent after-images before moving this machine's dependent rows.
         for table in ["workspace", "project"] {
@@ -337,8 +337,10 @@ impl ProjectEntry {
                 &serde_json::to_value(agent).map_err(decode_error)?,
             )?;
         }
-        // Placement is shared, membership is a machine-local derivation. Retain
-        // legacy remote members except where their workspace was removed.
+        // Which workspace a project belongs to is shared; `workspace_member` is
+        // this machine's own index of it, so rebuild its local rows from the
+        // shared placement. Rows of other kinds, written by older versions,
+        // stay as they are.
         tx.execute("DELETE FROM workspace_member WHERE ref_kind='local'", [])?;
         tx.execute("INSERT INTO workspace_member(workspace_id,ref_kind,device_fingerprint,project_id) SELECT workspace_id,'local','',project_id FROM project_workspace", [])?;
         Ok(())
@@ -428,7 +430,9 @@ pub struct RootKeyMapping {
     pub root_key: String,
 }
 
-/// Root choices are recorded locally so replay never consults git configuration.
+/// Restores recorded root-key assignments. Which key a root got depended on its
+/// git remotes at the time; the assignment is journaled, so replay restores it
+/// as recorded and never reads git configuration, which may have changed since.
 pub(crate) fn replay_root_keys(tx: &Transaction<'_>, value: Value) -> rusqlite::Result<()> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]

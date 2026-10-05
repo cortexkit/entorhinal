@@ -1,5 +1,9 @@
-//! Fail-closed application of verified log envelopes. Replay's compatibility
-//! skips are intentionally not used to decode a received operation.
+//! Applies entries received from the identity log, which engram has already
+//! verified, to this machine's store. An entry that can't be decoded, names an
+//! unknown operation or leaves the store inconsistent is refused and rolled
+//! back, never skipped. Journal replay tolerates some old entry shapes for
+//! compatibility; that tolerance is deliberately not used here, because a
+//! received entry was written by current code and must decode exactly.
 
 use rusqlite::{params, Transaction};
 use serde_json::{json, Value};
@@ -177,8 +181,10 @@ fn apply(tx: &Transaction<'_>, entry: &RemoteEntry) -> rusqlite::Result<i64> {
                 agent.seq = seq;
                 let payload = json!({"entry":agent,"signer":entry.signer,"key_id":entry.key_id});
                 crate::agent::replay_agent_entry(tx, &agent.op, &payload)?;
-                // The entry in the local feed carries its local seq; the stored
-                // log bytes remain untouched for audit and deterministic replay.
+                // The journal payload, which `agent.changes` serves, carries
+                // this machine's own seq. The bytes received from the log are
+                // stored alongside it unchanged, for audit and so replay
+                // restores exactly what was received.
                 tag(tx, seq, entry, &payload)?;
                 seq
             }
@@ -189,8 +195,10 @@ fn apply(tx: &Transaction<'_>, entry: &RemoteEntry) -> rusqlite::Result<i64> {
         "DELETE FROM pending_entry WHERE expected_head < ?1",
         [entry.position],
     )?;
-    // Deferred references must be checked here too, not just at commit, so the
-    // caller always receives the same apply_failed refusal for invalid images.
+    // Foreign-key checks are deferred while rows are installed, so a violation
+    // would otherwise surface only at commit, as a generic SQLite error. Check
+    // now, so a received entry that leaves dangling references is refused with
+    // the same `apply_failed` error as any other invalid entry.
     if tx.prepare("PRAGMA foreign_key_check")?.exists([])? {
         return Err(invalid("shared after-image violates a foreign key"));
     }

@@ -707,12 +707,14 @@ impl JournalWriter<'_> {
     ) -> Result<(i64, T), RegistryError> {
         self.db
             .with_conn_fenced(|tx| {
-                // Older migration fixtures have no log schema. Production
-                // stores always do; compare inside the same write transaction
-                // used by the lower-level append API as well as domain writes.
-                let has_log: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='identity_log_state')", [], |r| r.get(0))?;
-                let enabled = has_log && tx.query_row("SELECT state='enabled' FROM identity_log_state WHERE id=1", [], |r| r.get::<_,bool>(0))?;
-                let before = if enabled { Some(shared_entry::SharedState::capture(tx)?) } else { None };
+                // With the log on, compare the shared tables before and after
+                // this write, inside its own transaction, to record what it
+                // changed. Domain writes and this lower-level append both do.
+                let before = if log_schema::log_enabled(tx)? {
+                    Some(shared_entry::SharedState::capture(tx)?)
+                } else {
+                    None
+                };
                 tx.execute(
                     "INSERT INTO registry_journal
                      (op, payload_json, actor, request_key, created_at, principal)
@@ -730,7 +732,14 @@ impl JournalWriter<'_> {
                 let result = apply_projection(tx)?;
                 if let Some(before) = before {
                     let after = shared_entry::SharedState::capture(tx)?;
-                    shared_entry::record_local_entry(tx, op, actual_seq, payload_json, &before, &after)?;
+                    shared_entry::record_local_entry(
+                        tx,
+                        op,
+                        actual_seq,
+                        payload_json,
+                        &before,
+                        &after,
+                    )?;
                 }
                 Ok((actual_seq, result))
             })

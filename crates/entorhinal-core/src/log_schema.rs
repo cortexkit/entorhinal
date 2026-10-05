@@ -1,5 +1,25 @@
 //! Schema for the optional identity log and machine-local root paths.
 
+/// Whether the identity log is on. A write records a shared entry only then;
+/// while it's off, every write behaves exactly as it did before the log existed.
+/// A store whose schema predates migration 7 counts as off: production stores
+/// are always migrated first, but tests that build older stores write to them.
+pub(crate) fn log_enabled(conn: &rusqlite::Connection) -> rusqlite::Result<bool> {
+    let has_log: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='identity_log_state')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_log {
+        return Ok(false);
+    }
+    conn.query_row(
+        "SELECT state='enabled' FROM identity_log_state WHERE id=1",
+        [],
+        |r| r.get(0),
+    )
+}
+
 /// Migration 7 adds the schema for the optional identity log without turning it
 /// on: existing journal rows are tagged local and keep their bytes, the log
 /// starts `disabled`, and no root key is assigned. Keys are chosen only when an
