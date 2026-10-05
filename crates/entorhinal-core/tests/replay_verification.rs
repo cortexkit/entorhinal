@@ -236,17 +236,19 @@ fn corrupt_verify_reports_all_tables_and_rebuild_repairs_the_same_difference() {
         [("agent_name_claim", 1, 0), ("project", 0, 7)]
     );
     assert_eq!(database_image(&f.conn), membership_consistent);
+    // The unjournaled w-extra row alone produces workspace (0 missing, 1
+    // unexpected). Clearing w-main's local path changes workspace_root instead.
     f.conn.execute_batch("UPDATE project SET name='Wrong name' WHERE project_id='p-main';
         UPDATE project_root SET added_at=added_at+1;
-        INSERT INTO project_alias VALUES ('extra-alias','p-main',10);
-        INSERT INTO derived_root_parent VALUES ('/untracked-parent','p-main',NULL,NULL);
-        INSERT INTO workspace VALUES ('w-extra','Unjournaled',10,10,NULL);
-        UPDATE workspace SET root=NULL WHERE workspace_id='w-main';
+        INSERT INTO project_alias(old_id,project_id,created_at) VALUES ('extra-alias','p-main',10);
+        INSERT INTO derived_root_parent(canonical_parent,project_id,source_root,registration_epoch) VALUES ('/untracked-parent','p-main',NULL,NULL);
+        INSERT INTO workspace(workspace_id,name,created_at,updated_at) VALUES ('w-extra','Unjournaled',10,10);
+        UPDATE workspace_root SET root=NULL WHERE workspace_id='w-main';
         UPDATE project_workspace SET workspace_id='w-extra';
         DELETE FROM workspace_member;
-        INSERT INTO root_binding VALUES ('/untracked-root','p-main','token','extra-binding',1);
-        INSERT INTO retired_binding VALUES ('extra-retired','/retired-root','p-main','token','removed',1);
-        INSERT INTO root_approval VALUES ('extra-binding',1);
+        INSERT INTO root_binding(canonical_root,project_id,incarnation,registration_epoch,bound_seq) VALUES ('/untracked-root','p-main','token','extra-binding',1);
+        INSERT INTO retired_binding(registration_epoch,canonical_root,project_id,incarnation,reason,retired_seq) VALUES ('extra-retired','/retired-root','p-main','token','removed',1);
+        INSERT INTO root_approval(registration_epoch,approved_seq) VALUES ('extra-binding',1);
         UPDATE agent SET agent_generation=agent_generation+1;").unwrap();
     let corrupted = database_image(&f.conn);
     let reply = f.store.verify().unwrap();
@@ -271,7 +273,8 @@ fn corrupt_verify_reports_all_tables_and_rebuild_repairs_the_same_difference() {
             ("derived_root_parent", 0, 1),
             ("project_root", 1, 1),
             ("project", 1, 8),
-            ("workspace", 1, 2),
+            ("workspace_root", 1, 1),
+            ("workspace", 0, 1),
             ("root_binding", 0, 1),
             ("retired_binding", 0, 1),
             ("root_approval", 0, 1),
@@ -306,8 +309,9 @@ fn corrupt_verify_reports_all_tables_and_rebuild_repairs_the_same_difference() {
         ),
         (
             json!([{"workspace_id":"w-main"}]),
-            json!([{"workspace_id":"w-extra"},{"workspace_id":"w-main"}]),
+            json!([{"workspace_id":"w-main"}]),
         ),
+        (json!([]), json!([{"workspace_id":"w-extra"}])),
         (json!([]), json!([{"canonical_root":"/untracked-root"}])),
         (json!([]), json!([{"registration_epoch":"extra-retired"}])),
         (json!([]), json!([{"registration_epoch":"extra-binding"}])),

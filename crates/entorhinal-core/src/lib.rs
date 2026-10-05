@@ -21,6 +21,7 @@ use serde::Serialize;
 
 pub mod agent;
 mod binding;
+mod log_schema;
 mod mutations;
 mod ownership;
 mod read_connection;
@@ -111,7 +112,7 @@ pub const V2_WORKSPACE_ROOT: &str = "ALTER TABLE workspace ADD COLUMN root TEXT 
 pub const V5_JOURNAL_PRINCIPAL: &str =
     "ALTER TABLE registry_journal ADD COLUMN principal TEXT NULL;";
 
-const MIGRATIONS: [Migration; 6] = [
+const MIGRATIONS: [Migration; 7] = [
     Migration {
         version: 1,
         statements: V1_SCHEMA,
@@ -135,6 +136,10 @@ const MIGRATIONS: [Migration; 6] = [
     Migration {
         version: 6,
         statements: ownership::V6_OWNED_REMOTES,
+    },
+    Migration {
+        version: 7,
+        statements: log_schema::V7_IDENTITY_LOG,
     },
 ];
 
@@ -377,7 +382,9 @@ impl RegistryStore {
         self.read(|conn| {
             let workspaces = if let Some(workspace_id) = workspace_id {
                 conn.query_row(
-                    "SELECT workspace_id, name, root FROM workspace WHERE workspace_id = ?1",
+                    "SELECT w.workspace_id, w.name, r.root FROM workspace w
+                     LEFT JOIN workspace_root r ON r.workspace_id=w.workspace_id
+                     WHERE w.workspace_id = ?1",
                     params![workspace_id],
                     |row| {
                         Ok(vec![WorkspaceSummary {
@@ -391,7 +398,9 @@ impl RegistryStore {
                 .unwrap_or_default()
             } else {
                 let mut statement = conn.prepare(
-                    "SELECT workspace_id, name, root FROM workspace ORDER BY workspace_id",
+                    "SELECT w.workspace_id, w.name, r.root FROM workspace w
+                     LEFT JOIN workspace_root r ON r.workspace_id=w.workspace_id
+                     ORDER BY w.workspace_id",
                 )?;
                 let rows = statement
                     .query_map([], |row| {
@@ -578,10 +587,11 @@ impl RegistryStore {
         generation: i64,
     ) -> rusqlite::Result<ResolveReply> {
         let context = conn.query_row(
-            "SELECT p.name, w.workspace_id, w.root
+            "SELECT p.name, w.workspace_id, r.root
              FROM project AS p
              LEFT JOIN project_workspace AS pw ON pw.project_id = p.project_id
              LEFT JOIN workspace AS w ON w.workspace_id = pw.workspace_id
+             LEFT JOIN workspace_root AS r ON r.workspace_id = w.workspace_id
              WHERE p.project_id = ?1",
             params![project_id],
             |row| {
@@ -1081,7 +1091,12 @@ mod tests {
                         "request_key",
                         "created_at",
                         "response_json",
-                        "principal"
+                        "principal",
+                        "stream",
+                        "entry_id",
+                        "log_position",
+                        "origin",
+                        "entry"
                     ]
                 );
                 Ok(())
