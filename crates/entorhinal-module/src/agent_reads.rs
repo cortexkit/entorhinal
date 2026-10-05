@@ -273,7 +273,8 @@ mod tests {
                 handler,
             };
             if activated {
-                // A source with no agent table is the specified zero-agent import.
+                // A source with no `agent` table is a valid import of zero agents: an
+                // install that never created agents still has to record the cutover.
                 let source_path = f.root.join("snapshot.db");
                 let mut source_descriptor = f.descriptor.clone();
                 source_descriptor.storage_namespace.push_str("-source");
