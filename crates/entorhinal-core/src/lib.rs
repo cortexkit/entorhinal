@@ -21,8 +21,10 @@ use serde::Serialize;
 pub mod agent;
 mod binding;
 mod mutations;
+mod ownership;
 pub use binding::*;
 pub use mutations::*;
+pub use ownership::{ResolveRemoteReply, ResolveRemoteStatus, SetOwnedRemotesRequest};
 
 // The schema-migration namespace, NOT the module id, and deliberately left as
 // "projects" while the module id moved to "entorhinal".
@@ -107,7 +109,7 @@ pub const V2_WORKSPACE_ROOT: &str = "ALTER TABLE workspace ADD COLUMN root TEXT 
 pub const V5_JOURNAL_PRINCIPAL: &str =
     "ALTER TABLE registry_journal ADD COLUMN principal TEXT NULL;";
 
-const MIGRATIONS: [Migration; 5] = [
+const MIGRATIONS: [Migration; 6] = [
     Migration {
         version: 1,
         statements: V1_SCHEMA,
@@ -127,6 +129,10 @@ const MIGRATIONS: [Migration; 5] = [
     Migration {
         version: 5,
         statements: V5_JOURNAL_PRINCIPAL,
+    },
+    Migration {
+        version: 6,
+        statements: ownership::V6_OWNED_REMOTES,
     },
 ];
 

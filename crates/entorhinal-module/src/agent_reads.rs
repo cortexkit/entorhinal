@@ -1372,6 +1372,7 @@ mod tests {
         let expected_queries = [
             "resolve",
             "resolve_project_id",
+            "resolve_remote",
             "enumerate",
             "journal_tail",
             "trust",
@@ -1390,6 +1391,7 @@ mod tests {
             "register",
             "assign_workspace",
             "set_workspace_root",
+            "set_owned_remotes",
             "upgrade_implicit",
             "remove",
             "seed_import",

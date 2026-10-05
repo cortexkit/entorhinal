@@ -163,6 +163,9 @@ pub fn parse(face: Face, arguments: &[String]) -> Invocation {
                 None => return Invocation::Refuse("--subc needs a path".to_string()),
             },
             "--json" => json = true,
+            "--default" if face == Face::Projects && verb.as_deref() == Some("owned-remotes") => {
+                args.push(argument.clone());
+            }
             other if other.starts_with('-') => {
                 return Invocation::Refuse(format!("unknown flag '{other}'\n\n{}", usage(face)));
             }
@@ -212,6 +215,10 @@ usage: ck projects <verb> [args] [--subc <connection file>] [--json]
                           add another root to a project (starts unapproved)
   remove-root <project> <dir>
                           remove one root from a project
+  owned-remotes <root> [name ...]
+                          own these remote names (no names means own nothing)
+  owned-remotes <root> --default
+                          reset ownership to origin
   approve <dir>           approve every root of the project owning <dir>
   unapprove <dir>         withdraw that approval
   trust <dir>             show each root's identity and approval
@@ -246,7 +253,7 @@ This binary is the module itself; it is not an operator command. The operator
 surface is:
 
   ck projects      list, register, resolve, remove, add-root, remove-root,
-                   approve, unapprove, trust, verify
+                   owned-remotes, approve, unapprove, trust, verify
   ck workspaces    list, assign, set-root, clear-root
 
 With no arguments it runs as the supervised module, which is how the daemon
@@ -386,6 +393,25 @@ fn build(command: &Command) -> Result<(String, Value), String> {
             json!({ "projectId": need(0, "a project id")?, "actor": actor }),
         ),
         (Face::Projects, "verify") => ("verify".to_string(), json!({})),
+        (Face::Projects, "owned-remotes") => {
+            if command.args.first().is_some_and(|arg| arg == "--default") {
+                return Err("owned-remotes needs a root directory before --default".into());
+            }
+            let root = absolute(&need(0, "a root directory")?)?;
+            let names = &command.args[1..];
+            let remotes = if names.iter().any(|name| name == "--default") {
+                if names.len() != 1 {
+                    return Err("--default cannot be combined with remote names".into());
+                }
+                Value::Null
+            } else {
+                json!(names)
+            };
+            (
+                "set_owned_remotes".to_string(),
+                json!({"root":root, "remotes":remotes, "actor":actor}),
+            )
+        }
         (Face::Projects, "add-root") => (
             "add_root".to_string(),
             json!({
@@ -658,11 +684,30 @@ fn render(command: &Command, value: &Value) {
             }
         }
         (Face::Projects, "verify") => println!("{}", format_verify(value)),
+        (Face::Projects, "owned-remotes") => println!("{}", format_owned_remotes(value)),
         _ => println!(
             "{}",
             serde_json::to_string_pretty(value).unwrap_or_default()
         ),
     }
+}
+
+fn format_owned_remotes(value: &Value) -> String {
+    let names = value["remotes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    format!(
+        "{}: owned remotes: {}",
+        text(&value["root"]),
+        if names.is_empty() {
+            "none".into()
+        } else {
+            names.join(", ")
+        }
+    )
 }
 
 fn format_verify(value: &Value) -> String {
@@ -963,6 +1008,61 @@ mod tests {
         assert_eq!(params["projectId"], "p1");
 
         assert_eq!(build(&cmd(&["verify"])).unwrap().0, "verify");
+    }
+
+    #[test]
+    fn ownership_cli_maps_names_default_and_empty_set_and_renders() {
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        for (tail, expected) in [
+            (vec!["origin", "mirror"], json!(["origin", "mirror"])),
+            (vec!["--default"], Value::Null),
+            (vec![], json!([])),
+        ] {
+            let mut arguments = vec!["owned-remotes".to_string(), root.clone()];
+            arguments.extend(tail.iter().map(|arg| arg.to_string()));
+            let Invocation::Command(command) = parse(Face::Projects, &arguments) else {
+                panic!("owned-remotes must parse")
+            };
+            assert_eq!(
+                build(&command).unwrap(),
+                (
+                    "set_owned_remotes".into(),
+                    json!({"root":root,"remotes":expected,"actor":"ck-projects"})
+                )
+            );
+        }
+        let Invocation::Command(command) = parse(
+            Face::Projects,
+            &[
+                "owned-remotes".into(),
+                root.clone(),
+                "origin".into(),
+                "--default".into(),
+            ],
+        ) else {
+            panic!("parse")
+        };
+        assert!(build(&command).unwrap_err().contains("cannot be combined"));
+        let Invocation::Command(command) = parse(
+            Face::Projects,
+            &["owned-remotes".into(), "--default".into()],
+        ) else {
+            panic!("parse")
+        };
+        assert!(build(&command)
+            .unwrap_err()
+            .contains("needs a root directory"));
+        assert_eq!(
+            format_owned_remotes(&json!({"root":"/repo","remotes":["mirror","origin"]})),
+            "/repo: owned remotes: mirror, origin"
+        );
+        assert_eq!(
+            format_owned_remotes(&json!({"root":"/repo","remotes":[]})),
+            "/repo: owned remotes: none"
+        );
     }
 
     /// The RENDERER's field names come from the REGISTRY'S OWN REPLY TYPE.

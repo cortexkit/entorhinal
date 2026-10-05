@@ -19,6 +19,7 @@
         "remotes": [
           {
             "name": "origin",
+            "owned": true,
             "owner": "cortexkit",
             "repo": "common-auth"
           }
@@ -39,6 +40,7 @@
         "remotes": [
           {
             "name": "origin",
+            "owned": true,
             "owner": "cortexkit",
             "repo": "openai-auth"
           }

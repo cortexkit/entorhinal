@@ -134,6 +134,7 @@ pub struct GitRemote {
     pub name: String,
     pub owner: String,
     pub repo: String,
+    pub owned: bool,
 }
 
 /// The fields a resolve reply carries when root records are enabled. All are
@@ -271,7 +272,7 @@ fn create_token(common: &Path, token: &str) -> Result<String, String> {
 /// GitHub remotes from the checkout's git config: `[remote "<name>"]` sections
 /// whose `url` names github.com. Other hosts are left out; the reply's remote
 /// shape is GitHub's owner/repo.
-fn github_remotes(root: &Path) -> Vec<GitRemote> {
+pub(crate) fn github_remotes(root: &Path) -> Vec<GitRemote> {
     let Ok(common) = git_common_dir(root) else {
         return Vec::new();
     };
@@ -300,6 +301,7 @@ fn github_remotes(root: &Path) -> Vec<GitRemote> {
                 name: name.clone(),
                 owner,
                 repo,
+                owned: name == "origin",
             });
         }
     }
@@ -369,7 +371,7 @@ fn unapproved() -> Approval {
 
 /// The record for one registered root, with its identity checked against disk.
 fn root_record(conn: &Connection, root: &str) -> rusqlite::Result<RootRecord> {
-    let remotes = github_remotes(Path::new(root));
+    let remotes = super::ownership::root_remotes(conn, root)?;
     let binding = active_binding(conn, root)?;
     let disk = disk_identity(Path::new(root));
     let (identity, binding) = match (binding, &disk) {
@@ -421,7 +423,11 @@ fn worktree_record(
     source_root: Option<&str>,
     attached_epoch: Option<&str>,
 ) -> rusqlite::Result<RootRecord> {
-    let remotes = github_remotes(Path::new(worktree));
+    let names = super::ownership::effective_owned_names(conn, source_root.unwrap_or(worktree))?;
+    let mut remotes = github_remotes(Path::new(worktree));
+    for remote in &mut remotes {
+        remote.owned = names.contains(&remote.name);
+    }
     let none = |identity| RootRecord {
         root: worktree.to_string(),
         remotes: remotes.clone(),
@@ -1007,8 +1013,9 @@ fn nested_root(conn: &Connection, path: &str) -> rusqlite::Result<Option<(String
 }
 
 /// Another project that already owns one of these GitHub repositories through
-/// one of its roots. Two local clones of one repository are one project.
-fn repository_owner(
+/// one of its roots. Only effective owned remotes participate, so a fork's
+/// upstream does not claim the upstream project's repository.
+pub(crate) fn repository_owner(
     conn: &Connection,
     project_id: &str,
     remotes: &[GitRemote],
@@ -1024,11 +1031,15 @@ fn repository_owner(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for (root, owner) in rows {
-        for theirs in github_remotes(Path::new(&root)) {
-            if let Some(mine) = remotes
-                .iter()
-                .find(|mine| mine.owner == theirs.owner && mine.repo == theirs.repo)
-            {
+        for theirs in super::ownership::root_remotes(conn, &root)?
+            .into_iter()
+            .filter(|r| r.owned)
+        {
+            if let Some(mine) = remotes.iter().find(|mine| {
+                mine.owned
+                    && mine.owner.eq_ignore_ascii_case(&theirs.owner)
+                    && mine.repo.eq_ignore_ascii_case(&theirs.repo)
+            }) {
                 return Ok(Some((format!("{}/{}", mine.owner, mine.repo), owner)));
             }
         }

@@ -242,6 +242,7 @@ const MUTATING_METHODS: &[&str] = &[
     "register",
     "assign_workspace",
     "set_workspace_root",
+    "set_owned_remotes",
     "upgrade_implicit",
     "remove",
     "seed_import",
@@ -577,11 +578,13 @@ impl ProjectsHandler {
         let result = match request.method.as_str() {
             "resolve" => self.resolve(request.params),
             "resolve_project_id" => self.resolve_project_id(request.params),
+            "resolve_remote" => self.resolve_remote(request.params),
             "enumerate" => self.enumerate(request.params),
             "journal_tail" => self.journal_tail(request.params),
             "register" => self.register(request.params, &principal),
             "assign_workspace" => self.assign_workspace(request.params, &principal),
             "set_workspace_root" => self.set_workspace_root(request.params, &principal),
+            "set_owned_remotes" => self.set_owned_remotes(request.params, &principal),
             "upgrade_implicit" => self.upgrade_implicit(request.params, &principal),
             "remove" => self.remove(request.params, &principal),
             "seed_import" => self.seed_import(request.params, &principal),
@@ -759,6 +762,22 @@ impl ProjectsHandler {
         self.annotate_liveness(&mut reply);
         self.record_query(reply.generation, &self.health.enumerate_count);
         self.encode_read_result(reply)
+    }
+
+    fn resolve_remote(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
+        let params =
+            serde_json::from_value::<ResolveRemoteParams>(params).map_err(invalid_params)?;
+        let reply = self.with_store(|store| store.resolve_remote(&params.owner, &params.repo))?;
+        self.record_query(reply.generation, &self.health.resolve_count);
+        self.encode_read_result(reply)
+    }
+
+    fn set_owned_remotes(&self, params: Value, principal: &str) -> Result<Vec<u8>, HandlerError> {
+        let request = serde_json::from_value::<entorhinal_core::SetOwnedRemotesRequest>(params)
+            .map_err(invalid_params)?;
+        self.record_mutation(
+            self.with_store(|s| s.with_principal(principal).set_owned_remotes(request)),
+        )
     }
 
     /// Join the volatile liveness map onto enumerate results: a project's
@@ -1040,6 +1059,12 @@ struct ResolveProjectIdParams {
     project_id: String,
 }
 
+#[derive(Deserialize)]
+struct ResolveRemoteParams {
+    owner: String,
+    repo: String,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct EnumerateParams {
     #[serde(rename = "workspaceId", alias = "workspace_id")]
@@ -1073,6 +1098,11 @@ fn manifest() -> ModuleManifest {
                     "Look up a project by its durable project id and return its registration record.",
                 ),
                 management_operation(
+                    "resolve_remote",
+                    ManagementOperationKind::Query,
+                    "Find the project owning a GitHub repository through its live owned remotes.",
+                ),
+                management_operation(
                     "enumerate",
                     ManagementOperationKind::Query,
                     "List all registered projects with workspace assignments and tags.",
@@ -1096,6 +1126,11 @@ fn manifest() -> ModuleManifest {
                     "set_workspace_root",
                     ManagementOperationKind::Mutate,
                     "Set or clear a workspace's root directory (operator-set, never derived).",
+                ),
+                management_operation(
+                    "set_owned_remotes",
+                    ManagementOperationKind::Mutate,
+                    "Replace a root's owned remote names, or reset to origin with null.",
                 ),
                 management_operation(
                     "upgrade_implicit",
@@ -1392,6 +1427,7 @@ mod tests {
         for method in [
             "resolve",
             "resolve_project_id",
+            "resolve_remote",
             "enumerate",
             "journal_tail",
             "verify",
@@ -1461,6 +1497,7 @@ mod tests {
         for method in [
             "resolve",
             "resolve_project_id",
+            "resolve_remote",
             "enumerate",
             "journal_tail",
             "verify",
@@ -1588,6 +1625,176 @@ mod tests {
                 key,
             )
             .unwrap()
+    }
+
+    fn ownership_handler(label: &str) -> (PathBuf, ProjectsHandler, String) {
+        let (dir, descriptor) = scratch_descriptor(label);
+        let root = dir.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        for args in [
+            vec!["init", "--quiet"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/ualtinok/opencode.git",
+            ],
+        ] {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(&args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let root = std::fs::canonicalize(root)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let mut store = RegistryStore::open(&descriptor).unwrap();
+        store.set_root_records(true);
+        store
+            .register(RegisterRequest {
+                project_id: Some("p".into()),
+                name: "P".into(),
+                roots: vec![root.clone()],
+                ..Default::default()
+            })
+            .unwrap();
+        let handler = ProjectsHandler::with_runtime("ownership-incarnation".into(), unix_millis);
+        *handler.store.lock().unwrap() = Some(store);
+        (dir, handler, root)
+    }
+
+    #[test]
+    fn ownership_write_admission_and_principal_attribution() {
+        let (dir, handler, root) = ownership_handler("ownership-admission");
+        for (key, principal, names, label) in [
+            ((31, 1), Principal::Direct, json!([]), "direct"),
+            (
+                (32, 1),
+                reserved(WRITER_MODULE),
+                json!(["origin"]),
+                "reserved:prefrontal-core",
+            ),
+        ] {
+            handler
+                .route_admissions()
+                .insert(key, RouteAdmission::from_bind(Some(principal), None));
+            let out = execute_on(
+                &handler,
+                key,
+                "set_owned_remotes",
+                json!({"root":root,"remotes":names,"actor":"operator"}),
+            );
+            assert_eq!(
+                serde_json::from_slice::<Value>(&out).unwrap()["result"]["remotes"],
+                names
+            );
+            let tail = handler.with_store(|s| s.journal_tail(0, 100)).unwrap();
+            let row = tail.entries.last().unwrap();
+            assert_eq!(row.op, "set_owned_remotes");
+            assert_eq!(row.principal.as_deref(), Some(label));
+            assert_eq!(row.actor, "operator");
+        }
+        let before = handler.with_store(RegistryStore::generation).unwrap();
+        handler.route_admissions().insert(
+            (33, 1),
+            RouteAdmission::from_bind(Some(reserved("plexus")), None),
+        );
+        let err = handler
+            .execute(
+                WireRequest {
+                    method: "set_owned_remotes".into(),
+                    params: json!({"root":root,"remotes":[]}),
+                },
+                (33, 1),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "write_not_permitted");
+        assert_eq!(
+            handler.with_store(RegistryStore::generation).unwrap(),
+            before
+        );
+        drop(handler);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ownership_flow_route_refuses_write() {
+        let (dir, handler, root) = ownership_handler("ownership-flow");
+        handler.route_admissions().insert(
+            (34, 1),
+            RouteAdmission::from_bind(
+                Some(reserved(WRITER_MODULE)),
+                Some(&flow_stamp(Some("fl_ownership"))),
+            ),
+        );
+        let before = handler.with_store(RegistryStore::generation).unwrap();
+        let err = handler
+            .execute(
+                WireRequest {
+                    method: "set_owned_remotes".into(),
+                    params: json!({"root":root,"remotes":[]}),
+                },
+                (34, 1),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "flow_scope_not_admitted");
+        assert_eq!(
+            handler.with_store(RegistryStore::generation).unwrap(),
+            before
+        );
+        drop(handler);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ownership_query_is_open_and_carries_read_metadata_and_manifest() {
+        let (dir, handler, root) = ownership_handler("ownership-query");
+        for (index, principal) in [
+            Some(Principal::Direct),
+            Some(reserved(WRITER_MODULE)),
+            Some(reserved("plexus")),
+            Some(Principal::Unverified),
+            None,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let key = (40 + index as u16, 1);
+            handler.route_admissions().insert(
+                key,
+                RouteAdmission::from_bind(principal, Some(&flow_stamp(Some("fl_read")))),
+            );
+            let reply: Value = serde_json::from_slice(&execute_on(
+                &handler,
+                key,
+                "resolve_remote",
+                json!({"owner":"UALTINOK","repo":"OpenCode"}),
+            ))
+            .unwrap();
+            assert_eq!(
+                reply,
+                json!({"result":{"status":"found","projectId":"p","root":root,"generation":1,"incarnation":"ownership-incarnation"}})
+            );
+        }
+        let manifest = serde_json::to_value(manifest()).unwrap();
+        let operations = manifest["provides"][0]["operations"].as_array().unwrap();
+        for (name, kind) in [("resolve_remote", "query"), ("set_owned_remotes", "mutate")] {
+            let operation = operations
+                .iter()
+                .find(|op| op["name"] == name)
+                .expect("ownership operation declared");
+            assert_eq!(operation["kind"], kind);
+        }
+        drop(handler);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn journal_repo(dir: &std::path::Path, name: &str) -> String {
