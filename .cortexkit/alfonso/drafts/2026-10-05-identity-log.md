@@ -18,7 +18,6 @@ evidence:
     - crates/entorhinal-module/src/agent_reads.rs
     - crates/entorhinal-module/src/cli.rs
     - docs/designs/repository-ownership.md
-    - /Users/ufukaltinok/Work/Projects/CortexKit/engram/AGENT_SYNC.md
 ---
 
 ## intent
