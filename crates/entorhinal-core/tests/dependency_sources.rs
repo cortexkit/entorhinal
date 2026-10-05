@@ -45,8 +45,11 @@ fn outside_path_dependencies(metadata: &Value) -> Vec<String> {
 
 #[test]
 fn no_dependency_resolves_to_a_path_outside_the_repository() {
+    // Not `--offline`: metadata resolves every platform's and every optional
+    // dependency, including crates the build never downloaded, so on a fresh CI
+    // runner an offline run fails before it can check anything.
     let output = Command::new(env!("CARGO"))
-        .args(["metadata", "--format-version", "1", "--locked", "--offline"])
+        .args(["metadata", "--format-version", "1", "--locked"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .expect("cargo metadata runs");
