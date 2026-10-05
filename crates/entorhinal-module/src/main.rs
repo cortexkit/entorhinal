@@ -949,8 +949,8 @@ impl ProjectsHandler {
         self.encode_read_result(reply)
     }
     fn rebuild(&self) -> Result<Vec<u8>, HandlerError> {
-        let generation = self.with_store(|s| s.rebuild())?;
-        encode_result(json!({"generation":generation}))
+        let reply = self.with_store(|s| s.rebuild())?;
+        encode_result(reply)
     }
 }
 

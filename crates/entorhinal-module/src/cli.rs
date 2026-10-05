@@ -657,11 +657,33 @@ fn render(command: &Command, value: &Value) {
                 );
             }
         }
+        (Face::Projects, "verify") => println!("{}", format_verify(value)),
         _ => println!(
             "{}",
             serde_json::to_string_pretty(value).unwrap_or_default()
         ),
     }
+}
+
+fn format_verify(value: &Value) -> String {
+    // Preserve the existing membership summary. A clean replay adds no noise;
+    // differing tables get one line each, with counts relative to the journal.
+    let mut summary = value.clone();
+    if let Some(fields) = summary.as_object_mut() {
+        fields.remove("replay");
+    }
+    let mut output = serde_json::to_string_pretty(&summary).unwrap_or_default();
+    if let Some(tables) = value["replay"]["tables"].as_array() {
+        for table in tables {
+            output.push_str(&format!(
+                "\nreplay {}: missing={} unexpected={}",
+                text(&table["table"]),
+                text(&table["missing"]),
+                text(&table["unexpected"]),
+            ));
+        }
+    }
+    output
 }
 
 /// Render a JSON scalar for humans: strings unquoted, absence as `-`.
@@ -1106,5 +1128,102 @@ mod tests {
         assert_eq!(text(&Value::Null), "-");
         assert_eq!(text(&json!("null")), "null");
         assert_eq!(text(&json!("p1")), "p1");
+    }
+
+    #[test]
+    fn verify_renders_only_differing_replay_tables() {
+        use entorhinal_core::{ReplayReport, ReplayTableDifference, VerifyReply};
+
+        let mode = std::env::var("ENTORHINAL_TEST_VERIFY_RENDER_MODE").ok();
+        let mut reply = VerifyReply {
+            ok: true,
+            local_members: 2,
+            project_workspaces: 2,
+            mismatches: Vec::new(),
+            generation: 10,
+            replay: ReplayReport {
+                ok: true,
+                tables: Vec::new(),
+            },
+        };
+        if mode.as_deref() != Some("clean") {
+            reply.ok = false;
+            reply.replay = ReplayReport {
+                ok: false,
+                tables: vec![
+                    ReplayTableDifference {
+                        table: "project".into(),
+                        missing: 0,
+                        unexpected: 1,
+                        missing_keys: Vec::new(),
+                        unexpected_keys: Vec::new(),
+                    },
+                    ReplayTableDifference {
+                        table: "agent_name_claim".into(),
+                        missing: 1,
+                        unexpected: 0,
+                        missing_keys: Vec::new(),
+                        unexpected_keys: Vec::new(),
+                    },
+                ],
+            };
+        }
+        if let Some(mode) = mode {
+            render(
+                &Command {
+                    face: Face::Projects,
+                    verb: "verify".into(),
+                    connection: None,
+                    args: Vec::new(),
+                    json: mode == "json",
+                },
+                &serde_json::to_value(reply).unwrap(),
+            );
+            return;
+        }
+
+        // Capture the real renderer in a child test process, so removing its
+        // verify dispatch cannot pass a test of only the formatting helper.
+        let capture = |mode: &str| {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cli::tests::verify_renders_only_differing_replay_tables",
+                    "--nocapture",
+                ])
+                .env("ENTORHINAL_TEST_VERIFY_RENDER_MODE", mode)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        let clean = capture("clean");
+        assert!(clean.contains(
+            &serde_json::to_string_pretty(&json!({
+                "ok":true, "localMembers":2, "projectWorkspaces":2,
+                "mismatches":[], "generation":10,
+            }))
+            .unwrap()
+        ));
+        assert!(!clean.contains("\"replay\""));
+        assert!(!clean.lines().any(|line| line.starts_with("replay ")));
+        let dirty = capture("dirty");
+        assert!(dirty.contains("\nreplay project: missing=0 unexpected=1\nreplay agent_name_claim: missing=1 unexpected=0\n"));
+        assert_eq!(
+            dirty
+                .lines()
+                .filter(|line| line.starts_with("replay "))
+                .count(),
+            2
+        );
+        assert!(!dirty.contains("missingKeys"));
+        let json = capture("json");
+        assert!(json.contains("\"replay\": {"));
+        assert!(json.contains("\"missingKeys\": []"));
+        assert!(!json.lines().any(|line| line.starts_with("replay ")));
     }
 }

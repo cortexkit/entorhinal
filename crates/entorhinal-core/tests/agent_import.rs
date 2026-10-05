@@ -580,7 +580,7 @@ fn carried_fields_and_allowed_legacy_shapes_survive_import_and_rebuild() {
     assert_eq!(marker_before.4, "reserved:prefrontal-core");
     for rebuilt in [false, true] {
         if rebuilt {
-            assert_eq!(f.store().rebuild().unwrap(), head + 8);
+            assert_eq!(f.store().rebuild().unwrap().generation, head + 8);
         }
         for row in &expected {
             let id = row["agent_id"].as_str().unwrap();

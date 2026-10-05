@@ -828,7 +828,7 @@ mod tests {
         );
         let before = projection(&f);
         let head = f.store.generation().unwrap();
-        assert_eq!(f.store.rebuild().unwrap(), head);
+        assert_eq!(f.store.rebuild().unwrap().generation, head);
         assert_eq!(projection(&f), before);
         assert_eq!(entries(&f).len(), 4);
     }

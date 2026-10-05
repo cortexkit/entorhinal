@@ -4,7 +4,7 @@ use std::{
 };
 
 use cortexkit_paths::{IdentityError, ProjectRootId};
-use rusqlite::{params, OptionalExtension, Transaction};
+use rusqlite::{params, types::ValueRef, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -204,6 +204,45 @@ pub struct VerifyReply {
     pub project_workspaces: i64,
     pub mismatches: Vec<String>,
     pub generation: i64,
+    pub replay: ReplayReport,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RebuildReply {
+    pub generation: i64,
+    pub replay: ReplayReport,
+}
+
+/// Differences are relative to the journal: missing rows are restored by
+/// replay, while unexpected live rows are removed. A changed row appears on
+/// both sides, even when its primary key is unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplayReport {
+    pub ok: bool,
+    pub tables: Vec<ReplayTableDifference>,
+}
+
+impl Default for ReplayReport {
+    fn default() -> Self {
+        Self {
+            ok: true,
+            tables: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplayTableDifference {
+    pub table: String,
+    pub missing: u64,
+    pub unexpected: u64,
+    /// At most five primary keys across both sides, including every component
+    /// of a composite key. Column names are the database's names.
+    pub missing_keys: Vec<BTreeMap<String, Value>>,
+    pub unexpected_keys: Vec<BTreeMap<String, Value>>,
 }
 
 #[derive(Debug)]
@@ -912,31 +951,221 @@ impl super::JournalWriter<'_> {
 
 impl RegistryStore {
     pub fn verify(&self) -> Result<VerifyReply, RegistryError> {
-        self.read(|conn| { let mut mismatches=Vec::new(); let local: i64=conn.query_row("SELECT COUNT(*) FROM workspace_member WHERE ref_kind='local'",[],|r|r.get(0))?; let pairs:i64=conn.query_row("SELECT COUNT(*) FROM project_workspace",[],|r|r.get(0))?; let mut stmt=conn.prepare("SELECT wm.workspace_id,wm.project_id FROM workspace_member wm LEFT JOIN project_workspace pw ON pw.workspace_id=wm.workspace_id AND pw.project_id=wm.project_id WHERE wm.ref_kind='local' AND pw.project_id IS NULL")?; for row in stmt.query_map([],|r|Ok(format!("{}:{}",r.get::<_,String>(0)?,r.get::<_,String>(1)?)))? {mismatches.push(row?);} let mut stmt=conn.prepare("SELECT pw.workspace_id,pw.project_id FROM project_workspace pw LEFT JOIN workspace_member wm ON wm.workspace_id=pw.workspace_id AND wm.project_id=pw.project_id AND wm.ref_kind='local' WHERE wm.project_id IS NULL")?; for row in stmt.query_map([],|r|Ok(format!("{}:{}",r.get::<_,String>(0)?,r.get::<_,String>(1)?)))? {mismatches.push(row?);} Ok(VerifyReply{ok:mismatches.is_empty(),local_members:local,project_workspaces:pairs,mismatches,generation:self.generation_from_connection(conn)?}) })
+        self.read(|conn| {
+            // Keep the live checks and both snapshots in one transaction. On
+            // error Transaction's drop rolls back; success rolls back explicitly.
+            // Verification never commits the temporary replay or its side effects.
+            let tx = conn.unchecked_transaction()?;
+            let mut mismatches = Vec::new();
+            let local = tx.query_row(
+                "SELECT COUNT(*) FROM workspace_member WHERE ref_kind='local'",
+                [],
+                |r| r.get(0),
+            )?;
+            let pairs = tx.query_row("SELECT COUNT(*) FROM project_workspace", [], |r| r.get(0))?;
+            for query in [
+                "SELECT wm.workspace_id,wm.project_id FROM workspace_member wm LEFT JOIN project_workspace pw ON pw.workspace_id=wm.workspace_id AND pw.project_id=wm.project_id WHERE wm.ref_kind='local' AND pw.project_id IS NULL",
+                "SELECT pw.workspace_id,pw.project_id FROM project_workspace pw LEFT JOIN workspace_member wm ON wm.workspace_id=pw.workspace_id AND wm.project_id=pw.project_id AND wm.ref_kind='local' WHERE wm.project_id IS NULL",
+            ] {
+                let mut stmt = tx.prepare(query)?;
+                for row in stmt.query_map([], |r| {
+                    Ok(format!("{}:{}", r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })? {
+                    mismatches.push(row?);
+                }
+            }
+            let generation = self.generation_from_connection(&tx)?;
+            let replay = replay_and_compare(&tx)?;
+            tx.rollback()?;
+            Ok(VerifyReply {
+                ok: mismatches.is_empty() && replay.ok,
+                local_members: local,
+                project_workspaces: pairs,
+                mismatches,
+                generation,
+                replay,
+            })
+        })
     }
 
-    pub fn rebuild(&self) -> Result<i64, RegistryError> {
-        self.db.with_conn_fenced(|tx| {
-            // Historical claims and tombstoned ids are projections too. The
-            // journal supplies their original ids and generations on replay.
-            // Defer foreign-key checks until commit: agents referencing other
-            // agents through merged_into or supervisor_agent_id, and their
-            // claims, are deleted and replayed in journal order. Their targets
-            // may not exist until replay finishes, so the references can only
-            // be required to hold at commit.
-            tx.execute_batch("PRAGMA defer_foreign_keys=ON; DELETE FROM agent_name_claim; DELETE FROM agent; DELETE FROM workspace_member; DELETE FROM project_workspace; DELETE FROM project_alias; DELETE FROM derived_root_parent; DELETE FROM project_root; DELETE FROM project; DELETE FROM workspace; DELETE FROM root_binding; DELETE FROM retired_binding; DELETE FROM root_approval;")?;
-            let mut stmt = tx.prepare("SELECT seq,op,payload_json,created_at FROM registry_journal ORDER BY seq")?;
-            let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-            drop(stmt);
-            for (seq, op, payload, now) in rows {
-                let value: Value = serde_json::from_str(&payload)
-                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-                let request = value.get("request").cloned().unwrap_or(value);
-                replay(tx, seq, &op, request, now)?;
-            }
-            tx.query_row("SELECT COALESCE(MAX(seq),0) FROM registry_journal", [], |r| r.get(0))
-        }).map_err(RegistryError::Store)
+    pub fn rebuild(&self) -> Result<RebuildReply, RegistryError> {
+        self.db
+            .with_conn_fenced(|tx| {
+                let replay = replay_and_compare(tx)?;
+                Ok(RebuildReply {
+                    generation: self.generation_from_connection(tx)?,
+                    replay,
+                })
+            })
+            .map_err(RegistryError::Store)
     }
+}
+
+// Deletion order respects projection dependencies. This is also the sole list
+// used for snapshots, so verification and repair always cover the same tables.
+const DERIVED_TABLES: &[&str] = &[
+    "agent_name_claim",
+    "agent",
+    "workspace_member",
+    "project_workspace",
+    "project_alias",
+    "derived_root_parent",
+    "project_root",
+    "project",
+    "workspace",
+    "root_binding",
+    "retired_binding",
+    "root_approval",
+];
+
+fn delete_and_replay(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    // Historical claims and tombstoned ids are projections too. Defer foreign
+    // keys because an agent's merge target or supervisor may be replayed later.
+    tx.execute_batch("PRAGMA defer_foreign_keys=ON;")?;
+    for table in DERIVED_TABLES {
+        tx.execute(&format!("DELETE FROM {table}"), [])?;
+    }
+    let mut stmt =
+        tx.prepare("SELECT seq,op,payload_json,created_at FROM registry_journal ORDER BY seq")?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    for (seq, op, payload, now) in rows {
+        let value: Value = serde_json::from_str(&payload)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        let request = value.get("request").cloned().unwrap_or(value);
+        replay(tx, seq, &op, request, now)?;
+    }
+    Ok(())
+}
+
+// Preserve SQLite storage classes and exact bytes, rather than converting rows
+// to JSON (which could equate a blob with text, or lose integer precision).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum StoredCell {
+    Null,
+    Integer(i64),
+    Real(u64),
+    Text(Vec<u8>),
+    Blob(Vec<u8>),
+}
+
+impl StoredCell {
+    fn from_sql(value: ValueRef<'_>) -> Self {
+        match value {
+            ValueRef::Null => Self::Null,
+            ValueRef::Integer(value) => Self::Integer(value),
+            ValueRef::Real(value) => Self::Real(value.to_bits()),
+            ValueRef::Text(value) => Self::Text(value.to_vec()),
+            ValueRef::Blob(value) => Self::Blob(value.to_vec()),
+        }
+    }
+
+    fn sample_value(&self) -> Value {
+        match self {
+            Self::Null => Value::Null,
+            Self::Integer(value) => json!(value),
+            Self::Real(bits) => json!(f64::from_bits(*bits)),
+            Self::Text(bytes) => json!(String::from_utf8_lossy(bytes)),
+            Self::Blob(bytes) => json!(bytes),
+        }
+    }
+}
+
+struct TableSnapshot {
+    primary_columns: Vec<(usize, String)>,
+    // A sorted multiset compares every column deterministically, including
+    // duplicate rows allowed by SQLite's nullable non-integer primary keys.
+    rows: BTreeMap<Vec<StoredCell>, u64>,
+}
+
+fn snapshot_table(conn: &Connection, table: &str) -> rusqlite::Result<TableSnapshot> {
+    let primary_columns = conn
+        .prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, usize>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|(_, _, key_position)| *key_position > 0)
+        .map(|(index, name, _)| (index, name))
+        .collect();
+    let mut stmt = conn.prepare(&format!("SELECT * FROM {table}"))?;
+    let columns = stmt.column_count();
+    let mut rows = BTreeMap::new();
+    for row in stmt.query_map([], |r| {
+        (0..columns)
+            .map(|index| r.get_ref(index).map(StoredCell::from_sql))
+            .collect::<rusqlite::Result<Vec<_>>>()
+    })? {
+        *rows.entry(row?).or_insert(0) += 1;
+    }
+    Ok(TableSnapshot {
+        primary_columns,
+        rows,
+    })
+}
+
+fn differing_rows(
+    source: &TableSnapshot,
+    other: &TableSnapshot,
+    sample_limit: usize,
+) -> (u64, Vec<BTreeMap<String, Value>>) {
+    let mut count = 0;
+    let mut keys = Vec::new();
+    for (row, occurrences) in &source.rows {
+        let difference = occurrences.saturating_sub(*other.rows.get(row).unwrap_or(&0));
+        count += difference;
+        if difference > 0 && keys.len() < sample_limit {
+            keys.push(
+                source
+                    .primary_columns
+                    .iter()
+                    .map(|(index, name)| (name.clone(), row[*index].sample_value()))
+                    .collect(),
+            );
+        }
+    }
+    (count, keys)
+}
+
+fn replay_and_compare(tx: &Transaction<'_>) -> rusqlite::Result<ReplayReport> {
+    let live = DERIVED_TABLES
+        .iter()
+        .map(|table| snapshot_table(tx, table))
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    delete_and_replay(tx)?;
+    let mut tables = Vec::new();
+    for (table, before) in DERIVED_TABLES.iter().zip(live) {
+        let after = snapshot_table(tx, table)?;
+        let (missing, missing_keys) = differing_rows(&after, &before, 5);
+        let (unexpected, unexpected_keys) = differing_rows(&before, &after, 5 - missing_keys.len());
+        if missing > 0 || unexpected > 0 {
+            tables.push(ReplayTableDifference {
+                table: (*table).into(),
+                missing,
+                unexpected,
+                missing_keys,
+                unexpected_keys,
+            });
+        }
+    }
+    Ok(ReplayReport {
+        ok: tables.is_empty(),
+        tables,
+    })
 }
 
 fn seed_id(identity: &str) -> String {
@@ -2247,7 +2476,7 @@ pub(crate) mod tests {
             })
             .unwrap();
         let generation = f.store.generation().unwrap();
-        assert_eq!(f.store.rebuild().unwrap(), generation);
+        assert_eq!(f.store.rebuild().unwrap().generation, generation);
         let after: Vec<(String, String)> = f
             .store
             .db
@@ -2325,7 +2554,7 @@ pub(crate) mod tests {
         assert!(before > 0, "the fixture must have advanced the generation");
 
         assert_eq!(
-            f.store.rebuild().unwrap(),
+            f.store.rebuild().unwrap().generation,
             before,
             "replay must not move the generation"
         );
@@ -2354,7 +2583,7 @@ pub(crate) mod tests {
 
         // And a second replay from the longer journal is still stable.
         assert_eq!(
-            f.store.rebuild().unwrap(),
+            f.store.rebuild().unwrap().generation,
             next,
             "replay must stay stable once the journal has grown"
         );
@@ -2989,7 +3218,7 @@ mod project_replay_tests {
         // than a resolve reply that could hide an extra project or lost alias.
         let before = projection(f);
         let generation = f.store.generation().unwrap();
-        assert_eq!(f.store.rebuild().unwrap(), generation);
+        assert_eq!(f.store.rebuild().unwrap().generation, generation);
         let after = projection(f);
         for (table, rows) in before {
             assert_eq!(rows, after[table], "rebuild changed {table}");
