@@ -3,11 +3,15 @@ use icu_normalizer::ComposingNormalizer;
 
 use super::{AgentRegistryError, InvalidNameReason};
 
-// From prefrontal 873870be8 crates/prefrontal-core-store/src/agent_registry.rs:25-29.
+// Version 1 pins the name normalization pipeline, and its length limit applies
+// to both the display name and the folded lookup name in Unicode scalars.
+// Source: prefrontal 873870be8, crates/prefrontal-core-store/src/agent_registry.rs:25-29.
 pub const NAME_NORMALIZATION_VERSION: i64 = 1;
 const MAX_NAME_SCALARS: usize = 24;
 
-/// Core's pure normalization result, from prefrontal 873870be8
+/// Keep the user's display spelling separately from the case-folded lookup key,
+/// alongside the version that identifies how the two names were normalized.
+/// Source: prefrontal 873870be8,
 /// crates/prefrontal-core-store/src/agent_registry.rs:705-710.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedAgentName {
@@ -16,7 +20,9 @@ pub struct NormalizedAgentName {
     pub normalization_version: i64,
 }
 
-/// Ported from prefrontal 873870be8
+/// Recognize the fixed Unicode 15.1 whitespace set, so trimming does not change
+/// when the Rust toolchain's Unicode data changes.
+/// Source: prefrontal 873870be8,
 /// crates/prefrontal-core-store/src/agent_registry.rs:1237-1252.
 fn is_unicode_15_1_whitespace(character: char) -> bool {
     matches!(
@@ -35,13 +41,17 @@ fn is_unicode_15_1_whitespace(character: char) -> bool {
     )
 }
 
-/// Ported from prefrontal 873870be8
+/// Remove only Unicode 15.1 whitespace at the edges, leaving internal spelling
+/// unchanged and applying the same trim rule to all identity fields.
+/// Source: prefrontal 873870be8,
 /// crates/prefrontal-core-store/src/agent_registry.rs:1254-1256.
 pub(super) fn trim_unicode_15_1(value: &str) -> &str {
     value.trim_matches(is_unicode_15_1_whitespace)
 }
 
-/// Ported verbatim from prefrontal 873870be8
+/// Refuse invisible formatting, bidirectional controls and similar code points
+/// that could make two visually identical names differ in their lookup keys.
+/// Source: prefrontal 873870be8 (predicate copied verbatim),
 /// crates/prefrontal-core-store/src/agent_registry.rs:1258-1283.
 fn is_disallowed_name_character(character: char) -> bool {
     matches!(
@@ -73,7 +83,7 @@ fn is_disallowed_name_character(character: char) -> bool {
 /// Normalize a registry name without losing the user's case and spelling in the
 /// display form. ICU4X 1.5 compiled data is sourced from ICU 75, whose Unicode
 /// data is 15.1.0; `fold_string` is the full, non-Turkic C/F mapping.
-/// Ported from prefrontal 873870be8
+/// Source: prefrontal 873870be8,
 /// crates/prefrontal-core-store/src/agent_registry.rs:1285-1322.
 pub fn normalize_agent_name(raw: &str) -> Result<NormalizedAgentName, AgentRegistryError> {
     if let Some(character) = raw
@@ -115,7 +125,9 @@ pub fn normalize_agent_name(raw: &str) -> Result<NormalizedAgentName, AgentRegis
 mod tests {
     use super::*;
 
-    // Copied verbatim from prefrontal 873870be8
+    // Pin NFC, full case folding and trimming, including the order that counts
+    // scalars after composition/folding and never normalizes the fold output again.
+    // Source: prefrontal 873870be8 (test copied verbatim),
     // crates/prefrontal-core-store/src/agent_registry.rs:7533-7580.
     #[test]
     fn normalization_pipeline_pins_nfc_case_fold_trim_and_scalar_order() {
@@ -166,7 +178,9 @@ mod tests {
         );
     }
 
-    // Inputs and expected outcomes from prefrontal 873870be8
+    // Whitespace-only names are empty and 25 scalars exceed the 24-scalar limit;
+    // both must refuse with typed reasons rather than silently truncating a name.
+    // Source: prefrontal 873870be8,
     // crates/prefrontal-core-store/src/agent_registry.rs:7618-7634.
     #[test]
     fn invalid_names_are_typed_and_never_truncated() {
@@ -186,9 +200,11 @@ mod tests {
         assert_eq!(too_long.unwrap_err().code(), "invalid_name");
     }
 
-    // Pure-validator expectations from prefrontal 873870be8
-    // crates/prefrontal-core-store/src/agent_registry.rs:7636-7661,7733-7748.
+    // Pin the reported disallowed code points, preserved Cyrillic/display spelling,
+    // normalization version 1 and acceptance at the 24-scalar boundary.
     // Claim-path and row lifecycle assertions belong to the mutation implementation.
+    // Source: prefrontal 873870be8,
+    // crates/prefrontal-core-store/src/agent_registry.rs:7636-7661,7733-7748.
     #[test]
     fn names_pin_codepoints_display_and_normalization_version() {
         for (name, codepoint) in [

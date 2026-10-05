@@ -10,7 +10,9 @@ pub use validate::*;
 
 use std::fmt;
 
-/// Validator refusal reasons from prefrontal 873870be8
+/// Explain whether a name is empty, too long after normalization, or contains a
+/// disallowed code point, so callers can report the specific validation failure.
+/// Source: prefrontal 873870be8,
 /// crates/prefrontal-core-store/src/agent_registry.rs:734-740.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvalidNameReason {
@@ -19,7 +21,9 @@ pub enum InvalidNameReason {
     DisallowedCharacter { codepoint: u32 },
 }
 
-/// From prefrontal 873870be8
+/// Distinguish label count, emptiness, scalar-length and case-folded duplicate
+/// failures while keeping the shared `invalid_labels` refusal code.
+/// Source: prefrontal 873870be8,
 /// crates/prefrontal-core-store/src/agent_registry.rs:768-773.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvalidAgentLabelReason {
@@ -43,7 +47,10 @@ pub enum AgentRegistryError {
 }
 
 impl AgentRegistryError {
-    /// Codes ported from prefrontal 873870be8
+    /// Return the stable wire refusal code for each validation failure.
+    /// Decoding and request-shape failures use `invalid_request`, separately
+    /// from failures of an already decoded identity field.
+    /// Source: prefrontal 873870be8,
     /// crates/prefrontal-core-store/src/agent_registry.rs:843-873;
     /// `invalid_request` is core's module decoder/shape-check code.
     pub fn code(&self) -> &'static str {

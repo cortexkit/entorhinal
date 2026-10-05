@@ -1,12 +1,12 @@
-/// Migration 4 adds identity projections only. The name claims and lifecycle
-/// checks follow prefrontal 873870be8
-/// crates/prefrontal-core-store/migrations/076_agent_registry.sql:1-98 and
-/// 082_wake_delivery.sql:12-105 (which permits a workspace on heads and hirees).
-/// Avatar pairing follows 112_agent_avatar.sql:16-19; labels follow
-/// 126_agent_labels.sql:1-3. Generation is an explicit journal-projection value,
-/// never advanced by a SQLite trigger. Project/workspace references deliberately
-/// have no foreign keys: terminal rows outlive removed bindings, and a claim's
-/// original workspace namespace remains meaningful after that workspace is gone.
+/// Migration 4 stores agent identity and claim history, enforcing role shape,
+/// terminal/avatar consistency and one live head per project without generation
+/// triggers. Bindings have no foreign keys so terminal rows and historical claims
+/// survive removal of their projects or workspaces.
+/// Source: prefrontal 873870be8,
+/// crates/prefrontal-core-store/migrations/076_agent_registry.sql:1-98,
+/// crates/prefrontal-core-store/migrations/082_wake_delivery.sql:12-105,
+/// crates/prefrontal-core-store/migrations/112_agent_avatar.sql:16-19,
+/// crates/prefrontal-core-store/migrations/126_agent_labels.sql:1-3.
 pub const V4_AGENT_IDENTITY: &str = r#"
 CREATE TABLE agent (
     agent_id TEXT PRIMARY KEY,
@@ -207,8 +207,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        // Assert the migration's complete table set, not a blacklist that could
-        // miss a newly named residence/consent projection.
+        // Assert the migration's exact table set so any extra table fails the test.
         let conn = connection();
         let tables: Vec<String> = conn.prepare(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
@@ -394,14 +393,15 @@ mod tests {
     fn binary_without_agent_migration_refuses_migrated_store_as_ahead() {
         let scratch = Scratch::new();
         let old_chain = &MIGRATIONS[..3];
-        // The older chain works against its own version before upgrading.
+        // Check that the store opens with the first three migrations before migration 4.
         drop(RegistryStore::open_with_migrations(&scratch.descriptor, old_chain).unwrap());
         drop(RegistryStore::open(&scratch.descriptor).unwrap());
         let error =
             RegistryStore::open_with_migrations(&scratch.descriptor, old_chain).unwrap_err();
         assert!(matches!(error, RegistryError::Database(_)));
         assert_eq!(error.to_string(), "database: registry store is at schema version 4, ahead of this binary's highest migration 3; run a binary at or above the store's version");
-        // A refusal has not changed the migrated store's identity projection.
+        // Opening with the older chain after migration 4 leaves the agent table
+        // unchanged and readable by the current chain.
         let current = RegistryStore::open(&scratch.descriptor).unwrap();
         current
             .read(|conn| {

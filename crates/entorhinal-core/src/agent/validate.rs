@@ -6,14 +6,18 @@ use serde_json::Value;
 
 use super::{names::trim_unicode_15_1, AgentRegistryError, InvalidAgentLabelReason};
 
-// From prefrontal 873870be8 crates/prefrontal-core-store/src/agent_registry.rs:30-33.
+// Identity fields have separate bounds: tag/scope ids use bytes, labels use
+// Unicode scalars, and a label list has its own count limit.
+// Source: prefrontal 873870be8, crates/prefrontal-core-store/src/agent_registry.rs:30-33.
 const MAX_TAG_BYTES: usize = 256;
 const MAX_AGENT_LABELS: usize = 16;
 const MAX_AGENT_LABEL_SCALARS: usize = 32;
 const MAX_SCOPE_BYTES: usize = 512;
 
-/// Tagged credential references, not credentials themselves. Ported from
-/// prefrontal 873870be8 crates/prefrontal-core-store/src/agent_registry.rs:600-628.
+/// Represent a GitHub App or user-token identity using credential references,
+/// never the credentials themselves; reject fields outside the tagged variant.
+/// Source: prefrontal 873870be8,
+/// crates/prefrontal-core-store/src/agent_registry.rs:600-628.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GithubIdentity {
@@ -34,7 +38,9 @@ pub enum GithubIdentity {
     },
 }
 
-/// Core's set-avatar reply surface, from prefrontal 873870be8
+/// Carry an avatar genome with optional layout type and rendering version.
+/// Absent type/version fields are omitted from the set-avatar reply, not null.
+/// Source: prefrontal 873870be8,
 /// crates/prefrontal-core-store/src/agent_registry.rs:638-647.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -46,7 +52,9 @@ pub struct AgentAvatar {
     pub version: Option<i64>,
 }
 
-/// Ported from prefrontal 873870be8
+/// Trim a tag using Unicode 15.1 whitespace, then require a non-empty result of
+/// at most 256 bytes; the limit counts UTF-8 bytes, not Unicode scalars.
+/// Source: prefrontal 873870be8,
 /// crates/prefrontal-core-store/src/agent_registry.rs:1324-1330.
 pub fn validate_agent_tag(raw: &str) -> Result<String, AgentRegistryError> {
     let tag = trim_unicode_15_1(raw);
@@ -56,7 +64,9 @@ pub fn validate_agent_tag(raw: &str) -> Result<String, AgentRegistryError> {
     Ok(tag.to_owned())
 }
 
-/// Ported from prefrontal 873870be8
+/// Accept at most 16 trimmed, non-empty labels of at most 32 Unicode scalars,
+/// preserving request order and spelling while refusing case-folded duplicates.
+/// Source: prefrontal 873870be8,
 /// crates/prefrontal-core-store/src/agent_registry.rs:1332-1361.
 pub fn validate_agent_labels(raw: &[String]) -> Result<Vec<String>, AgentRegistryError> {
     if raw.len() > MAX_AGENT_LABELS {
@@ -89,7 +99,9 @@ pub fn validate_agent_labels(raw: &[String]) -> Result<Vec<String>, AgentRegistr
         .collect()
 }
 
-/// Ported from prefrontal 873870be8
+/// Validate a present string after Unicode 15.1 trimming against a byte bound,
+/// preserving an absent optional value and using the caller's refusal reason.
+/// Source: prefrontal 873870be8,
 /// crates/prefrontal-core-store/src/agent_registry.rs:1363-1377.
 fn validate_optional_scalar(
     raw: Option<&str>,
@@ -107,7 +119,9 @@ fn validate_optional_scalar(
     .transpose()
 }
 
-/// Ported from prefrontal 873870be8
+/// Require a project id that is non-empty after trimming and at most 512 bytes.
+/// Identity validation imposes no prefix or character-set restriction.
+/// Source: prefrontal 873870be8,
 /// crates/prefrontal-core-store/src/agent_registry.rs:1379-1386.
 pub fn validate_project_id(raw: &str) -> Result<String, AgentRegistryError> {
     validate_optional_scalar(
@@ -118,7 +132,9 @@ pub fn validate_project_id(raw: &str) -> Result<String, AgentRegistryError> {
     .ok_or(AgentRegistryError::InvalidProjectId)
 }
 
-/// Ported from prefrontal 873870be8
+/// Require a workspace id that is non-empty after trimming and at most 512 bytes.
+/// Identity validation imposes no prefix or character-set restriction.
+/// Source: prefrontal 873870be8,
 /// crates/prefrontal-core-store/src/agent_registry.rs:1388-1395.
 pub fn validate_workspace_id(raw: &str) -> Result<String, AgentRegistryError> {
     validate_optional_scalar(
@@ -129,7 +145,9 @@ pub fn validate_workspace_id(raw: &str) -> Result<String, AgentRegistryError> {
     .ok_or(AgentRegistryError::InvalidWorkspaceId)
 }
 
-/// Ported from prefrontal 873870be8
+/// Require positive numeric GitHub ids and non-empty required strings, including
+/// optional strings when present, without trimming or checking credential syntax.
+/// Source: prefrontal 873870be8,
 /// crates/prefrontal-core-store/src/agent_registry.rs:1507-1552.
 pub fn validate_github_identity(identity: &GithubIdentity) -> Result<(), AgentRegistryError> {
     let required_string = |value: &str, field| {
@@ -155,7 +173,8 @@ pub fn validate_github_identity(identity: &GithubIdentity) -> Result<(), AgentRe
                     field: "installation_id",
                 });
             }
-            // Present-but-empty is a defect; absent is a pre-correction row.
+            // Missing client_id is accepted because older bindings lack it,
+            // but a present client_id must be non-empty.
             if let Some(client_id) = client_id {
                 required_string(client_id, "client_id")?;
             }
@@ -177,9 +196,10 @@ pub fn validate_github_identity(identity: &GithubIdentity) -> Result<(), AgentRe
     }
 }
 
-/// Ported from prefrontal 873870be8
+/// Decode null as an unset identity and tagged objects as a GitHub identity.
+/// Malformed objects refuse `invalid_request`, separately from semantic validation.
+/// Source: prefrontal 873870be8,
 /// crates/prefrontal-core-module/src/agent_registry_ops.rs:844-851.
-/// Decoding and semantic validity are separate, with different refusal codes.
 pub fn decode_github_identity(value: Value) -> Result<Option<GithubIdentity>, AgentRegistryError> {
     if value.is_null() {
         return Ok(None);
@@ -189,7 +209,9 @@ pub fn decode_github_identity(value: Value) -> Result<Option<GithubIdentity>, Ag
     })
 }
 
-/// Ported from prefrontal 873870be8
+/// Return the fixed genome length for the supported `creature.classic` layout,
+/// refusing unknown avatar types rather than guessing their layout.
+/// Source: prefrontal 873870be8,
 /// crates/prefrontal-core-module/src/agent_registry_ops.rs:835-842.
 fn avatar_layout_hex_chars(avatar_type: &str) -> Result<usize, AgentRegistryError> {
     match avatar_type {
@@ -200,9 +222,11 @@ fn avatar_layout_hex_chars(avatar_type: &str) -> Result<usize, AgentRegistryErro
     }
 }
 
-/// Ported from prefrontal 873870be8
+/// Require an explicit supported avatar type and a genome of its fixed byte
+/// length, reporting missing types, unknown types and length mismatches as
+/// `invalid_request` rather than accepting an ambiguous or incomplete avatar.
+/// Source: prefrontal 873870be8,
 /// crates/prefrontal-core-module/src/agent_registry_ops.rs:3276-3285.
-/// Despite core's hex terminology, this checks byte length, not hex content.
 pub fn validate_agent_avatar(
     genome: &str,
     avatar_type: Option<&str>,
@@ -211,6 +235,9 @@ pub fn validate_agent_avatar(
         AgentRegistryError::invalid_request("agent.set_avatar requires type with genome")
     })?;
     let expected_hex_chars = avatar_layout_hex_chars(avatar_type)?;
+    // Check only length, not hex characters: core accepts 2048-character genomes
+    // with non-hex content, so a stricter check would refuse avatars it already
+    // stores. The length measurement remains UTF-8 bytes, as in core.
     if genome.len() != expected_hex_chars {
         return Err(AgentRegistryError::invalid_request(format!(
             "avatar genome for type '{avatar_type}' must be exactly 1024 bytes ({expected_hex_chars} hex chars); received {} hex chars",
@@ -225,7 +252,9 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    // Expected values from prefrontal 873870be8
+    // A tag containing only Unicode whitespace becomes empty after trimming and
+    // must refuse invalid_tag rather than storing an invisible tag.
+    // Source: prefrontal 873870be8,
     // crates/prefrontal-core-store/src/agent_registry.rs:1324-1330,843-873.
     #[test]
     fn tag_empty_after_unicode_trim_refuses_invalid_tag() {
@@ -234,7 +263,9 @@ mod tests {
         assert_eq!(error.code(), "invalid_tag");
     }
 
-    // Expected bound and byte counting from prefrontal 873870be8
+    // A 256-byte tag is accepted at the limit after edge whitespace is trimmed;
+    // multibyte characters ensure the bound counts bytes rather than scalars.
+    // Source: prefrontal 873870be8,
     // crates/prefrontal-core-store/src/agent_registry.rs:30,1324-1330.
     #[test]
     fn tag_256_bytes_passes_trimmed() {
@@ -244,7 +275,9 @@ mod tests {
         );
     }
 
-    // Expected refusal from prefrontal 873870be8
+    // A 257-byte tag is one byte over the 256-byte limit and refuses invalid_tag,
+    // even though its multibyte characters occupy fewer than 256 scalars.
+    // Source: prefrontal 873870be8,
     // crates/prefrontal-core-store/src/agent_registry.rs:30,1324-1330,843-873.
     #[test]
     fn tag_257_bytes_refuses_invalid_tag() {
@@ -253,7 +286,9 @@ mod tests {
         assert_eq!(error.code(), "invalid_tag");
     }
 
-    // Expected bound from prefrontal 873870be8
+    // Both an empty list and 16 distinct labels are valid, pinning that labels
+    // are optional and that the list-count bound is inclusive.
+    // Source: prefrontal 873870be8,
     // crates/prefrontal-core-store/src/agent_registry.rs:31,1332-1361.
     #[test]
     fn labels_16_pass_and_empty_list_passes() {
@@ -262,7 +297,9 @@ mod tests {
         assert_eq!(validate_agent_labels(&[]), Ok(vec![]));
     }
 
-    // Expected refusal from prefrontal 873870be8
+    // Seventeen labels exceed the 16-label limit and refuse invalid_labels before
+    // validating individual labels, even when every label is otherwise valid.
+    // Source: prefrontal 873870be8,
     // crates/prefrontal-core-store/src/agent_registry.rs:31,1332-1361,843-873.
     #[test]
     fn labels_17_refuse_invalid_labels() {
@@ -277,7 +314,9 @@ mod tests {
         assert_eq!(error.code(), "invalid_labels");
     }
 
-    // Expected scalar bound from prefrontal 873870be8
+    // A 32-scalar label is accepted even when its UTF-8 encoding takes more than
+    // 32 bytes, pinning the scalar bound rather than an accidental byte limit.
+    // Source: prefrontal 873870be8,
     // crates/prefrontal-core-store/src/agent_registry.rs:32,1332-1361.
     #[test]
     fn label_32_scalars_passes_without_a_byte_bound() {
@@ -287,7 +326,9 @@ mod tests {
         );
     }
 
-    // Expected refusal from prefrontal 873870be8
+    // A 33-scalar label is one scalar over the 32-scalar limit and refuses
+    // invalid_labels without truncating the requested label.
+    // Source: prefrontal 873870be8,
     // crates/prefrontal-core-store/src/agent_registry.rs:32,1332-1361,843-873.
     #[test]
     fn label_33_scalars_refuses_invalid_labels() {
@@ -301,7 +342,9 @@ mod tests {
         assert_eq!(error.code(), "invalid_labels");
     }
 
-    // Expected refusal from prefrontal 873870be8
+    // A whitespace-only label becomes empty after Unicode trimming and refuses
+    // invalid_labels instead of leaving an invisible entry in the list.
+    // Source: prefrontal 873870be8,
     // crates/prefrontal-core-store/src/agent_registry.rs:1332-1361,843-873.
     #[test]
     fn label_empty_after_unicode_trim_refuses_invalid_labels() {
@@ -315,7 +358,9 @@ mod tests {
         assert_eq!(error.code(), "invalid_labels");
     }
 
-    // Expected full ICU-fold duplicate refusal from prefrontal 873870be8
+    // Full ICU case folding makes these differently spelled pairs duplicates;
+    // the list must refuse invalid_labels instead of storing duplicate lookup keys.
+    // Source: prefrontal 873870be8,
     // crates/prefrontal-core-store/src/agent_registry.rs:1332-1361,843-873.
     #[test]
     fn case_fold_duplicate_labels_refuse_invalid_labels() {
@@ -331,7 +376,9 @@ mod tests {
         }
     }
 
-    // Expected order/trim (and no NFC step) from prefrontal 873870be8
+    // Labels retain request order and spelling after edge trimming, including
+    // composed/decomposed forms because label validation does not apply NFC.
+    // Source: prefrontal 873870be8,
     // crates/prefrontal-core-store/src/agent_registry.rs:1332-1361.
     #[test]
     fn labels_preserve_trimmed_request_order_and_spelling() {
@@ -345,7 +392,9 @@ mod tests {
         );
     }
 
-    // Expected lengths/type from prefrontal 873870be8
+    // A 2048-byte hex genome is exactly the creature.classic layout length and
+    // passes with the supported type, pinning the accepted boundary.
+    // Source: prefrontal 873870be8,
     // crates/prefrontal-core-module/src/agent_registry_ops.rs:835-842,3276-3285.
     #[test]
     fn avatar_2048_hex_bytes_pass() {
@@ -355,8 +404,10 @@ mod tests {
         );
     }
 
-    // Core deliberately does not validate hex content; expected result from
-    // prefrontal 873870be8 crates/prefrontal-core-module/src/agent_registry_ops.rs:3276-3285.
+    // A genome with non-hex content still passes at 2048 bytes, avoiding a
+    // stricter content check than core; the multibyte case pins byte counting.
+    // Source: prefrontal 873870be8,
+    // crates/prefrontal-core-module/src/agent_registry_ops.rs:3276-3285.
     #[test]
     fn avatar_2048_non_hex_bytes_pass() {
         assert_eq!(
@@ -369,7 +420,9 @@ mod tests {
         );
     }
 
-    // Expected refusal from prefrontal 873870be8
+    // A 2047-byte genome is one byte short of the fixed 2048-byte layout and
+    // refuses invalid_request instead of accepting a partial genome.
+    // Source: prefrontal 873870be8,
     // crates/prefrontal-core-module/src/agent_registry_ops.rs:3276-3285.
     #[test]
     fn avatar_2047_bytes_refuses_invalid_request() {
@@ -381,7 +434,9 @@ mod tests {
         );
     }
 
-    // Expected refusal from prefrontal 873870be8
+    // A 2049-byte genome is one byte over the fixed 2048-byte layout and refuses
+    // invalid_request instead of ignoring the extra byte.
+    // Source: prefrontal 873870be8,
     // crates/prefrontal-core-module/src/agent_registry_ops.rs:3276-3285.
     #[test]
     fn avatar_2049_bytes_refuses_invalid_request() {
@@ -393,7 +448,9 @@ mod tests {
         );
     }
 
-    // Expected refusal from prefrontal 873870be8
+    // Even a correctly sized genome requires an explicit type so its layout is
+    // known; omitting the type refuses invalid_request.
+    // Source: prefrontal 873870be8,
     // crates/prefrontal-core-module/src/agent_registry_ops.rs:3276-3285.
     #[test]
     fn avatar_missing_type_refuses_invalid_request() {
@@ -405,7 +462,9 @@ mod tests {
         );
     }
 
-    // Expected refusal from prefrontal 873870be8
+    // An unknown type refuses invalid_request despite a correctly sized genome,
+    // because length alone cannot identify a supported avatar layout.
+    // Source: prefrontal 873870be8,
     // crates/prefrontal-core-module/src/agent_registry_ops.rs:835-842.
     #[test]
     fn avatar_unknown_type_refuses_invalid_request() {
@@ -417,7 +476,9 @@ mod tests {
         );
     }
 
-    // Expected serialization from prefrontal 873870be8
+    // The avatar reply omits absent type/version fields and includes a present
+    // version, pinning omitted-vs-null behavior for reply consumers.
+    // Source: prefrontal 873870be8,
     // crates/prefrontal-core-store/src/agent_registry.rs:638-647.
     #[test]
     fn avatar_reply_omits_absent_version_and_type() {
@@ -443,19 +504,25 @@ mod tests {
         );
     }
 
-    // Fixture literal taken from the tagged enum in prefrontal 873870be8
+    // A valid App fixture names a credential reference and supplies its required
+    // fields while omitting the optional installation and client ids.
+    // Source: prefrontal 873870be8,
     // crates/prefrontal-core-store/src/agent_registry.rs:600-628.
     fn app() -> Value {
         json!({"kind":"app", "app_id":1, "app_slug":"bot", "credential_ref":"ckcred:bot", "coauthor_line":"Bot <bot@example.com>"})
     }
 
-    // Fixture literal taken from prefrontal 873870be8
+    // A valid user-token fixture requires a login and credential reference but
+    // permits an absent coauthor line, keeping optionality distinct from emptiness.
+    // Source: prefrontal 873870be8,
     // crates/prefrontal-core-store/src/agent_registry.rs:600-628.
     fn user() -> Value {
         json!({"kind":"user_token", "login":"alice", "credential_ref":"ckcred:alice"})
     }
 
-    // Expected decode and validation results from prefrontal 873870be8
+    // Pin null as an unset identity, both tagged variants and their optional fields,
+    // including whitespace-only strings because validity checks emptiness, not trim.
+    // Source: prefrontal 873870be8,
     // crates/prefrontal-core-store/src/agent_registry.rs:600-628,1507-1552;
     // crates/prefrontal-core-module/src/agent_registry_ops.rs:844-851.
     #[test]
@@ -507,7 +574,9 @@ mod tests {
         );
     }
 
-    // Expected decoder refusal from prefrontal 873870be8
+    // An unknown kind cannot decode as either tagged identity variant and refuses
+    // invalid_request before semantic identity validation can run.
+    // Source: prefrontal 873870be8,
     // crates/prefrontal-core-module/src/agent_registry_ops.rs:844-851.
     #[test]
     fn github_unknown_kind_refuses_invalid_request() {
@@ -519,7 +588,9 @@ mod tests {
         );
     }
 
-    // Expected deny_unknown_fields refusal from prefrontal 873870be8
+    // Extra fields refuse invalid_request on either variant, preventing an
+    // unrecognized field such as a secret from being silently accepted and ignored.
+    // Source: prefrontal 873870be8,
     // crates/prefrontal-core-store/src/agent_registry.rs:600-628;
     // crates/prefrontal-core-module/src/agent_registry_ops.rs:844-851.
     #[test]
@@ -533,7 +604,9 @@ mod tests {
         }
     }
 
-    // Each generated test's expected field and code comes from prefrontal 873870be8
+    // Each generated test decodes a valid-shaped identity with one invalid field,
+    // pinning that field's semantic failure as invalid_github_identity, not a decode error.
+    // Source: prefrontal 873870be8,
     // crates/prefrontal-core-store/src/agent_registry.rs:1507-1552,843-873.
     macro_rules! github_refusal {
         ($name:ident, $fixture:ident, $field:literal, $value:expr) => {
@@ -594,7 +667,9 @@ mod tests {
         ""
     );
 
-    // Each generated test's expectations are from prefrontal 873870be8
+    // For both scope-id validators, pin empty-after-trim refusal, acceptance at
+    // 512 bytes without a prefix/character restriction, and refusal at 513 bytes.
+    // Source: prefrontal 873870be8,
     // crates/prefrontal-core-store/src/agent_registry.rs:33,1237-1256,1363-1395,843-873.
     macro_rules! scope_id_tests {
         ($empty:ident, $max:ident, $over:ident, $validate:ident, $error:ident, $code:literal) => {
