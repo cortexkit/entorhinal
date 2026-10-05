@@ -326,6 +326,21 @@ impl super::JournalWriter<'_> {
     where
         F: FnOnce(&Transaction<'_>) -> Result<Action, RegistryError>,
     {
+        self.mutation_with_error(op, key, action)
+    }
+
+    // Agent refusals carry structured detail while project callers keep their
+    // existing error type. Both paths must share the same cache and rollback.
+    pub(crate) fn mutation_with_error<F, E>(
+        &self,
+        op: &str,
+        key: Option<&str>,
+        action: F,
+    ) -> Result<Vec<u8>, E>
+    where
+        F: FnOnce(&Transaction<'_>) -> Result<Action, E>,
+        E: From<RegistryError>,
+    {
         // Domain errors must ABORT the transaction, never commit around it:
         // with_conn_fenced commits on any Ok, so returning a domain error as
         // Ok(Err(_)) would commit whatever the action closure wrote before
@@ -333,9 +348,9 @@ impl super::JournalWriter<'_> {
         // response_json that then poisons request_key idempotency). The error
         // is stashed outside the closure and a rusqlite error is returned as
         // a rollback sentinel; the stash wins on the way out.
-        let domain_error = std::cell::RefCell::new(None::<RegistryError>);
+        let domain_error = std::cell::RefCell::new(None::<E>);
         let out = self.db.with_conn_fenced(|tx| -> rusqlite::Result<Vec<u8>> {
-            let fail = |e: RegistryError| -> rusqlite::Error {
+            let fail = |e: E| -> rusqlite::Error {
                 *domain_error.borrow_mut() = Some(e);
                 rusqlite::Error::QueryReturnedNoRows
             };
@@ -357,10 +372,13 @@ impl super::JournalWriter<'_> {
                     .optional()?
                 {
                     if other != op {
-                        return Err(fail(domain(
-                            "request_key_reused_across_ops",
-                            format!("request_key is already bound to op '{other}'"),
-                        )));
+                        return Err(fail(
+                            domain(
+                                "request_key_reused_across_ops",
+                                format!("request_key is already bound to op '{other}'"),
+                            )
+                            .into(),
+                        ));
                     }
                 }
             }
@@ -373,9 +391,11 @@ impl super::JournalWriter<'_> {
             let mut value = action.value;
             if let Value::Object(ref mut map) = value {
                 map.insert("generation".to_string(), json!(generation));
-                map.insert("noop".to_string(), json!(!action.changed));
+                if !op.starts_with("agent.") {
+                    map.insert("noop".to_string(), json!(!action.changed));
+                }
             }
-            let blob = wire(value).map_err(fail)?;
+            let blob = wire(value).map_err(|error| fail(error.into()))?;
             if action.changed {
                 tx.execute(
                     "UPDATE registry_journal SET payload_json=?1,response_json=?2 WHERE seq=?3",
@@ -392,7 +412,7 @@ impl super::JournalWriter<'_> {
             Ok(blob) => Ok(blob),
             Err(store_error) => Err(domain_error
                 .into_inner()
-                .unwrap_or(RegistryError::Store(store_error))),
+                .unwrap_or_else(|| RegistryError::Store(store_error).into())),
         }
     }
 
@@ -789,7 +809,21 @@ impl RegistryStore {
     }
 
     pub fn rebuild(&self) -> Result<i64, RegistryError> {
-        self.db.with_conn_fenced(|tx| { tx.execute_batch("DELETE FROM workspace_member; DELETE FROM project_workspace; DELETE FROM project_alias; DELETE FROM derived_root_parent; DELETE FROM project_root; DELETE FROM project; DELETE FROM workspace; DELETE FROM root_binding; DELETE FROM retired_binding; DELETE FROM root_approval;")?; let mut stmt=tx.prepare("SELECT seq,op,payload_json,created_at FROM registry_journal ORDER BY seq")?; let rows=stmt.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?; drop(stmt); for (seq,op,payload,now) in rows {let request:Value=serde_json::from_str::<Value>(&payload).ok().and_then(|v|v.get("request").cloned()).unwrap_or_else(||serde_json::from_str(&payload).unwrap()); replay(tx,seq,&op,request,now)?;} tx.query_row("SELECT COALESCE(MAX(seq),0) FROM registry_journal",[],|r|r.get(0)) }).map_err(RegistryError::Store)
+        self.db.with_conn_fenced(|tx| {
+            // Historical claims and tombstoned ids are projections too. The
+            // journal supplies their original ids and generations on replay.
+            tx.execute_batch("PRAGMA defer_foreign_keys=ON; DELETE FROM agent_name_claim; DELETE FROM agent; DELETE FROM workspace_member; DELETE FROM project_workspace; DELETE FROM project_alias; DELETE FROM derived_root_parent; DELETE FROM project_root; DELETE FROM project; DELETE FROM workspace; DELETE FROM root_binding; DELETE FROM retired_binding; DELETE FROM root_approval;")?;
+            let mut stmt = tx.prepare("SELECT seq,op,payload_json,created_at FROM registry_journal ORDER BY seq")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(stmt);
+            for (seq, op, payload, now) in rows {
+                let value: Value = serde_json::from_str(&payload)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+                let request = value.get("request").cloned().unwrap_or(value);
+                replay(tx, seq, &op, request, now)?;
+            }
+            tx.query_row("SELECT COALESCE(MAX(seq),0) FROM registry_journal", [], |r| r.get(0))
+        }).map_err(RegistryError::Store)
     }
 }
 
@@ -801,6 +835,9 @@ fn seed_id(identity: &str) -> String {
 }
 
 fn replay(tx: &Transaction<'_>, seq: i64, op: &str, v: Value, now: i64) -> rusqlite::Result<()> {
+    if super::agent::replay_agent_entry(tx, op, &v)? {
+        return Ok(());
+    }
     if super::binding::replay_binding_op(tx, seq, op, &v)?
         || super::binding::replay_root_op(tx, seq, op, &v, now)?
     {

@@ -77,7 +77,7 @@ pub(crate) enum IdSource {
 }
 
 impl IdSource {
-    fn hex(&self, bytes: usize) -> Result<String, RegistryError> {
+    pub(crate) fn hex(&self, bytes: usize) -> Result<String, RegistryError> {
         let mut buffer = vec![0u8; bytes];
         match self {
             Self::Random => getrandom::getrandom(&mut buffer)
