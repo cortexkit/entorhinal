@@ -1028,7 +1028,8 @@ fn nested_root(conn: &Connection, path: &str) -> rusqlite::Result<Option<(String
     }))
 }
 
-/// Root attachment uses the same path fences as an explicit add_root.
+/// Refuses a root that overlaps another project's root or a worker container
+/// directory, nested either way. Adding and attaching a root both apply it.
 pub(crate) fn check_root_location(conn: &Connection, root: &str) -> Result<(), RegistryError> {
     if let Some((nested, owner)) = nested_root(conn, root)? {
         return Err(domain(
