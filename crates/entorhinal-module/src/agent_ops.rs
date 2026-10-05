@@ -4,8 +4,6 @@
 //! one-time import that hands agent identity over from core, and every
 //! identity rule.
 
-use std::hash::BuildHasher;
-
 use entorhinal_core::agent::AgentMutationError;
 use serde_json::Value;
 
@@ -22,15 +20,6 @@ pub(super) const MUTATING_METHODS: &[&str] = &[
     "agent.merge",
     "agent.import",
 ];
-
-/// RandomState supplies randomized per-instance hash keys. This is a volatile
-/// invalidation nonce, not an authentication token, and needs no stable hash.
-pub(super) fn new_incarnation() -> String {
-    format!(
-        "{:016x}",
-        std::collections::hash_map::RandomState::new().hash_one(())
-    )
-}
 
 impl From<AgentMutationError> for HandlerError {
     fn from(error: AgentMutationError) -> Self {
@@ -807,8 +796,8 @@ mod tests {
 
     #[test]
     fn incarnation_is_a_fresh_lowercase_sixteen_hex_nonce() {
-        let a = ProjectsHandler::new().incarnation;
-        let b = ProjectsHandler::new().incarnation;
+        let a = crate::incarnation::new_incarnation().unwrap();
+        let b = crate::incarnation::new_incarnation().unwrap();
         for value in [&a, &b] {
             assert_eq!(value.len(), 16);
             assert!(value

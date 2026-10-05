@@ -50,7 +50,9 @@ const MODULE_ID: &str = "entorhinal";
 const DEFAULT_STORAGE_NAMESPACE: &str = "default";
 
 mod agent_ops;
+mod agent_reads;
 mod cli;
+mod incarnation;
 
 // PARSE ARGV BEFORE ACTING ON IT.
 //
@@ -121,7 +123,7 @@ fn main() -> std::process::ExitCode {
 
 #[tokio::main]
 async fn serve_module() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    subc_client_rs::serve(manifest(), ProjectsHandler::new()).await?;
+    subc_client_rs::serve(manifest(), ProjectsHandler::new()?).await?;
     Ok(())
 }
 
@@ -202,6 +204,9 @@ struct ProjectsHandler {
     /// Volatile reply token: never persisted in the request-key cache.
     incarnation: String,
     clock: fn() -> i64,
+    commits: tokio::sync::Notify,
+    feed_waits: tokio::sync::Semaphore,
+    feed_clock: Arc<dyn agent_reads::FeedClock>,
 }
 
 /// The parts of a route's bind stamp that decide what the route may do here.
@@ -319,8 +324,11 @@ fn principal_label(principal: Option<&Principal>) -> String {
 }
 
 impl ProjectsHandler {
-    fn new() -> Self {
-        Self::with_runtime(agent_ops::new_incarnation(), unix_millis)
+    fn new() -> Result<Self, std::io::Error> {
+        let incarnation = incarnation::new_incarnation().map_err(|error| {
+            std::io::Error::other(format!("cannot mint process incarnation: {error}"))
+        })?;
+        Ok(Self::with_runtime(incarnation, unix_millis))
     }
 
     fn with_runtime(incarnation: String, clock: fn() -> i64) -> Self {
@@ -331,6 +339,9 @@ impl ProjectsHandler {
             route_admissions: Mutex::new(HashMap::new()),
             incarnation,
             clock,
+            commits: tokio::sync::Notify::new(),
+            feed_waits: tokio::sync::Semaphore::new(8),
+            feed_clock: Arc::new(agent_reads::TokioFeedClock),
         }
     }
 
@@ -417,7 +428,8 @@ impl ProjectsHandler {
 #[async_trait]
 impl ModuleHandler for ProjectsHandler {
     async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
-        self.handle_request(&body, route_key(&ctx.route_handle()))
+        self.handle_request_wait(&body, route_key(&ctx.route_handle()))
+            .await
     }
 
     async fn on_bind(&self, request: &RouteBindRequest) -> BindDecision {
@@ -559,7 +571,12 @@ impl ProjectsHandler {
     fn execute(&self, request: WireRequest, key: RouteKey) -> Result<Vec<u8>, HandlerError> {
         let admission = self.admit(&request.method, key)?;
         let principal = principal_label(admission.principal.as_ref());
-        match request.method.as_str() {
+        // Notify after the commit, not from a poll timer. Comparing the store's
+        // head also catches secondary bind_root commits and partial successes;
+        // cached retries and volatile liveness updates don't wake idle readers.
+        let mutating = MUTATING_METHODS.contains(&request.method.as_str());
+        let before = mutating.then(|| self.with_store(RegistryStore::generation).ok());
+        let result = match request.method.as_str() {
             "resolve" => self.resolve(request.params),
             "resolve_project_id" => self.resolve_project_id(request.params),
             "enumerate" => self.enumerate(request.params),
@@ -584,6 +601,9 @@ impl ProjectsHandler {
             method if agent_ops::MUTATING_METHODS.contains(&method) => {
                 self.agent_mutation(method, request.params, &principal)
             }
+            method if agent_reads::READ_METHODS.contains(&method) => {
+                self.agent_read(method, request.params)
+            }
             _ => Err(HandlerError {
                 code: "unknown_method".to_string(),
                 detail: None,
@@ -592,7 +612,11 @@ impl ProjectsHandler {
                     request.method
                 ),
             }),
+        };
+        if mutating && before.flatten() != self.with_store(RegistryStore::generation).ok() {
+            self.commits.notify_waiters();
         }
+        result
     }
 
     /// Ingest a `projects.session_liveness` batch (push-on-transition +
@@ -720,7 +744,7 @@ impl ProjectsHandler {
             store.resolve_with_binding(&params.canonical_root, params.execution_binding.as_ref())
         })?;
         self.record_query(reply.generation, &self.health.resolve_count);
-        encode_result(reply)
+        self.encode_read_result(reply)
     }
 
     fn resolve_project_id(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
@@ -728,7 +752,7 @@ impl ProjectsHandler {
             serde_json::from_value::<ResolveProjectIdParams>(params).map_err(invalid_params)?;
         let reply = self.with_store(|store| store.resolve_project_id(&params.project_id))?;
         self.record_query(reply.generation, &self.health.resolve_count);
-        encode_result(reply)
+        self.encode_read_result(reply)
     }
 
     fn enumerate(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
@@ -736,7 +760,7 @@ impl ProjectsHandler {
         let mut reply = self.with_store(|store| store.enumerate(params.workspace_id.as_deref()))?;
         self.annotate_liveness(&mut reply);
         self.record_query(reply.generation, &self.health.enumerate_count);
-        encode_result(reply)
+        self.encode_read_result(reply)
     }
 
     /// Join the volatile liveness map onto enumerate results: a project's
@@ -774,7 +798,7 @@ impl ProjectsHandler {
             store.journal_tail(params.after_seq, params.limit.unwrap_or(100))
         })?;
         self.record_query(reply.generation, &self.health.journal_tail_count);
-        encode_result(reply)
+        self.encode_read_result(reply)
     }
 
     fn register(&self, params: Value, principal: &str) -> Result<Vec<u8>, HandlerError> {
@@ -890,7 +914,7 @@ impl ProjectsHandler {
         let params = serde_json::from_value::<ResolveParams>(params).map_err(invalid_params)?;
         let reply = self.with_store(|store| store.trust(&params.canonical_root))?;
         self.record_query(reply.generation, &self.health.resolve_count);
-        encode_result(reply)
+        self.encode_read_result(reply)
     }
     fn seed_import(&self, params: Value, principal: &str) -> Result<Vec<u8>, HandlerError> {
         let req = serde_json::from_value::<SeedImportRequest>(params).map_err(invalid_params)?;
@@ -922,7 +946,7 @@ impl ProjectsHandler {
     }
     fn verify(&self) -> Result<Vec<u8>, HandlerError> {
         let reply = self.with_store(|s| s.verify())?;
-        encode_result(reply)
+        self.encode_read_result(reply)
     }
     fn rebuild(&self) -> Result<Vec<u8>, HandlerError> {
         let generation = self.with_store(|s| s.rebuild())?;
@@ -1144,19 +1168,18 @@ fn manifest() -> ModuleManifest {
                     ManagementOperationKind::Mutate,
                     "Ingest session liveness snapshots and deltas from the executive for dead-folder detection.",
                 ),
-            ],
+            ].into_iter().chain(agent_reads::READ_METHODS.iter().map(|method| {
+                management_operation(method, ManagementOperationKind::Query, "Read authoritative agent identity.")
+            })).chain(agent_ops::MUTATING_METHODS.iter().map(|method| {
+                management_operation(method, ManagementOperationKind::Mutate, "Change agent identity through the executive's operator relay.")
+            })).collect(),
             config_schema: json!({"type": "object"}),
             observability: Vec::new(),
             identity_scope: Vec::new(),
-            // Registry ops are short SQLite reads/writes serialized behind the
-            // module's own store lock; ModuleManaged matches the pre-field
-            // default the daemon applied while `concurrency` was implicit.
+            // Registry ops use short SQLite locks. Change-feed waits suspend
+            // their task outside that lock and are capped by the module.
             concurrency: Concurrency::ModuleManaged,
         }])
-    // Capability grammar declarations wait for the fleet owner round: the
-    // cuts draft records entorhinal -> project-registry/v1, but a provides
-    // claim belongs with the reviewed registry entry and corpus, not ahead
-    // of them. None = grammar inactive for this module, deliberately.
     // entorhinal declares no self-signals yet: its ops are operator-driven
     // registry reads/writes, not autonomous signals.
     .self_signals(None)
@@ -1167,14 +1190,13 @@ fn manifest() -> ModuleManifest {
     // setting that variable only once every module reports the pipe, so a
     // module that declares no provenance holds that step up.
     .provenance(declared_provenance())
-    // The capability other modules declare `required` when they cannot work
-    // without project identity. The daemon holds a module not-ready while a
+    // The capabilities other modules declare `required` when they cannot work
+    // without project or agent identity. The daemon holds a module not-ready while a
     // capability it requires has no registered provider, so this name is what
-    // makes that dependency enforceable. It covers the whole surface above
-    // (resolve, resolve_project_id, enumerate, register and the workspace
-    // operations); a breaking change to that surface moves it to v2.
+    // makes that dependency enforceable. Breaking changes to either identity
+    // surface require a new capability version.
     .capabilities(Some(CapabilityDeclarations {
-        provides: vec![PROJECT_IDENTITY_CAPABILITY.to_owned()],
+        provides: vec![PROJECT_IDENTITY_CAPABILITY.to_owned(), "agent-identity/v1".to_owned()],
         requires: Vec::new(),
         must_never_reach: Vec::new(),
     }))
@@ -1456,7 +1478,7 @@ mod tests {
     /// actually applied to a bound route, not only that the check exists.
     #[test]
     fn the_handler_refuses_a_write_on_a_bound_flow_route() {
-        let handler = ProjectsHandler::new();
+        let handler = ProjectsHandler::new().unwrap();
         let flow_route: RouteKey = (7, 1);
         let head_route: RouteKey = (8, 1);
         handler.route_admissions().insert(
@@ -1581,7 +1603,7 @@ mod tests {
         ] {
             let (dir, descriptor) = scratch_descriptor(expected);
             let dir = std::fs::canonicalize(dir).unwrap();
-            let handler = ProjectsHandler::new();
+            let handler = ProjectsHandler::new().unwrap();
             let mut store = RegistryStore::open(&descriptor).unwrap();
             store.set_root_records(true);
             *handler.store.lock().unwrap() = Some(store);
@@ -1751,7 +1773,7 @@ mod tests {
     #[test]
     fn startup_binding_uses_entorhinal_and_later_request_binding_uses_direct() {
         let (dir, descriptor) = scratch_descriptor("startup-principal");
-        let handler = ProjectsHandler::new();
+        let handler = ProjectsHandler::new().unwrap();
         let store = RegistryStore::open(&descriptor).unwrap();
         let root = journal_repo(&dir, "before-restart");
         store
@@ -1814,7 +1836,7 @@ mod tests {
         );
         assert_eq!(principal_label(Some(&Principal::Unverified)), "unverified");
         let (dir, descriptor) = scratch_descriptor("refused-principal");
-        let handler = ProjectsHandler::new();
+        let handler = ProjectsHandler::new().unwrap();
         *handler.store.lock().unwrap() = Some(RegistryStore::open(&descriptor).unwrap());
         for (index, principal) in [
             None,
@@ -1864,7 +1886,7 @@ mod tests {
     async fn open_retries_while_a_predecessor_still_holds_the_lease() {
         let (dir, descriptor) = scratch_descriptor("lease-held-then-released");
         let predecessor = RegistryStore::open(&descriptor).expect("predecessor opens");
-        let handler = ProjectsHandler::new();
+        let handler = ProjectsHandler::new().unwrap();
 
         handler.on_hello_ack(&hello_ack(&descriptor)).await;
         let during = handler.health().await;
@@ -1902,7 +1924,7 @@ mod tests {
     async fn open_gives_up_on_a_lease_held_past_the_budget() {
         let (dir, descriptor) = scratch_descriptor("lease-held-past-budget");
         let _other_writer = RegistryStore::open(&descriptor).expect("other writer opens");
-        let handler = ProjectsHandler::new();
+        let handler = ProjectsHandler::new().unwrap();
 
         let started = Instant::now();
         handler.on_hello_ack(&hello_ack(&descriptor)).await;
@@ -1928,7 +1950,7 @@ mod tests {
         descriptor.backend = StorageBackend::Sqlite {
             path: blocker.join("store.db").to_string_lossy().into_owned(),
         };
-        let handler = ProjectsHandler::new();
+        let handler = ProjectsHandler::new().unwrap();
 
         let started = Instant::now();
         handler.on_hello_ack(&hello_ack(&descriptor)).await;
@@ -1944,7 +1966,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_liveness_gap_detection_and_snapshot_rebase() {
-        let handler = ProjectsHandler::new();
+        let handler = ProjectsHandler::new().unwrap();
         let call = |h: &ProjectsHandler, v: serde_json::Value| h.session_liveness(v);
         // Snapshot establishes the baseline at seq 10.
         let r = call(
@@ -2022,7 +2044,7 @@ mod tests {
     /// producer's serialized output, not against JSON written here.
     #[test]
     fn a_batch_that_does_not_say_it_is_a_snapshot_cannot_clear_staleness() {
-        let handler = ProjectsHandler::new();
+        let handler = ProjectsHandler::new().unwrap();
         let call = |v: serde_json::Value| handler.session_liveness(v);
         let requested = |bytes: &[u8]| -> bool {
             serde_json::from_slice::<Value>(bytes).unwrap()["result"]["snapshotRequested"]
@@ -2058,7 +2080,7 @@ mod tests {
     /// did not change missing until it changes again.
     #[test]
     fn a_fresh_receiver_asks_for_a_snapshot_until_one_arrives() {
-        let handler = ProjectsHandler::new();
+        let handler = ProjectsHandler::new().unwrap();
         let call = |v: serde_json::Value| handler.session_liveness(v);
         let requested = |bytes: &[u8]| -> bool {
             serde_json::from_slice::<Value>(bytes).unwrap()["result"]["snapshotRequested"]
@@ -2104,7 +2126,7 @@ mod tests {
     /// invariant, not a workaround for one producer's scheduling.
     #[test]
     fn an_older_batch_cannot_resurrect_a_session_that_is_already_gone() {
-        let handler = ProjectsHandler::new();
+        let handler = ProjectsHandler::new().unwrap();
         let call = |v: serde_json::Value| handler.session_liveness(v);
         let tracked = |bytes: &[u8]| -> u64 {
             serde_json::from_slice::<Value>(bytes).unwrap()["result"]["tracked"]
@@ -2177,7 +2199,7 @@ mod tests {
     /// disables recovery precisely where it is needed.
     #[test]
     fn a_snapshot_replaces_the_mirror_and_an_empty_one_still_counts() {
-        let handler = ProjectsHandler::new();
+        let handler = ProjectsHandler::new().unwrap();
         let call = |v: serde_json::Value| handler.session_liveness(v);
         let tracked = |bytes: &[u8]| -> u64 {
             serde_json::from_slice::<Value>(bytes).unwrap()["result"]["tracked"]
@@ -2212,7 +2234,7 @@ mod tests {
 
     #[test]
     fn enumerate_annotation_joins_liveness_by_root_containment() {
-        let handler = ProjectsHandler::new();
+        let handler = ProjectsHandler::new().unwrap();
         handler
             .session_liveness(json!({"seq": 1, "snapshot": true, "sessions": [
                 {"sessionId": "s1", "canonicalRoot": "/w/proj/sub", "state": "active", "lastActivityMs": 500},
@@ -2273,7 +2295,7 @@ mod tests {
         // Consumers declare this `required`, so its spelling is a contract.
         assert_eq!(
             value["capabilities"]["provides"],
-            serde_json::json!(["project-identity/v1"])
+            serde_json::json!(["project-identity/v1", "agent-identity/v1"])
         );
         assert!(subc_protocol::manifest::is_valid_capability_identifier(
             PROJECT_IDENTITY_CAPABILITY

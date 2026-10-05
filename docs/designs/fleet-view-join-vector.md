@@ -224,6 +224,15 @@ only agent identity edits. Every process restart creates a new incarnation and
 invalidates outstanding tokens, even if the journal head is unchanged or an
 older backup was restored.
 
+The incarnation is 16 lowercase hex characters minted from eight OS-random
+bytes at process start and never persisted. The token encodes that incarnation
+and the journal head as an opaque string; clients return it verbatim, without
+parsing it. In particular, create, rename, tag, labels, avatar re-roll, GitHub
+identity change, dispose, merge, project rename, a workspace assignment (even
+when all that project's agents are terminal), and an unrelated root approval
+all invalidate it. A restart invalidates both fleet tokens and change-feed
+cursors, even when no journal append occurred.
+
 This is a condition of the design rather than an optimisation. Identity barely
 changes, so with the token a client polls only core's half at its usual cadence
 and asks entorhinal rarely, which makes the split **cheaper** than today's

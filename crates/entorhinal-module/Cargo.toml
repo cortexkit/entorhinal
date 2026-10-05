@@ -23,6 +23,7 @@ async-trait = { workspace = true }
 subc-client-rs = { workspace = true }
 subc-protocol = { workspace = true }
 tokio = { workspace = true }
+getrandom = { workspace = true }
 
 [dev-dependencies]
 # The e2e test spawns the daemon and the module as child processes, which

@@ -22,9 +22,11 @@ fn manifest_flag_prints_the_manifest_with_the_provided_capability() {
     let manifest: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("--manifest prints JSON");
     assert_eq!(manifest["module_id"], "entorhinal");
+    // Pin the exact list: a capability appearing or disappearing changes what
+    // the daemon tells consumers this module serves.
     assert_eq!(
         manifest["capabilities"]["provides"],
-        serde_json::json!(["project-identity/v1"])
+        serde_json::json!(["project-identity/v1", "agent-identity/v1"])
     );
 }
 
