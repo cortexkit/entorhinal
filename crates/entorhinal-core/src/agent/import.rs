@@ -246,8 +246,10 @@ impl Snapshot {
 }
 
 impl RegistryStore {
-    /// Import after route admission; use `with_principal` on the serving path to
-    /// retain the attested writer independently of the caller-supplied actor.
+    /// Callers must have admitted the route first: this does no permission check
+    /// of its own. The serving path calls it through `with_principal`, so the
+    /// journal records the caller the daemon verified, not the `actor` the caller
+    /// wrote into the request. Called directly, the writer is recorded as `entorhinal`.
     pub fn agent_import(&self, params: Value, now: i64) -> Result<Vec<u8>, AgentMutationError> {
         self.with_principal("entorhinal").agent_import(params, now)
     }

@@ -12,8 +12,10 @@ use entorhinal_core::{
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
-// These are unchanged source files, not a reconstruction of core's schema.
-// Each citation names the original path so the copies can be independently checked.
+// Core's agent-table migrations, copied byte for byte, so the import is tested
+// against the schema a real core store has rather than a hand-written imitation
+// of it. Each citation below names the original file so a copy can be checked
+// against its source.
 const MIGRATIONS: &[&str] = &[
     // Source: prefrontal 873870be8 crates/prefrontal-core-store/migrations/076_agent_registry.sql.
     include_str!("fixtures/core-agent-migrations/076_agent_registry.sql"),
@@ -490,8 +492,9 @@ fn carried_fields_and_allowed_legacy_shapes_survive_import_and_rebuild() {
         UPDATE agent SET persona_ref='persona',wake_policy_json='{"schedule":true}',wake_policy_version=9,residence_machine_id='machine',residence_harness='broca',residence_address_json='{}',residence_epoch=8,residence_state='live',sleep=1 WHERE agent_id='agent_16013c86';
         UPDATE agent SET name_version=7,tag='carried tag',labels_json='["Red","Blue"]',generation=1000000 WHERE agent_id='agent_0000000000000004';
         CREATE VIEW hire_identity_mapping AS SELECT * FROM deliberately_absent_table;"#).unwrap();
-    // A broken mapping view makes an accidental read fail even though core's
-    // real hire mapping has no supervisor information worth importing.
+    // The import must read only `agent` and `agent_name_claim`. Core's
+    // `hire_identity_mapping` records no supervising head, so it has nothing to
+    // import; replacing it with a broken view makes any accidental read fail.
     // Source: prefrontal 873870be8 crates/prefrontal-core-store/migrations/079_hire_identity_mapping.sql:4-9.
     let github = json!({"kind":"app","app_id":42,"app_slug":"fixture-app","installation_id":84,"credential_ref":"cred:fixture","client_id":"client","coauthor_line":"Fixture <fixture@example.test>"});
     f.source.execute("UPDATE agent SET avatar_genome=?1,avatar_type='creature.classic',avatar_version=NULL,github_identity_json=?2 WHERE agent_id=?3", params!["a".repeat(2048),github.to_string(),D]).unwrap();
@@ -535,7 +538,8 @@ fn carried_fields_and_allowed_legacy_shapes_survive_import_and_rebuild() {
     expected[3]["avatar"] =
         json!({"genome":"a".repeat(2048),"type":"creature.classic","version":null});
     expected[3]["github_identity"] = github;
-    // 112/126's source trigger bumps generation once for the avatar/GitHub edit.
+    // Core's generation trigger (as redefined by migrations 112 and 126) adds one
+    // to `generation` for the avatar and GitHub identity edit made above.
     let expected_claims = vec![
         expected_claim(1, A, "Alice", "assistant", "global", None),
         expected_claim(2, B, "Bob", "workspace", "W1", None),
@@ -546,7 +550,9 @@ fn carried_fields_and_allowed_legacy_shapes_survive_import_and_rebuild() {
         expected_claim(7, E, "Eve", "assistant", "global", Some(606)),
         expected_claim(8, F, "Fred", "assistant", "global", Some(707)),
     ];
-    // Runtime-only edits and the avatar_version edit also advance core's trigger.
+    // Core's trigger also counts the runtime-only edits (persona, wake, residence) and the
+    // avatar_version edit, so the imported generations below include them: the
+    // import carries core's number as is, it doesn't recount identity changes.
     expected[0]["agent_generation"] = json!(2);
     expected[6]["agent_generation"] = json!(2);
     let source_bytes = fs::read(&f.source_path).unwrap();
@@ -629,8 +635,9 @@ fn carried_fields_and_allowed_legacy_shapes_survive_import_and_rebuild() {
             .collect();
         feed_claims.sort_by_key(|claim| claim["claim_id"].as_i64().unwrap());
         assert_eq!(feed_claims, expected_claims);
-        // Exercise the journal cursor boundary at one identity entry per page.
-        // The serving layer can skip the trailing non-identity marker separately.
+        // Page through the journal one agent entry at a time to check no entry is
+        // skipped or repeated at a page boundary. The cutover marker that ends the
+        // import is not an agent entry; the change feed's serving code skips it.
         let mut cursor = head;
         for expected_entry in entries {
             let payload: String = f.destination.query_row("SELECT payload_json FROM registry_journal WHERE op='agent.import' AND seq>?1 ORDER BY seq LIMIT 1", [cursor], |r| r.get(0)).unwrap();
