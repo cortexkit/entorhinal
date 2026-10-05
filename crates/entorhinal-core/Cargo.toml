@@ -14,6 +14,8 @@ cortexkit-lease = { workspace = true }
 cortexkit-store = { workspace = true }
 cortexkit-store-types = { workspace = true }
 getrandom = { workspace = true }
+icu_casemap = "=1.5.0"
+icu_normalizer = "=1.5.0"
 rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

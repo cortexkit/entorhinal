@@ -18,6 +18,7 @@ use cortexkit_store::{open_sqlite, Migration, SqliteStore, StorageDescriptor, St
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Serialize;
 
+pub mod agent;
 mod binding;
 mod mutations;
 pub use binding::*;
@@ -102,7 +103,7 @@ CREATE TABLE project_alias (
 /// NULL means "no root" and a reader must not guess one.
 pub const V2_WORKSPACE_ROOT: &str = "ALTER TABLE workspace ADD COLUMN root TEXT NULL;";
 
-const MIGRATIONS: [Migration; 3] = [
+const MIGRATIONS: [Migration; 4] = [
     Migration {
         version: 1,
         statements: V1_SCHEMA,
@@ -114,6 +115,10 @@ const MIGRATIONS: [Migration; 3] = [
     Migration {
         version: 3,
         statements: binding::V3_ROOT_BINDINGS,
+    },
+    Migration {
+        version: 4,
+        statements: agent::schema::V4_AGENT_IDENTITY,
     },
 ];
 
@@ -137,11 +142,18 @@ impl fmt::Debug for RegistryStore {
 
 impl RegistryStore {
     /// Open the descriptor's sqlite database, acquire its single-writer lease, and
-    /// apply the namespaced v1 schema exactly once.
+    /// apply the namespaced schema chain exactly once.
     pub fn open(descriptor: &StorageDescriptor) -> Result<Self, RegistryError> {
+        Self::open_with_migrations(descriptor, &MIGRATIONS)
+    }
+
+    fn open_with_migrations(
+        descriptor: &StorageDescriptor,
+        migrations: &[Migration],
+    ) -> Result<Self, RegistryError> {
         let db = open_sqlite(descriptor).map_err(RegistryError::Store)?;
         let outcome = db
-            .migrate(MIGRATION_NAMESPACE, &MIGRATIONS)
+            .migrate(MIGRATION_NAMESPACE, migrations)
             .map_err(RegistryError::Store)?;
         // A store written by a newer binary may hold tables and columns this
         // one cannot query; serving it would answer nothing while looking up.
