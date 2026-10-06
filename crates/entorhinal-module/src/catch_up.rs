@@ -413,8 +413,10 @@ mod tests {
         value["parts"] = count.into();
         value
     }
-    // Inspect transaction-owned journal fields without adding a test row: the
-    // intentionally invalid SELECT rolls back the inspection's journal insert.
+    // Reads journal columns that are only reachable inside a write transaction.
+    // `apply_entry` inserts a throwaway journal row to open one; the closure
+    // collects the columns, then runs a deliberately invalid SELECT so the
+    // transaction fails and rolls that row back. The store is left unchanged.
     fn audit(store: &RegistryStore) -> Vec<(String, String, i64, String, String)> {
         let rows = Mutex::new(None);
         let result = store.apply_entry("inspection", "{}", "test", None, |tx| {
@@ -848,11 +850,14 @@ mod tests {
                 if landed {
                     assert_eq!(f.tap.fake.release_next().unwrap(), 1);
                 } else {
-                    // The held request remains alive; another independent device
-                    // takes N+1. Bypass only queued resend faults, not log CAS.
+                    // The original append is still held open. Another device
+                    // now appends at position 1, the one the original expected
+                    // to take. This goes straight to the fake log, skipping the
+                    // refusals scripted for this machine's resends, but still
+                    // through the log's check that the head is where expected.
                     let params = json!({"expected_head":0,"entry_id":log_client::encode_hex(&[0xfe;16]),"entry":{"kind":"change","data":log_client::encode_hex(&serde_json::to_vec(&project("other")).unwrap())}});
-                    // A direct successful resend after draining the scripted
-                    // refusals can occupy the slot while the original is held.
+                    // Poll until the fake accepts the other device's append, so
+                    // position 1 is taken before the held original is released.
                     for _ in 0..30 {
                         let future = f.tap.fake.call(log_client::APPEND, params.clone());
                         tokio::pin!(future);
