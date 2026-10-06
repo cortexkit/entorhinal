@@ -1,14 +1,24 @@
-//! Lazy, plaintext client for engram's signed identity log.
+//! Client for engram's identity log: a shared, append-only log that engram
+//! signs and encrypts, so entorhinal sends and receives plaintext. The route is
+//! opened on first use, never at startup.
 //!
-//! Wire pin: engram master 74d841d0779d8069bbc0eec9c54aa1bb4e29c981,
-//! `crates/engram-module/src/agent_sync.rs` and core agent-sync limits:
-//! internal service `agent-sync`, `identity_log.append` / `identity_log.read`,
-//! lowercase hex ids/data, `{result: ...}` replies, decoded-byte caps.
-//! Refusal/receipt clarification: engram 9c567a5. Cloud order is roster, receipt,
-//! then head CAS. The receipt digest covers id, signer, expected_head, kind and
-//! data, so a resend must preserve the original expected_head as well as bytes.
-//! A receipt returns an ordinary `{position}` even after the head has advanced.
-//! Error extras are read from SUBC's `detail`, never inferred from messages.
+//! The contract, as engram serves it (engram-module/src/agent_sync.rs at
+//! engram 9c567a5):
+//! - Service `agent-sync`, methods `identity_log.append` and
+//!   `identity_log.read`. Entry ids and data travel as lowercase hex, and
+//!   success replies are wrapped as `{result: ...}`.
+//! - Size limits count decoded bytes: an entry's data is at most 256 KiB, and a
+//!   read page at most 128 entries and 1 MiB.
+//! - Engram checks, in order, that this device is a member, then whether this
+//!   entry id was already appended, then that the log head still equals
+//!   `expected_head`. An already-appended entry answers a plain `{position}`,
+//!   its original position, even after the head has moved on.
+//! - Engram recognises a resend only if the entry id, signer, `expected_head`,
+//!   kind and data all match the first attempt, so a resend must carry the
+//!   original `expected_head`, not the current head; anything else is refused
+//!   `id_reused`.
+//! - A refusal's extra fields (the head, a position, a size cap) arrive in the
+//!   error body's `detail` field, never parsed out of the message.
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -102,7 +112,9 @@ pub(crate) enum LogError {
     Refused { code: String, detail: Option<Value> },
 }
 
-/// All upstream code interpretation lives here; extra fields come from detail.
+/// Maps an engram refusal code to a `LogError`, reading its extra fields (the
+/// current head, the failing position, the exceeded cap) from `detail`. Every
+/// refusal code entorhinal acts on is interpreted here and nowhere else.
 pub(crate) fn decode_refusal(code: &str, detail: Option<Value>) -> LogError {
     match code {
         HEAD_MOVED => LogError::HeadMoved {
@@ -263,7 +275,9 @@ impl LogClient {
                 entry,
             });
         }
-        // Density and head regression belong to catch-up's durable-state checks.
+        // Gaps between positions and a head lower than one already applied are
+        // not checked here: only catch-up knows the last applied position, and
+        // it refuses both against that recorded state.
         Ok(ReadReply {
             head: page.head,
             entries,
@@ -331,8 +345,9 @@ impl SubcConnector {
                 };
             }
         }
-        // The serving SDK rejects missing/invalid --subc before serving. This
-        // default also supports callers constructing a consumer outside serve.
+        // Without `--subc`, fall back to the client library's default daemon
+        // connection file. A supervised entorhinal always receives `--subc`;
+        // the subc client library refuses to serve without a valid one.
         Self::default()
     }
 }
@@ -371,8 +386,10 @@ impl LogTransport for SubcTransport {
     async fn call(&self, method: &str, params: Value) -> Result<Vec<u8>, TransportError> {
         let body = serde_json::to_vec(&json!({"method":method,"params":params}))
             .map_err(|_| TransportError::Unavailable)?;
-        // SUBC's default options present the supervised module's cached launch
-        // nonce, not Direct or a caller-supplied principal, with no scope stamp.
+        // Default call options identify this route with the launch secret the
+        // daemon gave entorhinal at start, so the daemon verifies the caller as
+        // `reserved:entorhinal`, the only principal engram lets append. They
+        // present no operator identity and no session or flow scope.
         self.consumer
             .call(
                 engram_target(),

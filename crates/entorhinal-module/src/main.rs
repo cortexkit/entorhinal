@@ -53,8 +53,10 @@ mod agent_ops;
 mod agent_reads;
 mod cli;
 mod incarnation;
-// The transport is installed now; shared-write and catch-up orchestration use
-// this API without making startup or local reads depend on engram.
+// The client for engram's identity log. Only writes to shared state and
+// catch-up call it, and it opens its route on first use, so startup and every
+// read work with engram absent. It has no callers until the shared write path
+// lands, hence the dead-code allowances.
 #[cfg(test)]
 #[allow(dead_code)]
 mod fake_log;
