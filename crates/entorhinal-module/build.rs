@@ -25,7 +25,14 @@ fn main() {
     }
     // A dirty tree runs code HEAD does not describe, so the tree state travels
     // with the revision and the provenance helper declines to attest it.
-    let Some(status) = git(&manifest_dir, &["status", "--porcelain"]) else {
+    // `--no-optional-locks` keeps this read from taking the index lock to
+    // refresh stat data: a build killed mid-script would otherwise leave a
+    // stale `index.lock` that blocks every later `git add` in the checkout. The
+    // answer is the same either way; only the cached stat data isn't saved.
+    let Some(status) = git(
+        &manifest_dir,
+        &["--no-optional-locks", "status", "--porcelain"],
+    ) else {
         return;
     };
     let tree = if status.is_empty() { "clean" } else { "dirty" };
