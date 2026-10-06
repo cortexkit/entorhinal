@@ -559,6 +559,188 @@ mod tests {
         assert_eq!(before, image(f));
     }
 
+    #[test]
+    fn received_changes_refuse_occupied_and_older_positions_without_writes() {
+        let f = Fixture::new("remote-old-position");
+        enable(&f);
+        f.store
+            .apply_remote_entry(&envelope(1, &empty_project(), false))
+            .unwrap();
+        f.store
+            .apply_remote_entry(&envelope(2, &empty_project(), false))
+            .unwrap();
+        let before = image(&f);
+        // A delayed or duplicated read must not rewind progress, even when its
+        // entry id is new locally and therefore cannot hit a uniqueness constraint.
+        for position in [2, 1, 0] {
+            let mut entry = envelope(position, &empty_project(), false);
+            entry.entry_id = format!("late-{position}");
+            let error = f.store.apply_remote_entry(&entry).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("entry is not the next log position"));
+            assert_eq!(image(&f), before);
+        }
+        f.store
+            .apply_remote_entry(&envelope(3, &empty_project(), false))
+            .unwrap();
+        assert_eq!(
+            f.store.identity_log_status().unwrap().last_applied_position,
+            3
+        );
+    }
+
+    #[test]
+    fn snapshot_installer_refuses_a_valid_but_incomplete_prefix_atomically() {
+        let f = Fixture::new("remote-snapshot-prefix");
+        enable(&f);
+        let entries = (1..=2)
+            .map(|part| {
+                envelope(
+                    part,
+                    &json!({
+                        "snapshot_id":"two-part-snapshot", "part":part, "parts":2,
+                        "op":"shared.snapshot", "tables":{}
+                    }),
+                    true,
+                )
+            })
+            .collect::<Vec<_>>();
+        let before = image(&f);
+        // Each part is individually valid. Completeness must be checked by the
+        // installer itself, not only by the network reader that normally calls it.
+        let error = f.store.apply_remote_snapshot(&entries[..1]).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("snapshot parts are not complete and ordered"));
+        assert_eq!(image(&f), before);
+        f.store.apply_remote_snapshot(&entries).unwrap();
+        assert_eq!(
+            f.store.identity_log_status().unwrap().last_applied_position,
+            2
+        );
+    }
+
+    #[test]
+    fn remote_settlement_keeps_attempts_for_current_and_future_heads() {
+        let f = Fixture::new("remote-pending-boundary");
+        enable(&f);
+        // These durable rows represent unresolved appends after a restart. A
+        // reported head alone does not say which entry occupies any attempt's slot.
+        f.store.apply_entry("test-pending", "{}", "test", None, |tx| {
+            tx.execute("INSERT INTO pending_entry(entry_id,expected_head) VALUES('slot-one',0),('slot-two',1),('slot-three',2)", [])?;
+            Ok(())
+        }).unwrap();
+        f.store.observe_log_head(10).unwrap();
+        assert_eq!(
+            f.store.identity_log_status().unwrap().pending_write_count,
+            3
+        );
+        f.store
+            .apply_remote_entry(&envelope(1, &empty_project(), false))
+            .unwrap();
+        assert!(!f.store.is_pending_entry("slot-one").unwrap());
+        assert!(f.store.is_pending_entry("slot-two").unwrap());
+        assert!(f.store.is_pending_entry("slot-three").unwrap());
+        assert_eq!(
+            f.store.identity_log_status().unwrap().pending_write_count,
+            2
+        );
+        f.store
+            .apply_remote_entry(&envelope(2, &empty_project(), false))
+            .unwrap();
+        assert!(!f.store.is_pending_entry("slot-two").unwrap());
+        assert!(f.store.is_pending_entry("slot-three").unwrap());
+        assert_eq!(
+            f.store.identity_log_status().unwrap().pending_write_count,
+            1
+        );
+    }
+
+    #[test]
+    fn own_agent_receipt_advances_without_replaying_or_appending_to_the_feed() {
+        let f = Fixture::new("remote-own-agent");
+        enable(&f);
+        f.store
+            .apply_entry("agent.cutover", "{}", "test", None, |_| Ok(()))
+            .unwrap();
+        let params = json!({
+            "request_key":"own-create", "name":"Own Agent", "tag":"tag", "role":"assistant"
+        });
+        f.store
+            .shared_attempt(
+                "own-agent-entry".into(),
+                0,
+                |_| crate::pending::SharedSettlement::Commit(1),
+                || f.store.agent_mutation("agent.create", params, 50),
+            )
+            .unwrap();
+        let (seq, bytes) = f.store.read(|conn| conn.query_row(
+            "SELECT seq,entry FROM registry_journal WHERE entry_id='own-agent-entry' AND origin='here'", [],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+        )).unwrap();
+        // Simulate reading the durable receipt again. Agent replay can look
+        // idempotent in the projection while silently duplicating the identity feed.
+        f.store
+            .apply_entry("test-rewind", "{}", "test", None, |tx| {
+                tx.execute("UPDATE identity_log_state SET last_applied_position=0", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let before = f.store.agent_snapshot().unwrap();
+        let generation = f.store.generation().unwrap();
+        let mut entry = envelope(1, &empty_project(), false);
+        entry.entry_id = "own-agent-entry".into();
+        entry.entry = bytes;
+        assert_eq!(f.store.apply_remote_entry(&entry).unwrap(), seq);
+        assert_eq!(f.store.generation().unwrap(), generation);
+        assert_eq!(
+            serde_json::to_value(f.store.agent_snapshot().unwrap()).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+        assert_eq!(
+            f.store.identity_log_status().unwrap().last_applied_position,
+            1
+        );
+    }
+
+    #[test]
+    fn remote_delete_cannot_erase_a_machine_local_implicit_alias() {
+        let f = Fixture::new("remote-delete-implicit-alias");
+        let root = f.dir("checkout");
+        register(&f, "Local", vec![root.clone()], None);
+        enable(&f);
+        let source = Fixture::new("remote-delete-alias-source");
+        let start = state(&source);
+        register(&source, "Remote", vec![], None);
+        let mut change = delta(&source, start);
+        // Delete rows contain only primary keys. They must obey the same path
+        // isolation rule as upserts, or a peer can destroy local checkout aliases.
+        change.tables.insert(
+            "project_alias".into(),
+            TableChanges {
+                upsert: vec![],
+                delete: vec![
+                    serde_json::from_value(json!({"old_id": implicit_project_id(&root)})).unwrap(),
+                ],
+            },
+        );
+        let before = image(&f);
+        let error = f
+            .store
+            .apply_remote_entry(&envelope(1, &change, false))
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("implicit aliases are machine-local"));
+        assert_eq!(image(&f), before);
+        change.tables.remove("project_alias");
+        f.store
+            .apply_remote_entry(&envelope(1, &change, false))
+            .unwrap();
+        assert_eq!(f.store.enumerate(None).unwrap().projects.len(), 2);
+    }
+
     fn image(f: &Fixture) -> BTreeMap<String, Vec<Vec<rusqlite::types::Value>>> {
         f.store.read(|conn| {
             let names = conn.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name <> 'cortexkit_fence' ORDER BY name")?.query_map([],|r| r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;

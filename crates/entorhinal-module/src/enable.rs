@@ -1056,6 +1056,63 @@ mod tests {
         a.empty_import();
     }
 
+    #[derive(Clone)]
+    struct StaleBootstrapRead {
+        log: Arc<FakeLog>,
+        stale_once: Arc<AtomicBool>,
+    }
+    #[async_trait]
+    impl LogConnector for StaleBootstrapRead {
+        async fn connect(&self) -> Result<Arc<dyn LogTransport>, TransportError> {
+            Ok(Arc::new(self.clone()))
+        }
+    }
+    #[async_trait]
+    impl LogTransport for StaleBootstrapRead {
+        async fn call(&self, method: &str, params: Value) -> Result<Vec<u8>, TransportError> {
+            if method == log_client::READ && self.stale_once.swap(false, Ordering::SeqCst) {
+                return Ok(serde_json::to_vec(&json!({"result":{"head":0,"entries":[]}})).unwrap());
+            }
+            self.log.call(method, params).await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn own_bootstrap_found_after_head_moved_preserves_the_enable_plan() {
+        let log = Arc::new(FakeLog::default());
+        let mut f = Fixture::new("enable-own-race", log.clone());
+        let root = f.dir.join("local");
+        std::fs::create_dir_all(&root).unwrap();
+        f.project("Local", &root, "Local", None);
+        let journal = f.journal();
+        let shared = f.shared();
+        log.on_append(Action::DropReply);
+        assert_eq!(f.enable().await.unwrap_err(), "engram_unavailable");
+        let saved = f.rows("identity_log_state");
+        assert_eq!(log.head(), 1);
+        // A lagging read misses the landed append. A refused resend then forces
+        // a fresh position-one read: finding our own id is not proof we lost the
+        // slot, so the saved plan and the bootstrap import fence must survive.
+        log.on_append(Action::Refuse {
+            code: log_client::HEAD_MOVED.into(),
+            detail: Some(json!({"head":1})),
+        });
+        f.restart(Arc::new(StaleBootstrapRead {
+            log: log.clone(),
+            stale_once: Arc::new(AtomicBool::new(true)),
+        }));
+        assert_eq!(f.enable().await.unwrap_err(), "identity_log_invariant");
+        assert_eq!(f.store().identity_log_status().unwrap().state, "enabling");
+        assert_eq!(f.rows("identity_log_state"), saved);
+        assert_eq!(f.journal(), journal);
+        assert_eq!(f.shared(), shared);
+        assert_eq!(f.store().enable_parts().unwrap().len(), 1);
+        f.enable().await.unwrap();
+        assert_eq!(f.store().identity_log_status().unwrap().state, "enabled");
+        assert_eq!(log.head(), 1);
+        f.clean_rebuild();
+    }
+
     struct BootstrapOnly {
         log: Arc<FakeLog>,
         once: AtomicBool,
