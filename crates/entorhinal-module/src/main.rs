@@ -62,6 +62,7 @@ mod incarnation;
 mod fake_log;
 #[allow(dead_code)]
 mod log_client;
+mod shared_write;
 
 // PARSE ARGV BEFORE ACTING ON IT.
 //
@@ -170,6 +171,8 @@ struct HealthGauges {
     /// logged. Refusing quietly would let that regression hide behind a
     /// counter nobody reads.
     dropped_older_logged: AtomicBool,
+    log_state: AtomicU64,
+    log_own_entries_applied: AtomicU64,
 }
 
 /// Volatile liveness state fed by `projects.session_liveness` batches. Never
@@ -218,6 +221,8 @@ struct ProjectsHandler {
     feed_clock: Arc<dyn agent_reads::FeedClock>,
     #[allow(dead_code)]
     log_client: log_client::LogClient,
+    writer: tokio::sync::Mutex<()>,
+    agent_id_draw: fn() -> Result<String, HandlerError>,
 }
 
 /// The parts of a route's bind stamp that decide what the route may do here.
@@ -395,6 +400,8 @@ impl ProjectsHandler {
             feed_waits: tokio::sync::Semaphore::new(8),
             feed_clock: Arc::new(agent_reads::TokioFeedClock),
             log_client: log_client::LogClient::new(connector),
+            writer: tokio::sync::Mutex::new(()),
+            agent_id_draw: shared_write::draw_agent_id,
         }
     }
 
@@ -470,7 +477,7 @@ impl ProjectsHandler {
 #[async_trait]
 impl ModuleHandler for ProjectsHandler {
     async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
-        self.handle_request_wait(&body, route_key(&ctx.route_handle()))
+        self.handle_served_request(&body, route_key(&ctx.route_handle()))
             .await
     }
 
@@ -537,6 +544,8 @@ impl ModuleHandler for ProjectsHandler {
             HealthStatus::Degraded
         } else if failed || !ready {
             HealthStatus::Failing
+        } else if self.health.log_state.load(Ordering::Relaxed) != 0 {
+            HealthStatus::Degraded
         } else {
             HealthStatus::Ok
         };
@@ -559,6 +568,8 @@ impl ModuleHandler for ProjectsHandler {
                 "livenessGaps": self.health.liveness_gaps.load(Ordering::Relaxed),
                 "livenessDroppedOlder": self.health.liveness_dropped_older.load(Ordering::Relaxed),
                 "livenessSessions": self.health.liveness_sessions.load(Ordering::Relaxed),
+                "identityLogState": shared_write::health_state(self.health.log_state.load(Ordering::Relaxed)),
+                "logOwnEntriesAppliedFromLog": self.health.log_own_entries_applied.load(Ordering::Relaxed),
             })),
         }
     }
@@ -587,6 +598,23 @@ struct LivenessSession {
 }
 
 impl ProjectsHandler {
+    /// All transport mutations enter the asynchronous writer coordinator;
+    /// synchronous dispatch remains the local operation implementation.
+    async fn handle_served_request(&self, body: &[u8], key: RouteKey) -> HandlerOutcome {
+        let received = tokio::time::Instant::now();
+        let request = match serde_json::from_slice::<WireRequest>(body) {
+            Ok(request) => request,
+            Err(_) => return self.handle_request(body, key),
+        };
+        if !MUTATING_METHODS.contains(&request.method.as_str()) {
+            return self.handle_request_wait(body, key).await;
+        }
+        match self.write_wait(request, key, received).await {
+            Ok(body) => HandlerOutcome::Response(body),
+            Err(error) => error.into_outcome(),
+        }
+    }
+
     /// The same envelope/admission/response path serves SUBC and the route seam
     /// used by tests, without constructing a transport or inventing a principal.
     fn handle_request(&self, body: &[u8], key: RouteKey) -> HandlerOutcome {
@@ -1733,7 +1761,7 @@ mod tests {
         }
     }
 
-    fn scratch_descriptor(name: &str) -> (PathBuf, StorageDescriptor) {
+    pub(super) fn scratch_descriptor(name: &str) -> (PathBuf, StorageDescriptor) {
         let dir = std::env::temp_dir().join(format!(
             "entorhinal-{name}-{}-{}",
             std::process::id(),

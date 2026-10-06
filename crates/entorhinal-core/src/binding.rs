@@ -1244,7 +1244,16 @@ impl super::JournalWriter<'_> {
     /// another project, nests inside or around any registered root, sits in or
     /// around a worker container, or names a GitHub repository another project
     /// already owns. The new root is unbound and unapproved.
-    pub fn add_root(&self, mut request: AddRootRequest) -> Result<Vec<u8>, RegistryError> {
+    pub fn add_root(&self, request: AddRootRequest) -> Result<Vec<u8>, RegistryError> {
+        self.add_root_at(request, super::now_unix_millis())
+    }
+
+    /// Reuse the logical write's timestamp when a moved log head requires retry.
+    pub fn add_root_at(
+        &self,
+        mut request: AddRootRequest,
+        now: i64,
+    ) -> Result<Vec<u8>, RegistryError> {
         request.root = super::mutations::canonical(&request.root)?;
         let actor = request.actor.clone().unwrap_or_else(|| "module".into());
         self.mutation("add_root", None, move |tx| {
@@ -1294,7 +1303,6 @@ impl super::JournalWriter<'_> {
             }
             let payload = serde_json::to_value(&request)
                 .map_err(|error| domain("encode_failed", error.to_string()))?;
-            let now = super::now_unix_millis();
             let seq = super::mutations::append(
                 tx,
                 "add_root",

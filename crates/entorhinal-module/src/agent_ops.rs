@@ -46,9 +46,10 @@ impl ProjectsHandler {
                 .store
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let store = guard.as_ref().ok_or_else(|| {
+            let store = guard.as_ref().cloned().ok_or_else(|| {
                 HandlerError::new("storage_unavailable", "agent identity storage is not ready")
             })?;
+            drop(guard);
             let writer = store.with_principal(principal);
             let body = if method == "agent.import" {
                 writer.agent_import(params, (self.clock)())

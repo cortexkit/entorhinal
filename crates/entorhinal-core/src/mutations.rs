@@ -10,6 +10,10 @@ use serde_json::{json, Value};
 
 use super::{implicit_project_id, now_unix_millis, RegistryError, RegistryStore};
 
+#[path = "pending.rs"]
+pub(crate) mod pending;
+pub use pending::SharedSettlement;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct RegisterRequest {
@@ -303,7 +307,7 @@ pub(crate) fn append(
     Ok(tx.last_insert_rowid())
 }
 
-fn cached(tx: &Transaction<'_>, op: &str, key: Option<&str>) -> rusqlite::Result<Option<Vec<u8>>> {
+fn cached(tx: &Connection, op: &str, key: Option<&str>) -> rusqlite::Result<Option<Vec<u8>>> {
     // The op is part of the lookup: a request_key reused across DIFFERENT op
     // kinds must not serve the other op's cached reply as this op's result.
     key.and_then(|key| {
@@ -396,6 +400,7 @@ impl super::JournalWriter<'_> {
                 rusqlite::Error::QueryReturnedNoRows
             };
             if let Some(blob) = cached(tx, op, key)? {
+                pending::finish(tx, None).map_err(|e| fail(e.into()))?;
                 return Ok(blob);
             }
             // request_key is globally UNIQUE in the journal. A key that
@@ -477,6 +482,7 @@ impl super::JournalWriter<'_> {
                     ],
                 )?;
             }
+            pending::finish(tx, action.seq).map_err(|e| fail(e.into()))?;
             Ok(blob)
         });
         match out {
@@ -487,7 +493,16 @@ impl super::JournalWriter<'_> {
         }
     }
 
-    pub fn register(&self, mut req: RegisterRequest) -> Result<Vec<u8>, RegistryError> {
+    pub fn register(&self, req: RegisterRequest) -> Result<Vec<u8>, RegistryError> {
+        self.register_at(req, now_unix_millis())
+    }
+
+    /// The coordinator supplies a timestamp fixed across CAS retries.
+    pub fn register_at(
+        &self,
+        mut req: RegisterRequest,
+        now: i64,
+    ) -> Result<Vec<u8>, RegistryError> {
         if let Some(id) = req.project_id.as_ref() {
             if reserved(id) {
                 return Err(domain("reserved_project_id_namespace", id));
@@ -512,7 +527,6 @@ impl super::JournalWriter<'_> {
         let payload =
             serde_json::to_value(&req).map_err(|e| domain("encode_failed", e.to_string()))?;
         self.mutation("register", key.clone().as_deref(), move |tx| {
-            let now = now_unix_millis();
             let mut owners = BTreeSet::new();
             for root in &req.roots { if let Some(owner) = tx.query_row("SELECT project_id FROM project_root WHERE canonical_root=?1",[root],|r|r.get::<_,String>(0)).optional()? { owners.insert(owner); } }
             for parent in &req.derived_root_parents { if let Some(owner) = tx.query_row("SELECT project_id FROM derived_root_parent WHERE canonical_parent=?1",[parent],|r|r.get::<_,String>(0)).optional()? { owners.insert(owner); } }
@@ -573,6 +587,14 @@ impl super::JournalWriter<'_> {
     }
 
     pub fn assign_workspace(&self, req: AssignWorkspaceRequest) -> Result<Vec<u8>, RegistryError> {
+        self.assign_workspace_at(req, now_unix_millis())
+    }
+
+    pub fn assign_workspace_at(
+        &self,
+        req: AssignWorkspaceRequest,
+        now: i64,
+    ) -> Result<Vec<u8>, RegistryError> {
         let key = req.request_key.clone();
         let actor = req.actor.clone().unwrap_or_else(|| "module".into());
         let payload =
@@ -593,7 +615,6 @@ impl super::JournalWriter<'_> {
             "assign_workspace",
             key.clone().as_deref(),
             move |tx| {
-                let now = now_unix_millis();
                 if tx
                     .query_row(
                         "SELECT 1 FROM project WHERE project_id=?1",
@@ -740,9 +761,14 @@ impl super::JournalWriter<'_> {
         })
     }
 
-    pub fn upgrade_implicit(
+    pub fn upgrade_implicit(&self, req: UpgradeImplicitRequest) -> Result<Vec<u8>, RegistryError> {
+        self.upgrade_implicit_at(req, now_unix_millis())
+    }
+
+    pub fn upgrade_implicit_at(
         &self,
         mut req: UpgradeImplicitRequest,
+        now: i64,
     ) -> Result<Vec<u8>, RegistryError> {
         if let Some(id) = &req.project_id {
             if reserved(id) {
@@ -766,7 +792,6 @@ impl super::JournalWriter<'_> {
         let payload =
             serde_json::to_value(&req).map_err(|e| domain("encode_failed", e.to_string()))?;
         self.mutation("upgrade_implicit", key.clone().as_deref(), move |tx| {
-            let now = now_unix_millis();
             if let Some(target) = tx.query_row("SELECT project_id FROM project_alias WHERE old_id=?1", [&req.implicit_id], |r| r.get::<_, String>(0)).optional()? {
                 if target != id { return Err(domain("alias_conflict", target)); }
             }
@@ -817,12 +842,15 @@ impl super::JournalWriter<'_> {
     }
 
     pub fn remove(&self, req: RemoveRequest) -> Result<Vec<u8>, RegistryError> {
+        self.remove_at(req, now_unix_millis())
+    }
+
+    pub fn remove_at(&self, req: RemoveRequest, now: i64) -> Result<Vec<u8>, RegistryError> {
         let key = req.request_key.clone();
         let actor = req.actor.clone().unwrap_or_else(|| "module".into());
         let payload =
             serde_json::to_value(&req).map_err(|e| domain("encode_failed", e.to_string()))?;
         self.mutation("remove", key.clone().as_deref(), move |tx| {
-            let now = now_unix_millis();
             if let Some(w) = &req.workspace_id {
                 if tx.query_row("SELECT 1 FROM workspace WHERE workspace_id=?1", [w], |r| r.get::<_, i64>(0)).optional()?.is_none() {
                     return Err(domain("not_found", w));
@@ -912,7 +940,15 @@ struct SeedReportEntry {
 }
 
 impl super::JournalWriter<'_> {
-    pub fn seed_import(&self, mut req: SeedImportRequest) -> Result<Vec<u8>, RegistryError> {
+    pub fn seed_import(&self, req: SeedImportRequest) -> Result<Vec<u8>, RegistryError> {
+        self.seed_import_at(req, now_unix_millis())
+    }
+
+    pub fn seed_import_at(
+        &self,
+        mut req: SeedImportRequest,
+        now: i64,
+    ) -> Result<Vec<u8>, RegistryError> {
         if req.source != "mc" {
             return Err(domain("invalid_source", &req.source));
         }
@@ -976,7 +1012,7 @@ impl super::JournalWriter<'_> {
         let payload =
             serde_json::to_value(&req).map_err(|e| domain("encode_failed", e.to_string()))?;
         self.mutation("seed_import",key.clone().as_deref(),move|tx|{
-            let now=now_unix_millis(); let mut report=Vec::new(); let mut groups:BTreeMap<String,Vec<SeedPair>>=BTreeMap::new();
+            let mut report=Vec::new(); let mut groups:BTreeMap<String,Vec<SeedPair>>=BTreeMap::new();
             let mut mappings = Vec::new();
             for p in &missing {report.push(SeedReportEntry{kind:"skipped".into(),mc_identity:Some(p.mc_identity.clone()),canonical_root:Some(p.canonical_root.clone()),project_id:None,owner_project_id:None,new_project_id:None,roots:None,reason:Some("missing".into())});}
             for p in &home_scoped {report.push(SeedReportEntry{kind:"skipped".into(),mc_identity:Some(p.mc_identity.clone()),canonical_root:Some(p.canonical_root.clone()),project_id:None,owner_project_id:None,new_project_id:None,roots:None,reason:Some("home_scoped".into())});}

@@ -288,7 +288,15 @@ impl RegistryStore {
 }
 
 impl JournalWriter<'_> {
-    pub fn attach_root(&self, mut req: AttachRootRequest) -> Result<Vec<u8>, RegistryError> {
+    pub fn attach_root(&self, req: AttachRootRequest) -> Result<Vec<u8>, RegistryError> {
+        self.attach_root_at(req, crate::now_unix_millis())
+    }
+
+    pub fn attach_root_at(
+        &self,
+        mut req: AttachRootRequest,
+        now: i64,
+    ) -> Result<Vec<u8>, RegistryError> {
         // Refuse before path checks or filesystem writes, even for missing paths.
         if !self.read(crate::log_schema::log_enabled)? {
             return Err(domain(
@@ -321,7 +329,6 @@ impl JournalWriter<'_> {
             }
             let binding = crate::binding::fresh_binding(&req.path, &project, &self.ids)?;
             let payload = json!({"root":req.path,"projectId":project,"binding":binding});
-            let now = crate::now_unix_millis();
             let seq = append(
                 tx,
                 "attach_root",

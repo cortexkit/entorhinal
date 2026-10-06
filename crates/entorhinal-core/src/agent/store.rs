@@ -388,6 +388,7 @@ fn create(
     store: &RegistryStore,
     r: &Create,
     now: i64,
+    agent_id: Option<&str>,
 ) -> Result<(AgentRow, Vec<AgentNameClaim>), AgentMutationError> {
     let mut project_id = r
         .project_id
@@ -458,10 +459,20 @@ fn create(
     // The unique index on a project's live head is the last guard against
     // creating two heads. Its violation becomes `agent_project_taken`, naming
     // the existing head and its request key, which may be NULL for an imported head.
-    let agent_id = loop {
-        let id = format!("agent_{}", store.ids.hex(8)?);
-        if load_row(tx, &id)?.is_none() {
-            break id;
+    let agent_id = if let Some(id) = agent_id {
+        if load_row(tx, id)?.is_some() {
+            return Err(AgentMutationError::new(
+                "identity_log_invariant",
+                "pre-drawn agent id is occupied",
+            ));
+        }
+        id.to_string()
+    } else {
+        loop {
+            let id = format!("agent_{}", store.ids.hex(8)?);
+            if load_row(tx, &id)?.is_none() {
+                break id;
+            }
         }
     };
     let row = AgentRow {
@@ -526,11 +537,42 @@ impl RegistryStore {
 }
 
 impl JournalWriter<'_> {
+    /// Strict decoding and required-key checks precede the read-only cache
+    /// probe, just as they precede the in-transaction lookup below.
+    pub fn probe_agent_mutation(
+        &self,
+        op: &str,
+        params: Value,
+    ) -> Result<Option<Vec<u8>>, AgentMutationError> {
+        let request = Mutation::decode(op, params)?;
+        let key = request
+            .meta()
+            .0
+            .as_deref()
+            .filter(|key| !key.is_empty())
+            .ok_or_else(|| {
+                AgentMutationError::new("request_key_required", "request_key is required")
+            })?;
+        self.shared_request_cache(op, Some(key)).map_err(Into::into)
+    }
+
     pub fn agent_mutation(
         &self,
         op: &str,
         params: Value,
         now: i64,
+    ) -> Result<Vec<u8>, AgentMutationError> {
+        self.agent_mutation_with_id(op, params, now, None)
+    }
+
+    /// The shared coordinator draws a create id once, before its first attempt.
+    /// Local callers retain the original random draw inside the transaction.
+    pub fn agent_mutation_with_id(
+        &self,
+        op: &str,
+        params: Value,
+        now: i64,
+        agent_id: Option<&str>,
     ) -> Result<Vec<u8>, AgentMutationError> {
         let request = Mutation::decode(op, params)?;
         let (key, actor) = request.meta();
@@ -553,7 +595,7 @@ impl JournalWriter<'_> {
             }
             let (row, claims, value, old_name) = match &request {
                 Mutation::Create(r) => {
-                    let (row, claims) = create(tx, self, r, now)?;
+                    let (row, claims) = create(tx, self, r, now, agent_id)?;
                     let value = json!({"agent": row.digest()});
                     (row, claims, value, None)
                 }
