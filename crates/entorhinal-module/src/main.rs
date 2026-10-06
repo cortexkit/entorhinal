@@ -51,6 +51,7 @@ const DEFAULT_STORAGE_NAMESPACE: &str = "default";
 
 mod agent_ops;
 mod agent_reads;
+mod catch_up;
 mod cli;
 mod incarnation;
 // The client for engram's identity log. Only writes to shared state and
@@ -216,12 +217,13 @@ struct ProjectsHandler {
     /// Volatile reply token: never persisted in the request-key cache.
     incarnation: String,
     clock: fn() -> i64,
-    commits: tokio::sync::Notify,
+    commits: Arc<tokio::sync::Notify>,
     feed_waits: tokio::sync::Semaphore,
     feed_clock: Arc<dyn agent_reads::FeedClock>,
     #[allow(dead_code)]
     log_client: log_client::LogClient,
-    writer: tokio::sync::Mutex<()>,
+    writer: Arc<tokio::sync::Mutex<()>>,
+    catch_up_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     agent_id_draw: fn() -> Result<String, HandlerError>,
 }
 
@@ -396,11 +398,12 @@ impl ProjectsHandler {
             route_admissions: Mutex::new(HashMap::new()),
             incarnation,
             clock,
-            commits: tokio::sync::Notify::new(),
+            commits: Arc::new(tokio::sync::Notify::new()),
             feed_waits: tokio::sync::Semaphore::new(8),
             feed_clock: Arc::new(agent_reads::TokioFeedClock),
             log_client: log_client::LogClient::new(connector),
-            writer: tokio::sync::Mutex::new(()),
+            writer: Arc::new(tokio::sync::Mutex::new(())),
+            catch_up_task: Mutex::new(None),
             agent_id_draw: shared_write::draw_agent_id,
         }
     }
@@ -531,6 +534,7 @@ impl ModuleHandler for ProjectsHandler {
                 outcome.map_err(|error| format!("opening projects storage: {error}")),
             ),
         }
+        self.start_catch_up();
     }
 
     async fn health(&self) -> HealthReport {

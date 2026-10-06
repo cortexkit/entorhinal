@@ -6,6 +6,7 @@
 //! received entry was written by current code and must decode exactly.
 
 use rusqlite::{params, Transaction};
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::{
@@ -44,7 +45,148 @@ enum Decoded {
     Agent(Box<AgentChangeEntry>),
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotPart {
+    snapshot_id: String,
+    part: u64,
+    parts: u64,
+    op: String,
+    tables: std::collections::BTreeMap<String, crate::shared_entry::TableChanges>,
+    #[serde(default)]
+    agents: Vec<AgentChangeEntry>,
+}
+
+fn snapshot_part(entry: &RemoteEntry) -> Result<SnapshotPart, RegistryError> {
+    let part: SnapshotPart =
+        serde_json::from_slice(&entry.entry).map_err(|e| domain("apply_failed", e.to_string()))?;
+    if entry.kind != "snapshot"
+        || entry.envelope_version != ENVELOPE_VERSION
+        || part.op != "shared.snapshot"
+        || part.snapshot_id.is_empty()
+        || part.part == 0
+        || part.parts == 0
+        || part.part > part.parts
+    {
+        return Err(domain("apply_failed", "invalid snapshot part"));
+    }
+    Ok(part)
+}
+
+/// Inspect a part without installing it. The coordinator uses this to buffer
+/// incomplete snapshots; installation independently validates the whole group.
+pub fn snapshot_part_info(entry: &RemoteEntry) -> Result<(String, u64, u64), RegistryError> {
+    let part = snapshot_part(entry)?;
+    Ok((part.snapshot_id, part.part, part.parts))
+}
+
 impl RegistryStore {
+    /// Install all snapshot parts atomically, preserving each part's authorship
+    /// and original body for audit. The merged entry remains in replay's format.
+    pub fn apply_remote_snapshot(&self, entries: &[RemoteEntry]) -> Result<i64, RegistryError> {
+        let parts = entries
+            .iter()
+            .map(snapshot_part)
+            .collect::<Result<Vec<_>, _>>()?;
+        let first = parts
+            .first()
+            .ok_or_else(|| domain("apply_failed", "empty snapshot"))?;
+        if first.parts != parts.len() as u64
+            || parts.iter().enumerate().any(|(i, part)| {
+                part.snapshot_id != first.snapshot_id
+                    || part.parts != first.parts
+                    || part.part != i as u64 + 1
+            })
+        {
+            return Err(domain(
+                "apply_failed",
+                "snapshot parts are not complete and ordered",
+            ));
+        }
+        let mut merged = ProjectEntry {
+            op: "shared.snapshot".into(),
+            tables: Default::default(),
+            agents: vec![],
+        };
+        for part in parts {
+            for (table, changes) in part.tables {
+                if !changes.delete.is_empty() {
+                    return Err(domain("apply_failed", "snapshot cannot delete rows"));
+                }
+                merged
+                    .tables
+                    .entry(table)
+                    .or_default()
+                    .upsert
+                    .extend(changes.upsert);
+            }
+            merged.agents.extend(part.agents);
+        }
+        let empty = ProjectEntry {
+            op: "shared.snapshot".into(),
+            tables: Default::default(),
+            agents: vec![],
+        };
+        let error = std::cell::RefCell::new(None);
+        self.db
+            .with_conn_fenced(|tx| {
+                let install = || -> rusqlite::Result<i64> {
+                    let position: i64 = tx.query_row(
+                        "SELECT last_applied_position FROM identity_log_state WHERE id=1",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    if entries
+                        .iter()
+                        .enumerate()
+                        .any(|(i, entry)| entry.position != position + i as i64 + 1)
+                    {
+                        return Err(decode_error(serde_json::Error::io(std::io::Error::other(
+                            "snapshot positions are not contiguous",
+                        ))));
+                    }
+                    // Run the same image validation before inserting any journal row.
+                    merged.validate(tx)?;
+                    let mut seq = 0;
+                    for (i, entry) in entries.iter().enumerate() {
+                        let replay_entry = RemoteEntry {
+                            position: entry.position,
+                            entry_id: entry.entry_id.clone(),
+                            signer: entry.signer.clone(),
+                            key_id: entry.key_id.clone(),
+                            envelope_version: entry.envelope_version,
+                            kind: entry.kind.clone(),
+                            entry: canonical_bytes(if i == 0 { &merged } else { &empty }),
+                        };
+                        seq = apply(tx, &replay_entry)?;
+                        let payload: String = tx.query_row(
+                            "SELECT payload_json FROM registry_journal WHERE seq=?1",
+                            [seq],
+                            |r| r.get(0),
+                        )?;
+                        let mut payload: Value =
+                            serde_json::from_str(&payload).map_err(decode_error)?;
+                        // Keep the original multipart body alongside the merged bytes
+                        // used by replay; no transport dependency is needed to audit it.
+                        payload["snapshot_part"] =
+                            serde_json::from_slice(&entry.entry).map_err(decode_error)?;
+                        tx.execute(
+                            "UPDATE registry_journal SET payload_json=?1 WHERE seq=?2",
+                            params![String::from_utf8(canonical_bytes(&payload)).unwrap(), seq],
+                        )?;
+                    }
+                    Ok(seq)
+                };
+                install().inspect_err(|cause| *error.borrow_mut() = Some(cause.to_string()))
+            })
+            .map_err(|cause| {
+                domain(
+                    "apply_failed",
+                    error.into_inner().unwrap_or_else(|| cause.to_string()),
+                )
+            })
+    }
+
     /// Commit one complete change or assembled snapshot. A failure rolls back
     /// projection, journal and applied position together. Multipart buffering
     /// belongs to the coordinator, which must pass only a complete snapshot.
