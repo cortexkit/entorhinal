@@ -1,0 +1,762 @@
+//! Lazy, plaintext client for engram's signed identity log.
+//!
+//! Wire pin: engram master 74d841d0779d8069bbc0eec9c54aa1bb4e29c981,
+//! `crates/engram-module/src/agent_sync.rs` and core agent-sync limits:
+//! internal service `agent-sync`, `identity_log.append` / `identity_log.read`,
+//! lowercase hex ids/data, `{result: ...}` replies, decoded-byte caps.
+//! Refusal/receipt clarification: engram 9c567a5. Cloud order is roster, receipt,
+//! then head CAS. The receipt digest covers id, signer, expected_head, kind and
+//! data, so a resend must preserve the original expected_head as well as bytes.
+//! A receipt returns an ordinary `{position}` even after the head has advanced.
+//! Error extras are read from SUBC's `detail`, never inferred from messages.
+
+use std::{path::PathBuf, sync::Arc};
+
+use async_trait::async_trait;
+use serde::Deserialize;
+use serde_json::{json, Value};
+use subc_client_rs::{CallError, CallOptions, ConsumerOptions, SubcConsumer};
+use subc_protocol::{BindIdentity, RouteTarget};
+
+pub(crate) const APPEND: &str = "identity_log.append";
+pub(crate) const READ: &str = "identity_log.read";
+pub(crate) const HEAD_MOVED: &str = "head_moved";
+pub(crate) const NOT_MEMBER: &str = "not_member";
+pub(crate) const UNAVAILABLE: &str = "unavailable";
+pub(crate) const ID_REUSED: &str = "id_reused";
+pub(crate) const KEY_UNAVAILABLE: &str = "key_unavailable";
+pub(crate) const VERIFY_FAILED: &str = "verify_failed";
+pub(crate) const DECRYPT_FAILED: &str = "decrypt_failed";
+pub(crate) const TOO_LARGE: &str = "too_large";
+pub(crate) const ENTRY_DATA_CAP: usize = 256 * 1024;
+pub(crate) const PAGE_ENTRIES_CAP: usize = 128;
+pub(crate) const PAGE_DATA_CAP: usize = 1024 * 1024;
+
+pub(crate) type EntryId = [u8; 16];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EntryKind {
+    Change,
+    Snapshot,
+}
+
+impl EntryKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Change => "change",
+            Self::Snapshot => "snapshot",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AppendRequest {
+    pub expected_head: u64,
+    pub entry_id: EntryId,
+    pub kind: EntryKind,
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub(crate) struct AppendReply {
+    pub position: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub(crate) struct KeyId {
+    pub family: String,
+    pub epoch: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LogEntry {
+    pub position: u64,
+    pub entry_id: EntryId,
+    pub signer: [u8; 32],
+    pub key_id: KeyId,
+    pub envelope_version: u64,
+    // Preserve unknown kinds/versions so catch-up can stop at their position.
+    pub kind: String,
+    pub entry: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReadReply {
+    pub head: u64,
+    pub entries: Vec<LogEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum LogError {
+    // A missing head is still a refusal: catch up from the applied position.
+    HeadMoved { head: Option<u64> },
+    NotMember,
+    Unavailable,
+    IdReused,
+    KeyUnavailable,
+    VerifyFailed { position: Option<u64> },
+    DecryptFailed { position: Option<u64> },
+    TooLarge { field: String, cap: usize },
+    NoReply,
+    Protocol(String),
+    Refused { code: String, detail: Option<Value> },
+}
+
+/// All upstream code interpretation lives here; extra fields come from detail.
+pub(crate) fn decode_refusal(code: &str, detail: Option<Value>) -> LogError {
+    match code {
+        HEAD_MOVED => LogError::HeadMoved {
+            head: detail.as_ref().and_then(|v| v["head"].as_u64()),
+        },
+        NOT_MEMBER => LogError::NotMember,
+        UNAVAILABLE => LogError::Unavailable,
+        ID_REUSED => LogError::IdReused,
+        KEY_UNAVAILABLE => LogError::KeyUnavailable,
+        VERIFY_FAILED => LogError::VerifyFailed {
+            position: detail.as_ref().and_then(|v| v["position"].as_u64()),
+        },
+        DECRYPT_FAILED => LogError::DecryptFailed {
+            position: detail.as_ref().and_then(|v| v["position"].as_u64()),
+        },
+        TOO_LARGE => match detail
+            .as_ref()
+            .and_then(|v| Some((v["field"].as_str()?, v["cap"].as_u64()?)))
+        {
+            Some((field, cap)) if usize::try_from(cap).is_ok() => LogError::TooLarge {
+                field: field.into(),
+                cap: cap as usize,
+            },
+            _ => LogError::Refused {
+                code: code.into(),
+                detail,
+            },
+        },
+        _ => LogError::Refused {
+            code: code.into(),
+            detail,
+        },
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum TransportError {
+    Refusal { code: String, detail: Option<Value> },
+    Unavailable,
+    NoReply,
+}
+
+impl From<TransportError> for LogError {
+    fn from(error: TransportError) -> Self {
+        match error {
+            TransportError::Refusal { code, detail } => decode_refusal(&code, detail),
+            TransportError::Unavailable => Self::Unavailable,
+            TransportError::NoReply => Self::NoReply,
+        }
+    }
+}
+
+#[async_trait]
+pub(crate) trait LogTransport: Send + Sync {
+    async fn call(&self, method: &str, params: Value) -> Result<Vec<u8>, TransportError>;
+}
+
+#[async_trait]
+pub(crate) trait LogConnector: Send + Sync {
+    async fn connect(&self) -> Result<Arc<dyn LogTransport>, TransportError>;
+}
+
+#[derive(Clone)]
+pub(crate) struct LogClient {
+    connector: Arc<dyn LogConnector>,
+}
+
+impl LogClient {
+    /// Construction does no I/O. Only append and log-read can open a route.
+    pub(crate) fn new(connector: Arc<dyn LogConnector>) -> Self {
+        Self { connector }
+    }
+
+    async fn call(&self, method: &str, params: Value) -> Result<Value, LogError> {
+        let transport = self.connector.connect().await?;
+        let bytes = transport.call(method, params).await?;
+        let envelope: Value = serde_json::from_slice(&bytes).map_err(protocol)?;
+        envelope
+            .get("result")
+            .cloned()
+            .ok_or_else(|| LogError::Protocol("engram response has no result envelope".into()))
+    }
+
+    pub(crate) async fn append(&self, request: &AppendRequest) -> Result<AppendReply, LogError> {
+        if request.data.len() > ENTRY_DATA_CAP {
+            return Err(LogError::TooLarge {
+                field: "entry.data".into(),
+                cap: ENTRY_DATA_CAP,
+            });
+        }
+        let reply = self
+            .call(
+                APPEND,
+                json!({
+                    "expected_head": request.expected_head,
+                    "entry_id": encode_hex(&request.entry_id),
+                    "entry": {"kind":request.kind.as_str(), "data":encode_hex(&request.data)},
+                }),
+            )
+            .await?;
+        let reply: AppendReply = serde_json::from_value(reply).map_err(protocol)?;
+        if reply.position == 0 {
+            return Err(LogError::Protocol(
+                "append position must be positive".into(),
+            ));
+        }
+        // A receipt may name an earlier position; never check expected_head here.
+        Ok(reply)
+    }
+
+    pub(crate) async fn read(&self, after: u64, limit: usize) -> Result<ReadReply, LogError> {
+        let limit = limit.clamp(1, PAGE_ENTRIES_CAP);
+        let reply = self
+            .call(READ, json!({"after":after, "limit":limit}))
+            .await?;
+        #[derive(Deserialize)]
+        struct Page {
+            head: u64,
+            entries: Vec<Row>,
+        }
+        #[derive(Deserialize)]
+        struct Row {
+            position: u64,
+            entry_id: String,
+            signer: String,
+            key_id: KeyId,
+            envelope_version: u64,
+            kind: String,
+            entry: String,
+        }
+        let page: Page = serde_json::from_value(reply).map_err(protocol)?;
+        if page.entries.len() > limit {
+            return Err(LogError::Protocol(
+                "engram page exceeds requested limit".into(),
+            ));
+        }
+        let mut size = 0;
+        let mut entries = Vec::with_capacity(page.entries.len());
+        for row in page.entries {
+            let entry = decode_hex(&row.entry)?;
+            size += entry.len();
+            if entry.len() > ENTRY_DATA_CAP || size > PAGE_DATA_CAP {
+                return Err(LogError::Protocol(
+                    "engram page exceeds decoded-byte cap".into(),
+                ));
+            }
+            entries.push(LogEntry {
+                position: row.position,
+                entry_id: decode_hex(&row.entry_id)?
+                    .try_into()
+                    .map_err(|_| protocol("entry_id must be 16 bytes"))?,
+                signer: decode_hex(&row.signer)?
+                    .try_into()
+                    .map_err(|_| protocol("signer must be 32 bytes"))?,
+                key_id: row.key_id,
+                envelope_version: row.envelope_version,
+                kind: row.kind,
+                entry,
+            });
+        }
+        // Density and head regression belong to catch-up's durable-state checks.
+        Ok(ReadReply {
+            head: page.head,
+            entries,
+        })
+    }
+}
+
+fn protocol(error: impl std::fmt::Display) -> LogError {
+    LogError::Protocol(error.to_string())
+}
+
+pub(crate) fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        text.push(HEX[(byte >> 4) as usize] as char);
+        text.push(HEX[(byte & 15) as usize] as char);
+    }
+    text
+}
+
+pub(crate) fn decode_hex(text: &str) -> Result<Vec<u8>, LogError> {
+    fn nibble(byte: u8) -> Result<u8, LogError> {
+        match byte {
+            b'0'..=b'9' => Ok(byte - b'0'),
+            b'a'..=b'f' => Ok(byte - b'a' + 10),
+            _ => Err(protocol("expected lowercase hex")),
+        }
+    }
+    if !text.len().is_multiple_of(2) {
+        return Err(protocol("hex has odd length"));
+    }
+    text.as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| Ok(nibble(pair[0])? * 16 + nibble(pair[1])?))
+        .collect()
+}
+
+/// SUBC caches the consumer connection and routes, but opens neither at startup.
+#[derive(Default)]
+pub(crate) struct SubcConnector {
+    connection_file: Option<PathBuf>,
+    consumer: tokio::sync::Mutex<Option<Arc<SubcTransport>>>,
+}
+
+impl SubcConnector {
+    /// Use the supervisor's daemon, not discovery of a different live daemon.
+    /// Parsing argv is local only; the connection file is not read until connect.
+    pub(crate) fn from_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Self {
+        let mut args = args.into_iter();
+        while let Some(arg) = args.next() {
+            let path = if arg == "--subc" {
+                args.next().map(PathBuf::from)
+            } else {
+                arg.to_str()
+                    .and_then(|s| s.strip_prefix("--subc="))
+                    .map(PathBuf::from)
+            };
+            if let Some(path) = path {
+                return Self {
+                    connection_file: Some(path),
+                    ..Self::default()
+                };
+            }
+        }
+        // The serving SDK rejects missing/invalid --subc before serving. This
+        // default also supports callers constructing a consumer outside serve.
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl LogConnector for SubcConnector {
+    async fn connect(&self) -> Result<Arc<dyn LogTransport>, TransportError> {
+        let mut slot = self.consumer.lock().await;
+        if let Some(transport) = slot.as_ref() {
+            return Ok(transport.clone());
+        }
+        let consumer = match &self.connection_file {
+            Some(path) => SubcConsumer::connect(path, ConsumerOptions::default()).await,
+            None => SubcConsumer::connect_default(ConsumerOptions::default()).await,
+        }
+        .map_err(|_| TransportError::Unavailable)?;
+        let transport = Arc::new(SubcTransport { consumer });
+        *slot = Some(transport.clone());
+        Ok(transport)
+    }
+}
+
+struct SubcTransport {
+    consumer: SubcConsumer,
+}
+
+fn engram_target() -> RouteTarget {
+    RouteTarget::InternalService {
+        module_id: "engram".into(),
+        service_id: "agent-sync".into(),
+    }
+}
+
+#[async_trait]
+impl LogTransport for SubcTransport {
+    async fn call(&self, method: &str, params: Value) -> Result<Vec<u8>, TransportError> {
+        let body = serde_json::to_vec(&json!({"method":method,"params":params}))
+            .map_err(|_| TransportError::Unavailable)?;
+        // SUBC's default options present the supervised module's cached launch
+        // nonce, not Direct or a caller-supplied principal, with no scope stamp.
+        self.consumer
+            .call(
+                engram_target(),
+                BindIdentity::new(
+                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+                    "ck-entorhinal",
+                    "identity-log",
+                ),
+                body,
+                CallOptions::default(),
+            )
+            .await
+            .map_err(|error| match error {
+                CallError::Module(body) => TransportError::Refusal {
+                    code: body.code,
+                    detail: body.detail,
+                },
+                CallError::OutcomeUnknown(_) => TransportError::NoReply,
+                _ => TransportError::Unavailable,
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::fake_log::FailConnector;
+    use super::*;
+    use std::sync::Mutex;
+
+    // This stub owns literal wire fixtures, not the fake's encoder: a symmetric
+    // mistake in the client and fake must not make the wire test green.
+    struct Stub {
+        requests: Mutex<Vec<(String, Value)>>,
+        reply: Mutex<Result<Vec<u8>, TransportError>>,
+    }
+
+    impl Stub {
+        fn new(reply: Value) -> Arc<Self> {
+            Arc::new(Self {
+                requests: Mutex::new(Vec::new()),
+                reply: Mutex::new(Ok(serde_json::to_vec(&reply).unwrap())),
+            })
+        }
+    }
+
+    struct StubConnector(Arc<Stub>);
+    #[async_trait]
+    impl LogConnector for StubConnector {
+        async fn connect(&self) -> Result<Arc<dyn LogTransport>, TransportError> {
+            Ok(self.0.clone())
+        }
+    }
+    #[async_trait]
+    impl LogTransport for Stub {
+        async fn call(&self, method: &str, params: Value) -> Result<Vec<u8>, TransportError> {
+            self.requests.lock().unwrap().push((method.into(), params));
+            self.reply.lock().unwrap().clone()
+        }
+    }
+
+    fn client(stub: &Arc<Stub>) -> LogClient {
+        LogClient::new(Arc::new(StubConnector(stub.clone())))
+    }
+    fn request() -> AppendRequest {
+        AppendRequest {
+            expected_head: 9,
+            entry_id: [0xab; 16],
+            kind: EntryKind::Snapshot,
+            data: vec![0, 0xa1, 0xff],
+        }
+    }
+    fn row() -> Value {
+        json!({"position":10,"entry_id":"abababababababababababababababab",
+            "signer":"5151515151515151515151515151515151515151515151515151515151515151",
+            "key_id":{"family":"bmk","epoch":7},"envelope_version":1,"kind":"snapshot","entry":"00a1ff"})
+    }
+
+    #[tokio::test]
+    async fn wire_requests_and_metadata_match_engram_pin() {
+        for args in [
+            vec!["--subc", "target/nonexistent-daemon.json"],
+            vec!["--subc=target/nonexistent-daemon.json"],
+        ] {
+            let connector =
+                SubcConnector::from_args(args.into_iter().map(std::ffi::OsString::from));
+            assert_eq!(
+                connector.connection_file,
+                Some(PathBuf::from("target/nonexistent-daemon.json"))
+            );
+            assert!(
+                connector.consumer.lock().await.is_none(),
+                "parsing must not open the daemon connection"
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(engram_target()).unwrap(),
+            json!({"kind":"internal_service","module_id":"engram","service_id":"agent-sync"})
+        );
+        let stub = Stub::new(json!({"result":{"position":10}}));
+        let client = client(&stub);
+        assert_eq!(
+            client.append(&request()).await.unwrap(),
+            AppendReply { position: 10 }
+        );
+        assert_eq!(
+            stub.requests.lock().unwrap()[0],
+            (
+                "identity_log.append".into(),
+                json!({
+                    "expected_head":9,"entry_id":"abababababababababababababababab","entry":{"kind":"snapshot","data":"00a1ff"}
+                })
+            )
+        );
+        *stub.reply.lock().unwrap() =
+            Ok(serde_json::to_vec(&json!({"result":{"head":10,"entries":[row()]}})).unwrap());
+        let page = client.read(9, 999).await.unwrap();
+        assert_eq!(
+            page,
+            ReadReply {
+                head: 10,
+                entries: vec![LogEntry {
+                    position: 10,
+                    entry_id: [0xab; 16],
+                    signer: [0x51; 32],
+                    key_id: KeyId {
+                        family: "bmk".into(),
+                        epoch: 7
+                    },
+                    envelope_version: 1,
+                    kind: "snapshot".into(),
+                    entry: vec![0, 0xa1, 0xff],
+                }]
+            }
+        );
+        assert_eq!(
+            stub.requests.lock().unwrap()[1],
+            ("identity_log.read".into(), json!({"after":9,"limit":128}))
+        );
+        *stub.reply.lock().unwrap() = Ok(br#"{"result":{"head":10,"entries":[]}}"#.to_vec());
+        client.read(10, 0).await.unwrap();
+        assert_eq!(
+            stub.requests.lock().unwrap()[2].1,
+            json!({"after":10,"limit":1})
+        );
+    }
+
+    #[tokio::test]
+    async fn all_refusals_decode_from_error_detail_without_aliases() {
+        let stub = Stub::new(Value::Null);
+        let client = client(&stub);
+        let cases = [
+            (
+                "head_moved",
+                Some(json!({"head":42})),
+                LogError::HeadMoved { head: Some(42) },
+            ),
+            ("head_moved", None, LogError::HeadMoved { head: None }),
+            (
+                "head_moved",
+                Some(json!({"head":"42"})),
+                LogError::HeadMoved { head: None },
+            ),
+            ("not_member", None, LogError::NotMember),
+            ("unavailable", None, LogError::Unavailable),
+            ("id_reused", None, LogError::IdReused),
+            ("key_unavailable", None, LogError::KeyUnavailable),
+            (
+                "verify_failed",
+                Some(json!({"position":4})),
+                LogError::VerifyFailed { position: Some(4) },
+            ),
+            (
+                "decrypt_failed",
+                Some(json!({"position":5})),
+                LogError::DecryptFailed { position: Some(5) },
+            ),
+            (
+                "too_large",
+                Some(json!({"field":"entry.data","cap":262144})),
+                LogError::TooLarge {
+                    field: "entry.data".into(),
+                    cap: 262144,
+                },
+            ),
+            (
+                "not_a_member",
+                None,
+                LogError::Refused {
+                    code: "not_a_member".into(),
+                    detail: None,
+                },
+            ),
+        ];
+        for (code, detail, expected) in cases {
+            // Round-trip the actual SUBC ErrorBody: top-level extras do not exist.
+            let body: subc_protocol::ErrorBody =
+                serde_json::from_value(json!({"code":code,"message":"refusal","detail":detail}))
+                    .unwrap();
+            *stub.reply.lock().unwrap() = Err(TransportError::Refusal {
+                code: body.code,
+                detail: body.detail,
+            });
+            assert_eq!(
+                client.append(&request()).await.unwrap_err(),
+                expected,
+                "append {code}"
+            );
+            assert_eq!(
+                client.read(0, 128).await.unwrap_err(),
+                expected,
+                "read {code}"
+            );
+        }
+        *stub.reply.lock().unwrap() = Err(TransportError::NoReply);
+        assert_eq!(
+            client.append(&request()).await.unwrap_err(),
+            LogError::NoReply
+        );
+        *stub.reply.lock().unwrap() = Err(TransportError::Unavailable);
+        assert_eq!(
+            client.read(0, 128).await.unwrap_err(),
+            LogError::Unavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_replies_fail_closed_and_unknown_metadata_is_preserved() {
+        for reply in [
+            json!({"position":1}),
+            json!({"result":{}}),
+            json!({"result":{"position":0}}),
+        ] {
+            let stub = Stub::new(reply);
+            assert!(matches!(
+                client(&stub).append(&request()).await,
+                Err(LogError::Protocol(_))
+            ));
+        }
+        for (field, value) in [
+            ("entry", json!("AA")),
+            ("entry", json!("a")),
+            ("signer", json!("00")),
+            ("entry_id", json!("00")),
+            ("key_id", json!({"epoch":1})),
+            ("envelope_version", json!(null)),
+        ] {
+            let mut malformed = row();
+            malformed[field] = value;
+            let stub = Stub::new(json!({"result":{"head":10,"entries":[malformed]}}));
+            assert!(
+                matches!(client(&stub).read(9, 128).await, Err(LogError::Protocol(_))),
+                "{field}"
+            );
+        }
+        let stub = Stub::new(json!({"result":{"head":10,"entries":[row(),row()]}}));
+        assert!(matches!(
+            client(&stub).read(9, 1).await,
+            Err(LogError::Protocol(_))
+        ));
+        let mut big = row();
+        big["entry"] = json!("00".repeat(262145));
+        let stub = Stub::new(json!({"result":{"head":10,"entries":[big]}}));
+        assert!(matches!(
+            client(&stub).read(9, 128).await,
+            Err(LogError::Protocol(_))
+        ));
+        let mut full = row();
+        full["entry"] = json!("00".repeat(262144));
+        let stub = Stub::new(json!({"result":{"head":10,"entries":vec![full;5]}}));
+        assert!(matches!(
+            client(&stub).read(9, 128).await,
+            Err(LogError::Protocol(_))
+        ));
+        let mut unknown = row();
+        unknown["kind"] = json!("future");
+        unknown["envelope_version"] = json!(99);
+        let stub = Stub::new(json!({"result":{"head":10,"entries":[unknown]}}));
+        let page = client(&stub).read(9, 128).await.unwrap();
+        assert_eq!(page.entries[0].kind, "future");
+        assert_eq!(page.entries[0].envelope_version, 99);
+    }
+
+    #[tokio::test]
+    async fn failing_connector_panics_on_any_log_access() {
+        let connector = Arc::new(FailConnector::default());
+        let client = LogClient::new(connector.clone());
+        assert_eq!(connector.calls(), 0);
+        let task = tokio::spawn(async move { client.read(0, 128).await });
+        assert!(task.await.unwrap_err().is_panic());
+        assert_eq!(connector.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn startup_and_every_local_read_work_without_engram() {
+        use super::super::*;
+        let connector = Arc::new(FailConnector::default());
+        let handler =
+            ProjectsHandler::with_log_connector("offline".into(), unix_millis, connector.clone());
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/log-client-offline")
+            .join(incarnation::new_incarnation().unwrap());
+        std::fs::create_dir_all(&root).unwrap();
+        let descriptor = StorageDescriptor {
+            module_id: MODULE_ID.into(),
+            storage_namespace: "default".into(),
+            isolation: Isolation::Module,
+            backend: StorageBackend::Sqlite {
+                path: root.join("store.db").to_string_lossy().into_owned(),
+            },
+        };
+        handler
+            .on_hello_ack(&ModuleHelloAckBody {
+                negotiated_ver: PROTOCOL_VERSION,
+                subc_ops: vec![],
+                subc_capabilities: vec![],
+                storage: Some(serde_json::to_value(descriptor).unwrap()),
+                machine_id: None,
+            })
+            .await;
+        assert_eq!(handler.health().await.status, HealthStatus::Ok);
+        let requests = [
+            ("resolve", json!({"canonicalRoot":root})),
+            ("resolve_project_id", json!({"projectId":"missing"})),
+            (
+                "resolve_remote",
+                json!({"owner":"missing","repo":"missing"}),
+            ),
+            ("enumerate", json!({})),
+            ("journal_tail", json!({"afterSeq":0})),
+            ("trust", json!({"canonicalRoot":root})),
+            ("verify", json!({})),
+            ("identity_log.status", json!({})),
+            (
+                "resolve_root_key",
+                json!({"projectId":"missing","kind":"remote","rootKey":"a/b"}),
+            ),
+            ("preview_attach_root", json!({"path":root})),
+            (
+                "agent.resolve",
+                json!({"agent_id":"agent_0000000000000000"}),
+            ),
+            ("agent.resolve_name", json!({"name":"Missing"})),
+            ("agent.list", json!({})),
+            ("agent.peer_roster", json!({"workspace_id":"missing"})),
+            (
+                "agent.avatar_read",
+                json!({"agentIds":["agent_0000000000000000"]}),
+            ),
+            (
+                "agent.github_identity",
+                json!({"agent_id":"agent_0000000000000000"}),
+            ),
+            ("agent.snapshot", json!({})),
+            ("agent.fleet_identity", json!({})),
+            (
+                "agent.changes",
+                json!({"incarnation":"offline","cursor":0,"wait":false}),
+            ),
+        ];
+        for (method, params) in requests {
+            let body = serde_json::to_vec(&json!({"method":method,"params":params})).unwrap();
+            let outcome = handler.handle_request_wait(&body, (9, 1)).await;
+            let expected = match method {
+                "resolve_root_key" | "preview_attach_root" => Some("identity_log_disabled"),
+                "agent.peer_roster" => Some("registry_not_activated"),
+                "agent.github_identity" => Some("unknown_agent"),
+                _ => None,
+            };
+            match (outcome, expected) {
+                (HandlerOutcome::Response(bytes), None) => {
+                    assert!(
+                        serde_json::from_slice::<Value>(&bytes).unwrap()["result"].is_object(),
+                        "{method}"
+                    );
+                }
+                (HandlerOutcome::Error { code, .. }, Some(expected)) => {
+                    assert_eq!(code, expected, "{method}")
+                }
+                (other, _) => panic!("{method}: {other:?}"),
+            }
+        }
+        assert_eq!(connector.calls(), 0);
+        assert!(manifest().capabilities.unwrap().requires.is_empty());
+        drop(handler);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

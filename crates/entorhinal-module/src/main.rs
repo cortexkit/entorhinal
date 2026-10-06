@@ -53,6 +53,13 @@ mod agent_ops;
 mod agent_reads;
 mod cli;
 mod incarnation;
+// The transport is installed now; shared-write and catch-up orchestration use
+// this API without making startup or local reads depend on engram.
+#[cfg(test)]
+#[allow(dead_code)]
+mod fake_log;
+#[allow(dead_code)]
+mod log_client;
 
 // PARSE ARGV BEFORE ACTING ON IT.
 //
@@ -207,6 +214,8 @@ struct ProjectsHandler {
     commits: tokio::sync::Notify,
     feed_waits: tokio::sync::Semaphore,
     feed_clock: Arc<dyn agent_reads::FeedClock>,
+    #[allow(dead_code)]
+    log_client: log_client::LogClient,
 }
 
 /// The parts of a route's bind stamp that decide what the route may do here.
@@ -359,6 +368,20 @@ impl ProjectsHandler {
     }
 
     fn with_runtime(incarnation: String, clock: fn() -> i64) -> Self {
+        Self::with_log_connector(
+            incarnation,
+            clock,
+            Arc::new(log_client::SubcConnector::from_args(
+                std::env::args_os().skip(1),
+            )),
+        )
+    }
+
+    fn with_log_connector(
+        incarnation: String,
+        clock: fn() -> i64,
+        connector: Arc<dyn log_client::LogConnector>,
+    ) -> Self {
         Self {
             store: Arc::new(Mutex::new(None)),
             health: Arc::new(HealthGauges::default()),
@@ -369,6 +392,7 @@ impl ProjectsHandler {
             commits: tokio::sync::Notify::new(),
             feed_waits: tokio::sync::Semaphore::new(8),
             feed_clock: Arc::new(agent_reads::TokioFeedClock),
+            log_client: log_client::LogClient::new(connector),
         }
     }
 
