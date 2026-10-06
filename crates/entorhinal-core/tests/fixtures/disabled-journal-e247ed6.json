@@ -1,0 +1,108 @@
+{
+  "journal": [
+    {
+      "actor": "operator",
+      "op": "register",
+      "payload_json": "{\"implicitAliasCollisions\":[],\"request\":{\"actor\":\"operator\",\"derivedRootParents\":[],\"name\":\"Project\",\"projectId\":\"P\",\"requestKey\":\"register\",\"roots\":[\"$ROOT/one\"],\"workspaceId\":\"W\"}}",
+      "request_key": "register",
+      "seq": 1
+    },
+    {
+      "actor": "operator",
+      "op": "add_root",
+      "payload_json": "{\"actor\":\"operator\",\"projectId\":\"P\",\"root\":\"$ROOT/two\"}",
+      "request_key": null,
+      "seq": 2
+    },
+    {
+      "actor": "operator",
+      "op": "set_workspace_root",
+      "payload_json": "{\"actor\":\"operator\",\"requestKey\":\"workspace-root\",\"root\":\"$ROOT/workspace\",\"workspaceId\":\"W\"}",
+      "request_key": "workspace-root",
+      "seq": 3
+    },
+    {
+      "actor": "operator",
+      "op": "assign_workspace",
+      "payload_json": "{\"actor\":\"operator\",\"projectId\":\"P\",\"requestKey\":\"assign\",\"workspaceId\":\"W2\",\"workspaceName\":\"Second\"}",
+      "request_key": "assign",
+      "seq": 4
+    },
+    {
+      "actor": "operator",
+      "op": "bind_root",
+      "payload_json": "{\"canonicalRoot\":\"$ROOT/one\",\"incarnation\":\"$INCARNATION1\",\"projectId\":\"P\",\"registrationEpoch\":\"$EPOCH1\",\"replacedEpoch\":null}",
+      "request_key": null,
+      "seq": 5
+    },
+    {
+      "actor": "operator",
+      "op": "bind_root",
+      "payload_json": "{\"canonicalRoot\":\"$ROOT/two\",\"incarnation\":\"$INCARNATION2\",\"projectId\":\"P\",\"registrationEpoch\":\"$EPOCH2\",\"replacedEpoch\":null}",
+      "request_key": null,
+      "seq": 6
+    },
+    {
+      "actor": "operator",
+      "op": "approve_root",
+      "payload_json": "{\"canonicalRoot\":\"$ROOT/one\",\"registrationEpoch\":\"$EPOCH1\"}",
+      "request_key": null,
+      "seq": 7
+    },
+    {
+      "actor": "operator",
+      "op": "remove",
+      "payload_json": "{\"actor\":\"operator\",\"projectId\":\"P\",\"requestKey\":\"remove\",\"successorProjectId\":null,\"workspaceId\":null}",
+      "request_key": "remove",
+      "seq": 8
+    },
+    {
+      "actor": "module",
+      "op": "agent.import",
+      "payload_json": "{\"entry\":{\"agent_generation\":1,\"agent_id\":\"agent_0000000000000001\",\"claims\":[{\"agent_id\":\"agent_0000000000000001\",\"claim_id\":1,\"claimed_at_ms\":30,\"display_name\":\"Ada\",\"name_normalization_version\":1,\"namespace_key\":\"global\",\"namespace_kind\":\"assistant\",\"normalized_name\":\"ada\",\"released_at_ms\":null}],\"merged_into\":null,\"new_display_name\":null,\"old_display_name\":null,\"op\":\"agent.import\",\"row\":{\"agent_generation\":1,\"agent_id\":\"agent_0000000000000001\",\"avatar\":null,\"created_at_ms\":10,\"github_identity\":null,\"labels\":[],\"merged_into\":null,\"name\":\"Ada\",\"name_normalization_version\":1,\"name_version\":1,\"project_id\":null,\"request_key\":null,\"role\":\"assistant\",\"status\":\"live\",\"supervisor_agent_id\":null,\"tag\":\"helper\",\"terminal_at_ms\":null,\"updated_at_ms\":20,\"workspace_id\":null},\"seq\":9,\"status\":null}}",
+      "request_key": null,
+      "seq": 9
+    },
+    {
+      "actor": "module",
+      "op": "agent.import",
+      "payload_json": "{\"entry\":{\"agent_generation\":1,\"agent_id\":\"agent_0000000000000002\",\"claims\":[{\"agent_id\":\"agent_0000000000000002\",\"claim_id\":2,\"claimed_at_ms\":30,\"display_name\":\"Grace\",\"name_normalization_version\":1,\"namespace_key\":\"global\",\"namespace_kind\":\"assistant\",\"normalized_name\":\"grace\",\"released_at_ms\":null}],\"merged_into\":null,\"new_display_name\":null,\"old_display_name\":null,\"op\":\"agent.import\",\"row\":{\"agent_generation\":1,\"agent_id\":\"agent_0000000000000002\",\"avatar\":null,\"created_at_ms\":10,\"github_identity\":null,\"labels\":[],\"merged_into\":null,\"name\":\"Grace\",\"name_normalization_version\":1,\"name_version\":1,\"project_id\":null,\"request_key\":null,\"role\":\"assistant\",\"status\":\"live\",\"supervisor_agent_id\":null,\"tag\":\"helper\",\"terminal_at_ms\":null,\"updated_at_ms\":20,\"workspace_id\":null},\"seq\":10,\"status\":null}}",
+      "request_key": null,
+      "seq": 10
+    },
+    {
+      "actor": "module",
+      "op": "agent.cutover",
+      "payload_json": "{\"snapshot_path\":\"$ROOT/snapshot.db\"}",
+      "request_key": "import",
+      "seq": 11
+    },
+    {
+      "actor": "operator",
+      "op": "agent.rename",
+      "payload_json": "{\"entry\":{\"agent_generation\":2,\"agent_id\":\"agent_0000000000000001\",\"claims\":[{\"agent_id\":\"agent_0000000000000001\",\"claim_id\":1,\"claimed_at_ms\":30,\"display_name\":\"Ada\",\"name_normalization_version\":1,\"namespace_key\":\"global\",\"namespace_kind\":\"assistant\",\"normalized_name\":\"ada\",\"released_at_ms\":600},{\"agent_id\":\"agent_0000000000000001\",\"claim_id\":3,\"claimed_at_ms\":600,\"display_name\":\"Augusta\",\"name_normalization_version\":1,\"namespace_key\":\"global\",\"namespace_kind\":\"assistant\",\"normalized_name\":\"augusta\",\"released_at_ms\":null}],\"merged_into\":null,\"new_display_name\":\"Augusta\",\"old_display_name\":\"Ada\",\"op\":\"agent.rename\",\"row\":{\"agent_generation\":2,\"agent_id\":\"agent_0000000000000001\",\"avatar\":null,\"created_at_ms\":10,\"github_identity\":null,\"labels\":[],\"merged_into\":null,\"name\":\"Augusta\",\"name_normalization_version\":1,\"name_version\":2,\"project_id\":null,\"request_key\":null,\"role\":\"assistant\",\"status\":\"live\",\"supervisor_agent_id\":null,\"tag\":\"helper\",\"terminal_at_ms\":null,\"updated_at_ms\":600,\"workspace_id\":null},\"seq\":12,\"status\":null}}",
+      "request_key": "rename",
+      "seq": 12
+    },
+    {
+      "actor": "operator",
+      "op": "agent.dispose",
+      "payload_json": "{\"entry\":{\"agent_generation\":2,\"agent_id\":\"agent_0000000000000002\",\"claims\":[{\"agent_id\":\"agent_0000000000000002\",\"claim_id\":2,\"claimed_at_ms\":30,\"display_name\":\"Grace\",\"name_normalization_version\":1,\"namespace_key\":\"global\",\"namespace_kind\":\"assistant\",\"normalized_name\":\"grace\",\"released_at_ms\":700}],\"merged_into\":null,\"new_display_name\":null,\"old_display_name\":null,\"op\":\"agent.dispose\",\"row\":{\"agent_generation\":2,\"agent_id\":\"agent_0000000000000002\",\"avatar\":null,\"created_at_ms\":10,\"github_identity\":null,\"labels\":[],\"merged_into\":null,\"name\":\"Grace\",\"name_normalization_version\":1,\"name_version\":1,\"project_id\":null,\"request_key\":null,\"role\":\"assistant\",\"status\":\"retired\",\"supervisor_agent_id\":null,\"tag\":\"helper\",\"terminal_at_ms\":700,\"updated_at_ms\":700,\"workspace_id\":null},\"seq\":13,\"status\":\"retired\"}}",
+      "request_key": "dispose",
+      "seq": 13
+    }
+  ],
+  "replies": [
+    "{\"result\":{\"derivedRootParents\":[],\"generation\":1,\"implicitAliasCollisions\":[],\"name\":\"Project\",\"noop\":false,\"projectId\":\"P\",\"roots\":[\"$ROOT/one\"],\"warnings\":[]}}",
+    "{\"result\":{\"generation\":2,\"noop\":false,\"projectId\":\"P\",\"root\":\"$ROOT/two\"}}",
+    "{\"result\":{\"generation\":3,\"noop\":false,\"root\":\"$ROOT/workspace\",\"workspaceId\":\"W\"}}",
+    "{\"result\":{\"generation\":4,\"noop\":false,\"projectId\":\"P\",\"workspaceId\":\"W2\"}}",
+    "{\"result\":{\"canonicalRoot\":\"$ROOT/one\",\"generation\":5,\"noop\":false,\"registrationEpoch\":\"$EPOCH1\"}}",
+    "{\"result\":{\"canonicalRoot\":\"$ROOT/two\",\"generation\":6,\"noop\":false,\"registrationEpoch\":\"$EPOCH2\"}}",
+    "{\"result\":{\"canonicalRoot\":\"$ROOT/one\",\"generation\":7,\"noop\":false,\"registrationEpoch\":\"$EPOCH1\"}}",
+    "{\"result\":{\"droppedWorkspaceId\":\"W2\",\"generation\":8,\"noop\":false,\"projectId\":\"P\",\"successorProjectId\":null}}",
+    "{\"result\":{\"agents_imported\":2,\"claims_imported\":2,\"generation\":11}}",
+    "{\"result\":{\"agent\":{\"agent_generation\":2,\"agent_id\":\"agent_0000000000000001\",\"created_at\":10,\"labels\":[],\"name\":\"Augusta\",\"name_version\":2,\"role\":\"assistant\",\"tag\":\"helper\"},\"generation\":12}}",
+    "{\"result\":{\"generation\":13,\"gone\":{\"at\":700,\"reason\":\"deleted\"}}}"
+  ]
+}

@@ -234,6 +234,8 @@ struct ProjectsHandler {
     writer: Arc<tokio::sync::Mutex<()>>,
     catch_up_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     agent_id_draw: fn() -> Result<String, HandlerError>,
+    #[cfg(test)]
+    shared_commit_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// The parts of a route's bind stamp that decide what the route may do here.
@@ -414,6 +416,8 @@ impl ProjectsHandler {
             writer: Arc::new(tokio::sync::Mutex::new(())),
             catch_up_task: Mutex::new(None),
             agent_id_draw: shared_write::draw_agent_id,
+            #[cfg(test)]
+            shared_commit_hook: None,
         }
     }
 

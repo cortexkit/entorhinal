@@ -163,6 +163,9 @@ pub(super) fn finish(tx: &Transaction<'_>, seq: Option<i64>) -> Result<(), Regis
                 SharedSettlement::Commit(position) => {
                     tx.execute("UPDATE registry_journal SET entry_id=?1,log_position=?2 WHERE seq=?3", params![attempt.id,position,seq])?;
                     tx.execute("UPDATE identity_log_state SET last_applied_position=?1,last_seen_head=MAX(last_seen_head,?1) WHERE id=1", [position])?;
+                    // Observing an occupied position proves every older attempt
+                    // lost its only possible slot, even when its reply was lost.
+                    tx.execute("DELETE FROM pending_entry WHERE expected_head < ?1", [position])?;
                 }
                 SharedSettlement::Rollback { sent, code, message } => {
                     attempt.sent = sent;

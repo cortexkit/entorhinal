@@ -104,14 +104,15 @@ impl Worker {
                         .identity_log_status()
                         .is_ok_and(|s| s.state == "enabling")
                     {
-                        super::enable::resume(
+                        let result = super::enable::resume(
                             &store,
                             &self.log,
                             &self.health,
                             deadline,
                             "entorhinal",
                         )
-                        .await
+                        .await;
+                        result.and_then(|()| self.applied(&store))
                     } else {
                         self.run(&store, deadline).await
                     };

@@ -121,8 +121,8 @@ fn draw_id() -> Result<[u8; 16], HandlerError> {
     Ok(id)
 }
 
-/// With the writer lock held, resend the saved snapshot parts using their
-/// original ids and bytes. Keep the state enabling, which refuses shared
+/// With the writer lock held, read confirmed progress and resend only missing
+/// saved snapshot parts using their original ids and bytes. Keep the state enabling, which refuses shared
 /// mutations, until the log confirms every part at its original position or a
 /// read finds a different entry at position 1 and permits returning to disabled.
 /// A missing or failed reply alone is not a reason to discard the saved data.
@@ -134,7 +134,38 @@ pub(super) async fn resume(
     principal: &str,
 ) -> Result<(), HandlerError> {
     let parts = store.enable_parts()?;
-    for (i, part) in parts.iter().enumerate() {
+    // Receipts can arrive too slowly to fit all parts into one request. A read
+    // accumulates durable progress across retries without spending the deadline
+    // resending parts that already occupy their unique expected positions.
+    let page = timeout_at(deadline, log.read(0, parts.len()))
+        .await
+        .map_err(|_| {
+            HandlerError::new(
+                "engram_unavailable",
+                "enable recovery read deadline expired",
+            )
+        })?
+        .map_err(|e| log_error(e, health))?;
+    if let Some(first) = page.entries.first().filter(|e| e.position == 1) {
+        if first.entry_id != parts[0].entry_id {
+            store.abandon_enable()?;
+            store.check_enable_preconditions(page.head)?;
+            return Err(HandlerError::new(
+                "engram_unavailable",
+                "another machine supplied the bootstrap; retry to join",
+            ));
+        }
+    }
+    let confirmed = parts
+        .iter()
+        .enumerate()
+        .take_while(|(i, part)| {
+            page.entries
+                .iter()
+                .any(|entry| entry.position == *i as u64 + 1 && entry.entry_id == part.entry_id)
+        })
+        .count();
+    for (i, part) in parts.iter().enumerate().skip(confirmed) {
         let request = AppendRequest {
             expected_head: i as u64,
             entry_id: part.entry_id,
@@ -768,6 +799,102 @@ mod tests {
         }
         assert!(f.store().enable_parts().is_err());
         f.clean_rebuild();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn landed_multipart_enable_finishes_after_restart_without_resending_receipts() {
+        struct SlowReceipts(FakeLog);
+        #[async_trait]
+        impl LogConnector for SlowReceipts {
+            async fn connect(&self) -> Result<Arc<dyn LogTransport>, TransportError> {
+                Ok(Arc::new(SlowReceipts(self.0.clone())))
+            }
+        }
+        #[async_trait]
+        impl LogTransport for SlowReceipts {
+            async fn call(&self, method: &str, params: Value) -> Result<Vec<u8>, TransportError> {
+                let reply = self.0.call(method, params).await;
+                if method == log_client::APPEND {
+                    // The second part lands at 15 seconds, but its receipt is
+                    // dropped when the request's 25-second deadline expires.
+                    tokio::time::sleep(Duration::from_secs(15)).await;
+                }
+                reply
+            }
+        }
+        let log = FakeLog::default();
+        let connector = Arc::new(SlowReceipts(log.clone()));
+        let mut f = Fixture::new("enable-slow-receipts", connector.clone());
+        f.agents(3, 100_000);
+        assert_eq!(f.enable().await.unwrap_err(), "engram_outcome_unknown");
+        let parts = f.store().enable_parts().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(log.head(), 2);
+        f.restart(connector);
+        let calls = log.calls();
+        let resumed = Instant::now();
+        f.enable().await.unwrap();
+        assert_eq!(
+            Instant::now(),
+            resumed,
+            "recovery waited for redundant receipts"
+        );
+        assert_eq!(
+            log.calls(),
+            calls + 1,
+            "recovery should only read the saved part range"
+        );
+        assert_eq!(f.store().identity_log_status().unwrap().state, "enabled");
+        assert_eq!(
+            f.store()
+                .identity_log_status()
+                .unwrap()
+                .last_applied_position,
+            2
+        );
+        f.clean_rebuild();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn background_enable_completion_publishes_generation_and_wakes_parked_feed() {
+        use std::{
+            future::Future,
+            task::{Context, Poll, Waker},
+        };
+        let log = Arc::new(FakeLog::default());
+        let f = Fixture::new("enable-background-feed", log.clone());
+        log.on_append(Action::DropReply);
+        assert_eq!(f.enable().await.unwrap_err(), "engram_unavailable");
+        let cursor = f.store().generation().unwrap();
+        let body = serde_json::to_vec(&json!({"method":"agent.changes","params":{"incarnation":"enable-test","cursor":cursor,"wait":true}})).unwrap();
+        let waiter = f.handler.handle_request_wait(&body, CORE);
+        tokio::pin!(waiter);
+        assert!(waiter
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        let before = Instant::now();
+        f.handler.start_catch_up();
+        tokio::task::yield_now().await;
+        assert_eq!(f.store().identity_log_status().unwrap().state, "enabled");
+        assert_eq!(
+            Instant::now(),
+            before,
+            "completion must precede the feed timeout"
+        );
+        let Poll::Ready(HandlerOutcome::Response(bytes)) = waiter
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("parked feed was not notified after background enable committed")
+        };
+        let reply: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(reply["result"]["cursor"], f.store().generation().unwrap());
+        assert_eq!(
+            f.handler.health.generation.load(Ordering::Relaxed),
+            f.store().generation().unwrap()
+        );
+        assert!(f.store().generation().unwrap() > cursor);
     }
 
     #[tokio::test(start_paused = true)]

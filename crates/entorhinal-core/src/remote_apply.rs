@@ -262,6 +262,22 @@ fn apply(tx: &Transaction<'_>, entry: &RemoteEntry) -> rusqlite::Result<i64> {
             {
                 return Err(invalid("inconsistent agent after-image"));
             }
+            // Claims belong to the row being changed. Check stored ownership
+            // too: claim replay updates an existing id without changing its owner.
+            for claim in &agent.claims {
+                let owner: Option<String> = tx
+                    .query_row(
+                        "SELECT agent_id FROM agent_name_claim WHERE claim_id=?1",
+                        [claim.claim_id],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if claim.agent_id != agent.agent_id
+                    || owner.is_some_and(|owner| owner != agent.agent_id)
+                {
+                    return Err(invalid("agent entry changes another agent's claim"));
+                }
+            }
             Decoded::Agent(Box::new(agent))
         }
         _ => return Err(invalid("unknown entry op or kind/op mismatch")),
@@ -348,6 +364,15 @@ fn apply(tx: &Transaction<'_>, entry: &RemoteEntry) -> rusqlite::Result<i64> {
                 agent.seq = seq;
                 let payload = json!({"entry":agent,"signer":entry.signer,"key_id":entry.key_id});
                 crate::agent::replay_agent_entry(tx, &agent.op, &payload)?;
+                let active = crate::agent::load_claims(tx, &agent.agent_id)?
+                    .iter()
+                    .filter(|claim| claim.released_at_ms.is_none())
+                    .count();
+                if active != usize::from(agent.row.status == "live") {
+                    return Err(invalid(
+                        "agent after-image has an invalid active claim count",
+                    ));
+                }
                 // The journal payload, which `agent.changes` serves, carries
                 // this machine's own seq. The bytes received from the log are
                 // stored alongside it unchanged, for audit and so replay
@@ -891,6 +916,104 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        check_rebuild(&f);
+    }
+
+    #[test]
+    fn remote_agent_claims_cannot_release_another_owner_or_leave_invalid_liveness() {
+        let f = Fixture::new("remote-agent-claims");
+        enable(&f);
+        f.store
+            .apply_entry("agent.cutover", "{}", "test", None, |_| Ok(()))
+            .unwrap();
+        let a = "agent_0000000000000001";
+        let b = "agent_0000000000000002";
+        for (id, name) in [(a, "Ada"), (b, "Grace")] {
+            f.store
+                .with_principal("test")
+                .agent_mutation_with_id(
+                    "agent.create",
+                    json!({"role":"assistant","name":name,"tag":"helper","request_key":id}),
+                    10,
+                    Some(id),
+                )
+                .unwrap();
+        }
+        let row = f.store.agent_row(a).unwrap().unwrap();
+        let mut foreign = f.store.agent_claims(b).unwrap();
+        foreign[0].released_at_ms = Some(20);
+        let bad = AgentChangeEntry::new("agent.rename", row.clone(), foreign.clone());
+        let before = image(&f);
+        let agents_before = f.store.agent_snapshot().unwrap();
+        let error = f
+            .store
+            .apply_remote_entry(&envelope(1, &bad, false))
+            .unwrap_err();
+        assert!(error.to_string().starts_with("apply_failed"));
+        assert_eq!(image(&f), before);
+        assert_eq!(
+            serde_json::to_value(f.store.agent_snapshot().unwrap()).unwrap(),
+            serde_json::to_value(&agents_before).unwrap()
+        );
+        // Renaming the owner field cannot disguise a claim id belonging to B.
+        foreign[0].agent_id = a.into();
+        let disguised = AgentChangeEntry::new("agent.rename", row.clone(), foreign);
+        assert!(f
+            .store
+            .apply_remote_entry(&envelope(1, &disguised, false))
+            .is_err());
+        assert_eq!(
+            serde_json::to_value(f.store.agent_snapshot().unwrap()).unwrap(),
+            serde_json::to_value(&agents_before).unwrap()
+        );
+        let mut own = f.store.agent_claims(a).unwrap();
+        own[0].released_at_ms = Some(20);
+        let no_active = AgentChangeEntry::new("agent.rename", row.clone(), own.clone());
+        assert!(f
+            .store
+            .apply_remote_entry(&envelope(1, &no_active, false))
+            .is_err());
+        assert_eq!(image(&f), before);
+        assert_eq!(
+            serde_json::to_value(f.store.agent_snapshot().unwrap()).unwrap(),
+            serde_json::to_value(&agents_before).unwrap()
+        );
+        let mut retired = row.clone();
+        retired.status = "retired".into();
+        retired.terminal_at_ms = Some(20);
+        let active_retired = AgentChangeEntry::new("agent.dispose", retired, vec![]);
+        assert!(f
+            .store
+            .apply_remote_entry(&envelope(1, &active_retired, false))
+            .is_err());
+        assert_eq!(
+            serde_json::to_value(f.store.agent_snapshot().unwrap()).unwrap(),
+            serde_json::to_value(&agents_before).unwrap()
+        );
+        let mut replacement = own[0].clone();
+        replacement.claim_id += 2;
+        replacement.display_name = "Augusta".into();
+        replacement.normalized_name = "augusta".into();
+        replacement.claimed_at_ms = 20;
+        replacement.released_at_ms = None;
+        own.push(replacement);
+        let mut renamed = row;
+        renamed.name = "Augusta".into();
+        renamed.updated_at_ms = 20;
+        renamed.name_version += 1;
+        let good = AgentChangeEntry::new("agent.rename", renamed, own);
+        f.store
+            .apply_remote_entry(&envelope(1, &good, false))
+            .unwrap();
+        assert_eq!(f.store.agent_row(a).unwrap().unwrap().name, "Augusta");
+        assert_eq!(
+            f.store.agent_claims(b).unwrap(),
+            agents_before
+                .claims
+                .into_iter()
+                .filter(|claim| claim.agent_id == b)
+                .collect::<Vec<_>>()
+        );
         check_rebuild(&f);
     }
 

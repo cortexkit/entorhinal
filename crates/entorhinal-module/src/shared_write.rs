@@ -355,6 +355,136 @@ mod tests {
         assert_eq!(tap.fake.head(), 1);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn local_commit_clears_losing_attempts_but_keeps_current_and_future_slots() {
+        let tap = Tap::new(0);
+        let mut f = Fixture::new("shared-pending-cleanup", connector(&tap));
+        tap.fake.on_append(Action::Hold);
+        let received = Instant::now();
+        let mut x = Box::pin(f.call("register", register("X", "X")));
+        reach(x.as_mut(), tap.fake.wait_for_calls(2)).await;
+        assert_eq!(
+            expire(x.as_mut(), &tap, received + SETTLEMENT)
+                .await
+                .unwrap_err()
+                .code,
+            "engram_outcome_unknown"
+        );
+        assert_eq!(f.pending(), 1);
+        finish(std::pin::pin!(f.call("register", register("Y", "Y"))))
+            .await
+            .unwrap();
+        assert_eq!(tap.fake.head(), 1);
+        assert_eq!(f.pending(), 0);
+        assert_eq!(
+            ready(f.handler.health()).metrics.unwrap()["pendingWriteCount"],
+            0
+        );
+        let status: Value =
+            serde_json::from_slice(&ready(f.call("identity_log.status", json!({}))).unwrap())
+                .unwrap();
+        assert_eq!(status["result"]["pendingWriteCount"], 0);
+        // A held old send cannot win once another entry occupies its slot.
+        assert!(tap.fake.release_next().is_err());
+        drop(x);
+        f.restart(connector(&tap));
+        assert_eq!(f.pending(), 0);
+        for head in [2, 3] {
+            let store = f.store();
+            let result = store.shared_attempt(
+                format!("future-{head}"),
+                head,
+                |_| SharedSettlement::Rollback {
+                    sent: true,
+                    code: "engram_outcome_unknown".into(),
+                    message: "unobserved attempt".into(),
+                },
+                || {
+                    store.with_principal("test").register_at(
+                        RegisterRequest {
+                            project_id: Some(format!("future-{head}")),
+                            name: "Future".into(),
+                            ..Default::default()
+                        },
+                        700,
+                    )
+                },
+            );
+            assert!(result.is_err());
+        }
+        finish(std::pin::pin!(f.call("register", register("Z", "Z"))))
+            .await
+            .unwrap();
+        assert_eq!(tap.fake.head(), 2);
+        assert_eq!(
+            f.pending(),
+            2,
+            "attempts at or beyond the committed position must survive"
+        );
+        assert_eq!(
+            ready(f.handler.health()).metrics.unwrap()["pendingWriteCount"],
+            2
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropped_write_keeps_writer_exclusion_until_blocking_commit_finishes() {
+        let tap = Tap::new(0);
+        let mut f = Fixture::new("shared-dropped-commit", connector(&tap));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let signal = entered.clone();
+        // Park only after the append's successful receipt has reached the
+        // blocking worker, but before that worker commits its transaction.
+        f.handler.shared_commit_hook = Some(Arc::new(move || {
+            signal.notify_one();
+            release_rx.lock().unwrap().recv().unwrap();
+        }));
+        let mut write = Box::pin(f.handler.write_wait(
+            WireRequest {
+                method: "register".into(),
+                params: register("once", "once"),
+            },
+            ROUTE,
+            Instant::now(),
+        ));
+        reach(write.as_mut(), entered.notified()).await;
+        assert_eq!(tap.fake.head(), 1);
+        drop(write);
+        let mut queued = Box::pin(f.handler.writer.lock());
+        let excluded = queued
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending();
+        drop(queued);
+        // Always release the worker before asserting, including on a broken
+        // exclusion implementation, so a failed test cannot strand a thread.
+        release_tx.send(()).unwrap();
+        let store = f.store();
+        let catch = async {
+            let _writer = f.handler.writer.lock().await;
+            f.handler.catch_up(&store, Instant::now() + DEADLINE).await
+        };
+        finish(std::pin::pin!(catch)).await.unwrap();
+        assert!(
+            excluded,
+            "dropping the request released exclusion before commit"
+        );
+        assert_eq!(
+            f.store()
+                .identity_log_status()
+                .unwrap()
+                .last_applied_position,
+            1
+        );
+        assert_eq!(f.store().enumerate(None).unwrap().projects.len(), 1);
+        assert_eq!(f.store().generation().unwrap(), 3);
+        assert_eq!(f.handler.health.log_state.load(Ordering::Relaxed), 0);
+        assert_eq!(f.pending(), 0);
+        assert_eq!(tap.sends().len(), 1);
+    }
+
     #[tokio::test]
     async fn domain_and_oversize_refusals_restore_pending_journal_and_projection_on_restart() {
         let tap = Tap::new(0);
@@ -1154,7 +1284,7 @@ impl ProjectsHandler {
             }
         }
         let deadline = received + DEADLINE;
-        let _writer = timeout_at(deadline, self.writer.lock())
+        let mut writer = timeout_at(deadline, self.writer.clone().lock_owned())
             .await
             .map_err(|_| {
                 HandlerError::new("identity_log_contended", "writer lock deadline expired")
@@ -1196,9 +1326,13 @@ impl ProjectsHandler {
             let principal = principal.clone();
             let stable_id = agent_id.clone();
             let health = self.health.clone();
+            #[cfg(test)]
+            let commit_hook = self.shared_commit_hook.clone();
             let worker = tokio::task::spawn_blocking(move || {
+                // Dropping the request must not release exclusion before this
+                // worker has committed or rolled back its SQLite transaction.
                 let mut bytes_tx = Some(bytes_tx);
-                worker_store.shared_attempt(
+                let result = worker_store.shared_attempt(
                     log_client::encode_hex(&id),
                     head,
                     move |bytes| {
@@ -1208,16 +1342,25 @@ impl ProjectsHandler {
                             .log_pending
                             .store(pending_count + 1, Ordering::Relaxed);
                         let _ = bytes_tx.take().unwrap().send(bytes);
-                        decision_rx
-                            .recv()
-                            .unwrap_or_else(|_| SharedSettlement::Rollback {
-                                sent: true,
-                                code: "engram_outcome_unknown".into(),
-                                message: "settlement waiter was cancelled".into(),
-                            })
+                        let decision =
+                            decision_rx
+                                .recv()
+                                .unwrap_or_else(|_| SharedSettlement::Rollback {
+                                    sent: true,
+                                    code: "engram_outcome_unknown".into(),
+                                    message: "settlement waiter was cancelled".into(),
+                                });
+                        #[cfg(test)]
+                        if matches!(decision, SharedSettlement::Commit(_)) {
+                            if let Some(hook) = &commit_hook {
+                                hook();
+                            }
+                        }
+                        decision
                     },
                     || operation.run(&worker_store, &principal, now, &stable_id),
-                )
+                );
+                (writer, result)
             });
             let mut committed_position = None;
             let mut proven_unsent = false;
@@ -1235,13 +1378,12 @@ impl ProjectsHandler {
                 }
                 let _ = decision_tx.send(decision);
             }
-            let result = worker
+            let (returned_writer, result) = worker
                 .await
                 .map_err(|e| HandlerError::new("storage_error", e.to_string()))?;
+            writer = returned_writer;
             if result.is_ok() || proven_unsent {
-                self.health
-                    .log_pending
-                    .store(pending_count, Ordering::Relaxed);
+                super::enable::refresh(&self.health, &store);
                 if let Some(position) = committed_position.filter(|_| result.is_ok()) {
                     self.health.log_applied.store(position, Ordering::Relaxed);
                     self.health.log_head.fetch_max(position, Ordering::Relaxed);

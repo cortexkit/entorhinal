@@ -12,6 +12,7 @@ pub mod schema;
 mod store;
 mod validate;
 
+pub(crate) use claims::load_claims;
 pub use claims::AgentNameClaim;
 pub use feed::{AgentChangesReply, AgentSnapshotReply};
 pub use fleet::avatar_fingerprint;
