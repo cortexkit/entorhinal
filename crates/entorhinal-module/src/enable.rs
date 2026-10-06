@@ -1090,9 +1090,11 @@ mod tests {
         assert_eq!(f.enable().await.unwrap_err(), "engram_unavailable");
         let saved = f.rows("identity_log_state");
         assert_eq!(log.head(), 1);
-        // A lagging read misses the landed append. A refused resend then forces
-        // a fresh position-one read: finding our own id is not proof we lost the
-        // slot, so the saved plan and the bootstrap import fence must survive.
+        // A stale read hasn't seen this machine's first snapshot part, which has
+        // in fact landed at position 1. The resend is refused, so enable reads
+        // position 1 again and finds its own entry id there: its own snapshot is
+        // in the log, not another machine's. Enable must not give up, so the
+        // saved snapshot parts and the block on agent imports must both stay.
         log.on_append(Action::Refuse {
             code: log_client::HEAD_MOVED.into(),
             detail: Some(json!({"head":1})),
