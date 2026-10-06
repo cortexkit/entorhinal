@@ -257,6 +257,15 @@ impl RegistryStore {
 
 impl JournalWriter<'_> {
     pub fn agent_import(&self, params: Value, now: i64) -> Result<Vec<u8>, AgentMutationError> {
+        if matches!(
+            self.identity_log_status()?.state.as_str(),
+            "enabling" | "joining"
+        ) {
+            return Err(AgentMutationError::new(
+                "identity_log_enabling",
+                "identity log bootstrap is in progress",
+            ));
+        }
         let request: ImportRequest = serde_json::from_value(params)
             .map_err(|error| AgentMutationError::new("invalid_request", error.to_string()))?;
         let key = request

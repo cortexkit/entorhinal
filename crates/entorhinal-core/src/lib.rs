@@ -21,6 +21,7 @@ use serde::Serialize;
 
 pub mod agent;
 mod binding;
+pub mod enable_state;
 mod log_schema;
 mod mutations;
 mod ownership;

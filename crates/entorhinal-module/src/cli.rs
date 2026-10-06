@@ -1329,6 +1329,41 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn log_enable_cli_request_enables_through_operator_route() {
+        use crate::{fake_log::FakeLog, tests::scratch_descriptor};
+        let (dir, descriptor) = scratch_descriptor("enable-cli");
+        let log = std::sync::Arc::new(FakeLog::default());
+        let handler =
+            crate::ProjectsHandler::with_log_connector("cli-enable".into(), || 700, log.clone());
+        *handler.store.lock().unwrap() =
+            Some(entorhinal_core::RegistryStore::open(&descriptor).unwrap());
+        let Invocation::Command(command) = parse_as(Face::Projects, &["log", "enable"]) else {
+            panic!("log enable must parse")
+        };
+        let (method, params) = build(&command).unwrap();
+        let body = serde_json::to_vec(&json!({"method":method,"params":params})).unwrap();
+        handler.route_admissions().insert(
+            (141, 1),
+            crate::RouteAdmission {
+                principal: Some(crate::Principal::Direct),
+                flow_id: None,
+            },
+        );
+        let crate::HandlerOutcome::Response(bytes) =
+            handler.handle_served_request(&body, (141, 1)).await
+        else {
+            panic!("CLI enable was refused")
+        };
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap()["result"]["state"],
+            "enabled"
+        );
+        assert_eq!(log.head(), 1);
+        drop(handler);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// The RENDERER's field names come from the REGISTRY'S OWN REPLY TYPE.
     ///
     /// The request half was pinned from the start; the response half was not,

@@ -26,6 +26,7 @@ tokio = { workspace = true }
 getrandom = { workspace = true }
 
 [dev-dependencies]
+rusqlite = { workspace = true }
 # The e2e test spawns the daemon and the module as child processes, which
 # needs tokio's process feature. Declared here because nothing else in the
 # dependency graph enables it for this crate.

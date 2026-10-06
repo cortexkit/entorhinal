@@ -1183,10 +1183,9 @@ impl ProjectsHandler {
         let settlement = received + SETTLEMENT;
         for retry in 0..=RETRIES {
             self.catch_up(&store, deadline).await?;
-            let head = store
-                .identity_log_status()
-                .map_err(storage_error)?
-                .last_applied_position;
+            let status = store.identity_log_status().map_err(storage_error)?;
+            let head = status.last_applied_position;
+            let pending_count = status.pending_write_count;
             let mut id = [0; 16];
             getrandom::getrandom(&mut id)
                 .map_err(|e| HandlerError::new("storage_error", e.to_string()))?;
@@ -1196,12 +1195,18 @@ impl ProjectsHandler {
             let operation = write.clone();
             let principal = principal.clone();
             let stable_id = agent_id.clone();
+            let health = self.health.clone();
             let worker = tokio::task::spawn_blocking(move || {
                 let mut bytes_tx = Some(bytes_tx);
                 worker_store.shared_attempt(
                     log_client::encode_hex(&id),
                     head,
                     move |bytes| {
+                        // Preparation reaches this callback only after the pending
+                        // row committed. Publish before the append can park.
+                        health
+                            .log_pending
+                            .store(pending_count + 1, Ordering::Relaxed);
                         let _ = bytes_tx.take().unwrap().send(bytes);
                         decision_rx
                             .recv()
@@ -1214,6 +1219,8 @@ impl ProjectsHandler {
                     || operation.run(&worker_store, &principal, now, &stable_id),
                 )
             });
+            let mut committed_position = None;
+            let mut proven_unsent = false;
             if let Ok(bytes) = bytes_rx.await {
                 let append = AppendRequest {
                     expected_head: head as u64,
@@ -1222,11 +1229,27 @@ impl ProjectsHandler {
                     data: bytes,
                 };
                 let decision = self.settle(&append, settlement).await;
+                match &decision {
+                    SharedSettlement::Commit(position) => committed_position = Some(*position),
+                    SharedSettlement::Rollback { sent, .. } => proven_unsent = !sent,
+                }
                 let _ = decision_tx.send(decision);
             }
             let result = worker
                 .await
                 .map_err(|e| HandlerError::new("storage_error", e.to_string()))?;
+            if result.is_ok() || proven_unsent {
+                self.health
+                    .log_pending
+                    .store(pending_count, Ordering::Relaxed);
+                if let Some(position) = committed_position.filter(|_| result.is_ok()) {
+                    self.health.log_applied.store(position, Ordering::Relaxed);
+                    self.health.log_head.fetch_max(position, Ordering::Relaxed);
+                }
+            }
+            if let Err(error) = &result {
+                super::enable::record_error(&self.health, error);
+            }
             if result.as_ref().is_err_and(|e| e.code == "head_moved") {
                 if retry == RETRIES {
                     return Err(HandlerError::new(

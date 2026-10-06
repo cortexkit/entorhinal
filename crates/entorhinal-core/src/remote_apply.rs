@@ -84,6 +84,24 @@ impl RegistryStore {
     /// Install all snapshot parts atomically, preserving each part's authorship
     /// and original body for audit. The merged entry remains in replay's format.
     pub fn apply_remote_snapshot(&self, entries: &[RemoteEntry]) -> Result<i64, RegistryError> {
+        self.install_snapshot(entries, None)
+    }
+
+    /// Joining records its fence in the very transaction that installs the
+    /// bootstrap, so no crash exposes imported identities in a disabled store.
+    pub fn apply_join_snapshot(
+        &self,
+        entries: &[RemoteEntry],
+        head: i64,
+    ) -> Result<i64, RegistryError> {
+        self.install_snapshot(entries, Some(head))
+    }
+
+    fn install_snapshot(
+        &self,
+        entries: &[RemoteEntry],
+        join_head: Option<i64>,
+    ) -> Result<i64, RegistryError> {
         let parts = entries
             .iter()
             .map(snapshot_part)
@@ -174,6 +192,10 @@ impl RegistryStore {
                             "UPDATE registry_journal SET payload_json=?1 WHERE seq=?2",
                             params![String::from_utf8(canonical_bytes(&payload)).unwrap(), seq],
                         )?;
+                    }
+                    if let Some(head) = join_head {
+                        tx.execute("UPDATE identity_log_state SET state='joining',last_seen_head=?1 WHERE id=1 AND state='disabled'", [head])?;
+                        crate::enable_state::finish_join_at_head(tx, head)?;
                     }
                     Ok(seq)
                 };
@@ -333,6 +355,12 @@ fn apply(tx: &Transaction<'_>, entry: &RemoteEntry) -> rusqlite::Result<i64> {
         }
     };
     tx.execute("UPDATE identity_log_state SET last_applied_position=?1,last_seen_head=MAX(last_seen_head,?1) WHERE id=1", [entry.position])?;
+    let head: i64 = tx.query_row(
+        "SELECT last_seen_head FROM identity_log_state WHERE id=1",
+        [],
+        |r| r.get(0),
+    )?;
+    crate::enable_state::finish_join_at_head(tx, head)?;
     tx.execute(
         "DELETE FROM pending_entry WHERE expected_head < ?1",
         [entry.position],

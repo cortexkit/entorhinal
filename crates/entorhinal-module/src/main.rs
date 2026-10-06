@@ -53,6 +53,7 @@ mod agent_ops;
 mod agent_reads;
 mod catch_up;
 mod cli;
+mod enable;
 mod incarnation;
 // The client for engram's identity log. Only writes to shared state and
 // catch-up call it, and it opens its route on first use, so startup and every
@@ -174,6 +175,12 @@ struct HealthGauges {
     dropped_older_logged: AtomicBool,
     log_state: AtomicU64,
     log_own_entries_applied: AtomicU64,
+    log_mode: AtomicU64,
+    log_applied: AtomicI64,
+    log_head: AtomicI64,
+    log_pending: AtomicI64,
+    log_error: AtomicU64,
+    log_error_at: AtomicI64,
 }
 
 /// Volatile liveness state fed by `projects.session_liveness` batches. Never
@@ -572,7 +579,12 @@ impl ModuleHandler for ProjectsHandler {
                 "livenessGaps": self.health.liveness_gaps.load(Ordering::Relaxed),
                 "livenessDroppedOlder": self.health.liveness_dropped_older.load(Ordering::Relaxed),
                 "livenessSessions": self.health.liveness_sessions.load(Ordering::Relaxed),
-                "identityLogState": shared_write::health_state(self.health.log_state.load(Ordering::Relaxed)),
+                "identityLogState": enable::status_state(&self.health),
+                "lastAppliedPosition": self.health.log_applied.load(Ordering::Relaxed),
+                "lastSeenHead": self.health.log_head.load(Ordering::Relaxed),
+                "pendingWriteCount": self.health.log_pending.load(Ordering::Relaxed),
+                "lastError": enable::last_error(&self.health),
+                "lastErrorAt": enable::last_error_at(&self.health),
                 "logOwnEntriesAppliedFromLog": self.health.log_own_entries_applied.load(Ordering::Relaxed),
             })),
         }
@@ -615,7 +627,12 @@ impl ProjectsHandler {
         if !MUTATING_METHODS.contains(&request.method.as_str()) {
             return self.handle_request_wait(body, key).await;
         }
-        match self.write_wait(request, key, received).await {
+        let result = if request.method == "identity_log.enable" {
+            self.enable_log(key, received).await
+        } else {
+            self.write_wait(request, key, received).await
+        };
+        match result {
             Ok(body) => HandlerOutcome::Response(body),
             Err(error) => error.into_outcome(),
         }
@@ -881,6 +898,11 @@ impl ProjectsHandler {
 
     fn identity_log_status(&self) -> Result<Vec<u8>, HandlerError> {
         let reply = self.with_store(RegistryStore::identity_log_status)?;
+        enable::refresh_status(&self.health, &reply);
+        let mut reply = serde_json::to_value(reply).map_err(invalid_params)?;
+        reply["state"] = json!(enable::status_state(&self.health));
+        reply["lastError"] = json!(enable::last_error(&self.health));
+        reply["lastErrorAt"] = json!(enable::last_error_at(&self.health));
         self.encode_read_result(reply)
     }
 
@@ -1454,6 +1476,7 @@ fn install_store(
     match outcome {
         Ok(mut opened) => {
             enable_root_records(&mut opened);
+            enable::refresh(health, &opened);
             health
                 .generation
                 .store(opened.generation().unwrap_or(0), Ordering::Relaxed);
@@ -2039,7 +2062,7 @@ mod tests {
                 (
                     "identity_log.status",
                     json!({}),
-                    json!({"state":"enabled","lastAppliedPosition":0,"lastSeenHead":0,"pendingWriteCount":0}),
+                    json!({"state":"enabled","lastAppliedPosition":0,"lastSeenHead":0,"pendingWriteCount":0,"lastError":null,"lastErrorAt":null}),
                 ),
             ] {
                 let reply: Value =

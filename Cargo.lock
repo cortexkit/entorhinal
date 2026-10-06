@@ -235,6 +235,7 @@ dependencies = [
  "cortexkit-store-types",
  "entorhinal-core",
  "getrandom",
+ "rusqlite",
  "serde",
  "serde_json",
  "subc-client-rs",

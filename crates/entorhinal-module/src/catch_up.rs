@@ -44,7 +44,11 @@ impl ProjectsHandler {
         store: &RegistryStore,
         deadline: Instant,
     ) -> Result<(), HandlerError> {
-        self.catch_up_worker().run(store, deadline).await
+        let result = self.catch_up_worker().run(store, deadline).await;
+        if let Err(error) = &result {
+            super::enable::record_error(&self.health, error);
+        }
+        result
     }
 }
 
@@ -87,13 +91,30 @@ impl Worker {
             };
             let store = self.store.lock().unwrap().clone();
             if let Some(store) = store {
-                // Disabled stores never open a route. Enabling is resumed by the
-                // enable coordinator, not by installing its own pending snapshot.
+                // Disabled stores never open a route. A stored enable plan is
+                // resumed before ordinary catch-up, never installed as a join.
                 if store
                     .identity_log_status()
-                    .is_ok_and(|s| matches!(s.state.as_str(), "enabled" | "joining"))
+                    .is_ok_and(|s| matches!(s.state.as_str(), "enabled" | "joining" | "enabling"))
                 {
-                    if let Err(error) = self.run(&store, deadline).await {
+                    let result = if store
+                        .identity_log_status()
+                        .is_ok_and(|s| s.state == "enabling")
+                    {
+                        super::enable::resume(
+                            &store,
+                            &self.log,
+                            &self.health,
+                            deadline,
+                            "entorhinal",
+                        )
+                        .await
+                    } else {
+                        self.run(&store, deadline).await
+                    };
+                    super::enable::refresh(&self.health, &store);
+                    if let Err(error) = result {
+                        super::enable::record_error(&self.health, &error);
                         tracing::warn!(target: "identity_log", "catch-up: {}: {}", error.code, error.message);
                     }
                 }
@@ -109,7 +130,9 @@ impl Worker {
     }
 
     async fn run(&self, store: &RegistryStore, deadline: Instant) -> Result<(), HandlerError> {
-        if matches!(self.health.log_state.load(Ordering::Relaxed), 4..=6) {
+        if matches!(self.health.log_state.load(Ordering::Relaxed), 4..=6)
+            && store.identity_log_status().map_err(storage)?.state == "enabled"
+        {
             return Err(HandlerError::new(
                 "identity_log_stalled",
                 "identity log catch-up is stalled",
@@ -157,7 +180,10 @@ impl Worker {
             }
             let head = i64::try_from(page.head)
                 .map_err(|_| self.stalled(6, after + 1, "log head exceeds local range"))?;
-            store.observe_log_head(head).map_err(storage)?;
+            let mut joining = store.identity_log_status().map_err(storage)?.state == "disabled";
+            if !joining {
+                store.observe_log_head(head).map_err(storage)?;
+            }
             let page_start = after;
             for entry in page.entries {
                 if entry.position != after + 1 || entry.position > page.head {
@@ -177,14 +203,25 @@ impl Worker {
                     }
                     parts.push(entry);
                     if info.1 == info.2 {
-                        store
-                            .apply_remote_snapshot(&parts)
-                            .map_err(|e| self.stalled(6, position, e))?;
+                        (if joining {
+                            store.apply_join_snapshot(&parts, head)
+                        } else {
+                            store.apply_remote_snapshot(&parts)
+                        })
+                        .map_err(|e| self.stalled(6, position, e))?;
+                        joining = false;
                         parts.clear();
                         snapshot = None;
                         self.applied(store)?;
                     }
                 } else {
+                    if joining {
+                        return Err(self.stalled(
+                            6,
+                            position,
+                            "join requires a bootstrap snapshot",
+                        ));
+                    }
                     let own = store.is_pending_entry(&entry.entry_id).map_err(storage)?;
                     store
                         .apply_remote_entry(&entry)
@@ -208,6 +245,9 @@ impl Worker {
                     ));
                 }
                 self.health.log_state.store(0, Ordering::Relaxed);
+                store.finish_join(head).map_err(storage)?;
+                super::enable::refresh(&self.health, store);
+                self.applied(store)?;
                 return Ok(());
             }
             if after == page_start {
@@ -217,6 +257,7 @@ impl Worker {
     }
 
     fn applied(&self, store: &RegistryStore) -> Result<(), HandlerError> {
+        super::enable::refresh(&self.health, store);
         self.health
             .generation
             .fetch_max(store.generation().map_err(storage)?, Ordering::Relaxed);
