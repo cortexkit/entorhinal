@@ -39,12 +39,105 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
     };
+    use std::{
+        future::Future,
+        pin::Pin,
+        task::{Context, Poll, Waker},
+    };
 
     const ROUTE: RouteKey = (71, 1);
+    // Tokio's timer wheel has millisecond resolution. Advance past a tick, not
+    // by a wall-clock tolerance, when explicitly waking network timers.
+    const TIMER_TICK: Duration = Duration::from_millis(1);
     static DRAWS: AtomicUsize = AtomicUsize::new(0);
     fn fixed_draw() -> Result<String, HandlerError> {
         DRAWS.fetch_add(1, Ordering::SeqCst);
         Ok("agent_0123456789abcdef".into())
+    }
+
+    /// A cache hit, local liveness update or read must answer before a parked
+    /// writer is released, without measuring SQLite's wall-clock execution.
+    fn ready<F: Future>(future: F) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        match future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        {
+            Poll::Ready(result) => result,
+            Poll::Pending => panic!("operation waited instead of answering from committed state"),
+        }
+    }
+
+    fn pending<F: Future>(future: Pin<&mut F>) {
+        assert!(
+            future
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending(),
+            "write completed before its deadline"
+        );
+    }
+
+    /// Keep the executor runnable while SQLite prepares an attempt. Otherwise
+    /// Tokio may auto-advance the paused clock while spawn_blocking is still
+    /// working, consuming the network deadline before any send has begun.
+    async fn reach<F: Future, B: Future<Output = ()>>(mut write: Pin<&mut F>, barrier: B) {
+        let frozen = Instant::now();
+        tokio::pin!(barrier);
+        loop {
+            tokio::select! {
+                biased;
+                () = &mut barrier => break,
+                _ = &mut write => panic!("write finished before the expected log call"),
+                () = tokio::task::yield_now() => {},
+            }
+        }
+        assert_eq!(
+            Instant::now(),
+            frozen,
+            "SQLite preparation advanced the paused clock"
+        );
+    }
+
+    async fn finish<F: Future>(mut write: Pin<&mut F>) -> F::Output {
+        let frozen = Instant::now();
+        let result = loop {
+            tokio::select! {
+                result = &mut write => break result,
+                () = tokio::task::yield_now() => {},
+            }
+        };
+        assert_eq!(
+            Instant::now(),
+            frozen,
+            "SQLite completion advanced the paused clock"
+        );
+        result
+    }
+
+    /// Poll the expired writer before awaiting its SQLite rollback. A further
+    /// resend tick makes an incorrectly renewed deadline observable as a late
+    /// send, instead of hanging the test on an unadvanced network timer.
+    async fn expire<F: Future>(mut write: Pin<&mut F>, tap: &Tap, bound: Instant) -> F::Output {
+        tokio::time::advance(bound.saturating_duration_since(Instant::now()) + TIMER_TICK).await;
+        let mut result = match write.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(result) => Some(result),
+            Poll::Pending => None,
+        };
+        if result.is_none() {
+            tokio::time::advance(RESEND_DELAY + TIMER_TICK).await;
+            result = match write.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+                Poll::Ready(result) => Some(result),
+                Poll::Pending => None,
+            };
+        }
+        assert!(
+            tap.sent_at.lock().unwrap().iter().all(|time| *time < bound),
+            "a resend started at or after settlement expiry"
+        );
+        match result {
+            Some(result) => result,
+            None => finish(write).await,
+        }
     }
 
     struct Fixture {
@@ -155,6 +248,7 @@ mod tests {
     struct Tap {
         fake: FakeLog,
         requests: Mutex<Vec<Value>>,
+        sent_at: Mutex<Vec<Instant>>,
         races: AtomicUsize,
         hang_after_race: AtomicBool,
     }
@@ -163,6 +257,7 @@ mod tests {
             Arc::new(Self {
                 fake: FakeLog::default(),
                 requests: Mutex::new(vec![]),
+                sent_at: Mutex::new(vec![]),
                 races: AtomicUsize::new(races),
                 hang_after_race: AtomicBool::new(false),
             })
@@ -187,6 +282,7 @@ mod tests {
             let mut raced = false;
             if method == log_client::APPEND {
                 self.requests.lock().unwrap().push(params.clone());
+                self.sent_at.lock().unwrap().push(Instant::now());
                 if self
                     .races
                     .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -216,7 +312,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cached_register_restart_precedes_lock_connector_and_pending() {
         let tap = Tap::new(0);
         let mut f = Fixture::new("write-cache", connector(&tap));
@@ -230,10 +326,7 @@ mod tests {
         let fail = Arc::new(FailConnector::default());
         f.restart(fail.clone());
         let lock = f.handler.writer.lock().await;
-        let retry = tokio::time::timeout(Duration::from_millis(100), f.call("register", request))
-            .await
-            .unwrap()
-            .unwrap();
+        let retry = ready(f.call("register", request)).unwrap();
         assert_eq!(retry, body);
         assert_eq!(f.pending(), 0);
         assert_eq!(f.image(), image);
@@ -386,7 +479,7 @@ mod tests {
         assert_eq!(tap.fake.head(), 6);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn ambiguous_resend_refusals_keep_pending_until_receipt_relative_bound_and_recovery() {
         async fn case(code: Option<&str>, state: &str) {
             let tap = Tap::new(0);
@@ -399,22 +492,40 @@ mod tests {
             // Receipt is already 18 seconds old; the writer has only two seconds
             // to settle, not a fresh 20 seconds after its first send.
             let received = Instant::now() - Duration::from_secs(18);
-            let started = Instant::now();
-            let result = tokio::time::timeout(
-                Duration::from_secs(3),
-                f.handler.write_wait(
+            let bound = received + SETTLEMENT;
+            let result = {
+                let write = f.handler.write_wait(
                     WireRequest {
                         method: "register".into(),
                         params: register("P", "unknown"),
                     },
                     ROUTE,
                     received,
-                ),
-            )
-            .await
-            .unwrap();
+                );
+                tokio::pin!(write);
+                reach(write.as_mut(), tap.fake.wait_for_calls(2)).await;
+                assert_eq!(tap.fake.held_count(), 1);
+                assert_eq!(tap.sends().len(), 1);
+                // Time out the held send, then permit the resend under the same id.
+                tokio::time::advance(SEND_WAIT + TIMER_TICK).await;
+                pending(write.as_mut());
+                tokio::time::advance(RESEND_DELAY + TIMER_TICK).await;
+                reach(write.as_mut(), tap.fake.wait_for_calls(3)).await;
+                assert_eq!(tap.sends().len(), 2);
+                if code.is_some() {
+                    // Each refusal must allow another resend before expiry,
+                    // even if SQLite has not finished an erroneous early rollback.
+                    tokio::time::advance(RESEND_DELAY + TIMER_TICK).await;
+                    pending(write.as_mut());
+                    assert_eq!(
+                        tap.sends().len(),
+                        3,
+                        "a resend refusal ended settlement early"
+                    );
+                }
+                expire(write.as_mut(), &tap, bound).await
+            };
             assert_eq!(result.unwrap_err().code, "engram_outcome_unknown");
-            assert!(started.elapsed() >= Duration::from_millis(1900));
             assert_eq!(f.pending(), 1);
             assert_eq!(tap.fake.head(), 0);
             assert!(f.store().enumerate(None).unwrap().projects.is_empty());
@@ -451,12 +562,12 @@ mod tests {
             );
             assert!(f.store().verify().unwrap().ok);
         }
-        tokio::join!(
-            case(Some("unavailable"), "ok"),
-            case(Some("not_member"), "not_member"),
-            case(Some("key_unavailable"), "engram_key_unavailable"),
-            case(None, "ok")
-        );
+        // Each case owns the paused timeline; another case's network timers
+        // must not move time while this case is awaiting its SQLite worker.
+        case(Some("unavailable"), "ok").await;
+        case(Some("not_member"), "not_member").await;
+        case(Some("key_unavailable"), "engram_key_unavailable").await;
+        case(None, "ok").await;
     }
 
     struct Warning(Arc<Mutex<String>>);
@@ -527,7 +638,7 @@ mod tests {
             std::future::pending().await
         }
     }
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn queued_connecting_and_catchup_deadlines_are_receipt_relative_and_never_send() {
         assert_eq!(DEADLINE, Duration::from_secs(25));
         assert_eq!(SETTLEMENT, Duration::from_secs(20));
@@ -538,53 +649,57 @@ mod tests {
             } else {
                 None
             };
-            let received = Instant::now() - DEADLINE + Duration::from_millis(80);
-            let started = Instant::now();
-            let error = tokio::time::timeout(
-                Duration::from_millis(200),
-                f.handler.write_wait(
-                    WireRequest {
-                        method: "register".into(),
-                        params: register("P", "deadline"),
-                    },
-                    ROUTE,
-                    received,
-                ),
-            )
-            .await
-            .unwrap()
-            .unwrap_err();
-            assert_eq!(error.code, code);
-            assert!(started.elapsed() <= Duration::from_millis(150));
+            let before = f.image();
+            let received = Instant::now() - Duration::from_secs(18);
+            let write = f.handler.write_wait(
+                WireRequest {
+                    method: "register".into(),
+                    params: register("P", "deadline"),
+                },
+                ROUTE,
+                received,
+            );
+            tokio::pin!(write);
+            pending(write.as_mut());
+            tokio::time::advance(Duration::from_secs(6)).await;
+            pending(write.as_mut());
             assert_eq!(f.pending(), 0);
-            assert!(f.store().enumerate(None).unwrap().projects.is_empty());
+            assert_eq!(f.image(), before);
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::time::sleep_until(received + DEADLINE).await;
+            let error = ready(write.as_mut()).unwrap_err();
+            assert_eq!(error.code, code);
+            assert_eq!(f.pending(), 0);
+            assert_eq!(f.image(), before);
         }
         let tap = Tap::new(0);
         tap.fake.on_read(Action::Hang);
-        tokio::join!(
-            case(
-                "write-queued",
-                Arc::new(FailConnector::default()),
-                true,
-                "identity_log_contended"
-            ),
-            case(
-                "write-connect",
-                Arc::new(HangConnect),
-                false,
-                "engram_unavailable"
-            ),
-            case(
-                "write-catchup",
-                connector(&tap),
-                false,
-                "engram_unavailable"
-            )
-        );
+        case(
+            "write-queued",
+            Arc::new(FailConnector::default()),
+            true,
+            "identity_log_contended",
+        )
+        .await;
+        case(
+            "write-connect",
+            Arc::new(HangConnect),
+            false,
+            "engram_unavailable",
+        )
+        .await;
+        case(
+            "write-catchup",
+            connector(&tap),
+            false,
+            "engram_unavailable",
+        )
+        .await;
+        assert_eq!(tap.fake.calls(), 1);
         assert!(tap.sends().is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn settlement_expired_before_first_send_deletes_the_committed_pending_row() {
         let tap = Tap::new(0);
         let f = Fixture::new("write-never-sent", connector(&tap));
@@ -636,7 +751,7 @@ mod tests {
         assert_eq!(tap.fake.calls(), calls);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn local_writes_and_liveness_never_touch_engram_on_enabled_store() {
         let fail = Arc::new(FailConnector::default());
         let f = Fixture::new("write-local", fail.clone());
@@ -701,15 +816,10 @@ mod tests {
             .await
             .unwrap();
         let lock = f.handler.writer.lock().await;
-        tokio::time::timeout(
-            Duration::from_millis(100),
-            f.call(
-                "projects.session_liveness",
-                json!({"seq":1,"snapshot":true,"sessions":[]}),
-            ),
-        )
-        .await
-        .unwrap()
+        ready(f.call(
+            "projects.session_liveness",
+            json!({"seq":1,"snapshot":true,"sessions":[]}),
+        ))
         .unwrap();
         drop(lock);
         f.call("remove_root", json!({"projectId":"P","root":root}))
@@ -720,7 +830,7 @@ mod tests {
         assert_eq!(fail.calls(), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn pending_commits_before_parked_transaction_and_reads_show_prewrite_state() {
         let tap = Tap::new(0);
         let f = Fixture::new("write-parked", connector(&tap));
@@ -746,19 +856,10 @@ mod tests {
                 ("agent.resolve", json!({"agent_id":id})),
             ] {
                 let bytes = serde_json::to_vec(&json!({"method":op,"params":params})).unwrap();
-                let started = Instant::now();
-                let reply = tokio::time::timeout(
-                    Duration::from_millis(100),
-                    f.handler.handle_served_request(&bytes, ROUTE),
-                )
-                .await
-                .unwrap();
-                assert!(started.elapsed() < Duration::from_millis(100));
+                let reply = ready(f.handler.handle_served_request(&bytes, ROUTE));
                 assert!(matches!(reply, HandlerOutcome::Response(_)), "{op}");
             }
-            let health = tokio::time::timeout(Duration::from_millis(100), f.handler.health())
-                .await
-                .unwrap();
+            let health = ready(f.handler.health());
             assert_eq!(health.metrics.unwrap()["generation"], generation);
             assert_eq!(f.store().generation().unwrap(), generation);
             assert_eq!(f.store().agent_row(id).unwrap().unwrap().name, "Ada");
@@ -778,23 +879,26 @@ mod tests {
         assert!(f.store().verify().unwrap().ok);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn head_moved_then_ambiguous_append_does_not_restart_settlement_clock() {
         let tap = Tap::new(1);
         // First append races with an independent entry, then the retry hangs.
         tap.hang_after_race.store(true, Ordering::SeqCst);
         let f = Fixture::new("write-race-deadline", connector(&tap));
+        let received = Instant::now() - Duration::from_secs(18);
+        let bound = received + SETTLEMENT;
         let write = f.handler.write_wait(
             WireRequest {
                 method: "register".into(),
                 params: register("P", "race"),
             },
             ROUTE,
-            Instant::now() - Duration::from_secs(18),
+            received,
         );
-        let result = tokio::time::timeout(Duration::from_secs(3), write)
-            .await
-            .unwrap();
+        tokio::pin!(write);
+        reach(write.as_mut(), tap.fake.wait_for_calls(5)).await;
+        assert_eq!(tap.sends().len(), 2);
+        let result = expire(write.as_mut(), &tap, bound).await;
         assert_eq!(result.unwrap_err().code, "engram_outcome_unknown");
         assert_eq!(f.pending(), 1);
         assert!(f.store().enumerate(None).unwrap().projects.is_empty());

@@ -29,5 +29,6 @@ getrandom = { workspace = true }
 # The e2e test spawns the daemon and the module as child processes, which
 # needs tokio's process feature. Declared here because nothing else in the
 # dependency graph enables it for this crate.
-tokio = { workspace = true, features = ["process"] }
+# Writer deadline tests advance a paused clock instead of timing SQLite work.
+tokio = { workspace = true, features = ["process", "test-util"] }
 subc-transport = { workspace = true }
