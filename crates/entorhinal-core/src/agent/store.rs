@@ -537,8 +537,9 @@ impl RegistryStore {
 }
 
 impl JournalWriter<'_> {
-    /// Strict decoding and required-key checks precede the read-only cache
-    /// probe, just as they precede the in-transaction lookup below.
+    /// Decode the request and require its key before looking for a cached reply.
+    /// A malformed request must be refused even if that key already has a reply;
+    /// returning cached bytes first would accept unknown fields or wrong field types.
     pub fn probe_agent_mutation(
         &self,
         op: &str,
@@ -565,8 +566,11 @@ impl JournalWriter<'_> {
         self.agent_mutation_with_id(op, params, now, None)
     }
 
-    /// The shared coordinator draws a create id once, before its first attempt.
-    /// Local callers retain the original random draw inside the transaction.
+    /// The shared write path supplies a create id drawn once for the request.
+    /// If another writer adds a log entry first, creating the agent is rolled
+    /// back and run again with the same id, so the requested agent keeps its
+    /// identity across retries. Calls without a supplied id still draw one
+    /// inside the transaction.
     pub fn agent_mutation_with_id(
         &self,
         op: &str,

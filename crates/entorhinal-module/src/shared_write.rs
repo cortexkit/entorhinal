@@ -1,5 +1,9 @@
-//! Serializes shared writes without blocking readers. SQLite transactions live
-//! on blocking workers; the async task settles the bytes over the log client.
+//! Runs one shared write at a time while readers use already committed data.
+//! A worker thread keeps the SQLite transaction open while the async task asks
+//! the log to append the entry, resending it if the result is uncertain. Local
+//! changes commit only after the log confirms the append. If confirmation does
+//! not arrive before the time limit, or the log rejects the attempt as outdated
+//! or invalid, the local changes roll back.
 
 use super::{
     log_client::{self, AppendRequest, EntryKind, LogError},
@@ -46,8 +50,9 @@ mod tests {
     };
 
     const ROUTE: RouteKey = (71, 1);
-    // Tokio's timer wheel has millisecond resolution. Advance past a tick, not
-    // by a wall-clock tolerance, when explicitly waking network timers.
+    // Tokio schedules timers at millisecond precision. Advancing simulated time
+    // by an extra millisecond lets a due timer fire even if its deadline was
+    // rounded up; this does not measure how long SQLite takes in real time.
     const TIMER_TICK: Duration = Duration::from_millis(1);
     static DRAWS: AtomicUsize = AtomicUsize::new(0);
     fn fixed_draw() -> Result<String, HandlerError> {
@@ -55,8 +60,10 @@ mod tests {
         Ok("agent_0123456789abcdef".into())
     }
 
-    /// A cache hit, local liveness update or read must answer before a parked
-    /// writer is released, without measuring SQLite's wall-clock execution.
+    /// Require a result on the first poll, without waiting for another async task.
+    /// Tests use this while a write holds the lock or waits for the log's reply,
+    /// to prove that cached replies, liveness and reads do not queue behind it.
+    /// This checks whether an operation waits, not how fast SQLite runs.
     fn ready<F: Future>(future: F) -> F::Output {
         let mut future = std::pin::pin!(future);
         match future
@@ -77,9 +84,11 @@ mod tests {
         );
     }
 
-    /// Keep the executor runnable while SQLite prepares an attempt. Otherwise
-    /// Tokio may auto-advance the paused clock while spawn_blocking is still
-    /// working, consuming the network deadline before any send has begun.
+    /// Keep the test's async task runnable until the specified log call occurs.
+    /// When all async tasks are waiting, Tokio can advance its paused clock to
+    /// the next timer even though SQLite is still running on a worker thread.
+    /// Yielding in this loop keeps database preparation from using simulated
+    /// time that the test reserves for waiting on the log.
     async fn reach<F: Future, B: Future<Output = ()>>(mut write: Pin<&mut F>, barrier: B) {
         let frozen = Instant::now();
         tokio::pin!(barrier);
@@ -114,9 +123,11 @@ mod tests {
         result
     }
 
-    /// Poll the expired writer before awaiting its SQLite rollback. A further
-    /// resend tick makes an incorrectly renewed deadline observable as a late
-    /// send, instead of hanging the test on an unadvanced network timer.
+    /// Advance past the request's deadline and poll the write so it can discard
+    /// its temporary SQLite changes. If it is not ready, advance by one resend
+    /// interval and poll again. Code that incorrectly gave the request more time
+    /// would then send another append, which the timestamp check rejects. Finally
+    /// let any database rollback finish while the simulated clock stays still.
     async fn expire<F: Future>(mut write: Pin<&mut F>, tap: &Tap, bound: Instant) -> F::Output {
         tokio::time::advance(bound.saturating_duration_since(Instant::now()) + TIMER_TICK).await;
         let mut result = match write.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
@@ -243,8 +254,10 @@ mod tests {
         }
     }
 
-    // Records actual wire sends, not coordinator internals. A race inserts an
-    // independent entry before CAS, making head_moved a real position change.
+    // Record append requests when they reach the log transport, so assertions
+    // inspect what was actually sent. To simulate another writer acting first,
+    // add a separate entry before handling the tested request. Its expected log
+    // head is then outdated, so head_moved reflects a real new log position.
     struct Tap {
         fake: FakeLog,
         requests: Mutex<Vec<Value>>,
@@ -489,8 +502,9 @@ mod tests {
                     .on_append(code.map(refusal).unwrap_or(Action::Hang));
             }
             let mut f = Fixture::new(&format!("write-unknown-{state}"), connector(&tap));
-            // Receipt is already 18 seconds old; the writer has only two seconds
-            // to settle, not a fresh 20 seconds after its first send.
+            // Pretend the module received this request 18 seconds ago. Only two
+            // seconds remain in its 20-second limit for confirming the append;
+            // starting that limit at the first send would give it extra time.
             let received = Instant::now() - Duration::from_secs(18);
             let bound = received + SETTLEMENT;
             let result = {
@@ -562,8 +576,9 @@ mod tests {
             );
             assert!(f.store().verify().unwrap().ok);
         }
-        // Each case owns the paused timeline; another case's network timers
-        // must not move time while this case is awaiting its SQLite worker.
+        // Run the cases one at a time because they share Tokio's paused clock.
+        // One case advancing time could otherwise expire another case's request
+        // while its worker thread is still doing database work.
         case(Some("unavailable"), "ok").await;
         case(Some("not_member"), "not_member").await;
         case(Some("key_unavailable"), "engram_key_unavailable").await;
@@ -767,7 +782,10 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        // Set up a pre-enable local root and binding without a shared send.
+        // Register the checkout and its execution binding (the checkout identity
+        // used for approvals) with shared logging disabled. Turn logging back on
+        // before testing local writes, so their success cannot depend on a log
+        // connection. The fake connector fails if any operation tries to use it.
         f.store()
             .apply_entry("test.disabled", "{}", "test", None, |tx| {
                 tx.execute("UPDATE identity_log_state SET state='disabled'", [])?;
@@ -882,7 +900,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn head_moved_then_ambiguous_append_does_not_restart_settlement_clock() {
         let tap = Tap::new(1);
-        // First append races with an independent entry, then the retry hangs.
+        // Add another writer's entry first, so the initial append is refused with
+        // head_moved. Leave later append requests unanswered to verify that
+        // reading the new entry and retrying do not extend the original time limit.
         tap.hang_after_race.store(true, Ordering::SeqCst);
         let f = Fixture::new("write-race-deadline", connector(&tap));
         let received = Instant::now() - Duration::from_secs(18);

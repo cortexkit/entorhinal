@@ -497,7 +497,10 @@ impl super::JournalWriter<'_> {
         self.register_at(req, now_unix_millis())
     }
 
-    /// The coordinator supplies a timestamp fixed across CAS retries.
+    /// The shared write path supplies the same timestamp on every attempt.
+    /// If another writer adds a log entry first, registration is rolled back,
+    /// the new log entries are applied, and registration runs again. Reusing the
+    /// timestamp keeps one request's recorded times unchanged across those runs.
     pub fn register_at(
         &self,
         mut req: RegisterRequest,

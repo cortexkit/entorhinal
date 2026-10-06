@@ -598,8 +598,10 @@ struct LivenessSession {
 }
 
 impl ProjectsHandler {
-    /// All transport mutations enter the asynchronous writer coordinator;
-    /// synchronous dispatch remains the local operation implementation.
+    /// Decoded requests that change state use `write_wait`, which handles cached
+    /// replies, serializes database writes, and sends shared changes to the log.
+    /// It calls synchronous `execute` for operations that only change local state.
+    /// Queries use `handle_request_wait` instead, without joining the write queue.
     async fn handle_served_request(&self, body: &[u8], key: RouteKey) -> HandlerOutcome {
         let received = tokio::time::Instant::now();
         let request = match serde_json::from_slice::<WireRequest>(body) {

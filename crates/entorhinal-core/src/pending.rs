@@ -1,6 +1,7 @@
-//! A synchronous transaction bridge for the module's asynchronous log writer.
-//! The bridge runs on a blocking worker: SQLite keeps the transaction open while
-//! the module settles the exact entry bytes. No runtime or transport lives here.
+//! Synchronous SQLite helpers for shared writes made by the asynchronous module.
+//! A worker thread keeps the transaction open while the module asks the log to
+//! append an entry. The module reports whether to commit or roll back; these
+//! helpers record unfinished attempts without making network calls themselves.
 
 use super::{cached, domain};
 use crate::{RegistryError, RegistryStore};
@@ -26,8 +27,10 @@ thread_local! {
 }
 
 impl RegistryStore {
-    /// Read the same cache and cross-operation fence used inside mutations,
-    /// without taking SQLite's writer connection or contacting the log.
+    /// Look up a reply by request key and operation name, and refuse a key that
+    /// was already used for a different operation. Otherwise a request could
+    /// receive another operation's reply. Use the read connection so this check
+    /// does not wait for a database write or contact the log.
     pub fn shared_request_cache(
         &self,
         op: &str,
@@ -57,8 +60,11 @@ impl RegistryStore {
         result
     }
 
-    /// The pending row commits before the operation's transaction opens. Only
-    /// never-sent failures may remove it outside the operation's own commit.
+    /// Save the entry id and expected log head in a separate transaction before
+    /// running the operation. If the operation fails, delete this record only
+    /// when no append request for the entry could have been sent. Once a request
+    /// might have reached the log, keep the record for later log reads to check,
+    /// because the log may accept the entry even after the local write fails.
     pub fn shared_attempt<E: From<RegistryError>>(
         &self,
         id: String,
@@ -147,7 +153,11 @@ pub(super) fn finish(tx: &Transaction<'_>, seq: Option<i64>) -> Result<(), Regis
             if entry.len() > 256 * 1024 {
                 return Err(domain("shared_entry_too_large", format!("shared entry is {} bytes; cap is 262144 bytes", entry.len())));
             }
-            // Conservatively retain the pending row if the bridge is interrupted.
+            // Mark the entry as possibly sent before asking the module for an
+            // answer. If its async request is cancelled or the worker exits
+            // before getting that answer, the log may already have accepted it.
+            // Keeping the pending row lets later log reads check what happened;
+            // the row alone neither resends the entry nor commits local changes.
             attempt.sent = true;
             match (attempt.settle)(entry) {
                 SharedSettlement::Commit(position) => {
