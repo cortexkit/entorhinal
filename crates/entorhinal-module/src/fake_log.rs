@@ -27,11 +27,17 @@ pub(crate) enum Action {
 
 struct Held {
     request: AppendRequest,
+    author: [u8; 16],
     reply: oneshot::Sender<Result<Vec<u8>, TransportError>>,
 }
 
+struct StoredEntry {
+    request: AppendRequest,
+    author: [u8; 16],
+}
+
 struct State {
-    entries: Vec<AppendRequest>,
+    entries: Vec<StoredEntry>,
     member: bool,
     append_actions: VecDeque<Action>,
     read_actions: VecDeque<Action>,
@@ -57,9 +63,20 @@ pub(crate) struct FakeLog {
     state: Arc<Mutex<State>>,
     calls: Arc<AtomicUsize>,
     calls_changed: Arc<tokio::sync::Notify>,
+    author: [u8; 16],
 }
 
 impl FakeLog {
+    /// A store's view of the same log, with its explicit rotation-stable author.
+    /// Cloning keeps the identity; a restored copy uses the same author, while
+    /// another store uses a different one. The default view is the zero author.
+    pub(crate) fn with_author(&self, author: [u8; 16]) -> Self {
+        Self {
+            author,
+            ..self.clone()
+        }
+    }
+
     pub(crate) fn client(&self) -> wire::LogClient {
         wire::LogClient::new(Arc::new(self.clone()))
     }
@@ -102,7 +119,7 @@ impl FakeLog {
     pub(crate) fn release_next(&self) -> Result<u64, TransportError> {
         let mut state = self.state.lock().unwrap();
         let held = state.held.pop_front().expect("no held append to release");
-        let result = accept(&mut state, held.request);
+        let result = accept(&mut state, held.request, held.author);
         let reply = result
             .clone()
             .map(|position| response(json!({"position":position})));
@@ -149,8 +166,13 @@ fn parse_append(params: Value) -> Result<AppendRequest, TransportError> {
 }
 
 /// One serialized cloud transaction: roster, receipt, then CAS. A receipt's
-/// identity includes expected_head and both kind/data, as engram's digest does.
-fn accept(state: &mut State, request: AppendRequest) -> Result<u64, TransportError> {
+/// identity includes the appending author, expected_head and both kind/data, as
+/// engram's receipt does. The author models the signer's stable pseudonym.
+fn accept(
+    state: &mut State,
+    request: AppendRequest,
+    author: [u8; 16],
+) -> Result<u64, TransportError> {
     if !state.member {
         return Err(refuse(wire::NOT_MEMBER, None));
     }
@@ -158,11 +180,12 @@ fn accept(state: &mut State, request: AppendRequest) -> Result<u64, TransportErr
         .entries
         .iter()
         .enumerate()
-        .find(|(_, old)| old.entry_id == request.entry_id)
+        .find(|(_, old)| old.request.entry_id == request.entry_id)
     {
-        if old.expected_head != request.expected_head
-            || old.kind != request.kind
-            || old.data != request.data
+        if old.author != author
+            || old.request.expected_head != request.expected_head
+            || old.request.kind != request.kind
+            || old.request.data != request.data
         {
             return Err(refuse(wire::ID_REUSED, None));
         }
@@ -172,7 +195,7 @@ fn accept(state: &mut State, request: AppendRequest) -> Result<u64, TransportErr
     if request.expected_head != head {
         return Err(refuse(wire::HEAD_MOVED, Some(json!({"head":head}))));
     }
-    state.entries.push(request);
+    state.entries.push(StoredEntry { request, author });
     Ok(head + 1)
 }
 
@@ -196,7 +219,11 @@ impl LogTransport for FakeLog {
             let held_reply = if matches!(action, Some(Action::Hold)) && method == wire::APPEND {
                 let request = parse_append(params.clone())?;
                 let (tx, rx) = oneshot::channel();
-                state.held.push_back(Held { request, reply: tx });
+                state.held.push_back(Held {
+                    request,
+                    author: self.author,
+                    reply: tx,
+                });
                 Some(rx)
             } else {
                 None
@@ -221,7 +248,7 @@ impl LogTransport for FakeLog {
         let result = {
             let mut state = self.state.lock().unwrap();
             if method == wire::APPEND {
-                let position = accept(&mut state, parse_append(params)?)?;
+                let position = accept(&mut state, parse_append(params)?, self.author)?;
                 response(json!({"position":position}))
             } else {
                 let after = params["after"]
@@ -233,7 +260,8 @@ impl LogTransport for FakeLog {
                     .ok_or_else(|| refuse("invalid_request", None))?;
                 let mut size = 0;
                 let mut entries = Vec::new();
-                for (index, request) in state.entries.iter().enumerate() {
+                for (index, stored) in state.entries.iter().enumerate() {
+                    let request = &stored.request;
                     let position = index as u64 + 1;
                     if position <= after || state.skipped.contains(&position) {
                         continue;
@@ -248,6 +276,8 @@ impl LogTransport for FakeLog {
                         "position":position, "entry_id":wire::encode_hex(&request.entry_id),
                         "kind":request.kind.as_str(), "entry":wire::encode_hex(&request.data),
                         "signer":wire::encode_hex(&[0x51;32]), "key_id":{"family":"bmk","epoch":0},
+                        "author":wire::encode_hex(&stored.author),
+                        "signed_by_self":stored.author == self.author,
                         "envelope_version":1,
                     }));
                 }
@@ -296,6 +326,104 @@ mod tests {
             kind: EntryKind::Change,
             data: vec![id; size],
         }
+    }
+
+    #[tokio::test]
+    async fn authorship_is_stable_per_entry_and_relative_to_reader() {
+        let fake = FakeLog::default();
+        let a = fake.with_author([0x11; 16]);
+        let b = fake.with_author([0x22; 16]);
+        a.client().append(&request(0, 1, 1)).await.unwrap();
+        b.client().append(&request(1, 2, 1)).await.unwrap();
+        let restored_a = fake.with_author([0x11; 16]);
+        restored_a.client().append(&request(2, 3, 1)).await.unwrap();
+
+        // Literal wire rows check the fake independently of the client's decoder.
+        let reply: Value = serde_json::from_slice(
+            &b.call("identity_log.read", json!({"after":0,"limit":128}))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            reply,
+            json!({"result":{"head":3,"entries":[
+                {"position":1,"entry_id":"01010101010101010101010101010101",
+                 "signer":"5151515151515151515151515151515151515151515151515151515151515151",
+                 "author":"11111111111111111111111111111111","signed_by_self":false,
+                 "key_id":{"family":"bmk","epoch":0},"envelope_version":1,"kind":"change","entry":"01"},
+                {"position":2,"entry_id":"02020202020202020202020202020202",
+                 "signer":"5151515151515151515151515151515151515151515151515151515151515151",
+                 "author":"22222222222222222222222222222222","signed_by_self":true,
+                 "key_id":{"family":"bmk","epoch":0},"envelope_version":1,"kind":"change","entry":"02"},
+                {"position":3,"entry_id":"03030303030303030303030303030303",
+                 "signer":"5151515151515151515151515151515151515151515151515151515151515151",
+                 "author":"11111111111111111111111111111111","signed_by_self":false,
+                 "key_id":{"family":"bmk","epoch":0},"envelope_version":1,"kind":"change","entry":"03"}
+            ]}})
+        );
+        for view in [&a, &a.clone(), &restored_a] {
+            let page = view.client().read(0, 128).await.unwrap();
+            assert_eq!(
+                page.entries
+                    .iter()
+                    .map(|e| e.signed_by_self)
+                    .collect::<Vec<_>>(),
+                vec![true, false, true]
+            );
+            assert_eq!(page.entries[0].author, "11111111111111111111111111111111");
+            assert_eq!(page.entries[1].author, "22222222222222222222222222222222");
+            assert_eq!(page.entries[2].author, page.entries[0].author);
+        }
+    }
+
+    #[tokio::test]
+    async fn held_appends_and_receipts_keep_the_original_author() {
+        let fake = FakeLog::default();
+        let a = fake.with_author([0x11; 16]);
+        let b = fake.with_author([0x22; 16]);
+        let original = request(0, 1, 1);
+        a.on_append(Action::Hold);
+        let held = tokio::spawn({
+            let client = a.client();
+            let original = original.clone();
+            async move { client.append(&original).await }
+        });
+        fake.wait_for_calls(1).await;
+        // Releasing through B's view cannot change who sent the held request.
+        assert_eq!(b.release_next().unwrap(), 1);
+        assert_eq!(held.await.unwrap().unwrap().position, 1);
+        assert_eq!(a.client().append(&original).await.unwrap().position, 1);
+        assert_eq!(
+            b.client().append(&original).await.unwrap_err(),
+            LogError::IdReused
+        );
+        assert_eq!(
+            b.client().read(0, 128).await.unwrap().entries[0].author,
+            "11111111111111111111111111111111"
+        );
+
+        b.on_append(Action::DropReply);
+        let next = request(1, 2, 1);
+        assert_eq!(
+            b.client().append(&next).await.unwrap_err(),
+            LogError::NoReply
+        );
+        assert_eq!(b.client().append(&next).await.unwrap().position, 2);
+        assert_eq!(
+            a.client().read(0, 128).await.unwrap().entries[1].author,
+            "22222222222222222222222222222222"
+        );
+        assert_eq!(
+            fake.with_author([0x11; 16])
+                .client()
+                .append(&original)
+                .await
+                .unwrap()
+                .position,
+            1
+        );
+        assert_eq!(fake.head(), 2);
     }
 
     #[tokio::test]

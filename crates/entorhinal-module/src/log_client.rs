@@ -3,10 +3,15 @@
 //! opened on first use, never at startup.
 //!
 //! The contract, as engram serves it (engram-module/src/agent_sync.rs at
-//! engram 9c567a5):
+//! engram's agent-sync-author train commit ee1d51918464c8e725db84a33bd4045c5982da61;
+//! the author field is not yet on engram master):
 //! - Service `agent-sync`, methods `identity_log.append` and
 //!   `identity_log.read`. Entry ids and data travel as lowercase hex, and
 //!   success replies are wrapped as `{result: ...}`.
+//! - Read entries carry `signed_by_self` and `author`, the signing key's
+//!   rotation-stable roster pseudonym as exactly 32 lowercase hex characters.
+//!   The flag compares that author to the reader's pseudonym. Authors are only
+//!   compared in memory, never persisted, logged or displayed.
 //! - Size limits count decoded bytes: an entry's data is at most 256 KiB, and a
 //!   read page at most 128 entries and 1 MiB.
 //! - Engram checks, in order, that this device is a member, then whether this
@@ -83,6 +88,8 @@ pub(crate) struct LogEntry {
     pub position: u64,
     pub entry_id: EntryId,
     pub signer: [u8; 32],
+    pub signed_by_self: bool,
+    pub author: String,
     pub key_id: KeyId,
     pub envelope_version: u64,
     // Preserve unknown kinds/versions so catch-up can stop at their position.
@@ -240,6 +247,8 @@ impl LogClient {
             position: u64,
             entry_id: String,
             signer: String,
+            signed_by_self: bool,
+            author: String,
             key_id: KeyId,
             envelope_version: u64,
             kind: String,
@@ -254,6 +263,14 @@ impl LogClient {
         let mut size = 0;
         let mut entries = Vec::with_capacity(page.entries.len());
         for row in page.entries {
+            if row.author.len() != 32
+                || !row
+                    .author
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            {
+                return Err(protocol("author must be 32 lowercase hex characters"));
+            }
             let entry = decode_hex(&row.entry)?;
             size += entry.len();
             if entry.len() > ENTRY_DATA_CAP || size > PAGE_DATA_CAP {
@@ -269,6 +286,8 @@ impl LogClient {
                 signer: decode_hex(&row.signer)?
                     .try_into()
                     .map_err(|_| protocol("signer must be 32 bytes"))?,
+                signed_by_self: row.signed_by_self,
+                author: row.author,
                 key_id: row.key_id,
                 envelope_version: row.envelope_version,
                 kind: row.kind,
@@ -464,6 +483,7 @@ mod tests {
     fn row() -> Value {
         json!({"position":10,"entry_id":"abababababababababababababababab",
             "signer":"5151515151515151515151515151515151515151515151515151515151515151",
+            "signed_by_self":true,"author":"0123456789abcdef0123456789abcdef",
             "key_id":{"family":"bmk","epoch":7},"envelope_version":1,"kind":"snapshot","entry":"00a1ff"})
     }
 
@@ -514,6 +534,8 @@ mod tests {
                     position: 10,
                     entry_id: [0xab; 16],
                     signer: [0x51; 32],
+                    signed_by_self: true,
+                    author: "0123456789abcdef0123456789abcdef".into(),
                     key_id: KeyId {
                         family: "bmk".into(),
                         epoch: 7
@@ -670,6 +692,130 @@ mod tests {
         let page = client(&stub).read(9, 128).await.unwrap();
         assert_eq!(page.entries[0].kind, "future");
         assert_eq!(page.entries[0].envelope_version, 99);
+    }
+
+    // Keep the body and positions valid so a missing authorship check would
+    // apply the entry, rather than stall for an unrelated decoding error.
+    fn catch_up_row() -> Value {
+        let mut entry = row();
+        entry["position"] = json!(1);
+        entry["kind"] = json!("change");
+        entry["entry"] = json!(encode_hex(br#"{"op":"project.shared","tables":{}}"#));
+        entry
+    }
+
+    async fn assert_authorship_protocol_stalls(entry: Value, diagnostic: &str) {
+        use crate::ProjectsHandler;
+        use entorhinal_core::RegistryStore;
+        use std::sync::atomic::Ordering;
+        use tokio::time::{Duration, Instant};
+
+        let stub = Stub::new(json!({"result":{"head":1,"entries":[entry]}}));
+        let error = client(&stub).read(0, 128).await.unwrap_err();
+        assert!(
+            matches!(&error, LogError::Protocol(message) if message.contains(diagnostic)),
+            "{error:?}"
+        );
+
+        let (dir, descriptor) = crate::tests::scratch_descriptor(&format!(
+            "authorship-protocol-{}",
+            crate::incarnation::new_incarnation().unwrap()
+        ));
+        let store = RegistryStore::open(&descriptor).unwrap();
+        store
+            .apply_entry("identity_log.enable", "{}", "test", None, |tx| {
+                tx.execute("UPDATE identity_log_state SET state='enabled'", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let before = store.identity_log_status().unwrap();
+        let generation = store.generation().unwrap();
+        let handler = ProjectsHandler::with_log_connector(
+            "authorship-test".into(),
+            || 700,
+            Arc::new(StubConnector(stub.clone())),
+        );
+        let error = handler
+            .catch_up(&store, Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "identity_log_stalled");
+        assert!(error.message.contains(diagnostic), "{}", error.message);
+        assert!(error.message.contains("at log position 1"));
+        assert_eq!(handler.health.log_state.load(Ordering::Relaxed), 6);
+        assert_eq!(store.identity_log_status().unwrap(), before);
+        assert_eq!(store.generation().unwrap(), generation);
+        assert!(store.enumerate(None).unwrap().projects.is_empty());
+        drop(handler);
+
+        // With the same valid body and repaired metadata, a fresh reader can
+        // advance. The protocol error did not poison the durable progress.
+        *stub.reply.lock().unwrap() = Ok(serde_json::to_vec(
+            &json!({"result":{"head":1,"entries":[catch_up_row()]}}),
+        )
+        .unwrap());
+        let handler = ProjectsHandler::with_log_connector(
+            "authorship-test".into(),
+            || 700,
+            Arc::new(StubConnector(stub)),
+        );
+        handler
+            .catch_up(&store, Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.identity_log_status().unwrap().last_applied_position,
+            1
+        );
+        assert_eq!(handler.health.log_state.load(Ordering::Relaxed), 0);
+        drop(handler);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_requires_signed_by_self_and_catch_up_stalls() {
+        let mut missing = catch_up_row();
+        missing.as_object_mut().unwrap().remove("signed_by_self");
+        assert_authorship_protocol_stalls(missing, "signed_by_self").await;
+        for value in [json!(null), json!("true"), json!(1)] {
+            let mut invalid = catch_up_row();
+            invalid["signed_by_self"] = value;
+            assert_authorship_protocol_stalls(invalid, "boolean").await;
+        }
+    }
+
+    #[tokio::test]
+    async fn read_requires_author_and_catch_up_stalls() {
+        let mut missing = catch_up_row();
+        missing.as_object_mut().unwrap().remove("author");
+        assert_authorship_protocol_stalls(missing, "author").await;
+        for value in [json!(null), json!(false), json!(123)] {
+            let mut invalid = catch_up_row();
+            invalid["author"] = value;
+            assert_authorship_protocol_stalls(invalid, "string").await;
+        }
+    }
+
+    #[tokio::test]
+    async fn read_rejects_noncanonical_author_and_catch_up_stalls() {
+        for author in [
+            "".to_string(),
+            "a".repeat(31),
+            "a".repeat(33),
+            "A".repeat(32),
+            "g".repeat(32),
+            " ".repeat(32),
+            "é".repeat(16),
+        ] {
+            let mut invalid = catch_up_row();
+            invalid["author"] = json!(author);
+            assert_authorship_protocol_stalls(
+                invalid,
+                "author must be 32 lowercase hex characters",
+            )
+            .await;
+        }
     }
 
     #[tokio::test]
