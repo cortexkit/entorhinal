@@ -87,8 +87,11 @@ impl RegistryStore {
         self.install_snapshot(entries, None)
     }
 
-    /// Joining records its fence in the very transaction that installs the
-    /// bootstrap, so no crash exposes imported identities in a disabled store.
+    /// Commit the incoming shared rows, their journal entries and the joining
+    /// state together; if they reach the observed final log position, commit the
+    /// enabled state instead. A crash cannot leave imported identities committed
+    /// while the state is still disabled, which would incorrectly allow local
+    /// writes before the remaining log entries have been imported.
     pub fn apply_join_snapshot(
         &self,
         entries: &[RemoteEntry],

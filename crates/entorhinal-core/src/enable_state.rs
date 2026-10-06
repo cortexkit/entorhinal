@@ -119,7 +119,9 @@ fn partition(id: &str, image: ProjectEntry) -> Result<Vec<Vec<u8>>, RegistryErro
 }
 
 impl RegistryStore {
-    /// Precondition checks do not create a marker or change durable progress.
+    /// Check the existing agent.cutover journal row and registry counts without
+    /// writing. A refusal must leave the journal, saved identity-log state and
+    /// saved log positions unchanged, so local writes remain available.
     pub fn check_enable_preconditions(&self, head: u64) -> Result<(), RegistryError> {
         self.read(|conn| {
             let counts: (i64, i64, i64) = conn.query_row(
@@ -205,8 +207,10 @@ impl RegistryStore {
         })
     }
 
-    /// Only call after observing another entry at position 1: our CAS against
-    /// head zero can then never land, including an earlier unresolved send.
+    /// Discard the saved snapshot and return to disabled only after a log read
+    /// finds a different entry id at position 1. Our first append requires an
+    /// empty log; another entry permanently occupying position 1 means neither
+    /// a retry nor an earlier unanswered send can succeed, so discarding is safe.
     pub fn abandon_enable(&self) -> Result<(), RegistryError> {
         self.db.with_conn_fenced(|tx| {
             tx.execute("UPDATE identity_log_state SET state='disabled',enable_parts=NULL,enable_backfill=NULL WHERE id=1 AND state='enabling'", [])?;
@@ -230,8 +234,11 @@ impl RegistryStore {
         }).map_err(RegistryError::Store)
     }
 
-    /// The reader calls this only after reaching the head from a complete
-    /// bootstrap. The marker and state switch commit together, once.
+    /// Call after importing the complete initial snapshot and applying entries
+    /// through the final position returned by the latest log read. If the saved
+    /// state is joining and its applied position equals that final position,
+    /// append identity_log.enable to the journal and set the state to enabled in
+    /// one transaction. Repeating the call after completion adds no journal row.
     pub fn finish_join(&self, head: i64) -> Result<(), RegistryError> {
         self.db
             .with_conn_fenced(|tx| {
@@ -357,8 +364,9 @@ mod tests {
             })
             .collect();
         a.begin_enable(&parts, &plan.backfill).unwrap();
-        // This in-memory log retains the exact append bodies and positions that
-        // a joiner reads, independently of either store's projections.
+        // Feed B copies of the bytes A would append, numbered from position 1.
+        // B must obtain the root keys from these encoded snapshot entries, not
+        // directly from A's database tables, to prove the transfer includes them.
         let log: Vec<_> = parts
             .iter()
             .enumerate()

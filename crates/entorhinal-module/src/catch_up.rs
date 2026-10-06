@@ -91,8 +91,11 @@ impl Worker {
             };
             let store = self.store.lock().unwrap().clone();
             if let Some(store) = store {
-                // Disabled stores never open a route. A stored enable plan is
-                // resumed before ordinary catch-up, never installed as a join.
+                // Disabled stores never contact engram. An enabling store has
+                // snapshot parts saved in SQLite with their entry ids and bytes:
+                // retry those appends rather than import the log as if this
+                // machine had not started writing it. Joining and enabled stores
+                // read the remaining entries from their saved applied position.
                 if store
                     .identity_log_status()
                     .is_ok_and(|s| matches!(s.state.as_str(), "enabled" | "joining" | "enabling"))

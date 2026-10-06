@@ -1,5 +1,8 @@
-//! Operator enable and restart recovery. Every network call uses the stored
-//! entry id and bytes; a failed reply cannot prove that an append did not land.
+//! Enable the shared identity log and recover interrupted attempts. Save each
+//! snapshot part's entry id and encoded bytes before sending it, then reuse both
+//! on retries so engram recognises a duplicate instead of appending it again.
+//! A reply or connection can fail after engram accepts an append, so retain the
+//! saved data until the log confirms whether that append was accepted.
 
 use super::{
     log_client::{self, AppendRequest, EntryKind, LogClient, LogError},
@@ -118,8 +121,11 @@ fn draw_id() -> Result<[u8; 16], HandlerError> {
     Ok(id)
 }
 
-/// The caller holds the writer lock. Even after a lost reply, the stored plan
-/// remains fenced until a resend settles it or position one proves it lost.
+/// With the writer lock held, resend the saved snapshot parts using their
+/// original ids and bytes. Keep the state enabling, which refuses shared
+/// mutations, until the log confirms every part at its original position or a
+/// read finds a different entry at position 1 and permits returning to disabled.
+/// A missing or failed reply alone is not a reason to discard the saved data.
 pub(super) async fn resume(
     store: &RegistryStore,
     log: &LogClient,
@@ -967,14 +973,18 @@ mod tests {
         a.enable().await.unwrap();
         finish(a.call("agent.rename", json!({"agent_id":"agent_0000000000000000","name":"Remote rename","request_key":"remote"}))).await.unwrap();
         let mut b = Fixture::new("join-outage-b", log.clone());
-        // The precondition head read is independent of the bootstrap page.
+        // Make B receive only the initial snapshot on its first entry read, then
+        // fail its next read. The reported final log position still includes A's
+        // later rename, so B must remain joining until it can fetch that change.
         let connector = Arc::new(BootstrapOnly {
             log: log.clone(),
             once: AtomicBool::new(false),
         });
         b.handler.log_client = LogClient::new(connector.clone());
-        // Turn the page limiter on after the first head read via direct entry
-        // to the same catch-up coordinator that enable invokes after validation.
+        // Check B's registry using the fake log's current final position, then
+        // enable the one-time reply change and call catch-up directly. Skipping
+        // enable's separate network check makes the simulated outage occur after
+        // the snapshot is installed but before the rename is fetched.
         b.store().check_enable_preconditions(log.head()).unwrap();
         connector.once.store(true, Ordering::SeqCst);
         assert_eq!(
