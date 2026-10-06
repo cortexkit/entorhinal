@@ -691,6 +691,16 @@ impl super::JournalWriter<'_> {
         &self,
         req: SetWorkspaceRootRequest,
     ) -> Result<Vec<u8>, RegistryError> {
+        self.set_workspace_root_at(req, now_unix_millis())
+    }
+
+    /// Use the caller's operation timestamp, like the other project writes, so
+    /// the module's injected clock also governs machine-local workspace roots.
+    pub fn set_workspace_root_at(
+        &self,
+        req: SetWorkspaceRootRequest,
+        now: i64,
+    ) -> Result<Vec<u8>, RegistryError> {
         // Validated before the transaction: the path checks read the
         // filesystem, and the journal must record exactly the value the
         // projection holds so `rebuild` reproduces it without re-reading disk.
@@ -714,7 +724,6 @@ impl super::JournalWriter<'_> {
         let payload =
             serde_json::to_value(&req).map_err(|e| domain("encode_failed", e.to_string()))?;
         self.mutation("set_workspace_root", key.clone().as_deref(), move |tx| {
-            let now = now_unix_millis();
             let current = tx
                 .query_row(
                     "SELECT r.root FROM workspace w

@@ -65,6 +65,8 @@ mod fake_log;
 #[allow(dead_code)]
 mod log_client;
 mod shared_write;
+#[cfg(test)]
+mod two_machine_acceptance;
 
 // PARSE ARGV BEFORE ACTING ON IT.
 //
@@ -973,9 +975,10 @@ impl ProjectsHandler {
     fn set_workspace_root(&self, params: Value, principal: &str) -> Result<Vec<u8>, HandlerError> {
         let req =
             serde_json::from_value::<SetWorkspaceRootRequest>(params).map_err(invalid_params)?;
-        self.record_mutation(
-            self.with_store(|s| s.with_principal(principal).set_workspace_root(req)),
-        )
+        self.record_mutation(self.with_store(|s| {
+            s.with_principal(principal)
+                .set_workspace_root_at(req, (self.clock)())
+        }))
     }
 
     fn assign_workspace(&self, params: Value, principal: &str) -> Result<Vec<u8>, HandlerError> {
