@@ -165,9 +165,12 @@ fn parse_append(params: Value) -> Result<AppendRequest, TransportError> {
     })
 }
 
-/// One serialized cloud transaction: roster, receipt, then CAS. A receipt's
-/// identity includes the appending author, expected_head and both kind/data, as
-/// engram's receipt does. The author models the signer's stable pseudonym.
+/// One serialized cloud transaction, checked in engram's order: membership,
+/// then an earlier append with the same entry id, then the expected head. A
+/// repeated entry id counts as a resend, and returns the original position,
+/// only when the author, expected_head, kind and data all match the first
+/// append; anything else is refused `id_reused`, as engram does. The author
+/// stands in for the signer's rotation-stable pseudonym.
 fn accept(
     state: &mut State,
     request: AppendRequest,

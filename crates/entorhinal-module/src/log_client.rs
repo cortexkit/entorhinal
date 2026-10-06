@@ -2,9 +2,11 @@
 //! signs and encrypts, so entorhinal sends and receives plaintext. The route is
 //! opened on first use, never at startup.
 //!
-//! The contract, as engram serves it (engram-module/src/agent_sync.rs at
-//! engram's agent-sync-author train commit ee1d51918464c8e725db84a33bd4045c5982da61;
-//! the author field is not yet on engram master):
+//! The contract, as engram serves it in engram-module/src/agent_sync.rs at
+//! commit ee1d51918464c8e725db84a33bd4045c5982da61. That commit adds `author`
+//! and hadn't reached engram's master branch when this was written. An engram
+//! without it fails every read here as a protocol error, so the log must not be
+//! enabled against an older engram:
 //! - Service `agent-sync`, methods `identity_log.append` and
 //!   `identity_log.read`. Entry ids and data travel as lowercase hex, and
 //!   success replies are wrapped as `{result: ...}`.
