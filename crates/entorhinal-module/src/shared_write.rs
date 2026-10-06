@@ -384,7 +384,8 @@ mod tests {
             serde_json::from_slice(&ready(f.call("identity_log.status", json!({}))).unwrap())
                 .unwrap();
         assert_eq!(status["result"]["pendingWriteCount"], 0);
-        // A held old send cannot win once another entry occupies its slot.
+        // The earlier append, still held by the fake log, expected the head
+        // that Y's entry has since moved past, so the log refuses it.
         assert!(tap.fake.release_next().is_err());
         drop(x);
         f.restart(connector(&tap));

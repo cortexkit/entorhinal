@@ -102,8 +102,9 @@ fn disabled_workload_matches_pre_identity_log_reply_and_journal_bytes() {
                 request_key: Some("assign".into()),
             })
             .unwrap(),
-        // The module binds unbound checkouts after project writes; approve_root
-        // requires that same preparation when using the core API directly.
+        // `approve_root` needs a bound checkout. The entorhinal module binds new
+        // roots itself after each project write; calling the core API directly,
+        // as this test does, the binding has to be done explicitly first.
         writer.bind_root(&one, "operator").unwrap(),
         writer.bind_root(&two, "operator").unwrap(),
         writer.approve_root(&one, "operator").unwrap(),
@@ -177,7 +178,10 @@ fn disabled_workload_matches_pre_identity_log_reply_and_journal_bytes() {
     let actual =
         serde_json::to_string_pretty(&json!({"replies":replies,"journal":journal})).unwrap() + "\n";
     if let Ok(path) = std::env::var("DISABLED_GOLDEN_OUTPUT") {
-        // Generation is confined to the historical checkout. Never bless HEAD.
+        // Writing the fixture is allowed only from code that predates the
+        // identity log (no `stream` column in the journal), so the expected
+        // bytes always come from the old implementation. Regenerating it from
+        // current code would make the test compare the new code with itself.
         assert!(!conn.prepare("SELECT stream FROM registry_journal").is_ok());
         fs::write(path, actual).unwrap();
     } else {

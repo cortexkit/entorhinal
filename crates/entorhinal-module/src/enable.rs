@@ -815,8 +815,9 @@ mod tests {
             async fn call(&self, method: &str, params: Value) -> Result<Vec<u8>, TransportError> {
                 let reply = self.0.call(method, params).await;
                 if method == log_client::APPEND {
-                    // The second part lands at 15 seconds, but its receipt is
-                    // dropped when the request's 25-second deadline expires.
+                    // Each append reply arrives 15 seconds after the entry lands.
+                    // Two parts take 30 seconds, so the second part is in the log
+                    // but its reply misses enable's 25-second deadline.
                     tokio::time::sleep(Duration::from_secs(15)).await;
                 }
                 reply
