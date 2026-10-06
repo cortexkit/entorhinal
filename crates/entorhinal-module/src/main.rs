@@ -1308,8 +1308,11 @@ fn manifest() -> ModuleManifest {
     // surface require a new capability version.
     .capabilities(Some(CapabilityDeclarations {
         provides: vec![PROJECT_IDENTITY_CAPABILITY.to_owned(), "agent-identity/v1".to_owned()],
-        // Requiring engram would block all routes, including local reads, when
-        // its provider is absent. A lazy consumer route needs no declaration.
+        // Entorhinal calls engram (the module hosting the shared identity log)
+        // only to write shared state, and serves every read without it. So
+        // nothing is declared here: a `requires` entry makes the daemon refuse
+        // every route to entorhinal, reads included, while engram is down. The
+        // daemon admits a route that entorhinal opens to engram without one.
         requires: Vec::new(),
         must_never_reach: Vec::new(),
     }))
