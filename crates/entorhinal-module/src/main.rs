@@ -249,6 +249,8 @@ const MUTATING_METHODS: &[&str] = &[
     "rebuild",
     "projects.session_liveness",
     "add_root",
+    "attach_root",
+    "identity_log.enable",
     "remove_root",
     "attach_derived_parent",
     "approve_root",
@@ -269,6 +271,7 @@ const MUTATING_METHODS: &[&str] = &[
 /// Admit project/workspace mutations from the operator (`Direct`: the `ck`
 /// faces) or executive, but identity mutations only from the executive relay.
 /// An agent's shell can connect as Direct, so Direct cannot rewrite identities.
+/// Enabling the shared log is an operator decision, never an executive write.
 ///
 /// This stops a module that has no business writing here from changing the
 /// registry by accident or through a bug. Project ids key other modules' state,
@@ -277,6 +280,15 @@ const MUTATING_METHODS: &[&str] = &[
 /// the store file itself. A route with no recorded principal is refused rather
 /// than assumed to be the operator.
 fn authorize_write(method: &str, principal: Option<&Principal>) -> Result<(), HandlerError> {
+    if method == "identity_log.enable" {
+        return match principal {
+            Some(Principal::Direct) => Ok(()),
+            other => Err(HandlerError::new(
+                "write_not_permitted",
+                format!("'{method}' is accepted only from the operator (ck); this route was opened by {}", principal_label(other)),
+            )),
+        };
+    }
     if agent_ops::MUTATING_METHODS.contains(&method) {
         return match principal {
             Some(Principal::Reserved { module_id }) if module_id == WRITER_MODULE => Ok(()),
@@ -383,6 +395,7 @@ impl ProjectsHandler {
     /// session. `Direct` is refused for them because every local process,
     /// including an agent's shell, reaches entorhinal as `Direct`, so admitting
     /// it would let any agent rewrite agent identity.
+    /// Enabling the identity log is reserved to an unscoped operator route.
     fn admit(&self, method: &str, key: RouteKey) -> Result<RouteAdmission, HandlerError> {
         let admission = self.admission_for(key);
         refuse_flow_write(method, admission.flow_id.as_deref())?;
@@ -583,6 +596,13 @@ impl ProjectsHandler {
             "resolve" => self.resolve(request.params),
             "resolve_project_id" => self.resolve_project_id(request.params),
             "resolve_remote" => self.resolve_remote(request.params),
+            "resolve_root_key" => self.resolve_root_key(request.params),
+            "preview_attach_root" => self.preview_attach_root(request.params),
+            "identity_log.status" => self.identity_log_status(),
+            "identity_log.enable" => Err(HandlerError::new(
+                "engram_unavailable",
+                "identity log enabling isn't available in this build yet",
+            )),
             "enumerate" => self.enumerate(request.params),
             "journal_tail" => self.journal_tail(request.params),
             "register" => self.register(request.params, &principal),
@@ -594,6 +614,7 @@ impl ProjectsHandler {
             "seed_import" => self.seed_import(request.params, &principal),
             "projects.session_liveness" => self.session_liveness(request.params),
             "add_root" => self.add_root(request.params, &principal),
+            "attach_root" => self.attach_root(request.params, &principal),
             "remove_root" => self.remove_root(request.params, &principal),
             "attach_derived_parent" => self.attach_derived_parent(request.params, &principal),
             "approve_root" => self.set_root_approval(request.params, true, &principal),
@@ -782,6 +803,31 @@ impl ProjectsHandler {
         self.record_mutation(
             self.with_store(|s| s.with_principal(principal).set_owned_remotes(request)),
         )
+    }
+
+    fn resolve_root_key(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
+        let request = serde_json::from_value::<entorhinal_core::ResolveRootKeyRequest>(params)
+            .map_err(invalid_params)?;
+        let reply = self.with_store(|s| s.resolve_root_key(request))?;
+        self.encode_read_result(reply)
+    }
+
+    fn preview_attach_root(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
+        let request = serde_json::from_value::<entorhinal_core::AttachRootRequest>(params)
+            .map_err(invalid_params)?;
+        let reply = self.with_store(|s| s.preview_attach_root(request))?;
+        self.encode_read_result(reply)
+    }
+
+    fn identity_log_status(&self) -> Result<Vec<u8>, HandlerError> {
+        let reply = self.with_store(RegistryStore::identity_log_status)?;
+        self.encode_read_result(reply)
+    }
+
+    fn attach_root(&self, params: Value, principal: &str) -> Result<Vec<u8>, HandlerError> {
+        let request = serde_json::from_value::<entorhinal_core::AttachRootRequest>(params)
+            .map_err(invalid_params)?;
+        self.record_mutation(self.with_store(|s| s.with_principal(principal).attach_root(request)))
     }
 
     /// Join the volatile liveness map onto enumerate results: a project's
@@ -1107,6 +1153,26 @@ fn manifest() -> ModuleManifest {
                     "Find the project owning a GitHub repository through its live owned remotes.",
                 ),
                 management_operation(
+                    "resolve_root_key",
+                    ManagementOperationKind::Query,
+                    "List local roots mapped to a project's machine-neutral root key.",
+                ),
+                management_operation(
+                    "preview_attach_root",
+                    ManagementOperationKind::Query,
+                    "Match a checkout to an existing project and root key without attaching it.",
+                ),
+                management_operation(
+                    "identity_log.status",
+                    ManagementOperationKind::Query,
+                    "Read local identity log state, progress and pending-write count without contacting engram.",
+                ),
+                management_operation(
+                    "identity_log.enable",
+                    ManagementOperationKind::Mutate,
+                    "Enable the shared identity log or join it (operator only).",
+                ),
+                management_operation(
                     "enumerate",
                     ManagementOperationKind::Query,
                     "List all registered projects with workspace assignments and tags.",
@@ -1165,6 +1231,11 @@ fn manifest() -> ModuleManifest {
                     "add_root",
                     ManagementOperationKind::Mutate,
                     "Add a root to a registered project; it starts unapproved.",
+                ),
+                management_operation(
+                    "attach_root",
+                    ManagementOperationKind::Mutate,
+                    "Attach a local checkout to an existing project's root key; it starts unapproved.",
                 ),
                 management_operation(
                     "remove_root",
@@ -1237,6 +1308,8 @@ fn manifest() -> ModuleManifest {
     // surface require a new capability version.
     .capabilities(Some(CapabilityDeclarations {
         provides: vec![PROJECT_IDENTITY_CAPABILITY.to_owned(), "agent-identity/v1".to_owned()],
+        // Requiring engram would block all routes, including local reads, when
+        // its provider is absent. A lazy consumer route needs no declaration.
         requires: Vec::new(),
         must_never_reach: Vec::new(),
     }))
@@ -1454,10 +1527,12 @@ mod tests {
             } else {
                 assert!(direct.is_ok(), "{method} from direct");
             }
-            assert!(
-                authorize_write(method, Some(&reserved(WRITER_MODULE))).is_ok(),
-                "{method} from {WRITER_MODULE}"
-            );
+            let executive = authorize_write(method, Some(&reserved(WRITER_MODULE)));
+            if *method == "identity_log.enable" {
+                assert_eq!(executive.unwrap_err().code, "write_not_permitted");
+            } else {
+                assert!(executive.is_ok(), "{method} from {WRITER_MODULE}");
+            }
             for refused in [Some(reserved("aft")), Some(Principal::Unverified), None] {
                 let error = authorize_write(method, refused.as_ref())
                     .expect_err("a write from any other principal must be refused");
@@ -1716,6 +1791,261 @@ mod tests {
         let handler = ProjectsHandler::with_runtime("ownership-incarnation".into(), unix_millis);
         *handler.store.lock().unwrap() = Some(store);
         (dir, handler, root)
+    }
+
+    // Install a shared key image directly: admission and query tests do not
+    // depend on a transport or pretend to enable a real shared log.
+    pub(super) fn log_surface_handler(label: &str) -> (PathBuf, ProjectsHandler, String) {
+        let (dir, handler, root) = ownership_handler(label);
+        handler.with_store(|s| s.apply_entry("identity_log.enable", "{}", "test", None, |tx| {
+            tx.execute("UPDATE identity_log_state SET state='enabled'", [])?;
+            tx.execute("INSERT INTO project_root_key(project_id,kind,root_key,created_at) VALUES('p','remote','ualtinok/opencode',1),('p','label','local',1)", [])?;
+            tx.execute("UPDATE project_root SET root_key_kind='remote',root_key='ualtinok/opencode' WHERE project_id='p'", [])?;
+            Ok(())
+        })).unwrap();
+        (dir, handler, root)
+    }
+
+    fn attach_checkout(dir: &std::path::Path, name: &str) -> String {
+        let path = dir.join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        for args in [
+            vec!["init", "--quiet"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/ualtinok/opencode.git",
+            ],
+        ] {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&path)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        std::fs::canonicalize(path)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn attach_surface_writes_are_attributed_only_to_direct_and_core() {
+        let (dir, handler, _) = log_surface_handler("attach-admission");
+        for (index, principal, label) in [
+            (0, Principal::Direct, "direct"),
+            (1, reserved(WRITER_MODULE), "reserved:prefrontal-core"),
+        ] {
+            let key = (70 + index, 1);
+            handler
+                .route_admissions()
+                .insert(key, RouteAdmission::from_bind(Some(principal), None));
+            let root = attach_checkout(&dir, &format!("clone-{index}"));
+            let reply: Value = serde_json::from_slice(&execute_on(
+                &handler,
+                key,
+                "attach_root",
+                json!({"path":root,"actor":"operator"}),
+            ))
+            .unwrap();
+            assert_eq!(reply["result"]["projectId"], "p");
+            assert_eq!(
+                reply["result"]["rootKey"],
+                json!({"kind":"remote","rootKey":"ualtinok/opencode"})
+            );
+            let trust = handler.with_store(|s| s.trust(&root)).unwrap();
+            let trust = serde_json::to_value(trust).unwrap();
+            let record = trust["rootRecords"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["root"] == root)
+                .unwrap();
+            assert_eq!(record["identity"], "bound");
+            assert_eq!(record["approval"]["state"], "unapproved");
+            let tail = handler.with_store(|s| s.journal_tail(0, 100)).unwrap();
+            let rows: Vec<_> = tail
+                .entries
+                .iter()
+                .filter(|row| row.op == "attach_root" || row.op == "root_key.assign")
+                .rev()
+                .take(2)
+                .collect();
+            assert_eq!(
+                rows.len(),
+                2,
+                "attachment must journal its write and key mapping"
+            );
+            for row in rows {
+                assert_eq!(row.principal.as_deref(), Some(label));
+            }
+        }
+        let before = handler.with_store(RegistryStore::generation).unwrap();
+        for (index, principal) in [Some(reserved("plexus")), Some(Principal::Unverified), None]
+            .into_iter()
+            .enumerate()
+        {
+            let key = (80 + index as u16, 1);
+            handler
+                .route_admissions()
+                .insert(key, RouteAdmission::from_bind(principal, None));
+            let error = handler
+                .execute(
+                    WireRequest {
+                        method: "attach_root".into(),
+                        params: Value::Null,
+                    },
+                    key,
+                )
+                .unwrap_err();
+            assert_eq!(error.code, "write_not_permitted");
+        }
+        assert_eq!(
+            handler.with_store(RegistryStore::generation).unwrap(),
+            before
+        );
+        drop(handler);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn attach_surface_flow_routes_refuse_mutations_before_decoding() {
+        let handler = ProjectsHandler::new().unwrap();
+        for (index, principal) in [Principal::Direct, reserved(WRITER_MODULE)]
+            .into_iter()
+            .enumerate()
+        {
+            let key = (90 + index as u16, 1);
+            handler.route_admissions().insert(
+                key,
+                RouteAdmission::from_bind(Some(principal), Some(&flow_stamp(Some("fl_attach")))),
+            );
+            for method in ["attach_root", "identity_log.enable"] {
+                let error = handler
+                    .execute(
+                        WireRequest {
+                            method: method.into(),
+                            params: Value::Null,
+                        },
+                        key,
+                    )
+                    .unwrap_err();
+                assert_eq!(error.code, "flow_scope_not_admitted", "{method}");
+            }
+        }
+    }
+
+    #[test]
+    fn attach_surface_queries_answer_every_principal_on_flow_routes() {
+        let (dir, handler, original) = log_surface_handler("attach-queries");
+        let path = attach_checkout(&dir, "preview");
+        let before = handler.with_store(RegistryStore::generation).unwrap();
+        for (index, principal) in [
+            Some(Principal::Direct),
+            Some(reserved(WRITER_MODULE)),
+            Some(reserved("plexus")),
+            Some(Principal::Unverified),
+            None,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let key = (100 + index as u16, 1);
+            handler.route_admissions().insert(
+                key,
+                RouteAdmission::from_bind(principal, Some(&flow_stamp(Some("fl_queries")))),
+            );
+            for (method, params, expected) in [
+                (
+                    "resolve_root_key",
+                    json!({"projectId":"p","kind":"remote","rootKey":"ualtinok/opencode"}),
+                    json!({"roots":[original]}),
+                ),
+                (
+                    "preview_attach_root",
+                    json!({"path":path}),
+                    json!({"projectId":"p","root":path,"rootKey":{"kind":"remote","rootKey":"ualtinok/opencode"}}),
+                ),
+                (
+                    "identity_log.status",
+                    json!({}),
+                    json!({"state":"enabled","lastAppliedPosition":0,"lastSeenHead":0,"pendingWriteCount":0}),
+                ),
+            ] {
+                let reply: Value =
+                    serde_json::from_slice(&execute_on(&handler, key, method, params)).unwrap();
+                let mut expected = expected;
+                expected["incarnation"] = json!("ownership-incarnation");
+                assert_eq!(reply["result"], expected, "{method}");
+            }
+        }
+        assert_eq!(
+            handler.with_store(RegistryStore::generation).unwrap(),
+            before
+        );
+        assert!(!std::path::Path::new(&path)
+            .join(".git")
+            .join(entorhinal_core::INCARNATION_FILE)
+            .exists());
+        drop(handler);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn attach_surface_enable_is_direct_only_and_fails_closed() {
+        let (dir, descriptor) = scratch_descriptor("enable-admission");
+        let handler = ProjectsHandler::new().unwrap();
+        *handler.store.lock().unwrap() = Some(RegistryStore::open(&descriptor).unwrap());
+        let before = handler
+            .with_store(RegistryStore::identity_log_status)
+            .unwrap();
+        let head = handler.with_store(RegistryStore::generation).unwrap();
+        for (index, principal) in [
+            Some(Principal::Direct),
+            Some(reserved(WRITER_MODULE)),
+            Some(reserved("plexus")),
+            Some(Principal::Unverified),
+            None,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let key = (110 + index as u16, 1);
+            handler
+                .route_admissions()
+                .insert(key, RouteAdmission::from_bind(principal.clone(), None));
+            let error = handler
+                .execute(
+                    WireRequest {
+                        method: "identity_log.enable".into(),
+                        params: json!({}),
+                    },
+                    key,
+                )
+                .unwrap_err();
+            if principal == Some(Principal::Direct) {
+                assert_eq!(error.code, "engram_unavailable");
+                assert!(error.message.contains("isn't available in this build yet"));
+            } else {
+                assert_eq!(error.code, "write_not_permitted");
+            }
+        }
+        assert_eq!(
+            handler
+                .with_store(RegistryStore::identity_log_status)
+                .unwrap(),
+            before
+        );
+        assert_eq!(handler.with_store(RegistryStore::generation).unwrap(), head);
+        drop(handler);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -2596,6 +2926,18 @@ mod tests {
             value["capabilities"]["provides"],
             serde_json::json!(["project-identity/v1", "agent-identity/v1"])
         );
+        assert_eq!(value["capabilities"]["requires"], json!([]));
+        for (name, kind) in [
+            ("attach_root", "mutate"),
+            ("identity_log.enable", "mutate"),
+            ("resolve_root_key", "query"),
+            ("preview_attach_root", "query"),
+            ("identity_log.status", "query"),
+        ] {
+            let matches: Vec<_> = operations.iter().filter(|op| op["name"] == name).collect();
+            assert_eq!(matches.len(), 1, "{name} must be declared exactly once");
+            assert_eq!(matches[0]["kind"], kind, "{name}");
+        }
         assert!(subc_protocol::manifest::is_valid_capability_identifier(
             PROJECT_IDENTITY_CAPABILITY
         ));

@@ -31,7 +31,9 @@ pub mod shared_entry;
 pub use binding::*;
 pub use mutations::*;
 pub use ownership::{ResolveRemoteReply, ResolveRemoteStatus, SetOwnedRemotesRequest};
-pub use root_keys::{AttachRootRequest, ResolveRootKeyReply, ResolveRootKeyRequest, RootKey};
+pub use root_keys::{
+    AttachRootPreview, AttachRootRequest, ResolveRootKeyReply, ResolveRootKeyRequest, RootKey,
+};
 
 // The schema-migration namespace, NOT the module id, and deliberately left as
 // "projects" while the module id moved to "entorhinal".
@@ -159,6 +161,17 @@ pub struct RegistryStore {
     ids: Arc<binding::IdSource>,
 }
 
+/// The durable local log progress. Reading status never contacts the log or
+/// waits for an in-flight write's transaction.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityLogStatus {
+    pub state: String,
+    pub last_applied_position: i64,
+    pub last_seen_head: i64,
+    pub pending_write_count: i64,
+}
+
 /// A borrowed write context carrying the attested principal independently of
 /// the request's actor. Nested writes use the same context, without changing
 /// shared store state or allowing a request to set its principal in the body.
@@ -184,6 +197,22 @@ impl fmt::Debug for RegistryStore {
 }
 
 impl RegistryStore {
+    pub fn identity_log_status(&self) -> Result<IdentityLogStatus, RegistryError> {
+        self.read(|conn| {
+            conn.query_row(
+                "SELECT state,last_applied_position,last_seen_head,(SELECT COUNT(*) FROM pending_entry)
+                 FROM identity_log_state WHERE id=1",
+                [],
+                |row| Ok(IdentityLogStatus {
+                    state: row.get(0)?,
+                    last_applied_position: row.get(1)?,
+                    last_seen_head: row.get(2)?,
+                    pending_write_count: row.get(3)?,
+                }),
+            )
+        })
+    }
+
     /// Attribute writes to a route principal. Calls directly on the store are
     /// internal writes and record `entorhinal` instead.
     pub fn with_principal<'a>(&'a self, principal: &'a str) -> JournalWriter<'a> {

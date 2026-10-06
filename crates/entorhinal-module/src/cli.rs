@@ -163,6 +163,21 @@ pub fn parse(face: Face, arguments: &[String]) -> Invocation {
                 None => return Invocation::Refuse("--subc needs a path".to_string()),
             },
             "--json" => json = true,
+            "--project" | "--label"
+                if face == Face::Projects && verb.as_deref() == Some("attach") =>
+            {
+                let Some(value) = rest
+                    .next()
+                    .filter(|value| !value.starts_with('-') && !value.is_empty())
+                else {
+                    return Invocation::Refuse(format!("{argument} needs a value"));
+                };
+                args.push(argument.clone());
+                args.push(value.clone());
+            }
+            "--yes" if face == Face::Projects && verb.as_deref() == Some("attach") => {
+                args.push(argument.clone());
+            }
             "--default" | "--none"
                 if face == Face::Projects && verb.as_deref() == Some("owned-remotes") =>
             {
@@ -215,6 +230,8 @@ usage: ck projects <verb> [args] [--subc <connection file>] [--json]
   remove <project>        remove a project from the registry
   add-root <project> <dir>
                           add another root to a project (starts unapproved)
+  attach <path> [--project ID] [--label L] [--yes]
+                          preview the matched project/key; --yes attaches unapproved
   remove-root <project> <dir>
                           remove one root from a project
   owned-remotes <root> <name>...
@@ -227,6 +244,8 @@ usage: ck projects <verb> [args] [--subc <connection file>] [--json]
   unapprove <dir>         withdraw that approval
   trust <dir>             show each root's identity and approval
   verify                  check the store against its journal
+  log status              show local identity log state
+  log enable              enable or join the shared log (operator only)
 
   --subc <path>   daemon connection file; defaults to the usual discovery path
   --json          raw response instead of the rendered form
@@ -257,7 +276,7 @@ This binary is the module itself; it is not an operator command. The operator
 surface is:
 
   ck projects      list, register, resolve, remove, add-root, remove-root,
-                   owned-remotes, approve, unapprove, trust, verify
+                   attach, owned-remotes, approve, unapprove, trust, verify, log
   ck workspaces    list, assign, set-root, clear-root
 
 With no arguments it runs as the supervised module, which is how the daemon
@@ -392,6 +411,67 @@ fn build(command: &Command) -> Result<(String, Value), String> {
                 "actor": actor,
             }),
         ),
+        (Face::Projects, "attach") => {
+            let mut path = None;
+            let mut project = None;
+            let mut label = None;
+            let mut yes = false;
+            let mut args = command.args.iter();
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--project" | "--label" => {
+                        let target = if arg == "--project" {
+                            &mut project
+                        } else {
+                            &mut label
+                        };
+                        if target.is_some() {
+                            return Err(format!("{arg} may only be given once"));
+                        }
+                        let value = args
+                            .next()
+                            .filter(|value| !value.starts_with('-') && !value.is_empty())
+                            .ok_or_else(|| format!("{arg} needs a value"))?;
+                        *target = Some(value.clone());
+                    }
+                    "--yes" if !yes => yes = true,
+                    "--yes" => return Err("--yes may only be given once".into()),
+                    other if other.starts_with('-') => {
+                        return Err(format!("unknown attach flag '{other}'"))
+                    }
+                    _ if path.is_none() => path = Some(absolute(arg)?),
+                    _ => return Err("attach needs exactly one checkout path".into()),
+                }
+            }
+            let path = path.ok_or_else(|| "attach needs a checkout path".to_string())?;
+            let mut params = json!({"path": path, "actor": actor});
+            if let Some(project) = project {
+                params["projectId"] = json!(project);
+            }
+            if let Some(label) = label {
+                params["label"] = json!(label);
+            }
+            (
+                if yes {
+                    "attach_root"
+                } else {
+                    "preview_attach_root"
+                }
+                .into(),
+                params,
+            )
+        }
+        (Face::Projects, "log") => {
+            if command.args.len() != 1 {
+                return Err("log needs exactly one of: status, enable".into());
+            }
+            let method = match command.args[0].as_str() {
+                "status" => "identity_log.status",
+                "enable" => "identity_log.enable",
+                _ => return Err("log needs exactly one of: status, enable".into()),
+            };
+            (method.into(), json!({}))
+        }
         (Face::Projects, "remove") => (
             "remove".to_string(),
             json!({ "projectId": need(0, "a project id")?, "actor": actor }),
@@ -703,12 +783,31 @@ fn render(command: &Command, value: &Value) {
             }
         }
         (Face::Projects, "verify") => println!("{}", format_verify(value)),
+        (Face::Projects, "attach") => println!(
+            "{}",
+            format_attach(value, command.args.iter().any(|arg| arg == "--yes"))
+        ),
         (Face::Projects, "owned-remotes") => println!("{}", format_owned_remotes(value)),
         _ => println!(
             "{}",
             serde_json::to_string_pretty(value).unwrap_or_default()
         ),
     }
+}
+
+fn format_attach(value: &Value, confirmed: bool) -> String {
+    format!(
+        "project:   {}\nroot key:  {}:{}\nroot:      {}\n{}",
+        text(&value["projectId"]),
+        text(&value["rootKey"]["kind"]),
+        text(&value["rootKey"]["rootKey"]),
+        text(&value["root"]),
+        if confirmed {
+            "attached (unapproved)"
+        } else {
+            "preview only; pass --yes to attach (unapproved)"
+        },
+    )
 }
 
 fn format_owned_remotes(value: &Value) -> String {
@@ -1091,6 +1190,143 @@ mod tests {
             format_owned_remotes(&json!({"root":"/repo","remotes":[]})),
             "/repo: owned remotes: none"
         );
+    }
+
+    #[test]
+    fn attach_cli_previews_then_writes_only_with_yes_and_prints_the_same_match() {
+        use crate::{tests::log_surface_handler, Principal, RouteAdmission, WireRequest};
+        let (dir, handler, _) = log_surface_handler("attach-cli");
+        let path = dir.join("label-checkout");
+        std::fs::create_dir_all(&path).unwrap();
+        let root = std::fs::canonicalize(&path)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        handler.route_admissions().insert(
+            (120, 1),
+            RouteAdmission::from_bind(Some(Principal::Direct), None),
+        );
+        let mut args = vec![
+            "attach".into(),
+            path.to_string_lossy().into_owned(),
+            "--project".into(),
+            "p".into(),
+            "--label".into(),
+            "local".into(),
+        ];
+        let head = handler
+            .with_store(entorhinal_core::RegistryStore::generation)
+            .unwrap();
+        let mut preview = Value::Null;
+        for confirmed in [false, true] {
+            if confirmed {
+                args.push("--yes".into());
+            }
+            let Invocation::Command(command) = parse(Face::Projects, &args) else {
+                panic!("attach must parse")
+            };
+            let (method, params) = build(&command).unwrap();
+            assert_eq!(
+                method,
+                if confirmed {
+                    "attach_root"
+                } else {
+                    "preview_attach_root"
+                }
+            );
+            assert_eq!(
+                params,
+                json!({"path":root,"projectId":"p","label":"local","actor":"ck-projects"})
+            );
+            let value: Value = serde_json::from_slice(
+                &handler
+                    .execute(WireRequest { method, params }, (120, 1))
+                    .unwrap(),
+            )
+            .unwrap();
+            let value = unwrap_result(value).unwrap();
+            let rendered = format_attach(&value, confirmed);
+            assert!(
+                rendered.contains("project:   p\nroot key:  label:local"),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains(&format!("root:      {root}")),
+                "{rendered}"
+            );
+            if confirmed {
+                assert_eq!(value["projectId"], preview["projectId"]);
+                assert_eq!(value["rootKey"], preview["rootKey"]);
+                assert!(rendered.ends_with("attached (unapproved)"));
+                assert!(
+                    handler
+                        .with_store(entorhinal_core::RegistryStore::generation)
+                        .unwrap()
+                        > head
+                );
+                let roots = handler
+                    .with_store(|s| {
+                        s.resolve_root_key(entorhinal_core::ResolveRootKeyRequest {
+                            project_id: "p".into(),
+                            kind: "label".into(),
+                            root_key: "local".into(),
+                        })
+                    })
+                    .unwrap();
+                assert_eq!(roots.roots, vec![root.clone()]);
+            } else {
+                preview = value;
+                assert!(rendered.contains("preview only; pass --yes"));
+                assert_eq!(
+                    handler
+                        .with_store(entorhinal_core::RegistryStore::generation)
+                        .unwrap(),
+                    head
+                );
+                assert!(handler
+                    .with_store(
+                        |s| s.resolve_root_key(entorhinal_core::ResolveRootKeyRequest {
+                            project_id: "p".into(),
+                            kind: "label".into(),
+                            root_key: "local".into()
+                        })
+                    )
+                    .unwrap()
+                    .roots
+                    .is_empty());
+            }
+        }
+        drop(handler);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn attach_cli_refuses_malformed_flags_and_maps_log_commands() {
+        for args in [
+            vec!["attach", "--project"],
+            vec!["attach", "/checkout", "--label", "--yes"],
+            vec!["attach", "/checkout", "--project", "p", "--project", "q"],
+            vec!["attach", "/checkout", "--label", "l", "--label", "m"],
+            vec!["attach", "/checkout", "--yes", "--yes"],
+            vec!["attach", "/one", "/two"],
+            vec!["attach", "--yes"],
+            vec!["register", "n", "/checkout", "--yes"],
+        ] {
+            match parse_as(Face::Projects, &args) {
+                Invocation::Refuse(_) => {}
+                Invocation::Command(command) => assert!(build(&command).is_err(), "{args:?}"),
+                _ => panic!("malformed attach invocation must refuse: {args:?}"),
+            }
+        }
+        for (verb, method) in [
+            ("enable", "identity_log.enable"),
+            ("status", "identity_log.status"),
+        ] {
+            let Invocation::Command(command) = parse_as(Face::Projects, &["log", verb]) else {
+                panic!("log must parse")
+            };
+            assert_eq!(build(&command).unwrap(), (method.into(), json!({})));
+        }
     }
 
     /// The RENDERER's field names come from the REGISTRY'S OWN REPLY TYPE.

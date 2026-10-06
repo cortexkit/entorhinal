@@ -735,7 +735,10 @@ mod tests {
                 f.bind(principal.clone(), false);
                 for method in crate::MUTATING_METHODS
                     .iter()
-                    .filter(|method| !MUTATING_METHODS.contains(method))
+                    // identity_log.enable is Direct-only, covered by attach_surface_enable_is_direct_only_and_fails_closed.
+                    .filter(|method| {
+                        !MUTATING_METHODS.contains(method) && **method != "identity_log.enable"
+                    })
                 {
                     if principal == Some(Principal::Direct)
                         || principal == Some(reserved(WRITER_MODULE))

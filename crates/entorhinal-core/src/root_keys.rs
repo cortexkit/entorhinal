@@ -169,7 +169,106 @@ pub struct AttachRootRequest {
     pub request_key: Option<String>,
 }
 
+/// A read-only match, not a reservation: attachment checks again in its write
+/// transaction because shared key ownership may change after a preview.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachRootPreview {
+    pub project_id: String,
+    pub root: String,
+    pub root_key: RootKey,
+}
+
+fn attach_match(
+    conn: &Connection,
+    req: &AttachRootRequest,
+) -> Result<AttachRootPreview, RegistryError> {
+    // Check before touching the checkout, even when the supplied path is absent.
+    if !crate::log_schema::log_enabled(conn)? {
+        return Err(domain(
+            "identity_log_disabled",
+            "root keys require an enabled identity log",
+        ));
+    }
+    let root = canonical(&req.path)?;
+    let key = choose(
+        &crate::ownership::root_remotes(conn, &root)?,
+        req.label.as_deref(),
+    )
+    .ok_or_else(|| {
+        domain(
+            "root_key_not_found",
+            "no owned remote; supply project_id and label",
+        )
+    })?;
+    let project = if key.kind == "remote" {
+        let owner = conn
+            .query_row(
+                "SELECT project_id FROM project_root_key WHERE kind='remote' AND root_key=?1",
+                [&key.root_key],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| domain("root_key_not_found", &key.root_key))?;
+        if req.project_id.as_ref().is_some_and(|id| id != &owner) {
+            return Err(domain(
+                "root_key_conflict",
+                format!("{} belongs to project_id {owner}", key.root_key),
+            ));
+        }
+        owner
+    } else {
+        let project = req
+            .project_id
+            .clone()
+            .ok_or_else(|| domain("invalid_params", "a label needs project_id"))?;
+        if conn
+            .query_row(
+                "SELECT 1 FROM project_root_key WHERE project_id=?1 AND kind=?2 AND root_key=?3",
+                [&project, &key.kind, &key.root_key],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_none()
+        {
+            return Err(domain("root_key_not_found", &key.root_key));
+        }
+        project
+    };
+    if let Some(owner) = conn
+        .query_row(
+            "SELECT project_id FROM project_root WHERE canonical_root=?1",
+            [&root],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        if owner != project || mapped_key(conn, &root)?.as_ref() != Some(&key) {
+            return Err(domain(
+                "root_conflict",
+                format!("{root} is a root of {owner}"),
+            ));
+        }
+    } else {
+        crate::binding::check_root_location(conn, &root)?;
+    }
+    Ok(AttachRootPreview {
+        project_id: project,
+        root,
+        root_key: key,
+    })
+}
+
 impl RegistryStore {
+    /// Match the same remote or label key used by `attach_root`, without minting
+    /// binding tokens, changing database cells, or taking the writer lock.
+    pub fn preview_attach_root(
+        &self,
+        req: AttachRootRequest,
+    ) -> Result<AttachRootPreview, RegistryError> {
+        self.read(|conn| Ok(attach_match(conn, &req)))?
+    }
+
     pub fn resolve_root_key(
         &self,
         req: ResolveRootKeyRequest,
@@ -201,41 +300,54 @@ impl JournalWriter<'_> {
         let request_key = req.request_key.clone();
         let actor = req.actor.clone().unwrap_or_else(|| "module".into());
         self.mutation("attach_root", request_key.as_deref(), |tx| {
-            if !crate::log_schema::log_enabled(tx)? {
-                return Err(domain("identity_log_disabled", "root keys require an enabled identity log"));
+            let matched = attach_match(tx, &req)?;
+            let project = matched.project_id;
+            let key = matched.root_key;
+            if tx
+                .query_row(
+                    "SELECT 1 FROM project_root WHERE canonical_root=?1",
+                    [&req.path],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()?
+                .is_some()
+            {
+                return Ok(Action {
+                    changed: false,
+                    seq: None,
+                    value: json!({"projectId":project,"root":req.path,"rootKey":key}),
+                    payload: json!({}),
+                });
             }
-            let key = choose(&crate::ownership::root_remotes(tx, &req.path)?, req.label.as_deref())
-                .ok_or_else(|| domain("root_key_not_found", "no owned remote; supply project_id and label"))?;
-            let project = if key.kind == "remote" {
-                let owner = tx.query_row("SELECT project_id FROM project_root_key WHERE kind='remote' AND root_key=?1", [&key.root_key], |r| r.get::<_, String>(0)).optional()?
-                    .ok_or_else(|| domain("root_key_not_found", &key.root_key))?;
-                if req.project_id.as_ref().is_some_and(|id| id != &owner) {
-                    return Err(domain("root_key_conflict", format!("{} belongs to project_id {owner}", key.root_key)));
-                }
-                owner
-            } else {
-                let project = req.project_id.clone().ok_or_else(|| domain("invalid_params", "a label needs project_id"))?;
-                if tx.query_row("SELECT 1 FROM project_root_key WHERE project_id=?1 AND kind=?2 AND root_key=?3", [&project, &key.kind, &key.root_key], |r| r.get::<_, i64>(0)).optional()?.is_none() {
-                    return Err(domain("root_key_not_found", &key.root_key));
-                }
-                project
-            };
-            if let Some(owner) = tx.query_row("SELECT project_id FROM project_root WHERE canonical_root=?1", [&req.path], |r| r.get::<_, String>(0)).optional()? {
-                if owner != project || mapped_key(tx, &req.path)?.as_ref() != Some(&key) {
-                    return Err(domain("root_conflict", format!("{} is a root of {owner}", req.path)));
-                }
-                return Ok(Action { changed: false, seq: None, value: json!({"projectId":project,"root":req.path,"rootKey":key}), payload: json!({}) });
-            }
-            crate::binding::check_root_location(tx, &req.path)?;
             let binding = crate::binding::fresh_binding(&req.path, &project, &self.ids)?;
             let payload = json!({"root":req.path,"projectId":project,"binding":binding});
             let now = crate::now_unix_millis();
-            let seq = append(tx, "attach_root", &payload, &actor, request_key.as_deref(), now, self.principal)?;
+            let seq = append(
+                tx,
+                "attach_root",
+                &payload,
+                &actor,
+                request_key.as_deref(),
+                now,
+                self.principal,
+            )?;
             replay_attach(tx, seq, &payload, now)?;
             let mut mappings = Vec::new();
-            assign(tx, &project, &req.path, Some(key.clone()), now, &mut mappings)?;
+            assign(
+                tx,
+                &project,
+                &req.path,
+                Some(key.clone()),
+                now,
+                &mut mappings,
+            )?;
             journal_assignments(tx, mappings, &actor, now, self.principal)?;
-            Ok(Action { changed: true, seq: Some(seq), value: json!({"projectId":project,"root":req.path,"rootKey":key}), payload })
+            Ok(Action {
+                changed: true,
+                seq: Some(seq),
+                value: json!({"projectId":project,"root":req.path,"rootKey":key}),
+                payload,
+            })
         })
     }
 }
@@ -351,6 +463,121 @@ mod tests {
             })
             .unwrap()
             .roots
+    }
+
+    #[test]
+    fn attach_preview_is_read_only_and_matches_the_written_remote_or_label_key() {
+        let f = Fixture::new("attach-preview");
+        let original = repo(&f, "original", "preview/remote");
+        let clone = repo(&f, "clone", "preview/remote");
+        let labelled = f.dir("labelled");
+        let label_clone = f.dir("label-clone");
+        let disabled = cells(&f);
+        code(
+            f.store
+                .preview_attach_root(AttachRootRequest {
+                    path: clone.clone(),
+                    ..Default::default()
+                })
+                .unwrap_err(),
+            "identity_log_disabled",
+        );
+        assert_eq!(disabled, cells(&f));
+        enable(&f);
+        register(&f, "remote-project", original);
+        f.store
+            .register(RegisterRequest {
+                project_id: Some("label-project".into()),
+                name: "Label".into(),
+                roots: vec![labelled],
+                label: Some("preview/remote".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        for (path, project, kind, label) in [
+            (clone, "remote-project", "remote", None),
+            (
+                label_clone,
+                "label-project",
+                "label",
+                Some("preview/remote"),
+            ),
+        ] {
+            let req = AttachRootRequest {
+                path: path.clone(),
+                project_id: Some(project.into()),
+                label: label.map(str::to_string),
+                ..Default::default()
+            };
+            let before = cells(&f);
+            let head = f.store.generation().unwrap();
+            let preview = f.store.preview_attach_root(req.clone()).unwrap();
+            assert_eq!(
+                preview,
+                AttachRootPreview {
+                    project_id: project.into(),
+                    root: path.clone(),
+                    root_key: RootKey {
+                        kind: kind.into(),
+                        root_key: "preview/remote".into()
+                    },
+                }
+            );
+            assert_eq!(
+                before,
+                cells(&f),
+                "preview must leave every database cell unchanged"
+            );
+            assert_eq!(head, f.store.generation().unwrap());
+            assert!(
+                !std::path::Path::new(&path)
+                    .join(".git")
+                    .join(crate::INCARNATION_FILE)
+                    .exists(),
+                "preview must not mint a binding token"
+            );
+            let written = result(&f.store.attach_root(req).unwrap());
+            assert_eq!(written["projectId"], preview.project_id);
+            assert_eq!(written["root"], preview.root);
+            assert_eq!(
+                written["rootKey"],
+                serde_json::to_value(preview.root_key).unwrap()
+            );
+            assert!(f.store.generation().unwrap() > head);
+        }
+    }
+
+    #[test]
+    fn identity_log_status_reads_durable_progress_and_pending_count_without_writing() {
+        let f = Fixture::new("log-status");
+        assert_eq!(
+            f.store.identity_log_status().unwrap(),
+            crate::IdentityLogStatus {
+                state: "disabled".into(),
+                last_applied_position: 0,
+                last_seen_head: 0,
+                pending_write_count: 0,
+            }
+        );
+        for (index, state) in ["enabling", "joining", "enabled"].into_iter().enumerate() {
+            let applied = (index + 1) as i64;
+            f.store.apply_entry("test.progress", "{}", "test", None, |tx| {
+                tx.execute("UPDATE identity_log_state SET state=?1,last_applied_position=?2,last_seen_head=?3 WHERE id=1", params![state, applied, applied + 3])?;
+                tx.execute("INSERT INTO pending_entry(entry_id,expected_head) VALUES(?1,?2)", params![format!("pending-{index}"), applied])?;
+                Ok(())
+            }).unwrap();
+            let before = cells(&f);
+            assert_eq!(
+                f.store.identity_log_status().unwrap(),
+                crate::IdentityLogStatus {
+                    state: state.into(),
+                    last_applied_position: applied,
+                    last_seen_head: applied + 3,
+                    pending_write_count: applied,
+                }
+            );
+            assert_eq!(before, cells(&f));
+        }
     }
 
     fn assignment_rows(f: &Fixture) -> Vec<Value> {
