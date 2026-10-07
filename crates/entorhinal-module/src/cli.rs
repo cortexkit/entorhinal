@@ -44,15 +44,23 @@ pub enum Face {
 /// defaults to the module face: the daemon spawns this binary by its real
 /// path, and a wrapper that renames it should get the serving default, not a
 /// CLI that refuses to serve.
+///
+/// The fleet rule names test copies `ckdev-<name>`. macOS reports argv[0] in
+/// `ps`, so a test copy must recognize its safe dev name as the face it stands
+/// for. Production continues to start the binary under its `ck-` name.
 pub fn face_from_argv0(argv0: Option<&str>) -> Face {
     let stem = argv0
         .map(Path::new)
         .and_then(Path::file_stem)
         .and_then(|stem| stem.to_str())
         .unwrap_or("");
+    let stem = stem
+        .strip_prefix("ckdev-")
+        .or_else(|| stem.strip_prefix("ck-"))
+        .unwrap_or(stem);
     match stem {
-        "ck-projects" => Face::Projects,
-        "ck-workspaces" => Face::Workspaces,
+        "projects" => Face::Projects,
+        "workspaces" => Face::Workspaces,
         _ => Face::Entorhinal,
     }
 }
@@ -909,6 +917,25 @@ mod tests {
         );
         assert_eq!(face_from_argv0(Some("weird-wrapper")), Face::Entorhinal);
         assert_eq!(face_from_argv0(None), Face::Entorhinal);
+    }
+
+    #[test]
+    fn ckdev_face_names_match_their_ck_faces() {
+        for (production_name, dev_name, expected) in [
+            ("ck-projects", "ckdev-projects", Face::Projects),
+            ("ck-workspaces", "ckdev-workspaces", Face::Workspaces),
+            ("ck-entorhinal", "ckdev-entorhinal", Face::Entorhinal),
+        ] {
+            assert_eq!(face_from_argv0(Some(production_name)), expected);
+            assert_eq!(face_from_argv0(Some(dev_name)), expected);
+        }
+    }
+
+    #[test]
+    fn unknown_ckdev_face_names_keep_the_module_default() {
+        assert_eq!(face_from_argv0(Some("ckdev-")), Face::Entorhinal);
+        assert_eq!(face_from_argv0(Some("ckdev-foo")), Face::Entorhinal);
+        assert_eq!(face_from_argv0(Some("ckdev-ck-projects")), Face::Entorhinal);
     }
 
     /// Bare CLI faces explain; only the module face serves from empty argv.

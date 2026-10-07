@@ -13,6 +13,9 @@ use std::{
     time::Duration,
 };
 
+mod common;
+use common::ckdev_binary;
+
 use serde_json::Value;
 use subc_protocol::Frame;
 use subc_protocol::{BindIdentity, Flags, FrameType, Priority, RouteTarget};
@@ -59,7 +62,7 @@ fn unique_temp_dir(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!("ck-entorhinal-{label}-{}-{id}", std::process::id()))
 }
 
-fn build_subc_core() -> PathBuf {
+fn build_subc_core() {
     let root = subconscious_root();
     let status = std::process::Command::new(env!("CARGO"))
         .current_dir(&root)
@@ -73,13 +76,14 @@ fn build_subc_core() -> PathBuf {
         "ck-subc binary missing at {}",
         binary.display()
     );
-    binary
 }
 
 async fn start_real_daemon() -> RealDaemon {
-    let daemon_bin = build_subc_core();
-    let module_bin = PathBuf::from(env!("CARGO_BIN_EXE_ck-entorhinal"));
     let root = unique_temp_dir("real-daemon");
+    std::fs::create_dir_all(&root).expect("create daemon scratch directory");
+    build_subc_core();
+    let daemon_bin = ckdev_binary(subconscious_root().join("target/debug/ck-subc"), &root);
+    let module_bin = ckdev_binary(env!("CARGO_BIN_EXE_ck-entorhinal"), &root);
     let config_dir = root.join("config/cortexkit");
     let runtime_dir = root.join("runtime");
     std::fs::create_dir_all(&config_dir).expect("create config directory");

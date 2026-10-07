@@ -13,13 +13,18 @@
 //! hang.
 #![cfg(unix)]
 
+use std::os::unix::process::CommandExt;
 use std::{
+    ffi::OsStr,
     io::Read,
     path::PathBuf,
     process::{Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
+
+mod common;
+use common::ckdev_binary;
 
 /// Only stops a hang: a handshake that opened the store or waited on a daemon
 /// would block here instead of answering.
@@ -46,14 +51,14 @@ impl Drop for Scratch {
     }
 }
 
-/// Runs the binary through a symlink named `face` (the binary picks its role
-/// from the name it was run as), with an empty environment: no HOME, no XDG
-/// directories and no daemon connection file to find.
+/// Runs the binary under a fleet-safe file name while keeping the role in
+/// argv[0], with an empty environment and no daemon connection file to find.
 fn run_as(face: &str) -> (std::process::ExitStatus, String) {
     let scratch = Scratch::new();
-    let link = scratch.0.join(face);
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_ck-entorhinal"), &link).unwrap();
-    let mut child = Command::new(&link)
+    let binary = ckdev_binary(env!("CARGO_BIN_EXE_ck-entorhinal"), &scratch.0);
+    let dev_face = face.replacen("ck-", "ckdev-", 1);
+    let mut child = Command::new(&binary)
+        .arg0(OsStr::new(&dev_face))
         .arg("--ck-domain")
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
@@ -61,6 +66,32 @@ fn run_as(face: &str) -> (std::process::ExitStatus, String) {
         .stderr(Stdio::null())
         .spawn()
         .expect("run the face");
+    let process_name = Command::new("ps")
+        .args(["-o", "comm=", "-p", &child.id().to_string()])
+        .output()
+        .expect("read child executable name from ps");
+    assert!(process_name.status.success(), "ps failed to inspect child");
+    let process_name = String::from_utf8_lossy(&process_name.stdout);
+    if process_name.trim().is_empty() || process_name.trim() == "<defunct>" {
+        assert!(
+            child
+                .try_wait()
+                .expect("check whether the face exited")
+                .is_some(),
+            "ps lost a face process that was still running"
+        );
+        eprintln!("ck_domain argv[0]={dev_face}, ps sampled after child exit");
+    } else {
+        eprintln!(
+            "ck_domain argv[0]={dev_face}, ps -o comm= -> {}",
+            process_name.trim()
+        );
+        assert_eq!(
+            process_name.trim(),
+            dev_face,
+            "ps should show the safe development argv[0]"
+        );
+    }
     let started = Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait().expect("poll the face") {
