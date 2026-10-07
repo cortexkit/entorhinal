@@ -417,17 +417,11 @@ fn agent_history(
         } else if entry.kind == "change" {
             let agent: AgentChangeEntry =
                 serde_json::from_value(value).map_err(|e| invalid(e.to_string()))?;
-            if !matches!(
-                agent.op.as_str(),
-                "agent.create"
-                    | "agent.rename"
-                    | "agent.update_tag"
-                    | "agent.set_labels"
-                    | "agent.set_avatar"
-                    | "agent.set_github_identity"
-                    | "agent.dispose"
-                    | "agent.merge"
-            ) {
+            // Every agent change op except `agent.import`, which is never a
+            // shared write: imports reach the log only inside snapshots.
+            if agent.op == "agent.import"
+                || !crate::agent::IDENTITY_CHANGE_OPS.contains(&agent.op.as_str())
+            {
                 return Err(invalid("unknown agent operation".into()));
             }
             vec![agent]
