@@ -178,6 +178,62 @@ impl SharedState {
             agents,
         }
     }
+
+    /// Decode the captured storage rows into the same after-images used on the
+    /// wire. This keeps supersede validation inside the installation transaction.
+    pub(crate) fn agent_entries(&self) -> rusqlite::Result<Vec<AgentChangeEntry>> {
+        self.0["agent"]
+            .iter()
+            .map(|stored| {
+                let mut row = stored.clone();
+                let labels = row.remove("labels_json").unwrap();
+                row.insert(
+                    "labels".into(),
+                    serde_json::from_str(labels.as_str().unwrap()).map_err(decode_error)?,
+                );
+                let github = row.remove("github_identity_json").unwrap();
+                row.insert(
+                    "github_identity".into(),
+                    match github.as_str() {
+                        Some(text) => serde_json::from_str(text).map_err(decode_error)?,
+                        None => Value::Null,
+                    },
+                );
+                let genome = row.remove("avatar_genome").unwrap();
+                let avatar_type = row.remove("avatar_type").unwrap();
+                let version = row.remove("avatar_version").unwrap();
+                row.insert(
+                    "avatar".into(),
+                    if genome.is_null() {
+                        Value::Null
+                    } else {
+                        serde_json::json!({"genome":genome,"type":avatar_type,"version":version})
+                    },
+                );
+                let terminal = row.remove("terminal_reason").unwrap();
+                row.insert(
+                    "status".into(),
+                    if terminal.is_null() {
+                        Value::from("live")
+                    } else {
+                        terminal
+                    },
+                );
+                let row: crate::agent::AgentRow =
+                    serde_json::from_value(serde_json::to_value(row).map_err(decode_error)?)
+                        .map_err(decode_error)?;
+                let claims = self.0["agent_name_claim"]
+                    .iter()
+                    .filter(|claim| claim["agent_id"].as_str() == Some(&row.agent_id))
+                    .map(|claim| {
+                        serde_json::from_value(serde_json::to_value(claim).map_err(decode_error)?)
+                            .map_err(decode_error)
+                    })
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(AgentChangeEntry::new("agent.import", row, claims))
+            })
+            .collect()
+    }
 }
 
 /// Recursively sort object keys, independently of serde_json's map feature set.
@@ -258,6 +314,30 @@ fn sql_value(value: &Value) -> rusqlite::Result<rusqlite::types::Value> {
 }
 
 impl ProjectEntry {
+    /// Add only primary-key deletes for rows absent from a replacement image.
+    /// Received snapshots cannot supply deletes; the receiver computes them.
+    pub(crate) fn delete_absent(
+        &mut self,
+        conn: &Connection,
+        before: &SharedState,
+    ) -> rusqlite::Result<()> {
+        for table in PROJECT_SHARED_TABLES {
+            let (_, keys) = columns(conn, table)?;
+            let changes = self.tables.entry((*table).into()).or_default();
+            let present = changes
+                .upsert
+                .iter()
+                .map(|row| canonical_bytes(&row_key(row, &keys)))
+                .collect::<std::collections::BTreeSet<_>>();
+            changes.delete = before.0[*table]
+                .iter()
+                .filter(|row| !present.contains(&canonical_bytes(&row_key(row, &keys))))
+                .map(|row| row_key(row, &keys))
+                .collect();
+        }
+        Ok(())
+    }
+
     pub fn validate(&self, conn: &Connection) -> rusqlite::Result<()> {
         if !matches!(self.op.as_str(), "project.shared" | "shared.snapshot")
             || (self.op == "project.shared" && !self.agents.is_empty())
@@ -343,6 +423,15 @@ impl ProjectEntry {
         // stay as they are.
         tx.execute("DELETE FROM workspace_member WHERE ref_kind='local'", [])?;
         tx.execute("INSERT INTO workspace_member(workspace_id,ref_kind,device_fingerprint,project_id) SELECT workspace_id,'local','',project_id FROM project_workspace", [])?;
+        if self
+            .tables
+            .get("project_root_key")
+            .is_some_and(|changes| !changes.delete.is_empty())
+        {
+            // Successor moves and key upserts have finished. A moved key keeps
+            // its mapping, while a removed key leaves the local root unkeyed.
+            tx.execute("UPDATE project_root SET root_key=NULL,root_key_kind=NULL WHERE root_key IS NOT NULL AND NOT EXISTS(SELECT 1 FROM project_root_key k WHERE k.project_id=project_root.project_id AND k.kind=project_root.root_key_kind AND k.root_key=project_root.root_key)", [])?;
+        }
         Ok(())
     }
 
