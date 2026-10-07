@@ -133,6 +133,74 @@ impl Worker {
         HandlerError::new("identity_log_stalled", message)
     }
 
+    async fn read(
+        &self,
+        after: u64,
+        deadline: Instant,
+    ) -> Result<log_client::ReadReply, HandlerError> {
+        timeout_at(deadline, self.log.read(after, 128))
+            .await
+            .map_err(|_| {
+                HandlerError::new(
+                    "engram_unavailable",
+                    "connecting or catch-up deadline expired",
+                )
+            })?
+            .map_err(|error| match error {
+                log_client::LogError::KeyUnavailable => {
+                    self.health.log_state.store(1, Ordering::Relaxed);
+                    HandlerError::new("engram_key_unavailable", "engram key unavailable")
+                }
+                log_client::LogError::NotMember => {
+                    self.health.log_state.store(2, Ordering::Relaxed);
+                    HandlerError::new("identity_log_not_member", "device is not a log member")
+                }
+                log_client::LogError::VerifyFailed { position } => {
+                    self.stalled(5, position.unwrap_or(after + 1), "log verification failed")
+                }
+                log_client::LogError::Protocol(message) => self.stalled(6, after + 1, message),
+                _ => HandlerError::new("engram_unavailable", "engram unavailable during catch-up"),
+            })
+    }
+
+    async fn check_supersede_authors(
+        &self,
+        through: u64,
+        author: &str,
+        deadline: Instant,
+    ) -> Result<(), HandlerError> {
+        // Always re-read, even for a joiner that just read the prefix. A member
+        // (especially after restart) has no in-memory authorship for old entries.
+        let mut after = 0;
+        while after < through {
+            let page = self.read(after, deadline).await?;
+            if page.head < through {
+                self.health.log_state.store(7, Ordering::Relaxed);
+                return Err(HandlerError::new(
+                    "engram_unavailable",
+                    "log head regressed",
+                ));
+            }
+            let start = after;
+            for entry in page.entries {
+                if entry.position > through {
+                    break;
+                }
+                if entry.position != after + 1 {
+                    return Err(self.stalled(4, after + 1, "log gap"));
+                }
+                if entry.author != author {
+                    return Err(self.stalled(6, through + 1, format!("supersede invariant: replaced entry has a different author at position {}", entry.position)));
+                }
+                after = entry.position;
+            }
+            if after == start {
+                return Err(self.stalled(4, after + 1, "log page omitted the next position"));
+            }
+        }
+        Ok(())
+    }
+
     async fn run(&self, store: &RegistryStore, deadline: Instant) -> Result<(), HandlerError> {
         if matches!(self.health.log_state.load(Ordering::Relaxed), 4..=6)
             && store.identity_log_status().map_err(storage)?.state == "enabled"
@@ -147,34 +215,10 @@ impl Worker {
             .map_err(storage)?
             .last_applied_position as u64;
         let mut parts = Vec::new();
+        let mut authors = Vec::new();
         let mut snapshot = None;
         loop {
-            let page = timeout_at(deadline, self.log.read(after, 128))
-                .await
-                .map_err(|_| {
-                    HandlerError::new(
-                        "engram_unavailable",
-                        "connecting or catch-up deadline expired",
-                    )
-                })?
-                .map_err(|error| match error {
-                    log_client::LogError::KeyUnavailable => {
-                        self.health.log_state.store(1, Ordering::Relaxed);
-                        HandlerError::new("engram_key_unavailable", "engram key unavailable")
-                    }
-                    log_client::LogError::NotMember => {
-                        self.health.log_state.store(2, Ordering::Relaxed);
-                        HandlerError::new("identity_log_not_member", "device is not a log member")
-                    }
-                    log_client::LogError::VerifyFailed { position } => {
-                        self.stalled(5, position.unwrap_or(after + 1), "log verification failed")
-                    }
-                    log_client::LogError::Protocol(message) => self.stalled(6, after + 1, message),
-                    _ => HandlerError::new(
-                        "engram_unavailable",
-                        "engram unavailable during catch-up",
-                    ),
-                })?;
+            let page = self.read(after, deadline).await?;
             if page.head < after {
                 self.health.log_state.store(7, Ordering::Relaxed);
                 return Err(HandlerError::new(
@@ -193,6 +237,7 @@ impl Worker {
                 if entry.position != after + 1 || entry.position > page.head {
                     return Err(self.stalled(4, after + 1, "log gap"));
                 }
+                let author = entry.author.clone();
                 let entry = remote(entry).map_err(|e| self.stalled(6, after + 1, e.message))?;
                 let position = entry.position as u64;
                 if entry.kind == "snapshot" || !parts.is_empty() {
@@ -206,7 +251,18 @@ impl Worker {
                         return Err(self.stalled(6, position, "snapshot parts are not in order"));
                     }
                     parts.push(entry);
+                    authors.push(author);
                     if info.1 == info.2 {
+                        if let Some(through) =
+                            entorhinal_core::remote_apply::snapshot_supersedes_through(&parts)
+                                .map_err(|e| self.stalled(6, position, e))?
+                        {
+                            if authors.iter().any(|author| author != &authors[0]) {
+                                return Err(self.stalled(6, position, format!("supersede invariant: snapshot parts have different authors at position {position}")));
+                            }
+                            self.check_supersede_authors(through, &authors[0], deadline)
+                                .await?;
+                        }
                         (if joining {
                             store.apply_join_snapshot(&parts, head)
                         } else {
@@ -215,6 +271,7 @@ impl Worker {
                         .map_err(|e| self.stalled(6, position, e))?;
                         joining = false;
                         parts.clear();
+                        authors.clear();
                         snapshot = None;
                         self.applied(store)?;
                     }
@@ -298,6 +355,8 @@ mod tests {
         fake: FakeLog,
         reads: Mutex<Vec<Value>>,
         override_head: Mutex<Option<u64>>,
+        reread_author: Mutex<Option<u64>>,
+        reread_action: Mutex<Option<Action>>,
     }
     struct TapConnector(Arc<Tap>);
     #[async_trait]
@@ -309,11 +368,35 @@ mod tests {
     #[async_trait]
     impl LogTransport for Tap {
         async fn call(&self, method: &str, params: Value) -> Result<Vec<u8>, TransportError> {
+            let reread = method == log_client::READ
+                && params["after"] == 0
+                && self
+                    .reads
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|read| read["after"] == 0);
             if method == log_client::READ {
                 self.reads.lock().unwrap().push(params.clone());
             }
+            if reread {
+                if let Some(action) = self.reread_action.lock().unwrap().take() {
+                    self.fake.on_read(action);
+                }
+            }
             let reply = self.fake.call(method, params).await?;
             if method == log_client::READ {
+                if reread {
+                    if let Some(position) = *self.reread_author.lock().unwrap() {
+                        let mut value: Value = serde_json::from_slice(&reply).unwrap();
+                        for entry in value["result"]["entries"].as_array_mut().unwrap() {
+                            if entry["position"] == position {
+                                entry["author"] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into();
+                            }
+                        }
+                        return Ok(serde_json::to_vec(&value).unwrap());
+                    }
+                }
                 if let Some(head) = *self.override_head.lock().unwrap() {
                     let mut value: Value = serde_json::from_slice(&reply).unwrap();
                     value["result"]["head"] = head.into();
@@ -457,6 +540,431 @@ mod tests {
         value["part"] = number.into();
         value["parts"] = count.into();
         value
+    }
+
+    fn agent(id: char, name: &str, claim_id: i64) -> entorhinal_core::agent::AgentChangeEntry {
+        let id = format!("agent_{}", id.to_string().repeat(16));
+        serde_json::from_value(json!({"seq":0,"op":"agent.import","agent_id":id,"agent_generation":1,
+            "row":{"agent_id":id,"name":name,"name_version":1,"name_normalization_version":1,"tag":"test","labels":[],"role":"assistant","project_id":null,"workspace_id":null,"avatar":null,"github_identity":null,"status":"live","merged_into":null,"supervisor_agent_id":null,"request_key":null,"created_at_ms":1,"updated_at_ms":1,"terminal_at_ms":null,"agent_generation":1},
+            "claims":[{"claim_id":claim_id,"agent_id":id,"namespace_kind":"assistant","namespace_key":"","normalized_name":name.to_lowercase(),"name_normalization_version":1,"display_name":name,"claimed_at_ms":1,"released_at_ms":null}],
+            "old_display_name":null,"new_display_name":null,"status":null,"merged_into":null})).unwrap()
+    }
+
+    fn rename(
+        mut agent: entorhinal_core::agent::AgentChangeEntry,
+        name: &str,
+        claim_id: i64,
+    ) -> entorhinal_core::agent::AgentChangeEntry {
+        agent.agent_generation += 1;
+        agent.row.agent_generation += 1;
+        agent.row.name_version += 1;
+        agent.row.name = name.into();
+        agent.row.updated_at_ms += 1;
+        let mut claim = agent.claims.last().unwrap().clone();
+        agent.claims.last_mut().unwrap().released_at_ms = Some(agent.row.updated_at_ms);
+        claim.claim_id = claim_id;
+        claim.normalized_name = name.to_lowercase();
+        claim.display_name = name.into();
+        claim.claimed_at_ms = agent.row.updated_at_ms;
+        agent.claims.push(claim);
+        agent
+    }
+
+    fn agents_part(
+        agents: &[entorhinal_core::agent::AgentChangeEntry],
+        through: Option<u64>,
+    ) -> Value {
+        let mut value = part(1, 1, "P");
+        value["agents"] = serde_json::to_value(agents).unwrap();
+        if let Some(through) = through {
+            value["supersedes_through"] = through.into();
+        }
+        value
+    }
+
+    fn joiner(f: &Fixture) {
+        f.store()
+            .apply_entry("test-joining", "{}", "test", None, |tx| {
+                tx.execute("UPDATE identity_log_state SET state='disabled'", [])?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    async fn assert_supersede_stalled(
+        f: &mut Fixture,
+        position: i64,
+        bad_position: u64,
+        joining: bool,
+    ) {
+        for _ in 0..2 {
+            let error = f.catch().await.unwrap_err();
+            assert_eq!(error.code, "identity_log_stalled");
+            assert!(error.message.contains("supersede invariant"), "{error:?}");
+            assert!(
+                error.message.contains(&format!("position {bad_position}")),
+                "{error:?}"
+            );
+            assert_eq!(f.handler.health.log_state.load(Ordering::Relaxed), 6);
+            assert_eq!(f.state(), "apply_failed");
+            assert_eq!(
+                super::super::enable::last_error(&f.handler.health),
+                Some("apply_failed")
+            );
+            assert_eq!(f.position(), position);
+            let generation = f.store().generation().unwrap();
+            let before = serde_json::to_value(f.store().agent_snapshot().unwrap()).unwrap();
+            assert_eq!(
+                f.write("blocked").await.unwrap_err().code,
+                if joining {
+                    "identity_log_enabling"
+                } else {
+                    "identity_log_stalled"
+                }
+            );
+            assert_eq!(f.store().generation().unwrap(), generation);
+            assert_eq!(
+                serde_json::to_value(f.store().agent_snapshot().unwrap()).unwrap(),
+                before
+            );
+            assert!(audit(&f.store()).iter().all(|row| row.2 <= position));
+            f.restart(Arc::new(TapConnector(f.tap.clone())));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forged_or_malformed_supersedes_stall_joiners_members_and_restarted_members() {
+        for mode in ["joiner", "member", "restarted"] {
+            for bad in [
+                "foreign",
+                "zero",
+                "mixed",
+                "partial",
+                "reread",
+                "part-author",
+            ] {
+                let mut f = Fixture::new(&format!("supersede-{mode}-{bad}"));
+                if mode == "joiner" {
+                    joiner(&f);
+                }
+                f.append(part(1, 1, "Before"), true).await;
+                if bad == "foreign" {
+                    f.tap
+                        .fake
+                        .with_author([7; 16])
+                        .client()
+                        .append(&AppendRequest {
+                            expected_head: 1,
+                            entry_id: [9; 16],
+                            kind: EntryKind::Change,
+                            data: serde_json::to_vec(&empty()).unwrap(),
+                        })
+                        .await
+                        .unwrap();
+                } else {
+                    f.append(empty(), false).await;
+                }
+                if mode != "joiner" {
+                    f.catch().await.unwrap();
+                    if mode == "restarted" {
+                        f.restart(Arc::new(TapConnector(f.tap.clone())));
+                    }
+                }
+                let mut first = part(1, 2, "After1");
+                first["supersedes_through"] = if bad == "zero" { 0 } else { 2 }.into();
+                let mut second = part(2, 2, "After2");
+                if bad != "partial" {
+                    second["supersedes_through"] = if bad == "mixed" {
+                        1
+                    } else if bad == "zero" {
+                        0
+                    } else {
+                        2
+                    }
+                    .into();
+                }
+                f.append(first, true).await;
+                if bad == "part-author" {
+                    f.tap
+                        .fake
+                        .with_author([7; 16])
+                        .client()
+                        .append(&AppendRequest {
+                            expected_head: 3,
+                            entry_id: [8; 16],
+                            kind: EntryKind::Snapshot,
+                            data: serde_json::to_vec(&second).unwrap(),
+                        })
+                        .await
+                        .unwrap();
+                } else {
+                    f.append(second, true).await;
+                }
+                f.append(project("PastBadSnapshot"), false).await;
+                if bad == "reread" {
+                    *f.tap.reread_author.lock().unwrap() = Some(2);
+                }
+                let bad_position = match bad {
+                    "foreign" | "reread" => 2,
+                    "zero" => 3,
+                    _ => 4,
+                };
+                assert_supersede_stalled(&mut f, 2, bad_position, mode == "joiner").await;
+                let projects = f.store().enumerate(None).unwrap().projects;
+                assert_eq!(projects.len(), 1);
+                assert_eq!(projects[0].project_id, "Before");
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn restarted_member_supersede_rereads_paged_prefix_then_replaces_state() {
+        let mut f = Fixture::new("supersede-paged");
+        f.append(part(1, 1, "Before"), true).await;
+        for _ in 1..130 {
+            f.append(empty(), false).await;
+        }
+        f.catch().await.unwrap();
+        f.restart(Arc::new(TapConnector(f.tap.clone())));
+        f.tap.reads.lock().unwrap().clear();
+        f.append(agents_part(&[], Some(130)), true).await;
+        f.catch().await.unwrap();
+        assert_eq!(f.position(), 131);
+        assert_eq!(
+            *f.tap.reads.lock().unwrap(),
+            vec![
+                json!({"after":130,"limit":128}),
+                json!({"after":0,"limit":128}),
+                json!({"after":128,"limit":128})
+            ]
+        );
+        let projects = f.store().enumerate(None).unwrap().projects;
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].project_id, "P");
+        assert!(f.store().verify().unwrap().ok);
+        f.store().rebuild().unwrap();
+        assert_eq!(
+            f.store().enumerate(None).unwrap().projects[0].project_id,
+            "P"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supersede_reread_failures_use_main_read_health_and_never_install() {
+        for (action, code, state) in [
+            (
+                Action::Refuse {
+                    code: log_client::UNAVAILABLE.into(),
+                    detail: None,
+                },
+                "engram_unavailable",
+                8,
+            ),
+            (
+                Action::Refuse {
+                    code: log_client::VERIFY_FAILED.into(),
+                    detail: Some(json!({"position":1})),
+                },
+                "identity_log_stalled",
+                5,
+            ),
+            (
+                Action::Refuse {
+                    code: log_client::KEY_UNAVAILABLE.into(),
+                    detail: None,
+                },
+                "engram_key_unavailable",
+                1,
+            ),
+            (Action::Hang, "engram_unavailable", 8),
+        ] {
+            let f = Fixture::new("supersede-reread-errors");
+            f.append(part(1, 1, "Before"), true).await;
+            f.catch().await.unwrap();
+            let before = f.store().generation().unwrap();
+            f.append(agents_part(&[], Some(1)), true).await;
+            *f.tap.reread_action.lock().unwrap() = Some(action);
+            assert_eq!(f.catch().await.unwrap_err().code, code);
+            assert_eq!(f.handler.health.log_state.load(Ordering::Relaxed), state);
+            assert_eq!(f.position(), 1);
+            assert_eq!(f.store().generation().unwrap(), before);
+            assert_eq!(
+                f.store().enumerate(None).unwrap().projects[0].project_id,
+                "Before"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supersede_valid_rename_sorts_claims_and_wakes_import_feed_without_duplicates() {
+        let f = Fixture::new("supersede-rename");
+        let old = agent('b', "Ada", 1);
+        let unchanged = agent('c', "Unchanged", 3);
+        f.append(agents_part(&[old.clone(), unchanged.clone()], None), true)
+            .await;
+        f.catch().await.unwrap();
+        let cursor = f.store().generation().unwrap();
+        let body = serde_json::to_vec(&json!({"method":"agent.changes","params":{"incarnation":f.handler.incarnation,"cursor":cursor,"wait":true}})).unwrap();
+        let waiter = f.handler.handle_request_wait(&body, ROUTE);
+        tokio::pin!(waiter);
+        poll_pending(waiter.as_mut());
+        let mut renamed = rename(old, "Grace", 2);
+        renamed.claims.reverse(); // Sender order is not trusted.
+        f.append(agents_part(&[unchanged, renamed.clone()], Some(1)), true)
+            .await;
+        f.catch().await.unwrap();
+        let Poll::Ready(subc_client_rs::HandlerOutcome::Response(body)) = waiter
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("import feed waiter was not woken");
+        };
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        let entries = value["result"]["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["op"], "agent.import");
+        assert_eq!(entries[0]["agent_id"], renamed.agent_id);
+        renamed.claims.sort_by_key(|claim| claim.claim_id);
+        assert_eq!(
+            f.store().agent_claims(&renamed.agent_id).unwrap(),
+            renamed.claims
+        );
+        assert_eq!(
+            entries[0]["claims"],
+            serde_json::to_value(&renamed.claims).unwrap()
+        );
+        assert!(f.store().verify().unwrap().ok);
+        f.store().rebuild().unwrap();
+        assert_eq!(
+            f.store().agent_claims(&renamed.agent_id).unwrap(),
+            renamed.claims
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supersede_valid_head_replacement_writes_terminal_agents_before_live_heads() {
+        let f = Fixture::new("supersede-head");
+        let mut old = agent('f', "Old", 1);
+        old.row.role = "head".into();
+        old.row.project_id = Some("P".into());
+        f.append(agents_part(&[old.clone()], None), true).await;
+        f.catch().await.unwrap();
+        let cursor = f.store().generation().unwrap();
+        old.row.status = "retired".into();
+        old.row.terminal_at_ms = Some(2);
+        old.row.updated_at_ms = 2;
+        old.row.agent_generation = 2;
+        old.agent_generation = 2;
+        old.claims[0].released_at_ms = Some(2);
+        let mut new = agent('a', "New", 2);
+        new.row.role = "head".into();
+        new.row.project_id = Some("P".into());
+        f.append(agents_part(&[new.clone(), old.clone()], Some(1)), true)
+            .await;
+        f.catch().await.unwrap();
+        let entries = f.store().agent_changes(cursor, None).unwrap().entries;
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.agent_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![old.agent_id.as_str(), new.agent_id.as_str()]
+        );
+        assert!(entries.iter().all(|entry| entry.op == "agent.import"));
+        let before = serde_json::to_value(f.store().agent_snapshot().unwrap()).unwrap();
+        assert!(f.store().verify().unwrap().ok);
+        f.store().rebuild().unwrap();
+        assert_eq!(
+            serde_json::to_value(f.store().agent_snapshot().unwrap()).unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supersede_agent_forks_drops_and_regressions_stall_without_changing_tables() {
+        for bad in [
+            "missing",
+            "generation",
+            "version",
+            "equal-row",
+            "fork-rename",
+            "claim-agent",
+            "claim-namespace-kind",
+            "claim-namespace-key",
+            "claim-normalized",
+            "claim-display",
+            "claim-version",
+            "claim-time",
+            "claim-release",
+            "claim-missing",
+            "active-name",
+            "head",
+        ] {
+            let mut f = Fixture::new(&format!("supersede-agent-{bad}"));
+            let mut x = rename(agent('b', "Ada", 1), "Grace", 2);
+            if bad == "head" {
+                x.row.role = "head".into();
+                x.row.project_id = Some("P".into());
+            }
+            let y = agent('c', "Other", 3);
+            f.append(agents_part(&[x.clone(), y.clone()], None), true)
+                .await;
+            f.catch().await.unwrap();
+            let before = serde_json::to_value(f.store().agent_snapshot().unwrap()).unwrap();
+            let mut incoming = vec![x.clone(), y];
+            match bad {
+                "missing" => {
+                    incoming.remove(0);
+                }
+                "generation" => {
+                    incoming[0].agent_generation -= 1;
+                    incoming[0].row.agent_generation -= 1;
+                }
+                "version" => incoming[0].row.name_version -= 1,
+                "equal-row" => incoming[0].row.tag = "fork".into(),
+                "fork-rename" => {
+                    incoming[0] = rename(rename(agent('b', "Ada", 1), "Bob", 2), "Carol", 4)
+                }
+                "active-name" => {
+                    incoming[0] = rename(x.clone(), "Freed", 4);
+                    incoming[1] = rename(incoming[1].clone(), "Grace", 5);
+                }
+                "head" => {
+                    incoming[0].row.role = "hiree".into();
+                    incoming[0].row.agent_generation += 1;
+                    incoming[0].agent_generation += 1;
+                    incoming[1].row.role = "head".into();
+                    incoming[1].row.project_id = Some("P".into());
+                    incoming[1].row.agent_generation += 1;
+                    incoming[1].agent_generation += 1;
+                }
+                "claim-missing" => {
+                    incoming[0].claims.remove(0);
+                }
+                _ => {
+                    let claim = &mut incoming[0].claims[0];
+                    match bad {
+                        "claim-agent" => claim.agent_id = format!("agent_{}", "c".repeat(16)),
+                        "claim-namespace-kind" => claim.namespace_kind = "workspace".into(),
+                        "claim-namespace-key" => claim.namespace_key = "W".into(),
+                        "claim-normalized" => claim.normalized_name = "fork".into(),
+                        "claim-display" => claim.display_name = "Fork".into(),
+                        "claim-version" => claim.name_normalization_version = 2,
+                        "claim-time" => claim.claimed_at_ms = 10,
+                        "claim-release" => claim.released_at_ms = Some(10),
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            f.append(agents_part(&incoming, Some(1)), true).await;
+            f.append(project("PastBadSnapshot"), false).await;
+            assert_supersede_stalled(&mut f, 1, 2, false).await;
+            assert_eq!(
+                serde_json::to_value(f.store().agent_snapshot().unwrap()).unwrap(),
+                before,
+                "{bad}"
+            );
+        }
     }
     // Reads journal columns that are only reachable inside a write transaction.
     // `apply_entry` inserts a throwaway journal row to open one; the closure

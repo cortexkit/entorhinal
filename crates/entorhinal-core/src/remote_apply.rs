@@ -55,6 +55,8 @@ struct SnapshotPart {
     tables: std::collections::BTreeMap<String, crate::shared_entry::TableChanges>,
     #[serde(default)]
     agents: Vec<AgentChangeEntry>,
+    #[serde(default)]
+    supersedes_through: Option<u64>,
 }
 
 fn snapshot_part(entry: &RemoteEntry) -> Result<SnapshotPart, RegistryError> {
@@ -78,6 +80,129 @@ fn snapshot_part(entry: &RemoteEntry) -> Result<SnapshotPart, RegistryError> {
 pub fn snapshot_part_info(entry: &RemoteEntry) -> Result<(String, u64, u64), RegistryError> {
     let part = snapshot_part(entry)?;
     Ok((part.snapshot_id, part.part, part.parts))
+}
+
+/// Return the agreed replacement boundary. The coordinator checks authorship
+/// before installation; the installer independently checks these wire invariants.
+pub fn snapshot_supersedes_through(entries: &[RemoteEntry]) -> Result<Option<u64>, RegistryError> {
+    let parts = entries
+        .iter()
+        .map(snapshot_part)
+        .collect::<Result<Vec<_>, _>>()?;
+    let Some(first) = parts.first() else {
+        return Ok(None);
+    };
+    for (entry, part) in entries.iter().zip(&parts) {
+        if part.supersedes_through != first.supersedes_through {
+            return Err(domain(
+                "apply_failed",
+                format!(
+                    "supersede invariant: parts disagree on supersedes_through at position {}",
+                    entry.position
+                ),
+            ));
+        }
+    }
+    if let Some(through) = first.supersedes_through {
+        if entries[0].position < 1 || through != (entries[0].position - 1) as u64 {
+            return Err(domain(
+                "apply_failed",
+                format!(
+                    "supersede invariant: boundary is not the preceding position at position {}",
+                    entries[0].position
+                ),
+            ));
+        }
+    }
+    Ok(first.supersedes_through)
+}
+
+/// A replacement must extend every row and claim in the replaced history.
+/// This pure check is shared with writers, which must refuse before publishing.
+pub fn validate_agent_extension(
+    history: &[AgentChangeEntry],
+    incoming: &[AgentChangeEntry],
+) -> Result<(), RegistryError> {
+    use std::collections::BTreeMap;
+    let mut agents = BTreeMap::new();
+    let mut claims = BTreeMap::new();
+    let fork = |id: &str| {
+        domain(
+            "supersede_forks_agents",
+            format!(
+                "agent {id} has forked history; make name or live-head moves after superseding"
+            ),
+        )
+    };
+    for agent in incoming {
+        if agent.agent_id != agent.row.agent_id
+            || agent.agent_generation != agent.row.agent_generation
+            || agents.insert(agent.agent_id.as_str(), agent).is_some()
+        {
+            return Err(fork(&agent.agent_id));
+        }
+        for claim in &agent.claims {
+            if claim.agent_id != agent.agent_id || claims.insert(claim.claim_id, claim).is_some() {
+                return Err(fork(&agent.agent_id));
+            }
+        }
+    }
+    for old in history {
+        let new = agents.get(old.agent_id.as_str()).ok_or_else(|| {
+            domain(
+                "supersede_drops_agents",
+                format!("agent {} is missing", old.agent_id),
+            )
+        })?;
+        if new.row.agent_generation < old.row.agent_generation
+            || new.row.name_version < old.row.name_version
+        {
+            return Err(domain(
+                "supersede_regresses_agents",
+                format!("agent {} regresses", old.agent_id),
+            ));
+        }
+        if new.row.agent_generation == old.row.agent_generation && new.row != old.row {
+            return Err(fork(&old.agent_id));
+        }
+        for claim in &old.claims {
+            let Some(next) = claims.get(&claim.claim_id) else {
+                return Err(fork(&old.agent_id));
+            };
+            let mut extended = claim.clone();
+            if extended.released_at_ms.is_none() {
+                extended.released_at_ms = next.released_at_ms;
+            }
+            if &extended != *next {
+                return Err(fork(&old.agent_id));
+            }
+            if claim.released_at_ms.is_none()
+                && incoming.iter().flat_map(|a| &a.claims).any(|next| {
+                    next.released_at_ms.is_none()
+                        && next.agent_id != claim.agent_id
+                        && next.namespace_kind == claim.namespace_kind
+                        && next.namespace_key == claim.namespace_key
+                        && next.name_normalization_version == claim.name_normalization_version
+                        && next.normalized_name == claim.normalized_name
+                })
+            {
+                return Err(fork(&old.agent_id));
+            }
+        }
+        if old.row.status == "live"
+            && old.row.role == "head"
+            && new.row.status == "live"
+            && incoming.iter().any(|next| {
+                next.agent_id != old.agent_id
+                    && next.row.status == "live"
+                    && next.row.role == "head"
+                    && next.row.project_id == old.row.project_id
+            })
+        {
+            return Err(fork(&old.agent_id));
+        }
+    }
+    Ok(())
 }
 
 impl RegistryStore {
@@ -109,6 +234,7 @@ impl RegistryStore {
             .iter()
             .map(snapshot_part)
             .collect::<Result<Vec<_>, _>>()?;
+        let supersedes = snapshot_supersedes_through(entries)?.is_some();
         let first = parts
             .first()
             .ok_or_else(|| domain("apply_failed", "empty snapshot"))?;
@@ -151,7 +277,7 @@ impl RegistryStore {
         let error = std::cell::RefCell::new(None);
         self.db
             .with_conn_fenced(|tx| {
-                let install = || -> rusqlite::Result<i64> {
+                let mut install = || -> rusqlite::Result<i64> {
                     let position: i64 = tx.query_row(
                         "SELECT last_applied_position FROM identity_log_state WHERE id=1",
                         [],
@@ -168,6 +294,20 @@ impl RegistryStore {
                     }
                     // Run the same image validation before inserting any journal row.
                     merged.validate(tx)?;
+                    if supersedes {
+                        let before = crate::shared_entry::SharedState::capture(tx)?;
+                        let history = before.agent_entries()?;
+                        validate_agent_extension(&history, &merged.agents).map_err(|cause| {
+                            decode_error(serde_json::Error::io(std::io::Error::other(format!("supersede invariant: {cause} at position {}", entries.last().unwrap().position))))
+                        })?;
+                        // Authorship was rechecked over the entire replaced log
+                        // by the coordinator. Only that author's rows can be erased.
+                        merged.delete_absent(tx, &before)?;
+                        merged.agents.sort_by(|a, b| (a.row.status == "live", &a.agent_id).cmp(&(b.row.status == "live", &b.agent_id)));
+                        for agent in &mut merged.agents { agent.claims.sort_by_key(|claim| claim.claim_id); }
+                        // Unchanged agents do not produce duplicate feed imports.
+                        merged.agents.retain(|agent| !history.iter().any(|old| old.row == agent.row && old.claims == agent.claims));
+                    }
                     let mut seq = 0;
                     for (i, entry) in entries.iter().enumerate() {
                         let replay_entry = RemoteEntry {
@@ -557,6 +697,200 @@ mod tests {
         let rebuilt = f.store.rebuild().unwrap();
         assert!(rebuilt.replay.ok, "{rebuilt:?}");
         assert_eq!(before, image(f));
+    }
+
+    #[test]
+    fn supersede_replaces_shared_rows_cascades_local_rows_and_replays_cleared_keys() {
+        let source = Fixture::new("supersede-cascade-source");
+        register(&source, "P1", vec![], Some("W1"));
+        register(&source, "P2", vec![], Some("W2"));
+        let mut first = serde_json::to_value(state(&source).snapshot(vec![])).unwrap();
+        first["tables"]["project_root_key"]["upsert"] = json!([
+            {"project_id":"P1","kind":"label","root_key":"K","created_at":1},
+            {"project_id":"P1","kind":"remote","root_key":"owner/old","created_at":1},
+            {"project_id":"P2","kind":"label","root_key":"local","created_at":1}
+        ]);
+        first["snapshot_id"] = "original".into();
+        first["part"] = 1.into();
+        first["parts"] = 1.into();
+        let f = Fixture::new("supersede-cascade-member");
+        enable(&f);
+        f.store
+            .apply_remote_snapshot(&[envelope(1, &first, true)])
+            .unwrap();
+        let root = f.dir("label-root");
+        let remote = f.dir("remote-root");
+        let removed = f.dir("removed-root");
+        let workspace_root = f.dir("workspace-root");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&remote)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&removed)
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success());
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/owner/old.git",
+        ]);
+        let label_request = AttachRootRequest {
+            path: root.clone(),
+            project_id: Some("P1".into()),
+            label: Some("K".into()),
+            ..Default::default()
+        };
+        let remote_request = AttachRootRequest {
+            path: remote.clone(),
+            ..Default::default()
+        };
+        f.store.attach_root(label_request.clone()).unwrap();
+        f.store.attach_root(remote_request.clone()).unwrap();
+        f.store
+            .attach_root(AttachRootRequest {
+                path: removed.clone(),
+                project_id: Some("P2".into()),
+                label: Some("local".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let epoch: String = f
+            .store
+            .read(|conn| {
+                conn.query_row(
+                    "SELECT registration_epoch FROM root_binding WHERE canonical_root=?1",
+                    [&removed],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        append_local(
+            &f,
+            "approve_root",
+            json!({"canonicalRoot":removed,"registrationEpoch":epoch}),
+        );
+        f.store
+            .set_workspace_root(SetWorkspaceRootRequest {
+                workspace_id: "W2".into(),
+                root: Some(workspace_root),
+                ..Default::default()
+            })
+            .unwrap();
+        check_rebuild(&f);
+
+        let replacement = Fixture::new("supersede-cascade-replacement");
+        register(&replacement, "P1", vec![], Some("W1"));
+        let mut last = serde_json::to_value(state(&replacement).snapshot(vec![])).unwrap();
+        last["tables"]["project_root_key"]["upsert"] = json!([
+            {"project_id":"P1","kind":"remote","root_key":"owner/new","created_at":2}
+        ]);
+        last["snapshot_id"] = "replacement".into();
+        last["part"] = 1.into();
+        last["parts"] = 1.into();
+        last["supersedes_through"] = 1.into();
+        f.store
+            .apply_remote_snapshot(&[envelope(2, &last, true)])
+            .unwrap();
+        f.store.read(|conn| {
+            let roots = conn.prepare("SELECT canonical_root,project_id,root_key_kind,root_key FROM project_root ORDER BY canonical_root")?.query_map([], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            assert_eq!(roots.len(), 2);
+            assert!(roots.iter().all(|(path, project, kind, key)| [root.as_str(),remote.as_str()].contains(&path.as_str()) && project == "P1" && kind.is_none() && key.is_none()));
+            for table in ["project", "project_root", "root_binding", "project_alias", "derived_root_parent", "project_root_key", "project_workspace"] {
+                assert_eq!(conn.query_row(&format!("SELECT COUNT(*) FROM {table} WHERE project_id='P2'"), [], |r| r.get::<_,i64>(0))?, 0, "{table}");
+            }
+            for table in ["workspace_root", "workspace_member", "workspace"] {
+                assert_eq!(conn.query_row(&format!("SELECT COUNT(*) FROM {table} WHERE workspace_id='W2'"), [], |r| r.get::<_,i64>(0))?, 0, "{table}");
+            }
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM root_approval WHERE registration_epoch=?1", [&epoch], |r| r.get::<_,i64>(0))?, 0);
+            let bytes: Vec<u8> = conn.query_row("SELECT entry FROM registry_journal WHERE log_position=2", [], |r| r.get(0))?;
+            let entry: ProjectEntry = serde_json::from_slice(&bytes).map_err(decode_error)?;
+            assert_eq!(entry.tables["project"].delete, vec![serde_json::from_value(json!({"project_id":"P2"})).unwrap()]);
+            assert_eq!(entry.tables["project_root_key"].delete.len(), 3);
+            let payload: String = conn.query_row("SELECT payload_json FROM registry_journal WHERE log_position=2", [], |r| r.get(0))?;
+            let payload: Value = serde_json::from_str(&payload).map_err(decode_error)?;
+            assert_eq!(payload["snapshot_part"], last);
+            assert!(payload["snapshot_part"]["tables"]["project_root_key"]["delete"].as_array().unwrap().is_empty());
+            Ok(())
+        }).unwrap();
+        for (kind, key) in [("label", "K"), ("remote", "owner/old")] {
+            assert!(f
+                .store
+                .resolve_root_key(ResolveRootKeyRequest {
+                    project_id: "P1".into(),
+                    kind: kind.into(),
+                    root_key: key.into()
+                })
+                .unwrap()
+                .roots
+                .is_empty());
+        }
+        check_rebuild(&f);
+        assert!(f
+            .store
+            .attach_root(label_request.clone())
+            .unwrap_err()
+            .to_string()
+            .starts_with("root_key_not_found:"));
+        f.store
+            .remove_root(RemoveRootRequest {
+                project_id: "P1".into(),
+                root: root.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(f
+            .store
+            .attach_root(label_request)
+            .unwrap_err()
+            .to_string()
+            .starts_with("root_key_not_found:"));
+        git(&[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/owner/new.git",
+        ]);
+        assert!(f
+            .store
+            .attach_root(remote_request.clone())
+            .unwrap_err()
+            .to_string()
+            .starts_with("root_conflict:"));
+        f.store
+            .remove_root(RemoveRootRequest {
+                project_id: "P1".into(),
+                root: remote.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+        f.store.attach_root(remote_request).unwrap();
+        assert_eq!(
+            f.store
+                .resolve_root_key(ResolveRootKeyRequest {
+                    project_id: "P1".into(),
+                    kind: "remote".into(),
+                    root_key: "owner/new".into()
+                })
+                .unwrap()
+                .roots,
+            vec![remote]
+        );
+        check_rebuild(&f);
     }
 
     #[test]
