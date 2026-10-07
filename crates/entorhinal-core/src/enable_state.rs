@@ -26,6 +26,10 @@ pub struct EnablePart {
 pub struct Backfill {
     image: ProjectEntry,
     mappings: Vec<RootKeyMapping>,
+    // Kept with the saved backfill so old plans (which omit it) retain their
+    // original bootstrap positions and bytes when reopened by a newer build.
+    #[serde(default)]
+    base: u64,
 }
 
 pub struct EnablePlan {
@@ -38,20 +42,25 @@ struct WirePart<'a> {
     snapshot_id: &'a str,
     part: usize,
     parts: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    supersedes_through: Option<u64>,
     #[serde(flatten)]
     image: &'a ProjectEntry,
 }
 
-fn body(id: &str, part: usize, parts: usize, image: &ProjectEntry) -> Vec<u8> {
+fn body(id: &str, part: usize, parts: usize, image: &ProjectEntry, base: Option<u64>) -> Vec<u8> {
     canonical_bytes(&WirePart {
         snapshot_id: id,
         part,
         parts,
+        supersedes_through: base,
         image,
     })
 }
 
-fn partition(id: &str, image: ProjectEntry) -> Result<Vec<Vec<u8>>, RegistryError> {
+fn partition(id: &str, image: ProjectEntry, base: u64) -> Result<Vec<Vec<u8>>, RegistryError> {
+    let supersedes = (base > 0).then_some(base);
+    let estimate = supersedes.map(|_| u64::MAX);
     let empty = || ProjectEntry {
         op: "shared.snapshot".into(),
         tables: BTreeMap::new(),
@@ -86,8 +95,9 @@ fn partition(id: &str, image: ProjectEntry) -> Result<Vec<Vec<u8>>, RegistryErro
     let mut images = vec![];
     let mut current = empty();
     for (name, unit) in units {
-        // Reserve enough digits for the final part count before packing rows.
-        let size = body(id, usize::MAX, usize::MAX, &unit).len();
+        // Reserve maximum-width counts and replacement metadata before packing
+        // rows; adding supersedes_through must never push a part over the cap.
+        let size = body(id, usize::MAX, usize::MAX, &unit, estimate).len();
         if size > SNAPSHOT_CAP {
             return Err(domain(
                 "shared_entry_too_large",
@@ -103,7 +113,7 @@ fn partition(id: &str, image: ProjectEntry) -> Result<Vec<Vec<u8>>, RegistryErro
                 .extend(changes.upsert.clone());
         }
         next.agents.extend(unit.agents.clone());
-        if body(id, usize::MAX, usize::MAX, &next).len() > SNAPSHOT_CAP {
+        if body(id, usize::MAX, usize::MAX, &next, estimate).len() > SNAPSHOT_CAP {
             images.push(current);
             current = unit;
         } else {
@@ -114,11 +124,16 @@ fn partition(id: &str, image: ProjectEntry) -> Result<Vec<Vec<u8>>, RegistryErro
     Ok(images
         .iter()
         .enumerate()
-        .map(|(i, image)| body(id, i + 1, images.len(), image))
+        .map(|(i, image)| body(id, i + 1, images.len(), image, supersedes))
         .collect())
 }
 
 impl RegistryStore {
+    pub fn enable_registry_is_empty(&self) -> Result<bool, RegistryError> {
+        self.read(|conn| conn.query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM project) AND NOT EXISTS(SELECT 1 FROM workspace) AND NOT EXISTS(SELECT 1 FROM agent)",
+            [], |r| r.get(0)))
+    }
     /// Check the existing agent.cutover journal row and registry counts without
     /// writing. A refusal must leave the journal, saved identity-log state and
     /// saved log positions unchanged, so local writes remain available.
@@ -140,7 +155,7 @@ impl RegistryStore {
     ///
     /// Finishing an enable writes the `agent.cutover` marker, and once that
     /// marker exists `agent.import` refuses forever. So a machine that writes
-    /// the first snapshot of its own state to the log, with no agents and no
+    /// a snapshot of its own state to the log, with no agents and no
     /// marker, must either import its agents first or say explicitly, with
     /// `without_agents`, that there are none to import. The flag is refused
     /// whenever agents or a marker already exist, so it can never hide a real
@@ -179,6 +194,35 @@ impl RegistryStore {
     }
 
     pub fn prepare_enable(&self, snapshot_id: &str, now: i64) -> Result<EnablePlan, RegistryError> {
+        self.prepare_enable_plan(snapshot_id, now, 0, &[])
+    }
+
+    /// Read-only preparation: validate the replaced log's agent history before
+    /// saving a plan, so a writer cannot publish a snapshot readers must refuse.
+    pub fn prepare_supersede(
+        &self,
+        snapshot_id: &str,
+        now: i64,
+        base: u64,
+        log_entries: &[crate::remote_apply::RemoteEntry],
+    ) -> Result<EnablePlan, RegistryError> {
+        if base == 0 || base != log_entries.len() as u64 {
+            return Err(domain(
+                "identity_log_invariant",
+                "supersede requires the complete log prefix",
+            ));
+        }
+        let history = agent_history(log_entries)?;
+        self.prepare_enable_plan(snapshot_id, now, base, &history)
+    }
+
+    fn prepare_enable_plan(
+        &self,
+        snapshot_id: &str,
+        now: i64,
+        base: u64,
+        history: &[AgentChangeEntry],
+    ) -> Result<EnablePlan, RegistryError> {
         let agents = self
             .agent_snapshot()
             .map_err(|e| domain(&e.code, e.message))?;
@@ -194,7 +238,10 @@ impl RegistryStore {
                     .collect();
                 AgentChangeEntry::new("agent.import", row, claims)
             })
-            .collect();
+            .collect::<Vec<_>>();
+        if base > 0 {
+            crate::remote_apply::validate_agent_extension(history, &entries)?;
+        }
         let (mut image, backfill) = self.read(|conn| {
             let mut image = SharedState::capture(conn)?.snapshot(entries);
             let mut keys = crate::shared_entry::TableChanges::default();
@@ -216,12 +263,12 @@ impl RegistryStore {
                 }
             }
             image.tables.insert("project_root_key".into(), keys.clone());
-            let backfill = Backfill { image: ProjectEntry { op: "project.shared".into(), tables: [("project_root_key".into(), keys)].into(), agents: vec![] }, mappings };
+            let backfill = Backfill { image: ProjectEntry { op: "project.shared".into(), tables: [("project_root_key".into(), keys)].into(), agents: vec![] }, mappings, base };
             Ok(Ok((image, backfill)))
         })??;
         image.agents.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
         Ok(EnablePlan {
-            bodies: partition(snapshot_id, image)?,
+            bodies: partition(snapshot_id, image, base)?,
             backfill,
         })
     }
@@ -249,9 +296,21 @@ impl RegistryStore {
         })
     }
 
+    pub fn enable_base(&self) -> Result<u64, RegistryError> {
+        self.read(|conn| {
+            let backfill: String = conn.query_row(
+                "SELECT enable_backfill FROM identity_log_state WHERE id=1",
+                [],
+                |r| r.get(0),
+            )?;
+            let backfill: Backfill = serde_json::from_str(&backfill).map_err(decode_error)?;
+            Ok(backfill.base)
+        })
+    }
+
     /// Discard the saved snapshot and return to disabled only after a log read
-    /// finds a different entry id at position 1. Our first append requires an
-    /// empty log; another entry permanently occupying position 1 means neither
+    /// finds a different entry id at base + 1. Our first append requires head
+    /// base; another entry permanently occupying base + 1 means neither
     /// a retry nor an earlier unanswered send can succeed, so discarding is safe.
     pub fn abandon_enable(&self) -> Result<(), RegistryError> {
         self.db.with_conn_fenced(|tx| {
@@ -270,8 +329,11 @@ impl RegistryStore {
             crate::shared_entry::replay_root_keys(tx, json!({"mappings":backfill.mappings}))?;
             tx.execute("UPDATE registry_journal SET stream='shared',entry=?1 WHERE seq=?2", params![canonical_bytes(&backfill.image), seq])?;
             ensure_cutover(tx, now, principal)?;
-            append(tx, "identity_log.enable", &json!({}), "operator", None, now, principal)?;
-            tx.execute("UPDATE identity_log_state SET state='enabled',last_applied_position=?1,last_seen_head=?1,enable_parts=NULL,enable_backfill=NULL WHERE id=1", [parts.len() as i64])?;
+            let payload = if backfill.base > 0 { json!({"supersedes_through":backfill.base}) } else { json!({}) };
+            append(tx, "identity_log.enable", &payload, "operator", None, now, principal)?;
+            let position = backfill.base.checked_add(parts.len() as u64).and_then(|p| i64::try_from(p).ok())
+                .ok_or_else(|| decode_error(serde_json::Error::io(std::io::Error::other("enable position exceeds local range"))))?;
+            tx.execute("UPDATE identity_log_state SET state='enabled',last_applied_position=?1,last_seen_head=?1,enable_parts=NULL,enable_backfill=NULL WHERE id=1", [position])?;
             Ok(())
         }).map_err(RegistryError::Store)
     }
@@ -289,6 +351,123 @@ impl RegistryStore {
             })
             .map_err(RegistryError::Store)
     }
+}
+
+/// Reconstruct only agent history in memory. Change entries carry complete rows
+/// but only the claims inserted or released by that operation, so claims must
+/// accumulate across changes, even when a later tag/label update has none.
+fn agent_history(
+    entries: &[crate::remote_apply::RemoteEntry],
+) -> Result<Vec<AgentChangeEntry>, RegistryError> {
+    use crate::remote_apply::{snapshot_part_info, snapshot_supersedes_through};
+    let mut agents = BTreeMap::<String, AgentChangeEntry>::new();
+    let mut parts = vec![];
+    let mut snapshot = None;
+    for (i, entry) in entries.iter().enumerate() {
+        let invalid = |reason: String| {
+            domain(
+                "identity_log_invariant",
+                format!("{reason} at position {}", entry.position),
+            )
+        };
+        if entry.position != i as i64 + 1
+            || entry.envelope_version != crate::remote_apply::ENVELOPE_VERSION
+        {
+            return Err(invalid("invalid log position or envelope".into()));
+        }
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&entry.entry).map_err(|e| invalid(e.to_string()))?;
+        let after_images = if entry.kind == "snapshot" || !parts.is_empty() {
+            let info = snapshot_part_info(entry).map_err(|e| invalid(e.to_string()))?;
+            let expected = snapshot.get_or_insert_with(|| (info.0.clone(), info.2));
+            if info.0 != expected.0 || info.2 != expected.1 || info.1 != parts.len() as u64 + 1 {
+                return Err(invalid("snapshot parts are not in order".into()));
+            }
+            parts.push(entry);
+            if info.1 == info.2 {
+                let group = parts
+                    .iter()
+                    .map(|e| crate::remote_apply::RemoteEntry {
+                        position: e.position,
+                        entry_id: e.entry_id.clone(),
+                        signer: e.signer.clone(),
+                        key_id: e.key_id.clone(),
+                        envelope_version: e.envelope_version,
+                        kind: e.kind.clone(),
+                        entry: e.entry.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                snapshot_supersedes_through(&group).map_err(|e| invalid(e.to_string()))?;
+                parts.clear();
+                snapshot = None;
+            }
+            let object = value
+                .as_object_mut()
+                .ok_or_else(|| invalid("invalid snapshot".into()))?;
+            for key in ["snapshot_id", "part", "parts", "supersedes_through"] {
+                object.remove(key);
+            }
+            let image: ProjectEntry =
+                serde_json::from_value(value).map_err(|e| invalid(e.to_string()))?;
+            image.agents
+        } else if entry.kind == "change" && value["op"] == "project.shared" {
+            let _: ProjectEntry =
+                serde_json::from_value(value).map_err(|e| invalid(e.to_string()))?;
+            vec![]
+        } else if entry.kind == "change" {
+            let agent: AgentChangeEntry =
+                serde_json::from_value(value).map_err(|e| invalid(e.to_string()))?;
+            if !matches!(
+                agent.op.as_str(),
+                "agent.create"
+                    | "agent.rename"
+                    | "agent.update_tag"
+                    | "agent.set_labels"
+                    | "agent.set_avatar"
+                    | "agent.set_github_identity"
+                    | "agent.dispose"
+                    | "agent.merge"
+            ) {
+                return Err(invalid("unknown agent operation".into()));
+            }
+            vec![agent]
+        } else {
+            return Err(invalid("unknown entry kind".into()));
+        };
+        for mut agent in after_images {
+            if agent.agent_id != agent.row.agent_id
+                || agent.agent_generation != agent.row.agent_generation
+                || agent
+                    .claims
+                    .iter()
+                    .any(|claim| claim.agent_id != agent.agent_id)
+            {
+                return Err(invalid("inconsistent agent after-image".into()));
+            }
+            let mut claims = agents
+                .remove(&agent.agent_id)
+                .map(|old| old.claims)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|claim| (claim.claim_id, claim))
+                .collect::<BTreeMap<_, _>>();
+            for claim in agent.claims {
+                claims.insert(claim.claim_id, claim);
+            }
+            agent.claims = claims.into_values().collect();
+            agents.insert(agent.agent_id.clone(), agent);
+        }
+    }
+    if !parts.is_empty() {
+        return Err(domain(
+            "identity_log_invariant",
+            format!(
+                "snapshot incomplete at position {}",
+                entries.last().unwrap().position
+            ),
+        ));
+    }
+    Ok(agents.into_values().collect())
 }
 
 pub(crate) fn finish_join_at_head(tx: &Transaction<'_>, head: i64) -> rusqlite::Result<()> {
@@ -341,6 +520,49 @@ mod tests {
     use crate::remote_apply::RemoteEntry;
     use cortexkit_store::{Isolation, StorageBackend};
     use std::path::Path;
+
+    #[test]
+    fn supersede_partition_reserves_replacement_metadata_at_cap() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let mut image = ProjectEntry {
+            op: "shared.snapshot".into(),
+            tables: BTreeMap::new(),
+            agents: vec![],
+        };
+        let changes = image.tables.entry("project".into()).or_default();
+        for _ in 0..2 {
+            changes.upsert.push([("name".into(), json!(""))].into());
+        }
+        let overhead = body(id, usize::MAX, usize::MAX, &image, None).len();
+        // Without replacement metadata these two rows fit, just one byte under
+        // the estimator's cap. The real replacement field is wider than the
+        // digits freed by the final part count, so omitting it would overflow.
+        let padding = SNAPSHOT_CAP - overhead - 1;
+        for (i, row) in image
+            .tables
+            .get_mut("project")
+            .unwrap()
+            .upsert
+            .iter_mut()
+            .enumerate()
+        {
+            row.insert(
+                "name".into(),
+                json!("x".repeat(padding / 2 + if i == 0 { padding % 2 } else { 0 })),
+            );
+        }
+        assert_eq!(
+            body(id, usize::MAX, usize::MAX, &image, None).len(),
+            SNAPSHOT_CAP - 1
+        );
+        let parts = partition(id, image, i64::MAX as u64 - 2).unwrap();
+        assert_eq!(parts.len(), 2, "replacement metadata requires another part");
+        for part in parts {
+            assert!(part.len() <= SNAPSHOT_CAP);
+            let value: serde_json::Value = serde_json::from_slice(&part).unwrap();
+            assert_eq!(value["supersedes_through"], i64::MAX as u64 - 2);
+        }
+    }
 
     fn git(root: &Path, args: &[&str]) {
         let out = std::process::Command::new("git")

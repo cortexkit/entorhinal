@@ -131,7 +131,7 @@ fn draw_id() -> Result<[u8; 16], HandlerError> {
 /// With the writer lock held, read confirmed progress and resend only missing
 /// saved snapshot parts using their original ids and bytes. Keep the state enabling, which refuses shared
 /// mutations, until the log confirms every part at its original position or a
-/// read finds a different entry at position 1 and permits returning to disabled.
+/// read finds a different entry at base + 1 and permits returning to disabled.
 /// A missing or failed reply alone is not a reason to discard the saved data.
 pub(super) async fn resume(
     store: &RegistryStore,
@@ -141,40 +141,65 @@ pub(super) async fn resume(
     principal: &str,
 ) -> Result<(), HandlerError> {
     let parts = store.enable_parts()?;
+    let base = store.enable_base()?;
+    if parts.is_empty()
+        || base
+            .checked_add(parts.len() as u64)
+            .is_none_or(|p| p > i64::MAX as u64)
+    {
+        return Err(HandlerError::new(
+            "identity_log_invariant",
+            "invalid saved enable range",
+        ));
+    }
     // Receipts can arrive too slowly to fit all parts into one request. A read
     // accumulates durable progress across retries without spending the deadline
     // resending parts that already occupy their unique expected positions.
-    let page = timeout_at(deadline, log.read(0, parts.len()))
-        .await
-        .map_err(|_| {
-            HandlerError::new(
-                "engram_unavailable",
-                "enable recovery read deadline expired",
-            )
-        })?
-        .map_err(|e| log_error(e, health))?;
-    if let Some(first) = page.entries.first().filter(|e| e.position == 1) {
-        if first.entry_id != parts[0].entry_id {
-            store.abandon_enable()?;
-            store.check_enable_preconditions(page.head)?;
+    let mut confirmed = 0;
+    loop {
+        let after = base + confirmed as u64;
+        let page = timeout_at(deadline, log.read(after, parts.len() - confirmed))
+            .await
+            .map_err(|_| {
+                HandlerError::new(
+                    "engram_unavailable",
+                    "enable recovery read deadline expired",
+                )
+            })?
+            .map_err(|e| log_error(e, health))?;
+        if page.head < after || (page.entries.is_empty() && page.head > after) {
             return Err(HandlerError::new(
-                "engram_unavailable",
-                "another machine supplied the bootstrap; retry to join",
+                "identity_log_invariant",
+                "enable recovery log range is missing",
             ));
         }
+        for entry in page.entries {
+            if entry.position != base + confirmed as u64 + 1 {
+                return Err(HandlerError::new(
+                    "identity_log_invariant",
+                    "enable recovery log gap",
+                ));
+            }
+            if entry.entry_id != parts[confirmed].entry_id {
+                if confirmed == 0 {
+                    return abandon_contended(store, base, page.head);
+                }
+                return Err(HandlerError::new(
+                    "identity_log_invariant",
+                    "snapshot parts are not consecutive",
+                ));
+            }
+            confirmed += 1;
+        }
+        if confirmed == parts.len() || base + confirmed as u64 == page.head {
+            break;
+        }
+        // A byte-capped page may contain fewer than the requested parts. Read
+        // the rest before deciding which parts need another append.
     }
-    let confirmed = parts
-        .iter()
-        .enumerate()
-        .take_while(|(i, part)| {
-            page.entries
-                .iter()
-                .any(|entry| entry.position == *i as u64 + 1 && entry.entry_id == part.entry_id)
-        })
-        .count();
     for (i, part) in parts.iter().enumerate().skip(confirmed) {
         let request = AppendRequest {
-            expected_head: i as u64,
+            expected_head: base + i as u64,
             entry_id: part.entry_id,
             kind: EntryKind::Snapshot,
             data: part.data.clone(),
@@ -185,9 +210,9 @@ pub(super) async fn resume(
                 HandlerError::new("engram_outcome_unknown", "snapshot append deadline expired")
             })?;
         match reply {
-            Ok(reply) if reply.position == i as u64 + 1 => {}
+            Ok(reply) if reply.position == base + i as u64 + 1 => {}
             Err(LogError::HeadMoved { .. }) if i == 0 => {
-                let page = timeout_at(deadline, log.read(0, 1))
+                let page = timeout_at(deadline, log.read(base, 1))
                     .await
                     .map_err(|_| {
                         HandlerError::new(
@@ -196,19 +221,14 @@ pub(super) async fn resume(
                         )
                     })?
                     .map_err(|e| log_error(e, health))?;
-                if let Some(first) = page.entries.first().filter(|e| e.position == 1) {
+                if let Some(first) = page.entries.first().filter(|e| e.position == base + 1) {
                     if first.entry_id != part.entry_id {
-                        store.abandon_enable()?;
-                        store.check_enable_preconditions(page.head)?;
-                        return Err(HandlerError::new(
-                            "engram_unavailable",
-                            "another machine supplied the bootstrap; retry to join",
-                        ));
+                        return abandon_contended(store, base, page.head);
                     }
                 }
                 return Err(HandlerError::new(
                     "identity_log_invariant",
-                    "bootstrap receipt conflicts with position one",
+                    "snapshot receipt conflicts with first part position",
                 ));
             }
             Ok(_) | Err(LogError::HeadMoved { .. }) => {
@@ -229,6 +249,82 @@ pub(super) async fn resume(
     health.log_state.store(0, Ordering::Relaxed);
     refresh(health, store);
     Ok(())
+}
+
+fn abandon_contended(store: &RegistryStore, base: u64, head: u64) -> Result<(), HandlerError> {
+    store.abandon_enable()?;
+    if base > 0 {
+        return Err(HandlerError::new(
+            "identity_log_contended",
+            "another entry won the first snapshot position; retry enable",
+        ));
+    }
+    // Keep the existing bootstrap refusal: a populated store cannot join the
+    // winning snapshot, while an empty store can retry as a joiner.
+    store.check_enable_preconditions(head)?;
+    Err(HandlerError::new(
+        "engram_unavailable",
+        "another machine supplied the bootstrap; retry to join",
+    ))
+}
+
+/// Read precisely the head that was observed before enable. No durable state is
+/// updated: every author check and writer refusal precedes begin_enable.
+async fn own_prefix(
+    log: &LogClient,
+    health: &HealthGauges,
+    mut page: log_client::ReadReply,
+    deadline: Instant,
+) -> Result<Vec<entorhinal_core::remote_apply::RemoteEntry>, HandlerError> {
+    let head = page.head;
+    let mut entries = vec![];
+    let mut after = 0;
+    let mut own = true;
+    loop {
+        if page.head < head || page.entries.is_empty() {
+            return Err(HandlerError::new(
+                "identity_log_invariant",
+                format!("log prefix missing at position {}", after + 1),
+            ));
+        }
+        for entry in page.entries {
+            if entry.position != after + 1 || entry.position > head {
+                return Err(HandlerError::new(
+                    "identity_log_invariant",
+                    format!("log prefix gap at position {}", after + 1),
+                ));
+            }
+            own &= entry.signed_by_self;
+            after = entry.position;
+            entries.push(entorhinal_core::remote_apply::RemoteEntry {
+                position: i64::try_from(entry.position).map_err(|_| {
+                    HandlerError::new("identity_log_invariant", "log position exceeds local range")
+                })?,
+                entry_id: log_client::encode_hex(&entry.entry_id),
+                signer: log_client::encode_hex(&entry.signer),
+                key_id: json!({"family":entry.key_id.family,"epoch":entry.key_id.epoch})
+                    .to_string(),
+                envelope_version: i64::try_from(entry.envelope_version).unwrap_or(-1),
+                kind: entry.kind,
+                entry: entry.entry,
+            });
+        }
+        if after == head {
+            break;
+        }
+        page = timeout_at(deadline, log.read(after, (head - after).min(128) as usize))
+            .await
+            .map_err(|_| {
+                HandlerError::new("engram_unavailable", "enable prefix read deadline expired")
+            })?
+            .map_err(|e| log_error(e, health))?;
+    }
+    // An empty result identifies a foreign prefix; a nonzero head has at least
+    // one entry. The caller supplies the counts in the existing join refusal.
+    if !own {
+        entries.clear();
+    }
+    Ok(entries)
 }
 
 impl ProjectsHandler {
@@ -287,12 +383,27 @@ impl ProjectsHandler {
             .await
             .map_err(|_| HandlerError::new("engram_unavailable", "enable head deadline expired"))?
             .map_err(|e| log_error(e, &self.health))?;
-        store.check_enable_preconditions(page.head)?;
-        if page.head > 0 {
+        store.check_enable_preconditions(0)?;
+        let base = page.head;
+        if base > 0 && store.enable_registry_is_empty()? {
             return self.catch_up(store, deadline).await;
         }
+        let history = if base > 0 {
+            let entries = own_prefix(&self.log_client, &self.health, page, deadline).await?;
+            if entries.is_empty() {
+                store.check_enable_preconditions(base)?;
+            }
+            entries
+        } else {
+            vec![]
+        };
         store.check_agent_import_preconditions(without_agents)?;
-        let plan = store.prepare_enable(&log_client::encode_hex(&draw_id()?), (self.clock)())?;
+        let snapshot_id = log_client::encode_hex(&draw_id()?);
+        let plan = if base > 0 {
+            store.prepare_supersede(&snapshot_id, (self.clock)(), base, &history)?
+        } else {
+            store.prepare_enable(&snapshot_id, (self.clock)())?
+        };
         let parts = plan
             .bodies
             .into_iter()
@@ -374,6 +485,19 @@ mod tests {
         fn restart(&mut self, log: Arc<dyn LogConnector>) {
             self.handler.store.lock().unwrap().take();
             self.handler = Self::handler(&self.descriptor, log);
+        }
+        fn fork(&self, label: &str, log: Arc<dyn LogConnector>) -> Self {
+            let (dir, descriptor) = crate::tests::scratch_descriptor(label);
+            let StorageBackend::Sqlite { path } = &descriptor.backend else {
+                unreachable!()
+            };
+            self.conn().execute("VACUUM INTO ?1", [path]).unwrap();
+            let handler = Self::handler(&descriptor, log);
+            Self {
+                dir: dir.canonicalize().unwrap(),
+                descriptor,
+                handler,
+            }
         }
         fn store(&self) -> RegistryStore {
             self.handler.with_store(|s| Ok(s.clone())).unwrap()
@@ -551,6 +675,26 @@ mod tests {
                 cells
             );
         }
+        async fn refuse_supersede(&self, log: &FakeLog, params: Value, code: &str) {
+            let journal = self.journal();
+            let state = self.rows("identity_log_state");
+            let shared = self.shared();
+            let before = log.client().read(0, 128).await.unwrap();
+            assert_eq!(
+                self.call("identity_log.enable", params).await.unwrap_err(),
+                code
+            );
+            assert_eq!(self.journal(), journal);
+            assert_eq!(self.rows("identity_log_state"), state);
+            assert_eq!(self.shared(), shared);
+            let after = log.client().read(0, 128).await.unwrap();
+            assert_eq!(after.head, before.head);
+            assert_eq!(after.entries, before.entries);
+            assert_eq!(
+                self.store().identity_log_status().unwrap().state,
+                "disabled"
+            );
+        }
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
@@ -583,6 +727,592 @@ mod tests {
         loop {
             tokio::select! { result = &mut future => return result, () = tokio::task::yield_now() => {} }
         }
+    }
+
+    #[derive(Clone)]
+    struct SupersedeTap {
+        log: FakeLog,
+        calls: Arc<Mutex<Vec<(String, Value)>>>,
+        race: Arc<Mutex<Option<(FakeLog, AppendRequest)>>>,
+        own_race: Arc<AtomicBool>,
+    }
+    impl SupersedeTap {
+        fn new(log: &FakeLog) -> Self {
+            Self {
+                log: log.clone(),
+                calls: Arc::new(Mutex::new(vec![])),
+                race: Arc::new(Mutex::new(None)),
+                own_race: Arc::new(AtomicBool::new(false)),
+            }
+        }
+        fn appends(&self) -> Vec<Value> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(method, _)| method == log_client::APPEND)
+                .map(|(_, params)| params.clone())
+                .collect()
+        }
+    }
+    #[async_trait]
+    impl LogConnector for SupersedeTap {
+        async fn connect(&self) -> Result<Arc<dyn LogTransport>, TransportError> {
+            Ok(Arc::new(self.clone()))
+        }
+    }
+    #[async_trait]
+    impl LogTransport for SupersedeTap {
+        async fn call(&self, method: &str, params: Value) -> Result<Vec<u8>, TransportError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((method.into(), params.clone()));
+            if method == log_client::APPEND {
+                let race = self.race.lock().unwrap().take();
+                if let Some((foreign, request)) = race {
+                    foreign.client().append(&request).await.unwrap();
+                }
+                if self.own_race.swap(false, Ordering::SeqCst) {
+                    self.log.call(method, params.clone()).await?;
+                    return Err(TransportError::Refusal {
+                        code: log_client::HEAD_MOVED.into(),
+                        detail: Some(json!({"head":self.log.head()})),
+                    });
+                }
+            }
+            self.log.call(method, params).await
+        }
+    }
+
+    async fn supersede_setup(label: &str) -> (Arc<FakeLog>, Fixture, Fixture) {
+        let log = Arc::new(FakeLog::default());
+        let a = Fixture::new(&format!("{label}-a"), log.clone());
+        let root = a.dir.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        a.project("P", &root, "Before", None);
+        let restored = a.fork(&format!("{label}-restored"), log.clone());
+        a.enable_without_agents().await.unwrap();
+        restored.agents(3, 100_000);
+        (log, a, restored)
+    }
+
+    async fn append_empty_change(log: &FakeLog, id: u64) {
+        log.client()
+            .append(&AppendRequest {
+                expected_head: log.head(),
+                entry_id: id.to_le_bytes().repeat(2).try_into().unwrap(),
+                kind: EntryKind::Change,
+                data: serde_json::to_vec(&json!({"op":"project.shared","tables":{}})).unwrap(),
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn writer_supersede_requires_every_entry_signed_by_self_before_guard() {
+        for imported in [false, true] {
+            let log = Arc::new(FakeLog::default());
+            let a = Fixture::new("writer-auth-a", log.clone());
+            let root = a.dir.join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            a.project("P", &root, "Before", None);
+            let restored = a.fork("writer-auth-restored", log.clone());
+            a.enable_without_agents().await.unwrap();
+            for id in 1..=130 {
+                append_empty_change(&log, id).await;
+            }
+            append_empty_change(&log.with_author([0xcc; 16]), 131).await;
+            if imported {
+                restored.agents(1, 0);
+            }
+            for params in [json!({}), json!({"without_agents":true})] {
+                restored
+                    .refuse_supersede(&log, params, "join_requires_empty_registry")
+                    .await;
+            }
+            assert_eq!(log.head(), 132);
+        }
+        // An equally long own prefix is permitted, after the guarded branch's
+        // import/flag checks. A joiner must not take this writer branch.
+        let (log, _a, restored) = supersede_setup("writer-own-paged").await;
+        for id in 1..=130 {
+            append_empty_change(&log, id).await;
+        }
+        restored
+            .refuse_supersede(&log, json!({"without_agents":true}), "invalid_request")
+            .await;
+        restored.enable().await.unwrap();
+        assert_eq!(
+            restored
+                .store()
+                .identity_log_status()
+                .unwrap()
+                .last_applied_position,
+            133
+        );
+        let body: Value =
+            serde_json::from_slice(&log.client().read(131, 1).await.unwrap().entries[0].entry)
+                .unwrap();
+        assert_eq!(body["supersedes_through"], 131);
+
+        let log = Arc::new(FakeLog::default());
+        let a = Fixture::new("writer-guard-a", log.clone());
+        let root = a.dir.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        a.project("P", &root, "Before", None);
+        let restored = a.fork("writer-guard-restored", log.clone());
+        a.enable_without_agents().await.unwrap();
+        restored
+            .refuse_supersede(&log, json!({}), "agents_not_imported")
+            .await;
+        restored.enable_without_agents().await.unwrap();
+        assert_eq!(restored.marker_count(), 1);
+        assert_eq!(log.head(), 2);
+    }
+
+    fn rewrite_agent(f: &Fixture, mut row: entorhinal_core::agent::AgentRow) {
+        row.agent_generation += 1;
+        let entry = AgentChangeEntry::new(
+            "agent.import",
+            row.clone(),
+            f.store().agent_claims(&row.agent_id).unwrap(),
+        );
+        let payload = json!({"entry":entry});
+        f.store()
+            .apply_entry("agent.import", &payload.to_string(), "test", None, |tx| {
+                entorhinal_core::agent::replay_agent_entry(tx, "agent.import", &payload).map(|_| ())
+            })
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn writer_supersede_refusals_leave_journal_state_and_log_unchanged() {
+        const X: &str = "agent_0000000000000000";
+        for case in [
+            "drop",
+            "regress",
+            "fork-twice",
+            "fork-equal",
+            "name-transfer",
+            "head-transfer",
+            "incomplete",
+        ] {
+            let log = Arc::new(FakeLog::default());
+            let a = Fixture::new(&format!("writer-refuse-{case}-a"), log.clone());
+            a.agents(
+                if case == "head-transfer" {
+                    2
+                } else if case == "incomplete" {
+                    3
+                } else {
+                    1
+                },
+                if case == "incomplete" { 100_000 } else { 0 },
+            );
+            if case == "head-transfer" {
+                let mut row = a.store().agent_row(X).unwrap().unwrap();
+                row.role = "head".into();
+                row.project_id = Some("P".into());
+                rewrite_agent(&a, row);
+            }
+            let restored = a.fork(&format!("writer-refuse-{case}-restored"), log.clone());
+            if case == "incomplete" {
+                log.on_append(Action::DropReply);
+            }
+            let enabled = a.enable().await;
+            if case == "incomplete" {
+                assert_eq!(enabled.unwrap_err(), "engram_unavailable");
+            } else {
+                enabled.unwrap();
+            }
+            let code = match case {
+                "drop" => {
+                    finish(a.call(
+                        "agent.create",
+                        json!({"role":"assistant","name":"Extra","tag":"ok","request_key":"extra"}),
+                    ))
+                    .await
+                    .unwrap();
+                    "supersede_drops_agents"
+                }
+                "regress" => {
+                    finish(a.call(
+                        "agent.rename",
+                        json!({"agent_id":X,"name":"Grace","request_key":"grace"}),
+                    ))
+                    .await
+                    .unwrap();
+                    "supersede_regresses_agents"
+                }
+                "fork-twice" | "fork-equal" => {
+                    finish(a.call(
+                        "agent.rename",
+                        json!({"agent_id":X,"name":"Grace","request_key":"grace"}),
+                    ))
+                    .await
+                    .unwrap();
+                    finish(restored.call(
+                        "agent.rename",
+                        json!({"agent_id":X,"name":"Bob","request_key":"bob"}),
+                    ))
+                    .await
+                    .unwrap();
+                    if case == "fork-twice" {
+                        finish(restored.call(
+                            "agent.rename",
+                            json!({"agent_id":X,"name":"Carol","request_key":"carol"}),
+                        ))
+                        .await
+                        .unwrap();
+                    }
+                    // The last update carries no claims. Losing accumulated
+                    // rename claims would incorrectly admit the higher fork.
+                    if case == "fork-twice" {
+                        finish(a.call(
+                            "agent.update_tag",
+                            json!({"agent_id":X,"tag":"changed","request_key":"tag"}),
+                        ))
+                        .await
+                        .unwrap();
+                        finish(restored.call(
+                            "agent.update_tag",
+                            json!({"agent_id":X,"tag":"local","request_key":"tag"}),
+                        ))
+                        .await
+                        .unwrap();
+                    }
+                    "supersede_forks_agents"
+                }
+                "name-transfer" => {
+                    finish(restored.call(
+                        "agent.dispose",
+                        json!({"agent_id":X,"request_key":"dispose"}),
+                    ))
+                    .await
+                    .unwrap();
+                    finish(restored.call("agent.create", json!({"role":"assistant","name":"Agent 0","tag":"ok","request_key":"reuse"}))).await.unwrap();
+                    "supersede_forks_agents"
+                }
+                "head-transfer" => {
+                    let mut row = restored.store().agent_row(X).unwrap().unwrap();
+                    row.role = "hiree".into();
+                    rewrite_agent(&restored, row);
+                    let mut row = restored
+                        .store()
+                        .agent_row("agent_0000000000000001")
+                        .unwrap()
+                        .unwrap();
+                    row.role = "head".into();
+                    row.project_id = Some("P".into());
+                    rewrite_agent(&restored, row);
+                    "supersede_forks_agents"
+                }
+                "incomplete" => "identity_log_invariant",
+                _ => unreachable!(),
+            };
+            restored.refuse_supersede(&log, json!({}), code).await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn writer_supersede_parts_use_base_and_finish_at_base_plus_parts() {
+        let (log, _a, mut restored) = supersede_setup("writer-parts").await;
+        let tap = Arc::new(SupersedeTap::new(&log));
+        restored.restart(tap.clone());
+        restored.enable().await.unwrap();
+        let requests = tap.appends();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests
+                .iter()
+                .map(|r| r["expected_head"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        let page = log.client().read(1, 128).await.unwrap();
+        assert_eq!(
+            page.entries.iter().map(|e| e.position).collect::<Vec<_>>(),
+            [2, 3]
+        );
+        for (i, entry) in page.entries.iter().enumerate() {
+            let body: Value = serde_json::from_slice(&entry.entry).unwrap();
+            assert_eq!(body["supersedes_through"], 1);
+            assert_eq!(body["part"], i + 1);
+            assert_eq!(body["parts"], 2);
+            assert!(entry.entry.len() <= 200 * 1024);
+            assert_eq!(
+                entry.entry,
+                log_client::decode_hex(requests[i]["entry"]["data"].as_str().unwrap()).unwrap()
+            );
+        }
+        let status = restored.store().identity_log_status().unwrap();
+        assert_eq!(status.last_applied_position, 3);
+        assert_eq!(status.last_seen_head, 3);
+        assert_eq!(status.state, "enabled");
+        let payload: String = restored
+            .conn()
+            .query_row(
+                "SELECT payload_json FROM registry_journal WHERE op='identity_log.enable'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&payload).unwrap(),
+            json!({"supersedes_through":1})
+        );
+        restored.clean_rebuild();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn writer_supersede_lost_race_disables_and_refuses_foreign_retry() {
+        let (log, _a, mut restored) = supersede_setup("writer-race").await;
+        let tap = Arc::new(SupersedeTap::new(&log));
+        *tap.race.lock().unwrap() = Some((
+            log.with_author([0xcc; 16]),
+            AppendRequest {
+                expected_head: 1,
+                entry_id: [0xcc; 16],
+                kind: EntryKind::Change,
+                data: serde_json::to_vec(&json!({"op":"project.shared","tables":{}})).unwrap(),
+            },
+        ));
+        restored.restart(tap.clone());
+        let journal = restored.journal();
+        let shared = restored.shared();
+        assert_eq!(
+            restored.enable().await.unwrap_err(),
+            "identity_log_contended"
+        );
+        assert_eq!(
+            restored.store().identity_log_status().unwrap().state,
+            "disabled"
+        );
+        assert!(restored.store().enable_parts().is_err());
+        assert_eq!(restored.journal(), journal);
+        assert_eq!(restored.shared(), shared);
+        assert_eq!(log.head(), 2);
+        assert_eq!(tap.appends().len(), 1, "no blind retry");
+        restored
+            .refuse_supersede(&log, json!({}), "join_requires_empty_registry")
+            .await;
+        assert_eq!(tap.appends().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn writer_supersede_own_part_one_after_head_moved_keeps_plan() {
+        let (log, _a, mut restored) = supersede_setup("writer-own-race").await;
+        let tap = Arc::new(SupersedeTap::new(&log));
+        tap.own_race.store(true, Ordering::SeqCst);
+        restored.restart(tap.clone());
+        let journal = restored.journal();
+        assert_eq!(
+            restored.enable().await.unwrap_err(),
+            "identity_log_invariant"
+        );
+        assert_eq!(
+            restored.store().identity_log_status().unwrap().state,
+            "enabling"
+        );
+        assert_eq!(restored.store().enable_base().unwrap(), 1);
+        let parts = restored.store().enable_parts().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(
+            log.client().read(1, 1).await.unwrap().entries[0].entry_id,
+            parts[0].entry_id
+        );
+        assert_eq!(restored.journal(), journal);
+        restored.restart(tap.clone());
+        restored.enable().await.unwrap();
+        assert_eq!(log.head(), 3);
+        assert_eq!(tap.appends().len(), 2);
+        assert_eq!(
+            tap.appends()[1]["entry_id"],
+            log_client::encode_hex(&parts[1].entry_id)
+        );
+        restored.clean_rebuild();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn writer_supersede_resume_from_base_resends_only_unconfirmed_parts() {
+        let (log, _a, mut restored) = supersede_setup("writer-resume").await;
+        let tap = Arc::new(SupersedeTap::new(&log));
+        restored.restart(tap.clone());
+        let journal = restored.journal();
+        log.on_append(Action::Hold);
+        {
+            let enable = restored.enable();
+            tokio::pin!(enable);
+            let held = log.wait_for_calls(log.calls() + 3);
+            tokio::pin!(held);
+            loop {
+                tokio::select! { biased; () = &mut held => break, _ = &mut enable => panic!("enable did not park"), () = tokio::task::yield_now() => {} }
+            }
+            assert_eq!(log.release_next().unwrap(), 2);
+            // Cancel before the first receipt is polled: part 1 landed, but
+            // part 2 and the local completion transaction have not run.
+        }
+        assert_eq!(log.head(), 2);
+        assert_eq!(
+            restored.store().identity_log_status().unwrap().state,
+            "enabling"
+        );
+        assert_eq!(restored.journal(), journal);
+        let parts = restored.store().enable_parts().unwrap();
+        restored.restart(tap.clone());
+        tap.calls.lock().unwrap().clear();
+        restored.enable().await.unwrap();
+        let calls = tap.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0],
+            (log_client::READ.into(), json!({"after":1,"limit":2}))
+        );
+        assert_eq!(calls[1].1["expected_head"], 2);
+        assert_eq!(
+            calls[1].1["entry_id"],
+            log_client::encode_hex(&parts[1].entry_id)
+        );
+        assert_eq!(
+            log.client()
+                .read(1, 128)
+                .await
+                .unwrap()
+                .entries
+                .iter()
+                .map(|e| e.entry.clone())
+                .collect::<Vec<_>>(),
+            parts.iter().map(|p| p.data.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(&restored.journal()[..journal.len()], journal);
+        let completed = restored.journal();
+        restored.enable().await.unwrap();
+        assert_eq!(restored.journal(), completed);
+        assert_eq!(restored.marker_count(), 1);
+        assert_eq!(
+            restored
+                .store()
+                .identity_log_status()
+                .unwrap()
+                .last_applied_position,
+            3
+        );
+        restored.clean_rebuild();
+
+        // More than one decoded-byte page is already confirmed. None of those
+        // parts may be resent just because the first recovery read hit its cap.
+        let (log, _a, mut restored) = supersede_setup("writer-resume-paged").await;
+        restored.agents(13, 100_000);
+        log.on_append(Action::DropReply);
+        assert_eq!(restored.enable().await.unwrap_err(), "engram_unavailable");
+        let parts = restored.store().enable_parts().unwrap();
+        assert_eq!(parts.len(), 7);
+        for (i, part) in parts.iter().enumerate().take(6).skip(1) {
+            log.client()
+                .append(&AppendRequest {
+                    expected_head: 1 + i as u64,
+                    entry_id: part.entry_id,
+                    kind: EntryKind::Snapshot,
+                    data: part.data.clone(),
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(log.head(), 7);
+        let tap = Arc::new(SupersedeTap::new(&log));
+        restored.restart(tap.clone());
+        restored.enable().await.unwrap();
+        let calls = tap.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(
+            calls[0],
+            (log_client::READ.into(), json!({"after":1,"limit":7}))
+        );
+        assert_eq!(
+            calls[1],
+            (log_client::READ.into(), json!({"after":6,"limit":2}))
+        );
+        assert_eq!(calls[2].1["expected_head"], 7);
+        assert_eq!(tap.appends().len(), 1);
+        assert_eq!(
+            tap.appends()[0]["entry_id"],
+            log_client::encode_hex(&parts[6].entry_id)
+        );
+        assert_eq!(
+            restored
+                .store()
+                .identity_log_status()
+                .unwrap()
+                .last_applied_position,
+            8
+        );
+        restored.clean_rebuild();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn writer_supersede_legacy_plan_resumes_base_zero_without_duplicates() {
+        let log = Arc::new(FakeLog::default());
+        let mut f = Fixture::new("writer-legacy-plan", log.clone());
+        f.agents(3, 100_000);
+        log.on_append(Action::DropReply);
+        assert_eq!(f.enable().await.unwrap_err(), "engram_unavailable");
+        let parts = f.store().enable_parts().unwrap();
+        assert_eq!(parts.len(), 2);
+        // Restore exactly the older persisted backfill shape, not a fresh plan
+        // re-encoded by today's writer. Saved part ids and bytes stay untouched.
+        let StorageBackend::Sqlite { path } = &f.descriptor.backend else {
+            unreachable!()
+        };
+        let conn = Connection::open(path).unwrap();
+        let text: String = conn
+            .query_row("SELECT enable_backfill FROM identity_log_state", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let mut saved: Value = serde_json::from_str(&text).unwrap();
+        saved.as_object_mut().unwrap().remove("base");
+        conn.execute(
+            "UPDATE identity_log_state SET enable_backfill=?1",
+            [saved.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+        let journal = f.journal();
+        let tap = Arc::new(SupersedeTap::new(&log));
+        f.restart(tap.clone());
+        assert_eq!(f.store().enable_base().unwrap(), 0);
+        f.enable().await.unwrap();
+        let calls = tap.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0],
+            (log_client::READ.into(), json!({"after":0,"limit":2}))
+        );
+        assert_eq!(calls[1].1["expected_head"], 1);
+        assert_eq!(
+            calls[1].1["entry_id"],
+            log_client::encode_hex(&parts[1].entry_id)
+        );
+        let page = log.client().read(0, 128).await.unwrap();
+        assert_eq!(page.head, 2);
+        for (entry, part) in page.entries.iter().zip(&parts) {
+            assert_eq!(entry.entry_id, part.entry_id);
+            assert_eq!(entry.entry, part.data);
+            assert!(serde_json::from_slice::<Value>(&entry.entry)
+                .unwrap()
+                .get("supersedes_through")
+                .is_none());
+        }
+        assert_eq!(&f.journal()[..journal.len()], journal);
+        let completed = f.journal();
+        f.enable().await.unwrap();
+        assert_eq!(f.journal(), completed);
+        assert_eq!(f.marker_count(), 1);
+        let status = f.store().identity_log_status().unwrap();
+        assert_eq!(status.last_applied_position, 2);
+        assert_eq!(status.last_seen_head, 2);
+        f.clean_rebuild();
     }
 
     #[tokio::test(start_paused = true)]
