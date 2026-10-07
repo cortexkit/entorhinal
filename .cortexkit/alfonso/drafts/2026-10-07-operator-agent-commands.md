@@ -107,9 +107,7 @@ Each test must fail when the behaviour it names breaks. Each slice reports one d
 11. **Disabled is today.** The golden byte-invariance test passes unchanged.
 
 ## open_questions
-- None on the design. Deployment notes for reviewers:
-  - The subc-client-rs channel-0 helper isn't published yet. SUBC publishes the types before the daemon side, and S3 wires it then. Until then, the production implementation of the trait returns `Unsupported`.
-  - The `ck-agents` links (`~/.local/share/cortexkit/bin/ck-agents` and `~/.local/bin/ck-agents`) are created by SUBC when the card is placed, and verified with `place-module.sh --path-face ck-agents`. Nothing in this repo creates them.
+- None on the design. Deployment dependencies: SUBC publishes the subc-client-rs channel-0 helper before the daemon side, and S3 wires it then; until then the production trait implementation returns `Unsupported`. SUBC creates the `ck-agents` links (`~/.local/share/cortexkit/bin/ck-agents` and `~/.local/bin/ck-agents`) when the card is placed, and verifies them with `place-module.sh --path-face ck-agents`; nothing in this repo creates them.
 
 ## slice_hints
 - S1: module admission and the confirmation flow (pre-checks, busy guard, summary, no-lock prompt, re-validate and apply, payload flag) behind the trait, with a stub and the `Unsupported` production implementation. Acceptance 1 to 9 and 11.
