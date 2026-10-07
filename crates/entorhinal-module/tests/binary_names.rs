@@ -12,6 +12,7 @@
 //!   `ckdev_binary(...)` call (`statement_has_unwrapped_binary`);
 //! - a `let` binding holding such a raw path is remembered, so a later
 //!   `Command::new(that_binding)` is flagged too (`violations`).
+//!
 //! It recognises only the spawn shapes these tests use. The planted controls
 //! at the bottom prove it fires on a direct spawn and on a direct spawn right
 //! after a wrapped one, and stays quiet on a wrapped spawn.
