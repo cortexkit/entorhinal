@@ -587,7 +587,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn import_consent_order_and_flag_rules() {
-        // A populated registry must leave its only import path open on refusal.
+        // A store with projects but no agents and no marker is refused, and the
+        // refusal must write nothing: `agent.import` still works afterwards,
+        // and enable then succeeds.
         let log = Arc::new(FakeLog::default());
         let f = Fixture::new("guard-project", log.clone());
         let root = f.dir.join("root");
@@ -621,8 +623,10 @@ mod tests {
         a.enable_without_agents().await.unwrap();
         assert_eq!(a.journal(), before, "enabled ignores the flag");
 
-        // A join obtains its marker from the bootstrap; even an earlier zero-agent
-        // import does not make --without-agents invalid on this branch.
+        // Joining a log that already has entries skips the import check: the
+        // joiner gets its cutover marker from the first machine's snapshot. So
+        // --without-agents is ignored on a join, even on a store that already
+        // holds a marker from an earlier import of zero agents.
         for imported in [false, true] {
             let b = Fixture::new("guard-join", Arc::new(log.with_author([2; 16])));
             if imported {
@@ -670,8 +674,10 @@ mod tests {
                 .await;
         }
 
-        // The flag is irrelevant once a saved plan or a join is in progress,
-        // including when those states already hold imported agents and a marker.
+        // While an enable is resuming a saved plan (state `enabling`) or a join
+        // is catching up (state `joining`), the import check already happened
+        // or doesn't apply, so the flag is ignored, even when the store now
+        // holds imported agents and a marker.
         let log = Arc::new(FakeLog::default());
         let a = Fixture::new("guard-enabling-imported", log.clone());
         a.agents(1, 0);
@@ -743,7 +749,9 @@ mod tests {
                 .unwrap();
         }
         log.on_append(Action::Hold);
-        let calls = log.calls() + 3; // head read, recovery read, first append
+        // Enable makes three log calls before it parks: it reads the head, reads
+        // again to check for its own earlier parts, then sends part 1 of 2.
+        let calls = log.calls() + 3;
         {
             let enable = f.enable_without_agents();
             tokio::pin!(enable);
@@ -759,8 +767,9 @@ mod tests {
             }
             assert_eq!(log.held_count(), 1);
             assert_eq!(log.release_next().unwrap(), 1);
-            // Kill the request without polling its receipt: part 1 has landed,
-            // but part 2 has never been sent and finish_enable has never run.
+            // Dropping the enable future here kills the request. The first of
+            // the two snapshot parts is in the log, but the second was never
+            // sent and `finish_enable` (which writes the marker) never ran.
         }
         let parts = f.store().enable_parts().unwrap();
         assert_eq!(parts.len(), 2);

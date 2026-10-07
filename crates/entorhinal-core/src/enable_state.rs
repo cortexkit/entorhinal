@@ -136,21 +136,45 @@ impl RegistryStore {
         })?
     }
 
-    /// Check fresh bootstrap (or own-log supersede) consent before saving a plan.
-    /// Joins obtain their cutover from the log, and saved plans already have
-    /// consent, so neither joins nor recovery should call this guard.
+    /// Refuses to start an enable that would silently close the agent import.
+    ///
+    /// Finishing an enable writes the `agent.cutover` marker, and once that
+    /// marker exists `agent.import` refuses forever. So a machine that writes
+    /// the first snapshot of its own state to the log, with no agents and no
+    /// marker, must either import its agents first or say explicitly, with
+    /// `without_agents`, that there are none to import. The flag is refused
+    /// whenever agents or a marker already exist, so it can never hide a real
+    /// import.
+    ///
+    /// Call it only before saving a new enable plan. A machine joining an
+    /// existing log gets its marker from the snapshot it applies, and resuming
+    /// a saved plan was already checked when the plan was saved, so neither
+    /// path calls this.
     pub fn check_agent_import_preconditions(
         &self,
         without_agents: bool,
     ) -> Result<(), RegistryError> {
         self.read(|conn| {
             let agents: i64 = conn.query_row("SELECT COUNT(*) FROM agent", [], |r| r.get(0))?;
-            let marker: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM registry_journal WHERE op='agent.cutover')", [], |r| r.get(0))?;
-            Ok(if without_agents && (agents > 0 || marker) {
-                Err(domain("invalid_request", "--without-agents requires no agents and no agent.cutover marker"))
-            } else if agents == 0 && !marker && !without_agents {
-                Err(domain("agents_not_imported", "run the agent import before enabling the log, or pass --without-agents when the fleet has no agents to import"))
-            } else { Ok(()) })
+            let marker: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM registry_journal WHERE op='agent.cutover')",
+                [],
+                |r| r.get(0),
+            )?;
+            if without_agents && (agents > 0 || marker) {
+                return Ok(Err(domain(
+                    "invalid_request",
+                    "--without-agents requires no agents and no agent.cutover marker",
+                )));
+            }
+            if agents == 0 && !marker && !without_agents {
+                return Ok(Err(domain(
+                    "agents_not_imported",
+                    "run the agent import before enabling the log, or pass \
+                     --without-agents when the fleet has no agents to import",
+                )));
+            }
+            Ok(Ok(()))
         })?
     }
 
