@@ -178,62 +178,6 @@ impl SharedState {
             agents,
         }
     }
-
-    /// Decode the captured storage rows into the same after-images used on the
-    /// wire. This keeps supersede validation inside the installation transaction.
-    pub(crate) fn agent_entries(&self) -> rusqlite::Result<Vec<AgentChangeEntry>> {
-        self.0["agent"]
-            .iter()
-            .map(|stored| {
-                let mut row = stored.clone();
-                let labels = row.remove("labels_json").unwrap();
-                row.insert(
-                    "labels".into(),
-                    serde_json::from_str(labels.as_str().unwrap()).map_err(decode_error)?,
-                );
-                let github = row.remove("github_identity_json").unwrap();
-                row.insert(
-                    "github_identity".into(),
-                    match github.as_str() {
-                        Some(text) => serde_json::from_str(text).map_err(decode_error)?,
-                        None => Value::Null,
-                    },
-                );
-                let genome = row.remove("avatar_genome").unwrap();
-                let avatar_type = row.remove("avatar_type").unwrap();
-                let version = row.remove("avatar_version").unwrap();
-                row.insert(
-                    "avatar".into(),
-                    if genome.is_null() {
-                        Value::Null
-                    } else {
-                        serde_json::json!({"genome":genome,"type":avatar_type,"version":version})
-                    },
-                );
-                let terminal = row.remove("terminal_reason").unwrap();
-                row.insert(
-                    "status".into(),
-                    if terminal.is_null() {
-                        Value::from("live")
-                    } else {
-                        terminal
-                    },
-                );
-                let row: crate::agent::AgentRow =
-                    serde_json::from_value(serde_json::to_value(row).map_err(decode_error)?)
-                        .map_err(decode_error)?;
-                let claims = self.0["agent_name_claim"]
-                    .iter()
-                    .filter(|claim| claim["agent_id"].as_str() == Some(&row.agent_id))
-                    .map(|claim| {
-                        serde_json::from_value(serde_json::to_value(claim).map_err(decode_error)?)
-                            .map_err(decode_error)
-                    })
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(AgentChangeEntry::new("agent.import", row, claims))
-            })
-            .collect()
-    }
 }
 
 /// Recursively sort object keys, independently of serde_json's map feature set.

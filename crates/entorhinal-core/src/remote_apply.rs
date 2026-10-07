@@ -82,8 +82,12 @@ pub fn snapshot_part_info(entry: &RemoteEntry) -> Result<(String, u64, u64), Reg
     Ok((part.snapshot_id, part.part, part.parts))
 }
 
-/// Return the agreed replacement boundary. The coordinator checks authorship
-/// before installation; the installer independently checks these wire invariants.
+/// Returns `supersedes_through` for a complete snapshot: the last log position
+/// the snapshot replaces, or None for an ordinary snapshot. Every part must
+/// carry the same value (or none), and it must equal the position just before
+/// the snapshot's first part. Whether entries up to that position all share
+/// the snapshot's author is checked separately, by catch-up, which re-reads
+/// the log; this function sees only the snapshot parts.
 pub fn snapshot_supersedes_through(entries: &[RemoteEntry]) -> Result<Option<u64>, RegistryError> {
     let parts = entries
         .iter()
@@ -117,8 +121,39 @@ pub fn snapshot_supersedes_through(entries: &[RemoteEntry]) -> Result<Option<u64
     Ok(first.supersedes_through)
 }
 
-/// A replacement must extend every row and claim in the replaced history.
-/// This pure check is shared with writers, which must refuse before publishing.
+/// Every stored agent as the after-image the wire carries, in agent_id order
+/// with claims in claim_id order. It reads through the same loaders as the
+/// agent reads, so the comparison with a received snapshot can't drift from
+/// how agents are stored.
+fn stored_agent_entries(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<AgentChangeEntry>> {
+    let ids = conn
+        .prepare("SELECT agent_id FROM agent ORDER BY agent_id")?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    ids.into_iter()
+        .map(|id| {
+            let row = crate::agent::load_row(conn, &id)?.ok_or_else(|| {
+                decode_error(serde_json::Error::io(std::io::Error::other(format!(
+                    "stored agent {id} has an invalid id"
+                ))))
+            })?;
+            let claims = crate::agent::load_claims(conn, &id)?;
+            Ok(AgentChangeEntry::new("agent.import", row, claims))
+        })
+        .collect()
+}
+
+/// Checks that a superseding snapshot only moves agent history forward from
+/// `history`, the agents it replaces. Every agent must still be present, none
+/// may go back to a lower generation or name version, an agent at the same
+/// generation must be unchanged, and every existing name claim must be kept
+/// (it may only gain a release time). A name or a live head may not move to a
+/// different agent while the old holder stays live: one agent at a time can't
+/// apply such a move under the database's unique indexes.
+///
+/// Readers run it before applying a superseding snapshot. The machine that
+/// writes one must run it too, and refuse, so it never publishes a snapshot
+/// every reader would reject.
 pub fn validate_agent_extension(
     history: &[AgentChangeEntry],
     incoming: &[AgentChangeEntry],
@@ -296,16 +331,21 @@ impl RegistryStore {
                     merged.validate(tx)?;
                     if supersedes {
                         let before = crate::shared_entry::SharedState::capture(tx)?;
-                        let history = before.agent_entries()?;
+                        let history = stored_agent_entries(tx)?;
                         validate_agent_extension(&history, &merged.agents).map_err(|cause| {
                             decode_error(serde_json::Error::io(std::io::Error::other(format!("supersede invariant: {cause} at position {}", entries.last().unwrap().position))))
                         })?;
-                        // Authorship was rechecked over the entire replaced log
-                        // by the coordinator. Only that author's rows can be erased.
+                        // Deleting every shared row the snapshot lacks is safe
+                        // only because catch-up already re-read log entries
+                        // 1..supersedes_through and refused unless every one has
+                        // this snapshot's author. So these rows can only have
+                        // come from that same machine, never from another.
                         merged.delete_absent(tx, &before)?;
                         merged.agents.sort_by(|a, b| (a.row.status == "live", &a.agent_id).cmp(&(b.row.status == "live", &b.agent_id)));
                         for agent in &mut merged.agents { agent.claims.sort_by_key(|claim| claim.claim_id); }
-                        // Unchanged agents do not produce duplicate feed imports.
+                        // Only added or changed agents get an `agent.import`
+                        // journal row. An unchanged agent would otherwise reach
+                        // core again through `agent.changes` for no reason.
                         merged.agents.retain(|agent| !history.iter().any(|old| old.row == agent.row && old.claims == agent.claims));
                     }
                     let mut seq = 0;

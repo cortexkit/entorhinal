@@ -169,8 +169,10 @@ impl Worker {
         author: &str,
         deadline: Instant,
     ) -> Result<(), HandlerError> {
-        // Always re-read, even for a joiner that just read the prefix. A member
-        // (especially after restart) has no in-memory authorship for old entries.
+        // Re-read entries 1..through and compare each one's author with the
+        // snapshot's. Authors are never stored, so a member that applied those
+        // entries earlier, possibly before a restart, has no record of them. A
+        // joiner that just read them re-reads too, so there is one code path.
         let mut after = 0;
         while after < through {
             let page = self.read(after, deadline).await?;
@@ -809,7 +811,10 @@ mod tests {
         tokio::pin!(waiter);
         poll_pending(waiter.as_mut());
         let mut renamed = rename(old, "Grace", 2);
-        renamed.claims.reverse(); // Sender order is not trusted.
+        // Send the claims newest first. The reader must sort them by claim_id
+        // itself, releasing the old name before writing the new active one, or
+        // the unique index on active claims refuses the write.
+        renamed.claims.reverse();
         f.append(agents_part(&[unchanged, renamed.clone()], Some(1)), true)
             .await;
         f.catch().await.unwrap();
