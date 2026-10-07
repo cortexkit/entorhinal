@@ -54,13 +54,14 @@ pub fn face_from_argv0(argv0: Option<&str>) -> Face {
         .and_then(Path::file_stem)
         .and_then(|stem| stem.to_str())
         .unwrap_or("");
-    let stem = stem
+    // Only a `ck-` or `ckdev-` prefixed name selects a CLI face. A bare
+    // `projects` stays the module default, as it always was.
+    let face = stem
         .strip_prefix("ckdev-")
-        .or_else(|| stem.strip_prefix("ck-"))
-        .unwrap_or(stem);
-    match stem {
-        "projects" => Face::Projects,
-        "workspaces" => Face::Workspaces,
+        .or_else(|| stem.strip_prefix("ck-"));
+    match face {
+        Some("projects") => Face::Projects,
+        Some("workspaces") => Face::Workspaces,
         _ => Face::Entorhinal,
     }
 }
@@ -936,6 +937,9 @@ mod tests {
         assert_eq!(face_from_argv0(Some("ckdev-")), Face::Entorhinal);
         assert_eq!(face_from_argv0(Some("ckdev-foo")), Face::Entorhinal);
         assert_eq!(face_from_argv0(Some("ckdev-ck-projects")), Face::Entorhinal);
+        // Unprefixed names never selected a CLI face, and still don't.
+        assert_eq!(face_from_argv0(Some("projects")), Face::Entorhinal);
+        assert_eq!(face_from_argv0(Some("workspaces")), Face::Entorhinal);
     }
 
     /// Bare CLI faces explain; only the module face serves from empty argv.

@@ -1,3 +1,21 @@
+//! Guards the fleet rule that a process named `ck-<name>` is always a placed
+//! production binary: every binary a test executes must go through the
+//! `ckdev_binary` helper, which runs it as a `ckdev-<name>` hard link.
+//!
+//! The scan is lexical, over both crates' `tests/` sources:
+//! - comments and string or char literals are blanked first (`mask_non_code`),
+//!   so code-shaped text inside them is never judged;
+//! - the code is split into `;`-terminated statements, and each statement is
+//!   judged on its own: a wrapped spawn must not bless the statement after it;
+//! - a statement is flagged when it executes, symlinks or wraps a
+//!   `CARGO_BIN_EXE_ck-*` path or a `target/.../ck-` path outside a
+//!   `ckdev_binary(...)` call (`statement_has_unwrapped_binary`);
+//! - a `let` binding holding such a raw path is remembered, so a later
+//!   `Command::new(that_binding)` is flagged too (`violations`).
+//! It recognises only the spawn shapes these tests use. The planted controls
+//! at the bottom prove it fires on a direct spawn and on a direct spawn right
+//! after a wrapped one, and stays quiet on a wrapped spawn.
+
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},

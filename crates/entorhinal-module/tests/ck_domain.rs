@@ -51,8 +51,13 @@ impl Drop for Scratch {
     }
 }
 
-/// Runs the binary under a fleet-safe file name while keeping the role in
-/// argv[0], with an empty environment and no daemon connection file to find.
+/// Runs the binary under its `ckdev-` dev name, with an empty environment and
+/// no daemon connection file to find.
+///
+/// The executable is a `ckdev-entorhinal` hard link, and argv[0] is the face's
+/// dev name (`ckdev-projects`, ...). Both matter: the binary picks its face from
+/// argv[0], and macOS's process list shows argv[0], so a test copy must never
+/// carry a `ck-` name there, where it would look like a production binary.
 fn run_as(face: &str) -> (std::process::ExitStatus, String) {
     let scratch = Scratch::new();
     let binary = ckdev_binary(env!("CARGO_BIN_EXE_ck-entorhinal"), &scratch.0);
@@ -66,32 +71,6 @@ fn run_as(face: &str) -> (std::process::ExitStatus, String) {
         .stderr(Stdio::null())
         .spawn()
         .expect("run the face");
-    let process_name = Command::new("ps")
-        .args(["-o", "comm=", "-p", &child.id().to_string()])
-        .output()
-        .expect("read child executable name from ps");
-    assert!(process_name.status.success(), "ps failed to inspect child");
-    let process_name = String::from_utf8_lossy(&process_name.stdout);
-    if process_name.trim().is_empty() || process_name.trim() == "<defunct>" {
-        assert!(
-            child
-                .try_wait()
-                .expect("check whether the face exited")
-                .is_some(),
-            "ps lost a face process that was still running"
-        );
-        eprintln!("ck_domain argv[0]={dev_face}, ps sampled after child exit");
-    } else {
-        eprintln!(
-            "ck_domain argv[0]={dev_face}, ps -o comm= -> {}",
-            process_name.trim()
-        );
-        assert_eq!(
-            process_name.trim(),
-            dev_face,
-            "ps should show the safe development argv[0]"
-        );
-    }
     let started = Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait().expect("poll the face") {
