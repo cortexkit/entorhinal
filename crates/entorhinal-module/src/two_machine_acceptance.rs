@@ -87,6 +87,22 @@ impl Machine {
         self.handler = Self::open(&self.descriptor, connector);
     }
 
+    fn restore(label: &str, snapshot: &Path, connector: Arc<dyn LogConnector>) -> Self {
+        let (dir, descriptor) = crate::tests::scratch_descriptor(label);
+        let StorageBackend::Sqlite { path } = &descriptor.backend else {
+            unreachable!()
+        };
+        // The snapshot is a closed SQLite backup, not an open store whose WAL
+        // might be missing. Restore it before opening the new handler.
+        std::fs::copy(snapshot, path).unwrap();
+        let handler = Self::open(&descriptor, connector);
+        Self {
+            dir: dir.canonicalize().unwrap(),
+            descriptor,
+            handler,
+        }
+    }
+
     fn store(&self) -> RegistryStore {
         self.handler.with_store(|s| Ok(s.clone())).unwrap()
     }
@@ -517,6 +533,281 @@ async fn two_machines_converge_with_placement_and_agent_change_ops() {
     );
     a.clean_rebuild().await;
     b.clean_rebuild().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn restored_pre_enable_store_supersedes_and_three_members_converge() {
+    use std::task::{Context, Poll, Waker};
+
+    const ADA: &str = "agent_0000000000000001";
+    const LIN: &str = "agent_0000000000000002";
+    let log = FakeLog::default();
+    let author_a = Arc::new(log.with_author([0x11; 16]));
+    let author_b = Arc::new(log.with_author([0x22; 16]));
+    let author_d = Arc::new(log.with_author([0x33; 16]));
+    let a = Machine::new("incident-a", author_a.clone());
+    let root = a.repo("p", &[("origin", "incident/p")]);
+    a.register("P", &root, Some("W")).await;
+    let backup = a.dir.join("pre-enable.db");
+    // VACUUM INTO includes committed WAL contents without copying the live
+    // store's database files piecemeal.
+    a.conn()
+        .execute("VACUUM INTO ?1", [backup.to_str().unwrap()])
+        .unwrap();
+    let before_shared = a.shared();
+    let before_local = a.local();
+    let before_journal = a.rows("registry_journal");
+
+    a.enable_without_agents().await;
+    assert_eq!(log.head(), 1);
+    let original = drive(author_a.client().read(0, 128)).await.unwrap();
+    assert_eq!(original.entries.len(), 1);
+    let bootstrap: Value = serde_json::from_slice(&original.entries[0].entry).unwrap();
+    assert!(
+        bootstrap.get("agents").is_none(),
+        "empty agent lists are omitted on the wire"
+    );
+    assert!(a.rows("agent").is_empty());
+    assert!(bootstrap.get("supersedes_through").is_none());
+    assert_eq!(
+        a.query("SELECT COUNT(*) FROM registry_journal WHERE op='agent.cutover'"),
+        vec![vec![Cell::Integer(1)]]
+    );
+    let b = Machine::new("incident-b", author_b.clone());
+    b.enable().await;
+    assert_eq!(b.shared(), a.shared());
+    assert_eq!(
+        b.store()
+            .identity_log_status()
+            .unwrap()
+            .last_applied_position,
+        1
+    );
+    let initial = b.call("agent.snapshot", json!({})).await.unwrap();
+    assert!(initial["agents"].as_array().unwrap().is_empty());
+    assert!(initial["claims"].as_array().unwrap().is_empty());
+    let cursor = initial["generation"].as_i64().unwrap();
+    let body = serde_json::to_vec(&json!({"method":"agent.changes","params":{
+        "incarnation":"acceptance","cursor":cursor,"wait":true
+    }}))
+    .unwrap();
+    let waiter = b.handler.handle_request_wait(&body, CORE);
+    tokio::pin!(waiter);
+    assert!(waiter
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_pending());
+    let before = tokio::time::Instant::now();
+
+    let a2 = Machine::restore("incident-a2", &backup, author_a.clone());
+    assert_eq!(a2.shared(), before_shared);
+    assert_eq!(a2.local(), before_local);
+    assert_eq!(a2.rows("registry_journal"), before_journal);
+    assert_eq!(a2.store().identity_log_status().unwrap().state, "disabled");
+    assert_eq!(
+        a2.query("SELECT COUNT(*) FROM registry_journal WHERE op='agent.cutover'"),
+        vec![vec![Cell::Integer(0)]]
+    );
+
+    // Import real frozen core tables, including a released name claim. The
+    // restored copy has neither the zero-agent marker nor the enabled state.
+    let snapshot_path = a2.dir.join("core-agents.db");
+    let source = Connection::open(&snapshot_path).unwrap();
+    for migration in [
+        include_str!("../../entorhinal-core/tests/fixtures/core-agent-migrations/076_agent_registry.sql"),
+        include_str!("../../entorhinal-core/tests/fixtures/core-agent-migrations/080_agent_github_identity.sql"),
+        include_str!("../../entorhinal-core/tests/fixtures/core-agent-migrations/082_wake_delivery.sql"),
+        include_str!("../../entorhinal-core/tests/fixtures/core-agent-migrations/109_agent_generation.sql"),
+        include_str!("../../entorhinal-core/tests/fixtures/core-agent-migrations/112_agent_avatar.sql"),
+        include_str!("../../entorhinal-core/tests/fixtures/core-agent-migrations/126_agent_labels.sql"),
+    ] {
+        source.execute_batch(migration).unwrap();
+    }
+    source.execute_batch("INSERT INTO agent(agent_id,name,tag,role,name_version,generation,labels_json,created_at_ms,updated_at_ms)
+        VALUES('agent_0000000000000001','Ada','helper','assistant',2,2,'[\"imported\"]',10,20);
+        INSERT INTO agent(agent_id,name,tag,role,project_id,created_at_ms,updated_at_ms)
+        VALUES('agent_0000000000000002','Lin','lead','head','P',10,10);
+        INSERT INTO agent_name_claim(claim_id,agent_id,namespace_kind,namespace_key,normalized_name,display_name,claimed_at_ms,released_at_ms) VALUES
+        (1,'agent_0000000000000001','assistant','global','grace','Grace',10,20),
+        (2,'agent_0000000000000001','assistant','global','ada','Ada',20,NULL),
+        (3,'agent_0000000000000002','workspace','W','lin','Lin',10,NULL);").unwrap();
+    drop(source);
+    let imported = a2
+        .call(
+            "agent.import",
+            json!({
+                "snapshot_path":snapshot_path,"request_key":"incident-import"
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(imported["agents_imported"], 2);
+    assert_eq!(imported["claims_imported"], 3);
+    assert_eq!(log.head(), 1, "agent.import must remain a local operation");
+    let snapshot = a2.call("agent.snapshot", json!({})).await.unwrap();
+    a2.enable().await;
+    assert_eq!(log.head(), 2);
+    let enabled = a2.store().identity_log_status().unwrap();
+    assert_eq!(enabled.last_applied_position, 2);
+    assert_eq!(enabled.last_seen_head, 2);
+    let supersede = drive(author_a.client().read(0, 128)).await.unwrap();
+    assert_eq!(supersede.entries.len(), 2);
+    assert_eq!(supersede.entries[0], original.entries[0]);
+    let entry = &supersede.entries[1];
+    assert_eq!(entry.position, 2);
+    assert_eq!(entry.kind, "snapshot");
+    assert!(entry.signed_by_self);
+    assert_eq!(entry.author, original.entries[0].author);
+    let part: Value = serde_json::from_slice(&entry.entry).unwrap();
+    assert_eq!(part["supersedes_through"], 1);
+    assert_eq!(part["part"], 1);
+    assert_eq!(part["parts"], 1);
+    assert_eq!(part["agents"].as_array().unwrap().len(), 2);
+    let journal =
+        a2.query("SELECT payload_json FROM registry_journal WHERE op='identity_log.enable'");
+    let Cell::Text(payload) = &journal[0][0] else {
+        panic!("missing enable payload")
+    };
+    assert_eq!(
+        serde_json::from_str::<Value>(payload).unwrap()["supersedes_through"],
+        1
+    );
+    assert_eq!(
+        a2.query("SELECT COUNT(*) FROM registry_journal WHERE op='agent.cutover'"),
+        vec![vec![Cell::Integer(1)]]
+    );
+    assert_eq!(
+        b.store()
+            .identity_log_status()
+            .unwrap()
+            .last_applied_position,
+        1
+    );
+    assert!(waiter
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_pending());
+
+    b.catch_up().await;
+    assert_eq!(
+        tokio::time::Instant::now(),
+        before,
+        "catch-up must wake the waiter before its timeout"
+    );
+    let Poll::Ready(HandlerOutcome::Response(bytes)) = waiter
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+    else {
+        panic!("supersede did not notify the parked agent.changes waiter")
+    };
+    let waited: Value = serde_json::from_slice::<Value>(&bytes).unwrap()["result"].clone();
+    let feed = b
+        .call(
+            "agent.changes",
+            json!({
+                "incarnation":"acceptance","cursor":cursor,"wait":false
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        waited, feed,
+        "the pre-supersede cursor and waiter see the same after-images"
+    );
+    let entries = feed["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(
+        entries
+            .iter()
+            .map(|e| e["agent_id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec![ADA, LIN]
+    );
+    for (entry, row) in entries.iter().zip(snapshot["agents"].as_array().unwrap()) {
+        assert_eq!(entry["op"], "agent.import");
+        assert_eq!(&entry["row"], row);
+        assert_eq!(entry["agent_generation"], row["agent_generation"]);
+        let claims: Vec<_> = snapshot["claims"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|claim| claim["agent_id"] == row["agent_id"])
+            .cloned()
+            .collect();
+        assert_eq!(entry["claims"], json!(claims));
+        assert!(entry["seq"].as_i64().unwrap() > cursor);
+    }
+    assert_eq!(entries[0]["row"]["name"], "Ada");
+    assert_eq!(entries[0]["row"]["agent_generation"], 2);
+    assert_eq!(entries[0]["row"]["labels"], json!(["imported"]));
+    assert_eq!(entries[0]["claims"][0]["released_at_ms"], 20);
+    assert_eq!(entries[0]["claims"][1]["released_at_ms"], Value::Null);
+    assert_eq!(feed["cursor"], b.store().generation().unwrap());
+    assert_eq!(
+        b.handler.health.generation.load(Ordering::Relaxed),
+        b.store().generation().unwrap()
+    );
+    assert_eq!(b.shared(), a2.shared());
+    assert_eq!(
+        b.store()
+            .identity_log_status()
+            .unwrap()
+            .last_applied_position,
+        2
+    );
+
+    // The actual reserved core route must be able to mutate imported identity;
+    // success on a direct store call would not prove serving-path admission.
+    let renamed = b
+        .call(
+            "agent.rename",
+            json!({
+                "agent_id":ADA,"name":"Katherine","request_key":"incident-rename"
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(renamed["agent"]["name"], "Katherine");
+    assert_eq!(renamed["agent"]["agent_generation"], 3);
+    assert_eq!(log.head(), 3);
+    let tail = drive(author_b.client().read(2, 128)).await.unwrap();
+    assert_eq!(tail.entries.len(), 1);
+    assert_eq!(tail.entries[0].position, 3);
+    assert_eq!(tail.entries[0].kind, "change");
+    assert!(tail.entries[0].signed_by_self);
+    assert_ne!(tail.entries[0].author, entry.author);
+    let change: Value = serde_json::from_slice(&tail.entries[0].entry).unwrap();
+    assert_eq!(change["op"], "agent.rename");
+    assert_eq!(change["row"]["name"], "Katherine");
+    let d = Machine::new("incident-d", author_d);
+    d.enable().await;
+    a2.catch_up().await;
+    for member in [&a2, &b, &d] {
+        let status = member.store().identity_log_status().unwrap();
+        assert_eq!(status.state, "enabled");
+        assert_eq!(status.last_applied_position, 3);
+        assert_eq!(status.last_seen_head, 3);
+        assert_eq!(member.shared(), b.shared());
+        assert_eq!(member.rows("workspace_member"), b.rows("workspace_member"));
+        assert_eq!(member.rows("agent").len(), 2);
+        assert_eq!(member.rows("agent_name_claim").len(), 4);
+        assert_eq!(member.query("SELECT name,name_version,agent_generation FROM agent WHERE agent_id='agent_0000000000000001'"),
+            vec![vec![Cell::Text("Katherine".into()), Cell::Integer(3), Cell::Integer(3)]]);
+        member.clean_rebuild().await;
+        assert_eq!(
+            member
+                .store()
+                .identity_log_status()
+                .unwrap()
+                .last_applied_position,
+            3
+        );
+    }
+    assert_eq!(
+        log.head(),
+        3,
+        "verify and rebuild must not publish shared entries"
+    );
 }
 
 #[tokio::test(start_paused = true)]
