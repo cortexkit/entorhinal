@@ -177,6 +177,14 @@ impl Machine {
             "enabled"
         );
     }
+    async fn enable_without_agents(&self) {
+        assert_eq!(
+            self.call("identity_log.enable", json!({"without_agents":true}))
+                .await
+                .unwrap()["state"],
+            "enabled"
+        );
+    }
 
     async fn catch_up(&self) {
         let _writer = self.handler.writer.lock().await;
@@ -271,7 +279,7 @@ fn repo(path: &Path, remotes: &[(&str, &str)]) {
 async fn pair(label: &str, log: Arc<dyn LogConnector>) -> (Machine, Machine) {
     let a = Machine::new(&format!("{label}-a"), log.clone());
     let b = Machine::new(&format!("{label}-b"), log);
-    a.enable().await;
+    a.enable_without_agents().await;
     b.enable().await;
     (a, b)
 }
@@ -784,7 +792,7 @@ impl LogConnector for Absent {
 async fn absent_engram_all_reads_startup_and_same_key_core_retry() {
     let log = Arc::new(FakeLog::default());
     let mut m = Machine::new("absent", log.clone());
-    m.enable().await;
+    m.enable_without_agents().await;
     let root = m.repo("p", &[("origin", "absent/p")]);
     m.register("P", &root, Some("ws-W")).await;
     let created = m
@@ -879,7 +887,7 @@ async fn absent_engram_all_reads_startup_and_same_key_core_retry() {
 async fn absent_engram_local_writes_keep_keys_and_workspace_timestamps() {
     let log = Arc::new(FakeLog::default());
     let mut m = Machine::new("local-absent", log.clone());
-    m.enable().await;
+    m.enable_without_agents().await;
     let root = m.repo("first", &[("origin", "local/p")]);
     m.register("P", &root, Some("W")).await;
     let clone = m.repo("clone", &[("origin", "local/p")]);
@@ -956,7 +964,7 @@ async fn attach_matches_remote_selects_smallest_key_and_sorts_two_clones() {
     )
     .await
     .unwrap();
-    a.enable().await;
+    a.enable_without_agents().await;
     b.enable().await;
     assert_eq!(
         a.query("SELECT project_id,kind,root_key FROM project_root_key"),

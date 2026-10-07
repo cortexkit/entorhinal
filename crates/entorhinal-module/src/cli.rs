@@ -178,6 +178,13 @@ pub fn parse(face: Face, arguments: &[String]) -> Invocation {
             "--yes" if face == Face::Projects && verb.as_deref() == Some("attach") => {
                 args.push(argument.clone());
             }
+            "--without-agents"
+                if face == Face::Projects
+                    && verb.as_deref() == Some("log")
+                    && args.first().map(String::as_str) == Some("enable") =>
+            {
+                args.push(argument.clone());
+            }
             "--default" | "--none"
                 if face == Face::Projects && verb.as_deref() == Some("owned-remotes") =>
             {
@@ -245,7 +252,9 @@ usage: ck projects <verb> [args] [--subc <connection file>] [--json]
   trust <dir>             show each root's identity and approval
   verify                  check the store against its journal
   log status              show local identity log state
-  log enable              enable or join the shared log (operator only)
+  log enable [--without-agents]
+                          enable or join the shared log (operator only);
+                          skip agent import only when the fleet has no agents
 
   --subc <path>   daemon connection file; defaults to the usual discovery path
   --json          raw response instead of the rendered form
@@ -462,15 +471,20 @@ fn build(command: &Command) -> Result<(String, Value), String> {
             )
         }
         (Face::Projects, "log") => {
-            if command.args.len() != 1 {
-                return Err("log needs exactly one of: status, enable".into());
-            }
-            let method = match command.args[0].as_str() {
-                "status" => "identity_log.status",
-                "enable" => "identity_log.enable",
+            match command
+                .args
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                ["status"] => ("identity_log.status".into(), json!({})),
+                ["enable"] => ("identity_log.enable".into(), json!({})),
+                ["enable", "--without-agents"] => {
+                    ("identity_log.enable".into(), json!({"without_agents":true}))
+                }
                 _ => return Err("log needs exactly one of: status, enable".into()),
-            };
-            (method.into(), json!({}))
+            }
         }
         (Face::Projects, "remove") => (
             "remove".to_string(),
@@ -1338,7 +1352,9 @@ mod tests {
             crate::ProjectsHandler::with_log_connector("cli-enable".into(), || 700, log.clone());
         *handler.store.lock().unwrap() =
             Some(entorhinal_core::RegistryStore::open(&descriptor).unwrap());
-        let Invocation::Command(command) = parse_as(Face::Projects, &["log", "enable"]) else {
+        let Invocation::Command(command) =
+            parse_as(Face::Projects, &["log", "enable", "--without-agents"])
+        else {
             panic!("log enable must parse")
         };
         let (method, params) = build(&command).unwrap();
@@ -1362,6 +1378,49 @@ mod tests {
         assert_eq!(log.head(), 1);
         drop(handler);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn import_consent_cli_without_agents_is_enable_only_and_builds_boolean() {
+        let Invocation::Command(command) =
+            parse_as(Face::Projects, &["log", "enable", "--without-agents"])
+        else {
+            panic!("log enable --without-agents must parse")
+        };
+        assert_eq!(
+            build(&command).unwrap(),
+            ("identity_log.enable".into(), json!({"without_agents":true}))
+        );
+        assert!(usage(Face::Projects).contains("--without-agents"));
+        for args in [
+            vec!["log", "status", "--without-agents"],
+            vec!["register", "--without-agents"],
+            vec!["log", "--without-agents", "enable"],
+        ] {
+            assert!(
+                matches!(parse_as(Face::Projects, &args), Invocation::Refuse(_)),
+                "{args:?}"
+            );
+        }
+        for face in [Face::Workspaces, Face::Entorhinal] {
+            assert!(matches!(
+                parse_as(face, &["log", "enable", "--without-agents"]),
+                Invocation::Refuse(_)
+            ));
+        }
+        for args in [
+            vec!["log", "enable", "--without-agents", "--without-agents"],
+            vec!["log", "enable", "--without-agents", "extra"],
+        ] {
+            let Invocation::Command(command) = parse_as(Face::Projects, &args) else {
+                panic!("log must parse")
+            };
+            assert!(build(&command).is_err(), "{args:?}");
+        }
+        // Build must also refuse a status flag if handed a constructed command.
+        let mut status = command;
+        status.args[0] = "status".into();
+        assert!(build(&status).is_err());
     }
 
     /// The RENDERER's field names come from the REGISTRY'S OWN REPLY TYPE.

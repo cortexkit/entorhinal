@@ -634,7 +634,7 @@ impl ProjectsHandler {
             return self.handle_request_wait(body, key).await;
         }
         let result = if request.method == "identity_log.enable" {
-            self.enable_log(key, received).await
+            self.enable_log(request.params, key, received).await
         } else {
             self.write_wait(request, key, received).await
         };

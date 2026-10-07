@@ -11,6 +11,13 @@ use super::{
 use entorhinal_core::enable_state::EnablePart;
 use tokio::time::{timeout_at, Instant};
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnableParams {
+    #[serde(default)]
+    without_agents: bool,
+}
+
 pub(super) fn refresh(health: &HealthGauges, store: &RegistryStore) {
     if let Ok(status) = store.identity_log_status() {
         refresh_status(health, &status);
@@ -227,10 +234,13 @@ pub(super) async fn resume(
 impl ProjectsHandler {
     pub(super) async fn enable_log(
         &self,
+        params: Value,
         key: RouteKey,
         received: Instant,
     ) -> Result<Vec<u8>, HandlerError> {
         let admission = self.admit("identity_log.enable", key)?;
+        let params: EnableParams = serde_json::from_value(params)
+            .map_err(|error| HandlerError::new("invalid_request", error.to_string()))?;
         let deadline = received + Duration::from_secs(25);
         let _writer = timeout_at(deadline, self.writer.lock())
             .await
@@ -241,6 +251,7 @@ impl ProjectsHandler {
         let result = self
             .enable_locked(
                 &store,
+                params.without_agents,
                 deadline,
                 &principal_label(admission.principal.as_ref()),
             )
@@ -260,6 +271,7 @@ impl ProjectsHandler {
     async fn enable_locked(
         &self,
         store: &RegistryStore,
+        without_agents: bool,
         deadline: Instant,
         principal: &str,
     ) -> Result<(), HandlerError> {
@@ -279,6 +291,7 @@ impl ProjectsHandler {
         if page.head > 0 {
             return self.catch_up(store, deadline).await;
         }
+        store.check_agent_import_preconditions(without_agents)?;
         let plan = store.prepare_enable(&log_client::encode_hex(&draw_id()?), (self.clock)())?;
         let parts = plan
             .bodies
@@ -407,6 +420,10 @@ mod tests {
         async fn enable(&self) -> Result<Value, String> {
             self.call("identity_log.enable", json!({})).await
         }
+        async fn enable_without_agents(&self) -> Result<Value, String> {
+            self.call("identity_log.enable", json!({"without_agents":true}))
+                .await
+        }
         fn marker(&self) {
             self.store()
                 .apply_entry("agent.cutover", "{}", "test", None, |_| Ok(()))
@@ -458,6 +475,58 @@ mod tests {
                     100,
                 )
                 .unwrap();
+        }
+        fn marker_count(&self) -> i64 {
+            self.conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM registry_journal WHERE op='agent.cutover'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        }
+        async fn refuse_unwritten(&self, log: &FakeLog, params: Value, code: &str) {
+            let journal = self.journal();
+            let state = self.rows("identity_log_state");
+            let head = log.head();
+            let calls = log.calls();
+            assert_eq!(
+                self.call("identity_log.enable", params).await.unwrap_err(),
+                code
+            );
+            assert_eq!(self.journal(), journal);
+            assert_eq!(self.rows("identity_log_state"), state);
+            assert_eq!(
+                self.store().identity_log_status().unwrap().state,
+                "disabled"
+            );
+            assert_eq!(log.head(), head);
+            assert_eq!(log.calls(), calls + 1, "refusal must only read the head");
+        }
+        async fn import_agent(&self) {
+            let path = self.dir.join("agent-snapshot.db");
+            let source = Connection::open(&path).unwrap();
+            // Use the frozen core schema fixtures also used by the importer tests,
+            // so this exercises a real agent import rather than inserting a marker.
+            for migration in [
+                include_str!("../../entorhinal-core/tests/fixtures/core-agent-migrations/076_agent_registry.sql"),
+                include_str!("../../entorhinal-core/tests/fixtures/core-agent-migrations/080_agent_github_identity.sql"),
+                include_str!("../../entorhinal-core/tests/fixtures/core-agent-migrations/082_wake_delivery.sql"),
+                include_str!("../../entorhinal-core/tests/fixtures/core-agent-migrations/109_agent_generation.sql"),
+                include_str!("../../entorhinal-core/tests/fixtures/core-agent-migrations/112_agent_avatar.sql"),
+                include_str!("../../entorhinal-core/tests/fixtures/core-agent-migrations/126_agent_labels.sql"),
+            ] { source.execute_batch(migration).unwrap(); }
+            source.execute_batch("INSERT INTO agent(agent_id,name,tag,role,created_at_ms,updated_at_ms) VALUES('agent_0000000000000001','Imported','ok','assistant',10,10);
+                INSERT INTO agent_name_claim(agent_id,namespace_kind,namespace_key,normalized_name,display_name,claimed_at_ms) VALUES('agent_0000000000000001','assistant','global','imported','Imported',10);").unwrap();
+            drop(source);
+            self.call(
+                "agent.import",
+                json!({"snapshot_path":path,"request_key":"import-before-enable"}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(self.store().agent_snapshot().unwrap().agents.len(), 1);
+            assert_eq!(self.marker_count(), 1);
         }
         fn clean_rebuild(&self) {
             let before = self.shared();
@@ -517,10 +586,251 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn import_consent_order_and_flag_rules() {
+        // A populated registry must leave its only import path open on refusal.
+        let log = Arc::new(FakeLog::default());
+        let f = Fixture::new("guard-project", log.clone());
+        let root = f.dir.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        f.project("P", &root, "Project", None);
+        f.refuse_unwritten(&log, json!({}), "agents_not_imported")
+            .await;
+        let message = f
+            .store()
+            .check_agent_import_preconditions(false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("agent import") && message.contains("--without-agents"),
+            "{message}"
+        );
+        f.import_agent().await;
+        f.enable().await.unwrap();
+        assert_eq!(f.marker_count(), 1);
+        assert_eq!(log.head(), 1);
+        f.clean_rebuild();
+
+        let log = Arc::new(FakeLog::default());
+        let a = Fixture::new("guard-empty", Arc::new(log.with_author([1; 16])));
+        a.refuse_unwritten(&log, json!({}), "agents_not_imported")
+            .await;
+        assert_eq!(a.marker_count(), 0);
+        a.enable_without_agents().await.unwrap();
+        assert_eq!(a.marker_count(), 1);
+        let before = a.journal();
+        a.enable_without_agents().await.unwrap();
+        assert_eq!(a.journal(), before, "enabled ignores the flag");
+
+        // A join obtains its marker from the bootstrap; even an earlier zero-agent
+        // import does not make --without-agents invalid on this branch.
+        for imported in [false, true] {
+            let b = Fixture::new("guard-join", Arc::new(log.with_author([2; 16])));
+            if imported {
+                b.empty_import();
+            }
+            if imported {
+                b.enable_without_agents().await.unwrap();
+            } else {
+                b.enable().await.unwrap();
+            }
+            assert_eq!(b.marker_count(), 1);
+            assert_eq!(
+                b.store()
+                    .identity_log_status()
+                    .unwrap()
+                    .last_applied_position,
+                1
+            );
+            assert_eq!(b.shared(), a.shared());
+            b.clean_rebuild();
+        }
+        assert_eq!(log.head(), 1, "join must not append");
+
+        let log = Arc::new(FakeLog::default());
+        let f = Fixture::new("guard-imported-empty", log.clone());
+        f.empty_import();
+        f.refuse_unwritten(&log, json!({"without_agents":true}), "invalid_request")
+            .await;
+        f.enable().await.unwrap();
+        assert_eq!(f.marker_count(), 1);
+
+        let log = Arc::new(FakeLog::default());
+        let f = Fixture::new("guard-imported-agent", log.clone());
+        f.agents(1, 0);
+        f.refuse_unwritten(&log, json!({"without_agents":true}), "invalid_request")
+            .await;
+        f.store()
+            .apply_entry("test.legacy_agents", "{}", "test", None, |tx| {
+                tx.execute("DELETE FROM registry_journal WHERE op='agent.cutover'", [])?;
+                Ok(())
+            })
+            .unwrap();
+        for params in [json!({}), json!({"without_agents":true})] {
+            f.refuse_unwritten(&log, params, "authority_not_cut_over")
+                .await;
+        }
+
+        // The flag is irrelevant once a saved plan or a join is in progress,
+        // including when those states already hold imported agents and a marker.
+        let log = Arc::new(FakeLog::default());
+        let a = Fixture::new("guard-enabling-imported", log.clone());
+        a.agents(1, 0);
+        log.on_append(Action::DropReply);
+        assert_eq!(a.enable().await.unwrap_err(), "engram_unavailable");
+        assert_eq!(a.store().identity_log_status().unwrap().state, "enabling");
+        a.enable_without_agents().await.unwrap();
+        finish(a.call("agent.rename", json!({"agent_id":"agent_0000000000000000","name":"After bootstrap","request_key":"after-bootstrap"}))).await.unwrap();
+        let b = Fixture::new("guard-joining-imported", Arc::new(log.with_author([2; 16])));
+        let page = log.client().read(0, 1).await.unwrap();
+        let entry = &page.entries[0];
+        b.store()
+            .apply_join_snapshot(
+                &[entorhinal_core::remote_apply::RemoteEntry {
+                    position: 1,
+                    entry_id: log_client::encode_hex(&entry.entry_id),
+                    signer: "test".into(),
+                    key_id: "test".into(),
+                    envelope_version: 1,
+                    kind: entry.kind.clone(),
+                    entry: entry.entry.clone(),
+                }],
+                page.head as i64,
+            )
+            .unwrap();
+        assert_eq!(b.store().identity_log_status().unwrap().state, "joining");
+        b.enable_without_agents().await.unwrap();
+        assert_eq!(b.shared(), a.shared());
+        assert_eq!(b.marker_count(), 1);
+        b.clean_rebuild();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn import_consent_enable_params_fail_closed() {
+        let log = Arc::new(FakeLog::default());
+        let f = Fixture::new("guard-params", log.clone());
+        let state = f.rows("identity_log_state");
+        for params in [
+            json!({"without_agent":true}),
+            json!({"without_agents":true,"unknown":false}),
+            json!({"without_agents":"true"}),
+            json!({"without_agents":1}),
+            json!({"without_agents":null}),
+            json!({"without_agents":[]}),
+        ] {
+            assert_eq!(
+                f.call("identity_log.enable", params.clone())
+                    .await
+                    .unwrap_err(),
+                "invalid_request",
+                "{params}"
+            );
+            assert!(f.journal().is_empty());
+            assert_eq!(f.rows("identity_log_state"), state);
+            assert_eq!(log.calls(), 0, "invalid params must not contact engram");
+        }
+        f.refuse_unwritten(&log, json!({"without_agents":false}), "agents_not_imported")
+            .await;
+    }
+
+    async fn interrupt_without_agents(f: &Fixture, log: &FakeLog) -> Vec<EnablePart> {
+        for i in 0..3 {
+            f.store()
+                .register(RegisterRequest {
+                    project_id: Some(format!("P{i}")),
+                    name: "x".repeat(80_000),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        log.on_append(Action::Hold);
+        let calls = log.calls() + 3; // head read, recovery read, first append
+        {
+            let enable = f.enable_without_agents();
+            tokio::pin!(enable);
+            let held = log.wait_for_calls(calls);
+            tokio::pin!(held);
+            loop {
+                tokio::select! {
+                    biased;
+                    () = &mut held => break,
+                    _ = &mut enable => panic!("enable did not park"),
+                    () = tokio::task::yield_now() => {}
+                }
+            }
+            assert_eq!(log.held_count(), 1);
+            assert_eq!(log.release_next().unwrap(), 1);
+            // Kill the request without polling its receipt: part 1 has landed,
+            // but part 2 has never been sent and finish_enable has never run.
+        }
+        let parts = f.store().enable_parts().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(log.head(), 1);
+        assert_eq!(f.store().identity_log_status().unwrap().state, "enabling");
+        assert_eq!(f.marker_count(), 0);
+        parts
+    }
+
+    async fn assert_without_agents_finished(f: &Fixture, log: &FakeLog, parts: &[EnablePart]) {
+        assert_eq!(f.store().identity_log_status().unwrap().state, "enabled");
+        assert_eq!(
+            f.store()
+                .identity_log_status()
+                .unwrap()
+                .last_applied_position,
+            2
+        );
+        assert_eq!(f.marker_count(), 1);
+        assert_eq!(log.head(), 2);
+        let page = log.client().read(0, 128).await.unwrap();
+        for (entry, part) in page.entries.iter().zip(parts) {
+            assert_eq!(entry.entry_id, part.entry_id);
+            assert_eq!(entry.entry, part.data);
+        }
+        let journal = f.journal();
+        f.enable_without_agents().await.unwrap();
+        assert_eq!(f.journal(), journal);
+        assert_eq!(f.marker_count(), 1);
+        f.clean_rebuild();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn import_consent_interrupted_without_agents_reruns_without_flag() {
+        let log = Arc::new(FakeLog::default());
+        let mut f = Fixture::new("guard-resume-request", log.clone());
+        let parts = interrupt_without_agents(&f, &log).await;
+        let journal = f.journal();
+        f.restart(log.clone());
+        let calls = log.calls();
+        f.enable().await.unwrap();
+        assert_eq!(log.calls(), calls + 2, "resume only reads and sends part 2");
+        assert_eq!(&f.journal()[..journal.len()], journal);
+        assert_without_agents_finished(&f, &log, &parts).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn import_consent_interrupted_without_agents_background_resumes() {
+        let log = Arc::new(FakeLog::default());
+        let mut f = Fixture::new("guard-resume-background", log.clone());
+        let parts = interrupt_without_agents(&f, &log).await;
+        let journal = f.journal();
+        f.restart(log.clone());
+        let calls = log.calls();
+        f.handler.start_catch_up();
+        tokio::task::yield_now().await;
+        assert_eq!(
+            log.calls(),
+            calls + 2,
+            "background only reads and sends part 2"
+        );
+        assert_eq!(&f.journal()[..journal.len()], journal);
+        assert_without_agents_finished(&f, &log, &parts).await;
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn empty_enable_is_idempotent_admits_create_and_reports_status() {
         let log = Arc::new(FakeLog::default());
         let f = Fixture::new("enable-empty", log.clone());
-        let status = f.enable().await.unwrap();
+        let status = f.enable_without_agents().await.unwrap();
         assert_eq!(status["state"], "enabled");
         assert_eq!(status["lastAppliedPosition"], 1);
         assert_eq!(status["pendingWriteCount"], 0);
@@ -619,7 +929,10 @@ mod tests {
             );
         }
         let before = f.journal();
-        assert_eq!(f.enable().await.unwrap_err(), "root_key_exists");
+        assert_eq!(
+            f.enable_without_agents().await.unwrap_err(),
+            "root_key_exists"
+        );
         assert_eq!(f.journal(), before);
         assert!(f.rows("project_root_key").is_empty());
         assert_eq!(f.store().identity_log_status().unwrap().state, "disabled");
@@ -865,7 +1178,10 @@ mod tests {
         let log = Arc::new(FakeLog::default());
         let f = Fixture::new("enable-background-feed", log.clone());
         log.on_append(Action::DropReply);
-        assert_eq!(f.enable().await.unwrap_err(), "engram_unavailable");
+        assert_eq!(
+            f.enable_without_agents().await.unwrap_err(),
+            "engram_unavailable"
+        );
         let cursor = f.store().generation().unwrap();
         let body = serde_json::to_vec(&json!({"method":"agent.changes","params":{"incarnation":"enable-test","cursor":cursor,"wait":true}})).unwrap();
         let waiter = f.handler.handle_request_wait(&body, CORE);
@@ -901,9 +1217,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn nonempty_join_refuses_with_counts_without_marker_and_allows_import() {
         let log = Arc::new(FakeLog::default());
-        let a = Fixture::new("enable-nonempty-a", log.clone());
-        a.enable().await.unwrap();
-        let b = Fixture::new("enable-nonempty-b", log.clone());
+        let a = Fixture::new("enable-nonempty-a", Arc::new(log.with_author([1; 16])));
+        a.enable_without_agents().await.unwrap();
+        let b = Fixture::new("enable-nonempty-b", Arc::new(log.with_author([2; 16])));
         let root = b.dir.join("root");
         std::fs::create_dir_all(&root).unwrap();
         b.project("P", &root, "Project", None);
@@ -991,7 +1307,10 @@ mod tests {
         let log = Arc::new(FakeLog::default());
         let a = Fixture::new("enable-background-a", log.clone());
         log.on_append(Action::DropReply);
-        assert_eq!(a.enable().await.unwrap_err(), "engram_unavailable");
+        assert_eq!(
+            a.enable_without_agents().await.unwrap_err(),
+            "engram_unavailable"
+        );
         a.handler.start_catch_up();
         tokio::task::yield_now().await;
         assert_eq!(a.store().identity_log_status().unwrap().state, "enabled");
@@ -1043,9 +1362,12 @@ mod tests {
             code: "unavailable".into(),
             detail: None,
         });
-        assert_eq!(a.enable().await.unwrap_err(), "engram_unavailable");
+        assert_eq!(
+            a.enable_without_agents().await.unwrap_err(),
+            "engram_unavailable"
+        );
         let b = Fixture::new("enable-winner", log.clone());
-        b.enable().await.unwrap();
+        b.enable_without_agents().await.unwrap();
         assert_eq!(
             a.enable().await.unwrap_err(),
             "join_requires_empty_registry"
@@ -1087,7 +1409,10 @@ mod tests {
         let journal = f.journal();
         let shared = f.shared();
         log.on_append(Action::DropReply);
-        assert_eq!(f.enable().await.unwrap_err(), "engram_unavailable");
+        assert_eq!(
+            f.enable_without_agents().await.unwrap_err(),
+            "engram_unavailable"
+        );
         let saved = f.rows("identity_log_state");
         assert_eq!(log.head(), 1);
         // A stale read hasn't seen this machine's first snapshot part, which has
@@ -1221,7 +1546,7 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        a.enable().await.unwrap();
+        a.enable_without_agents().await.unwrap();
         let b = Fixture::new("join-history-b", log.clone());
         let old = b.dir.join("old");
         repo(&old, None);
