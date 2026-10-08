@@ -95,7 +95,7 @@ fn manifest_declares_build_provenance() {
             || provenance["build_git_sha_absence_reason"].is_string(),
         "provenance: {provenance}"
     );
-    if cfg!(debug_assertions) && provenance["build_git_sha"].is_null() {
+    if option_env!("ENTORHINAL_BUILD_PROFILE").is_none() && provenance["build_git_sha"].is_null() {
         assert_eq!(
             provenance["build_git_sha_absence_reason"], "provenance_stamped_only_in_release_builds",
             "debug builds intentionally omit git provenance: {provenance}"
