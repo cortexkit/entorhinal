@@ -36,7 +36,9 @@ pub enum Face {
     Projects,
     /// `ck-workspaces`: workspace listing and project placement.
     Workspaces,
-    /// `ck-agents`: operator-confirmed identity writes and identity reads.
+    /// `ck-agents`: reads agents, and creates, renames, retires, retags and
+    /// relabels them; each write lands only after the operator approves it at
+    /// a Touch ID prompt.
     Agents,
     /// `ck-entorhinal`: the supervised module itself. Serves; its only
     /// operator surface is `--version`/`--help`, which point at the faces.
@@ -1098,6 +1100,11 @@ fn call(
                     subc_protocol::RouteTarget::ManagementSurface {
                         module_id: super::MODULE_ID.into(),
                     },
+                    // `project_id` is deliberately left unset: this is the operator
+                    // CLI, which has no registered project to resolve and must not
+                    // invent one. Absent means "key on the triple", which is the
+                    // honest answer for a caller that binds from whatever directory
+                    // the operator happened to be standing in.
                     subc_protocol::BindIdentity::new(
                         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
                         "ck-entorhinal",
@@ -1108,6 +1115,10 @@ fn call(
                 )
                 .await
                 .map_err(|error| match error {
+                    // A module refusal is the registry answering, and its code is
+                    // the answer: `not_found` and a store failure need different
+                    // reactions from the operator, so the code is surfaced verbatim
+                    // rather than folded into a transport message.
                     subc_client_rs::CallError::Module(body) => {
                         (EXIT_REFUSED, format!("{}: {}", body.code, body.message))
                     }
@@ -2536,7 +2547,8 @@ mod agent_tests {
         handler: ProjectsHandler,
         root: PathBuf,
         calls: Mutex<Vec<String>>,
-        // 1 loses a landed reply; 2 loses the request before the handler sees it.
+        // Which failure to inject: 1 lets the write land and then loses its
+        // reply; 2 loses the request before entorhinal's handler sees it.
         lose: AtomicUsize,
     }
     impl Served {
@@ -2779,9 +2791,10 @@ mod cli_transport_tests {
         write_frame, ConnectionInfo, Endpoint, SCHEMA_VERSION,
     };
 
-    // A real SDK call gives the error its private typed Deadline/RouteEnded
-    // source. Constructing an OutcomeUnknown with a string would not exercise
-    // the classifier used by the production client.
+    // The client tells a timeout from a closed route by the error's typed
+    // cause, which only the subc client library can set. So this test makes a
+    // real library call; an error built by hand from a string would not
+    // exercise that classification.
     #[tokio::test]
     async fn agents_sdk_timeout_is_unknown_and_daemon_route_closure_is_distinct() {
         for close_route in [false, true] {
