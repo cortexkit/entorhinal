@@ -33,3 +33,7 @@ rusqlite = { workspace = true }
 # Writer deadline tests advance a paused clock instead of timing SQLite work.
 tokio = { workspace = true, features = ["process", "test-util"] }
 subc-transport = { workspace = true }
+# The operator-confirmation end-to-end tests drive the real handler against
+# the library's in-process stand-in daemon. Test builds only: the release
+# binary's dependency graph never carries the stand-in.
+subc-client-rs = { workspace = true, features = ["test-support"] }

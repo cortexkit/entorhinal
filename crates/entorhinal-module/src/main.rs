@@ -137,49 +137,18 @@ fn main() -> std::process::ExitCode {
 
 #[tokio::main]
 async fn serve_module() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let connection = module_connection_file(std::env::args_os().skip(1))?;
-    let mut manifest = manifest();
-    // Unlike serve(), serve_with_handle() takes launch configuration explicitly.
-    // Preserve the supervisor's module identity rather than guessing it locally.
-    match std::env::var("SUBC_MODULE_ID") {
-        Ok(id) if !id.trim().is_empty() => manifest.module_id = id,
-        Ok(_) => return Err(subc_client_rs::SubcModuleError::EmptyModuleIdEnv.into()),
-        Err(std::env::VarError::NotPresent) => {}
-        Err(std::env::VarError::NotUnicode(value)) => {
-            return Err(subc_client_rs::SubcModuleError::NonUnicodeModuleIdEnv { value }.into());
-        }
-    }
     let handler = ProjectsHandler::new()?;
     let confirmer = Arc::new(agent_ops::DaemonConfirmer::new(
         handler.route_admissions.clone(),
     ));
     let handler = handler.with_operator_confirmer(confirmer.clone());
-    let (handle, serving) =
-        subc_client_rs::serve_with_handle(&connection, manifest, handler).await?;
+    // The SDK reads `--subc` and `SUBC_MODULE_ID` exactly as `serve` does, but
+    // returns the live handle. Install it before polling the serve future so no
+    // request can need a confirmation before the confirmer has a connection.
+    let (handle, serving) = subc_client_rs::serve_from_env_with_handle(manifest(), handler).await?;
     confirmer.set_module_handle(handle);
     serving.await?;
     Ok(())
-}
-
-fn module_connection_file(
-    args: impl IntoIterator<Item = std::ffi::OsString>,
-) -> Result<PathBuf, subc_client_rs::SubcModuleError> {
-    let mut args = args.into_iter();
-    while let Some(arg) = args.next() {
-        if arg == "--subc" {
-            return args
-                .next()
-                .map(PathBuf::from)
-                .ok_or(subc_client_rs::SubcModuleError::MissingSubcValue);
-        }
-        if let Some(path) = arg.to_str().and_then(|arg| arg.strip_prefix("--subc=")) {
-            if path.is_empty() {
-                return Err(subc_client_rs::SubcModuleError::MissingSubcValue);
-            }
-            return Ok(PathBuf::from(path));
-        }
-    }
-    Err(subc_client_rs::SubcModuleError::MissingSubcArg)
 }
 
 /// How long a fresh instance keeps retrying a lease that a predecessor still
@@ -1653,29 +1622,6 @@ fn unix_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn module_connection_file_preserves_supervisor_argument_forms() {
-        for args in [
-            vec!["--subc", "/tmp/connection.json"],
-            vec!["--subc=/tmp/connection.json"],
-        ] {
-            assert_eq!(
-                module_connection_file(args.into_iter().map(std::ffi::OsString::from)).unwrap(),
-                PathBuf::from("/tmp/connection.json")
-            );
-        }
-        assert!(matches!(
-            module_connection_file(Vec::<std::ffi::OsString>::new()),
-            Err(subc_client_rs::SubcModuleError::MissingSubcArg)
-        ));
-        for args in [vec!["--subc"], vec!["--subc="]] {
-            assert!(matches!(
-                module_connection_file(args.into_iter().map(std::ffi::OsString::from)),
-                Err(subc_client_rs::SubcModuleError::MissingSubcValue)
-            ));
-        }
-    }
 
     #[tokio::test]
     async fn route_admission_keeps_bind_handle_until_route_gone() {

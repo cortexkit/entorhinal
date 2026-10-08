@@ -1965,6 +1965,265 @@ mod tests {
                 assert_eq!(entry["agent_id"], ID);
             }
         }
+
+        /// The tests above answer the prompt through a stub confirmer. These
+        /// serve the real handler, with the confirmer production builds, over
+        /// the SDK's in-process stand-in daemon: the `operator.confirm` request,
+        /// the scripted answer and any withdrawal cross the SDK's real
+        /// connection and its real error mapping.
+        mod served {
+            use super::*;
+            use crate::agent_ops::DaemonConfirmer;
+            use subc_client_rs::test_support::{
+                BindIdentity, Frame, FrameType, ModuleHarness, OperatorAnswer, OperatorRefusal,
+                RouteTarget,
+            };
+
+            /// The stand-in's HELLO_ACK carries no storage descriptor, and the
+            /// real `on_hello_ack` then falls back to the operator's live store.
+            /// This wrapper gives it the fixture's scratch descriptor instead and
+            /// forwards every hook `ProjectsHandler` implements, unchanged.
+            struct Scratch {
+                handler: ProjectsHandler,
+                descriptor: StorageDescriptor,
+            }
+            #[async_trait]
+            impl ModuleHandler for Scratch {
+                async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+                    self.handler.handle(ctx, body).await
+                }
+                async fn on_hello_ack(&self, ack: &ModuleHelloAckBody) {
+                    let ack = ModuleHelloAckBody {
+                        storage: Some(serde_json::to_value(&self.descriptor).unwrap()),
+                        ..ack.clone()
+                    };
+                    self.handler.on_hello_ack(&ack).await;
+                }
+                async fn on_bind(&self, request: &RouteBindRequest) -> BindDecision {
+                    self.handler.on_bind(request).await
+                }
+                async fn on_route_gone(&self, handle: &RouteHandle) {
+                    self.handler.on_route_gone(handle).await;
+                }
+                async fn health(&self) -> HealthReport {
+                    self.handler.health().await
+                }
+            }
+
+            /// Serve a fresh handler over the fixture's store, which already
+            /// holds the `agent.cutover` marker, and bind one `Direct` route.
+            async fn start(
+                f: &mut Fixture,
+                answers: impl IntoIterator<Item = OperatorAnswer>,
+            ) -> (ModuleHarness, RouteHandle) {
+                // Disabled keeps the write local, so no log stand-in is needed.
+                state(f, "disabled");
+                // Release the fixture's store and its lease. The served
+                // handler's own `on_hello_ack` reopens the same file into the
+                // same shared slot, so the fixture's helpers read its writes.
+                f.handler.store.lock().unwrap().take();
+                let mut handler = ProjectsHandler::with_log_connector(
+                    "0123456789abcdef".into(),
+                    || 700,
+                    Arc::new(FailConnector::default()),
+                );
+                handler.store = f.handler.store.clone();
+                // Built as `serve_module` builds it: the confirmer shares the
+                // handler's route admissions and receives the live module
+                // handle before any request is served.
+                let confirmer = Arc::new(DaemonConfirmer::new(handler.route_admissions.clone()));
+                let handler = handler.with_operator_confirmer(confirmer.clone());
+                let descriptor = f.descriptor.clone();
+                let mut module = ModuleHarness::start(
+                    move |handle| {
+                        confirmer.set_module_handle(handle);
+                        Scratch {
+                            handler,
+                            descriptor,
+                        }
+                    },
+                    answers,
+                )
+                .await;
+                assert!(
+                    f.handler.store.lock().unwrap().is_some(),
+                    "the served handler must open the scratch store"
+                );
+                let route = module
+                    .bind_route(
+                        RouteBindRequest::new(
+                            RouteHandle::detached(DIRECT.0, DIRECT.1),
+                            RouteTarget::ToolProvider {
+                                module_id: MODULE_ID.into(),
+                            },
+                            BindIdentity::new("/tmp/project", "test", "ck-agents"),
+                        )
+                        .with_principal(Principal::Direct),
+                    )
+                    .await;
+                (module, route)
+            }
+
+            async fn create(module: &mut ModuleHarness, route: RouteHandle) -> Frame {
+                let body = json!({"method":"agent.create","params":new_request("served")});
+                let corr = module
+                    .send_request(route, serde_json::to_vec(&body).unwrap())
+                    .await;
+                tokio::time::timeout(Duration::from_secs(30), module.read_reply(route, corr))
+                    .await
+                    .expect("the served handler never replied")
+            }
+
+            /// The one confirm request the module sent, checked against the
+            /// exact summary and the caller's route; returns its correlation.
+            fn one_confirm(module: &ModuleHarness) -> u64 {
+                let requests: Vec<_> = module.confirm_requests().collect();
+                assert_eq!(requests.len(), 1, "{requests:?}");
+                let (corr, request) = &requests[0];
+                assert_eq!(
+                    request.summary,
+                    "create assistant agent \"Ada\" with tag \"helper\""
+                );
+                assert_eq!((request.route_channel, request.route_epoch), DIRECT);
+                *corr
+            }
+
+            fn cancels(module: &ModuleHarness) -> Vec<(u16, u32, u64, usize)> {
+                module
+                    .observed_frames()
+                    .iter()
+                    .filter(|frame| frame.header.ty == FrameType::Cancel)
+                    .map(|frame| {
+                        let h = &frame.header;
+                        (h.channel, h.epoch, h.corr, frame.body.len())
+                    })
+                    .collect()
+            }
+
+            fn error(reply: &Frame) -> Value {
+                assert_eq!(
+                    reply.header.ty,
+                    FrameType::Error,
+                    "{}",
+                    String::from_utf8_lossy(&reply.body)
+                );
+                serde_json::from_slice(&reply.body).unwrap()
+            }
+
+            #[tokio::test]
+            async fn confirmed_direct_create_commits_with_the_exact_summary_and_route() {
+                let mut f = Fixture::new("served-confirmed", Arc::new(FailConnector::default()));
+                let (mut module, route) = start(&mut f, [OperatorAnswer::Confirmed]).await;
+                let generation = f.store().generation().unwrap();
+                let reply = create(&mut module, route).await;
+                assert_eq!(
+                    reply.header.ty,
+                    FrameType::Response,
+                    "{}",
+                    String::from_utf8_lossy(&reply.body)
+                );
+                let agent = id(&reply.body);
+                one_confirm(&module);
+                module.shutdown().await;
+                assert!(
+                    cancels(&module).is_empty(),
+                    "a confirmed prompt is not withdrawn"
+                );
+                let journal = rows(&f);
+                assert_eq!(journal.len(), 1);
+                assert_eq!(journal[0].op, "agent.create");
+                assert_eq!(journal[0].principal.as_deref(), Some("direct"));
+                let payload: Value = serde_json::from_str(&journal[0].payload_json).unwrap();
+                assert_eq!(payload["operator_confirmed"], true);
+                assert!(f.store().generation().unwrap() > generation);
+                assert!(serde_json::to_string(&f.store().agent_snapshot().unwrap())
+                    .unwrap()
+                    .contains(&agent));
+            }
+
+            #[tokio::test]
+            async fn every_scripted_refusal_maps_to_its_code_and_writes_nothing() {
+                let declined = (
+                    "operator_declined",
+                    "the operator declined this write at the prompt",
+                );
+                let unavailable = (
+                    "operator_presence_unavailable",
+                    "operator confirmation is unavailable on this machine",
+                );
+                let refused = |refusal| OperatorAnswer::Refused {
+                    refusal,
+                    reason: "scripted refusal".into(),
+                };
+                for (answer, (code, message)) in [
+                    (refused(OperatorRefusal::Declined), declined),
+                    (refused(OperatorRefusal::PresenceUnavailable), unavailable),
+                    (refused(OperatorRefusal::SummaryInvalid), unavailable),
+                    (refused(OperatorRefusal::NotPermitted), unavailable),
+                    (
+                        OperatorAnswer::UnknownOp,
+                        (
+                            "operator_presence_unavailable",
+                            "this daemon does not support operator confirmation",
+                        ),
+                    ),
+                ] {
+                    let label = format!("{answer:?}");
+                    let mut f = Fixture::new("served-refused", Arc::new(FailConnector::default()));
+                    let (mut module, route) = start(&mut f, [answer]).await;
+                    let before = image(&f);
+                    let body = error(&create(&mut module, route).await);
+                    assert_eq!(
+                        (body["code"].as_str(), body["message"].as_str()),
+                        (Some(code), Some(message)),
+                        "{label}"
+                    );
+                    one_confirm(&module);
+                    module.shutdown().await;
+                    assert!(
+                        cancels(&module).is_empty(),
+                        "{label}: a refused prompt is not withdrawn"
+                    );
+                    assert_eq!(image(&f), before, "{label}");
+                    assert!(rows(&f).is_empty(), "{label}");
+                }
+            }
+
+            /// The harness cannot close a route, so this drives the other
+            /// withdrawal: the stand-in never answers and entorhinal's own
+            /// receipt-relative bound expires before the SDK's 290-second one.
+            #[tokio::test(start_paused = true)]
+            async fn unanswered_prompt_is_withdrawn_at_the_operator_bound() {
+                let mut f = Fixture::new("served-unanswered", Arc::new(FailConnector::default()));
+                let (mut module, route) = start(&mut f, [OperatorAnswer::NoAnswer]).await;
+                let before = image(&f);
+                let sent = Instant::now();
+                let body = json!({"method":"agent.create","params":new_request("served")});
+                let corr = module
+                    .send_request(route, serde_json::to_vec(&body).unwrap())
+                    .await;
+                let frame = module.next_frame().await.unwrap();
+                assert_eq!(
+                    (frame.header.channel, frame.header.ty),
+                    (0, FrameType::Request)
+                );
+                let confirm = one_confirm(&module);
+                tokio::time::advance(OPERATOR_BOUND + TIMER_TICK).await;
+                let body = error(&module.read_reply(route, corr).await);
+                assert_eq!(body["code"], "operator_declined");
+                // The SDK's own 290-second deadline would have answered
+                // operator_presence_unavailable; this proves entorhinal's bound won.
+                let waited = Instant::now() - sent;
+                assert!(
+                    waited >= OPERATOR_BOUND && waited < Duration::from_secs(290),
+                    "{waited:?}"
+                );
+                module.shutdown().await;
+                assert_eq!(cancels(&module), [(0, 0, confirm, 0)]);
+                assert_eq!(image(&f), before);
+                assert!(rows(&f).is_empty());
+            }
+        }
     }
 }
 
