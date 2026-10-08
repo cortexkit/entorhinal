@@ -108,6 +108,30 @@ cargo test --workspace
 Every CortexKit dependency comes from crates.io, so a fresh clone builds on its
 own.
 
+## Mutation proofs
+
+`mutations.toml` records independent breaks of costly, silent safety properties
+and the exact tests that must fail; CI uses `ckdev-mutate` 0.8.0 pinned to commons
+`46cc166b0df2edcfd14b3eb54ed6eeac588fed69` to check every catalogue, replay touched
+rows on pushes and PRs, replay all rows on main, and audit every package target
+nightly with `--broad`.
+
+```sh
+cargo install --locked --git https://github.com/cortexkit/commons --rev 46cc166b0df2edcfd14b3eb54ed6eeac588fed69 cortexkit-mutate
+ckdev-mutate check
+ckdev-mutate run --only admission-flow-call-site --report target/mutations/one.json
+ckdev-mutate run --all --report target/mutations/all.json
+```
+
+Copy anchors from current code and break guarded logic independently: prove
+exactly-once guards through the production path, use failure-message checks when
+needed, and plant a violation for every scan guard. Narrow broad catches or
+record a justified shared-property `hub`; tests must assert order and outcome,
+not elapsed time, with deadlines sized for clean CI only to stop hangs. Never
+edit or check out source during replay; investigate survivors as coverage
+findings rather than weakening a test or calling a mutant equivalent without a
+concrete code fact.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
