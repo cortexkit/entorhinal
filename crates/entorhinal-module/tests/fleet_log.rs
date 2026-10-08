@@ -10,6 +10,9 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+mod common;
+use common::ckdev_binary;
+
 /// A scratch home removed on drop, named per process and per call so
 /// parallel tests never share one.
 struct Scratch(PathBuf);
@@ -38,7 +41,8 @@ impl Drop for Scratch {
 }
 
 fn run_module(home: &Path, module_id: Option<&str>) -> std::process::Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ck-entorhinal"));
+    let binary = ckdev_binary(env!("CARGO_BIN_EXE_ck-entorhinal"));
+    let mut command = Command::new(binary);
     command
         .env_clear()
         .env("PATH", "/usr/bin:/bin")

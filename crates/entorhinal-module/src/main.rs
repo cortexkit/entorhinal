@@ -29,9 +29,9 @@ use subc_client_rs::{
 };
 use subc_protocol::{
     manifest::{
-        build_provenance_from_source, BuildGitShaSource, CapabilityDeclarations, Concurrency,
-        GitTreeState, ManagementOperation, ManagementOperationKind, ManifestProvenance,
-        ModuleManifest, ProviderRole,
+        build_provenance_from_source, BuildGitShaAbsenceReason, BuildGitShaSource,
+        CapabilityDeclarations, Concurrency, GitTreeState, ManagementOperation,
+        ManagementOperationKind, ManifestProvenance, ModuleManifest, ProviderRole,
     },
     scope::ScopeStamp,
     ModuleHelloAckBody, Principal, PROTOCOL_VERSION,
@@ -77,10 +77,10 @@ mod two_machine_acceptance;
 // `serve`, claim the module's identity against the daemon, and sit there
 // looking healthy while doing nothing the operator asked for.
 fn main() -> std::process::ExitCode {
-    // The user-facing command surface is `ck projects` and `ck workspaces`,
-    // dispatched by `ck` to `ck-projects` / `ck-workspaces` -- both symlinks to
+    // The user-facing command surface is `ck projects`, `ck workspaces` and `ck agents`,
+    // dispatched by `ck` to `ck-projects` / `ck-workspaces` / `ck-agents` -- symlinks to
     // this binary. argv[0] selects the face; the module identity (ck-entorhinal)
-    // never appears in an operator's vocabulary. One binary rather than three
+    // never appears in an operator's vocabulary. One binary rather than four
     // because the faces share every line of transport, rendering, and parse
     // machinery, and a shared binary cannot drift from itself.
     let face = cli::face_from_argv0(std::env::args().next().as_deref());
@@ -137,7 +137,17 @@ fn main() -> std::process::ExitCode {
 
 #[tokio::main]
 async fn serve_module() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    subc_client_rs::serve(manifest(), ProjectsHandler::new()?).await?;
+    let handler = ProjectsHandler::new()?;
+    let confirmer = Arc::new(agent_ops::DaemonConfirmer::new(
+        handler.route_admissions.clone(),
+    ));
+    let handler = handler.with_operator_confirmer(confirmer.clone());
+    // The SDK reads `--subc` and `SUBC_MODULE_ID` exactly as `serve` does, but
+    // returns the live handle. Install it before polling the serve future so no
+    // request can need a confirmation before the confirmer has a connection.
+    let (handle, serving) = subc_client_rs::serve_from_env_with_handle(manifest(), handler).await?;
+    confirmer.set_module_handle(handle);
+    serving.await?;
     Ok(())
 }
 
@@ -222,18 +232,24 @@ struct ProjectsHandler {
     /// What the daemon stamped on each route when it was bound. The daemon
     /// stamps it once, at `route.bind`, never per request, so it is recorded
     /// here and looked up for every request on that route.
-    route_admissions: Mutex<HashMap<RouteKey, RouteAdmission>>,
+    route_admissions: Arc<Mutex<HashMap<RouteKey, RouteAdmission>>>,
     /// Volatile reply token: never persisted in the request-key cache.
     incarnation: String,
     clock: fn() -> i64,
     commits: Arc<tokio::sync::Notify>,
     feed_waits: tokio::sync::Semaphore,
     feed_clock: Arc<dyn agent_reads::FeedClock>,
+    /// Unit tests shorten this policy; production uses the ten-second default.
+    lease_retry_budget: Duration,
     #[allow(dead_code)]
     log_client: log_client::LogClient,
     writer: Arc<tokio::sync::Mutex<()>>,
     catch_up_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     agent_id_draw: fn() -> Result<String, HandlerError>,
+    operator_confirmer: Arc<dyn agent_ops::OperatorConfirmer>,
+    confirmation_slot: Arc<Mutex<Option<agent_ops::ConfirmationSlot>>>,
+    #[cfg(test)]
+    confirmation_admission_barrier: Option<Arc<tokio::sync::Barrier>>,
     #[cfg(test)]
     shared_commit_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -244,6 +260,8 @@ struct RouteAdmission {
     principal: Option<Principal>,
     /// The flow whose scope the route was opened under, if any.
     flow_id: Option<String>,
+    /// Retain the SDK's connection identity until this admission is removed.
+    handle: Option<RouteHandle>,
 }
 
 impl RouteAdmission {
@@ -251,6 +269,7 @@ impl RouteAdmission {
         Self {
             principal,
             flow_id: scope.and_then(|stamp| stamp.attributes.flow_id.clone()),
+            handle: None,
         }
     }
 }
@@ -402,20 +421,28 @@ impl ProjectsHandler {
         clock: fn() -> i64,
         connector: Arc<dyn log_client::LogConnector>,
     ) -> Self {
+        let route_admissions = Arc::new(Mutex::new(HashMap::new()));
+        let operator_confirmer =
+            Arc::new(agent_ops::DaemonConfirmer::new(route_admissions.clone()));
         Self {
             store: Arc::new(Mutex::new(None)),
             health: Arc::new(HealthGauges::default()),
             liveness: Arc::new(Mutex::new(LivenessState::default())),
-            route_admissions: Mutex::new(HashMap::new()),
+            route_admissions,
             incarnation,
             clock,
             commits: Arc::new(tokio::sync::Notify::new()),
             feed_waits: tokio::sync::Semaphore::new(8),
             feed_clock: Arc::new(agent_reads::TokioFeedClock),
+            lease_retry_budget: LEASE_HELD_RETRY_BUDGET,
             log_client: log_client::LogClient::new(connector),
             writer: Arc::new(tokio::sync::Mutex::new(())),
             catch_up_task: Mutex::new(None),
             agent_id_draw: shared_write::draw_agent_id,
+            operator_confirmer,
+            confirmation_slot: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            confirmation_admission_barrier: None,
             #[cfg(test)]
             shared_commit_hook: None,
         }
@@ -438,12 +465,12 @@ impl ProjectsHandler {
 
     /// Whether a request on this route may run `method`. A flow-scoped route may
     /// not write at all. Project writes are admitted from `Direct` (the `ck`
-    /// faces) or the executive, as before. Agent identity writes are admitted only
-    /// from the executive (`reserved:prefrontal-core`), which relays the
-    /// operator's own changes after checking they come from the operator's
-    /// session. `Direct` is refused for them because every local process,
-    /// including an agent's shell, reaches entorhinal as `Direct`, so admitting
-    /// it would let any agent rewrite agent identity.
+    /// faces) or the executive, as before. Agent identity writes are admitted
+    /// here only from the executive (`reserved:prefrontal-core`): every local
+    /// process, including an agent's shell, reaches entorhinal as `Direct`.
+    /// The one way a `Direct` caller writes agent identity is `write_wait`,
+    /// which, for five methods only, asks the operator to approve the exact
+    /// write at a Touch ID prompt first. Nothing else skips this refusal.
     /// Enabling the identity log is reserved to an unscoped operator route.
     fn admit(&self, method: &str, key: RouteKey) -> Result<RouteAdmission, HandlerError> {
         let admission = self.admission_for(key);
@@ -500,13 +527,27 @@ impl ModuleHandler for ProjectsHandler {
     async fn on_bind(&self, request: &RouteBindRequest) -> BindDecision {
         self.route_admissions().insert(
             route_key(&request.handle),
-            RouteAdmission::from_bind(request.principal.clone(), request.scope.as_ref()),
+            RouteAdmission {
+                handle: Some(request.handle),
+                ..RouteAdmission::from_bind(request.principal.clone(), request.scope.as_ref())
+            },
         );
         BindDecision::accept()
     }
 
     async fn on_route_gone(&self, handle: &RouteHandle) {
-        self.route_admissions().remove(&route_key(handle));
+        let key = route_key(handle);
+        self.route_admissions().remove(&key);
+        if let Some(slot) = self
+            .confirmation_slot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            if slot.route == key {
+                slot.cancelled.send_replace(true);
+            }
+        }
     }
 
     async fn on_hello_ack(&self, ack: &ModuleHelloAckBody) {
@@ -529,14 +570,15 @@ impl ModuleHandler for ProjectsHandler {
                 // HELLO_ACK handler and the health reply stay prompt.
                 tracing::warn!(
                     target: "store",
-                    "opening projects storage: {error}; retrying for up to {}s",
-                    LEASE_HELD_RETRY_BUDGET.as_secs()
+                    "opening projects storage: {error}; retrying for up to {:.1}s",
+                    self.lease_retry_budget.as_secs_f64()
                 );
                 self.health.store_opening.store(true, Ordering::Relaxed);
                 let store = Arc::clone(&self.store);
                 let health = Arc::clone(&self.health);
+                let retry_budget = self.lease_retry_budget;
                 tokio::spawn(async move {
-                    let outcome = retry_open_while_lease_held(&descriptor).await;
+                    let outcome = retry_open_while_lease_held(&descriptor, retry_budget).await;
                     health.store_opening.store(false, Ordering::Relaxed);
                     install_store(&store, &health, outcome);
                 });
@@ -1408,10 +1450,27 @@ fn manifest() -> ModuleManifest {
     .build()
 }
 
-/// Build facts embedded by `build.rs`. A revision from a dirty tree is declined
-/// with a reason, and a build with no git (a source tarball) says so, rather
-/// than declaring a revision that does not describe the running code.
+/// Build facts embedded by `build.rs`. Debug builds intentionally omit a git
+/// stamp and explain that provenance is stamped only for release builds. A
+/// revision from a dirty release tree is declined with a reason, while a source
+/// tarball reports that Git is unavailable.
 fn declared_provenance() -> Option<ManifestProvenance> {
+    if option_env!("ENTORHINAL_BUILD_PROFILE").is_none()
+        && option_env!("ENTORHINAL_BUILD_REV").is_none()
+    {
+        return Some(
+            ManifestProvenance::new()
+                .with_build_git_sha_absence_reason(Some(
+                    BuildGitShaAbsenceReason::ForwardCompatibleUnknown(
+                        "provenance_stamped_only_in_release_builds".to_string(),
+                    ),
+                ))
+                .with_wire_crate_version(Some(
+                    subc_protocol::SUBC_PROTOCOL_CRATE_VERSION.to_string(),
+                )),
+        );
+    }
+
     let source = match (
         option_env!("ENTORHINAL_BUILD_REV"),
         option_env!("ENTORHINAL_BUILD_TREE"),
@@ -1446,13 +1505,13 @@ fn agent_operation_description(method: &str) -> &'static str {
         "agent.fleet_identity" => "List live agents with their project and workspace placement for the fleet view.",
         "agent.snapshot" => "Read every agent and name claim at one generation, to seed a copy.",
         "agent.changes" => "Read identity changes after a cursor, optionally waiting up to 25 s for the next one.",
-        "agent.create" => "Create an agent. Accepted only from the executive.",
-        "agent.rename" => "Rename an agent. Accepted only from the executive.",
-        "agent.update_tag" => "Change an agent's tag. Accepted only from the executive.",
-        "agent.set_labels" => "Replace an agent's labels. Accepted only from the executive.",
+        "agent.create" => "Create an agent through the executive, or Direct with operator confirmation.",
+        "agent.rename" => "Rename an agent through the executive, or Direct with operator confirmation.",
+        "agent.update_tag" => "Change an agent's tag through the executive, or Direct with operator confirmation.",
+        "agent.set_labels" => "Replace an agent's labels through the executive, or Direct with operator confirmation.",
         "agent.set_avatar" => "Set an agent's avatar. Accepted only from the executive.",
         "agent.set_github_identity" => "Bind or clear an agent's GitHub identity. Accepted only from the executive.",
-        "agent.dispose" => "Retire an agent; its id stays reserved. Accepted only from the executive.",
+        "agent.dispose" => "Retire an agent; its id stays reserved. Executive or Direct with operator confirmation.",
         "agent.merge" => "Merge one agent into another and retire the source. Accepted only from the executive.",
         "agent.import" => "Import the executive's agent registry once, at cutover. Accepted only from the executive.",
         _ => "",
@@ -1531,16 +1590,18 @@ fn enable_root_records(store: &mut RegistryStore) {
 
 /// Retries the open with doubling delays while the only obstacle is a lease
 /// a predecessor still holds. Any other error, and a hold that outlasts the
-/// budget, end the retry with that error.
+/// budget, end the retry with that error. The budget is supplied by the handler
+/// so tests can exercise expiry without waiting for the production interval.
 async fn retry_open_while_lease_held(
     descriptor: &StorageDescriptor,
+    retry_budget: Duration,
 ) -> Result<RegistryStore, String> {
     let started = Instant::now();
     let mut delay = LEASE_HELD_RETRY_FIRST_DELAY;
     loop {
         tokio::time::sleep(delay).await;
         match RegistryStore::open(descriptor) {
-            Err(error) if error.is_lease_held() && started.elapsed() < LEASE_HELD_RETRY_BUDGET => {
+            Err(error) if error.is_lease_held() && started.elapsed() < retry_budget => {
                 delay = (delay * 2).min(LEASE_HELD_RETRY_MAX_DELAY);
             }
             outcome => {
@@ -1584,6 +1645,28 @@ fn unix_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn route_admission_keeps_bind_handle_until_route_gone() {
+        let handler = ProjectsHandler::new().unwrap();
+        let handle = RouteHandle::detached(7, 3);
+        let request = RouteBindRequest::new(
+            handle,
+            subc_protocol::RouteTarget::ToolProvider {
+                module_id: MODULE_ID.into(),
+            },
+            subc_protocol::BindIdentity::new(PathBuf::from("/tmp/project"), "test", "bind"),
+        )
+        .with_principal(Principal::Direct);
+        handler.on_bind(&request).await;
+        let key = route_key(&handle);
+        let admission = handler.admission_for(key);
+        assert_eq!(admission.handle, Some(handle));
+        assert!(matches!(admission.principal, Some(Principal::Direct)));
+        handler.on_route_gone(&handle).await;
+        assert!(!handler.route_admissions().contains_key(&key));
+        assert!(handler.admission_for(key).handle.is_none());
+    }
 
     pub(super) fn reserved(module_id: &str) -> Principal {
         Principal::Reserved {
@@ -1797,11 +1880,17 @@ mod tests {
         }
     }
 
+    /// A fresh store directory per call. Parallel tests often share a label and
+    /// start in the same millisecond, so the name also carries a per-process
+    /// counter; without it two tests open one store and the second fails on
+    /// the first's writer lease.
     pub(super) fn scratch_descriptor(name: &str) -> (PathBuf, StorageDescriptor) {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "entorhinal-{name}-{}-{}",
+            "entorhinal-{name}-{}-{}-{}",
             std::process::id(),
-            unix_millis()
+            unix_millis(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let descriptor = StorageDescriptor {
@@ -2608,7 +2697,8 @@ mod tests {
     async fn open_retries_while_a_predecessor_still_holds_the_lease() {
         let (dir, descriptor) = scratch_descriptor("lease-held-then-released");
         let predecessor = RegistryStore::open(&descriptor).expect("predecessor opens");
-        let handler = ProjectsHandler::new().unwrap();
+        let mut handler = ProjectsHandler::new().unwrap();
+        handler.lease_retry_budget = Duration::from_secs(2);
 
         handler.on_hello_ack(&hello_ack(&descriptor)).await;
         let during = handler.health().await;
@@ -2646,16 +2736,11 @@ mod tests {
     async fn open_gives_up_on_a_lease_held_past_the_budget() {
         let (dir, descriptor) = scratch_descriptor("lease-held-past-budget");
         let _other_writer = RegistryStore::open(&descriptor).expect("other writer opens");
-        let handler = ProjectsHandler::new().unwrap();
+        let mut handler = ProjectsHandler::new().unwrap();
+        handler.lease_retry_budget = Duration::from_millis(300);
 
-        let started = Instant::now();
         handler.on_hello_ack(&hello_ack(&descriptor)).await;
-        wait_until_settled(&handler, LEASE_HELD_RETRY_BUDGET + Duration::from_secs(3)).await;
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed >= LEASE_HELD_RETRY_BUDGET,
-            "gave up before the budget: {elapsed:?}"
-        );
+        wait_until_settled(&handler, Duration::from_secs(3)).await;
         let after = handler.health().await;
         assert_eq!(after.status, HealthStatus::Failing, "{after:?}");
         assert!(handler.store.lock().unwrap().is_none());

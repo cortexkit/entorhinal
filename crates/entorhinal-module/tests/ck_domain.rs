@@ -1,4 +1,4 @@
-//! `ck projects` and `ck workspaces` reach this binary only through the ck
+//! `ck projects`, `ck workspaces` and `ck agents` reach this binary only through the ck
 //! dispatcher's domain handshake: `ck-<name> --ck-domain` must exit 0 and print
 //! exactly one headline line within 2 seconds, or ck refuses the command. The
 //! face comes from argv[0], so the test calls the real binary through a symlink
@@ -13,47 +13,33 @@
 //! hang.
 #![cfg(unix)]
 
+use std::os::unix::process::CommandExt;
 use std::{
+    ffi::OsStr,
     io::Read,
-    path::PathBuf,
     process::{Command, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
+
+mod common;
+use common::ckdev_binary;
 
 /// Only stops a hang: a handshake that opened the store or waited on a daemon
 /// would block here instead of answering.
 const HANG_GUARD: Duration = Duration::from_secs(30);
 
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "ck-entorhinal-ck-domain-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&path).expect("create scratch dir");
-        Self(path)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// Runs the binary through a symlink named `face` (the binary picks its role
-/// from the name it was run as), with an empty environment: no HOME, no XDG
-/// directories and no daemon connection file to find.
+/// Runs the binary under its `ckdev-` dev name, with an empty environment and
+/// no daemon connection file to find.
+///
+/// The executable is a `ckdev-entorhinal` hard link, and argv[0] is the face's
+/// dev name (`ckdev-projects`, ...). Both matter: the binary picks its face from
+/// argv[0], and macOS's process list shows argv[0], so a test copy must never
+/// carry a `ck-` name there, where it would look like a production binary.
 fn run_as(face: &str) -> (std::process::ExitStatus, String) {
-    let scratch = Scratch::new();
-    let link = scratch.0.join(face);
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_ck-entorhinal"), &link).unwrap();
-    let mut child = Command::new(&link)
+    let binary = ckdev_binary(env!("CARGO_BIN_EXE_ck-entorhinal"));
+    let dev_face = face.replacen("ck-", "ckdev-", 1);
+    let mut child = Command::new(&binary)
+        .arg0(OsStr::new(&dev_face))
         .arg("--ck-domain")
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
@@ -87,6 +73,7 @@ fn operator_faces_answer_the_ck_domain_handshake_with_one_headline() {
     for (face, headline) in [
         ("ck-projects", "ck projects"),
         ("ck-workspaces", "ck workspaces"),
+        ("ck-agents", "ck agents"),
     ] {
         let (status, stdout) = run_as(face);
         assert!(status.success(), "{face} --ck-domain must exit 0: {status}");

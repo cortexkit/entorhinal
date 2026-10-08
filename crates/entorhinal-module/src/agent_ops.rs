@@ -1,5 +1,6 @@
 //! Serves agent identity mutations. Who may call them is decided in
-//! `ProjectsHandler::admit`; this module only routes an admitted request to
+//! `ProjectsHandler::admit`, or by the served path's operator confirmation;
+//! this module routes admitted requests to
 //! `entorhinal-core`, which owns request decoding, request-key caching, the
 //! one-time import that hands agent identity over from core, and every
 //! identity rule.
@@ -7,7 +8,154 @@
 use entorhinal_core::agent::AgentMutationError;
 use serde_json::Value;
 
-use super::{HandlerError, ProjectsHandler};
+use super::RouteKey;
+use super::{HandlerError, ProjectsHandler, RouteAdmission};
+use async_trait::async_trait;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, OnceLock},
+};
+use subc_client_rs::{ModuleHandle, OperatorConfirmError as SdkConfirmError};
+
+pub(super) const CONFIRMABLE_METHODS: &[&str] = &[
+    "agent.create",
+    "agent.rename",
+    "agent.dispose",
+    "agent.update_tag",
+    "agent.set_labels",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OperatorConfirmError {
+    Declined,
+    PresenceUnavailable,
+    Unsupported,
+}
+
+#[async_trait]
+pub(super) trait OperatorConfirmer: Send + Sync {
+    async fn confirm_operator(
+        &self,
+        summary: &str,
+        route: RouteKey,
+    ) -> Result<(), OperatorConfirmError>;
+}
+
+/// Uses the serving connection and the caller's live bind handle. The channel
+/// and epoch alone cannot recreate the SDK's private connection identity.
+pub(super) struct DaemonConfirmer {
+    module: OnceLock<ModuleHandle>,
+    admissions: Arc<Mutex<HashMap<RouteKey, RouteAdmission>>>,
+}
+
+impl DaemonConfirmer {
+    pub(super) fn new(admissions: Arc<Mutex<HashMap<RouteKey, RouteAdmission>>>) -> Self {
+        Self {
+            module: OnceLock::new(),
+            admissions,
+        }
+    }
+
+    /// Install before polling the serve future, so no request can arrive before
+    /// its confirmation connection is ready.
+    pub(super) fn set_module_handle(&self, handle: ModuleHandle) {
+        assert!(self.module.set(handle).is_ok(), "module handle already set");
+    }
+}
+
+#[async_trait]
+impl OperatorConfirmer for DaemonConfirmer {
+    async fn confirm_operator(
+        &self,
+        summary: &str,
+        route: RouteKey,
+    ) -> Result<(), OperatorConfirmError> {
+        let module = self.module.get().ok_or(OperatorConfirmError::Unsupported)?;
+        let handle = self
+            .admissions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&route)
+            .and_then(|admission| admission.handle)
+            .ok_or(OperatorConfirmError::Declined)?;
+        // Await directly: the outer deadline or route closure must drop the
+        // SDK future, which withdraws the daemon's outstanding prompt.
+        map_operator_confirmation(module.confirm_operator(summary, &handle).await)
+    }
+}
+
+fn map_operator_confirmation(
+    result: Result<(), SdkConfirmError>,
+) -> Result<(), OperatorConfirmError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(SdkConfirmError::Declined) => Err(OperatorConfirmError::Declined),
+        Err(SdkConfirmError::Unsupported) => Err(OperatorConfirmError::Unsupported),
+        // The SDK folds transport failures, connection loss and malformed replies
+        // into PresenceUnavailable. Unknown future variants must also refuse.
+        Err(_) => Err(OperatorConfirmError::PresenceUnavailable),
+    }
+}
+
+impl From<OperatorConfirmError> for HandlerError {
+    fn from(error: OperatorConfirmError) -> Self {
+        let (code, message) = match error {
+            OperatorConfirmError::Declined => (
+                "operator_declined",
+                "the operator declined this write at the prompt",
+            ),
+            OperatorConfirmError::PresenceUnavailable => (
+                "operator_presence_unavailable",
+                "operator confirmation is unavailable on this machine",
+            ),
+            OperatorConfirmError::Unsupported => (
+                "operator_presence_unavailable",
+                "this daemon does not support operator confirmation",
+            ),
+        };
+        HandlerError::new(code, message)
+    }
+}
+
+pub(super) struct ConfirmationSlot {
+    pub route: RouteKey,
+    pub cancelled: tokio::sync::watch::Sender<bool>,
+}
+
+/// Exclusion lasts through the write, not just through the presence prompt.
+/// Dropping an abandoned request releases it without trusting a late answer.
+pub(super) struct ConfirmationGuard {
+    slot: Arc<Mutex<Option<ConfirmationSlot>>>,
+    pub cancelled: tokio::sync::watch::Receiver<bool>,
+}
+impl ConfirmationGuard {
+    pub fn take(
+        slot: &Arc<Mutex<Option<ConfirmationSlot>>>,
+        route: RouteKey,
+    ) -> Result<Self, HandlerError> {
+        let mut current = slot.lock().unwrap_or_else(|e| e.into_inner());
+        if current.is_some() {
+            return Err(HandlerError::new(
+                "operator_confirmation_busy",
+                "another operator confirmation is outstanding",
+            ));
+        }
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        *current = Some(ConfirmationSlot {
+            route,
+            cancelled: tx,
+        });
+        Ok(Self {
+            slot: slot.clone(),
+            cancelled: rx,
+        })
+    }
+}
+impl Drop for ConfirmationGuard {
+    fn drop(&mut self) {
+        self.slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+    }
+}
 
 pub(super) const MUTATING_METHODS: &[&str] = &[
     "agent.create",
@@ -32,6 +180,11 @@ impl From<AgentMutationError> for HandlerError {
 }
 
 impl ProjectsHandler {
+    // Serving installs the daemon connection; tests can install prompt stubs.
+    pub(super) fn with_operator_confirmer(mut self, confirmer: Arc<dyn OperatorConfirmer>) -> Self {
+        self.operator_confirmer = confirmer;
+        self
+    }
     /// Called only after `admit`, including on retries. Delegate the body intact
     /// so core's deny_unknown_fields runs before its request-key cache: a retry
     /// cannot bypass decoding or restore a removed residence/persona field.
@@ -95,6 +248,38 @@ mod tests {
     const INCARNATION: &str = "0123456789abcdef";
     const A: &str = "agent_0000000000000001";
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn daemon_confirmation_mapping_accepts_only_confirmed() {
+        assert_eq!(map_operator_confirmation(Ok(())), Ok(()));
+        // PresenceUnavailable includes transport, protocol and unexpected
+        // replies: the SDK exposes no separate error variants for those cases.
+        for (error, expected) in [
+            (SdkConfirmError::Declined, OperatorConfirmError::Declined),
+            (
+                SdkConfirmError::PresenceUnavailable,
+                OperatorConfirmError::PresenceUnavailable,
+            ),
+            (
+                SdkConfirmError::SummaryInvalid,
+                OperatorConfirmError::PresenceUnavailable,
+            ),
+            (
+                SdkConfirmError::NotPermitted,
+                OperatorConfirmError::PresenceUnavailable,
+            ),
+            (
+                SdkConfirmError::Unsupported,
+                OperatorConfirmError::Unsupported,
+            ),
+        ] {
+            assert_eq!(
+                map_operator_confirmation(Err(error)),
+                Err(expected),
+                "{error:?}"
+            );
+        }
+    }
 
     // Import sources are built with core's own migrations, copied byte for byte,
     // so the handler reads the schema a real core store has. The bad-row cases

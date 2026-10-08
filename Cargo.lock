@@ -805,9 +805,9 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "subc-client-rs"
-version = "0.26.1"
+version = "0.26.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d671a838c7777805070da19080045ef5149882636b3bd8193c5e913a590c7315"
+checksum = "ec05915386b3fac20f7e8b7536c7b0f7d9865f15b1789bfce348f5fa8529c017"
 dependencies = [
  "async-trait",
  "serde",
@@ -844,9 +844,9 @@ dependencies = [
 
 [[package]]
 name = "subc-protocol"
-version = "0.29.0"
+version = "0.29.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d65caff6df13f6ccbc6fc855e9826af4cbcd13fcaf26ae9ce26871ed4429e471"
+checksum = "690bf351aca00d04ee2a491571b645948173568cfd5e0493c44f91771e536440"
 dependencies = [
  "serde",
  "serde_json",

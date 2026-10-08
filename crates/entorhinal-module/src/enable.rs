@@ -477,6 +477,7 @@ mod tests {
                     RouteAdmission {
                         principal: Some(principal),
                         flow_id: None,
+                        handle: None,
                     },
                 );
             }

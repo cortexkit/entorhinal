@@ -1,0 +1,10 @@
+# The bundled SQLite counts every allocation in one process-wide, mutex-guarded
+# total. Tests run many stores in parallel threads of one process, so that
+# mutex is contended on every allocation and burns kernel time: on this repo's
+# two large test binaries, parallel runs spent roughly twice the system time
+# of serial ones, and other fleet repos measured far worse on many-core Linux.
+# Entorhinal and its store libraries never read the total
+# (sqlite3_memory_used) or set a heap limit, so turning the counting off
+# changes no behaviour. A test pins that the flag reached the build.
+[env]
+LIBSQLITE3_FLAGS = "-DSQLITE_DEFAULT_MEMSTATUS=0"

@@ -1,11 +1,11 @@
 //! Operator surface for the registry: `ck projects <verb>` and
-//! `ck workspaces <verb>`.
+//! `ck workspaces <verb>` and `ck agents <verb>`.
 //!
-//! One binary, three names. `ck` dispatches unknown domains to `ck-<domain>`
-//! on PATH, and `ck-projects` / `ck-workspaces` are symlinks to this module
+//! One binary, four names. `ck` dispatches unknown domains to `ck-<domain>`
+//! on PATH, and `ck-projects` / `ck-workspaces` / `ck-agents` are symlinks to this module
 //! binary; argv[0] selects the face. The module id (entorhinal) is
 //! infrastructure and never part of the operator vocabulary -- a user thinks
-//! in projects and workspaces, not in the anatomy of the module serving them.
+//! in projects, workspaces and agents, not in the anatomy of the module serving them.
 //!
 //! The verbs live in the module binary rather than a sibling `-admin` binary
 //! because a second binary would leave this one receiving misdirected
@@ -20,6 +20,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -35,6 +36,10 @@ pub enum Face {
     Projects,
     /// `ck-workspaces`: workspace listing and project placement.
     Workspaces,
+    /// `ck-agents`: reads agents, and creates, renames, retires, retags and
+    /// relabels them; each write lands only after the operator approves it at
+    /// a Touch ID prompt.
+    Agents,
     /// `ck-entorhinal`: the supervised module itself. Serves; its only
     /// operator surface is `--version`/`--help`, which point at the faces.
     Entorhinal,
@@ -44,15 +49,25 @@ pub enum Face {
 /// defaults to the module face: the daemon spawns this binary by its real
 /// path, and a wrapper that renames it should get the serving default, not a
 /// CLI that refuses to serve.
+///
+/// The fleet rule names test copies `ckdev-<name>`. macOS reports argv[0] in
+/// `ps`, so a test copy must recognize its safe dev name as the face it stands
+/// for. Production continues to start the binary under its `ck-` name.
 pub fn face_from_argv0(argv0: Option<&str>) -> Face {
     let stem = argv0
         .map(Path::new)
         .and_then(Path::file_stem)
         .and_then(|stem| stem.to_str())
         .unwrap_or("");
-    match stem {
-        "ck-projects" => Face::Projects,
-        "ck-workspaces" => Face::Workspaces,
+    // Only a `ck-` or `ckdev-` prefixed name selects a CLI face. A bare
+    // `projects` stays the module default, as it always was.
+    let face = stem
+        .strip_prefix("ckdev-")
+        .or_else(|| stem.strip_prefix("ck-"));
+    match face {
+        Some("projects") => Face::Projects,
+        Some("workspaces") => Face::Workspaces,
+        Some("agents") => Face::Agents,
         _ => Face::Entorhinal,
     }
 }
@@ -122,7 +137,7 @@ pub fn parse(face: Face, arguments: &[String]) -> Invocation {
     if arguments.len() == 1 && arguments[0] == "--ck-domain" {
         return match face {
             Face::Entorhinal => Invocation::Refuse(
-                "ck-entorhinal is a module, not a ck domain; the domains are ck projects and ck workspaces"
+                "ck-entorhinal is a module, not a ck domain; the domains are ck projects, ck workspaces and ck agents"
                     .to_string(),
             ),
             _ => Invocation::Report(usage(face).lines().next().unwrap_or_default().to_string()),
@@ -163,6 +178,16 @@ pub fn parse(face: Face, arguments: &[String]) -> Invocation {
                 None => return Invocation::Refuse("--subc needs a path".to_string()),
             },
             "--json" => json = true,
+            "--role" | "--tag" | "--project" | "--workspace" | "--supervisor" | "--request-key"
+                if face == Face::Agents =>
+            {
+                let Some(value) = rest.next().filter(|value| !value.is_empty()) else {
+                    return Invocation::Refuse(format!("{argument} needs a value"));
+                };
+                args.push(argument.clone());
+                args.push(value.clone());
+            }
+            "--none" if face == Face::Agents => args.push(argument.clone()),
             "--project" | "--label"
                 if face == Face::Projects && verb.as_deref() == Some("attach") =>
             {
@@ -220,6 +245,7 @@ fn binary_name(face: Face) -> &'static str {
     match face {
         Face::Projects => "ck-projects",
         Face::Workspaces => "ck-workspaces",
+        Face::Agents => "ck-agents",
         Face::Entorhinal => "ck-entorhinal",
     }
 }
@@ -278,6 +304,26 @@ usage: ck workspaces <verb> [args] [--subc <connection file>] [--json]
 
 projects themselves live under 'ck projects'"
             .to_string(),
+        Face::Agents => "\
+ck agents — operator-confirmed agent identities
+
+usage: ck agents <verb> [args] [--subc <connection file>] [--json]
+
+  create <name> --role <assistant|workspace-head|head|hiree> --tag <text>
+                 [--project <id>] [--workspace <id>] [--supervisor <agent>]
+  rename <agent> <new-name>
+  retire <agent>
+  tag <agent> <text>
+  labels <agent> <label>...   replace the whole label set
+  labels <agent> --none      clear the label set
+  list [--project <id>] [--workspace <id>]
+  show <agent>               a live digest or a retired/merged identity
+
+  <agent> is an id or a live name, optionally workspace/name
+  --request-key <key>        reuse a write's key for a safe retry
+  --subc <path>              daemon connection file; defaults to discovery
+  --json                     raw response instead of the rendered form"
+            .to_string(),
         Face::Entorhinal => "\
 ck-entorhinal — the registry module (supervised by the subc daemon)
 
@@ -287,6 +333,7 @@ surface is:
   ck projects      list, register, resolve, remove, add-root, remove-root,
                    attach, owned-remotes, approve, unapprove, trust, verify, log
   ck workspaces    list, assign, set-root, clear-root
+  ck agents        create, rename, retire, tag, labels, list, show
 
 With no arguments it runs as the supervised module, which is how the daemon
 spawns it."
@@ -338,7 +385,7 @@ pub fn run(command: Command) -> ExitCode {
         },
     };
 
-    match call(&connection, &method, params) {
+    match call(&connection, &command, &method, params) {
         Ok(value) => {
             render(&command, &value);
             ExitCode::SUCCESS
@@ -358,6 +405,9 @@ pub fn run(command: Command) -> ExitCode {
 /// reads like the registry rejecting the request rather than the CLI addressing
 /// it wrongly.
 fn build(command: &Command) -> Result<(String, Value), String> {
+    if command.face == Face::Agents {
+        return build_agents(command);
+    }
     let need = |index: usize, what: &str| -> Result<String, String> {
         command
             .args
@@ -595,6 +645,414 @@ fn build(command: &Command) -> Result<(String, Value), String> {
     })
 }
 
+fn agent_write(method: &str) -> bool {
+    matches!(
+        method,
+        "agent.create" | "agent.rename" | "agent.dispose" | "agent.update_tag" | "agent.set_labels"
+    )
+}
+
+fn build_agents(command: &Command) -> Result<(String, Value), String> {
+    let method = match command.verb.as_str() {
+        "create" => "agent.create",
+        "rename" => "agent.rename",
+        "retire" => "agent.dispose",
+        "tag" => "agent.update_tag",
+        "labels" => "agent.set_labels",
+        "list" => "agent.list",
+        "show" => "agent.resolve",
+        other => return Err(format!("unknown verb '{other}'\n\n{}", usage(Face::Agents))),
+    };
+    let mut flags = std::collections::BTreeMap::new();
+    let mut positional = Vec::new();
+    let mut rest = command.args.iter();
+    while let Some(arg) = rest.next() {
+        if !arg.starts_with("--") {
+            positional.push(arg.clone());
+            continue;
+        }
+        let allowed = match arg.as_str() {
+            "--request-key" => agent_write(method),
+            "--role" | "--tag" | "--supervisor" => command.verb == "create",
+            "--project" | "--workspace" => matches!(command.verb.as_str(), "create" | "list"),
+            "--none" => command.verb == "labels",
+            _ => false,
+        };
+        if !allowed {
+            return Err(format!("{} does not accept {arg}", command.verb));
+        }
+        let value = if arg == "--none" {
+            String::new()
+        } else {
+            rest.next()
+                .filter(|value| !value.is_empty())
+                .cloned()
+                .ok_or_else(|| format!("{arg} needs a value"))?
+        };
+        if flags.insert(arg.as_str(), value).is_some() {
+            return Err(format!("{arg} may only be given once"));
+        }
+    }
+    let count_ok = match command.verb.as_str() {
+        "list" => positional.is_empty(),
+        "rename" | "tag" => positional.len() == 2,
+        "labels" if flags.contains_key("--none") => positional.len() == 1,
+        "labels" => positional.len() >= 2,
+        _ => positional.len() == 1,
+    };
+    if !count_ok {
+        return Err(format!(
+            "{} needs the arguments shown below (labels --none cannot include labels)\n\n{}",
+            command.verb,
+            usage(Face::Agents)
+        ));
+    }
+    let mut params = json!({});
+    for (flag, field) in [
+        ("--project", "project_id"),
+        ("--workspace", "workspace_id"),
+        ("--supervisor", "supervisor_agent_id"),
+    ] {
+        if let Some(value) = flags.get(flag) {
+            params[field] = json!(value);
+        }
+    }
+    match command.verb.as_str() {
+        "create" => {
+            let role = flags.get("--role").ok_or("create requires --role")?;
+            if !matches!(
+                role.as_str(),
+                "assistant" | "workspace-head" | "head" | "hiree"
+            ) {
+                return Err("--role must be assistant, workspace-head, head or hiree".into());
+            }
+            let tag = flags.get("--tag").ok_or("create requires --tag")?;
+            params["name"] = json!(positional[0]);
+            params["role"] = json!(role.replace('-', "_"));
+            params["tag"] = json!(tag);
+        }
+        "list" => (),
+        verb => {
+            params["agent_id"] = json!(positional[0]);
+            match verb {
+                "rename" => params["name"] = json!(positional[1]),
+                "tag" => params["tag"] = json!(positional[1]),
+                "labels" => params["labels"] = json!(&positional[1..]),
+                _ => (),
+            }
+        }
+    }
+    if agent_write(method) {
+        let key = match flags.get("--request-key") {
+            Some(key) => key.clone(),
+            None => {
+                let mut bytes = [0u8; 16];
+                getrandom::getrandom(&mut bytes)
+                    .map_err(|error| format!("draw request key: {error}"))?;
+                bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+            }
+        };
+        params["request_key"] = json!(key);
+        params["actor"] = json!("ck-agents");
+    }
+    Ok((method.into(), params))
+}
+
+fn is_agent_id(token: &str) -> bool {
+    token.strip_prefix("agent_").is_some_and(|hex| {
+        matches!(hex.len(), 8 | 16)
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+#[derive(Debug)]
+enum CallFailure {
+    Refused { code: String, message: String },
+    Transport(String),
+    Unknown(String),
+}
+
+impl CallFailure {
+    fn display(self) -> (u8, String) {
+        match self {
+            Self::Refused { code, message } => {
+                let explanation = match code.as_str() {
+                    "operator_declined" => "the operator declined this write at the prompt",
+                    "operator_presence_unavailable" => "operator confirmation is unavailable; use a daemon and machine that support it",
+                    "operator_confirmation_busy" => "another operator confirmation is outstanding; wait for it to finish",
+                    "operator_approval_stale" => "the identity changed after approval; review it and try again",
+                    "operator_summary_too_long" => "shorten the tag, name or label set",
+                    "authority_not_cut_over" => "agent identity authority has not been cut over to this registry",
+                    _ => "",
+                };
+                let message = if message.is_empty() {
+                    explanation
+                } else {
+                    &message
+                };
+                (EXIT_REFUSED, format!("{code}: {message}"))
+            }
+            Self::Transport(message) | Self::Unknown(message) => (EXIT_TRANSPORT, message),
+        }
+    }
+}
+
+fn call_failure(error: subc_client_rs::CallError) -> CallFailure {
+    if error.outcome_cause() == Some(subc_client_rs::OutcomeUnknownCause::Deadline) {
+        return CallFailure::Unknown("transport timeout: the write outcome is unknown".into());
+    }
+    if let Some(reason) = error.close_reason() {
+        return CallFailure::Transport(format!(
+            "daemon reported route closure: {reason:?}; {error}"
+        ));
+    }
+    match error {
+        subc_client_rs::CallError::Module(body) => CallFailure::Refused {
+            code: body.code,
+            message: body.message,
+        },
+        subc_client_rs::CallError::OutcomeUnknown(_) => {
+            CallFailure::Unknown(format!("call: {error}"))
+        }
+        _ => CallFailure::Transport(format!("call: {error}")),
+    }
+}
+
+/// This seam takes the actual SDK options, so fixtures observe the timeout
+/// passed to transport rather than a second copy of the timeout policy.
+#[async_trait::async_trait]
+trait CliCaller: Sync {
+    async fn call(
+        &self,
+        method: &str,
+        params: Value,
+        options: subc_client_rs::CallOptions,
+    ) -> Result<Value, CallFailure>;
+}
+
+#[async_trait::async_trait]
+impl CliCaller for subc_client_rs::SubcConsumer {
+    async fn call(
+        &self,
+        method: &str,
+        params: Value,
+        options: subc_client_rs::CallOptions,
+    ) -> Result<Value, CallFailure> {
+        let body = serde_json::to_vec(&json!({"method":method,"params":params}))
+            .map_err(|error| CallFailure::Transport(format!("serialize request: {error}")))?;
+        let bytes = self
+            .call(
+                subc_protocol::RouteTarget::ManagementSurface {
+                    module_id: super::MODULE_ID.into(),
+                },
+                // No project is invented for an operator calling from an arbitrary directory.
+                subc_protocol::BindIdentity::new(
+                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+                    "ck-entorhinal",
+                    "operator",
+                ),
+                body,
+                options,
+            )
+            .await
+            .map_err(call_failure)?;
+        let envelope = serde_json::from_slice(&bytes)
+            .map_err(|error| CallFailure::Transport(format!("decode response: {error}")))?;
+        unwrap_result(envelope).map_err(|(_, message)| CallFailure::Transport(message))
+    }
+}
+
+async fn agent_read(
+    caller: &impl CliCaller,
+    method: &str,
+    params: Value,
+) -> Result<Value, CallFailure> {
+    let value = caller
+        .call(method, params, subc_client_rs::CallOptions::default())
+        .await?;
+    if let Some(code) = value["refused"]["code"].as_str() {
+        return Err(CallFailure::Refused {
+            code: code.into(),
+            message: value["refused"]["details"].to_string(),
+        });
+    }
+    Ok(value)
+}
+
+async fn resolve_agent(caller: &impl CliCaller, token: &str) -> Result<String, CallFailure> {
+    if is_agent_id(token) {
+        return Ok(token.into());
+    }
+    let value = agent_read(caller, "agent.resolve_name", json!({"name":token})).await?;
+    value["agent_id"]
+        .as_str()
+        .map(Into::into)
+        .ok_or_else(|| CallFailure::Transport("resolve_name reply has no agent_id".into()))
+}
+
+async fn list_agents(caller: &impl CliCaller, mut params: Value) -> Result<Value, CallFailure> {
+    let mut agents = Vec::new();
+    loop {
+        let page = agent_read(caller, "agent.list", params.clone()).await?;
+        agents.extend(
+            page["agents"]
+                .as_array()
+                .ok_or_else(|| {
+                    CallFailure::Transport("agent.list reply has no agents array".into())
+                })?
+                .iter()
+                .cloned(),
+        );
+        let Some(cursor) = page["next_cursor"].as_str() else {
+            break;
+        };
+        if cursor.is_empty()
+            || params["cursor"]
+                .as_str()
+                .is_some_and(|previous| cursor <= previous)
+        {
+            return Err(CallFailure::Transport(
+                "agent.list cursor did not advance".into(),
+            ));
+        }
+        params["cursor"] = json!(cursor);
+    }
+    Ok(json!({"agents":agents}))
+}
+
+fn retry_args(command: &Command, params: &Value) -> Vec<String> {
+    let mut args = vec![command.verb.clone()];
+    if command.verb == "create" {
+        args.extend([
+            text(&params["name"]),
+            "--role".into(),
+            text(&params["role"]).replace('_', "-"),
+            "--tag".into(),
+            text(&params["tag"]),
+        ]);
+        for (field, flag) in [
+            ("project_id", "--project"),
+            ("workspace_id", "--workspace"),
+            ("supervisor_agent_id", "--supervisor"),
+        ] {
+            if let Some(value) = params[field].as_str() {
+                args.extend([flag.into(), value.into()]);
+            }
+        }
+    } else {
+        args.push(text(&params["agent_id"]));
+        match command.verb.as_str() {
+            "rename" => args.push(text(&params["name"])),
+            "tag" => args.push(text(&params["tag"])),
+            "labels" => {
+                let labels = params["labels"].as_array().expect("built label array");
+                if labels.is_empty() {
+                    args.push("--none".into());
+                } else {
+                    args.extend(labels.iter().map(text));
+                }
+            }
+            _ => (),
+        }
+    }
+    args.extend(["--request-key".into(), text(&params["request_key"])]);
+    if let Some(path) = &command.connection {
+        args.extend(["--subc".into(), path.to_string_lossy().into_owned()]);
+    }
+    if command.json {
+        args.push("--json".into());
+    }
+    args
+}
+
+fn shell_word(word: &str) -> String {
+    if !word.is_empty()
+        && word
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_./:-".contains(&byte))
+    {
+        word.into()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
+}
+
+async fn execute_agents(
+    caller: &impl CliCaller,
+    command: &Command,
+    method: &str,
+    mut params: Value,
+) -> Result<Value, (u8, String)> {
+    if !agent_write(method) {
+        let result = async {
+            if method == "agent.list" {
+                return list_agents(caller, params).await;
+            }
+            let token = params["agent_id"].as_str().expect("built show target");
+            if !is_agent_id(token) {
+                let value = agent_read(caller, "agent.resolve_name", json!({"name":token})).await?;
+                return value.get("digest").cloned().ok_or_else(|| {
+                    CallFailure::Transport("resolve_name reply has no digest".into())
+                });
+            }
+            let resolved = agent_read(caller, "agent.resolve", params.clone()).await?;
+            match resolved["status"].as_str() {
+                Some("unknown") => Err(CallFailure::Refused {
+                    code: "unknown_agent".into(),
+                    message: token.into(),
+                }),
+                Some("live") => {
+                    let listed = list_agents(caller, json!({})).await?;
+                    listed["agents"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|row| row["agent_id"] == token)
+                        .cloned()
+                        .ok_or_else(|| CallFailure::Refused {
+                            code: "unknown_agent".into(),
+                            message: token.into(),
+                        })
+                }
+                Some("retired" | "merged") => Ok(resolved),
+                _ => Err(CallFailure::Transport(
+                    "agent.resolve reply has no valid status".into(),
+                )),
+            }
+        }
+        .await;
+        return result.map_err(CallFailure::display);
+    }
+    for field in ["agent_id", "supervisor_agent_id"] {
+        if let Some(token) = params[field].as_str() {
+            let id = resolve_agent(caller, token)
+                .await
+                .map_err(CallFailure::display)?;
+            params[field] = json!(id);
+        }
+    }
+    let retry = format!(
+        "retry: ck agents {}",
+        retry_args(command, &params)
+            .iter()
+            .map(|arg| shell_word(arg))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    eprintln!("approval is pending on this Mac");
+    caller.call(method, params, subc_client_rs::CallOptions {
+        timeout: Duration::from_secs(300),
+        ..subc_client_rs::CallOptions::default()
+    }).await.map_err(|failure| {
+        let uncertain = matches!(&failure, CallFailure::Unknown(_)) || matches!(&failure, CallFailure::Refused { code, .. } if code == "engram_outcome_unknown");
+        let (exit, mut message) = failure.display();
+        if uncertain { message.push_str(&format!("\n{retry}")); }
+        (exit, message)
+    })
+}
+
 /// Where the daemon publishes its connection file, in the order `ck` looks.
 fn discover() -> Option<PathBuf> {
     if let Ok(explicit) = std::env::var("SUBC_CONNECTION_FILE") {
@@ -608,18 +1066,20 @@ fn discover() -> Option<PathBuf> {
     candidate.exists().then_some(candidate)
 }
 
-fn call(connection: &Path, method: &str, params: Value) -> Result<Value, (u8, String)> {
+fn call(
+    connection: &Path,
+    command: &Command,
+    method: &str,
+    params: Value,
+) -> Result<Value, (u8, String)> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
         .build()
         .map_err(|error| (EXIT_TRANSPORT, format!("start runtime: {error}")))?;
-    let body = serde_json::to_vec(&json!({ "method": method, "params": params }))
-        .map_err(|error| (EXIT_TRANSPORT, format!("serialize request: {error}")))?;
-    let connection = connection.to_path_buf();
-    runtime.block_on(async move {
+    runtime.block_on(async {
         let consumer = subc_client_rs::SubcConsumer::connect(
-            &connection,
+            connection,
             subc_client_rs::ConsumerOptions::default(),
         )
         .await
@@ -629,38 +1089,45 @@ fn call(connection: &Path, method: &str, params: Value) -> Result<Value, (u8, St
                 format!("connect {}: {error}", connection.display()),
             )
         })?;
-        let bytes = consumer
-            .call(
-                subc_protocol::RouteTarget::ManagementSurface {
-                    module_id: super::MODULE_ID.to_string(),
-                },
-                // `project_id` is deliberately left unset: this is the operator
-                // CLI, which has no registered project to resolve and must not
-                // invent one. Absent means "key on the triple", which is the
-                // honest answer for a caller that binds from whatever directory
-                // the operator happened to be standing in.
-                subc_protocol::BindIdentity::new(
-                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
-                    "ck-entorhinal".to_string(),
-                    "operator".to_string(),
-                ),
-                body,
-                subc_client_rs::CallOptions::default(),
-            )
-            .await
-            .map_err(|error| match error {
-                // A module refusal is the registry answering, and its code is
-                // the answer: `not_found` and a store failure need different
-                // reactions from the operator, so the code is surfaced VERBATIM
-                // rather than folded into a transport message.
-                subc_client_rs::CallError::Module(body) => {
-                    (EXIT_REFUSED, format!("{}: {}", body.code, body.message))
-                }
-                other => (EXIT_TRANSPORT, format!("call: {other}")),
-            })?;
-        let envelope: Value = serde_json::from_slice(&bytes)
-            .map_err(|error| (EXIT_TRANSPORT, format!("decode response: {error}")))?;
-        unwrap_result(envelope)
+        if command.face == Face::Agents {
+            execute_agents(&consumer, command, method, params).await
+        } else {
+            // Keep the established project/workspace transport messages unchanged.
+            let body = serde_json::to_vec(&json!({"method":method,"params":params}))
+                .map_err(|error| (EXIT_TRANSPORT, format!("serialize request: {error}")))?;
+            let bytes = consumer
+                .call(
+                    subc_protocol::RouteTarget::ManagementSurface {
+                        module_id: super::MODULE_ID.into(),
+                    },
+                    // `project_id` is deliberately left unset: this is the operator
+                    // CLI, which has no registered project to resolve and must not
+                    // invent one. Absent means "key on the triple", which is the
+                    // honest answer for a caller that binds from whatever directory
+                    // the operator happened to be standing in.
+                    subc_protocol::BindIdentity::new(
+                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+                        "ck-entorhinal",
+                        "operator",
+                    ),
+                    body,
+                    subc_client_rs::CallOptions::default(),
+                )
+                .await
+                .map_err(|error| match error {
+                    // A module refusal is the registry answering, and its code is
+                    // the answer: `not_found` and a store failure need different
+                    // reactions from the operator, so the code is surfaced verbatim
+                    // rather than folded into a transport message.
+                    subc_client_rs::CallError::Module(body) => {
+                        (EXIT_REFUSED, format!("{}: {}", body.code, body.message))
+                    }
+                    other => (EXIT_TRANSPORT, format!("call: {other}")),
+                })?;
+            let envelope = serde_json::from_slice(&bytes)
+                .map_err(|error| (EXIT_TRANSPORT, format!("decode response: {error}")))?;
+            unwrap_result(envelope)
+        }
     })
 }
 
@@ -704,6 +1171,7 @@ fn render(command: &Command, value: &Value) {
         return;
     }
     match (command.face, command.verb.as_str()) {
+        (Face::Agents, "list" | "show") => println!("{}", format_agents(&command.verb, value)),
         (Face::Workspaces, "list") => {
             let workspaces = value["workspaces"].as_array().cloned().unwrap_or_default();
             if workspaces.is_empty() {
@@ -809,6 +1277,39 @@ fn render(command: &Command, value: &Value) {
     }
 }
 
+fn format_agents(verb: &str, value: &Value) -> String {
+    if verb == "list" {
+        let agents = value["agents"].as_array().expect("combined agent list");
+        if agents.is_empty() {
+            return "no agents".into();
+        }
+        let rows = agents
+            .iter()
+            .map(|agent| {
+                format!(
+                    "{}  {}  {}  {}",
+                    text(&agent["agent_id"]),
+                    text(&agent["name"]),
+                    text(&agent["role"]),
+                    text(&agent["tag"])
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        return format!("{rows}\n\n{} agent(s)", agents.len());
+    }
+    if value.get("status").is_some() {
+        return format!(
+            "agent:       {}\nstatus:      {}\ngone:        {}\nmerged_into: {}",
+            text(&value["agent_id"]),
+            text(&value["status"]),
+            value["gone"],
+            text(&value["merged_into"])
+        );
+    }
+    format!("agent:     {}\nname:      {}\nrole:      {}\ntag:       {}\nproject:   {}\nworkspace: {}\nlabels:    {}", text(&value["agent_id"]), text(&value["name"]), text(&value["role"]), text(&value["tag"]), text(&value["project_id"]), text(&value["workspace_id"]), value["labels"])
+}
+
 fn format_attach(value: &Value, confirmed: bool) -> String {
     format!(
         "project:   {}\nroot key:  {}:{}\nroot:      {}\n{}",
@@ -898,6 +1399,7 @@ mod tests {
     /// supervisor spawn must always reach.
     #[test]
     fn face_resolution_follows_argv0() {
+        assert_eq!(face_from_argv0(Some("ck-agents")), Face::Agents);
         assert_eq!(
             face_from_argv0(Some("/usr/local/bin/ck-projects")),
             Face::Projects
@@ -911,12 +1413,35 @@ mod tests {
         assert_eq!(face_from_argv0(None), Face::Entorhinal);
     }
 
+    #[test]
+    fn ckdev_face_names_match_their_ck_faces() {
+        for (production_name, dev_name, expected) in [
+            ("ck-projects", "ckdev-projects", Face::Projects),
+            ("ck-workspaces", "ckdev-workspaces", Face::Workspaces),
+            ("ck-agents", "ckdev-agents", Face::Agents),
+            ("ck-entorhinal", "ckdev-entorhinal", Face::Entorhinal),
+        ] {
+            assert_eq!(face_from_argv0(Some(production_name)), expected);
+            assert_eq!(face_from_argv0(Some(dev_name)), expected);
+        }
+    }
+
+    #[test]
+    fn unknown_ckdev_face_names_keep_the_module_default() {
+        assert_eq!(face_from_argv0(Some("ckdev-")), Face::Entorhinal);
+        assert_eq!(face_from_argv0(Some("ckdev-foo")), Face::Entorhinal);
+        assert_eq!(face_from_argv0(Some("ckdev-ck-projects")), Face::Entorhinal);
+        // Unprefixed names never selected a CLI face, and still don't.
+        assert_eq!(face_from_argv0(Some("projects")), Face::Entorhinal);
+        assert_eq!(face_from_argv0(Some("workspaces")), Face::Entorhinal);
+    }
+
     /// Bare CLI faces explain; only the module face serves from empty argv.
     /// This is the `ck` convention (verbless domains print their help), and it
     /// is also what stops `ck projects` from booting a daemon.
     #[test]
     fn bare_cli_faces_explain_rather_than_serve() {
-        for face in [Face::Projects, Face::Workspaces] {
+        for face in [Face::Projects, Face::Workspaces, Face::Agents] {
             match parse_as(face, &[]) {
                 Invocation::Report(text) => {
                     assert!(text.contains("usage:"), "{face:?} bare must print usage")
@@ -939,7 +1464,7 @@ mod tests {
             parse_as(Face::Entorhinal, &["--subc", "/tmp/conn.json"]),
             Invocation::Module
         ));
-        for face in [Face::Projects, Face::Workspaces] {
+        for face in [Face::Projects, Face::Workspaces, Face::Agents] {
             assert!(
                 !matches!(
                     parse_as(face, &["--subc", "/tmp/conn.json"]),
@@ -1364,6 +1889,7 @@ mod tests {
             crate::RouteAdmission {
                 principal: Some(crate::Principal::Direct),
                 flow_id: None,
+                handle: None,
             },
         );
         let crate::HandlerOutcome::Response(bytes) =
@@ -1683,5 +2209,698 @@ mod tests {
         assert!(json.contains("\"replay\": {"));
         assert!(json.contains("\"missingKeys\": []"));
         assert!(!json.lines().any(|line| line.starts_with("replay ")));
+    }
+}
+
+#[cfg(test)]
+mod agent_tests {
+    use super::*;
+    use crate::agent_ops::{OperatorConfirmError, OperatorConfirmer};
+    use crate::{HandlerOutcome, Principal, ProjectsHandler, RegistryStore, RouteAdmission};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
+    const ID: &str = "agent_0123456789abcdef";
+
+    fn command(args: &[&str]) -> Command {
+        match parse(
+            Face::Agents,
+            &args.iter().map(|s| (*s).into()).collect::<Vec<_>>(),
+        ) {
+            Invocation::Command(command) => command,
+            _ => panic!("expected agent command: {args:?}"),
+        }
+    }
+    async fn execute(caller: &impl CliCaller, args: &[&str]) -> Result<Value, (u8, String)> {
+        let command = command(args);
+        let (method, params) = build(&command).unwrap();
+        execute_agents(caller, &command, &method, params).await
+    }
+
+    #[test]
+    fn agents_verbs_build_wire_shapes_keys_and_require_tag() {
+        for (args, method, fields) in [
+            (
+                vec![
+                    "create",
+                    "Ada",
+                    "--role",
+                    "workspace-head",
+                    "--tag",
+                    "helper",
+                    "--workspace",
+                    "W",
+                    "--project",
+                    "P",
+                    "--supervisor",
+                    "Boss",
+                ],
+                "agent.create",
+                json!({"name":"Ada","role":"workspace_head","tag":"helper","workspace_id":"W","project_id":"P","supervisor_agent_id":"Boss"}),
+            ),
+            (
+                vec!["rename", ID, "Grace"],
+                "agent.rename",
+                json!({"agent_id":ID,"name":"Grace"}),
+            ),
+            (vec!["retire", ID], "agent.dispose", json!({"agent_id":ID})),
+            (
+                vec!["tag", ID, "new tag"],
+                "agent.update_tag",
+                json!({"agent_id":ID,"tag":"new tag"}),
+            ),
+            (
+                vec!["labels", ID, "a", "b"],
+                "agent.set_labels",
+                json!({"agent_id":ID,"labels":["a","b"]}),
+            ),
+            (
+                vec!["labels", ID, "--none"],
+                "agent.set_labels",
+                json!({"agent_id":ID,"labels":[]}),
+            ),
+            (
+                vec!["list", "--project", "P", "--workspace", "W"],
+                "agent.list",
+                json!({"project_id":"P","workspace_id":"W"}),
+            ),
+            (vec!["show", ID], "agent.resolve", json!({"agent_id":ID})),
+        ] {
+            let (actual, mut params) = build(&command(&args)).unwrap();
+            assert_eq!(actual, method);
+            if agent_write(method) {
+                assert_eq!(
+                    params.as_object_mut().unwrap().remove("actor"),
+                    Some(json!("ck-agents"))
+                );
+                let key = params
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("request_key")
+                    .unwrap();
+                let key = key.as_str().unwrap();
+                assert_eq!(key.len(), 32);
+                assert!(key
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+                let (_, other) = build(&command(&args)).unwrap();
+                assert_ne!(other["request_key"], key);
+            }
+            assert_eq!(params, fields);
+        }
+        for role in ["assistant", "head", "hiree"] {
+            assert_eq!(
+                build(&command(&["create", "Ada", "--role", role, "--tag", "t"]))
+                    .unwrap()
+                    .1["role"],
+                role
+            );
+        }
+        let error = build(&command(&["create", "Ada", "--role", "assistant"])).unwrap_err();
+        assert!(error.contains("requires --tag"), "{error}");
+        assert_eq!(
+            build(&command(&["retire", ID, "--request-key", "verbatim key"]))
+                .unwrap()
+                .1["request_key"],
+            "verbatim key"
+        );
+        for args in [
+            vec!["labels", ID],
+            vec!["labels", ID, "--none", "a"],
+            vec!["show", ID, "extra"],
+            vec!["list", "--request-key", "read"],
+            vec!["retire", ID, "--tag", "bad"],
+            vec!["create", "Ada", "--role", "other", "--tag", "x"],
+        ] {
+            assert!(build(&command(&args)).is_err(), "{args:?}");
+        }
+        for token in ["agent_01234567", ID] {
+            assert!(is_agent_id(token));
+        }
+        for token in [
+            "agent_012345678",
+            "agent_ABCDEF00",
+            "agent_0123456g",
+            "Ada",
+            "W/Ada",
+        ] {
+            assert!(!is_agent_id(token));
+        }
+    }
+
+    type ObservedCall = (String, Value, Duration);
+    struct Script {
+        calls: Mutex<Vec<ObservedCall>>,
+        replies: Mutex<std::collections::VecDeque<Result<Value, CallFailure>>>,
+    }
+    impl Script {
+        fn new(replies: Vec<Result<Value, CallFailure>>) -> Self {
+            Self {
+                calls: Mutex::new(vec![]),
+                replies: Mutex::new(replies.into()),
+            }
+        }
+        fn calls(&self) -> Vec<ObservedCall> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+    #[async_trait::async_trait]
+    impl CliCaller for Script {
+        async fn call(
+            &self,
+            method: &str,
+            params: Value,
+            options: subc_client_rs::CallOptions,
+        ) -> Result<Value, CallFailure> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((method.into(), params, options.timeout));
+            self.replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected extra RPC")
+        }
+    }
+
+    #[tokio::test]
+    async fn agents_resolution_refuses_before_any_write_and_ids_skip_reads() {
+        for code in ["name_ambiguous", "name_unknown"] {
+            for args in [
+                vec!["rename", "W/Ada", "Grace"],
+                vec![
+                    "create",
+                    "Ada",
+                    "--role",
+                    "assistant",
+                    "--tag",
+                    "t",
+                    "--supervisor",
+                    "Boss",
+                ],
+            ] {
+                let script = Script::new(vec![Ok(
+                    json!({"refused":{"code":code,"details":{"name":"Ada"}}}),
+                )]);
+                let error = execute(&script, &args).await.unwrap_err();
+                assert_eq!(error.0, EXIT_REFUSED);
+                assert!(error.1.starts_with(code));
+                assert_eq!(script.calls().len(), 1);
+                assert_eq!(script.calls()[0].0, "agent.resolve_name");
+            }
+        }
+        let script = Script::new(vec![
+            Ok(json!({"agent_id":ID,"digest":{}})),
+            Ok(json!({"ok":true})),
+        ]);
+        execute(&script, &["rename", "W/Ada", "Grace"])
+            .await
+            .unwrap();
+        assert_eq!(script.calls()[0].1, json!({"name":"W/Ada"}));
+        assert_eq!(script.calls()[1].1["agent_id"], ID);
+        for id in [ID, "agent_01234567"] {
+            let script = Script::new(vec![Ok(json!({"ok":true}))]);
+            execute(&script, &["retire", id]).await.unwrap();
+            assert_eq!(script.calls().len(), 1);
+            assert_eq!(script.calls()[0].0, "agent.dispose");
+            assert_eq!(script.calls()[0].1["agent_id"], id);
+        }
+    }
+
+    #[tokio::test]
+    async fn agents_transport_observes_300_second_writes_and_default_reads() {
+        for args in [
+            vec![
+                "create",
+                "Ada",
+                "--role",
+                "assistant",
+                "--tag",
+                "t",
+                "--supervisor",
+                "Boss",
+            ],
+            vec!["rename", "Ada", "Grace"],
+            vec!["retire", "Ada"],
+            vec!["tag", "Ada", "t"],
+            vec!["labels", "Ada", "a"],
+            vec!["labels", "Ada", "--none"],
+        ] {
+            let script = Script::new(vec![Ok(json!({"agent_id":ID})), Ok(json!({"ok":true}))]);
+            execute(&script, &args).await.unwrap();
+            let calls = script.calls();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0].2, subc_client_rs::CallOptions::default().timeout);
+            assert_eq!(
+                calls[1].2,
+                Duration::from_secs(300),
+                "{} write budget",
+                calls[1].0
+            );
+        }
+        let script = Script::new(vec![Ok(json!({"agents":[]}))]);
+        execute(&script, &["list"]).await.unwrap();
+        assert_eq!(
+            script.calls()[0].2,
+            subc_client_rs::CallOptions::default().timeout
+        );
+    }
+
+    #[tokio::test]
+    async fn agents_list_and_show_page_digests_and_report_terminal_or_unknown() {
+        let digest =
+            json!({"agent_id":ID,"name":"Ada","role":"assistant","tag":"helper","labels":["a"]});
+        let pages = || {
+            vec![
+                Ok(
+                    json!({"agents":[{"agent_id":"agent_0000000000000001"}],"next_cursor":"agent_0000000000000001"}),
+                ),
+                Ok(json!({"agents":[digest.clone()]})),
+            ]
+        };
+        let script = Script::new(pages());
+        let listed = execute(
+            &script,
+            &["list", "--project", "P", "--workspace", "W", "--json"],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            listed,
+            json!({"agents":[{"agent_id":"agent_0000000000000001"},digest.clone()]})
+        );
+        assert_eq!(
+            script.calls()[1].1,
+            json!({"project_id":"P","workspace_id":"W","cursor":"agent_0000000000000001"})
+        );
+        assert!(format_agents("list", &listed).contains("2 agent(s)"));
+        let mut replies = vec![Ok(
+            json!({"agent_id":ID,"status":"live","gone":null,"merged_into":null}),
+        )];
+        replies.extend(pages());
+        let script = Script::new(replies);
+        assert_eq!(execute(&script, &["show", ID]).await.unwrap(), digest);
+        assert_eq!(script.calls()[0].1, json!({"agent_id":ID}));
+        assert_eq!(script.calls().len(), 3);
+        let script = Script::new(vec![Ok(json!({"agent_id":ID,"digest":digest.clone()}))]);
+        assert_eq!(execute(&script, &["show", "W/Ada"]).await.unwrap(), digest);
+        assert_eq!(script.calls()[0].0, "agent.resolve_name");
+        assert!(format_agents("show", &digest).contains("helper"));
+        for status in ["retired", "merged"] {
+            let resolved = json!({"agent_id":ID,"status":status,"gone":{"reason":status},"merged_into":"agent_00000001"});
+            let script = Script::new(vec![Ok(resolved.clone())]);
+            assert_eq!(execute(&script, &["show", ID]).await.unwrap(), resolved);
+            assert_eq!(script.calls().len(), 1);
+            let output = format_agents("show", &resolved);
+            assert!(
+                output.contains(status)
+                    && output.contains("gone:")
+                    && output.contains("merged_into:")
+                    && output.contains("agent_00000001")
+            );
+        }
+        let script = Script::new(vec![Ok(json!({"status":"unknown"}))]);
+        let error = execute(&script, &["show", ID]).await.unwrap_err();
+        assert_eq!(error, (EXIT_REFUSED, format!("unknown_agent: {ID}")));
+        let script = Script::new(vec![Ok(json!({"refused":{"code":"name_unknown"}}))]);
+        assert!(execute(&script, &["show", "Retired Ada"])
+            .await
+            .unwrap_err()
+            .1
+            .starts_with("name_unknown"));
+    }
+
+    struct Confirm(AtomicUsize);
+    #[async_trait::async_trait]
+    impl OperatorConfirmer for Confirm {
+        async fn confirm_operator(
+            &self,
+            _: &str,
+            _: crate::RouteKey,
+        ) -> Result<(), OperatorConfirmError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    struct Served {
+        handler: ProjectsHandler,
+        root: PathBuf,
+        calls: Mutex<Vec<String>>,
+        // Which failure to inject: 1 lets the write land and then loses its
+        // reply; 2 loses the request before entorhinal's handler sees it.
+        lose: AtomicUsize,
+    }
+    impl Served {
+        fn new(confirm: Option<Arc<Confirm>>) -> Self {
+            let (root, descriptor) = crate::tests::scratch_descriptor("agents-cli");
+            let mut handler = ProjectsHandler::with_runtime("0123456789abcdef".into(), || 700);
+            if let Some(confirm) = confirm {
+                handler = handler.with_operator_confirmer(confirm);
+            }
+            let store = RegistryStore::open(&descriptor).unwrap();
+            store
+                .apply_entry("agent.cutover", "{}", "fixture", None, |_| Ok(()))
+                .unwrap();
+            *handler.store.lock().unwrap() = Some(store);
+            handler.route_admissions().insert(
+                (91, 1),
+                RouteAdmission {
+                    principal: Some(Principal::Direct),
+                    flow_id: None,
+                    handle: None,
+                },
+            );
+            Self {
+                handler,
+                root,
+                calls: Mutex::new(vec![]),
+                lose: AtomicUsize::new(0),
+            }
+        }
+        fn store(&self) -> RegistryStore {
+            self.handler.with_store(|store| Ok(store.clone())).unwrap()
+        }
+        fn core_create(&self) -> String {
+            let bytes = self.store().with_principal("reserved:prefrontal-core").agent_mutation_with_id("agent.create", json!({"name":"Ada","role":"assistant","tag":"helper","request_key":"core-create"}), 700, Some(ID)).unwrap();
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            value["result"]["agent"]["agent_id"]
+                .as_str()
+                .unwrap()
+                .into()
+        }
+    }
+    impl Drop for Served {
+        fn drop(&mut self) {
+            self.handler.store.lock().unwrap().take();
+            std::fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+    #[async_trait::async_trait]
+    impl CliCaller for Served {
+        async fn call(
+            &self,
+            method: &str,
+            params: Value,
+            options: subc_client_rs::CallOptions,
+        ) -> Result<Value, CallFailure> {
+            self.calls.lock().unwrap().push(method.into());
+            assert_eq!(
+                options.timeout,
+                if agent_write(method) {
+                    Duration::from_secs(300)
+                } else {
+                    subc_client_rs::CallOptions::default().timeout
+                }
+            );
+            let lose = if agent_write(method) {
+                self.lose.swap(0, Ordering::SeqCst)
+            } else {
+                0
+            };
+            if lose == 2 {
+                return Err(CallFailure::Unknown(
+                    "transport timeout: the write outcome is unknown".into(),
+                ));
+            }
+            let outcome = self
+                .handler
+                .handle_served_request(
+                    &serde_json::to_vec(&json!({"method":method,"params":params})).unwrap(),
+                    (91, 1),
+                )
+                .await;
+            if lose == 1 {
+                assert!(matches!(outcome, HandlerOutcome::Response(_)));
+                return Err(CallFailure::Unknown(
+                    "transport timeout: the write outcome is unknown".into(),
+                ));
+            }
+            match outcome {
+                HandlerOutcome::Response(body) => {
+                    Ok(unwrap_result(serde_json::from_slice(&body).unwrap()).unwrap())
+                }
+                HandlerOutcome::Error { code, message }
+                | HandlerOutcome::ErrorWithDetail { code, message, .. } => {
+                    Err(CallFailure::Refused { code, message })
+                }
+                _ => panic!("unexpected streamed reply"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn agents_create_reaches_confirming_handler() {
+        let confirm = Arc::new(Confirm(AtomicUsize::new(0)));
+        let served = Served::new(Some(confirm.clone()));
+        let value = execute(
+            &served,
+            &["create", "Ada", "--role", "assistant", "--tag", "helper"],
+        )
+        .await
+        .unwrap();
+        assert_eq!(value["agent"]["name"], "Ada");
+        assert_eq!(confirm.0.load(Ordering::SeqCst), 1);
+        let listed = execute(&served, &["list"]).await.unwrap();
+        assert_eq!(listed["agents"].as_array().unwrap().len(), 1);
+        assert_eq!(listed["agents"][0]["agent_id"], value["agent"]["agent_id"]);
+    }
+
+    #[tokio::test]
+    async fn agents_create_unsupported_refuses_with_one_line_explanation() {
+        let served = Served::new(None);
+        let before = served.store().generation().unwrap();
+        let error = execute(
+            &served,
+            &["create", "Ada", "--role", "assistant", "--tag", "helper"],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error,
+            (
+                EXIT_REFUSED,
+                "operator_presence_unavailable: this daemon does not support operator confirmation"
+                    .into()
+            )
+        );
+        assert_eq!(error.1.lines().count(), 1);
+        assert_eq!(served.store().generation().unwrap(), before);
+        assert!(execute(&served, &["list"]).await.unwrap()["agents"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn agents_timeout_retry_uses_resolved_id_and_replays_without_resolution_or_prompt() {
+        for landed in [true, false] {
+            let confirm = Arc::new(Confirm(AtomicUsize::new(0)));
+            let served = Served::new(Some(confirm.clone()));
+            assert_eq!(served.core_create(), ID);
+            served
+                .lose
+                .store(if landed { 1 } else { 2 }, Ordering::SeqCst);
+            let error = execute(
+                &served,
+                &["rename", "Ada", "Grace", "--request-key", "retry-key"],
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.0, EXIT_TRANSPORT);
+            assert!(error
+                .1
+                .starts_with("transport timeout: the write outcome is unknown"));
+            let retry = error.1.split_once("retry: ck agents ").unwrap().1;
+            assert_eq!(retry, format!("rename {ID} Grace --request-key retry-key"));
+            let count = confirm.0.load(Ordering::SeqCst);
+            assert_eq!(count, usize::from(landed));
+            served.calls.lock().unwrap().clear();
+            let value = execute(&served, &retry.split_whitespace().collect::<Vec<_>>())
+                .await
+                .unwrap();
+            assert_eq!(value["agent"]["name"], "Grace");
+            assert_eq!(*served.calls.lock().unwrap(), vec!["agent.rename"]);
+            assert_eq!(confirm.0.load(Ordering::SeqCst), 1);
+            let named = execute(&served, &["show", "Grace"]).await.unwrap();
+            assert_eq!(named["agent_id"], ID);
+        }
+    }
+
+    #[tokio::test]
+    async fn agents_uncertain_retry_preserves_supervisor_ids_flags_and_shell_quoting() {
+        let script = Script::new(vec![
+            Ok(json!({"agent_id":ID})),
+            Err(CallFailure::Refused {
+                code: "engram_outcome_unknown".into(),
+                message: "append outcome unknown".into(),
+            }),
+        ]);
+        let error = execute(
+            &script,
+            &[
+                "create",
+                "O'Neil",
+                "--role",
+                "hiree",
+                "--tag",
+                "quoted tag",
+                "--project",
+                "P",
+                "--workspace",
+                "W",
+                "--supervisor",
+                "Boss",
+                "--request-key",
+                "key",
+                "--subc",
+                "/tmp/conn.json",
+                "--json",
+            ],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, EXIT_REFUSED);
+        assert!(error.1.contains(&format!("retry: ck agents create 'O'\\''Neil' --role hiree --tag 'quoted tag' --project P --workspace W --supervisor {ID} --request-key key --subc /tmp/conn.json --json")), "{}", error.1);
+        assert_eq!(script.calls()[1].1["supervisor_agent_id"], ID);
+        for code in [
+            "operator_declined",
+            "operator_presence_unavailable",
+            "operator_confirmation_busy",
+            "operator_approval_stale",
+            "operator_summary_too_long",
+            "authority_not_cut_over",
+        ] {
+            let (_, message) = CallFailure::Refused {
+                code: code.into(),
+                message: String::new(),
+            }
+            .display();
+            assert!(message.starts_with(code));
+            assert_eq!(message.lines().count(), 1);
+            assert!(message.len() > code.len() + 2);
+        }
+    }
+}
+
+#[cfg(test)]
+mod cli_transport_tests {
+    use super::*;
+    use subc_protocol::{Flags, Frame, FrameType, Priority};
+    use subc_transport::{
+        authenticate_server, generate_daemon_id, generate_key, read_frame, write_atomic,
+        write_frame, ConnectionInfo, Endpoint, SCHEMA_VERSION,
+    };
+
+    // The client tells a timeout from a closed route by the error's typed
+    // cause, which only the subc client library can set. So this test makes a
+    // real library call; an error built by hand from a string would not
+    // exercise that classification.
+    #[tokio::test]
+    async fn agents_sdk_timeout_is_unknown_and_daemon_route_closure_is_distinct() {
+        for close_route in [false, true] {
+            let (root, _) = crate::tests::scratch_descriptor("cli-transport");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let info = ConnectionInfo {
+                schema: SCHEMA_VERSION,
+                wire_version: None,
+                endpoints: vec![Endpoint {
+                    host: "127.0.0.1".into(),
+                    port: listener.local_addr().unwrap().port(),
+                }],
+                key: generate_key().unwrap(),
+                daemon_id: generate_daemon_id().unwrap(),
+                pid: std::process::id(),
+                daemon_ver: "cli-test".into(),
+            };
+            let path = root.join("connection.json");
+            write_atomic(&path, &info).unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                authenticate_server(
+                    &mut stream,
+                    &info.key,
+                    &info.daemon_id,
+                    &info.daemon_ver,
+                    Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
+                while let Some(frame) = read_frame(&mut stream).await.unwrap() {
+                    let (ty, body) = if frame.header.ty == FrameType::Ping {
+                        (FrameType::Pong, vec![])
+                    } else if frame.header.ty == FrameType::Request && frame.header.channel == 0 {
+                        let request: Value = serde_json::from_slice(&frame.body).unwrap();
+                        if request["op"] != "route.open" {
+                            continue;
+                        }
+                        (
+                            FrameType::Response,
+                            serde_json::to_vec(
+                                &json!({"op":"route.open","route_channel":41,"route_epoch":1}),
+                            )
+                            .unwrap(),
+                        )
+                    } else if frame.header.ty == FrameType::Request && close_route {
+                        (FrameType::Goodbye, vec![])
+                    } else {
+                        continue;
+                    };
+                    let reply = Frame::build_with_version(
+                        frame.header.ver,
+                        ty,
+                        Flags::new(false, Priority::Interactive, false),
+                        frame.header.channel,
+                        frame.header.epoch,
+                        frame.header.corr,
+                        body,
+                    )
+                    .unwrap();
+                    write_frame(&mut stream, &reply).await.unwrap();
+                }
+            });
+            let consumer = subc_client_rs::SubcConsumer::connect(
+                &path,
+                subc_client_rs::ConsumerOptions::default(),
+            )
+            .await
+            .unwrap();
+            let error = tokio::time::timeout(
+                Duration::from_secs(10),
+                CliCaller::call(
+                    &consumer,
+                    "agent.dispose",
+                    json!({"agent_id":"agent_01234567","request_key":"key"}),
+                    subc_client_rs::CallOptions {
+                        timeout: Duration::from_millis(100),
+                        ..subc_client_rs::CallOptions::default()
+                    },
+                ),
+            )
+            .await
+            .expect("transport test hung")
+            .unwrap_err();
+            if close_route {
+                assert!(matches!(error, CallFailure::Transport(_)));
+                assert!(error
+                    .display()
+                    .1
+                    .starts_with("daemon reported route closure:"));
+            } else {
+                assert!(matches!(error, CallFailure::Unknown(_)));
+                assert_eq!(
+                    error.display(),
+                    (
+                        EXIT_TRANSPORT,
+                        "transport timeout: the write outcome is unknown".into()
+                    )
+                );
+            }
+            consumer.close().await;
+            server.abort();
+            let _ = server.await;
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 }

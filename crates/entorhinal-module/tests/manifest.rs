@@ -4,9 +4,13 @@
 
 use std::process::Command;
 
+mod common;
+use common::ckdev_binary;
+
 #[test]
 fn manifest_flag_prints_the_manifest_with_the_provided_capability() {
-    let output = Command::new(env!("CARGO_BIN_EXE_ck-entorhinal"))
+    let binary = ckdev_binary(env!("CARGO_BIN_EXE_ck-entorhinal"));
+    let output = Command::new(binary)
         .arg("--manifest")
         // Offline inspection must not need supervision.
         .env_remove("SUBC_MODULE_ID")
@@ -36,7 +40,8 @@ fn manifest_flag_prints_the_manifest_with_the_provided_capability() {
 /// entorhinal reads the nonce from the daemon's pipe.
 #[test]
 fn manifest_declares_build_provenance() {
-    let output = Command::new(env!("CARGO_BIN_EXE_ck-entorhinal"))
+    let binary = ckdev_binary(env!("CARGO_BIN_EXE_ck-entorhinal"));
+    let output = Command::new(binary)
         .arg("--manifest")
         .env_remove("SUBC_MODULE_ID")
         .env_remove("SUBC_LAUNCH_NONCE")
@@ -59,4 +64,14 @@ fn manifest_declares_build_provenance() {
             || provenance["build_git_sha_absence_reason"].is_string(),
         "provenance: {provenance}"
     );
+    if option_env!("ENTORHINAL_BUILD_PROFILE").is_none() {
+        assert!(
+            provenance["build_git_sha"].is_null(),
+            "debug builds do not embed a git revision: {provenance}"
+        );
+        assert_eq!(
+            provenance["build_git_sha_absence_reason"], "provenance_stamped_only_in_release_builds",
+            "debug builds intentionally omit git provenance: {provenance}"
+        );
+    }
 }

@@ -5,8 +5,8 @@ members = ["crates/entorhinal-core", "crates/entorhinal-module"]
 [workspace.dependencies]
 # Every CortexKit dependency comes from crates.io, so a fresh clone builds with
 # no sibling checkouts beside it.
-subc-client-rs = "0.26.1"
-subc-protocol = "0.29.0"
+subc-client-rs = "0.26.3"
+subc-protocol = "0.29.4"
 subc-transport = "0.10.0"
 subc-jsonc = "0.1.1"
 
@@ -23,3 +23,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-trait = "0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

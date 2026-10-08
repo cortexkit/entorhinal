@@ -2,6 +2,8 @@
 
 Run every command from the worktree root. Serialize cargo invocations: one cargo command at a time, never in parallel; other workers share this machine.
 
+Always build, check and test with `--workspace` (filter tests by name), never run `-p entorhinal-core` alone; workspace feature unification avoids compiling a second variant of shared dependencies.
+
 ## Gates
 
 These are the three CI gates in `.github/workflows/ci.yml`.

@@ -8,7 +8,7 @@ use super::{
     claims, decode_github_identity, journal, normalize_agent_name, validate_agent_avatar,
     validate_agent_labels, validate_agent_tag, validate_github_identity, validate_project_id,
     validate_workspace_id, AgentAvatar, AgentChangeEntry, AgentNameClaim, AgentRegistryError,
-    GithubIdentity,
+    GithubIdentity, NormalizedAgentName,
 };
 use crate::{JournalWriter, RegistryError, RegistryStore};
 
@@ -383,13 +383,11 @@ fn head_conflict(
     }))
 }
 
-fn create(
-    tx: &Transaction<'_>,
-    store: &RegistryStore,
+fn validate_create(
+    tx: &Connection,
     r: &Create,
     now: i64,
-    agent_id: Option<&str>,
-) -> Result<(AgentRow, Vec<AgentNameClaim>), AgentMutationError> {
+) -> Result<(AgentRow, NameEdit), AgentMutationError> {
     let mut project_id = r
         .project_id
         .as_deref()
@@ -456,27 +454,21 @@ fn create(
         _ => ("workspace", workspace_id.as_deref().unwrap()),
     };
     claims::check_name(tx, kind, key, &name, None)?;
-    // The unique index on a project's live head is the last guard against
-    // creating two heads. Its violation becomes `agent_project_taken`, naming
-    // the existing head and its request key, which may be NULL for an imported head.
-    let agent_id = if let Some(id) = agent_id {
-        if load_row(tx, id)?.is_some() {
-            return Err(AgentMutationError::new(
-                "identity_log_invariant",
-                "pre-drawn agent id is occupied",
-            ));
+    // A project has at most one live head (the `uq_live_head` index). Check it
+    // with a query, rather than by attempting the INSERT, so validation can run
+    // on the query-only connection without attempting an INSERT.
+    if matches!(r.role, Role::Head) {
+        if let Some(conflict) = head_conflict(tx, project_id.as_deref().unwrap())? {
+            return Err(conflict);
         }
-        id.to_string()
-    } else {
-        loop {
-            let id = format!("agent_{}", store.ids.hex(8)?);
-            if load_row(tx, &id)?.is_none() {
-                break id;
-            }
-        }
+    }
+    let edit = NameEdit {
+        kind: kind.into(),
+        key: key.into(),
+        name: name.clone(),
     };
     let row = AgentRow {
-        agent_id,
+        agent_id: String::new(),
         name: name.stored_name.clone(),
         name_version: 1,
         name_normalization_version: 1,
@@ -496,22 +488,356 @@ fn create(
         terminal_at_ms: None,
         agent_generation: 1,
     };
-    if let Err(error) = write_row(tx, &row) {
-        if error
-            .to_string()
-            .contains("UNIQUE constraint failed: agent.project_id")
-        {
-            if let Some(conflict) = head_conflict(tx, project_id.as_deref().unwrap())? {
-                return Err(conflict);
-            }
-        }
-        return Err(error.into());
+    Ok((row, edit))
+}
+
+/// The macOS operator prompt clips longer descriptions. Count the escaped
+/// description's Unicode scalars, not bytes or the unescaped request text.
+pub const OPERATOR_SUMMARY_LIMIT: usize = 200;
+
+#[derive(Clone, Debug)]
+pub struct OperatorApproval {
+    summary: String,
+}
+impl OperatorApproval {
+    pub fn new(summary: String) -> Self {
+        Self { summary }
     }
-    let claim = claims::claim(tx, &row.agent_id, kind, key, &name, now)?;
-    Ok((row, vec![claim]))
+}
+
+pub enum AgentPrecheck {
+    Cached(Vec<u8>),
+    Ready(String),
+}
+
+fn required_key(request: &Mutation) -> Result<&str, AgentMutationError> {
+    request
+        .meta()
+        .0
+        .as_deref()
+        .filter(|key| !key.is_empty())
+        .ok_or_else(|| AgentMutationError::new("request_key_required", "request_key is required"))
+}
+
+fn require_cutover(conn: &Connection) -> Result<(), AgentMutationError> {
+    if conn
+        .query_row(
+            "SELECT 1 FROM registry_journal WHERE op='agent.cutover' LIMIT 1",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_none()
+    {
+        return Err(AgentMutationError::new(
+            "authority_not_cut_over",
+            "agent identity authority is not cut over",
+        ));
+    }
+    Ok(())
+}
+
+struct NameEdit {
+    kind: String,
+    key: String,
+    name: NormalizedAgentName,
+}
+
+struct Prepared {
+    row: AgentRow,
+    previous: Option<AgentRow>,
+    name: Option<NameEdit>,
+    release: bool,
+    applied: bool,
+    old_name: Option<String>,
+}
+
+fn validate(
+    conn: &Connection,
+    request: &Mutation,
+    now: i64,
+) -> Result<Prepared, AgentMutationError> {
+    if let Mutation::Create(r) = request {
+        let (row, name) = validate_create(conn, r, now)?;
+        return Ok(Prepared {
+            row,
+            previous: None,
+            name: Some(name),
+            release: false,
+            applied: true,
+            old_name: None,
+        });
+    }
+    let id = request.target().unwrap();
+    let mut row = load_row(conn, id)?
+        .ok_or_else(|| AgentMutationError::new("unknown_agent", format!("unknown agent {id}")))?;
+    let previous = row.clone();
+    let idempotent = matches!(request, Mutation::Dispose(_) if row.status == "retired")
+        || matches!(request, Mutation::Merge(r) if row.status == "merged" && row.merged_into.as_deref() == Some(r.into_agent_id.as_str()));
+    if row.status != "live" && !idempotent {
+        return Err(
+            AgentMutationError::new("gone", "agent is gone").with_detail(row.gone().unwrap())
+        );
+    }
+    let mut name = None;
+    let mut release = false;
+    let mut old_name = None;
+    let mut applied = true;
+    if !idempotent {
+        match request {
+            Mutation::Rename(r) => {
+                if matches!(row.role.as_str(), "head" | "hiree") {
+                    placement(conn, row.project_id.as_deref().unwrap())?;
+                }
+                let normalized = normalize_agent_name(&r.name)?;
+                // Renames keep the active claim's namespace, including imported
+                // historical namespaces, rather than current project placement.
+                let active = claims::active_claim(conn, id)?;
+                claims::check_name(
+                    conn,
+                    &active.namespace_kind,
+                    &active.namespace_key,
+                    &normalized,
+                    Some(id),
+                )?;
+                name = Some(NameEdit {
+                    kind: active.namespace_kind,
+                    key: active.namespace_key,
+                    name: normalized.clone(),
+                });
+                release = true;
+                old_name = Some(row.name.clone());
+                row.name = normalized.stored_name;
+                row.name_normalization_version = normalized.normalization_version;
+                row.name_version = row.name_version.checked_add(1).ok_or_else(|| {
+                    AgentMutationError::new("storage_error", "name version overflow")
+                })?;
+            }
+            Mutation::Tag(r) => row.tag = validate_agent_tag(&r.tag)?,
+            Mutation::Labels(r) => row.labels = validate_agent_labels(&r.labels)?,
+            Mutation::Avatar(r) => {
+                validate_agent_avatar(&r.genome, r.avatar_type.as_deref())?;
+                applied = !r.seed_only || row.avatar.is_none();
+                if applied {
+                    row.avatar = Some(StoredAgentAvatar {
+                        genome: r.genome.clone(),
+                        avatar_type: r.avatar_type.clone().unwrap(),
+                        version: r.version,
+                    });
+                }
+            }
+            Mutation::Github(_, identity) => {
+                if let Some(identity) = identity {
+                    validate_github_identity(identity)?;
+                }
+                row.github_identity = identity.clone();
+            }
+            Mutation::Dispose(_) | Mutation::Merge(_) => {
+                // Validate the claim that apply will release even on read-only
+                // pre-checks; a missing claim must not reach a prompt.
+                claims::active_claim(conn, id)?;
+                if let Mutation::Merge(r) = request {
+                    if id == r.into_agent_id {
+                        return Err(AgentMutationError::new(
+                            "merge_self",
+                            "an agent cannot merge into itself",
+                        ));
+                    }
+                    if !load_row(conn, &r.into_agent_id)?
+                        .is_some_and(|target| target.status == "live")
+                    {
+                        return Err(AgentMutationError::new(
+                            "merge_target_not_live",
+                            "merge target is not live",
+                        ));
+                    }
+                    row.status = "merged".into();
+                    row.merged_into = Some(r.into_agent_id.clone());
+                } else {
+                    row.status = "retired".into();
+                }
+                row.terminal_at_ms = Some(now);
+                release = true;
+            }
+            Mutation::Create(_) => unreachable!(),
+        }
+    }
+    if row != previous {
+        row.agent_generation = previous
+            .agent_generation
+            .checked_add(1)
+            .ok_or_else(|| AgentMutationError::new("storage_error", "agent generation overflow"))?;
+        row.updated_at_ms = now;
+    }
+    Ok(Prepared {
+        row,
+        previous: Some(previous),
+        name,
+        release,
+        applied,
+        old_name,
+    })
+}
+
+type Applied = (AgentRow, Vec<AgentNameClaim>, Value, Option<String>);
+impl Prepared {
+    fn apply(
+        mut self,
+        tx: &Transaction<'_>,
+        store: &RegistryStore,
+        request: &Mutation,
+        now: i64,
+        agent_id: Option<&str>,
+    ) -> Result<Applied, AgentMutationError> {
+        if self.previous.is_none() {
+            self.row.agent_id = if let Some(id) = agent_id {
+                if load_row(tx, id)?.is_some() {
+                    return Err(AgentMutationError::new(
+                        "identity_log_invariant",
+                        "pre-drawn agent id is occupied",
+                    ));
+                }
+                id.to_owned()
+            } else {
+                loop {
+                    let id = format!("agent_{}", store.ids.hex(8)?);
+                    if load_row(tx, &id)?.is_none() {
+                        break id;
+                    }
+                }
+            };
+        }
+        let mut claims = vec![];
+        if self.release {
+            claims.push(claims::release(tx, &self.row.agent_id, now)?);
+        }
+        // Insert a new identity before its claim (the claim has a foreign key).
+        if self.previous.as_ref() != Some(&self.row) {
+            write_row(tx, &self.row)?;
+        }
+        if let Some(name) = &self.name {
+            claims.push(claims::claim(
+                tx,
+                &self.row.agent_id,
+                &name.kind,
+                &name.key,
+                &name.name,
+                now,
+            )?);
+        }
+        let value = match request {
+            Mutation::Avatar(_) => json!({"avatar": self.row.avatar.as_ref().map(|a| AgentAvatar {
+                genome: a.genome.clone(), avatar_type: Some(a.avatar_type.clone()), version: a.version,
+            }), "applied": self.applied}),
+            Mutation::Github(_, _) => json!({"github_identity": self.row.github_identity}),
+            Mutation::Dispose(_) | Mutation::Merge(_) => json!({"gone": self.row.gone()}),
+            _ => json!({"agent": self.row.digest()}),
+        };
+        Ok((self.row, claims, value, self.old_name))
+    }
+}
+
+/// Build the exact text both before prompting and inside each write attempt.
+/// All interpolated data uses Debug escaping and ids are never abbreviated.
+fn summary(
+    conn: &Connection,
+    request: &Mutation,
+    prepared: &Prepared,
+) -> Result<String, AgentMutationError> {
+    let target = prepared.previous.as_ref().unwrap_or(&prepared.row);
+    Ok(match request {
+        Mutation::Create(_) => {
+            let row = &prepared.row;
+            let role = if row.role == "workspace_head" {
+                "workspace head"
+            } else {
+                &row.role
+            };
+            let mut text = format!("create {role} agent {:?}", row.name);
+            if let Some(project) = &row.project_id {
+                text.push_str(&format!(" for project {project:?}"));
+                if let Some(workspace) = &row.workspace_id {
+                    text.push_str(&format!(" in workspace {workspace:?}"));
+                }
+            } else if let Some(workspace) = &row.workspace_id {
+                text.push_str(&format!(" for workspace {workspace:?}"));
+            }
+            if let Some(id) = &row.supervisor_agent_id {
+                let supervisor = load_row(conn, id)?.ok_or_else(|| {
+                    AgentMutationError::new("invalid_supervisor", "supervisor disappeared")
+                })?;
+                text.push_str(&format!(" supervised by {:?} ({id:?})", supervisor.name));
+            }
+            text.push_str(&format!(" with tag {:?}", row.tag));
+            text
+        }
+        Mutation::Rename(_) => format!(
+            "rename agent {:?} ({:?}) to {:?}",
+            target.name, target.agent_id, prepared.row.name
+        ),
+        Mutation::Dispose(_) => format!("retire agent {:?} ({:?})", target.name, target.agent_id),
+        Mutation::Tag(_) => format!(
+            "set tag of agent {:?} ({:?}) to {:?}",
+            target.name, target.agent_id, prepared.row.tag
+        ),
+        Mutation::Labels(_) => format!(
+            "set labels of agent {:?} ({:?}) to {}",
+            target.name,
+            target.agent_id,
+            if prepared.row.labels.is_empty() {
+                "none".into()
+            } else {
+                prepared
+                    .row
+                    .labels
+                    .iter()
+                    .map(|label| format!("{label:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        ),
+        _ => {
+            return Err(AgentMutationError::new(
+                "direct_identity_write_not_admitted",
+                "this identity method cannot be confirmed",
+            ))
+        }
+    })
 }
 
 impl RegistryStore {
+    /// Checks a write from a `Direct` caller before the operator is prompted,
+    /// on the read connection, writing nothing (no id drawn, no claim, no
+    /// pending row). If this request key already landed, its stored reply is
+    /// returned first, so a retry never prompts again. Otherwise the write must
+    /// be allowed by now (agent identity handed over from core, the
+    /// `agent.cutover` marker) and pass every rule the write itself applies;
+    /// the result is the one-line description the operator will approve.
+    pub fn precheck_agent_confirmation(
+        &self,
+        op: &str,
+        params: Value,
+        now: i64,
+    ) -> Result<AgentPrecheck, AgentMutationError> {
+        let request = Mutation::decode(op, params)?;
+        let key = required_key(&request)?;
+        if let Some(body) = self.shared_request_cache(op, Some(key))? {
+            return Ok(AgentPrecheck::Cached(body));
+        }
+        self.read_agent(|conn| {
+            require_cutover(conn)?;
+            let prepared = validate(conn, &request, now)?;
+            let text = summary(conn, &request, &prepared)?;
+            if text.chars().count() > OPERATOR_SUMMARY_LIMIT {
+                return Err(AgentMutationError::new(
+                    "operator_summary_too_long",
+                    "shorten the tag, name or label set to fit the operator prompt",
+                ));
+            }
+            Ok(AgentPrecheck::Ready(text))
+        })
+    }
+
     /// Run an identity mutation after the module has admitted its route. Store
     /// the supplied timestamp; the serving layer attaches the process
     /// `incarnation` to replies instead of persisting it in the cache. Call
@@ -566,11 +892,10 @@ impl JournalWriter<'_> {
         self.agent_mutation_with_id(op, params, now, None)
     }
 
-    /// The shared write path supplies a create id drawn once for the request.
-    /// If another writer adds a log entry first, creating the agent is rolled
-    /// back and run again with the same id, so the requested agent keeps its
-    /// identity across retries. Calls without a supplied id still draw one
-    /// inside the transaction.
+    /// Runs an agent write with no operator approval: the path core's relayed
+    /// writes take, unchanged in payload and request-key caching. `agent_id`
+    /// is supplied when the shared identity log retries a create, so every
+    /// attempt creates the same agent.
     pub fn agent_mutation_with_id(
         &self,
         op: &str,
@@ -578,134 +903,58 @@ impl JournalWriter<'_> {
         now: i64,
         agent_id: Option<&str>,
     ) -> Result<Vec<u8>, AgentMutationError> {
+        self.agent_mutation_with_approval(op, params, now, agent_id, None)
+    }
+
+    /// The serving path supplies an approval only after operator presence was
+    /// confirmed. Rebuild its description inside every mutation transaction,
+    /// after domain validation and before writing any row or claim.
+    pub fn agent_mutation_with_approval(
+        &self,
+        op: &str,
+        params: Value,
+        now: i64,
+        agent_id: Option<&str>,
+        approval: Option<&OperatorApproval>,
+    ) -> Result<Vec<u8>, AgentMutationError> {
         let request = Mutation::decode(op, params)?;
-        let (key, actor) = request.meta();
-        let key = key
-            .as_deref()
-            .filter(|key| !key.is_empty())
-            .ok_or_else(|| {
-                AgentMutationError::new("request_key_required", "request_key is required")
-            })?;
+        let (_, actor) = request.meta();
+        let key = required_key(&request)?;
         self.mutation_with_error(op, Some(key), |tx| {
-            if tx.query_row(
-                "SELECT 1 FROM registry_journal WHERE op='agent.cutover' LIMIT 1",
-                [],
-                |_| Ok(()),
-            ).optional()?.is_none() {
-                return Err(AgentMutationError::new(
-                    "authority_not_cut_over",
-                    "agent identity authority is not cut over",
-                ));
+            require_cutover(tx)?;
+            let prepared = validate(tx, &request, now)?;
+            if let Some(approval) = approval {
+                if summary(tx, &request, &prepared)? != approval.summary {
+                    return Err(AgentMutationError::new(
+                        "operator_approval_stale",
+                        "agent identity or placement changed after operator approval",
+                    ));
+                }
             }
-            let (row, claims, value, old_name) = match &request {
-                Mutation::Create(r) => {
-                    let (row, claims) = create(tx, self, r, now, agent_id)?;
-                    let value = json!({"agent": row.digest()});
-                    (row, claims, value, None)
-                }
-                _ => {
-                    let id = request.target().unwrap();
-                    let mut row = load_row(tx, id)?.ok_or_else(|| {
-                        AgentMutationError::new("unknown_agent", format!("unknown agent {id}"))
-                    })?;
-                    let previous = row.clone();
-                    let idempotent = matches!(&request, Mutation::Dispose(_) if row.status == "retired")
-                        || matches!(&request, Mutation::Merge(r) if row.status == "merged"
-                            && row.merged_into.as_deref() == Some(r.into_agent_id.as_str()));
-                    if row.status != "live" && !idempotent {
-                        return Err(AgentMutationError::new("gone", "agent is gone")
-                            .with_detail(row.gone().unwrap()));
-                    }
-                    let mut claims = vec![];
-                    let mut old_name = None;
-                    let mut applied = true;
-                    if !idempotent {
-                        match &request {
-                            Mutation::Rename(r) => {
-                                if matches!(row.role.as_str(), "head" | "hiree") {
-                                    placement(tx, row.project_id.as_deref().unwrap())?;
-                                }
-                                let name = normalize_agent_name(&r.name)?;
-                                // A rename keeps the namespace of the agent's active
-                                // claim. Current project placement is only checked,
-                                // not used to choose the namespace, because an imported
-                                // claim may name a workspace that no longer exists.
-                                // Source: prefrontal 873870be8 crates/prefrontal-core-store/src/agent_claims.rs:248-266.
-                                let active = claims::active_claim(tx, id)?;
-                                claims::check_name(tx, &active.namespace_kind, &active.namespace_key, &name, Some(id))?;
-                                claims.push(claims::release(tx, id, now)?);
-                                claims.push(claims::claim(tx, id, &active.namespace_kind, &active.namespace_key, &name, now)?);
-                                old_name = Some(row.name.clone());
-                                row.name = name.stored_name;
-                                row.name_normalization_version = name.normalization_version;
-                                row.name_version = row.name_version.checked_add(1).ok_or_else(|| {
-                                    AgentMutationError::new("storage_error", "name version overflow")
-                                })?;
-                            }
-                            Mutation::Tag(r) => row.tag = validate_agent_tag(&r.tag)?,
-                            Mutation::Labels(r) => row.labels = validate_agent_labels(&r.labels)?,
-                            Mutation::Avatar(r) => {
-                                validate_agent_avatar(&r.genome, r.avatar_type.as_deref())?;
-                                applied = !r.seed_only || row.avatar.is_none();
-                                if applied {
-                                    row.avatar = Some(StoredAgentAvatar {
-                                        genome: r.genome.clone(),
-                                        avatar_type: r.avatar_type.clone().unwrap(),
-                                        version: r.version,
-                                    });
-                                }
-                            }
-                            Mutation::Github(_, identity) => {
-                                if let Some(identity) = identity {
-                                    validate_github_identity(identity)?;
-                                }
-                                row.github_identity = identity.clone();
-                            }
-                            Mutation::Dispose(_) | Mutation::Merge(_) => {
-                                if let Mutation::Merge(r) = &request {
-                                    if id == r.into_agent_id {
-                                        return Err(AgentMutationError::new("merge_self", "an agent cannot merge into itself"));
-                                    }
-                                    if !load_row(tx, &r.into_agent_id)?.is_some_and(|target| target.status == "live") {
-                                        return Err(AgentMutationError::new("merge_target_not_live", "merge target is not live"));
-                                    }
-                                    row.status = "merged".into();
-                                    row.merged_into = Some(r.into_agent_id.clone());
-                                } else {
-                                    row.status = "retired".into();
-                                }
-                                row.terminal_at_ms = Some(now);
-                                claims.push(claims::release(tx, id, now)?);
-                            }
-                            Mutation::Create(_) => unreachable!(),
-                        }
-                    }
-                    // A no-change success is still journaled, but must leave the
-                    // identity's own generation and modification timestamp alone.
-                    if row != previous {
-                        row.agent_generation = previous.agent_generation.checked_add(1).ok_or_else(|| {
-                            AgentMutationError::new("storage_error", "agent generation overflow")
-                        })?;
-                        row.updated_at_ms = now;
-                        write_row(tx, &row)?;
-                    }
-                    let value = match &request {
-                        Mutation::Avatar(_) => json!({"avatar": row.avatar.as_ref().map(|a| AgentAvatar {
-                            genome: a.genome.clone(), avatar_type: Some(a.avatar_type.clone()), version: a.version,
-                        }), "applied": applied}),
-                        Mutation::Github(_, _) => json!({"github_identity": row.github_identity}),
-                        Mutation::Dispose(_) | Mutation::Merge(_) => json!({"gone": row.gone()}),
-                        _ => json!({"agent": row.digest()}),
-                    };
-                    (row, claims, value, old_name)
-                }
-            };
+            let (row, claims, value, old_name) =
+                prepared.apply(tx, self, &request, now, agent_id)?;
             let mut entry = AgentChangeEntry::new(op, row, claims);
             if old_name.is_some() {
                 entry.old_display_name = old_name;
                 entry.new_display_name = Some(entry.row.name.clone());
             }
-            journal::record(tx, entry, value, actor.as_deref().unwrap_or("module"), key, now, self.principal)
+            let mut action = journal::record(
+                tx,
+                entry,
+                value,
+                actor.as_deref().unwrap_or("module"),
+                key,
+                now,
+                if approval.is_some() {
+                    "direct"
+                } else {
+                    self.principal
+                },
+            )?;
+            if approval.is_some() {
+                action.payload["operator_confirmed"] = json!(true);
+            }
+            Ok(action)
         })
     }
 }

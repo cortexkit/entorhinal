@@ -1575,10 +1575,10 @@ mod tests {
         );
         assert_eq!(manifest["capabilities"]["requires"], json!([]));
         let cargo = include_str!("../../../Cargo.toml");
-        assert!(cargo.contains("subc-protocol = \"0.29.0\""));
-        assert!(cargo.contains("subc-client-rs = \"0.26.1\""));
+        assert!(cargo.contains("subc-protocol = \"0.29.4\""));
+        assert!(cargo.contains("subc-client-rs = \"0.26.3\""));
         let lock = include_str!("../../../Cargo.lock");
-        for (name, version) in [("subc-protocol", "0.29.0"), ("subc-client-rs", "0.26.1")] {
+        for (name, version) in [("subc-protocol", "0.29.4"), ("subc-client-rs", "0.26.3")] {
             assert_eq!(lock.matches(&format!("name = \"{name}\"\n")).count(), 1);
             assert!(lock.contains(&format!("name = \"{name}\"\nversion = \"{version}\"")));
         }
