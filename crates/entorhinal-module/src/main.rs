@@ -77,10 +77,10 @@ mod two_machine_acceptance;
 // `serve`, claim the module's identity against the daemon, and sit there
 // looking healthy while doing nothing the operator asked for.
 fn main() -> std::process::ExitCode {
-    // The user-facing command surface is `ck projects` and `ck workspaces`,
-    // dispatched by `ck` to `ck-projects` / `ck-workspaces` -- both symlinks to
+    // The user-facing command surface is `ck projects`, `ck workspaces` and `ck agents`,
+    // dispatched by `ck` to `ck-projects` / `ck-workspaces` / `ck-agents` -- symlinks to
     // this binary. argv[0] selects the face; the module identity (ck-entorhinal)
-    // never appears in an operator's vocabulary. One binary rather than three
+    // never appears in an operator's vocabulary. One binary rather than four
     // because the faces share every line of transport, rendering, and parse
     // machinery, and a shared binary cannot drift from itself.
     let face = cli::face_from_argv0(std::env::args().next().as_deref());

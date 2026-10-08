@@ -1,4 +1,4 @@
-//! `ck projects` and `ck workspaces` reach this binary only through the ck
+//! `ck projects`, `ck workspaces` and `ck agents` reach this binary only through the ck
 //! dispatcher's domain handshake: `ck-<name> --ck-domain` must exit 0 and print
 //! exactly one headline line within 2 seconds, or ck refuses the command. The
 //! face comes from argv[0], so the test calls the real binary through a symlink
@@ -97,6 +97,7 @@ fn operator_faces_answer_the_ck_domain_handshake_with_one_headline() {
     for (face, headline) in [
         ("ck-projects", "ck projects"),
         ("ck-workspaces", "ck workspaces"),
+        ("ck-agents", "ck agents"),
     ] {
         let (status, stdout) = run_as(face);
         assert!(status.success(), "{face} --ck-domain must exit 0: {status}");
