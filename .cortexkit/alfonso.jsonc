@@ -5,15 +5,13 @@
       "mason": "broca"
     }
   },
-  // Masons' checks, lints and tests run on the Linux build server instead of
-  // this Mac. CI already runs the whole suite on Linux, and no test needs a
-  // macOS framework or a fleet binary on disk (the one real-daemon test is
-  // #[ignore]d). `cargo build` stays local: a remote build leaves no binary on
-  // this Mac, so anything that then runs the built binary here (a release
-  // card, a smoke check) would silently run a stale one. The mutation runner
-  // also stays local.
+  // Masons may run checks, lints and tests on the Linux build server. CI
+  // already runs the whole suite on Linux, and no test needs a macOS framework
+  // or a fleet binary on disk (the one real-daemon test is #[ignore]d). Keep
+  // `cargo build` and the mutation runner on this Mac: a remote build leaves no
+  // binary here, so anything that then runs the built binary locally (a
+  // release card, a smoke check) would silently run a stale one.
   "remote_exec": {
-    "enabled": true,
-    "commands": ["cd", "cargo check", "cargo test", "cargo clippy"]
+    "enabled": true
   }
 }
