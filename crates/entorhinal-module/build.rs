@@ -20,6 +20,9 @@ fn main() {
     let out_dir = std::env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR for build scripts");
     let always_restamp = Path::new(&out_dir).join("provenance-always-restamp");
     println!("cargo:rerun-if-changed={}", always_restamp.display());
+    // The manifest uses this to distinguish debug builds from release builds
+    // whose Git checkout is unavailable.
+    println!("cargo:rustc-env=ENTORHINAL_BUILD_PROFILE=release");
 
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
     let Some(revision) = git(&manifest_dir, &["rev-parse", "HEAD"]) else {

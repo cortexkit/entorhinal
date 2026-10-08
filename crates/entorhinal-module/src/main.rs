@@ -1486,7 +1486,9 @@ fn manifest() -> ModuleManifest {
 /// revision from a dirty release tree is declined with a reason, while a source
 /// tarball reports that Git is unavailable.
 fn declared_provenance() -> Option<ManifestProvenance> {
-    if cfg!(debug_assertions) && option_env!("ENTORHINAL_BUILD_REV").is_none() {
+    if option_env!("ENTORHINAL_BUILD_PROFILE").is_none()
+        && option_env!("ENTORHINAL_BUILD_REV").is_none()
+    {
         return Some(
             ManifestProvenance::new()
                 .with_build_git_sha_absence_reason(Some(
