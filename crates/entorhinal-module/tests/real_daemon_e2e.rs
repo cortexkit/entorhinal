@@ -13,8 +13,7 @@ use std::{
     time::Duration,
 };
 
-mod common;
-use common::ckdev_binary;
+use cortexkit_test_support::ckdev_binary;
 
 use serde_json::Value;
 use subc_protocol::Frame;

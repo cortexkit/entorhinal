@@ -21,8 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-mod common;
-use common::ckdev_binary;
+use cortexkit_test_support::ckdev_binary;
 
 /// Only stops a hang: a handshake that opened the store or waited on a daemon
 /// would block here instead of answering.
@@ -31,10 +30,11 @@ const HANG_GUARD: Duration = Duration::from_secs(30);
 /// Runs the binary under its `ckdev-` dev name, with an empty environment and
 /// no daemon connection file to find.
 ///
-/// The executable is a `ckdev-entorhinal` hard link, and argv[0] is the face's
-/// dev name (`ckdev-projects`, ...). Both matter: the binary picks its face from
-/// argv[0], and macOS's process list shows argv[0], so a test copy must never
-/// carry a `ck-` name there, where it would look like a production binary.
+/// The executable is a `ckdev-entorhinal` copy, and argv[0] selects the command
+/// domain (`ckdev-projects`, `ckdev-workspaces`, or `ckdev-agents`). Both matter:
+/// the binary selects its handshake headline from argv[0], and macOS's process
+/// list shows argv[0], so a test copy must never carry a `ck-` name there, where
+/// it would look like a production binary.
 fn run_as(face: &str) -> (std::process::ExitStatus, String) {
     let binary = ckdev_binary(env!("CARGO_BIN_EXE_ck-entorhinal"));
     let dev_face = face.replacen("ck-", "ckdev-", 1);

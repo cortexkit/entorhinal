@@ -160,6 +160,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cortexkit-test-support"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e62f7642eb194655979868dc48755a2474225c58f229427d99fb64b05d28eddb"
+dependencies = [
+ "rustix",
+ "sha2",
+ "subc-os",
+ "tokio",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -233,6 +245,7 @@ dependencies = [
  "async-trait",
  "cortexkit-log",
  "cortexkit-store-types",
+ "cortexkit-test-support",
  "entorhinal-core",
  "getrandom",
  "rusqlite",
@@ -834,9 +847,9 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.4"
+version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2eaab39470b0164f2f230c8ef0331eff3379f98e15673b2ce1efacb4447acfe5"
+checksum = "deaa591b1073aed5dcc9af687eb2bf45839bd3296a04b598b29cc2bee1bfe8d9"
 dependencies = [
  "libc",
  "rustix",

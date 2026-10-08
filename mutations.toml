@@ -990,21 +990,21 @@ expect_message = "direct_identity_write_not_admitted"
 
 [[control]]
 id = "scan-binary-names-recognizes-violations"
-guards = "The binary-name scanner recognizes its planted direct and adjacent unwrapped process spawns"
+guards = "The shared binary-name guard recognizes planted direct and adjacent unwrapped process spawns"
 file = "crates/entorhinal-module/tests/binary_names.rs"
-old = "if statement_has_unwrapped_binary(statement) || indirect_spawn {"
-new = "if false /* NON-VACUITY BREAK */ {"
+old = "assert_test_binary_spawns(&[&fixture.0]);"
+new = "let _ = &fixture; // NON-VACUITY BREAK"
 test_file = "crates/entorhinal-module/tests/binary_names.rs"
 runner = "cargo"
 package = "entorhinal-module"
 target = "--test binary_names"
 expect_red = ["binary_spawn_guard_controls_reject_direct_and_adjacent_spawns"]
-expect_message = "violations(\"direct.rs\", direct)"
+expect_message = "spawn guard accepted direct.rs"
 only = true
 
 [[control]]
 id = "scan-binary-names-planted-source"
-guards = "The real repository source scan refuses a planted unwrapped executable path"
+guards = "The shared guard scans real repository sources and refuses a planted unwrapped executable path"
 file = "crates/entorhinal-module/tests/manifest.rs"
 old = "fn manifest_flag_prints_the_manifest_with_the_provided_capability() {\n    let binary = ckdev_binary(env!(\"CARGO_BIN_EXE_ck-entorhinal\"));"
 new = "fn manifest_flag_prints_the_manifest_with_the_provided_capability() {\n    let binary = env!(\"CARGO_BIN_EXE_ck-entorhinal\"); // NON-VACUITY BREAK"

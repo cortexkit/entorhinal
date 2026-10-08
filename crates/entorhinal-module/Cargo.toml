@@ -26,6 +26,7 @@ tokio = { workspace = true }
 getrandom = { workspace = true }
 
 [dev-dependencies]
+cortexkit-test-support = "0.1.0"
 rusqlite = { workspace = true }
 # The e2e test spawns the daemon and the module as child processes, which
 # needs tokio's process feature. Declared here because nothing else in the

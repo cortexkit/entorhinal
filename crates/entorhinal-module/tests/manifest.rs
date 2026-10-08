@@ -4,8 +4,7 @@
 
 use std::process::Command;
 
-mod common;
-use common::ckdev_binary;
+use cortexkit_test_support::ckdev_binary;
 
 #[test]
 fn manifest_flag_prints_the_manifest_with_the_provided_capability() {

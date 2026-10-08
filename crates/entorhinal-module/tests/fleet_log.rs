@@ -10,8 +10,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-mod common;
-use common::ckdev_binary;
+use cortexkit_test_support::ckdev_binary;
 
 /// A scratch home removed on drop, named per process and per call so
 /// parallel tests never share one.
