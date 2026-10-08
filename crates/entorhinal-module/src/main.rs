@@ -2932,6 +2932,55 @@ mod tests {
     /// feed exists to produce. Hence the refusal is the receiver's own
     /// invariant, not a workaround for one producer's scheduling.
     #[test]
+    fn an_equal_sequence_batch_cannot_resurrect_a_gone_session() {
+        let handler = ProjectsHandler::new().unwrap();
+        handler
+            .session_liveness(json!({"seq":10,"snapshot":true,"sessions":[
+                {"sessionId":"s1","canonicalRoot":"/tmp/a","state":"active","lastActivityMs":100}
+            ]}))
+            .unwrap();
+        handler
+            .session_liveness(json!({"seq":11,"sessions":[
+                {"sessionId":"s1","canonicalRoot":"/tmp/a","state":"gone"}
+            ]}))
+            .unwrap();
+        let before = {
+            let state = handler.liveness.lock().unwrap();
+            (state.sessions.clone(), state.last_seq)
+        };
+        assert!(before.0.is_empty());
+        // A duplicate sequence need not carry the same payload. It must not
+        // undo an already applied terminal transition.
+        let reply = handler
+            .session_liveness(json!({"seq":11,"sessions":[
+                {"sessionId":"s1","canonicalRoot":"/tmp/a","state":"active","lastActivityMs":999}
+            ]}))
+            .unwrap();
+        let reply: Value = serde_json::from_slice(&reply).unwrap();
+        let state = handler.liveness.lock().unwrap();
+        assert_eq!(
+            (state.sessions.clone(), state.last_seq),
+            before,
+            "an equal-sequence delta must not change the mirror or its applied sequence"
+        );
+        assert!(
+            state.stale,
+            "a refused duplicate requests an authoritative rebase"
+        );
+        assert_eq!(reply["result"]["tracked"], 0);
+        assert_eq!(reply["result"]["snapshotRequested"], true);
+        assert_eq!(
+            handler
+                .health
+                .liveness_dropped_older
+                .load(Ordering::Relaxed),
+            1,
+            "the equal-sequence refusal must be counted"
+        );
+        assert_eq!(handler.health.liveness_gaps.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn an_older_batch_cannot_resurrect_a_session_that_is_already_gone() {
         let handler = ProjectsHandler::new().unwrap();
         let call = |v: serde_json::Value| handler.session_liveness(v);

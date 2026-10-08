@@ -516,6 +516,39 @@ mod tests {
     use std::path::Path;
 
     #[test]
+    fn without_agents_refuses_existing_agents_even_without_a_cutover_marker() {
+        let f = crate::mutations::tests::Fixture::new("without-agents-unmarked");
+        // Legacy agents may exist before the cutover marker. Test this helper
+        // directly so an earlier enable precondition cannot mask its refusal.
+        f.store.apply_entry("fixture.legacy_agent", "{}", "test", None, |tx| {
+            tx.execute("INSERT INTO agent(agent_id,name,tag,role,created_at_ms,updated_at_ms) VALUES('agent_0000000000000001','Ada','helper','assistant',1,1)", [])?;
+            Ok(())
+        }).unwrap();
+        let marked: bool = f
+            .store
+            .read(|conn| {
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM registry_journal WHERE op='agent.cutover')",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert!(!marked);
+        let before = serde_json::to_value(f.store.agent_snapshot().unwrap()).unwrap();
+        assert_eq!(before["agents"].as_array().unwrap().len(), 1);
+        let generation = f.store.generation().unwrap();
+        let error = f.store.check_agent_import_preconditions(true).unwrap_err();
+        assert!(matches!(&error, RegistryError::Domain { code, .. } if code == "invalid_request"));
+        assert!(error.to_string().contains("--without-agents"));
+        assert_eq!(
+            serde_json::to_value(f.store.agent_snapshot().unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(f.store.generation().unwrap(), generation);
+    }
+
+    #[test]
     fn supersede_partition_reserves_replacement_metadata_at_cap() {
         let id = "0123456789abcdef0123456789abcdef";
         let mut image = ProjectEntry {

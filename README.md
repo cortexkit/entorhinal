@@ -111,13 +111,13 @@ own.
 ## Mutation proofs
 
 `mutations.toml` records independent breaks of costly, silent safety properties
-and the exact tests that must fail; CI uses `ckdev-mutate` 0.8.0 pinned to commons
-`46cc166b0df2edcfd14b3eb54ed6eeac588fed69` to check every catalogue, replay touched
+and the exact tests that must fail; CI uses `ckdev-mutate` 0.9.3 pinned to commons
+`c1591d4a76fa3d3a7367237922b0bca5214dbf11` to check every catalogue, replay touched
 rows on pushes and PRs, replay all rows on main, and audit every package target
 nightly with `--broad`.
 
 ```sh
-cargo install --locked --git https://github.com/cortexkit/commons --rev 46cc166b0df2edcfd14b3eb54ed6eeac588fed69 cortexkit-mutate
+cargo install --locked --git https://github.com/cortexkit/commons --rev c1591d4a76fa3d3a7367237922b0bca5214dbf11 cortexkit-mutate
 ckdev-mutate check
 ckdev-mutate run --only admission-flow-call-site --report target/mutations/one.json
 ckdev-mutate run --all --report target/mutations/all.json

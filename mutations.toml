@@ -1,4 +1,4 @@
-# Mutation proofs for ckdev-mutate 0.8.0 (commons 46cc166b0df2edcfd14b3eb54ed6eeac588fed69).
+# Mutation proofs for ckdev-mutate 0.9.3 (commons c1591d4a76fa3d3a7367237922b0bca5214dbf11).
 # Anchors are copied from production code; named tests must turn red, not time out.
 # Defaults allow 1800 s to build and 600 s to test on a clean CI runner.
 # Reports belong under the already gitignored target/mutations/.
@@ -356,8 +356,8 @@ expect_red = ["agent::store::tests::create_check_order_and_every_refusal_leave_r
 id = "identity-retired-kept"
 guards = "Disposal keeps retired identities and their historical claims instead of deleting reserved ids"
 file = "crates/entorhinal-core/src/agent/store.rs"
-old = "write_row(tx, &row)?;"
-new = "write_row(tx, &row)?;\n                        if row.status == \"retired\" { // NON-VACUITY BREAK\n                            tx.execute(\"DELETE FROM agent_name_claim WHERE agent_id=?1\", [&row.agent_id])?;\n                            tx.execute(\"DELETE FROM agent WHERE agent_id=?1\", [&row.agent_id])?;\n                        }"
+old = "write_row(tx, &self.row)?;"
+new = "write_row(tx, &self.row)?;\n                        if self.row.status == \"retired\" { // NON-VACUITY BREAK\n                            tx.execute(\"DELETE FROM agent_name_claim WHERE agent_id=?1\", [&self.row.agent_id])?;\n                            tx.execute(\"DELETE FROM agent WHERE agent_id=?1\", [&self.row.agent_id])?;\n                        }"
 test_file = "crates/entorhinal-core/src/agent/store.rs"
 runner = "cargo"
 package = "entorhinal-core"
@@ -368,8 +368,8 @@ expect_red = ["agent::store::tests::merge_and_dispose_release_claims_but_refusal
 id = "identity-merged-kept"
 guards = "Merge retains the terminal source identity and its claim history"
 file = "crates/entorhinal-core/src/agent/store.rs"
-old = "write_row(tx, &row)?;"
-new = "write_row(tx, &row)?;\n                        if row.status == \"merged\" { // NON-VACUITY BREAK\n                            tx.execute(\"DELETE FROM agent_name_claim WHERE agent_id=?1\", [&row.agent_id])?;\n                            tx.execute(\"DELETE FROM agent WHERE agent_id=?1\", [&row.agent_id])?;\n                        }"
+old = "write_row(tx, &self.row)?;"
+new = "write_row(tx, &self.row)?;\n                        if self.row.status == \"merged\" { // NON-VACUITY BREAK\n                            tx.execute(\"DELETE FROM agent_name_claim WHERE agent_id=?1\", [&self.row.agent_id])?;\n                            tx.execute(\"DELETE FROM agent WHERE agent_id=?1\", [&self.row.agent_id])?;\n                        }"
 test_file = "crates/entorhinal-core/src/agent/store.rs"
 runner = "cargo"
 package = "entorhinal-core"
@@ -879,3 +879,156 @@ package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 expect_red = ["enable::tests::writer_supersede_refusals_leave_journal_state_and_log_unchanged"]
 expect_message = "called `Result::unwrap_err()` on an `Ok` value"
+
+# Duplicate-sequence liveness and the independent legacy-agent flag branch.
+[[control]]
+id = "liveness-equal-refused"
+guards = "An equal-sequence delta cannot reverse a gone transition and its refusal is counted"
+file = "crates/entorhinal-module/src/main.rs"
+old = "if batch.seq <= last {"
+new = "if batch.seq < last /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-module/src/main.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tests::an_equal_sequence_batch_cannot_resurrect_a_gone_session"]
+expect_message = "an equal-sequence delta must not change the mirror or its applied sequence"
+
+[[control]]
+id = "enable-without-agents-populated-refused"
+guards = "The import consent helper independently refuses without-agents when legacy agents exist without a marker"
+file = "crates/entorhinal-core/src/enable_state.rs"
+old = "if without_agents && (agents > 0 || marker) {"
+new = "if without_agents && marker /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-core/src/enable_state.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["enable_state::tests::without_agents_refuses_existing_agents_even_without_a_cutover_marker"]
+expect_message = "called `Result::unwrap_err()` on an `Ok` value"
+
+[[control]]
+id = "operator-sdk-refusal-served"
+guards = "The real served path never treats a non-confirmed SDK response as approval"
+file = "crates/entorhinal-module/src/agent_ops.rs"
+old = "Err(_) => Err(OperatorConfirmError::PresenceUnavailable),"
+new = "Err(_) => Ok(()), // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/shared_write.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["shared_write::tests::confirmation::served::every_scripted_refusal_maps_to_its_code_and_writes_nothing"]
+
+[[control]]
+id = "operator-transaction-local-stale-approval"
+guards = "A confirmed write revalidates the approved identity and placement inside its transaction"
+file = "crates/entorhinal-core/src/agent/store.rs"
+old = "if summary(tx, &request, &prepared)? != approval.summary {"
+new = "if false /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-module/src/shared_write.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["shared_write::tests::confirmation::prompt_holds_no_locks_and_revalidation_catches_name_and_placement_changes"]
+
+[[control]]
+id = "operator-confirmation-slot-drop"
+guards = "Abandoned confirmation requests release their exclusion slot on drop"
+file = "crates/entorhinal-module/src/agent_ops.rs"
+old = "self.slot.lock().unwrap_or_else(|e| e.into_inner()).take();"
+new = "// NON-VACUITY BREAK: retain an abandoned confirmation slot"
+test_file = "crates/entorhinal-module/src/shared_write.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["shared_write::tests::confirmation::busy_slot_survives_approval_and_releases_on_finish_drop_and_deadline"]
+
+[[control]]
+id = "operator-route-closure-latch"
+guards = "Closing the confirmed route latches cancellation before a ready prompt or lock can admit its write"
+file = "crates/entorhinal-module/src/main.rs"
+old = "slot.cancelled.send_replace(true);"
+new = "// NON-VACUITY BREAK: omit route-closure cancellation"
+test_file = "crates/entorhinal-module/src/shared_write.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["shared_write::tests::confirmation::route_closure_wins_ready_prompt_and_lock_and_admission_slot_gap"]
+
+[[control]]
+id = "operator-bound-precedes-sdk"
+guards = "The receipt-relative operator bound withdraws an unanswered prompt before the SDK's own unavailable deadline"
+file = "crates/entorhinal-module/src/shared_write.rs"
+old = "const OPERATOR_BOUND: Duration = Duration::from_secs(270);"
+new = "const OPERATOR_BOUND: Duration = Duration::from_secs(300); // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/shared_write.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["shared_write::tests::confirmation::served::unanswered_prompt_is_withdrawn_at_the_operator_bound"]
+
+[[control]]
+id = "direct-nonconfirmable-avatar-admission"
+guards = "The served write path still authorizes a non-confirmable Direct agent method before decoding it"
+file = "crates/entorhinal-module/src/shared_write.rs"
+old = "if !direct {\n            authorize_write(&request.method, admission.principal.as_ref())?;\n        }"
+new = "if !direct && request.method != \"agent.set_avatar\" { // NON-VACUITY BREAK\n            authorize_write(&request.method, admission.principal.as_ref())?;\n        }"
+test_file = "crates/entorhinal-module/src/shared_write.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["shared_write::tests::confirmation::relay_bytes_are_unchanged_and_unconfirmed_seams_stay_closed"]
+expect_message = "direct_identity_write_not_admitted"
+
+[[control]]
+id = "scan-binary-names-recognizes-violations"
+guards = "The binary-name scanner recognizes its planted direct and adjacent unwrapped process spawns"
+file = "crates/entorhinal-module/tests/binary_names.rs"
+old = "if statement_has_unwrapped_binary(statement) || indirect_spawn {"
+new = "if false /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-module/tests/binary_names.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--test binary_names"
+expect_red = ["binary_spawn_guard_controls_reject_direct_and_adjacent_spawns"]
+expect_message = "violations(\"direct.rs\", direct)"
+only = true
+
+[[control]]
+id = "scan-binary-names-planted-source"
+guards = "The real repository source scan refuses a planted unwrapped executable path"
+file = "crates/entorhinal-module/tests/manifest.rs"
+old = "fn manifest_flag_prints_the_manifest_with_the_provided_capability() {\n    let binary = ckdev_binary(env!(\"CARGO_BIN_EXE_ck-entorhinal\"));"
+new = "fn manifest_flag_prints_the_manifest_with_the_provided_capability() {\n    let binary = env!(\"CARGO_BIN_EXE_ck-entorhinal\"); // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/tests/binary_names.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--test binary_names"
+expect_red = ["test_sources_only_execute_ckdev_named_binaries"]
+expect_message = "manifest.rs"
+only = true
+
+[[control]]
+id = "sqlite-memory-accounting-build-pin"
+guards = "Cargo's actual bundled SQLite build retains the memory-accounting disable flag"
+file = ".cargo/config.toml"
+old = "LIBSQLITE3_FLAGS = \"-DSQLITE_DEFAULT_MEMSTATUS=0\""
+new = "LIBSQLITE3_FLAGS = \"-DSQLITE_DEFAULT_MEMSTATUS=1\" # NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/tests/sqlite_build.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--test sqlite_build"
+expect_red = ["bundled_sqlite_is_built_without_memory_accounting"]
+expect_message = "SQLITE_DEFAULT_MEMSTATUS=0 is missing"
+
+[[control]]
+id = "lease-retry-keeps-retrying-within-budget"
+guards = "A predecessor's live lease is retried within the budget rather than failing the first open attempt"
+file = "crates/entorhinal-module/src/main.rs"
+old = "Err(error) if error.is_lease_held() && started.elapsed() < retry_budget => {"
+new = "Err(error) if false /* NON-VACUITY BREAK */ => {"
+test_file = "crates/entorhinal-module/src/main.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tests::open_retries_while_a_predecessor_still_holds_the_lease"]
