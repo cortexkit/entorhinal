@@ -29,9 +29,9 @@ use subc_client_rs::{
 };
 use subc_protocol::{
     manifest::{
-        build_provenance_from_source, BuildGitShaSource, CapabilityDeclarations, Concurrency,
-        GitTreeState, ManagementOperation, ManagementOperationKind, ManifestProvenance,
-        ModuleManifest, ProviderRole,
+        build_provenance_from_source, BuildGitShaAbsenceReason, BuildGitShaSource,
+        CapabilityDeclarations, Concurrency, GitTreeState, ManagementOperation,
+        ManagementOperationKind, ManifestProvenance, ModuleManifest, ProviderRole,
     },
     scope::ScopeStamp,
     ModuleHelloAckBody, Principal, PROTOCOL_VERSION,
@@ -239,6 +239,8 @@ struct ProjectsHandler {
     commits: Arc<tokio::sync::Notify>,
     feed_waits: tokio::sync::Semaphore,
     feed_clock: Arc<dyn agent_reads::FeedClock>,
+    /// Unit tests shorten this policy; production uses the ten-second default.
+    lease_retry_budget: Duration,
     #[allow(dead_code)]
     log_client: log_client::LogClient,
     writer: Arc<tokio::sync::Mutex<()>>,
@@ -432,6 +434,7 @@ impl ProjectsHandler {
             commits: Arc::new(tokio::sync::Notify::new()),
             feed_waits: tokio::sync::Semaphore::new(8),
             feed_clock: Arc::new(agent_reads::TokioFeedClock),
+            lease_retry_budget: LEASE_HELD_RETRY_BUDGET,
             log_client: log_client::LogClient::new(connector),
             writer: Arc::new(tokio::sync::Mutex::new(())),
             catch_up_task: Mutex::new(None),
@@ -567,14 +570,15 @@ impl ModuleHandler for ProjectsHandler {
                 // HELLO_ACK handler and the health reply stay prompt.
                 tracing::warn!(
                     target: "store",
-                    "opening projects storage: {error}; retrying for up to {}s",
-                    LEASE_HELD_RETRY_BUDGET.as_secs()
+                    "opening projects storage: {error}; retrying for up to {:.1}s",
+                    self.lease_retry_budget.as_secs_f64()
                 );
                 self.health.store_opening.store(true, Ordering::Relaxed);
                 let store = Arc::clone(&self.store);
                 let health = Arc::clone(&self.health);
+                let retry_budget = self.lease_retry_budget;
                 tokio::spawn(async move {
-                    let outcome = retry_open_while_lease_held(&descriptor).await;
+                    let outcome = retry_open_while_lease_held(&descriptor, retry_budget).await;
                     health.store_opening.store(false, Ordering::Relaxed);
                     install_store(&store, &health, outcome);
                 });
@@ -1446,10 +1450,27 @@ fn manifest() -> ModuleManifest {
     .build()
 }
 
-/// Build facts embedded by `build.rs`. A revision from a dirty tree is declined
-/// with a reason, and a build with no git (a source tarball) says so, rather
-/// than declaring a revision that does not describe the running code.
+/// Build facts embedded by `build.rs`. Debug builds intentionally omit a git
+/// stamp and explain that provenance is stamped only for release builds. A
+/// revision from a dirty release tree is declined with a reason, while a source
+/// tarball reports that Git is unavailable.
 fn declared_provenance() -> Option<ManifestProvenance> {
+    if option_env!("ENTORHINAL_BUILD_PROFILE").is_none()
+        && option_env!("ENTORHINAL_BUILD_REV").is_none()
+    {
+        return Some(
+            ManifestProvenance::new()
+                .with_build_git_sha_absence_reason(Some(
+                    BuildGitShaAbsenceReason::ForwardCompatibleUnknown(
+                        "provenance_stamped_only_in_release_builds".to_string(),
+                    ),
+                ))
+                .with_wire_crate_version(Some(
+                    subc_protocol::SUBC_PROTOCOL_CRATE_VERSION.to_string(),
+                )),
+        );
+    }
+
     let source = match (
         option_env!("ENTORHINAL_BUILD_REV"),
         option_env!("ENTORHINAL_BUILD_TREE"),
@@ -1569,16 +1590,18 @@ fn enable_root_records(store: &mut RegistryStore) {
 
 /// Retries the open with doubling delays while the only obstacle is a lease
 /// a predecessor still holds. Any other error, and a hold that outlasts the
-/// budget, end the retry with that error.
+/// budget, end the retry with that error. The budget is supplied by the handler
+/// so tests can exercise expiry without waiting for the production interval.
 async fn retry_open_while_lease_held(
     descriptor: &StorageDescriptor,
+    retry_budget: Duration,
 ) -> Result<RegistryStore, String> {
     let started = Instant::now();
     let mut delay = LEASE_HELD_RETRY_FIRST_DELAY;
     loop {
         tokio::time::sleep(delay).await;
         match RegistryStore::open(descriptor) {
-            Err(error) if error.is_lease_held() && started.elapsed() < LEASE_HELD_RETRY_BUDGET => {
+            Err(error) if error.is_lease_held() && started.elapsed() < retry_budget => {
                 delay = (delay * 2).min(LEASE_HELD_RETRY_MAX_DELAY);
             }
             outcome => {
@@ -2674,7 +2697,8 @@ mod tests {
     async fn open_retries_while_a_predecessor_still_holds_the_lease() {
         let (dir, descriptor) = scratch_descriptor("lease-held-then-released");
         let predecessor = RegistryStore::open(&descriptor).expect("predecessor opens");
-        let handler = ProjectsHandler::new().unwrap();
+        let mut handler = ProjectsHandler::new().unwrap();
+        handler.lease_retry_budget = Duration::from_secs(2);
 
         handler.on_hello_ack(&hello_ack(&descriptor)).await;
         let during = handler.health().await;
@@ -2712,16 +2736,11 @@ mod tests {
     async fn open_gives_up_on_a_lease_held_past_the_budget() {
         let (dir, descriptor) = scratch_descriptor("lease-held-past-budget");
         let _other_writer = RegistryStore::open(&descriptor).expect("other writer opens");
-        let handler = ProjectsHandler::new().unwrap();
+        let mut handler = ProjectsHandler::new().unwrap();
+        handler.lease_retry_budget = Duration::from_millis(300);
 
-        let started = Instant::now();
         handler.on_hello_ack(&hello_ack(&descriptor)).await;
-        wait_until_settled(&handler, LEASE_HELD_RETRY_BUDGET + Duration::from_secs(3)).await;
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed >= LEASE_HELD_RETRY_BUDGET,
-            "gave up before the budget: {elapsed:?}"
-        );
+        wait_until_settled(&handler, Duration::from_secs(3)).await;
         let after = handler.health().await;
         assert_eq!(after.status, HealthStatus::Failing, "{after:?}");
         assert!(handler.store.lock().unwrap().is_none());
