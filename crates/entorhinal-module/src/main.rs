@@ -1857,11 +1857,17 @@ mod tests {
         }
     }
 
+    /// A fresh store directory per call. Parallel tests often share a label and
+    /// start in the same millisecond, so the name also carries a per-process
+    /// counter; without it two tests open one store and the second fails on
+    /// the first's writer lease.
     pub(super) fn scratch_descriptor(name: &str) -> (PathBuf, StorageDescriptor) {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "entorhinal-{name}-{}-{}",
+            "entorhinal-{name}-{}-{}-{}",
             std::process::id(),
-            unix_millis()
+            unix_millis(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let descriptor = StorageDescriptor {
