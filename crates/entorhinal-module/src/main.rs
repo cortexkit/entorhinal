@@ -234,6 +234,10 @@ struct ProjectsHandler {
     writer: Arc<tokio::sync::Mutex<()>>,
     catch_up_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     agent_id_draw: fn() -> Result<String, HandlerError>,
+    operator_confirmer: Arc<dyn agent_ops::OperatorConfirmer>,
+    confirmation_slot: Arc<Mutex<Option<agent_ops::ConfirmationSlot>>>,
+    #[cfg(test)]
+    confirmation_admission_barrier: Option<Arc<tokio::sync::Barrier>>,
     #[cfg(test)]
     shared_commit_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -416,6 +420,10 @@ impl ProjectsHandler {
             writer: Arc::new(tokio::sync::Mutex::new(())),
             catch_up_task: Mutex::new(None),
             agent_id_draw: shared_write::draw_agent_id,
+            operator_confirmer: Arc::new(agent_ops::Unsupported),
+            confirmation_slot: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            confirmation_admission_barrier: None,
             #[cfg(test)]
             shared_commit_hook: None,
         }
@@ -438,12 +446,10 @@ impl ProjectsHandler {
 
     /// Whether a request on this route may run `method`. A flow-scoped route may
     /// not write at all. Project writes are admitted from `Direct` (the `ck`
-    /// faces) or the executive, as before. Agent identity writes are admitted only
-    /// from the executive (`reserved:prefrontal-core`), which relays the
-    /// operator's own changes after checking they come from the operator's
-    /// session. `Direct` is refused for them because every local process,
-    /// including an agent's shell, reaches entorhinal as `Direct`, so admitting
-    /// it would let any agent rewrite agent identity.
+    /// faces) or the executive, as before. This unconfirmed seam admits agent
+    /// writes only from the executive relay. The async served path separately
+    /// confirms five Direct methods with operator presence; it never bypasses
+    /// this refusal for synchronous requests or other identity methods.
     /// Enabling the identity log is reserved to an unscoped operator route.
     fn admit(&self, method: &str, key: RouteKey) -> Result<RouteAdmission, HandlerError> {
         let admission = self.admission_for(key);
@@ -506,7 +512,18 @@ impl ModuleHandler for ProjectsHandler {
     }
 
     async fn on_route_gone(&self, handle: &RouteHandle) {
-        self.route_admissions().remove(&route_key(handle));
+        let key = route_key(handle);
+        self.route_admissions().remove(&key);
+        if let Some(slot) = self
+            .confirmation_slot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            if slot.route == key {
+                slot.cancelled.send_replace(true);
+            }
+        }
     }
 
     async fn on_hello_ack(&self, ack: &ModuleHelloAckBody) {
@@ -1446,13 +1463,13 @@ fn agent_operation_description(method: &str) -> &'static str {
         "agent.fleet_identity" => "List live agents with their project and workspace placement for the fleet view.",
         "agent.snapshot" => "Read every agent and name claim at one generation, to seed a copy.",
         "agent.changes" => "Read identity changes after a cursor, optionally waiting up to 25 s for the next one.",
-        "agent.create" => "Create an agent. Accepted only from the executive.",
-        "agent.rename" => "Rename an agent. Accepted only from the executive.",
-        "agent.update_tag" => "Change an agent's tag. Accepted only from the executive.",
-        "agent.set_labels" => "Replace an agent's labels. Accepted only from the executive.",
+        "agent.create" => "Create an agent through the executive, or Direct with operator confirmation.",
+        "agent.rename" => "Rename an agent through the executive, or Direct with operator confirmation.",
+        "agent.update_tag" => "Change an agent's tag through the executive, or Direct with operator confirmation.",
+        "agent.set_labels" => "Replace an agent's labels through the executive, or Direct with operator confirmation.",
         "agent.set_avatar" => "Set an agent's avatar. Accepted only from the executive.",
         "agent.set_github_identity" => "Bind or clear an agent's GitHub identity. Accepted only from the executive.",
-        "agent.dispose" => "Retire an agent; its id stays reserved. Accepted only from the executive.",
+        "agent.dispose" => "Retire an agent; its id stays reserved. Executive or Direct with operator confirmation.",
         "agent.merge" => "Merge one agent into another and retire the source. Accepted only from the executive.",
         "agent.import" => "Import the executive's agent registry once, at cutover. Accepted only from the executive.",
         _ => "",

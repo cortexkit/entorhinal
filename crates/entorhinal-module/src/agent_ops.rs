@@ -1,5 +1,6 @@
 //! Serves agent identity mutations. Who may call them is decided in
-//! `ProjectsHandler::admit`; this module only routes an admitted request to
+//! `ProjectsHandler::admit`, or by the served path's operator confirmation;
+//! this module routes admitted requests to
 //! `entorhinal-core`, which owns request decoding, request-key caching, the
 //! one-time import that hands agent identity over from core, and every
 //! identity rule.
@@ -7,7 +8,103 @@
 use entorhinal_core::agent::AgentMutationError;
 use serde_json::Value;
 
+use super::RouteKey;
 use super::{HandlerError, ProjectsHandler};
+use async_trait::async_trait;
+use std::sync::{Arc, Mutex};
+
+pub(super) const CONFIRMABLE_METHODS: &[&str] = &[
+    "agent.create",
+    "agent.rename",
+    "agent.dispose",
+    "agent.update_tag",
+    "agent.set_labels",
+];
+
+#[derive(Debug, Clone, Copy)]
+pub(super) enum OperatorConfirmError {
+    Declined,
+    #[allow(dead_code)] // Used by the presence adapter; Unsupported is the interim default.
+    PresenceUnavailable,
+    Unsupported,
+}
+
+#[async_trait]
+pub(super) trait OperatorConfirmer: Send + Sync {
+    async fn confirm_operator(
+        &self,
+        summary: &str,
+        route: RouteKey,
+    ) -> Result<(), OperatorConfirmError>;
+}
+
+pub(super) struct Unsupported;
+#[async_trait]
+impl OperatorConfirmer for Unsupported {
+    async fn confirm_operator(&self, _: &str, _: RouteKey) -> Result<(), OperatorConfirmError> {
+        Err(OperatorConfirmError::Unsupported)
+    }
+}
+
+impl From<OperatorConfirmError> for HandlerError {
+    fn from(error: OperatorConfirmError) -> Self {
+        let (code, message) = match error {
+            OperatorConfirmError::Declined => (
+                "operator_declined",
+                "the operator declined this write at the prompt",
+            ),
+            OperatorConfirmError::PresenceUnavailable => (
+                "operator_presence_unavailable",
+                "operator confirmation is unavailable on this machine",
+            ),
+            OperatorConfirmError::Unsupported => (
+                "operator_presence_unavailable",
+                "this daemon does not support operator confirmation",
+            ),
+        };
+        HandlerError::new(code, message)
+    }
+}
+
+pub(super) struct ConfirmationSlot {
+    pub route: RouteKey,
+    pub cancelled: tokio::sync::watch::Sender<bool>,
+}
+
+/// Exclusion lasts through the write, not just through the presence prompt.
+/// Dropping an abandoned request releases it without trusting a late answer.
+pub(super) struct ConfirmationGuard {
+    slot: Arc<Mutex<Option<ConfirmationSlot>>>,
+    pub cancelled: tokio::sync::watch::Receiver<bool>,
+}
+impl ConfirmationGuard {
+    pub fn take(
+        slot: &Arc<Mutex<Option<ConfirmationSlot>>>,
+        route: RouteKey,
+    ) -> Result<Self, HandlerError> {
+        let mut current = slot.lock().unwrap_or_else(|e| e.into_inner());
+        if current.is_some() {
+            return Err(HandlerError::new(
+                "operator_confirmation_busy",
+                "another operator confirmation is outstanding",
+            ));
+        }
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        *current = Some(ConfirmationSlot {
+            route,
+            cancelled: tx,
+        });
+        Ok(Self {
+            slot: slot.clone(),
+            cancelled: rx,
+        })
+    }
+}
+impl Drop for ConfirmationGuard {
+    fn drop(&mut self) {
+        self.slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+    }
+}
 
 pub(super) const MUTATING_METHODS: &[&str] = &[
     "agent.create",
@@ -32,6 +129,11 @@ impl From<AgentMutationError> for HandlerError {
 }
 
 impl ProjectsHandler {
+    #[allow(dead_code)] // The daemon adapter is supplied when channel-0 support ships.
+    pub(super) fn with_operator_confirmer(mut self, confirmer: Arc<dyn OperatorConfirmer>) -> Self {
+        self.operator_confirmer = confirmer;
+        self
+    }
     /// Called only after `admit`, including on retries. Delegate the body intact
     /// so core's deny_unknown_fields runs before its request-key cache: a retry
     /// cannot bypass decoding or restore a removed residence/persona field.

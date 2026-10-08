@@ -9,6 +9,7 @@ use super::{
     log_client::{self, AppendRequest, EntryKind, LogError},
     *,
 };
+use entorhinal_core::agent::{AgentPrecheck, OperatorApproval};
 use entorhinal_core::{RegistryStore, SharedSettlement};
 use serde_json::Value;
 use std::{sync::atomic::Ordering, time::Duration};
@@ -19,6 +20,7 @@ const SETTLEMENT: Duration = Duration::from_secs(20);
 const SEND_WAIT: Duration = Duration::from_secs(1);
 const RESEND_DELAY: Duration = Duration::from_millis(100);
 const RETRIES: usize = 5;
+const OPERATOR_BOUND: Duration = Duration::from_secs(270);
 
 pub(super) fn health_state(state: u64) -> &'static str {
     match state {
@@ -264,6 +266,7 @@ mod tests {
         sent_at: Mutex<Vec<Instant>>,
         races: AtomicUsize,
         hang_after_race: AtomicBool,
+        race_entry: Mutex<Option<Vec<u8>>>,
     }
     impl Tap {
         fn new(races: usize) -> Arc<Self> {
@@ -273,6 +276,7 @@ mod tests {
                 sent_at: Mutex::new(vec![]),
                 races: AtomicUsize::new(races),
                 hang_after_race: AtomicBool::new(false),
+                race_entry: Mutex::new(None),
             })
         }
         fn sends(&self) -> Vec<Value> {
@@ -303,13 +307,19 @@ mod tests {
                 {
                     raced = true;
                     let head = self.fake.head();
+                    let data = self
+                        .race_entry
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .unwrap_or_else(|| br#"{"op":"project.shared","tables":{}}"#.to_vec());
                     self.fake
                         .client()
                         .append(&AppendRequest {
                             expected_head: head,
                             entry_id: [(head + 1) as u8; 16],
                             kind: EntryKind::Change,
-                            data: br#"{"op":"project.shared","tables":{}}"#.to_vec(),
+                            data,
                         })
                         .await
                         .unwrap();
@@ -1099,6 +1109,861 @@ mod tests {
         assert_eq!(f.pending(), 0);
         assert!(f.store().verify().unwrap().ok);
     }
+    mod confirmation {
+        use super::*;
+        use crate::agent_ops::{OperatorConfirmError, OperatorConfirmer};
+        const DIRECT: RouteKey = (72, 1);
+        const ID: &str = "agent_0123456789abcdef";
+
+        type PromptAnswer = tokio::sync::oneshot::Sender<Result<(), OperatorConfirmError>>;
+        struct Prompt {
+            calls: Mutex<Vec<(String, RouteKey)>>,
+            answers: Mutex<Vec<Option<PromptAnswer>>>,
+            immediate: Option<Result<(), OperatorConfirmError>>,
+        }
+        impl Prompt {
+            fn new(immediate: Option<Result<(), OperatorConfirmError>>) -> Arc<Self> {
+                Arc::new(Self {
+                    calls: Mutex::new(vec![]),
+                    answers: Mutex::new(vec![]),
+                    immediate,
+                })
+            }
+            fn count(&self) -> usize {
+                self.calls.lock().unwrap().len()
+            }
+            fn answer(&self, index: usize) {
+                let _ = self.answers.lock().unwrap()[index]
+                    .take()
+                    .unwrap()
+                    .send(Ok(()));
+            }
+        }
+        #[async_trait]
+        impl OperatorConfirmer for Prompt {
+            async fn confirm_operator(
+                &self,
+                summary: &str,
+                route: RouteKey,
+            ) -> Result<(), OperatorConfirmError> {
+                self.calls.lock().unwrap().push((summary.into(), route));
+                if let Some(result) = self.immediate {
+                    return result;
+                }
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                self.answers.lock().unwrap().push(Some(tx));
+                rx.await.unwrap_or(Err(OperatorConfirmError::Declined))
+            }
+        }
+        fn direct(f: &mut Fixture, prompt: Arc<Prompt>, enabled: bool) {
+            f.handler.operator_confirmer = prompt;
+            bind(f);
+            if !enabled {
+                state(f, "disabled");
+            }
+        }
+        fn bind(f: &Fixture) {
+            f.handler.route_admissions().insert(
+                DIRECT,
+                RouteAdmission {
+                    principal: Some(Principal::Direct),
+                    flow_id: None,
+                },
+            );
+        }
+        fn state(f: &Fixture, state: &str) {
+            f.store()
+                .apply_entry("fixture.state", "{}", "test", None, |tx| {
+                    tx.execute("UPDATE identity_log_state SET state=?1", [state])?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        fn write<'a>(
+            f: &'a Fixture,
+            op: &str,
+            params: Value,
+        ) -> impl Future<Output = Result<Vec<u8>, HandlerError>> + 'a {
+            f.handler.write_wait(
+                WireRequest {
+                    method: op.into(),
+                    params,
+                },
+                DIRECT,
+                Instant::now(),
+            )
+        }
+        fn image(f: &Fixture) -> Value {
+            json!({"journal":f.image(), "snapshot":f.store().agent_snapshot().unwrap(), "pending":f.pending(), "generation":f.store().generation().unwrap()})
+        }
+        fn rows(f: &Fixture) -> Vec<entorhinal_core::JournalEntry> {
+            // The project feed intentionally excludes identities. Inspect the
+            // real identity journal in a transaction that always rolls back;
+            // neither its observation marker nor a generation is committed.
+            let mut observed = None;
+            let result = f.store().apply_entry("fixture.inspect", "{}", "test", None, |tx| {
+                observed = Some(tx.prepare("SELECT seq,op,payload_json,actor,request_key,created_at,principal FROM registry_journal WHERE op IN ('agent.create','agent.rename','agent.dispose','agent.update_tag','agent.set_labels') ORDER BY seq")?
+                    .query_map([], |r| Ok(entorhinal_core::JournalEntry { seq:r.get(0)?,op:r.get(1)?,payload_json:r.get(2)?,actor:r.get(3)?,request_key:r.get(4)?,created_at:r.get(5)?,principal:r.get(6)? }))?
+                    .collect::<Result<Vec<_>,_>>()?);
+                tx.execute_batch("SELECT fixture_observation_rollback;")
+            });
+            assert!(result.is_err());
+            observed.unwrap()
+        }
+        fn stable_draw() -> Result<String, HandlerError> {
+            Ok(ID.into())
+        }
+        fn new_request(key: &str) -> Value {
+            json!({"role":"assistant","name":"Ada","tag":"helper","request_key":key,"actor":"ck-agents"})
+        }
+        fn id(body: &[u8]) -> String {
+            serde_json::from_slice::<Value>(body).unwrap()["result"]["agent"]["agent_id"]
+                .as_str()
+                .unwrap()
+                .into()
+        }
+        fn methods(id: &str) -> Vec<(&'static str, Value)> {
+            vec![
+                (
+                    "agent.rename",
+                    json!({"agent_id":id,"name":"Grace","request_key":"rename"}),
+                ),
+                (
+                    "agent.update_tag",
+                    json!({"agent_id":id,"tag":"q\"\\\né","request_key":"tag"}),
+                ),
+                (
+                    "agent.set_labels",
+                    json!({"agent_id":id,"labels":["one","é"],"request_key":"labels"}),
+                ),
+                (
+                    "agent.set_labels",
+                    json!({"agent_id":id,"labels":[],"request_key":"none"}),
+                ),
+                (
+                    "agent.dispose",
+                    json!({"agent_id":id,"request_key":"dispose"}),
+                ),
+            ]
+        }
+
+        #[tokio::test]
+        async fn confirmed_methods_pin_summaries_local_attribution_and_shared_bytes() {
+            for enabled in [false, true] {
+                let tap = Tap::new(0);
+                let mut f = Fixture::new("confirmed-summaries", connector(&tap));
+                let prompt = Prompt::new(Some(Ok(())));
+                direct(&mut f, prompt.clone(), enabled);
+                f.handler.agent_id_draw = stable_draw;
+                let mut params = new_request("create");
+                params["tag"] = json!("q\"\\\né");
+                let notified = f.handler.commits.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let target = id(&write(&f, "agent.create", params).await.unwrap());
+                ready(notified.as_mut());
+                for (op, params) in methods(&target) {
+                    write(&f, op, params).await.unwrap();
+                }
+                let calls = prompt.calls.lock().unwrap().clone();
+                let expected = [
+                    "create assistant agent \"Ada\" with tag \"q\\\"\\\\\\né\"".into(),
+                    format!("rename agent \"Ada\" ({target:?}) to \"Grace\""),
+                    format!("set tag of agent \"Grace\" ({target:?}) to \"q\\\"\\\\\\né\""),
+                    format!("set labels of agent \"Grace\" ({target:?}) to \"one\", \"é\""),
+                    format!("set labels of agent \"Grace\" ({target:?}) to none"),
+                    format!("retire agent \"Grace\" ({target:?})"),
+                ];
+                assert_eq!(
+                    calls,
+                    expected
+                        .into_iter()
+                        .map(|s| (s, DIRECT))
+                        .collect::<Vec<_>>()
+                );
+                let journal = rows(&f);
+                assert_eq!(journal.len(), 6);
+                for row in &journal {
+                    assert_eq!(row.principal.as_deref(), Some("direct"));
+                    let payload: Value = serde_json::from_str(&row.payload_json).unwrap();
+                    assert_eq!(payload["operator_confirmed"], true);
+                    assert!(payload["entry"].get("operator_confirmed").is_none());
+                    let _: entorhinal_core::agent::AgentChangeEntry =
+                        serde_json::from_value(payload["entry"].clone()).unwrap();
+                }
+                let snapshot = f.store().agent_snapshot().unwrap();
+                let changes =
+                    serde_json::to_value(f.store().agent_changes(0, None).unwrap()).unwrap();
+                assert!(!changes.to_string().contains("operator_confirmed"));
+                f.store().rebuild().unwrap();
+                assert_eq!(
+                    serde_json::to_value(f.store().agent_snapshot().unwrap()).unwrap(),
+                    serde_json::to_value(snapshot).unwrap()
+                );
+                for send in tap.sends() {
+                    let bytes =
+                        log_client::decode_hex(send["entry"]["data"].as_str().unwrap()).unwrap();
+                    assert!(!String::from_utf8(bytes)
+                        .unwrap()
+                        .contains("operator_confirmed"));
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn refusals_are_unpersisted_and_retries_prompt_again() {
+            for error in [
+                OperatorConfirmError::Declined,
+                OperatorConfirmError::PresenceUnavailable,
+                OperatorConfirmError::Unsupported,
+            ] {
+                let mut f =
+                    Fixture::new("confirmation-refused", Arc::new(FailConnector::default()));
+                let prompt = Prompt::new(Some(Err(error)));
+                direct(&mut f, prompt.clone(), false);
+                let before = image(&f);
+                for _ in 0..2 {
+                    let result = write(&f, "agent.create", new_request("refused"))
+                        .await
+                        .unwrap_err();
+                    assert_eq!(
+                        result.code,
+                        if matches!(error, OperatorConfirmError::Declined) {
+                            "operator_declined"
+                        } else {
+                            "operator_presence_unavailable"
+                        }
+                    );
+                    assert_eq!(image(&f), before);
+                }
+                assert_eq!(prompt.count(), 2);
+            }
+        }
+
+        #[tokio::test]
+        async fn prechecks_replay_and_domain_refusals_do_not_wait_for_writer_or_prompt() {
+            for enabled in [false, true] {
+                let tap = Tap::new(0);
+                let mut f = Fixture::new("confirmation-precheck", connector(&tap));
+                let prompt = Prompt::new(Some(Ok(())));
+                direct(&mut f, prompt.clone(), enabled);
+                let landed = write(&f, "agent.create", new_request("landed"))
+                    .await
+                    .unwrap();
+                let target = id(&landed);
+                f.call("register", json!({"projectId":"P","name":"P","workspaceId":"W1","roots":[],"requestKey":"P"})).await.unwrap();
+                f.call("register", register("unplaced", "unplaced"))
+                    .await
+                    .unwrap();
+                f.call("agent.create", json!({"role":"head","name":"Head","tag":"ok","project_id":"P","request_key":"head"})).await.unwrap();
+                let lock = f.handler.writer.lock().await;
+                let before = image(&f);
+                let body = ready(write(&f, "agent.create", json!({"role":"assistant","name":"different","tag":"changed","request_key":"landed"}))).unwrap();
+                assert_eq!(id(&body), target);
+                assert_eq!(body, landed);
+                for (op, params, code) in [
+                    (
+                        "agent.rename",
+                        json!({"agent_id":target,"name":"Other","request_key":"landed"}),
+                        "request_key_reused_across_ops",
+                    ),
+                    (
+                        "agent.create",
+                        json!({"role":"assistant","name":"X","tag":"ok"}),
+                        "request_key_required",
+                    ),
+                    (
+                        "agent.create",
+                        json!({"role":"assistant","name":"","tag":"ok","request_key":"bad"}),
+                        "invalid_name",
+                    ),
+                    (
+                        "agent.create",
+                        json!({"role":"head","name":"Another","tag":"ok","project_id":"P","request_key":"taken"}),
+                        "agent_project_taken",
+                    ),
+                    (
+                        "agent.create",
+                        json!({"role":"head","name":"Head","tag":"ok","project_id":"unplaced","request_key":"workspace"}),
+                        "unresolved_workspace",
+                    ),
+                    (
+                        "agent.rename",
+                        json!({"agent_id":"agent_00000000","name":"X","request_key":"unknown"}),
+                        "unknown_agent",
+                    ),
+                    (
+                        "agent.create",
+                        json!({"role":"head","name":"H","tag":"ok","request_key":"shape"}),
+                        "invalid_role_shape",
+                    ),
+                    (
+                        "agent.create",
+                        json!({"role":"hiree","name":"Hire","tag":"ok","project_id":"P","supervisor_agent_id":target,"request_key":"supervisor"}),
+                        "invalid_supervisor",
+                    ),
+                    (
+                        "agent.create",
+                        json!({"role":"assistant","name":"X","tag":"ok","request_key":"fields","bad":true}),
+                        "invalid_request",
+                    ),
+                ] {
+                    assert_eq!(ready(write(&f, op, params)).unwrap_err().code, code);
+                }
+                assert_eq!(image(&f), before);
+                assert_eq!(prompt.count(), 1);
+                drop(lock);
+                for state_name in ["enabling", "joining"] {
+                    state(&f, state_name);
+                    for key in ["landed", "fresh"] {
+                        assert_eq!(
+                            ready(write(&f, "agent.create", new_request(key)))
+                                .unwrap_err()
+                                .code,
+                            "identity_log_enabling"
+                        );
+                    }
+                }
+                state(&f, "disabled");
+                f.store()
+                    .apply_entry("fixture.uncut", "{}", "test", None, |tx| {
+                        tx.execute("DELETE FROM registry_journal WHERE op='agent.cutover'", [])?;
+                        Ok(())
+                    })
+                    .unwrap();
+                assert_eq!(
+                    ready(write(&f, "agent.create", new_request("uncut")))
+                        .unwrap_err()
+                        .code,
+                    "authority_not_cut_over"
+                );
+                assert_eq!(
+                    id(&ready(write(&f, "agent.create", new_request("landed"))).unwrap()),
+                    target
+                );
+                f.handler
+                    .route_admissions()
+                    .get_mut(&DIRECT)
+                    .unwrap()
+                    .flow_id = Some("flow".into());
+                assert_eq!(
+                    ready(write(&f, "agent.create", new_request("flow")))
+                        .unwrap_err()
+                        .code,
+                    "flow_scope_not_admitted"
+                );
+                assert_eq!(prompt.count(), 1);
+            }
+            let f = Fixture::new(
+                "confirmation-default-unsupported",
+                Arc::new(FailConnector::default()),
+            );
+            bind(&f);
+            state(&f, "disabled");
+            let before = image(&f);
+            let error = write(&f, "agent.create", new_request("unsupported"))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "operator_presence_unavailable");
+            assert_eq!(
+                error.message,
+                "this daemon does not support operator confirmation"
+            );
+            assert_eq!(image(&f), before);
+        }
+
+        #[tokio::test]
+        async fn escaped_summary_cap_is_scalar_based_and_placement_is_pinned() {
+            let mut f = Fixture::new(
+                "confirmation-summary-cap",
+                Arc::new(FailConnector::default()),
+            );
+            let prompt = Prompt::new(Some(Ok(())));
+            direct(&mut f, prompt.clone(), false);
+            // Literal escaped prefix, followed by a multibyte tag and an
+            // interior newline (trailing whitespace would be trimmed).
+            let prefix = "create assistant agent \"Ada\" with tag \"";
+            let n = 200 - prefix.chars().count() - 4;
+            let tag = format!("{}\nx", "é".repeat(50) + &"x".repeat(n - 50));
+            let mut params = new_request("cap");
+            params["tag"] = json!(tag);
+            write(&f, "agent.create", params.clone()).await.unwrap();
+            assert_eq!(prompt.calls.lock().unwrap()[0].0.chars().count(), 200);
+            params["request_key"] = json!("over");
+            params["name"] = json!("Bob");
+            params["tag"] = json!(format!("{tag}x"));
+            assert_eq!(
+                ready(write(&f, "agent.create", params)).unwrap_err().code,
+                "operator_summary_too_long"
+            );
+            assert_eq!(prompt.count(), 1);
+            f.call("register", json!({"projectId":"P","name":"P","workspaceId":"W","roots":[],"requestKey":"project"})).await.unwrap();
+            f.call(
+                "agent.create",
+                json!({"role":"head","name":"H","tag":"ok","project_id":"P","request_key":"H"}),
+            )
+            .await
+            .unwrap();
+            let head = f
+                .store()
+                .agent_snapshot()
+                .unwrap()
+                .agents
+                .iter()
+                .find(|a| a.role == "head")
+                .unwrap()
+                .agent_id
+                .clone();
+            write(&f, "agent.create", json!({"role":"hiree","name":"Hire","tag":"ok","project_id":"P","supervisor_agent_id":head,"request_key":"hire"})).await.unwrap();
+            assert_eq!(prompt.calls.lock().unwrap()[1].0, format!("create hiree agent \"Hire\" for project \"P\" in workspace \"W\" supervised by \"H\" ({head:?}) with tag \"ok\""));
+            write(&f, "agent.create", json!({"role":"workspace_head","name":"WH","tag":"ok","workspace_id":"W","request_key":"WH"})).await.unwrap();
+            assert_eq!(
+                prompt.calls.lock().unwrap()[2].0,
+                "create workspace head agent \"WH\" for workspace \"W\" with tag \"ok\""
+            );
+        }
+
+        #[tokio::test]
+        async fn relay_bytes_are_unchanged_and_unconfirmed_seams_stay_closed() {
+            let tap = Tap::new(0);
+            let other = Tap::new(0);
+            let mut f = Fixture::new("confirmation-relay", connector(&tap));
+            let mut baseline = Fixture::new("confirmation-relay-baseline", connector(&other));
+            let prompt = Prompt::new(Some(Err(OperatorConfirmError::Declined)));
+            direct(&mut f, prompt.clone(), true);
+            f.handler.agent_id_draw = stable_draw;
+            baseline.handler.agent_id_draw = stable_draw;
+            for (op, params) in
+                std::iter::once(("agent.create", new_request("create"))).chain(methods(ID))
+            {
+                assert_eq!(
+                    f.call(op, params.clone()).await.unwrap(),
+                    baseline.call(op, params).await.unwrap()
+                );
+            }
+            let actual = rows(&f);
+            let expected = rows(&baseline);
+            assert_eq!(
+                serde_json::to_vec(&actual).unwrap(),
+                serde_json::to_vec(&expected).unwrap()
+            );
+            assert!(actual.iter().all(|r| r.principal.as_deref()
+                == Some("reserved:prefrontal-core")
+                && !r.payload_json.contains("operator_confirmed")));
+            let before = image(&f);
+            for op in [
+                "agent.set_avatar",
+                "agent.set_github_identity",
+                "agent.merge",
+                "agent.import",
+            ] {
+                assert_eq!(
+                    ready(write(&f, op, Value::Null)).unwrap_err().code,
+                    "direct_identity_write_not_admitted"
+                );
+            }
+            for cut in [true, false] {
+                if !cut {
+                    f.store()
+                        .apply_entry("fixture.uncut", "{}", "test", None, |tx| {
+                            tx.execute(
+                                "DELETE FROM registry_journal WHERE op='agent.cutover'",
+                                [],
+                            )?;
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+                let snapshot = image(&f);
+                for op in agent_ops::CONFIRMABLE_METHODS {
+                    let body = serde_json::to_vec(&json!({"method":op,"params":null})).unwrap();
+                    let outcome = f.handler.handle_request(&body, DIRECT);
+                    assert!(
+                        matches!(outcome, HandlerOutcome::Error {code, ..} | HandlerOutcome::ErrorWithDetail {code, ..} if code == "direct_identity_write_not_admitted")
+                    );
+                }
+                assert_eq!(image(&f), snapshot);
+            }
+            assert_eq!(prompt.count(), 0);
+            assert_eq!(
+                before["snapshot"]["agents"],
+                image(&f)["snapshot"]["agents"]
+            );
+            assert_eq!(
+                before["snapshot"]["claims"],
+                image(&f)["snapshot"]["claims"]
+            );
+        }
+
+        #[tokio::test]
+        async fn prompt_holds_no_locks_and_revalidation_catches_name_and_placement_changes() {
+            for (enabled, change) in [(false, "name"), (true, "name"), (false, "placement")] {
+                let tap = Tap::new(0);
+                let mut f = Fixture::new("confirmation-unlocked", connector(&tap));
+                let prompt = Prompt::new(None);
+                direct(&mut f, prompt.clone(), enabled);
+                let params = if change == "placement" {
+                    f.call("register", json!({"projectId":"P","name":"P","workspaceId":"W1","roots":[],"requestKey":"P"})).await.unwrap();
+                    json!({"role":"head","name":"Ada","tag":"ok","project_id":"P","request_key":"direct"})
+                } else {
+                    new_request("direct")
+                };
+                let mut waiting = Box::pin(write(&f, "agent.create", params));
+                pending(waiting.as_mut());
+                assert_eq!(prompt.count(), 1);
+                // Assert completion order while the prompt is still unanswered.
+                f.call("register", register("other", "other"))
+                    .await
+                    .unwrap();
+                if change == "name" {
+                    f.call("agent.create", new_request("core")).await.unwrap();
+                } else {
+                    f.call(
+                        "assign_workspace",
+                        json!({"projectId":"P","workspaceId":"W2","requestKey":"move"}),
+                    )
+                    .await
+                    .unwrap();
+                }
+                let before = image(&f);
+                prompt.answer(0);
+                assert_eq!(
+                    waiting.await.unwrap_err().code,
+                    if change == "name" {
+                        "name_conflict"
+                    } else {
+                        "operator_approval_stale"
+                    }
+                );
+                assert_eq!(image(&f), before);
+                assert_eq!(prompt.count(), 1);
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn busy_slot_survives_approval_and_releases_on_finish_drop_and_deadline() {
+            let mut f = Fixture::new("confirmation-busy", Arc::new(FailConnector::default()));
+            let prompt = Prompt::new(None);
+            direct(&mut f, prompt.clone(), false);
+            let mut first = Box::pin(write(&f, "agent.create", new_request("first")));
+            pending(first.as_mut());
+            assert_eq!(
+                ready(write(&f, "agent.create", new_request("second")))
+                    .unwrap_err()
+                    .code,
+                "operator_confirmation_busy"
+            );
+            let lock = f.handler.writer.lock().await;
+            prompt.answer(0);
+            pending(first.as_mut());
+            assert_eq!(
+                ready(write(&f, "agent.create", new_request("second")))
+                    .unwrap_err()
+                    .code,
+                "operator_confirmation_busy"
+            );
+            drop(lock);
+            first.await.unwrap();
+            let mut next = new_request("next");
+            next["name"] = json!("Bob");
+            let mut abandoned = Box::pin(write(&f, "agent.create", next.clone()));
+            pending(abandoned.as_mut());
+            drop(abandoned);
+            prompt.answer(1);
+            assert_eq!(rows(&f).len(), 1);
+            let received = Instant::now();
+            let mut expired = Box::pin(f.handler.write_wait(
+                WireRequest {
+                    method: "agent.create".into(),
+                    params: next.clone(),
+                },
+                DIRECT,
+                received,
+            ));
+            pending(expired.as_mut());
+            tokio::time::advance(Duration::from_secs(270) + TIMER_TICK).await;
+            assert_eq!(
+                ready(expired.as_mut()).unwrap_err().code,
+                "operator_declined"
+            );
+            drop(expired);
+            let mut last = Box::pin(write(&f, "agent.create", next));
+            pending(last.as_mut());
+            prompt.answer(3);
+            last.await.unwrap();
+            assert_eq!(prompt.count(), 4);
+            assert_eq!(rows(&f).len(), 2);
+        }
+
+        #[tokio::test]
+        async fn route_closure_wins_ready_prompt_and_lock_and_admission_slot_gap() {
+            for stage in ["prompt", "lock", "admission"] {
+                let tap = Tap::new(0);
+                let mut f = Fixture::new("confirmation-route-close", connector(&tap));
+                let prompt = Prompt::new(None);
+                direct(&mut f, prompt.clone(), true);
+                let barrier = Arc::new(tokio::sync::Barrier::new(2));
+                if stage == "admission" {
+                    f.handler.confirmation_admission_barrier = Some(barrier.clone());
+                }
+                let lock = f.handler.writer.clone().lock_owned().await;
+                let before = image(&f);
+                let mut first = Box::pin(write(&f, "agent.create", new_request("closed")));
+                pending(first.as_mut());
+                if stage == "lock" {
+                    prompt.answer(0);
+                    pending(first.as_mut());
+                }
+                f.handler
+                    .on_route_gone(&RouteHandle::detached(DIRECT.0, DIRECT.1))
+                    .await;
+                if stage == "prompt" {
+                    prompt.answer(0);
+                }
+                if stage == "admission" {
+                    barrier.wait().await;
+                }
+                drop(lock);
+                assert_eq!(first.await.unwrap_err().code, "operator_declined");
+                assert_eq!(prompt.count(), if stage == "admission" { 0 } else { 1 });
+                assert_eq!(image(&f), before);
+                assert!(tap.sends().is_empty());
+                f.handler.confirmation_admission_barrier = None;
+                bind(&f);
+                let count = prompt.count();
+                let mut later = Box::pin(write(&f, "agent.create", new_request("live")));
+                pending(later.as_mut());
+                prompt.answer(count);
+                later.await.unwrap();
+                assert_eq!(rows(&f).len(), 1);
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn approval_starts_stage_deadlines_and_late_approval_is_clamped() {
+            for (stage, late, enabled) in [
+                ("lock", false, true),
+                ("connect", false, true),
+                ("catchup", false, true),
+                ("unsent", false, true),
+                ("lock", true, true),
+                ("lock", true, false),
+            ] {
+                let tap = Tap::new(0);
+                if stage == "catchup" {
+                    tap.fake.on_read(Action::Hang);
+                }
+                let connector = if stage == "connect" {
+                    Arc::new(HangConnect) as Arc<dyn LogConnector>
+                } else {
+                    connector(&tap)
+                };
+                let mut f = Fixture::new("confirmation-stage-deadline", connector);
+                let prompt = Prompt::new(None);
+                direct(&mut f, prompt.clone(), enabled);
+                let received = Instant::now();
+                let mut first = Box::pin(write(&f, "agent.create", new_request("deadline")));
+                pending(first.as_mut());
+                tokio::time::advance(Duration::from_secs(if late { 260 } else { 30 })).await;
+                let approval = Instant::now();
+                let lock = if matches!(stage, "lock" | "unsent") {
+                    Some(f.handler.writer.clone().lock_owned().await)
+                } else {
+                    None
+                };
+                let before = image(&f);
+                prompt.answer(0);
+                pending(first.as_mut());
+                let bound =
+                    (approval + Duration::from_secs(25)).min(received + Duration::from_secs(270));
+                if stage == "unsent" {
+                    tokio::time::advance(Duration::from_secs(20) + TIMER_TICK).await;
+                    drop(lock);
+                    assert_eq!(
+                        finish(first.as_mut()).await.unwrap_err().code,
+                        "engram_unavailable"
+                    );
+                } else {
+                    tokio::time::advance(
+                        bound.saturating_duration_since(Instant::now()) - Duration::from_secs(1),
+                    )
+                    .await;
+                    pending(first.as_mut());
+                    tokio::time::advance(Duration::from_secs(1) + TIMER_TICK).await;
+                    assert_eq!(
+                        ready(first.as_mut()).unwrap_err().code,
+                        if stage == "lock" {
+                            "identity_log_contended"
+                        } else {
+                            "engram_unavailable"
+                        }
+                    );
+                }
+                assert_eq!(prompt.count(), 1);
+                assert_eq!(image(&f), before);
+                assert!(tap.sends().is_empty());
+            }
+            // An approval later than the old receipt-relative catch-up budget
+            // must still have a fresh budget and be able to land.
+            let tap = Tap::new(0);
+            let mut f = Fixture::new("confirmation-delayed-success", connector(&tap));
+            let prompt = Prompt::new(None);
+            direct(&mut f, prompt.clone(), true);
+            let mut first = Box::pin(write(&f, "agent.create", new_request("delayed")));
+            pending(first.as_mut());
+            tokio::time::advance(Duration::from_secs(30)).await;
+            prompt.answer(0);
+            finish(first.as_mut()).await.unwrap();
+            assert_eq!(rows(&f).len(), 1);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn recovered_append_loses_local_approval_but_lost_reply_resend_retains_it() {
+            for late in [false, true] {
+                let tap = Tap::new(0);
+                tap.fake.on_append(Action::DropReply);
+                for _ in 0..300 {
+                    tap.fake.on_append(Action::Hang);
+                }
+                let mut f = Fixture::new("confirmation-recovered", connector(&tap));
+                let prompt = Prompt::new(None);
+                direct(&mut f, prompt.clone(), true);
+                let received = Instant::now();
+                let mut first = Box::pin(write(&f, "agent.create", new_request("unknown")));
+                pending(first.as_mut());
+                tokio::time::advance(Duration::from_secs(if late { 260 } else { 30 })).await;
+                let approval = Instant::now();
+                prompt.answer(0);
+                reach(first.as_mut(), tap.fake.wait_for_calls(2)).await;
+                assert_eq!(tap.fake.head(), 1);
+                let bound =
+                    (approval + Duration::from_secs(20)).min(received + Duration::from_secs(270));
+                assert_eq!(
+                    expire(first.as_mut(), &tap, bound).await.unwrap_err().code,
+                    "engram_outcome_unknown"
+                );
+                drop(first);
+                assert!(rows(&f).is_empty());
+                assert_eq!(f.pending(), 1);
+                assert!(f.store().agent_snapshot().unwrap().agents.is_empty());
+                finish(std::pin::pin!(f
+                    .handler
+                    .catch_up(&f.store(), Instant::now() + DEADLINE)))
+                .await
+                .unwrap();
+                let row = rows(&f).pop().unwrap();
+                assert_eq!(row.actor, "log");
+                assert_eq!(row.principal.as_deref(), Some("entorhinal"));
+                assert!(!row.payload_json.contains("operator_confirmed"));
+                assert_eq!(f.pending(), 0);
+                assert_eq!(prompt.count(), 1);
+                let snapshot = f.store().agent_snapshot().unwrap();
+                finish(std::pin::pin!(f
+                    .handler
+                    .catch_up(&f.store(), Instant::now() + DEADLINE)))
+                .await
+                .unwrap();
+                assert_eq!(
+                    serde_json::to_value(f.store().agent_snapshot().unwrap()).unwrap(),
+                    serde_json::to_value(snapshot).unwrap()
+                );
+            }
+            let tap = Tap::new(0);
+            tap.fake.on_append(Action::DropReply);
+            let mut f = Fixture::new("confirmation-resend", connector(&tap));
+            let prompt = Prompt::new(Some(Ok(())));
+            direct(&mut f, prompt.clone(), true);
+            let mut first = Box::pin(write(&f, "agent.create", new_request("lost")));
+            reach(first.as_mut(), tap.fake.wait_for_calls(2)).await;
+            tokio::time::advance(RESEND_DELAY + TIMER_TICK).await;
+            finish(first.as_mut()).await.unwrap();
+            assert_eq!(tap.sends().len(), 2);
+            assert_eq!(tap.sends()[0], tap.sends()[1]);
+            let row = rows(&f).pop().unwrap();
+            assert_eq!(row.principal.as_deref(), Some("direct"));
+            assert_eq!(
+                serde_json::from_str::<Value>(&row.payload_json).unwrap()["operator_confirmed"],
+                true
+            );
+            assert_eq!(prompt.count(), 1);
+            assert_eq!(f.pending(), 0);
+        }
+
+        #[tokio::test]
+        async fn retry_catchup_renaming_target_invalidates_approval_without_reprompting() {
+            let tap = Tap::new(0);
+            let mut f = Fixture::new("confirmation-retry-stale", connector(&tap));
+            let prompt = Prompt::new(Some(Ok(())));
+            direct(&mut f, prompt.clone(), true);
+            f.handler.agent_id_draw = stable_draw;
+            f.call("agent.create", new_request("seed")).await.unwrap();
+            // Build the competing entry through the real core mutation and
+            // shared encoder, not by computing an expected summary ourselves.
+            let remote = Tap::new(0);
+            let mut peer = Fixture::new("confirmation-retry-peer", connector(&remote));
+            peer.handler.agent_id_draw = stable_draw;
+            peer.call("agent.create", new_request("seed"))
+                .await
+                .unwrap();
+            peer.call(
+                "agent.rename",
+                json!({"agent_id":ID,"name":"Grace","request_key":"remote-rename"}),
+            )
+            .await
+            .unwrap();
+            *tap.race_entry.lock().unwrap() = Some(
+                log_client::decode_hex(remote.sends()[1]["entry"]["data"].as_str().unwrap())
+                    .unwrap(),
+            );
+            tap.races.store(1, Ordering::SeqCst);
+            let error = write(
+                &f,
+                "agent.update_tag",
+                json!({"agent_id":ID,"tag":"new","request_key":"stale"}),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code, "operator_approval_stale");
+            assert_eq!(prompt.count(), 1);
+            let target = f.store().agent_row(ID).unwrap().unwrap();
+            assert_eq!(target.name, "Grace");
+            assert_eq!(target.tag, "helper");
+            assert_eq!(tap.sends().len(), 2);
+            assert_eq!(
+                rows(&f).iter().map(|r| r.op.as_str()).collect::<Vec<_>>(),
+                ["agent.create", "agent.rename"]
+            );
+            assert_eq!(f.pending(), 0);
+        }
+
+        #[tokio::test]
+        async fn head_moved_reuses_one_confirmation_and_one_agent_identity() {
+            let tap = Tap::new(1);
+            let mut f = Fixture::new("confirmation-head-moved", connector(&tap));
+            let prompt = Prompt::new(Some(Ok(())));
+            direct(&mut f, prompt.clone(), true);
+            static COUNT: AtomicUsize = AtomicUsize::new(0);
+            fn draw() -> Result<String, HandlerError> {
+                COUNT.fetch_add(1, Ordering::SeqCst);
+                Ok(ID.into())
+            }
+            f.handler.agent_id_draw = draw;
+            let target = id(&write(&f, "agent.create", new_request("retry"))
+                .await
+                .unwrap());
+            assert_eq!(target, ID);
+            assert_eq!(COUNT.load(Ordering::SeqCst), 1);
+            assert_eq!(prompt.count(), 1);
+            assert_eq!(tap.sends().len(), 2);
+            for send in tap.sends() {
+                let entry: Value = serde_json::from_slice(
+                    &log_client::decode_hex(send["entry"]["data"].as_str().unwrap()).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(entry["agent_id"], ID);
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1159,6 +2024,7 @@ impl Write {
         principal: &str,
         now: i64,
         agent_id: &str,
+        approval: Option<&OperatorApproval>,
     ) -> Result<Vec<u8>, HandlerError> {
         let writer = store.with_principal(principal);
         match self {
@@ -1171,11 +2037,12 @@ impl Write {
             Self::Attach(r) => writer.attach_root_at(r, now),
             Self::Agent(op, params) => {
                 return writer
-                    .agent_mutation_with_id(
+                    .agent_mutation_with_approval(
                         &op,
                         params,
                         now,
                         (!agent_id.is_empty()).then_some(agent_id),
+                        approval,
                     )
                     .map_err(Into::into)
             }
@@ -1259,7 +2126,15 @@ impl ProjectsHandler {
         key: RouteKey,
         received: Instant,
     ) -> Result<Vec<u8>, HandlerError> {
-        let admission = self.admit(&request.method, key)?;
+        // Only the served async path can confirm Direct. admit/execute remain
+        // unconfirmed, including synchronous tests and non-confirmable methods.
+        let admission = self.admission_for(key);
+        let direct = matches!(admission.principal, Some(Principal::Direct))
+            && agent_ops::CONFIRMABLE_METHODS.contains(&request.method.as_str());
+        refuse_flow_write(&request.method, admission.flow_id.as_deref())?;
+        if !direct {
+            authorize_write(&request.method, admission.principal.as_ref())?;
+        }
         let principal = principal_label(admission.principal.as_ref());
         // Liveness is volatile, not a SQLite mutation. It must not queue behind
         // a transaction waiting for the log.
@@ -1273,7 +2148,42 @@ impl ProjectsHandler {
             .then(|| Write::decode(&request.method, request.params.clone()))
             .transpose()?;
         bootstrap_fence(&store, &state, &request)?;
-        if state == "enabled" {
+        let mut confirmation = None;
+        let mut approval = None;
+        let mut budget_start = received;
+        if direct {
+            let summary = match store.precheck_agent_confirmation(
+                &request.method,
+                request.params.clone(),
+                (self.clock)(),
+            )? {
+                AgentPrecheck::Cached(body) => return self.attach_incarnation(body),
+                AgentPrecheck::Ready(summary) => summary,
+            };
+            #[cfg(test)]
+            if let Some(barrier) = &self.confirmation_admission_barrier {
+                barrier.wait().await;
+            }
+            let mut guard = agent_ops::ConfirmationGuard::take(&self.confirmation_slot, key)?;
+            // Removal precedes signalling in on_route_gone. A closure between
+            // admission and slot installation is therefore never lost.
+            if !self.route_admissions().contains_key(&key) {
+                return Err(agent_ops::OperatorConfirmError::Declined.into());
+            }
+            tokio::select! {
+                biased;
+                _ = guard.cancelled.wait_for(|closed| *closed) => return Err(agent_ops::OperatorConfirmError::Declined.into()),
+                result = timeout_at(received + OPERATOR_BOUND, self.operator_confirmer.confirm_operator(&summary, key)) => {
+                    result.map_err(|_| HandlerError::from(agent_ops::OperatorConfirmError::Declined))??;
+                }
+            }
+            if Instant::now() >= received + OPERATOR_BOUND {
+                return Err(agent_ops::OperatorConfirmError::Declined.into());
+            }
+            budget_start = Instant::now();
+            approval = Some(OperatorApproval::new(summary));
+            confirmation = Some(guard);
+        } else if state == "enabled" {
             if let Some(write) = &prepared {
                 if let Some(body) = write.probe(&store, &request.method, &principal)? {
                     return if request.method.starts_with("agent.") {
@@ -1284,16 +2194,44 @@ impl ProjectsHandler {
                 }
             }
         }
-        let deadline = received + DEADLINE;
-        let mut writer = timeout_at(deadline, self.writer.clone().lock_owned())
-            .await
-            .map_err(|_| {
-                HandlerError::new("identity_log_contended", "writer lock deadline expired")
-            })?;
+        let deadline = if direct {
+            (budget_start + DEADLINE).min(received + OPERATOR_BOUND)
+        } else {
+            received + DEADLINE
+        };
+        let lock = timeout_at(deadline, self.writer.clone().lock_owned());
+        let lock_result = if let Some(guard) = &mut confirmation {
+            tokio::select! {
+                biased;
+                _ = guard.cancelled.wait_for(|closed| *closed) => return Err(agent_ops::OperatorConfirmError::Declined.into()),
+                result = lock => result,
+            }
+        } else {
+            lock.await
+        };
+        let mut writer = lock_result.map_err(|_| {
+            HandlerError::new("identity_log_contended", "writer lock deadline expired")
+        })?;
         // Re-read after the lock: enable/join can change state while we queue.
         let state = store.identity_log_status().map_err(storage_error)?.state;
         bootstrap_fence(&store, &state, &request)?;
         if state != "enabled" || !candidate {
+            if let Some(approval) = &approval {
+                let before = store.generation().map_err(storage_error)?;
+                let body = prepared.unwrap().run(
+                    &store,
+                    &principal,
+                    (self.clock)(),
+                    "",
+                    Some(approval),
+                )?;
+                // Confirmed local commits wake the identity feed just like
+                // execute does; a cached reply must not wake idle readers.
+                if store.generation().map_err(storage_error)? != before {
+                    self.commits.notify_waiters();
+                }
+                return self.record_mutation(self.attach_incarnation(body));
+            }
             return self.execute(request, key);
         }
         let write = prepared.unwrap();
@@ -1311,7 +2249,11 @@ impl ProjectsHandler {
         } else {
             String::new()
         };
-        let settlement = received + SETTLEMENT;
+        let settlement = if direct {
+            (budget_start + SETTLEMENT).min(received + OPERATOR_BOUND)
+        } else {
+            received + SETTLEMENT
+        };
         for retry in 0..=RETRIES {
             self.catch_up(&store, deadline).await?;
             let status = store.identity_log_status().map_err(storage_error)?;
@@ -1326,6 +2268,7 @@ impl ProjectsHandler {
             let operation = write.clone();
             let principal = principal.clone();
             let stable_id = agent_id.clone();
+            let approval = approval.clone();
             let health = self.health.clone();
             #[cfg(test)]
             let commit_hook = self.shared_commit_hook.clone();
@@ -1359,7 +2302,15 @@ impl ProjectsHandler {
                         }
                         decision
                     },
-                    || operation.run(&worker_store, &principal, now, &stable_id),
+                    || {
+                        operation.run(
+                            &worker_store,
+                            &principal,
+                            now,
+                            &stable_id,
+                            approval.as_ref(),
+                        )
+                    },
                 );
                 (writer, result)
             });

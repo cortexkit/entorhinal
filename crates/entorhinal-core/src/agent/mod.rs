@@ -20,7 +20,10 @@ pub(crate) use journal::{change_ops_sql, IDENTITY_CHANGE_OPS, IDENTITY_MARKER_OP
 pub use journal::{replay_agent_entry, AgentChangeEntry};
 pub use names::*;
 pub(crate) use store::load_row;
-pub use store::{valid_agent_id, AgentMutationError, AgentRow, StoredAgentAvatar};
+pub use store::{
+    valid_agent_id, AgentMutationError, AgentPrecheck, AgentRow, OperatorApproval,
+    StoredAgentAvatar, OPERATOR_SUMMARY_LIMIT,
+};
 pub use validate::*;
 
 use std::fmt;
