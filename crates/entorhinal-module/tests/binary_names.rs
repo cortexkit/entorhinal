@@ -73,7 +73,7 @@ fn binary_spawn_guard_controls_reject_direct_and_adjacent_spawns() {
 
     let adjacent = r#"
         fn test() {
-            let safe = ckdev_binary(env!("CARGO_BIN_EXE_ck-entorhinal"));
+            Command::new(ckdev_binary(env!("CARGO_BIN_EXE_ck-entorhinal"))).spawn();
             Command::new(env!("CARGO_BIN_EXE_ck-entorhinal")).spawn();
         }
     "#;
