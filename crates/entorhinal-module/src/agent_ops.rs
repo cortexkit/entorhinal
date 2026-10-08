@@ -9,9 +9,13 @@ use entorhinal_core::agent::AgentMutationError;
 use serde_json::Value;
 
 use super::RouteKey;
-use super::{HandlerError, ProjectsHandler};
+use super::{HandlerError, ProjectsHandler, RouteAdmission};
 use async_trait::async_trait;
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, OnceLock},
+};
+use subc_client_rs::{ModuleHandle, OperatorConfirmError as SdkConfirmError};
 
 pub(super) const CONFIRMABLE_METHODS: &[&str] = &[
     "agent.create",
@@ -21,13 +25,9 @@ pub(super) const CONFIRMABLE_METHODS: &[&str] = &[
     "agent.set_labels",
 ];
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum OperatorConfirmError {
     Declined,
-    // Returned by the daemon-backed confirmer, which isn't wired yet: the daemon
-    // op that shows the Touch ID prompt hasn't shipped. Until then production
-    // uses `Unsupported`, which refuses every Direct identity write as before.
-    #[allow(dead_code)]
     PresenceUnavailable,
     Unsupported,
 }
@@ -41,11 +41,59 @@ pub(super) trait OperatorConfirmer: Send + Sync {
     ) -> Result<(), OperatorConfirmError>;
 }
 
-pub(super) struct Unsupported;
+/// Uses the serving connection and the caller's live bind handle. The channel
+/// and epoch alone cannot recreate the SDK's private connection identity.
+pub(super) struct DaemonConfirmer {
+    module: OnceLock<ModuleHandle>,
+    admissions: Arc<Mutex<HashMap<RouteKey, RouteAdmission>>>,
+}
+
+impl DaemonConfirmer {
+    pub(super) fn new(admissions: Arc<Mutex<HashMap<RouteKey, RouteAdmission>>>) -> Self {
+        Self {
+            module: OnceLock::new(),
+            admissions,
+        }
+    }
+
+    /// Install before polling the serve future, so no request can arrive before
+    /// its confirmation connection is ready.
+    pub(super) fn set_module_handle(&self, handle: ModuleHandle) {
+        assert!(self.module.set(handle).is_ok(), "module handle already set");
+    }
+}
+
 #[async_trait]
-impl OperatorConfirmer for Unsupported {
-    async fn confirm_operator(&self, _: &str, _: RouteKey) -> Result<(), OperatorConfirmError> {
-        Err(OperatorConfirmError::Unsupported)
+impl OperatorConfirmer for DaemonConfirmer {
+    async fn confirm_operator(
+        &self,
+        summary: &str,
+        route: RouteKey,
+    ) -> Result<(), OperatorConfirmError> {
+        let module = self.module.get().ok_or(OperatorConfirmError::Unsupported)?;
+        let handle = self
+            .admissions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&route)
+            .and_then(|admission| admission.handle)
+            .ok_or(OperatorConfirmError::Declined)?;
+        // Await directly: the outer deadline or route closure must drop the
+        // SDK future, which withdraws the daemon's outstanding prompt.
+        map_operator_confirmation(module.confirm_operator(summary, &handle).await)
+    }
+}
+
+fn map_operator_confirmation(
+    result: Result<(), SdkConfirmError>,
+) -> Result<(), OperatorConfirmError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(SdkConfirmError::Declined) => Err(OperatorConfirmError::Declined),
+        Err(SdkConfirmError::Unsupported) => Err(OperatorConfirmError::Unsupported),
+        // The SDK folds transport failures, connection loss and malformed replies
+        // into PresenceUnavailable. Unknown future variants must also refuse.
+        Err(_) => Err(OperatorConfirmError::PresenceUnavailable),
     }
 }
 
@@ -132,9 +180,7 @@ impl From<AgentMutationError> for HandlerError {
 }
 
 impl ProjectsHandler {
-    // Installs the daemon-backed confirmer once the subc client library ships
-    // the daemon's `operator.confirm` op; tests install stubs directly.
-    #[allow(dead_code)]
+    // Serving installs the daemon connection; tests can install prompt stubs.
     pub(super) fn with_operator_confirmer(mut self, confirmer: Arc<dyn OperatorConfirmer>) -> Self {
         self.operator_confirmer = confirmer;
         self
@@ -202,6 +248,38 @@ mod tests {
     const INCARNATION: &str = "0123456789abcdef";
     const A: &str = "agent_0000000000000001";
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn daemon_confirmation_mapping_accepts_only_confirmed() {
+        assert_eq!(map_operator_confirmation(Ok(())), Ok(()));
+        // PresenceUnavailable includes transport, protocol and unexpected
+        // replies: the SDK exposes no separate error variants for those cases.
+        for (error, expected) in [
+            (SdkConfirmError::Declined, OperatorConfirmError::Declined),
+            (
+                SdkConfirmError::PresenceUnavailable,
+                OperatorConfirmError::PresenceUnavailable,
+            ),
+            (
+                SdkConfirmError::SummaryInvalid,
+                OperatorConfirmError::PresenceUnavailable,
+            ),
+            (
+                SdkConfirmError::NotPermitted,
+                OperatorConfirmError::PresenceUnavailable,
+            ),
+            (
+                SdkConfirmError::Unsupported,
+                OperatorConfirmError::Unsupported,
+            ),
+        ] {
+            assert_eq!(
+                map_operator_confirmation(Err(error)),
+                Err(expected),
+                "{error:?}"
+            );
+        }
+    }
 
     // Import sources are built with core's own migrations, copied byte for byte,
     // so the handler reads the schema a real core store has. The bad-row cases

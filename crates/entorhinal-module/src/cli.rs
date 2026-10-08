@@ -1889,6 +1889,7 @@ mod tests {
             crate::RouteAdmission {
                 principal: Some(crate::Principal::Direct),
                 flow_id: None,
+                handle: None,
             },
         );
         let crate::HandlerOutcome::Response(bytes) =
@@ -2568,6 +2569,7 @@ mod agent_tests {
                 RouteAdmission {
                     principal: Some(Principal::Direct),
                     flow_id: None,
+                    handle: None,
                 },
             );
             Self {

@@ -137,8 +137,49 @@ fn main() -> std::process::ExitCode {
 
 #[tokio::main]
 async fn serve_module() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    subc_client_rs::serve(manifest(), ProjectsHandler::new()?).await?;
+    let connection = module_connection_file(std::env::args_os().skip(1))?;
+    let mut manifest = manifest();
+    // Unlike serve(), serve_with_handle() takes launch configuration explicitly.
+    // Preserve the supervisor's module identity rather than guessing it locally.
+    match std::env::var("SUBC_MODULE_ID") {
+        Ok(id) if !id.trim().is_empty() => manifest.module_id = id,
+        Ok(_) => return Err(subc_client_rs::SubcModuleError::EmptyModuleIdEnv.into()),
+        Err(std::env::VarError::NotPresent) => {}
+        Err(std::env::VarError::NotUnicode(value)) => {
+            return Err(subc_client_rs::SubcModuleError::NonUnicodeModuleIdEnv { value }.into());
+        }
+    }
+    let handler = ProjectsHandler::new()?;
+    let confirmer = Arc::new(agent_ops::DaemonConfirmer::new(
+        handler.route_admissions.clone(),
+    ));
+    let handler = handler.with_operator_confirmer(confirmer.clone());
+    let (handle, serving) =
+        subc_client_rs::serve_with_handle(&connection, manifest, handler).await?;
+    confirmer.set_module_handle(handle);
+    serving.await?;
     Ok(())
+}
+
+fn module_connection_file(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Result<PathBuf, subc_client_rs::SubcModuleError> {
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == "--subc" {
+            return args
+                .next()
+                .map(PathBuf::from)
+                .ok_or(subc_client_rs::SubcModuleError::MissingSubcValue);
+        }
+        if let Some(path) = arg.to_str().and_then(|arg| arg.strip_prefix("--subc=")) {
+            if path.is_empty() {
+                return Err(subc_client_rs::SubcModuleError::MissingSubcValue);
+            }
+            return Ok(PathBuf::from(path));
+        }
+    }
+    Err(subc_client_rs::SubcModuleError::MissingSubcArg)
 }
 
 /// How long a fresh instance keeps retrying a lease that a predecessor still
@@ -222,7 +263,7 @@ struct ProjectsHandler {
     /// What the daemon stamped on each route when it was bound. The daemon
     /// stamps it once, at `route.bind`, never per request, so it is recorded
     /// here and looked up for every request on that route.
-    route_admissions: Mutex<HashMap<RouteKey, RouteAdmission>>,
+    route_admissions: Arc<Mutex<HashMap<RouteKey, RouteAdmission>>>,
     /// Volatile reply token: never persisted in the request-key cache.
     incarnation: String,
     clock: fn() -> i64,
@@ -248,6 +289,8 @@ struct RouteAdmission {
     principal: Option<Principal>,
     /// The flow whose scope the route was opened under, if any.
     flow_id: Option<String>,
+    /// Retain the SDK's connection identity until this admission is removed.
+    handle: Option<RouteHandle>,
 }
 
 impl RouteAdmission {
@@ -255,6 +298,7 @@ impl RouteAdmission {
         Self {
             principal,
             flow_id: scope.and_then(|stamp| stamp.attributes.flow_id.clone()),
+            handle: None,
         }
     }
 }
@@ -406,11 +450,14 @@ impl ProjectsHandler {
         clock: fn() -> i64,
         connector: Arc<dyn log_client::LogConnector>,
     ) -> Self {
+        let route_admissions = Arc::new(Mutex::new(HashMap::new()));
+        let operator_confirmer =
+            Arc::new(agent_ops::DaemonConfirmer::new(route_admissions.clone()));
         Self {
             store: Arc::new(Mutex::new(None)),
             health: Arc::new(HealthGauges::default()),
             liveness: Arc::new(Mutex::new(LivenessState::default())),
-            route_admissions: Mutex::new(HashMap::new()),
+            route_admissions,
             incarnation,
             clock,
             commits: Arc::new(tokio::sync::Notify::new()),
@@ -420,7 +467,7 @@ impl ProjectsHandler {
             writer: Arc::new(tokio::sync::Mutex::new(())),
             catch_up_task: Mutex::new(None),
             agent_id_draw: shared_write::draw_agent_id,
-            operator_confirmer: Arc::new(agent_ops::Unsupported),
+            operator_confirmer,
             confirmation_slot: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             confirmation_admission_barrier: None,
@@ -508,7 +555,10 @@ impl ModuleHandler for ProjectsHandler {
     async fn on_bind(&self, request: &RouteBindRequest) -> BindDecision {
         self.route_admissions().insert(
             route_key(&request.handle),
-            RouteAdmission::from_bind(request.principal.clone(), request.scope.as_ref()),
+            RouteAdmission {
+                handle: Some(request.handle),
+                ..RouteAdmission::from_bind(request.principal.clone(), request.scope.as_ref())
+            },
         );
         BindDecision::accept()
     }
@@ -1603,6 +1653,51 @@ fn unix_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn module_connection_file_preserves_supervisor_argument_forms() {
+        for args in [
+            vec!["--subc", "/tmp/connection.json"],
+            vec!["--subc=/tmp/connection.json"],
+        ] {
+            assert_eq!(
+                module_connection_file(args.into_iter().map(std::ffi::OsString::from)).unwrap(),
+                PathBuf::from("/tmp/connection.json")
+            );
+        }
+        assert!(matches!(
+            module_connection_file(Vec::<std::ffi::OsString>::new()),
+            Err(subc_client_rs::SubcModuleError::MissingSubcArg)
+        ));
+        for args in [vec!["--subc"], vec!["--subc="]] {
+            assert!(matches!(
+                module_connection_file(args.into_iter().map(std::ffi::OsString::from)),
+                Err(subc_client_rs::SubcModuleError::MissingSubcValue)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn route_admission_keeps_bind_handle_until_route_gone() {
+        let handler = ProjectsHandler::new().unwrap();
+        let handle = RouteHandle::detached(7, 3);
+        let request = RouteBindRequest::new(
+            handle,
+            subc_protocol::RouteTarget::ToolProvider {
+                module_id: MODULE_ID.into(),
+            },
+            subc_protocol::BindIdentity::new(PathBuf::from("/tmp/project"), "test", "bind"),
+        )
+        .with_principal(Principal::Direct);
+        handler.on_bind(&request).await;
+        let key = route_key(&handle);
+        let admission = handler.admission_for(key);
+        assert_eq!(admission.handle, Some(handle));
+        assert!(matches!(admission.principal, Some(Principal::Direct)));
+        handler.on_route_gone(&handle).await;
+        assert!(!handler.route_admissions().contains_key(&key));
+        assert!(handler.admission_for(key).handle.is_none());
+    }
 
     pub(super) fn reserved(module_id: &str) -> Principal {
         Principal::Reserved {

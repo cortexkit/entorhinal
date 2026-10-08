@@ -194,6 +194,7 @@ mod tests {
                         module_id: WRITER_MODULE.into(),
                     }),
                     flow_id: None,
+                    handle: None,
                 },
             );
             handler
@@ -1168,6 +1169,7 @@ mod tests {
                 RouteAdmission {
                     principal: Some(Principal::Direct),
                     flow_id: None,
+                    handle: None,
                 },
             );
         }
@@ -2170,6 +2172,8 @@ impl ProjectsHandler {
             if !self.route_admissions().contains_key(&key) {
                 return Err(agent_ops::OperatorConfirmError::Declined.into());
             }
+            // The SDK waits up to 290 seconds. Our receipt-relative 270-second
+            // bound expires first and drops its future, withdrawing the prompt.
             tokio::select! {
                 biased;
                 _ = guard.cancelled.wait_for(|closed| *closed) => return Err(agent_ops::OperatorConfirmError::Declined.into()),

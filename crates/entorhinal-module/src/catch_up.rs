@@ -431,6 +431,7 @@ mod tests {
                         module_id: WRITER_MODULE.into(),
                     }),
                     flow_id: None,
+                    handle: None,
                 },
             );
             handler
