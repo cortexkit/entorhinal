@@ -24,7 +24,10 @@ pub(super) const CONFIRMABLE_METHODS: &[&str] = &[
 #[derive(Debug, Clone, Copy)]
 pub(super) enum OperatorConfirmError {
     Declined,
-    #[allow(dead_code)] // Used by the presence adapter; Unsupported is the interim default.
+    // Returned by the daemon-backed confirmer, which isn't wired yet: the daemon
+    // op that shows the Touch ID prompt hasn't shipped. Until then production
+    // uses `Unsupported`, which refuses every Direct identity write as before.
+    #[allow(dead_code)]
     PresenceUnavailable,
     Unsupported,
 }
@@ -129,7 +132,9 @@ impl From<AgentMutationError> for HandlerError {
 }
 
 impl ProjectsHandler {
-    #[allow(dead_code)] // The daemon adapter is supplied when channel-0 support ships.
+    // Installs the daemon-backed confirmer once the subc client library ships
+    // the daemon's `operator.confirm` op; tests install stubs directly.
+    #[allow(dead_code)]
     pub(super) fn with_operator_confirmer(mut self, confirmer: Arc<dyn OperatorConfirmer>) -> Self {
         self.operator_confirmer = confirmer;
         self

@@ -454,7 +454,8 @@ fn validate_create(
         _ => ("workspace", workspace_id.as_deref().unwrap()),
     };
     claims::check_name(tx, kind, key, &name, None)?;
-    // Query the same invariant enforced by uq_live_head, so validation can run
+    // A project has at most one live head (the `uq_live_head` index). Check it
+    // with a query, rather than by attempting the INSERT, so validation can run
     // on the query-only connection without attempting an INSERT.
     if matches!(r.role, Role::Head) {
         if let Some(conflict) = head_conflict(tx, project_id.as_deref().unwrap())? {
@@ -805,8 +806,13 @@ fn summary(
 }
 
 impl RegistryStore {
-    /// Read-only validation: no id draw, writer connection, claims or pending
-    /// rows. Cached replies precede cutover and domain checks in every log state.
+    /// Checks a write from a `Direct` caller before the operator is prompted,
+    /// on the read connection, writing nothing (no id drawn, no claim, no
+    /// pending row). If this request key already landed, its stored reply is
+    /// returned first, so a retry never prompts again. Otherwise the write must
+    /// be allowed by now (agent identity handed over from core, the
+    /// `agent.cutover` marker) and pass every rule the write itself applies;
+    /// the result is the one-line description the operator will approve.
     pub fn precheck_agent_confirmation(
         &self,
         op: &str,
@@ -886,8 +892,10 @@ impl JournalWriter<'_> {
         self.agent_mutation_with_id(op, params, now, None)
     }
 
-    /// Keep one create identity across shared-log retries. Unconfirmed relay
-    /// writes retain the same payload and request-key cache as before.
+    /// Runs an agent write with no operator approval: the path core's relayed
+    /// writes take, unchanged in payload and request-key caching. `agent_id`
+    /// is supplied when the shared identity log retries a create, so every
+    /// attempt creates the same agent.
     pub fn agent_mutation_with_id(
         &self,
         op: &str,

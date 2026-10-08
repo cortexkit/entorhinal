@@ -446,10 +446,12 @@ impl ProjectsHandler {
 
     /// Whether a request on this route may run `method`. A flow-scoped route may
     /// not write at all. Project writes are admitted from `Direct` (the `ck`
-    /// faces) or the executive, as before. This unconfirmed seam admits agent
-    /// writes only from the executive relay. The async served path separately
-    /// confirms five Direct methods with operator presence; it never bypasses
-    /// this refusal for synchronous requests or other identity methods.
+    /// faces) or the executive, as before. Agent identity writes are admitted
+    /// here only from the executive (`reserved:prefrontal-core`): every local
+    /// process, including an agent's shell, reaches entorhinal as `Direct`.
+    /// The one way a `Direct` caller writes agent identity is `write_wait`,
+    /// which, for five methods only, asks the operator to approve the exact
+    /// write at a Touch ID prompt first. Nothing else skips this refusal.
     /// Enabling the identity log is reserved to an unscoped operator route.
     fn admit(&self, method: &str, key: RouteKey) -> Result<RouteAdmission, HandlerError> {
         let admission = self.admission_for(key);
