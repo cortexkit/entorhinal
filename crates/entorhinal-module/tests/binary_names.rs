@@ -1,10 +1,11 @@
 //! Guards the fleet rule that a process named `ck-<name>` is always a placed
 //! production binary: every binary a test executes must go through the
-//! `ckdev_binary` helper, which runs it as a `ckdev-<name>` hard link.
+//! `ckdev_binary` helper, which runs it as a `ckdev-<name>` copy.
 //!
 //! The scan is lexical, over both crates' `tests/` sources:
-//! - comments and string or char literals are blanked first (`mask_non_code`),
-//!   so code-shaped text inside them is never judged;
+//! - comments are never judged: path text is looked for with comments blanked
+//!   (`mask_comments`), and code shapes such as `Command::new` with comments
+//!   and string or char literals blanked too (`mask_non_code`);
 //! - the code is split into `;`-terminated statements, and each statement is
 //!   judged on its own: a wrapped spawn must not bless the statement after it;
 //! - a statement is flagged when it executes, symlinks or wraps a
@@ -15,14 +16,28 @@
 //!
 //! It recognises only the spawn shapes these tests use. The planted controls
 //! at the bottom prove it fires on a direct spawn and on a direct spawn right
-//! after a wrapped one, and stays quiet on a wrapped spawn.
+//! after a wrapped one, and stays quiet on a wrapped spawn and on paths that
+//! appear only in comments.
 
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
 };
 
+/// Blanks comments and string or char literals, leaving only code.
 fn mask_non_code(source: &str) -> String {
+    mask(source, true)
+}
+
+/// Blanks comments only. String literals stay, because that's where a real
+/// path such as `"target/debug/ck-subc"` lives.
+fn mask_comments(source: &str) -> String {
+    mask(source, false)
+}
+
+/// Literals are always skipped over, so a `//` inside a string never starts a
+/// comment; they are blanked only when `mask_literals` is set.
+fn mask(source: &str, mask_literals: bool) -> String {
     let bytes = source.as_bytes();
     let mut masked = bytes.to_vec();
     let mut index = 0;
@@ -66,7 +81,9 @@ fn mask_non_code(source: &str) -> String {
                 }
                 index += 1;
             }
-            mask_range(&mut masked, start, index);
+            if mask_literals {
+                mask_range(&mut masked, start, index);
+            }
             continue;
         }
 
@@ -86,7 +103,9 @@ fn mask_non_code(source: &str) -> String {
                     _ => index += 1,
                 }
             }
-            mask_range(&mut masked, start, index);
+            if mask_literals {
+                mask_range(&mut masked, start, index);
+            }
             continue;
         }
 
@@ -94,7 +113,9 @@ fn mask_non_code(source: &str) -> String {
         // closing quote in this bounded scan and remains ordinary code.
         if bytes[index] == b'\'' {
             if let Some(end) = char_literal_end(bytes, index) {
-                mask_range(&mut masked, index, end);
+                if mask_literals {
+                    mask_range(&mut masked, index, end);
+                }
                 index = end;
                 continue;
             }
@@ -172,8 +193,9 @@ fn statements(source: &str) -> Vec<(usize, &str)> {
 
 fn env_binary_marker(statement: &str, code: &str) -> Option<usize> {
     let marker = "CARGO_BIN_EXE_ck-";
-    let index = statement.find(marker)?;
-    let quote = statement[..index].rfind('"')?;
+    let visible = mask_comments(statement);
+    let index = visible.find(marker)?;
+    let quote = visible[..index].rfind('"')?;
     code[..quote].trim_end().ends_with("env!(").then_some(index)
 }
 
@@ -211,6 +233,9 @@ fn helper_ranges(code: &str) -> Vec<std::ops::Range<usize>> {
 
 fn statement_has_unwrapped_binary(statement: &str) -> bool {
     let code = mask_non_code(statement);
+    // Paths are looked for in text with comments blanked; positions line up
+    // with `code`, because masking never changes the length.
+    let visible = mask_comments(statement);
     let mut markers = Vec::new();
     if let Some(index) = env_binary_marker(statement, &code) {
         if code.contains("Command::new")
@@ -221,19 +246,19 @@ fn statement_has_unwrapped_binary(statement: &str) -> bool {
         }
     }
 
-    if statement.contains("target/")
-        && statement.contains("ck-")
+    if visible.contains("target/")
+        && visible.contains("ck-")
         && (code.contains("Command::new")
             || code.contains("ckdev_binary")
             || code.contains("symlink"))
     {
-        if let Some(index) = statement.find("target/") {
+        if let Some(index) = visible.find("target/") {
             markers.push(index);
         }
     }
 
-    if code.contains("symlink") && statement.contains("ck-") {
-        if let Some(index) = statement.find("ck-") {
+    if code.contains("symlink") && visible.contains("ck-") {
+        if let Some(index) = visible.find("ck-") {
             markers.push(index);
         }
     }
@@ -312,9 +337,10 @@ fn violations(path: &str, source: &str) -> Vec<String> {
             wrapped_paths.insert(variable);
         }
 
+        let visible = mask_comments(statement);
         let raw_path = env_binary_marker(statement, &code).is_some()
-            || (statement.contains("target/")
-                && statement.contains("ck-")
+            || (visible.contains("target/")
+                && visible.contains("ck-")
                 && binding_name(&code).is_some());
         if raw_path && !code.contains("ckdev_binary") {
             if let Some(variable) = binding_name(&code) {
@@ -400,4 +426,26 @@ fn binary_spawn_guard_controls_reject_direct_and_adjacent_spawns() {
         }
     "#;
     assert!(violations("wrapped.rs", wrapped).is_empty());
+
+    let commented = r#"
+        /// Copies `ck-<name>` into `target/` as `ckdev-<name>`.
+        pub fn ckdev_binary(source: &Path) -> PathBuf {
+            // env!("CARGO_BIN_EXE_ck-entorhinal") is never spawned here.
+            let copy = Command::new("cp").arg(source).status();
+        }
+    "#;
+    assert!(
+        violations("commented.rs", commented).is_empty(),
+        "a path named only in a comment is not a spawn"
+    );
+
+    let literal = r#"
+        fn test() {
+            Command::new("target/debug/ck-subc").spawn();
+        }
+    "#;
+    assert!(
+        !violations("literal.rs", literal).is_empty(),
+        "a path in a string literal is still judged"
+    );
 }
