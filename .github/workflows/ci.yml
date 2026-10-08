@@ -18,7 +18,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: never
-  CK_MUTATE_REV: c1591d4a76fa3d3a7367237922b0bca5214dbf11
+  CK_MUTATE_REV: 73c7e66145e131eadffdd874c82d93548868b668
 
 jobs:
   test:

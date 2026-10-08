@@ -1,4 +1,4 @@
-# Mutation proofs for ckdev-mutate 0.9.3 (commons c1591d4a76fa3d3a7367237922b0bca5214dbf11).
+# Mutation proofs for ckdev-mutate 0.9.5 (commons 73c7e66145e131eadffdd874c82d93548868b668).
 # Anchors are copied from production code; named tests must turn red, not time out.
 # Defaults allow 1800 s to build and 600 s to test on a clean CI runner.
 # Reports belong under the already gitignored target/mutations/.
