@@ -1,0 +1,1034 @@
+# Mutation proofs for ckdev-mutate 0.9.3 (commons c1591d4a76fa3d3a7367237922b0bca5214dbf11).
+# Anchors are copied from production code; named tests must turn red, not time out.
+# Defaults allow 1800 s to build and 600 s to test on a clean CI runner.
+# Reports belong under the already gitignored target/mutations/.
+# only=false allows related assertions in the same target; nightly --broad audits other targets.
+
+# Write admission, including the production admission call and open reads.
+[[control]]
+id = "admission-flow-writes"
+guards = "Flow-scoped routes refuse every registry and identity mutation regardless of principal"
+file = "crates/entorhinal-module/src/main.rs"
+old = "Some(flow_id) if MUTATING_METHODS.contains(&method) => Err(HandlerError {"
+new = "Some(flow_id) if false /* NON-VACUITY BREAK */ => Err(HandlerError {"
+test_file = "crates/entorhinal-module/src/main.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tests::a_flow_scoped_route_cannot_write_even_with_the_executives_principal"]
+expect_message = "a flow must not change the registry"
+
+[[control]]
+id = "admission-flow-call-site"
+guards = "Production route admission actually invokes the flow-write refusal"
+file = "crates/entorhinal-module/src/main.rs"
+old = "refuse_flow_write(method, admission.flow_id.as_deref())?;"
+new = "// NON-VACUITY BREAK: flow admission omitted"
+test_file = "crates/entorhinal-module/src/main.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tests::the_handler_refuses_a_write_on_a_bound_flow_route"]
+expect_message = "a flow route must not write"
+
+[[control]]
+id = "admission-direct-agent"
+guards = "Direct callers cannot mutate agent identity through the executive-only relay"
+file = "crates/entorhinal-module/src/main.rs"
+old = "if agent_ops::MUTATING_METHODS.contains(&method) {"
+new = "if false /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-module/src/main.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tests::writes_are_refused_unless_the_operator_or_the_executive_opened_the_route"]
+expect_message = "called `Result::unwrap_err()` on an `Ok` value"
+
+[[control]]
+id = "admission-enable-direct-only"
+guards = "Only an operator's Direct route may enable the identity log"
+file = "crates/entorhinal-module/src/main.rs"
+old = "if method == \"identity_log.enable\" {"
+new = "if false /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-module/src/main.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tests::writes_are_refused_unless_the_operator_or_the_executive_opened_the_route"]
+expect_message = "called `Result::unwrap_err()` on an `Ok` value"
+
+[[control]]
+id = "admission-open-queries"
+guards = "Unverified and unrelated callers retain read access to registry queries"
+file = "crates/entorhinal-module/src/main.rs"
+old = "if !MUTATING_METHODS.contains(&method) {"
+new = "if false /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-module/src/main.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tests::queries_are_answered_for_every_principal"]
+expect_message = "resolve"
+
+[[control]]
+id = "admission-flow-open-queries"
+guards = "A flow route still answers reads while refusing writes"
+file = "crates/entorhinal-module/src/main.rs"
+old = "Some(flow_id) if MUTATING_METHODS.contains(&method) => Err(HandlerError {"
+new = "Some(flow_id) /* NON-VACUITY BREAK */ => Err(HandlerError {"
+test_file = "crates/entorhinal-module/src/main.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tests::a_flow_scoped_route_cannot_write_even_with_the_executives_principal"]
+expect_message = "is a read and answers every caller alike"
+
+# Session liveness must neither resurrect removed sessions nor report an incomplete mirror as fresh.
+[[control]]
+id = "liveness-older-refused"
+guards = "Overtaken deltas cannot resurrect a session after its gone signal"
+file = "crates/entorhinal-module/src/main.rs"
+old = "if batch.seq <= last {"
+new = "if false /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-module/src/main.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tests::an_older_batch_cannot_resurrect_a_session_that_is_already_gone"]
+expect_message = "a batch older than the last applied one must not be applied at all"
+
+[[control]]
+id = "liveness-refusal-counter"
+guards = "Rejected older batches increment livenessDroppedOlder instead of failing silently"
+file = "crates/entorhinal-module/src/main.rs"
+old = ".liveness_dropped_older\n                .fetch_add(1, Ordering::Relaxed);"
+new = ".liveness_dropped_older\n                .fetch_add(0, Ordering::Relaxed); // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/main.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tests::an_older_batch_cannot_resurrect_a_session_that_is_already_gone"]
+expect_message = "the refusal must be counted, not silent"
+
+[[control]]
+id = "liveness-staleness-latch"
+guards = "Contiguous deltas after a gap cannot clear the request for a full rebase"
+file = "crates/entorhinal-module/src/main.rs"
+old = "state.last_seq = Some(batch.seq);\n            }\n        } else {"
+new = "state.last_seq = Some(batch.seq);\n                state.stale = false; // NON-VACUITY BREAK\n            }\n        } else {"
+test_file = "crates/entorhinal-module/src/main.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tests::a_batch_that_does_not_say_it_is_a_snapshot_cannot_clear_staleness"]
+
+[[control]]
+id = "liveness-incomplete-until-snapshot"
+guards = "First-contact deltas do not describe sessions that did not change; the mirror remains incomplete"
+file = "crates/entorhinal-module/src/main.rs"
+old = "state.last_seq = Some(batch.seq);\n        }\n\n        // Request a snapshot"
+new = "state.last_seq = Some(batch.seq);\n            state.stale = false; // NON-VACUITY BREAK\n        }\n\n        // Request a snapshot"
+test_file = "crates/entorhinal-module/src/main.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tests::a_fresh_receiver_asks_for_a_snapshot_until_one_arrives"]
+expect_message = "a mirror that has never seen a snapshot is incomplete"
+
+[[control]]
+id = "liveness-snapshot-replaces"
+guards = "An empty authoritative snapshot clears sessions whose gone transition was lost"
+file = "crates/entorhinal-module/src/main.rs"
+old = "state.sessions.clear();"
+new = "// NON-VACUITY BREAK: retain sessions absent from snapshot"
+test_file = "crates/entorhinal-module/src/main.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tests::a_snapshot_replaces_the_mirror_and_an_empty_one_still_counts"]
+
+# Journal, projection and identity integrity.
+[[control]]
+id = "verify-drift-affects-ok"
+hub = "Replay drift alone makes verify unhealthy, asserted by corrupt-table verification, migrated workspace roots and private read snapshots"
+hub_targets = ["entorhinal_core"]
+guards = "Replay drift alone makes the verify result unhealthy even when membership is consistent"
+file = "crates/entorhinal-core/src/mutations.rs"
+old = "ok: mismatches.is_empty() && replay.ok,"
+new = "ok: mismatches.is_empty(), // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/tests/replay_verification.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--test replay_verification"
+expect_red = ["corrupt_verify_reports_all_tables_and_rebuild_repairs_the_same_difference"]
+expect_message = "replay drift alone must make verify fail"
+
+[[control]]
+id = "verify-reports-table-drift"
+hub = "Verify compares every projected table with journal replay, asserted by corrupt-table, migration, ownership and private snapshot tests"
+hub_targets = ["entorhinal_core"]
+guards = "Verify reports missing and unexpected rows rather than silently discarding table differences"
+file = "crates/entorhinal-core/src/mutations.rs"
+old = "if missing > 0 || unexpected > 0 {"
+new = "if false /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-core/tests/replay_verification.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--test replay_verification"
+expect_red = ["corrupt_verify_reports_all_tables_and_rebuild_repairs_the_same_difference"]
+expect_message = "replay drift alone must make verify fail"
+
+[[control]]
+id = "rebuild-replays-registration"
+hub = "Journal replay must restore registered projects and their dependent rows, asserted by private verification, rebuild and imported-agent projection tests"
+hub_targets = ["agent_import", "entorhinal_core"]
+guards = "Rebuild reproduces registered projects from the journal rather than dropping their tables"
+file = "crates/entorhinal-core/src/mutations.rs"
+old = "replay(tx, seq, &op, request, now, enabled)?;"
+new = "if op != \"register\" { replay(tx, seq, &op, request, now, enabled)?; } // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/tests/replay_verification.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--test replay_verification"
+expect_red = ["clean_verify_replays_and_preserves_every_table_byte_for_byte"]
+
+[[control]]
+id = "request-key-cross-op-refusal"
+hub = "Project and agent operations share one request-key namespace with a typed cross-operation refusal, including the one-time agent import"
+hub_targets = ["agent_import"]
+guards = "Request keys are globally bound to one operation and refuse cross-operation reuse with the typed code"
+file = "crates/entorhinal-core/src/mutations.rs"
+old = "if other != op {"
+new = "if false /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-core/src/mutations.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["mutations::audit_fix_tests::request_key_cache_is_op_scoped"]
+
+[[control]]
+id = "bound-project-refusal"
+guards = "A live agent prevents removal or reassignment of its project and namespace"
+file = "crates/entorhinal-core/src/agent/mod.rs"
+old = "if bound {\n        return Err(domain(\n            \"bound_by_live_agent\",\n            format!(\"project {project_id} is bound by a live agent\"),"
+new = "if false /* NON-VACUITY BREAK */ {\n        return Err(domain(\n            \"bound_by_live_agent\",\n            format!(\"project {project_id} is bound by a live agent\"),"
+test_file = "crates/entorhinal-core/src/mutations.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["mutations::agent_lifecycle_tests::remove_bound_project_refuses_and_writes_nothing"]
+
+[[control]]
+id = "bound-workspace-refusal"
+guards = "Workspace deletion refuses live workspace heads and agents in currently placed projects"
+file = "crates/entorhinal-core/src/agent/mod.rs"
+old = "if bound {\n        return Err(domain(\n            \"bound_by_live_agent\",\n            format!(\"workspace {workspace_id} is bound by a live agent\"),"
+new = "if false /* NON-VACUITY BREAK */ {\n        return Err(domain(\n            \"bound_by_live_agent\",\n            format!(\"workspace {workspace_id} is bound by a live agent\"),"
+test_file = "crates/entorhinal-core/src/mutations.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["mutations::agent_lifecycle_tests::remove_bound_workspace_refuses_heads_and_live_hires"]
+
+[[control]]
+id = "identity-one-live-head-index"
+guards = "The database allows only one live head for a project while keeping terminal heads"
+file = "crates/entorhinal-core/src/agent/schema.rs"
+old = "CREATE UNIQUE INDEX uq_live_head"
+new = "-- NON-VACUITY BREAK\nCREATE INDEX uq_live_head"
+test_file = "crates/entorhinal-core/src/agent/schema.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["agent::schema::tests::one_live_head_per_project_keeps_terminal_history"]
+
+[[control]]
+id = "identity-active-name-index"
+guards = "The database cannot grant one normalized namespace name to two live agents"
+file = "crates/entorhinal-core/src/agent/schema.rs"
+old = "CREATE UNIQUE INDEX uq_active_claim"
+new = "-- NON-VACUITY BREAK\nCREATE INDEX uq_active_claim"
+test_file = "crates/entorhinal-core/src/agent/schema.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["agent::schema::tests::claims_enforce_active_name_and_owner_uniqueness_but_keep_history"]
+
+[[control]]
+id = "migration-backfill-journal"
+guards = "Unjournaled legacy workspace roots gain a backfill entry so rebuild cannot lose their paths"
+file = "crates/entorhinal-core/src/log_schema.rs"
+old = "HAVING COUNT(*) > 0;"
+new = "HAVING COUNT(*) > 100; -- NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/log_schema.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["log_schema::tests::v6_unjournaled_workspace_roots_are_carried_and_replay_cleanly"]
+
+[[control]]
+id = "migration-backfill-timestamp"
+guards = "Backfill replay preserves the original machine-local workspace-root timestamp"
+file = "crates/entorhinal-core/src/log_schema.rs"
+old = "rusqlite::params![root.workspace_id, root.root, root.updated_at],"
+new = "rusqlite::params![root.workspace_id, root.root, 0], // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/log_schema.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["log_schema::tests::v6_unjournaled_workspace_roots_are_carried_and_replay_cleanly"]
+
+[[control]]
+id = "identity-name-invisible-refusal"
+guards = "Invisible and bidi codepoints cannot create deceptive agent name claims"
+file = "crates/entorhinal-core/src/agent/names.rs"
+old = ".find(|character| is_disallowed_name_character(*character))"
+new = ".find(|character| false && is_disallowed_name_character(*character)) /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-core/src/agent/store.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["agent::store::tests::invisible_and_bidi_characters_are_refused_at_claim_time_with_the_codepoint"]
+
+[[control]]
+id = "identity-name-empty-refusal"
+guards = "Whitespace-only names cannot be claimed as empty identity keys"
+file = "crates/entorhinal-core/src/agent/names.rs"
+old = "if stored_length == 0 || normalized_length == 0 {"
+new = "if false /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-core/src/agent/store.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["agent::store::tests::invalid_names_are_typed_and_never_truncated"]
+
+[[control]]
+id = "identity-name-length-refusal"
+guards = "Both display and folded names are limited to 24 Unicode scalars without truncation"
+file = "crates/entorhinal-core/src/agent/names.rs"
+old = "if stored_length > MAX_NAME_SCALARS || normalized_length > MAX_NAME_SCALARS {"
+new = "if false /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-core/src/agent/store.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["agent::store::tests::invalid_names_are_typed_and_never_truncated"]
+
+[[control]]
+id = "identity-name-case-fold-claims"
+hub = "All name claims use the same Unicode case-folded key for creation, lookup and imported claim validation; the historical workload imports those claims too"
+hub_targets = ["agent_import", "disabled_journal_golden"]
+guards = "NFC, case folding and trimming make visually equivalent spellings collide at claim time"
+file = "crates/entorhinal-core/src/agent/names.rs"
+old = "let folded = CaseMapper::new().fold_string(&display_nfc);"
+new = "let folded = display_nfc.clone(); // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/agent/store.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["agent::store::tests::nfc_case_fold_and_trim_each_create_claim_collisions"]
+
+[[control]]
+id = "identity-project-error-parity"
+guards = "Invalid project ids on create retain prefrontal-core's invalid_role_shape wire code"
+file = "crates/entorhinal-core/src/agent/mod.rs"
+old = "Self::InvalidProjectId | Self::InvalidWorkspaceId => \"invalid_role_shape\","
+new = "Self::InvalidProjectId => \"invalid_project_id\", // NON-VACUITY BREAK\n            Self::InvalidWorkspaceId => \"invalid_role_shape\","
+test_file = "crates/entorhinal-core/src/agent/store.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["agent::store::tests::create_check_order_and_every_refusal_leave_rows_claims_and_journal_unchanged"]
+
+[[control]]
+id = "identity-workspace-error-parity"
+guards = "Invalid workspace ids on create retain prefrontal-core's invalid_role_shape wire code"
+file = "crates/entorhinal-core/src/agent/mod.rs"
+old = "Self::InvalidProjectId | Self::InvalidWorkspaceId => \"invalid_role_shape\","
+new = "Self::InvalidProjectId => \"invalid_role_shape\",\n            Self::InvalidWorkspaceId => \"invalid_workspace_id\", // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/agent/store.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["agent::store::tests::create_check_order_and_every_refusal_leave_rows_claims_and_journal_unchanged"]
+
+[[control]]
+id = "identity-retired-kept"
+guards = "Disposal keeps retired identities and their historical claims instead of deleting reserved ids"
+file = "crates/entorhinal-core/src/agent/store.rs"
+old = "write_row(tx, &self.row)?;"
+new = "write_row(tx, &self.row)?;\n                        if self.row.status == \"retired\" { // NON-VACUITY BREAK\n                            tx.execute(\"DELETE FROM agent_name_claim WHERE agent_id=?1\", [&self.row.agent_id])?;\n                            tx.execute(\"DELETE FROM agent WHERE agent_id=?1\", [&self.row.agent_id])?;\n                        }"
+test_file = "crates/entorhinal-core/src/agent/store.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["agent::store::tests::merge_and_dispose_release_claims_but_refusals_and_idempotent_calls_do_not"]
+
+[[control]]
+id = "identity-merged-kept"
+guards = "Merge retains the terminal source identity and its claim history"
+file = "crates/entorhinal-core/src/agent/store.rs"
+old = "write_row(tx, &self.row)?;"
+new = "write_row(tx, &self.row)?;\n                        if self.row.status == \"merged\" { // NON-VACUITY BREAK\n                            tx.execute(\"DELETE FROM agent_name_claim WHERE agent_id=?1\", [&self.row.agent_id])?;\n                            tx.execute(\"DELETE FROM agent WHERE agent_id=?1\", [&self.row.agent_id])?;\n                        }"
+test_file = "crates/entorhinal-core/src/agent/store.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["agent::store::tests::merge_and_dispose_release_claims_but_refusals_and_idempotent_calls_do_not"]
+
+[[control]]
+id = "identity-feed-delivers-all-ops"
+guards = "The change feed delivers label changes as well as the other identity operations"
+file = "crates/entorhinal-core/src/agent/journal.rs"
+old = "    \"agent.set_labels\","
+new = "    // NON-VACUITY BREAK: omit label changes"
+test_file = "crates/entorhinal-core/src/agent/feed.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["agent::feed::tests::snapshot_and_every_change_op_pin_exact_row_claim_entry_key_sets"]
+
+[[control]]
+id = "identity-feed-excludes-cutover"
+hub = "The identity feed excludes marker rows lacking agent after-images, asserted by feed pagination and the import's post-cutover feed"
+hub_targets = ["agent_import"]
+guards = "The cutover marker has no agent after-image and never enters the identity change feed"
+file = "crates/entorhinal-core/src/agent/journal.rs"
+old = "    \"agent.import\",\n];"
+new = "    \"agent.import\",\n    \"agent.cutover\", // NON-VACUITY BREAK\n];"
+test_file = "crates/entorhinal-core/src/agent/feed.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["agent::feed::tests::changes_full_page_cursor_never_skips_identity_and_partial_pages_pass_nonidentity"]
+
+[[control]]
+id = "identity-feed-full-page-cursor"
+hub = "Full identity feed pages advance only to their last delivered entry, asserted by feed pagination and paged imported identities"
+hub_targets = ["agent_import"]
+guards = "A full feed page advances only to its last delivered identity, never past undelivered changes"
+file = "crates/entorhinal-core/src/agent/feed.rs"
+old = "entries.last().expect(\"positive full page\").seq"
+new = "generation /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-core/src/agent/feed.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["agent::feed::tests::changes_full_page_cursor_never_skips_identity_and_partial_pages_pass_nonidentity"]
+
+# Writer-side recovery and supersede safety. Retry mutations alter only later sends.
+[[control]]
+id = "writer-resend-original-head"
+guards = "An append retry resends its original expected_head, even if its lost reply already advanced the log"
+edits = [
+  { file = "crates/entorhinal-module/src/shared_write.rs", old = "let mut sent = false;\n        loop {", new = "let mut sent = false;\n        let mut attempts = 0; // NON-VACUITY BREAK\n        loop {" },
+  { file = "crates/entorhinal-module/src/shared_write.rs", old = "sent = true;\n            match timeout_at(", new = "sent = true;\n            attempts += 1;\n            match timeout_at(" },
+  { file = "crates/entorhinal-module/src/shared_write.rs", old = "self.log_client.append(request),", new = "self.log_client.append(&AppendRequest { expected_head: request.expected_head + u64::from(attempts > 1), ..request.clone() })," },
+]
+test_file = "crates/entorhinal-module/src/shared_write.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["shared_write::tests::lost_reply_resends_identical_bytes_id_and_stale_head_and_commits_once"]
+
+[[control]]
+id = "writer-resend-identical-payload"
+guards = "An append retry preserves the exact payload bytes instead of re-encoding an equivalent JSON body"
+edits = [
+  { file = "crates/entorhinal-module/src/shared_write.rs", old = "let mut sent = false;\n        loop {", new = "let mut sent = false;\n        let mut attempts = 0; // NON-VACUITY BREAK\n        loop {" },
+  { file = "crates/entorhinal-module/src/shared_write.rs", old = "sent = true;\n            match timeout_at(", new = "sent = true;\n            attempts += 1;\n            match timeout_at(" },
+  { file = "crates/entorhinal-module/src/shared_write.rs", old = "self.log_client.append(request),", new = "self.log_client.append(&AppendRequest { data: if attempts > 1 { [request.data.clone(), vec![b' ']].concat() } else { request.data.clone() }, ..request.clone() })," },
+]
+test_file = "crates/entorhinal-module/src/shared_write.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["shared_write::tests::lost_reply_resends_identical_bytes_id_and_stale_head_and_commits_once"]
+
+[[control]]
+id = "writer-prunes-orphaned-pending"
+guards = "A local commit prunes older losing attempts while retaining current and future slots"
+file = "crates/entorhinal-core/src/pending.rs"
+old = "tx.execute(\"DELETE FROM pending_entry WHERE expected_head < ?1\", [position])?;"
+new = "tx.execute(\"DELETE FROM pending_entry WHERE expected_head < ?1 AND 0\", [position])?; // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/shared_write.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["shared_write::tests::local_commit_clears_losing_attempts_but_keeps_current_and_future_slots"]
+
+[[control]]
+id = "writer-unresolved-settles-from-read"
+guards = "A restarted writer resolves an unknown append by applying the actual entry in the next log slot"
+file = "crates/entorhinal-module/src/catch_up.rs"
+old = ".apply_remote_entry(&entry)"
+new = ".observe_log_head(entry.position).map(|_| 0) /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-module/src/catch_up.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catch_up::tests::held_append_and_refused_resend_settle_by_position_across_restart"]
+
+[[control]]
+id = "enable-agents-imported"
+guards = "Enable refuses agents_not_imported rather than silently closing an unperformed import"
+file = "crates/entorhinal-core/src/enable_state.rs"
+old = "if agents == 0 && !marker && !without_agents {"
+new = "if false /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-module/src/enable.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["enable::tests::import_consent_order_and_flag_rules"]
+
+[[control]]
+id = "enable-without-agents-marker-refused"
+guards = "Without-agents cannot override an existing cutover marker, even after a zero-agent import"
+file = "crates/entorhinal-core/src/enable_state.rs"
+old = "if without_agents && (agents > 0 || marker) {"
+new = "if without_agents && agents > 0 /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-module/src/enable.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["enable::tests::import_consent_order_and_flag_rules"]
+
+[[control]]
+id = "enable-import-guard-call-site"
+guards = "The real enable path checks import consent before saving or appending a snapshot"
+file = "crates/entorhinal-module/src/enable.rs"
+old = "store.check_agent_import_preconditions(without_agents)?;"
+new = "// NON-VACUITY BREAK: enable consent omitted"
+test_file = "crates/entorhinal-module/src/enable.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["enable::tests::import_consent_order_and_flag_rules"]
+
+[[control]]
+id = "supersede-writer-all-self-signed"
+guards = "Every entry in the entire prior prefix must be signed_by_self before a writer can supersede it"
+file = "crates/entorhinal-module/src/enable.rs"
+old = "own &= entry.signed_by_self;"
+new = "own &= true; // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/enable.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["enable::tests::writer_supersede_requires_every_entry_signed_by_self_before_guard"]
+
+[[control]]
+id = "supersede-keeps-every-agent"
+guards = "Superseding snapshots cannot silently drop any previously logged agent identity"
+file = "crates/entorhinal-core/src/remote_apply.rs"
+old = "for old in history {"
+new = "for old in history.iter().filter(|old| agents.contains_key(old.agent_id.as_str())) { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/enable.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["enable::tests::writer_supersede_refusals_leave_journal_state_and_log_unchanged"]
+
+[[control]]
+id = "supersede-never-regresses-agent"
+guards = "Supersede refuses lower generations or name versions even when the snapshot contains the agent"
+file = "crates/entorhinal-core/src/remote_apply.rs"
+old = "if new.row.agent_generation < old.row.agent_generation\n            || new.row.name_version < old.row.name_version"
+new = "if false /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-module/src/enable.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["enable::tests::writer_supersede_refusals_leave_journal_state_and_log_unchanged"]
+
+[[control]]
+id = "supersede-never-forks-agent"
+guards = "An unchanged generation cannot hide a different agent after-image in a supersede"
+file = "crates/entorhinal-core/src/remote_apply.rs"
+old = "if new.row.agent_generation == old.row.agent_generation && new.row != old.row {"
+new = "if false /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-module/src/catch_up.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catch_up::tests::supersede_agent_forks_drops_and_regressions_stall_without_changing_tables"]
+expect_message = "called `Result::unwrap_err()` on an `Ok` value"
+
+[[control]]
+id = "enable-resume-saved-base"
+guards = "Resuming a supersede reads confirmed parts starting at the saved nonzero base"
+file = "crates/entorhinal-module/src/enable.rs"
+old = "let after = base + confirmed as u64;"
+new = "let after = confirmed as u64; // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/enable.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["enable::tests::writer_supersede_resume_from_base_resends_only_unconfirmed_parts"]
+
+[[control]]
+id = "enable-resume-only-missing-parts"
+guards = "Enable recovery sends only missing parts rather than resending already confirmed receipts"
+file = "crates/entorhinal-module/src/enable.rs"
+old = "for (i, part) in parts.iter().enumerate().skip(confirmed) {"
+new = "for (i, part) in parts.iter().enumerate() { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/enable.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["enable::tests::writer_supersede_resume_from_base_resends_only_unconfirmed_parts"]
+
+# Reader-side fail-closed decoding, atomic snapshots, ownership and recovery.
+[[control]]
+id = "reader-stops-on-log-gap"
+guards = "Catch-up stops before applying an entry beyond the next dense log position"
+file = "crates/entorhinal-module/src/catch_up.rs"
+old = "if entry.position != after + 1 || entry.position > page.head {"
+new = "if false /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-module/src/catch_up.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catch_up::tests::gap_stops_at_next_position_and_shared_writes_refuse_stalled"]
+
+[[control]]
+id = "reader-requires-signed-by-self"
+guards = "Missing signed_by_self is a protocol error and stalls catch-up, never an implicit false"
+file = "crates/entorhinal-module/src/log_client.rs"
+old = "            signed_by_self: bool,"
+new = "            #[serde(default)] // NON-VACUITY BREAK\n            signed_by_self: bool,"
+test_file = "crates/entorhinal-module/src/log_client.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["log_client::tests::read_requires_signed_by_self_and_catch_up_stalls"]
+
+[[control]]
+id = "reader-requires-author"
+guards = "Missing author is a protocol error rather than an anonymous entry admitted into catch-up"
+edits = [
+  { file = "crates/entorhinal-module/src/log_client.rs", old = "            author: String,", new = "            #[serde(default)] // NON-VACUITY BREAK\n            author: String," },
+  { file = "crates/entorhinal-module/src/log_client.rs", old = "if row.author.len() != 32", new = "if !row.author.is_empty() && row.author.len() != 32" },
+]
+test_file = "crates/entorhinal-module/src/log_client.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["log_client::tests::read_requires_author_and_catch_up_stalls"]
+
+[[control]]
+id = "reader-canonical-author"
+guards = "Malformed authors cannot bypass the required 32-lowercase-hex signing identity"
+file = "crates/entorhinal-module/src/log_client.rs"
+old = "if row.author.len() != 32\n                || !row\n                    .author\n                    .bytes()\n                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))"
+new = "if false /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-module/src/log_client.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["log_client::tests::read_rejects_noncanonical_author_and_catch_up_stalls"]
+
+[[control]]
+id = "reader-supersede-same-author"
+guards = "A superseding snapshot cannot erase entries written by another signing author"
+file = "crates/entorhinal-module/src/catch_up.rs"
+old = "if entry.author != author {"
+new = "if false /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-module/src/catch_up.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catch_up::tests::forged_or_malformed_supersedes_stall_joiners_members_and_restarted_members"]
+
+[[control]]
+id = "reader-supersede-author-call-site"
+guards = "The real catch-up path re-reads and authorizes the replaced prefix before installing a supersede"
+file = "crates/entorhinal-module/src/catch_up.rs"
+old = "self.check_supersede_authors(through, &authors[0], deadline)\n                                .await?;"
+new = "// NON-VACUITY BREAK: replaced-prefix authorization omitted"
+test_file = "crates/entorhinal-module/src/catch_up.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catch_up::tests::forged_or_malformed_supersedes_stall_joiners_members_and_restarted_members"]
+
+[[control]]
+id = "reader-supersede-parts-same-author"
+guards = "Every part of one superseding snapshot must have the same author"
+file = "crates/entorhinal-module/src/catch_up.rs"
+old = "if authors.iter().any(|author| author != &authors[0]) {"
+new = "if false /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-module/src/catch_up.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catch_up::tests::forged_or_malformed_supersedes_stall_joiners_members_and_restarted_members"]
+
+[[control]]
+id = "reader-snapshot-complete-before-install"
+guards = "A valid but incomplete snapshot prefix never commits even its first part"
+file = "crates/entorhinal-core/src/remote_apply.rs"
+old = "if first.parts != parts.len() as u64"
+new = "if false /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-core/src/remote_apply.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["remote_apply::tests::snapshot_installer_refuses_a_valid_but_incomplete_prefix_atomically"]
+
+[[control]]
+id = "reader-snapshot-errors-roll-back"
+guards = "A failure at the final snapshot position rolls back projections, audits and all applied positions atomically"
+file = "crates/entorhinal-core/src/remote_apply.rs"
+old = "install().inspect_err(|cause| *error.borrow_mut() = Some(cause.to_string()))"
+new = "install().or(Ok(0)) // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/catch_up.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catch_up::tests::snapshot_validation_and_fault_at_final_position_roll_back_the_whole_install"]
+
+[[control]]
+id = "reader-agent-claim-owner"
+guards = "An inbound agent entry cannot release a claim whose owner is another agent"
+file = "crates/entorhinal-core/src/remote_apply.rs"
+old = "if claim.agent_id != agent.agent_id\n                    || owner.is_some_and(|owner| owner != agent.agent_id)"
+new = "if owner.is_some_and(|owner| owner != claim.agent_id) /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-core/src/remote_apply.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["remote_apply::tests::remote_agent_claims_cannot_release_another_owner_or_leave_invalid_liveness"]
+
+[[control]]
+id = "reader-agent-stored-claim-owner"
+guards = "Renaming an inbound claim's owner field cannot disguise a claim id stored for another agent"
+file = "crates/entorhinal-core/src/remote_apply.rs"
+old = "|| owner.is_some_and(|owner| owner != agent.agent_id)"
+new = "|| false /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-core/src/remote_apply.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["remote_apply::tests::remote_agent_claims_cannot_release_another_owner_or_leave_invalid_liveness"]
+
+[[control]]
+id = "reader-agent-active-claim-count"
+guards = "Inbound live agents retain exactly one active claim and terminal agents retain none"
+file = "crates/entorhinal-core/src/remote_apply.rs"
+old = "if active != usize::from(agent.row.status == \"live\") {"
+new = "if false /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-core/src/remote_apply.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["remote_apply::tests::remote_agent_claims_cannot_release_another_owner_or_leave_invalid_liveness"]
+
+[[control]]
+id = "reader-own-entry-not-reapplied"
+guards = "The production catch-up path advances an already committed own entry without reapplying or duplicating the feed"
+file = "crates/entorhinal-core/src/remote_apply.rs"
+old = "let seq = if let Some(seq) = own {"
+new = "let seq = if let Some(seq) = own.filter(|_| false) { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/catch_up.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catch_up::tests::committed_own_entry_only_advances_position_without_reapplying"]
+
+[[control]]
+id = "reader-project-delete-cascades-local"
+guards = "A received project delete retires local authority and removes machine-local dependents"
+file = "crates/entorhinal-core/src/shared_entry.rs"
+old = "self.cascade_local(tx, seq)?;"
+new = "// NON-VACUITY BREAK: leave machine-local rows behind"
+test_file = "crates/entorhinal-core/src/remote_apply.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["remote_apply::tests::remote_project_delete_retires_authority_and_deletes_local_dependents"]
+
+[[control]]
+id = "reader-prunes-losing-pending"
+guards = "Applying the occupied next log slot prunes attempts orphaned by another entry"
+file = "crates/entorhinal-core/src/remote_apply.rs"
+old = "\"DELETE FROM pending_entry WHERE expected_head < ?1\","
+new = "\"DELETE FROM pending_entry WHERE expected_head < ?1 AND 0\", // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/catch_up.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catch_up::tests::held_append_and_refused_resend_settle_by_position_across_restart"]
+
+[[control]]
+id = "disabled-journal-golden-bytes"
+hub = "Agent replies retain the pre-log closed key set without noop, asserted by the byte golden, store mutation helpers and import contracts"
+hub_targets = ["agent_import", "entorhinal_core"]
+guards = "With the identity log off, historical replies and journal rows remain byte-identical to the pre-log implementation"
+file = "crates/entorhinal-core/src/mutations.rs"
+old = "if !op.starts_with(\"agent.\") {"
+new = "if true /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-core/tests/disabled_journal_golden.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--test disabled_journal_golden"
+expect_red = ["disabled_workload_matches_pre_identity_log_reply_and_journal_bytes"]
+expect_message = "assertion `left == right` failed"
+
+# Wire contracts and the scanner's planted violation.
+[[control]]
+id = "wire-head-moved-detail"
+guards = "head_moved decodes the current head from refusal detail without flattening the wire envelope"
+file = "crates/entorhinal-module/src/log_client.rs"
+old = "head: detail.as_ref().and_then(|v| v[\"head\"].as_u64()),"
+new = "head: None, // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/log_client.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["log_client::tests::all_refusals_decode_from_error_detail_without_aliases"]
+
+[[control]]
+id = "wire-not-member-refusal"
+guards = "not_member remains a membership refusal rather than a transient transport outage"
+file = "crates/entorhinal-module/src/log_client.rs"
+old = "NOT_MEMBER => LogError::NotMember,"
+new = "NOT_MEMBER => LogError::Unavailable, // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/log_client.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["log_client::tests::all_refusals_decode_from_error_detail_without_aliases"]
+
+[[control]]
+id = "wire-id-reused-refusal"
+guards = "id_reused is an invariant violation, not an ambiguous outage eligible for resend"
+file = "crates/entorhinal-module/src/log_client.rs"
+old = "ID_REUSED => LogError::IdReused,"
+new = "ID_REUSED => LogError::Unavailable, // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/log_client.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["log_client::tests::all_refusals_decode_from_error_detail_without_aliases"]
+
+[[control]]
+id = "wire-entry-cap-admits-boundary"
+guards = "A decoded entry of exactly 256 KiB is allowed at the wire boundary"
+file = "crates/entorhinal-module/src/log_client.rs"
+old = "if request.data.len() > ENTRY_DATA_CAP {"
+new = "if request.data.len() >= ENTRY_DATA_CAP /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-module/src/fake_log.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["fake_log::tests::data_and_page_caps_count_decoded_bytes_at_exact_boundaries"]
+expect_message = "TooLarge { field: \"entry.data\", cap: 262144 }"
+
+[[control]]
+id = "wire-entry-cap-refuses-oversize"
+guards = "An oversized decoded append is rejected before any connection to engram"
+file = "crates/entorhinal-module/src/log_client.rs"
+old = "if request.data.len() > ENTRY_DATA_CAP {"
+new = "if false /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-module/src/fake_log.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["fake_log::tests::data_and_page_caps_count_decoded_bytes_at_exact_boundaries"]
+expect_message = "client size check must precede even a connector call"
+
+[[control]]
+id = "scan-outside-path-dependency-control"
+guards = "The metadata scanner detects its planted sibling path dependency instead of passing vacuously"
+file = "crates/entorhinal-core/tests/dependency_sources.rs"
+old = "(!manifest.starts_with(&root)).then(|| {"
+new = "(false && !manifest.starts_with(&root)).then(|| { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/tests/dependency_sources.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--test dependency_sources"
+expect_red = ["a_planted_outside_path_dependency_is_refused"]
+expect_message = "assertion `left == right` failed"
+only = true
+
+[[control]]
+id = "disabled-journal-payload-bytes"
+hub = "Disabled journal payloads retain their compact byte encoding, asserted by both the historical byte golden and workspace-root cache tests"
+hub_targets = ["entorhinal_core"]
+guards = "With the log disabled, journal payload whitespace remains byte-identical rather than being re-encoded prettily"
+file = "crates/entorhinal-core/src/mutations.rs"
+old = "serde_json::to_string(&action.payload).unwrap(),"
+new = "serde_json::to_string_pretty(&action.payload).unwrap(), // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/tests/disabled_journal_golden.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--test disabled_journal_golden"
+expect_red = ["disabled_workload_matches_pre_identity_log_reply_and_journal_bytes"]
+expect_message = "assertion `left == right` failed"
+
+[[control]]
+id = "supersede-writer-extension-call-site"
+guards = "The real writer validates every prior agent and claim before saving a superseding snapshot"
+file = "crates/entorhinal-core/src/enable_state.rs"
+old = "crate::remote_apply::validate_agent_extension(history, &entries)?;"
+new = "// NON-VACUITY BREAK: writer history extension check omitted"
+test_file = "crates/entorhinal-module/src/enable.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["enable::tests::writer_supersede_refusals_leave_journal_state_and_log_unchanged"]
+expect_message = "called `Result::unwrap_err()` on an `Ok` value"
+
+# Duplicate-sequence liveness and the independent legacy-agent flag branch.
+[[control]]
+id = "liveness-equal-refused"
+guards = "An equal-sequence delta cannot reverse a gone transition and its refusal is counted"
+file = "crates/entorhinal-module/src/main.rs"
+old = "if batch.seq <= last {"
+new = "if batch.seq < last /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-module/src/main.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tests::an_equal_sequence_batch_cannot_resurrect_a_gone_session"]
+expect_message = "an equal-sequence delta must not change the mirror or its applied sequence"
+
+[[control]]
+id = "enable-without-agents-populated-refused"
+guards = "The import consent helper independently refuses without-agents when legacy agents exist without a marker"
+file = "crates/entorhinal-core/src/enable_state.rs"
+old = "if without_agents && (agents > 0 || marker) {"
+new = "if without_agents && marker /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-core/src/enable_state.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["enable_state::tests::without_agents_refuses_existing_agents_even_without_a_cutover_marker"]
+expect_message = "called `Result::unwrap_err()` on an `Ok` value"
+
+[[control]]
+id = "operator-sdk-refusal-served"
+guards = "The real served path never treats a non-confirmed SDK response as approval"
+file = "crates/entorhinal-module/src/agent_ops.rs"
+old = "Err(_) => Err(OperatorConfirmError::PresenceUnavailable),"
+new = "Err(_) => Ok(()), // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/shared_write.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["shared_write::tests::confirmation::served::every_scripted_refusal_maps_to_its_code_and_writes_nothing"]
+
+[[control]]
+id = "operator-transaction-local-stale-approval"
+guards = "A confirmed write revalidates the approved identity and placement inside its transaction"
+file = "crates/entorhinal-core/src/agent/store.rs"
+old = "if summary(tx, &request, &prepared)? != approval.summary {"
+new = "if false /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-module/src/shared_write.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["shared_write::tests::confirmation::prompt_holds_no_locks_and_revalidation_catches_name_and_placement_changes"]
+
+[[control]]
+id = "operator-confirmation-slot-drop"
+guards = "Abandoned confirmation requests release their exclusion slot on drop"
+file = "crates/entorhinal-module/src/agent_ops.rs"
+old = "self.slot.lock().unwrap_or_else(|e| e.into_inner()).take();"
+new = "// NON-VACUITY BREAK: retain an abandoned confirmation slot"
+test_file = "crates/entorhinal-module/src/shared_write.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["shared_write::tests::confirmation::busy_slot_survives_approval_and_releases_on_finish_drop_and_deadline"]
+
+[[control]]
+id = "operator-route-closure-latch"
+guards = "Closing the confirmed route latches cancellation before a ready prompt or lock can admit its write"
+file = "crates/entorhinal-module/src/main.rs"
+old = "slot.cancelled.send_replace(true);"
+new = "// NON-VACUITY BREAK: omit route-closure cancellation"
+test_file = "crates/entorhinal-module/src/shared_write.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["shared_write::tests::confirmation::route_closure_wins_ready_prompt_and_lock_and_admission_slot_gap"]
+
+[[control]]
+id = "operator-bound-precedes-sdk"
+guards = "The receipt-relative operator bound withdraws an unanswered prompt before the SDK's own unavailable deadline"
+file = "crates/entorhinal-module/src/shared_write.rs"
+old = "const OPERATOR_BOUND: Duration = Duration::from_secs(270);"
+new = "const OPERATOR_BOUND: Duration = Duration::from_secs(300); // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/shared_write.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["shared_write::tests::confirmation::served::unanswered_prompt_is_withdrawn_at_the_operator_bound"]
+
+[[control]]
+id = "direct-nonconfirmable-avatar-admission"
+guards = "The served write path still authorizes a non-confirmable Direct agent method before decoding it"
+file = "crates/entorhinal-module/src/shared_write.rs"
+old = "if !direct {\n            authorize_write(&request.method, admission.principal.as_ref())?;\n        }"
+new = "if !direct && request.method != \"agent.set_avatar\" { // NON-VACUITY BREAK\n            authorize_write(&request.method, admission.principal.as_ref())?;\n        }"
+test_file = "crates/entorhinal-module/src/shared_write.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["shared_write::tests::confirmation::relay_bytes_are_unchanged_and_unconfirmed_seams_stay_closed"]
+expect_message = "direct_identity_write_not_admitted"
+
+[[control]]
+id = "scan-binary-names-recognizes-violations"
+guards = "The binary-name scanner recognizes its planted direct and adjacent unwrapped process spawns"
+file = "crates/entorhinal-module/tests/binary_names.rs"
+old = "if statement_has_unwrapped_binary(statement) || indirect_spawn {"
+new = "if false /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-module/tests/binary_names.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--test binary_names"
+expect_red = ["binary_spawn_guard_controls_reject_direct_and_adjacent_spawns"]
+expect_message = "violations(\"direct.rs\", direct)"
+only = true
+
+[[control]]
+id = "scan-binary-names-planted-source"
+guards = "The real repository source scan refuses a planted unwrapped executable path"
+file = "crates/entorhinal-module/tests/manifest.rs"
+old = "fn manifest_flag_prints_the_manifest_with_the_provided_capability() {\n    let binary = ckdev_binary(env!(\"CARGO_BIN_EXE_ck-entorhinal\"));"
+new = "fn manifest_flag_prints_the_manifest_with_the_provided_capability() {\n    let binary = env!(\"CARGO_BIN_EXE_ck-entorhinal\"); // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/tests/binary_names.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--test binary_names"
+expect_red = ["test_sources_only_execute_ckdev_named_binaries"]
+expect_message = "manifest.rs"
+only = true
+
+[[control]]
+id = "sqlite-memory-accounting-build-pin"
+guards = "Cargo's actual bundled SQLite build retains the memory-accounting disable flag"
+file = ".cargo/config.toml"
+old = "LIBSQLITE3_FLAGS = \"-DSQLITE_DEFAULT_MEMSTATUS=0\""
+new = "LIBSQLITE3_FLAGS = \"-DSQLITE_DEFAULT_MEMSTATUS=1\" # NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/tests/sqlite_build.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--test sqlite_build"
+expect_red = ["bundled_sqlite_is_built_without_memory_accounting"]
+expect_message = "SQLITE_DEFAULT_MEMSTATUS=0 is missing"
+
+[[control]]
+id = "lease-retry-keeps-retrying-within-budget"
+guards = "A predecessor's live lease is retried within the budget rather than failing the first open attempt"
+file = "crates/entorhinal-module/src/main.rs"
+old = "Err(error) if error.is_lease_held() && started.elapsed() < retry_budget => {"
+new = "Err(error) if false /* NON-VACUITY BREAK */ => {"
+test_file = "crates/entorhinal-module/src/main.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tests::open_retries_while_a_predecessor_still_holds_the_lease"]
