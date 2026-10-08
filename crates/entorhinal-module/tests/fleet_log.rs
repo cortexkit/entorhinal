@@ -41,7 +41,7 @@ impl Drop for Scratch {
 }
 
 fn run_module(home: &Path, module_id: Option<&str>) -> std::process::Output {
-    let binary = ckdev_binary(env!("CARGO_BIN_EXE_ck-entorhinal"), home);
+    let binary = ckdev_binary(env!("CARGO_BIN_EXE_ck-entorhinal"));
     let mut command = Command::new(binary);
     command
         .env_clear()

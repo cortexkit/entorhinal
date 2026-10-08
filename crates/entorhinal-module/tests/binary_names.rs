@@ -385,7 +385,7 @@ fn binary_spawn_guard_controls_reject_direct_and_adjacent_spawns() {
 
     let adjacent = r#"
         fn test() {
-            let safe = ckdev_binary(env!("CARGO_BIN_EXE_ck-entorhinal"), scratch);
+            let safe = ckdev_binary(env!("CARGO_BIN_EXE_ck-entorhinal"));
             Command::new(env!("CARGO_BIN_EXE_ck-entorhinal")).spawn();
         }
     "#;
@@ -396,7 +396,7 @@ fn binary_spawn_guard_controls_reject_direct_and_adjacent_spawns() {
 
     let wrapped = r#"
         fn test() {
-            Command::new(ckdev_binary(env!("CARGO_BIN_EXE_ck-entorhinal"), scratch)).spawn();
+            Command::new(ckdev_binary(env!("CARGO_BIN_EXE_ck-entorhinal"))).spawn();
         }
     "#;
     assert!(violations("wrapped.rs", wrapped).is_empty());

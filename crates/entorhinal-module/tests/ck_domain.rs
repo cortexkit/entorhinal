@@ -17,9 +17,7 @@ use std::os::unix::process::CommandExt;
 use std::{
     ffi::OsStr,
     io::Read,
-    path::PathBuf,
     process::{Command, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
@@ -30,27 +28,6 @@ use common::ckdev_binary;
 /// would block here instead of answering.
 const HANG_GUARD: Duration = Duration::from_secs(30);
 
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "ck-entorhinal-ck-domain-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&path).expect("create scratch dir");
-        Self(path)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 /// Runs the binary under its `ckdev-` dev name, with an empty environment and
 /// no daemon connection file to find.
 ///
@@ -59,8 +36,7 @@ impl Drop for Scratch {
 /// argv[0], and macOS's process list shows argv[0], so a test copy must never
 /// carry a `ck-` name there, where it would look like a production binary.
 fn run_as(face: &str) -> (std::process::ExitStatus, String) {
-    let scratch = Scratch::new();
-    let binary = ckdev_binary(env!("CARGO_BIN_EXE_ck-entorhinal"), &scratch.0);
+    let binary = ckdev_binary(env!("CARGO_BIN_EXE_ck-entorhinal"));
     let dev_face = face.replacen("ck-", "ckdev-", 1);
     let mut child = Command::new(&binary)
         .arg0(OsStr::new(&dev_face))

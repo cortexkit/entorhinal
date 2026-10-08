@@ -82,8 +82,8 @@ async fn start_real_daemon() -> RealDaemon {
     let root = unique_temp_dir("real-daemon");
     std::fs::create_dir_all(&root).expect("create daemon scratch directory");
     build_subc_core();
-    let daemon_bin = ckdev_binary(subconscious_root().join("target/debug/ck-subc"), &root);
-    let module_bin = ckdev_binary(env!("CARGO_BIN_EXE_ck-entorhinal"), &root);
+    let daemon_bin = ckdev_binary(subconscious_root().join("target/debug/ck-subc"));
+    let module_bin = ckdev_binary(env!("CARGO_BIN_EXE_ck-entorhinal"));
     let config_dir = root.join("config/cortexkit");
     let runtime_dir = root.join("runtime");
     std::fs::create_dir_all(&config_dir).expect("create config directory");

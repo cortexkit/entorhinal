@@ -2,44 +2,14 @@
 //! only place lint can learn that entorhinal provides the capability other
 //! modules declare `required`. So the test runs the real binary.
 
-use std::{
-    path::PathBuf,
-    process::Command,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::process::Command;
 
 mod common;
 use common::ckdev_binary;
 
-struct ScratchDir(PathBuf);
-
-impl ScratchDir {
-    fn new(label: &str) -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "ck-entorhinal-{label}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&path).expect("create scratch directory");
-        Self(path)
-    }
-
-    fn path(&self) -> &std::path::Path {
-        &self.0
-    }
-}
-
-impl Drop for ScratchDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 #[test]
 fn manifest_flag_prints_the_manifest_with_the_provided_capability() {
-    let scratch = ScratchDir::new("manifest-capabilities");
-    let binary = ckdev_binary(env!("CARGO_BIN_EXE_ck-entorhinal"), scratch.path());
+    let binary = ckdev_binary(env!("CARGO_BIN_EXE_ck-entorhinal"));
     let output = Command::new(binary)
         .arg("--manifest")
         // Offline inspection must not need supervision.
@@ -70,8 +40,7 @@ fn manifest_flag_prints_the_manifest_with_the_provided_capability() {
 /// entorhinal reads the nonce from the daemon's pipe.
 #[test]
 fn manifest_declares_build_provenance() {
-    let scratch = ScratchDir::new("manifest-provenance");
-    let binary = ckdev_binary(env!("CARGO_BIN_EXE_ck-entorhinal"), scratch.path());
+    let binary = ckdev_binary(env!("CARGO_BIN_EXE_ck-entorhinal"));
     let output = Command::new(binary)
         .arg("--manifest")
         .env_remove("SUBC_MODULE_ID")
