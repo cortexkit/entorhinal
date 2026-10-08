@@ -77,6 +77,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # Each replay rebuilds the crate it breaks; cached dependencies keep
+      # that to entorhinal's own code.
+      - uses: Swatinem/rust-cache@v2
+
       - uses: actions/cache@v4
         id: mutate-cache
         with:

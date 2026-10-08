@@ -125,8 +125,10 @@ ckdev-mutate run --all --report target/mutations/all.json
 
 Copy anchors from current code and break guarded logic independently: prove
 exactly-once guards through the production path, use failure-message checks when
-needed, and plant a violation for every scan guard. Narrow broad catches or
-record a justified shared-property `hub`; tests must assert order and outcome,
+needed, and plant a violation for every scan guard. When a break is caught by a
+test other than the one its row names, narrow the break; only when several
+tests guard one property by design, mark the row `hub` and name that property.
+Tests must assert order and outcome,
 not elapsed time, with deadlines sized for clean CI only to stop hangs. Never
 edit or check out source during replay; investigate survivors as coverage
 findings rather than weakening a test or calling a mutant equivalent without a

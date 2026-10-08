@@ -2921,16 +2921,9 @@ mod tests {
         assert!(!requested(&r));
     }
 
-    /// Out-of-order delivery must not resurrect a removed session.
-    ///
-    /// Nothing in the protocol guarantees a producer delivers in seq order: a
-    /// producer that assigns seq and then sends concurrently can have a `gone`
-    /// overtaken by an older batch for the same session. Applying that older
-    /// batch reinserts an entry whose terminal signal is already spent, so
-    /// nothing prunes it again, and the entry keeps its project's
-    /// `last_route_activity_ms` alive forever -- the GC-candidacy signal this
-    /// feed exists to produce. Hence the refusal is the receiver's own
-    /// invariant, not a workaround for one producer's scheduling.
+    /// A repeated sequence number is refused like an older one. A replay of
+    /// seq N need not carry the same payload as the batch already applied at
+    /// N, so applying it could undo that batch's `gone`.
     #[test]
     fn an_equal_sequence_batch_cannot_resurrect_a_gone_session() {
         let handler = ProjectsHandler::new().unwrap();
@@ -2980,6 +2973,16 @@ mod tests {
         assert_eq!(handler.health.liveness_gaps.load(Ordering::Relaxed), 0);
     }
 
+    /// Out-of-order delivery must not resurrect a removed session.
+    ///
+    /// Nothing in the protocol guarantees a producer delivers in seq order: a
+    /// producer that assigns seq and then sends concurrently can have a `gone`
+    /// overtaken by an older batch for the same session. Applying that older
+    /// batch reinserts an entry whose terminal signal is already spent, so
+    /// nothing prunes it again, and the entry keeps its project's
+    /// `last_route_activity_ms` alive forever -- the GC-candidacy signal this
+    /// feed exists to produce. Hence the refusal is the receiver's own
+    /// invariant, not a workaround for one producer's scheduling.
     #[test]
     fn an_older_batch_cannot_resurrect_a_session_that_is_already_gone() {
         let handler = ProjectsHandler::new().unwrap();

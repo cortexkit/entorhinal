@@ -416,7 +416,9 @@ package = "entorhinal-core"
 target = "--lib"
 expect_red = ["agent::feed::tests::changes_full_page_cursor_never_skips_identity_and_partial_pages_pass_nonidentity"]
 
-# Writer-side recovery and supersede safety. Retry mutations alter only later sends.
+# Writing to the shared log: recovering an interrupted write, and the checks
+# before re-enable replaces this machine's own earlier snapshot. Breaks in the
+# retry logic change only the resends, never the first attempt.
 [[control]]
 id = "writer-resend-original-head"
 guards = "An append retry resends its original expected_head, even if its lost reply already advanced the log"
@@ -578,7 +580,9 @@ package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 expect_red = ["enable::tests::writer_supersede_resume_from_base_resends_only_unconfirmed_parts"]
 
-# Reader-side fail-closed decoding, atomic snapshots, ownership and recovery.
+# Reading the shared log: an entry that fails to decode stops catch-up, a
+# multi-part snapshot installs all at once, and a replacing snapshot is
+# accepted only over entries by its own author.
 [[control]]
 id = "reader-stops-on-log-gap"
 guards = "Catch-up stops before applying an entry beyond the next dense log position"
@@ -775,7 +779,9 @@ target = "--test disabled_journal_golden"
 expect_red = ["disabled_workload_matches_pre_identity_log_reply_and_journal_bytes"]
 expect_message = "assertion `left == right` failed"
 
-# Wire contracts and the scanner's planted violation.
+# Reply formats other modules depend on, and the scan guard that fails when a
+# test runs a binary without the ckdev helper. Its control is a deliberate
+# violation planted in a test source.
 [[control]]
 id = "wire-head-moved-detail"
 guards = "head_moved decodes the current head from refusal detail without flattening the wire envelope"
@@ -880,7 +886,9 @@ target = "--bin ck-entorhinal"
 expect_red = ["enable::tests::writer_supersede_refusals_leave_journal_state_and_log_unchanged"]
 expect_message = "called `Result::unwrap_err()` on an `Ok` value"
 
-# Duplicate-sequence liveness and the independent legacy-agent flag branch.
+# Two independent guards: a session update repeating the last sequence number
+# is refused, and `log enable --without-agents` is refused when agents already
+# exist, even before the cutover marker is written.
 [[control]]
 id = "liveness-equal-refused"
 guards = "An equal-sequence delta cannot reverse a gone transition and its refusal is counted"
