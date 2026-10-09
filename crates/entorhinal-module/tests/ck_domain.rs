@@ -1,9 +1,8 @@
 //! `ck projects`, `ck workspaces` and `ck agents` reach this binary only through the ck
 //! dispatcher's domain handshake: `ck-<name> --ck-domain` must exit 0 and print
 //! exactly one headline line within 2 seconds, or ck refuses the command. The
-//! face comes from argv[0], so the test calls the real binary through a symlink
-//! with each face's name, which is how the dispatcher reaches it. Unix only:
-//! the faces are symlinks there.
+//! face comes from argv[0], so the test supplies each face's name through arg0
+//! on Unix and through a named executable copy on Windows.
 //!
 //! The 2-second limit is met by doing no slow work at all, so that's what the
 //! test checks: the face answers with no home directory, no data directory and
@@ -11,11 +10,11 @@
 //! Elapsed time isn't asserted, because the shared test machine can take
 //! seconds just to start a process under load; the deadline below only stops a
 //! hang.
-#![cfg(unix)]
-
+#[cfg(unix)]
+use std::ffi::OsStr;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::{
-    ffi::OsStr,
     io::Read,
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -30,19 +29,44 @@ const HANG_GUARD: Duration = Duration::from_secs(30);
 /// Runs the binary under its `ckdev-` dev name, with an empty environment and
 /// no daemon connection file to find.
 ///
-/// The executable is a `ckdev-entorhinal` copy, and argv[0] selects the command
-/// domain (`ckdev-projects`, `ckdev-workspaces`, or `ckdev-agents`). Both matter:
-/// the binary selects its handshake headline from argv[0], and macOS's process
-/// list shows argv[0], so a test copy must never carry a `ck-` name there, where
-/// it would look like a production binary.
+/// Both the executable and argv[0] carry `ckdev-` names, so a test process
+/// cannot be mistaken for a production module. Unix overrides argv[0];
+/// Windows selects the domain through an executable copy with that name.
 fn run_as(face: &str) -> (std::process::ExitStatus, String) {
     let binary = ckdev_binary(env!("CARGO_BIN_EXE_ck-entorhinal"));
     let dev_face = face.replacen("ck-", "ckdev-", 1);
-    let mut child = Command::new(&binary)
+
+    #[cfg(windows)]
+    let scratch = std::env::temp_dir().join(format!(
+        "ck-domain-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    #[cfg(windows)]
+    let binary = {
+        std::fs::create_dir(&scratch).expect("create face scratch directory");
+        let copy = scratch.join(format!("{dev_face}.exe"));
+        std::fs::copy(binary, &copy).expect("copy the face binary");
+        copy
+    };
+
+    let mut command = Command::new(&binary);
+    command.arg("--ck-domain").env_clear();
+    #[cfg(unix)]
+    command
         .arg0(OsStr::new(&dev_face))
-        .arg("--ck-domain")
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
+        .env("PATH", "/usr/bin:/bin");
+    #[cfg(windows)]
+    for name in ["SYSTEMROOT", "PATH"] {
+        command.env(
+            name,
+            std::env::var_os(name).expect("Windows child environment"),
+        );
+    }
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -65,6 +89,8 @@ fn run_as(face: &str) -> (std::process::ExitStatus, String) {
         .expect("piped stdout")
         .read_to_string(&mut stdout)
         .expect("read stdout");
+    #[cfg(windows)]
+    std::fs::remove_dir_all(scratch).expect("remove face scratch directory");
     (status, stdout)
 }
 

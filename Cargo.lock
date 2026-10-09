@@ -259,6 +259,7 @@ dependencies = [
  "subc-transport",
  "tokio",
  "tracing",
+ "windows-sys",
 ]
 
 [[package]]

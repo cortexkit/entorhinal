@@ -44,7 +44,6 @@ fn run_module(home: &Path, module_id: Option<&str>) -> std::process::Output {
     let mut command = Command::new(binary);
     command
         .env_clear()
-        .env("PATH", "/usr/bin:/bin")
         .env("HOME", home)
         .env("XDG_DATA_HOME", home.join("data"))
         .env("XDG_RUNTIME_DIR", home.join("run"))
@@ -52,6 +51,15 @@ fn run_module(home: &Path, module_id: Option<&str>) -> std::process::Output {
         // A connection file that does not exist: serving fails right after
         // start, which is enough to prove where the process logs.
         .args(["--subc", home.join("absent.json").to_str().unwrap()]);
+    #[cfg(unix)]
+    command.env("PATH", "/usr/bin:/bin");
+    #[cfg(windows)]
+    for name in ["SYSTEMROOT", "PATH"] {
+        command.env(
+            name,
+            std::env::var_os(name).expect("Windows child environment"),
+        );
+    }
     if let Some(id) = module_id {
         command.env("SUBC_MODULE_ID", id);
     }

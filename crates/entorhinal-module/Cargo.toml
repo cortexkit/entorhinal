@@ -43,3 +43,6 @@ subc-transport = { workspace = true }
 # the library's in-process stand-in daemon. Test builds only: the release
 # binary's dependency graph never carries the stand-in.
 subc-client-rs = { workspace = true, features = ["test-support"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_SystemServices", "Win32_System_Threading"] }

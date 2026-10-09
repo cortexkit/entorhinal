@@ -12,6 +12,10 @@ use entorhinal_core::{
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
+#[cfg(windows)]
+#[path = "support/windows_acl.rs"]
+mod windows_acl;
+
 // Core's agent-table migrations, copied byte for byte, so the import is tested
 // against the schema a real core store has rather than a hand-written imitation
 // of it. Each citation below names the original file so a copy can be checked
@@ -757,6 +761,16 @@ fn missing_unreadable_and_non_sqlite_paths_refuse_without_writes() {
         fs::set_permissions(&f.source_path, fs::Permissions::from_mode(0o000)).unwrap();
         let result = f.import("unreadable");
         fs::set_permissions(&f.source_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let error = result.unwrap_err();
+        assert_eq!(error.code, "invalid_request");
+        assert!(error.message.contains(f.source_path.to_str().unwrap()));
+        f.empty(0);
+    }
+    #[cfg(windows)]
+    {
+        let acl = windows_acl::deny_read_for_current_user(&f.source_path).unwrap();
+        let result = f.import("unreadable");
+        windows_acl::restore(acl).unwrap();
         let error = result.unwrap_err();
         assert_eq!(error.code, "invalid_request");
         assert!(error.message.contains(f.source_path.to_str().unwrap()));

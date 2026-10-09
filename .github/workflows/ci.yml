@@ -60,6 +60,45 @@ jobs:
           ckdev-mutate --version
           ckdev-mutate check
 
+  native:
+    name: Native (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Require PowerShell 7.3+ on PATH
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          if ! command -v pwsh >/dev/null; then
+            echo '::error::missing pwsh 7.3+ on PATH'
+            exit 1
+          fi
+          pwsh -NoProfile -NonInteractive -Command '
+            if ($PSVersionTable.PSVersion -lt [version]"7.3") {
+              Write-Error "missing pwsh 7.3+ on PATH"
+              exit 1
+            }
+            $PSVersionTable.PSVersion.ToString()
+          '
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --all-targets --locked
+
   mutations:
     name: Mutation proofs (ubuntu, shard ${{ matrix.shard }})
     needs: test

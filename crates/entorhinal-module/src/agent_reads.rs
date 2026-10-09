@@ -324,10 +324,7 @@ mod tests {
         fn project(&self, id: &str, workspace: Option<&str>) -> String {
             let path = self.root.join(id);
             std::fs::create_dir_all(&path).unwrap();
-            let root = std::fs::canonicalize(path)
-                .unwrap()
-                .to_string_lossy()
-                .into_owned();
+            let root = RegistryStore::canonical_mutation_root(path.to_str().unwrap()).unwrap();
             let reply = self.ok(
                 "register",
                 json!({"projectId":id,"name":id,"roots":[root],"workspaceId":workspace}),

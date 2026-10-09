@@ -50,6 +50,9 @@ write is refused with `authority_not_cut_over`, before any prompt.
 
 ## Operations
 
+The registry store must be on a local disk. SQLite WAL and shared memory are
+not supported on network shares.
+
 Served to other modules through the subc daemon, which routes management calls
 between CortexKit modules. Reads are open to every caller.
 Project writes are accepted from the operator (`ck`) or the executive
