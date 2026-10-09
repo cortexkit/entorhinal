@@ -97,10 +97,10 @@ fn supervised_module_writes_its_start_and_failure_to_a_dated_segment() {
         text.contains("ERROR entorhinal: module exited:"),
         "the fatal error belongs in the log, found {text:?}"
     );
-    // Once the logger is installed, nothing is left for stderr to carry.
+    // Fatal module exits remain visible even when the operator cannot read logs.
     assert!(
-        output.stderr.is_empty(),
-        "stderr must be empty after logger start, got {:?}",
+        String::from_utf8_lossy(&output.stderr).starts_with("ck-entorhinal: module exited:"),
+        "stderr must report the fatal exit, got {:?}",
         String::from_utf8_lossy(&output.stderr)
     );
 }

@@ -1040,3 +1040,236 @@ runner = "cargo"
 package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 expect_red = ["tests::open_retries_while_a_predecessor_still_holds_the_lease"]
+
+# Startup refusals, argument/path policy and shell retry controls.
+[[control]]
+id = "s1-sdk-discovery"
+guards = "Explicit daemon overrides go directly to the SDK and preserve its Display error"
+file = "crates/entorhinal-module/src/cli.rs"
+old = '''subc_client_rs::SubcConsumer::connect(
+                    path,
+                    subc_client_rs::ConsumerOptions::default(),
+                )'''
+new = '''subc_client_rs::SubcConsumer::connect(
+                    &path.with_extension("NON-VACUITY BREAK"),
+                    subc_client_rs::ConsumerOptions::default(),
+                )'''
+test_file = "crates/entorhinal-module/tests/cli_launch.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--test cli_launch"
+expect_red = ["explicit_connection_failure_matches_the_sdk_display"]
+
+[[control]]
+id = "s1-descriptor-missing"
+guards = "Missing HELLO_ACK storage is refused by name"
+file = "crates/entorhinal-module/src/main.rs"
+old = '"storage_descriptor_missing: HELLO_ACK has no storage descriptor".to_owned()'
+new = '"NON-VACUITY BREAK: missing descriptor accepted".to_owned()'
+test_file = "crates/entorhinal-module/src/main.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["startup_tests::descriptor_missing_is_a_refusal"]
+
+[[control]]
+id = "s1-descriptor-invalid"
+guards = "Malformed HELLO_ACK storage is refused by name without a panic"
+file = "crates/entorhinal-module/src/main.rs"
+old = 'format!("storage_descriptor_invalid: {error}")'
+new = 'format!("NON-VACUITY BREAK: {error}")'
+test_file = "crates/entorhinal-module/src/main.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["startup_tests::descriptor_invalid_is_a_refusal"]
+
+[[control]]
+id = "s1-hello-refusal-signal"
+guards = "A descriptor refusal wakes serving without opening a store"
+file = "crates/entorhinal-module/src/main.rs"
+old = "self.hello_refusal.signal.notify_one();"
+new = "/* NON-VACUITY BREAK: do not wake serving */"
+test_file = "crates/entorhinal-module/src/main.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["startup_tests::missing_descriptor_signals_without_opening_a_store"]
+
+[[control]]
+id = "s1-serve-until-refused"
+guards = "The refusal signal terminates a pending server with the refusal error"
+file = "crates/entorhinal-module/src/main.rs"
+old = '''_ = refusal.signal.notified() => Err(refusal.error.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_else(|| "storage_descriptor_missing".into())),'''
+new = '''_ = refusal.signal.notified() => Ok(()) /* NON-VACUITY BREAK */,'''
+test_file = "crates/entorhinal-module/src/main.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["startup_tests::serve_returns_the_refusal_or_the_serve_result"]
+
+[[control]]
+id = "s1-store-unavailable"
+guards = "A bare served handler replies promptly with store_unavailable after startup refusal"
+file = "crates/entorhinal-module/src/main.rs"
+old = 'return HandlerError::new("store_unavailable", error).into_outcome();'
+new = 'return HandlerError::new("NON-VACUITY BREAK", error).into_outcome();'
+test_file = "crates/entorhinal-module/src/main.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["startup_tests::bare_served_handler_refuses_requests_after_hello"]
+
+[[control]]
+id = "s1-report-module-exit"
+guards = "Fatal module exits write stderr as well as the fleet log"
+file = "crates/entorhinal-module/src/main.rs"
+old = 'let _ = writeln!(writer, "ck-entorhinal: module exited: {error}");'
+new = 'let _ = writeln!(writer, "NON-VACUITY BREAK: {error}");'
+test_file = "crates/entorhinal-module/src/main.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["startup_tests::module_exit_reports_the_error_and_failure"]
+
+[[control]]
+id = "s1-cwd-unreadable-cli"
+guards = "An unreadable cwd is refused before the CLI connects"
+file = "crates/entorhinal-module/src/current_directory.rs"
+old = "let path = read().map_err(|error| CwdError {"
+new = 'let path = read().or_else(|_| Ok(std::path::PathBuf::from("/"))) /* NON-VACUITY BREAK */.map_err(|error: std::io::Error| CwdError {'
+test_file = "crates/entorhinal-module/src/cli.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["cli::launch_path_tests::cwd_read_failure_refuses_before_dialing"]
+
+[[control]]
+id = "s1-cwd-unreadable-connector"
+guards = "An unreadable cwd is a terminal identity-log refusal before any frame"
+file = "crates/entorhinal-module/src/current_directory.rs"
+old = "let path = read().map_err(|error| CwdError {"
+new = 'let path = read().or_else(|_| Ok(std::path::PathBuf::from("/"))) /* NON-VACUITY BREAK */.map_err(|error: std::io::Error| CwdError {'
+test_file = "crates/entorhinal-module/src/log_client.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["log_client::cwd_tests::cwd_unreadable_is_terminal_and_sends_no_frame"]
+
+[[control]]
+id = "s1-argument-not-unicode"
+guards = "Non-Unicode argv values are usage refusals instead of lossy strings"
+file = "crates/entorhinal-module/src/main.rs"
+old = '''arg.into_string()
+                .map_err(|_| "argument_not_unicode".to_owned())'''
+new = '''Ok(arg.to_string_lossy().into_owned()) /* NON-VACUITY BREAK */'''
+test_file = "crates/entorhinal-module/src/main.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["startup_tests::non_unicode_arguments_are_usage_refusals"]
+
+# The path_class call-site is cfg(windows), so Linux cannot compile or replay
+# it. The native windows_call_site_refuses_ambiguous_but_not_unc_paths test proves
+# ambiguous drive-relative/rooted-no-drive arguments are refused but UNC paths
+# are not refused by this usage guard (acceptance item 4).
+[[control]]
+id = "s1-path-classifier"
+guards = "The pure classifier distinguishes ambiguous Windows grammar on every OS"
+file = "crates/entorhinal-module/src/cli.rs"
+old = "bytes[0].is_ascii_alphabetic()"
+new = "false /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-module/src/cli.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["cli::launch_path_tests::every_windows_path_class_is_classified_on_every_os"]
+
+[[control]]
+id = "s1-canonical-mutation-cli"
+guards = "All CLI mutations require an existing core-canonical directory"
+file = "crates/entorhinal-module/src/cli.rs"
+old = "entorhinal_core::RegistryStore::canonical_mutation_root(raw)"
+new = "entorhinal_core::RegistryStore::canonical_query_path(Path::new(raw)).map(|(path, _)| path) /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-module/src/cli.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["cli::launch_path_tests::all_mutations_use_core_paths_and_refuse_missing_directories"]
+
+[[control]]
+id = "s1-path-not-unicode-cli"
+guards = "A non-Unicode CLI cwd is refused with path_not_unicode"
+file = "crates/entorhinal-module/src/current_directory.rs"
+old = 'code: "path_not_unicode",'
+new = 'code: "NON-VACUITY BREAK",'
+test_file = "crates/entorhinal-module/src/cli.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["cli::launch_path_tests::non_unicode_canonical_paths_and_cwd_are_refused"]
+
+[[control]]
+id = "s1-path-not-unicode-core"
+guards = "Canonicalized mutation and query paths cannot become lossy registry identities"
+file = "crates/entorhinal-core/src/lib.rs"
+old = '''path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| RegistryError::Path(format!("path_not_unicode: {}", path.display())))'''
+new = '''Ok(path.to_string_lossy().into_owned()) /* NON-VACUITY BREAK */'''
+test_file = "crates/entorhinal-module/src/cli.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["cli::launch_path_tests::non_unicode_canonical_paths_and_cwd_are_refused"]
+
+[[control]]
+id = "s1-face-from-argv0"
+guards = "Executable face selection accepts ASCII case aliases on every OS"
+file = "crates/entorhinal-module/src/cli.rs"
+old = "let lower = name.to_ascii_lowercase();"
+new = "let lower = name.to_owned(); /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-module/src/cli.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["cli::launch_path_tests::face_mapping_accepts_paths_case_and_one_exe_suffix"]
+
+[[control]]
+id = "s1-annotate-liveness"
+guards = "Enumerate liveness includes nested sessions but excludes prefix siblings"
+file = "crates/entorhinal-module/src/main.rs"
+old = '''entorhinal_core::path_prefix_or_equal(
+                            Path::new(project_root),
+                            Path::new(root),
+                        )'''
+new = '''root == project_root /* NON-VACUITY BREAK */'''
+test_file = "crates/entorhinal-module/src/main.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tests::enumerate_annotation_joins_liveness_by_root_containment"]
+
+[[control]]
+id = "s1-posix-quoting"
+guards = "POSIX single quotes survive shell-word quoting"
+file = "crates/entorhinal-module/src/retry_quote.rs"
+old = '''format!("'{}'", word.replace('\'', "'\\''"))'''
+new = '''format!("'{}'", word) /* NON-VACUITY BREAK */'''
+test_file = "crates/entorhinal-module/src/retry_quote.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["cli::retry_quote::tests::posix_vectors"]
+
+[[control]]
+id = "s1-powershell-quoting"
+guards = "PowerShell single quotes are doubled inside a quoted word"
+file = "crates/entorhinal-module/src/retry_quote.rs"
+old = '''format!("'{}'", word.replace('\'', "''"))'''
+new = '''format!("'{}'", word) /* NON-VACUITY BREAK */'''
+test_file = "crates/entorhinal-module/src/retry_quote.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["cli::retry_quote::tests::powershell_vectors"]

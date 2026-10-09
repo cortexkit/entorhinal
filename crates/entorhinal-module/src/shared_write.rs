@@ -1980,8 +1980,8 @@ mod tests {
             };
 
             /// The stand-in's HELLO_ACK carries no storage descriptor, and the
-            /// real `on_hello_ack` then falls back to the operator's live store.
-            /// This wrapper gives it the fixture's scratch descriptor instead and
+            /// real `on_hello_ack` refuses to open a store without one.
+            /// This wrapper gives it the fixture's scratch descriptor and
             /// forwards every hook `ProjectsHandler` implements, unchanged.
             struct Scratch {
                 handler: ProjectsHandler,

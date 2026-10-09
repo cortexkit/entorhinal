@@ -12,6 +12,11 @@ build = "build.rs"
 name = "ck-entorhinal"
 path = "src/main.rs"
 
+[[bin]]
+name = "ckdev-argv-echo"
+path = "src/bin/ckdev-argv-echo.rs"
+test = false
+
 [dependencies]
 entorhinal-core = { path = "../entorhinal-core" }
 cortexkit-store-types = { workspace = true }

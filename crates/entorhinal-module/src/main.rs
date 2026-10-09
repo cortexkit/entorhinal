@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::{
-    path::PathBuf,
+    path::Path,
     sync::{
         atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
         Arc, Mutex,
@@ -15,8 +15,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
+use std::path::PathBuf;
+
 use async_trait::async_trait;
-use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, StorageDescriptor};
+use cortexkit_store_types::StorageDescriptor;
+#[cfg(test)]
+use cortexkit_store_types::{Isolation, StorageBackend};
 use entorhinal_core::{
     AssignWorkspaceRequest, RegisterRequest, RegistryError, RegistryStore, RemoveRequest,
     SeedImportRequest, SetWorkspaceRootRequest, UpgradeImplicitRequest,
@@ -47,12 +52,14 @@ use subc_protocol::{
 // being free from then on -- it becomes a data migration. This module has never
 // been deployed, which is the only reason a one-line change is sufficient.
 const MODULE_ID: &str = "entorhinal";
+#[cfg(test)]
 const DEFAULT_STORAGE_NAMESPACE: &str = "default";
 
 mod agent_ops;
 mod agent_reads;
 mod catch_up;
 mod cli;
+mod current_directory;
 mod enable;
 mod incarnation;
 // The client for engram's identity log. Only writes to shared state and
@@ -83,8 +90,15 @@ fn main() -> std::process::ExitCode {
     // never appears in an operator's vocabulary. One binary rather than four
     // because the faces share every line of transport, rendering, and parse
     // machinery, and a shared binary cannot drift from itself.
-    let face = cli::face_from_argv0(std::env::args().next().as_deref());
-    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    let arguments = match unicode_arguments(std::env::args_os()) {
+        Ok(arguments) => arguments,
+        Err(error) => {
+            eprintln!("{error}");
+            return std::process::ExitCode::from(64);
+        }
+    };
+    let face = cli::face_from_argv0(arguments.first().map(String::as_str));
+    let arguments: Vec<String> = arguments.into_iter().skip(1).collect();
     match cli::parse(face, &arguments) {
         cli::Invocation::Report(text) => {
             println!("{text}");
@@ -126,10 +140,7 @@ fn main() -> std::process::ExitCode {
             tracing::info!("entorhinal module starting");
             match serve_module() {
                 Ok(()) => std::process::ExitCode::SUCCESS,
-                Err(error) => {
-                    tracing::error!("module exited: {error}");
-                    std::process::ExitCode::FAILURE
-                }
+                Err(error) => report_module_exit(error, &mut std::io::stderr()),
             }
         }
     }
@@ -138,6 +149,7 @@ fn main() -> std::process::ExitCode {
 #[tokio::main]
 async fn serve_module() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let handler = ProjectsHandler::new()?;
+    let refusal = handler.hello_refusal.clone();
     let confirmer = Arc::new(agent_ops::DaemonConfirmer::new(
         handler.route_admissions.clone(),
     ));
@@ -147,8 +159,53 @@ async fn serve_module() -> Result<(), Box<dyn std::error::Error + Send + Sync>> 
     // request can need a confirmation before the confirmer has a connection.
     let (handle, serving) = subc_client_rs::serve_from_env_with_handle(manifest(), handler).await?;
     confirmer.set_module_handle(handle);
-    serving.await?;
+    serve_until_refused(serving, &refusal).await?;
     Ok(())
+}
+
+fn unicode_arguments(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Result<Vec<String>, String> {
+    args.into_iter()
+        .map(|arg| {
+            arg.into_string()
+                .map_err(|_| "argument_not_unicode".to_owned())
+        })
+        .collect()
+}
+
+fn report_module_exit(
+    error: impl std::fmt::Display,
+    writer: &mut impl std::io::Write,
+) -> std::process::ExitCode {
+    tracing::error!("module exited: {error}");
+    let _ = writeln!(writer, "ck-entorhinal: module exited: {error}");
+    std::process::ExitCode::FAILURE
+}
+
+#[derive(Default)]
+struct HelloRefusal {
+    error: Mutex<Option<String>>,
+    signal: tokio::sync::Notify,
+}
+
+async fn serve_until_refused<E: std::fmt::Display>(
+    serve: impl std::future::Future<Output = Result<(), E>>,
+    refusal: &HelloRefusal,
+) -> Result<(), String> {
+    tokio::select! {
+        biased;
+        _ = refusal.signal.notified() => Err(refusal.error.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_else(|| "storage_descriptor_missing".into())),
+        result = serve => result.map_err(|error| error.to_string()),
+    }
+}
+
+fn descriptor_from_ack(ack: &ModuleHelloAckBody) -> Result<StorageDescriptor, String> {
+    let value = ack.storage.as_ref().ok_or_else(|| {
+        "storage_descriptor_missing: HELLO_ACK has no storage descriptor".to_owned()
+    })?;
+    serde_json::from_value(value.clone())
+        .map_err(|error| format!("storage_descriptor_invalid: {error}"))
 }
 
 /// How long a fresh instance keeps retrying a lease that a predecessor still
@@ -227,6 +284,7 @@ impl Default for LivenessState {
 
 struct ProjectsHandler {
     store: Arc<Mutex<Option<RegistryStore>>>,
+    hello_refusal: Arc<HelloRefusal>,
     health: Arc<HealthGauges>,
     liveness: Arc<Mutex<LivenessState>>,
     /// What the daemon stamped on each route when it was bound. The daemon
@@ -399,6 +457,14 @@ fn principal_label(principal: Option<&Principal>) -> String {
 }
 
 impl ProjectsHandler {
+    fn startup_refusal(&self) -> Option<String> {
+        self.hello_refusal
+            .error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     fn new() -> Result<Self, std::io::Error> {
         let incarnation = incarnation::new_incarnation().map_err(|error| {
             std::io::Error::other(format!("cannot mint process incarnation: {error}"))
@@ -426,6 +492,7 @@ impl ProjectsHandler {
             Arc::new(agent_ops::DaemonConfirmer::new(route_admissions.clone()));
         Self {
             store: Arc::new(Mutex::new(None)),
+            hello_refusal: Arc::new(HelloRefusal::default()),
             health: Arc::new(HealthGauges::default()),
             liveness: Arc::new(Mutex::new(LivenessState::default())),
             route_admissions,
@@ -520,6 +587,9 @@ impl ProjectsHandler {
 #[async_trait]
 impl ModuleHandler for ProjectsHandler {
     async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+        if let Some(error) = self.startup_refusal() {
+            return HandlerError::new("store_unavailable", error).into_outcome();
+        }
         self.handle_served_request(&body, route_key(&ctx.route_handle()))
             .await
     }
@@ -551,15 +621,15 @@ impl ModuleHandler for ProjectsHandler {
     }
 
     async fn on_hello_ack(&self, ack: &ModuleHelloAckBody) {
-        let descriptor = match ack.storage.as_ref() {
-            Some(value) => serde_json::from_value::<StorageDescriptor>(value.clone())
-                .map_err(|error| format!("HELLO_ACK storage descriptor is invalid: {error}")),
-            None => Ok(fallback_storage_descriptor()),
-        };
-        let descriptor = match descriptor {
+        let descriptor = match descriptor_from_ack(ack) {
             Ok(descriptor) => descriptor,
             Err(error) => {
-                install_store(&self.store, &self.health, Err(error));
+                *self
+                    .hello_refusal
+                    .error
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(error);
+                self.hello_refusal.signal.notify_one();
                 return;
             }
         };
@@ -979,8 +1049,10 @@ impl ProjectsHandler {
                 .values()
                 .filter(|(_, root, _)| {
                     project.roots.iter().any(|project_root| {
-                        root == project_root
-                            || root.starts_with(&format!("{}/", project_root.trim_end_matches('/')))
+                        entorhinal_core::path_prefix_or_equal(
+                            Path::new(project_root),
+                            Path::new(root),
+                        )
                     })
                 })
                 .map(|(_, _, activity)| *activity)
@@ -1613,25 +1685,6 @@ async fn retry_open_while_lease_held(
                 })
             }
         }
-    }
-}
-
-fn fallback_storage_descriptor() -> StorageDescriptor {
-    let data_home = std::env::var_os("XDG_DATA_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|value| !value.is_empty())
-                .map(|home| PathBuf::from(home).join(".local/share"))
-        })
-        .unwrap_or_else(|| std::env::temp_dir().join("ck-entorhinal-data"));
-    let path = sqlite_store_path(&data_home.to_string_lossy(), "ck-entorhinal");
-    StorageDescriptor {
-        module_id: MODULE_ID.to_string(),
-        storage_namespace: DEFAULT_STORAGE_NAMESPACE.to_string(),
-        isolation: Isolation::Module,
-        backend: StorageBackend::Sqlite { path },
     }
 }
 
@@ -3096,9 +3149,9 @@ mod tests {
         let handler = ProjectsHandler::new().unwrap();
         handler
             .session_liveness(json!({"seq": 1, "snapshot": true, "sessions": [
-                {"sessionId": "s1", "canonicalRoot": "/w/proj/sub", "state": "active", "lastActivityMs": 500},
+                {"sessionId": "s1", "canonicalRoot": Path::new("/w/proj").join("sub").to_str().unwrap(), "state": "active", "lastActivityMs": 500},
                 {"sessionId": "s2", "canonicalRoot": "/w/proj", "state": "idle", "lastActivityMs": 900},
-                {"sessionId": "s3", "canonicalRoot": "/elsewhere", "state": "active", "lastActivityMs": 999}]}))
+                {"sessionId": "s3", "canonicalRoot": "/w/proj-other", "state": "active", "lastActivityMs": 999}]}))
             .unwrap();
         let mut reply = entorhinal_core::EnumerateReply {
             generation: 1,
@@ -3130,8 +3183,21 @@ mod tests {
         };
         handler.annotate_liveness(&mut reply);
         // p1 gets the NEWEST activity among sessions inside its root (s1
-        // strictly under, s2 exactly at) and never /elsewhere's.
+        // strictly under, s2 exactly at) and never the prefix sibling's.
         assert_eq!(reply.projects[0].last_route_activity_ms, Some(900));
+        handler.liveness.lock().unwrap().sessions.remove("s2");
+        handler.annotate_liveness(&mut reply);
+        assert_eq!(
+            reply.projects[0].last_route_activity_ms,
+            Some(500),
+            "nested sessions must contribute"
+        );
+        handler.liveness.lock().unwrap().sessions.remove("s1");
+        handler.annotate_liveness(&mut reply);
+        assert_eq!(
+            reply.projects[0].last_route_activity_ms, None,
+            "a string-prefix sibling is not contained"
+        );
         // No live session touches p2: annotation stays None, not zero.
         assert_eq!(reply.projects[1].last_route_activity_ms, None);
     }
@@ -3179,6 +3245,158 @@ mod tests {
         assert_eq!(
             subc_protocol::session::MODULE_CONTROL_OP_HEALTH_CHECK,
             "health.check"
+        );
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    fn ack(storage: Option<Value>) -> ModuleHelloAckBody {
+        ModuleHelloAckBody {
+            negotiated_ver: 1,
+            subc_ops: vec![],
+            subc_capabilities: vec![],
+            storage,
+            machine_id: None,
+        }
+    }
+
+    #[test]
+    fn descriptor_missing_is_a_refusal() {
+        assert!(descriptor_from_ack(&ack(None))
+            .unwrap_err()
+            .starts_with("storage_descriptor_missing"));
+    }
+
+    #[test]
+    fn descriptor_invalid_is_a_refusal() {
+        assert!(descriptor_from_ack(&ack(Some(json!(42))))
+            .unwrap_err()
+            .starts_with("storage_descriptor_invalid"));
+    }
+
+    #[tokio::test]
+    async fn missing_descriptor_signals_without_opening_a_store() {
+        let (dir, _) = tests::scratch_descriptor("missing-descriptor");
+        let handler = ProjectsHandler::new().unwrap();
+        handler.on_hello_ack(&ack(None)).await;
+        assert!(handler
+            .startup_refusal()
+            .unwrap()
+            .starts_with("storage_descriptor_missing"));
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            handler.hello_refusal.signal.notified(),
+        )
+        .await
+        .expect("hello refusal must signal the serving task");
+        assert!(handler.store.lock().unwrap().is_none());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_returns_the_refusal_or_the_serve_result() {
+        let refusal = HelloRefusal::default();
+        *refusal.error.lock().unwrap() = Some("storage_descriptor_missing: test".into());
+        refusal.signal.notify_one();
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            serve_until_refused(std::future::pending::<Result<(), String>>(), &refusal),
+        )
+        .await
+        .expect("refusal must cancel a pending server");
+        assert_eq!(result.unwrap_err(), "storage_descriptor_missing: test");
+        let no_refusal = HelloRefusal::default();
+        assert_eq!(
+            serve_until_refused(std::future::ready(Ok::<(), String>(())), &no_refusal).await,
+            Ok(())
+        );
+        assert_eq!(
+            serve_until_refused(
+                std::future::ready(Err::<(), _>("serve failed")),
+                &no_refusal
+            )
+            .await,
+            Err("serve failed".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_served_handler_refuses_requests_after_hello() {
+        use subc_client_rs::test_support::{ModuleHarness, OperatorAnswer};
+        let handler = ProjectsHandler::new().unwrap();
+        let store = handler.store.clone();
+        let refusal = handler.hello_refusal.clone();
+        let mut module =
+            ModuleHarness::start(move |_| handler, std::iter::empty::<OperatorAnswer>()).await;
+        assert!(refusal
+            .error
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .starts_with("storage_descriptor_missing"));
+        assert!(store.lock().unwrap().is_none());
+        let route = module
+            .bind_route(
+                RouteBindRequest::new(
+                    RouteHandle::detached(1, 1),
+                    subc_protocol::RouteTarget::ManagementSurface {
+                        module_id: MODULE_ID.into(),
+                    },
+                    subc_protocol::BindIdentity::new("/scratch/project", "test", "operator"),
+                )
+                .with_principal(Principal::Direct),
+            )
+            .await;
+        let corr = module
+            .send_request(
+                route,
+                serde_json::to_vec(&json!({"method":"enumerate","params":{}})).unwrap(),
+            )
+            .await;
+        let frame = tokio::time::timeout(Duration::from_secs(2), module.read_reply(route, corr))
+            .await
+            .expect("a refused store must reply promptly");
+        let body: Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(body["code"], "store_unavailable");
+        assert!(store.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn module_exit_reports_the_error_and_failure() {
+        let mut output = Vec::new();
+        assert_eq!(
+            report_module_exit("storage_descriptor_missing: test", &mut output),
+            std::process::ExitCode::FAILURE
+        );
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "ck-entorhinal: module exited: storage_descriptor_missing: test\n"
+        );
+    }
+
+    #[test]
+    fn non_unicode_arguments_are_usage_refusals() {
+        #[cfg(unix)]
+        let invalid = {
+            use std::os::unix::ffi::OsStringExt;
+            std::ffi::OsString::from_vec(vec![0xff])
+        };
+        #[cfg(windows)]
+        let invalid = {
+            use std::os::windows::ffi::OsStringExt;
+            std::ffi::OsString::from_wide(&[0xd800])
+        };
+        for args in [vec![invalid.clone()], vec!["ck-projects".into(), invalid]] {
+            assert_eq!(unicode_arguments(args).unwrap_err(), "argument_not_unicode");
+        }
+        assert_eq!(
+            unicode_arguments(["ck-projects".into(), "list".into()]).unwrap(),
+            ["ck-projects", "list"]
         );
     }
 }

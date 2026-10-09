@@ -24,6 +24,64 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+#[path = "retry_quote.rs"]
+mod retry_quote;
+
+#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+enum PathClass {
+    DriveRelative,
+    RootedNoDrive,
+    Ordinary,
+}
+
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn path_class(value: &str) -> PathClass {
+    let bytes = value.as_bytes();
+    let separator = |byte: &u8| matches!(byte, b'/' | b'\\');
+    if bytes.len() >= 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && bytes.get(2).is_none_or(|byte| !separator(byte))
+    {
+        PathClass::DriveRelative
+    } else if bytes.first().is_some_and(separator)
+        && bytes.get(1).is_none_or(|byte| !separator(byte))
+    {
+        PathClass::RootedNoDrive
+    } else {
+        PathClass::Ordinary
+    }
+}
+
+fn cli_path(value: &str, cwd: &str, mutation: bool) -> Result<String, String> {
+    #[cfg(windows)]
+    match path_class(value) {
+        PathClass::DriveRelative => {
+            return Err(format!("drive-relative path is ambiguous: {value}"))
+        }
+        PathClass::RootedNoDrive => {
+            return Err(format!("rooted-no-drive path is ambiguous: {value}"))
+        }
+        PathClass::Ordinary => {}
+    }
+    let path = Path::new(value);
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        Path::new(cwd).join(path)
+    };
+    let result = if mutation {
+        let raw = joined
+            .to_str()
+            .ok_or_else(|| format!("path_refused: path_not_unicode: {value}"))?;
+        entorhinal_core::RegistryStore::canonical_mutation_root(raw)
+    } else {
+        entorhinal_core::RegistryStore::canonical_query_path(&joined).map(|(path, _)| path)
+    };
+    result.map_err(|error| format!("path_refused: {value}: {error}"))
+}
+
 const EXIT_TRANSPORT: u8 = 2;
 const EXIT_REFUSED: u8 = 3;
 const EXIT_USAGE: u8 = 64;
@@ -45,29 +103,16 @@ pub enum Face {
     Entorhinal,
 }
 
-/// Resolve the face from argv[0]'s file stem. Unrecognised or absent argv[0]
-/// defaults to the module face: the daemon spawns this binary by its real
-/// path, and a wrapper that renames it should get the serving default, not a
-/// CLI that refuses to serve.
-///
-/// The fleet rule names test copies `ckdev-<name>`. macOS reports argv[0] in
-/// `ps`, so a test copy must recognize its safe dev name as the face it stands
-/// for. Production continues to start the binary under its `ck-` name.
+/// Select a face by the final component, accepting production and development
+/// names and one optional executable suffix. Unknown names keep module mode.
 pub fn face_from_argv0(argv0: Option<&str>) -> Face {
-    let stem = argv0
-        .map(Path::new)
-        .and_then(Path::file_stem)
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("");
-    // Only a `ck-` or `ckdev-` prefixed name selects a CLI face. A bare
-    // `projects` stays the module default, as it always was.
-    let face = stem
-        .strip_prefix("ckdev-")
-        .or_else(|| stem.strip_prefix("ck-"));
-    match face {
-        Some("projects") => Face::Projects,
-        Some("workspaces") => Face::Workspaces,
-        Some("agents") => Face::Agents,
+    let name = argv0.unwrap_or("").rsplit(['/', '\\']).next().unwrap_or("");
+    let lower = name.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
+    match stem {
+        "ck-projects" | "ckdev-projects" => Face::Projects,
+        "ck-workspaces" | "ckdev-workspaces" => Face::Workspaces,
+        "ck-agents" | "ckdev-agents" => Face::Agents,
         _ => Face::Entorhinal,
     }
 }
@@ -357,41 +402,42 @@ pub fn run(command: Command) -> ExitCode {
     // missing descriptor and fails.
     std::env::remove_var("SUBC_LAUNCH_NONCE_FD");
 
-    let (method, params) = match build(&command) {
+    run_with_directory(command, std::env::current_dir, &mut std::io::stderr())
+}
+
+fn run_with_directory(
+    command: Command,
+    read: super::current_directory::CwdReader,
+    stderr: &mut impl std::io::Write,
+) -> ExitCode {
+    let cwd = match super::current_directory::read_current_directory(read) {
+        Ok(cwd) => cwd,
+        Err(error) => {
+            let _ = writeln!(stderr, "{}: {}", error.code, error.message);
+            return ExitCode::from(EXIT_REFUSED);
+        }
+    };
+    let (method, params) = match build_at(&command, &cwd) {
         Ok(request) => request,
         Err(message) => {
-            eprintln!("{message}");
-            return ExitCode::from(EXIT_USAGE);
+            let _ = writeln!(stderr, "{message}");
+            return ExitCode::from(build_failure_exit(&message));
         }
     };
 
-    let connection = match command.connection.clone() {
-        Some(path) => {
-            // An explicit path that does not exist is a REFUSAL, never a
-            // fallback to discovery: silently retargeting an operator who named
-            // a rig connection file would run their command against production.
-            if !path.exists() {
-                eprintln!("connection file not found: {}", path.display());
-                return ExitCode::from(EXIT_TRANSPORT);
-            }
-            path
-        }
-        None => match discover() {
-            Some(path) => path,
-            None => {
-                eprintln!("no daemon connection file found; pass --subc <path>");
-                return ExitCode::from(EXIT_TRANSPORT);
-            }
-        },
-    };
-
-    match call(&connection, &command, &method, params) {
+    match call(
+        command.connection.as_deref(),
+        &command,
+        &method,
+        params,
+        &cwd,
+    ) {
         Ok(value) => {
             render(&command, &value);
             ExitCode::SUCCESS
         }
         Err(failure) => {
-            eprintln!("{}", failure.1);
+            let _ = writeln!(stderr, "{}", failure.1);
             ExitCode::from(failure.0)
         }
     }
@@ -404,7 +450,22 @@ pub fn run(command: Command) -> ExitCode {
 /// command that guesses a field name fails as a refusal from the module, which
 /// reads like the registry rejecting the request rather than the CLI addressing
 /// it wrongly.
+#[cfg(test)]
 fn build(command: &Command) -> Result<(String, Value), String> {
+    let cwd = super::current_directory::read_current_directory(std::env::current_dir)
+        .map_err(|error| format!("{}: {}", error.code, error.message))?;
+    build_at(command, &cwd)
+}
+
+fn build_failure_exit(message: &str) -> u8 {
+    if message.starts_with("path_refused:") {
+        EXIT_REFUSED
+    } else {
+        EXIT_USAGE
+    }
+}
+
+fn build_at(command: &Command, cwd: &str) -> Result<(String, Value), String> {
     if command.face == Face::Agents {
         return build_agents(command);
     }
@@ -415,35 +476,9 @@ fn build(command: &Command) -> Result<(String, Value), String> {
             .cloned()
             .ok_or_else(|| format!("{} needs {what}\n\n{}", command.verb, usage(command.face)))
     };
-    // Directories are CANONICALIZED against the operator's shell before they are
-    // sent. Two separate reasons, and only the first was obvious:
-    //
-    // 1. A relative path has to be resolved here, because the registry resolves
-    //    what it is given against the DAEMON's working directory, not the
-    //    operator's.
-    // 2. The registry REFUSES a non-canonical path outright (`not_canonical`).
-    //    On macOS /tmp is a symlink to /private/tmp, so an absolute path that
-    //    the operator can `cd` into is still rejected -- making absolute
-    //    necessary but not sufficient. Sending it verbatim turns an ordinary
-    //    path into a refusal the operator cannot act on, since nothing about
-    //    the path they typed looks wrong.
-    //
-    // Falls back to the lexically-joined path when the directory does not exist
-    // yet: canonicalize() requires existence, and a clear refusal from the
-    // registry about a missing directory is better than one from here about a
-    // failed syscall.
-    let absolute = |value: &str| -> Result<String, String> {
-        let path = Path::new(value);
-        let joined = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            std::env::current_dir()
-                .map_err(|error| format!("resolve '{value}': {error}"))?
-                .join(path)
-        };
-        let resolved = std::fs::canonicalize(&joined).unwrap_or(joined);
-        Ok(resolved.to_string_lossy().to_string())
-    };
+    // Use the core's path policy so the client sends the exact registry identity.
+    let mutation = |value: &str| cli_path(value, cwd, true);
+    let query = |value: &str| cli_path(value, cwd, false);
 
     // The actor recorded in the registry journal is the FACE the operator
     // used, so journal forensics read the command that ran, not the module
@@ -460,13 +495,13 @@ fn build(command: &Command) -> Result<(String, Value), String> {
         ),
         (Face::Projects, "resolve") => (
             "resolve".to_string(),
-            json!({ "canonicalRoot": absolute(&need(0, "a directory")?)? }),
+            json!({ "canonicalRoot": query(&need(0, "a directory")?)? }),
         ),
         (Face::Projects, "register") => (
             "register".to_string(),
             json!({
                 "name": need(0, "a name")?,
-                "roots": [absolute(&need(1, "a directory")?)?],
+                "roots": [mutation(&need(1, "a directory")?)?],
                 "actor": actor,
             }),
         ),
@@ -498,7 +533,7 @@ fn build(command: &Command) -> Result<(String, Value), String> {
                     other if other.starts_with('-') => {
                         return Err(format!("unknown attach flag '{other}'"))
                     }
-                    _ if path.is_none() => path = Some(absolute(arg)?),
+                    _ if path.is_none() => path = Some(mutation(arg)?),
                     _ => return Err("attach needs exactly one checkout path".into()),
                 }
             }
@@ -549,7 +584,7 @@ fn build(command: &Command) -> Result<(String, Value), String> {
             {
                 return Err("owned-remotes needs a root directory before its flag".into());
             }
-            let root = absolute(&need(0, "a root directory")?)?;
+            let root = query(&need(0, "a root directory")?)?;
             let names = &command.args[1..];
             let flag = names.iter().find(|name| name.starts_with("--"));
             // Owning nothing makes Plexus stop watching the root's repo, so it
@@ -579,7 +614,7 @@ fn build(command: &Command) -> Result<(String, Value), String> {
             "add_root".to_string(),
             json!({
                 "projectId": need(0, "a project id")?,
-                "root": absolute(&need(1, "a directory")?)?,
+                "root": mutation(&need(1, "a directory")?)?,
                 "actor": actor,
             }),
         ),
@@ -587,21 +622,21 @@ fn build(command: &Command) -> Result<(String, Value), String> {
             "remove_root".to_string(),
             json!({
                 "projectId": need(0, "a project id")?,
-                "root": absolute(&need(1, "a directory")?)?,
+                "root": query(&need(1, "a directory")?)?,
                 "actor": actor,
             }),
         ),
         (Face::Projects, "approve") => (
             "approve_project".to_string(),
-            json!({ "canonicalRoot": absolute(&need(0, "a directory")?)?, "actor": actor }),
+            json!({ "canonicalRoot": query(&need(0, "a directory")?)?, "actor": actor }),
         ),
         (Face::Projects, "unapprove") => (
             "unapprove_project".to_string(),
-            json!({ "canonicalRoot": absolute(&need(0, "a directory")?)?, "actor": actor }),
+            json!({ "canonicalRoot": query(&need(0, "a directory")?)?, "actor": actor }),
         ),
         (Face::Projects, "trust") => (
             "trust".to_string(),
-            json!({ "canonicalRoot": absolute(&need(0, "a directory")?)? }),
+            json!({ "canonicalRoot": query(&need(0, "a directory")?)? }),
         ),
         // `list` on the workspaces face is the same enumerate op; the renderer
         // shows the workspace column of the reply instead of the projects.
@@ -618,7 +653,7 @@ fn build(command: &Command) -> Result<(String, Value), String> {
             "set_workspace_root".to_string(),
             json!({
                 "workspaceId": need(0, "a workspace id")?,
-                "root": absolute(&need(1, "a directory")?)?,
+                "root": mutation(&need(1, "a directory")?)?,
                 "actor": actor,
             }),
         ),
@@ -832,8 +867,20 @@ trait CliCaller: Sync {
     ) -> Result<Value, CallFailure>;
 }
 
+struct ConsumerCaller<'a> {
+    consumer: &'a subc_client_rs::SubcConsumer,
+    cwd: String,
+}
+
+fn connect_failure(connection: Option<&Path>, error: impl std::fmt::Display) -> String {
+    match connection {
+        Some(path) => format!("connect {}: {error}", path.display()),
+        None => format!("connect: {error}"),
+    }
+}
+
 #[async_trait::async_trait]
-impl CliCaller for subc_client_rs::SubcConsumer {
+impl CliCaller for ConsumerCaller<'_> {
     async fn call(
         &self,
         method: &str,
@@ -843,16 +890,13 @@ impl CliCaller for subc_client_rs::SubcConsumer {
         let body = serde_json::to_vec(&json!({"method":method,"params":params}))
             .map_err(|error| CallFailure::Transport(format!("serialize request: {error}")))?;
         let bytes = self
+            .consumer
             .call(
                 subc_protocol::RouteTarget::ManagementSurface {
                     module_id: super::MODULE_ID.into(),
                 },
                 // No project is invented for an operator calling from an arbitrary directory.
-                subc_protocol::BindIdentity::new(
-                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
-                    "ck-entorhinal",
-                    "operator",
-                ),
+                subc_protocol::BindIdentity::new(&self.cwd, "ck-entorhinal", "operator"),
                 body,
                 options,
             )
@@ -967,18 +1011,6 @@ fn retry_args(command: &Command, params: &Value) -> Vec<String> {
     args
 }
 
-fn shell_word(word: &str) -> String {
-    if !word.is_empty()
-        && word
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"_./:-".contains(&byte))
-    {
-        word.into()
-    } else {
-        format!("'{}'", word.replace('\'', "'\\''"))
-    }
-}
-
 async fn execute_agents(
     caller: &impl CliCaller,
     command: &Command,
@@ -1033,15 +1065,10 @@ async fn execute_agents(
             params[field] = json!(id);
         }
     }
-    let retry = format!(
-        "retry: ck agents {}",
-        retry_args(command, &params)
-            .iter()
-            .map(|arg| shell_word(arg))
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
-    eprintln!("approval is pending on this Mac");
+    let args = retry_args(command, &params);
+    let words: Vec<_> = args.iter().map(String::as_str).collect();
+    let retry = retry_quote::render_retry(&words, cfg!(windows));
+    eprintln!("approval is waiting at the operator prompt");
     caller.call(method, params, subc_client_rs::CallOptions {
         timeout: Duration::from_secs(300),
         ..subc_client_rs::CallOptions::default()
@@ -1053,24 +1080,12 @@ async fn execute_agents(
     })
 }
 
-/// Where the daemon publishes its connection file, in the order `ck` looks.
-fn discover() -> Option<PathBuf> {
-    if let Ok(explicit) = std::env::var("SUBC_CONNECTION_FILE") {
-        let path = PathBuf::from(explicit);
-        return path.exists().then_some(path);
-    }
-    let home = std::env::var("HOME").ok()?;
-    let candidate = PathBuf::from(&home)
-        .join(".local/share/cortexkit/run")
-        .join("subc-connection.json");
-    candidate.exists().then_some(candidate)
-}
-
 fn call(
-    connection: &Path,
+    connection: Option<&Path>,
     command: &Command,
     method: &str,
     params: Value,
+    cwd: &str,
 ) -> Result<Value, (u8, String)> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
@@ -1078,19 +1093,33 @@ fn call(
         .build()
         .map_err(|error| (EXIT_TRANSPORT, format!("start runtime: {error}")))?;
     runtime.block_on(async {
-        let consumer = subc_client_rs::SubcConsumer::connect(
-            connection,
-            subc_client_rs::ConsumerOptions::default(),
-        )
-        .await
-        .map_err(|error| {
-            (
-                EXIT_TRANSPORT,
-                format!("connect {}: {error}", connection.display()),
-            )
-        })?;
+        let consumer = match connection {
+            Some(path) => {
+                subc_client_rs::SubcConsumer::connect(
+                    path,
+                    subc_client_rs::ConsumerOptions::default(),
+                )
+                .await
+            }
+            None => {
+                subc_client_rs::SubcConsumer::connect_default(
+                    subc_client_rs::ConsumerOptions::default(),
+                )
+                .await
+            }
+        }
+        .map_err(|error| (EXIT_TRANSPORT, connect_failure(connection, error)))?;
         if command.face == Face::Agents {
-            execute_agents(&consumer, command, method, params).await
+            execute_agents(
+                &ConsumerCaller {
+                    consumer: &consumer,
+                    cwd: cwd.to_owned(),
+                },
+                command,
+                method,
+                params,
+            )
+            .await
         } else {
             // Keep the established project/workspace transport messages unchanged.
             let body = serde_json::to_vec(&json!({"method":method,"params":params}))
@@ -1105,11 +1134,7 @@ fn call(
                     // invent one. Absent means "key on the triple", which is the
                     // honest answer for a caller that binds from whatever directory
                     // the operator happened to be standing in.
-                    subc_protocol::BindIdentity::new(
-                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
-                        "ck-entorhinal",
-                        "operator",
-                    ),
+                    subc_protocol::BindIdentity::new(cwd, "ck-entorhinal", "operator"),
                     body,
                     subc_client_rs::CallOptions::default(),
                 )
@@ -2055,8 +2080,8 @@ mod tests {
         let dot = sent_for(".");
         assert!(Path::new(&dot).is_absolute(), "sent a relative path: {dot}");
         assert_eq!(
-            Path::new(&dot),
-            std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap(),
+            dot,
+            entorhinal_core::RegistryStore::canonical_mutation_root(".").unwrap(),
             "resolved against something other than the operator's cwd"
         );
 
@@ -2064,16 +2089,16 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ent-canon-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let given = dir.to_string_lossy().to_string();
-        let canonical = std::fs::canonicalize(&dir).unwrap();
+        let canonical = entorhinal_core::RegistryStore::canonical_mutation_root(&given).unwrap();
         assert_eq!(
-            Path::new(&sent_for(&given)),
+            sent_for(&given),
             canonical,
             "sent path must be canonical, not just absolute"
         );
         // Non-vacuity: leg (2) only discriminates where the temp dir actually
         // goes through a symlink. Where it does not, say so rather than
         // passing as though the stronger property had been tested.
-        if Path::new(&given) == canonical {
+        if given == canonical {
             eprintln!("note: temp dir is already canonical on this host; leg (2) ran weak");
         }
         std::fs::remove_dir_all(&dir).ok();
@@ -2712,14 +2737,32 @@ mod agent_tests {
             assert!(error
                 .1
                 .starts_with("transport timeout: the write outcome is unknown"));
-            let retry = error.1.split_once("retry: ck agents ").unwrap().1;
-            assert_eq!(retry, format!("rename {ID} Grace --request-key retry-key"));
+            let prefix = if cfg!(windows) {
+                "retry (pwsh): ck agents "
+            } else {
+                "retry: ck agents "
+            };
+            let retry = error.1.split_once(prefix).unwrap().1;
+            let expected = if cfg!(windows) {
+                format!("'rename' '{ID}' 'Grace' '--request-key' 'retry-key'")
+            } else {
+                format!("rename {ID} Grace --request-key retry-key")
+            };
+            assert_eq!(retry, expected);
             let count = confirm.0.load(Ordering::SeqCst);
             assert_eq!(count, usize::from(landed));
             served.calls.lock().unwrap().clear();
-            let value = execute(&served, &retry.split_whitespace().collect::<Vec<_>>())
-                .await
-                .unwrap();
+            let retry_words: Vec<_> = retry
+                .split_whitespace()
+                .map(|word| {
+                    if cfg!(windows) {
+                        word.trim_matches('\'')
+                    } else {
+                        word
+                    }
+                })
+                .collect();
+            let value = execute(&served, &retry_words).await.unwrap();
             assert_eq!(value["agent"]["name"], "Grace");
             assert_eq!(*served.calls.lock().unwrap(), vec!["agent.rename"]);
             assert_eq!(confirm.0.load(Ordering::SeqCst), 1);
@@ -2762,7 +2805,12 @@ mod agent_tests {
         .await
         .unwrap_err();
         assert_eq!(error.0, EXIT_REFUSED);
-        assert!(error.1.contains(&format!("retry: ck agents create 'O'\\''Neil' --role hiree --tag 'quoted tag' --project P --workspace W --supervisor {ID} --request-key key --subc /tmp/conn.json --json")), "{}", error.1);
+        let expected = if cfg!(windows) {
+            format!("retry (pwsh): ck agents 'create' 'O''Neil' '--role' 'hiree' '--tag' 'quoted tag' '--project' 'P' '--workspace' 'W' '--supervisor' '{ID}' '--request-key' 'key' '--subc' '/tmp/conn.json' '--json'")
+        } else {
+            format!("retry: ck agents create 'O'\\''Neil' --role hiree --tag 'quoted tag' --project P --workspace W --supervisor {ID} --request-key key --subc /tmp/conn.json --json")
+        };
+        assert!(error.1.contains(&expected), "{}", error.1);
         assert_eq!(script.calls()[1].1["supervisor_agent_id"], ID);
         for code in [
             "operator_declined",
@@ -2869,7 +2917,10 @@ mod cli_transport_tests {
             let error = tokio::time::timeout(
                 Duration::from_secs(10),
                 CliCaller::call(
-                    &consumer,
+                    &ConsumerCaller {
+                        consumer: &consumer,
+                        cwd: "/tmp/project".into(),
+                    },
                     "agent.dispose",
                     json!({"agent_id":"agent_01234567","request_key":"key"}),
                     subc_client_rs::CallOptions {
@@ -2902,5 +2953,211 @@ mod cli_transport_tests {
             let _ = server.await;
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod launch_path_tests {
+    use super::*;
+
+    fn command(face: Face, verb: &str, args: &[&str]) -> Command {
+        Command {
+            face,
+            verb: verb.into(),
+            args: args.iter().map(|arg| (*arg).into()).collect(),
+            connection: None,
+            json: false,
+        }
+    }
+
+    #[test]
+    fn every_windows_path_class_is_classified_on_every_os() {
+        for input in ["C:", "C:repo"] {
+            assert_eq!(path_class(input), PathClass::DriveRelative, "{input}");
+        }
+        for input in ["\\", "\\repo", "/repo"] {
+            assert_eq!(path_class(input), PathClass::RootedNoDrive, "{input}");
+        }
+        for input in [
+            "repo",
+            "C:\\repo",
+            "C:/repo",
+            "\\\\server\\share\\repo",
+            "//server/share/repo",
+            "\\\\?\\C:\\repo",
+            "1:repo",
+            "",
+            "\\/repo",
+        ] {
+            assert_eq!(path_class(input), PathClass::Ordinary, "{input}");
+        }
+    }
+
+    #[test]
+    fn face_mapping_accepts_paths_case_and_one_exe_suffix() {
+        for (stem, expected) in [
+            ("projects", Face::Projects),
+            ("workspaces", Face::Workspaces),
+            ("agents", Face::Agents),
+            ("entorhinal", Face::Entorhinal),
+        ] {
+            for name in [
+                format!("ck-{stem}"),
+                format!("ckdev-{stem}"),
+                format!("/usr/local/bin/ck-{stem}"),
+                format!("C:\\tools\\ckdev-{stem}.exe"),
+                format!("CKDEV-{}.EXE", stem.to_ascii_uppercase()),
+            ] {
+                assert_eq!(face_from_argv0(Some(&name)), expected, "{name}");
+            }
+        }
+        assert_eq!(
+            face_from_argv0(Some("ck-projects.exe.exe")),
+            Face::Entorhinal
+        );
+        assert_eq!(face_from_argv0(Some("ck-projects.other")), Face::Entorhinal);
+    }
+
+    #[test]
+    fn cwd_read_failure_refuses_before_dialing() {
+        let mut stderr = Vec::new();
+        let mut command = command(Face::Projects, "list", &[]);
+        let (dir, _) = crate::tests::scratch_descriptor("cli-cwd-failure");
+        command.connection = Some(dir.join("absent.json"));
+        let exit = run_with_directory(
+            command,
+            || Err(std::io::Error::other("injected cwd failure")),
+            &mut stderr,
+        );
+        assert_eq!(exit, ExitCode::from(EXIT_REFUSED));
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "cwd_unreadable: injected cwd failure\n"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn all_mutations_use_core_paths_and_refuse_missing_directories() {
+        let (dir, _) = crate::tests::scratch_descriptor("cli-paths");
+        let root = dir.to_str().unwrap();
+        let expected = entorhinal_core::RegistryStore::canonical_mutation_root(root).unwrap();
+        for (face, verb, args, field) in [
+            (Face::Projects, "register", vec!["name", root], "roots"),
+            (Face::Projects, "add-root", vec!["p1", root], "root"),
+            (Face::Projects, "attach", vec![root, "--yes"], "path"),
+            (Face::Workspaces, "set-root", vec!["w1", root], "root"),
+        ] {
+            let params = build(&command(face, verb, &args)).unwrap().1;
+            let sent = if field == "roots" {
+                &params[field][0]
+            } else {
+                &params[field]
+            };
+            assert_eq!(sent, &json!(expected));
+            let missing = dir.join("missing");
+            let missing = missing.to_str().unwrap();
+            let args: Vec<_> = args
+                .iter()
+                .map(|arg| if *arg == root { missing } else { *arg })
+                .collect();
+            let mut stderr = Vec::new();
+            let mut missing_command = command(face, verb, &args);
+            missing_command.connection = Some(dir.join("absent.json"));
+            assert_eq!(
+                run_with_directory(missing_command, std::env::current_dir, &mut stderr),
+                ExitCode::from(EXIT_REFUSED)
+            );
+            assert!(String::from_utf8(stderr).unwrap().contains(missing));
+        }
+        #[cfg(unix)]
+        for name in ["C:repo", "\\repo"] {
+            std::fs::create_dir(dir.join(name)).unwrap();
+            assert_eq!(
+                cli_path(name, root, true).unwrap(),
+                entorhinal_core::RegistryStore::canonical_mutation_root(
+                    dir.join(name).to_str().unwrap()
+                )
+                .unwrap()
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn default_connect_failure_preserves_sdk_display() {
+        let (dir, _) = crate::tests::scratch_descriptor("discovery-display");
+        let error = subc_client_rs::SubcConsumer::connect(
+            &dir.join("absent.json"),
+            subc_client_rs::ConsumerOptions::default(),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(connect_failure(None, &error), format!("connect: {error}"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_unicode_canonical_paths_and_cwd_are_refused() {
+        use std::os::unix::ffi::OsStringExt;
+        let (dir, _) = crate::tests::scratch_descriptor("cli-non-unicode");
+        let invalid = dir.join(std::ffi::OsString::from_vec(vec![0xff]));
+        if let Err(error) = std::fs::create_dir(&invalid) {
+            eprintln!("non_unicode_canonical_paths_and_cwd_are_refused skipped: {error}");
+            std::fs::remove_dir_all(dir).unwrap();
+            return;
+        }
+        let alias = dir.join("alias");
+        std::os::unix::fs::symlink(&invalid, &alias).unwrap();
+        let raw = alias.to_str().unwrap();
+        assert!(cli_path(raw, "/", true)
+            .unwrap_err()
+            .contains("path_not_unicode"));
+        assert!(cli_path(raw, "/", false)
+            .unwrap_err()
+            .contains("path_not_unicode"));
+        assert!(
+            cli_path(alias.join("missing").to_str().unwrap(), "/", false)
+                .unwrap_err()
+                .contains("path_not_unicode")
+        );
+        fn invalid_cwd() -> std::io::Result<PathBuf> {
+            Ok(PathBuf::from(std::ffi::OsString::from_vec(vec![
+                b'/', 0xff,
+            ])))
+        }
+        let mut stderr = Vec::new();
+        assert_eq!(
+            run_with_directory(
+                command(Face::Projects, "list", &[]),
+                invalid_cwd,
+                &mut stderr
+            ),
+            ExitCode::from(EXIT_REFUSED)
+        );
+        assert!(String::from_utf8(stderr)
+            .unwrap()
+            .contains("path_not_unicode"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_call_site_refuses_ambiguous_but_not_unc_paths() {
+        for (value, class) in [
+            ("C:", "drive-relative"),
+            ("C:repo", "drive-relative"),
+            ("\\", "rooted-no-drive"),
+            ("\\repo", "rooted-no-drive"),
+            ("/repo", "rooted-no-drive"),
+        ] {
+            let error = cli_path(value, "C:\\scratch", true).unwrap_err();
+            assert!(error.contains(class));
+            assert_eq!(build_failure_exit(&error), EXIT_USAGE);
+        }
+        let error = cli_path("\\\\server\\share\\absent", "C:\\scratch", true).unwrap_err();
+        assert!(!error.contains("rooted-no-drive"));
     }
 }

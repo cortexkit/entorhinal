@@ -573,9 +573,15 @@ impl RegistryStore {
     /// Canonicalize a mutation path with cortexkit-paths. Mutations require an
     /// existing path and therefore cannot accept the query-side gone fallback.
     pub fn canonical_mutation_root(raw_path: &str) -> Result<String, RegistryError> {
-        ProjectRootId::from_path(raw_path)
-            .map(|id| id.to_string())
-            .map_err(|error| RegistryError::Path(error.to_string()))
+        let id = ProjectRootId::from_path(raw_path)
+            .map_err(|error| RegistryError::Path(error.to_string()))?;
+        unicode_path(&id.into_path_buf())
+    }
+
+    /// Reduce a query path, canonicalizing its existing prefix while preserving
+    /// the spelling of missing tail components. The boolean reports existence.
+    pub fn canonical_query_path(path: &Path) -> Result<(String, bool), RegistryError> {
+        canonical_query_path(path)
     }
 
     /// The only projection-write entry point. The journal row is inserted before
@@ -935,7 +941,7 @@ fn canonical_query_path(path: &Path) -> Result<(String, bool), RegistryError> {
     if lexical.exists() {
         let canonical = ProjectRootId::from_path(&lexical)
             .map_err(|error| RegistryError::Path(error.to_string()))?;
-        return Ok((canonical.to_string(), true));
+        return Ok((unicode_path(&canonical.into_path_buf())?, true));
     }
 
     let mut probe = lexical.clone();
@@ -957,9 +963,9 @@ fn canonical_query_path(path: &Path) -> Result<(String, bool), RegistryError> {
         for component in missing_components.iter().rev() {
             canonical.push(component);
         }
-        Ok((canonical.to_string_lossy().into_owned(), false))
+        Ok((unicode_path(&canonical)?, false))
     } else {
-        Ok((lexical.to_string_lossy().into_owned(), false))
+        Ok((unicode_path(&lexical)?, false))
     }
 }
 
@@ -986,7 +992,13 @@ fn lexical_absolute(path: &Path) -> Result<PathBuf, RegistryError> {
     Ok(normalized)
 }
 
-pub(crate) fn path_prefix_or_equal(parent: &Path, query: &Path) -> bool {
+fn unicode_path(path: &Path) -> Result<String, RegistryError> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| RegistryError::Path(format!("path_not_unicode: {}", path.display())))
+}
+
+pub fn path_prefix_or_equal(parent: &Path, query: &Path) -> bool {
     let mut parent_components = parent.components();
     let mut query_components = query.components();
     loop {

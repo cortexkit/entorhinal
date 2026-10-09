@@ -340,10 +340,20 @@ pub(crate) fn decode_hex(text: &str) -> Result<Vec<u8>, LogError> {
 }
 
 /// SUBC caches the consumer connection and routes, but opens neither at startup.
-#[derive(Default)]
 pub(crate) struct SubcConnector {
     connection_file: Option<PathBuf>,
     consumer: tokio::sync::Mutex<Option<Arc<SubcTransport>>>,
+    read_cwd: super::current_directory::CwdReader,
+}
+
+impl Default for SubcConnector {
+    fn default() -> Self {
+        Self {
+            connection_file: None,
+            consumer: tokio::sync::Mutex::new(None),
+            read_cwd: std::env::current_dir,
+        }
+    }
 }
 
 impl SubcConnector {
@@ -376,6 +386,13 @@ impl SubcConnector {
 #[async_trait]
 impl LogConnector for SubcConnector {
     async fn connect(&self) -> Result<Arc<dyn LogTransport>, TransportError> {
+        let cwd =
+            super::current_directory::read_current_directory(self.read_cwd).map_err(|error| {
+                TransportError::Refusal {
+                    code: error.code.into(),
+                    detail: Some(json!({"message": error.message})),
+                }
+            })?;
         let mut slot = self.consumer.lock().await;
         if let Some(transport) = slot.as_ref() {
             return Ok(transport.clone());
@@ -385,7 +402,7 @@ impl LogConnector for SubcConnector {
             None => SubcConsumer::connect_default(ConsumerOptions::default()).await,
         }
         .map_err(|_| TransportError::Unavailable)?;
-        let transport = Arc::new(SubcTransport { consumer });
+        let transport = Arc::new(SubcTransport { consumer, cwd });
         *slot = Some(transport.clone());
         Ok(transport)
     }
@@ -393,6 +410,7 @@ impl LogConnector for SubcConnector {
 
 struct SubcTransport {
     consumer: SubcConsumer,
+    cwd: String,
 }
 
 fn engram_target() -> RouteTarget {
@@ -414,11 +432,7 @@ impl LogTransport for SubcTransport {
         self.consumer
             .call(
                 engram_target(),
-                BindIdentity::new(
-                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
-                    "ck-entorhinal",
-                    "identity-log",
-                ),
+                BindIdentity::new(&self.cwd, "ck-entorhinal", "identity-log"),
                 body,
                 CallOptions::default(),
             )
@@ -923,5 +937,28 @@ mod tests {
         assert!(manifest().capabilities.unwrap().requires.is_empty());
         drop(handler);
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod cwd_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cwd_unreadable_is_terminal_and_sends_no_frame() {
+        let connector = SubcConnector {
+            connection_file: Some(std::env::temp_dir().join("absent-cwd-refusal.json")),
+            read_cwd: || Err(std::io::Error::other("injected cwd failure")),
+            ..SubcConnector::default()
+        };
+        let error = match connector.connect().await {
+            Ok(_) => panic!("cwd failure must refuse"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, TransportError::Refusal { code, .. } if code == "cwd_unreadable"));
+        assert!(
+            connector.consumer.lock().await.is_none(),
+            "no consumer or route may be opened"
+        );
     }
 }
