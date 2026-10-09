@@ -103,8 +103,12 @@ pub enum Face {
     Entorhinal,
 }
 
-/// Select a face by the final component, accepting production and development
-/// names and one optional executable suffix. Unknown names keep module mode.
+/// Select a face by argv[0]'s final path component, ignoring ASCII case and
+/// one `.exe` suffix. Production starts the faces through `ck-` links; tests
+/// run copies named `ckdev-`, so a test process never looks like a placed
+/// production binary in the process list. Any other name gets the module
+/// face: the daemon spawns this binary by its real path, and a renamed binary
+/// should serve, not turn into a CLI.
 pub fn face_from_argv0(argv0: Option<&str>) -> Face {
     let name = argv0.unwrap_or("").rsplit(['/', '\\']).next().unwrap_or("");
     let lower = name.to_ascii_lowercase();
@@ -476,7 +480,16 @@ fn build_at(command: &Command, cwd: &str) -> Result<(String, Value), String> {
             .cloned()
             .ok_or_else(|| format!("{} needs {what}\n\n{}", command.verb, usage(command.face)))
     };
-    // Use the core's path policy so the client sends the exact registry identity.
+    // Directories are resolved here, against the operator's shell, for two
+    // reasons. A relative path must be joined to the operator's directory,
+    // because the registry would resolve it against the daemon's. And the
+    // registry refuses any root that isn't already in its canonical form
+    // (`not_canonical`), so the CLI sends exactly what core's own path
+    // function produces: on macOS `/tmp` is a symlink to `/private/tmp`, and
+    // on Windows the canonical form drops the `\\?\` prefix that
+    // `std::fs::canonicalize` adds. Mutations need an existing directory;
+    // lookups accept one that has since gone, keeping the missing tail's
+    // spelling.
     let mutation = |value: &str| cli_path(value, cwd, true);
     let query = |value: &str| cli_path(value, cwd, false);
 

@@ -1172,7 +1172,7 @@ expect_red = ["startup_tests::non_unicode_arguments_are_usage_refusals"]
 # The path_class call-site is cfg(windows), so Linux cannot compile or replay
 # it. The native windows_call_site_refuses_ambiguous_but_not_unc_paths test proves
 # ambiguous drive-relative/rooted-no-drive arguments are refused but UNC paths
-# are not refused by this usage guard (acceptance item 4).
+# are not refused by this usage guard.
 [[control]]
 id = "s1-path-classifier"
 guards = "The pure classifier distinguishes ambiguous Windows grammar on every OS"
@@ -1208,6 +1208,10 @@ runner = "cargo"
 package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 expect_red = ["cli::launch_path_tests::non_unicode_canonical_paths_and_cwd_are_refused"]
+# The test needs a directory named with byte 0xff. Only Linux filesystems
+# accept that name (APFS and NTFS require valid Unicode), so the test is
+# Linux-only, and so is this proof.
+platforms = ["linux"]
 
 [[control]]
 id = "s1-path-not-unicode-core"
@@ -1222,6 +1226,9 @@ runner = "cargo"
 package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 expect_red = ["cli::launch_path_tests::non_unicode_canonical_paths_and_cwd_are_refused"]
+# Linux-only: the test needs a directory named with byte 0xff, which only
+# Linux filesystems accept.
+platforms = ["linux"]
 
 [[control]]
 id = "s1-face-from-argv0"
