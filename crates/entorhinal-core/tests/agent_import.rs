@@ -12,6 +12,9 @@ use entorhinal_core::{
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
+#[path = "support/scratch_cleanup.rs"]
+mod scratch_cleanup;
+
 #[cfg(windows)]
 #[path = "support/windows_acl.rs"]
 mod windows_acl;
@@ -52,6 +55,7 @@ struct Fixture {
     destination: Connection,
     store: Option<RegistryStore>,
     descriptor: StorageDescriptor,
+    _cleanup: scratch_cleanup::ScratchCleanup,
 }
 
 impl Fixture {
@@ -83,6 +87,7 @@ impl Fixture {
         let store = RegistryStore::open(&descriptor).unwrap();
         let destination = Connection::open(root.join("store.db")).unwrap();
         Self {
+            _cleanup: scratch_cleanup::ScratchCleanup(root.clone()),
             root,
             source_path,
             source,
@@ -196,13 +201,6 @@ impl Fixture {
                 assert_eq!(entry.seq, seq, "the feed cursor is each entry's own seq");
                 Ok(entry)
             }).unwrap().collect::<rusqlite::Result<_>>().unwrap()
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        drop(self.store.take());
-        let _ = fs::remove_dir_all(&self.root);
     }
 }
 

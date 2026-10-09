@@ -347,11 +347,7 @@ pub(super) mod tests {
     pub(in crate::agent) struct Fixture {
         pub store: RegistryStore,
         pub root: PathBuf,
-    }
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
-        }
+        _cleanup: crate::scratch_cleanup::ScratchCleanup,
     }
 
     pub(in crate::agent) fn fixture(active: bool) -> Fixture {
@@ -380,7 +376,11 @@ pub(super) mod tests {
                 .apply_entry("agent.cutover", "{}", "test", None, |_| Ok(()))
                 .unwrap();
         }
-        Fixture { store, root }
+        Fixture {
+            _cleanup: crate::scratch_cleanup::ScratchCleanup(root.clone()),
+            store,
+            root,
+        }
     }
 
     pub(in crate::agent) fn result(bytes: &[u8]) -> Value {

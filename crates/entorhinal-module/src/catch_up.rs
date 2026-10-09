@@ -1060,6 +1060,8 @@ mod tests {
         tokio::time::advance(Duration::from_secs(60)).await;
         tokio::task::yield_now().await;
         assert_eq!(fail.calls(), 0);
+        crate::tests::stop_catch_up(&f.handler).await;
+        crate::tests::stop_catch_up(&disabled.handler).await;
     }
 
     #[tokio::test(start_paused = true)]

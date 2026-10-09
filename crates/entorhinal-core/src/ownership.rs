@@ -505,7 +505,14 @@ mod tests {
         let f = fixture("ownership-overrides");
         let root = repo(&f, "root", "mine/fork", "public/upstream");
         register(&f, "p", root.clone());
-        let out = result(&set(&f, &format!("{root}/."), Some(&["upstream", "upstream"])).unwrap());
+        let out = result(
+            &set(
+                &f,
+                Path::new(&root).join(".").to_str().unwrap(),
+                Some(&["upstream", "upstream"]),
+            )
+            .unwrap(),
+        );
         assert_eq!(out["remotes"], json!(["upstream"]));
         assert_eq!(out["root"], root);
         assert_eq!(

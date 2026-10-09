@@ -85,6 +85,7 @@ fn cli_path(value: &str, cwd: &str, mutation: bool) -> Result<String, String> {
 const EXIT_TRANSPORT: u8 = 2;
 const EXIT_REFUSED: u8 = 3;
 const EXIT_USAGE: u8 = 64;
+const AGENT_WRITE_NOTICE: &str = "a confirmation prompt may appear; approve it to continue";
 
 /// Which name this binary was invoked under. The face decides the verb
 /// vocabulary and the help text; the wire behind them is shared.
@@ -1081,7 +1082,7 @@ async fn execute_agents(
     let args = retry_args(command, &params);
     let words: Vec<_> = args.iter().map(String::as_str).collect();
     let retry = retry_quote::render_retry(&words, cfg!(windows));
-    eprintln!("approval is waiting at the operator prompt");
+    eprintln!("{AGENT_WRITE_NOTICE}");
     caller.call(method, params, subc_client_rs::CallOptions {
         timeout: Duration::from_secs(300),
         ..subc_client_rs::CallOptions::default()
@@ -1669,7 +1670,7 @@ mod tests {
             json: false,
         };
         let dir = std::env::temp_dir();
-        let canonical = std::fs::canonicalize(&dir).unwrap();
+        let canonical = crate::tests::canonical_test_path(&dir);
         let (method, params) = build(&ws(&["set-root", "w1", dir.to_str().unwrap()])).unwrap();
         assert_eq!(method, "set_workspace_root");
         assert_eq!(params["workspaceId"], "w1");
@@ -1707,8 +1708,7 @@ mod tests {
 
     #[test]
     fn ownership_cli_maps_names_default_and_empty_set_and_renders() {
-        let root = std::fs::canonicalize(std::env::temp_dir())
-            .unwrap()
+        let root = crate::tests::canonical_test_path(std::env::temp_dir())
             .to_string_lossy()
             .into_owned();
         for (tail, expected) in [
@@ -1775,8 +1775,7 @@ mod tests {
         let (dir, handler, _) = log_surface_handler("attach-cli");
         let path = dir.join("label-checkout");
         std::fs::create_dir_all(&path).unwrap();
-        let root = std::fs::canonicalize(&path)
-            .unwrap()
+        let root = crate::tests::canonical_test_path(&path)
             .to_string_lossy()
             .into_owned();
         handler.route_admissions().insert(
@@ -2469,6 +2468,10 @@ mod agent_tests {
 
     #[tokio::test]
     async fn agents_transport_observes_300_second_writes_and_default_reads() {
+        assert_eq!(
+            AGENT_WRITE_NOTICE,
+            "a confirmation prompt may appear; approve it to continue"
+        );
         for args in [
             vec![
                 "create",

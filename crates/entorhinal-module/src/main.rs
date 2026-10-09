@@ -1699,6 +1699,20 @@ fn unix_millis() -> i64 {
 mod tests {
     use super::*;
 
+    pub(super) fn canonical_test_path(path: impl AsRef<std::path::Path>) -> PathBuf {
+        PathBuf::from(
+            RegistryStore::canonical_mutation_root(path.as_ref().to_str().unwrap()).unwrap(),
+        )
+    }
+
+    pub(super) async fn stop_catch_up(handler: &ProjectsHandler) {
+        let task = handler.catch_up_task.lock().unwrap().take();
+        if let Some(task) = task {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
     #[tokio::test]
     async fn route_admission_keeps_bind_handle_until_route_gone() {
         let handler = ProjectsHandler::new().unwrap();
@@ -2009,8 +2023,7 @@ mod tests {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
-        let root = std::fs::canonicalize(root)
-            .unwrap()
+        let root = crate::tests::canonical_test_path(root)
             .to_string_lossy()
             .into_owned();
         let mut store = RegistryStore::open(&descriptor).unwrap();
@@ -2065,8 +2078,7 @@ mod tests {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
-        std::fs::canonicalize(path)
-            .unwrap()
+        crate::tests::canonical_test_path(path)
             .to_string_lossy()
             .into_owned()
     }
@@ -2412,8 +2424,7 @@ mod tests {
     fn journal_repo(dir: &std::path::Path, name: &str) -> String {
         let root = dir.join(name);
         std::fs::create_dir_all(root.join(".git")).unwrap();
-        std::fs::canonicalize(root)
-            .unwrap()
+        crate::tests::canonical_test_path(root)
             .to_string_lossy()
             .into_owned()
     }
@@ -2466,7 +2477,7 @@ mod tests {
             (reserved(WRITER_MODULE), "reserved:prefrontal-core"),
         ] {
             let (dir, descriptor) = scratch_descriptor(expected);
-            let dir = std::fs::canonicalize(dir).unwrap();
+            let dir = crate::tests::canonical_test_path(dir);
             let handler = ProjectsHandler::new().unwrap();
             let mut store = RegistryStore::open(&descriptor).unwrap();
             store.set_root_records(true);
@@ -2780,7 +2791,9 @@ mod tests {
             settled_after < Duration::from_secs(3),
             "the retry must pick the lease up promptly after release, not at the budget (took {settled_after:?})"
         );
-        let _ = std::fs::remove_dir_all(dir);
+        stop_catch_up(&handler).await;
+        drop(handler);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     // A hold that outlasts the budget is a second live writer: the refusal
@@ -2797,7 +2810,10 @@ mod tests {
         let after = handler.health().await;
         assert_eq!(after.status, HealthStatus::Failing, "{after:?}");
         assert!(handler.store.lock().unwrap().is_none());
-        let _ = std::fs::remove_dir_all(dir);
+        stop_catch_up(&handler).await;
+        drop(handler);
+        drop(_other_writer);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     // Only the lease is retried. Any other open error is the same fail-once

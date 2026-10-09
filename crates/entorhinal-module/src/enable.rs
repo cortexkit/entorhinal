@@ -451,7 +451,7 @@ mod tests {
     impl Fixture {
         fn new(label: &str, log: Arc<dyn LogConnector>) -> Self {
             let (dir, descriptor) = crate::tests::scratch_descriptor(label);
-            let dir = dir.canonicalize().unwrap();
+            let dir = crate::tests::canonical_test_path(dir);
             let handler = Self::handler(&descriptor, log);
             Self {
                 dir,
@@ -495,7 +495,7 @@ mod tests {
             self.conn().execute("VACUUM INTO ?1", [path]).unwrap();
             let handler = Self::handler(&descriptor, log);
             Self {
-                dir: dir.canonicalize().unwrap(),
+                dir: crate::tests::canonical_test_path(dir),
                 descriptor,
                 handler,
             }
@@ -1564,6 +1564,7 @@ mod tests {
         );
         assert_eq!(&f.journal()[..journal.len()], journal);
         assert_without_agents_finished(&f, &log, &parts).await;
+        crate::tests::stop_catch_up(&f.handler).await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -1952,6 +1953,7 @@ mod tests {
             f.store().generation().unwrap()
         );
         assert!(f.store().generation().unwrap() > cursor);
+        crate::tests::stop_catch_up(&f.handler).await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -2055,13 +2057,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(a.store().identity_log_status().unwrap().state, "enabled");
         assert_eq!(log.head(), 1);
-        a.handler
-            .catch_up_task
-            .lock()
-            .unwrap()
-            .take()
-            .unwrap()
-            .abort();
+        crate::tests::stop_catch_up(&a.handler).await;
         finish(a.call(
             "agent.create",
             json!({"role":"assistant","name":"Background","tag":"ok","request_key":"background"}),
@@ -2088,6 +2084,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(b.store().identity_log_status().unwrap().state, "enabled");
         assert_eq!(b.shared(), a.shared());
+        crate::tests::stop_catch_up(&b.handler).await;
     }
 
     #[tokio::test(start_paused = true)]

@@ -2353,6 +2353,7 @@ pub(crate) mod tests {
     pub(crate) struct Fixture {
         pub(crate) root: PathBuf,
         pub(crate) store: RegistryStore,
+        _cleanup: crate::scratch_cleanup::ScratchCleanup,
     }
     impl Fixture {
         pub(crate) fn new(label: &str) -> Self {
@@ -2371,6 +2372,7 @@ pub(crate) mod tests {
                 },
             };
             Self {
+                _cleanup: crate::scratch_cleanup::ScratchCleanup(root.clone()),
                 root,
                 store: RegistryStore::open(&descriptor).unwrap(),
             }
@@ -2379,11 +2381,6 @@ pub(crate) mod tests {
             let path = self.root.join(name);
             fs::create_dir_all(&path).unwrap();
             RegistryStore::canonical_mutation_root(path.to_str().unwrap()).unwrap()
-        }
-    }
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
         }
     }
     pub(crate) fn result(blob: &[u8]) -> Value {
@@ -2466,7 +2463,7 @@ pub(crate) mod tests {
                 .register(RegisterRequest {
                     project_id: Some("x".into()),
                     name: "x".into(),
-                    roots: vec![format!("{root}/.")],
+                    roots: vec![Path::new(&root).join(".").to_str().unwrap().into()],
                     ..Default::default()
                 })
                 .unwrap_err(),
@@ -3396,12 +3393,17 @@ mod workspace_root_tests {
             "not_absolute",
         );
         code(
-            set(&f, "ws", Some("/definitely/not/here/xyz")).unwrap_err(),
+            set(
+                &f,
+                "ws",
+                Some(f.root.join("missing-root").to_str().unwrap()),
+            )
+            .unwrap_err(),
             "root_not_found",
         );
-        let file = format!("{}/a-file", f.dir("holder"));
+        let file = Path::new(&f.dir("holder")).join("a-file");
         std::fs::write(&file, b"x").unwrap();
-        code(set(&f, "ws", Some(&file)).unwrap_err(), "not_a_directory");
+        code(set(&f, "ws", file.to_str()).unwrap_err(), "not_a_directory");
         let root = f.dir("workspace-root");
         code(
             set(&f, "no-such-workspace", Some(&root)).unwrap_err(),
@@ -4231,7 +4233,7 @@ mod path_identity_tests {
             format!("{home}-other"),
             format!("{config}-sibling"),
             format!("{data}-other"),
-            format!("{home}/child"),
+            Path::new(&home).join("child").to_str().unwrap().into(),
             f.root.join("relocat").to_str().unwrap().to_owned(),
         ] {
             assert!(!check(&root, homes), "not an ancestor {root}");

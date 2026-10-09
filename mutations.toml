@@ -1366,8 +1366,8 @@ hub = "Worktree identity and remotes both come from the common directory; contai
 hub_targets = ["entorhinal_core"]
 guards = "Worktrees still read their common directory rather than their admin directory"
 file = "crates/entorhinal-core/src/binding.rs"
-old = 'fs::canonicalize(absolute_from(&admin, common.trim()))'
-new = 'fs::canonicalize({ let _ = common; &admin }) /* NON-VACUITY BREAK */'
+old = 'Ok(common) => absolute_from(&admin, common.trim()),'
+new = 'Ok(common) => { let _ = common; admin.clone() }, /* NON-VACUITY BREAK */'
 test_file = "crates/entorhinal-core/src/binding.rs"
 runner = "cargo"
 package = "entorhinal-core"
@@ -1378,8 +1378,8 @@ expect_red = ["binding::tests::worktree_commondir_is_followed_and_missing_admin_
 id = "s3-git-separate-dir"
 guards = "A gitdir target without commondir is itself the common directory"
 file = "crates/entorhinal-core/src/binding.rs"
-old = 'fs::canonicalize(&admin).map_err(|error| error.to_string())'
-new = 'if metadata.is_dir() { fs::canonicalize(&admin).map_err(|error| error.to_string()) } else { Err("NON-VACUITY BREAK: missing commondir".into()) }'
+old = 'Err(error) if error.kind() == ErrorKind::NotFound => admin,'
+new = 'Err(error) if error.kind() == ErrorKind::NotFound => if metadata.is_dir() { admin } else { return Err("NON-VACUITY BREAK: missing commondir".into()); },'
 test_file = "crates/entorhinal-core/src/binding.rs"
 runner = "cargo"
 package = "entorhinal-core"
@@ -1499,3 +1499,19 @@ runner = "cargo"
 package = "entorhinal-core"
 target = "--test git_metadata"
 expect_red = ["unreadable_config_backfill_deduplicates_shared_key_without_retimestamping"]
+
+# Simulate std::fs::canonicalize's Windows \\?\ path prefix, which registry roots
+# omit. Both admin-directory and commondir layouts return through this boundary.
+# Linux's canonicalizer never emits that prefix, so explicitly prepend it to
+# prove the shared canonical-path assertion rejects this Windows spelling mismatch.
+[[control]]
+id = "s4-git-common-canonical-path"
+guards = "Git common directories use the registry's canonical path spelling in both layouts"
+file = "crates/entorhinal-core/src/binding.rs"
+old = '.map(ProjectRootId::into_path_buf)'
+new = '.map(|id| PathBuf::from(format!(r"\\?\{}", id.into_path_buf().display()))) /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-core/src/binding.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["binding::tests::git_common_dir_uses_registry_canonical_paths_for_both_layouts"]

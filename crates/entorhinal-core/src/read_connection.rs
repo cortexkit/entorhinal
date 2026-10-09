@@ -107,9 +107,9 @@ mod tests {
 
     struct Fixture {
         store: RegistryStore,
-        root: std::path::PathBuf,
         path: std::path::PathBuf,
         checkout: String,
+        _cleanup: crate::scratch_cleanup::ScratchCleanup,
     }
 
     impl Fixture {
@@ -136,8 +136,8 @@ mod tests {
                 RegistryStore::canonical_mutation_root(root.join("checkout").to_str().unwrap())
                     .unwrap();
             Self {
+                _cleanup: crate::scratch_cleanup::ScratchCleanup(root.clone()),
                 store,
-                root,
                 path,
                 checkout,
             }
@@ -155,12 +155,6 @@ mod tests {
                 workspace_id: Some("W".into()),
                 ..Default::default()
             }
-        }
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            fs::remove_dir_all(&self.root).unwrap();
         }
     }
 

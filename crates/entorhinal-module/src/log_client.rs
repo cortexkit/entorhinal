@@ -935,6 +935,7 @@ mod tests {
         }
         assert_eq!(connector.calls(), 0);
         assert!(manifest().capabilities.unwrap().requires.is_empty());
+        crate::tests::stop_catch_up(&handler).await;
         drop(handler);
         std::fs::remove_dir_all(root).unwrap();
     }

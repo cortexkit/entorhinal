@@ -1065,6 +1065,10 @@ pub(crate) fn now_unix_millis() -> i64 {
 }
 
 #[cfg(test)]
+#[path = "../tests/support/scratch_cleanup.rs"]
+pub(crate) mod scratch_cleanup;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::{
@@ -1077,6 +1081,7 @@ mod tests {
     struct TestStore {
         root: PathBuf,
         store: RegistryStore,
+        _cleanup: crate::scratch_cleanup::ScratchCleanup,
     }
 
     impl TestStore {
@@ -1095,13 +1100,11 @@ mod tests {
                 },
             };
             let store = RegistryStore::open(&descriptor).expect("open test store");
-            Self { root, store }
-        }
-    }
-
-    impl Drop for TestStore {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
+            Self {
+                _cleanup: crate::scratch_cleanup::ScratchCleanup(root.clone()),
+                root,
+                store,
+            }
         }
     }
 

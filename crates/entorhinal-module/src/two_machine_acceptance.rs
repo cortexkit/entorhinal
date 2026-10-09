@@ -55,7 +55,7 @@ impl Machine {
         let (dir, descriptor) = crate::tests::scratch_descriptor(label);
         let handler = Self::open(&descriptor, connector);
         Self {
-            dir: dir.canonicalize().unwrap(),
+            dir: crate::tests::canonical_test_path(dir),
             descriptor,
             handler,
         }
@@ -97,7 +97,7 @@ impl Machine {
         std::fs::copy(snapshot, path).unwrap();
         let handler = Self::open(&descriptor, connector);
         Self {
-            dir: dir.canonicalize().unwrap(),
+            dir: crate::tests::canonical_test_path(dir),
             descriptor,
             handler,
         }
@@ -224,7 +224,9 @@ impl Machine {
     fn repo(&self, name: &str, remotes: &[(&str, &str)]) -> String {
         let path = self.dir.join(name);
         repo(&path, remotes);
-        path.canonicalize().unwrap().to_string_lossy().into_owned()
+        crate::tests::canonical_test_path(path)
+            .to_string_lossy()
+            .into_owned()
     }
 
     async fn approve(&self, root: &str) -> Value {

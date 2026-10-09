@@ -344,7 +344,7 @@ mod tests {
         let parent = f.dir.join("workers");
         std::fs::create_dir(&root).unwrap();
         std::fs::create_dir(&parent).unwrap();
-        let request = json!({"projectId":"P","name":"P","roots":[std::fs::canonicalize(root).unwrap()],"derivedRootParents":[std::fs::canonicalize(parent).unwrap()],"requestKey":"key"});
+        let request = json!({"projectId":"P","name":"P","roots":[crate::tests::canonical_test_path(root)],"derivedRootParents":[crate::tests::canonical_test_path(parent)],"requestKey":"key"});
         let body = f.call("register", request.clone()).await.unwrap();
         let image = f.image();
         let fail = Arc::new(FailConnector::default());
@@ -538,7 +538,7 @@ mod tests {
         f.call("register", register("P", "first")).await.unwrap();
         let root = f.dir.join("root");
         std::fs::create_dir(&root).unwrap();
-        let root = std::fs::canonicalize(root).unwrap();
+        let root = crate::tests::canonical_test_path(root);
         let before = f.store().generation().unwrap();
         f.call(
             "register",
@@ -916,8 +916,8 @@ mod tests {
         let container = f.dir.join("workers");
         std::fs::create_dir(&root).unwrap();
         std::fs::create_dir(&container).unwrap();
-        let root = std::fs::canonicalize(root).unwrap();
-        let container = std::fs::canonicalize(container).unwrap();
+        let root = crate::tests::canonical_test_path(root);
+        let container = crate::tests::canonical_test_path(container);
         assert!(std::process::Command::new("git")
             .args(["init", "--quiet"])
             .arg(&root)
@@ -1009,7 +1009,7 @@ mod tests {
             for (op, params) in [
                 (
                     "resolve",
-                    json!({"canonicalRoot":std::fs::canonicalize(&f.dir).unwrap()}),
+                    json!({"canonicalRoot":crate::tests::canonical_test_path(&f.dir)}),
                 ),
                 ("enumerate", json!({})),
                 ("verify", json!({})),
@@ -1074,7 +1074,7 @@ mod tests {
         tap.races.store(1, Ordering::SeqCst);
         let root = f.dir.join("root");
         std::fs::create_dir(&root).unwrap();
-        let root = std::fs::canonicalize(root).unwrap();
+        let root = crate::tests::canonical_test_path(root);
         f.call(
             "add_root",
             json!({"projectId":"P","root":root,"label":"stable"}),

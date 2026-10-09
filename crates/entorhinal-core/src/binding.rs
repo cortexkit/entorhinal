@@ -29,6 +29,7 @@ use std::{
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use cortexkit_paths::ProjectRootId;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -211,14 +212,16 @@ fn git_common_dir(root: &Path) -> Result<PathBuf, String> {
             admin.display()
         ));
     }
-    match fs::read_to_string(admin.join("commondir")) {
-        Ok(common) => fs::canonicalize(absolute_from(&admin, common.trim()))
-            .map_err(|error| error.to_string()),
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            fs::canonicalize(&admin).map_err(|error| error.to_string())
-        }
-        Err(error) => Err(format!("{}/commondir: {error}", admin.display())),
-    }
+    let common = match fs::read_to_string(admin.join("commondir")) {
+        Ok(common) => absolute_from(&admin, common.trim()),
+        Err(error) if error.kind() == ErrorKind::NotFound => admin,
+        Err(error) => return Err(format!("{}: {error}", admin.join("commondir").display())),
+    };
+    // Repository identity must use the same non-verbatim Windows spelling as
+    // registered roots, rather than std::fs::canonicalize's extended prefix.
+    ProjectRootId::from_path(common)
+        .map(ProjectRootId::into_path_buf)
+        .map_err(|error| error.to_string())
 }
 
 fn absolute_from(base: &Path, value: &str) -> PathBuf {
@@ -1610,6 +1613,39 @@ mod tests {
         fixture
     }
 
+    pub(super) fn child_path(base: &str, components: &[&str]) -> String {
+        components
+            .iter()
+            .fold(PathBuf::from(base), |path, component| path.join(component))
+            .to_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    pub(super) fn child_dir(base: &str, components: &[&str]) -> String {
+        let path = child_path(base, components);
+        fs::create_dir_all(&path).unwrap();
+        RegistryStore::canonical_mutation_root(&path).unwrap()
+    }
+
+    #[test]
+    fn git_common_dir_uses_registry_canonical_paths_for_both_layouts() {
+        let f = store("git-common-paths");
+        let root = repo(&f, "checkout", None);
+        let admin = Path::new(&root).join(".git");
+        let expected = RegistryStore::canonical_mutation_root(admin.to_str().unwrap()).unwrap();
+        assert_eq!(
+            git_common_dir(Path::new(&root)).unwrap(),
+            PathBuf::from(expected)
+        );
+        let common = f.dir("common");
+        fs::write(admin.join("commondir"), &common).unwrap();
+        assert_eq!(
+            git_common_dir(Path::new(&root)).unwrap(),
+            PathBuf::from(common)
+        );
+    }
+
     fn fields(reply: &ResolveReply) -> &RootFields {
         reply
             .root_fields
@@ -1868,7 +1904,7 @@ mod tests {
         let root = repo(&f, "alpha", None);
         register(&f, "pj-alpha", root.clone());
         let epoch = bind(&f, &root);
-        let sub = format!("{root}/src/deep");
+        let sub = child_dir(&root, &["src", "deep"]);
         fs::create_dir_all(&sub).unwrap();
         let reply = f.store.resolve(&sub).unwrap();
         assert_eq!(reply.via, "walk");
@@ -1887,9 +1923,9 @@ mod tests {
         let f = store("nested");
         let root = repo(&f, "alpha", None);
         register(&f, "pj-alpha", root.clone());
-        let vendored = format!("{root}/vendor/other");
+        let vendored = child_dir(&root, &["vendor", "other"]);
         fs::create_dir_all(Path::new(&vendored).join(".git")).unwrap();
-        let reply = f.store.resolve(&format!("{vendored}/src")).unwrap();
+        let reply = f.store.resolve(&child_path(&vendored, &["src"])).unwrap();
         assert_eq!(reply.via, "implicit");
         assert!(fields(&reply).root_records.is_empty());
     }
@@ -1903,7 +1939,7 @@ mod tests {
         f.store.approve_root(&root, "test").unwrap();
         let container = f.dir("worktrees");
         attach(&f, &container, "pj-alpha", &root, &epoch);
-        let wt = format!("{container}/task-1");
+        let wt = child_path(&container, &["task-1"]);
         worktree(&root, &wt, "task-1");
         assert_eq!(first_record(&f, &wt).identity, "bound");
         // The admin directory goes (a reclone of the source), and the worktree's
@@ -1923,7 +1959,7 @@ mod tests {
         f.store.approve_root(&root, "test").unwrap();
         let container = f.dir("worktrees");
         attach(&f, &container, "pj-alpha", &root, &epoch);
-        let wt = format!("{container}/task-1");
+        let wt = child_path(&container, &["task-1"]);
         worktree(&root, &wt, "task-1");
         let record = first_record(&f, &wt);
         assert_eq!(
@@ -2133,10 +2169,10 @@ mod tests {
         let plain = f.dir("plain-folder");
         let unregistered = repo(&f, "unregistered", None);
         let container = f.dir("worktrees");
-        let wt = format!("{container}/task-1");
-        let sub = format!("{home}/src/lib");
+        let wt = child_path(&container, &["task-1"]);
+        let sub = child_dir(&home, &["src", "lib"]);
         fs::create_dir_all(&sub).unwrap();
-        let missing = format!("{real}/does-not-exist");
+        let missing = child_path(&real, &["does-not-exist"]);
 
         f.store
             .register(RegisterRequest {
@@ -2285,6 +2321,7 @@ mod tests {
 
 #[cfg(test)]
 mod root_membership_tests {
+    use super::tests::{child_dir, child_path};
     use super::*;
     use crate::mutations::tests::{register, result, Fixture};
     use crate::{RegisterRequest, RemoveRequest};
@@ -2362,7 +2399,7 @@ mod root_membership_tests {
         assert_eq!(result(&add(&f, "pj-home", &second).unwrap())["noop"], true);
 
         refused(add(&f, "pj-home", &other), "root_conflict");
-        let inner = format!("{home}/packages/inner");
+        let inner = child_dir(&home, &["packages", "inner"]);
         fs::create_dir_all(&inner).unwrap();
         refused(add(&f, "pj-home", &inner), "root_nested");
         refused(add(&f, "pj-other", &f.dir("")), "root_nested");
@@ -2484,7 +2521,7 @@ mod root_membership_tests {
             })
             .unwrap();
         f.store.bind_unbound_roots("test").unwrap();
-        let sub = format!("{third}/src");
+        let sub = child_dir(&third, &["src"]);
         fs::create_dir_all(&sub).unwrap();
         let approved = result(&f.store.set_project_approval(&sub, "test", true).unwrap());
         assert_eq!(approved["roots"].as_array().unwrap().len(), 2);
@@ -2544,10 +2581,10 @@ mod root_membership_tests {
                     home.clone(),
                     other.clone(),
                     container.clone(),
-                    format!("{container}/inner"),
-                    format!("{real}/worktrees-2"),
-                    format!("{real}/nowhere"),
-                    format!("{real}/missing-container"),
+                    child_path(&container, &["inner"]),
+                    child_path(&real, &["worktrees-2"]),
+                    child_path(&real, &["nowhere"]),
+                    child_path(&real, &["missing-container"]),
                 ],
             )
         };
@@ -2590,7 +2627,7 @@ mod root_membership_tests {
         let mut refusals = serde_json::Map::new();
         refusals.insert(
             "root_not_registered".into(),
-            refuse(with(&|r| r.root = format!("{real}/nowhere"))),
+            refuse(with(&|r| r.root = child_path(&real, &["nowhere"]))),
         );
         refusals.insert(
             "root_conflict".into(),
@@ -2614,13 +2651,15 @@ mod root_membership_tests {
             refuse(request)
         });
         refusals.insert("container_overlaps".into(), {
-            let nested = format!("{container}/inner");
+            let nested = child_dir(&container, &["inner"]);
             fs::create_dir_all(&nested).unwrap();
             refuse(with(&|r| r.container = nested.clone()))
         });
         refusals.insert(
             "root_not_found".into(),
-            refuse(with(&|r| r.container = format!("{real}/missing-container"))),
+            refuse(with(&|r| {
+                r.container = child_path(&real, &["missing-container"])
+            })),
         );
         refusals.insert("binding_unapproved".into(), {
             f.store.unapprove_root(&home, "test").unwrap();
@@ -2667,8 +2706,11 @@ mod root_membership_tests {
             if std::env::var("UPDATE_GOLDENS").as_deref() == Ok("1") {
                 fs::create_dir_all(&dir).unwrap();
                 fs::write(&path, &text).unwrap();
-            } else if fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
-                mismatches.push(name);
+            } else {
+                let expected = fs::read_to_string(&path).ok();
+                if expected.as_deref() != Some(text.as_str()) {
+                    mismatches.push(format!("{name}: expected {expected:?}, produced {text:?}"));
+                }
             }
         }
         assert!(
@@ -2721,13 +2763,13 @@ mod root_membership_tests {
                 .attach_derived_parent(request(&container, "0".repeat(32).as_str())),
             "binding_stale",
         );
-        let nested = format!("{container}/inner");
+        let nested = child_dir(&container, &["inner"]);
         fs::create_dir_all(&nested).unwrap();
         refused(
             f.store.attach_derived_parent(request(&nested, &epoch)),
             "container_overlaps",
         );
-        let inside_root = format!("{home}/sub-container");
+        let inside_root = child_dir(&home, &["sub-container"]);
         fs::create_dir_all(&inside_root).unwrap();
         refused(
             f.store.attach_derived_parent(request(&inside_root, &epoch)),

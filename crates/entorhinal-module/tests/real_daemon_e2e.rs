@@ -261,10 +261,9 @@ async fn real_daemon_supervises_projects_and_routes_resolve() {
     // which is how the operator's `ck` faces connect, and the registry accepts
     // writes from it. This exercises the whole path the write check depends
     // on: the principal recorded at bind time and looked up per request.
-    let canonical_root = std::fs::canonicalize(&project_root)
-        .expect("canonicalize query root")
-        .to_string_lossy()
-        .into_owned();
+    let canonical_root =
+        entorhinal_core::RegistryStore::canonical_mutation_root(project_root.to_str().unwrap())
+            .expect("canonical registry root");
     let register = Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Interactive, false),
