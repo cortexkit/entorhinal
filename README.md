@@ -119,7 +119,10 @@ config and `.git` marker. One exception to keep in mind: a root under a
 folder macOS protects (Desktop, Documents, Downloads, iCloud Drive) needs
 Files & Folders access under entorhinal's own name before its remotes can be
 read. Without that access, entorhinal can't read the root's git config, so
-the root reports no remotes and `resolve_remote` finds no repository it owns.
+the root reports no remotes with `remotesError` containing the OS error, and
+`resolve_remote` finds no repository it owns. Conditional git-config includes
+(`includeIf`) and URL rewrites (`insteadOf`) are unsupported; only remote URLs
+written directly in the common directory's config are read.
 
 ## Building
 

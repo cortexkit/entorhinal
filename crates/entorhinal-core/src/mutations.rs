@@ -567,7 +567,7 @@ impl super::JournalWriter<'_> {
                 if let Some(owner)=tx.query_row("SELECT project_id FROM project_root WHERE canonical_root=?1",[root],|r|r.get::<_,String>(0)).optional()? { if owner!=project_id { return Err(domain("root_conflict",format!("root {root} is owned by {owner}"))); } }
                 if let Some(owner)=tx.query_row("SELECT project_id FROM derived_root_parent WHERE canonical_parent=?1",[root],|r|r.get::<_,String>(0)).optional()? { if owner!=project_id { return Err(domain("root_conflict",format!("root {root} is claimed by {owner}"))); } }
                 chosen.insert(root.clone(), super::root_keys::incoming(tx, &project_id, root, req.label.as_deref())?);
-                let remotes = super::ownership::root_remotes(tx, root)?;
+                let (remotes, _) = super::ownership::root_remotes(tx, root)?;
                 if let Some((repository, owner)) = super::binding::repository_owner(tx, &project_id, &remotes)? {
                     return Err(domain("repository_owned", format!("{repository} belongs to {owner}")));
                 }

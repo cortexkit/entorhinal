@@ -100,6 +100,8 @@ pub struct RootRecord {
     pub root: String,
     pub remotes: Vec<GitRemote>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub remotes_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub root_key: Option<crate::RootKey>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub root_key_mismatch: Option<bool>,
@@ -183,33 +185,40 @@ enum DiskIdentity {
 
 /// The git common directory for a checkout, read from the filesystem only.
 ///
-/// A `.git` directory is the common directory. A `.git` file names a worktree
-/// admin directory, whose `commondir` names the common directory; a missing
-/// admin directory or `commondir` is an error, because a pointer to where an
-/// admin directory would be says nothing about which repository is there.
+/// A `.git` directory, including a symlink to one, names the admin directory.
+/// A `.git` file names it through a `gitdir:` pointer. If that directory has a
+/// `commondir`, follow it for worktrees; otherwise the admin directory itself
+/// is the common directory, as for submodules and separate-git-dir checkouts.
+/// Missing `.git` or admin directories cannot establish repository identity.
 fn git_common_dir(root: &Path) -> Result<PathBuf, String> {
     let dot_git = root.join(".git");
-    let metadata = fs::symlink_metadata(&dot_git)
-        .map_err(|error| format!("{}: {error}", dot_git.display()))?;
-    if metadata.is_dir() {
-        return fs::canonicalize(&dot_git).map_err(|error| error.to_string());
-    }
-    let text = fs::read_to_string(&dot_git).map_err(|error| error.to_string())?;
-    let target = text
-        .trim()
-        .strip_prefix("gitdir:")
-        .map(str::trim)
-        .ok_or_else(|| format!("{}: not a gitdir pointer", dot_git.display()))?;
-    let admin = absolute_from(root, target);
+    let metadata =
+        fs::metadata(&dot_git).map_err(|error| format!("{}: {error}", dot_git.display()))?;
+    let admin = if metadata.is_dir() {
+        dot_git
+    } else {
+        let text = fs::read_to_string(&dot_git).map_err(|error| error.to_string())?;
+        let target = text
+            .trim()
+            .strip_prefix("gitdir:")
+            .map(str::trim)
+            .ok_or_else(|| format!("{}: not a gitdir pointer", dot_git.display()))?;
+        absolute_from(root, target)
+    };
     if !admin.is_dir() {
         return Err(format!(
             "worktree admin directory {} is missing",
             admin.display()
         ));
     }
-    let common = fs::read_to_string(admin.join("commondir"))
-        .map_err(|error| format!("{}/commondir: {error}", admin.display()))?;
-    fs::canonicalize(absolute_from(&admin, common.trim())).map_err(|error| error.to_string())
+    match fs::read_to_string(admin.join("commondir")) {
+        Ok(common) => fs::canonicalize(absolute_from(&admin, common.trim()))
+            .map_err(|error| error.to_string()),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            fs::canonicalize(&admin).map_err(|error| error.to_string())
+        }
+        Err(error) => Err(format!("{}/commondir: {error}", admin.display())),
+    }
 }
 
 fn absolute_from(base: &Path, value: &str) -> PathBuf {
@@ -230,7 +239,10 @@ fn is_token(value: &str) -> bool {
 
 fn read_token(common: &Path) -> DiskIdentity {
     match fs::read_to_string(common.join(INCARNATION_FILE)) {
-        Ok(text) => match text.strip_suffix('\n') {
+        Ok(text) => match text
+            .strip_suffix("\r\n")
+            .or_else(|| text.strip_suffix('\n'))
+        {
             Some(token) if is_token(token) => DiskIdentity::Token(token.to_string()),
             _ => DiskIdentity::Unverifiable(format!(
                 "{} is malformed",
@@ -259,9 +271,15 @@ fn create_token(common: &Path, token: &str) -> Result<String, String> {
         .open(&path)
     {
         Ok(mut file) => {
+            // On Windows, syncing the file is the strongest available step;
+            // opening a directory for sync_all is not supported by std.
             file.write_all(format!("{token}\n").as_bytes())
                 .and_then(|()| file.sync_all())
                 .map_err(|error| format!("{}: {error}", path.display()))?;
+            #[cfg(unix)]
+            fs::File::open(common)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| format!("{}: {error}", common.display()))?;
             Ok(token.to_string())
         }
         Err(error) if error.kind() == ErrorKind::AlreadyExists => match read_token(common) {
@@ -276,17 +294,18 @@ fn create_token(common: &Path, token: &str) -> Result<String, String> {
 /// GitHub remotes from the checkout's git config: `[remote "<name>"]` sections
 /// whose `url` names github.com. Other hosts are left out; the reply's remote
 /// shape is GitHub's owner/repo.
-pub(crate) fn github_remotes(root: &Path) -> Vec<GitRemote> {
+pub(crate) fn github_remotes(root: &Path) -> Result<Vec<GitRemote>, String> {
     let Ok(common) = git_common_dir(root) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    let Ok(config) = fs::read_to_string(common.join("config")) else {
-        return Vec::new();
-    };
+    let config = fs::read_to_string(common.join("config")).map_err(|error| error.to_string())?;
     let mut remotes = Vec::new();
     let mut current: Option<String> = None;
     for line in config.lines() {
         let line = line.trim();
+        if line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
         if line.starts_with('[') {
             current = line
                 .strip_prefix("[remote \"")
@@ -311,7 +330,7 @@ pub(crate) fn github_remotes(root: &Path) -> Vec<GitRemote> {
     }
     remotes.sort_by(|a, b| a.name.cmp(&b.name));
     remotes.dedup();
-    remotes
+    Ok(remotes)
 }
 
 fn parse_github_url(url: &str) -> Option<(String, String)> {
@@ -375,7 +394,7 @@ fn unapproved() -> Approval {
 
 /// The record for one registered root, with its identity checked against disk.
 fn root_record(conn: &Connection, root: &str) -> rusqlite::Result<RootRecord> {
-    let remotes = super::ownership::root_remotes(conn, root)?;
+    let (remotes, remotes_error) = super::ownership::root_remotes(conn, root)?;
     let root_key = crate::root_keys::mapped_key(conn, root)?;
     let root_key_mismatch = root_key
         .as_ref()
@@ -398,6 +417,7 @@ fn root_record(conn: &Connection, root: &str) -> rusqlite::Result<RootRecord> {
     Ok(RootRecord {
         root: root.to_string(),
         remotes,
+        remotes_error,
         root_key,
         root_key_mismatch,
         incarnation: binding.as_ref().map(|bound| Incarnation {
@@ -434,13 +454,17 @@ fn worktree_record(
     attached_epoch: Option<&str>,
 ) -> rusqlite::Result<RootRecord> {
     let names = super::ownership::effective_owned_names(conn, source_root.unwrap_or(worktree))?;
-    let mut remotes = github_remotes(Path::new(worktree));
+    let (mut remotes, remotes_error) = match github_remotes(Path::new(worktree)) {
+        Ok(remotes) => (remotes, None),
+        Err(error) => (Vec::new(), Some(error)),
+    };
     for remote in &mut remotes {
         remote.owned = names.contains(&remote.name);
     }
     let none = |identity| RootRecord {
         root: worktree.to_string(),
         remotes: remotes.clone(),
+        remotes_error: remotes_error.clone(),
         root_key: None,
         root_key_mismatch: None,
         incarnation: None,
@@ -466,6 +490,7 @@ fn worktree_record(
     Ok(RootRecord {
         root: worktree.to_string(),
         remotes,
+        remotes_error,
         root_key: None,
         root_key_mismatch: None,
         incarnation: Some(Incarnation {
@@ -1101,6 +1126,7 @@ pub(crate) fn repository_owner(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for (root, owner) in rows {
         for theirs in super::ownership::root_remotes(conn, &root)?
+            .0
             .into_iter()
             .filter(|r| r.owned)
         {
@@ -1294,7 +1320,7 @@ impl super::JournalWriter<'_> {
             check_root_location(tx, &request.root)?;
             let root_key =
                 crate::root_keys::incoming(tx, project, &request.root, request.label.as_deref())?;
-            let remotes = super::ownership::root_remotes(tx, &request.root)?;
+            let (remotes, _) = super::ownership::root_remotes(tx, &request.root)?;
             if let Some((repository, owner)) = repository_owner(tx, project, &remotes)? {
                 return Err(domain(
                     "repository_owned",
@@ -1608,6 +1634,137 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
+    }
+
+    #[test]
+    fn symlinked_git_directory_reads_remotes_and_binds() {
+        let f = store("git-symlink");
+        let root = repo(&f, "alpha", Some("https://github.com/owner/symlink.git"));
+        let common = Path::new(&root).with_file_name("common");
+        fs::rename(Path::new(&root).join(".git"), &common).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&common, Path::new(&root).join(".git")).unwrap();
+        #[cfg(windows)]
+        if let Err(error) =
+            std::os::windows::fs::symlink_dir(&common, Path::new(&root).join(".git"))
+        {
+            eprintln!("symlinked_git_directory_reads_remotes_and_binds: skipped: {error}");
+            return;
+        }
+        assert_eq!(git_common_dir(Path::new(&root)).unwrap(), common);
+        assert_eq!(github_remotes(Path::new(&root)).unwrap()[0].repo, "symlink");
+        register(&f, "P", root.clone());
+        bind(&f, &root);
+        assert!(common.join(INCARNATION_FILE).is_file());
+        assert_eq!(first_record(&f, &root).identity, "bound");
+    }
+
+    #[test]
+    fn separate_git_directory_without_commondir_reads_remotes_and_binds() {
+        let f = store("git-separate");
+        let root = f.dir("alpha");
+        let common = Path::new(&root).with_file_name("common");
+        let output = std::process::Command::new("git")
+            .args(["init", "--quiet", "--separate-git-dir"])
+            .arg(&common)
+            .arg(&root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::write(
+            common.join("config"),
+            "[remote \"origin\"]\nurl = https://github.com/owner/separate.git\n",
+        )
+        .unwrap();
+        assert!(!common.join("commondir").exists());
+        assert_eq!(git_common_dir(Path::new(&root)).unwrap(), common);
+        assert_eq!(
+            github_remotes(Path::new(&root)).unwrap()[0].repo,
+            "separate"
+        );
+        register(&f, "P", root.clone());
+        bind(&f, &root);
+        assert!(common.join(INCARNATION_FILE).is_file());
+        assert_eq!(first_record(&f, &root).identity, "bound");
+    }
+
+    #[test]
+    fn worktree_commondir_is_followed_and_missing_admin_stays_an_error() {
+        let f = store("git-worktree");
+        let source = repo(&f, "source", Some("https://github.com/owner/common.git"));
+        let root = f.dir("worktree");
+        worktree(&source, &root, "linked");
+        assert_eq!(
+            git_common_dir(Path::new(&root)).unwrap(),
+            Path::new(&source).join(".git")
+        );
+        assert_eq!(github_remotes(Path::new(&root)).unwrap()[0].repo, "common");
+        fs::remove_dir_all(Path::new(&source).join(".git/worktrees/linked")).unwrap();
+        assert!(git_common_dir(Path::new(&root)).is_err());
+        assert!(github_remotes(Path::new(&root)).unwrap().is_empty());
+        fs::remove_file(Path::new(&root).join(".git")).unwrap();
+        assert!(git_common_dir(Path::new(&root)).is_err());
+    }
+
+    #[test]
+    fn marker_accepts_one_lf_or_crlf_and_rejects_other_endings() {
+        let f = store("marker-newlines");
+        let root = repo(&f, "alpha", None);
+        register(&f, "P", root.clone());
+        let common = Path::new(&root).join(".git");
+        let token = "a".repeat(64);
+        for ending in ["\n", "\r\n"] {
+            fs::write(common.join(INCARNATION_FILE), format!("{token}{ending}")).unwrap();
+            bind(&f, &root);
+            assert_eq!(first_record(&f, &root).identity, "bound", "{ending:?}");
+        }
+        for ending in ["", "\r", "\n\n", "\r\n\n", "\r\r\n"] {
+            fs::write(common.join(INCARNATION_FILE), format!("{token}{ending}")).unwrap();
+            assert!(
+                matches!(read_token(&common), DiskIdentity::Unverifiable(_)),
+                "{ending:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_comments_other_sections_includes_and_rewrites_are_skipped() {
+        let f = store("config-sections");
+        let root = repo(&f, "alpha", None);
+        let common = Path::new(&root).join(".git");
+        fs::write(
+            common.join("config"),
+            concat!(
+                "# comment\n[includeIf \"gitdir:somewhere/\"]\npath = extra.config\n",
+                "[url \"https://github.com/\"]\ninsteadOf = gh:\n",
+                "[remote \"origin\"]\n; url = https://github.com/wrong/comment.git\n",
+                "url = https://github.com/owner/direct.git\n",
+                "[core]\nurl = https://github.com/wrong/core.git\n",
+                "[remote \"alias\"]\nurl = gh:owner/alias.git\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            common.join("extra.config"),
+            "[remote \"included\"]\nurl = https://github.com/wrong/included.git\n",
+        )
+        .unwrap();
+        let remotes = github_remotes(Path::new(&root)).unwrap();
+        assert_eq!(remotes.len(), 1);
+        assert_eq!(remotes[0].repo, "direct");
+        fs::write(common.join("config"), [0xff]).unwrap();
+        assert_eq!(
+            github_remotes(Path::new(&root)).unwrap_err(),
+            fs::read_to_string(common.join("config"))
+                .unwrap_err()
+                .to_string()
+        );
+        fs::write(common.join("config"), "[core]\nbare = false\n").unwrap();
+        assert!(github_remotes(Path::new(&root)).unwrap().is_empty());
     }
 
     #[test]

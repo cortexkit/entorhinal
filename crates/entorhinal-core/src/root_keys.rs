@@ -61,7 +61,11 @@ pub(crate) fn incoming(
     {
         return Ok(None);
     }
-    let key = choose(&crate::ownership::root_remotes(conn, root)?, label);
+    let (remotes, error) = crate::ownership::root_remotes(conn, root)?;
+    if error.is_some() {
+        return Ok(None);
+    }
+    let key = choose(&remotes, label);
     if let Some(key) = &key {
         if key.kind == "remote" {
             if let Some(owner) = conn.query_row(
@@ -191,11 +195,11 @@ fn attach_match(
         ));
     }
     let root = canonical(&req.path)?;
-    let key = choose(
-        &crate::ownership::root_remotes(conn, &root)?,
-        req.label.as_deref(),
-    )
-    .ok_or_else(|| {
+    let (remotes, error) = crate::ownership::root_remotes(conn, &root)?;
+    if let Some(error) = error {
+        return Err(domain("remotes_unreadable", error));
+    }
+    let key = choose(&remotes, req.label.as_deref()).ok_or_else(|| {
         domain(
             "root_key_not_found",
             "no owned remote; supply project_id and label",
@@ -381,7 +385,11 @@ pub(crate) fn disk_mismatches(conn: &Connection) -> rusqlite::Result<Vec<String>
     let mut errors = Vec::new();
     for root in roots {
         let key = mapped_key(conn, &root)?.expect("selected mapped root");
-        if mismatch(&key, &crate::ownership::root_remotes(conn, &root)?) {
+        let (remotes, error) = crate::ownership::root_remotes(conn, &root)?;
+        if error.is_some() {
+            continue;
+        }
+        if mismatch(&key, &remotes) {
             errors.push(format!(
                 "root_key_mismatch:{root}:{}:{}",
                 key.kind, key.root_key
@@ -1172,7 +1180,8 @@ mod tests {
             choose(
                 &a.store
                     .read(|conn| crate::ownership::root_remotes(conn, &root))
-                    .unwrap(),
+                    .unwrap()
+                    .0,
                 None
             )
             .unwrap()

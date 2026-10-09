@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use rusqlite::{params, Transaction};
+use rusqlite::{params, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -251,14 +251,41 @@ impl RegistryStore {
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             let mut owners = BTreeMap::<String, String>::new();
             for (project, root) in roots {
-                if let Some(key) = crate::root_keys::choose(&crate::ownership::root_remotes(conn, &root)?, None) {
+                let (remotes, error) = crate::ownership::root_remotes(conn, &root)?;
+                let (key, created_at) = if error.is_some() {
+                    // Unreadable metadata cannot justify replacing a durable key.
+                    // Carry its row and mapping with the original creation time.
+                    let key = conn.query_row(
+                        "SELECT root_key_kind,root_key FROM project_root WHERE canonical_root=?1 AND root_key IS NOT NULL",
+                        [&root], |r| Ok(crate::root_keys::RootKey { kind: r.get(0)?, root_key: r.get(1)? }),
+                    ).optional()?;
+                    let created_at = match &key {
+                        Some(key) => conn.query_row(
+                            "SELECT created_at FROM project_root_key WHERE project_id=?1 AND kind=?2 AND root_key=?3",
+                            [&project, &key.kind, &key.root_key], |r| r.get::<_, i64>(0),
+                        )?,
+                        None => now,
+                    };
+                    (key, created_at)
+                } else {
+                    (crate::root_keys::choose(&remotes, None), now)
+                };
+                if let Some(key) = key {
                     if let Some(owner) = owners.insert(key.root_key.clone(), project.clone()) {
                         if owner != project {
                             return Ok(Err(domain("root_key_exists", format!("{} belongs to both project_id {owner} and {project}", key.root_key))));
                         }
                     }
-                    let row = serde_json::from_value(json!({"project_id":project,"kind":key.kind,"root_key":key.root_key,"created_at":now})).map_err(decode_error)?;
-                    if !keys.upsert.contains(&row) { keys.upsert.push(row); }
+                    let row: crate::shared_entry::SharedRow = serde_json::from_value(json!({"project_id":project,"kind":key.kind,"root_key":key.root_key,"created_at":created_at})).map_err(decode_error)?;
+                    if let Some(existing) = keys.upsert.iter_mut().find(|existing| {
+                        ["project_id", "kind", "root_key"].iter().all(|column| existing[*column] == row[*column])
+                    }) {
+                        // Roots of one project may share a key. A carried row takes
+                        // precedence over a freshly chosen duplicate's timestamp.
+                        if error.is_some() { *existing = row; }
+                    } else {
+                        keys.upsert.push(row);
+                    }
                     mappings.push(RootKeyMapping { canonical_root: root, kind: key.kind, root_key: key.root_key });
                 }
             }

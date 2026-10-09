@@ -1346,3 +1346,156 @@ package = "entorhinal-core"
 target = "--lib"
 expect_red = ["mutations::path_identity_tests::canonical_rejects_non_unicode_canonical_form"]
 platforms = ["linux"]
+
+# Git metadata layouts and config failures must not silently alter durable keys.
+[[control]]
+id = "s3-git-symlink"
+guards = "A symlinked .git directory is followed for remotes and binding"
+file = "crates/entorhinal-core/src/binding.rs"
+old = 'fs::metadata(&dot_git)'
+new = 'fs::symlink_metadata(&dot_git) /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-core/src/binding.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["binding::tests::symlinked_git_directory_reads_remotes_and_binds"]
+
+[[control]]
+id = "s3-git-commondir"
+hub = "Worktree identity and remotes both come from the common directory; containment replies and retired-epoch checks assert the same repository association"
+hub_targets = ["entorhinal_core"]
+guards = "Worktrees still read their common directory rather than their admin directory"
+file = "crates/entorhinal-core/src/binding.rs"
+old = 'fs::canonicalize(absolute_from(&admin, common.trim()))'
+new = 'fs::canonicalize({ let _ = common; &admin }) /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-core/src/binding.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["binding::tests::worktree_commondir_is_followed_and_missing_admin_stays_an_error"]
+
+[[control]]
+id = "s3-git-separate-dir"
+guards = "A gitdir target without commondir is itself the common directory"
+file = "crates/entorhinal-core/src/binding.rs"
+old = 'fs::canonicalize(&admin).map_err(|error| error.to_string())'
+new = 'if metadata.is_dir() { fs::canonicalize(&admin).map_err(|error| error.to_string()) } else { Err("NON-VACUITY BREAK: missing commondir".into()) }'
+test_file = "crates/entorhinal-core/src/binding.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["binding::tests::separate_git_directory_without_commondir_reads_remotes_and_binds"]
+
+[[control]]
+id = "s3-remotes-error"
+guards = "The root record exposes the OS error when config cannot be read"
+file = "crates/entorhinal-core/src/binding.rs"
+old = '''        root: root.to_string(),
+        remotes,
+        remotes_error,'''
+new = '''        root: root.to_string(),
+        remotes,
+        remotes_error: { let _ = remotes_error; None }, // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-core/tests/git_metadata.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--test git_metadata"
+expect_red = ["unreadable_config_reports_os_error_and_no_remotes"]
+
+[[control]]
+id = "s3-incoming-no-key"
+hub = "Unreadable registration cannot mint a label key, including unkeyed roots used by the backfill preservation test"
+hub_targets = ["git_metadata"]
+guards = "Registration and add-root do not fall back to a label key on config errors"
+file = "crates/entorhinal-core/src/root_keys.rs"
+old = '''    if error.is_some() {
+        return Ok(None);
+    }
+    let key = choose(&remotes, label);'''
+new = '''    if false && error.is_some() { // NON-VACUITY BREAK
+        return Ok(None);
+    }
+    let key = choose(&remotes, label);'''
+test_file = "crates/entorhinal-core/tests/git_metadata.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--test git_metadata"
+expect_red = ["unreadable_config_register_and_add_root_mint_no_key"]
+
+[[control]]
+id = "s3-backfill-carry"
+hub = "Preserving an unreadable root's key row is required both for publishing its identity and for detecting foreign ownership collisions"
+hub_targets = ["git_metadata"]
+guards = "An unreadable root contributes its existing key row to the published backfill"
+file = "crates/entorhinal-core/src/enable_state.rs"
+old = '''                    (key, created_at)
+                } else {'''
+new = '''                    { let _ = (key, created_at); (None, now) } // NON-VACUITY BREAK
+                } else {'''
+test_file = "crates/entorhinal-core/tests/git_metadata.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--test git_metadata"
+expect_red = ["unreadable_config_backfill_carries_key_rows_and_mappings"]
+
+[[control]]
+id = "s3-backfill-owners"
+guards = "Carried keys participate in the same cross-project collision check as chosen keys"
+file = "crates/entorhinal-core/src/enable_state.rs"
+old = 'if let Some(owner) = owners.insert(key.root_key.clone(), project.clone()) {'
+new = 'if let Some(owner) = if error.is_some() { None } else { owners.insert(key.root_key.clone(), project.clone()) } { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/tests/git_metadata.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--test git_metadata"
+expect_red = ["unreadable_config_backfill_carry_detects_foreign_owner"]
+
+[[control]]
+id = "s3-resolve-remote-skip"
+guards = "An unreadable root does not stop resolution from considering other roots"
+file = "crates/entorhinal-core/src/ownership.rs"
+old = 'if error.is_some() { continue; }'
+new = 'if error.is_some() { break; } // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/tests/git_metadata.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--test git_metadata"
+expect_red = ["unreadable_config_resolve_remote_skips_only_bad_root"]
+
+[[control]]
+id = "s3-remotes-unreadable"
+guards = "Unreadable configs refuse ownership edits before any journal or override write"
+file = "crates/entorhinal-core/src/ownership.rs"
+old = '''github_remotes(Path::new(&request.root))
+                .map_err(|error| domain("remotes_unreadable", error))?'''
+new = 'github_remotes(Path::new(&request.root)).unwrap_or_default() /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-core/tests/git_metadata.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--test git_metadata"
+expect_red = ["unreadable_config_owned_remotes_refusal_writes_nothing"]
+
+[[control]]
+id = "s3-marker-crlf"
+guards = "An incarnation marker with one CRLF binds without accepting malformed endings"
+file = "crates/entorhinal-core/src/binding.rs"
+old = '''.strip_suffix("\r\n")
+            .or_else(|| text.strip_suffix('\n'))'''
+new = '''.strip_suffix('\n') /* NON-VACUITY BREAK */'''
+test_file = "crates/entorhinal-core/src/binding.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["binding::tests::marker_accepts_one_lf_or_crlf_and_rejects_other_endings"]
+
+[[control]]
+id = "s3-backfill-carry-dedup"
+guards = "A carried key row keeps its timestamp even when a readable root selects the same key first"
+file = "crates/entorhinal-core/src/enable_state.rs"
+old = 'if error.is_some() { *existing = row; }'
+new = 'if false && error.is_some() { *existing = row; } // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/tests/git_metadata.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--test git_metadata"
+expect_red = ["unreadable_config_backfill_deduplicates_shared_key_without_retimestamping"]

@@ -57,13 +57,19 @@ pub(crate) fn effective_owned_names(
     Ok(override_names(conn, root)?.unwrap_or_else(|| vec!["origin".into()]))
 }
 
-pub(crate) fn root_remotes(conn: &Connection, root: &str) -> rusqlite::Result<Vec<GitRemote>> {
+pub(crate) fn root_remotes(
+    conn: &Connection,
+    root: &str,
+) -> rusqlite::Result<(Vec<GitRemote>, Option<String>)> {
+    let mut remotes = match github_remotes(Path::new(root)) {
+        Ok(remotes) => remotes,
+        Err(error) => return Ok((Vec::new(), Some(error))),
+    };
     let names = effective_owned_names(conn, root)?;
-    let mut remotes = github_remotes(Path::new(root));
     for remote in &mut remotes {
         remote.owned = names.contains(&remote.name);
     }
-    Ok(remotes)
+    Ok((remotes, None))
 }
 
 fn apply_owned_remotes(
@@ -145,7 +151,9 @@ impl RegistryStore {
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             let mut projects = BTreeMap::new();
             for (project, root) in roots {
-                if root_remotes(conn, &root)?.iter().any(|remote| {
+                let (remotes, error) = root_remotes(conn, &root)?;
+                if error.is_some() { continue; }
+                if remotes.iter().any(|remote| {
                     remote.owned && remote.owner.eq_ignore_ascii_case(owner) && remote.repo.eq_ignore_ascii_case(repo)
                 }) {
                     // Multiple roots of one project are one owner; retain its
@@ -201,7 +209,8 @@ impl JournalWriter<'_> {
                 .remotes
                 .clone()
                 .unwrap_or_else(|| vec!["origin".into()]);
-            let mut remotes = github_remotes(Path::new(&request.root));
+            let mut remotes = github_remotes(Path::new(&request.root))
+                .map_err(|error| domain("remotes_unreadable", error))?;
             for remote in &mut remotes {
                 remote.owned = names.contains(&remote.name);
             }
