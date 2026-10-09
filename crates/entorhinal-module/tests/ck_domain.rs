@@ -36,14 +36,20 @@ fn run_as(face: &str) -> (std::process::ExitStatus, String) {
     let binary = ckdev_binary(env!("CARGO_BIN_EXE_ck-entorhinal"));
     let dev_face = face.replacen("ck-", "ckdev-", 1);
 
+    // The clock alone can't name the directory: Windows' clock is coarse, and
+    // the tests in this file run in parallel, so two calls can read the same
+    // time. The per-process counter keeps every directory distinct.
+    #[cfg(windows)]
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     #[cfg(windows)]
     let scratch = std::env::temp_dir().join(format!(
-        "ck-domain-{}-{}",
+        "ck-domain-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     #[cfg(windows)]
     let binary = {
