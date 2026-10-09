@@ -280,8 +280,10 @@ impl RegistryStore {
                     if let Some(existing) = keys.upsert.iter_mut().find(|existing| {
                         ["project_id", "kind", "root_key"].iter().all(|column| existing[*column] == row[*column])
                     }) {
-                        // Roots of one project may share a key. A carried row takes
-                        // precedence over a freshly chosen duplicate's timestamp.
+                        // Two roots of one project can yield the same key. When one of
+                        // them has an unreadable git config, its row was copied from
+                        // the store with the key's original created_at; keep that row
+                        // rather than the readable root's new one stamped `now`.
                         if error.is_some() { *existing = row; }
                     } else {
                         keys.upsert.push(row);

@@ -153,7 +153,9 @@ struct ScratchCleanup(PathBuf);
 
 impl Drop for ScratchCleanup {
     fn drop(&mut self) {
-        // This field drops after the SQLite handles, so Windows can remove them.
+        // Declared as the fixture's last field, so it drops after the store
+        // and its SQLite connections have closed: Windows refuses to delete a
+        // directory holding an open file.
         let _ = fs::remove_dir_all(&self.0);
     }
 }

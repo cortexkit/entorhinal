@@ -34,7 +34,9 @@ impl Drop for Token {
     }
 }
 
-/// The descriptor owns the original DACL until it has been restored.
+/// A path's access list as it was before a test changed it. `dacl` points into
+/// the security descriptor held in `_descriptor`, so the descriptor is kept
+/// alive until the original access list has been written back to the path.
 pub struct SavedDacl {
     path: Vec<u16>,
     _descriptor: Allocation,

@@ -1169,10 +1169,11 @@ package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 expect_red = ["startup_tests::non_unicode_arguments_are_usage_refusals"]
 
-# The path_class call-site is cfg(windows), so Linux cannot compile or replay
-# it. The native windows_call_site_refuses_ambiguous_but_not_unc_paths test proves
-# ambiguous drive-relative/rooted-no-drive arguments are refused but UNC paths
-# are not refused by this usage guard.
+# No row for the Windows-only refusal in cli.rs `cli_path`, which rejects
+# drive-relative (`C:repo`) and rooted-no-drive (`\repo`) arguments. It is
+# cfg(windows), so Linux replays cannot compile it. The native Windows test
+# windows_call_site_refuses_ambiguous_but_not_unc_paths covers it, and shows
+# UNC paths are not refused.
 [[control]]
 id = "s1-path-classifier"
 guards = "The pure classifier distinguishes ambiguous Windows grammar on every OS"
@@ -1283,8 +1284,8 @@ expect_red = ["cli::retry_quote::tests::powershell_vectors"]
 
 # The Windows device_id FFI arm cannot be compiled by Linux mutation replays.
 # Native Windows proof: directory_device_ids_equal_the_volume_serial compares two
-# directories against the independent GetVolumeInformationW serial, rejecting a constant
-# device id (reviewed platform-support spec, acceptance item 12).
+# directories against the independent GetVolumeInformationW serial, so a
+# constant or wrong device id fails it.
 [[control]]
 id = "s2-home-component-matching"
 guards = "Home ancestry compares path components rather than string-prefix siblings"

@@ -151,7 +151,10 @@ fn reduce_homes(homes: SeedHomes<'_>) -> Result<Vec<String>, RegistryError> {
 
 fn is_home_scoped(root: &str, homes: &[String]) -> Result<bool, RegistryError> {
     let path = Path::new(root);
-    // A drive or share root contains its homes even when that volume is offline.
+    // A bare filesystem root (`/`, `C:\`, `\\server\share`) could contain any
+    // user's home, so it always counts as home-scoped. This is decided from the
+    // text alone, before canonicalizing, so it holds even for a drive or share
+    // that isn't mounted and can't be resolved.
     if path.has_root()
         && !path
             .components()
