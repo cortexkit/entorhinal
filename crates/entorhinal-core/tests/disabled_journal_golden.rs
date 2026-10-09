@@ -63,8 +63,11 @@ fn disabled_workload_matches_pre_identity_log_reply_and_journal_bytes() {
     };
     let store = RegistryStore::open(&descriptor).unwrap();
     let writer = store.with_principal("reserved:prefrontal-core");
-    let one = root.join("one").to_string_lossy().into_owned();
-    let two = root.join("two").to_string_lossy().into_owned();
+    let canonical =
+        |path: &Path| RegistryStore::canonical_mutation_root(path.to_str().unwrap()).unwrap();
+    let one = canonical(&root.join("one"));
+    let two = canonical(&root.join("two"));
+    let workspace = canonical(&root.join("workspace"));
     let mut replies = vec![
         writer
             .register(RegisterRequest {
@@ -88,7 +91,7 @@ fn disabled_workload_matches_pre_identity_log_reply_and_journal_bytes() {
         writer
             .set_workspace_root(SetWorkspaceRootRequest {
                 workspace_id: "W".into(),
-                root: Some(root.join("workspace").to_string_lossy().into()),
+                root: Some(workspace.clone()),
                 actor: Some("operator".into()),
                 request_key: Some("workspace-root".into()),
             })
@@ -110,7 +113,24 @@ fn disabled_workload_matches_pre_identity_log_reply_and_journal_bytes() {
         writer.approve_root(&one, "operator").unwrap(),
     ];
     let conn = Connection::open(root.join("store.db")).unwrap();
-    let mut replacements = vec![(root.to_string_lossy().into_owned(), "$ROOT".to_owned())];
+    // Replace complete JSON string encodings, not raw platform-dependent prefixes.
+    let mut replacements: Vec<(String, String)> = [
+        (one.clone(), "$ROOT/one"),
+        (two.clone(), "$ROOT/two"),
+        (workspace, "$ROOT/workspace"),
+        (
+            root.join("snapshot.db").to_str().unwrap().to_owned(),
+            "$ROOT/snapshot.db",
+        ),
+    ]
+    .into_iter()
+    .map(|(from, to)| {
+        (
+            serde_json::to_string(&from).unwrap(),
+            serde_json::to_string(to).unwrap(),
+        )
+    })
+    .collect();
     for (i, path) in [&one, &two].iter().enumerate() {
         let (incarnation, epoch): (String, String) = conn
             .query_row(

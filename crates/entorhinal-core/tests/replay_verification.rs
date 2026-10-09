@@ -41,7 +41,8 @@ impl Fixture {
             ));
         fs::create_dir_all(root.join("project")).unwrap();
         let root = fs::canonicalize(root).unwrap();
-        let project_root = root.join("project").to_string_lossy().into_owned();
+        let project_root =
+            RegistryStore::canonical_mutation_root(root.join("project").to_str().unwrap()).unwrap();
         let path = root.join("store.db");
         let store = RegistryStore::open(&StorageDescriptor {
             module_id: "entorhinal-replay-verification-test".into(),
@@ -64,7 +65,7 @@ impl Fixture {
         store
             .set_workspace_root(SetWorkspaceRootRequest {
                 workspace_id: "w-main".into(),
-                root: Some(root.to_string_lossy().into_owned()),
+                root: Some(RegistryStore::canonical_mutation_root(root.to_str().unwrap()).unwrap()),
                 ..Default::default()
             })
             .unwrap();

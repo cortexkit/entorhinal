@@ -1280,3 +1280,69 @@ runner = "cargo"
 package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 expect_red = ["cli::retry_quote::tests::powershell_vectors"]
+
+# The Windows device_id FFI arm cannot be compiled by Linux mutation replays.
+# Native Windows proof: directory_device_ids_equal_the_volume_serial compares two
+# directories against the independent GetVolumeInformationW serial, rejecting a constant
+# device id (reviewed platform-support spec, acceptance item 12).
+[[control]]
+id = "s2-home-component-matching"
+guards = "Home ancestry compares path components rather than string-prefix siblings"
+file = "crates/entorhinal-core/src/mutations.rs"
+old = "Path::new(home).starts_with(Path::new(&root))"
+new = "home.starts_with(&root) /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-core/src/mutations.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["mutations::path_identity_tests::home_matching_is_component_wise_and_keeps_xdg_homes"]
+
+[[control]]
+id = "s2-home-lexical-filesystem-root"
+guards = "Filesystem roots remain home-scoped even without reachable homes or volumes"
+file = "crates/entorhinal-core/src/mutations.rs"
+old = "if path.has_root()"
+new = "if false /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-core/src/mutations.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["mutations::path_identity_tests::lexical_filesystem_roots_are_home_scoped"]
+
+[[control]]
+id = "s2-seed-non-absolute"
+guards = "Seed roots cannot be interpreted relative to the daemon's current directory with either home flag"
+file = "crates/entorhinal-core/src/mutations.rs"
+old = "if !Path::new(&pair.canonical_root).is_absolute() {"
+new = "if false /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-core/src/mutations.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["mutations::path_identity_tests::seed_non_absolute_roots_are_skipped_with_either_flag"]
+
+[[control]]
+id = "s2-home-unreducible"
+guards = "An unreducible absolute home refuses the whole seed request before any journal write"
+file = "crates/entorhinal-core/src/mutations.rs"
+old = '.map_err(|error| domain("home_unreducible", format!("{home}: {error}")))'
+new = '.or_else(|_| Ok::<String, RegistryError>(home.to_owned())) /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-core/src/mutations.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["mutations::path_identity_tests::unreducible_home_refuses_before_any_journal_write"]
+platforms = ["linux"]
+
+[[control]]
+id = "s2-path-not-unicode-canonical"
+guards = "Strict mutation validation refuses non-Unicode canonical forms before lossy identity comparison"
+file = "crates/entorhinal-core/src/mutations.rs"
+old = "let value = super::unicode_path(&id.into_path_buf())?;"
+new = "let value = id.to_string(); /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-core/src/mutations.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["mutations::path_identity_tests::canonical_rejects_non_unicode_canonical_form"]
+platforms = ["linux"]

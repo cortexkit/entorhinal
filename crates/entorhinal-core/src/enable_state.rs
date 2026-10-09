@@ -637,7 +637,7 @@ mod tests {
         a.register(crate::RegisterRequest {
             project_id: Some("P".into()),
             name: "Project".into(),
-            roots: vec![root.to_string_lossy().into()],
+            roots: vec![RegistryStore::canonical_mutation_root(root.to_str().unwrap()).unwrap()],
             ..Default::default()
         })
         .unwrap();
@@ -687,7 +687,7 @@ mod tests {
             ],
         );
         b.attach_root(crate::AttachRootRequest {
-            path: checkout.to_string_lossy().into(),
+            path: RegistryStore::canonical_mutation_root(checkout.to_str().unwrap()).unwrap(),
             ..Default::default()
         })
         .unwrap();
@@ -699,7 +699,7 @@ mod tests {
             })
             .unwrap()
             .roots,
-            vec![checkout.to_string_lossy().to_string()]
+            vec![RegistryStore::canonical_mutation_root(checkout.to_str().unwrap()).unwrap()]
         );
         for path in [&root, &checkout] {
             std::fs::remove_file(path.join(".git/config")).unwrap();
@@ -718,7 +718,7 @@ mod tests {
             })
             .unwrap()
             .roots,
-            vec![root.to_string_lossy().to_string()]
+            vec![RegistryStore::canonical_mutation_root(root.to_str().unwrap()).unwrap()]
         );
         drop(a);
         drop(b);

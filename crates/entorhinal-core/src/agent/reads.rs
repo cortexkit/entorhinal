@@ -363,7 +363,8 @@ pub(super) mod tests {
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
         fs::create_dir_all(&root).unwrap();
-        let root = fs::canonicalize(root).unwrap();
+        let root =
+            PathBuf::from(RegistryStore::canonical_mutation_root(root.to_str().unwrap()).unwrap());
         let descriptor = StorageDescriptor {
             module_id: "agent-read-test".into(),
             storage_namespace: "test".into(),

@@ -1895,14 +1895,51 @@ mod tests {
         paths: Vec<String>,
     }
 
+    fn fixture_path(real: &str, path: &str) -> String {
+        let relative = Path::new(path).strip_prefix(real).unwrap();
+        let mut fake = "/fixture".to_owned();
+        for component in relative.components() {
+            fake.push('/');
+            fake.push_str(component.as_os_str().to_str().unwrap());
+        }
+        fake
+    }
+
+    fn json_string_contents(value: &str) -> String {
+        let encoded = serde_json::to_string(value).unwrap();
+        encoded[1..encoded.len() - 1].to_owned()
+    }
+
+    pub(super) fn normalize_paths(mut text: String, real: &str, paths: &[String]) -> String {
+        let mut replacements = Vec::new();
+        for path in paths {
+            let canonical = RegistryStore::canonical_query_path(Path::new(path))
+                .unwrap()
+                .0;
+            let fake = fixture_path(real, &canonical);
+            text = text.replace(
+                &implicit_project_id(&canonical),
+                &implicit_project_id(&fake),
+            );
+            for spelling in [path, &canonical] {
+                replacements.push((json_string_contents(spelling), json_string_contents(&fake)));
+            }
+        }
+        // Replace longer paths first so a parent cannot consume a nested path's prefix.
+        replacements.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
+        for (from, to) in replacements {
+            text = text.replace(&from, &to);
+        }
+        text.replace(
+            &json_string_contents(real),
+            &json_string_contents("/fixture"),
+        )
+    }
+
     impl Normalizer {
         fn apply(&self, value: &impl Serialize) -> String {
-            let mut text = serde_json::to_string_pretty(&json!({ "result": value })).unwrap();
-            for path in &self.paths {
-                let fake = path.replacen(&self.real, "/fixture", 1);
-                text = text.replace(&implicit_project_id(path), &implicit_project_id(&fake));
-            }
-            text.replace(&self.real, "/fixture") + "\n"
+            let text = serde_json::to_string_pretty(&json!({ "result": value })).unwrap();
+            normalize_paths(text, &self.real, &self.paths) + "\n"
         }
     }
 
@@ -1924,10 +1961,7 @@ mod tests {
     fn resolve_and_enumerate_replies_match_the_committed_goldens() {
         let mut f = Fixture::new("golden");
         f.store.use_sequential_ids();
-        let real = fs::canonicalize(&f.root)
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
+        let real = RegistryStore::canonical_mutation_root(f.root.to_str().unwrap()).unwrap();
         let home = repo(
             &f,
             "openai-auth",
@@ -2328,10 +2362,7 @@ mod root_membership_tests {
     #[test]
     fn attach_replies_match_the_committed_goldens() {
         let f = store("attach-golden");
-        let real = fs::canonicalize(&f.root)
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
+        let real = RegistryStore::canonical_mutation_root(f.root.to_str().unwrap()).unwrap();
         let home = repo(&f, "home", None);
         let other = repo(&f, "other", None);
         register(&f, "pj-home", home.clone());
@@ -2348,7 +2379,21 @@ mod root_membership_tests {
             container: container.clone(),
             actor: Some("prefrontal-core".into()),
         };
-        let normalize = |text: String| text.replace(&real, "/fixture");
+        let normalize = |text: String| {
+            super::tests::normalize_paths(
+                text,
+                &real,
+                &[
+                    home.clone(),
+                    other.clone(),
+                    container.clone(),
+                    format!("{container}/inner"),
+                    format!("{real}/worktrees-2"),
+                    format!("{real}/nowhere"),
+                    format!("{real}/missing-container"),
+                ],
+            )
+        };
         let mut files: Vec<(String, String)> = Vec::new();
         let pretty = |bytes: &[u8]| {
             let value: Value = serde_json::from_slice(bytes).unwrap();

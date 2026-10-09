@@ -122,44 +122,67 @@ fn default_true() -> bool {
     true
 }
 
-/// True when `root` is the user's home directory, an ancestor of it, or an
-/// ancestor-or-equal of an XDG config/data home. The XDG homes are consulted
-/// explicitly: when XDG_CONFIG_HOME or XDG_DATA_HOME points outside $HOME
-/// (containerized setups, custom layouts), a root containing them is still
-/// observation debris, not a project.
-fn is_home_scoped(root: &str) -> bool {
-    is_home_scoped_against(
-        root,
-        std::env::var("HOME").ok().as_deref(),
-        std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
-        std::env::var("XDG_DATA_HOME").ok().as_deref(),
-    )
+/// Caller-supplied home paths; no defaults or process environment reads occur here.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SeedHomes<'a> {
+    pub home: Option<&'a str>,
+    pub userprofile: Option<&'a str>,
+    pub xdg_config: Option<&'a str>,
+    pub xdg_data: Option<&'a str>,
 }
 
-/// Env-injected core of the guard, so tests exercise relocated-XDG layouts
-/// without process-global env mutation (which races parallel tests).
+fn reduce_homes(homes: SeedHomes<'_>) -> Result<Vec<String>, RegistryError> {
+    [
+        homes.home,
+        homes.userprofile,
+        homes.xdg_config,
+        homes.xdg_data,
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|home| !home.is_empty() && Path::new(home).is_absolute())
+    .map(|home| {
+        RegistryStore::canonical_query_path(Path::new(home))
+            .map(|(path, _)| path)
+            .map_err(|error| domain("home_unreducible", format!("{home}: {error}")))
+    })
+    .collect()
+}
+
+fn is_home_scoped(root: &str, homes: &[String]) -> Result<bool, RegistryError> {
+    let path = Path::new(root);
+    // A drive or share root contains its homes even when that volume is offline.
+    if path.has_root()
+        && !path
+            .components()
+            .any(|c| matches!(c, std::path::Component::Normal(_)))
+    {
+        return Ok(true);
+    }
+    let (root, _) = RegistryStore::canonical_query_path(path)?;
+    Ok(homes
+        .iter()
+        .any(|home| Path::new(home).starts_with(Path::new(&root))))
+}
+
+/// Test-only home-scope check accepting caller-supplied HOME, USERPROFILE and XDG homes.
+#[cfg(test)]
 fn is_home_scoped_against(
     root: &str,
     home: Option<&str>,
+    userprofile: Option<&str>,
     xdg_config: Option<&str>,
     xdg_data: Option<&str>,
-) -> bool {
-    let root_trimmed = root.trim_end_matches('/');
-    if root_trimmed.is_empty() {
-        // Filesystem root contains everything, including the homes.
-        return true;
-    }
-    let ancestor_or_equal = |target: &str| -> bool {
-        let target = target.trim_end_matches('/');
-        if target.is_empty() {
-            return false;
-        }
-        root_trimmed == target || target.starts_with(&format!("{root_trimmed}/"))
-    };
-    [home, xdg_config, xdg_data]
-        .into_iter()
-        .flatten()
-        .any(ancestor_or_equal)
+) -> Result<bool, RegistryError> {
+    is_home_scoped(
+        root,
+        &reduce_homes(SeedHomes {
+            home,
+            userprofile,
+            xdg_config,
+            xdg_data,
+        })?,
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -277,7 +300,7 @@ fn reserved(id: &str) -> bool {
 pub(crate) fn canonical(raw: &str) -> Result<String, RegistryError> {
     match ProjectRootId::from_path(raw) {
         Ok(id) => {
-            let value = id.to_string();
+            let value = super::unicode_path(&id.into_path_buf())?;
             if value != raw {
                 return Err(domain(
                     "not_canonical",
@@ -958,40 +981,90 @@ impl super::JournalWriter<'_> {
 
     pub fn seed_import_at(
         &self,
+        req: SeedImportRequest,
+        now: i64,
+    ) -> Result<Vec<u8>, RegistryError> {
+        let home = std::env::var("HOME").ok();
+        let userprofile = std::env::var("USERPROFILE").ok();
+        let xdg_config = std::env::var("XDG_CONFIG_HOME").ok();
+        let xdg_data = std::env::var("XDG_DATA_HOME").ok();
+        self.seed_import_at_against(
+            req,
+            now,
+            SeedHomes {
+                home: home.as_deref(),
+                userprofile: userprofile.as_deref(),
+                xdg_config: xdg_config.as_deref(),
+                xdg_data: xdg_data.as_deref(),
+            },
+        )
+    }
+
+    pub fn seed_import_at_against(
+        &self,
         mut req: SeedImportRequest,
         now: i64,
+        homes: SeedHomes<'_>,
     ) -> Result<Vec<u8>, RegistryError> {
         if req.source != "mc" {
             return Err(domain("invalid_source", &req.source));
         }
+        // Validate every consulted home before planning any journal or projection write.
+        let homes = if req.exclude_home_scoped {
+            reduce_homes(homes)?
+        } else {
+            Vec::new()
+        };
         // Seeds import HISTORICAL topology: roots that no longer exist on disk
         // are skipped with per-root provenance (spec §10 rule 1), unlike live
         // mutations where existence-at-registration rejects. The journal payload
         // records survivors only, so rebuild never depends on disk state.
         let mut missing: Vec<SeedPair> = Vec::new();
+        let mut canonicalization_failed: Vec<SeedPair> = Vec::new();
         let mut home_scoped: Vec<SeedPair> = Vec::new();
         let mut surviving = Vec::with_capacity(req.payload.pairs.len());
         for mut pair in std::mem::take(&mut req.payload.pairs) {
-            if req.exclude_home_scoped && is_home_scoped(&pair.canonical_root) {
-                home_scoped.push(pair);
+            if !Path::new(&pair.canonical_root).is_absolute() {
+                canonicalization_failed.push(pair);
                 continue;
+            }
+            if req.exclude_home_scoped {
+                match is_home_scoped(&pair.canonical_root, &homes) {
+                    Ok(true) => {
+                        home_scoped.push(pair);
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(_) => {
+                        canonicalization_failed.push(pair);
+                        continue;
+                    }
+                }
             }
             // Seeds are historically OBSERVED path strings, not caller input:
             // the module canonicalizes them itself (case drift on APFS, symlink
             // components). I6's strict canonical-input equality applies to live
             // mutations only.
             match ProjectRootId::from_path(&pair.canonical_root) {
-                Ok(id) => {
-                    pair.canonical_root = id.to_string();
-                    surviving.push(pair);
-                }
+                Ok(id) => match super::unicode_path(&id.into_path_buf()) {
+                    Ok(root) => {
+                        pair.canonical_root = root;
+                        surviving.push(pair);
+                    }
+                    Err(_) => canonicalization_failed.push(pair),
+                },
                 Err(IdentityError::NonExistentPath { .. }) => {
                     missing.push(pair);
                 }
-                Err(error) => return Err(domain("not_canonical", error.to_string())),
+                Err(_) => canonicalization_failed.push(pair),
             }
         }
         req.payload.pairs = surviving;
+        canonicalization_failed.sort_by(|a, b| {
+            a.mc_identity
+                .cmp(&b.mc_identity)
+                .then(a.canonical_root.cmp(&b.canonical_root))
+        });
         missing.sort_by(|a, b| {
             a.mc_identity
                 .cmp(&b.mc_identity)
@@ -1027,6 +1100,7 @@ impl super::JournalWriter<'_> {
             let mut report=Vec::new(); let mut groups:BTreeMap<String,Vec<SeedPair>>=BTreeMap::new();
             let mut mappings = Vec::new();
             for p in &missing {report.push(SeedReportEntry{kind:"skipped".into(),mc_identity:Some(p.mc_identity.clone()),canonical_root:Some(p.canonical_root.clone()),project_id:None,owner_project_id:None,new_project_id:None,roots:None,reason:Some("missing".into())});}
+            for p in &canonicalization_failed {report.push(SeedReportEntry{kind:"skipped".into(),mc_identity:Some(p.mc_identity.clone()),canonical_root:Some(p.canonical_root.clone()),project_id:None,owner_project_id:None,new_project_id:None,roots:None,reason:Some("canonicalization_failed".into())});}
             for p in &home_scoped {report.push(SeedReportEntry{kind:"skipped".into(),mc_identity:Some(p.mc_identity.clone()),canonical_root:Some(p.canonical_root.clone()),project_id:None,owner_project_id:None,new_project_id:None,roots:None,reason:Some("home_scoped".into())});}
             let mut by_root:BTreeMap<String,Vec<SeedPair>>=BTreeMap::new(); for p in &req.payload.pairs {by_root.entry(p.canonical_root.clone()).or_default().push(p.clone());}
             for (root, rows) in &by_root { let has_git=rows.iter().any(|p|p.identity_class.as_deref()==Some("git")||p.mc_identity.starts_with("git:")); let mut identities=BTreeSet::new(); for p in rows {if has_git&&p.identity_class.as_deref()==Some("dir"){report.push(SeedReportEntry{kind:"identity_class_precedence".into(),mc_identity:Some(p.mc_identity.clone()),canonical_root:Some(root.clone()),project_id:None,owner_project_id:None,new_project_id:None,roots:None,reason:Some("git identity wins".into())});}else{identities.insert(p.mc_identity.clone());}} if identities.len()>1 {for id in identities {report.push(SeedReportEntry{kind:"conflicted".into(),mc_identity:Some(id),canonical_root:Some(root.clone()),project_id:None,owner_project_id:None,new_project_id:None,roots:None,reason:Some("one root observed under multiple identities".into())});}} else if let Some(id)=identities.into_iter().next(){groups.entry(id).or_default().extend(rows.iter().filter(|p|!has_git||p.identity_class.as_deref()!=Some("dir")).cloned());}}
@@ -2092,14 +2166,19 @@ mod agent_lifecycle_tests {
                 ..Default::default()
             };
             f.store
-                .seed_import(SeedImportRequest {
-                    source: "mc".into(),
-                    payload: SeedPayload {
-                        pairs: vec![first.clone()],
+                .with_principal("entorhinal")
+                .seed_import_at_against(
+                    SeedImportRequest {
+                        source: "mc".into(),
+                        payload: SeedPayload {
+                            pairs: vec![first.clone()],
+                            ..Default::default()
+                        },
                         ..Default::default()
                     },
-                    ..Default::default()
-                })
+                    10,
+                    crate::SeedHomes::default(),
+                )
                 .unwrap();
             let id = import_bound(&f, role, &project, "W1");
             let req = SeedImportRequest {
@@ -2132,10 +2211,17 @@ mod agent_lifecycle_tests {
                 ..Default::default()
             };
             refused(&f, || {
-                f.store.with_principal("direct").seed_import(req.clone())
+                f.store.with_principal("direct").seed_import_at_against(
+                    req.clone(),
+                    10,
+                    SeedHomes::default(),
+                )
             });
             dispose(&f, &id);
-            f.store.seed_import(req).unwrap();
+            f.store
+                .with_principal("entorhinal")
+                .seed_import_at_against(req, 10, crate::SeedHomes::default())
+                .unwrap();
             assert_eq!(
                 f.store
                     .read(|conn| conn.query_row(
@@ -2212,18 +2298,23 @@ mod agent_lifecycle_tests {
             };
             if op == "seed_import" {
                 f.store
-                    .seed_import(SeedImportRequest {
-                        source: "mc".into(),
-                        payload: SeedPayload {
-                            pairs: vec![SeedPair {
-                                canonical_root: f.dir("initial"),
-                                mc_identity: "git:bound".into(),
+                    .with_principal("entorhinal")
+                    .seed_import_at_against(
+                        SeedImportRequest {
+                            source: "mc".into(),
+                            payload: SeedPayload {
+                                pairs: vec![SeedPair {
+                                    canonical_root: f.dir("initial"),
+                                    mc_identity: "git:bound".into(),
+                                    ..Default::default()
+                                }],
                                 ..Default::default()
-                            }],
+                            },
                             ..Default::default()
                         },
-                        ..Default::default()
-                    })
+                        10,
+                        crate::SeedHomes::default(),
+                    )
                     .unwrap();
             } else {
                 placed(&f, &project, (op == "remove-workspace").then_some("W1"));
@@ -2287,10 +2378,7 @@ pub(crate) mod tests {
         pub(crate) fn dir(&self, name: &str) -> String {
             let path = self.root.join(name);
             fs::create_dir_all(&path).unwrap();
-            fs::canonicalize(path)
-                .unwrap()
-                .to_string_lossy()
-                .into_owned()
+            RegistryStore::canonical_mutation_root(path.to_str().unwrap()).unwrap()
         }
     }
     impl Drop for Fixture {
@@ -2633,8 +2721,16 @@ pub(crate) mod tests {
             },
             ..Default::default()
         };
-        let first = f.store.seed_import(request.clone()).unwrap();
-        let second = f.store.seed_import(request).unwrap();
+        let first = f
+            .store
+            .with_principal("entorhinal")
+            .seed_import_at_against(request.clone(), 10, crate::SeedHomes::default())
+            .unwrap();
+        let second = f
+            .store
+            .with_principal("entorhinal")
+            .seed_import_at_against(request, 10, crate::SeedHomes::default())
+            .unwrap();
         assert!(result(&first)["report"].is_array());
         assert!(result(&second)["report"].is_array());
         assert_eq!(result(&second)["noop"], true);
@@ -2801,10 +2897,7 @@ mod adversarial_tests {
         let tree = f.dir("tree");
         let child = PathBuf::from(&tree).join("child");
         fs::create_dir_all(&child).unwrap();
-        let child = fs::canonicalize(child)
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
+        let child = RegistryStore::canonical_mutation_root(child.to_str().unwrap()).unwrap();
         f.store
             .register(RegisterRequest {
                 project_id: Some("foreign".into()),
@@ -2882,8 +2975,12 @@ mod adversarial_tests {
 
     #[test]
     fn seed_import_home_guard_excludes_by_default_and_flag_disables() {
-        let home = std::env::var("HOME").unwrap();
         let f = Fixture::new("seed-home");
+        let home = f.dir("home");
+        let homes = SeedHomes {
+            home: Some(&home),
+            ..Default::default()
+        };
         let live = f.dir("normal-project");
         let build = |exclude: bool| SeedImportRequest {
             source: "mc".into(),
@@ -2909,7 +3006,11 @@ mod adversarial_tests {
             },
         };
         // Default: $HOME row skips with home_scoped provenance, normal row mints.
-        let out = f.store.seed_import(build(true)).unwrap();
+        let out = f
+            .store
+            .with_principal("entorhinal")
+            .seed_import_at_against(build(true), 10, homes)
+            .unwrap();
         let v = result(&out);
         let entries = v["report"].as_array().unwrap();
         assert!(
@@ -2923,7 +3024,11 @@ mod adversarial_tests {
         assert!(gone.gone, "$HOME group must not mint under the guard");
         // Contrastive: guard off (stress runs) imports the row.
         let f2 = Fixture::new("seed-home-off");
-        let out2 = f2.store.seed_import(build(false)).unwrap();
+        let out2 = f2
+            .store
+            .with_principal("entorhinal")
+            .seed_import_at_against(build(false), 10, homes)
+            .unwrap();
         let v2 = result(&out2);
         assert!(
             !v2["report"]
@@ -2944,35 +3049,40 @@ mod adversarial_tests {
         let dead = format!("{}/long-gone-worktree", f.root.display());
         let out = f
             .store
-            .seed_import(SeedImportRequest {
-                source: "mc".into(),
-                request_key: None,
-                actor: None,
-                exclude_home_scoped: true,
-                payload: SeedPayload {
-                    pairs: vec![
-                        SeedPair {
-                            canonical_root: live.clone(),
-                            mc_identity: "git:aaaa".into(),
-                            identity_class: Some("git".into()),
-                            ..Default::default()
-                        },
-                        SeedPair {
-                            canonical_root: dead.clone(),
-                            mc_identity: "git:aaaa".into(),
-                            identity_class: Some("git".into()),
-                            ..Default::default()
-                        },
-                        SeedPair {
-                            canonical_root: format!("{dead}-2"),
-                            mc_identity: "git:bbbb".into(),
-                            identity_class: Some("git".into()),
-                            ..Default::default()
-                        },
-                    ],
-                    ..Default::default()
+            .with_principal("entorhinal")
+            .seed_import_at_against(
+                SeedImportRequest {
+                    source: "mc".into(),
+                    request_key: None,
+                    actor: None,
+                    exclude_home_scoped: true,
+                    payload: SeedPayload {
+                        pairs: vec![
+                            SeedPair {
+                                canonical_root: live.clone(),
+                                mc_identity: "git:aaaa".into(),
+                                identity_class: Some("git".into()),
+                                ..Default::default()
+                            },
+                            SeedPair {
+                                canonical_root: dead.clone(),
+                                mc_identity: "git:aaaa".into(),
+                                identity_class: Some("git".into()),
+                                ..Default::default()
+                            },
+                            SeedPair {
+                                canonical_root: format!("{dead}-2"),
+                                mc_identity: "git:bbbb".into(),
+                                identity_class: Some("git".into()),
+                                ..Default::default()
+                            },
+                        ],
+                        ..Default::default()
+                    },
                 },
-            })
+                10,
+                crate::SeedHomes::default(),
+            )
             .unwrap();
         let v = result(&out);
         let entries = v["report"].as_array().unwrap();
@@ -3054,7 +3164,12 @@ mod adversarial_tests {
             },
             ..Default::default()
         };
-        let out = result(&f.store.seed_import(request).unwrap());
+        let out = result(
+            &f.store
+                .with_principal("entorhinal")
+                .seed_import_at_against(request, 10, crate::SeedHomes::default())
+                .unwrap(),
+        );
         let kinds = out["report"]
             .as_array()
             .unwrap()
@@ -3190,32 +3305,6 @@ mod audit_fix_tests {
             replayed["result"], registered["result"],
             "same-op replay must serve the cached reply byte-for-byte"
         );
-    }
-
-    /// Audit finding (sol C4): the home guard's contract is XDG-aware. An
-    /// explicitly relocated XDG home outside $HOME must still be guarded.
-    #[test]
-    fn home_guard_consults_relocated_xdg_homes() {
-        let check = |root: &str| {
-            is_home_scoped_against(root, Some("/Users/u"), Some("/srv/xdg/config"), None)
-        };
-        // Ancestor-or-equal of the relocated XDG config home: guarded.
-        assert!(check("/srv/xdg"));
-        assert!(check("/srv/xdg/config"));
-        // Unrelated path outside both trees: admitted.
-        assert!(!check("/srv/projects/app"));
-        // $HOME and its ancestors remain guarded; filesystem root always.
-        assert!(check("/Users/u"));
-        assert!(check("/Users"));
-        assert!(check("/"));
-        // A CHILD of the XDG home is not an ancestor: admitted (matches the
-        // $HOME semantics where only home itself and ancestors guard).
-        assert!(!is_home_scoped_against(
-            "/srv/xdg/config/app",
-            Some("/Users/u"),
-            Some("/srv/xdg/config"),
-            None
-        ));
     }
 }
 
@@ -3506,11 +3595,16 @@ mod project_replay_tests {
     fn seed(f: &Fixture, payload: SeedPayload) -> Value {
         result(
             &f.store
-                .seed_import(SeedImportRequest {
-                    source: "mc".into(),
-                    payload,
-                    ..Default::default()
-                })
+                .with_principal("entorhinal")
+                .seed_import_at_against(
+                    SeedImportRequest {
+                        source: "mc".into(),
+                        payload,
+                        ..Default::default()
+                    },
+                    10,
+                    crate::SeedHomes::default(),
+                )
                 .unwrap(),
         )
     }
@@ -4059,5 +4153,312 @@ mod project_replay_tests {
             ])
         );
         assert_rebuild_preserves_projection(&f);
+    }
+}
+
+#[cfg(test)]
+mod path_identity_tests {
+    use super::tests::{result, Fixture};
+    use super::*;
+    use std::fs;
+
+    fn homes(home: &str) -> SeedHomes<'_> {
+        SeedHomes {
+            home: Some(home),
+            ..Default::default()
+        }
+    }
+
+    fn request(roots: &[&str], exclude_home_scoped: bool) -> SeedImportRequest {
+        SeedImportRequest {
+            source: "mc".into(),
+            exclude_home_scoped,
+            payload: SeedPayload {
+                pairs: roots
+                    .iter()
+                    .enumerate()
+                    .map(|(i, root)| SeedPair {
+                        canonical_root: (*root).into(),
+                        mc_identity: format!("dir:{i}"),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn check(root: &str, homes: SeedHomes<'_>) -> bool {
+        is_home_scoped_against(
+            root,
+            homes.home,
+            homes.userprofile,
+            homes.xdg_config,
+            homes.xdg_data,
+        )
+        .unwrap()
+    }
+
+    fn reason(f: &Fixture, root: &str, homes: SeedHomes<'_>) -> String {
+        let bytes = f
+            .store
+            .with_principal("entorhinal")
+            .seed_import_at_against(request(&[root], true), 10, homes)
+            .unwrap();
+        result(&bytes)["report"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    #[test]
+    fn home_matching_is_component_wise_and_keeps_xdg_homes() {
+        let f = Fixture::new("home-components");
+        let home = f.dir("home");
+        let config = f.dir("relocated/config");
+        let data = f.dir("other/data");
+        let homes = SeedHomes {
+            home: Some(&home),
+            xdg_config: Some(&config),
+            xdg_data: Some(&data),
+            ..Default::default()
+        };
+        for root in [&home, &config, &data, f.root.to_str().unwrap()] {
+            assert!(check(root, homes), "ancestor {root}");
+        }
+        for root in [
+            format!("{home}-other"),
+            format!("{config}-sibling"),
+            format!("{data}-other"),
+            format!("{home}/child"),
+            f.root.join("relocat").to_str().unwrap().to_owned(),
+        ] {
+            assert!(!check(&root, homes), "not an ancestor {root}");
+        }
+        assert_eq!(reason(&f, &home, homes), "home_scoped");
+        assert!(!check(
+            &home,
+            SeedHomes {
+                home: Some(""),
+                ..Default::default()
+            }
+        ));
+        assert!(!check(
+            &home,
+            SeedHomes {
+                home: Some("relative/home"),
+                ..Default::default()
+            }
+        ));
+        assert!(
+            !check("", SeedHomes::default()),
+            "an empty string is not a filesystem root"
+        );
+    }
+
+    #[test]
+    fn lexical_filesystem_roots_are_home_scoped() {
+        #[cfg(unix)]
+        let roots = ["/"];
+        #[cfg(windows)]
+        let roots = [r"C:\", r"D:\", r"\\server\share", r"\\?\C:\"];
+        for root in roots {
+            assert!(check(root, SeedHomes::default()), "lexical root {root}");
+            let f = Fixture::new("lexical-root");
+            assert_eq!(reason(&f, root, SeedHomes::default()), "home_scoped");
+        }
+    }
+
+    #[test]
+    fn missing_roots_match_only_home_ancestors() {
+        let f = Fixture::new("home-missing");
+        let ancestor = f.root.join("historical");
+        let home = ancestor.join("home");
+        let other = f.root.join("no/such/historical");
+        let homes = homes(home.to_str().unwrap());
+        assert!(check(ancestor.to_str().unwrap(), homes));
+        assert!(!check(other.to_str().unwrap(), homes));
+        assert_eq!(reason(&f, ancestor.to_str().unwrap(), homes), "home_scoped");
+        assert_eq!(reason(&f, other.to_str().unwrap(), homes), "missing");
+    }
+
+    fn symlink_dir(target: &Path, link: &Path, test: &str) -> bool {
+        #[cfg(unix)]
+        let outcome = std::os::unix::fs::symlink(target, link);
+        #[cfg(windows)]
+        let outcome = std::os::windows::fs::symlink_dir(target, link);
+        if let Err(error) = outcome {
+            #[cfg(unix)]
+            panic!("{test}: symlink failed: {error}");
+            #[cfg(windows)]
+            {
+                eprintln!("SKIP {test}: cannot create directory symlink: {error}");
+                return false;
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn home_guard_reduces_symlink_aliases() {
+        let f = Fixture::new("home-symlink");
+        let home = f.dir("real/home");
+        let alias = f.root.join("alias");
+        if !symlink_dir(
+            Path::new(&home),
+            &alias,
+            "home_guard_reduces_symlink_aliases",
+        ) {
+            return;
+        }
+        let alias = alias.to_str().unwrap();
+        assert!(check(alias, homes(&home)));
+        assert!(check(&home, homes(alias)));
+        assert_eq!(reason(&f, alias, homes(&home)), "home_scoped");
+    }
+
+    #[test]
+    fn home_guard_reduces_case_aliases_when_supported() {
+        let f = Fixture::new("home-case");
+        let home = f.dir("A");
+        let alias = f.root.join("a");
+        if let Err(error) = fs::read_dir(&alias) {
+            eprintln!("SKIP home_guard_reduces_case_aliases_when_supported: filesystem is case-sensitive ({error})");
+            return;
+        }
+        assert!(check(alias.to_str().unwrap(), homes(&home)));
+        assert_eq!(
+            reason(&f, alias.to_str().unwrap(), homes(&home)),
+            "home_scoped"
+        );
+    }
+
+    #[test]
+    fn seed_non_absolute_roots_are_skipped_with_either_flag() {
+        let f = Fixture::new("seed-relative");
+        let existing = fs::read_dir(".")
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|entry| entry.file_type().unwrap().is_dir())
+            .unwrap()
+            .file_name()
+            .into_string()
+            .unwrap();
+        assert!(Path::new(&existing).is_dir());
+        for exclude in [false, true] {
+            let req = request(&["", ".", "..", "C:", &existing], exclude);
+            let bytes = f
+                .store
+                .with_principal("entorhinal")
+                .seed_import_at_against(req, 10, SeedHomes::default())
+                .unwrap();
+            let report = result(&bytes);
+            let report = report["report"].as_array().unwrap();
+            assert_eq!(report.len(), 5);
+            assert!(
+                report.iter().all(|entry| entry["kind"] == "skipped"
+                    && entry["reason"] == "canonicalization_failed"),
+                "{report:?}"
+            );
+            assert!(f.store.enumerate(None).unwrap().projects.is_empty());
+            assert_eq!(f.store.generation().unwrap(), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seed_root_reduction_error_is_canonicalization_failure() {
+        let f = Fixture::new("seed-loop");
+        let link = f.root.join("loop");
+        std::os::unix::fs::symlink(&link, &link).unwrap();
+        assert_eq!(
+            reason(&f, link.to_str().unwrap(), SeedHomes::default()),
+            "canonicalization_failed"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn unicode_symlink(f: &Fixture, test: &str) -> Option<String> {
+        use std::os::unix::ffi::OsStringExt;
+        let bad = f.root.join(std::ffi::OsString::from_vec(vec![0xff]));
+        if let Err(error) = fs::create_dir(&bad) {
+            eprintln!("SKIP {test}: filesystem refuses byte 0xff: {error}");
+            return None;
+        }
+        let link = f.root.join("unicode-link");
+        std::os::unix::fs::symlink(&bad, &link).unwrap();
+        Some(link.to_str().unwrap().to_owned())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unreducible_home_refuses_before_any_journal_write() {
+        let f = Fixture::new("home-unicode");
+        let Some(home) = unicode_symlink(&f, "unreducible_home_refuses_before_any_journal_write")
+        else {
+            return;
+        };
+        let root = f.dir("candidate");
+        assert_eq!(f.store.generation().unwrap(), 0);
+        let req = request(&[f.root.to_str().unwrap()], true);
+        let error = f
+            .store
+            .with_principal("entorhinal")
+            .seed_import_at_against(req, 10, homes(&home))
+            .unwrap_err();
+        assert!(error.to_string().starts_with("home_unreducible"), "{error}");
+        assert!(
+            error.to_string().contains(&home) && error.to_string().contains("path_not_unicode")
+        );
+        assert_eq!(f.store.generation().unwrap(), 0);
+        assert!(f.store.enumerate(None).unwrap().projects.is_empty());
+        f.store
+            .with_principal("entorhinal")
+            .seed_import_at_against(request(&[&root], false), 10, homes(&home))
+            .unwrap();
+        assert_eq!(f.store.enumerate(None).unwrap().projects.len(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn canonical_rejects_non_unicode_canonical_form() {
+        let f = Fixture::new("canonical-unicode");
+        let Some(root) = unicode_symlink(&f, "canonical_rejects_non_unicode_canonical_form") else {
+            return;
+        };
+        for error in [
+            canonical(&root).unwrap_err(),
+            RegistryStore::canonical_mutation_root(&root).unwrap_err(),
+            RegistryStore::canonical_query_path(Path::new(&root)).unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("path_not_unicode"), "{error}");
+        }
+        assert_eq!(
+            reason(&f, &root, SeedHomes::default()),
+            "canonicalization_failed"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn home_guard_consults_userprofile_and_other_volume_roots() {
+        let f = Fixture::new("userprofile");
+        let profile = f.dir("profiles/user");
+        let homes = SeedHomes {
+            userprofile: Some(&profile),
+            ..Default::default()
+        };
+        assert!(check(f.root.to_str().unwrap(), homes));
+        assert_eq!(reason(&f, f.root.to_str().unwrap(), homes), "home_scoped");
+        for root in [r"C:\", r"D:\", r"\\server\share"] {
+            assert!(check(
+                root,
+                SeedHomes {
+                    home: Some(r"C:\Users\user"),
+                    ..Default::default()
+                }
+            ));
+        }
     }
 }

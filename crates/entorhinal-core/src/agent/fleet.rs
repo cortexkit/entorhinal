@@ -109,18 +109,15 @@ mod tests {
         let a = f.root.join("a-root");
         std::fs::create_dir_all(&z).unwrap();
         std::fs::create_dir_all(&a).unwrap();
-        let a_root = std::fs::canonicalize(&a)
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
+        let a_root = crate::RegistryStore::canonical_mutation_root(a.to_str().unwrap()).unwrap();
         f.store
             .register(RegisterRequest {
                 project_id: Some("P".into()),
                 name: "Project".into(),
                 workspace_id: Some("W2".into()),
                 roots: vec![
-                    z.to_string_lossy().into_owned(),
-                    a.to_string_lossy().into_owned(),
+                    crate::RegistryStore::canonical_mutation_root(z.to_str().unwrap()).unwrap(),
+                    a_root.clone(),
                 ],
                 ..Default::default()
             })

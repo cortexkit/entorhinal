@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 //! Domain logic and persistence for the fleet project/workspace registry.
 //!
@@ -579,7 +579,8 @@ impl RegistryStore {
     }
 
     /// Reduce a query path, canonicalizing its existing prefix while preserving
-    /// the spelling of missing tail components. The boolean reports existence.
+    /// the caller's spelling of missing tail components, without case folding
+    /// those components even on a case-insensitive filesystem. The boolean reports existence.
     pub fn canonical_query_path(path: &Path) -> Result<(String, bool), RegistryError> {
         canonical_query_path(path)
     }
@@ -938,7 +939,10 @@ fn hex_prefix(bytes: &[u8]) -> String {
 
 fn canonical_query_path(path: &Path) -> Result<(String, bool), RegistryError> {
     let lexical = lexical_absolute(path)?;
-    if lexical.exists() {
+    if lexical
+        .try_exists()
+        .map_err(|error| RegistryError::Path(error.to_string()))?
+    {
         let canonical = ProjectRootId::from_path(&lexical)
             .map_err(|error| RegistryError::Path(error.to_string()))?;
         return Ok((unicode_path(&canonical.into_path_buf())?, true));
@@ -946,7 +950,10 @@ fn canonical_query_path(path: &Path) -> Result<(String, bool), RegistryError> {
 
     let mut probe = lexical.clone();
     let mut missing_components = Vec::new();
-    while !probe.exists() {
+    while !probe
+        .try_exists()
+        .map_err(|error| RegistryError::Path(error.to_string()))?
+    {
         let Some(component) = probe.file_name().map(|value| value.to_os_string()) else {
             break;
         };
@@ -956,7 +963,10 @@ fn canonical_query_path(path: &Path) -> Result<(String, bool), RegistryError> {
         }
     }
 
-    if probe.exists() {
+    if probe
+        .try_exists()
+        .map_err(|error| RegistryError::Path(error.to_string()))?
+    {
         let existing = ProjectRootId::from_path(&probe)
             .map_err(|error| RegistryError::Path(error.to_string()))?;
         let mut canonical = existing.into_path_buf();
@@ -1023,7 +1033,26 @@ fn device_id(path: &Path) -> Option<u64> {
     std::fs::metadata(path).ok().map(|metadata| metadata.dev())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+// Windows exposes directory volume identity only through its handle-based FFI.
+#[allow(unsafe_code)]
+fn device_id(path: &Path) -> Option<u64> {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
+    };
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .ok()?;
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // The owned file keeps the directory handle valid for this metadata read.
+    let succeeded = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) };
+    (succeeded != 0).then_some(u64::from(information.dwVolumeSerialNumber))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn device_id(_path: &Path) -> Option<u64> {
     None
 }
@@ -1409,5 +1438,129 @@ mod tests {
                 Ok(())
             })
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod path_identity_tests {
+    use super::*;
+    use crate::mutations::tests::Fixture;
+
+    #[test]
+    fn missing_query_tail_preserves_the_callers_case() {
+        let f = Fixture::new("query-case");
+        let prefix = f.dir("MiXeD");
+        let path = Path::new(&prefix).join("mIxEdMissing").join("TaIl");
+        let (reduced, exists) = RegistryStore::canonical_query_path(&path).unwrap();
+        assert!(!exists);
+        assert_eq!(Path::new(&reduced), path);
+        let (existing, exists) = RegistryStore::canonical_query_path(Path::new(&prefix)).unwrap();
+        assert!(exists);
+        assert_eq!(existing, prefix);
+    }
+
+    #[test]
+    fn missing_query_tail_canonicalizes_its_existing_symlink_prefix() {
+        let f = Fixture::new("query-symlink");
+        let prefix = f.dir("real");
+        let alias = f.root.join("alias");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&prefix, &alias).unwrap();
+        #[cfg(windows)]
+        if let Err(error) = std::os::windows::fs::symlink_dir(&prefix, &alias) {
+            eprintln!("SKIP missing_query_tail_canonicalizes_its_existing_symlink_prefix: {error}");
+            return;
+        }
+        let path = alias.join("MiSsInG").join("TaIl");
+        let (reduced, exists) = RegistryStore::canonical_query_path(&path).unwrap();
+        assert!(!exists);
+        assert_eq!(
+            Path::new(&reduced),
+            Path::new(&prefix).join("MiSsInG").join("TaIl")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_mutation_input_is_still_refused_as_not_canonical() {
+        let f = Fixture::new("verbatim");
+        let canonical = f.dir("root");
+        let verbatim = std::fs::canonicalize(&canonical).unwrap();
+        assert_ne!(verbatim.to_str().unwrap(), canonical);
+        let error = f
+            .store
+            .register(RegisterRequest {
+                name: "verbatim".into(),
+                roots: vec![verbatim.to_str().unwrap().into()],
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(error.to_string().starts_with("not_canonical"), "{error}");
+    }
+
+    #[cfg(windows)]
+    #[allow(unsafe_code)]
+    fn volume_serial(path: &Path) -> u64 {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{GetVolumeInformationW, GetVolumePathNameW};
+        let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut volume = vec![0u16; 32768];
+        assert_ne!(
+            unsafe { GetVolumePathNameW(path.as_ptr(), volume.as_mut_ptr(), volume.len() as u32) },
+            0,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+        let mut serial = 0;
+        assert_ne!(
+            unsafe {
+                GetVolumeInformationW(
+                    volume.as_ptr(),
+                    std::ptr::null_mut(),
+                    0,
+                    &mut serial,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                )
+            },
+            0,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+        u64::from(serial)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn directory_device_ids_equal_the_volume_serial() {
+        let f = Fixture::new("volume");
+        let a = f.dir("a");
+        let b = f.dir("b");
+        let serial = volume_serial(Path::new(&a));
+        assert_eq!(device_id(Path::new(&a)), Some(serial));
+        assert_eq!(device_id(Path::new(&b)), Some(serial));
+    }
+
+    /// On Windows set CK_TEST_VOLUME_A and CK_TEST_VOLUME_B to existing directories
+    /// on different volumes, then run `cargo test --workspace --all-targets --locked
+    /// directory_device_ids_differ_across_volumes -- --ignored`.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires two independently mounted volumes"]
+    fn directory_device_ids_differ_across_volumes() {
+        let a = std::env::var_os("CK_TEST_VOLUME_A").expect("set CK_TEST_VOLUME_A");
+        let b = std::env::var_os("CK_TEST_VOLUME_B").expect("set CK_TEST_VOLUME_B");
+        let a = Path::new(&a);
+        let b = Path::new(&b);
+        assert_ne!(
+            volume_serial(a),
+            volume_serial(b),
+            "choose different volumes"
+        );
+        assert_eq!(device_id(a), Some(volume_serial(a)));
+        assert_eq!(device_id(b), Some(volume_serial(b)));
+        assert_ne!(device_id(a), device_id(b));
     }
 }

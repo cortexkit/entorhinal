@@ -648,20 +648,24 @@ mod tests {
                 request_key: Some("write".into()),
                 ..Default::default()
             }),
-            "seed_import" => f.store.seed_import(SeedImportRequest {
-                source: "mc".into(),
-                request_key: Some("write".into()),
-                exclude_home_scoped: false,
-                payload: SeedPayload {
-                    pairs: vec![SeedPair {
-                        canonical_root: root.into(),
-                        mc_identity: "git:new".into(),
+            "seed_import" => f.store.with_principal("entorhinal").seed_import_at_against(
+                SeedImportRequest {
+                    source: "mc".into(),
+                    request_key: Some("write".into()),
+                    exclude_home_scoped: false,
+                    payload: SeedPayload {
+                        pairs: vec![SeedPair {
+                            canonical_root: root.into(),
+                            mc_identity: "git:new".into(),
+                            ..Default::default()
+                        }],
                         ..Default::default()
-                    }],
+                    },
                     ..Default::default()
                 },
-                ..Default::default()
-            }),
+                10,
+                crate::SeedHomes::default(),
+            ),
             _ => unreachable!(),
         }
     }

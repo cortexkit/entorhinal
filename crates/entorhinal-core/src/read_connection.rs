@@ -132,10 +132,9 @@ mod tests {
                 },
             })
             .unwrap();
-            let checkout = fs::canonicalize(root.join("checkout"))
-                .unwrap()
-                .to_string_lossy()
-                .into_owned();
+            let checkout =
+                RegistryStore::canonical_mutation_root(root.join("checkout").to_str().unwrap())
+                    .unwrap();
             Self {
                 store,
                 root,
