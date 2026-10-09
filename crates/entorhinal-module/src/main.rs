@@ -1950,9 +1950,20 @@ mod tests {
     /// A fresh store directory per call. Parallel tests often share a label and
     /// start in the same millisecond, so the name also carries a per-process
     /// counter; without it two tests open one store and the second fails on
-    /// the first's writer lease.
+    /// the first's writer lease. Labels are restricted to portable filename
+    /// characters because callers also use principal names such as `reserved:core`.
     pub(super) fn scratch_descriptor(name: &str) -> (PathBuf, StorageDescriptor) {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let name: String = name
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
+                    character
+                } else {
+                    '-'
+                }
+            })
+            .collect();
         let dir = std::env::temp_dir().join(format!(
             "entorhinal-{name}-{}-{}-{}",
             std::process::id(),
@@ -1969,6 +1980,28 @@ mod tests {
             },
         };
         (dir, descriptor)
+    }
+
+    #[test]
+    fn scratch_descriptor_sanitizes_labels_and_keeps_unique_suffixes() {
+        let label = "reserved:core/\\*?\"<>| é";
+        let (first, _) = scratch_descriptor(label);
+        let (second, _) = scratch_descriptor(label);
+        assert_ne!(
+            first, second,
+            "sanitized labels must retain the unique counter"
+        );
+        for path in [first, second] {
+            let name = path.file_name().unwrap().to_str().unwrap();
+            assert!(name.starts_with("entorhinal-reserved-core"), "{name}");
+            assert!(
+                name.chars()
+                    .all(|character| character.is_ascii_alphanumeric()
+                        || matches!(character, '.' | '_' | '-')),
+                "{name}"
+            );
+            std::fs::remove_dir_all(path).unwrap();
+        }
     }
 
     fn hello_ack(descriptor: &StorageDescriptor) -> ModuleHelloAckBody {

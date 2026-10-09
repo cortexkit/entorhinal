@@ -1930,9 +1930,7 @@ mod tests {
         reroll["request_key"] = json!("reroll");
         call(&f, "agent.set_avatar", reroll, 50);
         let db_path = f.root.join("store.db");
-        let mut replacement = Fixture::new("temporary-replacement");
-        std::mem::swap(&mut f.store, &mut replacement.store);
-        drop(replacement);
+        drop(f.store);
         let descriptor = cortexkit_store::StorageDescriptor {
             module_id: "restart".into(),
             storage_namespace: "tests".into(),

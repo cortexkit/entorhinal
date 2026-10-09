@@ -25,7 +25,8 @@ use windows_sys::Win32::{
         },
         CreateWellKnownSid, EqualSid, GetAce, GetSecurityDescriptorControl, GetTokenInformation,
         IsValidSid, TokenUser, WinAuthenticatedUserSid, WinBuiltinAdministratorsSid,
-        WinLocalSystemSid, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION,
+        WinLocalSystemSid, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, CONTAINER_INHERIT_ACE,
+        DACL_SECURITY_INFORMATION, INHERITED_ACE, OBJECT_INHERIT_ACE,
         PROTECTED_DACL_SECURITY_INFORMATION, PSID, SECURITY_MAX_SID_SIZE, SE_DACL_PRESENT,
         SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER, WELL_KNOWN_SID_TYPE,
     },
@@ -155,7 +156,7 @@ impl CurrentUser {
     }
 }
 
-fn owner_only(path: &Path, user: &CurrentUser) -> Result<(), String> {
+fn read_dacl(path: &Path) -> Result<(Allocation, *mut ACL, u16), String> {
     let mut descriptor = ptr::null_mut();
     let mut dacl: *mut ACL = ptr::null_mut();
     check_status(unsafe {
@@ -180,7 +181,12 @@ fn owner_only(path: &Path, user: &CurrentUser) -> Result<(), String> {
     if control & SE_DACL_PRESENT == 0 || dacl.is_null() {
         return Err("DACL must be present and non-null".into());
     }
-    if control & SE_DACL_PROTECTED == 0 {
+    Ok((descriptor, dacl, control))
+}
+
+fn owner_only(path: &Path, user: &CurrentUser, require_protected: bool) -> Result<(), String> {
+    let (_descriptor, dacl, control) = read_dacl(path)?;
+    if require_protected && control & SE_DACL_PROTECTED == 0 {
         return Err("DACL must be protected from inheritance".into());
     }
     let system = Sid::well_known(WinLocalSystemSid);
@@ -237,7 +243,7 @@ fn snapshot(root: &Path) -> BTreeSet<PathBuf> {
 }
 
 #[test]
-fn store_directory_sqlite_and_any_lease_have_protected_owner_only_dacls() {
+fn store_directory_is_protected_and_all_entries_have_owner_only_dacls() {
     let scratch = Scratch::new("store");
     let before = snapshot(&scratch.0);
     assert!(before.is_empty());
@@ -287,14 +293,18 @@ fn store_directory_sqlite_and_any_lease_have_protected_owner_only_dacls() {
         } else {
             "lease file"
         };
-        owner_only(path, &user)
+        // Every created file is checked, including SQLite's lazily created WAL
+        // and shared-memory files. Directories must block ACL inheritance; files
+        // may inherit grants, but only for the current user, LocalSystem or
+        // BUILTIN\\Administrators.
+        owner_only(path, &user, metadata.is_dir())
             .unwrap_or_else(|error| panic!("{kind} {}: {error}", path.display()));
     }
     drop(store);
 }
 
 #[test]
-fn module_mode_log_has_a_protected_owner_only_dacl() {
+fn module_mode_log_has_an_owner_only_dacl() {
     let scratch = Scratch::new("log");
     let before = snapshot(&scratch.0);
     assert!(before.is_empty());
@@ -363,7 +373,7 @@ fn module_mode_log_has_a_protected_owner_only_dacl() {
         1,
         "expected one entorhinal log under scratch: {after:?}; stderr: {stderr}"
     );
-    owner_only(logs[0], &CurrentUser::get())
+    owner_only(logs[0], &CurrentUser::get(), false)
         .unwrap_or_else(|error| panic!("log {}: {error}", logs[0].display()));
 }
 
@@ -382,14 +392,7 @@ fn allow(sid: PSID) -> EXPLICIT_ACCESS_W {
     }
 }
 
-#[test]
-fn owner_only_checker_rejects_authenticated_users_even_on_a_protected_dacl() {
-    let scratch = Scratch::new("negative");
-    let path = scratch.0.join("authenticated-users.txt");
-    fs::write(&path, b"negative ACL fixture").unwrap();
-    let user = CurrentUser::get();
-    let authenticated_users = Sid::well_known(WinAuthenticatedUserSid);
-    let entries = [allow(user.sid()), allow(authenticated_users.as_ptr())];
+fn set_protected_dacl(path: &Path, entries: &[EXPLICIT_ACCESS_W]) {
     let mut dacl = ptr::null_mut();
     check_status(unsafe {
         SetEntriesInAclW(
@@ -403,7 +406,7 @@ fn owner_only_checker_rejects_authenticated_users_even_on_a_protected_dacl() {
     let dacl = Allocation(dacl.cast());
     check_status(unsafe {
         SetNamedSecurityInfoW(
-            wide(&path).as_ptr(),
+            wide(path).as_ptr(),
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
             ptr::null_mut(),
@@ -413,7 +416,62 @@ fn owner_only_checker_rejects_authenticated_users_even_on_a_protected_dacl() {
         )
     })
     .unwrap();
+}
+
+#[test]
+fn owner_only_checker_rejects_authenticated_users_even_on_a_protected_dacl() {
+    let scratch = Scratch::new("negative");
+    let path = scratch.0.join("authenticated-users.txt");
+    fs::write(&path, b"negative ACL fixture").unwrap();
+    let user = CurrentUser::get();
+    let authenticated_users = Sid::well_known(WinAuthenticatedUserSid);
+    set_protected_dacl(
+        &path,
+        &[allow(user.sid()), allow(authenticated_users.as_ptr())],
+    );
     let error =
-        owner_only(&path, &user).expect_err("Authenticated Users must not pass the checker");
+        owner_only(&path, &user, true).expect_err("Authenticated Users must not pass the checker");
+    assert!(error.contains("unexpected SID"), "wrong rejection: {error}");
+}
+
+#[test]
+fn owner_only_checker_rejects_inherited_authenticated_users() {
+    let scratch = Scratch::new("negative-inherited");
+    let user = CurrentUser::get();
+    let authenticated_users = Sid::well_known(WinAuthenticatedUserSid);
+    let mut entries = [allow(user.sid()), allow(authenticated_users.as_ptr())];
+    for entry in &mut entries {
+        entry.grfInheritance = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+    }
+    set_protected_dacl(&scratch.0, &entries);
+    let path = scratch.0.join("inherited-authenticated-users.txt");
+    fs::write(&path, b"inherited negative ACL fixture").unwrap();
+    let (_descriptor, dacl, control) = read_dacl(&path).unwrap();
+    assert_eq!(
+        control & SE_DACL_PROTECTED,
+        0,
+        "child must inherit its DACL"
+    );
+    let mut inherited_authenticated_users = false;
+    for index in 0..unsafe { (*dacl).AceCount } {
+        let mut ace = ptr::null_mut();
+        assert_ne!(unsafe { GetAce(dacl, index.into(), &mut ace) }, 0);
+        let header = unsafe { &*ace.cast::<ACE_HEADER>() };
+        if u32::from(header.AceType) == ACCESS_ALLOWED_ACE_TYPE
+            && u32::from(header.AceFlags) & INHERITED_ACE != 0
+        {
+            let sid = unsafe { ptr::addr_of!((*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart) }
+                .cast_mut()
+                .cast();
+            inherited_authenticated_users |=
+                unsafe { EqualSid(sid, authenticated_users.as_ptr()) } != 0;
+        }
+    }
+    assert!(
+        inherited_authenticated_users,
+        "fixture must grant Authenticated Users through inheritance"
+    );
+    let error = owner_only(&path, &user, false)
+        .expect_err("inherited Authenticated Users must not pass the checker");
     assert!(error.contains("unexpected SID"), "wrong rejection: {error}");
 }

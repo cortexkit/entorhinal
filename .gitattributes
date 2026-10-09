@@ -1,2 +1,4 @@
+* text=auto eol=lf
+
 # Golden replies are byte-compared by their consumers; never convert line endings.
 crates/*/tests/golden/** -text
