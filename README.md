@@ -26,26 +26,27 @@ ck workspaces assign <project> <workspace>  put a project in a workspace
 
 ck agents list [--project <id>] [--workspace <id>]
 ck agents show <agent>                      one agent, live or retired
-ck agents create <name> --role <role> --tag <text> [--project <id>] ...
+ck agents create <name> --role <role> --tag <text> [options]
 ck agents rename <agent> <new-name>
 ck agents retire <agent>
 ck agents tag <agent> <text>
-ck agents labels <agent> <label>... | --none
+ck agents labels <agent> <label>...         replace the whole label set
+ck agents labels <agent> --none             clear the label set
 ```
 
-Each command prints its full usage when run without arguments. `--json`
-prints the raw response. `ck-entorhinal --manifest` prints the module manifest
-as JSON without connecting to anything, for offline checks such as
-`ck fleet lint`.
+`ck projects`, `ck workspaces` or `ck agents` on its own prints the full usage,
+including the roles and options `create` accepts. `--json` prints the raw
+response. `ck-entorhinal --manifest` prints the module manifest as JSON without
+connecting to anything, for offline checks such as `ck fleet lint`.
 
 An agent write from `ck agents` lands only after the operator approves it at a
 Touch ID prompt that names the exact change. The subc daemon shows the prompt,
 one at a time, and a write that would fail anyway is refused before any prompt
-appears. The command waits up to five minutes for the answer. If its reply is
-lost, it prints a retry command that is safe to run: the retry can neither
-create a duplicate nor change a different agent. Until agent identity has moved
-from prefrontal-core to entorhinal, every write is refused with
-`authority_not_cut_over`, before any prompt.
+appears. The write waits up to five minutes for the answer. If its outcome is
+unknown, for example after a timeout, the command prints a retry command that
+is safe to run: the retry can neither create a duplicate nor change a different
+agent. Until agent identity has moved from prefrontal-core to entorhinal, every
+write is refused with `authority_not_cut_over`, before any prompt.
 
 ## Operations
 
@@ -54,7 +55,10 @@ between CortexKit modules. Reads are open to every caller.
 Project writes are accepted from the operator (`ck`) or the executive
 (prefrontal-core). Agent writes are accepted from the executive, which relays
 the operator's own changes, and from the operator through `ck agents` once the
-Touch ID prompt approves them. A route opened for a flow can't write at all.
+Touch ID prompt approves them. A flow (an automation an agent installs to run
+without a session) can only read: the daemon marks each request a flow makes,
+even when the executive forwards it, and entorhinal refuses every write that
+carries that mark, so a flow can't borrow the executive's write access.
 
 **Projects**
 
