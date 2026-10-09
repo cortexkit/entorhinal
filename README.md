@@ -23,19 +23,38 @@ ck projects verify                  check the store against its journal
 
 ck workspaces list                          workspaces known to the registry
 ck workspaces assign <project> <workspace>  put a project in a workspace
+
+ck agents list [--project <id>] [--workspace <id>]
+ck agents show <agent>                      one agent, live or retired
+ck agents create <name> --role <role> --tag <text> [--project <id>] ...
+ck agents rename <agent> <new-name>
+ck agents retire <agent>
+ck agents tag <agent> <text>
+ck agents labels <agent> <label>... | --none
 ```
 
-`--json` prints the raw response. `ck-entorhinal --manifest` prints the module
-manifest as JSON without connecting to anything, for offline checks such as
+Each command prints its full usage when run without arguments. `--json`
+prints the raw response. `ck-entorhinal --manifest` prints the module manifest
+as JSON without connecting to anything, for offline checks such as
 `ck fleet lint`.
+
+An agent write from `ck agents` lands only after the operator approves it at a
+Touch ID prompt that names the exact change. The subc daemon shows the prompt,
+one at a time, and a write that would fail anyway is refused before any prompt
+appears. The command waits up to five minutes for the answer. If its reply is
+lost, it prints a retry command that is safe to run: the retry can neither
+create a duplicate nor change a different agent. Until agent identity has moved
+from prefrontal-core to entorhinal, every write is refused with
+`authority_not_cut_over`, before any prompt.
 
 ## Operations
 
 Served to other modules through the subc daemon, which routes management calls
 between CortexKit modules. Reads are open to every caller.
 Project writes are accepted from the operator (`ck`) or the executive
-(prefrontal-core); agent writes only from the executive, which relays the
-operator's own changes. A route opened for a flow can't write at all.
+(prefrontal-core). Agent writes are accepted from the executive, which relays
+the operator's own changes, and from the operator through `ck agents` once the
+Touch ID prompt approves them. A route opened for a flow can't write at all.
 
 **Projects**
 
