@@ -73,6 +73,8 @@ mod incarnation;
 mod fake_log;
 #[allow(dead_code)]
 mod log_client;
+#[cfg(test)]
+mod served_vectors;
 mod shared_write;
 #[cfg(test)]
 mod two_machine_acceptance;
