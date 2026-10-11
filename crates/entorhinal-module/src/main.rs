@@ -60,6 +60,8 @@ mod agent_reads;
 mod catch_up;
 mod cli;
 mod current_directory;
+#[cfg(test)]
+mod cut_barrier_rehearsal;
 mod enable;
 mod incarnation;
 // The client for engram's identity log. Only writes to shared state and
