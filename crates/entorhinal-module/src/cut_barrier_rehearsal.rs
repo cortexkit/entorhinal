@@ -245,6 +245,7 @@ fn expected_snapshot(path: &Path) -> RehearsalResult<Value> {
     })?;
     // Read the frozen core columns directly; using entorhinal's importer to form
     // the expectation would hide a dropped or incorrectly decoded source field.
+    // Keys are the agent wire names, so core's `avatar_type` column is `type`.
     let rows = source_rows(
         &conn,
         "SELECT json_object(
@@ -252,7 +253,7 @@ fn expected_snapshot(path: &Path) -> RehearsalResult<Value> {
         'name_normalization_version',name_normalization_version,'tag',tag,
         'labels',json(labels_json),'role',role,'project_id',project_id,'workspace_id',workspace_id,
         'avatar',CASE WHEN avatar_genome IS NULL THEN NULL ELSE json_object(
-            'genome',avatar_genome,'avatar_type',avatar_type,'version',avatar_version) END,
+            'genome',avatar_genome,'type',avatar_type,'version',avatar_version) END,
         'github_identity',json(github_identity_json),
         'status',CASE WHEN terminal_reason IS NULL THEN 'live' WHEN terminal_reason='deleted'
             THEN 'retired' ELSE terminal_reason END,
