@@ -243,7 +243,7 @@ dependencies = [
 
 [[package]]
 name = "entorhinal-module"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "async-trait",
  "cortexkit-log",
