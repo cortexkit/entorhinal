@@ -343,10 +343,30 @@ async fn avatar_read_matches_core_contract_v1_0() {
     assert_eq!(core["version"], "avatar-read-vectors-v1.0");
     let vectors = core["vectors"].as_array().unwrap();
     assert!(!vectors.is_empty());
+    let mut ids = BTreeMap::new();
+    let mut original_ids = BTreeMap::new();
+    for vector in vectors {
+        for id in vector["request"]["agentIds"].as_array().unwrap() {
+            let id = id.as_str().unwrap();
+            let mapped = map_core_agent_id(id);
+            if let Some(previous) = original_ids.insert(mapped.clone(), id) {
+                assert_eq!(
+                    previous, id,
+                    "core id mapping is not one-to-one: {previous} and {id} map to {mapped}"
+                );
+            }
+            ids.insert(id, mapped);
+        }
+    }
     let mut avatars = BTreeMap::new();
     for vector in vectors {
         for avatar in vector["reply"]["avatars"].as_array().unwrap() {
             let id = avatar["agentId"].as_str().unwrap();
+            assert!(
+                ids.contains_key(id),
+                "core vector {} has an unmapped reply agentId {id}",
+                vector["name"]
+            );
             if let Some(previous) = avatars.insert(id, avatar) {
                 assert_eq!(previous, avatar, "conflicting core triples for {id}");
             }
@@ -358,33 +378,68 @@ async fn avatar_read_matches_core_contract_v1_0() {
     for (index, (id, avatar)) in avatars.iter().enumerate() {
         seed_agent(
             &source,
-            id,
+            &ids[id],
             &format!("Avatar {index}"),
             Some(avatar),
             false,
             false,
         );
     }
-    drop(source);
-    match fixture.import().await {
-        HandlerOutcome::Response(_) => {}
-        outcome => {
-            let error = refusal(outcome);
-            assert_eq!(error["code"], "import_invariant_failed");
-            assert_eq!(error["detail"]["check"], "agent_id");
-            let id = error["detail"]["agent_id"].as_str().unwrap();
-            assert!(avatars.contains_key(id));
-            // Core v1.0 uses agent-avatar-* ids, but import requires agent_ plus
-            // 8 or 16 lowercase hex characters. Reply comparison cannot run
-            // after that refusal; remapping ids would compare different requests.
-            eprintln!("core avatar v1.0 parity not exercised: agent.import refused {id}: {error}");
-            return;
-        }
+    // The absent id represents a known row without an avatar, while the unknown
+    // id remains unseeded. Both omissions must survive the mapped request.
+    let absent = ids.get("agent-avatar-absent");
+    if let Some(id) = absent {
+        seed_agent(&source, id, "No avatar", None, false, false);
     }
+    drop(source);
+    let imported = fixture.import().await;
+    let HandlerOutcome::Response(bytes) = imported else {
+        panic!("mapped core-avatar import refused: {}", refusal(imported));
+    };
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).unwrap()["result"]["agents_imported"],
+        avatars.len() + usize::from(absent.is_some())
+    );
     for vector in vectors {
-        let actual = fixture
-            .success(READER, "agent.avatar_read", vector["request"].clone())
-            .await;
+        let mut request = vector["request"].clone();
+        for id in request["agentIds"].as_array_mut().unwrap() {
+            let mapped = ids.get(id.as_str().unwrap()).unwrap_or_else(|| {
+                panic!(
+                    "core vector {} uses an unmapped request id {id}",
+                    vector["name"]
+                )
+            });
+            *id = json!(mapped);
+        }
+        let mut actual = fixture.success(READER, "agent.avatar_read", request).await;
+        // Avatar reads echo the request id. Reverse only that echo, leaving
+        // genome, type, version, order, omissions, and reply keys untouched.
+        for avatar in actual["avatars"].as_array_mut().unwrap() {
+            let mapped = avatar["agentId"].as_str().unwrap();
+            let id = original_ids.get(mapped).unwrap_or_else(|| {
+                panic!(
+                    "core vector {} returned an unmapped agentId {mapped}",
+                    vector["name"]
+                )
+            });
+            avatar["agentId"] = json!(id);
+        }
         assert_avatar_reply(&actual, &vector["reply"]);
+    }
+}
+
+fn map_core_agent_id(id: &str) -> String {
+    match id {
+        "agent-avatar-absent" => "agent_fffffffffffffffe".into(),
+        "agent-avatar-unknown" => "agent_ffffffffffffffff".into(),
+        _ => {
+            let number = id.strip_prefix("agent-avatar-").filter(|number| {
+                !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+            }).unwrap_or_else(|| panic!("cannot map core agent id {id}: expected agent-avatar-NN, agent-avatar-absent, or agent-avatar-unknown"));
+            let number: u64 = number.parse().unwrap_or_else(|error| {
+                panic!("cannot map core agent id {id}: numeric suffix must fit u64 ({error})")
+            });
+            format!("agent_{number:016x}")
+        }
     }
 }

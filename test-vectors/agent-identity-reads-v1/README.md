@@ -71,13 +71,23 @@ returns the stored genome/type/version, not the fingerprint.
 
 The non-ignored `served_vectors::avatar_read_matches_core_contract_v1_0` test
 reads the unchanged published fixture at
-`crates/entorhinal-module/tests/fixtures/core-avatar-read-vectors-v1.0.json` and
-attempts to import exactly its agent ids and stored avatar triples. Entorhinal
-currently refuses `agent-avatar-00` with `import_invariant_failed`, detail
-`{"agent_id":"agent-avatar-00","check":"agent_id"}`. Imported ids must be
-`agent_` followed by 8 or 16 lowercase hex characters. The test checks this
-refusal and stops there; it does **not** prove core-vector reply parity by
-remapping ids or bypassing import. If those ids become importable, the test
-will compare every vector's `avatars` exactly and allow only `generation` and
-`incarnation` as extra top-level keys. The same strict reply-key assertion is
-also exercised by the served-record test with valid imported ids today.
+`crates/entorhinal-module/tests/fixtures/core-avatar-read-vectors-v1.0.json`.
+Entorhinal imports ids of the form `agent_` followed by 8 or 16 lowercase hex
+characters, while core's fixture uses `agent-avatar-*`. The test maps the ids
+reversibly before importing the fixture's exact genome/type/version triples
+through the real `agent.import` operation:
+
+- `agent-avatar-NN` maps to `agent_` plus the decimal suffix's value encoded as
+  16 lowercase hex digits (for example, `agent-avatar-29` maps to
+  `agent_000000000000001d`).
+- `agent-avatar-absent` maps to `agent_fffffffffffffffe` and is imported as a
+  known agent without an avatar.
+- `agent-avatar-unknown` maps to `agent_ffffffffffffffff` and remains unseeded.
+
+The test rejects mapping collisions and unsupported ids with explicit errors.
+Every vector runs through the real handler with mapped request ids. Because
+`avatar_read` echoes each requested id in `agentId`, only that reply field is
+mapped back before comparison. Genomes, types, versions, omissions, duplicates,
+and order remain unchanged: `avatars` must equal core's reply exactly, with
+only `generation` and `incarnation` allowed as extra top-level keys. The same
+strict reply-key assertion also runs in the served-record test.
