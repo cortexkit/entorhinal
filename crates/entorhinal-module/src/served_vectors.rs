@@ -72,13 +72,6 @@ impl Fixture {
             )
             .await;
         fixture
-            .success(
-                DIRECT,
-                "set_workspace_root",
-                json!({"workspaceId":"served-workspace","root":fixture.dir}),
-            )
-            .await;
-        fixture
     }
 
     async fn outcome(&self, route: RouteKey, op: &str, request: Value) -> HandlerOutcome {

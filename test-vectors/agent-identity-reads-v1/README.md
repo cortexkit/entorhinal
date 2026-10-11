@@ -58,9 +58,9 @@ Without the write environment variable, the non-ignored
 captured records with these files on every CI run, including Linux, macOS, and
 Windows. The fixed process incarnation is `0123456789abcdef`. The project is
 registered with an empty roots list, a supported rootless placement, so its
-optional `canonicalRoot` is absent. The workspace's scratch root is registered
-through a real request but is not part of either read reply. No platform path
-or temporary-directory name enters the captured replies.
+optional `canonicalRoot` is absent, and the workspace has no root folder. No
+platform path or temporary-directory name enters the fixture or the captured
+replies.
 
 Fleet avatar fingerprints are the first 32 hexadecimal characters of BLAKE3
 over `genome + "\n" + type + "\n" + version`, with the version written in decimal
