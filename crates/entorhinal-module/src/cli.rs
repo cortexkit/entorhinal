@@ -1,9 +1,11 @@
 //! Operator surface for the registry: `ck projects <verb>` and
 //! `ck workspaces <verb>` and `ck agents <verb>`.
 //!
-//! One binary, four names. `ck` dispatches unknown domains to `ck-<domain>`
-//! on PATH, and `ck-projects` / `ck-workspaces` / `ck-agents` are symlinks to this module
-//! binary; argv[0] selects the face. The module id (entorhinal) is
+//! One binary, four names. `ck` runs an unknown domain as `ck-<domain>`, looked
+//! up in CortexKit's bin folder first, then on PATH. `ck-projects`,
+//! `ck-workspaces` and `ck-agents` are links to this module binary in that
+//! folder, and argv[0] selects the face. Operators type `ck projects`, never
+//! `ck-projects`. The module id (entorhinal) is
 //! infrastructure and never part of the operator vocabulary -- a user thinks
 //! in projects, workspaces and agents, not in the anatomy of the module serving them.
 //!
