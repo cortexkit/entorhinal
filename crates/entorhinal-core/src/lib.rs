@@ -119,7 +119,82 @@ pub const V2_WORKSPACE_ROOT: &str = "ALTER TABLE workspace ADD COLUMN root TEXT 
 pub const V5_JOURNAL_PRINCIPAL: &str =
     "ALTER TABLE registry_journal ADD COLUMN principal TEXT NULL;";
 
-const MIGRATIONS: [Migration; 7] = [
+/// Migration 8: the agent session, claim, role and member-name tables.
+///
+/// Every table here except `member_name` is machine-local: none is listed in
+/// the derived-table set that `verify` and `rebuild` replay, none is written
+/// through `registry_journal`, and none is ever sent to the identity log.
+/// `member_name` holds display names learned from the shared identity log,
+/// keyed by the author pseudonym engram returns.
+///
+/// - `session_binding` maps an agent's session reference (`ref_kind`, `ref`)
+///   to the host session that runs it (`harness`, `session_id`), recording
+///   which reserved capability registered it. A session key binds at most one
+///   reference.
+/// - `claim_cache` and `role_cache` cache engram's claim records for agents
+///   and roles. A NULL `holder` means the record was absent.
+/// - `role_take_request` remembers each operator-approved role take so a
+///   retry resends the approved bytes instead of prompting again.
+/// - `self_identity` holds this device's own author pseudonym, once learned.
+pub const V8_AGENT_SESSIONS: &str = r#"
+CREATE TABLE session_binding (
+    ref_kind TEXT NOT NULL,
+    ref TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    harness TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    registered_by TEXT NOT NULL CHECK(registered_by IN ('orchestrator','host')),
+    registered_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (ref_kind, ref)
+);
+CREATE UNIQUE INDEX session_binding_session ON session_binding(harness, session_id);
+
+CREATE TABLE claim_cache (
+    agent_id TEXT PRIMARY KEY,
+    holder TEXT NULL,
+    epoch INTEGER NOT NULL,
+    cut_id TEXT NULL,
+    version INTEGER NOT NULL,
+    read_at_ms INTEGER NOT NULL,
+    stale INTEGER NOT NULL CHECK(stale IN (0,1)),
+    integrity_failed INTEGER NOT NULL DEFAULT 0 CHECK(integrity_failed IN (0,1))
+);
+
+CREATE TABLE role_cache (
+    role TEXT PRIMARY KEY,
+    holder TEXT NULL,
+    epoch INTEGER NOT NULL DEFAULT 0,
+    source TEXT NULL CHECK(source IN ('cloud','local')),
+    stale INTEGER NOT NULL DEFAULT 1 CHECK(stale IN (0,1)),
+    version INTEGER NOT NULL DEFAULT 0,
+    read_at_ms INTEGER NULL,
+    integrity_failed INTEGER NOT NULL DEFAULT 0 CHECK(integrity_failed IN (0,1))
+);
+
+CREATE TABLE role_take_request (
+    request_id TEXT PRIMARY KEY,
+    role TEXT NOT NULL,
+    expected_epoch INTEGER NOT NULL,
+    reason TEXT NULL,
+    expected_version INTEGER NOT NULL,
+    body BLOB NOT NULL,
+    epoch INTEGER NULL,
+    created_at_ms INTEGER NOT NULL
+);
+
+CREATE TABLE self_identity (
+    id INTEGER PRIMARY KEY CHECK(id = 1),
+    self_author TEXT NOT NULL,
+    learned_at_ms INTEGER NOT NULL
+);
+
+CREATE TABLE member_name (
+    author TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL
+);
+"#;
+
+const MIGRATIONS: [Migration; 8] = [
     Migration {
         version: 1,
         statements: V1_SCHEMA,
@@ -147,6 +222,10 @@ const MIGRATIONS: [Migration; 7] = [
     Migration {
         version: 7,
         statements: log_schema::V7_IDENTITY_LOG,
+    },
+    Migration {
+        version: 8,
+        statements: V8_AGENT_SESSIONS,
     },
 ];
 
@@ -786,6 +865,225 @@ impl JournalWriter<'_> {
     }
 }
 
+/// A session registration as `agent.register_session` admits it. The caller's
+/// role is decided by the module from the resolved capability providers;
+/// the store only records it.
+#[derive(Debug, Clone)]
+pub struct SessionRegistration<'a> {
+    pub agent_id: &'a str,
+    pub ref_kind: &'a str,
+    pub session_ref: &'a str,
+    pub harness: &'a str,
+    pub session_id: &'a str,
+    /// `orchestrator` or `host`.
+    pub registered_by: &'a str,
+    pub now_ms: i64,
+}
+
+/// One row of `session_binding`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionBinding {
+    pub agent_id: String,
+    pub ref_kind: String,
+    #[serde(rename = "ref")]
+    pub session_ref: String,
+    pub harness: String,
+    pub session_id: String,
+    pub registered_by: String,
+    pub registered_at_ms: i64,
+}
+
+impl SessionBinding {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            agent_id: row.get(0)?,
+            ref_kind: row.get(1)?,
+            session_ref: row.get(2)?,
+            harness: row.get(3)?,
+            session_id: row.get(4)?,
+            registered_by: row.get(5)?,
+            registered_at_ms: row.get(6)?,
+        })
+    }
+}
+
+const SESSION_BINDING_COLUMNS: &str =
+    "agent_id,ref_kind,ref,harness,session_id,registered_by,registered_at_ms";
+
+fn session_refusal(
+    code: &str,
+    message: impl Into<String>,
+    detail: Option<serde_json::Value>,
+) -> agent::AgentMutationError {
+    agent::AgentMutationError {
+        code: code.into(),
+        message: message.into(),
+        detail,
+    }
+}
+
+impl RegistryStore {
+    /// Bind a session reference to an agent and to the host session running
+    /// it. The binding is machine-local: it is never journaled and never sent
+    /// to the identity log.
+    ///
+    /// Every check reads the same SQLite transaction that writes the binding,
+    /// so nothing can change the agent or the bindings between the check and
+    /// the write. Refusals, in order: `authority_not_cut_over`,
+    /// `unknown_agent`, `gone`, `ref_bound_elsewhere` (the reference already
+    /// belongs to another agent) and `session_bound_elsewhere` (the session key
+    /// already binds another reference, even one of the same agent).
+    /// Registering the same reference again for the same agent moves it to the
+    /// new session key and records the new caller role and time.
+    pub fn register_session(
+        &self,
+        request: &SessionRegistration<'_>,
+    ) -> Result<SessionBinding, agent::AgentMutationError> {
+        let outcome = self
+            .db
+            .with_conn_fenced(|tx| Ok(Self::register_session_in(tx, request)));
+        match outcome {
+            Ok(result) => result,
+            Err(error) => Err(session_refusal("storage_error", error.to_string(), None)),
+        }
+    }
+
+    // A refusal is returned inside `Ok`, which commits the transaction. That
+    // is safe only because every check runs before the single write at the
+    // end, so a refused registration has written nothing.
+    fn register_session_in(
+        tx: &Transaction<'_>,
+        request: &SessionRegistration<'_>,
+    ) -> Result<SessionBinding, agent::AgentMutationError> {
+        let cut_over = tx
+            .query_row(
+                "SELECT 1 FROM registry_journal WHERE op=?1 LIMIT 1",
+                [agent::IDENTITY_MARKER_OP],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !cut_over {
+            return Err(session_refusal(
+                "authority_not_cut_over",
+                "agent identity authority is not cut over",
+                None,
+            ));
+        }
+        let row = agent::load_row(tx, request.agent_id)?.ok_or_else(|| {
+            session_refusal(
+                "unknown_agent",
+                format!("unknown agent {}", request.agent_id),
+                None,
+            )
+        })?;
+        if let Some(gone) = row.gone() {
+            return Err(session_refusal("gone", "agent is gone", Some(gone)));
+        }
+        let by_ref = tx
+            .query_row(
+                &format!("SELECT {SESSION_BINDING_COLUMNS} FROM session_binding WHERE ref_kind=?1 AND ref=?2"),
+                params![request.ref_kind, request.session_ref],
+                SessionBinding::from_row,
+            )
+            .optional()?;
+        if let Some(bound) = &by_ref {
+            if bound.agent_id != request.agent_id {
+                return Err(session_refusal(
+                    "ref_bound_elsewhere",
+                    format!("this reference is bound to agent {}", bound.agent_id),
+                    Some(serde_json::json!({"agent_id": bound.agent_id})),
+                ));
+            }
+        }
+        let by_session = tx
+            .query_row(
+                &format!("SELECT {SESSION_BINDING_COLUMNS} FROM session_binding WHERE harness=?1 AND session_id=?2"),
+                params![request.harness, request.session_id],
+                SessionBinding::from_row,
+            )
+            .optional()?;
+        if let Some(bound) = &by_session {
+            if bound.ref_kind != request.ref_kind || bound.session_ref != request.session_ref {
+                return Err(session_refusal(
+                    "session_bound_elsewhere",
+                    format!(
+                        "this session already binds reference {}:{} of agent {}",
+                        bound.ref_kind, bound.session_ref, bound.agent_id
+                    ),
+                    Some(serde_json::json!({
+                        "ref_kind": bound.ref_kind,
+                        "ref": bound.session_ref,
+                        "agent_id": bound.agent_id,
+                    })),
+                ));
+            }
+        }
+        tx.execute(
+            "INSERT INTO session_binding(agent_id,ref_kind,ref,harness,session_id,registered_by,registered_at_ms)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)
+             ON CONFLICT(ref_kind,ref) DO UPDATE SET harness=excluded.harness,
+                 session_id=excluded.session_id, registered_by=excluded.registered_by,
+                 registered_at_ms=excluded.registered_at_ms",
+            params![
+                request.agent_id,
+                request.ref_kind,
+                request.session_ref,
+                request.harness,
+                request.session_id,
+                request.registered_by,
+                request.now_ms
+            ],
+        )?;
+        Ok(SessionBinding {
+            agent_id: request.agent_id.into(),
+            ref_kind: request.ref_kind.into(),
+            session_ref: request.session_ref.into(),
+            harness: request.harness.into(),
+            session_id: request.session_id.into(),
+            registered_by: request.registered_by.into(),
+            registered_at_ms: request.now_ms,
+        })
+    }
+
+    /// The binding a host session key selects, if any. Reads never wait for a
+    /// writer.
+    pub fn session_binding_for(
+        &self,
+        harness: &str,
+        session_id: &str,
+    ) -> Result<Option<SessionBinding>, RegistryError> {
+        self.read(|conn| {
+            conn.query_row(
+                &format!("SELECT {SESSION_BINDING_COLUMNS} FROM session_binding WHERE harness=?1 AND session_id=?2"),
+                params![harness, session_id],
+                SessionBinding::from_row,
+            )
+            .optional()
+        })
+    }
+
+    /// The binding of each session reference, in the order given, read in one
+    /// snapshot. `None` marks a reference that was never registered.
+    pub fn session_bindings_for_refs(
+        &self,
+        refs: &[(&str, &str)],
+    ) -> Result<Vec<Option<SessionBinding>>, RegistryError> {
+        self.read(|conn| {
+            let mut statement = conn.prepare(&format!(
+                "SELECT {SESSION_BINDING_COLUMNS} FROM session_binding WHERE ref_kind=?1 AND ref=?2"
+            ))?;
+            refs.iter()
+                .map(|(ref_kind, session_ref)| {
+                    statement
+                        .query_row(params![ref_kind, session_ref], SessionBinding::from_row)
+                        .optional()
+                })
+                .collect()
+        })
+    }
+}
+
 /// A domain failure that can be mapped to a module error without importing subc.
 #[derive(Debug)]
 pub enum RegistryError {
@@ -1133,6 +1431,133 @@ mod tests {
                 Ok(())
             })
             .expect("insert test project");
+    }
+
+    fn legacy_descriptor(scratch: &TestStore, file: &str) -> StorageDescriptor {
+        StorageDescriptor {
+            module_id: "session-migration-test".into(),
+            storage_namespace: "test".into(),
+            isolation: cortexkit_store::Isolation::Module,
+            backend: cortexkit_store::StorageBackend::Sqlite {
+                path: scratch.root.join(file).to_string_lossy().into_owned(),
+            },
+        }
+    }
+
+    /// A store last opened by a binary whose chain ends at migration 7 gains
+    /// all six session, claim, role and name tables, with exactly these
+    /// columns, when this binary opens it.
+    #[test]
+    fn opening_a_v7_store_creates_every_session_and_claim_table() {
+        let scratch = TestStore::new("v8-upgrade");
+        let descriptor = legacy_descriptor(&scratch, "v7.db");
+        let old = RegistryStore::open_with_migrations(&descriptor, &MIGRATIONS[..7]).unwrap();
+        let missing = old
+            .read(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='session_binding'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(missing, 0, "a V7 store has no session tables yet");
+        drop(old);
+        let store = RegistryStore::open(&descriptor).unwrap();
+        let expected: [(&str, &[&str]); 6] = [
+            (
+                "session_binding",
+                &[
+                    "ref_kind",
+                    "ref",
+                    "agent_id",
+                    "harness",
+                    "session_id",
+                    "registered_by",
+                    "registered_at_ms",
+                ],
+            ),
+            (
+                "claim_cache",
+                &[
+                    "agent_id",
+                    "holder",
+                    "epoch",
+                    "cut_id",
+                    "version",
+                    "read_at_ms",
+                    "stale",
+                    "integrity_failed",
+                ],
+            ),
+            (
+                "role_cache",
+                &[
+                    "role",
+                    "holder",
+                    "epoch",
+                    "source",
+                    "stale",
+                    "version",
+                    "read_at_ms",
+                    "integrity_failed",
+                ],
+            ),
+            (
+                "role_take_request",
+                &[
+                    "request_id",
+                    "role",
+                    "expected_epoch",
+                    "reason",
+                    "expected_version",
+                    "body",
+                    "epoch",
+                    "created_at_ms",
+                ],
+            ),
+            ("self_identity", &["id", "self_author", "learned_at_ms"]),
+            ("member_name", &["author", "display_name"]),
+        ];
+        store
+            .read(|conn| {
+                for (table, columns) in expected {
+                    let found = conn
+                        .prepare(&format!("PRAGMA table_info({table})"))?
+                        .query_map([], |row| row.get::<_, String>(1))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    assert_eq!(found, columns, "{table}");
+                }
+                let unique: Vec<String> = conn
+                    .prepare("PRAGMA index_info(session_binding_session)")?
+                    .query_map([], |row| row.get::<_, String>(2))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                assert_eq!(unique, ["harness", "session_id"]);
+                let is_unique: i64 = conn.query_row(
+                    "SELECT \"unique\" FROM pragma_index_list('session_binding') WHERE name='session_binding_session'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(is_unique, 1, "one session key binds one reference");
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// A binary whose chain stops at migration 7 must refuse a store this
+    /// binary migrated, naming schema version 8, and leave it untouched.
+    #[test]
+    fn binary_without_session_migration_refuses_v8_store_as_ahead() {
+        let scratch = TestStore::new("v8-ahead");
+        let descriptor = legacy_descriptor(&scratch, "v8.db");
+        drop(RegistryStore::open(&descriptor).unwrap());
+        let error = RegistryStore::open_with_migrations(&descriptor, &MIGRATIONS[..7]).unwrap_err();
+        assert!(matches!(error, RegistryError::Database(_)));
+        assert_eq!(
+            error.to_string(),
+            "database: registry store is at schema version 8, ahead of this binary's highest migration 7; run a binary at or above the store's version"
+        );
+        drop(RegistryStore::open(&descriptor).unwrap());
     }
 
     #[test]

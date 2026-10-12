@@ -514,6 +514,16 @@ mod tests {
                     "cortexkit_schema_version",
                     "cortexkit_fence",
                     "sqlite_sequence",
+                    // Machine-local agent session, claim and role state.
+                    "session_binding",
+                    "claim_cache",
+                    "role_cache",
+                    "role_take_request",
+                    "self_identity",
+                    // Display names come only from identity-log entries
+                    // checked against their own author, never from a project
+                    // or agent write, so this comparison does not cover them.
+                    "member_name",
                 ];
                 let schema = conn
                     .prepare("SELECT name FROM sqlite_schema WHERE type='table'")?

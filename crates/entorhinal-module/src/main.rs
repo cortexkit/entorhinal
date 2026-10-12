@@ -75,6 +75,7 @@ mod fake_log;
 mod log_client;
 #[cfg(test)]
 mod served_vectors;
+mod sessions;
 mod shared_write;
 #[cfg(test)]
 mod two_machine_acceptance;
@@ -258,16 +259,100 @@ struct HealthGauges {
 
 /// Volatile liveness state fed by `projects.session_liveness` batches. Never
 /// journaled (I8 forbids liveness in the topology journal); it exists to
-/// annotate enumerate answers and to feed future GC-candidacy signals, so a
-/// wrong, late, or absent feed can never corrupt topology.
+/// annotate enumerate answers, to answer `agent.session_liveness`, and to feed
+/// future GC-candidacy signals, so a wrong, late, or absent feed can never
+/// corrupt topology.
 struct LivenessState {
     /// Last accepted per-emitter sequence number; None until first contact.
     last_seq: Option<u64>,
     /// True until a snapshot has rebased the mirror: from startup, and again
     /// after a dropped or refused batch.
     stale: bool,
-    /// session_id -> (state, canonical_root, last_activity_ms).
-    sessions: BTreeMap<String, (String, String, i64)>,
+    /// Every session the feed reports as not `gone`, keyed by
+    /// `(harness, sessionId)`.
+    sessions: MirrorSessions,
+    /// Sessions whose last report was `gone`. They leave `sessions` exactly as
+    /// before, so enumerate's annotation never counts them, and are kept here
+    /// only so `agent.session_liveness` can answer `gone` rather than
+    /// `unknown`. A snapshot clears them like the rest of the mirror.
+    gone: std::collections::BTreeSet<SessionKey>,
+}
+
+/// The most `gone` sessions remembered between snapshots. Forgetting one only
+/// turns its answer from `gone` into `unknown`, which callers treat as busy,
+/// so the bound can never make a live session look ended.
+const GONE_SESSIONS_CAP: usize = 4096;
+
+/// A host session as the liveness feed names it. The two parts are kept
+/// apart and never concatenated: the same session id under two harnesses is
+/// two sessions.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SessionKey {
+    harness: String,
+    session_id: String,
+}
+
+impl SessionKey {
+    fn new(harness: &str, session_id: &str) -> Self {
+        Self {
+            harness: harness.into(),
+            session_id: session_id.into(),
+        }
+    }
+}
+
+/// A bare session id names the session a feed entry without `harness`
+/// reported: such an entry is keyed with an empty harness, which never matches
+/// a registered binding because registration requires a harness.
+impl From<&str> for SessionKey {
+    fn from(session_id: &str) -> Self {
+        Self::new("", session_id)
+    }
+}
+
+/// One mirrored session. `state` is stored as the feed sent it, so `lapsed`
+/// and states this build does not know are kept and read as `unknown`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MirrorEntry {
+    state: String,
+    canonical_root: String,
+    last_activity_ms: i64,
+    /// Why the producer could not say more, such as `host_not_seen` or
+    /// `lease_expired`; any other text is kept as given.
+    cause: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct MirrorSessions(BTreeMap<SessionKey, MirrorEntry>);
+
+impl MirrorSessions {
+    fn get(&self, key: &SessionKey) -> Option<&MirrorEntry> {
+        self.0.get(key)
+    }
+
+    fn insert(&mut self, key: SessionKey, entry: MirrorEntry) {
+        self.0.insert(key, entry);
+    }
+
+    fn remove(&mut self, key: impl Into<SessionKey>) -> Option<MirrorEntry> {
+        self.0.remove(&key.into())
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn values(&self) -> impl Iterator<Item = &MirrorEntry> {
+        self.0.values()
+    }
 }
 
 impl Default for LivenessState {
@@ -281,7 +366,8 @@ impl Default for LivenessState {
         Self {
             last_seq: None,
             stale: true,
-            sessions: BTreeMap::new(),
+            sessions: MirrorSessions::default(),
+            gone: std::collections::BTreeSet::new(),
         }
     }
 }
@@ -308,6 +394,9 @@ struct ProjectsHandler {
     writer: Arc<tokio::sync::Mutex<()>>,
     catch_up_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     agent_id_draw: fn() -> Result<String, HandlerError>,
+    /// Names the module providing each session capability, asked afresh for
+    /// every `agent.register_session` on the served path.
+    provider_resolver: Arc<dyn sessions::ProviderResolver>,
     operator_confirmer: Arc<dyn agent_ops::OperatorConfirmer>,
     confirmation_slot: Arc<Mutex<Option<agent_ops::ConfirmationSlot>>>,
     #[cfg(test)]
@@ -376,7 +465,15 @@ const MUTATING_METHODS: &[&str] = &[
     "agent.dispose",
     "agent.merge",
     "agent.import",
+    "agent.register_session",
 ];
+
+/// Mutations that `authorize_write` passes through because each is admitted
+/// by its own rule in `admit` instead of by the operator-or-executive gate.
+/// `agent.register_session` is admitted from whichever module the daemon
+/// resolves as the sole provider of a session capability, so a fixed module
+/// name here would refuse a correctly bound provider.
+const SELF_ADMITTED_METHODS: &[&str] = &[sessions::REGISTER_SESSION];
 
 /// Admit project/workspace mutations from the operator (`Direct`: the `ck`
 /// faces) or executive, but identity mutations only from the executive relay.
@@ -390,6 +487,9 @@ const MUTATING_METHODS: &[&str] = &[
 /// the store file itself. A route with no recorded principal is refused rather
 /// than assumed to be the operator.
 fn authorize_write(method: &str, principal: Option<&Principal>) -> Result<(), HandlerError> {
+    if SELF_ADMITTED_METHODS.contains(&method) {
+        return Ok(());
+    }
     if method == "identity_log.enable" {
         return match principal {
             Some(Principal::Direct) => Ok(()),
@@ -510,6 +610,9 @@ impl ProjectsHandler {
             writer: Arc::new(tokio::sync::Mutex::new(())),
             catch_up_task: Mutex::new(None),
             agent_id_draw: shared_write::draw_agent_id,
+            provider_resolver: Arc::new(sessions::SubcProviderResolver::from_args(
+                std::env::args_os().skip(1),
+            )),
             operator_confirmer,
             confirmation_slot: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -543,11 +646,37 @@ impl ProjectsHandler {
     /// which, for five methods only, asks the operator to approve the exact
     /// write at a Touch ID prompt first. Nothing else skips this refusal.
     /// Enabling the identity log is reserved to an unscoped operator route.
+    /// `agent.register_session` is admitted only from the module the daemon
+    /// currently names as the sole provider of a session capability; this
+    /// path passes no resolved providers, so it refuses that method.
     fn admit(&self, method: &str, key: RouteKey) -> Result<RouteAdmission, HandlerError> {
+        self.admit_with(method, key, None)
+            .map(|(admission, _)| admission)
+    }
+
+    /// `admit`, plus the session-capability rule for `agent.register_session`
+    /// against providers resolved for this one request. Resolution is never
+    /// stored on the route: a provider can be rebound between two requests on
+    /// the same route. Returns the role the caller was admitted under for that
+    /// method, and `None` for every other method.
+    fn admit_with(
+        &self,
+        method: &str,
+        key: RouteKey,
+        providers: Option<&sessions::ResolvedProviders>,
+    ) -> Result<(RouteAdmission, Option<sessions::SessionRole>), HandlerError> {
         let admission = self.admission_for(key);
         refuse_flow_write(method, admission.flow_id.as_deref())?;
         authorize_write(method, admission.principal.as_ref())?;
-        Ok(admission)
+        let role = if method == sessions::REGISTER_SESSION {
+            Some(sessions::admit_session_registration(
+                providers,
+                admission.principal.as_ref(),
+            )?)
+        } else {
+            None
+        };
+        Ok((admission, role))
     }
 
     fn with_store<T>(
@@ -726,11 +855,19 @@ struct LivenessBatch {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LivenessSession {
+    /// With `session_id`, the session key. An entry without it is keyed with
+    /// an empty harness and so never matches a registered binding.
+    #[serde(default)]
+    harness: String,
     session_id: String,
     canonical_root: String,
+    /// Any string is accepted, so a batch carrying `lapsed` or a state this
+    /// build does not know is still applied; such a session reads `unknown`.
     state: String,
     #[serde(default)]
     last_activity_ms: i64,
+    #[serde(default)]
+    cause: Option<String>,
     // project_id_hint intentionally ignored for state: the registry re-resolves
     // canonical_root at read time; the hint is a producer fast-path only.
 }
@@ -784,7 +921,18 @@ impl ProjectsHandler {
     /// request writes, including the `bind_root` rows a `register` or `add_root`
     /// appends after its own row. Reading it once means the two can't disagree.
     fn execute(&self, request: WireRequest, key: RouteKey) -> Result<Vec<u8>, HandlerError> {
-        let admission = self.admit(&request.method, key)?;
+        self.execute_with(request, key, None)
+    }
+
+    /// `execute` with the capability providers resolved for this request.
+    /// Only the served path resolves them; every other caller passes `None`.
+    fn execute_with(
+        &self,
+        request: WireRequest,
+        key: RouteKey,
+        providers: Option<&sessions::ResolvedProviders>,
+    ) -> Result<Vec<u8>, HandlerError> {
+        let (admission, session_role) = self.admit_with(&request.method, key, providers)?;
         let principal = principal_label(admission.principal.as_ref());
         // Notify after the commit, not from a poll timer. Comparing the store's
         // head also catches secondary bind_root commits and partial successes;
@@ -823,6 +971,12 @@ impl ProjectsHandler {
             "unapprove_project" => self.set_project_approval(request.params, false, &principal),
             "verify" => self.verify(),
             "rebuild" => self.rebuild(),
+            sessions::REGISTER_SESSION => match session_role {
+                Some(role) => self.register_session(request.params, role),
+                None => Err(sessions::orchestrator_unbound(providers)),
+            },
+            sessions::FOR_SESSION => self.for_session(request.params),
+            sessions::SESSION_LIVENESS => self.agent_session_liveness(request.params),
             method if agent_ops::MUTATING_METHODS.contains(&method) => {
                 self.agent_mutation(method, request.params, &principal)
             }
@@ -867,6 +1021,7 @@ impl ProjectsHandler {
             // way a mirror still holding sessions whose `gone` was lost can be
             // emptied again.
             state.sessions.clear();
+            state.gone.clear();
             state.stale = false;
             state.last_seq = Some(batch.seq);
         } else if let Some(last) = state.last_seq {
@@ -912,16 +1067,26 @@ impl ProjectsHandler {
 
         if dropped_after.is_none() {
             for session in batch.sessions {
+                let key = SessionKey {
+                    harness: session.harness,
+                    session_id: session.session_id,
+                };
                 if session.state == "gone" {
-                    state.sessions.remove(&session.session_id);
+                    state.sessions.remove(key.clone());
+                    state.gone.insert(key);
+                    if state.gone.len() > GONE_SESSIONS_CAP {
+                        state.gone.pop_first();
+                    }
                 } else {
+                    state.gone.remove(&key);
                     state.sessions.insert(
-                        session.session_id,
-                        (
-                            session.state,
-                            session.canonical_root,
-                            session.last_activity_ms,
-                        ),
+                        key,
+                        MirrorEntry {
+                            state: session.state,
+                            canonical_root: session.canonical_root,
+                            last_activity_ms: session.last_activity_ms,
+                            cause: session.cause,
+                        },
                     );
                 }
             }
@@ -1051,7 +1216,8 @@ impl ProjectsHandler {
             let newest = state
                 .sessions
                 .values()
-                .filter(|(_, root, _)| {
+                .map(|entry| (&entry.state, &entry.canonical_root, entry.last_activity_ms))
+                .filter(|&(_, root, _)| {
                     project.roots.iter().any(|project_root| {
                         entorhinal_core::path_prefix_or_equal(
                             Path::new(project_root),
@@ -1059,7 +1225,7 @@ impl ProjectsHandler {
                         )
                     })
                 })
-                .map(|(_, _, activity)| *activity)
+                .map(|(_, _, activity)| activity)
                 .max();
             project.last_route_activity_ms = newest;
         }
@@ -1490,6 +1656,10 @@ fn manifest() -> ModuleManifest {
                 management_operation(method, ManagementOperationKind::Query, agent_operation_description(method))
             })).chain(agent_ops::MUTATING_METHODS.iter().map(|method| {
                 management_operation(method, ManagementOperationKind::Mutate, agent_operation_description(method))
+            })).chain(sessions::READ_METHODS.iter().map(|method| {
+                management_operation(method, ManagementOperationKind::Query, agent_operation_description(method))
+            })).chain(std::iter::once(sessions::REGISTER_SESSION).map(|method| {
+                management_operation(method, ManagementOperationKind::Mutate, agent_operation_description(method))
             })).collect(),
             config_schema: json!({"type": "object"}),
             observability: Vec::new(),
@@ -1590,6 +1760,9 @@ fn agent_operation_description(method: &str) -> &'static str {
         "agent.dispose" => "Retire an agent; its id stays reserved. Executive or Direct with operator confirmation.",
         "agent.merge" => "Merge one agent into another and retire the source. Accepted only from the executive.",
         "agent.import" => "Import the executive's agent registry once, at cutover. Accepted only from the executive.",
+        "agent.register_session" => "Bind an agent's session reference to its host session. Accepted only from the provider of agent-orchestrator/v1 or agent-host/v1.",
+        "agent.for_session" => "Find the agent and session reference bound to a host session.",
+        "agent.session_liveness" => "Answer active, gone or unknown for up to 256 session references, in request order.",
         _ => "",
     }
 }
@@ -1751,6 +1924,8 @@ mod tests {
         for method in agent_reads::READ_METHODS
             .iter()
             .chain(agent_ops::MUTATING_METHODS.iter())
+            .chain(sessions::READ_METHODS.iter())
+            .chain(std::iter::once(&sessions::REGISTER_SESSION))
         {
             let description = agent_operation_description(method);
             assert!(!description.is_empty(), "{method} has no description");
@@ -1763,7 +1938,13 @@ mod tests {
 
     #[test]
     fn writes_are_refused_unless_the_operator_or_the_executive_opened_the_route() {
-        for method in MUTATING_METHODS {
+        // Self-admitted methods have their own admission rule in `admit`;
+        // `authorize_write` passes them through for every principal, which
+        // `self_admitted_methods_pass_the_write_gate_for_every_principal` pins.
+        for method in MUTATING_METHODS
+            .iter()
+            .filter(|method| !SELF_ADMITTED_METHODS.contains(method))
+        {
             let direct = authorize_write(method, Some(&Principal::Direct));
             if agent_ops::MUTATING_METHODS.contains(method) {
                 assert_eq!(
@@ -1786,6 +1967,31 @@ mod tests {
                 assert_eq!(
                     error.code, "write_not_permitted",
                     "{method} from {refused:?}"
+                );
+            }
+        }
+    }
+
+    /// A self-admitted method must reach its own rule in `admit` whoever
+    /// called: refusing it here by module name would refuse a correctly bound
+    /// capability provider that is not the executive.
+    #[test]
+    fn self_admitted_methods_pass_the_write_gate_for_every_principal() {
+        assert_eq!(SELF_ADMITTED_METHODS, ["agent.register_session"]);
+        for method in SELF_ADMITTED_METHODS {
+            assert!(MUTATING_METHODS.contains(method), "{method} is a mutation");
+            assert!(!agent_ops::MUTATING_METHODS.contains(method));
+            assert!(!agent_ops::CONFIRMABLE_METHODS.contains(method));
+            for principal in [
+                Some(Principal::Direct),
+                Some(reserved(WRITER_MODULE)),
+                Some(reserved("thalamus-harness")),
+                Some(Principal::Unverified),
+                None,
+            ] {
+                assert!(
+                    authorize_write(method, principal.as_ref()).is_ok(),
+                    "{method} from {principal:?}"
                 );
             }
         }

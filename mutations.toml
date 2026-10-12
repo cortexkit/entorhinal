@@ -1516,3 +1516,203 @@ runner = "cargo"
 package = "entorhinal-core"
 target = "--lib"
 expect_red = ["binding::tests::git_common_dir_uses_registry_canonical_paths_for_both_layouts"]
+
+# Agent sessions: registration admission, registration refusals, the
+# session-liveness mapping and the V8 session tables.
+[[control]]
+id = "sessions-register-pass-through"
+guards = "The fixed operator-or-executive write gate passes agent.register_session through to its capability rule, so a host provider other than the executive can register"
+file = "crates/entorhinal-module/src/main.rs"
+old = '''    if SELF_ADMITTED_METHODS.contains(&method) {
+        return Ok(());
+    }'''
+new = '''    if false /* NON-VACUITY BREAK */ {
+        return Ok(());
+    }'''
+test_file = "crates/entorhinal-module/src/sessions.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["sessions::tests::a_host_provider_other_than_the_executive_registers_as_host"]
+
+[[control]]
+id = "sessions-register-principal-comparison"
+guards = "A registration is admitted only when the caller is the currently resolved provider, so a provider replaced by a rebinding is refused"
+file = "crates/entorhinal-module/src/sessions.rs"
+old = "if caller.is_some() && caller == orchestrator {"
+new = "if true /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-module/src/sessions.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["sessions::tests::after_a_provider_switch_the_old_principal_is_caller_forbidden"]
+
+[[control]]
+id = "sessions-register-unbound-first"
+guards = "With no sole provider of either session capability, and on the synchronous seam that resolves none, registration refuses orchestrator_unbound before judging the caller"
+file = "crates/entorhinal-module/src/sessions.rs"
+old = '''    if orchestrator.is_none() && host.is_none() {
+        return Err(orchestrator_unbound(providers));
+    }'''
+new = '''    // NON-VACUITY BREAK: resolution failure no longer refused first'''
+test_file = "crates/entorhinal-module/src/sessions.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = [
+    "sessions::tests::no_sole_provider_refuses_every_caller_orchestrator_unbound",
+    "sessions::tests::the_sync_seam_refuses_registration_orchestrator_unbound",
+]
+
+[[control]]
+id = "sessions-register-cutover"
+guards = "Registration is refused authority_not_cut_over until agent identity authority is cut over"
+file = "crates/entorhinal-core/src/lib.rs"
+old = "if !cut_over {"
+new = "if false && !cut_over { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/sessions.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["sessions::tests::registration_refuses_cutover_agent_ref_and_session_in_order"]
+
+[[control]]
+id = "sessions-register-gone"
+guards = "A retired or merged agent cannot gain a session binding"
+file = "crates/entorhinal-core/src/lib.rs"
+old = "if let Some(gone) = row.gone() {"
+new = "if let Some(gone) = row.gone().filter(|_| false) { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/sessions.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["sessions::tests::registration_refuses_cutover_agent_ref_and_session_in_order"]
+
+[[control]]
+id = "sessions-register-ref-bound-elsewhere"
+guards = "A session reference bound to one agent is never re-registered for another"
+file = "crates/entorhinal-core/src/lib.rs"
+old = "if bound.agent_id != request.agent_id {"
+new = "if false && bound.agent_id != request.agent_id { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/sessions.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["sessions::tests::registration_refuses_cutover_agent_ref_and_session_in_order"]
+
+[[control]]
+id = "sessions-register-session-bound-elsewhere"
+guards = "A host session key that already binds one reference is refused session_bound_elsewhere for any other, even of the same agent"
+file = "crates/entorhinal-core/src/lib.rs"
+old = "if bound.ref_kind != request.ref_kind || bound.session_ref != request.session_ref {"
+new = "if false { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/sessions.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = [
+    "sessions::tests::registration_refuses_cutover_agent_ref_and_session_in_order",
+    "sessions::tests::for_session_returns_the_binding_or_not_found",
+]
+
+[[control]]
+id = "sessions-v8-unique-session-key"
+guards = "The V8 schema makes a host session key bind at most one session reference"
+file = "crates/entorhinal-core/src/lib.rs"
+old = "CREATE UNIQUE INDEX session_binding_session ON session_binding(harness, session_id);"
+new = "CREATE INDEX session_binding_session ON session_binding(harness, session_id); -- NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/lib.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["tests::opening_a_v7_store_creates_every_session_and_claim_table"]
+
+[[control]]
+id = "sessions-request-bounds"
+guards = "Session request strings outside their byte bounds are refused invalid_request"
+file = "crates/entorhinal-module/src/sessions.rs"
+old = "if value.is_empty() || value.len() > max {"
+new = "if value.is_empty() { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/sessions.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["sessions::tests::malformed_session_requests_are_invalid_request"]
+
+[[control]]
+id = "sessions-liveness-ref-count"
+guards = "agent.session_liveness answers at most 256 references per request"
+file = "crates/entorhinal-module/src/sessions.rs"
+old = "if request.refs.is_empty() || request.refs.len() > LIVENESS_REFS_MAX {"
+new = "if request.refs.is_empty() { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/sessions.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["sessions::tests::malformed_session_requests_are_invalid_request"]
+
+[[control]]
+id = "sessions-liveness-idle-is-active"
+guards = "An idle session answers active, because its host process is open"
+file = "crates/entorhinal-module/src/sessions.rs"
+old = '"active" | "idle" => LivenessAnswer {'
+new = '"active" => LivenessAnswer { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/sessions.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["sessions::tests::session_liveness_maps_every_state_in_request_order"]
+
+[[control]]
+id = "sessions-liveness-waiting-mirror"
+guards = "A liveness mirror still waiting for a snapshot answers unknown for every session"
+file = "crates/entorhinal-module/src/sessions.rs"
+old = "if self.stale {"
+new = "if false && self.stale { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/sessions.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["sessions::tests::session_liveness_maps_every_state_in_request_order"]
+
+[[control]]
+id = "sessions-liveness-cause-only-on-unknown"
+guards = "A cause is reported only on an unknown answer, never beside active"
+file = "crates/entorhinal-module/src/sessions.rs"
+old = '''                "active" | "idle" => LivenessAnswer {
+                    state: "active",
+                    cause: None,
+                },'''
+new = '''                "active" | "idle" => LivenessAnswer {
+                    state: "active",
+                    cause: entry.cause.clone(), // NON-VACUITY BREAK
+                },'''
+test_file = "crates/entorhinal-module/src/sessions.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["sessions::tests::session_liveness_maps_every_state_in_request_order"]
+
+[[control]]
+id = "sessions-liveness-gone-remembered"
+guards = "A session reported gone answers gone, not unknown, until the next snapshot"
+file = "crates/entorhinal-module/src/main.rs"
+old = "state.gone.insert(key);"
+new = "drop(key); // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/sessions.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["sessions::tests::session_liveness_maps_every_state_in_request_order"]
+
+[[control]]
+id = "sessions-liveness-harness-in-key"
+guards = "The liveness mirror keys sessions by harness and session id, so the same id under two harnesses stays two sessions"
+file = "crates/entorhinal-module/src/main.rs"
+old = "harness: session.harness,"
+new = "harness: String::new(), // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/sessions.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["sessions::tests::session_liveness_maps_every_state_in_request_order"]
