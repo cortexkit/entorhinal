@@ -12,6 +12,7 @@ use serde_json::Value;
 use super::{encode_result, HandlerError, ProjectsHandler, RouteKey, WireRequest};
 
 pub(super) const READ_METHODS: &[&str] = &[
+    "agent.preview_repair_workspaces",
     "agent.resolve",
     "agent.resolve_name",
     "agent.list",
@@ -1500,6 +1501,7 @@ mod tests {
         assert_eq!(surfaces.len(), 1, "no tool surface");
         let operations = surfaces[0]["operations"].as_array().unwrap();
         let expected_queries = [
+            "agent.preview_repair_workspaces",
             "resolve",
             "resolve_project_id",
             "resolve_remote",
@@ -1523,6 +1525,7 @@ mod tests {
             "agent.session_liveness",
         ];
         let expected_mutations = [
+            "agent.repair_workspaces",
             "register",
             "assign_workspace",
             "set_workspace_root",

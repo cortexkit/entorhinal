@@ -77,6 +77,7 @@ mod log_client;
 mod served_vectors;
 mod sessions;
 mod shared_write;
+use shared_write::placement_confirmation;
 #[cfg(test)]
 mod two_machine_acceptance;
 
@@ -439,6 +440,7 @@ const WRITER_MODULE: &str = "prefrontal-core";
 
 /// Methods that change the registry or the liveness state derived from it.
 const MUTATING_METHODS: &[&str] = &[
+    "agent.repair_workspaces",
     "register",
     "assign_workspace",
     "set_workspace_root",
@@ -477,8 +479,9 @@ const MUTATING_METHODS: &[&str] = &[
 const SELF_ADMITTED_METHODS: &[&str] = &[sessions::REGISTER_SESSION];
 
 /// Admit project/workspace mutations from the operator (`Direct`: the `ck`
-/// faces) or executive, but identity mutations only from the executive relay.
-/// An agent's shell can connect as Direct, so Direct cannot rewrite identities.
+/// commands) or executive, but unconfirmed identity mutations only from the
+/// executive relay. The async serving path separately confirms eligible Direct
+/// identity writes. Workspace correction is Direct-only and never executive.
 /// Enabling the shared log is an operator decision, never an executive write.
 ///
 /// This stops a module that has no business writing here from changing the
@@ -501,6 +504,12 @@ fn authorize_write(method: &str, principal: Option<&Principal>) -> Result<(), Ha
         };
     }
     if agent_ops::MUTATING_METHODS.contains(&method) {
+        if method == "agent.repair_workspaces" && !matches!(principal, Some(Principal::Direct)) {
+            return Err(HandlerError::new(
+                "direct_caller_required",
+                "agent.repair_workspaces requires the operator (ck), with confirmation",
+            ));
+        }
         return match principal {
             Some(Principal::Reserved { module_id }) if module_id == WRITER_MODULE => Ok(()),
             Some(Principal::Direct) => Err(HandlerError::new(
@@ -1243,8 +1252,11 @@ impl ProjectsHandler {
 
     fn register(&self, params: Value, principal: &str) -> Result<Vec<u8>, HandlerError> {
         let req = serde_json::from_value::<RegisterRequest>(params).map_err(invalid_params)?;
-        let reply =
-            self.record_mutation(self.with_store(|s| s.with_principal(principal).register(req)))?;
+        let reply = self.record_mutation(self.with_store(|s| {
+            s.with_principal(principal)
+                .with_confirmation(placement_confirmation(principal, None))
+                .register(req)
+        }))?;
         // With root records on, a newly registered root is bound at once, so
         // it never answers as unbound. Unreadable identity leaves it unbound
         // and authorizing nothing; the registration itself still stands.
@@ -1273,12 +1285,20 @@ impl ProjectsHandler {
     fn assign_workspace(&self, params: Value, principal: &str) -> Result<Vec<u8>, HandlerError> {
         let req =
             serde_json::from_value::<AssignWorkspaceRequest>(params).map_err(invalid_params)?;
-        self.record_mutation(self.with_store(|s| s.with_principal(principal).assign_workspace(req)))
+        self.record_mutation(self.with_store(|s| {
+            s.with_principal(principal)
+                .with_confirmation(placement_confirmation(principal, None))
+                .assign_workspace(req)
+        }))
     }
     fn upgrade_implicit(&self, params: Value, principal: &str) -> Result<Vec<u8>, HandlerError> {
         let req =
             serde_json::from_value::<UpgradeImplicitRequest>(params).map_err(invalid_params)?;
-        self.record_mutation(self.with_store(|s| s.with_principal(principal).upgrade_implicit(req)))
+        self.record_mutation(self.with_store(|s| {
+            s.with_principal(principal)
+                .with_confirmation(placement_confirmation(principal, None))
+                .upgrade_implicit(req)
+        }))
     }
     fn remove(&self, params: Value, principal: &str) -> Result<Vec<u8>, HandlerError> {
         let req = serde_json::from_value::<RemoveRequest>(params).map_err(invalid_params)?;
@@ -1359,7 +1379,11 @@ impl ProjectsHandler {
     }
     fn seed_import(&self, params: Value, principal: &str) -> Result<Vec<u8>, HandlerError> {
         let req = serde_json::from_value::<SeedImportRequest>(params).map_err(invalid_params)?;
-        self.record_mutation(self.with_store(|s| s.with_principal(principal).seed_import(req)))
+        self.record_mutation(self.with_store(|s| {
+            s.with_principal(principal)
+                .with_confirmation(placement_confirmation(principal, None))
+                .seed_import(req)
+        }))
     }
 
     /// Refresh the health generation gauge from a mutation's wire reply, which
@@ -1743,6 +1767,8 @@ fn declared_provenance() -> Option<ManifestProvenance> {
 /// missing here fails the manifest test rather than shipping undescribed.
 fn agent_operation_description(method: &str) -> &'static str {
     match method {
+        "agent.preview_repair_workspaces" => "Preview stored agent workspaces and name claims that the operator correction would change, including any refusal.",
+        "agent.repair_workspaces" => "Clear stored project-agent workspaces and align live name claims with project placement. Direct only, after cutover, with operator confirmation.",
         "agent.resolve" => "Look up one agent by id, including retired and merged agents.",
         "agent.resolve_name" => "Find an agent by name within a workspace or the global namespace.",
         "agent.list" => "List agents, filtered by role, project or workspace and paged by agent id.",
@@ -1959,6 +1985,8 @@ mod tests {
             let executive = authorize_write(method, Some(&reserved(WRITER_MODULE)));
             if *method == "identity_log.enable" {
                 assert_eq!(executive.unwrap_err().code, "write_not_permitted");
+            } else if *method == "agent.repair_workspaces" {
+                assert_eq!(executive.unwrap_err().code, "direct_caller_required");
             } else {
                 assert!(executive.is_ok(), "{method} from {WRITER_MODULE}");
             }
@@ -1966,7 +1994,12 @@ mod tests {
                 let error = authorize_write(method, refused.as_ref())
                     .expect_err("a write from any other principal must be refused");
                 assert_eq!(
-                    error.code, "write_not_permitted",
+                    error.code,
+                    if *method == "agent.repair_workspaces" {
+                        "direct_caller_required"
+                    } else {
+                        "write_not_permitted"
+                    },
                     "{method} from {refused:?}"
                 );
             }

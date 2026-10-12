@@ -23,7 +23,7 @@ const UNKNOWN: &str = "agent_ffffffffffffffff";
 
 // Use the preserved migrations so the import sees the same columns and defaults
 // as a core snapshot, including the name claims required for live identities.
-const MIGRATIONS: &[&str] = &[
+pub(super) const MIGRATIONS: &[&str] = &[
     include_str!(
         "../../entorhinal-core/tests/fixtures/core-agent-migrations/076_agent_registry.sql"
     ),
@@ -47,8 +47,19 @@ struct Fixture {
 
 impl Fixture {
     async fn new(label: &str) -> Self {
+        Self::with_confirmer(
+            label,
+            std::sync::Arc::new(Approve {
+                summaries: std::sync::Mutex::new(vec![]),
+            }),
+        )
+        .await
+    }
+
+    async fn with_confirmer(label: &str, confirmer: std::sync::Arc<Approve>) -> Self {
         let (dir, descriptor) = crate::tests::scratch_descriptor(label);
-        let handler = ProjectsHandler::with_runtime(INCARNATION.into(), || 700);
+        let handler = ProjectsHandler::with_runtime(INCARNATION.into(), || 700)
+            .with_operator_confirmer(confirmer);
         let mut store = RegistryStore::open(&descriptor).unwrap();
         store.set_root_records(true);
         install_store(&handler.store, &handler.health, Ok(store));
@@ -435,4 +446,205 @@ fn map_core_agent_id(id: &str) -> String {
             format!("agent_{number:016x}")
         }
     }
+}
+
+pub(super) struct Approve {
+    pub(super) summaries: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl crate::agent_ops::OperatorConfirmer for Approve {
+    async fn confirm_operator(
+        &self,
+        summary: &str,
+        _: RouteKey,
+    ) -> Result<(), crate::agent_ops::OperatorConfirmError> {
+        self.summaries.lock().unwrap().push(summary.into());
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn served_changes_match_published_file() {
+    let confirmer = std::sync::Arc::new(Approve {
+        summaries: std::sync::Mutex::new(vec![]),
+    });
+    let fixture = Fixture::with_confirmer("served-changes", confirmer.clone()).await;
+    fixture.success(DIRECT, "register", json!({"projectId":"hiree-project","name":"Hiree project","roots":[],"workspaceId":"served-workspace"})).await;
+    fixture.success(DIRECT, "register", json!({"projectId":"clear-project","name":"Clear project","roots":[],"workspaceId":"served-workspace"})).await;
+    let source = fixture.snapshot();
+    seed_agent(&source, HEAD, "Off placement", None, false, true);
+    seed_agent(&source, NO_AVATAR, "Stored workspace", None, false, false);
+    seed_agent(&source, ASSISTANT, "Live hiree", None, false, false);
+    source
+        .execute(
+            "UPDATE agent SET workspace_id='served-project' WHERE agent_id=?1",
+            [HEAD],
+        )
+        .unwrap();
+    source
+        .execute(
+            "UPDATE agent_name_claim SET namespace_key='served-project' WHERE agent_id=?1",
+            [HEAD],
+        )
+        .unwrap();
+    source
+        .execute(
+            "UPDATE agent SET role='head',project_id='clear-project',workspace_id='served-workspace' WHERE agent_id=?1",
+            [NO_AVATAR],
+        )
+        .unwrap();
+    source
+        .execute(
+            "UPDATE agent SET role='hiree',project_id='hiree-project' WHERE agent_id=?1",
+            [ASSISTANT],
+        )
+        .unwrap();
+    source.execute("UPDATE agent_name_claim SET namespace_kind='workspace',namespace_key='served-workspace' WHERE agent_id IN (?1,?2)", params![NO_AVATAR,ASSISTANT]).unwrap();
+    drop(source);
+    assert!(matches!(
+        fixture.import().await,
+        HandlerOutcome::Response(_)
+    ));
+    let cursor = fixture
+        .success(
+            READER,
+            "agent.changes",
+            json!({"incarnation":INCARNATION,"cursor":0,"wait":false}),
+        )
+        .await["cursor"]
+        .as_i64()
+        .unwrap();
+    let preview = fixture
+        .success(READER, "agent.preview_repair_workspaces", json!({}))
+        .await;
+    assert!(preview["refusal"].is_null());
+    assert_eq!(preview["changes"].as_array().unwrap().len(), 2);
+    let repaired_bytes = match fixture
+        .outcome(
+            DIRECT,
+            "agent.repair_workspaces",
+            json!({"request_key":"served-repair"}),
+        )
+        .await
+    {
+        HandlerOutcome::Response(bytes) => bytes,
+        outcome => panic!("repair refused: {}", refusal(outcome)),
+    };
+    let repaired = serde_json::from_slice::<Value>(&repaired_bytes).unwrap()["result"].clone();
+    assert_eq!(repaired["cleared"], 2);
+    assert_eq!(repaired["moved"], 1);
+    let generation = fixture
+        .handler
+        .with_store(RegistryStore::generation)
+        .unwrap();
+    match fixture
+        .outcome(
+            DIRECT,
+            "agent.repair_workspaces",
+            json!({"request_key":"served-repair"}),
+        )
+        .await
+    {
+        HandlerOutcome::Response(bytes) => assert_eq!(bytes, repaired_bytes),
+        _ => panic!("cached correction must succeed"),
+    }
+    assert_eq!(
+        fixture
+            .handler
+            .with_store(RegistryStore::generation)
+            .unwrap(),
+        generation
+    );
+    assert_eq!(confirmer.summaries.lock().unwrap().len(), 1);
+    let executive = refusal(
+        fixture
+            .outcome(
+                CORE,
+                "agent.repair_workspaces",
+                json!({"request_key":"served-repair"}),
+            )
+            .await,
+    );
+    assert_eq!(executive["code"], "direct_caller_required");
+    fixture.success(DIRECT, "assign_workspace", json!({"projectId":"hiree-project","workspaceId":"destination","requestKey":"served-carry"})).await;
+    let (record, reply) = fixture
+        .record(
+            "agent.changes",
+            json!({"incarnation":INCARNATION,"cursor":cursor,"wait":false}),
+        )
+        .await;
+    let entries = reply["result"]["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 3);
+    assert!(entries
+        .iter()
+        .all(|e| e["op"] == "agent.set_namespace" && e["row"]["workspace_id"].is_null()));
+    assert_eq!(entries[0]["claims"].as_array().unwrap().len(), 2);
+    assert!(entries[1]["claims"].as_array().unwrap().is_empty());
+    assert_eq!(entries[2]["claims"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        *confirmer.summaries.lock().unwrap(),
+        vec![
+            "repair agent workspaces: clear 2 stored workspaces, move 1 name claims",
+            "move \"hiree-project\" to \"destination\": \"Live hiree\""
+        ]
+    );
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../test-vectors/agent-identity-changes-v1/agent-changes.json");
+    let served = format!("[\n{record}\n]\n");
+    if std::env::var("ENTO_WRITE_SERVED_VECTORS").as_deref() == Ok("1") {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &served).unwrap();
+    } else {
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            served,
+            "agent.changes differs from the real handler reply"
+        );
+    }
+    let store = fixture.handler.with_store(|s| Ok(s.clone())).unwrap();
+    assert!(store.verify().unwrap().ok);
+    assert!(store.rebuild().unwrap().replay.ok);
+}
+
+#[tokio::test]
+async fn repair_preview_is_open_and_cutover_refusal_precedes_confirmation() {
+    let confirmer = std::sync::Arc::new(Approve {
+        summaries: std::sync::Mutex::new(vec![]),
+    });
+    let fixture = Fixture::with_confirmer("repair-before-cutover", confirmer.clone()).await;
+    for route in [DIRECT, CORE, READER, (999, 1)] {
+        let preview = fixture
+            .success(route, "agent.preview_repair_workspaces", json!({}))
+            .await;
+        assert_eq!(preview["refusal"]["code"], "authority_not_cut_over");
+    }
+    let before = fixture
+        .handler
+        .with_store(RegistryStore::generation)
+        .unwrap();
+    let outcome = refusal(
+        fixture
+            .outcome(
+                DIRECT,
+                "agent.repair_workspaces",
+                json!({"request_key":"before"}),
+            )
+            .await,
+    );
+    assert_eq!(outcome["code"], "authority_not_cut_over");
+    let outcome = refusal(
+        fixture
+            .outcome(CORE, "agent.repair_workspaces", Value::Null)
+            .await,
+    );
+    assert_eq!(outcome["code"], "direct_caller_required");
+    assert!(confirmer.summaries.lock().unwrap().is_empty());
+    assert_eq!(
+        fixture
+            .handler
+            .with_store(RegistryStore::generation)
+            .unwrap(),
+        before
+    );
 }

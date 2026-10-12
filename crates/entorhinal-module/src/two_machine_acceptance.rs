@@ -1415,3 +1415,130 @@ async fn same_name_and_path_minted_id_refuses_project_id_occupied() {
     assert_eq!(a.rows("project_root").len(), 1);
     b.clean_rebuild().await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn two_machines_carry_and_correct_once_and_refuse_forged_claim_owner() {
+    let log = Arc::new(FakeLog::default());
+    let mut a = Machine::new("carry-correct-a", log.clone());
+    let b = Machine::new("carry-correct-b", log.clone());
+    let confirmer = Arc::new(crate::served_vectors::Approve {
+        summaries: std::sync::Mutex::new(vec![]),
+    });
+    a.handler.operator_confirmer = confirmer.clone();
+    a.call(
+        "register",
+        json!({"projectId":"P","name":"P","roots":[],"workspaceId":"W1"}),
+    )
+    .await
+    .unwrap();
+    let source = Connection::open(a.dir.join("source.db")).unwrap();
+    for migration in crate::served_vectors::MIGRATIONS {
+        source.execute_batch(migration).unwrap();
+    }
+    source.execute_batch("INSERT INTO agent(agent_id,name,tag,role,project_id,workspace_id,created_at_ms,updated_at_ms) VALUES
+        ('agent_0000000000000001','Head','','head','P','P',10,10),
+        ('agent_0000000000000002','Hiree','','hiree','P','W1',10,10);
+        INSERT INTO agent_name_claim(agent_id,namespace_kind,namespace_key,normalized_name,display_name,claimed_at_ms) VALUES
+        ('agent_0000000000000001','workspace','P','head','Head',10),
+        ('agent_0000000000000002','workspace','W1','hiree','Hiree',10);").unwrap();
+    drop(source);
+    a.call(
+        "agent.import",
+        json!({"snapshot_path":a.dir.join("source.db"),"request_key":"import"}),
+    )
+    .await
+    .unwrap();
+    a.enable().await;
+    b.enable().await;
+    assert_eq!(a.shared(), b.shared());
+    let cursor = b.store().generation().unwrap();
+    let before = log.head();
+    let correction = a
+        .bytes_on(
+            DIRECT,
+            "agent.repair_workspaces",
+            json!({"request_key":"correct"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&correction).unwrap()["result"]["cleared"],
+        2
+    );
+    assert_eq!(log.head(), before + 1);
+    b.catch_up().await;
+    assert_eq!(a.shared(), b.shared());
+    a.call(
+        "assign_workspace",
+        json!({"projectId":"P","workspaceId":"W2","requestKey":"carry"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(log.head(), before + 2);
+    b.catch_up().await;
+    assert_eq!(a.shared(), b.shared());
+    assert_eq!(confirmer.summaries.lock().unwrap().len(), 2);
+    let page = log.client().read(before, 128).await.unwrap();
+    assert_eq!(page.entries.len(), 2);
+    let entries: Vec<Value> = page
+        .entries
+        .iter()
+        .map(|entry| serde_json::from_slice(&entry.entry).unwrap())
+        .collect();
+    for entry in &entries {
+        assert_eq!(entry["op"], "project.shared");
+        assert_eq!(entry["agents"].as_array().unwrap().len(), 2);
+        assert!(entry["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|agent| agent["op"] == "agent.set_namespace"
+                && agent["row"]["workspace_id"].is_null()));
+    }
+    assert!(entries[0]["tables"].as_object().unwrap().is_empty());
+    let feed = b
+        .call(
+            "agent.changes",
+            json!({"incarnation":"acceptance","cursor":cursor,"wait":false}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(feed["entries"].as_array().unwrap().len(), 4);
+    assert!(a.store().verify().unwrap().ok);
+    assert!(b.store().verify().unwrap().ok);
+    a.clean_rebuild().await;
+    b.clean_rebuild().await;
+    let state = b.shared();
+    let head = b.store().generation().unwrap();
+    let mut forged = entries[1].clone();
+    forged["agents"][0]["claims"][0]["agent_id"] = json!("agent_0000000000000002");
+    log.client()
+        .append(&log_client::AppendRequest {
+            expected_head: log.head(),
+            entry_id: [0xf1; 16],
+            kind: log_client::EntryKind::Change,
+            data: serde_json::to_vec(&forged).unwrap(),
+        })
+        .await
+        .unwrap();
+    let error = drive(b.handler.catch_up(
+        &b.store(),
+        tokio::time::Instant::now() + Duration::from_secs(25),
+    ))
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, "identity_log_stalled");
+    assert_eq!(
+        shared_write::health_state(b.handler.health.log_state.load(Ordering::Relaxed)),
+        "apply_failed"
+    );
+    assert!(
+        error
+            .message
+            .contains("agent entry changes another agent's claim"),
+        "{}",
+        error.message
+    );
+    assert_eq!(b.shared(), state);
+    assert_eq!(b.store().generation().unwrap(), head);
+}

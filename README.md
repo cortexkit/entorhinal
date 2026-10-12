@@ -32,6 +32,7 @@ ck agents retire <agent>
 ck agents tag <agent> <text>
 ck agents labels <agent> <label>...         replace the whole label set
 ck agents labels <agent> --none             clear the label set
+ck agents repair-workspaces [--yes]         preview correction; --yes sends the write
 ```
 
 `ck projects`, `ck workspaces` or `ck agents` on its own prints the full usage,

@@ -881,6 +881,7 @@ mod tests {
             .await;
         assert_eq!(handler.health().await.status, HealthStatus::Ok);
         let requests = [
+            ("agent.preview_repair_workspaces", json!({})),
             ("resolve", json!({"canonicalRoot":root})),
             ("resolve_project_id", json!({"projectId":"missing"})),
             (

@@ -1910,3 +1910,64 @@ runner = "cargo"
 package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 expect_red = ["sessions::tests::session_liveness_maps_every_state_in_request_order"]
+
+# Served placement approval and operator-only workspace correction.
+[[control]]
+id = "module-repair-direct-only"
+guards = "Executive workspace correction is refused before decoding and cached replies"
+file = "crates/entorhinal-module/src/main.rs"
+old = 'if method == "agent.repair_workspaces" && !matches!(principal, Some(Principal::Direct)) {'
+new = 'if false /* NON-VACUITY BREAK */ {'
+test_file = "crates/entorhinal-module/src/agent_ops.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["agent_ops::tests::agent_principal_matrix_precedes_decode_keys_and_cached_replies_before_and_after_cutover"]
+
+[[control]]
+id = "module-carry-sync-no-prompt"
+guards = "Synchronous Direct placements refuse a carry while executive placements carry without prompting"
+file = "crates/entorhinal-module/src/shared_write.rs"
+old = "PlacementConfirmation::NoPrompt\n    }"
+new = "PlacementConfirmation::NotRequired /* NON-VACUITY BREAK */\n    }"
+test_file = "crates/entorhinal-module/src/shared_write.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["shared_write::tests::confirmation::carrying_refusals_precede_prompt_and_sync_direct_requires_approval"]
+
+[[control]]
+id = "module-carry-cached-verbatim"
+guards = "Cached placement replies remain byte-identical and never acquire an agent incarnation"
+file = "crates/entorhinal-module/src/shared_write.rs"
+old = "AgentPrecheck::Cached(body) => {\n                    return if request.method.starts_with(\"agent.\") {"
+new = "AgentPrecheck::Cached(body) => {\n                    return if true /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-module/src/shared_write.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["shared_write::tests::confirmation::carrying_placement_prompts_exactly_and_cached_reply_is_unchanged"]
+
+[[control]]
+id = "cli-repair-preview-refused"
+guards = "A refusal inside a workspace correction preview exits EXIT_REFUSED rather than success"
+file = "crates/entorhinal-module/src/cli.rs"
+old = 'if !preview["refusal"].is_null() {'
+new = 'if false /* NON-VACUITY BREAK */ {'
+test_file = "crates/entorhinal-module/src/cli.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["cli::agent_tests::repair_workspaces_previews_refusal_and_yes_sends_confirmed_write"]
+
+[[control]]
+id = "cli-placement-confirmation-wait"
+guards = "Project registration and workspace assignment keep the 300-second confirmation wait"
+file = "crates/entorhinal-module/src/cli.rs"
+old = "fn placement_call_options(method: &str) -> subc_client_rs::CallOptions {\n    if matches!(method, \"assign_workspace\" | \"register\") {"
+new = "fn placement_call_options(method: &str) -> subc_client_rs::CallOptions {\n    if false /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-module/src/cli.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["cli::agent_tests::repair_workspaces_previews_refusal_and_yes_sends_confirmed_write"]

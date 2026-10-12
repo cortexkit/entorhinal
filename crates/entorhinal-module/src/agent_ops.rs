@@ -18,6 +18,11 @@ use std::{
 use subc_client_rs::{ModuleHandle, OperatorConfirmError as SdkConfirmError};
 
 pub(super) const CONFIRMABLE_METHODS: &[&str] = &[
+    "assign_workspace",
+    "register",
+    "upgrade_implicit",
+    "seed_import",
+    "agent.repair_workspaces",
     "agent.create",
     "agent.rename",
     "agent.dispose",
@@ -158,6 +163,7 @@ impl Drop for ConfirmationGuard {
 }
 
 pub(super) const MUTATING_METHODS: &[&str] = &[
+    "agent.repair_workspaces",
     "agent.create",
     "agent.rename",
     "agent.update_tag",
@@ -244,10 +250,19 @@ mod tests {
 
     const OPERATOR: RouteKey = (30, 1);
     const CALLER: RouteKey = (31, 1);
+    const DIRECT: RouteKey = (32, 1);
     const NOW: i64 = 700;
     const INCARNATION: &str = "0123456789abcdef";
     const A: &str = "agent_0000000000000001";
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct Yes;
+    #[async_trait]
+    impl OperatorConfirmer for Yes {
+        async fn confirm_operator(&self, _: &str, _: RouteKey) -> Result<(), OperatorConfirmError> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn daemon_confirmation_mapping_accepts_only_confirmed() {
@@ -334,11 +349,16 @@ mod tests {
                 Ok(())
             }).unwrap();
             let descriptor = descriptor("store.db");
-            let handler = ProjectsHandler::with_runtime(INCARNATION.into(), || NOW);
+            let handler = ProjectsHandler::with_runtime(INCARNATION.into(), || NOW)
+                .with_operator_confirmer(Arc::new(Yes));
             *handler.store.lock().unwrap() = Some(RegistryStore::open(&descriptor).unwrap());
             handler.route_admissions().insert(
                 OPERATOR,
                 RouteAdmission::from_bind(Some(reserved(WRITER_MODULE)), None),
+            );
+            handler.route_admissions().insert(
+                DIRECT,
+                RouteAdmission::from_bind(Some(Principal::Direct), None),
             );
             Self {
                 root,
@@ -374,6 +394,16 @@ mod tests {
         }
 
         fn outcome(&self, route: RouteKey, method: &str, params: Value) -> HandlerOutcome {
+            if route == DIRECT && method == "agent.repair_workspaces" {
+                return tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(self.handler.handle_served_request(
+                        &serde_json::to_vec(&json!({"method":method,"params":params})).unwrap(),
+                        route,
+                    ));
+            }
             self.handler.handle_request(
                 &serde_json::to_vec(&json!({"method":method,"params":params})).unwrap(),
                 route,
@@ -381,7 +411,15 @@ mod tests {
         }
 
         fn success(&self, method: &str, params: Value) -> Value {
-            let body = match self.outcome(OPERATOR, method, params) {
+            let body = match self.outcome(
+                if method == "agent.repair_workspaces" {
+                    DIRECT
+                } else {
+                    OPERATOR
+                },
+                method,
+                params,
+            ) {
                 HandlerOutcome::Response(body) => body,
                 HandlerOutcome::Error { code, message } => panic!("{method}: {code}: {message}"),
                 HandlerOutcome::ErrorWithDetail {
@@ -413,6 +451,7 @@ mod tests {
             // `actor`, and no caller or residence fields (core strips those).
             // Source: prefrontal 873870be8 crates/prefrontal-core-module/src/agent_registry_ops.rs:548-732.
             let mut value = match method {
+                "agent.repair_workspaces" => json!({}),
                 "agent.create" => json!({"role":"assistant","name":"Alice","tag":"test"}),
                 "agent.rename" => json!({"agent_id":A,"name":"Renamed"}),
                 "agent.update_tag" => json!({"agent_id":A,"tag":"changed"}),
@@ -451,12 +490,17 @@ mod tests {
         fn restart(&mut self) {
             let previous = self.handler.store.lock().unwrap().take();
             drop(previous);
-            self.handler = ProjectsHandler::with_runtime("fedcba9876543210".into(), || NOW + 1);
+            self.handler = ProjectsHandler::with_runtime("fedcba9876543210".into(), || NOW + 1)
+                .with_operator_confirmer(Arc::new(Yes));
             *self.handler.store.lock().unwrap() =
                 Some(RegistryStore::open(&self.descriptor).unwrap());
             self.handler.route_admissions().insert(
                 OPERATOR,
                 RouteAdmission::from_bind(Some(reserved(WRITER_MODULE)), None),
+            );
+            self.handler.route_admissions().insert(
+                DIRECT,
+                RouteAdmission::from_bind(Some(Principal::Direct), None),
             );
         }
 
@@ -528,14 +572,23 @@ mod tests {
     /// Commit a real key for every op; later admission tests must not read those
     /// cache entries, even when their bodies would otherwise decode or succeed.
     fn commit_every_mutation(f: &Fixture) -> Vec<(&'static str, Value, Value)> {
+        f.register();
+        f.source_sql("INSERT INTO agent(agent_id,name,tag,role,project_id,workspace_id,created_at_ms,updated_at_ms) VALUES('agent_0000000000000003','Stale head','','head','project','workspace',10,10); INSERT INTO agent_name_claim(agent_id,namespace_kind,namespace_key,normalized_name,display_name,claimed_at_ms) VALUES('agent_0000000000000003','workspace','workspace','stale head','Stale head',10);");
         let import = f.cut_over();
-        assert_eq!(import["agents_imported"], 0);
-        assert_eq!(import["claims_imported"], 0);
+        assert_eq!(import["agents_imported"], 1);
+        assert_eq!(import["claims_imported"], 1);
         let mut committed = vec![(
             "agent.import",
             f.params("agent.import", Some("committed-agent.import")),
             import,
         )];
+        let params = f.params(
+            "agent.repair_workspaces",
+            Some("committed-agent.repair_workspaces"),
+        );
+        let repaired = f.success("agent.repair_workspaces", params.clone());
+        assert_eq!(repaired["cleared"], 1);
+        committed.push(("agent.repair_workspaces", params, repaired));
         let mut create = f.params("agent.create", Some("committed-agent.create"));
         create["actor"] = json!("operator:test");
         let created = f.success("agent.create", create.clone());
@@ -564,7 +617,7 @@ mod tests {
             json!({"agent_id":source,"into_agent_id":target,"request_key":"committed-agent.merge"});
         let result = f.success("agent.merge", params.clone());
         committed.push(("agent.merge", params, result));
-        assert_eq!(committed.len(), 9);
+        assert_eq!(committed.len(), 10);
         committed
     }
 
@@ -609,7 +662,7 @@ mod tests {
     fn agent_principal_matrix_precedes_decode_keys_and_cached_replies_before_and_after_cutover() {
         let f = Fixture::new();
         for method in MUTATING_METHODS {
-            if *method != "agent.import" {
+            if *method != "agent.import" && *method != "agent.repair_workspaces" {
                 f.refusal(
                     OPERATOR,
                     method,
@@ -626,11 +679,17 @@ mod tests {
             for principal in principals() {
                 f.bind(principal.clone(), false);
                 for method in MUTATING_METHODS {
-                    if principal == Some(reserved(WRITER_MODULE)) {
+                    if principal == Some(reserved(WRITER_MODULE))
+                        && *method != "agent.repair_workspaces"
+                    {
                         assert!(f.handler.admit(method, CALLER).is_ok());
                         continue;
                     }
-                    let code = if principal == Some(Principal::Direct) {
+                    let code = if *method == "agent.repair_workspaces"
+                        && principal != Some(Principal::Direct)
+                    {
+                        "direct_caller_required"
+                    } else if principal == Some(Principal::Direct) {
                         "direct_identity_write_not_admitted"
                     } else {
                         "write_not_permitted"
@@ -679,24 +738,29 @@ mod tests {
                 f.cut_over();
             }
             for method in MUTATING_METHODS {
+                let route = if *method == "agent.repair_workspaces" {
+                    DIRECT
+                } else {
+                    OPERATOR
+                };
                 for body in [Value::Null, json!([]), json!("bad"), json!({})] {
-                    f.refusal(OPERATOR, method, body, "invalid_request");
+                    let code = if *method == "agent.repair_workspaces" && body == json!({}) {
+                        "request_key_required"
+                    } else {
+                        "invalid_request"
+                    };
+                    f.refusal(route, method, body, code);
                 }
                 for key in [None, Some("")] {
-                    f.refusal(
-                        OPERATOR,
-                        method,
-                        f.params(method, key),
-                        "request_key_required",
-                    );
+                    f.refusal(route, method, f.params(method, key), "request_key_required");
                 }
                 let mut body = f.params(method, None);
                 body["request_key"] = Value::Null;
-                f.refusal(OPERATOR, method, body, "request_key_required");
+                f.refusal(route, method, body, "request_key_required");
                 for field in ["request_key", "actor"] {
                     let mut body = f.params(method, Some("key"));
                     body[field] = json!(42);
-                    f.refusal(OPERATOR, method, body, "invalid_request");
+                    f.refusal(route, method, body, "invalid_request");
                 }
                 for field in [
                     "callerHarness",
@@ -718,7 +782,7 @@ mod tests {
                 ] {
                     let mut body = f.params(method, Some("key"));
                     body[field] = Value::Null;
-                    f.refusal(OPERATOR, method, body, "invalid_request");
+                    f.refusal(route, method, body, "invalid_request");
                 }
             }
         }

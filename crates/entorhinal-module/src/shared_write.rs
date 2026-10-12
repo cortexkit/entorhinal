@@ -1312,6 +1312,145 @@ mod tests {
             }
         }
 
+        async fn placed_head(f: &Fixture) -> String {
+            f.call(
+                "register",
+                json!({"projectId":"P","name":"P","workspaceId":"W1","roots":[],"requestKey":"P"}),
+            )
+            .await
+            .unwrap();
+            id(&f.call("agent.create", json!({"role":"head","name":"Head","tag":"ok","project_id":"P","request_key":"head"})).await.unwrap())
+        }
+
+        #[tokio::test]
+        async fn carrying_placement_prompts_exactly_and_cached_reply_is_unchanged() {
+            for enabled in [false, true] {
+                let tap = Tap::new(0);
+                let mut f = Fixture::new("carry-confirmed", connector(&tap));
+                let prompt = Prompt::new(Some(Ok(())));
+                direct(&mut f, prompt.clone(), enabled);
+                write(&f, "register", json!({"projectId":"empty","name":"Empty","roots":[],"workspaceId":"W1","requestKey":"empty"})).await.unwrap();
+                assert_eq!(prompt.count(), 0);
+                placed_head(&f).await;
+                let params = json!({"projectId":"P","workspaceId":"W2","requestKey":"carry"});
+                let committed = write(&f, "assign_workspace", params.clone()).await.unwrap();
+                assert_eq!(
+                    *prompt.calls.lock().unwrap(),
+                    vec![("move \"P\" to \"W2\": \"Head\"".into(), DIRECT)]
+                );
+                assert!(
+                    serde_json::from_slice::<Value>(&committed).unwrap()["result"]
+                        .get("incarnation")
+                        .is_none()
+                );
+                assert_eq!(
+                    committed,
+                    f.store()
+                        .shared_request_cache("assign_workspace", Some("carry"))
+                        .unwrap()
+                        .unwrap()
+                );
+                prompt.calls.lock().unwrap().clear();
+                let before = image(&f);
+                assert_eq!(
+                    write(&f, "assign_workspace", params).await.unwrap(),
+                    committed
+                );
+                assert_eq!(prompt.count(), 0);
+                assert_eq!(image(&f), before);
+                assert!(f.store().verify().unwrap().ok);
+                assert!(f.store().rebuild().unwrap().replay.ok);
+            }
+        }
+
+        #[tokio::test]
+        async fn carrying_refusals_precede_prompt_and_sync_direct_requires_approval() {
+            let tap = Tap::new(0);
+            let mut f = Fixture::new("carry-refusals", connector(&tap));
+            let prompt = Prompt::new(Some(Ok(())));
+            direct(&mut f, prompt.clone(), false);
+            let moving = placed_head(&f).await;
+            f.call(
+                "register",
+                json!({"projectId":"Q","name":"Q","workspaceId":"W2","roots":[],"requestKey":"Q"}),
+            )
+            .await
+            .unwrap();
+            let holder = id(&f.call("agent.create", json!({"role":"head","name":"Head","tag":"ok","project_id":"Q","request_key":"holder"})).await.unwrap());
+            let before = image(&f);
+            let error = write(
+                &f,
+                "assign_workspace",
+                json!({"projectId":"P","workspaceId":"W2","requestKey":"taken"}),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code, "name_conflict");
+            assert_eq!(
+                error.detail.unwrap(),
+                json!({"agent_id":moving,"holder_agent_id":holder,"workspace_id":"W2"})
+            );
+            assert_eq!(prompt.count(), 0);
+            assert_eq!(image(&f), before);
+            assert_eq!(
+                write(
+                    &f,
+                    "assign_workspace",
+                    json!({"projectId":"missing","workspaceId":"W3"})
+                )
+                .await
+                .unwrap_err()
+                .code,
+                "not_found"
+            );
+            let params = json!({"projectId":"P","workspaceId":"W3","requestKey":"sync"});
+            let body =
+                serde_json::to_vec(&json!({"method":"assign_workspace","params":params})).unwrap();
+            assert!(
+                matches!(f.handler.handle_request(&body, DIRECT), HandlerOutcome::Error {code, ..} if code == "operator_approval_stale")
+            );
+            assert_eq!(image(&f), before);
+            assert!(matches!(
+                f.handler.handle_request(&body, ROUTE),
+                HandlerOutcome::Response(_)
+            ));
+            f.call(
+                "assign_workspace",
+                json!({"projectId":"P","workspaceId":"W1","requestKey":"executive"}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(prompt.count(), 0);
+            assert!(f.store().verify().unwrap().ok);
+            assert!(f.store().rebuild().unwrap().replay.ok);
+        }
+
+        #[tokio::test]
+        async fn carrying_approval_rechecks_summary_under_writer_lock() {
+            let tap = Tap::new(0);
+            let mut f = Fixture::new("carry-stale", connector(&tap));
+            let prompt = Prompt::new(None);
+            direct(&mut f, prompt.clone(), false);
+            let moving = placed_head(&f).await;
+            let mut waiting = Box::pin(write(
+                &f,
+                "assign_workspace",
+                json!({"projectId":"P","workspaceId":"W2","requestKey":"stale"}),
+            ));
+            pending(waiting.as_mut());
+            assert_eq!(prompt.count(), 1);
+            f.call(
+                "agent.rename",
+                json!({"agent_id":moving,"name":"Changed","request_key":"rename"}),
+            )
+            .await
+            .unwrap();
+            let before = image(&f);
+            prompt.answer(0);
+            assert_eq!(waiting.await.unwrap_err().code, "operator_approval_stale");
+            assert_eq!(image(&f), before);
+        }
+
         #[tokio::test]
         async fn refusals_are_unpersisted_and_retries_prompt_again() {
             for error in [
@@ -1577,7 +1716,10 @@ mod tests {
                         .unwrap();
                 }
                 let snapshot = image(&f);
-                for op in agent_ops::CONFIRMABLE_METHODS {
+                for op in agent_ops::CONFIRMABLE_METHODS
+                    .iter()
+                    .filter(|op| op.starts_with("agent."))
+                {
                     let body = serde_json::to_vec(&json!({"method":op,"params":null})).unwrap();
                     let outcome = f.handler.handle_request(&body, DIRECT);
                     assert!(
@@ -2287,7 +2429,9 @@ impl Write {
         agent_id: &str,
         approval: Option<&OperatorApproval>,
     ) -> Result<Vec<u8>, HandlerError> {
-        let writer = store.with_principal(principal);
+        let writer = store
+            .with_principal(principal)
+            .with_confirmation(placement_confirmation(principal, approval));
         match self {
             Self::Register(r) => writer.register_at(r, now),
             Self::Assign(r) => writer.assign_workspace_at(r, now),
@@ -2313,13 +2457,32 @@ impl Write {
 }
 
 fn storage_error(error: entorhinal_core::RegistryError) -> HandlerError {
-    HandlerError::new(
-        match &error {
-            RegistryError::Domain { code, .. } => code.as_str(),
-            _ => "storage_error",
+    match error {
+        RegistryError::Domain {
+            code,
+            message,
+            detail,
+        } => HandlerError {
+            code,
+            message,
+            detail,
         },
-        error.to_string(),
-    )
+        error => HandlerError::new("storage_error", error.to_string()),
+    }
+}
+
+pub(super) fn placement_confirmation(
+    principal: &str,
+    approval: Option<&OperatorApproval>,
+) -> entorhinal_core::agent::PlacementConfirmation {
+    use entorhinal_core::agent::PlacementConfirmation;
+    if principal != "direct" {
+        PlacementConfirmation::NotRequired
+    } else if let Some(approval) = approval {
+        PlacementConfirmation::Approved(approval.clone())
+    } else {
+        PlacementConfirmation::NoPrompt
+    }
 }
 
 pub(super) fn draw_agent_id() -> Result<String, HandlerError> {
@@ -2427,7 +2590,13 @@ impl ProjectsHandler {
                 request.params.clone(),
                 (self.clock)(),
             )? {
-                AgentPrecheck::Cached(body) => return self.attach_incarnation(body),
+                AgentPrecheck::Cached(body) => {
+                    return if request.method.starts_with("agent.") {
+                        self.attach_incarnation(body)
+                    } else {
+                        Ok(body)
+                    }
+                }
                 AgentPrecheck::Ready(summary) => Some(summary),
                 // A confirmable method whose precheck found nothing needing approval.
                 AgentPrecheck::NoPrompt => None,
@@ -2506,7 +2675,19 @@ impl ProjectsHandler {
                 if store.generation().map_err(storage_error)? != before {
                     self.commits.notify_waiters();
                 }
-                return self.record_mutation(self.attach_incarnation(body));
+                if request.method == "register" && store.root_records_enabled() {
+                    if let Err(error) = store
+                        .with_principal(&principal)
+                        .bind_unbound_roots("entorhinal")
+                    {
+                        tracing::warn!(target:"binding", "binding after confirmed register failed: {error}");
+                    }
+                }
+                return self.record_mutation(if request.method.starts_with("agent.") {
+                    self.attach_incarnation(body)
+                } else {
+                    Ok(body)
+                });
             }
             return self.execute(request, key);
         }

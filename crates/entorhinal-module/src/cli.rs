@@ -240,6 +240,9 @@ pub fn parse(face: Face, arguments: &[String]) -> Invocation {
                 args.push(value.clone());
             }
             "--none" if face == Face::Agents => args.push(argument.clone()),
+            "--yes" if face == Face::Agents && verb.as_deref() == Some("repair-workspaces") => {
+                args.push(argument.clone())
+            }
             "--project" | "--label"
                 if face == Face::Projects && verb.as_deref() == Some("attach") =>
             {
@@ -370,6 +373,7 @@ usage: ck agents <verb> [args] [--subc <connection file>] [--json]
   labels <agent> --none      clear the label set
   list [--project <id>] [--workspace <id>]
   show <agent>               a live digest or a retired/merged identity
+  repair-workspaces [--yes]   preview the correction; --yes asks for confirmation
 
   <agent> is an id or a live name, optionally workspace/name
   --request-key <key>        reuse a write's key for a safe retry
@@ -699,12 +703,18 @@ fn build_at(command: &Command, cwd: &str) -> Result<(String, Value), String> {
 fn agent_write(method: &str) -> bool {
     matches!(
         method,
-        "agent.create" | "agent.rename" | "agent.dispose" | "agent.update_tag" | "agent.set_labels"
+        "agent.create"
+            | "agent.rename"
+            | "agent.dispose"
+            | "agent.update_tag"
+            | "agent.set_labels"
+            | "agent.repair_workspaces"
     )
 }
 
 fn build_agents(command: &Command) -> Result<(String, Value), String> {
-    let method = match command.verb.as_str() {
+    let mut method = match command.verb.as_str() {
+        "repair-workspaces" => "agent.repair_workspaces",
         "create" => "agent.create",
         "rename" => "agent.rename",
         "retire" => "agent.dispose",
@@ -727,12 +737,13 @@ fn build_agents(command: &Command) -> Result<(String, Value), String> {
             "--role" | "--tag" | "--supervisor" => command.verb == "create",
             "--project" | "--workspace" => matches!(command.verb.as_str(), "create" | "list"),
             "--none" => command.verb == "labels",
+            "--yes" => command.verb == "repair-workspaces",
             _ => false,
         };
         if !allowed {
             return Err(format!("{} does not accept {arg}", command.verb));
         }
-        let value = if arg == "--none" {
+        let value = if matches!(arg.as_str(), "--none" | "--yes") {
             String::new()
         } else {
             rest.next()
@@ -745,7 +756,7 @@ fn build_agents(command: &Command) -> Result<(String, Value), String> {
         }
     }
     let count_ok = match command.verb.as_str() {
-        "list" => positional.is_empty(),
+        "list" | "repair-workspaces" => positional.is_empty(),
         "rename" | "tag" => positional.len() == 2,
         "labels" if flags.contains_key("--none") => positional.len() == 1,
         "labels" => positional.len() >= 2,
@@ -783,6 +794,14 @@ fn build_agents(command: &Command) -> Result<(String, Value), String> {
             params["tag"] = json!(tag);
         }
         "list" => (),
+        "repair-workspaces" => {
+            if !flags.contains_key("--yes") {
+                if flags.contains_key("--request-key") {
+                    return Err("--request-key requires repair-workspaces --yes".into());
+                }
+                method = "agent.preview_repair_workspaces";
+            }
+        }
         verb => {
             params["agent_id"] = json!(positional[0]);
             match verb {
@@ -1001,6 +1020,8 @@ fn retry_args(command: &Command, params: &Value) -> Vec<String> {
                 args.extend([flag.into(), value.into()]);
             }
         }
+    } else if command.verb == "repair-workspaces" {
+        args.push("--yes".into());
     } else {
         args.push(text(&params["agent_id"]));
         match command.verb.as_str() {
@@ -1033,6 +1054,18 @@ async fn execute_agents(
     method: &str,
     mut params: Value,
 ) -> Result<Value, (u8, String)> {
+    if method == "agent.preview_repair_workspaces" {
+        let preview = agent_read(caller, method, params)
+            .await
+            .map_err(CallFailure::display)?;
+        if !preview["refusal"].is_null() {
+            return Err((
+                EXIT_REFUSED,
+                serde_json::to_string_pretty(&preview).unwrap(),
+            ));
+        }
+        return Ok(preview);
+    }
     if !agent_write(method) {
         let result = async {
             if method == "agent.list" {
@@ -1140,6 +1173,10 @@ fn call(
             // Keep the established project/workspace transport messages unchanged.
             let body = serde_json::to_vec(&json!({"method":method,"params":params}))
                 .map_err(|error| (EXIT_TRANSPORT, format!("serialize request: {error}")))?;
+            let options = placement_call_options(method);
+            if matches!(method, "assign_workspace" | "register") {
+                eprintln!("{AGENT_WRITE_NOTICE}");
+            }
             let bytes = consumer
                 .call(
                     subc_protocol::RouteTarget::ManagementSurface {
@@ -1152,7 +1189,7 @@ fn call(
                     // the operator happened to be standing in.
                     subc_protocol::BindIdentity::new(cwd, "ck-entorhinal", "operator"),
                     body,
-                    subc_client_rs::CallOptions::default(),
+                    options,
                 )
                 .await
                 .map_err(|error| match error {
@@ -1170,6 +1207,17 @@ fn call(
             unwrap_result(envelope)
         }
     })
+}
+
+fn placement_call_options(method: &str) -> subc_client_rs::CallOptions {
+    if matches!(method, "assign_workspace" | "register") {
+        subc_client_rs::CallOptions {
+            timeout: Duration::from_secs(300),
+            ..subc_client_rs::CallOptions::default()
+        }
+    } else {
+        subc_client_rs::CallOptions::default()
+    }
 }
 
 /// Strip the `{"result": ...}` wrapper the registry puts on every reply.
@@ -2421,6 +2469,45 @@ mod agent_tests {
                 .unwrap()
                 .pop_front()
                 .expect("unexpected extra RPC")
+        }
+    }
+
+    #[tokio::test]
+    async fn repair_workspaces_previews_refusal_and_yes_sends_confirmed_write() {
+        let preview = json!({"changes":[],"refusal":null,"incarnation":"fixed","generation":0});
+        let script = Script::new(vec![Ok(preview.clone())]);
+        assert_eq!(
+            execute(&script, &["repair-workspaces"]).await.unwrap(),
+            preview
+        );
+        assert_eq!(script.calls()[0].0, "agent.preview_repair_workspaces");
+        assert_eq!(script.calls()[0].1, json!({}));
+        let refused = json!({"changes":[],"refusal":{"code":"authority_not_cut_over","message":"not yet","detail":null}});
+        let script = Script::new(vec![Ok(refused.clone())]);
+        let error = execute(&script, &["repair-workspaces"]).await.unwrap_err();
+        assert_eq!(error.0, EXIT_REFUSED);
+        assert_eq!(serde_json::from_str::<Value>(&error.1).unwrap(), refused);
+        assert_eq!(script.calls().len(), 1);
+        let script = Script::new(vec![Ok(json!({"cleared":1,"moved":0}))]);
+        execute(
+            &script,
+            &["repair-workspaces", "--yes", "--request-key", "retry"],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            script.calls(),
+            vec![(
+                "agent.repair_workspaces".into(),
+                json!({"actor":"ck-agents","request_key":"retry"}),
+                Duration::from_secs(300)
+            )]
+        );
+        for method in ["assign_workspace", "register"] {
+            assert_eq!(
+                placement_call_options(method).timeout,
+                Duration::from_secs(300)
+            );
         }
     }
 
