@@ -929,10 +929,12 @@ impl RegistryStore {
     ///
     /// Every check reads the same SQLite transaction that writes the binding,
     /// so nothing can change the agent or the bindings between the check and
-    /// the write. Refusals, in order: `authority_not_cut_over`,
-    /// `unknown_agent`, `gone`, `ref_bound_elsewhere` (the reference already
-    /// belongs to another agent) and `session_bound_elsewhere` (the session key
-    /// already binds another reference, even one of the same agent).
+    /// the write. Refusals, in order: `authority_not_cut_over` (the journal
+    /// holds no agent-identity cutover marker yet, so this store does not own
+    /// agent identity), `unknown_agent`, `gone` (the agent is retired or
+    /// merged), `ref_bound_elsewhere` (the reference already belongs to
+    /// another agent) and `session_bound_elsewhere` (the session key already
+    /// binds another reference, even one of the same agent).
     /// Registering the same reference again for the same agent moves it to the
     /// new session key and records the new caller role and time.
     pub fn register_session(

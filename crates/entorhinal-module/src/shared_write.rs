@@ -2404,8 +2404,9 @@ impl ProjectsHandler {
         }
         // Session registration writes only machine-local rows, so it never
         // queues for the shared-log writer. Its providers are resolved here,
-        // after the flow refusal, and handed to admission for this request
-        // only.
+        // after `refuse_flow_write` above, so a flow-scoped route is refused
+        // without asking the daemon anything; the result is handed to
+        // admission for this request only.
         if request.method == super::sessions::REGISTER_SESSION {
             let providers = self.resolve_session_providers().await;
             return self.execute_with(request, key, Some(&providers));

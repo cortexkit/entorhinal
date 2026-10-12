@@ -167,8 +167,10 @@ impl SessionRole {
 }
 
 /// The refusal when neither session capability has a sole provider, or when
-/// nothing was resolved at all (the synchronous seam). The detail names what
-/// the daemon answered for each capability.
+/// no resolution was performed (`providers` is `None`): only the served
+/// request path can await the daemon, so the synchronous `handle_request`
+/// path passes `None` and always refuses. When providers were resolved, the
+/// detail names what the daemon answered for each capability.
 pub(super) fn orchestrator_unbound(providers: Option<&ResolvedProviders>) -> HandlerError {
     let detail = providers.map(|providers| {
         json!({
@@ -660,10 +662,10 @@ mod tests {
         json!({"agent_id":agent_id,"ref_kind":"pi","ref":session_ref,"harness":harness,"session_id":session_id})
     }
 
-    /// A host provider that is not the executive registers through the served
-    /// path, and its binding records that it came from the host capability.
-    /// This needs `authorize_write` to pass the method through: its fixed
-    /// operator-or-executive gate would refuse this caller.
+    /// A host provider that is not the executive can register through
+    /// `handle_served_request`, and its binding is recorded as `host`. This
+    /// requires `authorize_write` to exempt the method from its usual
+    /// operator-or-executive check, which would otherwise refuse this caller.
     #[tokio::test]
     async fn a_host_provider_other_than_the_executive_registers_as_host() {
         let f = Fixture::new("register-host", true);
@@ -686,9 +688,10 @@ mod tests {
         );
     }
 
-    /// The orchestrator's provider registers as `orchestrator`; a module that
-    /// provides both capabilities, as the executive does today, is recorded as
-    /// the orchestrator. Every request asks the daemon again.
+    /// The orchestrator's provider registers as `orchestrator`, and so does a
+    /// module that provides both capabilities. Provider resolution is never
+    /// cached: each registration asks the resolver for both capabilities
+    /// again, which the call count checks.
     #[tokio::test]
     async fn the_orchestrator_and_a_provider_of_both_register_as_orchestrator() {
         let f = Fixture::new("register-orchestrator", true);
@@ -705,7 +708,9 @@ mod tests {
                 .await,
         );
         assert_eq!(reply["registered_by"], "orchestrator");
-        // Either capability alone is enough.
+        // Being the sole provider of either capability alone is enough to
+        // register: here the executive provides only the host capability and
+        // is recorded as `host`.
         f.providers(ProviderResolution::Unprovided, provider("prefrontal-core"));
         let reply = result(
             f.register(EXECUTIVE, registration(&agent, "r3", "pi", "s3"))
@@ -805,8 +810,8 @@ mod tests {
             "flow_scope_not_admitted"
         );
         assert_eq!(f.resolver.calls(), 0, "a flow route resolves nothing");
-        // Resolution precedes the principal: Direct is told the capability
-        // is unbound, not that it is forbidden.
+        // Provider resolution is checked before the caller's principal, so a
+        // `Direct` caller gets `orchestrator_unbound`, not `caller_forbidden`.
         f.bind(CALLER, Some(Principal::Direct), false);
         assert_eq!(
             code(
@@ -835,8 +840,10 @@ mod tests {
         assert_eq!(f.bindings(), 0);
     }
 
-    /// After admission: the cutover, then the agent, then the reference, then
-    /// the session key. Each refusal writes nothing.
+    /// Once a caller is admitted, registration checks in order: that agent
+    /// identity is cut over to this store, then the agent, then the
+    /// reference, then the session key. Each refusal leaves the bindings
+    /// unchanged.
     #[tokio::test]
     async fn registration_refuses_cutover_agent_ref_and_session_in_order() {
         let pre = Fixture::new("register-precutover", false);
@@ -1177,8 +1184,9 @@ mod tests {
         .map(|session_ref| json!({"ref_kind":"pi","ref":session_ref}))
         .collect();
         let refs = json!(refs);
-        // Before any snapshot the mirror vouches for nothing, cause included
-        // where an entry carried one.
+        // Before the first snapshot the mirror trusts no reported state:
+        // every ref answers `unknown`, but an entry's `cause` (here
+        // `host_not_seen`) is still passed through on its answer.
         f.feed(json!({"seq":1,"sessions":[
             {"harness":"pi","sessionId":"s-active","canonicalRoot":"/w","state":"active"},
             {"harness":"pi","sessionId":"s-caused","canonicalRoot":"/w","state":"lapsed","cause":"host_not_seen"}]}));

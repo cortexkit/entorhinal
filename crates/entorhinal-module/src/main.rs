@@ -271,10 +271,11 @@ struct LivenessState {
     /// Every session the feed reports as not `gone`, keyed by
     /// `(harness, sessionId)`.
     sessions: MirrorSessions,
-    /// Sessions whose last report was `gone`. They leave `sessions` exactly as
-    /// before, so enumerate's annotation never counts them, and are kept here
-    /// only so `agent.session_liveness` can answer `gone` rather than
-    /// `unknown`. A snapshot clears them like the rest of the mirror.
+    /// Sessions whose last report was `gone`. They are removed from
+    /// `sessions`, so `annotate_liveness` never counts them toward a project's
+    /// `last_route_activity_ms`; they are kept here only so
+    /// `agent.session_liveness` can answer `gone` rather than `unknown`. A
+    /// snapshot clears them like the rest of the mirror.
     gone: std::collections::BTreeSet<SessionKey>,
 }
 
