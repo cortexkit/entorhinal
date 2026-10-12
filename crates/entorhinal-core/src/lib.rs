@@ -21,6 +21,7 @@ use serde::Serialize;
 
 pub mod agent;
 mod binding;
+pub mod claim_cache;
 pub mod enable_state;
 mod log_schema;
 mod mutations;
@@ -951,7 +952,8 @@ impl RegistryStore {
     /// the write. Refusals, in order: `authority_not_cut_over` (the journal
     /// holds no agent-identity cutover marker yet, so this store does not own
     /// agent identity), `unknown_agent`, `gone` (the agent is retired or
-    /// merged), `ref_bound_elsewhere` (the reference already belongs to
+    /// merged), `claim_integrity_failed`, `held_elsewhere` (a cached claim at
+    /// epoch 1 or higher belongs to another device), `ref_bound_elsewhere` (the reference already belongs to
     /// another agent) and `session_bound_elsewhere` (the session key already
     /// binds another reference, even one of the same agent).
     /// Registering the same reference again for the same agent moves it to the
@@ -1001,6 +1003,7 @@ impl RegistryStore {
         if let Some(gone) = row.gone() {
             return Err(session_refusal("gone", "agent is gone", Some(gone)));
         }
+        claim_cache::check_registration_claim(tx, request.agent_id)?;
         let by_ref = tx
             .query_row(
                 &format!("SELECT {SESSION_BINDING_COLUMNS} FROM session_binding WHERE ref_kind=?1 AND ref=?2"),

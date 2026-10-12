@@ -12,8 +12,9 @@
 //!   success replies are wrapped as `{result: ...}`.
 //! - Read entries carry `signed_by_self` and `author`, the signing key's
 //!   rotation-stable roster pseudonym as exactly 32 lowercase hex characters.
-//!   The flag compares that author to the reader's pseudonym. Authors are only
-//!   compared in memory, never persisted, logged or displayed.
+//!   The flag compares that author to the reader's pseudonym. The same pseudonym
+//!   is persisted in the machine-local claim cache and self identity, and may
+//!   be displayed with its member name.
 //! - Size limits count decoded bytes: an entry's data is at most 256 KiB, and a
 //!   read page at most 128 entries and 1 MiB.
 //! - Engram checks, in order, that this device is a member, then whether this

@@ -239,7 +239,7 @@ pub fn parse(face: Face, arguments: &[String]) -> Invocation {
                 args.push(argument.clone());
                 args.push(value.clone());
             }
-            "--none" if face == Face::Agents => args.push(argument.clone()),
+            "--none" | "--refresh" if face == Face::Agents => args.push(argument.clone()),
             "--yes" if face == Face::Agents && verb.as_deref() == Some("repair-workspaces") => {
                 args.push(argument.clone())
             }
@@ -374,6 +374,7 @@ usage: ck agents <verb> [args] [--subc <connection file>] [--json]
   list [--project <id>] [--workspace <id>]
   show <agent>               a live digest or a retired/merged identity
   repair-workspaces [--yes]   preview the correction; --yes asks for confirmation
+  where <agent> [--refresh]  cached checkout claim; optionally refresh first
 
   <agent> is an id or a live name, optionally workspace/name
   --request-key <key>        reuse a write's key for a safe retry
@@ -722,6 +723,7 @@ fn build_agents(command: &Command) -> Result<(String, Value), String> {
         "labels" => "agent.set_labels",
         "list" => "agent.list",
         "show" => "agent.resolve",
+        "where" => "agent.where",
         other => return Err(format!("unknown verb '{other}'\n\n{}", usage(Face::Agents))),
     };
     let mut flags = std::collections::BTreeMap::new();
@@ -738,12 +740,13 @@ fn build_agents(command: &Command) -> Result<(String, Value), String> {
             "--project" | "--workspace" => matches!(command.verb.as_str(), "create" | "list"),
             "--none" => command.verb == "labels",
             "--yes" => command.verb == "repair-workspaces",
+            "--refresh" => command.verb == "where",
             _ => false,
         };
         if !allowed {
             return Err(format!("{} does not accept {arg}", command.verb));
         }
-        let value = if matches!(arg.as_str(), "--none" | "--yes") {
+        let value = if matches!(arg.as_str(), "--none" | "--yes" | "--refresh") {
             String::new()
         } else {
             rest.next()
@@ -1070,6 +1073,14 @@ async fn execute_agents(
         let result = async {
             if method == "agent.list" {
                 return list_agents(caller, params).await;
+            }
+            if method == "agent.where" {
+                let token = params["agent_id"].as_str().expect("built where target");
+                let id = resolve_agent(caller, token).await?;
+                if command.args.iter().any(|arg| arg == "--refresh") {
+                    agent_read(caller, "agent.refresh_claims", json!({})).await?;
+                }
+                return agent_read(caller, method, json!({"agent_id":id})).await;
             }
             let token = params["agent_id"].as_str().expect("built show target");
             if !is_agent_id(token) {
@@ -2596,6 +2607,43 @@ mod agent_tests {
             script.calls()[0].2,
             subc_client_rs::CallOptions::default().timeout
         );
+    }
+
+    #[tokio::test]
+    async fn agents_where_resolves_names_and_refreshes_before_cache_read() {
+        let answer = json!({"known":true,"status":"unclaimed","epoch":0});
+        let script = Script::new(vec![
+            Ok(json!({"agent_id":ID})),
+            Ok(json!({"refreshed":1,"failed":0})),
+            Ok(answer.clone()),
+        ]);
+        assert_eq!(
+            execute(&script, &["where", "Ada", "--refresh"])
+                .await
+                .unwrap(),
+            answer
+        );
+        let calls = script.calls();
+        assert_eq!(
+            calls.iter().map(|c| c.0.as_str()).collect::<Vec<_>>(),
+            vec!["agent.resolve_name", "agent.refresh_claims", "agent.where"]
+        );
+        assert_eq!(calls[1].1, json!({}));
+        assert_eq!(calls[2].1, json!({"agent_id":ID}));
+        let script = Script::new(vec![Ok(answer.clone())]);
+        assert_eq!(execute(&script, &["where", ID]).await.unwrap(), answer);
+        assert_eq!(script.calls().len(), 1);
+        let script = Script::new(vec![Err(CallFailure::Refused {
+            code: "engram_unavailable".into(),
+            message: "offline".into(),
+        })]);
+        assert!(execute(&script, &["where", ID, "--refresh"])
+            .await
+            .unwrap_err()
+            .1
+            .starts_with("engram_unavailable"));
+        assert_eq!(script.calls().len(), 1);
+        assert!(build(&command(&["show", ID, "--refresh"])).is_err());
     }
 
     #[tokio::test]
