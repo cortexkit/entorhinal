@@ -685,9 +685,10 @@ mod tests {
         let f = fixture(false);
         placed(&f, "P", "W1");
         placed(&f, "Q", "W2");
-        // Core's post-082 shape: Ada's name is claimed under its own project id
-        // and copied into the stored workspace; Grace's claim already sits at
-        // its placement but the row still stores the workspace.
+        // The shape core's agent rows were imported in: Ada's name is claimed
+        // under its own project id, and that id was also copied into its
+        // stored workspace. Grace's claim already sits at its placement (W2),
+        // but the row still stores the workspace.
         let ada = "agent_0000000000000011";
         let grace = "agent_0000000000000012";
         import_core(&f, &format!("INSERT INTO agent(agent_id,name,tag,role,project_id,workspace_id,created_at_ms,updated_at_ms) VALUES('{ada}','Ada','tag','head','P','P',1,2),('{grace}','Grace','tag','head','Q','W2',1,2);

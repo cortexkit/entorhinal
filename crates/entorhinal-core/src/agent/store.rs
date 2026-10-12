@@ -137,8 +137,9 @@ impl AgentRow {
             value["project_id"] = json!(id);
         }
         // A head or hiree stores no workspace (its workspace is its project's
-        // placement), so it echoes `workspace_id: null` where core's rows
-        // carried the copied placement. Assistants keep omitting the key.
+        // placement), but it still echoes `workspace_id: null`, so the reply
+        // keeps the key set clients already decode for these roles. Assistants
+        // have never had the key and still omit it.
         if self.workspace_id.is_some() || matches!(self.role.as_str(), "head" | "hiree") {
             value["workspace_id"] = json!(self.workspace_id);
         }

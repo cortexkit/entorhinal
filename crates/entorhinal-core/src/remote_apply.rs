@@ -1634,7 +1634,8 @@ mod tests {
             );
             assert_eq!(image(&f), before);
         }
-        // A's own move into W2, beside B's different name, applies.
+        // An entry that releases only A's own claim and claims A's name in W2
+        // is applied. B's claim in W2, under a different name, stays active.
         let mut released = own.clone();
         released.released_at_ms = Some(20);
         let entry = AgentChangeEntry::new(
