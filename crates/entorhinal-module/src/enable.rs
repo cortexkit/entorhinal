@@ -543,6 +543,7 @@ mod tests {
                         principal: Some(principal),
                         flow_id: None,
                         handle: None,
+                        providers: Default::default(),
                     },
                 );
             }

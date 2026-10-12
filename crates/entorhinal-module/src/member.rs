@@ -167,6 +167,7 @@ mod tests {
                     principal,
                     flow_id: flow.map(str::to_string),
                     handle: None,
+                    providers: Default::default(),
                 },
             );
             store

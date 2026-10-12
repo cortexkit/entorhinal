@@ -195,6 +195,7 @@ mod tests {
                     }),
                     flow_id: None,
                     handle: None,
+                    providers: Default::default(),
                 },
             );
             handler
@@ -1177,6 +1178,7 @@ mod tests {
                     principal: Some(Principal::Direct),
                     flow_id: None,
                     handle: None,
+                    providers: Default::default(),
                 },
             );
         }
@@ -2582,21 +2584,20 @@ impl ProjectsHandler {
         // Liveness is volatile, not a SQLite mutation. It must not queue behind
         // a transaction waiting for the log.
         if request.method == "projects.session_liveness" {
-            let providers = super::sessions::ResolvedProviders {
-                orchestrator: super::sessions::ProviderResolution::Unprovided,
-                host: self
-                    .resolve_session_provider(super::sessions::HOST_CAPABILITY)
-                    .await,
-            };
+            let providers = self
+                .route_session_providers(&request.method, &admission)
+                .await;
             return self.execute_with(request, key, Some(&providers));
         }
         // Session registration writes only machine-local rows, so it never
-        // queues for the shared-log writer. Its providers are resolved here,
+        // queues for the shared-log writer. Its providers are obtained here,
         // after `refuse_flow_write` above, so a flow-scoped route is refused
         // without asking the daemon anything; the result is handed to
-        // admission for this request only.
+        // admission without allowing the synchronous seam to use the cache.
         if request.method == super::sessions::REGISTER_SESSION {
-            let providers = self.resolve_session_providers().await;
+            let providers = self
+                .route_session_providers(&request.method, &admission)
+                .await;
             return self.execute_with(request, key, Some(&providers));
         }
         let store = self.with_store(|s| Ok(s.clone()))?;

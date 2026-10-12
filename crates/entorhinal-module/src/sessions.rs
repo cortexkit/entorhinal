@@ -8,9 +8,12 @@
 //! reserved capability to exactly one module id, so the caller is admitted
 //! when its daemon-stamped principal is `reserved:<that module id>`.
 //!
-//! The provider of each capability is asked of the daemon for every request
-//! and never remembered on the route: a capability can be rebound to another
-//! module between two requests. No module name is compared anywhere here.
+//! Lookup answers identify the daemon's sole provider module id, or the lack
+//! of a sole provider. Each bound route caches its own answers. Replacing a
+//! reserved provider requires the previous provider to leave the daemon, which
+//! closes that provider's routes. A cached answer that would refuse a caller
+//! is refreshed once, never on a timer. Closing a route or changing its
+//! principal invalidates its cache. No fixed module name decides admission.
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
@@ -149,6 +152,32 @@ impl ProviderResolver for SubcProviderResolver {
 pub(super) struct ResolvedProviders {
     pub(super) orchestrator: ProviderResolution,
     pub(super) host: ProviderResolution,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CachedProviders {
+    host: Option<ProviderResolution>,
+    orchestrator: Option<ProviderResolution>,
+    invalidated: bool,
+}
+
+/// A route owns both its answers and its lookup lock. The lock coalesces first
+/// use by concurrent requests without blocking unrelated routes.
+#[derive(Debug, Default)]
+pub(super) struct RouteProviders {
+    cached: std::sync::Mutex<CachedProviders>,
+    resolving: tokio::sync::Mutex<()>,
+}
+
+impl RouteProviders {
+    /// Retire this admission, including answers held by an in-flight lookup.
+    /// A replacement route gets a new cache rather than reviving this one.
+    pub(super) fn invalidate(&self) {
+        let mut cached = self.cached.lock().unwrap_or_else(|e| e.into_inner());
+        cached.host = None;
+        cached.orchestrator = None;
+        cached.invalidated = true;
+    }
 }
 
 /// Which capability a registration was admitted under, stored on the binding.
@@ -376,14 +405,108 @@ impl ProjectsHandler {
         })
     }
 
-    /// Ask the daemon for both session capabilities at once. A lookup that
-    /// does not finish within its deadline counts as a transport failure.
-    pub(super) async fn resolve_session_providers(&self) -> ResolvedProviders {
-        let (orchestrator, host) = tokio::join!(
-            self.resolve_session_provider(ORCHESTRATOR_CAPABILITY),
-            self.resolve_session_provider(HOST_CAPABILITY)
+    async fn resolve_needed_providers(
+        &self,
+        providers: &mut ResolvedProviders,
+        host: bool,
+        orchestrator: bool,
+    ) {
+        let (host, orchestrator) = tokio::join!(
+            async {
+                if host {
+                    Some(self.resolve_session_provider(HOST_CAPABILITY).await)
+                } else {
+                    None
+                }
+            },
+            async {
+                if orchestrator {
+                    Some(self.resolve_session_provider(ORCHESTRATOR_CAPABILITY).await)
+                } else {
+                    None
+                }
+            }
         );
-        ResolvedProviders { orchestrator, host }
+        if let Some(host) = host {
+            providers.host = host;
+        }
+        if let Some(orchestrator) = orchestrator {
+            providers.orchestrator = orchestrator;
+        }
+    }
+
+    /// Use route-local claimant answers, resolving missing capabilities and
+    /// refreshing cached answers once before a refusal. Transport failures are
+    /// never remembered, even when the other capability resolved successfully.
+    pub(super) async fn route_session_providers(
+        &self,
+        method: &str,
+        admission: &super::RouteAdmission,
+    ) -> ResolvedProviders {
+        let route = &admission.providers;
+        let _lookup = route.resolving.lock().await;
+        let cached = route
+            .cached
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let registration = method == REGISTER_SESSION;
+        let mut providers = ResolvedProviders {
+            host: cached
+                .host
+                .clone()
+                .unwrap_or(ProviderResolution::Unprovided),
+            orchestrator: cached
+                .orchestrator
+                .clone()
+                .unwrap_or(ProviderResolution::Unprovided),
+        };
+        if cached.invalidated {
+            return providers;
+        }
+        self.resolve_needed_providers(
+            &mut providers,
+            cached.host.is_none(),
+            registration && cached.orchestrator.is_none(),
+        )
+        .await;
+        let transport_failed = |providers: &ResolvedProviders| {
+            matches!(providers.host, ProviderResolution::Transport(_))
+                || (registration
+                    && matches!(providers.orchestrator, ProviderResolution::Transport(_)))
+        };
+        let would_refuse = if registration {
+            admit_session_registration(Some(&providers), admission.principal.as_ref()).is_err()
+        } else {
+            admit_liveness_feed(Some(&providers), admission.principal.as_ref()).is_err()
+        };
+        if would_refuse && !transport_failed(&providers) {
+            // Fresh answers already read above need no second lookup. Only
+            // cached answers get the one refresh before the final decision.
+            self.resolve_needed_providers(
+                &mut providers,
+                cached.host.is_some(),
+                registration && cached.orchestrator.is_some(),
+            )
+            .await;
+        }
+        let mut cache = route.cached.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.invalidated {
+            return ResolvedProviders {
+                host: ProviderResolution::Unprovided,
+                orchestrator: ProviderResolution::Unprovided,
+            };
+        }
+        if transport_failed(&providers) {
+            cache.host = None;
+            cache.orchestrator = None;
+        } else {
+            cache.host = Some(providers.host.clone());
+            if registration {
+                cache.orchestrator = Some(providers.orchestrator.clone());
+            }
+        }
+        providers
     }
 
     /// Called only after admission decided `role`. Decoding comes after
@@ -721,14 +844,13 @@ mod tests {
         assert_eq!(
             f.resolver.calls(),
             2,
-            "both capabilities are resolved per request"
+            "both capabilities are resolved on first registration"
         );
     }
 
     /// The orchestrator's provider registers as `orchestrator`, and so does a
-    /// module that provides both capabilities. Provider resolution is never
-    /// cached: each registration asks the resolver for both capabilities
-    /// again, which the call count checks.
+    /// module that provides both capabilities. Each new route resolves both
+    /// capabilities once; later registrations reuse those answers.
     #[tokio::test]
     async fn the_orchestrator_and_a_provider_of_both_register_as_orchestrator() {
         let f = Fixture::new("register-orchestrator", true);
@@ -740,6 +862,10 @@ mod tests {
         );
         assert_eq!(reply["registered_by"], "orchestrator");
         f.providers(provider("prefrontal-core"), provider("prefrontal-core"));
+        f.handler
+            .on_route_gone(&RouteHandle::detached(EXECUTIVE.0, EXECUTIVE.1))
+            .await;
+        f.bind(EXECUTIVE, Some(reserved("prefrontal-core")), false);
         let reply = result(
             f.register(EXECUTIVE, registration(&agent, "r2", "pi", "s2"))
                 .await,
@@ -749,6 +875,10 @@ mod tests {
         // register: here the executive provides only the host capability and
         // is recorded as `host`.
         f.providers(ProviderResolution::Unprovided, provider("prefrontal-core"));
+        f.handler
+            .on_route_gone(&RouteHandle::detached(EXECUTIVE.0, EXECUTIVE.1))
+            .await;
+        f.bind(EXECUTIVE, Some(reserved("prefrontal-core")), false);
         let reply = result(
             f.register(EXECUTIVE, registration(&agent, "r3", "pi", "s3"))
                 .await,
@@ -1019,18 +1149,23 @@ mod tests {
         assert_eq!(f.resolver.calls(), calls, "the seam never asks the daemon");
     }
 
-    /// Providers are resolved per request and never remembered on the route,
-    /// so after a rebinding the previous provider is refused at once.
+    /// A cached mismatch gets exactly one fresh answer before refusing, so a
+    /// transiently outdated claimant answer does not decide admission alone.
     #[tokio::test]
-    async fn after_a_provider_switch_the_old_principal_is_caller_forbidden() {
+    async fn a_cached_registration_mismatch_refreshes_once_before_refusal() {
         let f = Fixture::new("register-switch", true);
         let agent = f.create("Switched");
-        f.providers(ProviderResolution::Unprovided, provider("prefrontal-core"));
-        result(
-            f.register(EXECUTIVE, registration(&agent, "r1", "pi", "s1"))
-                .await,
-        );
         f.providers(ProviderResolution::Unprovided, provider("thalamus-harness"));
+        assert_eq!(
+            code(
+                f.register(EXECUTIVE, registration(&agent, "r1", "pi", "s1"))
+                    .await
+            ),
+            "caller_forbidden"
+        );
+        let calls = f.resolver.calls();
+        assert_eq!(calls, 2);
+        f.providers(ProviderResolution::Unprovided, provider("another-host"));
         assert_eq!(
             code(
                 f.register(EXECUTIVE, registration(&agent, "r2", "pi", "s2"))
@@ -1038,6 +1173,20 @@ mod tests {
             ),
             "caller_forbidden"
         );
+        assert_eq!(
+            f.resolver.calls(),
+            calls + 2,
+            "each capability is refreshed once"
+        );
+        let cache = f
+            .handler
+            .admission_for(EXECUTIVE)
+            .providers
+            .cached
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(cache.host, Some(provider("another-host")));
         assert!(f.binding("pi", "s2").is_none());
     }
 
@@ -1286,6 +1435,432 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn registration_reuses_both_claimants_on_one_route() {
+        let f = Fixture::new("register-cache", true);
+        let agent = f.create("Cached");
+        f.providers(provider("prefrontal-core"), provider("prefrontal-core"));
+        for (session_ref, session_id) in [("r1", "s1"), ("r2", "s2"), ("r3", "s3")] {
+            let reply = result(
+                f.register(
+                    EXECUTIVE,
+                    registration(&agent, session_ref, "pi", session_id),
+                )
+                .await,
+            );
+            assert_eq!(reply["registered_by"], "orchestrator");
+        }
+        assert_eq!(
+            f.resolver.calls(),
+            2,
+            "one lookup for each capability, not each registration"
+        );
+        f.feed(json!({"seq":1,"snapshot":true,"sessions":[]})).await;
+        assert_eq!(
+            f.resolver.calls(),
+            2,
+            "the feed reuses this route's cached host"
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_after_feed_resolves_only_the_missing_orchestrator() {
+        let f = Fixture::new("register-cache-after-feed", true);
+        let agent = f.create("Cached");
+        f.providers(provider("prefrontal-core"), provider("prefrontal-core"));
+        f.feed(json!({"seq":1,"snapshot":true,"sessions":[]})).await;
+        assert_eq!(f.resolver.calls(), 1);
+        let reply = result(
+            f.register(EXECUTIVE, registration(&agent, "r1", "pi", "s1"))
+                .await,
+        );
+        assert_eq!(reply["registered_by"], "orchestrator");
+        assert_eq!(
+            f.resolver.calls(),
+            2,
+            "registration reuses the host already resolved by the feed"
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_transport_failure_caches_neither_capability() {
+        let f = Fixture::new("register-cache-transport", true);
+        let agent = f.create("Cached");
+        f.providers(
+            ProviderResolution::Transport("catalog unavailable".into()),
+            provider("prefrontal-core"),
+        );
+        let reply = result(
+            f.register(EXECUTIVE, registration(&agent, "r1", "pi", "s1"))
+                .await,
+        );
+        assert_eq!(
+            reply["registered_by"], "host",
+            "a failed capability still admits no one while the other can admit"
+        );
+        let cache = f
+            .handler
+            .admission_for(EXECUTIVE)
+            .providers
+            .cached
+            .lock()
+            .unwrap()
+            .clone();
+        assert!(cache.host.is_none());
+        assert!(cache.orchestrator.is_none());
+        f.providers(provider("prefrontal-core"), provider("prefrontal-core"));
+        let reply = result(
+            f.register(EXECUTIVE, registration(&agent, "r2", "pi", "s2"))
+                .await,
+        );
+        assert_eq!(reply["registered_by"], "orchestrator");
+        assert_eq!(f.resolver.calls(), 4);
+    }
+
+    #[tokio::test]
+    async fn registration_cached_unbound_refreshes_and_admits_rebound_host() {
+        let f = Fixture::new("register-cache-unbound", true);
+        let agent = f.create("Rebound");
+        f.bind(CALLER, Some(reserved("thalamus-harness")), false);
+        assert_eq!(
+            code(
+                f.register(CALLER, registration(&agent, "r1", "pi", "s1"))
+                    .await
+            ),
+            "orchestrator_unbound"
+        );
+        assert_eq!(f.resolver.calls(), 2);
+        f.providers(provider("prefrontal-core"), provider("thalamus-harness"));
+        let reply = result(
+            f.register(CALLER, registration(&agent, "r1", "pi", "s1"))
+                .await,
+        );
+        assert_eq!(reply["registered_by"], "host");
+        assert_eq!(
+            f.resolver.calls(),
+            4,
+            "one fresh lookup per capability before deciding"
+        );
+        result(
+            f.register(CALLER, registration(&agent, "r2", "pi", "s2"))
+                .await,
+        );
+        assert_eq!(f.resolver.calls(), 4);
+    }
+
+    #[tokio::test]
+    async fn feed_batches_resolve_host_once_per_route_and_invalidate_on_close() {
+        let f = Fixture::new("feed-cache", false);
+        f.resolver.set(HOST_CAPABILITY, provider("prefrontal-core"));
+        for seq in 1..=4 {
+            f.feed(json!({"seq":seq,"snapshot":seq == 1,"sessions":[]}))
+                .await;
+        }
+        assert_eq!(f.resolver.calls(), 1);
+        let old = f.handler.admission_for(EXECUTIVE).providers;
+        assert_eq!(
+            old.cached.lock().unwrap().host,
+            Some(provider("prefrontal-core"))
+        );
+        f.handler
+            .on_route_gone(&RouteHandle::detached(EXECUTIVE.0, EXECUTIVE.1))
+            .await;
+        let cache = old.cached.lock().unwrap().clone();
+        assert!(
+            cache.invalidated,
+            "closing the route retires even retained admissions"
+        );
+        assert!(cache.host.is_none());
+        let next = (EXECUTIVE.0, EXECUTIVE.1 + 1);
+        f.bind(next, Some(reserved("prefrontal-core")), false);
+        result(
+            f.served(
+                next,
+                "projects.session_liveness",
+                json!({"seq":1,"snapshot":true,"sessions":[]}),
+            )
+            .await,
+        );
+        assert_eq!(
+            f.resolver.calls(),
+            2,
+            "a new route cannot inherit the closed route's answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn feed_cached_mismatch_refreshes_once_before_refusal() {
+        let f = Fixture::new("feed-cache-mismatch", false);
+        f.bind(CALLER, Some(reserved("non-host")), false);
+        f.resolver.set(HOST_CAPABILITY, provider("first-host"));
+        let before = mirror(&f);
+        assert_eq!(
+            code(
+                f.served(
+                    CALLER,
+                    "projects.session_liveness",
+                    json!({"seq":1,"snapshot":true,"sessions":[]})
+                )
+                .await
+            ),
+            "caller_forbidden"
+        );
+        assert_eq!(
+            f.resolver.calls(),
+            1,
+            "a fresh refusal does not trigger another lookup"
+        );
+        f.resolver.set(HOST_CAPABILITY, provider("second-host"));
+        assert_eq!(
+            code(
+                f.served(
+                    CALLER,
+                    "projects.session_liveness",
+                    json!({"seq":1,"snapshot":true,"sessions":[]})
+                )
+                .await
+            ),
+            "caller_forbidden"
+        );
+        assert_eq!(
+            f.resolver.calls(),
+            2,
+            "a cached mismatch gets exactly one refresh"
+        );
+        assert_eq!(
+            f.handler
+                .admission_for(CALLER)
+                .providers
+                .cached
+                .lock()
+                .unwrap()
+                .host,
+            Some(provider("second-host"))
+        );
+        assert_eq!(mirror(&f), before);
+    }
+
+    #[tokio::test]
+    async fn feed_cached_unbound_refreshes_before_deciding() {
+        let f = Fixture::new("feed-cache-unbound", false);
+        assert_eq!(
+            code(
+                f.served(
+                    EXECUTIVE,
+                    "projects.session_liveness",
+                    json!({"seq":1,"snapshot":true,"sessions":[]})
+                )
+                .await
+            ),
+            "host_unbound"
+        );
+        assert_eq!(f.resolver.calls(), 1);
+        f.resolver.set(HOST_CAPABILITY, provider("prefrontal-core"));
+        f.feed(json!({"seq":1,"snapshot":true,"sessions":[]})).await;
+        assert_eq!(
+            f.resolver.calls(),
+            2,
+            "unbound cache is refreshed once before admission"
+        );
+        f.feed(json!({"seq":2,"sessions":[]})).await;
+        assert_eq!(f.resolver.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn feed_principal_change_invalidates_the_old_admission() {
+        let f = Fixture::new("feed-cache-principal", false);
+        f.resolver.set(HOST_CAPABILITY, provider("prefrontal-core"));
+        f.feed(json!({"seq":1,"snapshot":true,"sessions":[]})).await;
+        let old = f.handler.admission_for(EXECUTIVE).providers;
+        f.resolver
+            .set(HOST_CAPABILITY, provider("thalamus-harness"));
+        let request = subc_client_rs::RouteBindRequest::new(
+            RouteHandle::detached(EXECUTIVE.0, EXECUTIVE.1),
+            subc_protocol::RouteTarget::ToolProvider {
+                module_id: "entorhinal".into(),
+            },
+            subc_protocol::BindIdentity::new(f.dir.clone(), "test", "bind"),
+        )
+        .with_principal(reserved("thalamus-harness"));
+        f.handler.on_bind(&request).await;
+        assert!(old.cached.lock().unwrap().invalidated);
+        assert!(old.cached.lock().unwrap().host.is_none());
+        assert!(mirror(&f).stale);
+        f.feed(json!({"seq":2,"sessions":[]})).await;
+        assert_eq!(f.resolver.calls(), 2);
+        assert_eq!(
+            mirror(&f).sender,
+            Some((EXECUTIVE, reserved("thalamus-harness")))
+        );
+    }
+
+    #[tokio::test]
+    async fn feed_transport_failure_is_not_cached() {
+        let f = Fixture::new("feed-cache-transport", false);
+        f.resolver.set(
+            HOST_CAPABILITY,
+            ProviderResolution::Transport("catalog unavailable".into()),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                code(
+                    f.served(
+                        EXECUTIVE,
+                        "projects.session_liveness",
+                        json!({"seq":1,"snapshot":true,"sessions":[]})
+                    )
+                    .await
+                ),
+                "host_unbound"
+            );
+            assert!(f
+                .handler
+                .admission_for(EXECUTIVE)
+                .providers
+                .cached
+                .lock()
+                .unwrap()
+                .host
+                .is_none());
+        }
+        assert_eq!(f.resolver.calls(), 2);
+        f.resolver.set(HOST_CAPABILITY, provider("prefrontal-core"));
+        f.feed(json!({"seq":1,"snapshot":true,"sessions":[]})).await;
+        f.feed(json!({"seq":2,"sessions":[]})).await;
+        assert_eq!(f.resolver.calls(), 3);
+    }
+
+    struct GateResolver {
+        fake: Arc<FakeResolver>,
+        first: std::sync::atomic::AtomicBool,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl GateResolver {
+        fn new(fake: Arc<FakeResolver>) -> Arc<Self> {
+            Arc::new(Self {
+                fake,
+                first: std::sync::atomic::AtomicBool::new(true),
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ProviderResolver for GateResolver {
+        async fn resolve_provider(&self, capability: &str) -> ProviderResolution {
+            let answer = self.fake.resolve_provider(capability).await;
+            if self.first.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            answer
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_feed_first_use_shares_one_resolution() {
+        let mut f = Fixture::new("feed-cache-concurrent", false);
+        f.resolver.set(HOST_CAPABILITY, provider("prefrontal-core"));
+        let gate = GateResolver::new(f.resolver.clone());
+        f.handler.provider_resolver = gate.clone();
+        let both = async {
+            tokio::join!(
+                f.served(
+                    EXECUTIVE,
+                    "projects.session_liveness",
+                    json!({"seq":1,"snapshot":true,"sessions":[]})
+                ),
+                f.served(
+                    EXECUTIVE,
+                    "projects.session_liveness",
+                    json!({"seq":2,"sessions":[]})
+                )
+            )
+        };
+        tokio::pin!(both);
+        tokio::select! { _ = gate.entered.notified() => {}, _ = &mut both => panic!("requests completed before the catalog answered") }
+        assert_eq!(f.resolver.calls(), 1);
+        gate.release.notify_one();
+        let (first, second) = tokio::time::timeout(Duration::from_secs(1), both)
+            .await
+            .unwrap();
+        result(first);
+        result(second);
+        assert_eq!(
+            f.resolver.calls(),
+            1,
+            "concurrent batches share the first lookup"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closing_a_route_during_resolution_cannot_repopulate_its_cache() {
+        let mut f = Fixture::new("feed-cache-inflight", false);
+        f.resolver.set(HOST_CAPABILITY, provider("prefrontal-core"));
+        let gate = GateResolver::new(f.resolver.clone());
+        f.handler.provider_resolver = gate.clone();
+        let old = f.handler.admission_for(EXECUTIVE).providers;
+        let first = f.served(
+            EXECUTIVE,
+            "projects.session_liveness",
+            json!({"seq":1,"snapshot":true,"sessions":[]}),
+        );
+        tokio::pin!(first);
+        tokio::select! { _ = gate.entered.notified() => {}, _ = &mut first => panic!("request completed before the catalog answered") }
+        f.handler
+            .on_route_gone(&RouteHandle::detached(EXECUTIVE.0, EXECUTIVE.1))
+            .await;
+        f.bind(EXECUTIVE, Some(reserved("prefrontal-core")), false);
+        gate.release.notify_one();
+        assert_eq!(code(first.await), "host_unbound");
+        assert!(old.cached.lock().unwrap().host.is_none());
+        assert!(f
+            .handler
+            .admission_for(EXECUTIVE)
+            .providers
+            .cached
+            .lock()
+            .unwrap()
+            .host
+            .is_none());
+        assert_eq!(mirror(&f).last_seq, None);
+        f.feed(json!({"seq":1,"snapshot":true,"sessions":[]})).await;
+        assert_eq!(f.resolver.calls(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn feed_resolution_timeout_is_not_cached() {
+        let mut f = Fixture::new("feed-cache-timeout", false);
+        f.resolver.set(HOST_CAPABILITY, provider("prefrontal-core"));
+        let gate = GateResolver::new(f.resolver.clone());
+        f.handler.provider_resolver = gate;
+        assert_eq!(
+            code(
+                f.served(
+                    EXECUTIVE,
+                    "projects.session_liveness",
+                    json!({"seq":1,"snapshot":true,"sessions":[]})
+                )
+                .await
+            ),
+            "host_unbound"
+        );
+        assert!(f
+            .handler
+            .admission_for(EXECUTIVE)
+            .providers
+            .cached
+            .lock()
+            .unwrap()
+            .host
+            .is_none());
+        f.feed(json!({"seq":1,"snapshot":true,"sessions":[]})).await;
+        assert_eq!(f.resolver.calls(), 2);
+    }
+
     #[derive(Debug, PartialEq, Eq)]
     struct MirrorSnapshot {
         last_seq: Option<u64>,
@@ -1380,6 +1955,7 @@ mod tests {
                 ProviderResolution::InvalidIdentifier,
             ] {
                 f.resolver.set(HOST_CAPABILITY, unavailable.clone());
+                f.bind(EXECUTIVE, Some(reserved("prefrontal-core")), false);
                 let calls = f.resolver.calls();
                 let batches = f
                     .handler
@@ -1407,7 +1983,7 @@ mod tests {
                 assert_eq!(
                     f.resolver.calls(),
                     calls + 1,
-                    "only the host is resolved per batch"
+                    "a fresh feed route resolves only the host"
                 );
                 assert_eq!(mirror(&f), before);
                 assert_eq!(f.liveness(feed_refs()), answers);
@@ -1494,14 +2070,28 @@ mod tests {
     #[tokio::test]
     async fn liveness_feed_rebinding_to_thalamus_latches_until_snapshot() {
         let f = live_feed_fixture("feed-rebinding").await;
+        let previous_cache = f.handler.admission_for(EXECUTIVE).providers;
+        f.bind(CALLER, Some(reserved("thalamus-harness")), false);
+        assert_eq!(
+            code(
+                f.served(
+                    CALLER,
+                    "projects.session_liveness",
+                    json!({"seq":11,"sessions":[]})
+                )
+                .await
+            ),
+            "caller_forbidden"
+        );
         f.resolver
             .set(HOST_CAPABILITY, provider("thalamus-harness"));
-        f.bind(CALLER, Some(reserved("thalamus-harness")), false);
+        let orchestrator_route = (53, 1);
+        f.bind(orchestrator_route, Some(reserved("prefrontal-core")), false);
         let before = mirror(&f);
         assert_eq!(
             code(
                 f.served(
-                    EXECUTIVE,
+                    orchestrator_route,
                     "projects.session_liveness",
                     json!({"seq":11,"snapshot":true,"sessions":[]})
                 )
@@ -1515,6 +2105,7 @@ mod tests {
             "the orchestrator is not the rebound host"
         );
 
+        let calls = f.resolver.calls();
         let reply = result(
             f.served(
                 CALLER,
@@ -1523,7 +2114,16 @@ mod tests {
             )
             .await,
         );
+        assert_eq!(
+            f.resolver.calls(),
+            calls + 1,
+            "the new module's cached mismatch refreshes once"
+        );
         assert_eq!(reply["accepted"], true);
+        assert!(
+            previous_cache.cached.lock().unwrap().invalidated,
+            "a different host principal retires the previous sender's claimant cache"
+        );
         assert_eq!(
             reply["snapshotRequested"], true,
             "a new principal invalidates the old complete mirror even at a contiguous sequence"

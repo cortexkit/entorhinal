@@ -500,6 +500,7 @@ mod tests {
                     }),
                     flow_id: None,
                     handle: None,
+                    providers: Default::default(),
                 },
             );
             handler

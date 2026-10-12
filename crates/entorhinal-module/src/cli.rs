@@ -1997,6 +1997,7 @@ mod tests {
                 principal: Some(crate::Principal::Direct),
                 flow_id: None,
                 handle: None,
+                providers: Default::default(),
             },
         );
         let crate::HandlerOutcome::Response(bytes) =
@@ -2788,6 +2789,7 @@ mod agent_tests {
                     principal: Some(Principal::Direct),
                     flow_id: None,
                     handle: None,
+                    providers: Default::default(),
                 },
             );
             Self {

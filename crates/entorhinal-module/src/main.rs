@@ -286,7 +286,7 @@ struct LivenessState {
     /// after a sequence gap, an out-of-order batch, or loss/change of the host.
     stale: bool,
     /// Last admitted sender, used only to detect host changes and route loss,
-    /// never to admit a batch. Admission resolves the host anew every time.
+    /// never to admit a batch. Claimants are cached separately on each route.
     sender: Option<(RouteKey, Principal)>,
     /// Every session the feed reports as not `gone`, keyed by
     /// `(harness, sessionId)`.
@@ -419,8 +419,8 @@ struct ProjectsHandler {
     claim_refresh: Arc<claims::RefreshQueue>,
     claim_refresh_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     agent_id_draw: fn() -> Result<String, HandlerError>,
-    /// Names the module providing each session capability, asked afresh for
-    /// every session registration and liveness batch on the served path.
+    /// Names the module providing each session capability on first use of a
+    /// route, and once more before refusing a cached mismatch or unbound answer.
     provider_resolver: Arc<dyn sessions::ProviderResolver>,
     operator_confirmer: Arc<dyn agent_ops::OperatorConfirmer>,
     confirmation_slot: Arc<Mutex<Option<agent_ops::ConfirmationSlot>>>,
@@ -434,6 +434,7 @@ struct ProjectsHandler {
 #[derive(Clone, Debug, Default)]
 struct RouteAdmission {
     principal: Option<Principal>,
+    providers: Arc<sessions::RouteProviders>,
     /// The flow whose scope the route was opened under, if any.
     flow_id: Option<String>,
     /// Retain the SDK's connection identity until this admission is removed.
@@ -444,6 +445,7 @@ impl RouteAdmission {
     fn from_bind(principal: Option<Principal>, scope: Option<&ScopeStamp>) -> Self {
         Self {
             principal,
+            providers: Arc::default(),
             flow_id: scope.and_then(|stamp| stamp.attributes.flow_id.clone()),
             handle: None,
         }
@@ -690,7 +692,7 @@ impl ProjectsHandler {
 
     /// Whether a request on this route may run `method`. A flow-scoped route may
     /// not write at all. Project writes are admitted from `Direct` (the `ck`
-    /// faces) or the executive, as before. Agent identity writes are admitted
+    /// command-line clients) or the executive, as before. Agent identity writes are admitted
     /// here only from the executive (`reserved:prefrontal-core`): every local
     /// process, including an agent's shell, reaches entorhinal as `Direct`.
     /// The one way a `Direct` caller writes agent identity is `write_wait`,
@@ -698,18 +700,17 @@ impl ProjectsHandler {
     /// write at a Touch ID prompt first. Nothing else skips this refusal.
     /// Enabling the identity log is reserved to an unscoped operator route.
     /// `agent.register_session` is admitted only from the module the daemon
-    /// currently names as the sole provider of a session capability; this
-    /// path passes no resolved providers, so it refuses that method.
+    /// names as the sole provider of a session capability. Only the asynchronous
+    /// `handle_served_request` path may resolve or use the route's capability
+    /// cache; the synchronous request handler always refuses without resolving.
     fn admit(&self, method: &str, key: RouteKey) -> Result<RouteAdmission, HandlerError> {
         self.admit_with(method, key, None)
             .map(|(admission, _)| admission)
     }
 
     /// `admit`, plus the capability rules for session registration and liveness
-    /// against providers resolved for this one request. Resolution is never
-    /// stored on the route: a provider can be rebound between two requests on
-    /// the same route. Returns the role the caller was admitted under for that
-    /// method, and `None` for every other method.
+    /// against the route's claimant resolution supplied by the served path.
+    /// Returns the registration role, and `None` for every other method.
     fn admit_with(
         &self,
         method: &str,
@@ -794,19 +795,34 @@ impl ModuleHandler for ProjectsHandler {
     }
 
     async fn on_bind(&self, request: &RouteBindRequest) -> BindDecision {
-        self.route_admissions().insert(
+        let previous = self.route_admissions().insert(
             route_key(&request.handle),
             RouteAdmission {
                 handle: Some(request.handle),
                 ..RouteAdmission::from_bind(request.principal.clone(), request.scope.as_ref())
             },
         );
+        if let Some(previous) = previous {
+            previous.providers.invalidate();
+            if previous.principal != request.principal {
+                let mut state = self.liveness.lock().unwrap_or_else(|e| e.into_inner());
+                if state
+                    .sender
+                    .as_ref()
+                    .is_some_and(|(key, _)| *key == route_key(&request.handle))
+                {
+                    state.stale = true;
+                }
+            }
+        }
         BindDecision::accept()
     }
 
     async fn on_route_gone(&self, handle: &RouteHandle) {
         let key = route_key(handle);
-        self.route_admissions().remove(&key);
+        if let Some(admission) = self.route_admissions().remove(&key) {
+            admission.providers.invalidate();
+        }
         {
             let mut state = self.liveness.lock().unwrap_or_else(|e| e.into_inner());
             if state
@@ -1017,8 +1033,8 @@ impl ProjectsHandler {
         self.execute_with(request, key, None)
     }
 
-    /// `execute` with the capability providers resolved for this request.
-    /// Only the served path resolves them; every other caller passes `None`.
+    /// `execute` with the route's capability resolution. Only the served path
+    /// resolves or uses cached claimants; every other caller passes `None`.
     fn execute_with(
         &self,
         request: WireRequest,
@@ -1132,6 +1148,11 @@ impl ProjectsHandler {
             .is_some_and(|(_, previous)| *previous != principal)
         {
             state.stale = true;
+            if let Some((previous_route, _)) = state.sender.as_ref() {
+                if *previous_route != key {
+                    self.admission_for(*previous_route).providers.invalidate();
+                }
+            }
         }
         state.sender = Some((key, principal));
 
