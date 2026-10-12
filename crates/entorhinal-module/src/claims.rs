@@ -14,7 +14,7 @@ use entorhinal_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::{atomic::Ordering, Arc, Mutex};
+use std::sync::{atomic::Ordering, Arc, Mutex, Weak};
 use tokio::sync::{mpsc, oneshot};
 
 pub(crate) const REFRESH: &str = "agent.refresh_claims";
@@ -48,22 +48,35 @@ impl RefreshQueue {
     }
 }
 
+/// The refresh task outlives no handler: it holds the handler's store slot
+/// weakly, and takes a store handle only for the moment it reads or writes
+/// SQLite, never across a call to engram. So dropping the handler, or taking
+/// its store out, closes the database even while a refresh waits on a
+/// slow or hung engram reply.
 struct Worker {
-    store: Arc<Mutex<Option<RegistryStore>>>,
+    store: Weak<Mutex<Option<RegistryStore>>>,
     records: RecordClient,
     health: Arc<HealthGauges>,
     clock: fn() -> i64,
 }
 
 impl Worker {
+    /// The handler's current store, or `None` once the handler or its store
+    /// is gone.
+    fn store(&self) -> Option<RegistryStore> {
+        self.store.upgrade()?.lock().unwrap().clone()
+    }
+
     async fn pass(&self) -> Result<RefreshCounts, HandlerError> {
-        let Some(store) = self.store.lock().unwrap().clone() else {
-            return Ok(RefreshCounts::default());
+        let agents = {
+            let Some(store) = self.store() else {
+                return Ok(RefreshCounts::default());
+            };
+            if store.identity_log_status()?.state != "enabled" {
+                return Ok(RefreshCounts::default());
+            }
+            store.live_claim_agents()?
         };
-        if store.identity_log_status()?.state != "enabled" {
-            return Ok(RefreshCounts::default());
-        }
-        let agents = store.live_claim_agents()?;
         let mut counts = RefreshCounts::default();
         let mut reads_succeeded = 0;
         for chunk in agents.chunks(MANY_CAP) {
@@ -141,7 +154,9 @@ impl Worker {
                 // A shared write can own SQLite's writer connection while its
                 // engram reply is pending. Waiting for that connection must not
                 // block the executor that delivers the reply.
-                let cache = store.clone();
+                let Some(cache) = self.store() else {
+                    return Ok(counts);
+                };
                 let now = (self.clock)();
                 let conflicts = tokio::task::spawn_blocking(move || {
                     cache.cache_agent_claims(&observations, now)
@@ -183,7 +198,7 @@ impl ProjectsHandler {
         }
         let mut receiver = self.claim_refresh.receiver.lock().unwrap().take().unwrap();
         let worker = Worker {
-            store: self.store.clone(),
+            store: Arc::downgrade(&self.store),
             records: self.record_client.clone(),
             health: self.health.clone(),
             clock: self.clock,
@@ -549,7 +564,7 @@ mod tests {
         f.refresh().await;
         let other = FakeRecord::new([2; 16]);
         let worker = Worker {
-            store: f.handler.store.clone(),
+            store: Arc::downgrade(&f.handler.store),
             records: RecordClient::new(Arc::new(FakeRecordConnector(other))),
             health: f.handler.health.clone(),
             clock: f.handler.clock,
