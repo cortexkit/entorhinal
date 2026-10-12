@@ -1,6 +1,6 @@
 # Heads and hirees take their workspace from their project
 
-Status: direction agreed with the operator (2026-10-12). Open: where the heads of projects outside every workspace keep their names.
+Status: agreed with the operator (2026-10-12).
 
 ## The rule
 
@@ -15,6 +15,10 @@ This is the shape prefrontal-core's first agent schema enforced (migration 076):
 Names stay unique per workspace. A head's or hiree's active name claim is keyed on its project's placement (`namespace_kind = 'workspace'`, `namespace_key` = the placement). Placing a project in a workspace, or moving it to another, moves the active claims of its live heads and hirees in the same transaction. Before anything changes, every name is checked against the target workspace. If one is taken, the whole placement is refused with `name_conflict`, naming both agents. This replaces today's `bound_by_live_agent` refusal for placement changes. Removing a project or a workspace that live agents are bound to stays refused.
 
 Retired and merged agents keep their historical claims untouched, so their names stay reserved where they were.
+
+A project still needs a workspace before it can have agents, as today. A project with no agents may stay outside every workspace, because it has no names to keep unique. One workspace per project is allowed and expected to be common. Allowing agent-bearing projects without a workspace was considered and rejected: it would save one row per standalone project, but every reader of placement (create, peer roster, workspace-scoped standing grants, the phone's fleet view, name lookup) would need a second, no-workspace case.
+
+Since names are unique per workspace, the same name can exist in two workspaces. A name lookup without a workspace refuses with `name_ambiguous` and lists the candidates, never picking one. Entorhinal's `resolve_name` already does this.
 
 ## How the stored workspace drifted
 
@@ -34,7 +38,7 @@ Both are journaled with one after-image per agent, so verify, rebuild, `agent.ch
 Operator rulings that shape the data:
 
 - The 5 heads of unplaced projects (GOOSE, ORW, TMIGN, TOKSCALE, XURL) are no longer needed. They are retired, keeping their ids as tombstones.
-- Nothing outside `~/Work/Projects/CortexKit` belongs in the `cortexkit` workspace. Today that means `opencode`, `pi-mono` and `oh-my-pi`, whose heads are OC, PI and OMP. Where they go is the open question above.
+- Nothing outside `~/Work/Projects/CortexKit` belongs in the `cortexkit` workspace. Today that means `opencode`, `pi-mono` and `oh-my-pi`. Each moves to a workspace of its own (`opencode`, `pi`, `oh-my-pi`), and their heads' names (OC, PI, OMP) move with them. Messaging between workspaces needs nothing stored: prefrontal-core addresses agents registry-wide, and `peer_list` can list other workspaces.
 
 ## Ordering with prefrontal-core
 
