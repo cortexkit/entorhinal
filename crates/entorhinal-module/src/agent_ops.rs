@@ -922,8 +922,11 @@ mod tests {
                 for method in crate::MUTATING_METHODS
                     .iter()
                     // identity_log.enable is Direct-only, covered by attach_surface_enable_is_direct_only_and_fails_closed.
+                    // Self-admitted methods have their own rule, covered in sessions.rs.
                     .filter(|method| {
-                        !MUTATING_METHODS.contains(method) && **method != "identity_log.enable"
+                        !MUTATING_METHODS.contains(method)
+                            && **method != "identity_log.enable"
+                            && !crate::SELF_ADMITTED_METHODS.contains(method)
                     })
                 {
                     if principal == Some(Principal::Direct)

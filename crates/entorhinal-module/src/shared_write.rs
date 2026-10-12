@@ -2402,6 +2402,15 @@ impl ProjectsHandler {
         if request.method == "projects.session_liveness" {
             return self.execute(request, key);
         }
+        // Session registration writes only machine-local rows, so it never
+        // queues for the shared-log writer. Its providers are resolved here,
+        // after `refuse_flow_write` above, so a flow-scoped route is refused
+        // without asking the daemon anything; the result is handed to
+        // admission for this request only.
+        if request.method == super::sessions::REGISTER_SESSION {
+            let providers = self.resolve_session_providers().await;
+            return self.execute_with(request, key, Some(&providers));
+        }
         let store = self.with_store(|s| Ok(s.clone()))?;
         let state = store.identity_log_status().map_err(storage_error)?.state;
         let candidate = shared_candidate(&request.method);

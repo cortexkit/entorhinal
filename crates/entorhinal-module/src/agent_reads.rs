@@ -118,7 +118,7 @@ impl ProjectsHandler {
         self.attach_incarnation(encode_result(reply)?)
     }
 
-    fn with_agent_store<T>(
+    pub(super) fn with_agent_store<T>(
         &self,
         read: impl FnOnce(&RegistryStore) -> Result<T, entorhinal_core::agent::AgentMutationError>,
     ) -> Result<T, HandlerError> {
@@ -1519,6 +1519,8 @@ mod tests {
             "agent.fleet_identity",
             "agent.snapshot",
             "agent.changes",
+            "agent.for_session",
+            "agent.session_liveness",
         ];
         let expected_mutations = [
             "register",
@@ -1548,6 +1550,7 @@ mod tests {
             "agent.dispose",
             "agent.merge",
             "agent.import",
+            "agent.register_session",
         ];
         for (kind, names) in [
             ("query", expected_queries.as_slice()),

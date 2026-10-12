@@ -360,27 +360,35 @@ impl SubcConnector {
     /// Use the supervisor's daemon, not discovery of a different live daemon.
     /// Parsing argv is local only; the connection file is not read until connect.
     pub(crate) fn from_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Self {
-        let mut args = args.into_iter();
-        while let Some(arg) = args.next() {
-            let path = if arg == "--subc" {
-                args.next().map(PathBuf::from)
-            } else {
-                arg.to_str()
-                    .and_then(|s| s.strip_prefix("--subc="))
-                    .map(PathBuf::from)
-            };
-            if let Some(path) = path {
-                return Self {
-                    connection_file: Some(path),
-                    ..Self::default()
-                };
-            }
+        Self {
+            connection_file: subc_connection_file(args),
+            ..Self::default()
         }
-        // Without `--subc`, fall back to the client library's default daemon
-        // connection file. A supervised entorhinal always receives `--subc`;
-        // the subc client library refuses to serve without a valid one.
-        Self::default()
     }
+}
+
+/// The daemon connection file the supervisor passed as `--subc <path>` or
+/// `--subc=<path>`. Without one, a consumer falls back to the client
+/// library's default daemon connection file. A supervised entorhinal always
+/// receives `--subc`; the subc client library refuses to serve without a
+/// valid one.
+pub(crate) fn subc_connection_file(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Option<PathBuf> {
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        let path = if arg == "--subc" {
+            args.next().map(PathBuf::from)
+        } else {
+            arg.to_str()
+                .and_then(|s| s.strip_prefix("--subc="))
+                .map(PathBuf::from)
+        };
+        if path.is_some() {
+            return path;
+        }
+    }
+    None
 }
 
 #[async_trait]
