@@ -999,8 +999,9 @@ mod tests {
         let id = body["result"]["agent"]["agent_id"].as_str().unwrap();
         let generation = f.store().generation().unwrap();
         tap.fake.on_append(Action::Hold);
+        let before_calls = tap.fake.calls();
         let observe = async {
-            tap.fake.wait_for_calls(4).await;
+            tap.fake.wait_for_calls(before_calls + 2).await;
             assert_eq!(
                 f.pending(),
                 1,
@@ -2379,6 +2380,7 @@ enum Write {
     Add(entorhinal_core::AddRootRequest),
     Attach(entorhinal_core::AttachRootRequest),
     Agent(String, Value),
+    Member(entorhinal_core::shared_entry::MemberName),
 }
 
 impl Write {
@@ -2395,6 +2397,9 @@ impl Write {
             "seed_import" => Self::Seed(serde_json::from_value(params).map_err(invalid_params)?),
             "add_root" => Self::Add(serde_json::from_value(params).map_err(invalid_params)?),
             "attach_root" => Self::Attach(serde_json::from_value(params).map_err(invalid_params)?),
+            super::member::SET_NAME => {
+                Self::Member(serde_json::from_value(params).map_err(invalid_params)?)
+            }
             op => Self::Agent(op.into(), params),
         })
     }
@@ -2412,6 +2417,7 @@ impl Write {
             Self::Seed(r) => r.request_key.as_deref(),
             Self::Add(_) => None,
             Self::Attach(r) => r.request_key.as_deref(),
+            Self::Member(_) => None,
             Self::Agent(op, params) => {
                 return store
                     .with_principal(principal)
@@ -2440,6 +2446,9 @@ impl Write {
             Self::Seed(r) => writer.seed_import_at(r, now),
             Self::Add(r) => writer.add_root_at(r, now),
             Self::Attach(r) => writer.attach_root_at(r, now),
+            Self::Member(name) => {
+                return store.set_member_name(name, principal).map_err(Into::into)
+            }
             Self::Agent(op, params) => {
                 return writer
                     .agent_mutation_with_approval(
@@ -2508,6 +2517,7 @@ fn shared_candidate(op: &str) -> bool {
             | "seed_import"
             | "add_root"
             | "attach_root"
+            | "member.set_name"
     ) || (agent_ops::MUTATING_METHODS.contains(&op) && op != "agent.import")
 }
 
@@ -2546,7 +2556,7 @@ fn bootstrap_fence(
 impl ProjectsHandler {
     pub(super) async fn write_wait(
         &self,
-        request: WireRequest,
+        mut request: WireRequest,
         key: RouteKey,
         received: Instant,
     ) -> Result<Vec<u8>, HandlerError> {
@@ -2556,6 +2566,9 @@ impl ProjectsHandler {
         let direct = matches!(admission.principal, Some(Principal::Direct))
             && agent_ops::CONFIRMABLE_METHODS.contains(&request.method.as_str());
         refuse_flow_write(&request.method, admission.flow_id.as_deref())?;
+        if request.method == super::member::SET_NAME {
+            super::member::admit(admission.principal.as_ref())?;
+        }
         if !direct {
             authorize_write(&request.method, admission.principal.as_ref())?;
         }
@@ -2575,6 +2588,10 @@ impl ProjectsHandler {
             return self.execute_with(request, key, Some(&providers));
         }
         let store = self.with_store(|s| Ok(s.clone()))?;
+        if request.method == super::member::SET_NAME {
+            let name = super::member::prepare(&store, request.params.clone())?;
+            request.params = serde_json::to_value(name).expect("member name encodes");
+        }
         let state = store.identity_log_status().map_err(storage_error)?.state;
         let candidate = shared_candidate(&request.method);
         let prepared = candidate
@@ -2811,6 +2828,11 @@ impl ProjectsHandler {
                 continue;
             }
             let mut body = result?;
+            // Append receipts have no author. Read back a first own write so
+            // the next operator call can use its verified member identity.
+            if store.persisted_self_author()?.is_none() {
+                let _ = self.catch_up(&store, deadline).await;
+            }
             if matches!(request.method.as_str(), "register" | "add_root")
                 && store.root_records_enabled()
             {

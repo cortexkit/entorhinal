@@ -22,6 +22,7 @@ pub const PROJECT_SHARED_TABLES: &[&str] = &[
     "project_root_key",
 ];
 pub const AGENT_SHARED_TABLES: &[&str] = &["agent", "agent_name_claim"];
+pub const MEMBER_SHARED_TABLES: &[&str] = &["member_name"];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -41,6 +42,53 @@ pub struct ProjectEntry {
     /// decoder serves all of them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agents: Vec<AgentChangeEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_name: Option<MemberName>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemberName {
+    pub author: String,
+    pub display_name: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemberNameEntry {
+    pub op: String,
+    #[serde(flatten)]
+    pub name: MemberName,
+}
+
+impl MemberName {
+    pub fn validate(&self) -> rusqlite::Result<()> {
+        if self.author.len() != 32
+            || !self
+                .author
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || self.display_name != self.display_name.trim()
+            || !(1..=64).contains(&self.display_name.chars().count())
+        {
+            return Err(invalid("invalid member name"));
+        }
+        Ok(())
+    }
+
+    pub fn restore(&self, tx: &Transaction<'_>) -> rusqlite::Result<()> {
+        self.validate()?;
+        tx.execute("INSERT INTO member_name(author,display_name) VALUES(?1,?2) ON CONFLICT(author) DO UPDATE SET display_name=excluded.display_name", [&self.author, &self.display_name])?;
+        Ok(())
+    }
+}
+
+pub(crate) fn replay_member_name(tx: &Transaction<'_>, value: Value) -> rusqlite::Result<()> {
+    let entry: MemberNameEntry = serde_json::from_value(value).map_err(decode_error)?;
+    if entry.op != "member.set_name" {
+        return Err(invalid("invalid member name op"));
+    }
+    entry.name.restore(tx)
 }
 
 /// Captured inside the write transaction, on both sides of the operation.
@@ -83,7 +131,11 @@ fn row_key(row: &SharedRow, keys: &[String]) -> SharedRow {
 impl SharedState {
     pub fn capture(conn: &Connection) -> rusqlite::Result<Self> {
         let mut tables = BTreeMap::new();
-        for table in PROJECT_SHARED_TABLES.iter().chain(AGENT_SHARED_TABLES) {
+        for table in PROJECT_SHARED_TABLES
+            .iter()
+            .chain(AGENT_SHARED_TABLES)
+            .chain(MEMBER_SHARED_TABLES)
+        {
             let (names, keys) = columns(conn, table)?;
             let filter = if *table == "project_alias" {
                 " WHERE substr(old_id,1,13) <> 'pj-implicit1-'"
@@ -156,6 +208,7 @@ impl SharedState {
             op: "project.shared".into(),
             tables,
             agents: vec![],
+            member_name: None,
         })
     }
 
@@ -178,6 +231,7 @@ impl SharedState {
                 })
                 .collect(),
             agents,
+            member_name: None,
         }
     }
 }
@@ -227,7 +281,7 @@ pub(crate) fn record_local_entry(
             let mut entry = before.project_delta(after, tx)?;
             entry.agents = agents;
             canonical_bytes(&entry)
-        } else if op.starts_with("agent.") {
+        } else if op.starts_with("agent.") || op == "member.set_name" {
             let payload: Value = serde_json::from_str(payload).map_err(decode_error)?;
             canonical_bytes(payload.get("entry").unwrap_or(&payload))
         } else {
@@ -301,6 +355,7 @@ impl ProjectEntry {
         // the workspace correction, whose agent changes are all
         // `agent.set_namespace`.
         if !matches!(self.op.as_str(), "project.shared" | "shared.snapshot")
+            || (self.op == "project.shared" && self.member_name.is_some())
             || (self.op == "project.shared"
                 && self
                     .agents
@@ -326,6 +381,9 @@ impl ProjectEntry {
                 return Err(invalid("snapshot agents must be imports"));
             }
         }
+        if let Some(name) = &self.member_name {
+            name.validate()?;
+        }
         Ok(())
     }
 
@@ -340,6 +398,9 @@ impl ProjectEntry {
         cascade: bool,
     ) -> rusqlite::Result<()> {
         self.validate(tx)?;
+        if let Some(name) = &self.member_name {
+            name.restore(tx)?;
+        }
         // Defer foreign-key checks to the end of this transaction, so rows that
         // reference each other (for example an agent merged into another agent
         // in the same entry) can be installed in any order. The final state
@@ -541,10 +602,6 @@ mod tests {
                     "role_cache",
                     "role_take_request",
                     "self_identity",
-                    // Display names come only from identity-log entries
-                    // checked against their own author, never from a project
-                    // or agent write, so this comparison does not cover them.
-                    "member_name",
                 ];
                 let schema = conn
                     .prepare("SELECT name FROM sqlite_schema WHERE type='table'")?
@@ -557,6 +614,7 @@ mod tests {
                 let compared = PROJECT_SHARED_TABLES
                     .iter()
                     .chain(AGENT_SHARED_TABLES)
+                    .chain(MEMBER_SHARED_TABLES)
                     .map(|name| name.to_string())
                     .collect::<BTreeSet<_>>();
                 assert_eq!(

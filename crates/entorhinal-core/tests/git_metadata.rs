@@ -145,7 +145,7 @@ impl Fixture {
             })
             .collect();
         self.store.begin_enable(&parts, &plan.backfill).unwrap();
-        self.store.finish_enable(987654321, "direct").unwrap();
+        self.store.finish_enable(987654321, "direct", None).unwrap();
     }
 }
 

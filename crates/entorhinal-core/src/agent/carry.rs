@@ -1287,15 +1287,19 @@ mod tests {
         for (position, (_, bytes)) in corrected.iter().chain(&carried).enumerate() {
             reader
                 .store
-                .apply_remote_entry(&crate::remote_apply::RemoteEntry {
-                    position: position as i64 + 1,
-                    entry_id: format!("writer-{position}"),
-                    signer: "writer".into(),
-                    key_id: "key".into(),
-                    envelope_version: crate::remote_apply::ENVELOPE_VERSION,
-                    kind: "change".into(),
-                    entry: bytes.clone(),
-                })
+                .apply_remote_entry(
+                    &crate::remote_apply::RemoteEntry {
+                        position: position as i64 + 1,
+                        entry_id: format!("writer-{position}"),
+                        author: "01".repeat(16),
+                        signer: "writer".into(),
+                        key_id: "key".into(),
+                        envelope_version: crate::remote_apply::ENVELOPE_VERSION,
+                        kind: "change".into(),
+                        entry: bytes.clone(),
+                    },
+                    None,
+                )
                 .unwrap();
         }
         assert_eq!(
@@ -1335,15 +1339,19 @@ mod tests {
         ] {
             let error = reader
                 .store
-                .apply_remote_entry(&crate::remote_apply::RemoteEntry {
-                    position: 3,
-                    entry_id: "forged".into(),
-                    signer: "writer".into(),
-                    key_id: "key".into(),
-                    envelope_version: crate::remote_apply::ENVELOPE_VERSION,
-                    kind: "change".into(),
-                    entry: crate::shared_entry::canonical_bytes(&image),
-                })
+                .apply_remote_entry(
+                    &crate::remote_apply::RemoteEntry {
+                        position: 3,
+                        entry_id: "forged".into(),
+                        author: "01".repeat(16),
+                        signer: "writer".into(),
+                        key_id: "key".into(),
+                        envelope_version: crate::remote_apply::ENVELOPE_VERSION,
+                        kind: "change".into(),
+                        entry: crate::shared_entry::canonical_bytes(&image),
+                    },
+                    None,
+                )
                 .unwrap_err()
                 .to_string();
             assert!(error.contains(expected), "{error}");

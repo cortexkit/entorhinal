@@ -75,6 +75,7 @@ fn remote(entry: log_client::LogEntry) -> Result<RemoteEntry, HandlerError> {
             HandlerError::new("identity_log_stalled", "log position exceeds local range")
         })?,
         entry_id: log_client::encode_hex(&entry.entry_id),
+        author: entry.author,
         signer: log_client::encode_hex(&entry.signer),
         key_id: serde_json::json!({"family":entry.key_id.family,"epoch":entry.key_id.epoch})
             .to_string(),
@@ -179,8 +180,8 @@ impl Worker {
         deadline: Instant,
     ) -> Result<(), HandlerError> {
         // Re-read entries 1..through and compare each one's author with the
-        // snapshot's. Authors are never stored, so a member that applied those
-        // entries earlier, possibly before a restart, has no record of them. A
+        // snapshot's. The journal does not retain every entry's author, so a
+        // member that applied the prefix before a restart must re-read it. A
         // joiner that just read them re-reads too, so there is one code path.
         let mut after = 0;
         while after < through {
@@ -225,8 +226,28 @@ impl Worker {
             .identity_log_status()
             .map_err(storage)?
             .last_applied_position as u64;
+        if after > 0
+            && store.persisted_self_author().map_err(storage)?.is_none()
+            && store
+                .has_committed_own_entry_at_position()
+                .map_err(storage)?
+        {
+            let page = self.read(after - 1, deadline).await?;
+            if let Some(entry) = page
+                .entries
+                .into_iter()
+                .next()
+                .filter(|e| e.position == after && e.signed_by_self && e.kind == "change")
+            {
+                let author = entry.author.clone();
+                store
+                    .advance_own_entry(&remote(entry)?, Some(&author))
+                    .map_err(storage)?;
+            }
+        }
         let mut parts = Vec::new();
         let mut authors = Vec::new();
+        let mut self_authors = Vec::new();
         let mut snapshot = None;
         let started_unenabled = store.identity_log_status().map_err(storage)?.state != "enabled";
         let mut reconnect = self.health.log_state.load(Ordering::Relaxed) != 0;
@@ -259,6 +280,7 @@ impl Worker {
                     return Err(self.stalled(4, after + 1, "log gap"));
                 }
                 let author = entry.author.clone();
+                let self_author = entry.signed_by_self.then(|| author.clone());
                 let entry = remote(entry).map_err(|e| self.stalled(6, after + 1, e.message))?;
                 let position = entry.position as u64;
                 if entry.kind == "snapshot" || !parts.is_empty() {
@@ -273,6 +295,7 @@ impl Worker {
                     }
                     parts.push(entry);
                     authors.push(author);
+                    self_authors.push(self_author);
                     if info.1 == info.2 {
                         if let Some(through) =
                             entorhinal_core::remote_apply::snapshot_supersedes_through(&parts)
@@ -285,14 +308,25 @@ impl Worker {
                                 .await?;
                         }
                         (if joining {
-                            store.apply_join_snapshot(&parts, head)
+                            store.apply_join_snapshot(
+                                &parts,
+                                head,
+                                self_authors.iter().flatten().next().map(String::as_str),
+                            )
                         } else {
-                            store.apply_remote_snapshot(&parts)
+                            store.apply_remote_snapshot(
+                                &parts,
+                                self_authors.iter().flatten().next().map(String::as_str),
+                            )
                         })
                         .map_err(|e| self.stalled(6, position, e))?;
                         joining = false;
+                        for author in self_authors.iter().flatten() {
+                            self.identity_health(store, author)?;
+                        }
                         parts.clear();
                         authors.clear();
+                        self_authors.clear();
                         snapshot = None;
                         self.applied(store)?;
                     }
@@ -306,8 +340,11 @@ impl Worker {
                     }
                     let own = store.is_pending_entry(&entry.entry_id).map_err(storage)?;
                     store
-                        .apply_remote_entry(&entry)
+                        .apply_remote_entry(&entry, self_author.as_deref())
                         .map_err(|e| self.stalled(6, position, e))?;
+                    if let Some(author) = self_author {
+                        self.identity_health(store, &author)?;
+                    }
                     if own {
                         self.health
                             .log_own_entries_applied
@@ -347,6 +384,15 @@ impl Worker {
             .generation
             .fetch_max(store.generation().map_err(storage)?, Ordering::Relaxed);
         self.commits.notify_waiters();
+        Ok(())
+    }
+
+    fn identity_health(&self, store: &RegistryStore, author: &str) -> Result<(), HandlerError> {
+        if store.persisted_self_author().map_err(storage)?.as_deref() != Some(author) {
+            self.health
+                .self_author_conflicts
+                .fetch_add(1, Ordering::Relaxed);
+        }
         Ok(())
     }
 }
@@ -554,6 +600,93 @@ mod tests {
     }
     fn empty() -> Value {
         json!({"op":"project.shared","tables":{}})
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn s3_forged_name_stalls_and_upgrade_retries_the_name_position() {
+        let f = Fixture::new("name-forged");
+        f.append(
+            json!({"op":"member.set_name","author":"02".repeat(16),"display_name":"Forged"}),
+            false,
+        )
+        .await;
+        assert_eq!(f.catch().await.unwrap_err().code, "identity_log_stalled");
+        assert_eq!(f.position(), 0);
+        assert_eq!(f.state(), "apply_failed");
+        let cortexkit_store_types::StorageBackend::Sqlite { path } = &f.descriptor.backend else {
+            unreachable!()
+        };
+        assert_eq!(
+            rusqlite::Connection::open(path)
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM member_name", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+
+        let mut valid = Fixture::new("name-upgrade");
+        valid
+            .append(
+                json!({"op":"member.set_name","author":"00".repeat(16),"display_name":"Studio"}),
+                false,
+            )
+            .await;
+        // A decoder without member.set_name leaves the durable position before
+        // the name entry; reopening with the new decoder retries that entry.
+        valid.handler.health.log_state.store(6, Ordering::Relaxed);
+        assert_eq!(
+            valid.catch().await.unwrap_err().code,
+            "identity_log_stalled"
+        );
+        valid.restart(Arc::new(TapConnector(valid.tap.clone())));
+        valid.catch().await.unwrap();
+        assert_eq!(valid.position(), 1);
+        assert_eq!(
+            valid.store().persisted_self_author().unwrap(),
+            Some("00".repeat(16))
+        );
+        let cortexkit_store_types::StorageBackend::Sqlite { path } = &valid.descriptor.backend
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            rusqlite::Connection::open(path)
+                .unwrap()
+                .query_row("SELECT display_name FROM member_name", [], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            "Studio"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn s3_log_author_conflict_preserves_identity_and_reports_health() {
+        let f = Fixture::new("name-conflict");
+        f.store()
+            .apply_entry("identity_log.enable", "{}", "test", None, |tx| {
+                tx.execute(
+                    "INSERT INTO self_identity VALUES(1,?1,700)",
+                    ["01".repeat(16)],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        f.append(empty(), false).await;
+        f.catch().await.unwrap();
+        assert_eq!(f.position(), 1);
+        assert_eq!(
+            f.store().persisted_self_author().unwrap(),
+            Some("01".repeat(16))
+        );
+        assert_eq!(
+            f.handler
+                .health
+                .self_author_conflicts
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(f.state(), "ok");
     }
     fn project(id: &str) -> Value {
         json!({"op":"project.shared","tables":{"project":{"upsert":[{"project_id":id,"name":id,"implicit":0,"seed_identity":null,"created_at":1,"updated_at":1}],"delete":[]}}})
@@ -1357,6 +1490,7 @@ mod tests {
                 .map(|e| RemoteEntry {
                     position: e.position,
                     entry_id: e.entry_id.clone(),
+                    author: e.author.clone(),
                     signer: e.signer.clone(),
                     key_id: e.key_id.clone(),
                     envelope_version: e.envelope_version,
@@ -1372,13 +1506,13 @@ mod tests {
                 _ => value["parts"] = 3.into(),
             }
             wrong[1].entry = serde_json::to_vec(&value).unwrap();
-            assert!(f.store().apply_remote_snapshot(&wrong).is_err());
+            assert!(f.store().apply_remote_snapshot(&wrong, None).is_err());
             assert_eq!(f.position(), 0);
             assert_eq!(f.store().generation().unwrap(), before);
         }
         f.store().apply_entry("test-fault", "{}", "test", None, |tx| { tx.execute_batch("CREATE TEMP TRIGGER fail_snapshot_commit BEFORE UPDATE OF last_applied_position ON identity_log_state WHEN NEW.last_applied_position=2 BEGIN SELECT RAISE(ABORT,'final position fault'); END;")?; Ok(()) }).unwrap();
         let before = f.store().generation().unwrap();
-        let error = f.store().apply_remote_snapshot(&entries).unwrap_err();
+        let error = f.store().apply_remote_snapshot(&entries, None).unwrap_err();
         assert!(error.to_string().contains("final position fault"));
         assert_eq!(f.position(), 0);
         assert_eq!(f.store().generation().unwrap(), before);

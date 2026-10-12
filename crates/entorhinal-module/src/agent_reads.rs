@@ -1556,6 +1556,7 @@ mod tests {
             "agent.import",
             "agent.register_session",
             "agent.refresh_claims",
+            "member.set_name",
         ];
         for (kind, names) in [
             ("query", expected_queries.as_slice()),

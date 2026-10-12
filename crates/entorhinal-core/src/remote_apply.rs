@@ -34,6 +34,7 @@ const AGENT_OPS: &[&str] = &[
 pub struct RemoteEntry {
     pub position: i64,
     pub entry_id: String,
+    pub author: String,
     pub signer: String,
     pub key_id: String,
     pub envelope_version: i64,
@@ -44,6 +45,7 @@ pub struct RemoteEntry {
 enum Decoded {
     Project(ProjectEntry),
     Agent(Box<AgentChangeEntry>),
+    Member(crate::shared_entry::MemberName),
 }
 
 #[derive(Deserialize)]
@@ -58,9 +60,13 @@ struct SnapshotPart {
     agents: Vec<AgentChangeEntry>,
     #[serde(default)]
     supersedes_through: Option<u64>,
+    #[serde(default)]
+    member_name: Option<crate::shared_entry::MemberName>,
 }
 
 fn snapshot_part(entry: &RemoteEntry) -> Result<SnapshotPart, RegistryError> {
+    let value: Value =
+        serde_json::from_slice(&entry.entry).map_err(|e| domain("apply_failed", e.to_string()))?;
     let part: SnapshotPart =
         serde_json::from_slice(&entry.entry).map_err(|e| domain("apply_failed", e.to_string()))?;
     if entry.kind != "snapshot"
@@ -70,6 +76,11 @@ fn snapshot_part(entry: &RemoteEntry) -> Result<SnapshotPart, RegistryError> {
         || part.part == 0
         || part.parts == 0
         || part.part > part.parts
+        || (part.part != 1 && value.get("member_name").is_some())
+        || part
+            .member_name
+            .as_ref()
+            .is_some_and(|name| name.author != entry.author)
     {
         return Err(domain("apply_failed", "invalid snapshot part"));
     }
@@ -242,10 +253,73 @@ pub fn validate_agent_extension(
 }
 
 impl RegistryStore {
+    pub fn has_committed_own_entry_at_position(&self) -> Result<bool, RegistryError> {
+        self.read(|conn| conn.query_row("SELECT EXISTS(SELECT 1 FROM registry_journal WHERE origin='here' AND stream='shared' AND entry_id IS NOT NULL AND log_position=(SELECT last_applied_position FROM identity_log_state WHERE id=1))", [], |r| r.get(0)))
+    }
+
+    pub fn advance_own_entry(
+        &self,
+        entry: &RemoteEntry,
+        self_author: Option<&str>,
+    ) -> Result<(), RegistryError> {
+        self.db.with_conn_fenced(|tx| {
+            let committed: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM registry_journal WHERE entry_id=?1 AND origin='here' AND log_position=?2)", params![entry.entry_id, entry.position], |r| r.get(0))?;
+            let position: i64 = tx.query_row("SELECT last_applied_position FROM identity_log_state WHERE id=1", [], |r| r.get(0))?;
+            if !committed || entry.position != position { return Err(invalid_entry("own entry is not the committed position")); }
+            learn_identity(tx, self_author)?;
+            tx.execute("UPDATE identity_log_state SET last_seen_head=MAX(last_seen_head,?1) WHERE id=1", [entry.position])?;
+            Ok(())
+        }).map_err(RegistryError::Store)
+    }
+
+    pub fn set_member_name(
+        &self,
+        name: crate::shared_entry::MemberName,
+        principal: &str,
+    ) -> Result<Vec<u8>, RegistryError> {
+        let body = canonical_bytes(&crate::shared_entry::MemberNameEntry {
+            op: "member.set_name".into(),
+            name: name.clone(),
+        });
+        let error = std::cell::RefCell::new(None);
+        self.db
+            .with_conn_fenced(|tx| {
+                let write = || -> Result<(), RegistryError> {
+                    let seq = append(
+                        tx,
+                        "member.set_name",
+                        &serde_json::from_slice::<Value>(&body).map_err(decode_error)?,
+                        "entorhinal",
+                        None,
+                        crate::now_unix_millis(),
+                        principal,
+                    )?;
+                    name.restore(tx)?;
+                    tx.execute(
+                        "UPDATE registry_journal SET stream='shared',entry=?1 WHERE seq=?2",
+                        params![body, seq],
+                    )?;
+                    crate::pending::finish(tx, Some(seq))?;
+                    Ok(())
+                };
+                write().map_err(|cause| {
+                    let sql_error = invalid_entry(&cause.to_string());
+                    *error.borrow_mut() = Some(cause);
+                    sql_error
+                })
+            })
+            .map_err(|cause| error.into_inner().unwrap_or(RegistryError::Store(cause)))?;
+        Ok(b"{\"ok\":true}".to_vec())
+    }
+
     /// Install all snapshot parts atomically, preserving each part's authorship
     /// and original body for audit. The merged entry remains in replay's format.
-    pub fn apply_remote_snapshot(&self, entries: &[RemoteEntry]) -> Result<i64, RegistryError> {
-        self.install_snapshot(entries, None)
+    pub fn apply_remote_snapshot(
+        &self,
+        entries: &[RemoteEntry],
+        self_author: Option<&str>,
+    ) -> Result<i64, RegistryError> {
+        self.install_snapshot(entries, None, self_author)
     }
 
     /// Commit the incoming shared rows, their journal entries and the joining
@@ -257,14 +331,16 @@ impl RegistryStore {
         &self,
         entries: &[RemoteEntry],
         head: i64,
+        self_author: Option<&str>,
     ) -> Result<i64, RegistryError> {
-        self.install_snapshot(entries, Some(head))
+        self.install_snapshot(entries, Some(head), self_author)
     }
 
     fn install_snapshot(
         &self,
         entries: &[RemoteEntry],
         join_head: Option<i64>,
+        self_author: Option<&str>,
     ) -> Result<i64, RegistryError> {
         let parts = entries
             .iter()
@@ -290,8 +366,12 @@ impl RegistryStore {
             op: "shared.snapshot".into(),
             tables: Default::default(),
             agents: vec![],
+            member_name: None,
         };
         for part in parts {
+            if part.member_name.is_some() {
+                merged.member_name = part.member_name;
+            }
             for (table, changes) in part.tables {
                 if !changes.delete.is_empty() {
                     return Err(domain("apply_failed", "snapshot cannot delete rows"));
@@ -309,6 +389,7 @@ impl RegistryStore {
             op: "shared.snapshot".into(),
             tables: Default::default(),
             agents: vec![],
+            member_name: None,
         };
         let error = std::cell::RefCell::new(None);
         self.db
@@ -331,6 +412,10 @@ impl RegistryStore {
                     // Run the same image validation before inserting any journal row.
                     merged.validate(tx)?;
                     if supersedes {
+                        let had_name: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM member_name WHERE author=?1)", [&entries[0].author], |r| r.get(0))?;
+                        if had_name && merged.member_name.is_none() {
+                            return Err(invalid_entry("supersede invariant: snapshot drops member name"));
+                        }
                         let before = crate::shared_entry::SharedState::capture(tx)?;
                         let history = stored_agent_entries(tx)?;
                         validate_agent_extension(&history, &merged.agents).map_err(|cause| {
@@ -354,6 +439,7 @@ impl RegistryStore {
                         let replay_entry = RemoteEntry {
                             position: entry.position,
                             entry_id: entry.entry_id.clone(),
+                            author: entry.author.clone(),
                             signer: entry.signer.clone(),
                             key_id: entry.key_id.clone(),
                             envelope_version: entry.envelope_version,
@@ -377,6 +463,7 @@ impl RegistryStore {
                             params![String::from_utf8(canonical_bytes(&payload)).unwrap(), seq],
                         )?;
                     }
+                    learn_identity(tx, self_author)?;
                     if let Some(head) = join_head {
                         tx.execute("UPDATE identity_log_state SET state='joining',last_seen_head=?1 WHERE id=1 AND state='disabled'", [head])?;
                         crate::enable_state::finish_join_at_head(tx, head)?;
@@ -396,10 +483,19 @@ impl RegistryStore {
     /// Commit one complete change or assembled snapshot. A failure rolls back
     /// projection, journal and applied position together. Multipart buffering
     /// belongs to the coordinator, which must pass only a complete snapshot.
-    pub fn apply_remote_entry(&self, entry: &RemoteEntry) -> Result<i64, RegistryError> {
+    pub fn apply_remote_entry(
+        &self,
+        entry: &RemoteEntry,
+        self_author: Option<&str>,
+    ) -> Result<i64, RegistryError> {
         let error = std::cell::RefCell::new(None);
         let result = self.db.with_conn_fenced(|tx| {
-            apply(tx, entry).inspect_err(|cause| {
+            (|| {
+                let seq = apply(tx, entry)?;
+                learn_identity(tx, self_author)?;
+                Ok(seq)
+            })()
+            .inspect_err(|cause: &rusqlite::Error| {
                 *error.borrow_mut() = Some(cause.to_string());
             })
         });
@@ -410,6 +506,16 @@ impl RegistryStore {
             )
         })
     }
+}
+
+pub(crate) fn learn_identity(
+    tx: &Transaction<'_>,
+    self_author: Option<&str>,
+) -> rusqlite::Result<()> {
+    if let Some(author) = self_author {
+        crate::claim_cache::learn_self_author(tx, author, crate::now_unix_millis())?;
+    }
+    Ok(())
 }
 
 fn apply(tx: &Transaction<'_>, entry: &RemoteEntry) -> rusqlite::Result<i64> {
@@ -434,6 +540,13 @@ fn apply(tx: &Transaction<'_>, entry: &RemoteEntry) -> rusqlite::Result<i64> {
         ("change", "project.shared") | ("snapshot", "shared.snapshot") => {
             let project: ProjectEntry = serde_json::from_value(value).map_err(decode_error)?;
             project.validate(tx)?;
+            if project
+                .member_name
+                .as_ref()
+                .is_some_and(|name| name.author != entry.author)
+            {
+                return Err(invalid("snapshot names another author"));
+            }
             // The agents a placement carry or the workspace correction
             // changed pass the same checks as a standalone agent entry.
             if project.op == "project.shared" {
@@ -442,6 +555,15 @@ fn apply(tx: &Transaction<'_>, entry: &RemoteEntry) -> rusqlite::Result<i64> {
                 }
             }
             Decoded::Project(project)
+        }
+        ("change", "member.set_name") => {
+            let member: crate::shared_entry::MemberNameEntry =
+                serde_json::from_value(value).map_err(decode_error)?;
+            member.name.validate()?;
+            if member.name.author != entry.author {
+                return Err(invalid("member name author differs from log author"));
+            }
+            Decoded::Member(member.name)
         }
         ("change", op) if AGENT_OPS.contains(&op) => {
             let agent: AgentChangeEntry = serde_json::from_value(value).map_err(decode_error)?;
@@ -530,6 +652,25 @@ fn apply(tx: &Transaction<'_>, entry: &RemoteEntry) -> rusqlite::Result<i64> {
                 // stored alongside it unchanged, for audit and so replay
                 // restores exactly what was received.
                 tag(tx, seq, entry, &payload)?;
+                seq
+            }
+            Decoded::Member(name) => {
+                let seq = append(
+                    tx,
+                    "member.set_name",
+                    &json!({}),
+                    "log",
+                    None,
+                    0,
+                    "entorhinal",
+                )?;
+                name.restore(tx)?;
+                tag(
+                    tx,
+                    seq,
+                    entry,
+                    &json!({"signer":entry.signer,"key_id":entry.key_id}),
+                )?;
                 seq
             }
         }
@@ -682,6 +823,149 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn s3_member_author_mismatch_rolls_back_and_signer_is_not_author() {
+        let f = Fixture::new("member-author");
+        enable(&f);
+        let wrong = envelope(
+            1,
+            &json!({"op":"member.set_name","author":"02".repeat(16),"display_name":"Forged"}),
+            false,
+        );
+        assert!(f
+            .store
+            .apply_remote_entry(&wrong, None)
+            .unwrap_err()
+            .to_string()
+            .contains("author differs"));
+        assert_eq!(
+            f.store.identity_log_status().unwrap().last_applied_position,
+            0
+        );
+        assert_eq!(
+            f.store
+                .read(
+                    |c| c.query_row("SELECT COUNT(*) FROM member_name", [], |r| r
+                        .get::<_, i64>(0))
+                )
+                .unwrap(),
+            0
+        );
+        let good = envelope(
+            1,
+            &json!({"op":"member.set_name","author":"01".repeat(16),"display_name":"Studio"}),
+            false,
+        );
+        assert_ne!(good.signer, good.author);
+        f.store.apply_remote_entry(&good, None).unwrap();
+        assert_eq!(
+            f.store
+                .read(
+                    |c| c.query_row("SELECT display_name FROM member_name", [], |r| r
+                        .get::<_, String>(0))
+                )
+                .unwrap(),
+            "Studio"
+        );
+        assert_eq!(f.store.persisted_self_author().unwrap(), None);
+        assert!(f.store.verify().unwrap().replay.ok);
+    }
+
+    #[test]
+    fn s3_project_shared_cannot_bypass_member_author_validation() {
+        let f = Fixture::new("member-project-forgery");
+        enable(&f);
+        let entry = envelope(
+            1,
+            &json!({"op":"project.shared","tables":{},"member_name":{"author":"01".repeat(16),"display_name":"Studio"}}),
+            false,
+        );
+        assert!(f.store.apply_remote_entry(&entry, None).is_err());
+        assert_eq!(
+            f.store.identity_log_status().unwrap().last_applied_position,
+            0
+        );
+    }
+
+    #[test]
+    fn s3_reader_supersede_keeps_member_name() {
+        let f = Fixture::new("member-retention");
+        enable(&f);
+        f.store.apply_remote_entry(&envelope(1, &json!({"op":"member.set_name","author":"01".repeat(16),"display_name":"Studio"}), false), None).unwrap();
+        let snapshot = |name: Option<Value>| {
+            let mut v = json!({"snapshot_id":"s","part":1,"parts":1,"supersedes_through":1,"op":"shared.snapshot","tables":{}});
+            if let Some(name) = name {
+                v["member_name"] = name;
+            }
+            envelope(2, &v, true)
+        };
+        let before = f.store.generation().unwrap();
+        let error = f
+            .store
+            .apply_remote_snapshot(&[snapshot(None)], None)
+            .unwrap_err();
+        assert!(error.to_string().contains("drops member name"), "{error}");
+        assert_eq!(f.store.generation().unwrap(), before);
+        assert_eq!(
+            f.store.identity_log_status().unwrap().last_applied_position,
+            1
+        );
+        f.store
+            .apply_remote_snapshot(
+                &[snapshot(Some(
+                    json!({"author":"01".repeat(16),"display_name":"Studio"}),
+                ))],
+                None,
+            )
+            .unwrap();
+        assert!(f.store.verify().unwrap().replay.ok);
+    }
+
+    #[test]
+    fn s3_snapshot_names_only_its_author_and_only_in_part_one() {
+        let f = Fixture::new("member-snapshot-guard");
+        let name = json!({"author":"02".repeat(16),"display_name":"Other"});
+        let snapshot = |part, name: Value| {
+            let mut value =
+                json!({"snapshot_id":"s","part":part,"parts":2,"op":"shared.snapshot","tables":{}});
+            if !name.is_null() {
+                value["member_name"] = name;
+            }
+            envelope(part, &value, true)
+        };
+        assert!(snapshot_part_info(&snapshot(1, name.clone())).is_err());
+        assert!(f
+            .store
+            .apply_join_snapshot(
+                &[snapshot(1, name.clone()), snapshot(2, Value::Null)],
+                2,
+                None
+            )
+            .is_err());
+        let name = json!({"author":"01".repeat(16),"display_name":"Studio"});
+        assert!(snapshot_part_info(&snapshot(2, name.clone())).is_err());
+        assert!(f
+            .store
+            .apply_join_snapshot(
+                &[snapshot(1, Value::Null), snapshot(2, name.clone())],
+                2,
+                None
+            )
+            .is_err());
+        assert_eq!(f.store.persisted_self_author().unwrap(), None);
+        f.store
+            .apply_join_snapshot(
+                &[snapshot(1, name), snapshot(2, Value::Null)],
+                2,
+                Some(&"01".repeat(16)),
+            )
+            .unwrap();
+        assert_eq!(
+            f.store.persisted_self_author().unwrap(),
+            Some("01".repeat(16))
+        );
+    }
+
     fn register(f: &Fixture, id: &str, roots: Vec<String>, workspace: Option<&str>) {
         f.store
             .register(RegisterRequest {
@@ -702,6 +986,7 @@ mod tests {
         RemoteEntry {
             position,
             entry_id: format!("fake-{position}"),
+            author: "01".repeat(16),
             signer: "fake-source".into(),
             key_id: "key".into(),
             envelope_version: ENVELOPE_VERSION,
@@ -715,6 +1000,7 @@ mod tests {
             op: "project.shared".into(),
             tables: BTreeMap::new(),
             agents: vec![],
+            member_name: None,
         }
     }
 
@@ -764,7 +1050,7 @@ mod tests {
         let mut image = empty_project();
         image.tables.insert("project_root_key".into(), TableChanges { upsert:vec![serde_json::from_value(json!({"project_id":"P","kind":"remote","root_key":"owner/repo","created_at":10})).unwrap()], delete:vec![] });
         f.store
-            .apply_remote_entry(&envelope(1, &image, false))
+            .apply_remote_entry(&envelope(1, &image, false), None)
             .unwrap();
         append_local(
             f,
@@ -784,7 +1070,7 @@ mod tests {
         // Install exactly this machine's shared rows, without any paths or epochs.
         source
             .store
-            .apply_remote_entry(&envelope(1, &state(f).snapshot(vec![]), true))
+            .apply_remote_entry(&envelope(1, &state(f).snapshot(vec![]), true), None)
             .unwrap();
         let before = state(&source);
         source
@@ -824,7 +1110,7 @@ mod tests {
         let f = Fixture::new("supersede-cascade-member");
         enable(&f);
         f.store
-            .apply_remote_snapshot(&[envelope(1, &first, true)])
+            .apply_remote_snapshot(&[envelope(1, &first, true)], None)
             .unwrap();
         let root = f.dir("label-root");
         let remote = f.dir("remote-root");
@@ -912,7 +1198,7 @@ mod tests {
         last["parts"] = 1.into();
         last["supersedes_through"] = 1.into();
         f.store
-            .apply_remote_snapshot(&[envelope(2, &last, true)])
+            .apply_remote_snapshot(&[envelope(2, &last, true)], None)
             .unwrap();
         f.store.read(|conn| {
             let roots = conn.prepare("SELECT canonical_root,project_id,root_key_kind,root_key FROM project_root ORDER BY canonical_root")?.query_map([], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1006,10 +1292,10 @@ mod tests {
         let f = Fixture::new("remote-old-position");
         enable(&f);
         f.store
-            .apply_remote_entry(&envelope(1, &empty_project(), false))
+            .apply_remote_entry(&envelope(1, &empty_project(), false), None)
             .unwrap();
         f.store
-            .apply_remote_entry(&envelope(2, &empty_project(), false))
+            .apply_remote_entry(&envelope(2, &empty_project(), false), None)
             .unwrap();
         let before = image(&f);
         // A delayed or duplicated read must not rewind progress, even when its
@@ -1017,14 +1303,14 @@ mod tests {
         for position in [2, 1, 0] {
             let mut entry = envelope(position, &empty_project(), false);
             entry.entry_id = format!("late-{position}");
-            let error = f.store.apply_remote_entry(&entry).unwrap_err();
+            let error = f.store.apply_remote_entry(&entry, None).unwrap_err();
             assert!(error
                 .to_string()
                 .contains("entry is not the next log position"));
             assert_eq!(image(&f), before);
         }
         f.store
-            .apply_remote_entry(&envelope(3, &empty_project(), false))
+            .apply_remote_entry(&envelope(3, &empty_project(), false), None)
             .unwrap();
         assert_eq!(
             f.store.identity_log_status().unwrap().last_applied_position,
@@ -1051,12 +1337,15 @@ mod tests {
         let before = image(&f);
         // Each part is individually valid. Completeness must be checked by the
         // installer itself, not only by the network reader that normally calls it.
-        let error = f.store.apply_remote_snapshot(&entries[..1]).unwrap_err();
+        let error = f
+            .store
+            .apply_remote_snapshot(&entries[..1], None)
+            .unwrap_err();
         assert!(error
             .to_string()
             .contains("snapshot parts are not complete and ordered"));
         assert_eq!(image(&f), before);
-        f.store.apply_remote_snapshot(&entries).unwrap();
+        f.store.apply_remote_snapshot(&entries, None).unwrap();
         assert_eq!(
             f.store.identity_log_status().unwrap().last_applied_position,
             2
@@ -1079,7 +1368,7 @@ mod tests {
             3
         );
         f.store
-            .apply_remote_entry(&envelope(1, &empty_project(), false))
+            .apply_remote_entry(&envelope(1, &empty_project(), false), None)
             .unwrap();
         assert!(!f.store.is_pending_entry("slot-one").unwrap());
         assert!(f.store.is_pending_entry("slot-two").unwrap());
@@ -1089,7 +1378,7 @@ mod tests {
             2
         );
         f.store
-            .apply_remote_entry(&envelope(2, &empty_project(), false))
+            .apply_remote_entry(&envelope(2, &empty_project(), false), None)
             .unwrap();
         assert!(!f.store.is_pending_entry("slot-two").unwrap());
         assert!(f.store.is_pending_entry("slot-three").unwrap());
@@ -1134,7 +1423,13 @@ mod tests {
         let mut entry = envelope(1, &empty_project(), false);
         entry.entry_id = "own-agent-entry".into();
         entry.entry = bytes;
-        assert_eq!(f.store.apply_remote_entry(&entry).unwrap(), seq);
+        assert_eq!(
+            f.store
+                .apply_remote_entry(&entry, Some(&entry.author))
+                .unwrap(),
+            seq
+        );
+        assert_eq!(f.store.persisted_self_author().unwrap(), Some(entry.author));
         assert_eq!(f.store.generation().unwrap(), generation);
         assert_eq!(
             serde_json::to_value(f.store.agent_snapshot().unwrap()).unwrap(),
@@ -1170,7 +1465,7 @@ mod tests {
         let before = image(&f);
         let error = f
             .store
-            .apply_remote_entry(&envelope(1, &change, false))
+            .apply_remote_entry(&envelope(1, &change, false), None)
             .unwrap_err();
         assert!(error
             .to_string()
@@ -1178,7 +1473,7 @@ mod tests {
         assert_eq!(image(&f), before);
         change.tables.remove("project_alias");
         f.store
-            .apply_remote_entry(&envelope(1, &change, false))
+            .apply_remote_entry(&envelope(1, &change, false), None)
             .unwrap();
         assert_eq!(f.store.enumerate(None).unwrap().projects.len(), 2);
     }
@@ -1201,7 +1496,7 @@ mod tests {
         let f = Fixture::new("remote-delete");
         let (root, _) = local_checkout(&f);
         f.store
-            .apply_remote_entry(&envelope(2, &removal(&f, false), false))
+            .apply_remote_entry(&envelope(2, &removal(&f, false), false), None)
             .unwrap();
         f.store
             .read(|conn| {
@@ -1237,7 +1532,7 @@ mod tests {
         let f = Fixture::new("remote-successor");
         let (root, parent) = local_checkout(&f);
         f.store
-            .apply_remote_entry(&envelope(2, &removal(&f, true), false))
+            .apply_remote_entry(&envelope(2, &removal(&f, true), false), None)
             .unwrap();
         f.store
             .read(|conn| {
@@ -1328,7 +1623,7 @@ mod tests {
             },
         );
         f.store
-            .apply_remote_entry(&envelope(1, &image, false))
+            .apply_remote_entry(&envelope(1, &image, false), None)
             .unwrap();
         register(&f, "Q", vec![], Some("W"));
         f.store
@@ -1375,11 +1670,11 @@ mod tests {
         cases.push(envelope(1,&json!({"op":"project.shared","tables":{"workspace":{"upsert":[{"workspace_id":"W","name":"W","created_at":0,"updated_at":0}],"delete":[]},"project_workspace":{"upsert":[{"project_id":"missing","workspace_id":"W"}],"delete":[]}}}),false));
         cases.push(envelope(1, &empty_project(), true));
         for entry in cases {
-            let error = f.store.apply_remote_entry(&entry).unwrap_err();
+            let error = f.store.apply_remote_entry(&entry, None).unwrap_err();
             assert!(error.to_string().starts_with("apply_failed"), "{error}");
             assert_eq!(before, image(&f), "invalid entry applied partially");
         }
-        f.store.apply_remote_entry(&valid).unwrap();
+        f.store.apply_remote_entry(&valid, None).unwrap();
         assert_eq!(f.store.generation().unwrap(), 2);
         check_rebuild(&f);
     }
@@ -1442,7 +1737,7 @@ mod tests {
             AgentChangeEntry::new("agent.import", agents.agents[0].clone(), agents.claims);
         let snapshot = state(&source).snapshot(vec![bootstrap]);
         f.store
-            .apply_remote_entry(&envelope(1, &snapshot, true))
+            .apply_remote_entry(&envelope(1, &snapshot, true), None)
             .unwrap();
         let created: Value = serde_json::from_slice(
             &source
@@ -1471,7 +1766,7 @@ mod tests {
         })?.collect()).unwrap();
         for (i, entry) in entries.iter().enumerate() {
             f.store
-                .apply_remote_entry(&envelope(i as i64 + 2, entry, false))
+                .apply_remote_entry(&envelope(i as i64 + 2, entry, false), None)
                 .unwrap();
         }
         let bootstrap_id = snapshot.agents[0].agent_id.clone();
@@ -1571,7 +1866,7 @@ mod tests {
         let agents_before = f.store.agent_snapshot().unwrap();
         let error = f
             .store
-            .apply_remote_entry(&envelope(1, &bad, false))
+            .apply_remote_entry(&envelope(1, &bad, false), None)
             .unwrap_err();
         assert!(error.to_string().starts_with("apply_failed"));
         assert_eq!(image(&f), before);
@@ -1584,7 +1879,7 @@ mod tests {
         let disguised = AgentChangeEntry::new("agent.rename", row.clone(), foreign);
         assert!(f
             .store
-            .apply_remote_entry(&envelope(1, &disguised, false))
+            .apply_remote_entry(&envelope(1, &disguised, false), None)
             .is_err());
         assert_eq!(
             serde_json::to_value(f.store.agent_snapshot().unwrap()).unwrap(),
@@ -1595,7 +1890,7 @@ mod tests {
         let no_active = AgentChangeEntry::new("agent.rename", row.clone(), own.clone());
         assert!(f
             .store
-            .apply_remote_entry(&envelope(1, &no_active, false))
+            .apply_remote_entry(&envelope(1, &no_active, false), None)
             .is_err());
         assert_eq!(image(&f), before);
         assert_eq!(
@@ -1608,7 +1903,7 @@ mod tests {
         let active_retired = AgentChangeEntry::new("agent.dispose", retired, vec![]);
         assert!(f
             .store
-            .apply_remote_entry(&envelope(1, &active_retired, false))
+            .apply_remote_entry(&envelope(1, &active_retired, false), None)
             .is_err());
         assert_eq!(
             serde_json::to_value(f.store.agent_snapshot().unwrap()).unwrap(),
@@ -1627,7 +1922,7 @@ mod tests {
         renamed.name_version += 1;
         let good = AgentChangeEntry::new("agent.rename", renamed, own);
         f.store
-            .apply_remote_entry(&envelope(1, &good, false))
+            .apply_remote_entry(&envelope(1, &good, false), None)
             .unwrap();
         assert_eq!(f.store.agent_row(a).unwrap().unwrap().name, "Augusta");
         assert_eq!(
@@ -1691,7 +1986,7 @@ mod tests {
             );
             let error = f
                 .store
-                .apply_remote_entry(&envelope(1, &entry, false))
+                .apply_remote_entry(&envelope(1, &entry, false), None)
                 .unwrap_err()
                 .to_string();
             assert!(error.starts_with("apply_failed"), "{error}");
@@ -1711,7 +2006,7 @@ mod tests {
             vec![released, next_claim(&own)],
         );
         f.store
-            .apply_remote_entry(&envelope(1, &entry, false))
+            .apply_remote_entry(&envelope(1, &entry, false), None)
             .unwrap();
         assert_eq!(f.store.agent_row(a).unwrap().unwrap(), moved);
         assert_eq!(f.store.agent_claims(a).unwrap(), entry.claims);

@@ -66,6 +66,7 @@ mod current_directory;
 mod cut_barrier_rehearsal;
 mod enable;
 mod incarnation;
+mod member;
 // The client for engram's identity log. Only writes to shared state and
 // catch-up call it, and it opens its route on first use, so startup and every
 // read work with engram absent. It has no callers until the shared write path
@@ -487,6 +488,7 @@ const MUTATING_METHODS: &[&str] = &[
     "agent.import",
     "agent.register_session",
     "agent.refresh_claims",
+    "member.set_name",
 ];
 
 /// Mutations that `authorize_write` passes through because each is admitted
@@ -495,7 +497,11 @@ const MUTATING_METHODS: &[&str] = &[
 /// resolves as the sole provider of a session capability, so a fixed module
 /// name here would refuse a correctly bound provider.
 /// Claim refresh instead has its own Direct-only rule.
-const SELF_ADMITTED_METHODS: &[&str] = &[sessions::REGISTER_SESSION, claims::REFRESH];
+const SELF_ADMITTED_METHODS: &[&str] = &[
+    sessions::REGISTER_SESSION,
+    claims::REFRESH,
+    member::SET_NAME,
+];
 
 /// Admit project/workspace mutations from the operator (`Direct`: the `ck`
 /// commands) or executive, but unconfirmed identity mutations only from the
@@ -707,6 +713,9 @@ impl ProjectsHandler {
         let admission = self.admission_for(key);
         refuse_flow_write(method, admission.flow_id.as_deref())?;
         authorize_write(method, admission.principal.as_ref())?;
+        if method == member::SET_NAME {
+            member::admit(admission.principal.as_ref())?;
+        }
         if method == claims::REFRESH {
             self.admit_claim_refresh(key)?;
         }
@@ -1004,6 +1013,14 @@ impl ProjectsHandler {
             "resolve_root_key" => self.resolve_root_key(request.params),
             "preview_attach_root" => self.preview_attach_root(request.params),
             "identity_log.status" => self.identity_log_status(),
+            member::SET_NAME => {
+                let store = self.with_store(|s| Ok(s.clone()))?;
+                member::prepare(&store, request.params)?;
+                Err(HandlerError::new(
+                    "served_path_required",
+                    "member.set_name requires the served shared-write path",
+                ))
+            }
             "identity_log.enable" => Err(HandlerError::new(
                 "engram_unavailable",
                 "identity log enabling isn't available in this build yet",
@@ -1624,6 +1641,11 @@ fn manifest() -> ModuleManifest {
                     "Enable the shared identity log or join it (operator only).",
                 ),
                 management_operation(
+                    member::SET_NAME,
+                    ManagementOperationKind::Mutate,
+                    "Set this identity-log member's display name (Direct only).",
+                ),
+                management_operation(
                     "enumerate",
                     ManagementOperationKind::Query,
                     "List all registered projects with workspace assignments and tags.",
@@ -1849,6 +1871,7 @@ fn agent_operation_description(method: &str) -> &'static str {
         "agent.session_liveness" => "Answer active, gone or unknown for up to 256 session references, in request order.",
         "agent.where" => "Answer an agent's cached claim, including whether it is known and which device holds it.",
         "agent.refresh_claims" => "Refresh live agents' claim records from engram without waiting for the shared-log writer.",
+        "member.set_name" => "Set this identity-log member's display name (Direct only).",
         _ => "",
     }
 }
@@ -2073,7 +2096,11 @@ mod tests {
     fn self_admitted_methods_pass_the_write_gate_for_every_principal() {
         assert_eq!(
             SELF_ADMITTED_METHODS,
-            ["agent.register_session", "agent.refresh_claims"]
+            [
+                "agent.register_session",
+                "agent.refresh_claims",
+                "member.set_name"
+            ]
         );
         for method in SELF_ADMITTED_METHODS {
             assert!(MUTATING_METHODS.contains(method), "{method} is a mutation");

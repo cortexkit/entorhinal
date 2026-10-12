@@ -65,6 +65,7 @@ fn partition(id: &str, image: ProjectEntry, base: u64) -> Result<Vec<Vec<u8>>, R
         op: "shared.snapshot".into(),
         tables: BTreeMap::new(),
         agents: vec![],
+        member_name: None,
     };
     let mut units = vec![];
     for (table, changes) in image.tables {
@@ -94,6 +95,7 @@ fn partition(id: &str, image: ProjectEntry, base: u64) -> Result<Vec<Vec<u8>>, R
     }
     let mut images = vec![];
     let mut current = empty();
+    current.member_name = image.member_name;
     for (name, unit) in units {
         // Reserve maximum-width counts and replacement metadata before packing
         // rows; adding supersedes_through must never push a part over the cap.
@@ -213,7 +215,21 @@ impl RegistryStore {
             ));
         }
         let history = agent_history(log_entries)?;
-        self.prepare_enable_plan(snapshot_id, now, base, &history)
+        let plan = self.prepare_enable_plan(snapshot_id, now, base, &history)?;
+        let prefix_has_name = log_entries.iter().any(|entry| {
+            let value: serde_json::Value = serde_json::from_slice(&entry.entry).unwrap_or_default();
+            value["op"] == "member.set_name"
+                || value.get("member_name").is_some_and(|name| !name.is_null())
+        });
+        let first: serde_json::Value = serde_json::from_slice(&plan.bodies[0])
+            .map_err(|e| domain("identity_log_invariant", e.to_string()))?;
+        if prefix_has_name && first.get("member_name").is_none() {
+            return Err(domain(
+                "supersede_drops_member_name",
+                "snapshot drops member name",
+            ));
+        }
+        Ok(plan)
     }
 
     fn prepare_enable_plan(
@@ -244,6 +260,7 @@ impl RegistryStore {
         }
         let (mut image, backfill) = self.read(|conn| {
             let mut image = SharedState::capture(conn)?.snapshot(entries);
+            image.member_name = conn.query_row("SELECT author,display_name FROM member_name WHERE author=(SELECT self_author FROM self_identity WHERE id=1)", [], |r| Ok(crate::shared_entry::MemberName { author:r.get(0)?, display_name:r.get(1)? })).optional()?;
             let mut keys = crate::shared_entry::TableChanges::default();
             let mut mappings = vec![];
             let roots = conn.prepare("SELECT project_id,canonical_root FROM project_root ORDER BY canonical_root")?
@@ -292,7 +309,7 @@ impl RegistryStore {
                 }
             }
             image.tables.insert("project_root_key".into(), keys.clone());
-            let backfill = Backfill { image: ProjectEntry { op: "project.shared".into(), tables: [("project_root_key".into(), keys)].into(), agents: vec![] }, mappings, base };
+            let backfill = Backfill { image: ProjectEntry { op: "project.shared".into(), tables: [("project_root_key".into(), keys)].into(), agents: vec![], member_name: None }, mappings, base };
             Ok(Ok((image, backfill)))
         })??;
         image.agents.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
@@ -348,8 +365,14 @@ impl RegistryStore {
         }).map_err(RegistryError::Store)
     }
 
-    pub fn finish_enable(&self, now: i64, principal: &str) -> Result<(), RegistryError> {
+    pub fn finish_enable(
+        &self,
+        now: i64,
+        principal: &str,
+        self_author: Option<&str>,
+    ) -> Result<(), RegistryError> {
         self.db.with_conn_fenced(|tx| {
+            crate::remote_apply::learn_identity(tx, self_author)?;
             let (parts, backfill): (String, String) = tx.query_row("SELECT enable_parts,enable_backfill FROM identity_log_state WHERE id=1 AND state='enabling'", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
             let parts: Vec<EnablePart> = serde_json::from_str(&parts).map_err(decode_error)?;
             let backfill: Backfill = serde_json::from_str(&backfill).map_err(decode_error)?;
@@ -419,6 +442,7 @@ fn agent_history(
                     .map(|e| crate::remote_apply::RemoteEntry {
                         position: e.position,
                         entry_id: e.entry_id.clone(),
+                        author: e.author.clone(),
                         signer: e.signer.clone(),
                         key_id: e.key_id.clone(),
                         envelope_version: e.envelope_version,
@@ -452,6 +476,14 @@ fn agent_history(
                 return Err(invalid("unknown agent operation".into()));
             }
             image.agents
+        } else if entry.kind == "change" && value["op"] == "member.set_name" {
+            let name: crate::shared_entry::MemberNameEntry =
+                serde_json::from_value(value).map_err(|e| invalid(e.to_string()))?;
+            name.name.validate().map_err(|e| invalid(e.to_string()))?;
+            if name.name.author != entry.author {
+                return Err(invalid("member name author differs from log author".into()));
+            }
+            vec![]
         } else if entry.kind == "change" {
             let agent: AgentChangeEntry =
                 serde_json::from_value(value).map_err(|e| invalid(e.to_string()))?;
@@ -593,6 +625,7 @@ mod tests {
             op: "shared.snapshot".into(),
             tables: BTreeMap::new(),
             agents: vec![],
+            member_name: None,
         };
         let changes = image.tables.entry("project".into()).or_default();
         for _ in 0..2 {
@@ -627,6 +660,60 @@ mod tests {
             let value: serde_json::Value = serde_json::from_slice(&part).unwrap();
             assert_eq!(value["supersedes_through"], i64::MAX as u64 - 2);
         }
+    }
+
+    #[test]
+    fn s3_unnamed_supersede_bytes_are_unchanged_and_name_is_only_on_part_one() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let image = ProjectEntry {
+            op: "shared.snapshot".into(),
+            tables: BTreeMap::new(),
+            agents: vec![],
+            member_name: None,
+        };
+        let bodies = partition(id, image.clone(), 5).unwrap();
+        assert_eq!(bodies, vec![br#"{"op":"shared.snapshot","part":1,"parts":1,"snapshot_id":"0123456789abcdef0123456789abcdef","supersedes_through":5,"tables":{}}"#.to_vec()]);
+        let mut image = image;
+        image.member_name = Some(crate::shared_entry::MemberName {
+            author: "01".repeat(16),
+            display_name: "Studio".into(),
+        });
+        let rows = image.tables.entry("project".into()).or_default();
+        for _ in 0..3 {
+            rows.upsert
+                .push([("name".into(), json!("x".repeat(SNAPSHOT_CAP / 2)))].into());
+        }
+        let parts = partition(id, image, 5).unwrap();
+        assert!(parts.len() > 1);
+        for (i, part) in parts.iter().enumerate() {
+            assert!(part.len() <= SNAPSHOT_CAP);
+            let value: serde_json::Value = serde_json::from_slice(part).unwrap();
+            assert_eq!(value.get("member_name").is_some(), i == 0);
+        }
+    }
+
+    #[test]
+    fn s3_writer_supersede_refuses_to_drop_prefix_name() {
+        let f = crate::mutations::tests::Fixture::new("writer-name-keep");
+        let prefix = crate::remote_apply::RemoteEntry {
+            position: 1,
+            entry_id: "name".into(),
+            author: "01".repeat(16),
+            signer: "key".into(),
+            key_id: "key".into(),
+            envelope_version: 1,
+            kind: "change".into(),
+            entry: canonical_bytes(
+                &json!({"op":"member.set_name","author":"01".repeat(16),"display_name":"Studio"}),
+            ),
+        };
+        assert!(f
+            .store
+            .prepare_supersede("snapshot", 700, 1, &[prefix])
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("supersede_drops_member_name"));
     }
 
     fn git(root: &Path, args: &[&str]) {
@@ -702,6 +789,7 @@ mod tests {
             .map(|(i, p)| RemoteEntry {
                 position: i as i64 + 1,
                 entry_id: format!("part-{i}"),
+                author: "01".repeat(16),
                 signer: "fake".into(),
                 key_id: "fake".into(),
                 envelope_version: 1,
@@ -709,9 +797,9 @@ mod tests {
                 entry: p.data.clone(),
             })
             .collect();
-        a.finish_enable(100, "direct").unwrap();
+        a.finish_enable(100, "direct", None).unwrap();
         let b = RegistryStore::open(&descriptor("b.db")).unwrap();
-        b.apply_join_snapshot(&log, log.len() as i64).unwrap();
+        b.apply_join_snapshot(&log, log.len() as i64, None).unwrap();
         let checkout = dir.join("b");
         std::fs::create_dir_all(&checkout).unwrap();
         git(&checkout, &["init", "-q"]);
@@ -808,10 +896,12 @@ mod tests {
             op: "project.shared".into(),
             tables: Default::default(),
             agents: vec![moved.clone()],
+            member_name: None,
         };
         let entry = |position: i64, bytes: Vec<u8>| RemoteEntry {
             position,
             entry_id: format!("e{position}"),
+            author: "01".repeat(16),
             signer: "fake".into(),
             key_id: "fake".into(),
             envelope_version: 1,

@@ -240,6 +240,61 @@ mod tests {
     }
 
     #[test]
+    fn s3_fault_after_apply_reopen_persists_identity_and_rebuild_is_cell_identical() {
+        use crate::{
+            remote_apply::RemoteEntry,
+            shared_entry::{canonical_bytes, MemberName},
+        };
+        let f = Fixture::new("member-fault-reopen");
+        let descriptor = descriptor(&f);
+        let store = RegistryStore::open(&descriptor).unwrap();
+        store
+            .apply_entry("identity_log.enable", "{}", "test", None, |tx| {
+                tx.execute("UPDATE identity_log_state SET state='enabled'", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let author = "01".repeat(16);
+        let entry = RemoteEntry {
+            position: 1,
+            entry_id: "name-1".into(),
+            author: author.clone(),
+            signer: "signing-key".into(),
+            key_id: "key".into(),
+            envelope_version: 1,
+            kind: "change".into(),
+            entry: canonical_bytes(
+                &json!({"op":"member.set_name","author":author,"display_name":"Studio"}),
+            ),
+        };
+        let fault = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.apply_remote_entry(&entry, Some(&author)).unwrap();
+            panic!("injected fault after apply");
+        }));
+        assert!(fault.is_err());
+        drop(store);
+        let store = RegistryStore::open(&descriptor).unwrap();
+        assert_eq!(store.persisted_self_author().unwrap(), Some(author.clone()));
+        assert_eq!(
+            store.identity_log_status().unwrap().last_applied_position,
+            1
+        );
+        store
+            .set_member_name(
+                MemberName {
+                    author,
+                    display_name: "New Studio".into(),
+                },
+                "direct",
+            )
+            .unwrap();
+        let before = cells(&store);
+        assert!(store.verify().unwrap().replay.ok);
+        store.rebuild().unwrap();
+        assert_eq!(cells(&store), before);
+    }
+
+    #[test]
     fn v6_upgrade_uses_root_journal_timestamp_and_replays_every_cell() {
         let f = Fixture::new("log-schema-upgrade");
         let descriptor = descriptor(&f);

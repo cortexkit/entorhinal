@@ -333,6 +333,7 @@ usage: ck projects <verb> [args] [--subc <connection file>] [--json]
   trust <dir>             show each root's identity and approval
   verify                  check the store against its journal
   log status              show local identity log state
+  log name <display name> set this member's shared display name
   log enable [--without-agents]
                           enable or join the shared log (operator only);
                           skip agent import only when the fleet has no agents
@@ -585,11 +586,19 @@ fn build_at(command: &Command, cwd: &str) -> Result<(String, Value), String> {
                 .as_slice()
             {
                 ["status"] => ("identity_log.status".into(), json!({})),
+                ["name", display_name] => (
+                    "member.set_name".into(),
+                    json!({"display_name":display_name}),
+                ),
                 ["enable"] => ("identity_log.enable".into(), json!({})),
                 ["enable", "--without-agents"] => {
                     ("identity_log.enable".into(), json!({"without_agents":true}))
                 }
-                _ => return Err("log needs exactly one of: status, enable".into()),
+                _ => {
+                    return Err(
+                        "log needs exactly one of: status, enable, name <display name>".into(),
+                    )
+                }
             }
         }
         (Face::Projects, "remove") => (
@@ -2000,6 +2009,37 @@ mod tests {
             "enabled"
         );
         assert_eq!(log.head(), 1);
+        let Invocation::Command(command) = parse_as(Face::Projects, &["log", "name", "Studio"])
+        else {
+            panic!("log name must parse")
+        };
+        let (method, params) = build(&command).unwrap();
+        assert_eq!(method, "member.set_name");
+        assert_eq!(params, json!({"display_name":"Studio"}));
+        let body = serde_json::to_vec(&json!({"method":method,"params":params})).unwrap();
+        let result = {
+            let response = handler.handle_served_request(&body, (141, 1));
+            tokio::pin!(response);
+            loop {
+                tokio::select! { result = &mut response => break result, () = tokio::task::yield_now() => {} }
+            }
+        };
+        assert!(
+            matches!(result, crate::HandlerOutcome::Response(_)),
+            "{result:?}"
+        );
+        assert_eq!(log.head(), 2);
+        let cortexkit_store_types::StorageBackend::Sqlite { path } = &descriptor.backend else {
+            unreachable!()
+        };
+        assert_eq!(
+            rusqlite::Connection::open(path)
+                .unwrap()
+                .query_row("SELECT display_name FROM member_name", [], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            "Studio"
+        );
         drop(handler);
         std::fs::remove_dir_all(dir).unwrap();
     }

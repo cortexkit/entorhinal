@@ -141,7 +141,7 @@ impl RegistryStore {
     }
 }
 
-pub(super) fn finish(tx: &Transaction<'_>, seq: Option<i64>) -> Result<(), RegistryError> {
+pub(crate) fn finish(tx: &Transaction<'_>, seq: Option<i64>) -> Result<(), RegistryError> {
     ATTEMPT.with(|slot| {
         let mut slot = slot.borrow_mut();
         let Some(attempt) = slot.as_mut() else { return Ok(()); };

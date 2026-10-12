@@ -463,7 +463,7 @@ expect_red = ["shared_write::tests::local_commit_clears_losing_attempts_but_keep
 id = "writer-unresolved-settles-from-read"
 guards = "A restarted writer resolves an unknown append by applying the actual entry in the next log slot"
 file = "crates/entorhinal-module/src/catch_up.rs"
-old = ".apply_remote_entry(&entry)"
+old = ".apply_remote_entry(&entry, self_author.as_deref())"
 new = ".observe_log_head(entry.position).map(|_| 0) /* NON-VACUITY BREAK */"
 test_file = "crates/entorhinal-module/src/catch_up.rs"
 runner = "cargo"
@@ -2328,3 +2328,147 @@ runner = "cargo"
 package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 expect_red = ["claims::tests::hello_ack_startup_refreshes_persisted_live_agents"]
+
+[[control]]
+id = "s3-name-direct-only"
+guards = "Member names reject every non-Direct principal before decoding or queuing for the writer"
+file = "crates/entorhinal-module/src/member.rs"
+old = "if !matches!(principal, Some(Principal::Direct)) {"
+new = "if false && !matches!(principal, Some(Principal::Direct)) { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/member.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["member::tests::s3_name_refusals_precede_decode_writer_and_engram_in_order"]
+
+[[control]]
+id = "s3-name-closed-params"
+guards = "Member name requests carry only display_name, never a caller-supplied author"
+file = "crates/entorhinal-module/src/member.rs"
+old = "#[serde(deny_unknown_fields)]"
+new = "// NON-VACUITY BREAK: accepts unknown request fields"
+test_file = "crates/entorhinal-module/src/member.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["member::tests::s3_name_refusals_precede_decode_writer_and_engram_in_order"]
+
+[[control]]
+id = "s3-name-length"
+guards = "Trimmed member names contain 1 to 64 characters"
+file = "crates/entorhinal-module/src/member.rs"
+old = "if !(1..=64).contains(&display_name.chars().count()) {"
+new = "if false && !(1..=64).contains(&display_name.chars().count()) { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/member.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["member::tests::s3_name_refusals_precede_decode_writer_and_engram_in_order"]
+
+[[control]]
+id = "s3-name-enabled-only"
+guards = "Naming refuses disabled, enabling and joining before the shared writer"
+file = "crates/entorhinal-module/src/member.rs"
+old = "match store.identity_log_status()?.state.as_str() {"
+new = "match \"enabled\" { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/member.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["member::tests::s3_name_refusals_precede_decode_writer_and_engram_in_order"]
+
+[[control]]
+id = "s3-name-self-author-known"
+guards = "A joiner cannot assume the bootstrap writer's identity when naming itself"
+file = "crates/entorhinal-module/src/member.rs"
+old = "store.persisted_self_author()?"
+new = "Some(\"00\".repeat(16)) /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-module/src/member.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["member::tests::s3_name_refusals_precede_decode_writer_and_engram_in_order", "two_machine_acceptance::s3_names_replicate_to_where_and_survive_supersede_for_late_joiner"]
+
+[[control]]
+id = "s3-name-log-author"
+guards = "A received member name belongs to its verified log author, not a signing key or another author"
+file = "crates/entorhinal-core/src/remote_apply.rs"
+old = "if member.name.author != entry.author {"
+new = "if false && member.name.author != entry.author { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/remote_apply.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["remote_apply::tests::s3_member_author_mismatch_rolls_back_and_signer_is_not_author"]
+
+[[control]]
+id = "s3-reader-keeps-member-name"
+guards = "A superseding snapshot cannot omit the member name set by the prefix it replaces"
+file = "crates/entorhinal-core/src/remote_apply.rs"
+old = "if had_name && merged.member_name.is_none() {"
+new = "if false && had_name && merged.member_name.is_none() { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/remote_apply.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["remote_apply::tests::s3_reader_supersede_keeps_member_name"]
+
+[[control]]
+id = "s3-snapshot-name-part-one"
+guards = "Only part one of a snapshot may carry member_name"
+file = "crates/entorhinal-core/src/remote_apply.rs"
+old = "|| (part.part != 1 && value.get(\"member_name\").is_some())"
+new = "|| (false && part.part != 1 && value.get(\"member_name\").is_some()) /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-core/src/remote_apply.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["remote_apply::tests::s3_snapshot_names_only_its_author_and_only_in_part_one"]
+
+[[control]]
+id = "s3-snapshot-name-author"
+guards = "Snapshot inspection rejects a name that belongs to another log author"
+file = "crates/entorhinal-core/src/remote_apply.rs"
+old = "|| part\n            .member_name\n            .as_ref()\n            .is_some_and(|name| name.author != entry.author)"
+new = "|| false /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-core/src/remote_apply.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["remote_apply::tests::s3_snapshot_names_only_its_author_and_only_in_part_one"]
+
+[[control]]
+id = "s3-project-cannot-set-member-name"
+guards = "Generic project shared entries cannot bypass member-name authorship admission"
+file = "crates/entorhinal-core/src/shared_entry.rs"
+old = "|| (self.op == \"project.shared\" && self.member_name.is_some())"
+new = "|| (false && self.op == \"project.shared\" && self.member_name.is_some()) /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-core/src/remote_apply.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["remote_apply::tests::s3_project_shared_cannot_bypass_member_author_validation"]
+
+[[control]]
+id = "s3-writer-keeps-member-name"
+guards = "Supersede preparation refuses a restored store that lost the prefix's member name"
+file = "crates/entorhinal-core/src/enable_state.rs"
+old = "if prefix_has_name && first.get(\"member_name\").is_none() {"
+new = "if false && prefix_has_name && first.get(\"member_name\").is_none() { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/enable_state.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["enable_state::tests::s3_writer_supersede_refuses_to_drop_prefix_name"]
+
+[[control]]
+id = "s3-log-identity-atomic"
+guards = "Self identity is committed inside log apply and snapshot/own-entry advancement, surviving a fault immediately afterward"
+file = "crates/entorhinal-core/src/remote_apply.rs"
+old = "crate::claim_cache::learn_self_author(tx, author, crate::now_unix_millis())?;"
+new = "let _ = (tx, author); // NON-VACUITY BREAK: no identity learned"
+test_file = "crates/entorhinal-core/src/log_schema.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["log_schema::tests::s3_fault_after_apply_reopen_persists_identity_and_rebuild_is_cell_identical", "remote_apply::tests::s3_snapshot_names_only_its_author_and_only_in_part_one", "remote_apply::tests::own_agent_receipt_advances_without_replaying_or_appending_to_the_feed"]

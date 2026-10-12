@@ -18,6 +18,7 @@ const SHARED: &[&str] = &[
     "agent",
     "agent_name_claim",
     "project_root_key",
+    "member_name",
 ];
 const LOCAL: &[&str] = &[
     "project_root",
@@ -62,7 +63,33 @@ impl Machine {
     }
 
     fn open(descriptor: &StorageDescriptor, connector: Arc<dyn LogConnector>) -> ProjectsHandler {
-        let handler = ProjectsHandler::with_log_connector("acceptance".into(), || 700, connector);
+        Self::open_with_record(descriptor, connector, None)
+    }
+
+    fn new_with_record(
+        label: &str,
+        connector: Arc<dyn LogConnector>,
+        record: crate::record_client::RecordClient,
+    ) -> Self {
+        let (dir, descriptor) = crate::tests::scratch_descriptor(label);
+        let handler = Self::open_with_record(&descriptor, connector, Some(record));
+        Self {
+            dir: crate::tests::canonical_test_path(dir),
+            descriptor,
+            handler,
+        }
+    }
+
+    fn open_with_record(
+        descriptor: &StorageDescriptor,
+        connector: Arc<dyn LogConnector>,
+        record: Option<crate::record_client::RecordClient>,
+    ) -> ProjectsHandler {
+        let mut handler =
+            ProjectsHandler::with_log_connector("acceptance".into(), || 700, connector);
+        if let Some(record) = record {
+            handler.record_client = record;
+        }
         let mut store = RegistryStore::open(descriptor).unwrap();
         store.set_root_records(true);
         install_store(&handler.store, &handler.health, Ok(store));
@@ -454,6 +481,150 @@ async fn disabled_workload_keeps_local_journal_and_never_connects() {
     assert_eq!(fail.calls(), 0);
     assert_eq!(m.store().identity_log_status().unwrap().state, "disabled");
     m.clean_rebuild().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn s3_names_replicate_to_where_and_survive_supersede_for_late_joiner() {
+    use crate::{
+        fake_record::{FakeRecord, FakeRecordConnector},
+        record_client::RecordClient,
+    };
+    let root = FakeLog::default();
+    let a_log = Arc::new(root.with_author([0x11; 16]));
+    let b_log = Arc::new(root.with_author([0x22; 16]));
+    let a_record = FakeRecord::new([0x11; 16]);
+    let b_record = FakeRecord::new([0x22; 16]);
+    b_record.offline.store(true, Ordering::Relaxed);
+    let a = Machine::new_with_record(
+        "name-a",
+        a_log.clone(),
+        RecordClient::new(Arc::new(FakeRecordConnector(a_record))),
+    );
+    let b = Machine::new_with_record(
+        "name-b",
+        b_log.clone(),
+        RecordClient::new(Arc::new(FakeRecordConnector(b_record.clone()))),
+    );
+    a.enable_without_agents().await;
+    b.enable_without_agents().await;
+    assert_eq!(
+        a.store().persisted_self_author().unwrap(),
+        Some("11".repeat(16))
+    );
+    assert_eq!(b.store().persisted_self_author().unwrap(), None);
+    assert_eq!(
+        b.call("member.set_name", json!({"display_name":"Joiner"}))
+            .await
+            .unwrap_err(),
+        "self_author_unknown"
+    );
+    assert!(b.rows("self_identity").is_empty());
+    a.call("member.set_name", json!({"display_name":"  Studio  "}))
+        .await
+        .unwrap();
+    let created = a
+        .call(
+            "agent.create",
+            json!({"request_key":"named-agent","name":"Ada","tag":"test","role":"assistant"}),
+        )
+        .await
+        .unwrap();
+    let agent = created["agent"]["agent_id"].as_str().unwrap();
+    b.catch_up().await;
+    assert_eq!(
+        b.rows("member_name"),
+        vec![vec![
+            Cell::Text("11".repeat(16)),
+            Cell::Text("Studio".into())
+        ]]
+    );
+    let claim = serde_json::to_vec(&json!({"v":1,"agent_id":agent,"holder":"11".repeat(16),"epoch":1,"cut_id":null,"reason":null})).unwrap();
+    b_record.put(
+        &format!("claim:{agent}"),
+        1,
+        claim.clone(),
+        &"11".repeat(16),
+    );
+    b_record.offline.store(false, Ordering::Relaxed);
+    b.bytes_on(DIRECT, "agent.refresh_claims", json!({}))
+        .await
+        .unwrap();
+    let where_reply = b
+        .call("agent.where", json!({"agent_id":agent}))
+        .await
+        .unwrap();
+    assert_eq!(where_reply["status"], "held_elsewhere");
+    assert_eq!(where_reply["holder_name"], "Studio");
+
+    // Reset the enable flag to disabled without dropping shared rows, as a
+    // restored copy must re-enable by superseding its own existing log prefix.
+    a.store()
+        .apply_entry("identity_log.enable", "{}", "test", None, |tx| {
+            tx.execute("UPDATE identity_log_state SET state='disabled'", [])?;
+            Ok(())
+        })
+        .unwrap();
+    a.enable().await;
+    let page = a_log.client().read(0, 128).await.unwrap();
+    let snapshot = page.entries.last().unwrap();
+    let value: Value = serde_json::from_slice(&snapshot.entry).unwrap();
+    assert!(value["supersedes_through"].as_u64().unwrap() > 0);
+    assert_eq!(
+        value["member_name"],
+        json!({"author":"11".repeat(16),"display_name":"Studio"})
+    );
+    let c_record = FakeRecord::new([0x33; 16]);
+    c_record.put(&format!("claim:{agent}"), 1, claim, &"11".repeat(16));
+    c_record.offline.store(true, Ordering::Relaxed);
+    let c = Machine::new_with_record(
+        "name-late",
+        Arc::new(root.with_author([0x33; 16])),
+        RecordClient::new(Arc::new(FakeRecordConnector(c_record.clone()))),
+    );
+    c.enable_without_agents().await;
+    assert_eq!(c.rows("member_name"), b.rows("member_name"));
+    assert_eq!(c.store().persisted_self_author().unwrap(), None);
+    c_record.offline.store(false, Ordering::Relaxed);
+    c.bytes_on(DIRECT, "agent.refresh_claims", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(
+        c.call("agent.where", json!({"agent_id":agent}))
+            .await
+            .unwrap()["holder_name"],
+        "Studio"
+    );
+    a.clean_rebuild().await;
+    b.clean_rebuild().await;
+    c.clean_rebuild().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn s3_joiner_first_own_write_learns_author_before_name() {
+    let root = FakeLog::default();
+    let a = Machine::new("first-own-a", Arc::new(root.with_author([0x11; 16])));
+    let b = Machine::new("first-own-b", Arc::new(root.with_author([0x22; 16])));
+    a.enable_without_agents().await;
+    b.enable_without_agents().await;
+    assert_eq!(b.store().persisted_self_author().unwrap(), None);
+    b.call("register", json!({"projectId":"B","name":"B","roots":[]}))
+        .await
+        .unwrap();
+    assert_eq!(
+        b.store().persisted_self_author().unwrap(),
+        Some("22".repeat(16))
+    );
+    b.call("member.set_name", json!({"display_name":"Joiner"}))
+        .await
+        .unwrap();
+    a.catch_up().await;
+    assert_eq!(
+        a.rows("member_name"),
+        vec![vec![
+            Cell::Text("22".repeat(16)),
+            Cell::Text("Joiner".into())
+        ]]
+    );
 }
 
 #[tokio::test(start_paused = true)]

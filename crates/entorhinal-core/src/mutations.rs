@@ -1334,6 +1334,7 @@ impl RegistryStore {
 // Deletion order respects projection dependencies. This is also the sole list
 // used for snapshots, so verification and repair always cover the same tables.
 const DERIVED_TABLES: &[&str] = &[
+    "member_name",
     "agent_name_claim",
     "agent",
     "workspace_member",
@@ -1414,7 +1415,11 @@ fn delete_and_replay(tx: &Transaction<'_>) -> rusqlite::Result<()> {
             continue;
         }
         if origin == "here" && op != "project.shared" && op != "shared.snapshot" {
-            replay(tx, seq, &op, request, now, enabled)?;
+            if op == "member.set_name" {
+                super::shared_entry::replay_member_name(tx, request)?;
+            } else {
+                replay(tx, seq, &op, request, now, enabled)?;
+            }
         }
         if stream == "shared" || op == "project.shared" || op == "shared.snapshot" {
             let bytes = entry.ok_or_else(|| {
@@ -1428,7 +1433,9 @@ fn delete_and_replay(tx: &Transaction<'_>) -> rusqlite::Result<()> {
             // A carry's or the correction's shared row holds a `project.shared`
             // entry with the agents' after-images, also when the row itself is
             // an `agent.set_namespace` row (the correction's last one).
-            if op.starts_with("agent.") && image["op"] != "project.shared" {
+            if op == "member.set_name" {
+                super::shared_entry::replay_member_name(tx, image)?;
+            } else if op.starts_with("agent.") && image["op"] != "project.shared" {
                 super::agent::replay_agent_entry(tx, &op, &image)?;
             } else {
                 let image: super::shared_entry::ProjectEntry =

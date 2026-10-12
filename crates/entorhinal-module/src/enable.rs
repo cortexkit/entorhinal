@@ -156,6 +156,7 @@ pub(super) async fn resume(
     // accumulates durable progress across retries without spending the deadline
     // resending parts that already occupy their unique expected positions.
     let mut confirmed = 0;
+    let mut self_author = None;
     loop {
         let after = base + confirmed as u64;
         let page = timeout_at(deadline, log.read(after, parts.len() - confirmed))
@@ -188,6 +189,18 @@ pub(super) async fn resume(
                     "identity_log_invariant",
                     "snapshot parts are not consecutive",
                 ));
+            }
+            if entry.signed_by_self {
+                if self_author
+                    .as_ref()
+                    .is_some_and(|author| author != &entry.author)
+                {
+                    return Err(HandlerError::new(
+                        "identity_log_invariant",
+                        "snapshot authors differ",
+                    ));
+                }
+                self_author = Some(entry.author);
             }
             confirmed += 1;
         }
@@ -245,7 +258,56 @@ pub(super) async fn resume(
             }
         }
     }
-    store.finish_enable(unix_millis(), principal)?;
+    let mut after = base;
+    while self_author.is_none() && after < base + parts.len() as u64 {
+        let page = timeout_at(deadline, log.read(after, parts.len()))
+            .await
+            .map_err(|_| {
+                HandlerError::new(
+                    "engram_unavailable",
+                    "snapshot identity read deadline expired",
+                )
+            })?
+            .map_err(|e| log_error(e, health))?;
+        let start = after;
+        for entry in page
+            .entries
+            .into_iter()
+            .take_while(|e| e.position <= base + parts.len() as u64)
+        {
+            let i = (entry.position - base - 1) as usize;
+            if entry.position != after + 1
+                || entry.entry_id != parts[i].entry_id
+                || !entry.signed_by_self
+            {
+                return Err(HandlerError::new(
+                    "identity_log_invariant",
+                    "snapshot identity read differs from saved parts",
+                ));
+            }
+            if self_author
+                .as_ref()
+                .is_some_and(|author| author != &entry.author)
+            {
+                return Err(HandlerError::new(
+                    "identity_log_invariant",
+                    "snapshot authors differ",
+                ));
+            }
+            self_author = Some(entry.author);
+            after = entry.position;
+        }
+        if after == start {
+            return Err(HandlerError::new(
+                "engram_unavailable",
+                "snapshot identity read made no progress",
+            ));
+        }
+    }
+    store.finish_enable(unix_millis(), principal, self_author.as_deref())?;
+    if store.persisted_self_author()?.as_ref() != self_author.as_ref() {
+        health.self_author_conflicts.fetch_add(1, Ordering::Relaxed);
+    }
     health.log_state.store(0, Ordering::Relaxed);
     refresh(health, store);
     Ok(())
@@ -301,6 +363,7 @@ async fn own_prefix(
                     HandlerError::new("identity_log_invariant", "log position exceeds local range")
                 })?,
                 entry_id: log_client::encode_hex(&entry.entry_id),
+                author: entry.author,
                 signer: log_client::encode_hex(&entry.signer),
                 key_id: json!({"family":entry.key_id.family,"epoch":entry.key_id.epoch})
                     .to_string(),
@@ -1428,12 +1491,14 @@ mod tests {
                     position: 1,
                     entry_id: log_client::encode_hex(&entry.entry_id),
                     signer: "test".into(),
+                    author: entry.author.clone(),
                     key_id: "test".into(),
                     envelope_version: 1,
                     kind: entry.kind.clone(),
                     entry: entry.entry.clone(),
                 }],
                 page.head as i64,
+                None,
             )
             .unwrap();
         assert_eq!(b.store().identity_log_status().unwrap().state, "joining");
@@ -2073,13 +2138,14 @@ mod tests {
             position: 1,
             entry_id: log_client::encode_hex(&entry.entry_id),
             signer: "test".into(),
+            author: entry.author.clone(),
             key_id: "test".into(),
             envelope_version: 1,
             kind: entry.kind.clone(),
             entry: entry.entry.clone(),
         };
         b.store()
-            .apply_join_snapshot(&[remote], page.head as i64)
+            .apply_join_snapshot(&[remote], page.head as i64, None)
             .unwrap();
         assert_eq!(b.store().identity_log_status().unwrap().state, "joining");
         b.handler.start_catch_up();
