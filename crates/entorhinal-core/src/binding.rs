@@ -2612,7 +2612,7 @@ mod root_membership_tests {
 
         let refuse = |request: AttachDerivedParentRequest| -> Value {
             match f.store.attach_derived_parent(request) {
-                Err(RegistryError::Domain { code, message }) => {
+                Err(RegistryError::Domain { code, message, .. }) => {
                     json!({"code": code, "message": message})
                 }
                 other => panic!("expected a refusal, got {other:?}"),

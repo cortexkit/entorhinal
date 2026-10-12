@@ -2419,33 +2419,37 @@ impl ProjectsHandler {
                 (self.clock)(),
             )? {
                 AgentPrecheck::Cached(body) => return self.attach_incarnation(body),
-                AgentPrecheck::Ready(summary) => summary,
+                AgentPrecheck::Ready(summary) => Some(summary),
+                // A confirmable method whose precheck found nothing needing approval.
+                AgentPrecheck::NoPrompt => None,
             };
-            #[cfg(test)]
-            if let Some(barrier) = &self.confirmation_admission_barrier {
-                barrier.wait().await;
-            }
-            let mut guard = agent_ops::ConfirmationGuard::take(&self.confirmation_slot, key)?;
-            // Removal precedes signalling in on_route_gone. A closure between
-            // admission and slot installation is therefore never lost.
-            if !self.route_admissions().contains_key(&key) {
-                return Err(agent_ops::OperatorConfirmError::Declined.into());
-            }
-            // The SDK waits up to 290 seconds. Our receipt-relative 270-second
-            // bound expires first and drops its future, withdrawing the prompt.
-            tokio::select! {
-                biased;
-                _ = guard.cancelled.wait_for(|closed| *closed) => return Err(agent_ops::OperatorConfirmError::Declined.into()),
-                result = timeout_at(received + OPERATOR_BOUND, self.operator_confirmer.confirm_operator(&summary, key)) => {
-                    result.map_err(|_| HandlerError::from(agent_ops::OperatorConfirmError::Declined))??;
+            if let Some(summary) = summary {
+                #[cfg(test)]
+                if let Some(barrier) = &self.confirmation_admission_barrier {
+                    barrier.wait().await;
                 }
+                let mut guard = agent_ops::ConfirmationGuard::take(&self.confirmation_slot, key)?;
+                // Removal precedes signalling in on_route_gone. A closure between
+                // admission and slot installation is therefore never lost.
+                if !self.route_admissions().contains_key(&key) {
+                    return Err(agent_ops::OperatorConfirmError::Declined.into());
+                }
+                // The SDK waits up to 290 seconds. Our receipt-relative 270-second
+                // bound expires first and drops its future, withdrawing the prompt.
+                tokio::select! {
+                    biased;
+                    _ = guard.cancelled.wait_for(|closed| *closed) => return Err(agent_ops::OperatorConfirmError::Declined.into()),
+                    result = timeout_at(received + OPERATOR_BOUND, self.operator_confirmer.confirm_operator(&summary, key)) => {
+                        result.map_err(|_| HandlerError::from(agent_ops::OperatorConfirmError::Declined))??;
+                    }
+                }
+                if Instant::now() >= received + OPERATOR_BOUND {
+                    return Err(agent_ops::OperatorConfirmError::Declined.into());
+                }
+                budget_start = Instant::now();
+                approval = Some(OperatorApproval::new(summary));
+                confirmation = Some(guard);
             }
-            if Instant::now() >= received + OPERATOR_BOUND {
-                return Err(agent_ops::OperatorConfirmError::Declined.into());
-            }
-            budget_start = Instant::now();
-            approval = Some(OperatorApproval::new(summary));
-            confirmation = Some(guard);
         } else if state == "enabled" {
             if let Some(write) = &prepared {
                 if let Some(body) = write.probe(&store, &request.method, &principal)? {

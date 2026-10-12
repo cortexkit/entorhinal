@@ -1,6 +1,7 @@
 //! Agent identity schema and pure validators. Identity does not include runtime
 //! residence, personas, wake policies or authority grants.
 
+mod carry;
 mod claims;
 mod feed;
 mod fleet;
@@ -12,6 +13,7 @@ pub mod schema;
 mod store;
 mod validate;
 
+pub(crate) use carry::{placement_mismatches, plan_carry};
 pub(crate) use claims::load_claims;
 pub use claims::AgentNameClaim;
 pub use feed::{AgentChangesReply, AgentSnapshotReply};
@@ -22,18 +24,20 @@ pub use names::*;
 pub(crate) use store::load_row;
 pub use store::{
     valid_agent_id, AgentMutationError, AgentPrecheck, AgentRow, OperatorApproval,
-    StoredAgentAvatar, OPERATOR_SUMMARY_LIMIT,
+    PlacementConfirmation, StoredAgentAvatar, OPERATOR_SUMMARY_LIMIT,
 };
 pub use validate::*;
 
 use std::fmt;
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 
 use crate::{mutations::domain, RegistryError};
 
-/// A live agent's project must stay present and in the same workspace so its
-/// identity and name claim keep referring to the same namespace.
+/// A live agent's project must stay present, so its identity and name claim
+/// keep referring to a project: removing it, or merging it into a successor,
+/// is refused. Placing or moving the project instead carries its live heads'
+/// and hirees' claims to the new workspace (see `carry`).
 pub(crate) fn ensure_project_unbound(
     conn: &Connection,
     project_id: &str,
@@ -71,26 +75,6 @@ pub(crate) fn ensure_workspace_unbound(
             "bound_by_live_agent",
             format!("workspace {workspace_id} is bound by a live agent"),
         ));
-    }
-    Ok(())
-}
-
-/// Insert-only placement operations can change an unplaced project, but leave
-/// an existing placement alone. Refuse only the attachment that would change it.
-pub(crate) fn ensure_project_attachment_allowed(
-    conn: &Connection,
-    project_id: &str,
-) -> Result<(), RegistryError> {
-    if conn
-        .query_row(
-            "SELECT 1 FROM project_workspace WHERE project_id=?1",
-            [project_id],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_none()
-    {
-        ensure_project_unbound(conn, project_id)?;
     }
     Ok(())
 }

@@ -30,7 +30,7 @@ impl AgentMutationError {
         }
     }
 
-    fn with_detail(mut self, detail: Value) -> Self {
+    pub(crate) fn with_detail(mut self, detail: Value) -> Self {
         self.detail = Some(detail);
         self
     }
@@ -50,8 +50,27 @@ impl From<AgentRegistryError> for AgentMutationError {
 impl From<RegistryError> for AgentMutationError {
     fn from(error: RegistryError) -> Self {
         match error {
-            RegistryError::Domain { code, message } => Self::new(&code, message),
+            RegistryError::Domain {
+                code,
+                message,
+                detail,
+            } => Self {
+                code,
+                message,
+                detail,
+            },
             _ => Self::new("storage_error", error.to_string()),
+        }
+    }
+}
+// Placement writes return `RegistryError`; a carry refusal keeps its detail
+// (for example the holder of a name) so the serving layer can report it.
+impl From<AgentMutationError> for RegistryError {
+    fn from(error: AgentMutationError) -> Self {
+        RegistryError::Domain {
+            code: error.code,
+            message: error.message,
+            detail: error.detail,
         }
     }
 }
@@ -515,11 +534,35 @@ impl OperatorApproval {
     pub fn new(summary: String) -> Self {
         Self { summary }
     }
+
+    pub(crate) fn approves(&self, summary: &str) -> bool {
+        self.summary == summary
+    }
+}
+
+/// How a placement write (`register`, `assign_workspace`, `upgrade_implicit`,
+/// `seed_import`) or the agent workspace correction was confirmed. It matters
+/// only when the write would carry live heads' or hirees' name claims.
+#[derive(Clone, Debug, Default)]
+pub enum PlacementConfirmation {
+    /// The caller needs no operator approval: every principal other than
+    /// `Direct`, and in-process store calls.
+    #[default]
+    NotRequired,
+    /// `Direct`, after the operator approved this exact summary.
+    Approved(OperatorApproval),
+    /// `Direct` without a prompt: the precheck found nothing to carry, or the
+    /// request came through a path that cannot prompt. Carrying anything is
+    /// then refused with `operator_approval_stale`.
+    NoPrompt,
 }
 
 pub enum AgentPrecheck {
     Cached(Vec<u8>),
     Ready(String),
+    /// A confirmable placement write that, as things stand, carries no live
+    /// agent: it needs no operator prompt.
+    NoPrompt,
 }
 
 fn required_key(request: &Mutation) -> Result<&str, AgentMutationError> {
@@ -531,7 +574,7 @@ fn required_key(request: &Mutation) -> Result<&str, AgentMutationError> {
         .ok_or_else(|| AgentMutationError::new("request_key_required", "request_key is required"))
 }
 
-fn require_cutover(conn: &Connection) -> Result<(), AgentMutationError> {
+pub(super) fn require_cutover(conn: &Connection) -> Result<(), AgentMutationError> {
     if conn
         .query_row(
             "SELECT 1 FROM registry_journal WHERE op='agent.cutover' LIMIT 1",
@@ -826,13 +869,22 @@ impl RegistryStore {
     /// returned first, so a retry never prompts again. Otherwise the write must
     /// be allowed by now (agent identity handed over from core, the
     /// `agent.cutover` marker) and pass every rule the write itself applies;
-    /// the result is the one-line description the operator will approve.
+    /// the result is the one-line description the operator will approve. The
+    /// placement writes (`register`, `assign_workspace`, `upgrade_implicit`,
+    /// `seed_import`) answer `NoPrompt` when they would carry no live agent,
+    /// and `agent.repair_workspaces` always asks.
     pub fn precheck_agent_confirmation(
         &self,
         op: &str,
         params: Value,
         now: i64,
     ) -> Result<AgentPrecheck, AgentMutationError> {
+        if op == super::carry::REPAIR_METHOD {
+            return self.precheck_repair(params);
+        }
+        if crate::mutations::PLACEMENT_METHODS.contains(&op) {
+            return self.precheck_placement(op, params, now);
+        }
         let request = Mutation::decode(op, params)?;
         let key = required_key(&request)?;
         if let Some(body) = self.shared_request_cache(op, Some(key))? {
@@ -885,6 +937,9 @@ impl JournalWriter<'_> {
         op: &str,
         params: Value,
     ) -> Result<Option<Vec<u8>>, AgentMutationError> {
+        if op == super::carry::REPAIR_METHOD {
+            return self.probe_repair(params);
+        }
         let request = Mutation::decode(op, params)?;
         let key = request
             .meta()
@@ -931,6 +986,9 @@ impl JournalWriter<'_> {
         agent_id: Option<&str>,
         approval: Option<&OperatorApproval>,
     ) -> Result<Vec<u8>, AgentMutationError> {
+        if op == super::carry::REPAIR_METHOD {
+            return self.repair_agent_workspaces(params, now, approval);
+        }
         let request = Mutation::decode(op, params)?;
         let (_, actor) = request.meta();
         let key = required_key(&request)?;

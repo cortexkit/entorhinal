@@ -179,6 +179,14 @@ pub struct IdentityLogStatus {
 pub struct JournalWriter<'a> {
     store: &'a RegistryStore,
     principal: &'a str,
+    /// How the caller confirmed a placement change that carries live heads'
+    /// and hirees' name claims into the target workspace. Writes that carry
+    /// nothing ignore it.
+    confirmation: agent::PlacementConfirmation,
+    /// Set only while the placement precheck runs a write on a throwaway copy
+    /// of the store: the write records the operator summary of what it would
+    /// carry here instead of checking `confirmation`.
+    probe: Option<&'a std::cell::RefCell<Option<String>>>,
 }
 
 impl std::ops::Deref for JournalWriter<'_> {
@@ -220,6 +228,8 @@ impl RegistryStore {
         JournalWriter {
             store: self,
             principal,
+            confirmation: agent::PlacementConfirmation::NotRequired,
+            probe: None,
         }
     }
 
@@ -735,6 +745,14 @@ impl RegistryStore {
 }
 
 impl JournalWriter<'_> {
+    /// Record how the operator confirmed this write. A placement change that
+    /// would carry live agents checks it under the writer lock: `Approved`
+    /// must match the recomputed summary, and `NoPrompt` refuses any carry.
+    pub fn with_confirmation(mut self, confirmation: agent::PlacementConfirmation) -> Self {
+        self.confirmation = confirmation;
+        self
+    }
+
     /// Append a row and apply its projection atomically under this principal.
     pub fn apply_entry<T>(
         &self,
@@ -778,6 +796,7 @@ impl JournalWriter<'_> {
                         payload_json,
                         &before,
                         &after,
+                        Vec::new(),
                     )?;
                 }
                 Ok((actual_seq, result))
@@ -787,12 +806,18 @@ impl JournalWriter<'_> {
 }
 
 /// A domain failure that can be mapped to a module error without importing subc.
+/// `detail` carries structured data for refusals that need it (for example
+/// which agent holds a name a placement change would carry into a workspace).
 #[derive(Debug)]
 pub enum RegistryError {
     Store(StoreError),
     Database(String),
     Path(String),
-    Domain { code: String, message: String },
+    Domain {
+        code: String,
+        message: String,
+        detail: Option<serde_json::Value>,
+    },
 }
 
 impl fmt::Display for RegistryError {
@@ -801,7 +826,7 @@ impl fmt::Display for RegistryError {
             Self::Store(error) => write!(f, "{error}"),
             Self::Database(error) => write!(f, "database: {error}"),
             Self::Path(error) => write!(f, "path: {error}"),
-            Self::Domain { code, message } => write!(f, "{code}: {message}"),
+            Self::Domain { code, message, .. } => write!(f, "{code}: {message}"),
         }
     }
 }

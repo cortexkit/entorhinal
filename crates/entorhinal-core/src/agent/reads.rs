@@ -119,6 +119,10 @@ struct AvatarRequest {
     agent_ids: Vec<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyRequest {}
+
 impl RegistryStore {
     pub(super) fn read_agent<T>(
         &self,
@@ -276,6 +280,10 @@ impl RegistryStore {
                     if let Some(id) = row.project_id { reply["projectId"] = json!(id); }
                     Ok(reply)
                 })?
+            }
+            "agent.preview_repair_workspaces" => {
+                let EmptyRequest {} = decode(params)?;
+                self.read_agent(super::carry::preview_repair)?
             }
             _ => {
                 return Err(AgentMutationError::new(
