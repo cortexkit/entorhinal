@@ -26,6 +26,11 @@ pub(crate) const IDENTITY_CHANGE_OPS: &[&str] = &[
     "agent.dispose",
     "agent.merge",
     "agent.import",
+    // Moves a head's or hiree's active name claim to another workspace and
+    // clears its stored workspace. Its entry is shaped like a rename's: the
+    // after-image row, then the released claim and the new active claim, or
+    // no claims when only the stored workspace is cleared.
+    "agent.set_namespace",
 ];
 
 /// These SQL literals come only from the fixed operation names above, never
@@ -121,8 +126,8 @@ pub fn replay_agent_entry(
     )
     .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     write_row(tx, &entry.row)?;
-    // Rename records the released claim first, avoiding the active-owner index
-    // collision when inserting its replacement.
+    // Rename and set_namespace record the released claim first, avoiding the
+    // active-owner index collision when inserting its replacement.
     for claim in &entry.claims {
         write_claim(tx, claim)?;
     }

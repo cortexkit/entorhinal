@@ -8,8 +8,8 @@ use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{json, Value};
 
 use super::{
-    normalize_agent_name, store::load_row, validate_project_id, validate_workspace_id,
-    AgentMutationError, AgentRow,
+    claims::load_claims, normalize_agent_name, store::load_row, validate_project_id,
+    validate_workspace_id, AgentMutationError, AgentRow,
 };
 use crate::RegistryStore;
 
@@ -26,6 +26,26 @@ pub(super) fn all_rows(conn: &Connection) -> rusqlite::Result<Vec<AgentRow>> {
     ids.iter()
         .map(|id| load_row(conn, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows))
         .collect()
+}
+
+/// The workspace a read scopes an agent under. A head or hiree stores no
+/// workspace (only imported rows may still carry one, and it can be stale):
+/// it belongs to the workspace its name is claimed in, which is the key of its
+/// active claim in the `workspace` namespace. A gone head or hiree has no
+/// active claim and is scoped by the claim it held last. Every other role, and
+/// a head or hiree without a workspace claim, is scoped by the stored column.
+fn scope_workspace(conn: &Connection, row: &AgentRow) -> rusqlite::Result<Option<String>> {
+    if matches!(row.role.as_str(), "head" | "hiree") {
+        let claims = load_claims(conn, &row.agent_id)?;
+        let claim = claims
+            .iter()
+            .find(|claim| claim.released_at_ms.is_none())
+            .or(claims.last());
+        if let Some(claim) = claim.filter(|claim| claim.namespace_kind == "workspace") {
+            return Ok(Some(claim.namespace_key.clone()));
+        }
+    }
+    Ok(row.workspace_id.clone())
 }
 
 pub(super) fn activated(conn: &Connection) -> rusqlite::Result<bool> {
@@ -163,13 +183,24 @@ impl RegistryStore {
                     if request.activated_only.unwrap_or(false) && !activated(conn)? {
                         return Ok(json!({"agents":[], "generation":generation}));
                     }
-                    let mut rows = all_rows(conn)?.into_iter().filter(|row| {
-                        (request.include_gone.unwrap_or(false) || row.status == "live")
+                    let mut rows = Vec::new();
+                    for row in all_rows(conn)? {
+                        if rows.len() > limit as usize {
+                            break;
+                        }
+                        let selected = (request.include_gone.unwrap_or(false) || row.status == "live")
                             && request.role.as_ref().is_none_or(|role| row.role == role.as_str())
                             && project.as_deref().is_none_or(|id| row.project_id.as_deref() == Some(id))
-                            && workspace.as_deref().is_none_or(|id| row.workspace_id.as_deref() == Some(id))
-                            && request.cursor.as_ref().is_none_or(|id| &row.agent_id > id)
-                    }).take(limit as usize + 1).collect::<Vec<_>>();
+                            && request.cursor.as_ref().is_none_or(|id| &row.agent_id > id);
+                        // The workspace filter matches a head or hiree by the
+                        // workspace its name is claimed in, as name lookup does.
+                        if selected && match workspace.as_deref() {
+                            Some(id) => scope_workspace(conn, &row)?.as_deref() == Some(id),
+                            None => true,
+                        } {
+                            rows.push(row);
+                        }
+                    }
                     let more = rows.len() > limit as usize;
                     rows.truncate(limit as usize);
                     let mut reply = json!({"agents":rows.iter().filter(|r| r.status == "live").map(AgentRow::digest).collect::<Vec<_>>(), "generation":generation});
@@ -260,8 +291,9 @@ impl RegistryStore {
 // Resolve a name the way core does, so a lookup gives the same answer before
 // and after the move: a `workspace:` prefix restricts the match to that
 // workspace, while a `workspace_id` hint only prefers it and falls back to
-// matches elsewhere. Matching uses each agent's stored `workspace_id`, which is
-// the namespace its name was claimed in, not where its project sits today.
+// matches elsewhere. Matching uses the workspace each agent's name is claimed
+// in (`scope_workspace`), not where its project sits today; for a head or
+// hiree that is its active claim's workspace, not its stored `workspace_id`.
 // Source: prefrontal 873870be8 crates/prefrontal-core-module/src/agent_registry_ops.rs:1168-1289.
 fn resolve_name(conn: &Connection, request: &NameRequest) -> Result<Value, AgentMutationError> {
     let (prefix, raw_name) = match request.name.split_once('/') {
@@ -282,23 +314,23 @@ fn resolve_name(conn: &Connection, request: &NameRequest) -> Result<Value, Agent
     let mut matches = Vec::new();
     for row in all_rows(conn)?.into_iter().filter(|r| r.status == "live") {
         if normalize_agent_name(&row.name)?.normalized_name == name {
-            matches.push(row);
+            let workspace = scope_workspace(conn, &row)?;
+            matches.push((row, workspace));
         }
     }
     let candidates = if let Some(scope) = scope.as_deref() {
         let mut local = Vec::new();
         let mut foreign = Vec::new();
-        for row in matches {
-            let workspace = row
-                .workspace_id
+        for (row, workspace) in matches {
+            let normalized = workspace
                 .as_deref()
                 .map(normalize_agent_name)
                 .transpose()?
                 .map(|n| n.normalized_name);
-            if workspace.as_deref().unwrap_or("global") == scope {
-                local.push(row);
+            if normalized.as_deref().unwrap_or("global") == scope {
+                local.push((row, workspace));
             } else {
-                foreign.push(row);
+                foreign.push((row, workspace));
             }
         }
         if local.len() == 1 {
@@ -315,16 +347,12 @@ fn resolve_name(conn: &Connection, request: &NameRequest) -> Result<Value, Agent
         0 => Ok(
             json!({"refused":{"code":"name_unknown","details":{"name":request.name,"workspace":scope}}}),
         ),
-        1 => Ok(json!({"agent_id":candidates[0].agent_id,"digest":candidates[0].digest()})),
+        1 => Ok(json!({"agent_id":candidates[0].0.agent_id,"digest":candidates[0].0.digest()})),
         _ => {
             let names = candidates
                 .iter()
-                .map(|row| {
-                    format!(
-                        "{}/{}",
-                        row.workspace_id.as_deref().unwrap_or("global"),
-                        row.name
-                    )
+                .map(|(row, workspace)| {
+                    format!("{}/{}", workspace.as_deref().unwrap_or("global"), row.name)
                 })
                 .collect::<BTreeSet<_>>();
             Ok(json!({"refused":{"code":"name_ambiguous","details":{"candidates":names}}}))
@@ -546,7 +574,7 @@ pub(super) mod tests {
         assert_eq!(filtered["agents"].as_array().unwrap().len(), 1);
         assert_eq!(
             filtered["agents"][0],
-            json!({"agent_id":c,"name":"Hire","name_version":1,"tag":"tag","labels":[],"role":"hiree","created_at":100,"agent_generation":1,"project_id":"P","workspace_id":"W"})
+            json!({"agent_id":c,"name":"Hire","name_version":1,"tag":"tag","labels":[],"role":"hiree","created_at":100,"agent_generation":1,"project_id":"P","workspace_id":null})
         );
         // Stored rows alone do not activate the registry.
         f.store
@@ -586,7 +614,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn resolve_name_pins_core_refusals_prefix_hint_and_stored_workspace() {
+    fn resolve_name_pins_core_refusals_prefix_hint_and_claimed_workspace() {
         let f = fixture(true);
         placed(&f, "P1", "W1");
         placed(&f, "P2", "W2");
@@ -634,20 +662,73 @@ pub(super) mod tests {
             )["agent_id"],
             c
         );
+        // A head's workspace for name lookup is its active claim's, not the
+        // stored column: give `a` an imported-style stale column and move its
+        // claim to W3, and every lookup follows the claim.
         f.store
             .db
             .with_conn_fenced(|tx| {
-                tx.execute("UPDATE agent SET workspace_id='W3' WHERE agent_id=?1", [&a])?;
+                tx.execute(
+                    "UPDATE agent SET workspace_id='Stale' WHERE agent_id=?1",
+                    [&a],
+                )?;
+                tx.execute(
+                    "UPDATE agent_name_claim SET namespace_key='W3' WHERE agent_id=?1",
+                    [&a],
+                )?;
                 Ok(())
             })
             .unwrap();
-        let stored = read(&f, "agent.resolve_name", json!({"name":"w3/Café"}));
-        assert_eq!(stored["agent_id"], a);
-        assert_eq!(stored["digest"]["workspace_id"], "W3");
-        assert_eq!(stored["digest"]["agent_generation"], 1);
+        let claimed = read(&f, "agent.resolve_name", json!({"name":"w3/Café"}));
+        assert_eq!(claimed["agent_id"], a);
+        // The digest still echoes the stored row unchanged.
+        assert_eq!(claimed["digest"]["workspace_id"], "Stale");
+        assert_eq!(claimed["digest"]["agent_generation"], 1);
+        for missing in ["w1/Café", "stale/Café"] {
+            assert_eq!(
+                read(&f, "agent.resolve_name", json!({"name":missing}))["refused"]["code"],
+                "name_unknown"
+            );
+        }
         assert_eq!(
-            read(&f, "agent.resolve_name", json!({"name":"w1/Café"}))["refused"]["code"],
-            "name_unknown"
+            read(
+                &f,
+                "agent.resolve_name",
+                json!({"name":"Café","workspace_id":"W3"})
+            )["agent_id"],
+            a
+        );
+        assert_eq!(
+            read(&f, "agent.resolve_name", json!({"name":"Café"}))["refused"],
+            json!({"code":"name_ambiguous","details":{"candidates":["W2/Café","W3/Café"]}})
+        );
+        // `agent.list`'s workspace filter scopes heads by the same claim.
+        let listed = |workspace: &str| {
+            read(&f, "agent.list", json!({"workspace_id":workspace}))["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|agent| agent["agent_id"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(listed("W3"), vec![a.clone()]);
+        assert_eq!(listed("W2"), vec![b.clone()]);
+        assert!(listed("W1").is_empty());
+        assert!(listed("Stale").is_empty());
+        // A gone head has no active claim and stays listed under the workspace
+        // of the claim it held last.
+        call(
+            &f,
+            "agent.dispose",
+            json!({"agent_id":b,"request_key":"dispose-b"}),
+        );
+        assert_eq!(
+            read(
+                &f,
+                "agent.list",
+                json!({"workspace_id":"W2","include_gone":true})
+            )["gone"][0]["agent_id"],
+            b
         );
     }
 

@@ -26,6 +26,7 @@ const AGENT_OPS: &[&str] = &[
     "agent.set_github_identity",
     "agent.dispose",
     "agent.merge",
+    "agent.set_namespace",
 ];
 
 /// The log coordinator supplies decoded bytes, not hex, after checking paging
@@ -1570,6 +1571,89 @@ mod tests {
                 .filter(|claim| claim.agent_id == b)
                 .collect::<Vec<_>>()
         );
+        check_rebuild(&f);
+    }
+
+    #[test]
+    fn remote_set_namespace_entry_moves_its_own_claim_but_not_another_agents() {
+        let f = Fixture::new("remote-set-namespace");
+        register(&f, "P", vec![], Some("W1"));
+        register(&f, "Q", vec![], Some("W2"));
+        enable(&f);
+        f.store
+            .apply_entry("agent.cutover", "{}", "test", None, |_| Ok(()))
+            .unwrap();
+        let a = "agent_0000000000000001";
+        let b = "agent_0000000000000002";
+        for (id, name, project) in [(a, "Ada", "P"), (b, "Grace", "Q")] {
+            f.store
+                .with_principal("test")
+                .agent_mutation_with_id(
+                    "agent.create",
+                    json!({"role":"head","project_id":project,"name":name,"tag":"helper","request_key":id}),
+                    10,
+                    Some(id),
+                )
+                .unwrap();
+        }
+        let row = f.store.agent_row(a).unwrap().unwrap();
+        let mut moved = row.clone();
+        moved.agent_generation += 1;
+        moved.updated_at_ms = 20;
+        let next_claim = |claim: &crate::agent::AgentNameClaim| {
+            let mut claimed = claim.clone();
+            claimed.claim_id = 3;
+            claimed.namespace_key = "W2".into();
+            claimed.claimed_at_ms = 20;
+            claimed.released_at_ms = None;
+            claimed
+        };
+        let before = image(&f);
+        // A forged move that releases B's claim, whether or not it relabels the
+        // claim as A's, is refused before anything is applied.
+        let mut foreign = f.store.agent_claims(b).unwrap().remove(0);
+        foreign.released_at_ms = Some(20);
+        let mut disguised = foreign.clone();
+        disguised.agent_id = a.into();
+        let own = f.store.agent_claims(a).unwrap().remove(0);
+        for forged in [foreign, disguised] {
+            let entry = AgentChangeEntry::new(
+                "agent.set_namespace",
+                moved.clone(),
+                vec![forged, next_claim(&own)],
+            );
+            let error = f
+                .store
+                .apply_remote_entry(&envelope(1, &entry, false))
+                .unwrap_err()
+                .to_string();
+            assert!(error.starts_with("apply_failed"), "{error}");
+            assert!(
+                error.contains("agent entry changes another agent's claim"),
+                "{error}"
+            );
+            assert_eq!(image(&f), before);
+        }
+        // A's own move into W2, beside B's different name, applies.
+        let mut released = own.clone();
+        released.released_at_ms = Some(20);
+        let entry = AgentChangeEntry::new(
+            "agent.set_namespace",
+            moved.clone(),
+            vec![released, next_claim(&own)],
+        );
+        f.store
+            .apply_remote_entry(&envelope(1, &entry, false))
+            .unwrap();
+        assert_eq!(f.store.agent_row(a).unwrap().unwrap(), moved);
+        assert_eq!(f.store.agent_claims(a).unwrap(), entry.claims);
+        assert_eq!(f.store.agent_claims(b).unwrap()[0].released_at_ms, None);
+        // The remote's own changes feed serves the received entry.
+        let changes = f.store.agent_changes(0, Some(100)).unwrap();
+        let last = changes.entries.last().unwrap();
+        assert_eq!(last.op, "agent.set_namespace");
+        assert_eq!(last.row, moved);
+        assert_eq!(last.claims, entry.claims);
         check_rebuild(&f);
     }
 

@@ -123,7 +123,7 @@ impl RegistryStore {
 
 #[cfg(test)]
 mod tests {
-    use super::super::reads::tests::{call, create, fixture, import_core, placed};
+    use super::super::reads::tests::{call, create, fixture, import_core, placed, result, Fixture};
     use super::*;
     use rusqlite::{params_from_iter, types::Value as SqlValue};
     use serde_json::json;
@@ -616,5 +616,151 @@ mod tests {
                 claims.insert(claim["claim_id"].as_i64().unwrap(), claim.clone());
             }
         }
+    }
+
+    /// Hand-build the entry an `agent.set_namespace` change journals: the
+    /// after-image with no stored workspace and the next generation, then, when
+    /// the claim moves to `target`, the released claim followed by the new
+    /// active claim. With no target it is a pure clear and carries no claims.
+    fn set_namespace(
+        f: &Fixture,
+        agent_id: &str,
+        target: Option<&str>,
+        now: i64,
+    ) -> AgentChangeEntry {
+        let mut row = f.store.agent_row(agent_id).unwrap().unwrap();
+        row.workspace_id = None;
+        row.agent_generation += 1;
+        row.updated_at_ms = now;
+        let mut claims = vec![];
+        if let Some(target) = target {
+            let mut released = f
+                .store
+                .agent_claims(agent_id)
+                .unwrap()
+                .into_iter()
+                .find(|claim| claim.released_at_ms.is_none())
+                .unwrap();
+            let mut claimed = released.clone();
+            released.released_at_ms = Some(now);
+            claimed.claim_id = f
+                .store
+                .agent_snapshot()
+                .unwrap()
+                .claims
+                .iter()
+                .map(|claim| claim.claim_id)
+                .max()
+                .unwrap()
+                + 1;
+            claimed.namespace_key = target.into();
+            claimed.claimed_at_ms = now;
+            claims = vec![released, claimed];
+        }
+        AgentChangeEntry::new("agent.set_namespace", row, claims)
+    }
+
+    /// Journal a hand-built entry the way an identity write stores it, applying
+    /// it through the same replay function rebuild uses.
+    fn journal(f: &Fixture, mut entry: AgentChangeEntry) -> AgentChangeEntry {
+        entry.seq = f.store.generation().unwrap() + 1;
+        let payload = json!({ "entry": entry });
+        let (seq, replayed) = f
+            .store
+            .apply_entry(
+                "agent.set_namespace",
+                &payload.to_string(),
+                "test",
+                None,
+                |tx| crate::agent::replay_agent_entry(tx, "agent.set_namespace", &payload),
+            )
+            .unwrap();
+        assert!(replayed, "replay did not recognise agent.set_namespace");
+        assert_eq!(seq, entry.seq);
+        entry
+    }
+
+    #[test]
+    fn set_namespace_entries_replay_rebuild_and_serve_on_the_changes_page() {
+        let f = fixture(false);
+        placed(&f, "P", "W1");
+        placed(&f, "Q", "W2");
+        // Core's post-082 shape: Ada's name is claimed under its own project id
+        // and copied into the stored workspace; Grace's claim already sits at
+        // its placement but the row still stores the workspace.
+        let ada = "agent_0000000000000011";
+        let grace = "agent_0000000000000012";
+        import_core(&f, &format!("INSERT INTO agent(agent_id,name,tag,role,project_id,workspace_id,created_at_ms,updated_at_ms) VALUES('{ada}','Ada','tag','head','P','P',1,2),('{grace}','Grace','tag','head','Q','W2',1,2);
+            INSERT INTO agent_name_claim(agent_id,namespace_kind,namespace_key,normalized_name,display_name,claimed_at_ms) VALUES('{ada}','workspace','P','ada','Ada',3),('{grace}','workspace','W2','grace','Grace',3);"));
+        // The op is a journal op only, never a request method.
+        assert_eq!(
+            f.store
+                .agent_mutation(
+                    "agent.set_namespace",
+                    json!({"agent_id":ada,"request_key":"k"}),
+                    100
+                )
+                .unwrap_err()
+                .code,
+            "unknown_method"
+        );
+        let cursor = f.store.generation().unwrap();
+        let original = f.store.agent_claims(ada).unwrap();
+        let moved = journal(&f, set_namespace(&f, ada, Some("W1"), 200));
+        let cleared = journal(&f, set_namespace(&f, grace, None, 200));
+        assert_eq!(moved.claims.len(), 2);
+        assert!(cleared.claims.is_empty());
+
+        // Replay installed both after-images and kept the released claim.
+        for entry in [&moved, &cleared] {
+            let row = f.store.agent_row(&entry.agent_id).unwrap().unwrap();
+            assert_eq!(row, entry.row);
+            assert_eq!(row.workspace_id, None);
+            assert_eq!(row.agent_generation, 2);
+            assert_eq!(row.updated_at_ms, 200);
+        }
+        let claims = f.store.agent_claims(ada).unwrap();
+        assert_eq!(claims, moved.claims);
+        assert_eq!(claims[0].claim_id, original[0].claim_id);
+        assert_eq!(claims[0].namespace_key, "P");
+        assert_eq!(claims[0].released_at_ms, Some(200));
+        assert_eq!(
+            (
+                claims[1].namespace_kind.as_str(),
+                claims[1].namespace_key.as_str(),
+                claims[1].released_at_ms
+            ),
+            ("workspace", "W1", None)
+        );
+        let grace_claims = f.store.agent_claims(grace).unwrap();
+        assert_eq!(grace_claims.len(), 1);
+        assert_eq!(grace_claims[0].namespace_key, "W2");
+        // Name lookup follows the moved claim.
+        assert_eq!(
+            result(
+                &f.store
+                    .agent_read("agent.resolve_name", json!({"name":"w1/ada"}))
+                    .unwrap()
+            )["agent_id"],
+            ada
+        );
+
+        // The changes page from before the moves serves both entries exactly.
+        let page = f.store.agent_changes(cursor, None).unwrap();
+        assert_eq!(page.entries, vec![moved.clone(), cleared.clone()]);
+        assert_eq!(page.cursor, f.store.generation().unwrap());
+        let wire = serde_json::to_value(&page).unwrap();
+        assert_eq!(wire["entries"][0]["op"], "agent.set_namespace");
+        assert_eq!(wire["entries"][0]["row"]["workspace_id"], Value::Null);
+        assert_eq!(wire["entries"][1]["claims"], json!([]));
+
+        // Rebuild replays the same entries into the same projection.
+        let before = serde_json::to_value(f.store.agent_snapshot().unwrap()).unwrap();
+        let rebuilt = f.store.rebuild().unwrap();
+        assert!(rebuilt.replay.ok, "{rebuilt:?}");
+        assert_eq!(
+            serde_json::to_value(f.store.agent_snapshot().unwrap()).unwrap(),
+            before
+        );
     }
 }

@@ -136,8 +136,11 @@ impl AgentRow {
         if let Some(id) = &self.project_id {
             value["project_id"] = json!(id);
         }
-        if let Some(id) = &self.workspace_id {
-            value["workspace_id"] = json!(id);
+        // A head or hiree stores no workspace (its workspace is its project's
+        // placement), so it echoes `workspace_id: null` where core's rows
+        // carried the copied placement. Assistants keep omitting the key.
+        if self.workspace_id.is_some() || matches!(self.role.as_str(), "head" | "hiree") {
+            value["workspace_id"] = json!(self.workspace_id);
         }
         value
     }
@@ -476,7 +479,15 @@ fn validate_create(
         labels: vec![],
         role: r.role.as_str().into(),
         project_id: project_id.clone(),
-        workspace_id: workspace_id.clone(),
+        // Only a workspace head stores its workspace. A head's or hiree's
+        // workspace is always its project's current placement, which the name
+        // claim above is keyed on, so storing it here would only go stale
+        // when the project moves.
+        workspace_id: if matches!(r.role, Role::WorkspaceHead) {
+            workspace_id.clone()
+        } else {
+            None
+        },
         avatar: None,
         github_identity: None,
         status: "live".into(),
@@ -756,8 +767,10 @@ fn summary(
             let mut text = format!("create {role} agent {:?}", row.name);
             if let Some(project) = &row.project_id {
                 text.push_str(&format!(" for project {project:?}"));
-                if let Some(workspace) = &row.workspace_id {
-                    text.push_str(&format!(" in workspace {workspace:?}"));
+                // A head or hiree stores no workspace; name the placement its
+                // claim is keyed on instead.
+                if let Some(name) = &prepared.name {
+                    text.push_str(&format!(" in workspace {:?}", name.key));
                 }
             } else if let Some(workspace) = &row.workspace_id {
                 text.push_str(&format!(" for workspace {workspace:?}"));
@@ -1061,15 +1074,15 @@ mod tests {
         let f = fixture("agent-roles");
         placed(&f, "P", "W");
         let a = assistant(&f, "Shared", "a");
-        let h = call(
+        let created = call(
             &f,
             "agent.create",
             json!({"role":"head","project_id":"P","name":"Shared","tag":"head","request_key":"h"}),
             20,
-        )["agent"]["agent_id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
+        );
+        // The reply echoes the stored row: a head stores no workspace.
+        assert_eq!(created["agent"].get("workspace_id"), Some(&Value::Null));
+        let h = created["agent"]["agent_id"].as_str().unwrap().to_owned();
         assert_eq!(a, "agent_0000000000000001");
         assert_eq!(h, "agent_0000000000000002");
         assert_ne!(a, h);
@@ -1079,7 +1092,9 @@ mod tests {
             ("workspace_head", "Team", "team", None, Some("W")),
         ] {
             let id = call(&f,"agent.create",json!({"role":role,"name":name,"tag":role,"project_id":project_id,"workspace_id":workspace_id,"request_key":key}),30)["agent"]["agent_id"].as_str().unwrap().to_owned();
-            assert_eq!(row(&f, &id).workspace_id.as_deref(), Some("W"));
+            // Only the workspace head stores its workspace; the hiree's comes
+            // from its project's placement, through its claim below.
+            assert_eq!(row(&f, &id).workspace_id.as_deref(), workspace_id);
             assert_eq!(row(&f, &id).agent_generation, 1);
             assert_eq!(row(&f, &id).name_version, 1);
             let claims = f.store.agent_claims(&id).unwrap();
@@ -1096,7 +1111,7 @@ mod tests {
             (ac[0].namespace_kind.as_str(), ac[0].namespace_key.as_str()),
             ("assistant", "global")
         );
-        assert_eq!(row(&f, &h).workspace_id.as_deref(), Some("W"));
+        assert_eq!(row(&f, &h).workspace_id, None);
         let hc = f.store.agent_claims(&h).unwrap();
         assert_eq!(
             (hc[0].namespace_kind.as_str(), hc[0].namespace_key.as_str()),
@@ -1347,7 +1362,14 @@ mod tests {
             .unwrap()
             .to_owned();
         assert_eq!(row(&f, &current).project_id.as_deref(), Some("P"));
-        assert_eq!(row(&f, &current).workspace_id.as_deref(), Some("W"));
+        // The current project's placement (W), not the alias target's (V),
+        // keys the claim; the row itself stores no workspace.
+        assert_eq!(row(&f, &current).workspace_id, None);
+        let claim = &f.store.agent_claims(&current).unwrap()[0];
+        assert_eq!(
+            (claim.namespace_kind.as_str(), claim.namespace_key.as_str()),
+            ("workspace", "W")
+        );
         f.store
             .register(RegisterRequest {
                 project_id: Some("unplaced".into()),
