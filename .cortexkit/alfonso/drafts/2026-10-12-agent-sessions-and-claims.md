@@ -6,8 +6,7 @@ mint: auto
 integration_ref: "main"
 evidence:
   include:
-    - "/Users/ufukaltinok/Work/Projects/CortexKit/engram/AGENT_SYNC.md:16-23"
-    - "/Users/ufukaltinok/Work/Projects/CortexKit/engram/AGENT_SYNC.md:50-110"
+    - ".cortexkit/alfonso/context/agent-sync-draft11-excerpt.md"
     - "crates/entorhinal-core/src/lib.rs:100-240"
     - "crates/entorhinal-core/src/log_schema.rs"
     - "crates/entorhinal-module/src/main.rs:440-800"
