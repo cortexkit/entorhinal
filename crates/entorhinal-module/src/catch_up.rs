@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::time::{timeout_at, Instant};
 
 const INTERVAL: Duration = Duration::from_secs(30);
-const READ_DEADLINE: Duration = Duration::from_secs(25);
+pub(super) const READ_DEADLINE: Duration = Duration::from_secs(25);
 
 struct Worker {
     store: Arc<Mutex<Option<RegistryStore>>>,
@@ -16,6 +16,7 @@ struct Worker {
     log: log_client::LogClient,
     writer: Arc<tokio::sync::Mutex<()>>,
     commits: Arc<tokio::sync::Notify>,
+    claim_refresh: Arc<super::claims::RefreshQueue>,
 }
 
 impl ProjectsHandler {
@@ -26,6 +27,7 @@ impl ProjectsHandler {
             log: self.log_client.clone(),
             writer: self.writer.clone(),
             commits: self.commits.clone(),
+            claim_refresh: self.claim_refresh.clone(),
         }
     }
 
@@ -55,6 +57,9 @@ impl ProjectsHandler {
 impl Drop for ProjectsHandler {
     fn drop(&mut self) {
         if let Some(task) = self.catch_up_task.get_mut().unwrap().take() {
+            task.abort();
+        }
+        if let Some(task) = self.claim_refresh_task.get_mut().unwrap().take() {
             task.abort();
         }
     }
@@ -112,7 +117,10 @@ impl Worker {
                             "entorhinal",
                         )
                         .await;
-                        result.and_then(|()| self.applied(&store))
+                        result.and_then(|()| {
+                            self.claim_refresh.signal();
+                            self.applied(&store)
+                        })
                     } else {
                         self.run(&store, deadline).await
                     };
@@ -138,7 +146,7 @@ impl Worker {
         after: u64,
         deadline: Instant,
     ) -> Result<log_client::ReadReply, HandlerError> {
-        timeout_at(deadline, self.log.read(after, 128))
+        let reply = timeout_at(deadline, self.log.read(after, 128))
             .await
             .map_err(|_| {
                 HandlerError::new(
@@ -160,7 +168,8 @@ impl Worker {
                 }
                 log_client::LogError::Protocol(message) => self.stalled(6, after + 1, message),
                 _ => HandlerError::new("engram_unavailable", "engram unavailable during catch-up"),
-            })
+            })?;
+        Ok(reply)
     }
 
     async fn check_supersede_authors(
@@ -219,8 +228,18 @@ impl Worker {
         let mut parts = Vec::new();
         let mut authors = Vec::new();
         let mut snapshot = None;
+        let started_unenabled = store.identity_log_status().map_err(storage)?.state != "enabled";
+        let mut reconnect = self.health.log_state.load(Ordering::Relaxed) != 0;
         loop {
             let page = self.read(after, deadline).await?;
+            let retry_refresh = self
+                .health
+                .claim_refresh_failed
+                .swap(false, Ordering::Relaxed);
+            if reconnect || retry_refresh {
+                reconnect = false;
+                self.claim_refresh.signal();
+            }
             if page.head < after {
                 self.health.log_state.store(7, Ordering::Relaxed);
                 return Err(HandlerError::new(
@@ -311,6 +330,9 @@ impl Worker {
                 store.finish_join(head).map_err(storage)?;
                 super::enable::refresh(&self.health, store);
                 self.applied(store)?;
+                if started_unenabled {
+                    self.claim_refresh.signal();
+                }
                 return Ok(());
             }
             if after == page_start {

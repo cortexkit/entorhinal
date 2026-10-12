@@ -1910,3 +1910,360 @@ runner = "cargo"
 package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 expect_red = ["sessions::tests::session_liveness_maps_every_state_in_request_order"]
+
+# Agent checkout claims and generic records. These controls pin the reviewed
+# record API until engram's serving commit is available to release.
+
+[[control]]
+id = "claims-codec-version"
+guards = "Unknown claim body versions are refused by name"
+file = "crates/entorhinal-module/src/claim_codec.rs"
+old = "if v != 1 {"
+new = "if false && v != 1 { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/claim_codec.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["claim_codec::tests::claim_codec_refuses_each_named_error_and_roundtrips"]
+
+[[control]]
+id = "claims-codec-subject"
+guards = "A claim cannot impersonate another subject"
+file = "crates/entorhinal-module/src/claim_codec.rs"
+old = "if claim.agent_id != id {"
+new = "if false && claim.agent_id != id { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/claim_codec.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["claim_codec::tests::claim_codec_refuses_each_named_error_and_roundtrips"]
+
+[[control]]
+id = "claims-codec-holder"
+guards = "A positive claim epoch requires a holder"
+file = "crates/entorhinal-module/src/claim_codec.rs"
+old = "|| (claim.epoch >= 1 && claim.holder.is_none())"
+new = "|| (false && claim.epoch >= 1 && claim.holder.is_none()) // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/claim_codec.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["claim_codec::tests::claim_codec_refuses_each_named_error_and_roundtrips"]
+
+[[control]]
+id = "claims-registration-integrity"
+guards = "Session admission fails closed on a persisted integrity mark"
+file = "crates/entorhinal-core/src/claim_cache.rs"
+old = '''    if let Some(claim) = load_claim(tx, id)? {
+        if claim.integrity_failed {'''
+new = '''    if let Some(claim) = load_claim(tx, id)? {
+        if false && claim.integrity_failed { // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-core/src/claim_cache.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["claim_cache::tests::register_claim_admission_checks_integrity_before_holder_and_binding"]
+
+[[control]]
+id = "claims-registration-holder"
+guards = "A positive claim held on another device refuses registration"
+file = "crates/entorhinal-core/src/claim_cache.rs"
+old = "if claim.epoch >= 1 && (claim.holder.is_none() || claim.holder != self_author(tx)?) {"
+new = "if false && claim.epoch >= 1 && (claim.holder.is_none() || claim.holder != self_author(tx)?) { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/claim_cache.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["claim_cache::tests::register_claim_admission_checks_integrity_before_holder_and_binding"]
+
+[[control]]
+id = "claims-integrity-present"
+guards = "Integrity failures retain the body and set the durable mark"
+file = "crates/entorhinal-core/src/claim_cache.rs"
+old = "row.integrity_failed = true;"
+new = "row.integrity_failed = false; // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/claim_cache.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["claim_cache::tests::integrity_present_keeps_body_and_sets_mark"]
+
+[[control]]
+id = "claims-integrity-none"
+guards = "An integrity failure with no row creates a stale marked version-zero row"
+file = "crates/entorhinal-core/src/claim_cache.rs"
+old = "old.unwrap_or_else(|| unclaimed(now, true, true))"
+new = "old.unwrap_or_else(|| unclaimed(now, false, true)) /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-core/src/claim_cache.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["claim_cache::tests::integrity_none_creates_marked_unclaimed_version_zero"]
+
+[[control]]
+id = "claims-newer-clears-mark"
+guards = "A verified equal or newer claim clears its integrity mark"
+file = "crates/entorhinal-core/src/claim_cache.rs"
+old = "row.integrity_failed = false;"
+new = "row.integrity_failed = true; // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/claim_cache.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["claim_cache::tests::verified_newer_equal_or_first_replaces_and_clears_mark"]
+
+[[control]]
+id = "claims-older-keeps-body"
+guards = "An older verified version never overwrites a newer cached body or mark"
+file = "crates/entorhinal-core/src/claim_cache.rs"
+old = "Some(mut cached) if claim.version < cached.version => {"
+new = "Some(mut cached) if false && claim.version < cached.version => { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/claim_cache.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["claim_cache::tests::verified_older_keeps_body_and_mark_and_becomes_stale"]
+
+[[control]]
+id = "claims-stale-absent-keeps-positive"
+guards = "A stale absent answer cannot erase a positive-version claim"
+file = "crates/entorhinal-core/src/claim_cache.rs"
+old = "Some(mut cached) if *stale && cached.version >= 1 => {"
+new = "Some(mut cached) if false && *stale && cached.version >= 1 => { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/claim_cache.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["claim_cache::tests::stale_absent_preserves_positive_version_and_mark"]
+
+[[control]]
+id = "claims-stale-zero-keeps-mark"
+guards = "A stale absent version-zero row retains its integrity mark"
+file = "crates/entorhinal-core/src/claim_cache.rs"
+old = "*stale && cached.is_some_and(|c| c.integrity_failed),"
+new = "false && *stale && cached.is_some_and(|c| c.integrity_failed), // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/claim_cache.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["claim_cache::tests::stale_absent_none_or_zero_stores_zero_and_keeps_mark"]
+
+[[control]]
+id = "claims-unclaimed-version-zero"
+guards = "Unclaimed replies always store version zero"
+file = "crates/entorhinal-core/src/claim_cache.rs"
+old = "_ if claim.epoch == 0 => unclaimed(now, claim.stale, false),"
+new = "_ if false && claim.epoch == 0 => unclaimed(now, claim.stale, false), // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/claim_cache.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["claim_cache::tests::verified_epoch_zero_is_unclaimed_with_version_zero"]
+
+[[control]]
+id = "claims-self-author-conflict"
+guards = "A conflicting record identity never overwrites the persisted self author"
+file = "crates/entorhinal-core/src/claim_cache.rs"
+old = "return Ok(known == author);"
+new = "return Ok(true); // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/claim_cache.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["claim_cache::tests::self_author_conflict_never_overwrites_identity_and_cache_never_journals"]
+
+[[control]]
+id = "claims-where-known"
+guards = "Known reflects presence of a cache row, not assumed knowledge"
+file = "crates/entorhinal-core/src/claim_cache.rs"
+old = "let known = claim.is_some();"
+new = "let known = true; // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/claim_cache.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["claim_cache::tests::where_wire_nulls_known_status_integrity_and_restart"]
+
+[[control]]
+id = "claims-where-integrity"
+guards = "Agent where refuses marked claims instead of answering a cached holder"
+file = "crates/entorhinal-core/src/claim_cache.rs"
+old = '''                if claim.integrity_failed {
+                    return Err(refusal("claim_integrity_failed", None));'''
+new = '''                if false && claim.integrity_failed { // NON-VACUITY BREAK
+                    return Err(refusal("claim_integrity_failed", None));'''
+test_file = "crates/entorhinal-core/src/claim_cache.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["claim_cache::tests::where_wire_nulls_known_status_integrity_and_restart"]
+
+[[control]]
+id = "claims-refresh-direct-only"
+guards = "Only Direct may request an agent claim refresh"
+file = "crates/entorhinal-module/src/claims.rs"
+old = "if admission.principal != Some(subc_protocol::Principal::Direct) {"
+new = "if false && admission.principal != Some(subc_protocol::Principal::Direct) { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/claims.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["claims::tests::refresh_admission_empty_disabled_and_sync_seam_are_closed"]
+
+[[control]]
+id = "claims-refresh-log-enabled"
+guards = "Explicit claim refresh requires the identity log enabled"
+file = "crates/entorhinal-module/src/claims.rs"
+old = 'if self.with_store(RegistryStore::identity_log_status)?.state != "enabled" {'
+new = 'if false && self.with_store(RegistryStore::identity_log_status)?.state != "enabled" { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/claims.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["claims::tests::refresh_admission_empty_disabled_and_sync_seam_are_closed"]
+
+[[control]]
+id = "claims-reconnect-after-failure"
+guards = "A first successful catch-up after a failed refresh schedules exactly one new agent pass"
+file = "crates/entorhinal-module/src/catch_up.rs"
+old = "if reconnect || retry_refresh {"
+new = "if reconnect { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/claims.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["claims::tests::refresh_failure_reconnect_signals_exactly_one_pass_without_private_timer"]
+
+[[control]]
+id = "record-subject-cap"
+guards = "Record subject limits count UTF-8 bytes and stop at 256"
+file = "crates/entorhinal-module/src/record_client.rs"
+old = "if subject.len() > SUBJECT_CAP {"
+new = "if false && subject.len() > SUBJECT_CAP { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/fake_record.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["fake_record::tests::record_fake_and_client_enforce_admission_bounds_and_closed_refusals"]
+
+[[control]]
+id = "record-many-page-prefix"
+guards = "A partial record batch must name exactly its first unanswered subject"
+file = "crates/entorhinal-module/src/record_client.rs"
+old = "|| (page.entries.len() < subjects.len() && page.next != Some(page.entries.len()))"
+new = "|| (false && page.entries.len() < subjects.len() && page.next != Some(page.entries.len())) // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/fake_record.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["fake_record::tests::record_client_refuses_malformed_pages_and_inconsistent_replies"]
+
+[[control]]
+id = "record-receipt-window"
+guards = "A subject retains receipts for exactly its last 64 versions"
+file = "crates/entorhinal-module/src/fake_record.rs"
+old = "r.version > version.saturating_sub(64)"
+new = "r.version > version.saturating_sub(63) /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-module/src/fake_record.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["fake_record::tests::record_resend_replays_before_cas_and_enforces_account_wide_id_and_window"]
+
+[[control]]
+id = "record-pending-offline-refusal"
+guards = "An unsettled write never exposes a pre-write offline copy"
+file = "crates/entorhinal-module/src/fake_record.rs"
+old = "if let Some(mark) = local.pending.get(subject) {"
+new = "if let Some(mark) = local.pending.get(subject).filter(|_| false) { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/fake_record.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["fake_record::tests::record_pending_mark_survives_restart_and_low_read_then_clears_on_higher_read"]
+
+[[control]]
+id = "record-caller-admission"
+guards = "Record methods refuse every caller except daemon-attested entorhinal"
+file = "crates/entorhinal-module/src/fake_record.rs"
+old = 'if *self.principal.lock().unwrap() != "reserved:entorhinal"'
+new = 'if false && *self.principal.lock().unwrap() != "reserved:entorhinal" /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/fake_record.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["fake_record::tests::record_fake_and_client_enforce_admission_bounds_and_closed_refusals"]
+
+[[control]]
+id = "claims-confirmed-absent-clears-mark"
+guards = "A cloud-confirmed absent answer clears an existing integrity mark"
+file = "crates/entorhinal-core/src/claim_cache.rs"
+old = "*stale && cached.is_some_and(|c| c.integrity_failed),"
+new = "cached.is_some_and(|c| c.integrity_failed), // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/claim_cache.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["claim_cache::tests::confirmed_absent_resets_version_and_clears_mark"]
+
+[[control]]
+id = "claims-where-here-needs-own-author"
+guards = "A positive claim is held here only when its holder matches persisted self identity"
+file = "crates/entorhinal-core/src/claim_cache.rs"
+old = "} else if claim.holder.is_some() && claim.holder == own {"
+new = "} else if claim.holder.is_some() { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/claim_cache.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["claim_cache::tests::holder_without_self_identity_is_elsewhere_and_never_assumed_here"]
+
+[[control]]
+id = "record-caps-pinned"
+guards = "Record body size caps are the contract's exact decoded-byte values"
+file = "crates/entorhinal-module/src/record_client.rs"
+old = "pub(crate) const BODY_CAP: usize = 64 * 1024;"
+new = "pub(crate) const BODY_CAP: usize = 64 * 1024 - 1; // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/fake_record.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["fake_record::tests::record_fake_and_client_enforce_admission_bounds_and_closed_refusals"]
+
+[[control]]
+id = "record-resend-body-must-match"
+guards = "A remembered write id with different bytes refuses id_reused"
+file = "crates/entorhinal-module/src/fake_record.rs"
+old = "|| receipt.body != body"
+new = "|| (false && receipt.body != body) // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/fake_record.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["fake_record::tests::record_resend_replays_before_cas_and_enforces_account_wide_id_and_window"]
+
+[[control]]
+id = "record-pending-clears-only-higher"
+guards = "A confirmed read at the pending write's expected version does not clear its mark"
+file = "crates/entorhinal-module/src/fake_record.rs"
+old = ".is_some_and(|mark| version > mark.expected)"
+new = ".is_some_and(|mark| version >= mark.expected) // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/fake_record.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["fake_record::tests::record_pending_mark_survives_restart_and_low_read_then_clears_on_higher_read"]
+
+[[control]]
+id = "claims-startup-agent-pass"
+guards = "Startup with an enabled store refreshes its persisted live-agent claims"
+file = "crates/entorhinal-module/src/main.rs"
+old = '''        self.start_claim_refresh();
+        self.claim_refresh.signal();'''
+new = '''        self.start_claim_refresh();
+        // NON-VACUITY BREAK: omit the startup agent pass'''
+test_file = "crates/entorhinal-module/src/claims.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["claims::tests::hello_ack_startup_refreshes_persisted_live_agents"]

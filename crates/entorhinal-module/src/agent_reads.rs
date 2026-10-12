@@ -1521,6 +1521,7 @@ mod tests {
             "agent.changes",
             "agent.for_session",
             "agent.session_liveness",
+            "agent.where",
         ];
         let expected_mutations = [
             "register",
@@ -1551,6 +1552,7 @@ mod tests {
             "agent.merge",
             "agent.import",
             "agent.register_session",
+            "agent.refresh_claims",
         ];
         for (kind, names) in [
             ("query", expected_queries.as_slice()),

@@ -58,6 +58,8 @@ const DEFAULT_STORAGE_NAMESPACE: &str = "default";
 mod agent_ops;
 mod agent_reads;
 mod catch_up;
+mod claim_codec;
+mod claims;
 mod cli;
 mod current_directory;
 #[cfg(test)]
@@ -71,8 +73,11 @@ mod incarnation;
 #[cfg(test)]
 #[allow(dead_code)]
 mod fake_log;
+#[cfg(test)]
+mod fake_record;
 #[allow(dead_code)]
 mod log_client;
+mod record_client;
 #[cfg(test)]
 mod served_vectors;
 mod sessions;
@@ -255,6 +260,15 @@ struct HealthGauges {
     log_pending: AtomicI64,
     log_error: AtomicU64,
     log_error_at: AtomicI64,
+    claim_refresh_failed: AtomicBool,
+    claim_refreshed: AtomicU64,
+    claim_failed: AtomicU64,
+    claim_version_unknown: AtomicU64,
+    claim_subject_mismatch: AtomicU64,
+    claim_malformed: AtomicU64,
+    self_author_conflicts: AtomicU64,
+    #[cfg(test)]
+    claim_refresh_done: tokio::sync::Notify,
 }
 
 /// Volatile liveness state fed by `projects.session_liveness` batches. Never
@@ -394,6 +408,9 @@ struct ProjectsHandler {
     log_client: log_client::LogClient,
     writer: Arc<tokio::sync::Mutex<()>>,
     catch_up_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    record_client: record_client::RecordClient,
+    claim_refresh: Arc<claims::RefreshQueue>,
+    claim_refresh_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     agent_id_draw: fn() -> Result<String, HandlerError>,
     /// Names the module providing each session capability, asked afresh for
     /// every `agent.register_session` on the served path.
@@ -467,6 +484,7 @@ const MUTATING_METHODS: &[&str] = &[
     "agent.merge",
     "agent.import",
     "agent.register_session",
+    "agent.refresh_claims",
 ];
 
 /// Mutations that `authorize_write` passes through because each is admitted
@@ -474,7 +492,8 @@ const MUTATING_METHODS: &[&str] = &[
 /// `agent.register_session` is admitted from whichever module the daemon
 /// resolves as the sole provider of a session capability, so a fixed module
 /// name here would refuse a correctly bound provider.
-const SELF_ADMITTED_METHODS: &[&str] = &[sessions::REGISTER_SESSION];
+/// Claim refresh instead has its own Direct-only rule.
+const SELF_ADMITTED_METHODS: &[&str] = &[sessions::REGISTER_SESSION, claims::REFRESH];
 
 /// Admit project/workspace mutations from the operator (`Direct`: the `ck`
 /// faces) or executive, but identity mutations only from the executive relay.
@@ -595,6 +614,13 @@ impl ProjectsHandler {
         let route_admissions = Arc::new(Mutex::new(HashMap::new()));
         let operator_confirmer =
             Arc::new(agent_ops::DaemonConfirmer::new(route_admissions.clone()));
+        #[cfg(test)]
+        let record_connector: Arc<dyn log_client::LogConnector> =
+            Arc::new(record_client::UnavailableConnector);
+        #[cfg(not(test))]
+        let record_connector: Arc<dyn log_client::LogConnector> = Arc::new(
+            log_client::SubcConnector::from_args(std::env::args_os().skip(1)),
+        );
         Self {
             store: Arc::new(Mutex::new(None)),
             hello_refusal: Arc::new(HelloRefusal::default()),
@@ -610,6 +636,9 @@ impl ProjectsHandler {
             log_client: log_client::LogClient::new(connector),
             writer: Arc::new(tokio::sync::Mutex::new(())),
             catch_up_task: Mutex::new(None),
+            record_client: record_client::RecordClient::new(record_connector),
+            claim_refresh: Arc::new(claims::RefreshQueue::default()),
+            claim_refresh_task: Mutex::new(None),
             agent_id_draw: shared_write::draw_agent_id,
             provider_resolver: Arc::new(sessions::SubcProviderResolver::from_args(
                 std::env::args_os().skip(1),
@@ -669,6 +698,9 @@ impl ProjectsHandler {
         let admission = self.admission_for(key);
         refuse_flow_write(method, admission.flow_id.as_deref())?;
         authorize_write(method, admission.principal.as_ref())?;
+        if method == claims::REFRESH {
+            self.admit_claim_refresh(key)?;
+        }
         let role = if method == sessions::REGISTER_SESSION {
             Some(sessions::admit_session_registration(
                 providers,
@@ -781,10 +813,12 @@ impl ModuleHandler for ProjectsHandler {
                 let store = Arc::clone(&self.store);
                 let health = Arc::clone(&self.health);
                 let retry_budget = self.lease_retry_budget;
+                let claim_refresh = self.claim_refresh.clone();
                 tokio::spawn(async move {
                     let outcome = retry_open_while_lease_held(&descriptor, retry_budget).await;
                     health.store_opening.store(false, Ordering::Relaxed);
                     install_store(&store, &health, outcome);
+                    claim_refresh.signal();
                 });
             }
             outcome => install_store(
@@ -794,6 +828,8 @@ impl ModuleHandler for ProjectsHandler {
             ),
         }
         self.start_catch_up();
+        self.start_claim_refresh();
+        self.claim_refresh.signal();
     }
 
     async fn health(&self) -> HealthReport {
@@ -807,7 +843,9 @@ impl ModuleHandler for ProjectsHandler {
             HealthStatus::Degraded
         } else if failed || !ready {
             HealthStatus::Failing
-        } else if self.health.log_state.load(Ordering::Relaxed) != 0 {
+        } else if self.health.log_state.load(Ordering::Relaxed) != 0
+            || self.health.self_author_conflicts.load(Ordering::Relaxed) != 0
+        {
             HealthStatus::Degraded
         } else {
             HealthStatus::Ok
@@ -838,6 +876,13 @@ impl ModuleHandler for ProjectsHandler {
                 "lastError": enable::last_error(&self.health),
                 "lastErrorAt": enable::last_error_at(&self.health),
                 "logOwnEntriesAppliedFromLog": self.health.log_own_entries_applied.load(Ordering::Relaxed),
+                "claimRefreshed": self.health.claim_refreshed.load(Ordering::Relaxed),
+                "claimFailed": self.health.claim_failed.load(Ordering::Relaxed),
+                "claimVersionUnknown": self.health.claim_version_unknown.load(Ordering::Relaxed),
+                "claimSubjectMismatch": self.health.claim_subject_mismatch.load(Ordering::Relaxed),
+                "claimMalformed": self.health.claim_malformed.load(Ordering::Relaxed),
+                "claimError": if self.health.self_author_conflicts.load(Ordering::Relaxed) > 0 { Some("self_author_conflict") } else { None },
+                "selfAuthorConflicts": self.health.self_author_conflicts.load(Ordering::Relaxed),
             })),
         }
     }
@@ -874,9 +919,10 @@ struct LivenessSession {
 }
 
 impl ProjectsHandler {
-    /// Decoded requests that change state use `write_wait`, which handles cached
-    /// replies, serializes database writes, and sends shared changes to the log.
-    /// It calls synchronous `execute` for operations that only change local state.
+    /// Shared writes use `write_wait`, which handles cached replies, serializes
+    /// database writes, and sends shared changes to the log. It calls synchronous
+    /// `execute` for local session registration. Claim refresh has its own async
+    /// arm and never joins the shared-log writer queue.
     /// Queries use `handle_request_wait` instead, without joining the write queue.
     async fn handle_served_request(&self, body: &[u8], key: RouteKey) -> HandlerOutcome {
         let received = tokio::time::Instant::now();
@@ -889,6 +935,8 @@ impl ProjectsHandler {
         }
         let result = if request.method == "identity_log.enable" {
             self.enable_log(request.params, key, received).await
+        } else if request.method == claims::REFRESH {
+            self.refresh_agent_claims(request.params, key).await
         } else {
             self.write_wait(request, key, received).await
         };
@@ -978,6 +1026,11 @@ impl ProjectsHandler {
             },
             sessions::FOR_SESSION => self.for_session(request.params),
             sessions::SESSION_LIVENESS => self.agent_session_liveness(request.params),
+            claims::WHERE => self.agent_where(request.params),
+            claims::REFRESH => Err(HandlerError::new(
+                "served_path_required",
+                "claim refresh requires the asynchronous served path",
+            )),
             method if agent_ops::MUTATING_METHODS.contains(&method) => {
                 self.agent_mutation(method, request.params, &principal)
             }
@@ -1661,6 +1714,10 @@ fn manifest() -> ModuleManifest {
                 management_operation(method, ManagementOperationKind::Query, agent_operation_description(method))
             })).chain(std::iter::once(sessions::REGISTER_SESSION).map(|method| {
                 management_operation(method, ManagementOperationKind::Mutate, agent_operation_description(method))
+            })).chain(std::iter::once(claims::WHERE).map(|method| {
+                management_operation(method, ManagementOperationKind::Query, agent_operation_description(method))
+            })).chain(std::iter::once(claims::REFRESH).map(|method| {
+                management_operation(method, ManagementOperationKind::Mutate, agent_operation_description(method))
             })).collect(),
             config_schema: json!({"type": "object"}),
             observability: Vec::new(),
@@ -1764,6 +1821,8 @@ fn agent_operation_description(method: &str) -> &'static str {
         "agent.register_session" => "Bind an agent's session reference to its host session. Accepted only from the provider of agent-orchestrator/v1 or agent-host/v1.",
         "agent.for_session" => "Find the agent and session reference bound to a host session.",
         "agent.session_liveness" => "Answer active, gone or unknown for up to 256 session references, in request order.",
+        "agent.where" => "Answer an agent's cached claim, including whether it is known and which device holds it.",
+        "agent.refresh_claims" => "Refresh live agents' claim records from engram without waiting for the shared-log writer.",
         _ => "",
     }
 }
@@ -1927,6 +1986,7 @@ mod tests {
             .chain(agent_ops::MUTATING_METHODS.iter())
             .chain(sessions::READ_METHODS.iter())
             .chain(std::iter::once(&sessions::REGISTER_SESSION))
+            .chain([&claims::WHERE, &claims::REFRESH])
         {
             let description = agent_operation_description(method);
             assert!(!description.is_empty(), "{method} has no description");
@@ -1978,7 +2038,10 @@ mod tests {
     /// capability provider that is not the executive.
     #[test]
     fn self_admitted_methods_pass_the_write_gate_for_every_principal() {
-        assert_eq!(SELF_ADMITTED_METHODS, ["agent.register_session"]);
+        assert_eq!(
+            SELF_ADMITTED_METHODS,
+            ["agent.register_session", "agent.refresh_claims"]
+        );
         for method in SELF_ADMITTED_METHODS {
             assert!(MUTATING_METHODS.contains(method), "{method} is a mutation");
             assert!(!agent_ops::MUTATING_METHODS.contains(method));
@@ -2215,7 +2278,7 @@ mod tests {
         }
     }
 
-    fn hello_ack(descriptor: &StorageDescriptor) -> ModuleHelloAckBody {
+    pub(crate) fn hello_ack(descriptor: &StorageDescriptor) -> ModuleHelloAckBody {
         ModuleHelloAckBody {
             negotiated_ver: 1,
             subc_ops: Vec::new(),

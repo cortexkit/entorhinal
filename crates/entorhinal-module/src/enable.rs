@@ -361,6 +361,8 @@ impl ProjectsHandler {
             record_error(&self.health, error);
         }
         result?;
+        self.start_claim_refresh();
+        self.claim_refresh.signal();
         self.identity_log_status()
     }
 
