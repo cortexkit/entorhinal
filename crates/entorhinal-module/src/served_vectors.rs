@@ -501,6 +501,20 @@ async fn served_changes_match_published_file() {
         )
         .unwrap();
     source.execute("UPDATE agent_name_claim SET namespace_kind='workspace',namespace_key='served-workspace' WHERE agent_id IN (?1,?2)", params![NO_AVATAR,ASSISTANT]).unwrap();
+    // Every agent create and tag change refuses an empty tag, and core's
+    // readers reject one too, so these published entries carry real tags.
+    for (id, tag) in [
+        (HEAD, "Head whose name sits off its project's placement"),
+        (NO_AVATAR, "Head that still stores its workspace"),
+        (ASSISTANT, "Hiree carried with its project"),
+    ] {
+        source
+            .execute(
+                "UPDATE agent SET tag=?2 WHERE agent_id=?1",
+                params![id, tag],
+            )
+            .unwrap();
+    }
     drop(source);
     assert!(matches!(
         fixture.import().await,
