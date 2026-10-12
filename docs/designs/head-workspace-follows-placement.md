@@ -47,4 +47,5 @@ The cost is a behaviour change: moving a project to another workspace changes it
 
 - Retired and merged agents keep their historical claims untouched: their names stay reserved where they were.
 - The re-key is admitted like every other agent write: relayed from prefrontal-core, or from the operator through a Touch ID prompt that names the change.
-- Prefrontal-core's replica must read the re-key entry as a plain after-image update of the agent and its claims.
+- The re-key is journaled as `agent.set_workspace`, with the same entry shape as `agent.rename`: the full after-image row plus the released claim and the new one.
+- Ordering: prefrontal-core's replica applies only the op names it knows, and fails the whole `agent.changes` page on any other, which stops it advancing. So core must serve `agent.set_workspace` before entorhinal emits one. Entorhinal publishes an example entry for core's test, and only ships the op after core's replica is live with it.
