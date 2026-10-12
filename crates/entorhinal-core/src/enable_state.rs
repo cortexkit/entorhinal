@@ -440,9 +440,18 @@ fn agent_history(
                 serde_json::from_value(value).map_err(|e| invalid(e.to_string()))?;
             image.agents
         } else if entry.kind == "change" && value["op"] == "project.shared" {
-            let _: ProjectEntry =
+            let image: ProjectEntry =
                 serde_json::from_value(value).map_err(|e| invalid(e.to_string()))?;
-            vec![]
+            // A placement carry or the workspace correction embeds the
+            // `agent.set_namespace` after-images of the agents it changed.
+            if image
+                .agents
+                .iter()
+                .any(|agent| agent.op != "agent.set_namespace")
+            {
+                return Err(invalid("unknown agent operation".into()));
+            }
+            image.agents
         } else if entry.kind == "change" {
             let agent: AgentChangeEntry =
                 serde_json::from_value(value).map_err(|e| invalid(e.to_string()))?;
@@ -752,5 +761,78 @@ mod tests {
         drop(a);
         drop(b);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn agent_history_folds_the_agents_a_project_entry_carries() {
+        let row = |generation: i64, workspace: Option<&str>| crate::agent::AgentRow {
+            agent_id: "agent_0000000000000001".into(),
+            name: "Ada".into(),
+            name_version: 1,
+            name_normalization_version: 1,
+            tag: "helper".into(),
+            labels: vec![],
+            role: "head".into(),
+            project_id: Some("P".into()),
+            workspace_id: workspace.map(str::to_owned),
+            avatar: None,
+            github_identity: None,
+            status: "live".into(),
+            merged_into: None,
+            supervisor_agent_id: None,
+            request_key: None,
+            created_at_ms: 1,
+            updated_at_ms: generation,
+            terminal_at_ms: None,
+            agent_generation: generation,
+        };
+        let claim = |id: i64, key: &str, released: Option<i64>| crate::agent::AgentNameClaim {
+            claim_id: id,
+            agent_id: "agent_0000000000000001".into(),
+            namespace_kind: "workspace".into(),
+            namespace_key: key.into(),
+            normalized_name: "ada".into(),
+            name_normalization_version: 1,
+            display_name: "Ada".into(),
+            claimed_at_ms: id,
+            released_at_ms: released,
+        };
+        let created =
+            AgentChangeEntry::new("agent.create", row(1, None), vec![claim(1, "W1", None)]);
+        let moved = AgentChangeEntry::new(
+            "agent.set_namespace",
+            row(2, None),
+            vec![claim(1, "W1", Some(2)), claim(2, "W2", None)],
+        );
+        let carry = ProjectEntry {
+            op: "project.shared".into(),
+            tables: Default::default(),
+            agents: vec![moved.clone()],
+        };
+        let entry = |position: i64, bytes: Vec<u8>| RemoteEntry {
+            position,
+            entry_id: format!("e{position}"),
+            signer: "fake".into(),
+            key_id: "fake".into(),
+            envelope_version: 1,
+            kind: "change".into(),
+            entry: bytes,
+        };
+        let history = agent_history(&[
+            entry(1, canonical_bytes(&created)),
+            entry(2, canonical_bytes(&carry)),
+        ])
+        .unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].row, moved.row);
+        assert_eq!(history[0].claims, moved.claims);
+        // Only `agent.set_namespace` after-images may ride on a project entry.
+        let mut forged = carry;
+        forged.agents[0].op = "agent.rename".into();
+        assert!(agent_history(&[
+            entry(1, canonical_bytes(&created)),
+            entry(2, canonical_bytes(&forged)),
+        ])
+        .is_err());
     }
 }

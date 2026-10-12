@@ -878,7 +878,13 @@ mod tests {
         );
         assert!(entries.iter().all(|entry| entry.op == "agent.import"));
         let before = serde_json::to_value(f.store().agent_snapshot().unwrap()).unwrap();
-        assert!(f.store().verify().unwrap().ok);
+        // The hand-built head's claim is not keyed on a placement (P is unplaced).
+        let verified = f.store().verify().unwrap();
+        assert!(verified.replay.ok);
+        assert_eq!(
+            verified.mismatches,
+            vec![format!("agent_claim_off_placement:{}", new.agent_id)]
+        );
         f.store().rebuild().unwrap();
         assert_eq!(
             serde_json::to_value(f.store().agent_snapshot().unwrap()).unwrap(),

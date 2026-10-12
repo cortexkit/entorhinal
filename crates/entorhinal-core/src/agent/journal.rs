@@ -141,16 +141,41 @@ mod tests {
     #[test]
     fn every_agent_store_journal_op_is_an_identity_change_or_marker() {
         // Inspect production operation literals as well as exercised operations:
-        // a new mutation branch must not disappear just because no fixture calls it yet.
-        for source in [include_str!("store.rs"), include_str!("import.rs")] {
-            let production = source.split("#[cfg(test)]").next().unwrap();
-            for op in production.split('"').skip(1).step_by(2) {
-                if op.starts_with("agent.") && !op.contains(char::is_whitespace) {
-                    assert!(
-                        IDENTITY_CHANGE_OPS.contains(&op) || op == IDENTITY_MARKER_OP,
-                        "store operation {op} is absent from the identity journal operations"
-                    );
+        // a new mutation branch must not disappear just because no fixture calls
+        // it yet. The sources are every production file that journals agent
+        // ops, including the placement writes that journal carried agents.
+        // Only request methods that are never journal ops are exempt, by name.
+        const REQUEST_METHODS: &[&str] = &["agent.repair_workspaces"];
+        for (file, source) in [
+            ("store.rs", include_str!("store.rs")),
+            ("import.rs", include_str!("import.rs")),
+            ("carry.rs", include_str!("carry.rs")),
+            ("mutations.rs", include_str!("../mutations.rs")),
+        ] {
+            // Test modules start at a `#[cfg(test)]` module; a test-only
+            // helper function earlier in a file is still scanned. Line endings
+            // are normalized first, for checkouts that convert them.
+            let source = source.replace("\r\n", "\n");
+            let production = source.split("#[cfg(test)]\nmod ").next().unwrap();
+            let production = production
+                .split("#[cfg(test)]\npub(crate) mod ")
+                .next()
+                .unwrap();
+            for (start, _) in production.match_indices("\"agent.") {
+                let literal = &production[start + 1..];
+                let literal = &literal[..literal.find('"').unwrap()];
+                // `"agent."` is the prefix agent ops are recognised by, and a
+                // literal with spaces is a message, not an op.
+                if literal == "agent."
+                    || literal.contains(char::is_whitespace)
+                    || REQUEST_METHODS.contains(&literal)
+                {
+                    continue;
                 }
+                assert!(
+                    IDENTITY_CHANGE_OPS.contains(&literal) || literal == IDENTITY_MARKER_OP,
+                    "{file}: operation {literal} is absent from the identity journal operations"
+                );
             }
         }
     }

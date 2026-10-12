@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::{implicit_project_id, now_unix_millis, RegistryError, RegistryStore};
+use crate::agent::{AgentChangeEntry, AgentMutationError, AgentPrecheck, PlacementConfirmation};
 
 #[path = "pending.rs"]
 pub(crate) mod pending;
@@ -289,6 +290,7 @@ pub(crate) fn domain(code: &str, message: impl Into<String>) -> RegistryError {
     RegistryError::Domain {
         code: code.to_string(),
         message: message.into(),
+        detail: None,
     }
 }
 
@@ -351,6 +353,29 @@ fn cached(tx: &Connection, op: &str, key: Option<&str>) -> rusqlite::Result<Opti
 
 pub(crate) fn wire_value(value: Value) -> Result<Vec<u8>, RegistryError> {
     wire(value)
+}
+
+/// The placement writes whose carries a `Direct` caller confirms. They share
+/// one precheck (`precheck_placement`) and one confirmation argument.
+pub(crate) const PLACEMENT_METHODS: &[&str] = &[
+    "register",
+    "assign_workspace",
+    "upgrade_implicit",
+    "seed_import",
+];
+
+/// The after-images of the `agent.set_namespace` rows appended after journal
+/// position `head`, that is, by the transaction that is still open: the
+/// agents a placement carried or the workspace correction changed.
+fn carried_agents(tx: &Connection, head: i64) -> rusqlite::Result<Vec<AgentChangeEntry>> {
+    tx.prepare("SELECT payload_json FROM registry_journal WHERE seq>?1 AND op='agent.set_namespace' ORDER BY seq")?
+        .query_map([head], |r| r.get::<_, String>(0))?
+        .map(|payload| {
+            let payload: Value = serde_json::from_str(&payload?)
+                .map_err(super::shared_entry::decode_error)?;
+            serde_json::from_value(payload["entry"].clone()).map_err(super::shared_entry::decode_error)
+        })
+        .collect()
 }
 
 fn wire(value: Value) -> Result<Vec<u8>, RegistryError> {
@@ -420,6 +445,17 @@ impl super::JournalWriter<'_> {
         // is stashed outside the closure and a rusqlite error is returned as
         // a rollback sentinel; the stash wins on the way out.
         let domain_error = std::cell::RefCell::new(None::<E>);
+        if self.probe.is_some() {
+            // The placement precheck runs the whole write, with its own
+            // refusals, on a throwaway copy of the committed store and then
+            // discards it: nothing reaches the live file, the journal or the
+            // log. The write records what it would carry in the probe.
+            let copy = self.read(super::read_connection::copy_snapshot)?;
+            let tx = copy.unchecked_transaction().map_err(RegistryError::from)?;
+            let outcome = action(&tx);
+            tx.rollback().map_err(RegistryError::from)?;
+            return outcome.map(|_| Vec::new());
+        }
         let out = self.db.with_conn_fenced(|tx| -> rusqlite::Result<Vec<u8>> {
             let fail = |e: E| -> rusqlite::Error {
                 *domain_error.borrow_mut() = Some(e);
@@ -455,12 +491,17 @@ impl super::JournalWriter<'_> {
                 }
             }
             let before = if super::log_schema::log_enabled(tx)? {
-                Some(super::shared_entry::SharedState::capture(tx)?)
+                let head: i64 = tx.query_row(
+                    "SELECT COALESCE(MAX(seq),0) FROM registry_journal",
+                    [],
+                    |r| r.get(0),
+                )?;
+                Some((head, super::shared_entry::SharedState::capture(tx)?))
             } else {
                 None
             };
             let action = action(tx).map_err(fail)?;
-            if let Some(before) = before {
+            if let Some((head, before)) = before {
                 let after = super::shared_entry::SharedState::capture(tx)?;
                 if let Some(seq) = action.seq {
                     super::shared_entry::record_local_entry(
@@ -470,6 +511,7 @@ impl super::JournalWriter<'_> {
                         &action.payload.to_string(),
                         &before,
                         &after,
+                        carried_agents(tx, head)?,
                     )?;
                 }
             }
@@ -586,9 +628,15 @@ impl super::JournalWriter<'_> {
                 for row in rows { let (owner,parent)=row?; if super::path_prefix_or_equal(Path::new(&parent),Path::new(root)) { return Err(domain("root_under_foreign_derived_parent",format!("root {root} is under {parent}, owned by {owner}"))); } }
             }
             if let Some(w) = &req.workspace_id { if let Some(old)=tx.query_row("SELECT workspace_id FROM project_workspace WHERE project_id=?1",[&project_id],|r|r.get::<_,String>(0)).optional()? { if old!=*w { return Err(domain("workspace_conflict",format!("project {project_id} belongs to workspace {old}"))); } } }
-            if req.workspace_id.is_some() {
-                super::agent::ensure_project_attachment_allowed(tx, &project_id)?;
-            }
+            // Placing an unplaced project carries its live heads' and hirees'
+            // name claims into the workspace. A placed project either stays
+            // where it is or was refused just above.
+            let carries = match &req.workspace_id {
+                Some(w) if tx.query_row("SELECT 1 FROM project_workspace WHERE project_id=?1",[&project_id],|r|r.get::<_,i64>(0)).optional()?.is_none() => {
+                    vec![super::agent::plan_carry(tx, &project_id, w)?]
+                }
+                _ => Vec::new(),
+            };
             let mut aliases=Vec::new();
             for root in &req.roots { let old=implicit_project_id(root); if let Some(target)=tx.query_row("SELECT project_id FROM project_alias WHERE old_id=?1",[&old],|r|r.get::<_,String>(0)).optional()? { if target!=project_id { aliases.push(json!({"oldId":old,"owner":target})); } } }
             let mut changed=existing.is_none();
@@ -599,6 +647,7 @@ impl super::JournalWriter<'_> {
             let alias_new= req.roots.iter().any(|r| tx.query_row("SELECT 1 FROM project_alias WHERE old_id=?1",[implicit_project_id(r)],|x|x.get::<_,i64>(0)).optional().unwrap_or(None).is_none()); changed |= alias_new;
             let mut response=json!({"projectId":project_id,"name":req.name,"roots":req.roots,"derivedRootParents":req.derived_root_parents,"warnings":aliases});
             if !changed { return Ok(Action{changed:false,seq:None,value:response,payload}); }
+            self.admit_carry(tx, &carries)?;
             let seq=append(tx,"register",&payload,&actor,key.as_deref(),now,self.principal)?;
             if existing.is_none() { tx.execute("INSERT INTO project(project_id,name,implicit,seed_identity,created_at,updated_at) VALUES(?1,?2,0,NULL,?3,?3)",params![&project_id,&req.name,now])?; } else { tx.execute("UPDATE project SET name=?1,updated_at=?2 WHERE project_id=?3",params![&req.name,&now,&project_id])?; }
             let mut mappings = Vec::new();
@@ -611,6 +660,7 @@ impl super::JournalWriter<'_> {
             super::root_keys::journal_assignments(tx, mappings, &actor, now, self.principal)?;
             for parent in &req.derived_root_parents { tx.execute("INSERT OR IGNORE INTO derived_root_parent(canonical_parent,project_id) VALUES(?1,?2)",[parent,&project_id])?; }
             if let Some(w)=&req.workspace_id { tx.execute("INSERT OR IGNORE INTO workspace(workspace_id,name,created_at,updated_at) VALUES(?1,?1,?2,?2)",params![w,now])?; tx.execute("INSERT OR IGNORE INTO project_workspace(project_id,workspace_id) VALUES(?1,?2)",[&project_id,w])?; tx.execute("INSERT OR IGNORE INTO workspace_member(workspace_id,ref_kind,device_fingerprint,project_id) VALUES(?1,'local','',?2)",[w,&project_id])?; }
+            self.apply_carry(tx, &carries, &actor, now)?;
             response["implicitAliasCollisions"]=json!(aliases); Ok(Action{changed:true,seq:Some(seq),value:response,payload:json!({"request":payload,"implicitAliasCollisions":aliases})})
         })
     }
@@ -674,7 +724,15 @@ impl super::JournalWriter<'_> {
                         payload,
                     });
                 }
-                super::agent::ensure_project_unbound(tx, &req.project_id)?;
+                // Placing or moving the project carries its live heads' and
+                // hirees' name claims into the target workspace. Every name is
+                // checked, and the confirmation too, before anything is written.
+                let carries = vec![super::agent::plan_carry(
+                    tx,
+                    &req.project_id,
+                    &req.workspace_id,
+                )?];
+                self.admit_carry(tx, &carries)?;
                 let seq = append(
                     tx,
                     "assign_workspace",
@@ -703,6 +761,7 @@ impl super::JournalWriter<'_> {
                     [&req.project_id, &req.workspace_id],
                 )?;
                 tx.execute("INSERT INTO workspace_member(workspace_id,ref_kind,device_fingerprint,project_id) VALUES(?1,'local','',?2)",[&req.workspace_id,&req.project_id])?;
+                self.apply_carry(tx, &carries, &actor, now)?;
                 Ok(Action {
                     changed: true,
                     seq: Some(seq),
@@ -849,9 +908,16 @@ impl super::JournalWriter<'_> {
             if !changed {
                 return Ok(Action { changed: false, seq: None, value: json!({"projectId":id,"oldId":req.implicit_id}), payload });
             }
-            if req.workspace_id.is_some() {
-                super::agent::ensure_project_attachment_allowed(tx, &id)?;
-            }
+            // Placing an unplaced project carries its live heads' and hirees'
+            // name claims into the workspace. A placed project keeps its
+            // workspace (the placement insert below is a no-op for it).
+            let carries = match &req.workspace_id {
+                Some(w) if tx.query_row("SELECT 1 FROM project_workspace WHERE project_id=?1", [&id], |r| r.get::<_, i64>(0)).optional()?.is_none() => {
+                    vec![super::agent::plan_carry(tx, &id, w)?]
+                }
+                _ => Vec::new(),
+            };
+            self.admit_carry(tx, &carries)?;
             let mut chosen = Vec::new();
             for root in &req.roots {
                 chosen.push(super::root_keys::incoming(tx, &id, root, None)?);
@@ -875,6 +941,7 @@ impl super::JournalWriter<'_> {
                 tx.execute("INSERT OR IGNORE INTO project_workspace(project_id,workspace_id) VALUES(?1,?2)", [&id,w])?;
                 tx.execute("INSERT OR IGNORE INTO workspace_member(workspace_id,ref_kind,device_fingerprint,project_id) VALUES(?1,'local','',?2)", [w,&id])?;
             }
+            self.apply_carry(tx, &carries, &actor, now)?;
             Ok(Action { changed: true, seq: Some(seq), value: json!({"projectId":id,"oldId":req.implicit_id}), payload })
         })
     }
@@ -1108,6 +1175,7 @@ impl super::JournalWriter<'_> {
             let mut by_root:BTreeMap<String,Vec<SeedPair>>=BTreeMap::new(); for p in &req.payload.pairs {by_root.entry(p.canonical_root.clone()).or_default().push(p.clone());}
             for (root, rows) in &by_root { let has_git=rows.iter().any(|p|p.identity_class.as_deref()==Some("git")||p.mc_identity.starts_with("git:")); let mut identities=BTreeSet::new(); for p in rows {if has_git&&p.identity_class.as_deref()==Some("dir"){report.push(SeedReportEntry{kind:"identity_class_precedence".into(),mc_identity:Some(p.mc_identity.clone()),canonical_root:Some(root.clone()),project_id:None,owner_project_id:None,new_project_id:None,roots:None,reason:Some("git identity wins".into())});}else{identities.insert(p.mc_identity.clone());}} if identities.len()>1 {for id in identities {report.push(SeedReportEntry{kind:"conflicted".into(),mc_identity:Some(id),canonical_root:Some(root.clone()),project_id:None,owner_project_id:None,new_project_id:None,roots:None,reason:Some("one root observed under multiple identities".into())});}} else if let Some(id)=identities.into_iter().next(){groups.entry(id).or_default().extend(rows.iter().filter(|p|!has_git||p.identity_class.as_deref()!=Some("dir")).cloned());}}
             let mut changed=false;
+            let mut carries = Vec::new();
             for workspace in &req.payload.workspaces {
                 let old=tx.query_row("SELECT name FROM workspace WHERE workspace_id=?1",[&workspace.workspace_id],|r|r.get::<_,String>(0)).optional()?;
                 if old.as_deref()!=Some(&workspace.name) {
@@ -1122,8 +1190,10 @@ impl super::JournalWriter<'_> {
                 let Some(project) = target else { continue };
                 if !available.is_empty() || live.is_none() {
                     let claims = req.payload.members.iter().filter(|m| m.mc_identity == identity).map(|m| m.workspace_id.clone()).collect::<BTreeSet<_>>();
-                    if claims.len() == 1 {
-                        super::agent::ensure_project_attachment_allowed(tx, &project)?;
+                    if claims.len() == 1 && tx.query_row("SELECT 1 FROM project_workspace WHERE project_id=?1", [&project], |r| r.get::<_, i64>(0)).optional()?.is_none() {
+                        // Placing an unplaced project carries its live heads'
+                        // and hirees' name claims; checked after the loop.
+                        carries.push(super::agent::plan_carry(tx, &project, claims.iter().next().unwrap())?);
                     }
                     let name = req.payload.names.get(&identity).cloned().or_else(|| rows.first().and_then(|p| p.name.clone())).unwrap_or_else(|| Path::new(&rows[0].canonical_root).file_name().map(|x| x.to_string_lossy().into_owned()).unwrap_or_else(|| identity.clone()));
                     if live.is_none() {
@@ -1147,14 +1217,67 @@ impl super::JournalWriter<'_> {
                     }
                 }
             }
-            let value=json!({"report":report}); if !changed {return Ok(Action{changed:false,seq:None,value,payload});} let seq=append(tx,"seed_import",&payload,&actor,key.as_deref(),now,self.principal)?;
+            let value=json!({"report":report}); if !changed {return Ok(Action{changed:false,seq:None,value,payload});}
+            // Every carried name is checked against the state before this
+            // call's own carries, and against each other, before the first
+            // journal row; the transaction discards the placements on refusal.
+            self.admit_carry(tx, &carries)?;
+            let seq=append(tx,"seed_import",&payload,&actor,key.as_deref(),now,self.principal)?;
             super::root_keys::journal_assignments(tx, mappings, &actor, now, self.principal)?;
+            self.apply_carry(tx, &carries, &actor, now)?;
             Ok(Action{changed:true,seq:Some(seq),value,payload})
         })
     }
 }
 
 impl RegistryStore {
+    /// The precheck of a placement write from a `Direct` caller, run before
+    /// any operator prompt, in this order: the reply already committed for
+    /// this request key; the write's own refusals (`not_found`,
+    /// `name_conflict` and the rest); `NoPrompt` when the write would carry no
+    /// live head or hiree; otherwise `Ready` with the carry summary the write
+    /// re-checks under the writer lock. The write runs on a throwaway copy of
+    /// the committed store, so nothing is written.
+    pub(crate) fn precheck_placement(
+        &self,
+        op: &str,
+        params: Value,
+        now: i64,
+    ) -> Result<AgentPrecheck, AgentMutationError> {
+        fn decode<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, AgentMutationError> {
+            serde_json::from_value(params)
+                .map_err(|error| AgentMutationError::new("invalid_params", error.to_string()))
+        }
+        let summary = std::cell::RefCell::new(None);
+        let writer = super::JournalWriter {
+            store: self,
+            principal: "direct",
+            confirmation: PlacementConfirmation::NotRequired,
+            probe: Some(&summary),
+        };
+        let cached = |key: Option<&str>| self.shared_request_cache(op, key);
+        macro_rules! probe {
+            ($request:ty, $write:ident) => {{
+                let request: $request = decode(params)?;
+                if let Some(body) = cached(request.request_key.as_deref())? {
+                    return Ok(AgentPrecheck::Cached(body));
+                }
+                writer.$write(request, now)?;
+            }};
+        }
+        match op {
+            "register" => probe!(RegisterRequest, register_at),
+            "assign_workspace" => probe!(AssignWorkspaceRequest, assign_workspace_at),
+            "upgrade_implicit" => probe!(UpgradeImplicitRequest, upgrade_implicit_at),
+            "seed_import" => probe!(SeedImportRequest, seed_import_at),
+            _ => return Err(AgentMutationError::new("unknown_method", op)),
+        }
+        Ok(match summary.into_inner() {
+            Some(summary) => AgentPrecheck::Ready(summary),
+            None => AgentPrecheck::NoPrompt,
+        })
+    }
+
     pub fn verify(&self) -> Result<VerifyReply, RegistryError> {
         // Replay deletes and rewrites projections. Copy one committed snapshot
         // first so those writes never touch the live file or wait for its writer.
@@ -1181,6 +1304,7 @@ impl RegistryStore {
             }
             let generation = self.generation_from_connection(&tx)?;
             mismatches.extend(super::root_keys::disk_mismatches(&tx)?);
+            mismatches.extend(super::agent::placement_mismatches(&tx)?);
             let replay = replay_and_compare(&tx)?;
             tx.rollback()?;
             Ok(VerifyReply {
@@ -1301,7 +1425,10 @@ fn delete_and_replay(tx: &Transaction<'_>) -> rusqlite::Result<()> {
             })?;
             let image: Value =
                 serde_json::from_slice(&bytes).map_err(super::shared_entry::decode_error)?;
-            if op.starts_with("agent.") {
+            // A carry's or the correction's shared row holds a `project.shared`
+            // entry with the agents' after-images, also when the row itself is
+            // an `agent.set_namespace` row (the correction's last one).
+            if op.starts_with("agent.") && image["op"] != "project.shared" {
                 super::agent::replay_agent_entry(tx, &op, &image)?;
             } else {
                 let image: super::shared_entry::ProjectEntry =
@@ -1512,11 +1639,9 @@ fn replay(
             // Mirrors the live `register`, which renames an existing project and
             // places a new one in its workspace. Replay used to do neither, so a
             // `rebuild` reverted renames and silently unplaced every project that
-            // was put in a workspace at registration.
-            if r.workspace_id.is_some() {
-                super::agent::ensure_project_attachment_allowed(tx, &id)
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-            }
+            // was put in a workspace at registration. Live agents carried by the
+            // placement are restored by the `agent.set_namespace` rows that
+            // follow this one, so a bound project is not refused here.
             tx.execute("INSERT INTO project(project_id,name,implicit,seed_identity,created_at,updated_at) VALUES(?1,?2,0,NULL,?3,?3) ON CONFLICT(project_id) DO UPDATE SET name=excluded.name,updated_at=excluded.updated_at",params![id,r.name,now])?;
             if let Some(w) = &r.workspace_id {
                 tx.execute("INSERT OR IGNORE INTO workspace(workspace_id,name,created_at,updated_at) VALUES(?1,?1,?2,?2)",params![w,now])?;
@@ -1555,7 +1680,9 @@ fn replay(
             // Mirrors the live path in `assign_workspace`, including removing
             // the stale membership row -- UNIQUE(ref_kind, device_fingerprint,
             // project_id) means the insert below would otherwise fail on the
-            // second assignment and abort the whole rebuild.
+            // second assignment and abort the whole rebuild. A move that
+            // carried live agents is followed by their `agent.set_namespace`
+            // rows, which replay restores, so live agents don't refuse it.
             let previous = tx
                 .query_row(
                     "SELECT workspace_id FROM project_workspace WHERE project_id=?1",
@@ -1563,10 +1690,6 @@ fn replay(
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?;
-            if previous.as_deref() != Some(r.workspace_id.as_str()) {
-                super::agent::ensure_project_unbound(tx, &r.project_id)
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-            }
             if let Some(old) = previous.as_deref() {
                 tx.execute(
                     "DELETE FROM workspace_member WHERE workspace_id=?1 AND ref_kind='local' AND device_fingerprint='' AND project_id=?2",
@@ -1589,10 +1712,6 @@ fn replay(
             let id = r
                 .project_id
                 .unwrap_or_else(|| mint("upgrade1", &r.name, &r.roots));
-            if r.workspace_id.is_some() {
-                super::agent::ensure_project_attachment_allowed(tx, &id)
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-            }
             tx.execute("INSERT INTO project(project_id,name,implicit,seed_identity,created_at,updated_at) VALUES(?1,?2,0,NULL,?3,?3) ON CONFLICT(project_id) DO UPDATE SET name=excluded.name,updated_at=excluded.updated_at", params![id,r.name,now])?;
             for root in r.roots {
                 tx.execute("INSERT OR IGNORE INTO project_root(canonical_root,project_id,added_at) VALUES(?1,?2,?3)",params![root,id,now])?;
@@ -1715,8 +1834,6 @@ fn replay(
                     .collect::<BTreeSet<_>>();
                 if claims.len() == 1 {
                     let w = claims.into_iter().next().unwrap();
-                    super::agent::ensure_project_attachment_allowed(tx, &id)
-                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
                     tx.execute("INSERT OR IGNORE INTO project_workspace(project_id,workspace_id) VALUES(?1,?2)",params![id,w])?;
                     tx.execute("INSERT OR IGNORE INTO workspace_member(workspace_id,ref_kind,device_fingerprint,project_id) VALUES(?1,'local','',?2)",params![w,id])?;
                 }
@@ -2062,46 +2179,94 @@ mod agent_lifecycle_tests {
         }
     }
 
+    // The journal rows appended after `seq`, as (op, request_key).
+    fn journal_since(f: &Fixture, seq: i64) -> Vec<(String, Option<String>)> {
+        f.store
+            .read(|conn| {
+                conn.prepare(
+                    "SELECT op,request_key FROM registry_journal WHERE seq>?1 ORDER BY seq",
+                )?
+                .query_map([seq], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect()
+            })
+            .unwrap()
+    }
+
+    // A carried head or hiree stores no workspace, and its only active claim
+    // is keyed on the workspace it was carried to.
+    fn assert_carried(f: &Fixture, id: &str, workspace: &str) {
+        assert_eq!(f.store.agent_row(id).unwrap().unwrap().workspace_id, None);
+        let active = f
+            .store
+            .agent_claims(id)
+            .unwrap()
+            .into_iter()
+            .filter(|claim| claim.released_at_ms.is_none())
+            .map(|claim| (claim.namespace_kind, claim.namespace_key))
+            .collect::<Vec<_>>();
+        assert_eq!(active, vec![("workspace".into(), workspace.into())]);
+    }
+
+    // Verify finds no mismatch and rebuild reproduces the stored projection.
+    fn clean_after(f: &Fixture) {
+        let verified = f.store.verify().unwrap();
+        assert!(verified.ok, "{verified:?}");
+        let before = projection(f);
+        assert!(f.store.rebuild().unwrap().replay.ok);
+        assert_eq!(projection(f), before);
+    }
+
     #[test]
-    fn assign_workspace_refuses_bound_placement_changes_but_allows_same_workspace() {
+    fn assign_workspace_carries_live_agents_and_same_workspace_stays_a_noop() {
         for role in ["head", "hiree"] {
             for workspace in [Some("W1"), None] {
                 let f = fixture(role);
                 placed(&f, "P", workspace);
-                if workspace.is_some() {
-                    create(&f, role, Some("P"), None, "Bound");
+                let id = if workspace.is_some() {
+                    create(&f, role, Some("P"), None, "Bound")
                 } else {
-                    import_bound(&f, role, "P", "W1");
-                }
-                let req = AssignWorkspaceRequest {
-                    project_id: "P".into(),
-                    workspace_id: "W2".into(),
-                    request_key: Some("move".into()),
-                    ..Default::default()
+                    import_bound(&f, role, "P", "W1")
                 };
-                refused(&f, || {
-                    f.store.with_principal("direct").assign_workspace(req)
-                });
-                if workspace.is_some() {
-                    let before = projection(&f);
-                    let out = result(
-                        &f.store
-                            .assign_workspace(AssignWorkspaceRequest {
-                                project_id: "P".into(),
-                                workspace_id: "W1".into(),
-                                ..Default::default()
-                            })
-                            .unwrap(),
-                    );
-                    assert_eq!(out["noop"], true);
-                    assert_eq!(projection(&f), before);
-                }
+                let head = f.store.generation().unwrap();
+                let out = result(
+                    &f.store
+                        .with_principal("direct")
+                        .assign_workspace(AssignWorkspaceRequest {
+                            project_id: "P".into(),
+                            workspace_id: "W2".into(),
+                            request_key: Some("move".into()),
+                            ..Default::default()
+                        })
+                        .unwrap(),
+                );
+                assert_eq!(out["noop"], false);
+                assert_eq!(
+                    journal_since(&f, head),
+                    vec![
+                        ("assign_workspace".into(), Some("move".into())),
+                        ("agent.set_namespace".into(), None)
+                    ]
+                );
+                assert_carried(&f, &id, "W2");
+                clean_after(&f);
+                let before = projection(&f);
+                let out = result(
+                    &f.store
+                        .assign_workspace(AssignWorkspaceRequest {
+                            project_id: "P".into(),
+                            workspace_id: "W2".into(),
+                            ..Default::default()
+                        })
+                        .unwrap(),
+                );
+                assert_eq!(out["noop"], true);
+                assert_eq!(projection(&f), before);
             }
         }
     }
 
     #[test]
-    fn register_refuses_attaching_unplaced_bound_projects_but_allows_renames() {
+    fn register_carries_live_agents_when_it_places_an_unplaced_project() {
         for role in ["head", "hiree"] {
             let f = fixture(role);
             placed(&f, "P", None);
@@ -2110,25 +2275,31 @@ mod agent_lifecycle_tests {
             let mut req = RegisterRequest {
                 project_id: Some("P".into()),
                 name: "Renamed".into(),
-                workspace_id: Some("W2".into()),
                 roots: vec![f.dir("new-root")],
                 request_key: Some("register".into()),
                 ..Default::default()
             };
-            refused(&f, || {
-                f.store.with_principal("direct").register(req.clone())
-            });
-            req.workspace_id = None;
-            f.store.register(req).unwrap();
+            // A rename that leaves the project unplaced carries nothing.
+            f.store.register(req.clone()).unwrap();
             assert_eq!(f.store.agent_claims(&id).unwrap(), claims);
-            let before = projection(&f);
-            f.store.rebuild().unwrap();
-            assert_eq!(projection(&f), before);
+            req.workspace_id = Some("W2".into());
+            req.request_key = Some("place".into());
+            let head = f.store.generation().unwrap();
+            f.store.with_principal("direct").register(req).unwrap();
+            assert_eq!(
+                journal_since(&f, head),
+                vec![
+                    ("register".into(), Some("place".into())),
+                    ("agent.set_namespace".into(), None)
+                ]
+            );
+            assert_carried(&f, &id, "W2");
+            clean_after(&f);
         }
     }
 
     #[test]
-    fn upgrade_implicit_refuses_attaching_bound_projects_but_allows_renames() {
+    fn upgrade_implicit_carries_live_agents_when_it_places_an_unplaced_project() {
         for role in ["head", "hiree"] {
             let f = fixture(role);
             placed(&f, "P", None);
@@ -2138,27 +2309,34 @@ mod agent_lifecycle_tests {
                 implicit_id: "old-id".into(),
                 project_id: Some("P".into()),
                 name: "Renamed".into(),
-                workspace_id: Some("W2".into()),
                 roots: vec![f.dir("new-root")],
                 request_key: Some("upgrade".into()),
                 ..Default::default()
             };
-            refused(&f, || {
-                f.store
-                    .with_principal("direct")
-                    .upgrade_implicit(req.clone())
-            });
-            req.workspace_id = None;
-            f.store.upgrade_implicit(req).unwrap();
+            f.store.upgrade_implicit(req.clone()).unwrap();
             assert_eq!(f.store.agent_claims(&id).unwrap(), claims);
-            let before = projection(&f);
-            f.store.rebuild().unwrap();
-            assert_eq!(projection(&f), before);
+            req.implicit_id = "other-old-id".into();
+            req.workspace_id = Some("W2".into());
+            req.request_key = Some("place".into());
+            let head = f.store.generation().unwrap();
+            f.store
+                .with_principal("direct")
+                .upgrade_implicit(req)
+                .unwrap();
+            assert_eq!(
+                journal_since(&f, head),
+                vec![
+                    ("upgrade_implicit".into(), Some("place".into())),
+                    ("agent.set_namespace".into(), None)
+                ]
+            );
+            assert_carried(&f, &id, "W2");
+            clean_after(&f);
         }
     }
 
     #[test]
-    fn seed_import_refuses_bound_attachment_and_rolls_back_the_whole_call() {
+    fn seed_import_carries_live_agents_of_a_project_it_places() {
         for role in ["head", "hiree"] {
             let f = fixture(role);
             let identity = "git:bound";
@@ -2195,11 +2373,6 @@ mod agent_lifecycle_tests {
                             mc_identity: identity.into(),
                             ..Default::default()
                         },
-                        SeedPair {
-                            canonical_root: f.dir("unrelated"),
-                            mc_identity: "aaa:earlier".into(),
-                            ..Default::default()
-                        },
                     ],
                     workspaces: vec![SeedWorkspace {
                         workspace_id: "W2".into(),
@@ -2213,18 +2386,18 @@ mod agent_lifecycle_tests {
                 },
                 ..Default::default()
             };
-            refused(&f, || {
-                f.store.with_principal("direct").seed_import_at_against(
-                    req.clone(),
-                    10,
-                    SeedHomes::default(),
-                )
-            });
-            dispose(&f, &id);
+            let head = f.store.generation().unwrap();
             f.store
-                .with_principal("entorhinal")
-                .seed_import_at_against(req, 10, crate::SeedHomes::default())
+                .with_principal("direct")
+                .seed_import_at_against(req, 10, SeedHomes::default())
                 .unwrap();
+            assert_eq!(
+                journal_since(&f, head),
+                vec![
+                    ("seed_import".into(), Some("seed".into())),
+                    ("agent.set_namespace".into(), None)
+                ]
+            );
             assert_eq!(
                 f.store
                     .read(|conn| conn.query_row(
@@ -2235,9 +2408,8 @@ mod agent_lifecycle_tests {
                     .unwrap(),
                 "W2"
             );
-            let before = projection(&f);
-            f.store.rebuild().unwrap();
-            assert_eq!(projection(&f), before);
+            assert_carried(&f, &id, "W2");
+            clean_after(&f);
         }
     }
 
@@ -2274,7 +2446,7 @@ mod agent_lifecycle_tests {
     }
 
     #[test]
-    fn rebuild_refuses_historical_ops_that_change_live_bindings_and_rolls_back() {
+    fn rebuild_refuses_historical_removals_of_live_bindings_but_replays_placements() {
         for op in [
             "register",
             "assign_workspace",
@@ -2331,6 +2503,12 @@ mod agent_lifecycle_tests {
             f.store
                 .apply_entry(journal_op, &request.to_string(), "test", None, |_| Ok(()))
                 .unwrap();
+            if !op.starts_with("remove-") {
+                // A placement that carried live agents is followed by their
+                // `agent.set_namespace` rows, so replaying it never refuses.
+                f.store.rebuild().unwrap();
+                continue;
+            }
             let before = projection(&f);
             let error = f.store.rebuild().unwrap_err();
             assert!(
@@ -3529,7 +3707,18 @@ mod project_replay_tests {
             f.store.agent_fleet_identity(None, "replay-test").unwrap(),
             "rebuild changed fleet identity"
         );
-        assert!(f.store.verify().unwrap().ok);
+        // A head imported onto an unplaced project is reported as off its
+        // placement until a placement carries it or the correction runs; the
+        // operations here leave it unplaced, so that is the only mismatch.
+        let verified = f.store.verify().unwrap();
+        assert!(verified.replay.ok, "{verified:?}");
+        assert!(
+            verified
+                .mismatches
+                .iter()
+                .all(|m| m.starts_with("agent_claim_off_placement:")),
+            "{verified:?}"
+        );
     }
 
     fn bind_live_head(f: &Fixture, project: &str) {

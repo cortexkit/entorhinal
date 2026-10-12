@@ -35,8 +35,10 @@ pub struct TableChanges {
 pub struct ProjectEntry {
     pub op: String,
     pub tables: BTreeMap<String, TableChanges>,
-    /// Agents in a bootstrap snapshot, each in the same `AgentChangeEntry`
-    /// format an agent write records, so one decoder serves both.
+    /// Agents in a bootstrap snapshot, or the `agent.set_namespace`
+    /// after-images of a placement carry or the workspace correction, each in
+    /// the same `AgentChangeEntry` format an agent write records, so one
+    /// decoder serves all of them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agents: Vec<AgentChangeEntry>,
 }
@@ -201,6 +203,12 @@ pub fn canonical_bytes(value: &impl Serialize) -> Vec<u8> {
     .expect("shared values encode")
 }
 
+/// Mark the journal row at `seq` as this transaction's one shared entry.
+/// `agents` are the after-images of the `agent.set_namespace` rows the
+/// transaction appended (a placement carry or the workspace correction). When
+/// there are any, the entry is a `project.shared` entry holding them in agent
+/// id order next to the project delta (empty for the correction), so the log
+/// receives the project change and every carried agent as one entry.
 pub(crate) fn record_local_entry(
     tx: &Transaction<'_>,
     op: &str,
@@ -208,12 +216,18 @@ pub(crate) fn record_local_entry(
     payload: &str,
     before: &SharedState,
     after: &SharedState,
+    mut agents: Vec<AgentChangeEntry>,
 ) -> rusqlite::Result<()> {
     if crate::log_schema::log_enabled(tx)?
         && before != after
         && !matches!(op, "agent.import" | "root_key.assign" | "root_key.backfill")
     {
-        let body = if op.starts_with("agent.") {
+        let body = if !agents.is_empty() {
+            agents.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
+            let mut entry = before.project_delta(after, tx)?;
+            entry.agents = agents;
+            canonical_bytes(&entry)
+        } else if op.starts_with("agent.") {
             let payload: Value = serde_json::from_str(payload).map_err(decode_error)?;
             canonical_bytes(payload.get("entry").unwrap_or(&payload))
         } else {
@@ -283,8 +297,15 @@ impl ProjectEntry {
     }
 
     pub fn validate(&self, conn: &Connection) -> rusqlite::Result<()> {
+        // A `project.shared` entry carries agents only for a placement carry or
+        // the workspace correction, whose agent changes are all
+        // `agent.set_namespace`.
         if !matches!(self.op.as_str(), "project.shared" | "shared.snapshot")
-            || (self.op == "project.shared" && !self.agents.is_empty())
+            || (self.op == "project.shared"
+                && self
+                    .agents
+                    .iter()
+                    .any(|agent| agent.op != "agent.set_namespace"))
         {
             return Err(invalid("unsupported project entry op"));
         }
@@ -301,7 +322,7 @@ impl ProjectEntry {
             }
         }
         for agent in &self.agents {
-            if agent.op != "agent.import" {
+            if self.op == "shared.snapshot" && agent.op != "agent.import" {
                 return Err(invalid("snapshot agents must be imports"));
             }
         }

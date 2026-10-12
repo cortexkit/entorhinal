@@ -208,7 +208,7 @@ expect_red = ["mutations::audit_fix_tests::request_key_cache_is_op_scoped"]
 
 [[control]]
 id = "bound-project-refusal"
-guards = "A live agent prevents removal or reassignment of its project and namespace"
+guards = "A live agent prevents removing its project or merging it into a successor; placing or moving the project carries the agent instead"
 file = "crates/entorhinal-core/src/agent/mod.rs"
 old = "if bound {\n        return Err(domain(\n            \"bound_by_live_agent\",\n            format!(\"project {project_id} is bound by a live agent\"),"
 new = "if false /* NON-VACUITY BREAK */ {\n        return Err(domain(\n            \"bound_by_live_agent\",\n            format!(\"project {project_id} is bound by a live agent\"),"
@@ -696,7 +696,7 @@ expect_red = ["catch_up::tests::snapshot_validation_and_fault_at_final_position_
 id = "reader-agent-claim-owner"
 guards = "An inbound agent entry cannot release a claim whose owner is another agent"
 file = "crates/entorhinal-core/src/remote_apply.rs"
-old = "if claim.agent_id != agent.agent_id\n                    || owner.is_some_and(|owner| owner != agent.agent_id)"
+old = "if claim.agent_id != agent.agent_id || owner.is_some_and(|owner| owner != agent.agent_id)"
 new = "if owner.is_some_and(|owner| owner != claim.agent_id) /* NON-VACUITY BREAK */"
 test_file = "crates/entorhinal-core/src/remote_apply.rs"
 runner = "cargo"
@@ -1516,3 +1516,197 @@ runner = "cargo"
 package = "entorhinal-core"
 target = "--lib"
 expect_red = ["binding::tests::git_common_dir_uses_registry_canonical_paths_for_both_layouts"]
+
+# Heads and hirees follow their project's placement: carries, the workspace
+# correction, their shared entries and verify's agent placement mismatches.
+[[control]]
+id = "carry-stored-name-conflict"
+guards = "A carried or corrected name already held in the target workspace refuses with name_conflict naming both agents before any write"
+file = "crates/entorhinal-core/src/agent/carry.rs"
+old = "if let Some(holder) = stored.or_else(|| batch.get(&key).map(|id| id.to_string())) {"
+new = "if let Some(holder) = stored.filter(|_| false /* NON-VACUITY BREAK */).or_else(|| batch.get(&key).map(|id| id.to_string())) {"
+test_file = "crates/entorhinal-core/src/agent/carry.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["agent::carry::tests::a_carry_into_a_taken_name_refuses_naming_both_agents_and_writes_nothing"]
+
+[[control]]
+id = "carry-batch-name-conflict"
+guards = "Two agents of one carry or correction moving the same name into one workspace refuse with name_conflict before any write"
+file = "crates/entorhinal-core/src/agent/carry.rs"
+old = ".or_else(|| batch.get(&key).map(|id| id.to_string()))"
+new = ".or_else(|| None::<String> /* NON-VACUITY BREAK */)"
+test_file = "crates/entorhinal-core/src/agent/carry.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["agent::carry::tests::a_carry_whose_moving_names_collide_with_each_other_refuses"]
+
+[[control]]
+id = "carry-confirmation-stale"
+guards = "A carrying placement under NoPrompt, or under an approval whose summary differs, refuses with operator_approval_stale"
+file = "crates/entorhinal-core/src/agent/carry.rs"
+old = "PlacementConfirmation::Approved(_) | PlacementConfirmation::NoPrompt => Err(stale()),"
+new = "PlacementConfirmation::Approved(_) | PlacementConfirmation::NoPrompt => Ok(()), // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/agent/carry.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["agent::carry::tests::placement_precheck_orders_cache_refusals_no_prompt_and_ready_and_the_write_rechecks"]
+
+[[control]]
+id = "carry-requires-cutover"
+guards = "A placement that would carry live agents refuses before the agent identity switchover"
+file = "crates/entorhinal-core/src/agent/carry.rs"
+old = "require_cutover(conn)?;\n        let mut moves = carrying"
+new = "// NON-VACUITY BREAK: switchover check omitted\n        let mut moves = carrying"
+test_file = "crates/entorhinal-core/src/agent/carry.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["agent::carry::tests::carries_are_refused_before_the_switchover"]
+
+[[control]]
+id = "placement-precheck-no-prompt"
+guards = "A Direct placement whose precheck finds nothing to carry needs no operator prompt"
+file = "crates/entorhinal-core/src/mutations.rs"
+old = "None => AgentPrecheck::NoPrompt,"
+new = "None => AgentPrecheck::Ready(String::new()), // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/agent/carry.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["agent::carry::tests::placement_precheck_orders_cache_refusals_no_prompt_and_ready_and_the_write_rechecks"]
+
+[[control]]
+id = "repair-unresolved-workspace"
+guards = "The workspace correction refuses as a whole when a live head or hiree has an unplaced project"
+file = "crates/entorhinal-core/src/agent/carry.rs"
+old = "if unresolved.is_some() {"
+new = "if false /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-core/src/agent/carry.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["agent::carry::tests::the_correction_refuses_unplaced_live_agents_and_colliding_names_writing_nothing"]
+
+[[control]]
+id = "repair-approval-stale"
+guards = "The workspace correction re-checks an operator approval against the recomputed summary under the writer lock"
+file = "crates/entorhinal-core/src/agent/carry.rs"
+old = "if approval.is_some_and(|approval| !approval.approves(&repair_summary(&moves))) {"
+new = "if false /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-core/src/agent/carry.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["agent::carry::tests::the_correction_rechecks_its_approval_and_refuses_before_the_switchover"]
+
+[[control]]
+id = "verify-agent-workspace-stored"
+guards = "verify reports a head or hiree that still stores a workspace"
+file = "crates/entorhinal-core/src/agent/carry.rs"
+old = "AND workspace_id IS NOT NULL ORDER BY agent_id"
+new = "AND workspace_id IS NOT NULL AND 0 /* NON-VACUITY BREAK */ ORDER BY agent_id"
+test_file = "crates/entorhinal-core/src/agent/carry.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["agent::carry::tests::the_correction_previews_clears_and_moves_exactly_the_stale_agents_once"]
+
+[[control]]
+id = "verify-agent-claim-off-placement"
+guards = "verify reports a live head or hiree whose active claim is not keyed on its project's placement"
+file = "crates/entorhinal-core/src/agent/carry.rs"
+old = "OR c.namespace_key<>w.workspace_id)"
+new = "OR 0 /* NON-VACUITY BREAK */)"
+test_file = "crates/entorhinal-core/src/agent/carry.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["agent::carry::tests::the_correction_previews_clears_and_moves_exactly_the_stale_agents_once"]
+
+[[control]]
+id = "verify-agent-claim-unplaced"
+guards = "verify reports a live head or hiree whose project is unplaced as off its placement"
+file = "crates/entorhinal-core/src/agent/carry.rs"
+old = "AND (w.workspace_id IS NULL OR c.claim_id IS NULL"
+new = "AND (0 /* NON-VACUITY BREAK */ OR c.claim_id IS NULL"
+test_file = "crates/entorhinal-core/src/agent/carry.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["agent::carry::tests::the_correction_refuses_unplaced_live_agents_and_colliding_names_writing_nothing"]
+
+[[control]]
+id = "verify-agent-mismatch-call-site"
+guards = "verify includes the agent placement mismatches in its report"
+file = "crates/entorhinal-core/src/mutations.rs"
+old = "mismatches.extend(super::agent::placement_mismatches(&tx)?);"
+new = "// NON-VACUITY BREAK: agent placement mismatches omitted"
+test_file = "crates/entorhinal-core/src/agent/carry.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["agent::carry::tests::the_correction_previews_clears_and_moves_exactly_the_stale_agents_once"]
+
+[[control]]
+id = "shared-carry-embeds-agents"
+guards = "A carry or correction posts one project.shared entry holding every changed agent's after-image"
+file = "crates/entorhinal-core/src/shared_entry.rs"
+old = "let body = if !agents.is_empty() {"
+new = "let body = if false /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-core/src/agent/carry.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["agent::carry::tests::a_carry_and_the_correction_each_post_one_shared_entry_another_node_applies"]
+
+[[control]]
+id = "shared-entry-agents-are-set-namespace"
+guards = "A received project.shared entry may carry agents only as agent.set_namespace after-images"
+file = "crates/entorhinal-core/src/shared_entry.rs"
+old = ".any(|agent| agent.op != \"agent.set_namespace\"))"
+new = ".any(|agent| false && agent.op != \"agent.set_namespace\")) // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/agent/carry.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["agent::carry::tests::a_carry_and_the_correction_each_post_one_shared_entry_another_node_applies"]
+
+[[control]]
+id = "reader-embedded-agent-claim-owner"
+guards = "Agents embedded in a received project.shared entry pass the standalone agent entry checks"
+file = "crates/entorhinal-core/src/remote_apply.rs"
+old = "check_agent_entry(tx, agent)?;"
+new = "let _ = agent; // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/agent/carry.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["agent::carry::tests::a_carry_and_the_correction_each_post_one_shared_entry_another_node_applies"]
+
+[[control]]
+id = "history-folds-carried-agents"
+guards = "Supersede history folds the agents a project.shared entry carries and refuses any op but agent.set_namespace"
+file = "crates/entorhinal-core/src/enable_state.rs"
+old = ".any(|agent| agent.op != \"agent.set_namespace\")"
+new = ".any(|agent| false && agent.op != \"agent.set_namespace\") // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/enable_state.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["enable_state::tests::agent_history_folds_the_agents_a_project_entry_carries"]
+
+[[control]]
+id = "journal-literals-cover-placements"
+guards = "Every agent op literal in the production files that journal agent rows, including the placement writes, is an identity change op"
+file = "crates/entorhinal-core/src/mutations.rs"
+old = "pub(crate) const PLACEMENT_METHODS: &[&str] = &[\n    \"register\","
+new = "pub(crate) const PLACEMENT_METHODS: &[&str] = &[\n    \"agent.bogus\", // NON-VACUITY BREAK\n    \"register\","
+test_file = "crates/entorhinal-core/src/agent/journal.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["agent::journal::tests::every_agent_store_journal_op_is_an_identity_change_or_marker"]

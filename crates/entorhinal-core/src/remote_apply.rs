@@ -434,31 +434,18 @@ fn apply(tx: &Transaction<'_>, entry: &RemoteEntry) -> rusqlite::Result<i64> {
         ("change", "project.shared") | ("snapshot", "shared.snapshot") => {
             let project: ProjectEntry = serde_json::from_value(value).map_err(decode_error)?;
             project.validate(tx)?;
+            // The agents a placement carry or the workspace correction
+            // changed pass the same checks as a standalone agent entry.
+            if project.op == "project.shared" {
+                for agent in &project.agents {
+                    check_agent_entry(tx, agent)?;
+                }
+            }
             Decoded::Project(project)
         }
         ("change", op) if AGENT_OPS.contains(&op) => {
             let agent: AgentChangeEntry = serde_json::from_value(value).map_err(decode_error)?;
-            if agent.agent_id != agent.row.agent_id
-                || agent.agent_generation != agent.row.agent_generation
-            {
-                return Err(invalid("inconsistent agent after-image"));
-            }
-            // Claims belong to the row being changed. Check stored ownership
-            // too: claim replay updates an existing id without changing its owner.
-            for claim in &agent.claims {
-                let owner: Option<String> = tx
-                    .query_row(
-                        "SELECT agent_id FROM agent_name_claim WHERE claim_id=?1",
-                        [claim.claim_id],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
-                if claim.agent_id != agent.agent_id
-                    || owner.is_some_and(|owner| owner != agent.agent_id)
-                {
-                    return Err(invalid("agent entry changes another agent's claim"));
-                }
-            }
+            check_agent_entry(tx, &agent)?;
             Decoded::Agent(Box::new(agent))
         }
         _ => return Err(invalid("unknown entry op or kind/op mismatch")),
@@ -522,38 +509,22 @@ fn apply(tx: &Transaction<'_>, entry: &RemoteEntry) -> rusqlite::Result<i64> {
                         )?;
                     }
                 }
-                let seq = append(tx, &project.op, &json!({}), "log", None, 0, "entorhinal")?;
-                project.apply(tx, seq)?;
-                tag(
-                    tx,
-                    seq,
-                    entry,
-                    &json!({"signer":entry.signer,"key_id":entry.key_id}),
-                )?;
-                seq
-            }
-            Decoded::Agent(mut agent) => {
-                let seq = append(
-                    tx,
-                    &agent.op,
-                    &json!({}),
-                    "log",
-                    None,
-                    agent.row.updated_at_ms,
-                    "entorhinal",
-                )?;
-                agent.seq = seq;
-                let payload = json!({"entry":agent,"signer":entry.signer,"key_id":entry.key_id});
-                crate::agent::replay_agent_entry(tx, &agent.op, &payload)?;
-                let active = crate::agent::load_claims(tx, &agent.agent_id)?
-                    .iter()
-                    .filter(|claim| claim.released_at_ms.is_none())
-                    .count();
-                if active != usize::from(agent.row.status == "live") {
-                    return Err(invalid(
-                        "agent after-image has an invalid active claim count",
-                    ));
+                if project.op == "project.shared" && !project.agents.is_empty() {
+                    apply_carried(tx, &project, entry)?
+                } else {
+                    let seq = append(tx, &project.op, &json!({}), "log", None, 0, "entorhinal")?;
+                    project.apply(tx, seq)?;
+                    tag(
+                        tx,
+                        seq,
+                        entry,
+                        &json!({"signer":entry.signer,"key_id":entry.key_id}),
+                    )?;
+                    seq
                 }
+            }
+            Decoded::Agent(agent) => {
+                let (seq, payload) = install_agent(tx, *agent, entry)?;
                 // The journal payload, which `agent.changes` serves, carries
                 // this machine's own seq. The bytes received from the log are
                 // stored alongside it unchanged, for audit and so replay
@@ -594,6 +565,102 @@ fn tag(
 ) -> rusqlite::Result<()> {
     tx.execute("UPDATE registry_journal SET payload_json=?1,stream='shared',origin='log',entry_id=?2,log_position=?3,entry=?4 WHERE seq=?5", params![String::from_utf8(canonical_bytes(payload)).unwrap(),entry.entry_id,entry.position,entry.entry,seq])?;
     Ok(())
+}
+
+fn invalid_entry(message: &str) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        message,
+    )))
+}
+
+/// Checks a received agent after-image, whether it came on its own or inside
+/// a `project.shared` entry: the row must be consistent with the entry, and
+/// every claim must belong to that agent, both as received and as stored
+/// (claim replay updates an existing claim id without changing its owner).
+fn check_agent_entry(tx: &Transaction<'_>, agent: &AgentChangeEntry) -> rusqlite::Result<()> {
+    if agent.agent_id != agent.row.agent_id || agent.agent_generation != agent.row.agent_generation
+    {
+        return Err(invalid_entry("inconsistent agent after-image"));
+    }
+    for claim in &agent.claims {
+        let owner: Option<String> = tx
+            .query_row(
+                "SELECT agent_id FROM agent_name_claim WHERE claim_id=?1",
+                [claim.claim_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if claim.agent_id != agent.agent_id || owner.is_some_and(|owner| owner != agent.agent_id) {
+            return Err(invalid_entry("agent entry changes another agent's claim"));
+        }
+    }
+    Ok(())
+}
+
+/// Journals a received agent change under this machine's next seq, installs
+/// it and checks that a live agent keeps exactly one active claim and a gone
+/// one none. Returns the seq and the journal payload `agent.changes` serves.
+fn install_agent(
+    tx: &Transaction<'_>,
+    mut agent: AgentChangeEntry,
+    entry: &RemoteEntry,
+) -> rusqlite::Result<(i64, Value)> {
+    let seq = append(
+        tx,
+        &agent.op,
+        &json!({}),
+        "log",
+        None,
+        agent.row.updated_at_ms,
+        "entorhinal",
+    )?;
+    agent.seq = seq;
+    let payload = json!({"entry":agent,"signer":entry.signer,"key_id":entry.key_id});
+    crate::agent::replay_agent_entry(tx, &agent.op, &payload)?;
+    let active = crate::agent::load_claims(tx, &agent.agent_id)?
+        .iter()
+        .filter(|claim| claim.released_at_ms.is_none())
+        .count();
+    if active != usize::from(agent.row.status == "live") {
+        return Err(invalid_entry(
+            "agent after-image has an invalid active claim count",
+        ));
+    }
+    Ok((seq, payload))
+}
+
+/// Applies a `project.shared` entry that carries agents (a placement carry or
+/// the workspace correction) the way the writer journaled it: the project row
+/// first when the entry changes project tables, then one `agent.set_namespace`
+/// row per agent, so this machine's `agent.changes` serves those rows too.
+/// The received entry is recorded on the project row, or on the last agent
+/// row when there is no project row; rebuild restores everything from it, so
+/// the other agent rows are marked as received and not replayed on their own.
+fn apply_carried(
+    tx: &Transaction<'_>,
+    project: &ProjectEntry,
+    entry: &RemoteEntry,
+) -> rusqlite::Result<i64> {
+    let mut tagged = None;
+    if !project.tables.is_empty() {
+        let seq = append(tx, &project.op, &json!({}), "log", None, 0, "entorhinal")?;
+        project.apply(tx, seq)?;
+        tagged = Some((seq, json!({"signer":entry.signer,"key_id":entry.key_id})));
+    }
+    for agent in &project.agents {
+        let (seq, payload) = install_agent(tx, agent.clone(), entry)?;
+        tx.execute(
+            "UPDATE registry_journal SET payload_json=?1,origin='log' WHERE seq=?2",
+            params![String::from_utf8(canonical_bytes(&payload)).unwrap(), seq],
+        )?;
+        if project.tables.is_empty() {
+            tagged = Some((seq, payload));
+        }
+    }
+    let (seq, payload) = tagged.expect("a carrying entry has tables or agents");
+    tag(tx, seq, entry, &payload)?;
+    Ok(seq)
 }
 
 #[cfg(test)]
@@ -1655,7 +1722,16 @@ mod tests {
         assert_eq!(last.op, "agent.set_namespace");
         assert_eq!(last.row, moved);
         assert_eq!(last.claims, entry.claims);
-        check_rebuild(&f);
+        // This hand-built entry moves A's claim to W2 without moving project P
+        // (still in W1), so verify reports exactly that claim as off its
+        // placement; rebuild still reproduces the received state.
+        assert_eq!(
+            f.store.verify().unwrap().mismatches,
+            vec![format!("agent_claim_off_placement:{a}")]
+        );
+        let before = image(&f);
+        assert!(f.store.rebuild().unwrap().replay.ok);
+        assert_eq!(before, image(&f));
     }
 
     #[test]
