@@ -564,7 +564,13 @@ mod tests {
         }
         let expected = requests
             .iter()
-            .map(|(method, params)| f.ok(method, params.clone()))
+            .map(|(method, params)| {
+                if *method == "projects.session_liveness" {
+                    json!({"code":"host_unbound"})
+                } else {
+                    f.ok(method, params.clone())
+                }
+            })
             .collect::<Vec<_>>();
         let (parked_tx, parked_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -589,7 +595,12 @@ mod tests {
             scope.spawn(move || {
                 for (method, params) in requests {
                     let start = Instant::now();
-                    let reply = success(handler.handle_request(&body(method, params), OPERATOR));
+                    let outcome = handler.handle_request(&body(method, params), OPERATOR);
+                    let reply = if method == "projects.session_liveness" {
+                        json!({"code":wire_error(outcome).code})
+                    } else {
+                        success(outcome)
+                    };
                     let _ = reply_tx.send((method, reply, start.elapsed()));
                 }
             });
@@ -624,6 +635,14 @@ mod tests {
         for ((method, reply, _), expected) in received.into_iter().zip(expected) {
             assert_eq!(reply, expected, "{method} must see only committed state");
         }
+        let mirror = f.handler.liveness.lock().unwrap();
+        assert!(mirror.sessions.is_empty());
+        assert_eq!(mirror.last_seq, None);
+        assert!(
+            mirror.stale,
+            "the unresolved sync feed must not clear the latch"
+        );
+        assert_eq!(mirror.sender, None);
     }
 
     #[tokio::test]

@@ -244,6 +244,7 @@ struct HealthGauges {
     liveness_batches: AtomicU64,
     liveness_gaps: AtomicU64,
     liveness_sessions: AtomicU64,
+    liveness_refusals: AtomicU64,
     /// Batches refused for carrying a seq at or below the last applied one.
     /// Separate from `liveness_gaps` on purpose: a gap means "a batch I never
     /// saw may exist", while this means "a batch arrived out of order". After
@@ -282,8 +283,11 @@ struct LivenessState {
     /// Last accepted per-emitter sequence number; None until first contact.
     last_seq: Option<u64>,
     /// True until a snapshot has rebased the mirror: from startup, and again
-    /// after a dropped or refused batch.
+    /// after a sequence gap, an out-of-order batch, or loss/change of the host.
     stale: bool,
+    /// Last admitted sender, used only to detect host changes and route loss,
+    /// never to admit a batch. Admission resolves the host anew every time.
+    sender: Option<(RouteKey, Principal)>,
     /// Every session the feed reports as not `gone`, keyed by
     /// `(harness, sessionId)`.
     sessions: MirrorSessions,
@@ -383,6 +387,7 @@ impl Default for LivenessState {
         Self {
             last_seq: None,
             stale: true,
+            sender: None,
             sessions: MirrorSessions::default(),
             gone: std::collections::BTreeSet::new(),
         }
@@ -415,7 +420,7 @@ struct ProjectsHandler {
     claim_refresh_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     agent_id_draw: fn() -> Result<String, HandlerError>,
     /// Names the module providing each session capability, asked afresh for
-    /// every `agent.register_session` on the served path.
+    /// every session registration and liveness batch on the served path.
     provider_resolver: Arc<dyn sessions::ProviderResolver>,
     operator_confirmer: Arc<dyn agent_ops::OperatorConfirmer>,
     confirmation_slot: Arc<Mutex<Option<agent_ops::ConfirmationSlot>>>,
@@ -452,7 +457,7 @@ fn route_key(handle: &RouteHandle) -> RouteKey {
 }
 
 /// The one module besides the operator that may change the registry: the
-/// executive registers repositories, records session liveness, and writes the
+/// executive registers repositories and writes the
 /// user's decisions.
 const WRITER_MODULE: &str = "prefrontal-core";
 
@@ -498,6 +503,7 @@ const MUTATING_METHODS: &[&str] = &[
 /// name here would refuse a correctly bound provider.
 /// Claim refresh instead has its own Direct-only rule.
 const SELF_ADMITTED_METHODS: &[&str] = &[
+    "projects.session_liveness",
     sessions::REGISTER_SESSION,
     claims::REFRESH,
     member::SET_NAME,
@@ -699,7 +705,7 @@ impl ProjectsHandler {
             .map(|(admission, _)| admission)
     }
 
-    /// `admit`, plus the session-capability rule for `agent.register_session`
+    /// `admit`, plus the capability rules for session registration and liveness
     /// against providers resolved for this one request. Resolution is never
     /// stored on the route: a provider can be rebound between two requests on
     /// the same route. Returns the role the caller was admitted under for that
@@ -713,6 +719,15 @@ impl ProjectsHandler {
         let admission = self.admission_for(key);
         refuse_flow_write(method, admission.flow_id.as_deref())?;
         authorize_write(method, admission.principal.as_ref())?;
+        if method == "projects.session_liveness" {
+            sessions::admit_liveness_feed(providers, admission.principal.as_ref()).inspect_err(
+                |_| {
+                    self.health
+                        .liveness_refusals
+                        .fetch_add(1, Ordering::Relaxed);
+                },
+            )?;
+        }
         if method == member::SET_NAME {
             member::admit(admission.principal.as_ref())?;
         }
@@ -792,6 +807,16 @@ impl ModuleHandler for ProjectsHandler {
     async fn on_route_gone(&self, handle: &RouteHandle) {
         let key = route_key(handle);
         self.route_admissions().remove(&key);
+        {
+            let mut state = self.liveness.lock().unwrap_or_else(|e| e.into_inner());
+            if state
+                .sender
+                .as_ref()
+                .is_some_and(|(route, _)| *route == key)
+            {
+                state.stale = true;
+            }
+        }
         if let Some(slot) = self
             .confirmation_slot
             .lock()
@@ -887,6 +912,7 @@ impl ModuleHandler for ProjectsHandler {
                 "livenessGaps": self.health.liveness_gaps.load(Ordering::Relaxed),
                 "livenessDroppedOlder": self.health.liveness_dropped_older.load(Ordering::Relaxed),
                 "livenessSessions": self.health.liveness_sessions.load(Ordering::Relaxed),
+                "livenessRefusals": self.health.liveness_refusals.load(Ordering::Relaxed),
                 "identityLogState": enable::status_state(&self.health),
                 "lastAppliedPosition": self.health.log_applied.load(Ordering::Relaxed),
                 "lastSeenHead": self.health.log_head.load(Ordering::Relaxed),
@@ -1034,7 +1060,13 @@ impl ProjectsHandler {
             "upgrade_implicit" => self.upgrade_implicit(request.params, &principal),
             "remove" => self.remove(request.params, &principal),
             "seed_import" => self.seed_import(request.params, &principal),
-            "projects.session_liveness" => self.session_liveness(request.params),
+            "projects.session_liveness" => self.session_liveness(
+                request.params,
+                key,
+                admission
+                    .principal
+                    .expect("liveness admission requires a principal"),
+            ),
             "add_root" => self.add_root(request.params, &principal),
             "attach_root" => self.attach_root(request.params, &principal),
             "remove_root" => self.remove_root(request.params, &principal),
@@ -1082,12 +1114,26 @@ impl ProjectsHandler {
     /// snapshot-on-reconnect, pinned in #workspace-projects-design). A seq gap
     /// marks the volatile state stale until the next snapshot rebases it; the
     /// reply carries `snapshotRequested` so the emitter can resend cheaply.
-    fn session_liveness(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
+    fn session_liveness(
+        &self,
+        params: Value,
+        key: RouteKey,
+        principal: Principal,
+    ) -> Result<Vec<u8>, HandlerError> {
         let batch = serde_json::from_value::<LivenessBatch>(params).map_err(invalid_params)?;
         let mut state = self
             .liveness
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if state
+            .sender
+            .as_ref()
+            .is_some_and(|(_, previous)| *previous != principal)
+        {
+            state.stale = true;
+        }
+        state.sender = Some((key, principal));
 
         // Set when the batch is refused for arriving out of order, carrying the
         // last seq that was applied, for the log line below.
@@ -1289,7 +1335,7 @@ impl ProjectsHandler {
             .liveness
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.sessions.is_empty() {
+        if state.stale || state.sessions.is_empty() {
             return;
         }
         for project in &mut reply.projects {
@@ -2097,6 +2143,7 @@ mod tests {
         assert_eq!(
             SELF_ADMITTED_METHODS,
             [
+                "projects.session_liveness",
                 "agent.register_session",
                 "agent.refresh_claims",
                 "member.set_name"
@@ -3207,16 +3254,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    pub(super) fn liveness_handler() -> ProjectsHandler {
+        let mut handler = ProjectsHandler::new().unwrap();
+        let resolver = sessions::FakeResolver::new();
+        resolver.set(
+            sessions::HOST_CAPABILITY,
+            sessions::ProviderResolution::Provider("test-host".into()),
+        );
+        handler.provider_resolver = resolver;
+        handler.route_admissions().insert(
+            (60, 1),
+            RouteAdmission::from_bind(
+                Some(Principal::Reserved {
+                    module_id: "test-host".into(),
+                }),
+                None,
+            ),
+        );
+        handler
+    }
+
+    pub(super) async fn served_liveness(
+        handler: &ProjectsHandler,
+        params: Value,
+    ) -> Result<Vec<u8>, HandlerOutcome> {
+        let body = serde_json::to_vec(&json!({
+            "method": "projects.session_liveness", "params": params
+        }))
+        .unwrap();
+        match handler.handle_served_request(&body, (60, 1)).await {
+            HandlerOutcome::Response(bytes) => Ok(bytes),
+            other => Err(other),
+        }
+    }
+
     #[tokio::test]
     async fn session_liveness_gap_detection_and_snapshot_rebase() {
-        let handler = ProjectsHandler::new().unwrap();
-        let call = |h: &ProjectsHandler, v: serde_json::Value| h.session_liveness(v);
+        let handler = liveness_handler();
+        let call = served_liveness;
         // Snapshot establishes the baseline at seq 10.
         let r = call(
             &handler,
             json!({"seq": 10, "snapshot": true, "sessions": [
             {"sessionId": "s1", "canonicalRoot": "/tmp/a", "state": "active"}]}),
         )
+        .await
         .unwrap();
         let v: Value = serde_json::from_slice(&r).unwrap();
         assert_eq!(v["result"]["snapshotRequested"], false);
@@ -3227,6 +3309,7 @@ mod tests {
             json!({"seq": 11, "sessions": [
             {"sessionId": "s2", "canonicalRoot": "/tmp/b", "state": "idle"}]}),
         )
+        .await
         .unwrap();
         let v: Value = serde_json::from_slice(&r).unwrap();
         assert_eq!(v["result"]["snapshotRequested"], false);
@@ -3237,6 +3320,7 @@ mod tests {
             json!({"seq": 13, "sessions": [
             {"sessionId": "s1", "canonicalRoot": "/tmp/a", "state": "gone"}]}),
         )
+        .await
         .unwrap();
         let v: Value = serde_json::from_slice(&r).unwrap();
         assert_eq!(
@@ -3254,6 +3338,7 @@ mod tests {
             json!({"seq": 14, "sessions": [
             {"sessionId": "s3", "canonicalRoot": "/tmp/c", "state": "active"}]}),
         )
+        .await
         .unwrap();
         let v: Value = serde_json::from_slice(&r).unwrap();
         assert_eq!(
@@ -3265,12 +3350,15 @@ mod tests {
             &handler,
             json!({"seq": 1, "snapshot": true, "sessions": []}),
         )
+        .await
         .unwrap();
         let v: Value = serde_json::from_slice(&r).unwrap();
         assert_eq!(v["result"]["snapshotRequested"], false);
         assert_eq!(v["result"]["tracked"], 0);
         // And post-rebase deltas read clean again.
-        let r = call(&handler, json!({"seq": 2, "sessions": []})).unwrap();
+        let r = call(&handler, json!({"seq": 2, "sessions": []}))
+            .await
+            .unwrap();
         let v: Value = serde_json::from_slice(&r).unwrap();
         assert_eq!(v["result"]["snapshotRequested"], false);
     }
@@ -3285,10 +3373,10 @@ mod tests {
     /// batch type had no such field, while tests on both sides stayed green.
     /// Proving a producer marks its snapshots needs a test against that
     /// producer's serialized output, not against JSON written here.
-    #[test]
-    fn a_batch_that_does_not_say_it_is_a_snapshot_cannot_clear_staleness() {
-        let handler = ProjectsHandler::new().unwrap();
-        let call = |v: serde_json::Value| handler.session_liveness(v);
+    #[tokio::test]
+    async fn a_batch_that_does_not_say_it_is_a_snapshot_cannot_clear_staleness() {
+        let handler = liveness_handler();
+        let call = |v| served_liveness(&handler, v);
         let requested = |bytes: &[u8]| -> bool {
             serde_json::from_slice::<Value>(bytes).unwrap()["result"]["snapshotRequested"]
                 .as_bool()
@@ -3297,14 +3385,18 @@ mod tests {
 
         call(json!({"seq": 1, "snapshot": true, "sessions": [
             {"sessionId": "s1", "canonicalRoot": "/tmp/a", "state": "active"}]}))
+        .await
         .unwrap();
         // Skip seq 2, so a batch is genuinely missing and staleness latches.
-        assert!(requested(&call(json!({"seq": 3, "sessions": []})).unwrap()));
+        assert!(requested(
+            &call(json!({"seq": 3, "sessions": []})).await.unwrap()
+        ));
 
         // A full-state resend carrying every tracked session but no `snapshot`
         // key. However complete it looks, it must not count as a rebase.
         let r = call(json!({"seq": 4, "sessions": [
             {"sessionId": "s1", "canonicalRoot": "/tmp/a", "state": "active"}]}))
+        .await
         .unwrap();
         assert!(
             requested(&r),
@@ -3313,7 +3405,9 @@ mod tests {
 
         // Only the marked batch rebases.
         assert!(!requested(
-            &call(json!({"seq": 5, "snapshot": true, "sessions": []})).unwrap()
+            &call(json!({"seq": 5, "snapshot": true, "sessions": []}))
+                .await
+                .unwrap()
         ));
     }
 
@@ -3321,10 +3415,10 @@ mod tests {
     /// snapshot, because the first batch it sees is a delta and its mirror is
     /// empty. Taking that delta as the whole state leaves every session that
     /// did not change missing until it changes again.
-    #[test]
-    fn a_fresh_receiver_asks_for_a_snapshot_until_one_arrives() {
-        let handler = ProjectsHandler::new().unwrap();
-        let call = |v: serde_json::Value| handler.session_liveness(v);
+    #[tokio::test]
+    async fn a_fresh_receiver_asks_for_a_snapshot_until_one_arrives() {
+        let handler = liveness_handler();
+        let call = |v| served_liveness(&handler, v);
         let requested = |bytes: &[u8]| -> bool {
             serde_json::from_slice::<Value>(bytes).unwrap()["result"]["snapshotRequested"]
                 .as_bool()
@@ -3334,6 +3428,7 @@ mod tests {
         // The emitter is mid-stream: its first batch to this process is a delta.
         let r = call(json!({"seq": 4200, "sessions": [
             {"sessionId": "s1", "canonicalRoot": "/tmp/a", "state": "active"}]}))
+        .await
         .unwrap();
         assert!(
             requested(&r),
@@ -3346,13 +3441,14 @@ mod tests {
         );
 
         // A contiguous delta does not complete the mirror either.
-        let r = call(json!({"seq": 4201, "sessions": []})).unwrap();
+        let r = call(json!({"seq": 4201, "sessions": []})).await.unwrap();
         assert!(requested(&r), "only a snapshot completes the mirror");
 
         // The snapshot does.
         let r = call(json!({"seq": 4202, "snapshot": true, "sessions": [
             {"sessionId": "s1", "canonicalRoot": "/tmp/a", "state": "active"},
             {"sessionId": "s2", "canonicalRoot": "/tmp/b", "state": "idle"}]}))
+        .await
         .unwrap();
         assert!(!requested(&r));
     }
@@ -3360,19 +3456,25 @@ mod tests {
     /// A repeated sequence number is refused like an older one. A replay of
     /// seq N need not carry the same payload as the batch already applied at
     /// N, so applying it could undo that batch's `gone`.
-    #[test]
-    fn an_equal_sequence_batch_cannot_resurrect_a_gone_session() {
-        let handler = ProjectsHandler::new().unwrap();
-        handler
-            .session_liveness(json!({"seq":10,"snapshot":true,"sessions":[
+    #[tokio::test]
+    async fn an_equal_sequence_batch_cannot_resurrect_a_gone_session() {
+        let handler = liveness_handler();
+        served_liveness(
+            &handler,
+            json!({"seq":10,"snapshot":true,"sessions":[
                 {"sessionId":"s1","canonicalRoot":"/tmp/a","state":"active","lastActivityMs":100}
-            ]}))
-            .unwrap();
-        handler
-            .session_liveness(json!({"seq":11,"sessions":[
+            ]}),
+        )
+        .await
+        .unwrap();
+        served_liveness(
+            &handler,
+            json!({"seq":11,"sessions":[
                 {"sessionId":"s1","canonicalRoot":"/tmp/a","state":"gone"}
-            ]}))
-            .unwrap();
+            ]}),
+        )
+        .await
+        .unwrap();
         let before = {
             let state = handler.liveness.lock().unwrap();
             (state.sessions.clone(), state.last_seq)
@@ -3380,11 +3482,14 @@ mod tests {
         assert!(before.0.is_empty());
         // A duplicate sequence need not carry the same payload. It must not
         // undo an already applied terminal transition.
-        let reply = handler
-            .session_liveness(json!({"seq":11,"sessions":[
+        let reply = served_liveness(
+            &handler,
+            json!({"seq":11,"sessions":[
                 {"sessionId":"s1","canonicalRoot":"/tmp/a","state":"active","lastActivityMs":999}
-            ]}))
-            .unwrap();
+            ]}),
+        )
+        .await
+        .unwrap();
         let reply: Value = serde_json::from_slice(&reply).unwrap();
         let state = handler.liveness.lock().unwrap();
         assert_eq!(
@@ -3419,10 +3524,10 @@ mod tests {
     /// `last_route_activity_ms` alive forever -- the GC-candidacy signal this
     /// feed exists to produce. Hence the refusal is the receiver's own
     /// invariant, not a workaround for one producer's scheduling.
-    #[test]
-    fn an_older_batch_cannot_resurrect_a_session_that_is_already_gone() {
-        let handler = ProjectsHandler::new().unwrap();
-        let call = |v: serde_json::Value| handler.session_liveness(v);
+    #[tokio::test]
+    async fn an_older_batch_cannot_resurrect_a_session_that_is_already_gone() {
+        let handler = liveness_handler();
+        let call = |v| served_liveness(&handler, v);
         let tracked = |bytes: &[u8]| -> u64 {
             serde_json::from_slice::<Value>(bytes).unwrap()["result"]["tracked"]
                 .as_u64()
@@ -3430,16 +3535,17 @@ mod tests {
         };
 
         call(json!({"seq": 10, "snapshot": true, "sessions": [
-            {"sessionId": "s1", "canonicalRoot": "/tmp/a", "state": "active", "lastActivityMs": 100}]}))
+            {"sessionId": "s1", "canonicalRoot": "/tmp/a", "state": "active", "lastActivityMs": 100}]})).await
         .unwrap();
         let r = call(json!({"seq": 11, "sessions": [
             {"sessionId": "s1", "canonicalRoot": "/tmp/a", "state": "gone"}]}))
+        .await
         .unwrap();
         assert_eq!(tracked(&r), 0, "gone prunes the entry");
 
         // The overtaken batch: seq 9, arriving after seq 11 was applied.
         let r = call(json!({"seq": 9, "sessions": [
-            {"sessionId": "s1", "canonicalRoot": "/tmp/a", "state": "active", "lastActivityMs": 90}]}))
+            {"sessionId": "s1", "canonicalRoot": "/tmp/a", "state": "active", "lastActivityMs": 90}]})).await
         .unwrap();
         assert_eq!(
             tracked(&r),
@@ -3463,7 +3569,7 @@ mod tests {
         // Refusing alone would be fail-deaf, so the refusal asks for a rebase:
         // otherwise an emitter that restarted its counter and lost its snapshot
         // would have every later delta look older than the old high-water mark.
-        let r = call(json!({"seq": 12, "sessions": []})).unwrap();
+        let r = call(json!({"seq": 12, "sessions": []})).await.unwrap();
         assert_eq!(
             serde_json::from_slice::<Value>(&r).unwrap()["result"]["snapshotRequested"],
             true,
@@ -3474,6 +3580,7 @@ mod tests {
         // is what a restarted emitter sends.
         let r = call(json!({"seq": 1, "snapshot": true, "sessions": [
             {"sessionId": "s2", "canonicalRoot": "/tmp/b", "state": "active"}]}))
+        .await
         .unwrap();
         assert_eq!(tracked(&r), 1);
         assert_eq!(
@@ -3492,10 +3599,10 @@ mod tests {
     /// be honoured as well, since "I track nothing" is the whole message in
     /// that case. A producer that suppresses an empty snapshot as a no-op
     /// disables recovery precisely where it is needed.
-    #[test]
-    fn a_snapshot_replaces_the_mirror_and_an_empty_one_still_counts() {
-        let handler = ProjectsHandler::new().unwrap();
-        let call = |v: serde_json::Value| handler.session_liveness(v);
+    #[tokio::test]
+    async fn a_snapshot_replaces_the_mirror_and_an_empty_one_still_counts() {
+        let handler = liveness_handler();
+        let call = |v| served_liveness(&handler, v);
         let tracked = |bytes: &[u8]| -> u64 {
             serde_json::from_slice::<Value>(bytes).unwrap()["result"]["tracked"]
                 .as_u64()
@@ -3505,12 +3612,14 @@ mod tests {
         let r = call(json!({"seq": 1, "snapshot": true, "sessions": [
             {"sessionId": "s1", "canonicalRoot": "/tmp/a", "state": "active"},
             {"sessionId": "s2", "canonicalRoot": "/tmp/b", "state": "idle"}]}))
+        .await
         .unwrap();
         assert_eq!(tracked(&r), 2);
 
         // s1 is absent from this snapshot and was never sent as `gone`.
         let r = call(json!({"seq": 2, "snapshot": true, "sessions": [
             {"sessionId": "s2", "canonicalRoot": "/tmp/b", "state": "idle"}]}))
+        .await
         .unwrap();
         assert_eq!(
             tracked(&r),
@@ -3519,7 +3628,9 @@ mod tests {
         );
 
         // The empty snapshot: the emitter states it tracks nothing.
-        let r = call(json!({"seq": 3, "snapshot": true, "sessions": []})).unwrap();
+        let r = call(json!({"seq": 3, "snapshot": true, "sessions": []}))
+            .await
+            .unwrap();
         assert_eq!(
             tracked(&r),
             0,
@@ -3527,14 +3638,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn enumerate_annotation_joins_liveness_by_root_containment() {
-        let handler = ProjectsHandler::new().unwrap();
-        handler
-            .session_liveness(json!({"seq": 1, "snapshot": true, "sessions": [
+    #[tokio::test]
+    async fn enumerate_annotation_joins_liveness_by_root_containment() {
+        let handler = liveness_handler();
+        served_liveness(&handler, json!({"seq": 1, "snapshot": true, "sessions": [
                 {"sessionId": "s1", "canonicalRoot": Path::new("/w/proj").join("sub").to_str().unwrap(), "state": "active", "lastActivityMs": 500},
                 {"sessionId": "s2", "canonicalRoot": "/w/proj", "state": "idle", "lastActivityMs": 900},
-                {"sessionId": "s3", "canonicalRoot": "/w/proj-other", "state": "active", "lastActivityMs": 999}]}))
+                {"sessionId": "s3", "canonicalRoot": "/w/proj-other", "state": "active", "lastActivityMs": 999}]})).await
             .unwrap();
         let mut reply = entorhinal_core::EnumerateReply {
             generation: 1,

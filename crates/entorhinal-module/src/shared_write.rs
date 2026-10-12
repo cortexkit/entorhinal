@@ -911,7 +911,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn local_writes_and_liveness_never_touch_engram_on_enabled_store() {
         let fail = Arc::new(FailConnector::default());
-        let f = Fixture::new("write-local", fail.clone());
+        let mut f = Fixture::new("write-local", fail.clone());
+        let resolver = crate::sessions::FakeResolver::new();
+        resolver.set(
+            crate::sessions::HOST_CAPABILITY,
+            crate::sessions::ProviderResolution::Provider("prefrontal-core".into()),
+        );
+        f.handler.provider_resolver = resolver;
         let root = f.dir.join("repo");
         let container = f.dir.join("workers");
         std::fs::create_dir(&root).unwrap();
@@ -2576,7 +2582,13 @@ impl ProjectsHandler {
         // Liveness is volatile, not a SQLite mutation. It must not queue behind
         // a transaction waiting for the log.
         if request.method == "projects.session_liveness" {
-            return self.execute(request, key);
+            let providers = super::sessions::ResolvedProviders {
+                orchestrator: super::sessions::ProviderResolution::Unprovided,
+                host: self
+                    .resolve_session_provider(super::sessions::HOST_CAPABILITY)
+                    .await,
+            };
+            return self.execute_with(request, key, Some(&providers));
         }
         // Session registration writes only machine-local rows, so it never
         // queues for the shared-log writer. Its providers are resolved here,

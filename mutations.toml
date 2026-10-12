@@ -2472,3 +2472,128 @@ runner = "cargo"
 package = "entorhinal-core"
 target = "--lib"
 expect_red = ["log_schema::tests::s3_fault_after_apply_reopen_persists_identity_and_rebuild_is_cell_identical", "remote_apply::tests::s3_snapshot_names_only_its_author_and_only_in_part_one", "remote_apply::tests::own_agent_receipt_advances_without_replaying_or_appending_to_the_feed"]
+
+# Each liveness batch must come from the resolved host claimant. Losing or
+# changing that host makes the session mirror incomplete until a new snapshot.
+[[control]]
+id = "feed-host-pass-through"
+guards = "The legacy registry writer gate does not block a rebound host claimant"
+file = "crates/entorhinal-module/src/main.rs"
+old = '''    "projects.session_liveness",
+    sessions::REGISTER_SESSION,'''
+new = '''    // NON-VACUITY BREAK: feed falls back to the legacy writer gate
+    sessions::REGISTER_SESSION,'''
+test_file = "crates/entorhinal-module/src/sessions.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["sessions::tests::liveness_feed_rebinding_to_thalamus_latches_until_snapshot"]
+
+[[control]]
+id = "feed-host-resolution-per-batch"
+guards = "Every feed batch resolves the host capability rather than admitting a fixed module name"
+file = "crates/entorhinal-module/src/shared_write.rs"
+old = '''                host: self
+                    .resolve_session_provider(super::sessions::HOST_CAPABILITY)
+                    .await,'''
+new = '''                host: super::sessions::ProviderResolution::Provider("prefrontal-core".into()), // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-module/src/sessions.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["sessions::tests::liveness_feed_rebinding_to_thalamus_latches_until_snapshot"]
+
+[[control]]
+id = "feed-host-unbound-first"
+guards = "A host capability without a sole claimant refuses host_unbound and leaves the complete or stale mirror unchanged"
+file = "crates/entorhinal-module/src/sessions.rs"
+old = '''    let Some(host) = host else {
+        return Err(HandlerError {
+            code: "host_unbound".into(),
+            message: format!("no sole provider of {HOST_CAPABILITY} was resolved for this batch"),
+            detail: providers.map(|providers| json!({HOST_CAPABILITY: providers.host.outcome()})),
+        });
+    };'''
+new = '''    let host = host.unwrap_or("prefrontal-core"); // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-module/src/sessions.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["sessions::tests::liveness_feed_unbound_preserves_mirror_sequence_and_latch", "sessions::tests::liveness_feed_sync_seam_has_no_cached_provider"]
+
+[[control]]
+id = "feed-host-principal-comparison"
+guards = "Direct, unrelated modules and unstamped callers cannot mutate the host's mirror"
+file = "crates/entorhinal-module/src/sessions.rs"
+old = "if matches!(principal, Some(Principal::Reserved { module_id }) if module_id == host) {"
+new = "if { let _ = host; true } /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-module/src/sessions.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["sessions::tests::liveness_feed_non_host_callers_preserve_every_answer"]
+
+[[control]]
+id = "feed-principal-change-latch"
+guards = "An admitted batch from a new host principal invalidates the old complete mirror until a snapshot lands"
+file = "crates/entorhinal-module/src/main.rs"
+old = '''            .is_some_and(|(_, previous)| *previous != principal)
+        {
+            state.stale = true;
+        }'''
+new = '''            .is_some_and(|(_, previous)| *previous != principal)
+        {
+            state.stale = false; // NON-VACUITY BREAK
+        }'''
+test_file = "crates/entorhinal-module/src/sessions.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["sessions::tests::liveness_feed_rebinding_to_thalamus_latches_until_snapshot"]
+
+[[control]]
+id = "feed-recorded-route-close-latch"
+guards = "Closing the recorded feed route sets the stale latch without erasing the mirror or its sequence"
+file = "crates/entorhinal-module/src/main.rs"
+old = '''                .is_some_and(|(route, _)| *route == key)
+            {
+                state.stale = true;
+            }'''
+new = '''                .is_some_and(|(route, _)| *route == key)
+            {
+                state.stale = false; // NON-VACUITY BREAK
+            }'''
+test_file = "crates/entorhinal-module/src/sessions.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["sessions::tests::liveness_feed_recorded_route_closing_latches_until_snapshot"]
+
+[[control]]
+id = "feed-enumerate-honors-stale-latch"
+guards = "Enumerate hides liveness activity while the host mirror waits for a new full snapshot"
+file = "crates/entorhinal-module/src/main.rs"
+old = "if state.stale || state.sessions.is_empty() {"
+new = "if state.sessions.is_empty() { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/sessions.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["sessions::tests::liveness_feed_recorded_route_closing_latches_until_snapshot"]
+
+[[control]]
+id = "feed-refusal-preserves-latch"
+guards = "An admission refusal changes only the atomic refusal counter, never the stale latch"
+file = "crates/entorhinal-module/src/main.rs"
+old = '''                    self.health
+                        .liveness_refusals
+                        .fetch_add(1, Ordering::Relaxed);'''
+new = '''                    self.health
+                        .liveness_refusals
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.liveness.lock().unwrap().stale = true; // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-module/src/sessions.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["sessions::tests::liveness_feed_unbound_preserves_mirror_sequence_and_latch"]
