@@ -62,6 +62,10 @@ pub struct AgentChangeEntry {
     pub new_display_name: Option<String>,
     pub status: Option<String>,
     pub merged_into: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requesting_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<super::consent::Authorization>,
 }
 
 impl AgentChangeEntry {
@@ -82,6 +86,8 @@ impl AgentChangeEntry {
             claims,
             old_display_name: None,
             new_display_name: None,
+            requesting_agent_id: None,
+            authorization: None,
         }
     }
 }
@@ -91,13 +97,13 @@ pub(crate) fn record(
     mut entry: AgentChangeEntry,
     value: Value,
     actor: &str,
-    key: &str,
+    key: Option<&str>,
     now: i64,
     principal: &str,
 ) -> Result<Action, AgentMutationError> {
-    entry.seq = append(tx, &entry.op, &json!({}), actor, Some(key), now, principal)?;
+    entry.seq = append(tx, &entry.op, &json!({}), actor, key, now, principal)?;
     Ok(Action {
-        // Even an unchanged after-image needs a keyed, cached journal entry.
+        // Record identity state even when its stored values have not changed.
         changed: true,
         seq: Some(entry.seq),
         value,

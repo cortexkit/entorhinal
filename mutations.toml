@@ -2964,3 +2964,66 @@ runner = "cargo"
 package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 expect_red = ["sessions::tests::session_for_ref_returns_the_matching_binding_and_tracks_reregistration"]
+
+# Agent hiring (phase 2): core consent state, grants and the hire cap.
+
+[[control]]
+id = "consent-hire-cap-transaction"
+guards = "An agent hire rechecks the cap in the write transaction, including under a grant"
+file = "crates/entorhinal-core/src/agent/store.rs"
+old = 'if commit.action == "agents_hire" {'
+new = 'if commit.action == "disabled" /* NON-VACUITY BREAK */ {'
+test_file = "crates/entorhinal-core/src/agent/consent_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["agent::consent_tests::hire_cap_is_rechecked_in_transaction_even_with_a_standing_grant"]
+
+[[control]]
+id = "consent-journal-authorization"
+guards = "Authorization evidence is retained in agent journal after-images and exports"
+file = "crates/entorhinal-core/src/mutations.rs"
+old = 'evidence["authorization"] = json!(commit.authorization);'
+new = 'evidence["authorization"] = json!(null); /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-core/src/agent/consent_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["agent::consent_tests::journal_authorization_variants_survive_export_and_replay_without_local_authority"]
+
+[[control]]
+id = "consent-grants-local-only"
+guards = "Machine-local grants are excluded from the shared identity image"
+file = "crates/entorhinal-core/src/shared_entry.rs"
+old = 'pub const PROJECT_SHARED_TABLES: &[&str] = &['
+new = '''pub const PROJECT_SHARED_TABLES: &[&str] = &[
+    "consent_grant", // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-core/src/agent/consent_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["agent::consent_tests::consent_state_is_local_persistent_and_not_rebuilt_or_exported"]
+
+[[control]]
+id = "consent-request-digest-conflict"
+guards = "A namespaced request key cannot be reused with different arguments even after terminal settlement"
+file = "crates/entorhinal-core/src/agent/consent.rs"
+old = 'if existing.args_digest != request.args_digest {'
+new = 'if false /* NON-VACUITY BREAK */ {'
+test_file = "crates/entorhinal-core/src/agent/consent_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["agent::consent_tests::request_keys_are_ascii_namespaced_and_conflicts_survive_terminal_state"]
+
+[[control]]
+id = "consent-request-atomic-completion"
+guards = "The identity mutation atomically commits its request outcome, audit and newly minted grant"
+file = "crates/entorhinal-core/src/mutations.rs"
+old = 'super::agent::consent::complete(tx, commit, &value)'
+new = 'Ok::<(), super::agent::AgentMutationError>(()) /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-core/src/agent/consent_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["agent::consent_tests::terminal_retry_is_atomic_does_not_remint_and_rejects_changed_digest"]

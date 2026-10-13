@@ -66,6 +66,8 @@ fn partition(id: &str, image: ProjectEntry, base: u64) -> Result<Vec<Vec<u8>>, R
         tables: BTreeMap::new(),
         agents: vec![],
         member_name: None,
+        requesting_agent_id: None,
+        authorization: None,
     };
     let mut units = vec![];
     for (table, changes) in image.tables {
@@ -309,7 +311,7 @@ impl RegistryStore {
                 }
             }
             image.tables.insert("project_root_key".into(), keys.clone());
-            let backfill = Backfill { image: ProjectEntry { op: "project.shared".into(), tables: [("project_root_key".into(), keys)].into(), agents: vec![], member_name: None }, mappings, base };
+            let backfill = Backfill { image: ProjectEntry { op: "project.shared".into(), tables: [("project_root_key".into(), keys)].into(), agents: vec![], member_name: None, requesting_agent_id: None, authorization: None }, mappings, base };
             Ok(Ok((image, backfill)))
         })??;
         image.agents.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
@@ -626,6 +628,8 @@ mod tests {
             tables: BTreeMap::new(),
             agents: vec![],
             member_name: None,
+            requesting_agent_id: None,
+            authorization: None,
         };
         let changes = image.tables.entry("project".into()).or_default();
         for _ in 0..2 {
@@ -670,6 +674,8 @@ mod tests {
             tables: BTreeMap::new(),
             agents: vec![],
             member_name: None,
+            requesting_agent_id: None,
+            authorization: None,
         };
         let bodies = partition(id, image.clone(), 5).unwrap();
         assert_eq!(bodies, vec![br#"{"op":"shared.snapshot","part":1,"parts":1,"snapshot_id":"0123456789abcdef0123456789abcdef","supersedes_through":5,"tables":{}}"#.to_vec()]);
@@ -897,6 +903,8 @@ mod tests {
             tables: Default::default(),
             agents: vec![moved.clone()],
             member_name: None,
+            requesting_agent_id: None,
+            authorization: None,
         };
         let entry = |position: i64, bytes: Vec<u8>| RemoteEntry {
             position,

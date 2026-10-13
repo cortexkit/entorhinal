@@ -445,6 +445,7 @@ impl super::JournalWriter<'_> {
         // is stashed outside the closure and a rusqlite error is returned as
         // a rollback sentinel; the stash wins on the way out.
         let domain_error = std::cell::RefCell::new(None::<E>);
+        let key = if self.consent.is_some() { None } else { key };
         if self.probe.is_some() {
             // The placement precheck runs the whole write, with its own
             // refusals, on a throwaway copy of the committed store and then
@@ -461,6 +462,13 @@ impl super::JournalWriter<'_> {
                 *domain_error.borrow_mut() = Some(e);
                 rusqlite::Error::QueryReturnedNoRows
             };
+            if let Some(commit) = &self.consent {
+                if let Some(outcome) = super::agent::consent::admit_commit(tx, commit)
+                    .map_err(|e| fail(RegistryError::from(e).into()))?
+                {
+                    return wire(outcome).map_err(|e| fail(e.into()));
+                }
+            }
             if let Some(blob) = cached(tx, op, key)? {
                 pending::finish(tx, None).map_err(|e| fail(e.into()))?;
                 return Ok(blob);
@@ -500,7 +508,16 @@ impl super::JournalWriter<'_> {
             } else {
                 None
             };
-            let action = action(tx).map_err(fail)?;
+            let mut action = action(tx).map_err(fail)?;
+            if let Some(commit) = &self.consent {
+                let evidence = if action.payload.get("entry").is_some() {
+                    &mut action.payload["entry"]
+                } else {
+                    &mut action.payload
+                };
+                evidence["requesting_agent_id"] = json!(commit.request.identity.agent_id);
+                evidence["authorization"] = json!(commit.authorization);
+            }
             if let Some((head, before)) = before {
                 let after = super::shared_entry::SharedState::capture(tx)?;
                 if let Some(seq) = action.seq {
@@ -539,6 +556,10 @@ impl super::JournalWriter<'_> {
                     map.insert("noop".to_string(), json!(!action.changed));
                 }
             }
+            if let Some(commit) = &self.consent {
+                super::agent::consent::complete(tx, commit, &value)
+                    .map_err(|e| fail(RegistryError::from(e).into()))?;
+            }
             let blob = wire(value).map_err(|error| fail(error.into()))?;
             if action.changed {
                 tx.execute(
@@ -574,6 +595,9 @@ impl super::JournalWriter<'_> {
         mut req: RegisterRequest,
         now: i64,
     ) -> Result<Vec<u8>, RegistryError> {
+        if self.consent.is_some() {
+            req.request_key = None;
+        }
         if let Some(id) = req.project_id.as_ref() {
             if reserved(id) {
                 return Err(domain("reserved_project_id_namespace", id));
@@ -1254,6 +1278,7 @@ impl RegistryStore {
             principal: "direct",
             confirmation: PlacementConfirmation::NotRequired,
             probe: Some(&summary),
+            consent: None,
         };
         let cached = |key: Option<&str>| self.shared_request_cache(op, key);
         macro_rules! probe {
