@@ -1108,6 +1108,7 @@ mod tests {
         let first = result(tasks.remove(0).await.unwrap());
         let second = result(tasks.remove(0).await.unwrap());
         assert_eq!(first, second);
+        f.handler.stop_move_driver().await;
         assert_eq!(f.store().list_agent_moves().unwrap().len(), 1);
         let checkpoint = f
             .store()
@@ -1118,12 +1119,14 @@ mod tests {
         let restarted = RegistryStore::open(&f.descriptor).unwrap();
         assert_eq!(restarted.list_open_agent_moves().unwrap(), vec![checkpoint]);
         *f.handler.store.lock().unwrap() = Some(restarted);
+        f.handler.start_move_driver();
         f.records.record.offline.store(true, Ordering::Relaxed);
         assert_eq!(
             result(f.handler.handle_served_request(&request, ORCH).await),
             first,
             "committed resend skips admission even after restart"
         );
+        f.handler.stop_move_driver().await;
     }
 
     #[tokio::test]

@@ -1571,6 +1571,7 @@ mod tests {
                 .await
                 .unwrap();
             let worker = Worker {
+                sql_operations: Arc::default(),
                 store: Arc::downgrade(&slot),
                 records: RecordClient::new(Arc::new(Connector(records.clone()))),
                 door: door.for_author([2; 16]).client(),
@@ -2308,13 +2309,7 @@ mod tests {
         f.records.inbox_reads.acquire().await.unwrap().forget();
         connector.connect().await.unwrap();
         f.records.inbox_reads.acquire().await.unwrap().forget();
-        handler
-            .move_driver_task
-            .lock()
-            .unwrap()
-            .take()
-            .unwrap()
-            .abort();
+        handler.stop_move_driver().await;
     }
 
     #[tokio::test]

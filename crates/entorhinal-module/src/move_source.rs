@@ -1326,6 +1326,7 @@ mod tests {
                 race: Arc::new(Mutex::new(None)),
             });
             let worker = Worker {
+                sql_operations: Arc::default(),
                 store: Arc::downgrade(&slot),
                 records: RecordClient::new(record_pipe.clone()),
                 door: crate::door_client::DoorClient::new(Arc::new(Door {

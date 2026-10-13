@@ -29,7 +29,7 @@ type Waiter = oneshot::Sender<Result<RefreshCounts, HandlerError>>;
 
 pub(crate) struct RefreshQueue {
     sender: mpsc::UnboundedSender<Option<Waiter>>,
-    receiver: Mutex<Option<mpsc::UnboundedReceiver<Option<Waiter>>>>,
+    receiver: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Option<Waiter>>>>,
 }
 
 impl Default for RefreshQueue {
@@ -37,7 +37,7 @@ impl Default for RefreshQueue {
         let (sender, receiver) = mpsc::unbounded_channel();
         Self {
             sender,
-            receiver: Mutex::new(Some(receiver)),
+            receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
         }
     }
 }
@@ -55,6 +55,7 @@ impl RefreshQueue {
 /// slow or hung engram reply.
 struct Worker {
     store: Weak<Mutex<Option<RegistryStore>>>,
+    sql_operations: Arc<crate::move_driver::SqlOperations>,
     records: RecordClient,
     health: Arc<HealthGauges>,
     clock: fn() -> i64,
@@ -158,8 +159,11 @@ impl Worker {
                     return Ok(counts);
                 };
                 let now = (self.clock)();
+                let guard = self.sql_operations.begin();
                 let conflicts = tokio::task::spawn_blocking(move || {
-                    cache.cache_agent_claims(&observations, now)
+                    let _guard = guard;
+                    let store = cache;
+                    store.cache_agent_claims(&observations, now)
                 })
                 .await
                 .map_err(|e| HandlerError::new("storage_error", e.to_string()))??;
@@ -196,14 +200,16 @@ impl ProjectsHandler {
         if task.is_some() {
             return;
         }
-        let mut receiver = self.claim_refresh.receiver.lock().unwrap().take().unwrap();
+        let receiver = self.claim_refresh.receiver.clone();
         let worker = Worker {
             store: Arc::downgrade(&self.store),
+            sql_operations: self.claim_refresh_sql.clone(),
             records: self.record_client.clone(),
             health: self.health.clone(),
             clock: self.clock,
         };
         *task = Some(tokio::spawn(async move {
+            let mut receiver = receiver.lock().await;
             while let Some(first) = receiver.recv().await {
                 let mut waiters = first.into_iter().collect::<Vec<_>>();
                 // Coalesce queued requests before beginning a pass. Requests
@@ -230,6 +236,16 @@ impl ProjectsHandler {
                 }
             }
         }));
+    }
+
+    #[cfg(test)]
+    pub(super) async fn stop_claim_refresh(&self) {
+        let task = self.claim_refresh_task.lock().unwrap().take();
+        if let Some(task) = task {
+            task.abort();
+            let _ = task.await;
+        }
+        self.claim_refresh_sql.wait().await;
     }
 
     pub(super) fn admit_claim_refresh(&self, key: RouteKey) -> Result<(), HandlerError> {
@@ -450,6 +466,8 @@ mod tests {
         );
         let f = Fixture::new(true).await;
         assert_eq!(f.refresh().await, json!({"refreshed":0,"failed":0}));
+        f.handler.stop_claim_refresh().await;
+        assert_eq!(f.refresh().await, json!({"refreshed":0,"failed":0}));
         assert_eq!(f.record.calls.load(Ordering::Relaxed), 0);
     }
     #[tokio::test]
@@ -572,6 +590,7 @@ mod tests {
         let other = FakeRecord::new([2; 16]);
         let worker = Worker {
             store: Arc::downgrade(&f.handler.store),
+            sql_operations: f.handler.claim_refresh_sql.clone(),
             records: RecordClient::new(Arc::new(FakeRecordConnector(other))),
             health: f.handler.health.clone(),
             clock: f.handler.clock,
@@ -716,11 +735,8 @@ mod tests {
         let descriptor = f.descriptor.clone();
         let record = f.record.clone();
         let log = f.log.clone();
-        if let Some(task) = f.handler.claim_refresh_task.lock().unwrap().take() {
-            task.abort();
-        }
+        crate::tests::stop_store_tasks(&f.handler).await;
         f.handler.store.lock().unwrap().take();
-        tokio::task::yield_now().await;
         let mut handler =
             ProjectsHandler::with_log_connector("abcdef0123456789".into(), || 701, Arc::new(log));
         record.offline.store(true, Ordering::Relaxed);
@@ -788,11 +804,8 @@ mod tests {
         let id = f.create(1).await;
         f.put(&id, &f.record.author, 1);
         f.refresh().await;
-        if let Some(task) = f.handler.claim_refresh_task.lock().unwrap().take() {
-            task.abort();
-        }
+        crate::tests::stop_store_tasks(&f.handler).await;
         f.handler.store.lock().unwrap().take();
-        tokio::task::yield_now().await;
         let peer = FakeRecord::new([1; 16]);
         let holder = "02020202020202020202020202020202";
         peer.put(

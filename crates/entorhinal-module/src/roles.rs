@@ -258,6 +258,7 @@ impl ProjectsHandler {
         let signal = self.role_refresh.clone();
         let health = self.health.clone();
         let clock = self.clock;
+        let sql_operations = self.role_refresh_sql.clone();
         *task = Some(tokio::spawn(async move {
             let mut ticks = tokio::time::interval_at(
                 Instant::now() + Duration::from_secs(30),
@@ -354,8 +355,11 @@ impl ProjectsHandler {
                             return;
                         };
                         let now = clock();
+                        let guard = sql_operations.begin();
                         match tokio::task::spawn_blocking(move || {
-                            cache.cache_roles(&observations, now)
+                            let _guard = guard;
+                            let store = cache;
+                            store.cache_roles(&observations, now)
                         })
                         .await
                         {
@@ -374,6 +378,16 @@ impl ProjectsHandler {
                 health.role_refresh_done.notify_one();
             }
         }));
+    }
+
+    #[cfg(test)]
+    pub(super) async fn stop_role_refresh(&self) {
+        let task = self.role_refresh_task.lock().unwrap().take();
+        if let Some(task) = task {
+            task.abort();
+            let _ = task.await;
+        }
+        self.role_refresh_sql.wait().await;
     }
 }
 
@@ -481,6 +495,10 @@ mod tests {
             self.handler.role_refresh.notify_one();
             self.handler.health.role_refresh_done.notified().await;
         }
+
+        async fn close(&self) {
+            crate::tests::stop_store_tasks(&self.handler).await;
+        }
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
@@ -557,6 +575,7 @@ mod tests {
         f.refresh().await;
         assert_eq!(f.read()["stale"], false);
         assert_eq!(f.log.calls(), 0);
+        f.close().await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -577,6 +596,7 @@ mod tests {
         f.read();
         f.record
             .put("role:x", 1, claim(1, &f.record.author), &f.record.author);
+        crate::tests::stop_store_tasks(&f.handler).await;
         f.handler.store.lock().unwrap().take();
         f.handler
             .on_hello_ack(&crate::tests::hello_ack(&f.descriptor))
@@ -613,6 +633,7 @@ mod tests {
         f.handler.health.role_refresh_done.notified().await;
         assert_eq!(role_batches(), before + 1);
         assert_eq!(f.read()["stale"], false);
+        f.close().await;
     }
 
     #[tokio::test]
@@ -651,6 +672,7 @@ mod tests {
         assert_eq!(f.read()["source"], "cloud");
         assert_eq!(f.read()["stale"], false);
         assert_eq!(f.store().generation().unwrap(), 0);
+        f.close().await;
     }
 
     #[tokio::test]
@@ -721,6 +743,7 @@ mod tests {
             code(f.call(DIRECT, TAKE, input()).await),
             "flow_scope_not_admitted"
         );
+        f.close().await;
     }
 
     #[tokio::test]
@@ -742,6 +765,7 @@ mod tests {
         assert_eq!(result(f.call(DIRECT, TAKE, input()).await), answer);
         assert_eq!(f.record.calls.load(Ordering::Relaxed), calls);
         assert_eq!(f.prompt.calls.lock().unwrap().len(), 1);
+        f.close().await;
     }
 
     #[tokio::test]
@@ -760,6 +784,7 @@ mod tests {
             result(f.call(MODULE, READ, json!({"role":"x"})).await)["known"],
             false
         );
+        f.close().await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -792,6 +817,7 @@ mod tests {
                 .version,
             1
         );
+        f.close().await;
     }
 
     #[tokio::test]
@@ -830,6 +856,7 @@ mod tests {
                 .epoch,
             Some(1)
         );
+        f.close().await;
     }
 
     #[tokio::test]
@@ -871,6 +898,7 @@ mod tests {
                     .version,
                 65
             );
+            f.close().await;
         }
     }
 
@@ -899,6 +927,7 @@ mod tests {
             assert_eq!(take.await.unwrap().unwrap_err().code, "operator_declined");
             assert!(f.handler.confirmation_slot.lock().unwrap().is_none());
             assert_eq!(f.record.calls.load(Ordering::Relaxed), 0);
+            f.close().await;
         }
     }
 
@@ -922,6 +951,7 @@ mod tests {
             .await
             .expect("role take must not wait for shared writer");
         assert_eq!(result(answer), json!({"epoch":1,"held_here":true}));
+        f.close().await;
     }
 
     #[tokio::test]
@@ -930,13 +960,7 @@ mod tests {
         result(f.call(DIRECT, TAKE, input()).await);
         f.record.error("role:x", Some("verify_failed"));
         f.refresh().await;
-        f.handler
-            .role_refresh_task
-            .lock()
-            .unwrap()
-            .take()
-            .unwrap()
-            .abort();
+        crate::tests::stop_store_tasks(&f.handler).await;
         f.handler.store.lock().unwrap().take();
         super::super::install_store(
             &f.handler.store,
@@ -951,13 +975,7 @@ mod tests {
         f.refresh().await;
         assert_eq!(f.read()["source"], "cloud");
         assert_eq!(f.read()["stale"], false);
-        f.handler
-            .role_refresh_task
-            .lock()
-            .unwrap()
-            .take()
-            .unwrap()
-            .abort();
+        crate::tests::stop_store_tasks(&f.handler).await;
         f.handler.store.lock().unwrap().take();
         super::super::install_store(
             &f.handler.store,
@@ -966,5 +984,6 @@ mod tests {
         );
         assert_eq!(f.read()["stale"], true);
         assert_eq!(f.read()["source"], "cloud");
+        f.close().await;
     }
 }

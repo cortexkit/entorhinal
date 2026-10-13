@@ -11,11 +11,59 @@ use crate::{
 use entorhinal_core::{move_store::AgentMove, RegistryError, RegistryStore};
 use std::{
     collections::HashSet,
-    sync::{atomic::Ordering, Arc, Mutex, Weak},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, Weak,
+    },
     time::Duration,
 };
 
 pub(crate) const POLL: Duration = Duration::from_secs(30);
+
+#[derive(Default)]
+pub(crate) struct SqlOperations {
+    count: AtomicUsize,
+    idle: tokio::sync::Notify,
+    #[cfg(test)]
+    waiting: tokio::sync::Notify,
+}
+
+impl SqlOperations {
+    pub(crate) fn begin(self: &Arc<Self>) -> SqlGuard {
+        self.count.fetch_add(1, Ordering::AcqRel);
+        SqlGuard(self.clone())
+    }
+
+    pub(crate) async fn wait(&self) {
+        #[cfg(test)]
+        self.waiting.notify_one();
+        loop {
+            let idle = self.idle.notified();
+            tokio::pin!(idle);
+            idle.as_mut().enable();
+            if self.count.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            idle.await;
+        }
+    }
+}
+
+pub(crate) struct SqlGuard(Arc<SqlOperations>);
+
+impl Drop for SqlGuard {
+    fn drop(&mut self) {
+        if self.0.count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.idle.notify_waiters();
+        }
+    }
+}
+
+pub(crate) struct MoveDriver {
+    stop: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+    sql: Arc<SqlOperations>,
+}
 
 pub(crate) struct ReconnectConnector {
     pub(crate) inner: Arc<dyn crate::log_client::LogConnector>,
@@ -37,6 +85,7 @@ impl crate::log_client::LogConnector for ReconnectConnector {
 #[derive(Clone)]
 pub(crate) struct Worker {
     pub(crate) store: Weak<Mutex<Option<RegistryStore>>>,
+    pub(crate) sql_operations: Arc<SqlOperations>,
     pub(crate) records: RecordClient,
     pub(crate) door: DoorClient,
     pub(crate) discovery: Arc<dyn ParticipantDiscovery>,
@@ -53,7 +102,11 @@ impl Worker {
         operation: impl FnOnce(&RegistryStore) -> Result<T, RegistryError> + Send + 'static,
     ) -> Result<T, HandlerError> {
         let slot = self.store.clone();
+        // Count queued work too: aborting its async caller cannot stop a blocking closure.
+        let guard = self.sql_operations.begin();
         tokio::task::spawn_blocking(move || {
+            // The store is dropped before this guard, including when the operation panics.
+            let _guard = guard;
             let store = slot
                 .upgrade()
                 .and_then(|slot| slot.lock().unwrap().clone())
@@ -131,8 +184,10 @@ impl ProjectsHandler {
         if task.is_some() {
             return;
         }
+        let sql = Arc::new(SqlOperations::default());
         let worker = Worker {
             store: Arc::downgrade(&self.store),
+            sql_operations: sql.clone(),
             records: self.record_client.clone(),
             door: self.door_client.clone(),
             discovery: self.participant_discovery.clone(),
@@ -144,59 +199,83 @@ impl ProjectsHandler {
         };
         let liveness = self.liveness.clone();
         let wake = self.move_wake.clone();
-        *task = Some(tokio::spawn(async move {
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let driver = tokio::spawn(async move {
             let mut interval = tokio::time::interval(POLL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut owners = HashSet::new();
             let mut tasks = tokio::task::JoinSet::new();
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {},
-                    _ = wake.notified() => {},
-                    Some(result) = tasks.join_next(), if !tasks.is_empty() => {
-                        if let Ok(owner) = result { owners.remove(&owner); }
+            let poll = async {
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {},
+                        _ = wake.notified() => {},
+                        Some(result) = tasks.join_next(), if !tasks.is_empty() => {
+                            if let Ok(owner) = result { owners.remove(&owner); }
+                        }
                     }
-                }
-                if worker.store.upgrade().is_none() {
-                    break;
-                }
-                let _ = poll_inbox(&worker).await;
-                let Ok(rows) = worker.sql(RegistryStore::list_open_agent_moves).await else {
-                    continue;
-                };
-                let _ = worker.gauges().await;
-                for row in rows {
-                    if owners.insert((row.cut_id.clone(), false)) {
-                        let worker = worker.clone();
-                        let liveness = liveness.clone();
-                        tasks.spawn(async move {
-                            let cut = row.cut_id;
-                            match row.side {
-                                entorhinal_core::move_store::MoveSide::Source => {
-                                    Source::new(worker, cut.clone()).run().await
-                                }
-                                entorhinal_core::move_store::MoveSide::Receiver => {
-                                    Receiver::new(worker, cut.clone(), liveness).run().await
-                                }
-                            }
-                            (cut, false)
-                        });
+                    if worker.store.upgrade().is_none() {
+                        break;
                     }
-                }
-                if let Ok(rows) = worker.sql(RegistryStore::list_pending_cut_accepts).await {
+                    let _ = poll_inbox(&worker).await;
+                    let Ok(rows) = worker.sql(RegistryStore::list_open_agent_moves).await else {
+                        continue;
+                    };
+                    let _ = worker.gauges().await;
                     for row in rows {
-                        if owners.insert((row.cut_id.clone(), true)) {
+                        if owners.insert((row.cut_id.clone(), false)) {
                             let worker = worker.clone();
+                            let liveness = liveness.clone();
                             tasks.spawn(async move {
                                 let cut = row.cut_id;
-                                CutAccept::new(worker, cut.clone()).run().await;
-                                (cut, true)
+                                match row.side {
+                                    entorhinal_core::move_store::MoveSide::Source => {
+                                        Source::new(worker, cut.clone()).run().await
+                                    }
+                                    entorhinal_core::move_store::MoveSide::Receiver => {
+                                        Receiver::new(worker, cut.clone(), liveness).run().await
+                                    }
+                                }
+                                (cut, false)
                             });
                         }
                     }
+                    if let Ok(rows) = worker.sql(RegistryStore::list_pending_cut_accepts).await {
+                        for row in rows {
+                            if owners.insert((row.cut_id.clone(), true)) {
+                                let worker = worker.clone();
+                                tasks.spawn(async move {
+                                    let cut = row.cut_id;
+                                    CutAccept::new(worker, cut.clone()).run().await;
+                                    (cut, true)
+                                });
+                            }
+                        }
+                    }
                 }
+            };
+            tokio::select! {
+                _ = stopped => {},
+                _ = poll => {},
             }
-        }));
+            tasks.shutdown().await;
+        });
+        *task = Some(MoveDriver {
+            stop,
+            task: driver,
+            sql,
+        });
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn stop_move_driver(&self) {
+        let driver = self.move_driver_task.lock().unwrap().take();
+        if let Some(driver) = driver {
+            let _ = driver.stop.send(());
+            let _ = driver.task.await;
+            // Draining async tasks does not release stores held by spawn_blocking work.
+            driver.sql.wait().await;
+        }
     }
 }
 
@@ -206,4 +285,93 @@ pub(crate) fn backoff(attempts: i64) -> Duration {
             .unwrap_or(300)
             .min(300),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{future::Future, task::Poll};
+
+    #[tokio::test]
+    async fn stop_move_driver_waits_for_blocking_sql_before_store_reopen() {
+        let (dir, descriptor) = crate::tests::scratch_descriptor("move-driver-stop");
+        let mut handler = ProjectsHandler::with_runtime("sql-drain".into(), || 0);
+        handler.record_client = RecordClient::new(Arc::new(
+            crate::fake_record::FakeRecordConnector(crate::fake_record::FakeRecord::new([1; 16])),
+        ));
+        *handler.store.lock().unwrap() = Some(RegistryStore::open(&descriptor).unwrap());
+        handler.start_move_driver();
+        let sql = handler
+            .move_driver_task
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .sql
+            .clone();
+        let worker = Worker {
+            store: Arc::downgrade(&handler.store),
+            sql_operations: sql.clone(),
+            records: handler.record_client.clone(),
+            door: handler.door_client.clone(),
+            discovery: handler.participant_discovery.clone(),
+            health: handler.health.clone(),
+            writer: handler.writer.clone(),
+            clock: handler.clock,
+            wake: handler.move_wake.clone(),
+        };
+        let (entered, running) = tokio::sync::oneshot::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let blocked_worker = worker.clone();
+        let operation = tokio::spawn(async move {
+            blocked_worker
+                .sql(move |store| {
+                    entered.send(()).unwrap();
+                    gate.recv().unwrap();
+                    store.list_open_agent_moves()
+                })
+                .await
+        });
+        running.await.unwrap();
+        operation.abort();
+        assert!(operation.await.unwrap_err().is_cancelled());
+
+        let mut stop = Box::pin(handler.stop_move_driver());
+        let stopped_early = tokio::select! {
+            _ = &mut stop => true,
+            _ = sql.waiting.notified() => {
+                // Poll after the driver and its move tasks have drained, not merely after stop begins.
+                std::future::poll_fn(|cx| Poll::Ready(stop.as_mut().poll(cx).is_ready())).await
+            }
+        };
+        // Release the blocking thread even if shutdown returned early, so a red test cannot hang.
+        release.send(()).unwrap();
+        if stopped_early {
+            sql.wait().await;
+        } else {
+            stop.await;
+        }
+        assert!(
+            !stopped_early,
+            "stop_move_driver returned while blocking SQL still held the writer lease"
+        );
+
+        assert_eq!(
+            worker
+                .sql::<()>(|_| panic!("SQL panic exercises the drop guard"))
+                .await
+                .unwrap_err()
+                .code,
+            "storage_error"
+        );
+        assert_eq!(sql.count.load(Ordering::Acquire), 0);
+
+        *handler.store.lock().unwrap() = None;
+        *handler.store.lock().unwrap() = Some(RegistryStore::open(&descriptor).unwrap());
+        handler.start_move_driver();
+        handler.stop_move_driver().await;
+        handler.stop_move_driver().await;
+        *handler.store.lock().unwrap() = None;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

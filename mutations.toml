@@ -4,6 +4,20 @@
 # Reports belong under the already gitignored target/mutations/.
 # only=false allows related assertions in the same target; nightly --broad audits other targets.
 
+# Move driver shutdown must release blocking SQL store handles before a restart.
+[[control]]
+id = "move-driver-stop-drains-blocking-sql"
+guards = "Stopping the move driver releases blocking SQL store clones before a simulated restart"
+file = "crates/entorhinal-module/src/move_driver.rs"
+old = "driver.sql.wait().await;"
+new = "// NON-VACUITY BREAK: skip draining blocking SQL"
+test_file = "crates/entorhinal-module/src/move_driver.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["move_driver::tests::stop_move_driver_waits_for_blocking_sql_before_store_reopen"]
+expect_message = "stop_move_driver returned while blocking SQL still held the writer lease"
+
 # Write admission, including the production admission call and open reads.
 [[control]]
 id = "admission-flow-writes"
