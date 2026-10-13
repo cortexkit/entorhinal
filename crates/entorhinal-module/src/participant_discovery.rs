@@ -445,8 +445,11 @@ mod tests {
                 "--ignored",
                 "--nocapture",
             ]);
+        // Windows needs a few variables the cleared environment drops. Without
+        // TEMP and TMP, the temp directory falls back to C:\Windows, where the
+        // probe's scratch folder can't be made owner-only.
         #[cfg(windows)]
-        for name in ["SYSTEMROOT", "PATH"] {
+        for name in ["SYSTEMROOT", "PATH", "TEMP", "TMP"] {
             if let Some(value) = std::env::var_os(name) {
                 child.env(name, value);
             }
