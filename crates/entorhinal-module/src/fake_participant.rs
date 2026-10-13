@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use crate::log_client::{LogTransport, TransportError};
 use crate::participant_client::*;
 
-pub(crate) const REFUSAL_CODES: [&str; 13] = [
+pub(crate) const REFUSAL_CODES: [&str; 14] = [
     "caller_forbidden",
     "invalid_request",
     "unknown_ref",
@@ -23,6 +23,7 @@ pub(crate) const REFUSAL_CODES: [&str; 13] = [
     "digest_mismatch",
     "external_not_present",
     "unavailable",
+    "local_advanced",
 ];
 
 #[derive(Clone)]
@@ -514,13 +515,29 @@ mod tests {
         let a = client(source.clone());
         a.prepare(&cut(&["a", "b"])).await.unwrap();
         let wrong = cut(&["a"]);
-        for result in [
-            a.export(&wrong).await.map(|_| ()),
-            a.abort(&wrong).await.map(|_| ()),
-            a.status(&wrong).await.map(|_| ()),
-            a.diverged(&wrong).await.map(|_| ()),
+        for (result, violating_op) in [
+            (a.export(&wrong).await.map(|_| ()), None),
+            (a.abort(&wrong).await.map(|_| ()), None),
+            (
+                a.status(&wrong).await.map(|_| ()),
+                Some("agent_data.status"),
+            ),
+            (
+                a.diverged(&wrong).await.map(|_| ()),
+                Some("agent_data.diverged"),
+            ),
         ] {
-            let detail = refusal(result, "invalid_state").unwrap();
+            let detail = match violating_op {
+                None => refusal(result, "invalid_state").unwrap(),
+                Some(expected_op) => match result.unwrap_err() {
+                    ClientError::ContractViolation { op, code, detail } => {
+                        assert_eq!(op, expected_op);
+                        assert_eq!(code, "invalid_state");
+                        detail.unwrap()
+                    }
+                    other => panic!("expected contract violation for {expected_op}, got {other:?}"),
+                },
+            };
             assert_eq!(detail["step"], "prepared");
             assert_eq!(
                 detail["refs"],
@@ -663,10 +680,23 @@ mod tests {
                     detail: Some(json!({"step":"none","note":"scripted refusal"})),
                 }),
             );
-            assert_eq!(
-                refusal(c.prepare(&cut(&["a"])).await, code).unwrap()["note"],
-                "scripted refusal"
-            );
+            let error = fake
+                .handle(
+                    "reserved:entorhinal",
+                    "agent_data.prepare",
+                    json!(cut(&["a"])),
+                )
+                .unwrap_err();
+            match error {
+                TransportError::Refusal {
+                    code: actual_code,
+                    detail,
+                } => {
+                    assert_eq!(actual_code, code);
+                    assert_eq!(detail.unwrap()["note"], "scripted refusal");
+                }
+                other => panic!("expected scripted {code}, got {other:?}"),
+            }
             assert!(fake.cut(CUT).is_none());
             assert!(fake.frozen().is_empty());
         }

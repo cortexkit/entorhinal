@@ -288,11 +288,137 @@ pub(crate) struct Refusal {
     pub(crate) detail: Option<Value>,
 }
 
+/// Per-op refusal codes permitted by agent-data/v1; other codes are contract violations.
+/// Mirrors cortexkit-role-agent-data CONTRACT §6.3 (`errors::allowed_refusals`).
+/// This table stays in-tree until the published crate is pinned, then its definitions replace it.
+pub(crate) const ALLOWED_REFUSALS: [(&str, &[&str]); 10] = [
+    (
+        "agent_data.describe",
+        &["caller_forbidden", "invalid_request", "unavailable"],
+    ),
+    (
+        "agent_data.busy",
+        &[
+            "caller_forbidden",
+            "invalid_request",
+            "unavailable",
+            "unknown_ref",
+        ],
+    ),
+    (
+        "agent_data.status",
+        &["caller_forbidden", "invalid_request", "unavailable"],
+    ),
+    (
+        "agent_data.prepare",
+        &[
+            "caller_forbidden",
+            "invalid_request",
+            "unavailable",
+            "id_reused",
+            "unknown_ref",
+            "invalid_state",
+            "busy",
+            "not_exportable",
+        ],
+    ),
+    (
+        "agent_data.export",
+        &[
+            "caller_forbidden",
+            "invalid_request",
+            "unavailable",
+            "id_reused",
+            "unknown_ref",
+            "invalid_state",
+            "cut_unknown",
+        ],
+    ),
+    (
+        "agent_data.diverged",
+        &[
+            "caller_forbidden",
+            "invalid_request",
+            "unavailable",
+            "external_not_present",
+            "cut_not_ready",
+            "incompatible_version",
+        ],
+    ),
+    (
+        "agent_data.import",
+        &[
+            "caller_forbidden",
+            "invalid_request",
+            "unavailable",
+            "id_reused",
+            "invalid_state",
+            "cut_not_ready",
+            "incompatible_version",
+            "digest_mismatch",
+            "busy",
+            "local_advanced",
+        ],
+    ),
+    (
+        "agent_data.activate",
+        &[
+            "caller_forbidden",
+            "invalid_request",
+            "unavailable",
+            "id_reused",
+            "invalid_state",
+            "cut_unknown",
+            "external_not_present",
+            "busy",
+            "local_advanced",
+        ],
+    ),
+    (
+        "agent_data.abort",
+        &[
+            "caller_forbidden",
+            "invalid_request",
+            "unavailable",
+            "id_reused",
+            "invalid_state",
+        ],
+    ),
+    (
+        "agent_data.release",
+        &[
+            "caller_forbidden",
+            "invalid_request",
+            "unavailable",
+            "id_reused",
+            "unknown_ref",
+            "invalid_state",
+            "cut_unknown",
+        ],
+    ),
+];
+
 #[derive(Debug, Clone)]
 pub(crate) enum ClientError {
     Refused(Refusal),
+    ContractViolation {
+        op: &'static str,
+        code: String,
+        detail: Option<Value>,
+    },
     OutcomeUnknown,
     InvalidReply(String),
+}
+
+fn classify_refusal(op: &'static str, code: String, detail: Option<Value>) -> ClientError {
+    if ALLOWED_REFUSALS
+        .iter()
+        .any(|(method, codes)| *method == op && codes.contains(&code.as_str()))
+    {
+        ClientError::Refused(Refusal { code, detail })
+    } else {
+        ClientError::ContractViolation { op, code, detail }
+    }
 }
 
 #[derive(Deserialize)]
@@ -329,7 +455,7 @@ impl ParticipantClient {
                 .await
                 .map_err(|error| match error {
                     TransportError::Refusal { code, detail } => {
-                        ClientError::Refused(Refusal { code, detail })
+                        classify_refusal(request.op(), code, detail)
                     }
                     TransportError::NoReply | TransportError::Unavailable => {
                         ClientError::OutcomeUnknown
@@ -343,7 +469,10 @@ impl ParticipantClient {
     async fn reconcile(&self, cut: &CutRequest) -> Result<(), ClientError> {
         self.once::<StatusReply>(&Request::Status(cut.clone()))
             .await
-            .map_err(|_| ClientError::OutcomeUnknown)?;
+            .map_err(|error| match error {
+                violation @ ClientError::ContractViolation { .. } => violation,
+                _ => ClientError::OutcomeUnknown,
+            })?;
         self.unresolved.lock().unwrap().remove(&cut.cut_id);
         Ok(())
     }
@@ -897,6 +1026,153 @@ mod tests {
         };
         assert!(
             matches!(plan_participants(&available, &[missing]).await, Err(PlanError::RefKindUnavailable(kind)) if kind == "unsupported")
+        );
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+    use crate::fake_participant::{Effect, FakeParticipant};
+    use serde_json::json;
+
+    fn cut() -> CutRequest {
+        CutRequest {
+            refs: vec![AgentRef {
+                ref_kind: "session".into(),
+                reference: "s1".into(),
+            }],
+            cut_id: "0123456789abcdef0123456789abcdef".into(),
+        }
+    }
+
+    fn client(fake: Arc<FakeParticipant>) -> ParticipantClient {
+        ParticipantClient::new(&Participant {
+            module_id: "adapter".into(),
+            transport: fake,
+        })
+    }
+
+    #[tokio::test]
+    async fn allowed_refusals_per_op_preserve_code_and_opaque_detail() {
+        let cases = [
+            (Request::Describe(Empty {}), "unavailable"),
+            (
+                Request::Busy(BusyRequest { refs: cut().refs }),
+                "unknown_ref",
+            ),
+            (Request::Status(cut()), "invalid_request"),
+            (Request::Prepare(cut()), "not_exportable"),
+            (Request::Export(cut()), "cut_unknown"),
+            (Request::Diverged(cut()), "external_not_present"),
+            (Request::Import(cut()), "digest_mismatch"),
+            (Request::Activate(cut()), "external_not_present"),
+            (Request::Abort(cut()), "invalid_state"),
+            (
+                Request::Release(ReleaseRequest {
+                    refs: cut().refs,
+                    cut_id: cut().cut_id,
+                    holder: "mac-b".into(),
+                }),
+                "unknown_ref",
+            ),
+            (Request::Diverged(cut()), "cut_not_ready"),
+            (Request::Diverged(cut()), "incompatible_version"),
+            (Request::Import(cut()), "busy"),
+            (Request::Import(cut()), "local_advanced"),
+            (Request::Activate(cut()), "busy"),
+            (Request::Activate(cut()), "local_advanced"),
+        ];
+        for (request, code) in cases {
+            let fake = Arc::new(FakeParticipant::new(&["session"], cut().refs));
+            let detail = json!({"note":"fixture refusal","new_metadata":{"versions":[1,2]}});
+            fake.script(
+                request.op(),
+                Effect::Refuse(Refusal {
+                    code: code.into(),
+                    detail: Some(detail.clone()),
+                }),
+            );
+            match client(fake.clone())
+                .call::<Value>(request.clone())
+                .await
+                .unwrap_err()
+            {
+                ClientError::Refused(refusal) => {
+                    assert_eq!(refusal.code, code, "{}", request.op());
+                    assert_eq!(refusal.detail, Some(detail));
+                }
+                other => panic!("{} must allow {code}, got {other:?}", request.op()),
+            }
+            assert_eq!(fake.calls(), vec![request]);
+        }
+    }
+
+    #[tokio::test]
+    async fn disallowed_and_unknown_refusal_codes_are_contract_violations() {
+        for (request, code) in [
+            (
+                Request::Release(ReleaseRequest {
+                    refs: cut().refs,
+                    cut_id: cut().cut_id,
+                    holder: "mac-b".into(),
+                }),
+                "busy",
+            ),
+            (Request::Prepare(cut()), "frobnicated"),
+        ] {
+            let fake = Arc::new(FakeParticipant::new(&["session"], cut().refs));
+            let detail = json!({"note":"contract violation","nested":{"future":true}});
+            fake.script(
+                request.op(),
+                Effect::Refuse(Refusal {
+                    code: code.into(),
+                    detail: Some(detail.clone()),
+                }),
+            );
+            match client(fake.clone())
+                .call::<Value>(request.clone())
+                .await
+                .unwrap_err()
+            {
+                ClientError::ContractViolation {
+                    op,
+                    code: actual_code,
+                    detail: actual_detail,
+                } => {
+                    assert_eq!(op, request.op());
+                    assert_eq!(actual_code, code);
+                    assert_eq!(actual_detail, Some(detail));
+                }
+                other => panic!(
+                    "{} must reject {code} as a contract violation, got {other:?}",
+                    request.op()
+                ),
+            }
+            assert_eq!(fake.calls(), vec![request]);
+        }
+    }
+
+    #[tokio::test]
+    async fn status_probe_contract_violation_is_not_masked_as_unknown() {
+        let fake = Arc::new(FakeParticipant::new(&["session"], cut().refs));
+        fake.script(
+            "agent_data.prepare",
+            Effect::LoseReply(TransportError::NoReply),
+        );
+        fake.script(
+            "agent_data.status",
+            Effect::Refuse(Refusal {
+                code: "busy".into(),
+                detail: Some(json!({"step":"prepared"})),
+            }),
+        );
+        assert!(matches!(client(fake.clone()).prepare(&cut()).await,
+            Err(ClientError::ContractViolation { op: "agent_data.status", code, detail })
+            if code == "busy" && detail == Some(json!({"step":"prepared"}))));
+        assert_eq!(
+            fake.calls().iter().map(Request::op).collect::<Vec<_>>(),
+            ["agent_data.prepare", "agent_data.status"]
         );
     }
 }
