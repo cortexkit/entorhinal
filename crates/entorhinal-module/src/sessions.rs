@@ -403,17 +403,17 @@ impl ProjectsHandler {
     /// the route cache and refresh a cached mismatch once, without resolving
     /// the separate agent-host/v1 provider.
     pub(super) async fn move_orchestrator(&self, admission: &super::RouteAdmission) -> bool {
-        let route = &admission.providers;
-        let _lookup = route.resolving.lock().await;
-        let cached = route
+        let move_route = &admission.providers;
+        let _move_lookup = move_route.resolving.lock().await;
+        let move_cached = move_route
             .cached
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        if cached.invalidated {
+        if move_cached.invalidated {
             return false;
         }
-        let mut answer = match cached.orchestrator.clone() {
+        let mut answer = match move_cached.orchestrator.clone() {
             Some(answer) => answer,
             None => self.resolve_session_provider(ORCHESTRATOR_CAPABILITY).await,
         };
@@ -422,16 +422,16 @@ impl ProjectsHandler {
             _ => false,
         };
         if !matches(&answer)
-            && cached.orchestrator.is_some()
+            && move_cached.orchestrator.is_some()
             && !matches!(answer, ProviderResolution::Transport(_))
         {
             answer = self.resolve_session_provider(ORCHESTRATOR_CAPABILITY).await;
         }
-        let mut cache = route.cached.lock().unwrap_or_else(|e| e.into_inner());
-        if cache.invalidated {
+        let mut move_cache = move_route.cached.lock().unwrap_or_else(|e| e.into_inner());
+        if move_cache.invalidated {
             return false;
         }
-        cache.orchestrator = if matches!(answer, ProviderResolution::Transport(_)) {
+        move_cache.orchestrator = if matches!(answer, ProviderResolution::Transport(_)) {
             None
         } else {
             Some(answer.clone())

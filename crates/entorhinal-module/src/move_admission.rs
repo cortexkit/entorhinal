@@ -5,10 +5,11 @@ use super::{
     agent_ops::{ConfirmationGuard, OperatorConfirmError},
     claim_codec::AgentClaim,
     encode_result,
-    participant_client::{self, AgentRef, BusyState, PlannedParticipant},
+    participant_client::{self, AgentRef, PlannedParticipant},
     participant_discovery::discover_participants,
     HandlerError, ProjectsHandler, RouteKey,
 };
+use cortexkit_role_agent_data::busy::BusyState;
 use entorhinal_core::{
     move_record::{MoveParticipant, MoveRef},
     move_store::{AgentMove, MoveSide, MoveStep},
@@ -119,10 +120,7 @@ impl ProjectsHandler {
             })?;
         let wire_refs: Vec<_> = refs
             .iter()
-            .map(|r| AgentRef {
-                ref_kind: r.ref_kind.clone(),
-                reference: r.reference.clone(),
-            })
+            .map(|r| AgentRef::new(r.ref_kind.clone(), r.reference.clone()))
             .collect();
         let plan = participant_client::plan_participants(&available, &wire_refs).await.map_err(|e| {
             let detail = match e {
@@ -180,7 +178,7 @@ impl ProjectsHandler {
                     .iter()
                     .map(|r| MoveRef {
                         ref_kind: r.ref_kind.clone(),
-                        reference: r.reference.clone(),
+                        reference: r.r#ref.clone(),
                     })
                     .collect(),
                 external: vec![],
@@ -336,14 +334,14 @@ impl ProjectsHandler {
                 Ok(answer) if answer.refs.len() == participant.refs.len() => {
                     for (reference, verdict) in participant.refs.iter().zip(answer.refs) {
                         if verdict.state != BusyState::Idle {
-                            busy.push(json!({"ref_kind":reference.ref_kind,"ref":reference.reference,"participant":participant.client.module_id,
+                            busy.push(json!({"ref_kind":reference.ref_kind,"ref":reference.r#ref,"participant":participant.client.module_id,
                                 "reason_code":verdict.reason_code,"reason":verdict.reason}));
                         }
                     }
                 }
                 answer => {
                     for reference in &participant.refs {
-                        busy.push(json!({"ref_kind":reference.ref_kind,"ref":reference.reference,"participant":participant.client.module_id,
+                        busy.push(json!({"ref_kind":reference.ref_kind,"ref":reference.r#ref,"participant":participant.client.module_id,
                             "reason_code":"busy_unknown","reason":format!("{answer:?}")}));
                     }
                     if participant.refs.is_empty() {
@@ -519,10 +517,7 @@ mod tests {
                 daemon: FakeDaemon::new(snapshot()),
                 participant: Arc::new(FakeParticipant::new(
                     &["session"],
-                    vec![AgentRef {
-                        ref_kind: "session".into(),
-                        reference: "r".into(),
-                    }],
+                    vec![AgentRef::new("session", "r")],
                 )),
                 gate: AtomicBool::new(false),
                 entered: tokio::sync::Semaphore::new(0),
@@ -762,17 +757,12 @@ mod tests {
         let f = Fixture::new(2).await;
         let id = f.create().await;
         f.register(&id, "r").unwrap();
-        let reference = AgentRef {
-            ref_kind: "session".into(),
-            reference: "r".into(),
-        };
+        let reference = AgentRef::new("session", "r");
         f.discovery.participant.set_busy(
             reference.clone(),
-            BusyRef {
-                state: BusyState::Busy,
-                reason_code: Some("writing".into()),
-                reason: Some("pending writes".into()),
-            },
+            BusyRef::new(BusyState::Busy)
+                .with_reason_code("writing")
+                .with_reason("pending writes"),
         );
         let before = f.discovery.participant.held();
         f.clear_calls();
@@ -795,10 +785,10 @@ mod tests {
         assert_eq!(
             f.discovery.participant.calls(),
             vec![
-                Request::Describe(participant_client::Empty {}),
-                Request::Busy(participant_client::BusyRequest {
-                    refs: vec![reference]
-                })
+                Request::Describe(participant_client::DescribeRequest::new()),
+                Request::Busy(participant_client::BusyRequest::new(
+                    cortexkit_role_agent_data::refs::Refs::new(vec![reference]).unwrap(),
+                ))
             ]
         );
         let calls = f.records.calls.lock().unwrap();
@@ -997,7 +987,10 @@ mod tests {
                         store.insert_agent_move(&row).unwrap();
                     }
                     _ => {
-                        participant.set_busy(AgentRef {ref_kind:"session".into(),reference:"r".into()},BusyRef {state:BusyState::Unknown,reason_code:Some("unknown".into()),reason:None});
+                        participant.set_busy(
+                            AgentRef::new("session", "r"),
+                            BusyRef::new(BusyState::Unknown).with_reason_code("unknown"),
+                        );
                     }
                 }
             }));
