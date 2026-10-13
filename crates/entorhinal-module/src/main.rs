@@ -447,11 +447,13 @@ struct ProjectsHandler {
     participant_discovery: Arc<dyn participant_discovery::ParticipantDiscovery>,
     door_client: door_client::DoorClient,
     move_wake: Arc<tokio::sync::Notify>,
-    move_driver_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    move_driver_task: Mutex<Option<move_driver::MoveDriver>>,
     claim_refresh: Arc<claims::RefreshQueue>,
     claim_refresh_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    claim_refresh_sql: Arc<move_driver::SqlOperations>,
     role_refresh: Arc<tokio::sync::Notify>,
     role_refresh_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    role_refresh_sql: Arc<move_driver::SqlOperations>,
     agent_id_draw: fn() -> Result<String, HandlerError>,
     /// Names the module providing each session capability on first use of a
     /// route, and once more before refusing a cached mismatch or unbound answer.
@@ -716,8 +718,10 @@ impl ProjectsHandler {
             move_wake,
             move_driver_task: Mutex::new(None),
             claim_refresh_task: Mutex::new(None),
+            claim_refresh_sql: Arc::default(),
             role_refresh: Arc::new(tokio::sync::Notify::new()),
             role_refresh_task: Mutex::new(None),
+            role_refresh_sql: Arc::default(),
             agent_id_draw: shared_write::draw_agent_id,
             provider_resolver: Arc::new(sessions::SubcProviderResolver::from_args(
                 std::env::args_os().skip(1),
@@ -2190,6 +2194,13 @@ mod tests {
             task.abort();
             let _ = task.await;
         }
+    }
+
+    pub(super) async fn stop_store_tasks(handler: &ProjectsHandler) {
+        stop_catch_up(handler).await;
+        handler.stop_move_driver().await;
+        handler.stop_claim_refresh().await;
+        handler.stop_role_refresh().await;
     }
 
     #[tokio::test]
