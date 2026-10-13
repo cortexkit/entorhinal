@@ -1331,8 +1331,10 @@ impl RegistryStore {
     }
 }
 
-// Deletion order respects projection dependencies. This is also the sole list
-// used for snapshots, so verification and repair always cover the same tables.
+// Delete referring tables before the tables they reference. This is also the
+// sole list used for snapshots, so verification and repair cover the same tables.
+// Machine-local driver checkpoints and settings (agent_move, move_setting) are
+// deliberately excluded: the identity journal cannot reconstruct them.
 const DERIVED_TABLES: &[&str] = &[
     "member_name",
     "agent_name_claim",

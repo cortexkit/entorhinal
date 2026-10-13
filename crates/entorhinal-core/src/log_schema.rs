@@ -761,7 +761,10 @@ mod tests {
         drop(current);
         let error = RegistryStore::open_with_migrations(&descriptor, &MIGRATIONS[..6]).unwrap_err();
         assert!(matches!(error, RegistryError::Database(_)));
-        assert_eq!(error.to_string(), "database: registry store is at schema version 8, ahead of this binary's highest migration 6; run a binary at or above the store's version");
+        assert_eq!(error.to_string(), format!(
+            "database: registry store is at schema version {}, ahead of this binary's highest migration 6; run a binary at or above the store's version",
+            MIGRATIONS.last().unwrap().version
+        ));
         assert_eq!(cells(&RegistryStore::open(&descriptor).unwrap()), before);
     }
 }

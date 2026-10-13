@@ -595,6 +595,8 @@ mod tests {
                     "pending_entry",
                     "cortexkit_schema_version",
                     "cortexkit_fence",
+                    "agent_move",
+                    "move_setting",
                     "sqlite_sequence",
                     // Machine-local agent session, claim and role state.
                     "session_binding",

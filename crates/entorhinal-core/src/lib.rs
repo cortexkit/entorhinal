@@ -24,6 +24,7 @@ mod binding;
 pub mod claim_cache;
 pub mod enable_state;
 mod log_schema;
+pub mod move_store;
 mod mutations;
 mod ownership;
 mod read_connection;
@@ -196,7 +197,7 @@ CREATE TABLE member_name (
 );
 "#;
 
-const MIGRATIONS: [Migration; 8] = [
+const MIGRATIONS: [Migration; 9] = [
     Migration {
         version: 1,
         statements: V1_SCHEMA,
@@ -228,6 +229,10 @@ const MIGRATIONS: [Migration; 8] = [
     Migration {
         version: 8,
         statements: V8_AGENT_SESSIONS,
+    },
+    Migration {
+        version: 9,
+        statements: move_store::V9_AGENT_MOVES,
     },
 ];
 
@@ -1576,9 +1581,9 @@ mod tests {
     }
 
     /// A binary whose chain stops at migration 7 must refuse a store this
-    /// binary migrated, naming schema version 8, and leave it untouched.
+    /// binary migrated, naming the chain's current version, and leave it untouched.
     #[test]
-    fn binary_without_session_migration_refuses_v8_store_as_ahead() {
+    fn binary_without_session_migration_refuses_migrated_store_as_ahead() {
         let scratch = TestStore::new("v8-ahead");
         let descriptor = legacy_descriptor(&scratch, "v8.db");
         drop(RegistryStore::open(&descriptor).unwrap());
@@ -1586,7 +1591,10 @@ mod tests {
         assert!(matches!(error, RegistryError::Database(_)));
         assert_eq!(
             error.to_string(),
-            "database: registry store is at schema version 8, ahead of this binary's highest migration 7; run a binary at or above the store's version"
+            format!(
+                "database: registry store is at schema version {}, ahead of this binary's highest migration 7; run a binary at or above the store's version",
+                MIGRATIONS.last().unwrap().version
+            )
         );
         drop(RegistryStore::open(&descriptor).unwrap());
     }
