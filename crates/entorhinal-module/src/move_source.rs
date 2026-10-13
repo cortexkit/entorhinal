@@ -207,7 +207,6 @@ impl Source {
     /// Resume participant aborts after an operator repairs corrupted undo bytes.
     /// A digest refusal pauses cleanup for this driver instance; restarting
     /// retries once, then pauses again if the participant still refuses.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn retry_held_abort(&mut self) {
         self.abort_held = false;
     }
@@ -221,6 +220,14 @@ impl Source {
             }
             if self.worker.store.upgrade().is_none() {
                 return;
+            }
+            if self
+                .worker
+                .consume_abort_retry(&self.cut)
+                .await
+                .unwrap_or(false)
+            {
+                self.retry_held_abort();
             }
             match self.tick().await {
                 Ok(Some(next)) => delay = next,
@@ -1131,6 +1138,7 @@ mod tests {
     struct Trace {
         slot: std::sync::Weak<Mutex<Option<RegistryStore>>>,
         events: Mutex<Vec<Event>>,
+        participant_called: tokio::sync::Notify,
     }
     impl Trace {
         fn call(&self, op: &str) {
@@ -1186,7 +1194,9 @@ mod tests {
                     }
                 }
             }
-            self.participant.call(method, params).await
+            let result = self.participant.call(method, params).await;
+            self.trace.participant_called.notify_one();
+            result
         }
     }
     struct Discovery {
@@ -1342,6 +1352,7 @@ mod tests {
             let trace = Arc::new(Trace {
                 slot: Arc::downgrade(&slot),
                 events: Mutex::new(vec![]),
+                participant_called: tokio::sync::Notify::new(),
             });
             let door = FakeDoor::new([1; 16]);
             let records = FakeRecord::new([1; 16]);
@@ -1791,6 +1802,76 @@ mod tests {
             assert!(f.participants.iter().all(|p| p.frozen().is_empty()));
             assert!(f.row().hold.is_none());
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn operator_abort_retry_wakes_only_the_requested_stuck_cut_once() {
+        let f = Fixture::new();
+        let mut source = f.source();
+        f.until(&mut source, Step::Exported).await;
+        f.abort();
+        for _ in 0..2 {
+            f.participants[1].script(
+                "agent_data.abort",
+                ParticipantEffect::Refuse(crate::move_driver::digest_refusal("abort")),
+            );
+        }
+        f.step(&mut source).await;
+        assert!(f.row().abort_stuck());
+        let other_cut = "99999999999999999999999999999999";
+        let mut other = f.row();
+        other.cut_id = other_cut.into();
+        other.agent_id = "other-agent".into();
+        other.request_key = None;
+        f.worker
+            .sql(move |store| store.insert_agent_move(&other))
+            .await
+            .unwrap();
+        let mut other_source = Source::new(f.worker.clone(), other_cut.into());
+        other_source.abort_held = true;
+        let first = tokio::spawn(source.run());
+        let second = tokio::spawn(other_source.run());
+        let cut = f.row().cut_id;
+        f.slot
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .request_agent_move_abort(&cut, 99)
+            .unwrap();
+        f.worker.wake.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(300), async {
+            loop {
+                let notified = f.trace.participant_called.notified();
+                if f.participants[1]
+                    .calls()
+                    .iter()
+                    .filter(|r| matches!(r, Request::Abort(_)))
+                    .count()
+                    == 2
+                {
+                    break;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("the requested owner retries abort");
+        let aborts: Vec<_> = f.participants[1]
+            .calls()
+            .into_iter()
+            .filter_map(|r| match r {
+                Request::Abort(r) => Some(r.cut_id.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(aborts, vec![f.row().cut_id.clone(), f.row().cut_id]);
+        assert!(f.worker.row(other_cut).await.unwrap().abort_stuck());
+        assert!(!f.worker.consume_abort_retry(other_cut).await.unwrap());
+        first.abort();
+        second.abort();
+        let _ = first.await;
+        let _ = second.await;
     }
 
     #[tokio::test(start_paused = true)]

@@ -163,6 +163,189 @@ pub struct AgentMove {
     pub updated_at_ms: i64,
 }
 
+impl AgentMove {
+    pub fn abort_stuck(&self) -> bool {
+        self.abort_requested.is_some()
+            && self
+                .hold
+                .as_ref()
+                .is_some_and(|h| h["state"] == "stuck" && h["op"] == "agent_data.abort")
+    }
+
+    /// Operator-facing diagnostics are derived from the durable participant
+    /// checkpoints, without exposing the private recovery plan or claim bodies.
+    pub fn notices(&self) -> Value {
+        let mut notices = serde_json::Map::new();
+        let diagnostics: Vec<_> = ["_source", "_receiver"]
+            .into_iter()
+            .flat_map(|key| {
+                self.plan[key]["errors"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .cloned()
+            })
+            .collect();
+        if !diagnostics.is_empty() {
+            notices.insert("diagnostics".into(), Value::Array(diagnostics));
+        }
+        let warnings: Vec<_> = self.plan["_source"]["enforced"].as_object().into_iter().flatten()
+            .filter(|(_, enforced)| **enforced == false)
+            .map(|(module, _)| serde_json::json!({"module_id":module,"code":"release_not_enforced","message":format!("The old Mac cannot block writes for {module}; anything typed there becomes a fork")}))
+            .collect();
+        if !warnings.is_empty() {
+            notices.insert("warnings".into(), Value::Array(warnings));
+        }
+        let progress = if self.side == MoveSide::Source {
+            &self.plan["_source"]
+        } else {
+            &self.plan["_receiver"]
+        };
+        let violation = &progress["contract_violation"];
+        let fork = &progress["activation_fork"];
+        let (status, detail, message) = if self.abort_stuck() {
+            let detail = self.hold.as_ref().unwrap();
+            let module = detail["module_id"].as_str().unwrap_or("the participant");
+            let message = if self.side == MoveSide::Source {
+                format!("abort stuck, agent frozen on this Mac until {module} is repaired")
+            } else {
+                format!("abort stuck, cleanup cannot finish until {module} is repaired")
+            };
+            ("abort_stuck", detail, message)
+        } else if self.side == MoveSide::Receiver
+            && self.step == MoveStep::Activating
+            && (!fork.is_null() || !violation.is_null())
+        {
+            let detail = if !fork.is_null() { fork } else { violation };
+            (
+                "held_as_fork",
+                detail,
+                "held as a fork, awaiting the operator".into(),
+            )
+        } else if !violation.is_null() {
+            (
+                "contract_violation",
+                violation,
+                "participant contract violation; operator repair is required".into(),
+            )
+        } else {
+            return Value::Object(notices);
+        };
+        notices.insert("status".into(), status.into());
+        notices.insert("message".into(), message.into());
+        notices.insert("diagnostic".into(), detail.clone());
+        Value::Object(notices)
+    }
+
+    pub fn error_codes(&self) -> Vec<String> {
+        let mut codes = Vec::new();
+        for key in ["_source", "_receiver"] {
+            if let Some(errors) = self.plan[key]["errors"].as_array() {
+                codes.extend(
+                    errors
+                        .iter()
+                        .filter_map(|e| e["code"].as_str().map(str::to_owned)),
+                );
+            }
+        }
+        if let Some(accept) = self
+            .cut_accept
+            .as_ref()
+            .filter(|v| v["state"] != "accepted")
+        {
+            codes.push(
+                accept["code"]
+                    .as_str()
+                    .unwrap_or("cut_accept_pending")
+                    .into(),
+            );
+        }
+        if let Some(hold) = self.hold.as_ref().filter(|v| v["move_error"] == true) {
+            if let Some(code) = hold["code"].as_str() {
+                codes.push(code.into());
+            }
+        }
+        codes.sort();
+        codes.dedup();
+        codes
+    }
+}
+
+fn public_move(conn: &rusqlite::Connection, row: &AgentMove) -> rusqlite::Result<Value> {
+    let mut value = serde_json::to_value(row).expect("move row serializes");
+    let object = value.as_object_mut().unwrap();
+    for key in [
+        "plan",
+        "request_body",
+        "claim_version",
+        "claim_take_body",
+        "claim_take_version",
+        "claim_landed_version",
+    ] {
+        object.remove(key);
+    }
+    object.insert(
+        "peer_name".into(),
+        serde_json::json!(crate::claim_cache::holder_name(conn, Some(&row.peer))?),
+    );
+    object.extend(row.notices().as_object().unwrap().clone());
+    Ok(value)
+}
+
+pub(crate) type WhereMoveView = (Option<Value>, Vec<Value>, Vec<Value>, Vec<Value>);
+
+pub(crate) fn where_moves(
+    conn: &rusqlite::Connection,
+    agent: &str,
+) -> rusqlite::Result<WhereMoveView> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {MOVE_COLUMNS} FROM agent_move WHERE agent_id=?1 ORDER BY created_at_ms, cut_id"
+    ))?;
+    let rows = stmt
+        .query_map([agent], AgentMove::from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut moving = None;
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
+    let mut diagnostics = Vec::new();
+    for row in rows {
+        let notices = row.notices();
+        if !row.step.is_terminal() {
+            let mut value = serde_json::json!({"cut_id":row.cut_id,"side":row.side,"step":row.step,"peer":row.peer,"peer_name":crate::claim_cache::holder_name(conn, Some(&row.peer))?});
+            if let Some(hold) = &row.hold {
+                value["hold"] = hold.clone();
+            }
+            value.as_object_mut().unwrap().extend(
+                notices
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .filter(|(key, _)| key.as_str() != "warnings")
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+            moving = Some(value);
+        }
+        for code in row.error_codes() {
+            errors.push(serde_json::json!({"cut_id":row.cut_id,"code":code}));
+        }
+        if let Some(items) = notices["warnings"].as_array() {
+            for item in items {
+                let mut item = item.clone();
+                item["cut_id"] = serde_json::json!(row.cut_id);
+                warnings.push(item);
+            }
+        }
+        if let Some(items) = notices["diagnostics"].as_array() {
+            for item in items {
+                let mut item = item.clone();
+                item["cut_id"] = serde_json::json!(row.cut_id);
+                diagnostics.push(item);
+            }
+        }
+    }
+    Ok((moving, errors, warnings, diagnostics))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MoveSetting {
     pub lid_close_moves: bool,
@@ -497,7 +680,14 @@ impl RegistryStore {
                         Some(move_detail(&row)),
                     )));
                 }
-                row.abort_requested = Some(serde_json::json!({"reason":"operator","detail":null}));
+                if row.abort_stuck() {
+                    row.abort_requested.as_mut().unwrap()["retry_pending"] = Value::Bool(true);
+                } else if row.abort_requested.is_some() {
+                    return Ok(Ok(row));
+                } else {
+                    row.abort_requested =
+                        Some(serde_json::json!({"reason":"operator","detail":null}));
+                }
                 row.updated_at_ms = now_ms;
                 row.write(tx, false)?;
                 Ok(Ok(row))
@@ -581,6 +771,72 @@ impl RegistryStore {
                     AgentMove::from_row,
                 )
                 .optional()
+            })
+            .map_err(RegistryError::Store)
+    }
+
+    /// Consume only this cut's explicit retry. Persisting the flag lets a
+    /// stopped driver honor the request after its next start.
+    pub fn consume_move_abort_retry(&self, cut_id: &str) -> Result<bool, RegistryError> {
+        self.db
+            .with_conn_fenced(|tx| {
+                let mut row = load_move(tx, cut_id)?;
+                if row
+                    .abort_requested
+                    .as_ref()
+                    .is_some_and(|v| v["retry_pending"] == true)
+                {
+                    row.abort_requested
+                        .as_mut()
+                        .unwrap()
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("retry_pending");
+                    row.write(tx, false)?;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            })
+            .map_err(RegistryError::Store)
+    }
+
+    pub fn move_status_view(&self, cut_id: &str) -> Result<Option<Value>, RegistryError> {
+        self.db
+            .with_conn_fenced(|conn| {
+                conn.query_row(
+                    &format!("SELECT {MOVE_COLUMNS} FROM agent_move WHERE cut_id=?1"),
+                    [cut_id],
+                    AgentMove::from_row,
+                )
+                .optional()?
+                .map(|row| public_move(conn, &row))
+                .transpose()
+            })
+            .map_err(RegistryError::Store)
+    }
+
+    pub fn moves_view(&self) -> Result<Vec<Value>, RegistryError> {
+        self.db
+            .with_conn_fenced(|conn| {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {MOVE_COLUMNS} FROM agent_move
+                WHERE step NOT IN ('released','aborted','done','taken_over')
+                ORDER BY created_at_ms, cut_id"
+                ))?;
+                let mut rows = stmt
+                    .query_map([], AgentMove::from_row)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {MOVE_COLUMNS} FROM agent_move
+                WHERE step IN ('released','aborted','done','taken_over')
+                ORDER BY updated_at_ms DESC, cut_id DESC LIMIT 32"
+                ))?;
+                rows.extend(
+                    stmt.query_map([], AgentMove::from_row)?
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+                rows.iter().map(|row| public_move(conn, row)).collect()
             })
             .map_err(RegistryError::Store)
     }
@@ -847,6 +1103,187 @@ mod tests {
                 assert_eq!(f.store.agent_move("cut").unwrap().unwrap(), row);
             }
         }
+    }
+
+    fn view_row() -> AgentMove {
+        let mut row = checkpoint("cut", MoveSide::Receiver);
+        row.agent_id = "agent_00000001".into();
+        row.abort_requested = None;
+        row.cut_accept = None;
+        row.reason = None;
+        row.detail = None;
+        row
+    }
+
+    fn view_agent(f: &Fixture) {
+        f.store.db.with_conn_fenced(|tx| {
+            tx.execute("INSERT INTO agent(agent_id,name,tag,role,created_at_ms,updated_at_ms) VALUES('agent_00000001','Ada','test','assistant',1,1)", [])?;
+            tx.execute("INSERT INTO member_name(author,display_name) VALUES('peer-author','Studio Mac')", [])?;
+            Ok(())
+        }).unwrap();
+    }
+
+    #[test]
+    fn move_views_pin_where_hold_moves_and_cut_accept_failure_literals() {
+        let f = Fixture::new();
+        view_agent(&f);
+        let row = view_row();
+        f.store.insert_agent_move(&row).unwrap();
+        assert_eq!(
+            serde_json::to_string(&f.store.agent_where("agent_00000001").unwrap()).unwrap(),
+            r#"{"known":false,"status":"unclaimed","holder":null,"holder_name":null,"epoch":0,"cut_id":null,"read_at_ms":null,"stale":true,"moving":{"cut_id":"cut","hold":{"code":"external_not_present","note":"外部","ref":"r"},"peer":"peer-author","peer_name":"Studio Mac","side":"receiver","step":"picked_up"}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&json!({"moves":f.store.moves_view().unwrap()})).unwrap(),
+            r#"{"moves":[{"abort_requested":null,"activated_at_ms":99,"agent_id":"agent_00000001","attempts":7,"created_at_ms":1,"cut_accept":null,"cut_id":"cut","detail":null,"hold":{"code":"external_not_present","note":"外部","ref":"r"},"peer":"peer-author","peer_name":"Studio Mac","reason":null,"record_version":3,"request_key":"key-cut","seal_sent":true,"side":"receiver","step":"picked_up","updated_at_ms":2}]}"#
+        );
+        let mut row = row;
+        row.step = MoveStep::Done;
+        row.hold = None;
+        row.cut_accept = Some(json!({"state":"refused","code":"cut_not_published"}));
+        f.store.update_agent_move(&row).unwrap();
+        assert_eq!(
+            serde_json::to_string(&f.store.move_status_view("cut").unwrap().unwrap()).unwrap(),
+            r#"{"abort_requested":null,"activated_at_ms":99,"agent_id":"agent_00000001","attempts":7,"created_at_ms":1,"cut_accept":{"code":"cut_not_published","state":"refused"},"cut_id":"cut","detail":null,"hold":null,"peer":"peer-author","peer_name":"Studio Mac","reason":null,"record_version":3,"request_key":"key-cut","seal_sent":true,"side":"receiver","step":"done","updated_at_ms":2}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&f.store.agent_where("agent_00000001").unwrap()).unwrap(),
+            r#"{"known":false,"status":"unclaimed","holder":null,"holder_name":null,"epoch":0,"cut_id":null,"read_at_ms":null,"stale":true,"moveErrors":[{"code":"cut_not_published","cut_id":"cut"}]}"#
+        );
+        assert_eq!(
+            f.store.moves_view().unwrap()[0],
+            f.store.move_status_view("cut").unwrap().unwrap()
+        );
+        assert!(f.store.move_status_view("missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn moves_view_orders_open_first_and_limits_finished_to_latest_32() {
+        let f = Fixture::new();
+        for n in 0..36 {
+            let mut row = view_row();
+            row.cut_id = format!("cut-{n:02}");
+            row.request_key = Some(format!("key-{n}"));
+            row.step = MoveStep::Done;
+            row.updated_at_ms = n;
+            f.store.insert_agent_move(&row).unwrap();
+        }
+        let mut row = view_row();
+        row.cut_id = "open".into();
+        row.request_key = None;
+        f.store.insert_agent_move(&row).unwrap();
+        let rows = f.store.moves_view().unwrap();
+        assert_eq!(rows.len(), 33);
+        assert_eq!(rows[0]["cut_id"], "open");
+        assert_eq!(rows[1]["cut_id"], "cut-35");
+        assert_eq!(rows[32]["cut_id"], "cut-04");
+        for key in [
+            "plan",
+            "request_body",
+            "claim_version",
+            "claim_take_body",
+            "claim_take_version",
+            "claim_landed_version",
+        ] {
+            assert!(rows.iter().all(|row| row.get(key).is_none()), "{key}");
+        }
+    }
+
+    #[test]
+    fn move_views_explain_forks_stuck_aborts_contract_violations_and_release_warnings() {
+        let f = Fixture::new();
+        view_agent(&f);
+        let mut row = view_row();
+        row.side = MoveSide::Source;
+        row.step = MoveStep::Released;
+        row.hold = None;
+        row.plan["_source"] = json!({"enforced":{"data":false,"other":true}});
+        f.store.insert_agent_move(&row).unwrap();
+        let status = f.store.move_status_view("cut").unwrap().unwrap();
+        assert_eq!(status["warnings"][0]["module_id"], "data");
+        assert_eq!(
+            status["warnings"][0]["message"],
+            "The old Mac cannot block writes for data; anything typed there becomes a fork"
+        );
+        let where_ = serde_json::to_value(f.store.agent_where("agent_00000001").unwrap()).unwrap();
+        assert!(where_.get("moveErrors").is_none());
+        assert_eq!(where_["moveWarnings"][0]["code"], "release_not_enforced");
+        assert_eq!(where_["moveWarnings"][0]["cut_id"], "cut");
+        for marker in ["activation_fork", "contract_violation"] {
+            row.side = MoveSide::Receiver;
+            row.step = MoveStep::Activating;
+            row.plan = json!({"_receiver":{marker:{"module_id":"data","code":"digest_mismatch","reason":"staging_digest_mismatch"}}});
+            f.store.update_agent_move(&row).unwrap();
+            let status = f.store.move_status_view("cut").unwrap().unwrap();
+            assert_eq!(status["status"], "held_as_fork");
+            assert_eq!(status["message"], "held as a fork, awaiting the operator");
+            assert_eq!(status["diagnostic"]["module_id"], "data");
+            assert_eq!(status["diagnostic"]["reason"], "staging_digest_mismatch");
+            assert_eq!(
+                serde_json::to_value(f.store.agent_where("agent_00000001").unwrap()).unwrap()
+                    ["moving"]["status"],
+                "held_as_fork"
+            );
+        }
+        row.side = MoveSide::Source;
+        row.step = MoveStep::Preparing;
+        row.abort_requested = Some(json!({"reason":"operator","detail":null}));
+        row.hold = Some(
+            json!({"state":"stuck","op":"agent_data.abort","module_id":"data","code":"digest_mismatch","reason":"undo_digest_mismatch","move_error":true}),
+        );
+        f.store.update_agent_move(&row).unwrap();
+        let status = f.store.move_status_view("cut").unwrap().unwrap();
+        assert_eq!(status["status"], "abort_stuck");
+        assert_eq!(
+            status["message"],
+            "abort stuck, agent frozen on this Mac until data is repaired"
+        );
+        assert_eq!(
+            serde_json::to_value(f.store.agent_where("agent_00000001").unwrap()).unwrap()["moving"]
+                ["message"],
+            status["message"]
+        );
+        row.hold = None;
+        row.plan = json!({"_source":{"contract_violation":{"module_id":"data","code":"unexpected_refusal"},"errors":[{"module_id":"data","code":"unexpected_refusal"}]}});
+        f.store.update_agent_move(&row).unwrap();
+        let status = f.store.move_status_view("cut").unwrap().unwrap();
+        assert_eq!(
+            status["diagnostic"],
+            json!({"module_id":"data","code":"unexpected_refusal"})
+        );
+        assert_eq!(
+            status["diagnostics"][0],
+            json!({"module_id":"data","code":"unexpected_refusal"})
+        );
+        assert_eq!(
+            serde_json::to_value(f.store.agent_where("agent_00000001").unwrap()).unwrap()
+                ["moveDiagnostics"][0],
+            json!({"cut_id":"cut","module_id":"data","code":"unexpected_refusal"})
+        );
+        assert_eq!(row.error_codes(), vec!["unexpected_refusal"]);
+    }
+
+    #[test]
+    fn abort_retry_is_durable_cut_scoped_and_consumed_once() {
+        let f = Fixture::new();
+        for cut in ["a", "b"] {
+            let mut row = view_row();
+            row.cut_id = cut.into();
+            row.agent_id = cut.into();
+            row.request_key = None;
+            row.abort_requested = Some(json!({"reason":"operator","detail":null}));
+            row.hold =
+                Some(json!({"state":"stuck","op":"agent_data.abort","code":"digest_mismatch"}));
+            f.store.insert_agent_move(&row).unwrap();
+        }
+        let before_b = f.store.agent_move("b").unwrap().unwrap();
+        f.store.request_agent_move_abort("a", 99).unwrap();
+        drop(f.store);
+        let reopened = RegistryStore::open(&f.descriptor).unwrap();
+        assert!(!reopened.consume_move_abort_retry("b").unwrap());
+        assert!(reopened.consume_move_abort_retry("a").unwrap());
+        assert!(!reopened.consume_move_abort_retry("a").unwrap());
+        assert_eq!(reopened.agent_move("b").unwrap().unwrap(), before_b);
     }
 
     #[test]

@@ -234,6 +234,7 @@ pub fn parse(face: Face, arguments: &[String]) -> Invocation {
             },
             "--json" => json = true,
             "--role" | "--tag" | "--project" | "--workspace" | "--supervisor" | "--request-key"
+            | "--to"
                 if face == Face::Agents =>
             {
                 let Some(value) = rest.next().filter(|value| !value.is_empty()) else {
@@ -388,6 +389,10 @@ usage: ck agents <verb> [args] [--subc <connection file>] [--json]
   show <agent>               a live digest or a retired/merged identity
   repair-workspaces [--yes]   preview the correction; --yes asks for confirmation
   where <agent> [--refresh]  cached checkout claim; optionally refresh first
+  move <agent> --to <mac>    move an idle agent to another named Mac
+  moves                     open moves and the last 32 finished moves
+  move-abort <cut_id>        request cleanup before the irreversible boundary
+  lid-close-moves on|off     allow or deny engram's lid-close moves
 
   <agent> is an id or a live name, optionally workspace/name
   --request-key <key>        reuse a write's key for a safe retry
@@ -740,6 +745,9 @@ fn agent_write(method: &str) -> bool {
             | "agent.update_tag"
             | "agent.set_labels"
             | "agent.repair_workspaces"
+            | "agent.move"
+            | "agent.move_abort"
+            | "agent.set_lid_close_moves"
     )
 }
 
@@ -754,6 +762,10 @@ fn build_agents(command: &Command) -> Result<(String, Value), String> {
         "list" => "agent.list",
         "show" => "agent.resolve",
         "where" => "agent.where",
+        "move" => "agent.move",
+        "moves" => "agent.moves",
+        "move-abort" => "agent.move_abort",
+        "lid-close-moves" => "agent.set_lid_close_moves",
         other => return Err(format!("unknown verb '{other}'\n\n{}", usage(Face::Agents))),
     };
     let mut flags = std::collections::BTreeMap::new();
@@ -771,6 +783,7 @@ fn build_agents(command: &Command) -> Result<(String, Value), String> {
             "--none" => command.verb == "labels",
             "--yes" => command.verb == "repair-workspaces",
             "--refresh" => command.verb == "where",
+            "--to" => command.verb == "move",
             _ => false,
         };
         if !allowed {
@@ -789,7 +802,7 @@ fn build_agents(command: &Command) -> Result<(String, Value), String> {
         }
     }
     let count_ok = match command.verb.as_str() {
-        "list" | "repair-workspaces" => positional.is_empty(),
+        "list" | "moves" | "repair-workspaces" => positional.is_empty(),
         "rename" | "tag" => positional.len() == 2,
         "labels" if flags.contains_key("--none") => positional.len() == 1,
         "labels" => positional.len() >= 2,
@@ -826,7 +839,15 @@ fn build_agents(command: &Command) -> Result<(String, Value), String> {
             params["role"] = json!(role.replace('-', "_"));
             params["tag"] = json!(tag);
         }
-        "list" => (),
+        "list" | "moves" => (),
+        "move-abort" => params["cut_id"] = json!(positional[0]),
+        "lid-close-moves" => {
+            params["enabled"] = json!(match positional[0].as_str() {
+                "on" => true,
+                "off" => false,
+                _ => return Err("lid-close-moves requires on or off".into()),
+            });
+        }
         "repair-workspaces" => {
             if !flags.contains_key("--yes") {
                 if flags.contains_key("--request-key") {
@@ -841,6 +862,7 @@ fn build_agents(command: &Command) -> Result<(String, Value), String> {
                 "rename" => params["name"] = json!(positional[1]),
                 "tag" => params["tag"] = json!(positional[1]),
                 "labels" => params["labels"] = json!(&positional[1..]),
+                "move" => params["to"] = json!(flags.get("--to").ok_or("move requires --to")?),
                 _ => (),
             }
         }
@@ -856,7 +878,12 @@ fn build_agents(command: &Command) -> Result<(String, Value), String> {
             }
         };
         params["request_key"] = json!(key);
-        params["actor"] = json!("ck-agents");
+        if !matches!(
+            method,
+            "agent.move" | "agent.move_abort" | "agent.set_lid_close_moves"
+        ) {
+            params["actor"] = json!("ck-agents");
+        }
     }
     Ok((method.into(), params))
 }
@@ -1104,11 +1131,23 @@ fn retry_args(command: &Command, params: &Value) -> Vec<String> {
         }
     } else if command.verb == "repair-workspaces" {
         args.push("--yes".into());
+    } else if command.verb == "move-abort" {
+        args.push(text(&params["cut_id"]));
+    } else if command.verb == "lid-close-moves" {
+        args.push(
+            if params["enabled"] == true {
+                "on"
+            } else {
+                "off"
+            }
+            .into(),
+        );
     } else {
         args.push(text(&params["agent_id"]));
         match command.verb.as_str() {
             "rename" => args.push(text(&params["name"])),
             "tag" => args.push(text(&params["tag"])),
+            "move" => args.extend(["--to".into(), text(&params["to"])]),
             "labels" => {
                 let labels = params["labels"].as_array().expect("built label array");
                 if labels.is_empty() {
@@ -1152,6 +1191,9 @@ async fn execute_agents(
         let result = async {
             if method == "agent.list" {
                 return list_agents(caller, params).await;
+            }
+            if method == "agent.moves" {
+                return agent_read(caller, method, params).await;
             }
             if method == "agent.where" {
                 let token = params["agent_id"].as_str().expect("built where target");
@@ -2633,6 +2675,66 @@ mod agent_tests {
         }
     }
 
+    #[test]
+    fn move_verbs_build_wire_shapes_and_retries() {
+        for (args, method, expected) in [
+            (
+                vec!["move", ID, "--to", "Studio Mac"],
+                "agent.move",
+                json!({"agent_id":ID,"to":"Studio Mac"}),
+            ),
+            (
+                vec!["move-abort", "cut-1"],
+                "agent.move_abort",
+                json!({"cut_id":"cut-1"}),
+            ),
+            (
+                vec!["lid-close-moves", "on"],
+                "agent.set_lid_close_moves",
+                json!({"enabled":true}),
+            ),
+            (
+                vec!["lid-close-moves", "off"],
+                "agent.set_lid_close_moves",
+                json!({"enabled":false}),
+            ),
+        ] {
+            let cmd = command(&args);
+            let (actual, mut params) = build(&cmd).unwrap();
+            assert_eq!(actual, method);
+            assert!(params.get("actor").is_none());
+            assert_eq!(params["request_key"].as_str().unwrap().len(), 32);
+            let retry = command(
+                &retry_args(&cmd, &params)
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+            );
+            assert_eq!(build(&retry).unwrap(), (actual, params.clone()));
+            params.as_object_mut().unwrap().remove("request_key");
+            assert_eq!(params, expected);
+        }
+        assert_eq!(
+            build(&command(&["moves"])).unwrap(),
+            ("agent.moves".into(), json!({}))
+        );
+        for args in [
+            vec!["move", ID],
+            vec!["move", ID, "--to", "Mac", "--to", "Mac"],
+            vec!["moves", ID],
+            vec!["moves", "--request-key", "k"],
+            vec!["move-abort"],
+            vec!["lid-close-moves", "yes"],
+            vec!["retire", ID, "--to", "Mac"],
+        ] {
+            assert!(build(&command(&args)).is_err(), "{args:?}");
+        }
+        assert!(matches!(
+            parse(Face::Agents, &["move".into(), ID.into(), "--to".into()]),
+            Invocation::Refuse(_)
+        ));
+    }
+
     type ObservedCall = (String, Value, Duration);
     struct Script {
         calls: Mutex<Vec<ObservedCall>>,
@@ -2666,6 +2768,42 @@ mod agent_tests {
                 .unwrap()
                 .pop_front()
                 .expect("unexpected extra RPC")
+        }
+    }
+
+    #[tokio::test]
+    async fn move_cli_resolves_only_agent_targets_and_uses_write_timeout() {
+        let script = Script::new(vec![
+            Ok(json!({"agent_id":ID})),
+            Ok(json!({"cut_id":"cut-1","step":"preparing"})),
+        ]);
+        execute(&script, &["move", "Ada", "--to", "Studio Mac"])
+            .await
+            .unwrap();
+        let calls = script.calls();
+        assert_eq!(calls[0].0, "agent.resolve_name");
+        assert_eq!(calls[1].0, "agent.move");
+        assert_eq!(calls[1].1["agent_id"], ID);
+        assert_eq!(calls[1].1["to"], "Studio Mac");
+        assert_eq!(calls[1].2, Duration::from_secs(300));
+        for (args, method) in [
+            (vec!["moves"], "agent.moves"),
+            (vec!["move-abort", "cut-1"], "agent.move_abort"),
+            (vec!["lid-close-moves", "on"], "agent.set_lid_close_moves"),
+        ] {
+            let script = Script::new(vec![Ok(json!({}))]);
+            execute(&script, &args).await.unwrap();
+            let calls = script.calls();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].0, method);
+            assert_eq!(
+                calls[0].2,
+                if agent_write(method) {
+                    Duration::from_secs(300)
+                } else {
+                    subc_client_rs::CallOptions::default().timeout
+                }
+            );
         }
     }
 

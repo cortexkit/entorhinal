@@ -1546,6 +1546,8 @@ mod tests {
             "agent.session_for_ref",
             "agent.session_liveness",
             "agent.where",
+            "agent.move_status",
+            "agent.moves",
             "role.read",
         ];
         let expected_mutations = [
@@ -1581,6 +1583,8 @@ mod tests {
             "agent.register_session",
             "agent.refresh_claims",
             "agent.move",
+            "agent.move_abort",
+            "agent.set_lid_close_moves",
             "member.set_name",
             "role.take",
         ];

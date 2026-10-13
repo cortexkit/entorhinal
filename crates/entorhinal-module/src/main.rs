@@ -78,6 +78,7 @@ mod incarnation;
 mod member;
 mod move_admission;
 mod move_driver;
+mod move_ops;
 mod move_receiver;
 mod move_source;
 // The client for engram's identity log. Only writes to shared state and
@@ -541,6 +542,8 @@ const MUTATING_METHODS: &[&str] = &[
     "member.set_name",
     "role.take",
     "agent.move",
+    "agent.move_abort",
+    "agent.set_lid_close_moves",
 ];
 
 /// Mutations that `authorize_write` passes through because each is admitted
@@ -556,6 +559,8 @@ const SELF_ADMITTED_METHODS: &[&str] = &[
     member::SET_NAME,
     roles::TAKE,
     move_admission::MOVE,
+    move_ops::ABORT,
+    move_ops::SET_LID,
 ];
 
 /// Admit project/workspace mutations from the operator (`Direct`: the `ck`
@@ -1095,6 +1100,11 @@ impl ProjectsHandler {
                 self.move_wake.notify_one();
             }
             result
+        } else if request.method == move_ops::ABORT {
+            self.abort_move(request.params, key, received).await
+        } else if request.method == move_ops::SET_LID {
+            self.set_lid_close_moves(request.params, key, received)
+                .await
         } else {
             self.write_wait(request, key, received).await
         };
@@ -1210,10 +1220,12 @@ impl ProjectsHandler {
                 "served_path_required",
                 "claim refresh requires the asynchronous served path",
             )),
-            move_admission::MOVE => Err(HandlerError::new(
+            move_admission::MOVE | move_ops::ABORT | move_ops::SET_LID => Err(HandlerError::new(
                 "served_path_required",
-                "agent.move requires the asynchronous served path",
+                "move writes require the asynchronous served path",
             )),
+            move_ops::STATUS => self.move_status(request.params),
+            move_ops::MOVES => self.moves(request.params),
             method if agent_ops::MUTATING_METHODS.contains(&method) => {
                 self.agent_mutation(method, request.params, &principal)
             }
@@ -1965,6 +1977,10 @@ fn manifest() -> ModuleManifest {
                 management_operation(method, ManagementOperationKind::Mutate, "Take a role from Direct with operator confirmation and an idempotent request id.")
             })).chain(std::iter::once(move_admission::MOVE).map(|method| {
                 management_operation(method, ManagementOperationKind::Mutate, agent_operation_description(method))
+            })).chain(move_ops::READS.iter().map(|method| {
+                management_operation(method, ManagementOperationKind::Query, agent_operation_description(method))
+            })).chain(move_ops::WRITES.iter().map(|method| {
+                management_operation(method, ManagementOperationKind::Mutate, agent_operation_description(method))
             })).collect(),
             config_schema: json!({"type": "object"}),
             observability: Vec::new(),
@@ -2075,6 +2091,10 @@ fn agent_operation_description(method: &str) -> &'static str {
         "agent.where" => "Answer an agent's cached claim, including whether it is known and which device holds it.",
         "agent.refresh_claims" => "Refresh live agents' claim records from engram without waiting for the shared-log writer.",
         "agent.move" => "Admit an idle agent move to a named member, with Direct confirmation, an orchestrator relay or enabled lid-close moves.",
+        "agent.move_status" => "Read a local move checkpoint, holds, warnings and diagnostics without calling a participant or engram.",
+        "agent.moves" => "Read open local moves followed by the last 32 finished moves, including warnings and diagnostics.",
+        "agent.move_abort" => "Request move cleanup before the irreversible boundary; Direct confirms, or the orchestrator relays. Only Direct can retry a stuck abort.",
+        "agent.set_lid_close_moves" => "Enable or disable engram's lid-close moves on this Mac, from Direct with operator confirmation.",
         "member.set_name" => "Set this identity-log member's display name (Direct only).",
         _ => "",
     }
@@ -2320,6 +2340,8 @@ mod tests {
                 "member.set_name",
                 "role.take",
                 "agent.move",
+                "agent.move_abort",
+                "agent.set_lid_close_moves",
             ]
         );
         for method in SELF_ADMITTED_METHODS {
@@ -4057,10 +4079,18 @@ mod tests {
             ("resolve_root_key", "query"),
             ("preview_attach_root", "query"),
             ("identity_log.status", "query"),
+            ("agent.move", "mutate"),
+            ("agent.move_status", "query"),
+            ("agent.moves", "query"),
+            ("agent.move_abort", "mutate"),
+            ("agent.set_lid_close_moves", "mutate"),
         ] {
             let matches: Vec<_> = operations.iter().filter(|op| op["name"] == name).collect();
             assert_eq!(matches.len(), 1, "{name} must be declared exactly once");
             assert_eq!(matches[0]["kind"], kind, "{name}");
+            if name.starts_with("agent.") {
+                assert!(!agent_operation_description(name).is_empty(), "{name}");
+            }
         }
         assert!(subc_protocol::manifest::is_valid_capability_identifier(
             PROJECT_IDENTITY_CAPABILITY

@@ -160,6 +160,12 @@ impl Worker {
             .ok_or_else(|| HandlerError::new("invalid_state", "move row is gone"))
     }
 
+    pub(crate) async fn consume_abort_retry(&self, cut: &str) -> Result<bool, HandlerError> {
+        let cut = cut.to_owned();
+        self.sql(move |store| store.consume_move_abort_retry(&cut))
+            .await
+    }
+
     /// Serialize checkpoints with local operator edits in the fenced writer,
     /// without waiting for journal catch-up's shared writer lock.
     pub(crate) async fn save(

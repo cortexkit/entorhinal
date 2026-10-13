@@ -313,7 +313,6 @@ impl Receiver {
     /// Resume participant aborts after an operator repairs corrupted undo bytes.
     /// A digest refusal pauses cleanup for this driver instance; restarting
     /// retries once, then pauses again if the participant still refuses.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn retry_held_abort(&mut self) {
         self.abort_held = false;
     }
@@ -323,6 +322,14 @@ impl Receiver {
             tokio::select! { _ = tokio::time::sleep(delay) => {}, _ = self.worker.wake.notified() => {} }
             if self.worker.store.upgrade().is_none() {
                 return;
+            }
+            if self
+                .worker
+                .consume_abort_retry(&self.cut)
+                .await
+                .unwrap_or(false)
+            {
+                self.retry_held_abort();
             }
             match self.tick().await {
                 Ok(Some(next)) => delay = next,

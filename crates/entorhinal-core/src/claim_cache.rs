@@ -4,6 +4,7 @@
 use crate::{agent, RegistryError, RegistryStore};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Serialize;
+use serde_json::Value;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CachedClaim {
@@ -45,6 +46,14 @@ pub struct AgentWhere {
     pub cut_id: Option<String>,
     pub read_at_ms: Option<i64>,
     pub stale: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moving: Option<Value>,
+    #[serde(rename = "moveErrors", skip_serializing_if = "Vec::is_empty")]
+    pub move_errors: Vec<Value>,
+    #[serde(rename = "moveWarnings", skip_serializing_if = "Vec::is_empty")]
+    pub move_warnings: Vec<Value>,
+    #[serde(rename = "moveDiagnostics", skip_serializing_if = "Vec::is_empty")]
+    pub move_diagnostics: Vec<Value>,
 }
 
 pub(crate) fn load_claim(conn: &Connection, id: &str) -> rusqlite::Result<Option<CachedClaim>> {
@@ -281,6 +290,8 @@ impl RegistryStore {
                 } else {
                     "held_elsewhere"
                 };
+                let (moving, move_errors, move_warnings, move_diagnostics) =
+                    crate::move_store::where_moves(conn, id)?;
                 Ok(AgentWhere {
                     known,
                     status,
@@ -294,6 +305,10 @@ impl RegistryStore {
                     cut_id: claim.cut_id,
                     read_at_ms,
                     stale: claim.stale,
+                    moving,
+                    move_errors,
+                    move_warnings,
+                    move_diagnostics,
                 })
             })();
             Ok(result)
