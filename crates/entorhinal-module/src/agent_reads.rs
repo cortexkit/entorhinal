@@ -1557,6 +1557,7 @@ mod tests {
             "rebuild",
             "projects.session_liveness",
             "add_root",
+            "rebind_root",
             "attach_root",
             "identity_log.enable",
             "remove_root",

@@ -493,6 +493,7 @@ const MUTATING_METHODS: &[&str] = &[
     "rebuild",
     "projects.session_liveness",
     "add_root",
+    "rebind_root",
     "attach_root",
     "identity_log.enable",
     "remove_root",
@@ -1115,6 +1116,7 @@ impl ProjectsHandler {
                     .expect("liveness admission requires a principal"),
             ),
             "add_root" => self.add_root(request.params, &principal),
+            "rebind_root" => self.rebind_root(request.params, &principal),
             "attach_root" => self.attach_root(request.params, &principal),
             "remove_root" => self.remove_root(request.params, &principal),
             "attach_derived_parent" => self.attach_derived_parent(request.params, &principal),
@@ -1497,6 +1499,15 @@ impl ProjectsHandler {
         })?;
         Ok(reply)
     }
+    fn rebind_root(&self, params: Value, principal: &str) -> Result<Vec<u8>, HandlerError> {
+        let params = serde_json::from_value::<RebindRootParams>(params).map_err(invalid_params)?;
+        self.record_mutation(self.with_store(|store| {
+            store
+                .with_principal(principal)
+                .rebind_root(&params.root, "entorhinal")
+        }))
+    }
+
     fn remove_root(&self, params: Value, principal: &str) -> Result<Vec<u8>, HandlerError> {
         let req = serde_json::from_value::<entorhinal_core::RemoveRootRequest>(params)
             .map_err(invalid_params)?;
@@ -1674,6 +1685,11 @@ struct RootApprovalParams {
     actor: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct RebindRootParams {
+    root: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct ResolveProjectIdParams {
     #[serde(rename = "projectId", alias = "project_id")]
@@ -1807,6 +1823,11 @@ fn manifest() -> ModuleManifest {
                     "add_root",
                     ManagementOperationKind::Mutate,
                     "Add a root to a registered project; it starts unapproved.",
+                ),
+                management_operation(
+                    "rebind_root",
+                    ManagementOperationKind::Mutate,
+                    "Rebind a replaced or unbound registered checkout, keeping its project id without approving it.",
                 ),
                 management_operation(
                     "attach_root",
@@ -3127,6 +3148,162 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn rebind_wire_repairs_checkout_and_approve_then_succeeds() {
+        for principal in [Principal::Direct, reserved(WRITER_MODULE)] {
+            let (dir, handler, root) = ownership_handler("rebind-wire");
+            let key = (73, 1);
+            handler.route_admissions().insert(
+                key,
+                RouteAdmission::from_bind(Some(principal.clone()), None),
+            );
+            handler
+                .with_store(|s| s.bind_root(&root, "entorhinal"))
+                .unwrap();
+            execute_on(
+                &handler,
+                key,
+                "approve_project",
+                json!({"canonicalRoot":root}),
+            );
+            let before = handler.with_store(|s| s.trust(&root)).unwrap();
+            let old_epoch = before.root_fields.unwrap().root_records[0]
+                .registration_epoch
+                .clone();
+            std::fs::remove_dir_all(Path::new(&root).join(".git")).unwrap();
+            let init = std::process::Command::new("git")
+                .args(["-C", &root, "init", "-q"])
+                .output()
+                .unwrap();
+            assert!(
+                init.status.success(),
+                "{}",
+                String::from_utf8_lossy(&init.stderr)
+            );
+            let head = handler.with_store(RegistryStore::generation).unwrap();
+            let replaced = handler.with_store(|s| s.trust(&root)).unwrap();
+            assert_eq!(
+                replaced.root_fields.unwrap().root_records[0].identity,
+                "replaced"
+            );
+            let bytes = handler
+                .write_wait(
+                    WireRequest {
+                        method: "rebind_root".into(),
+                        params: json!({"root":format!("{root}/.")}),
+                    },
+                    key,
+                    tokio::time::Instant::now(),
+                )
+                .await
+                .unwrap();
+            let reply: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(reply["result"]["projectId"], "p");
+            assert_eq!(reply["result"]["canonicalRoot"], root);
+            assert_eq!(reply["result"]["oldIdentity"], "replaced");
+            assert_eq!(reply["result"]["identity"], "bound");
+            assert_eq!(reply["result"]["approval"]["state"], "unapproved");
+            assert_eq!(reply["result"]["noop"], false);
+            assert_ne!(reply["result"]["registrationEpoch"], json!(old_epoch));
+            let rows = handler
+                .with_store(|s| s.journal_tail(head, 10))
+                .unwrap()
+                .entries;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].op, "bind_root");
+            assert_eq!(rows[0].actor, "entorhinal");
+            assert_eq!(
+                rows[0].principal.as_deref(),
+                Some(principal_label(Some(&principal)).as_str())
+            );
+            let noop: Value = serde_json::from_slice(&execute_on(
+                &handler,
+                key,
+                "rebind_root",
+                json!({"root":root}),
+            ))
+            .unwrap();
+            assert_eq!(noop["result"]["noop"], true);
+            assert!(handler
+                .with_store(|s| s.journal_tail(rows[0].seq, 10))
+                .unwrap()
+                .entries
+                .is_empty());
+            execute_on(
+                &handler,
+                key,
+                "approve_project",
+                json!({"canonicalRoot":root}),
+            );
+            let approved = handler.with_store(|s| s.trust(&root)).unwrap();
+            assert_eq!(
+                approved.root_fields.unwrap().root_records[0].approval.state,
+                "approved"
+            );
+            assert!(handler.with_store(RegistryStore::verify).unwrap().ok);
+            assert!(
+                handler
+                    .with_store(RegistryStore::rebuild)
+                    .unwrap()
+                    .replay
+                    .ok
+            );
+            assert!(handler.with_store(RegistryStore::verify).unwrap().ok);
+            drop(handler);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn rebind_wire_refuses_flow_and_unadmitted_principal_without_binding() {
+        let (dir, handler, root) = ownership_handler("rebind-admission");
+        let head = handler.with_store(RegistryStore::generation).unwrap();
+        for (index, principal, flow, expected) in [
+            (
+                1,
+                Some(Principal::Direct),
+                Some("flow"),
+                "flow_scope_not_admitted",
+            ),
+            (
+                2,
+                Some(reserved(WRITER_MODULE)),
+                Some("flow"),
+                "flow_scope_not_admitted",
+            ),
+            (
+                3,
+                Some(reserved("other-module")),
+                None,
+                "write_not_permitted",
+            ),
+            (4, None, None, "write_not_permitted"),
+        ] {
+            let key = (73, index);
+            let mut admission = RouteAdmission::from_bind(principal, None);
+            admission.flow_id = flow.map(str::to_owned);
+            handler.route_admissions().insert(key, admission);
+            let error = handler
+                .write_wait(
+                    WireRequest {
+                        method: "rebind_root".into(),
+                        params: json!({"root":root}),
+                    },
+                    key,
+                    tokio::time::Instant::now(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, expected);
+        }
+        assert_eq!(handler.with_store(RegistryStore::generation).unwrap(), head);
+        assert!(!Path::new(&root)
+            .join(".git/cortexkit-root-incarnation")
+            .exists());
+        drop(handler);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn startup_binding_uses_entorhinal_and_later_request_binding_uses_direct() {
         let (dir, descriptor) = scratch_descriptor("startup-principal");
@@ -3786,6 +3963,7 @@ mod tests {
         assert_eq!(value["capabilities"]["requires"], json!([]));
         for (name, kind) in [
             ("attach_root", "mutate"),
+            ("rebind_root", "mutate"),
             ("identity_log.enable", "mutate"),
             ("resolve_root_key", "query"),
             ("preview_attach_root", "query"),

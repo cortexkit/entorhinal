@@ -31,6 +31,23 @@ fn manifest_flag_prints_the_manifest_with_the_provided_capability() {
         manifest["capabilities"]["provides"],
         serde_json::json!(["project-identity/v1", "agent-identity/v1"])
     );
+    let operations = manifest["provides"][0]["operations"].as_array().unwrap();
+    let rebind: Vec<_> = operations
+        .iter()
+        .filter(|op| op["name"] == "rebind_root")
+        .collect();
+    assert_eq!(rebind.len(), 1);
+    assert_eq!(rebind[0]["kind"], "mutate");
+    let mut descriptions = std::collections::BTreeSet::new();
+    for operation in operations {
+        let description = operation["description"].as_str().unwrap();
+        assert!(!description.is_empty(), "{}", operation["name"]);
+        assert!(
+            descriptions.insert(description),
+            "{} repeats a description",
+            operation["name"]
+        );
+    }
 }
 
 /// The daemon can only show which source and wire version entorhinal runs, and

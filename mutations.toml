@@ -1350,6 +1350,18 @@ platforms = ["linux"]
 
 # Git metadata layouts and config failures must not silently alter durable keys.
 [[control]]
+id = "rebind-replaced-identity"
+guards = "A replaced registered checkout enters the repair branch, creates a new epoch and remains unapproved"
+file = "crates/entorhinal-core/src/binding.rs"
+old = 'if !matches!(record.identity, "replaced" | "unbound") {'
+new = 'if !matches!(record.identity, "bound" | "unbound") { /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-core/tests/rebind_root.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--test rebind_root"
+expect_red = ["rebind_replaced_checkout_preserves_project_and_requires_approval"]
+
+[[control]]
 id = "s3-git-symlink"
 guards = "A symlinked .git directory is followed for remotes and binding"
 file = "crates/entorhinal-core/src/binding.rs"

@@ -681,6 +681,11 @@ impl RegistryStore {
             .bind_root(canonical_root, actor)
     }
 
+    /// Repair a registered root's checkout identity without approving it.
+    pub fn rebind_root(&self, root: &str, actor: &str) -> Result<Vec<u8>, RegistryError> {
+        self.with_principal("entorhinal").rebind_root(root, actor)
+    }
+
     pub fn bind_unbound_roots(&self, actor: &str) -> Result<Vec<BindReport>, RegistryError> {
         self.with_principal("entorhinal").bind_unbound_roots(actor)
     }
@@ -705,6 +710,61 @@ impl RegistryStore {
 }
 
 impl super::JournalWriter<'_> {
+    /// Only a replaced or never-bound checkout needs repair. An intact binding
+    /// keeps its epoch and approval, and unreadable identity must not be guessed.
+    pub fn rebind_root(&self, root: &str, actor: &str) -> Result<Vec<u8>, RegistryError> {
+        let root = RegistryStore::canonical_mutation_root(root)?;
+        let registered = self.read(|conn| {
+            let project_id = conn
+                .query_row(
+                    "SELECT project_id FROM project_root WHERE canonical_root = ?1",
+                    [&root],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            project_id
+                .map(|project_id| {
+                    Ok((
+                        project_id,
+                        root_record(conn, &root)?,
+                        self.generation_from_connection(conn)?,
+                    ))
+                })
+                .transpose()
+        })?;
+        let (project_id, record, generation) = registered
+            .ok_or_else(|| domain("not_found", format!("{root} is not a registered root")))?;
+        if record.identity == "bound" {
+            return super::mutations::wire_value(json!({
+                "projectId": project_id, "canonicalRoot": root,
+                "oldIdentity": record.identity, "identity": record.identity,
+                "registrationEpoch": record.registration_epoch,
+                "approval": record.approval, "generation": generation, "noop": true,
+            }));
+        }
+        if !matches!(record.identity, "replaced" | "unbound") {
+            let detail = match disk_identity(Path::new(&root)) {
+                DiskIdentity::Unverifiable(reason) => reason,
+                _ => format!("identity is {}", record.identity),
+            };
+            return Err(domain(
+                "root_identity_unverifiable",
+                format!("{root}: {detail}"),
+            ));
+        }
+        // Reuse the binding journal operation so retirement and replay follow
+        // exactly the same path as binding immediately after registration.
+        let reply = self.bind_root(&root, actor)?;
+        let mut reply: serde_json::Value = serde_json::from_slice(&reply)
+            .map_err(|error| domain("encode_failed", error.to_string()))?;
+        let current = self.read(|conn| root_record(conn, &root))?;
+        reply["result"]["projectId"] = json!(project_id);
+        reply["result"]["oldIdentity"] = json!(record.identity);
+        reply["result"]["identity"] = json!(current.identity);
+        reply["result"]["approval"] = json!(current.approval);
+        serde_json::to_vec(&reply).map_err(|error| domain("encode_failed", error.to_string()))
+    }
+
     /// Bind a registered root to the checkout on disk. A root already bound to
     /// the checkout that is there is left alone. A root whose checkout was
     /// replaced gets a new binding; the old epoch is retired as `replaced` and

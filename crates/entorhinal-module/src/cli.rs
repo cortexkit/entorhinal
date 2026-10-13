@@ -333,6 +333,7 @@ usage: ck projects <verb> [args] [--subc <connection file>] [--json]
                           preview the matched project/key; --yes attaches unapproved
   remove-root <project> <dir>
                           remove one root from a project
+  rebind <dir>            rebind a replaced checkout (approval still needed)
   owned-remotes <root> <name>...
                           own exactly these remote names
   owned-remotes <root> --none
@@ -663,6 +664,10 @@ fn build_at(command: &Command, cwd: &str) -> Result<(String, Value), String> {
                 "root": mutation(&need(1, "a directory")?)?,
                 "actor": actor,
             }),
+        ),
+        (Face::Projects, "rebind") => (
+            "rebind_root".to_string(),
+            json!({"root": mutation(&need(0, "a directory")?)?}),
         ),
         (Face::Projects, "remove-root") => (
             "remove_root".to_string(),
@@ -1448,6 +1453,7 @@ fn render(command: &Command, value: &Value) {
                 );
             }
         }
+        (Face::Projects, "rebind") => println!("{}", format_rebind(value)),
         (Face::Projects, "verify") => println!("{}", format_verify(value)),
         (Face::Projects, "attach") => println!(
             "{}",
@@ -1459,6 +1465,29 @@ fn render(command: &Command, value: &Value) {
             serde_json::to_string_pretty(value).unwrap_or_default()
         ),
     }
+}
+
+fn format_rebind(value: &Value) -> String {
+    let root = text(&value["canonicalRoot"]);
+    let mut output = format!(
+        "project:   {}\nroot:      {root}\nidentity:  {} -> {}{}\napproval:  {}",
+        text(&value["projectId"]),
+        text(&value["oldIdentity"]),
+        text(&value["identity"]),
+        if value["noop"].as_bool() == Some(true) {
+            " (unchanged)"
+        } else {
+            ""
+        },
+        text(&value["approval"]["state"]),
+    );
+    if value["approval"]["state"].as_str() != Some("approved") {
+        output.push_str(&format!(
+            "\napproval still needed: ck projects approve {}",
+            retry_quote::render_arguments(&[&root], cfg!(windows)),
+        ));
+    }
+    output
 }
 
 fn format_agents(verb: &str, value: &Value) -> String {
@@ -1850,6 +1879,44 @@ mod tests {
         assert_eq!(params["projectId"], "p1");
 
         assert_eq!(build(&cmd(&["verify"])).unwrap().0, "verify");
+    }
+
+    #[test]
+    fn rebind_cli_maps_canonical_root_and_renders_identity_and_approval() {
+        let root = crate::tests::canonical_test_path(std::env::temp_dir())
+            .to_string_lossy()
+            .into_owned();
+        let Invocation::Command(command) =
+            parse(Face::Projects, &["rebind".into(), format!("{root}/.")])
+        else {
+            panic!("rebind must parse")
+        };
+        assert_eq!(
+            build(&command).unwrap(),
+            ("rebind_root".into(), json!({"root":root}),)
+        );
+        let Invocation::Command(missing) = parse(Face::Projects, &["rebind".into()]) else {
+            panic!("rebind must parse")
+        };
+        assert!(build(&missing).unwrap_err().contains("a directory"));
+        let output = format_rebind(&json!({
+            "projectId":"project", "canonicalRoot":root,
+            "oldIdentity":"replaced", "identity":"bound", "noop":false,
+            "approval":{"state":"unapproved"},
+        }));
+        assert!(output.contains("project:   project"));
+        assert!(output.contains(&format!("root:      {root}")));
+        assert!(output.contains("identity:  replaced -> bound"));
+        assert!(output.contains("approval:  unapproved"));
+        assert!(output.contains("approval still needed: ck projects approve"));
+        let output = format_rebind(&json!({
+            "projectId":"project", "canonicalRoot":root,
+            "oldIdentity":"bound", "identity":"bound", "noop":true,
+            "approval":{"state":"approved"},
+        }));
+        assert!(output.contains("bound -> bound (unchanged)"));
+        assert!(!output.contains("approval still needed"));
+        assert!(usage(Face::Projects).contains("rebind <dir>"));
     }
 
     #[test]

@@ -18,6 +18,7 @@ The binary `ck-entorhinal` is the module itself. People use it through `ck`:
 ck projects list [workspace]        projects, optionally scoped to one workspace
 ck projects resolve <dir>           which project owns a directory
 ck projects register <name> <dir>   register a project rooted at a directory
+ck projects rebind <dir>            repair a replaced checkout; then approve it
 ck projects remove <project>        remove a project from the registry
 ck projects verify                  check the store against its journal
 ck projects log status              local state of the shared identity log
@@ -87,6 +88,7 @@ carries that mark, so a flow can't borrow the executive's write access.
 | `upgrade_implicit` | mutate | Promote an implicit (path-derived) project to a registered one, keeping its id. |
 | `remove` | mutate | Remove a project registration; its id stops resolving. |
 | `add_root` | mutate | Add a root to a registered project; it starts unapproved. |
+| `rebind_root` | mutate | Rebind a replaced or unbound registered checkout, keeping its project id; approval is still required. An intact binding is unchanged. |
 | `remove_root` | mutate | Remove one root from a project, retiring its binding and worker containers. |
 | `attach_derived_parent` | mutate | Attach a worker container to a root's current approved binding. |
 | `approve_root` | mutate | Approve a root's current binding for autonomous work. |
