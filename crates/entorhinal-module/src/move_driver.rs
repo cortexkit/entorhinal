@@ -1,8 +1,12 @@
 //! Machine-local move tasks. Remote calls never own a store handle or the writer.
 
 use crate::{
-    door_client::DoorClient, move_source::Source, participant_discovery::ParticipantDiscovery,
-    record_client::RecordClient, HandlerError, HealthGauges, ProjectsHandler,
+    door_client::DoorClient,
+    move_receiver::{poll_inbox, Receiver},
+    move_source::Source,
+    participant_discovery::ParticipantDiscovery,
+    record_client::RecordClient,
+    HandlerError, HealthGauges, ProjectsHandler,
 };
 use entorhinal_core::{move_store::AgentMove, RegistryError, RegistryStore};
 use std::{
@@ -12,6 +16,23 @@ use std::{
 };
 
 pub(crate) const POLL: Duration = Duration::from_secs(30);
+
+pub(crate) struct ReconnectConnector {
+    pub(crate) inner: Arc<dyn crate::log_client::LogConnector>,
+    pub(crate) wake: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl crate::log_client::LogConnector for ReconnectConnector {
+    async fn connect(
+        &self,
+    ) -> Result<Arc<dyn crate::log_client::LogTransport>, crate::log_client::TransportError> {
+        let transport = self.inner.connect().await?;
+        self.wake.notify_waiters();
+        self.wake.notify_one();
+        Ok(transport)
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct Worker {
@@ -87,12 +108,16 @@ impl Worker {
         let errors = rows
             .iter()
             .map(|r| {
-                let diagnostics = r
-                    .plan
-                    .get("_source")
-                    .and_then(|s| s.get("errors"))
-                    .and_then(serde_json::Value::as_array)
-                    .map_or(0, Vec::len);
+                let diagnostics = ["_source", "_receiver"]
+                    .iter()
+                    .map(|key| {
+                        r.plan
+                            .get(key)
+                            .and_then(|s| s.get("errors"))
+                            .and_then(serde_json::Value::as_array)
+                            .map_or(0, Vec::len)
+                    })
+                    .sum::<usize>();
                 diagnostics
                     + usize::from(
                         r.cut_accept
@@ -125,6 +150,7 @@ impl ProjectsHandler {
             clock: self.clock,
             wake: self.move_wake.clone(),
         };
+        let liveness = self.liveness.clone();
         let wake = self.move_wake.clone();
         *task = Some(tokio::spawn(async move {
             let mut interval = tokio::time::interval(POLL);
@@ -142,18 +168,25 @@ impl ProjectsHandler {
                 if worker.store.upgrade().is_none() {
                     break;
                 }
+                let _ = poll_inbox(&worker).await;
                 let Ok(rows) = worker.sql(RegistryStore::list_open_agent_moves).await else {
                     continue;
                 };
                 let _ = worker.gauges().await;
                 for row in rows {
-                    if row.side == entorhinal_core::move_store::MoveSide::Source
-                        && owners.insert(row.cut_id.clone())
-                    {
+                    if owners.insert(row.cut_id.clone()) {
                         let worker = worker.clone();
+                        let liveness = liveness.clone();
                         tasks.spawn(async move {
                             let cut = row.cut_id;
-                            Source::new(worker, cut.clone()).run().await;
+                            match row.side {
+                                entorhinal_core::move_store::MoveSide::Source => {
+                                    Source::new(worker, cut.clone()).run().await
+                                }
+                                entorhinal_core::move_store::MoveSide::Receiver => {
+                                    Receiver::new(worker, cut.clone(), liveness).run().await
+                                }
+                            }
                             cut
                         });
                     }

@@ -748,6 +748,42 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn hello_ack_startup_refreshes_persisted_live_agents() {
+        #[derive(Clone)]
+        struct ClaimBatchObserver {
+            peer: Arc<FakeRecord>,
+            completed: Arc<tokio::sync::Semaphore>,
+        }
+        #[async_trait::async_trait]
+        impl crate::log_client::LogConnector for ClaimBatchObserver {
+            async fn connect(
+                &self,
+            ) -> Result<Arc<dyn crate::log_client::LogTransport>, crate::log_client::TransportError>
+            {
+                Ok(Arc::new(self.clone()))
+            }
+        }
+        #[async_trait::async_trait]
+        impl crate::log_client::LogTransport for ClaimBatchObserver {
+            async fn call(
+                &self,
+                method: &str,
+                params: Value,
+            ) -> Result<Vec<u8>, crate::log_client::TransportError> {
+                let claims = method == "record.read_many"
+                    && params["subjects"].as_array().is_some_and(|subjects| {
+                        !subjects.is_empty()
+                            && subjects
+                                .iter()
+                                .all(|s| s.as_str().is_some_and(|s| s.starts_with("claim:")))
+                    });
+                let reply =
+                    crate::log_client::LogTransport::call(self.peer.as_ref(), method, params).await;
+                if claims && reply.is_ok() {
+                    self.completed.add_permits(1);
+                }
+                reply
+            }
+        }
         let f = Fixture::new(true).await;
         let id = f.create(1).await;
         f.put(&id, &f.record.author, 1);
@@ -773,7 +809,22 @@ mod tests {
             || 701,
             Arc::new(f.log.clone()),
         );
-        handler.record_client = RecordClient::new(Arc::new(FakeRecordConnector(peer.clone())));
+        let completed = Arc::new(tokio::sync::Semaphore::new(0));
+        handler.record_client = RecordClient::new(Arc::new(ClaimBatchObserver {
+            peer: peer.clone(),
+            completed: completed.clone(),
+        }));
+        let claim_batches = || {
+            peer.batches
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|subjects| {
+                    !subjects.is_empty()
+                        && subjects.iter().all(|subject| subject.starts_with("claim:"))
+                })
+                .count()
+        };
         handler.route_admissions().insert(
             DIRECT,
             RouteAdmission::from_bind(Some(Principal::Direct), None),
@@ -781,14 +832,19 @@ mod tests {
         handler
             .on_hello_ack(&super::super::tests::hello_ack(&f.descriptor))
             .await;
-        tokio::time::timeout(std::time::Duration::from_secs(1), peer.wait_for_calls(1))
+        // Startup also polls the move inbox. Only a completed claim batch
+        // proves that the claim refresher ran; unrelated peer reads do not.
+        tokio::time::timeout(std::time::Duration::from_secs(1), completed.acquire())
             .await
-            .expect("startup must schedule a refresh");
+            .expect("startup must schedule a claim refresh")
+            .unwrap()
+            .forget();
+        assert_eq!(claim_batches(), 1);
         handler
             .refresh_agent_claims(json!({}), DIRECT)
             .await
             .unwrap();
-        assert_eq!(peer.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(claim_batches(), 2);
         assert_eq!(
             result(handler.handle_request(&body(WHERE, json!({"agent_id":id})), OTHER))["holder"],
             holder

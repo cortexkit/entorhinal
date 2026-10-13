@@ -78,6 +78,7 @@ mod incarnation;
 mod member;
 mod move_admission;
 mod move_driver;
+mod move_receiver;
 mod move_source;
 // The client for engram's identity log. Only writes to shared state and
 // catch-up call it, and it opens its route on first use, so startup and every
@@ -682,6 +683,11 @@ impl ProjectsHandler {
         let record_connector: Arc<dyn log_client::LogConnector> = Arc::new(
             log_client::SubcConnector::from_args(std::env::args_os().skip(1)),
         );
+        let move_wake = Arc::new(tokio::sync::Notify::new());
+        let record_connector = Arc::new(move_driver::ReconnectConnector {
+            inner: record_connector,
+            wake: move_wake.clone(),
+        });
         Self {
             store: Arc::new(Mutex::new(None)),
             hello_refusal: Arc::new(HelloRefusal::default()),
@@ -707,7 +713,7 @@ impl ProjectsHandler {
             door_client: door_client::DoorClient::production(log_client::SubcConnector::from_args(
                 std::env::args_os().skip(1),
             )),
-            move_wake: Arc::new(tokio::sync::Notify::new()),
+            move_wake,
             move_driver_task: Mutex::new(None),
             claim_refresh_task: Mutex::new(None),
             role_refresh: Arc::new(tokio::sync::Notify::new()),

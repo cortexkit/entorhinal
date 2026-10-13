@@ -52,6 +52,7 @@ pub enum MoveReason {
     DoorRefused,
     CutAuthorMismatch,
     Diverged,
+    IncompatibleVersion,
     ClaimMoved,
     ProjectNotCheckedOut,
     Gone,
@@ -547,6 +548,18 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&expected).unwrap()["participants"][0]["external"][0]["check"],
             json!({"digest":"abc", "row":7})
+        );
+    }
+
+    #[test]
+    fn move_codec_accepts_literal_incompatible_version_abort() {
+        let literal = r#"{"v":1,"cut_id":"0123456789abcdef0123456789abcdef","agent_id":"agent-a","from":"mac-a","to":"mac-b","state":"aborted","claim_version":0,"participants":[],"reason":"incompatible_version","detail":{"code":"incompatible_version","module_id":"adapter","note":"Upgrade this Mac"}}"#;
+        let subject = "move:0123456789abcdef0123456789abcdef";
+        let body = decode_move_record(subject, literal.as_bytes()).unwrap();
+        assert_eq!(body.reason, Some(MoveReason::IncompatibleVersion));
+        assert_eq!(
+            encode_move_record(subject, &body).unwrap(),
+            literal.as_bytes()
         );
     }
 

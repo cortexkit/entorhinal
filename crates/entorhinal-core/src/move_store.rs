@@ -366,6 +366,56 @@ impl RegistryStore {
         outcome.map_err(|e| crate::session_refusal("storage_error", e.to_string(), None))?
     }
 
+    /// Acquire a receiver move slot atomically with source admission. If this
+    /// cut_id already has a checkpoint, return it unchanged so an inbox poll
+    /// after a crash cannot insert a second receiver row for the same move.
+    pub fn admit_received_move(&self, row: &AgentMove) -> Result<AgentMove, AgentMutationError> {
+        let outcome = self.db.with_conn_fenced(|tx| {
+            let check = || -> Result<AgentMove, AgentMutationError> {
+                if row.side != MoveSide::Receiver
+                    || !matches!(row.step, MoveStep::PickedUp | MoveStep::Aborted)
+                {
+                    return Err(crate::session_refusal(
+                        "invalid_request",
+                        "invalid receiver checkpoint",
+                        None,
+                    ));
+                }
+                if let Some(existing) = tx
+                    .query_row(
+                        &format!("SELECT {MOVE_COLUMNS} FROM agent_move WHERE cut_id=?1"),
+                        [&row.cut_id],
+                        AgentMove::from_row,
+                    )
+                    .optional()?
+                {
+                    return Ok(existing);
+                }
+                {
+                    let open = open_moves(tx)?;
+                    if let Some(existing) = open.iter().find(|m| m.agent_id == row.agent_id) {
+                        return Err(crate::session_refusal(
+                            "move_in_progress",
+                            "agent has an open move",
+                            Some(move_detail(existing)),
+                        ));
+                    }
+                    if open.len() >= 4 {
+                        return Err(crate::session_refusal(
+                            "move_cap",
+                            "four moves are already open",
+                            None,
+                        ));
+                    }
+                }
+                row.write(tx, true)?;
+                Ok(row.clone())
+            };
+            Ok(check())
+        });
+        outcome.map_err(|e| crate::session_refusal("storage_error", e.to_string(), None))?
+    }
+
     /// Insert a checkpoint, refusing duplicate cuts or request keys and a second
     /// non-terminal move for the same agent, on either side.
     pub fn insert_agent_move(&self, row: &AgentMove) -> Result<(), RegistryError> {
@@ -618,6 +668,87 @@ mod tests {
             activated_at_ms: Some(99),
             created_at_ms: 1,
             updated_at_ms: 2,
+        }
+    }
+
+    #[test]
+    fn received_move_acquires_slot_and_refuses_open_agent_and_cap() {
+        let f = Fixture::new();
+        let receiver = checkpoint("receiver", MoveSide::Receiver);
+        assert_eq!(f.store.admit_received_move(&receiver).unwrap(), receiver);
+        let mut resend = receiver.clone();
+        resend.plan = json!({"changed":true});
+        assert_eq!(f.store.admit_received_move(&resend).unwrap(), receiver);
+        let other_cut = checkpoint("duplicate-agent", MoveSide::Receiver);
+        assert_eq!(
+            f.store.admit_received_move(&other_cut).unwrap_err().code,
+            "move_in_progress"
+        );
+        for i in 2..=4 {
+            let mut row = checkpoint(&format!("r{i}"), MoveSide::Receiver);
+            row.agent_id = format!("agent-{i}");
+            f.store.admit_received_move(&row).unwrap();
+        }
+        let mut fifth = checkpoint("fifth", MoveSide::Receiver);
+        fifth.agent_id = "agent-5".into();
+        assert_eq!(
+            f.store.admit_received_move(&fifth).unwrap_err().code,
+            "move_cap"
+        );
+        assert!(f.store.agent_move("fifth").unwrap().is_none());
+        fifth.step = MoveStep::Aborted;
+        assert_eq!(
+            f.store.admit_received_move(&fifth).unwrap_err().code,
+            "move_cap"
+        );
+        let mut invalid = checkpoint("invalid", MoveSide::Source);
+        invalid.agent_id = "agent-6".into();
+        assert_eq!(
+            f.store.admit_received_move(&invalid).unwrap_err().code,
+            "invalid_request"
+        );
+    }
+
+    #[test]
+    fn received_move_races_source_admission_in_one_fenced_transaction() {
+        for same_agent in [true, false] {
+            let f = Fixture::new();
+            if !same_agent {
+                for i in 1..=3 {
+                    let mut row = checkpoint(&format!("existing-{i}"), MoveSide::Receiver);
+                    row.agent_id = format!("existing-{i}");
+                    f.store.admit_received_move(&row).unwrap();
+                }
+            }
+            let mut source = checkpoint("source", MoveSide::Source);
+            let receiver = checkpoint("receiver", MoveSide::Receiver);
+            if !same_agent {
+                source.agent_id = "other-agent".into();
+            }
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let store = f.store.clone();
+            let start = barrier.clone();
+            let thread = std::thread::spawn(move || {
+                start.wait();
+                store.admit_agent_move(&source, &[])
+            });
+            barrier.wait();
+            let received = f.store.admit_received_move(&receiver);
+            let admitted = thread.join().unwrap();
+            assert_ne!(received.is_ok(), admitted.is_ok());
+            let refusal = received.err().or_else(|| admitted.err()).unwrap();
+            assert_eq!(
+                refusal.code,
+                if same_agent {
+                    "move_in_progress"
+                } else {
+                    "move_cap"
+                }
+            );
+            assert_eq!(
+                f.store.list_open_agent_moves().unwrap().len(),
+                if same_agent { 1 } else { 4 }
+            );
         }
     }
 

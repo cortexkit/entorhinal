@@ -562,6 +562,18 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn role_store_install_and_reconnect_signal_the_role_pass() {
         let f = Fixture::new();
+        let role_batches = || {
+            f.record
+                .batches
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|subjects| {
+                    !subjects.is_empty()
+                        && subjects.iter().all(|subject| subject.starts_with("role:"))
+                })
+                .count()
+        };
         f.read();
         f.record
             .put("role:x", 1, claim(1, &f.record.author), &f.record.author);
@@ -570,7 +582,7 @@ mod tests {
             .on_hello_ack(&crate::tests::hello_ack(&f.descriptor))
             .await;
         tokio::task::yield_now().await;
-        assert_eq!(f.record.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(role_batches(), 1);
         f.handler.health.role_refresh_done.notified().await;
         assert_eq!(f.read()["known"], true);
         assert_eq!(f.log.calls(), 0);
@@ -594,12 +606,12 @@ mod tests {
         assert_eq!(f.read()["stale"], true);
         f.record.error("role:x", None);
         f.handler.health.log_state.store(2, Ordering::Relaxed);
-        let before = f.record.calls.load(Ordering::Relaxed);
+        let before = role_batches();
         f.handler.start_catch_up();
         tokio::task::yield_now().await;
-        assert_eq!(f.record.calls.load(Ordering::Relaxed), before + 1);
+        assert_eq!(role_batches(), before + 1);
         f.handler.health.role_refresh_done.notified().await;
-        assert_eq!(f.record.calls.load(Ordering::Relaxed), before + 1);
+        assert_eq!(role_batches(), before + 1);
         assert_eq!(f.read()["stale"], false);
     }
 
