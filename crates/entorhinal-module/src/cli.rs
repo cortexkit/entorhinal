@@ -2140,6 +2140,8 @@ mod tests {
                 principal: Some(crate::Principal::Direct),
                 flow_id: None,
                 handle: None,
+                scope: None,
+                call_mode: None,
                 providers: Default::default(),
             },
         );
@@ -2932,6 +2934,8 @@ mod agent_tests {
                     principal: Some(Principal::Direct),
                     flow_id: None,
                     handle: None,
+                    scope: None,
+                    call_mode: None,
                     providers: Default::default(),
                 },
             );

@@ -152,6 +152,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "cortexkit-role-tool-provider"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a8ffe3d7ea381fa7be0d92fec76e947adbbb459b8e5b6f5bb773ef388c51cd81"
+dependencies = [
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2",
+ "subc-protocol",
+]
+
+[[package]]
 name = "cortexkit-store"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -258,6 +271,7 @@ dependencies = [
  "async-trait",
  "cortexkit-log",
  "cortexkit-role-agent-data",
+ "cortexkit-role-tool-provider",
  "cortexkit-store-types",
  "cortexkit-test-support",
  "entorhinal-core",
@@ -725,6 +739,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "ryu-js"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6518fc26bced4d53678a22d6e423e9d8716377def84545fe328236e3af070e7f"
+
+[[package]]
 name = "serde"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -752,6 +772,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.6",
+]
+
+[[package]]
+name = "serde_jcs"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3a60f3fda61525e439ef6d67422118f11e986566997d9021c56867ad814a0aa"
+dependencies = [
+ "ryu-js",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

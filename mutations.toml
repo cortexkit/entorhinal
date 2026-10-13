@@ -3027,3 +3027,161 @@ runner = "cargo"
 package = "entorhinal-core"
 target = "--lib"
 expect_red = ["agent::consent_tests::terminal_retry_is_atomic_does_not_remint_and_rejects_changed_digest"]
+
+# Agent tool-provider admission and catalog contracts.
+[[control]]
+id = "agent-tools-stamp-capture"
+guards = "Agent authority is retained only from the daemon's bind stamp, including scope epoch"
+file = "crates/entorhinal-module/src/main.rs"
+old = "scope: scope.cloned(),"
+new = "scope: None, // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/tool_provider_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tool_provider::tests::bind_captures_scope_epoch_and_mode_and_route_gone_drops_authority"]
+expect_message = "assertion `left == right` failed"
+
+[[control]]
+id = "agent-tools-scope-admission"
+guards = "Flow, worker, unauthorized and nondelegating run scopes cannot exercise agent tool authority"
+file = "crates/entorhinal-module/src/tool_provider.rs"
+old = '''if !scope.owner_authorized
+            || scope.kind == ScopeKind::Worker
+            || scope.attributes.flow_id.is_some()
+            || (scope.attributes.run_id.is_some() && !scope.attributes.delegates)
+        {'''
+new = "if false /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-module/src/tool_provider_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tool_provider::tests::stamped_caller_is_required_and_body_identity_cannot_supply_it"]
+expect_message = "caller_forbidden"
+
+[[control]]
+id = "agent-tools-live-caller"
+guards = "Retiring a stamped caller invalidates authority even on an already-bound route"
+file = "crates/entorhinal-module/src/tool_provider.rs"
+old = 'if caller.status != "live" {'
+new = "if false /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-module/src/tool_provider_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tool_provider::tests::retired_and_unknown_callers_are_refused_on_previously_bound_routes"]
+expect_message = "gone"
+
+[[control]]
+id = "agent-tools-table-roles"
+guards = "Each of the six tools admits only its table's stored role, before keys or arguments"
+file = "crates/entorhinal-module/src/tool_provider.rs"
+old = "if caller.role != tool.role {"
+new = "if false /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-module/src/tool_provider_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tool_provider::tests::every_tool_admits_only_its_table_role_before_key_or_arguments"]
+expect_message = "role_forbidden"
+
+[[control]]
+id = "agent-tools-request-key"
+guards = "Every write rejects absent, nonstring, control, non-ASCII and overlong request keys before other arguments"
+file = "crates/entorhinal-module/src/tool_provider.rs"
+old = '''if !valid {
+        return Err(HandlerError::new(
+            "invalid_request_key",'''
+new = '''if false /* NON-VACUITY BREAK */ {
+        return Err(HandlerError::new(
+            "invalid_request_key",'''
+test_file = "crates/entorhinal-module/src/tool_provider_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tool_provider::tests::every_write_validates_printable_ascii_request_keys_before_other_arguments"]
+expect_message = "invalid_request_key"
+
+[[control]]
+id = "agent-tools-argument-shapes"
+guards = "Tool arguments match their schemas and cannot override caller, role or supervision"
+file = "crates/entorhinal-module/src/tool_provider.rs"
+old = "validate_arguments(tool, arguments)?;"
+new = "// NON-VACUITY BREAK: argument validation omitted"
+test_file = "crates/entorhinal-module/src/tool_provider_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tool_provider::tests::tool_arguments_match_the_flat_schemas_without_caller_or_role_overrides"]
+expect_message = "invalid_request"
+
+[[control]]
+id = "agent-tools-schema-pin"
+guards = "A schema pin with a changed argument digest refuses before execution"
+file = "crates/entorhinal-module/src/tool_provider.rs"
+old = "if pin.schema_digest != definition.schema_digest {"
+new = "if false /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-module/src/tool_provider_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tool_provider::tests::schema_pins_and_call_modes_are_checked_after_agent_admission"]
+expect_message = "tool_schema_changed"
+
+[[control]]
+id = "agent-tools-semantics-pin"
+guards = "A schema pin with changed semantics refuses before execution"
+file = "crates/entorhinal-module/src/tool_provider.rs"
+old = "if pin.semantics != definition.semantics {"
+new = "if false /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-module/src/tool_provider_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tool_provider::tests::schema_pins_and_call_modes_are_checked_after_agent_admission"]
+expect_message = "tool_semantics_changed"
+
+[[control]]
+id = "agent-tools-call-mode"
+guards = "Unknown and flow call modes refuse while classic and codemode admit"
+file = "crates/entorhinal-module/src/tool_provider.rs"
+old = "if !cortexkit_role_tool_provider::catalog::serves_call_mode(&definition, mode) {"
+new = "if false /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-module/src/tool_provider_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tool_provider::tests::schema_pins_and_call_modes_are_checked_after_agent_admission"]
+expect_message = "call_mode_unsupported"
+
+[[control]]
+id = "agent-tools-catalog-key-schema"
+guards = "HELLO and the tool catalog both require request_key on exactly the five write tools"
+file = "crates/entorhinal-module/src/tool_provider.rs"
+old = 'required.push("request_key");'
+new = "// NON-VACUITY BREAK: required request_key omitted"
+test_file = "crates/entorhinal-module/src/tool_provider_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tool_provider::tests::provider_discovery_catalog_and_hello_agree_on_exact_tool_table"]
+expect_message = "request_key"
+
+[[control]]
+id = "agent-tools-catalog-inputs"
+guards = "Catalog discovery rejects unsupported variants, system text, unknown members and wrong types"
+file = "crates/entorhinal-module/src/tool_provider.rs"
+old = '''if !valid {
+            return Err(HandlerError::new(
+                "invalid_request",
+                format!("unsupported catalog member or type: {field}"),'''
+new = '''if false /* NON-VACUITY BREAK */ {
+            return Err(HandlerError::new(
+                "invalid_request",
+                format!("unsupported catalog member or type: {field}"),'''
+test_file = "crates/entorhinal-module/src/tool_provider_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tool_provider::tests::catalog_digest_only_and_composition_are_stable_and_unsupported_inputs_refuse"]
+expect_message = "expected refusal"

@@ -195,6 +195,8 @@ mod tests {
                     }),
                     flow_id: None,
                     handle: None,
+                    scope: None,
+                    call_mode: None,
                     providers: Default::default(),
                 },
             );
@@ -1178,6 +1180,8 @@ mod tests {
                     principal: Some(Principal::Direct),
                     flow_id: None,
                     handle: None,
+                    scope: None,
+                    call_mode: None,
                     providers: Default::default(),
                 },
             );

@@ -1517,7 +1517,9 @@ mod tests {
     fn manifest_pins_exact_authority_surface_capabilities_and_protocol_dependencies() {
         let manifest = serde_json::to_value(crate::manifest()).unwrap();
         let surfaces = manifest["provides"].as_array().unwrap();
-        assert_eq!(surfaces.len(), 1, "no tool surface");
+        assert_eq!(surfaces.len(), 2, "management and agent tool surfaces");
+        assert_eq!(surfaces[0]["role"], "management_surface");
+        assert_eq!(surfaces[1]["role"], "tool_provider");
         let operations = surfaces[0]["operations"].as_array().unwrap();
         let expected_queries = [
             "agent.preview_repair_workspaces",
@@ -1601,7 +1603,12 @@ mod tests {
         );
         assert_eq!(
             manifest["capabilities"]["provides"],
-            json!(["project-identity/v1", "agent-identity/v1"])
+            json!([
+                "project-identity/v1",
+                "agent-identity/v1",
+                "tool-provider/v1",
+                "call-modes/v1"
+            ])
         );
         assert_eq!(manifest["capabilities"]["requires"], json!([]));
         let cargo = include_str!("../../../Cargo.toml");

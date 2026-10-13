@@ -20,6 +20,7 @@ test = false
 [dependencies]
 entorhinal-core = { path = "../entorhinal-core" }
 cortexkit-role-agent-data = "0.1"
+cortexkit-role-tool-provider = "=0.7.3"
 cortexkit-store-types = { workspace = true }
 cortexkit-log = { workspace = true }
 tracing = { workspace = true }

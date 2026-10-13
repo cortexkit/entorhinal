@@ -106,6 +106,7 @@ mod roles;
 mod served_vectors;
 mod sessions;
 mod shared_write;
+mod tool_provider;
 use shared_write::placement_confirmation;
 #[cfg(test)]
 mod two_machine_acceptance;
@@ -469,6 +470,9 @@ struct ProjectsHandler {
 struct RouteAdmission {
     principal: Option<Principal>,
     providers: Arc<sessions::RouteProviders>,
+    /// The daemon's authority stamp, never a caller-supplied tool argument.
+    scope: Option<ScopeStamp>,
+    call_mode: Option<subc_protocol::call_mode::CallMode>,
     /// The flow whose scope the route was opened under, if any.
     flow_id: Option<String>,
     /// Retain the SDK's connection identity until this admission is removed.
@@ -480,6 +484,8 @@ impl RouteAdmission {
         Self {
             principal,
             providers: Arc::default(),
+            scope: scope.cloned(),
+            call_mode: None,
             flow_id: scope.and_then(|stamp| stamp.attributes.flow_id.clone()),
             handle: None,
         }
@@ -858,6 +864,7 @@ impl ModuleHandler for ProjectsHandler {
             route_key(&request.handle),
             RouteAdmission {
                 handle: Some(request.handle),
+                call_mode: Some(request.call_mode.clone()),
                 ..RouteAdmission::from_bind(request.principal.clone(), request.scope.as_ref())
             },
         );
@@ -1058,6 +1065,11 @@ impl ProjectsHandler {
     /// arm and never joins the shared-log writer queue.
     /// Queries use `handle_request_wait` instead, without joining the write queue.
     async fn handle_served_request(&self, body: &[u8], key: RouteKey) -> HandlerOutcome {
+        if let Ok(value) = serde_json::from_slice::<Value>(body) {
+            if value.get("name").is_some() {
+                return self.handle_tool_request(value, key);
+            }
+        }
         let received = tokio::time::Instant::now();
         let request = match serde_json::from_slice::<WireRequest>(body) {
             Ok(request) => request,
@@ -1956,9 +1968,8 @@ fn manifest() -> ModuleManifest {
             // Registry ops use short SQLite locks. Change-feed waits suspend
             // their task outside that lock and are capped by the module.
             concurrency: Concurrency::ModuleManaged,
-        }])
-    // entorhinal declares no self-signals yet: its ops are operator-driven
-    // registry reads/writes, not autonomous signals.
+        }, tool_provider::provider_role()])
+    // Entorhinal serves requests but emits no autonomous self-signals.
     .self_signals(None)
     // Which source commit and wire version this binary is, so `ck provenance
     // entorhinal` can answer. At HELLO the SDK adds where this process got its
@@ -1973,7 +1984,9 @@ fn manifest() -> ModuleManifest {
     // makes that dependency enforceable. Breaking changes to either identity
     // surface require a new capability version.
     .capabilities(Some(CapabilityDeclarations {
-        provides: vec![PROJECT_IDENTITY_CAPABILITY.to_owned(), "agent-identity/v1".to_owned()],
+        provides: vec![PROJECT_IDENTITY_CAPABILITY.to_owned(), "agent-identity/v1".to_owned(),
+            cortexkit_role_tool_provider::PROVIDES.to_owned(),
+            cortexkit_role_tool_provider::CALL_MODES_CAPABILITY.to_owned()],
         // Entorhinal calls engram (the module hosting the shared identity log)
         // only to write shared state, and serves every read without it. So
         // nothing is declared here: a `requires` entry makes the daemon refuse
@@ -4018,7 +4031,12 @@ mod tests {
         // Consumers declare this `required`, so its spelling is a contract.
         assert_eq!(
             value["capabilities"]["provides"],
-            serde_json::json!(["project-identity/v1", "agent-identity/v1"])
+            serde_json::json!([
+                "project-identity/v1",
+                "agent-identity/v1",
+                "tool-provider/v1",
+                "call-modes/v1"
+            ])
         );
         assert_eq!(value["capabilities"]["requires"], json!([]));
         for (name, kind) in [
