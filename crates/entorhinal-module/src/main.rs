@@ -77,6 +77,8 @@ mod fake_door;
 mod incarnation;
 mod member;
 mod move_admission;
+mod move_driver;
+mod move_source;
 // The client for engram's identity log. Only writes to shared state and
 // catch-up call it, and it opens its route on first use, so startup and every
 // read work with engram absent. It has no callers until the shared write path
@@ -293,6 +295,8 @@ struct HealthGauges {
     #[cfg(test)]
     role_refresh_done: tokio::sync::Notify,
     self_author_conflicts: AtomicU64,
+    moves_open: AtomicU64,
+    move_errors: AtomicU64,
     #[cfg(test)]
     claim_refresh_done: tokio::sync::Notify,
 }
@@ -440,6 +444,9 @@ struct ProjectsHandler {
     catch_up_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     record_client: record_client::RecordClient,
     participant_discovery: Arc<dyn participant_discovery::ParticipantDiscovery>,
+    door_client: door_client::DoorClient,
+    move_wake: Arc<tokio::sync::Notify>,
+    move_driver_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     claim_refresh: Arc<claims::RefreshQueue>,
     claim_refresh_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     role_refresh: Arc<tokio::sync::Notify>,
@@ -697,6 +704,11 @@ impl ProjectsHandler {
                 )),
             )),
             claim_refresh: Arc::new(claims::RefreshQueue::default()),
+            door_client: door_client::DoorClient::production(log_client::SubcConnector::from_args(
+                std::env::args_os().skip(1),
+            )),
+            move_wake: Arc::new(tokio::sync::Notify::new()),
+            move_driver_task: Mutex::new(None),
             claim_refresh_task: Mutex::new(None),
             role_refresh: Arc::new(tokio::sync::Notify::new()),
             role_refresh_task: Mutex::new(None),
@@ -915,12 +927,15 @@ impl ModuleHandler for ProjectsHandler {
                 let retry_budget = self.lease_retry_budget;
                 let claim_refresh = self.claim_refresh.clone();
                 let role_refresh = self.role_refresh.clone();
+                let move_wake = self.move_wake.clone();
                 tokio::spawn(async move {
                     let outcome = retry_open_while_lease_held(&descriptor, retry_budget).await;
                     health.store_opening.store(false, Ordering::Relaxed);
                     install_store(&store, &health, outcome);
                     claim_refresh.signal();
                     role_refresh.notify_one();
+                    move_wake.notify_one();
+                    move_wake.notify_waiters();
                 });
             }
             outcome => install_store(
@@ -934,6 +949,9 @@ impl ModuleHandler for ProjectsHandler {
         self.claim_refresh.signal();
         self.start_role_refresh();
         self.role_refresh.notify_one();
+        self.start_move_driver();
+        self.move_wake.notify_one();
+        self.move_wake.notify_waiters();
     }
 
     async fn health(&self) -> HealthReport {
@@ -949,6 +967,7 @@ impl ModuleHandler for ProjectsHandler {
             HealthStatus::Failing
         } else if self.health.log_state.load(Ordering::Relaxed) != 0
             || self.health.self_author_conflicts.load(Ordering::Relaxed) != 0
+            || self.health.move_errors.load(Ordering::Relaxed) != 0
         {
             HealthStatus::Degraded
         } else {
@@ -989,6 +1008,8 @@ impl ModuleHandler for ProjectsHandler {
                 "claimMalformed": self.health.claim_malformed.load(Ordering::Relaxed),
                 "claimError": if self.health.self_author_conflicts.load(Ordering::Relaxed) > 0 { Some("self_author_conflict") } else { None },
                 "selfAuthorConflicts": self.health.self_author_conflicts.load(Ordering::Relaxed),
+                "movesOpen": self.health.moves_open.load(Ordering::Relaxed),
+                "moveErrors": self.health.move_errors.load(Ordering::Relaxed),
             })),
         }
     }
@@ -1046,7 +1067,12 @@ impl ProjectsHandler {
         } else if request.method == claims::REFRESH {
             self.refresh_agent_claims(request.params, key).await
         } else if request.method == move_admission::MOVE {
-            self.admit_move(request.params, key, received).await
+            let result = self.admit_move(request.params, key, received).await;
+            if result.is_ok() {
+                self.start_move_driver();
+                self.move_wake.notify_one();
+            }
+            result
         } else {
             self.write_wait(request, key, received).await
         };
