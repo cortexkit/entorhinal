@@ -44,6 +44,10 @@ struct Progress {
     seal_state: Option<SealState>,
     #[serde(default)]
     handoff_state: Option<HandoffState>,
+    #[serde(default)]
+    enforced: BTreeMap<String, bool>,
+    #[serde(default)]
+    contract_violation: Option<Value>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -87,6 +91,7 @@ struct Failure {
     module: Option<String>,
     diagnostic: bool,
     unknown: bool,
+    contract_violation: bool,
 }
 
 impl Failure {
@@ -98,16 +103,17 @@ impl Failure {
             module: None,
             diagnostic: false,
             unknown: false,
+            contract_violation: false,
         }
     }
     fn participant(op: &str, module: &str, error: ClientError) -> Self {
-        let (code, detail, unknown) = match error {
-            ClientError::Refused(r) => (r.code, r.detail.unwrap_or(Value::Null), false),
+        let (code, detail, unknown, contract_violation) = match error {
+            ClientError::Refused(r) => (r.code, r.detail.unwrap_or(Value::Null), false, false),
             ClientError::ContractViolation { code, detail, .. } => {
-                (code, detail.unwrap_or(Value::Null), false)
+                (code, detail.unwrap_or(Value::Null), false, true)
             }
-            ClientError::OutcomeUnknown => ("unavailable".into(), Value::Null, true),
-            ClientError::InvalidReply(detail) => ("unavailable".into(), json!(detail), true),
+            ClientError::OutcomeUnknown => ("unavailable".into(), Value::Null, true, false),
+            ClientError::InvalidReply(detail) => ("unavailable".into(), json!(detail), true, false),
         };
         Self {
             code,
@@ -116,6 +122,7 @@ impl Failure {
             module: Some(module.into()),
             diagnostic: false,
             unknown,
+            contract_violation,
         }
     }
     fn door(op: &str, error: DoorError) -> Self {
@@ -130,14 +137,16 @@ impl Failure {
         failure
     }
     fn detail(&self) -> Value {
-        let mut detail = json!({"op":self.op,"code":self.code,"detail":self.detail});
+        let mut detail = json!({"op":self.op,"code":self.code,"detail":self.detail,
+            "contract_violation":self.contract_violation});
         if let Some(module) = &self.module {
             detail["module_id"] = json!(module);
         }
         detail
     }
     fn retryable(&self) -> bool {
-        ["cut_not_ready", "unavailable", "handoff_not_covered"].contains(&self.code.as_str())
+        !self.contract_violation
+            && ["cut_not_ready", "unavailable", "handoff_not_covered"].contains(&self.code.as_str())
     }
 }
 impl From<HandlerError> for Failure {
@@ -254,6 +263,19 @@ impl Source {
                     .map_err(|f| HandlerError::new(&f.code, f.detail.to_string()))?;
             }
         }
+        if plan.source.contract_violation.is_some() {
+            if observed
+                .as_ref()
+                .is_some_and(|(record, _)| record.state == State::Released)
+            {
+                Self::change_step(&mut row, &mut plan, Step::Released);
+                self.save(&mut row, &plan, true)
+                    .await
+                    .map_err(|f| HandlerError::new(&f.code, f.detail.to_string()))?;
+                return Ok(None);
+            }
+            return Ok(Some(POLL));
+        }
         if (self.worker.clock)() < plan.source.retry_at_ms {
             let remaining =
                 Duration::from_millis((plan.source.retry_at_ms - (self.worker.clock)()) as u64);
@@ -280,15 +302,37 @@ impl Source {
         plan: &mut Plan,
         error: Failure,
     ) -> Result<Option<Duration>, HandlerError> {
-        let busy_retry =
-            error.code == "busy" && error.op == "agent_data.prepare" && row.attempts < 8;
+        let busy_retry = !error.contract_violation
+            && error.code == "busy"
+            && error.op == "agent_data.prepare"
+            && row.attempts < 8;
         let cleanup = row.abort_requested.is_some();
-        let retry = error.diagnostic
-            || error.unknown
-            || error.retryable()
-            || busy_retry
-            || cleanup
-            || row.step == Step::Releasing;
+        if error.contract_violation {
+            let detail = error.detail();
+            if !plan.source.errors.contains(&detail) {
+                plan.source.errors.push(detail.clone());
+            }
+            if cleanup || row.step == Step::Releasing {
+                // Release cannot be rolled back, and cleanup cannot finish by
+                // trusting a participant that broke its contract. Stop calls
+                // durably rather than turning the violation into another retry.
+                plan.source.contract_violation = Some(detail.clone());
+                row.detail = Some(detail.clone());
+                row.hold = Some(detail);
+                plan.source.retry_at_ms = 0;
+                self.save(row, plan, false)
+                    .await
+                    .map_err(|f| HandlerError::new(&f.code, f.detail.to_string()))?;
+                return Ok(Some(POLL));
+            }
+        }
+        let retry = !error.contract_violation
+            && (error.diagnostic
+                || error.unknown
+                || error.retryable()
+                || busy_retry
+                || cleanup
+                || row.step == Step::Releasing);
         if error.diagnostic {
             let diagnostic = json!({"code":error.code,"op":error.op});
             if !plan.source.errors.contains(&diagnostic) {
@@ -753,7 +797,7 @@ impl Source {
         };
         if let Err(error) = result {
             let failure = Failure::participant(&pending.op, &pending.module_id, error);
-            if failure.unknown {
+            if failure.unknown || failure.contract_violation {
                 return Err(failure);
             }
         }
@@ -953,16 +997,22 @@ impl Source {
                 ));
             }
         }
-        for participant in &plan.participants {
-            let request = self.request(participant);
+        for participant in plan.participants.clone() {
+            let request = self.request(&participant);
             let release = ReleaseRequest::new(request.refs, request.cut_id, plan.to.clone());
-            self.client(&participant.module_id)
+            let reply = self
+                .client(&participant.module_id)
                 .await?
                 .release(&release)
                 .await
                 .map_err(|e| {
                     Failure::participant("agent_data.release", &participant.module_id, e)
                 })?;
+            plan.source
+                .enforced
+                .entry(participant.module_id)
+                .or_insert(reply.enforced);
+            self.save(row, plan, false).await?;
         }
         let mut released = record;
         released.state = State::Released;
@@ -1046,14 +1096,39 @@ mod tests {
             });
         }
     }
+    struct ReleaseGate {
+        enabled: std::sync::atomic::AtomicBool,
+        entered: tokio::sync::Semaphore,
+        resume: tokio::sync::Semaphore,
+    }
+
+    impl Default for ReleaseGate {
+        fn default() -> Self {
+            Self {
+                enabled: std::sync::atomic::AtomicBool::new(false),
+                entered: tokio::sync::Semaphore::new(0),
+                resume: tokio::sync::Semaphore::new(0),
+            }
+        }
+    }
+
     struct Peer {
         participant: Arc<FakeParticipant>,
         trace: Arc<Trace>,
+        release_gate: Option<Arc<ReleaseGate>>,
     }
     #[async_trait]
     impl LogTransport for Peer {
         async fn call(&self, method: &str, params: Value) -> Result<Vec<u8>, TransportError> {
             self.trace.call(method);
+            if method == "agent_data.release" {
+                if let Some(gate) = &self.release_gate {
+                    if gate.enabled.load(Ordering::Relaxed) {
+                        gate.entered.add_permits(1);
+                        gate.resume.acquire().await.unwrap().forget();
+                    }
+                }
+            }
             self.participant.call(method, params).await
         }
     }
@@ -1160,6 +1235,7 @@ mod tests {
         slot: Slot,
         worker: Worker,
         participants: Vec<Arc<FakeParticipant>>,
+        release_gate: Arc<ReleaseGate>,
         door: FakeDoor,
         records: Arc<FakeRecord>,
         record_pipe: Arc<Records>,
@@ -1214,6 +1290,7 @@ mod tests {
             let records = FakeRecord::new([1; 16]);
             let mut peers = BTreeMap::new();
             let mut participants = vec![];
+            let release_gate = Arc::new(ReleaseGate::default());
             for (index, module) in ["a", "b", "c"].into_iter().enumerate() {
                 let reference = format!("r{module}");
                 let participant = Arc::new(FakeParticipant::new(
@@ -1237,6 +1314,7 @@ mod tests {
                     Arc::new(Peer {
                         participant: participant.clone(),
                         trace: trace.clone(),
+                        release_gate: (module == "b").then(|| release_gate.clone()),
                     }),
                 );
                 participants.push(participant);
@@ -1264,6 +1342,7 @@ mod tests {
                 slot,
                 worker,
                 participants,
+                release_gate,
                 door,
                 records,
                 record_pipe,
@@ -1871,6 +1950,148 @@ mod tests {
                 assert_eq!(f.row().record_version, 3);
             }
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn source_release_enforcement_is_persisted_per_module_across_a_mid_release_restart() {
+        let f = Fixture::new();
+        let mut source = f.source();
+        f.published(&mut source).await;
+        f.participants[0].set_enforced(false);
+        f.participants[1].set_enforced(true);
+        f.claim();
+        f.state(State::Activated, TO);
+        f.door.script(
+            "cut.handoff",
+            DoorEffect::Handoff(crate::door_client::HandoffReply {
+                state: HandoffState::Released,
+                session_ref: None,
+                code: None,
+            }),
+        );
+        f.release_gate.enabled.store(true, Ordering::Relaxed);
+        let task = tokio::spawn(async move { source.tick().await });
+        f.release_gate.entered.acquire().await.unwrap().forget();
+        assert_eq!(f.row().step, Step::Releasing);
+        assert_eq!(f.row().plan["_source"]["enforced"], json!({"a":false}));
+        assert!(f.participants[1]
+            .calls()
+            .iter()
+            .all(|r| !matches!(r, Request::Release(_))));
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        f.release_gate.enabled.store(false, Ordering::Relaxed);
+        f.participants[0].set_enforced(true);
+        let mut restarted = f.source();
+        f.until(&mut restarted, Step::Released).await;
+        assert_eq!(
+            f.row().plan["_source"]["enforced"],
+            json!({"a":false,"b":true,"c":true})
+        );
+        assert_eq!(
+            f.participants[0]
+                .calls()
+                .iter()
+                .filter(|r| matches!(r, Request::Release(_)))
+                .count(),
+            2
+        );
+        assert!(f.row().hold.is_none());
+        assert_eq!(f.worker.health.move_errors.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn source_release_contract_violation_stops_calls_without_retry_even_after_restart() {
+        let f = Fixture::new();
+        let mut source = f.source();
+        f.published(&mut source).await;
+        f.claim();
+        f.state(State::Activated, TO);
+        f.door.script(
+            "cut.handoff",
+            DoorEffect::Handoff(crate::door_client::HandoffReply {
+                state: HandoffState::Released,
+                session_ref: None,
+                code: None,
+            }),
+        );
+        f.participants[1].script(
+            "agent_data.release",
+            ParticipantEffect::Refuse(Refusal {
+                code: "cut_not_ready".into(),
+                detail: Some(json!({"note":"not allowed for release"})),
+            }),
+        );
+        f.step(&mut source).await;
+        let row = f.row();
+        assert_eq!(row.step, Step::Releasing);
+        assert_eq!(row.attempts, 0);
+        assert!(row.abort_requested.is_none());
+        assert_eq!(row.detail.as_ref().unwrap()["contract_violation"], true);
+        assert_eq!(row.detail.as_ref().unwrap()["module_id"], "b");
+        assert_eq!(row.detail.as_ref().unwrap()["code"], "cut_not_ready");
+        assert_eq!(row.plan["_source"]["enforced"], json!({"a":true}));
+        assert_eq!(row.plan["_source"]["errors"][0]["contract_violation"], true);
+        assert_eq!(f.worker.health.move_errors.load(Ordering::Relaxed), 1);
+        let counts: Vec<_> = f.participants.iter().map(|p| p.calls().len()).collect();
+        for _ in 0..3 {
+            f.step(&mut source).await;
+        }
+        let mut restarted = f.source();
+        f.step(&mut restarted).await;
+        assert_eq!(
+            f.participants
+                .iter()
+                .map(|p| p.calls().len())
+                .collect::<Vec<_>>(),
+            counts
+        );
+        assert_eq!(
+            f.participants[1]
+                .calls()
+                .iter()
+                .filter(|r| matches!(r, Request::Release(_)))
+                .count(),
+            1
+        );
+        assert!(f.participants[2]
+            .calls()
+            .iter()
+            .all(|r| !matches!(r, Request::Release(_))));
+        let reply = f.worker.records.read(&format!("move:{CUT}")).await.unwrap();
+        assert_eq!(
+            wire::decode_move_record(&format!("move:{CUT}"), reply.body.as_ref().unwrap())
+                .unwrap()
+                .state,
+            State::Activated
+        );
+    }
+
+    #[test]
+    fn participant_contract_violations_are_never_retryable_by_code() {
+        for code in ["unavailable", "cut_not_ready", "handoff_not_covered"] {
+            let violation = Failure::participant(
+                "agent_data.release",
+                "a",
+                ClientError::ContractViolation {
+                    op: "agent_data.release",
+                    code: code.into(),
+                    detail: None,
+                },
+            );
+            assert!(!violation.retryable());
+            assert_eq!(violation.detail()["contract_violation"], true);
+        }
+        let unavailable = Failure::participant(
+            "agent_data.release",
+            "a",
+            ClientError::Refused(Refusal {
+                code: "unavailable".into(),
+                detail: None,
+            }),
+        );
+        assert!(unavailable.retryable());
+        assert_eq!(unavailable.detail()["contract_violation"], false);
     }
 
     #[tokio::test(start_paused = true)]
