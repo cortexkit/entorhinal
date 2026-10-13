@@ -29,7 +29,12 @@ fn manifest_flag_prints_the_manifest_with_the_provided_capability() {
     // the daemon tells consumers this module serves.
     assert_eq!(
         manifest["capabilities"]["provides"],
-        serde_json::json!(["project-identity/v1", "agent-identity/v1"])
+        serde_json::json!([
+            "project-identity/v1",
+            "agent-identity/v1",
+            "tool-provider/v1",
+            "call-modes/v1"
+        ])
     );
     let operations = manifest["provides"][0]["operations"].as_array().unwrap();
     let rebind: Vec<_> = operations
