@@ -79,6 +79,7 @@ mod fake_record;
 #[allow(dead_code)]
 mod log_client;
 mod record_client;
+mod roles;
 #[cfg(test)]
 mod served_vectors;
 mod sessions;
@@ -269,6 +270,9 @@ struct HealthGauges {
     claim_version_unknown: AtomicU64,
     claim_subject_mismatch: AtomicU64,
     claim_malformed: AtomicU64,
+    role_refresh_failed: AtomicBool,
+    #[cfg(test)]
+    role_refresh_done: tokio::sync::Notify,
     self_author_conflicts: AtomicU64,
     #[cfg(test)]
     claim_refresh_done: tokio::sync::Notify,
@@ -418,6 +422,8 @@ struct ProjectsHandler {
     record_client: record_client::RecordClient,
     claim_refresh: Arc<claims::RefreshQueue>,
     claim_refresh_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    role_refresh: Arc<tokio::sync::Notify>,
+    role_refresh_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     agent_id_draw: fn() -> Result<String, HandlerError>,
     /// Names the module providing each session capability on first use of a
     /// route, and once more before refusing a cached mismatch or unbound answer.
@@ -496,6 +502,7 @@ const MUTATING_METHODS: &[&str] = &[
     "agent.register_session",
     "agent.refresh_claims",
     "member.set_name",
+    "role.take",
 ];
 
 /// Mutations that `authorize_write` passes through because each is admitted
@@ -509,6 +516,7 @@ const SELF_ADMITTED_METHODS: &[&str] = &[
     sessions::REGISTER_SESSION,
     claims::REFRESH,
     member::SET_NAME,
+    roles::TAKE,
 ];
 
 /// Admit project/workspace mutations from the operator (`Direct`: the `ck`
@@ -662,6 +670,8 @@ impl ProjectsHandler {
             record_client: record_client::RecordClient::new(record_connector),
             claim_refresh: Arc::new(claims::RefreshQueue::default()),
             claim_refresh_task: Mutex::new(None),
+            role_refresh: Arc::new(tokio::sync::Notify::new()),
+            role_refresh_task: Mutex::new(None),
             agent_id_draw: shared_write::draw_agent_id,
             provider_resolver: Arc::new(sessions::SubcProviderResolver::from_args(
                 std::env::args_os().skip(1),
@@ -731,6 +741,9 @@ impl ProjectsHandler {
         }
         if method == member::SET_NAME {
             member::admit(admission.principal.as_ref())?;
+        }
+        if method == roles::TAKE {
+            self.admit_role_take(key)?;
         }
         if method == claims::REFRESH {
             self.admit_claim_refresh(key)?;
@@ -873,11 +886,13 @@ impl ModuleHandler for ProjectsHandler {
                 let health = Arc::clone(&self.health);
                 let retry_budget = self.lease_retry_budget;
                 let claim_refresh = self.claim_refresh.clone();
+                let role_refresh = self.role_refresh.clone();
                 tokio::spawn(async move {
                     let outcome = retry_open_while_lease_held(&descriptor, retry_budget).await;
                     health.store_opening.store(false, Ordering::Relaxed);
                     install_store(&store, &health, outcome);
                     claim_refresh.signal();
+                    role_refresh.notify_one();
                 });
             }
             outcome => install_store(
@@ -889,6 +904,8 @@ impl ModuleHandler for ProjectsHandler {
         self.start_catch_up();
         self.start_claim_refresh();
         self.claim_refresh.signal();
+        self.start_role_refresh();
+        self.role_refresh.notify_one();
     }
 
     async fn health(&self) -> HealthReport {
@@ -936,6 +953,7 @@ impl ModuleHandler for ProjectsHandler {
                 "lastError": enable::last_error(&self.health),
                 "lastErrorAt": enable::last_error_at(&self.health),
                 "logOwnEntriesAppliedFromLog": self.health.log_own_entries_applied.load(Ordering::Relaxed),
+                "roleRefreshFailed": self.health.role_refresh_failed.load(Ordering::Relaxed),
                 "claimRefreshed": self.health.claim_refreshed.load(Ordering::Relaxed),
                 "claimFailed": self.health.claim_failed.load(Ordering::Relaxed),
                 "claimVersionUnknown": self.health.claim_version_unknown.load(Ordering::Relaxed),
@@ -995,6 +1013,8 @@ impl ProjectsHandler {
         }
         let result = if request.method == "identity_log.enable" {
             self.enable_log(request.params, key, received).await
+        } else if request.method == roles::TAKE {
+            self.take_role(request.params, key, received).await
         } else if request.method == claims::REFRESH {
             self.refresh_agent_claims(request.params, key).await
         } else {
@@ -1100,6 +1120,11 @@ impl ProjectsHandler {
             },
             sessions::FOR_SESSION => self.for_session(request.params),
             sessions::SESSION_LIVENESS => self.agent_session_liveness(request.params),
+            roles::READ => self.role_read(request.params),
+            roles::TAKE => Err(HandlerError::new(
+                "served_path_required",
+                "role.take requires the asynchronous served path",
+            )),
             claims::WHERE => self.agent_where(request.params),
             claims::REFRESH => Err(HandlerError::new(
                 "served_path_required",
@@ -1831,6 +1856,10 @@ fn manifest() -> ModuleManifest {
                 management_operation(method, ManagementOperationKind::Query, agent_operation_description(method))
             })).chain(std::iter::once(claims::REFRESH).map(|method| {
                 management_operation(method, ManagementOperationKind::Mutate, agent_operation_description(method))
+            })).chain(std::iter::once(roles::READ).map(|method| {
+                management_operation(method, ManagementOperationKind::Query, "Read a cached role claim without waiting for engram.")
+            })).chain(std::iter::once(roles::TAKE).map(|method| {
+                management_operation(method, ManagementOperationKind::Mutate, "Take a role from Direct with operator confirmation and an idempotent request id.")
             })).collect(),
             config_schema: json!({"type": "object"}),
             observability: Vec::new(),
@@ -1964,6 +1993,12 @@ fn install_store(
     let mut guard = store
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let outcome = outcome.and_then(|opened| {
+        opened
+            .stale_roles()
+            .map_err(|error| format!("staling role cache: {error}"))?;
+        Ok(opened)
+    });
     match outcome {
         Ok(mut opened) => {
             enable_root_records(&mut opened);
@@ -2167,7 +2202,8 @@ mod tests {
                 "projects.session_liveness",
                 "agent.register_session",
                 "agent.refresh_claims",
-                "member.set_name"
+                "member.set_name",
+                "role.take",
             ]
         );
         for method in SELF_ADMITTED_METHODS {
