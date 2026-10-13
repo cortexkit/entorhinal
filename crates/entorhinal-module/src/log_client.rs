@@ -392,9 +392,8 @@ pub(crate) fn subc_connection_file(
     None
 }
 
-#[async_trait]
-impl LogConnector for SubcConnector {
-    async fn connect(&self) -> Result<Arc<dyn LogTransport>, TransportError> {
+impl SubcConnector {
+    async fn transport(&self) -> Result<Arc<SubcTransport>, TransportError> {
         let cwd =
             super::current_directory::read_current_directory(self.read_cwd).map_err(|error| {
                 TransportError::Refusal {
@@ -411,15 +410,92 @@ impl LogConnector for SubcConnector {
             None => SubcConsumer::connect_default(ConsumerOptions::default()).await,
         }
         .map_err(|_| TransportError::Unavailable)?;
-        let transport = Arc::new(SubcTransport { consumer, cwd });
+        let transport = Arc::new(SubcTransport {
+            consumer: Arc::new(consumer),
+            cwd,
+        });
         *slot = Some(transport.clone());
         Ok(transport)
+    }
+
+    pub(crate) async fn consumer(&self) -> Result<Arc<SubcConsumer>, TransportError> {
+        Ok(self.transport().await?.consumer.clone())
+    }
+
+    pub(crate) async fn open_internal_service(
+        &self,
+        target: RouteTarget,
+        activity: &'static str,
+    ) -> Result<Arc<dyn LogTransport>, TransportError> {
+        let transport = self.transport().await?;
+        let identity = BindIdentity::new(&transport.cwd, "ck-entorhinal", activity);
+        // With the default CallOptions the SDK fills the omitted consumer identity
+        // from SUBC_MODULE_ID and the supervisor's cached launch secret. The daemon
+        // therefore authenticates reserved:entorhinal, the principal participants
+        // admit, without an operator identity or a session/flow scope.
+        transport
+            .consumer
+            .open_route(target.clone(), identity.clone(), CallOptions::default())
+            .await
+            .map_err(service_call_error)?;
+        Ok(Arc::new(ServiceTransport {
+            consumer: transport.consumer.clone(),
+            target,
+            identity,
+        }))
+    }
+}
+
+#[async_trait]
+impl LogConnector for SubcConnector {
+    async fn connect(&self) -> Result<Arc<dyn LogTransport>, TransportError> {
+        Ok(self.transport().await?)
     }
 }
 
 struct SubcTransport {
-    consumer: SubcConsumer,
+    consumer: Arc<SubcConsumer>,
     cwd: String,
+}
+
+struct ServiceTransport {
+    consumer: Arc<SubcConsumer>,
+    target: RouteTarget,
+    identity: BindIdentity,
+}
+
+pub(crate) fn service_call_error(error: CallError) -> TransportError {
+    if let Some(body) = error.route_open_refusal() {
+        return TransportError::Refusal {
+            code: body.code.clone(),
+            detail: body.detail.clone(),
+        };
+    }
+    match error {
+        CallError::Module(body) => TransportError::Refusal {
+            code: body.code,
+            detail: body.detail,
+        },
+        CallError::OutcomeUnknown(_) => TransportError::NoReply,
+        _ => TransportError::Unavailable,
+    }
+}
+
+#[async_trait]
+impl LogTransport for ServiceTransport {
+    async fn call(&self, method: &str, params: Value) -> Result<Vec<u8>, TransportError> {
+        let body = serde_json::to_vec(&json!({"method": method, "params": params}))
+            .map_err(|_| TransportError::Unavailable)?;
+        self.consumer
+            .call(
+                self.target.clone(),
+                self.identity.clone(),
+                body,
+                CallOptions::default(),
+            )
+            .await
+            .map_err(service_call_error)
+    }
 }
 
 fn engram_target() -> RouteTarget {

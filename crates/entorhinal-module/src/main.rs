@@ -65,6 +65,8 @@ mod current_directory;
 #[cfg(test)]
 mod cut_barrier_rehearsal;
 mod enable;
+#[cfg(test)]
+mod fake_daemon;
 mod incarnation;
 mod member;
 // The client for engram's identity log. Only writes to shared state and
@@ -79,6 +81,9 @@ mod fake_record;
 #[allow(dead_code)]
 mod log_client;
 mod record_client;
+// The move driver uses discovery on admission, not at module startup.
+#[allow(dead_code)]
+mod participant_discovery;
 mod roles;
 #[cfg(test)]
 mod served_vectors;
