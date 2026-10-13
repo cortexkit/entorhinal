@@ -2,7 +2,7 @@
 //! Opaque metadata is preserved for a future switch to cortexkit-role-agent-data wire types.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
@@ -305,6 +305,7 @@ struct ReplyEnvelope<T> {
 pub(crate) struct ParticipantClient {
     pub(crate) module_id: String,
     transport: Arc<dyn LogTransport>,
+    unresolved: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl ParticipantClient {
@@ -312,6 +313,7 @@ impl ParticipantClient {
         Self {
             module_id: participant.module_id.clone(),
             transport: participant.transport.clone(),
+            unresolved: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
 
@@ -338,22 +340,48 @@ impl ParticipantClient {
             .map_err(|error| ClientError::InvalidReply(error.to_string()))
     }
 
+    async fn reconcile(&self, cut: &CutRequest) -> Result<(), ClientError> {
+        self.once::<StatusReply>(&Request::Status(cut.clone()))
+            .await
+            .map_err(|_| ClientError::OutcomeUnknown)?;
+        self.unresolved.lock().unwrap().remove(&cut.cut_id);
+        Ok(())
+    }
+
     async fn call<T: DeserializeOwned>(&self, request: Request) -> Result<T, ClientError> {
+        let cut = request.cut();
+        let is_status = matches!(request, Request::Status(_));
+        // A failed status probe leaves the cut unresolved across calls and client clones.
+        // The next attempt must obtain status before sending another op for that cut.
+        if !is_status {
+            if let Some(cut) = &cut {
+                let unresolved = self.unresolved.lock().unwrap().contains(&cut.cut_id);
+                if unresolved {
+                    self.reconcile(cut).await?;
+                }
+            }
+        }
         // Status cannot supply the first op's full reply. Reconcile the step, then resend
         // the identical request to retrieve the participant's durable idempotent reply.
         // Bound local recovery; a still-unknown outcome belongs to the driver's backoff.
         for _ in 0..2 {
             match self.once(&request).await {
                 Err(ClientError::OutcomeUnknown) => {
-                    if !matches!(request, Request::Status(_)) {
-                        if let Some(cut) = request.cut() {
-                            self.once::<StatusReply>(&Request::Status(cut))
-                                .await
-                                .map_err(|_| ClientError::OutcomeUnknown)?;
+                    if let Some(cut) = &cut {
+                        self.unresolved.lock().unwrap().insert(cut.cut_id.clone());
+                        if !is_status {
+                            self.reconcile(cut).await?;
                         }
                     }
                 }
-                result => return result,
+                result => {
+                    if result.is_ok() && is_status {
+                        if let Some(cut) = &cut {
+                            self.unresolved.lock().unwrap().remove(&cut.cut_id);
+                        }
+                    }
+                    return result;
+                }
             }
         }
         Err(ClientError::OutcomeUnknown)
@@ -725,6 +753,7 @@ mod tests {
     #[tokio::test]
     async fn failed_status_probe_does_not_resend_or_turn_unknown_into_a_refusal() {
         let fake = Arc::new(FakeParticipant::new(&["session"], vec![reference("s1")]));
+        let c = client(fake.clone());
         fake.script(
             "agent_data.prepare",
             Effect::LoseReply(TransportError::NoReply),
@@ -737,7 +766,7 @@ mod tests {
             }),
         );
         assert!(matches!(
-            client(fake.clone()).prepare(&cut()).await,
+            c.prepare(&cut()).await,
             Err(ClientError::OutcomeUnknown)
         ));
         assert_eq!(
@@ -745,6 +774,16 @@ mod tests {
             ["agent_data.prepare", "agent_data.status"]
         );
         assert_eq!(fake.cut(CUT).unwrap().step, Step::Prepared);
+        c.clone().prepare(&cut()).await.unwrap();
+        assert_eq!(
+            fake.calls().iter().map(Request::op).collect::<Vec<_>>(),
+            [
+                "agent_data.prepare",
+                "agent_data.status",
+                "agent_data.status",
+                "agent_data.prepare"
+            ]
+        );
     }
 
     #[tokio::test]
