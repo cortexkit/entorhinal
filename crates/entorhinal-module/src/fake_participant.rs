@@ -9,22 +9,7 @@ use serde_json::{json, Value};
 use crate::log_client::{LogTransport, TransportError};
 use crate::participant_client::*;
 
-pub(crate) const REFUSAL_CODES: [&str; 14] = [
-    "caller_forbidden",
-    "invalid_request",
-    "unknown_ref",
-    "id_reused",
-    "invalid_state",
-    "cut_unknown",
-    "cut_not_ready",
-    "busy",
-    "not_exportable",
-    "incompatible_version",
-    "digest_mismatch",
-    "external_not_present",
-    "unavailable",
-    "local_advanced",
-];
+pub(crate) const REFUSAL_CODES: &[&str] = cortexkit_role_agent_data::errors::codes::ALL;
 
 #[derive(Clone)]
 pub(crate) enum Effect {
@@ -65,21 +50,17 @@ impl FakeParticipant {
     pub(crate) fn new(ref_kinds: &[&str], held: Vec<AgentRef>) -> Self {
         Self {
             state: Mutex::new(State {
-                description: DescribeReply {
-                    ref_kinds: ref_kinds.iter().map(|kind| (*kind).into()).collect(),
-                    stores: vec![],
-                    external: false,
-                    detail: None,
-                },
+                description: DescribeReply::new(
+                    ref_kinds.iter().map(|kind| (*kind).into()).collect(),
+                    vec![],
+                    false,
+                ),
                 held: held.into_iter().collect(),
                 unknown_busy_for_unheld: false,
                 busy: BTreeMap::new(),
                 diverged: BTreeMap::new(),
-                prepare: PrepareReply {
-                    items: vec![],
-                    external: vec![],
-                },
-                import: ImportReply { items: vec![] },
+                prepare: PrepareReply::new(vec![], vec![]),
+                import: ImportReply::new(vec![]),
                 enforced: true,
                 cuts: BTreeMap::new(),
                 replies: BTreeMap::new(),
@@ -144,28 +125,36 @@ impl FakeParticipant {
         method: &str,
         params: Value,
     ) -> Result<Vec<u8>, TransportError> {
-        if caller != "reserved:entorhinal" {
-            return Err(refuse("caller_forbidden", None));
+        if !cortexkit_role_agent_data::caller_admitted(caller) {
+            return Err(refuse(
+                cortexkit_role_agent_data::errors::codes::CALLER_FORBIDDEN,
+                None,
+            ));
         }
-        let mut object = params
-            .as_object()
-            .cloned()
-            .ok_or_else(|| refuse("invalid_request", None))?;
+        let object = params.as_object().cloned().ok_or_else(|| {
+            refuse(
+                cortexkit_role_agent_data::errors::codes::INVALID_REQUEST,
+                None,
+            )
+        })?;
         // The method belongs to the routed envelope, never to the params object.
         if object.contains_key("op") {
-            return Err(refuse("invalid_request", None));
+            return Err(refuse(
+                cortexkit_role_agent_data::errors::codes::INVALID_REQUEST,
+                None,
+            ));
         }
-        object.insert("op".into(), Value::String(method.into()));
-        let request: Request = serde_json::from_value(Value::Object(object))
-            .map_err(|_| refuse("invalid_request", None))?;
-        validate(&request)?;
+        let request = Request::decode(method, &Value::Object(object))
+            .map_err(|error| refuse(error.code.as_str(), error.detail))?;
         let mut state = self.state.lock().unwrap();
         state.calls.push(request.clone());
         let effect = state.scripts.get_mut(method).and_then(VecDeque::pop_front);
-        let recorded = request.changes_state()
-            && request
-                .cut()
-                .is_some_and(|cut| state.replies.contains_key(&(cut.cut_id, request.op())));
+        let recorded = request.op().changes_state()
+            && request_cut(&request).is_some_and(|cut| {
+                state
+                    .replies
+                    .contains_key(&(cut.cut_id.as_str().to_owned(), request.op().method()))
+            });
         match &effect {
             Some(Effect::Refuse(refusal)) if !recorded => {
                 return Err(refuse(&refusal.code, refusal.detail.clone()))
@@ -184,73 +173,62 @@ impl FakeParticipant {
 #[async_trait]
 impl LogTransport for FakeParticipant {
     async fn call(&self, method: &str, params: Value) -> Result<Vec<u8>, TransportError> {
-        self.handle("reserved:entorhinal", method, params)
+        self.handle(cortexkit_role_agent_data::ADMITTED_CALLER, method, params)
     }
 }
 
 fn refuse(code: &str, detail: Option<Value>) -> TransportError {
     TransportError::Refusal {
-        code: code.into(),
+        code: code.to_string(),
         detail,
     }
 }
 
-fn validate(request: &Request) -> Result<(), TransportError> {
-    let refs: BTreeSet<_> = request.refs().iter().collect();
-    if request.refs().len() > 256 || refs.len() != request.refs().len() {
-        return Err(refuse("invalid_request", None));
-    }
-    if let Some(cut) = request.cut() {
-        if cut.cut_id.len() != 32
-            || !cut
-                .cut_id
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
-            return Err(refuse("invalid_request", None));
-        }
-    }
-    Ok(())
+fn canonicalize(request: Request) -> Request {
+    request.with_sorted_refs()
 }
 
-fn canonicalize(mut request: Request) -> Request {
-    match &mut request {
-        Request::Describe(_) => {}
-        Request::Busy(r) => r.refs.sort(),
-        Request::Release(r) => r.refs.sort(),
-        Request::Status(r)
-        | Request::Prepare(r)
-        | Request::Export(r)
-        | Request::Diverged(r)
-        | Request::Import(r)
-        | Request::Activate(r)
-        | Request::Abort(r) => r.refs.sort(),
-    }
-    request
+fn request_cut(request: &Request) -> Option<CutRequest> {
+    Some(CutRequest::new(
+        request.refs()?.clone(),
+        request.cut_id()?.clone(),
+    ))
+}
+
+fn request_refs(request: &Request) -> &[AgentRef] {
+    request.refs().map(Refs::as_slice).unwrap_or(&[])
 }
 
 fn invalid_state(cut: &CutState) -> TransportError {
     refuse(
-        "invalid_state",
+        cortexkit_role_agent_data::errors::codes::INVALID_STATE,
         Some(json!({"step": cut.step, "refs": cut.refs})),
     )
 }
 
 fn execute(state: &mut State, request: Request) -> Result<Value, TransportError> {
-    let cut = request.cut();
-    let refs: BTreeSet<_> = request.refs().iter().cloned().collect();
-    let key = cut.as_ref().map(|cut| (cut.cut_id.clone(), request.op()));
+    let op = request.op();
+    let cut = request_cut(&request);
+    let refs: BTreeSet<_> = request_refs(&request).iter().cloned().collect();
+    let key = cut
+        .as_ref()
+        .map(|cut| (cut.cut_id.as_str().to_owned(), op.method()));
     let canonical = canonicalize(request.clone());
-    if request.changes_state() {
+    if op.changes_state() {
         if let Some((first, reply)) = key.as_ref().and_then(|key| state.replies.get(key)) {
             return if first == &canonical {
                 Ok(reply.clone())
             } else {
-                Err(refuse("id_reused", None))
+                Err(refuse(
+                    cortexkit_role_agent_data::errors::codes::ID_REUSED,
+                    None,
+                ))
             };
         }
     }
-    let existing = cut.as_ref().and_then(|cut| state.cuts.get(&cut.cut_id));
+    let existing = cut
+        .as_ref()
+        .and_then(|cut| state.cuts.get(cut.cut_id.as_str()));
     if let Some(existing) = existing {
         if existing.refs != refs {
             return Err(invalid_state(existing));
@@ -264,30 +242,35 @@ fn execute(state: &mut State, request: Request) -> Result<Value, TransportError>
             for reference in &request.refs {
                 if !state.held.contains(reference) {
                     if !state.unknown_busy_for_unheld {
-                        return Err(refuse("unknown_ref", Some(json!(reference))));
+                        return Err(refuse(
+                            cortexkit_role_agent_data::errors::codes::UNKNOWN_REF,
+                            Some(json!(reference)),
+                        ));
                     }
-                    result.push(BusyRef {
-                        state: BusyState::Unknown,
-                        reason_code: Some("unheld".into()),
-                        reason: Some("No local data".into()),
-                    });
+                    result.push(
+                        BusyRef::new(BusyState::Unknown)
+                            .with_reason_code("unheld")
+                            .with_reason("No local data"),
+                    );
                 } else {
-                    result.push(state.busy.get(reference).cloned().unwrap_or(BusyRef {
-                        state: BusyState::Idle,
-                        reason_code: None,
-                        reason: None,
-                    }));
+                    result.push(
+                        state
+                            .busy
+                            .get(reference)
+                            .cloned()
+                            .unwrap_or_else(|| BusyRef::new(BusyState::Idle)),
+                    );
                 }
             }
-            json!(BusyReply { refs: result })
+            json!(BusyReply::new(result))
         }
-        Request::Status(_) => json!(StatusReply { step }),
-        Request::Diverged(request) => json!(DivergedReply {
-            refs: request
+        Request::Status(_) => json!(StatusReply::new(step)),
+        Request::Diverged(request) => json!(DivergedReply::new(
+            request
                 .refs
                 .iter()
-                .map(|reference| DivergedRef {
-                    state: if state.held.contains(reference) {
+                .map(|reference| {
+                    DivergedRef::new(if state.held.contains(reference) {
                         state
                             .diverged
                             .get(reference)
@@ -295,41 +278,63 @@ fn execute(state: &mut State, request: Request) -> Result<Value, TransportError>
                             .unwrap_or(DivergedState::AtCut)
                     } else {
                         DivergedState::AtCut
-                    },
+                    })
                 })
-                .collect()
-        }),
+                .collect(),
+        )),
         Request::Prepare(_) => {
             require_step(state, cut.as_ref().unwrap(), step, Step::None)?;
             for reference in &refs {
                 if !state.held.contains(reference) {
-                    return Err(refuse("unknown_ref", Some(json!(reference))));
+                    return Err(refuse(
+                        cortexkit_role_agent_data::errors::codes::UNKNOWN_REF,
+                        Some(json!(reference)),
+                    ));
                 }
             }
-            let busy: Vec<_> = refs.iter().filter_map(|reference| state.busy.get(reference)
-                .filter(|busy| busy.state != BusyState::Idle).map(|busy| json!({"ref_kind": reference.ref_kind, "ref": reference.reference, "state": busy.state, "reason_code": busy.reason_code, "reason": busy.reason}))).collect();
+            let busy: Vec<_> = refs
+                .iter()
+                .filter_map(|reference| {
+                    state
+                        .busy
+                        .get(reference)
+                        .filter(|busy| busy.state != BusyState::Idle)
+                        .map(|busy| {
+                            json!({
+                                "ref_kind": reference.ref_kind,
+                                "ref": reference.r#ref,
+                                "state": busy.state,
+                                "reason_code": busy.reason_code,
+                                "reason": busy.reason,
+                            })
+                        })
+                })
+                .collect();
             if !busy.is_empty() {
-                return Err(refuse("busy", Some(json!({"refs": busy}))));
+                return Err(refuse(
+                    cortexkit_role_agent_data::errors::codes::BUSY,
+                    Some(json!({"refs": busy})),
+                ));
             }
             state.frozen.extend(refs.clone());
             json!(state.prepare)
         }
         Request::Export(_) => {
             require_step(state, cut.as_ref().unwrap(), step, Step::Prepared)?;
-            let prepare =
-                &state.replies[&(cut.as_ref().unwrap().cut_id.clone(), "agent_data.prepare")].1;
+            let prepare_key = (
+                cut.as_ref().unwrap().cut_id.as_str().to_owned(),
+                cortexkit_role_agent_data::ops::PREPARE,
+            );
+            let prepare = &state.replies[&prepare_key].1;
             let prepare: PrepareReply =
                 serde_json::from_value(prepare.clone()).expect("cached prepare is typed");
-            json!(ExportReply {
-                items: prepare
+            json!(ExportReply::new(
+                prepare
                     .items
                     .into_iter()
-                    .map(|item| ExportItem {
-                        session_ref: item.session_ref,
-                        end_offset: item.end_offset
-                    })
-                    .collect()
-            })
+                    .map(|item| ExportItem::new(item.session_ref, item.end_offset))
+                    .collect(),
+            ))
         }
         Request::Import(_) => {
             require_step(state, cut.as_ref().unwrap(), step, Step::None)?;
@@ -343,7 +348,7 @@ fn execute(state: &mut State, request: Request) -> Result<Value, TransportError>
                 state.staged.remove(reference);
                 state.tombstones.remove(reference);
             }
-            json!({})
+            json!(Empty::new())
         }
         Request::Abort(_) => {
             if matches!(step, Step::Activated | Step::Released) {
@@ -353,7 +358,7 @@ fn execute(state: &mut State, request: Request) -> Result<Value, TransportError>
                 state.frozen.remove(reference);
                 state.staged.remove(reference);
             }
-            json!({})
+            json!(Empty::new())
         }
         Request::Release(request) => {
             require_step(state, cut.as_ref().unwrap(), step, Step::Exported)?;
@@ -363,12 +368,10 @@ fn execute(state: &mut State, request: Request) -> Result<Value, TransportError>
                     .tombstones
                     .insert(reference.clone(), request.holder.clone());
             }
-            json!(ReleaseReply {
-                enforced: state.enforced
-            })
+            json!(ReleaseReply::new(state.enforced))
         }
     };
-    if request.changes_state() {
+    if op.changes_state() {
         let cut = cut.unwrap();
         let step = match request {
             Request::Prepare(_) => Step::Prepared,
@@ -379,7 +382,9 @@ fn execute(state: &mut State, request: Request) -> Result<Value, TransportError>
             Request::Release(_) => Step::Released,
             _ => unreachable!(),
         };
-        state.cuts.insert(cut.cut_id, CutState { refs, step });
+        state
+            .cuts
+            .insert(cut.cut_id.as_str().to_owned(), CutState { refs, step });
         state
             .replies
             .insert(key.unwrap(), (canonical, reply.clone()));
@@ -396,9 +401,12 @@ fn require_step(
     if actual == required {
         return Ok(());
     }
-    match state.cuts.get(&cut.cut_id) {
+    match state.cuts.get(cut.cut_id.as_str()) {
         Some(cut) => Err(invalid_state(cut)),
-        None => Err(refuse("cut_unknown", None)),
+        None => Err(refuse(
+            cortexkit_role_agent_data::errors::codes::CUT_UNKNOWN,
+            None,
+        )),
     }
 }
 
@@ -411,16 +419,16 @@ mod tests {
 
     const CUT: &str = "0123456789abcdef0123456789abcdef";
     fn reference(name: &str) -> AgentRef {
-        AgentRef {
-            ref_kind: "session".into(),
-            reference: name.into(),
-        }
+        AgentRef::new("session", name)
     }
     fn cut(refs: &[&str]) -> CutRequest {
-        CutRequest {
-            refs: refs.iter().map(|r| reference(r)).collect(),
-            cut_id: CUT.into(),
-        }
+        CutRequest::new(
+            Refs::new(refs.iter().map(|r| reference(r)).collect()).unwrap(),
+            CutId::new(CUT).unwrap(),
+        )
+    }
+    fn release_request(cut: &CutRequest, holder: &str) -> ReleaseRequest {
+        ReleaseRequest::new(cut.refs.clone(), cut.cut_id.clone(), holder)
     }
     fn client(fake: Arc<FakeParticipant>) -> ParticipantClient {
         ParticipantClient::new(&Participant {
@@ -445,46 +453,33 @@ mod tests {
             vec![reference("a"), reference("b")],
         ));
         let c = client(fake.clone());
-        let original = PrepareReply {
-            items: vec![],
-            external: vec![ExternalRef {
-                ref_kind: "session".into(),
-                reference: "a".into(),
-                note: "Copy host data".into(),
-                check: json!({"v":1}),
-            }],
-        };
+        let original = PrepareReply::new(
+            vec![],
+            vec![ExternalRef::new(
+                "session",
+                "a",
+                "Copy host data",
+                json!({"v":1}),
+            )],
+        );
         fake.set_prepare(original.clone());
         assert_eq!(c.prepare(&cut(&["a", "b"])).await.unwrap(), original);
-        fake.set_prepare(PrepareReply {
-            items: vec![],
-            external: vec![],
-        });
+        fake.set_prepare(PrepareReply::new(vec![], vec![]));
         assert_eq!(c.prepare(&cut(&["b", "a"])).await.unwrap(), original);
         refusal(c.prepare(&cut(&["a"])).await, "id_reused");
         c.export(&cut(&["b", "a"])).await.unwrap();
-        let release = ReleaseRequest {
-            refs: cut(&["a", "b"]).refs,
-            cut_id: CUT.into(),
-            holder: "mac-b".into(),
-        };
+        let release = release_request(&cut(&["a", "b"]), "mac-b");
         assert!(c.release(&release).await.unwrap().enforced);
         fake.set_enforced(false);
         assert!(
-            c.release(&ReleaseRequest {
-                refs: cut(&["b", "a"]).refs,
-                ..release.clone()
-            })
-            .await
-            .unwrap()
-            .enforced
+            c.release(&release_request(&cut(&["b", "a"]), "mac-b"))
+                .await
+                .unwrap()
+                .enforced
         );
         refusal(
-            c.release(&ReleaseRequest {
-                holder: "mac-c".into(),
-                ..release
-            })
-            .await,
+            c.release(&release_request(&cut(&["a", "b"]), "mac-c"))
+                .await,
             "id_reused",
         );
         fake.script(
@@ -546,12 +541,7 @@ mod tests {
         }
         a.export(&cut(&["a", "b"])).await.unwrap();
         refusal(
-            a.release(&ReleaseRequest {
-                refs: wrong.refs.clone(),
-                cut_id: CUT.into(),
-                holder: "b".into(),
-            })
-            .await,
+            a.release(&release_request(&wrong, "b")).await,
             "invalid_state",
         );
         let receiver = Arc::new(FakeParticipant::new(&["session"], vec![]));
@@ -576,12 +566,7 @@ mod tests {
         refusal(a.export(&request).await, "cut_unknown");
         refusal(a.activate(&request).await, "cut_unknown");
         refusal(
-            a.release(&ReleaseRequest {
-                refs: request.refs.clone(),
-                cut_id: CUT.into(),
-                holder: "mac-b".into(),
-            })
-            .await,
+            a.release(&release_request(&request, "mac-b")).await,
             "cut_unknown",
         );
         refusal(b.prepare(&request).await, "unknown_ref");
@@ -600,12 +585,7 @@ mod tests {
         );
         refusal(a.import(&request).await, "invalid_state");
         refusal(
-            a.release(&ReleaseRequest {
-                refs: request.refs.clone(),
-                cut_id: CUT.into(),
-                holder: "mac-b".into(),
-            })
-            .await,
+            a.release(&release_request(&request, "mac-b")).await,
             "invalid_state",
         );
         a.export(&request).await.unwrap();
@@ -621,13 +601,9 @@ mod tests {
             "activated"
         );
         assert_eq!(source.cut(CUT).unwrap().step, Step::Exported);
-        a.release(&ReleaseRequest {
-            refs: request.refs.clone(),
-            cut_id: CUT.into(),
-            holder: "mac-b".into(),
-        })
-        .await
-        .unwrap();
+        a.release(&release_request(&request, "mac-b"))
+            .await
+            .unwrap();
         assert_eq!(
             refusal(a.abort(&request).await, "invalid_state").unwrap()["step"],
             "released"
@@ -676,7 +652,7 @@ mod tests {
             fake.script(
                 "agent_data.prepare",
                 Effect::Refuse(Refusal {
-                    code: code.into(),
+                    code: String::from(*code),
                     detail: Some(json!({"step":"none","note":"scripted refusal"})),
                 }),
             );
@@ -692,7 +668,7 @@ mod tests {
                     code: actual_code,
                     detail,
                 } => {
-                    assert_eq!(actual_code, code);
+                    assert_eq!(actual_code, *code);
                     assert_eq!(detail.unwrap()["note"], "scripted refusal");
                 }
                 other => panic!("expected scripted {code}, got {other:?}"),
@@ -702,22 +678,13 @@ mod tests {
         }
         fake.set_busy(
             reference("a"),
-            BusyRef {
-                state: BusyState::Busy,
-                reason_code: Some("run_active".into()),
-                reason: Some("Run active".into()),
-            },
+            BusyRef::new(BusyState::Busy)
+                .with_reason_code("run_active")
+                .with_reason("Run active"),
         );
         let busy = refusal(c.prepare(&cut(&["a"])).await, "busy").unwrap();
         assert_eq!(busy["refs"][0]["reason_code"], "run_active");
-        fake.set_busy(
-            reference("a"),
-            BusyRef {
-                state: BusyState::Idle,
-                reason_code: None,
-                reason: None,
-            },
-        );
+        fake.set_busy(reference("a"), BusyRef::new(BusyState::Idle));
         c.prepare(&cut(&["a"])).await.unwrap();
         assert_eq!(fake.cut(CUT).unwrap().step, Step::Prepared);
     }
@@ -728,24 +695,18 @@ mod tests {
         fake.unknown_busy_for_unheld(true);
         let c = client(fake.clone());
         let request = cut(&["a"]);
-        let reply = c.busy(&request.refs).await.unwrap();
+        let reply = c.busy(request.refs.as_slice()).await.unwrap();
         assert_eq!(reply.refs[0].state, BusyState::Unknown);
         assert_eq!(reply.refs[0].reason_code.as_deref(), Some("unheld"));
         assert_eq!(
             c.diverged(&request).await.unwrap().refs[0].state,
             DivergedState::AtCut
         );
-        fake.set_import(ImportReply {
-            items: vec![ImportItem {
-                session_ref: "s".into(),
-                end_offset: 17,
-                digest: "digest".into(),
-            }],
-        });
+        fake.set_import(ImportReply::new(vec![ImportItem::new("s", 17, "digest")]));
         assert_eq!(c.import(&request).await.unwrap().items[0].end_offset, 17);
         c.activate(&request).await.unwrap();
         assert_eq!(
-            c.busy(&request.refs).await.unwrap().refs[0].state,
+            c.busy(request.refs.as_slice()).await.unwrap().refs[0].state,
             BusyState::Idle
         );
         fake.set_diverged(reference("a"), DivergedState::Advanced);

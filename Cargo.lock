@@ -142,6 +142,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d14cf5bd9d4b76fcf4d5380550dd11f9191598309ecaacc4805e317b2d6deb90"
 
 [[package]]
+name = "cortexkit-role-agent-data"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f17fa4a4f8512840e3f08eb24bbc38784b859ddb343984f1d4dba3d9c6730d4c"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cortexkit-store"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -247,6 +257,7 @@ version = "0.1.25"
 dependencies = [
  "async-trait",
  "cortexkit-log",
+ "cortexkit-role-agent-data",
  "cortexkit-store-types",
  "cortexkit-test-support",
  "entorhinal-core",
