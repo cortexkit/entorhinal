@@ -1440,10 +1440,10 @@ mod tests {
             ),
         ] {
             let full = f.ok("agent.fleet_identity", json!({}));
-            fleet_keys(&full, &["token", "unchanged", "agents"]);
+            fleet_keys(&full, &["logPosition", "token", "unchanged", "agents"]);
             assert_eq!(full["token"], format!("{}:{}", INCARNATION, f.head()));
             let unchanged = f.ok("agent.fleet_identity", json!({"token":full["token"]}));
-            fleet_keys(&unchanged, &["token", "unchanged"]);
+            fleet_keys(&unchanged, &["logPosition", "token", "unchanged"]);
             assert_eq!(unchanged["unchanged"], true);
             f.ok(method, params);
             assert_eq!(
@@ -1472,7 +1472,7 @@ mod tests {
             json!({"bad":true}),
         ] {
             let reply = f.ok("agent.fleet_identity", json!({"token":token}));
-            fleet_keys(&reply, &["token", "unchanged", "agents"]);
+            fleet_keys(&reply, &["logPosition", "token", "unchanged", "agents"]);
             assert_eq!(reply["unchanged"], false);
             assert_eq!(reply["agents"].as_array().unwrap().len(), 1);
         }

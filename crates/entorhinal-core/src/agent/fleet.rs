@@ -30,7 +30,18 @@ impl RegistryStore {
         let value = self.read_agent(|conn| {
             let generation = self.generation_from_connection(conn)?;
             let current = format!("{incarnation}:{generation}");
-            let mut reply = json!({"incarnation":incarnation,"generation":generation,"token":current,"unchanged":token == Some(current.as_str())});
+            // The last shared identity-log position this machine has applied
+            // (0 while sharing is off). `generation` and `token` count this
+            // machine's own journal, so they can't be compared between
+            // machines; a client merging several machines' replies keeps the
+            // one with the highest `logPosition`, which has seen the most of
+            // the shared history.
+            let log_position: i64 = conn.query_row(
+                "SELECT last_applied_position FROM identity_log_state WHERE id=1",
+                [],
+                |r| r.get(0),
+            )?;
+            let mut reply = json!({"incarnation":incarnation,"generation":generation,"logPosition":log_position,"token":current,"unchanged":token == Some(current.as_str())});
             if token == Some(current.as_str()) { return Ok(reply); }
             let mut agents = Vec::new();
             // One identity row drives each result; roots cannot multiply agents.
@@ -156,7 +167,7 @@ mod tests {
         let generation = f.store.generation().unwrap();
         assert_eq!(
             fleet(&f, None),
-            json!({"incarnation":INCARNATION,"generation":generation,"token":format!("{INCARNATION}:{generation}"),"unchanged":false,"agents":[
+            json!({"incarnation":INCARNATION,"generation":generation,"logPosition":0,"token":format!("{INCARNATION}:{generation}"),"unchanged":false,"agents":[
             {"agentId":head,"displayName":"Head","tag":"tag","labels":[],"role":"head","project":{"id":"P","name":"Project","canonicalRoot":a_root},"workspace":{"id":"W2","name":"W2"},"avatar":{"fingerprint":"b4c04a5d931e65a48e022b8943678d55","type":"creature.classic","version":2}},
             {"agentId":w,"displayName":"Workspace","tag":"tag","labels":[],"role":"workspace_head"},
             {"agentId":assistant,"displayName":"Assistant","tag":"tag","labels":[],"role":"assistant"}]})
@@ -192,7 +203,7 @@ mod tests {
         let f = fixture(false);
         assert_eq!(
             fleet(&f, None),
-            json!({"incarnation":INCARNATION,"generation":0,"token":format!("{INCARNATION}:0"),"unchanged":false,"agents":[]})
+            json!({"incarnation":INCARNATION,"generation":0,"logPosition":0,"token":format!("{INCARNATION}:0"),"unchanged":false,"agents":[]})
         );
         import_core(&f,"INSERT INTO agent(agent_id,name,tag,role,created_at_ms,updated_at_ms,terminal_reason,terminal_at_ms,merged_into_agent_id) VALUES
             ('agent_16013c86','Deleted','tag','assistant',1,2,'deleted',3,NULL),
@@ -226,7 +237,7 @@ mod tests {
         let mut token = fleet(&f, None)["token"].as_str().unwrap().to_owned();
         assert_eq!(
             fleet(&f, Some(&token)),
-            json!({"incarnation":INCARNATION,"generation":f.store.generation().unwrap(),"token":token,"unchanged":true})
+            json!({"incarnation":INCARNATION,"generation":f.store.generation().unwrap(),"logPosition":0,"token":token,"unchanged":true})
         );
         for bad in [
             "malformed",

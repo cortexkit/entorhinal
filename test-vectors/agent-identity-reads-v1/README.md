@@ -20,7 +20,11 @@ detail was supplied).
   returned token, and an unknown-field `invalid_request` refusal. The fixture
   has a head with a versioned avatar, an assistant with an unversioned avatar,
   an assistant without an avatar, and a retired assistant with an avatar.
-  Only the three live agents appear in fleet identity.
+  Only the three live agents appear in fleet identity. Every reply carries
+  `logPosition`: the last shared identity-log position this machine applied,
+  `0` here because sharing is off. A client merging several machines' replies
+  keeps the one with the highest `logPosition`; `generation` and `token` count
+  each machine's own journal and are never compared across machines.
 - **`avatar-read.json`**: both live stored avatars; then an ordered mix of a
   present avatar, an unknown id, an unset avatar, a retired avatar, another
   present avatar, and a duplicate of the first id. Unknown/unset avatars are

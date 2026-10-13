@@ -627,6 +627,33 @@ async fn s3_joiner_first_own_write_learns_author_before_name() {
     );
 }
 
+// A client merging several machines' fleet replies picks the one with the
+// highest `logPosition`. This pins that the field is the shared position each
+// machine has applied: a machine that hasn't caught up reports less, and both
+// report the log head once they agree.
+#[tokio::test(start_paused = true)]
+async fn fleet_identity_reports_the_shared_log_position_each_machine_applied() {
+    let log = Arc::new(FakeLog::default());
+    let (a, b) = pair("fleet-position", log.clone()).await;
+    async fn fleet(m: &Machine) -> Value {
+        m.call("agent.fleet_identity", json!({})).await.unwrap()
+    }
+    a.call(
+        "agent.create",
+        json!({"role":"assistant","name":"Ada","tag":"helper","request_key":"create"}),
+    )
+    .await
+    .unwrap();
+    let (ahead, behind) = (fleet(&a).await, fleet(&b).await);
+    assert_eq!(ahead["logPosition"], log.head());
+    assert!(behind["logPosition"].as_i64() < ahead["logPosition"].as_i64());
+    b.catch_up().await;
+    let (a_reply, b_reply) = (fleet(&a).await, fleet(&b).await);
+    assert_eq!(a_reply["logPosition"], log.head());
+    assert_eq!(b_reply["logPosition"], log.head());
+    assert_eq!(a_reply["agents"], b_reply["agents"]);
+}
+
 #[tokio::test(start_paused = true)]
 async fn two_machines_converge_with_placement_and_agent_change_ops() {
     let log = Arc::new(FakeLog::default());
