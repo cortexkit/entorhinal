@@ -8,6 +8,10 @@ use crate::{
     record_client::RecordClient,
     HandlerError, HealthGauges, ProjectsHandler,
 };
+use cortexkit_role_agent_data::{
+    errors::{driver_action_for, DriverAction, ErrorBody, RefusalCode},
+    Op,
+};
 use entorhinal_core::{move_store::AgentMove, RegistryError, RegistryStore};
 use std::{
     collections::HashSet,
@@ -19,6 +23,38 @@ use std::{
 };
 
 pub(crate) const POLL: Duration = Duration::from_secs(30);
+
+pub(crate) fn participant_action(op: &str, code: &str) -> Option<DriverAction> {
+    Op::ALL
+        .into_iter()
+        .find(|candidate| candidate.method() == op)
+        .map(|op| driver_action_for(op, &RefusalCode::from_code(code)))
+}
+
+pub(crate) fn digest_reason(code: &str, detail: Option<&serde_json::Value>) -> Option<String> {
+    let mut body = ErrorBody::new(RefusalCode::from_code(code), "");
+    body.detail = detail.cloned();
+    body.digest_mismatch_detail().ok().flatten()?.reason
+}
+
+#[cfg(test)]
+pub(crate) fn digest_refusal(op: &str) -> crate::participant_client::Refusal {
+    let vectors: serde_json::Value = serde_json::from_str(
+        cortexkit_role_agent_data::vectors::file("digest-mismatch.json").unwrap(),
+    )
+    .unwrap();
+    let vector = vectors["refusals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["op"] == op)
+        .unwrap();
+    let body: ErrorBody = serde_json::from_value(vector["body"].clone()).unwrap();
+    crate::participant_client::Refusal {
+        code: body.code.as_str().into(),
+        detail: body.detail,
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct SqlOperations {

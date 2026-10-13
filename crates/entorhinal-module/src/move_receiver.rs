@@ -4,12 +4,13 @@
 use crate::{
     claim_codec::AgentClaim,
     door_client::CutRequest as DoorCut,
-    move_driver::{backoff, Worker, POLL},
+    move_driver::{backoff, digest_reason, participant_action, Worker, POLL},
     participant_client::{AgentRef, ClientError, CutRequest, ParticipantClient, Refs},
     participant_discovery::Participant,
     record_client::{CasRequest, CasSettlement, RecordError, RecordReply},
     HandlerError, LivenessState, SessionKey,
 };
+use cortexkit_role_agent_data::errors::DriverAction;
 use cortexkit_role_agent_data::{busy::BusyState, diverged::DivergedState};
 use entorhinal_core::{
     claim_cache::{CachedClaim, ClaimObservation},
@@ -195,6 +196,8 @@ pub(crate) async fn poll_inbox(worker: &Worker) -> Result<(), HandlerError> {
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Progress {
     #[serde(default)]
+    aborted: Vec<String>,
+    #[serde(default)]
     touched: Vec<String>,
     #[serde(default)]
     errors: Vec<Value>,
@@ -223,6 +226,7 @@ struct Failure {
     reason: Option<MoveReason>,
     diagnostic: bool,
     violation: bool,
+    action: Option<DriverAction>,
 }
 impl Failure {
     fn hold(code: &str, detail: Value) -> Self {
@@ -232,6 +236,7 @@ impl Failure {
             reason: None,
             diagnostic: false,
             violation: false,
+            action: None,
         }
     }
     fn abort(reason: MoveReason, detail: Value) -> Self {
@@ -251,15 +256,19 @@ impl Failure {
                 true,
             ),
         };
-        let detail = json!({"module_id":module,"op":op,"code":code,"detail":detail});
+        let reason = digest_reason(&code, detail.as_ref());
+        let mut detail = json!({"module_id":module,"op":op,"code":code,"detail":detail});
+        if let Some(reason) = reason {
+            detail["reason"] = json!(reason);
+        }
         let mut failure = Self::hold(&code, detail);
         failure.violation = violation;
+        failure.action = participant_action(op, &code);
         if !violation
-            && !matches!(
-                code.as_str(),
-                "cut_not_ready" | "unavailable" | "handoff_not_covered" | "external_not_present"
+            && matches!(
+                failure.action,
+                Some(DriverAction::Abort | DriverAction::TerminalForStep)
             )
-            && !(op == "agent_data.import" && code == "busy")
         {
             failure.reason = Some(match code.as_str() {
                 "local_advanced" if op == "agent_data.import" => MoveReason::Diverged,
@@ -289,6 +298,7 @@ pub(crate) struct Receiver {
     cut: String,
     clients: BTreeMap<String, ParticipantClient>,
     liveness: Arc<Mutex<LivenessState>>,
+    abort_held: bool,
 }
 impl Receiver {
     pub(crate) fn new(worker: Worker, cut: String, liveness: Arc<Mutex<LivenessState>>) -> Self {
@@ -297,7 +307,15 @@ impl Receiver {
             cut,
             clients: BTreeMap::new(),
             liveness,
+            abort_held: false,
         }
+    }
+    /// Resume participant aborts after an operator repairs corrupted undo bytes.
+    /// A digest refusal pauses cleanup for this driver instance; restarting
+    /// retries once, then pauses again if the participant still refuses.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn retry_held_abort(&mut self) {
+        self.abort_held = false;
     }
     pub(crate) async fn run(mut self) {
         let mut delay = Duration::ZERO;
@@ -421,6 +439,9 @@ impl Receiver {
             if progress.contract_violation.is_some() || progress.activation_fork.is_some() {
                 return Ok(POLL);
             }
+            if self.abort_held {
+                return Ok(POLL);
+            }
             // Completion is independent of retry deadlines and accept failures.
             if row.step == Step::Activated && observed.state == State::Released {
                 Self::step(&mut row, &mut progress, Step::Done);
@@ -457,13 +478,32 @@ impl Receiver {
                 },
             )),
             Err(mut f) => {
+                if !f.violation
+                    && f.detail["op"] == "agent_data.abort"
+                    && f.action == Some(DriverAction::RetryAfterOperator)
+                {
+                    self.abort_held = true;
+                    f.detail["state"] = json!("stuck");
+                    f.detail["step"] = json!(row.step);
+                    f.detail["move_error"] = json!(true);
+                    row.detail = Some(f.detail.clone());
+                    row.hold = Some(f.detail);
+                    progress.retry_at_ms = 0;
+                    self.save(&mut row, &progress)
+                        .await
+                        .map_err(|e| HandlerError::new(&e.code, e.detail.to_string()))?;
+                    return Ok(Some(POLL));
+                }
                 let irreversible = !row.step.before_boundary(MoveSide::Receiver);
                 if irreversible {
                     f.reason = None;
                     f.diagnostic = true;
-                    if f.code == "local_advanced" {
-                        f.detail["note"] = json!("Local data advanced after import; operator fork resolution is required");
+                    if f.action == Some(DriverAction::TerminalForStep) {
+                        f.detail["note"] = json!(
+                            "Activation cannot safely finish; operator fork resolution is required"
+                        );
                         progress.activation_fork = Some(f.detail.clone());
+                        row.detail = Some(f.detail.clone());
                     }
                 }
                 if f.violation || f.diagnostic || f.reason == Some(MoveReason::ClaimMoved) {
@@ -494,7 +534,7 @@ impl Receiver {
                     if let Some(module) = f.detail.get("module_id") {
                         row.hold.as_mut().unwrap()["module_id"] = module.clone();
                     }
-                    for key in ["ref", "reason_code", "note"] {
+                    for key in ["ref", "reason_code", "reason", "op", "note"] {
                         if let Some(value) = f.detail.get(key) {
                             row.hold.as_mut().unwrap()[key] = value.clone();
                         }
@@ -726,6 +766,7 @@ impl Receiver {
                         .abort(&self.request(p))
                         .await
                         .map_err(|e| Failure::participant(&p.module_id, &pending.op, e))?;
+                    progress.aborted.push(p.module_id.clone());
                 }
                 "agent_data.activate" => {
                     client
@@ -1175,13 +1216,10 @@ impl Receiver {
             self.take_claim(row, plan, progress).await?;
         }
         self.return_claim(row, plan).await?;
-        let (record, version) = self.read_move(plan).await?;
-        row.record_version = checked_version(version)?;
-        if record.state != State::Aborted {
-            self.cas_move(row, plan, record.state, State::Aborted)
-                .await?;
-        }
         for p in &plan.participants {
+            if progress.aborted.contains(&p.module_id) {
+                continue;
+            }
             // A module absent before any diverged/import call cannot have staged
             // data to discard. Persist which modules were called so a module
             // that disappears after a call still must abort when it returns.
@@ -1204,7 +1242,16 @@ impl Receiver {
                 .await
                 .map_err(|e| Failure::participant(&p.module_id, "agent_data.abort", e))?;
             progress.pending = None;
+            progress.aborted.push(p.module_id.clone());
             self.save(row, progress).await?;
+        }
+        // The source may unfreeze as soon as it sees the shared abort. Publish
+        // that state only after every receiver participant has restored its data.
+        let (record, version) = self.read_move(plan).await?;
+        row.record_version = checked_version(version)?;
+        if record.state != State::Aborted {
+            self.cas_move(row, plan, record.state, State::Aborted)
+                .await?;
         }
         self.apply_claim(row).await?;
         remove_inbox(&self.worker, &plan.to, &self.cut).await?;
@@ -2103,6 +2150,126 @@ mod tests {
         assert_eq!(f.row().step, Step::PickedUp);
         assert_eq!(f.worker.health.move_errors.load(Ordering::Relaxed), 2);
         assert_eq!(f.claim_cas_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn receiver_digest_mismatch_import_aborts() {
+        let f = Fixture::new(false).await;
+        f.pickup().await;
+        f.refuse("agent_data.import", "digest_mismatch");
+        let mut receiver = f.receiver();
+        receiver.tick().await.unwrap();
+        assert_eq!(f.row().reason.as_deref(), Some("participant_refused"));
+        assert_eq!(f.row().detail.unwrap()["code"], "digest_mismatch");
+        f.until(&mut receiver, Step::Aborted).await;
+        assert_eq!(f.claim_cas_count(), 0);
+        assert!(f.discovery.participant.fake.staged().is_empty());
+    }
+
+    #[tokio::test]
+    async fn receiver_digest_mismatch_activate_holds_fork_across_restart() {
+        for with_reason in [true, false] {
+            let f = Fixture::new(false).await;
+            f.pickup().await;
+            let mut receiver = f.receiver();
+            f.until(&mut receiver, Step::Activating).await;
+            let mut refusal = crate::move_driver::digest_refusal("activate");
+            if !with_reason {
+                refusal.detail = None;
+            }
+            f.discovery
+                .participant
+                .fake
+                .script("agent_data.activate", Effect::Refuse(refusal));
+            receiver.tick().await.unwrap();
+            let row = f.row();
+            assert_eq!(row.step, Step::Activating);
+            assert!(row.abort_requested.is_none());
+            assert!(row.plan["_receiver"]["contract_violation"].is_null());
+            assert!(row.plan["_receiver"]["activation_fork"].is_object());
+            let detail = row.detail.unwrap();
+            assert_eq!(detail["module_id"], "data");
+            assert_eq!(detail["op"], "agent_data.activate");
+            assert_eq!(detail["code"], "digest_mismatch");
+            if with_reason {
+                assert_eq!(detail["reason"], "staging_digest_mismatch");
+            } else {
+                assert!(detail.get("reason").is_none());
+            }
+            let calls = f.discovery.participant.fake.calls().len();
+            for _ in 0..3 {
+                advance_clock();
+                receiver.tick().await.unwrap();
+            }
+            let mut restarted = f.receiver();
+            restarted.tick().await.unwrap();
+            assert_eq!(calls, f.discovery.participant.fake.calls().len());
+            assert_eq!(f.row().step, Step::Activating);
+            assert_eq!(f.claim().await.version, 1);
+            assert_eq!(f.claim_cas_count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn receiver_digest_mismatch_abort_stuck_retries_once_on_restart() {
+        let f = Fixture::new(false).await;
+        f.pickup().await;
+        let mut receiver = f.receiver();
+        f.until(&mut receiver, Step::Claimed).await;
+        f.edit(|r| r.abort_requested = Some(json!({"reason":"operator","detail":null})));
+        for _ in 0..2 {
+            f.discovery.participant.fake.script(
+                "agent_data.abort",
+                Effect::Refuse(crate::move_driver::digest_refusal("abort")),
+            );
+        }
+        receiver.tick().await.unwrap();
+        let row = f.row();
+        assert_eq!(row.step, Step::Claimed);
+        let hold = row.hold.unwrap();
+        assert_eq!(hold["state"], "stuck");
+        assert_eq!(hold["module_id"], "data");
+        assert_eq!(hold["op"], "agent_data.abort");
+        assert_eq!(hold["step"], "claimed");
+        assert_eq!(hold["code"], "digest_mismatch");
+        assert_eq!(hold["reason"], "undo_digest_mismatch");
+        assert_eq!(row.detail.unwrap(), hold);
+        assert!(row.plan["_receiver"]["contract_violation"].is_null());
+        let aborts = || {
+            f.discovery
+                .participant
+                .fake
+                .calls()
+                .iter()
+                .filter(|r| matches!(r, Request::Abort(_)))
+                .count()
+        };
+        assert_eq!(aborts(), 1);
+        for _ in 0..3 {
+            advance_clock();
+            receiver.tick().await.unwrap();
+        }
+        assert_eq!(aborts(), 1);
+        let reply = f.worker.records.read(&format!("move:{CUT}")).await.unwrap();
+        assert_eq!(
+            wire::decode_move_record(&format!("move:{CUT}"), reply.body.as_deref().unwrap())
+                .unwrap()
+                .state,
+            State::Claimed
+        );
+        let mut restarted = f.receiver();
+        restarted.tick().await.unwrap();
+        assert_eq!(aborts(), 2);
+        for _ in 0..3 {
+            advance_clock();
+            restarted.tick().await.unwrap();
+        }
+        assert_eq!(aborts(), 2);
+        assert_eq!(f.row().hold.unwrap()["reason"], "undo_digest_mismatch");
+        restarted.retry_held_abort();
+        f.until(&mut restarted, Step::Aborted).await;
+        assert_eq!(aborts(), 3);
+        assert!(f.row().hold.is_none());
     }
     #[tokio::test]
     async fn receiver_wrong_author_wrong_epoch_or_no_persisted_take_aborts_claim_moved() {

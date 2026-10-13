@@ -7,7 +7,7 @@ use crate::{
         CutItem, CutRequest as DoorCut, DoorError, HandoffState, SealRequest, SealState,
     },
     log_client::TransportError,
-    move_driver::{backoff, Worker, POLL},
+    move_driver::{backoff, digest_reason, participant_action, Worker, POLL},
     participant_client::{
         AgentRef, ClientError, CutRequest, ParticipantClient, Refs, ReleaseRequest,
     },
@@ -15,7 +15,7 @@ use crate::{
     record_client::{CasRequest, CasSettlement, RecordError, RecordReply},
     HandlerError,
 };
-use cortexkit_role_agent_data::refs::CutId;
+use cortexkit_role_agent_data::{errors::DriverAction, refs::CutId};
 use entorhinal_core::{
     claim_cache::{CachedClaim, ClaimObservation},
     move_record::{
@@ -30,6 +30,8 @@ use std::{collections::BTreeMap, sync::atomic::Ordering, time::Duration};
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Progress {
+    #[serde(default)]
+    aborted: Vec<String>,
     #[serde(default)]
     prepared: bool,
     #[serde(default)]
@@ -142,11 +144,27 @@ impl Failure {
         if let Some(module) = &self.module {
             detail["module_id"] = json!(module);
         }
+        if let Some(reason) = digest_reason(&self.code, Some(&self.detail)) {
+            detail["reason"] = json!(reason);
+        }
         detail
+    }
+    fn action(&self) -> Option<DriverAction> {
+        self.module
+            .as_ref()
+            .and_then(|_| participant_action(&self.op, &self.code))
     }
     fn retryable(&self) -> bool {
         !self.contract_violation
-            && ["cut_not_ready", "unavailable", "handoff_not_covered"].contains(&self.code.as_str())
+            && if self.module.is_some() {
+                matches!(
+                    self.action(),
+                    Some(DriverAction::RetryWithinStep | DriverAction::Retry)
+                )
+            } else {
+                ["cut_not_ready", "unavailable", "handoff_not_covered"]
+                    .contains(&self.code.as_str())
+            }
     }
 }
 impl From<HandlerError> for Failure {
@@ -171,6 +189,7 @@ pub(crate) struct Source {
     clients: BTreeMap<String, ParticipantClient>,
     resumed: bool,
     last_poll: Option<tokio::time::Instant>,
+    abort_held: bool,
 }
 
 impl Source {
@@ -181,7 +200,16 @@ impl Source {
             clients: BTreeMap::new(),
             resumed: false,
             last_poll: None,
+            abort_held: false,
         }
+    }
+
+    /// Resume participant aborts after an operator repairs corrupted undo bytes.
+    /// A digest refusal pauses cleanup for this driver instance; restarting
+    /// retries once, then pauses again if the participant still refuses.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn retry_held_abort(&mut self) {
+        self.abort_held = false;
     }
 
     pub(crate) async fn run(mut self) {
@@ -276,6 +304,9 @@ impl Source {
             }
             return Ok(Some(POLL));
         }
+        if self.abort_held {
+            return Ok(Some(POLL));
+        }
         if (self.worker.clock)() < plan.source.retry_at_ms {
             let remaining =
                 Duration::from_millis((plan.source.retry_at_ms - (self.worker.clock)()) as u64);
@@ -297,16 +328,33 @@ impl Source {
     }
 
     async fn failed(
-        &self,
+        &mut self,
         row: &mut AgentMove,
         plan: &mut Plan,
         error: Failure,
     ) -> Result<Option<Duration>, HandlerError> {
         let busy_retry = !error.contract_violation
-            && error.code == "busy"
+            && error.action() == Some(DriverAction::RetryLater)
             && error.op == "agent_data.prepare"
             && row.attempts < 8;
         let cleanup = row.abort_requested.is_some();
+        if !error.contract_violation
+            && error.op == "agent_data.abort"
+            && error.action() == Some(DriverAction::RetryAfterOperator)
+        {
+            self.abort_held = true;
+            let mut detail = error.detail();
+            detail["state"] = json!("stuck");
+            detail["step"] = json!(row.step);
+            detail["move_error"] = json!(true);
+            row.detail = Some(detail.clone());
+            row.hold = Some(detail);
+            plan.source.retry_at_ms = 0;
+            self.save(row, plan, false)
+                .await
+                .map_err(|f| HandlerError::new(&f.code, f.detail.to_string()))?;
+            return Ok(Some(POLL));
+        }
         if error.contract_violation {
             let detail = error.detail();
             if !plan.source.errors.contains(&detail) {
@@ -851,7 +899,7 @@ impl Source {
                             .await
                             .map_err(|e| Failure::door("cut.abort", e))?;
                     }
-                    self.abort_participants(plan).await?;
+                    self.abort_participants(row, plan).await?;
                     Self::change_step(row, plan, Step::Aborted);
                     self.save(row, plan, true).await?;
                     return Ok(Duration::ZERO);
@@ -866,7 +914,7 @@ impl Source {
                 None => {}
             }
         }
-        self.abort_participants(plan).await?;
+        self.abort_participants(row, plan).await?;
         if row.seal_sent {
             self.worker
                 .door
@@ -887,13 +935,22 @@ impl Source {
         Ok(Duration::ZERO)
     }
 
-    async fn abort_participants(&mut self, plan: &Plan) -> Result<(), Failure> {
-        for participant in &plan.participants {
+    async fn abort_participants(
+        &mut self,
+        row: &mut AgentMove,
+        plan: &mut Plan,
+    ) -> Result<(), Failure> {
+        for participant in plan.participants.clone() {
+            if plan.source.aborted.contains(&participant.module_id) {
+                continue;
+            }
             self.client(&participant.module_id)
                 .await?
-                .abort(&self.request(participant))
+                .abort(&self.request(&participant))
                 .await
                 .map_err(|e| Failure::participant("agent_data.abort", &participant.module_id, e))?;
+            plan.source.aborted.push(participant.module_id.clone());
+            self.save(row, plan, false).await?;
         }
         Ok(())
     }
@@ -1651,6 +1708,89 @@ mod tests {
             .position(|e| e.op == "agent_data.abort")
             .unwrap();
         assert!(door_abort < participant_abort);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn source_digest_mismatch_abort_stuck_frozen_retries_once_on_restart() {
+        for published in [false, true] {
+            let f = Fixture::new();
+            let mut source = f.source();
+            if published {
+                f.published(&mut source).await;
+            } else {
+                f.until(&mut source, Step::Exported).await;
+            }
+            f.abort();
+            for _ in 0..2 {
+                f.participants[1].script(
+                    "agent_data.abort",
+                    ParticipantEffect::Refuse(crate::move_driver::digest_refusal("abort")),
+                );
+            }
+            for _ in 0..3 {
+                f.step(&mut source).await;
+                if f.row().hold.is_some() {
+                    break;
+                }
+            }
+            let row = f.row();
+            assert_eq!(
+                row.step,
+                if published {
+                    Step::Published
+                } else {
+                    Step::Exported
+                }
+            );
+            let hold = row.hold.unwrap();
+            assert_eq!(hold["state"], "stuck");
+            assert_eq!(hold["module_id"], "b");
+            assert_eq!(hold["op"], "agent_data.abort");
+            assert_eq!(hold["code"], "digest_mismatch");
+            assert_eq!(hold["reason"], "undo_digest_mismatch");
+            assert_eq!(row.detail.unwrap(), hold);
+            assert!(f.plan().source.contract_violation.is_none());
+            assert!(!f.participants[1].frozen().is_empty());
+            assert!(!f.participants[2].frozen().is_empty());
+            let aborts = || {
+                f.participants[1]
+                    .calls()
+                    .iter()
+                    .filter(|r| matches!(r, Request::Abort(_)))
+                    .count()
+            };
+            assert_eq!(aborts(), 1);
+            let calls = f
+                .participants
+                .iter()
+                .map(|p| p.calls().len())
+                .sum::<usize>();
+            for _ in 0..3 {
+                f.step(&mut source).await;
+            }
+            assert_eq!(
+                calls,
+                f.participants
+                    .iter()
+                    .map(|p| p.calls().len())
+                    .sum::<usize>()
+            );
+            let mut restarted = f.source();
+            f.step(&mut restarted).await;
+            assert_eq!(aborts(), 2);
+            for _ in 0..3 {
+                f.step(&mut restarted).await;
+            }
+            assert_eq!(aborts(), 2);
+            assert!(!f.participants[1].frozen().is_empty());
+            assert!(!f.row().step.is_terminal());
+            assert_eq!(f.row().hold.unwrap()["reason"], "undo_digest_mismatch");
+            restarted.retry_held_abort();
+            f.until(&mut restarted, Step::Aborted).await;
+            assert_eq!(aborts(), 3);
+            assert!(f.participants.iter().all(|p| p.frozen().is_empty()));
+            assert!(f.row().hold.is_none());
+        }
     }
 
     #[tokio::test(start_paused = true)]

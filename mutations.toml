@@ -4,6 +4,106 @@
 # Reports belong under the already gitignored target/mutations/.
 # only=false allows related assertions in the same target; nightly --broad audits other targets.
 
+[[control]]
+id = "move-digest-receiver-no-auto-retry"
+guards = "A stuck receiver abort sends no further participant calls until an explicit retry or driver restart"
+file = "crates/entorhinal-module/src/move_receiver.rs"
+old = 'if self.abort_held {'
+new = 'if false && self.abort_held { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/move_receiver.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["move_receiver::tests::receiver_digest_mismatch_abort_stuck_retries_once_on_restart"]
+
+[[control]]
+id = "move-digest-source-no-auto-retry"
+guards = "A stuck source abort sends no further participant calls and remains frozen until retry or restart"
+file = "crates/entorhinal-module/src/move_source.rs"
+old = 'if self.abort_held {'
+new = 'if false && self.abort_held { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/move_source.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["move_source::tests::source_digest_mismatch_abort_stuck_frozen_retries_once_on_restart"]
+
+[[control]]
+id = "move-digest-activate-fork"
+guards = "A terminal activation refusal holds as a fork without returning the claim or retrying after restart"
+file = "crates/entorhinal-module/src/move_receiver.rs"
+old = "if f.action == Some(DriverAction::TerminalForStep) {"
+new = "if false && f.action == Some(DriverAction::TerminalForStep) { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/move_receiver.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["move_receiver::tests::receiver_digest_mismatch_activate_holds_fork_across_restart"]
+
+[[control]]
+id = "move-digest-receiver-abort-hold"
+guards = "A digest refusal on receiver abort is stuck until operator retry or one fresh driver attempt"
+file = "crates/entorhinal-module/src/move_receiver.rs"
+old = '&& f.action == Some(DriverAction::RetryAfterOperator)'
+new = '&& false && f.action == Some(DriverAction::RetryAfterOperator) // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/move_receiver.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["move_receiver::tests::receiver_digest_mismatch_abort_stuck_retries_once_on_restart"]
+
+[[control]]
+id = "move-digest-source-abort-hold"
+guards = "A digest refusal on source abort keeps the move open and agent frozen without automatic retries"
+file = "crates/entorhinal-module/src/move_source.rs"
+old = '&& error.action() == Some(DriverAction::RetryAfterOperator)'
+new = '&& false && error.action() == Some(DriverAction::RetryAfterOperator) // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/move_source.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["move_source::tests::source_digest_mismatch_abort_stuck_frozen_retries_once_on_restart"]
+
+[[control]]
+id = "move-digest-import-aborts"
+guards = "An import digest refusal aborts rather than holding for a retry"
+file = "crates/entorhinal-module/src/move_driver.rs"
+old = '.map(|op| driver_action_for(op, &RefusalCode::from_code(code)))'
+new = '.map(|op| if op == Op::Import && code == "digest_mismatch" { DriverAction::Retry } else { driver_action_for(op, &RefusalCode::from_code(code)) }) // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/move_receiver.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["move_receiver::tests::receiver_digest_mismatch_import_aborts"]
+
+[[control]]
+id = "move-digest-abort-publication"
+guards = "Receiver abort cannot publish the state that permits source unfreeze before its participants finish undo"
+file = "crates/entorhinal-module/src/move_receiver.rs"
+old = 'self.return_claim(row, plan).await?;'
+new = '''self.return_claim(row, plan).await?;
+        let (record, _) = self.read_move(plan).await?;
+        if record.state != State::Aborted {
+            self.cas_move(row, plan, record.state, State::Aborted).await?; // NON-VACUITY BREAK
+        }'''
+test_file = "crates/entorhinal-module/src/move_receiver.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["move_receiver::tests::receiver_digest_mismatch_abort_stuck_retries_once_on_restart"]
+
+[[control]]
+id = "move-digest-reason"
+guards = "Digest mismatch detail is decoded and its staging or undo reason is retained for the operator"
+file = "crates/entorhinal-module/src/move_driver.rs"
+old = 'body.detail = detail.cloned();'
+new = 'body.detail = detail.filter(|_| false).cloned(); // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/move_receiver.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["move_receiver::tests::receiver_digest_mismatch_activate_holds_fork_across_restart"]
+
 # Move driver shutdown must release blocking SQL store handles before a restart.
 [[control]]
 id = "move-driver-stop-drains-blocking-sql"
