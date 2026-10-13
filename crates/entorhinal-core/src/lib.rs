@@ -198,7 +198,7 @@ CREATE TABLE member_name (
 );
 "#;
 
-const MIGRATIONS: [Migration; 9] = [
+const MIGRATIONS: [Migration; 10] = [
     Migration {
         version: 1,
         statements: V1_SCHEMA,
@@ -234,6 +234,10 @@ const MIGRATIONS: [Migration; 9] = [
     Migration {
         version: 9,
         statements: move_store::V9_AGENT_MOVES,
+    },
+    Migration {
+        version: 10,
+        statements: agent::consent::V10_CONSENT,
     },
 ];
 
@@ -274,6 +278,7 @@ pub struct JournalWriter<'a> {
     /// of the store: the write records the operator summary of what it would
     /// carry here instead of checking `confirmation`.
     probe: Option<&'a std::cell::RefCell<Option<String>>>,
+    consent: Option<agent::consent::ConsentCommit>,
 }
 
 impl std::ops::Deref for JournalWriter<'_> {
@@ -317,6 +322,7 @@ impl RegistryStore {
             principal,
             confirmation: agent::PlacementConfirmation::NotRequired,
             probe: None,
+            consent: None,
         }
     }
 

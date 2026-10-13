@@ -367,6 +367,8 @@ impl RegistryStore {
             tables: Default::default(),
             agents: vec![],
             member_name: None,
+            requesting_agent_id: None,
+            authorization: None,
         };
         for part in parts {
             if part.member_name.is_some() {
@@ -390,6 +392,8 @@ impl RegistryStore {
             tables: Default::default(),
             agents: vec![],
             member_name: None,
+            requesting_agent_id: None,
+            authorization: None,
         };
         let error = std::cell::RefCell::new(None);
         self.db
@@ -1001,6 +1005,8 @@ mod tests {
             tables: BTreeMap::new(),
             agents: vec![],
             member_name: None,
+            requesting_agent_id: None,
+            authorization: None,
         }
     }
 

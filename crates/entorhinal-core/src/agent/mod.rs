@@ -3,6 +3,9 @@
 
 mod carry;
 mod claims;
+pub mod consent;
+#[cfg(test)]
+mod consent_tests;
 mod feed;
 mod fleet;
 pub mod import;

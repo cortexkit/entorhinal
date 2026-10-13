@@ -522,6 +522,27 @@ fn validate_create(
     Ok((row, edit))
 }
 
+fn hire_body(
+    conn: &Connection,
+    caller: &str,
+    hire: &super::consent::HireRequest,
+) -> Result<Value, AgentMutationError> {
+    let head = load_row(conn, caller)?
+        .ok_or_else(|| AgentMutationError::new("unknown_agent", "unknown requesting agent"))?;
+    if head.status != "live" {
+        return Err(AgentMutationError::new("gone", "requesting agent is gone"));
+    }
+    if head.role != "head" {
+        return Err(AgentMutationError::new(
+            "role_forbidden",
+            "only a project head may hire",
+        ));
+    }
+    Ok(
+        json!({"role":"hiree","name":hire.name,"tag":hire.tag,"project_id":head.project_id,"supervisor_agent_id":caller,"request_key":"agent-tool"}),
+    )
+}
+
 /// The macOS operator prompt clips longer descriptions. Count the escaped
 /// description's Unicode scalars, not bytes or the unescaped request text.
 pub const OPERATOR_SUMMARY_LIMIT: usize = 200;
@@ -929,6 +950,52 @@ impl RegistryStore {
 }
 
 impl JournalWriter<'_> {
+    /// Validate the head, hire arguments and project cap without writing, before
+    /// asking for consent. Hiring repeats these checks inside its write transaction
+    /// so concurrent changes cannot bypass the project limit.
+    pub fn precheck_agent_hire(
+        &self,
+        caller: &str,
+        hire: &super::consent::HireRequest,
+        now: i64,
+    ) -> Result<(), AgentMutationError> {
+        self.read_agent(|conn| {
+            require_cutover(conn)?;
+            let request = Mutation::decode("agent.create", hire_body(conn, caller, hire)?)?;
+            let prepared = validate(conn, &request, now)?;
+            validate_agent_labels(&hire.labels)?;
+            super::consent::check_hire_cap(conn, prepared.row.project_id.as_deref().unwrap())
+        })
+    }
+
+    /// Create a hire requested by a project head, subject to the project hire cap.
+    /// Creation by the operator or core's relay and journal replay use the existing
+    /// identity mutation methods, which do not impose this limit.
+    pub fn agents_hire(
+        &self,
+        hire: &super::consent::HireRequest,
+        now: i64,
+        agent_id: Option<&str>,
+    ) -> Result<Vec<u8>, AgentMutationError> {
+        let commit = self
+            .consent
+            .as_ref()
+            .filter(|c| c.action == "agents_hire" && c.request.identity.tool == "agents_hire")
+            .ok_or_else(|| {
+                AgentMutationError::new("invalid_request", "agent hiring requires a consent commit")
+            })?;
+        let body =
+            self.read_agent(|conn| hire_body(conn, &commit.request.identity.agent_id, hire))?;
+        self.run_agent_mutation(
+            "agent.create",
+            body,
+            now,
+            agent_id,
+            None,
+            Some(&hire.labels),
+        )
+    }
+
     /// Decode the request and require its key before looking for a cached reply.
     /// A malformed request must be refused even if that key already has a reply;
     /// returning cached bytes first would accept unknown fields or wrong field types.
@@ -986,6 +1053,18 @@ impl JournalWriter<'_> {
         agent_id: Option<&str>,
         approval: Option<&OperatorApproval>,
     ) -> Result<Vec<u8>, AgentMutationError> {
+        self.run_agent_mutation(op, params, now, agent_id, approval, None)
+    }
+
+    fn run_agent_mutation(
+        &self,
+        op: &str,
+        params: Value,
+        now: i64,
+        agent_id: Option<&str>,
+        approval: Option<&OperatorApproval>,
+        initial_labels: Option<&[String]>,
+    ) -> Result<Vec<u8>, AgentMutationError> {
         if op == super::carry::REPAIR_METHOD {
             return self.repair_agent_workspaces(params, now, approval);
         }
@@ -994,7 +1073,23 @@ impl JournalWriter<'_> {
         let key = required_key(&request)?;
         self.mutation_with_error(op, Some(key), |tx| {
             require_cutover(tx)?;
-            let prepared = validate(tx, &request, now)?;
+            let mut prepared = validate(tx, &request, now)?;
+            if let Some(labels) = initial_labels {
+                prepared.row.labels = validate_agent_labels(labels)?;
+            }
+            if self.consent.is_some() && prepared.previous.is_none() {
+                prepared.row.request_key = None;
+            }
+            if let Some(commit) = &self.consent {
+                if commit.action == "agents_hire" {
+                    super::consent::check_hire_cap(
+                        tx,
+                        prepared.row.project_id.as_deref().ok_or_else(|| {
+                            AgentMutationError::new("invalid_role_shape", "hire requires a project")
+                        })?,
+                    )?;
+                }
+            }
             if let Some(approval) = approval {
                 if summary(tx, &request, &prepared)? != approval.summary {
                     return Err(AgentMutationError::new(
@@ -1015,7 +1110,11 @@ impl JournalWriter<'_> {
                 entry,
                 value,
                 actor.as_deref().unwrap_or("module"),
-                key,
+                if self.consent.is_some() {
+                    None
+                } else {
+                    Some(key)
+                },
                 now,
                 if approval.is_some() {
                     "direct"

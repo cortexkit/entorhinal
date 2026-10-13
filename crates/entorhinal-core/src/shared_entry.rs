@@ -44,6 +44,10 @@ pub struct ProjectEntry {
     pub agents: Vec<AgentChangeEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member_name: Option<MemberName>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requesting_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<crate::agent::consent::Authorization>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -209,6 +213,8 @@ impl SharedState {
             tables,
             agents: vec![],
             member_name: None,
+            requesting_agent_id: None,
+            authorization: None,
         })
     }
 
@@ -232,6 +238,8 @@ impl SharedState {
                 .collect(),
             agents,
             member_name: None,
+            requesting_agent_id: None,
+            authorization: None,
         }
     }
 }
@@ -276,16 +284,34 @@ pub(crate) fn record_local_entry(
         && before != after
         && !matches!(op, "agent.import" | "root_key.assign" | "root_key.backfill")
     {
+        let payload: Value = serde_json::from_str(payload).map_err(decode_error)?;
+        let attribution = |entry: &mut ProjectEntry| -> rusqlite::Result<()> {
+            entry.requesting_agent_id = payload
+                .get("requesting_agent_id")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(decode_error)?;
+            entry.authorization = payload
+                .get("authorization")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(decode_error)?;
+            Ok(())
+        };
         let body = if !agents.is_empty() {
             agents.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
             let mut entry = before.project_delta(after, tx)?;
             entry.agents = agents;
+            attribution(&mut entry)?;
             canonical_bytes(&entry)
         } else if op.starts_with("agent.") || op == "member.set_name" {
-            let payload: Value = serde_json::from_str(payload).map_err(decode_error)?;
             canonical_bytes(payload.get("entry").unwrap_or(&payload))
         } else {
-            canonical_bytes(&before.project_delta(after, tx)?)
+            let mut entry = before.project_delta(after, tx)?;
+            attribution(&mut entry)?;
+            canonical_bytes(&entry)
         };
         tx.execute(
             "UPDATE registry_journal SET stream='shared',entry=?1 WHERE seq=?2",
@@ -604,6 +630,12 @@ mod tests {
                     "role_cache",
                     "role_take_request",
                     "self_identity",
+                    // Consent decisions, retry state, audit and hire limits stay local.
+                    "consent_grant",
+                    "consent_request",
+                    "consent_feed_cursor",
+                    "agent_audit",
+                    "project_hire_cap",
                 ];
                 let schema = conn
                     .prepare("SELECT name FROM sqlite_schema WHERE type='table'")?
