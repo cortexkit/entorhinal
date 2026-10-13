@@ -53,12 +53,15 @@ struct Local {
     pending: HashMap<String, Pending>,
 }
 
+type DropHook = Box<dyn FnOnce(&FakeRecord) + Send>;
+
 pub(crate) struct FakeRecord {
     cloud: Arc<Mutex<Cloud>>,
     local: Arc<Mutex<Local>>,
     pub author: String,
     pub offline: AtomicBool,
     pub hung: AtomicBool,
+    pub after_drop: Mutex<Option<DropHook>>,
     pub drop_reply: AtomicBool,
     pub member: AtomicBool,
     pub keys: AtomicBool,
@@ -78,6 +81,7 @@ impl FakeRecord {
             author: encode_hex(&author),
             offline: AtomicBool::new(false),
             hung: AtomicBool::new(false),
+            after_drop: Mutex::new(None),
             drop_reply: AtomicBool::new(false),
             member: AtomicBool::new(true),
             keys: AtomicBool::new(true),
@@ -134,6 +138,15 @@ impl FakeRecord {
                 author: author.into(),
             },
         );
+    }
+
+    /// Commit genuine intervening versions so receipt expiry is exercised, not
+    /// simulated by bypassing the fake's 64-version retention rule.
+    pub(crate) fn advance_versions(&self, subject: &str, first: u64, count: u64, body: &[u8]) {
+        for version in first..first + count {
+            self.cas(subject, version, body.to_vec(), format!("{version:032x}"))
+                .unwrap();
+        }
     }
 
     fn read(&self, subject: &str) -> Result<RecordReply, TransportError> {
@@ -264,6 +277,10 @@ impl FakeRecord {
         match outcome {
             Ok(version) => {
                 if self.drop_reply.swap(false, Ordering::Relaxed) {
+                    let hook = self.after_drop.lock().unwrap().take();
+                    if let Some(hook) = hook {
+                        hook(self);
+                    }
                     return Err(TransportError::NoReply);
                 }
                 let mut local = self.local.lock().unwrap();

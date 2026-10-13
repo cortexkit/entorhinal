@@ -101,6 +101,8 @@ pub enum Face {
     /// relabels them; each write lands only after the operator approves it at
     /// a Touch ID prompt.
     Agents,
+    /// `ck-roles`: cached role claims and operator-confirmed takes.
+    Roles,
     /// `ck-entorhinal`: the supervised module itself. Serves; its only
     /// operator surface is `--version`/`--help`, which point at the faces.
     Entorhinal,
@@ -120,6 +122,7 @@ pub fn face_from_argv0(argv0: Option<&str>) -> Face {
         "ck-projects" | "ckdev-projects" => Face::Projects,
         "ck-workspaces" | "ckdev-workspaces" => Face::Workspaces,
         "ck-agents" | "ckdev-agents" => Face::Agents,
+        "ck-roles" | "ckdev-roles" => Face::Roles,
         _ => Face::Entorhinal,
     }
 }
@@ -189,7 +192,7 @@ pub fn parse(face: Face, arguments: &[String]) -> Invocation {
     if arguments.len() == 1 && arguments[0] == "--ck-domain" {
         return match face {
             Face::Entorhinal => Invocation::Refuse(
-                "ck-entorhinal is a module, not a ck domain; the domains are ck projects, ck workspaces and ck agents"
+                "ck-entorhinal is a module, not a ck domain; the domains are ck projects, ck workspaces, ck agents and ck roles"
                     .to_string(),
             ),
             _ => Invocation::Report(usage(face).lines().next().unwrap_or_default().to_string()),
@@ -235,6 +238,13 @@ pub fn parse(face: Face, arguments: &[String]) -> Invocation {
             {
                 let Some(value) = rest.next().filter(|value| !value.is_empty()) else {
                     return Invocation::Refuse(format!("{argument} needs a value"));
+                };
+                args.push(argument.clone());
+                args.push(value.clone());
+            }
+            "--reason" if face == Face::Roles => {
+                let Some(value) = rest.next() else {
+                    return Invocation::Refuse("--reason needs a value".into());
                 };
                 args.push(argument.clone());
                 args.push(value.clone());
@@ -301,6 +311,7 @@ fn binary_name(face: Face) -> &'static str {
         Face::Projects => "ck-projects",
         Face::Workspaces => "ck-workspaces",
         Face::Agents => "ck-agents",
+        Face::Roles => "ck-roles",
         Face::Entorhinal => "ck-entorhinal",
     }
 }
@@ -382,6 +393,7 @@ usage: ck agents <verb> [args] [--subc <connection file>] [--json]
   --subc <path>              daemon connection file; defaults to discovery
   --json                     raw response instead of the rendered form"
             .to_string(),
+        Face::Roles => "ck roles — cached role claims and operator-confirmed takes\n\nusage: ck roles <verb> [args] [--subc <connection file>] [--json]\n\n  read <role>\n  take <role> --reason <text>\n\nRole names use lowercase letters, digits and underscores (1 to 64 bytes).\nTakes require operator confirmation; reads never wait on engram.".to_string(),
         Face::Entorhinal => "\
 ck-entorhinal — the registry module (supervised by the subc daemon)
 
@@ -391,7 +403,8 @@ surface is:
   ck projects      list, register, resolve, remove, add-root, remove-root,
                    attach, owned-remotes, approve, unapprove, trust, verify, log
   ck workspaces    list, assign, set-root, clear-root
-  ck agents        create, rename, retire, tag, labels, list, show
+   ck agents        create, rename, retire, tag, labels, list, show
+   ck roles         read, take
 
 With no arguments it runs as the supervised module, which is how the daemon
 spawns it."
@@ -479,6 +492,9 @@ fn build_failure_exit(message: &str) -> u8 {
 }
 
 fn build_at(command: &Command, cwd: &str) -> Result<(String, Value), String> {
+    if command.face == Face::Roles {
+        return build_roles(command);
+    }
     if command.face == Face::Agents {
         return build_agents(command);
     }
@@ -840,6 +856,55 @@ fn build_agents(command: &Command) -> Result<(String, Value), String> {
     Ok((method.into(), params))
 }
 
+fn build_roles(command: &Command) -> Result<(String, Value), String> {
+    match (command.verb.as_str(), command.args.as_slice()) {
+        ("read", [role]) if entorhinal_core::role_cache::valid_role(role) => {
+            Ok(("role.read".into(), json!({"role":role})))
+        }
+        ("take", [role, flag, reason])
+            if flag == "--reason" && entorhinal_core::role_cache::valid_role(role) =>
+        {
+            let mut bytes = [0; 16];
+            getrandom::getrandom(&mut bytes).map_err(|e| format!("draw request id: {e}"))?;
+            Ok((
+                "role.take".into(),
+                json!({"role":role,"reason":reason,"request_id":super::log_client::encode_hex(&bytes)}),
+            ))
+        }
+        _ => Err(usage(Face::Roles)),
+    }
+}
+
+async fn execute_roles(
+    caller: &impl CliCaller,
+    method: &str,
+    mut params: Value,
+) -> Result<Value, (u8, String)> {
+    if method == "role.take" {
+        let read = caller
+            .call(
+                "role.read",
+                json!({"role":params["role"]}),
+                subc_client_rs::CallOptions::default(),
+            )
+            .await
+            .map_err(CallFailure::display)?;
+        let epoch = read["epoch"]
+            .as_i64()
+            .ok_or_else(|| (EXIT_TRANSPORT, "role.read reply has no epoch".into()))?;
+        params["expected_epoch"] = json!(epoch);
+        eprintln!("{AGENT_WRITE_NOTICE}");
+    }
+    let options = subc_client_rs::CallOptions {
+        timeout: Duration::from_secs(if method == "role.take" { 300 } else { 30 }),
+        ..subc_client_rs::CallOptions::default()
+    };
+    caller
+        .call(method, params, options)
+        .await
+        .map_err(CallFailure::display)
+}
+
 fn is_agent_id(token: &str) -> bool {
     token.strip_prefix("agent_").is_some_and(|hex| {
         matches!(hex.len(), 8 | 16)
@@ -1178,7 +1243,17 @@ fn call(
             }
         }
         .map_err(|error| (EXIT_TRANSPORT, connect_failure(connection, error)))?;
-        if command.face == Face::Agents {
+        if command.face == Face::Roles {
+            execute_roles(
+                &ConsumerCaller {
+                    consumer: &consumer,
+                    cwd: cwd.to_owned(),
+                },
+                method,
+                params,
+            )
+            .await
+        } else if command.face == Face::Agents {
             execute_agents(
                 &ConsumerCaller {
                     consumer: &consumer,
@@ -1528,6 +1603,7 @@ mod tests {
             ("ck-projects", "ckdev-projects", Face::Projects),
             ("ck-workspaces", "ckdev-workspaces", Face::Workspaces),
             ("ck-agents", "ckdev-agents", Face::Agents),
+            ("ck-roles", "ckdev-roles", Face::Roles),
             ("ck-entorhinal", "ckdev-entorhinal", Face::Entorhinal),
         ] {
             assert_eq!(face_from_argv0(Some(production_name)), expected);
@@ -3194,6 +3270,7 @@ mod launch_path_tests {
             ("projects", Face::Projects),
             ("workspaces", Face::Workspaces),
             ("agents", Face::Agents),
+            ("roles", Face::Roles),
             ("entorhinal", Face::Entorhinal),
         ] {
             for name in [
@@ -3354,5 +3431,92 @@ mod launch_path_tests {
         }
         let error = cli_path("\\\\server\\share\\absent", "C:\\scratch", true).unwrap_err();
         assert!(!error.contains("rooted-no-drive"));
+    }
+}
+
+#[cfg(test)]
+mod role_tests {
+    use super::*;
+    use std::sync::Mutex;
+    #[derive(Default)]
+    struct Caller {
+        calls: Mutex<Vec<(String, Value, Duration)>>,
+    }
+    #[async_trait::async_trait]
+    impl CliCaller for Caller {
+        async fn call(
+            &self,
+            method: &str,
+            params: Value,
+            options: subc_client_rs::CallOptions,
+        ) -> Result<Value, CallFailure> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((method.into(), params, options.timeout));
+            Ok(if method == "role.read" {
+                json!({"role":"x","known":true,"epoch":7})
+            } else {
+                json!({"epoch":8,"held_here":true})
+            })
+        }
+    }
+    fn command(args: &[&str]) -> Command {
+        match parse(
+            Face::Roles,
+            &args.iter().map(|s| (*s).into()).collect::<Vec<_>>(),
+        ) {
+            Invocation::Command(command) => command,
+            _ => panic!("expected command"),
+        }
+    }
+    #[tokio::test]
+    async fn roles_cli_reads_and_takes_with_cached_epoch_and_fresh_id() {
+        let caller = Caller::default();
+        let read = command(&["read", "x"]);
+        let (method, params) = build(&read).unwrap();
+        assert_eq!(
+            (method.as_str(), params.clone()),
+            ("role.read", json!({"role":"x"}))
+        );
+        execute_roles(&caller, &method, params).await.unwrap();
+        let take = command(&["take", "x", "--reason", "run coordinator"]);
+        let (method, params) = build(&take).unwrap();
+        let first_id = params["request_id"].as_str().unwrap().to_owned();
+        assert_eq!(first_id.len(), 32);
+        assert!(first_id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        assert_ne!(build(&take).unwrap().1["request_id"], first_id);
+        assert_eq!(
+            execute_roles(&caller, &method, params).await.unwrap(),
+            json!({"epoch":8,"held_here":true})
+        );
+        let calls = caller.calls.lock().unwrap();
+        assert_eq!(
+            calls.iter().map(|c| c.0.as_str()).collect::<Vec<_>>(),
+            ["role.read", "role.read", "role.take"]
+        );
+        assert_eq!(
+            calls[2].1,
+            json!({"role":"x","expected_epoch":7,"reason":"run coordinator","request_id":first_id})
+        );
+        assert_eq!(calls[2].2, Duration::from_secs(300));
+        for args in [
+            ["take", "x", "--reason", "why", "extra"].as_slice(),
+            ["take", "x"].as_slice(),
+            ["read", "X"].as_slice(),
+            ["read", "x", "extra"].as_slice(),
+        ] {
+            assert!(build(&command(args)).is_err());
+        }
+        assert!(matches!(
+            parse(Face::Roles, &["--reason".into()]),
+            Invocation::Refuse(_)
+        ));
+        assert!(matches!(parse(Face::Roles, &[]), Invocation::Report(_)));
+        assert!(
+            matches!(parse(Face::Roles,&["--ck-domain".into()]),Invocation::Report(text) if text.starts_with("ck roles"))
+        );
     }
 }

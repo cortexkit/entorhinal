@@ -16,6 +16,7 @@ struct Worker {
     log: log_client::LogClient,
     writer: Arc<tokio::sync::Mutex<()>>,
     commits: Arc<tokio::sync::Notify>,
+    role_refresh: Arc<tokio::sync::Notify>,
     claim_refresh: Arc<super::claims::RefreshQueue>,
 }
 
@@ -27,6 +28,7 @@ impl ProjectsHandler {
             log: self.log_client.clone(),
             writer: self.writer.clone(),
             commits: self.commits.clone(),
+            role_refresh: self.role_refresh.clone(),
             claim_refresh: self.claim_refresh.clone(),
         }
     }
@@ -57,6 +59,9 @@ impl ProjectsHandler {
 impl Drop for ProjectsHandler {
     fn drop(&mut self) {
         if let Some(task) = self.catch_up_task.get_mut().unwrap().take() {
+            task.abort();
+        }
+        if let Some(task) = self.role_refresh_task.get_mut().unwrap().take() {
             task.abort();
         }
         if let Some(task) = self.claim_refresh_task.get_mut().unwrap().take() {
@@ -257,6 +262,13 @@ impl Worker {
                 .health
                 .claim_refresh_failed
                 .swap(false, Ordering::Relaxed);
+            let retry_roles = self
+                .health
+                .role_refresh_failed
+                .swap(false, Ordering::Relaxed);
+            if reconnect || retry_refresh || retry_roles {
+                self.role_refresh.notify_one();
+            }
             if reconnect || retry_refresh {
                 reconnect = false;
                 self.claim_refresh.signal();

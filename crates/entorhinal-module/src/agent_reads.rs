@@ -1543,6 +1543,7 @@ mod tests {
             "agent.for_session",
             "agent.session_liveness",
             "agent.where",
+            "role.read",
         ];
         let expected_mutations = [
             "agent.repair_workspaces",
@@ -1576,6 +1577,7 @@ mod tests {
             "agent.register_session",
             "agent.refresh_claims",
             "member.set_name",
+            "role.take",
         ];
         for (kind, names) in [
             ("query", expected_queries.as_slice()),

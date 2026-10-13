@@ -173,6 +173,12 @@ pub(crate) struct CasRequest {
     pub write_id: [u8; 16],
 }
 
+#[derive(Debug)]
+pub(crate) enum CasSettlement {
+    Landed(u64),
+    Moved(RecordReply),
+}
+
 #[derive(Clone)]
 pub(crate) struct RecordClient {
     connector: Arc<dyn LogConnector>,
@@ -210,7 +216,6 @@ impl RecordClient {
         .unwrap_or_else(|_| Err(RecordError::refusal("unavailable", None)))
     }
 
-    #[allow(dead_code)] // Single-subject reads are needed by operator-confirmed role acquisition.
     pub(crate) async fn read(&self, subject: &str) -> Result<RecordReply, RecordError> {
         validate_subject(subject)?;
         decode_reply(self.call(READ, json!({"subject":subject})).await?)
@@ -281,7 +286,38 @@ impl RecordClient {
         Ok((entries, page.next))
     }
 
-    #[allow(dead_code)] // Agent checkout claims are not written here; role acquisition uses CAS.
+    /// Resend the exact attempt first. Once its receipt has aged out of the
+    /// 64-version window, only a verified subject read can establish whether it
+    /// landed. Compare decoded values, not encoding choices such as whitespace.
+    pub(crate) async fn cas_settled<T: PartialEq>(
+        &self,
+        request: &CasRequest,
+        author: &str,
+        decode: impl Fn(&[u8]) -> Result<T, &'static str>,
+    ) -> Result<CasSettlement, RecordError> {
+        match self.cas(request).await {
+            Ok(version) => Ok(CasSettlement::Landed(version)),
+            Err(error)
+                if error.code() == "version_moved" || matches!(error, RecordError::NoReply) =>
+            {
+                let reply = self.read(&request.subject).await?;
+                let expected =
+                    decode(&request.body).map_err(|code| RecordError::refusal(code, None))?;
+                let matches = reply
+                    .body
+                    .as_deref()
+                    .and_then(|body| decode(body).ok())
+                    .is_some_and(|body| body == expected);
+                if !reply.absent && reply.author.as_deref() == Some(author) && matches {
+                    Ok(CasSettlement::Landed(reply.version))
+                } else {
+                    Ok(CasSettlement::Moved(reply))
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub(crate) async fn cas(&self, request: &CasRequest) -> Result<u64, RecordError> {
         validate_subject(&request.subject)?;
         if request.body.len() > BODY_CAP {

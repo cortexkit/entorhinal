@@ -1985,7 +1985,7 @@ test_file = "crates/entorhinal-module/src/claim_codec.rs"
 runner = "cargo"
 package = "entorhinal-module"
 target = "--bin ck-entorhinal"
-expect_red = ["claim_codec::tests::claim_codec_refuses_each_named_error_and_roundtrips"]
+expect_red = ["claim_codec::tests::claim_codec_refuses_each_named_error_and_roundtrips", "claim_codec::role_tests::role_codec_refuses_named_errors_and_roundtrips"]
 
 [[control]]
 id = "claims-codec-subject"
@@ -2003,8 +2003,8 @@ expect_red = ["claim_codec::tests::claim_codec_refuses_each_named_error_and_roun
 id = "claims-codec-holder"
 guards = "A positive claim epoch requires a holder"
 file = "crates/entorhinal-module/src/claim_codec.rs"
-old = "|| (claim.epoch >= 1 && claim.holder.is_none())"
-new = "|| (false && claim.epoch >= 1 && claim.holder.is_none()) // NON-VACUITY BREAK"
+old = "if claim.epoch < 0\n            || (claim.epoch >= 1 && claim.holder.is_none())"
+new = "if claim.epoch < 0\n            || (false && claim.epoch >= 1 && claim.holder.is_none()) /* NON-VACUITY BREAK */"
 test_file = "crates/entorhinal-module/src/claim_codec.rs"
 runner = "cargo"
 package = "entorhinal-module"
@@ -2047,7 +2047,7 @@ test_file = "crates/entorhinal-core/src/claim_cache.rs"
 runner = "cargo"
 package = "entorhinal-core"
 target = "--lib"
-expect_red = ["claim_cache::tests::integrity_present_keeps_body_and_sets_mark"]
+expect_red = ["claim_cache::tests::integrity_present_keeps_body_and_sets_mark", "role_cache::tests::role_integrity_present_keeps_body_and_sets_mark", "role_cache::tests::role_codec_failure_keeps_body_and_sets_mark"]
 
 [[control]]
 id = "claims-integrity-none"
@@ -2059,7 +2059,7 @@ test_file = "crates/entorhinal-core/src/claim_cache.rs"
 runner = "cargo"
 package = "entorhinal-core"
 target = "--lib"
-expect_red = ["claim_cache::tests::integrity_none_creates_marked_unclaimed_version_zero"]
+expect_red = ["claim_cache::tests::integrity_none_creates_marked_unclaimed_version_zero", "role_cache::tests::role_integrity_none_creates_mark_with_null_read_at_treated_as_none"]
 
 [[control]]
 id = "claims-newer-clears-mark"
@@ -2071,7 +2071,7 @@ test_file = "crates/entorhinal-core/src/claim_cache.rs"
 runner = "cargo"
 package = "entorhinal-core"
 target = "--lib"
-expect_red = ["claim_cache::tests::verified_newer_equal_or_first_replaces_and_clears_mark"]
+expect_red = ["claim_cache::tests::verified_newer_equal_or_first_replaces_and_clears_mark", "role_cache::tests::role_verified_replacement_clears_mark_and_sets_cloud"]
 
 [[control]]
 id = "claims-older-keeps-body"
@@ -2083,7 +2083,7 @@ test_file = "crates/entorhinal-core/src/claim_cache.rs"
 runner = "cargo"
 package = "entorhinal-core"
 target = "--lib"
-expect_red = ["claim_cache::tests::verified_older_keeps_body_and_mark_and_becomes_stale"]
+expect_red = ["claim_cache::tests::verified_older_keeps_body_and_mark_and_becomes_stale", "role_cache::tests::role_older_version_retains_body_mark_and_source"]
 
 [[control]]
 id = "claims-stale-absent-keeps-positive"
@@ -2095,7 +2095,7 @@ test_file = "crates/entorhinal-core/src/claim_cache.rs"
 runner = "cargo"
 package = "entorhinal-core"
 target = "--lib"
-expect_red = ["claim_cache::tests::stale_absent_preserves_positive_version_and_mark"]
+expect_red = ["claim_cache::tests::stale_absent_preserves_positive_version_and_mark", "role_cache::tests::role_stale_absent_retains_newer_body_and_mark"]
 
 [[control]]
 id = "claims-stale-zero-keeps-mark"
@@ -2107,7 +2107,7 @@ test_file = "crates/entorhinal-core/src/claim_cache.rs"
 runner = "cargo"
 package = "entorhinal-core"
 target = "--lib"
-expect_red = ["claim_cache::tests::stale_absent_none_or_zero_stores_zero_and_keeps_mark"]
+expect_red = ["claim_cache::tests::stale_absent_none_or_zero_stores_zero_and_keeps_mark", "role_cache::tests::role_stale_absent_none_or_zero_is_unclaimed_and_keeps_mark"]
 
 [[control]]
 id = "claims-unclaimed-version-zero"
@@ -2265,7 +2265,7 @@ test_file = "crates/entorhinal-core/src/claim_cache.rs"
 runner = "cargo"
 package = "entorhinal-core"
 target = "--lib"
-expect_red = ["claim_cache::tests::confirmed_absent_resets_version_and_clears_mark"]
+expect_red = ["claim_cache::tests::confirmed_absent_resets_version_and_clears_mark", "role_cache::tests::role_fresh_absent_clears_mark"]
 
 [[control]]
 id = "claims-where-here-needs-own-author"
@@ -2699,3 +2699,243 @@ runner = "cargo"
 package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 expect_red = ["sessions::tests::registration_reuses_both_claimants_on_one_route"]
+
+[[control]]
+id = "roles-set-is-bounded"
+guards = "A never-read role enrolls once, and the persisted refresh set refuses its 257th role"
+file = "crates/entorhinal-core/src/role_cache.rs"
+old = "if count >= 256 {"
+new = "if count >= 257 { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/role_cache.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["role_cache::tests::role_read_derives_identity_names_and_keeps_nulls_and_role_set_bound"]
+
+[[control]]
+id = "roles-null-read-is-none"
+guards = "Enrollment is not a record observation; NULL read_at_ms supplies no cached body to the shared decision table"
+file = "crates/entorhinal-core/src/role_cache.rs"
+old = "SELECT holder,epoch,version,read_at_ms,stale,integrity_failed FROM role_cache WHERE role=?1 AND read_at_ms IS NOT NULL"
+new = "SELECT holder,epoch,version,COALESCE(read_at_ms,0),stale,integrity_failed FROM role_cache WHERE role=?1 /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-core/src/role_cache.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["role_cache::tests::role_integrity_none_creates_mark_with_null_read_at_treated_as_none"]
+
+[[control]]
+id = "roles-integrity-read-fails-closed"
+guards = "A persisted integrity mark refuses role.read until a verified observation clears it"
+file = "crates/entorhinal-core/src/role_cache.rs"
+old = "if row.as_ref().is_some_and(|r| r.integrity_failed) {"
+new = "if false && row.as_ref().is_some_and(|r| r.integrity_failed) { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/role_cache.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["role_cache::tests::role_integrity_present_keeps_body_and_sets_mark"]
+
+[[control]]
+id = "roles-holder-is-derived"
+guards = "Held-here requires a positive epoch and the currently persisted device author, without a role refresh"
+file = "crates/entorhinal-core/src/role_cache.rs"
+old = "r.epoch >= 1 && r.holder.is_some() && r.holder == own"
+new = "r.epoch >= 1 && r.holder.is_some() && own.is_some() /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-core/src/role_cache.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["role_cache::tests::role_read_derives_identity_names_and_keeps_nulls_and_role_set_bound"]
+
+[[control]]
+id = "roles-take-id-input-is-stable"
+guards = "An approved request id cannot be reused for another role, expected epoch or reason"
+file = "crates/entorhinal-core/src/role_cache.rs"
+old = "if attempt.as_ref().is_some_and(|a| a.input != *input) {"
+new = "if false && attempt.as_ref().is_some_and(|a| a.input != *input) { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/role_cache.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["role_cache::tests::role_ledger_checks_input_conflicts_and_commits_result_without_journal"]
+
+[[control]]
+id = "roles-result-is-local"
+guards = "A landed role take writes a local cache observation atomically with its ledger epoch"
+file = "crates/entorhinal-core/src/role_cache.rs"
+old = "                Some(\"local\"),"
+new = "                Some(\"cloud\"), // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/role_cache.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["role_cache::tests::role_ledger_checks_input_conflicts_and_commits_result_without_journal"]
+
+[[control]]
+id = "roles-refresh-is-cloud"
+guards = "A verified refresh replacing a role observation clears the mark and changes its source to cloud"
+file = "crates/entorhinal-core/src/role_cache.rs"
+old = "                                Some(\"cloud\")"
+new = "                                Some(\"local\") // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/role_cache.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["role_cache::tests::role_verified_replacement_clears_mark_and_sets_cloud"]
+
+[[control]]
+id = "roles-ledger-before-confirmation"
+guards = "Completed and unresolved same-id retries consult approved bytes before any new presence prompt or record read"
+file = "crates/entorhinal-module/src/roles.rs"
+old = "let attempt = store.role_take_attempt(&input)?;"
+new = "let attempt = None; // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/roles.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["roles::tests::role_take_is_confirmed_direct_only_and_ledger_precedes_prompts", "roles::tests::role_unsettled_lost_reply_retry_reuses_approved_bytes_without_presence"]
+
+[[control]]
+id = "roles-take-is-direct-only"
+guards = "No module principal can reach the operator-confirmation role take path"
+file = "crates/entorhinal-module/src/roles.rs"
+old = "if admission.principal != Some(subc_protocol::Principal::Direct) {"
+new = "if false && admission.principal != Some(subc_protocol::Principal::Direct) { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/roles.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["roles::tests::role_take_is_confirmed_direct_only_and_ledger_precedes_prompts"]
+
+[[control]]
+id = "roles-take-revalidates-epoch"
+guards = "The post-approval read refuses a moved epoch before storing or sending a new CAS attempt"
+file = "crates/entorhinal-module/src/roles.rs"
+old = "if claim.as_ref().map_or(0, |c| c.epoch) != input.expected_epoch {"
+new = "if false && claim.as_ref().map_or(0, |c| c.epoch) != input.expected_epoch { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/roles.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["roles::tests::role_take_refuses_missing_presence_epoch_conflict_and_invalid_requests"]
+
+[[control]]
+id = "roles-confirmation-requires-presence"
+guards = "Missing presence refuses without making a record call or approving a ledger row"
+file = "crates/entorhinal-module/src/roles.rs"
+old = "result.map_err(|_| HandlerError::from(OperatorConfirmError::Declined))??;"
+new = "let _ = result; // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/roles.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["roles::tests::role_take_refuses_missing_presence_epoch_conflict_and_invalid_requests"]
+
+[[control]]
+id = "roles-private-thirty-second-timer"
+guards = "Role subjects refresh every 30 seconds even with the identity log disabled"
+file = "crates/entorhinal-module/src/roles.rs"
+old = "Instant::now() + Duration::from_secs(30),"
+new = "Instant::now() + Duration::from_secs(60), // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/roles.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["roles::tests::role_timer_runs_with_log_disabled_and_refreshes_integrity_and_sources"]
+
+[[control]]
+id = "roles-install-starts-refresh"
+guards = "Installing a store starts the independent role pass without waiting for a log enable"
+file = "crates/entorhinal-module/src/main.rs"
+old = "        self.role_refresh.notify_one();"
+new = "        // NON-VACUITY BREAK: no store-install role pass"
+test_file = "crates/entorhinal-module/src/roles.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["roles::tests::role_store_install_and_reconnect_signal_the_role_pass"]
+
+[[control]]
+id = "roles-reconnect-signals-refresh"
+guards = "A successful identity-log read after an error signals the role pass independently of the agent subject set"
+file = "crates/entorhinal-module/src/catch_up.rs"
+old = "                self.role_refresh.notify_one();"
+new = "                // NON-VACUITY BREAK: no reconnect role pass"
+test_file = "crates/entorhinal-module/src/roles.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["roles::tests::role_store_install_and_reconnect_signal_the_role_pass"]
+
+[[control]]
+id = "roles-restart-is-stale"
+guards = "A persisted role retains its source and integrity mark but answers stale until a new verified observation"
+file = "crates/entorhinal-core/src/role_cache.rs"
+old = "UPDATE role_cache SET stale=1"
+new = "UPDATE role_cache SET stale=stale /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-module/src/roles.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["roles::tests::role_store_install_refreshes_persisted_set_and_restart_stales_until_verified_read"]
+
+[[control]]
+id = "roles-settlement-compares-decoded-values"
+guards = "Past the 64-version receipt window, a landed role write is recognised despite JSON re-encoding"
+file = "crates/entorhinal-module/src/record_client.rs"
+old = "                    .and_then(|body| decode(body).ok())"
+new = "                    .and_then(|body| if body == request.body.as_slice() { decode(body).ok() } else { None }) // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/roles.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["roles::tests::role_past_window_settlement_compares_decoded_body_and_author"]
+
+[[control]]
+id = "roles-settlement-requires-own-author"
+guards = "A matching body written by another author is superseded, leaving the ledger epoch NULL for a no-prompt retry"
+file = "crates/entorhinal-module/src/record_client.rs"
+old = "reply.author.as_deref() == Some(author)"
+new = "!author.is_empty() /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-module/src/roles.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["roles::tests::role_past_window_superseded_keeps_ledger_unsettled_and_retries_without_prompt"]
+
+[[control]]
+id = "roles-codec-subject"
+guards = "A decoded role record cannot impersonate another subject"
+file = "crates/entorhinal-module/src/claim_codec.rs"
+old = "if claim.role != role {"
+new = "if false && claim.role != role { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/claim_codec.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["claim_codec::role_tests::role_codec_refuses_named_errors_and_roundtrips"]
+
+[[control]]
+id = "roles-codec-positive-epoch-needs-holder"
+guards = "A positive role epoch cannot decode without a holder"
+file = "crates/entorhinal-module/src/claim_codec.rs"
+old = "|| claim.epoch < 0\n            || (claim.epoch >= 1 && claim.holder.is_none())"
+new = "|| claim.epoch < 0\n            || (false && claim.epoch >= 1 && claim.holder.is_none()) /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-module/src/claim_codec.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["claim_codec::role_tests::role_codec_refuses_named_errors_and_roundtrips"]
+
+[[control]]
+id = "roles-take-closed-request-fields"
+guards = "An unknown role.take field is invalid_request before confirmation or any record call"
+file = "crates/entorhinal-core/src/role_cache.rs"
+old = "#[serde(deny_unknown_fields)]"
+new = "// NON-VACUITY BREAK: role.take silently accepts unknown fields"
+test_file = "crates/entorhinal-module/src/roles.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["roles::tests::role_take_refuses_missing_presence_epoch_conflict_and_invalid_requests"]

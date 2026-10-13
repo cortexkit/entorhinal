@@ -28,6 +28,7 @@ mod mutations;
 mod ownership;
 mod read_connection;
 pub mod remote_apply;
+pub mod role_cache;
 mod root_keys;
 pub mod shared_entry;
 pub use binding::*;

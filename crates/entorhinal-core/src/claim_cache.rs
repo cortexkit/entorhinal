@@ -81,7 +81,10 @@ pub(crate) fn learn_self_author(
     Ok(true)
 }
 
-fn holder_name(conn: &Connection, holder: Option<&str>) -> rusqlite::Result<Option<String>> {
+pub(crate) fn holder_name(
+    conn: &Connection,
+    holder: Option<&str>,
+) -> rusqlite::Result<Option<String>> {
     conn.query_row(
         "SELECT display_name FROM member_name WHERE author=?1",
         [holder],
@@ -141,6 +144,54 @@ fn unclaimed(now: i64, stale: bool, integrity_failed: bool) -> CachedClaim {
     }
 }
 
+/// Implements the cache observation table: integrity errors retain the body and
+/// set the mark; older versions and stale absence retain newer bodies and marks;
+/// verified replacements and fresh absence clear the mark. Unavailable reads
+/// only stale an existing row. A never-read role supplies `None` as its old row.
+pub(crate) fn decide(
+    old: Option<CachedClaim>,
+    observation: &ClaimObservation,
+    now: i64,
+) -> Option<CachedClaim> {
+    let mut next = match observation {
+        ClaimObservation::IntegrityFailed | ClaimObservation::CodecFailed { .. } => {
+            let mut row = old.unwrap_or_else(|| unclaimed(now, true, true));
+            row.integrity_failed = true;
+            row
+        }
+        ClaimObservation::Unavailable => {
+            let mut row = old?;
+            row.stale = true;
+            row
+        }
+        ClaimObservation::Present { claim, .. } => match old {
+            Some(mut cached) if claim.version < cached.version => {
+                cached.stale = true;
+                cached
+            }
+            _ if claim.epoch == 0 => unclaimed(now, claim.stale, false),
+            _ => {
+                let mut row = claim.clone();
+                row.integrity_failed = false;
+                row
+            }
+        },
+        ClaimObservation::Absent { stale, .. } => match old {
+            Some(mut cached) if *stale && cached.version >= 1 => {
+                cached.stale = true;
+                cached
+            }
+            cached => unclaimed(
+                now,
+                *stale,
+                *stale && cached.is_some_and(|c| c.integrity_failed),
+            ),
+        },
+    };
+    next.read_at_ms = now;
+    Some(next)
+}
+
 fn apply(
     tx: &Transaction<'_>,
     id: &str,
@@ -148,52 +199,17 @@ fn apply(
     now: i64,
 ) -> rusqlite::Result<bool> {
     let old = load_claim(tx, id)?;
-    let mut conflict = false;
-    let mut next = match observation {
-        ClaimObservation::IntegrityFailed | ClaimObservation::CodecFailed { .. } => {
-            if let ClaimObservation::CodecFailed { self_author } = observation {
-                conflict = !learn_self_author(tx, self_author, now)?;
-            }
-            let mut row = old.unwrap_or_else(|| unclaimed(now, true, true));
-            row.integrity_failed = true;
-            row
+    let conflict = match observation {
+        ClaimObservation::Present { self_author, .. }
+        | ClaimObservation::Absent { self_author, .. }
+        | ClaimObservation::CodecFailed { self_author } => {
+            !learn_self_author(tx, self_author, now)?
         }
-        ClaimObservation::Unavailable => {
-            let Some(mut row) = old else { return Ok(false) };
-            row.stale = true;
-            row
-        }
-        ClaimObservation::Present { claim, self_author } => {
-            conflict = !learn_self_author(tx, self_author, now)?;
-            match old {
-                Some(mut cached) if claim.version < cached.version => {
-                    cached.stale = true;
-                    cached
-                }
-                _ if claim.epoch == 0 => unclaimed(now, claim.stale, false),
-                _ => {
-                    let mut row = claim.clone();
-                    row.integrity_failed = false;
-                    row
-                }
-            }
-        }
-        ClaimObservation::Absent { stale, self_author } => {
-            conflict = !learn_self_author(tx, self_author, now)?;
-            match old {
-                Some(mut cached) if *stale && cached.version >= 1 => {
-                    cached.stale = true;
-                    cached
-                }
-                cached => unclaimed(
-                    now,
-                    *stale,
-                    *stale && cached.is_some_and(|c| c.integrity_failed),
-                ),
-            }
-        }
+        _ => false,
     };
-    next.read_at_ms = now;
+    let Some(next) = decide(old, observation, now) else {
+        return Ok(conflict);
+    };
     tx.execute(
         "INSERT INTO claim_cache(agent_id,holder,epoch,cut_id,version,read_at_ms,stale,integrity_failed) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
          ON CONFLICT(agent_id) DO UPDATE SET holder=excluded.holder,epoch=excluded.epoch,cut_id=excluded.cut_id,version=excluded.version,read_at_ms=excluded.read_at_ms,stale=excluded.stale,integrity_failed=excluded.integrity_failed",

@@ -20,7 +20,7 @@ const SETTLEMENT: Duration = Duration::from_secs(20);
 const SEND_WAIT: Duration = Duration::from_secs(1);
 const RESEND_DELAY: Duration = Duration::from_millis(100);
 const RETRIES: usize = 5;
-const OPERATOR_BOUND: Duration = Duration::from_secs(270);
+pub(super) const OPERATOR_BOUND: Duration = Duration::from_secs(270);
 
 pub(super) fn health_state(state: u64) -> &'static str {
     match state {
