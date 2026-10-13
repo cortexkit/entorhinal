@@ -53,7 +53,7 @@ An agent's data lives in several modules. When entorhinal moves an agent from on
 Reply: `{ref_kinds: [string], stores: [{name, sync_class}], external: bool, detail?}`.
 - `ref_kinds`: the ref kinds this participant holds.
 - `stores`: its per-agent stores, with `sync_class` taken verbatim from AGENT_SYNC's list.
-- `external`: true when part of an agent's data is a file another program owns and ships itself (for example, the OpenCode database or Pi and Claude Code transcripts behind THALAMUS's harness).
+- `external`: true when part of an agent's data is a file another program owns and ships itself (for example, Claude Code transcripts behind THALAMUS's harness). A participant that ships all of its data through the door, as the OpenCode adapter does with its row log, declares `false`.
 - `detail`: optional, opaque, tolerant.
 A read.
 
@@ -80,7 +80,7 @@ On the source: decide where the data ends, and freeze it where possible. Reply:
 - **`format`:** opaque text naming the data's store version. The receiver's `import` checks it before reading, and refuses `incompatible_version` if it can't accept it.
 - **`frozen`:** `frozen: false` means the participant can't stop writes. Anything written after `endOffset` stays on this Mac and becomes a fork if the agent is used here again.
 - **`external`:** lists data the host program ships itself.
-  - `note` is the operator text (for example, "OpenCode session database: copy it with the project").
+  - `note` is the operator text (for example, "Claude Code transcript: copy it with the project").
   - `check` is opaque to entorhinal: whatever the receiving participant needs to recognise the right host data (for THALAMUS, the host's native session id, the last host row id, and a digest of the transcript up to it).
 - **Before replying:** the participant checks with `session.cover` that everything it admitted so far is covered, and makes the freeze durable.
 - **Refusals:** `busy` (checked again here, atomically with the freeze), `not_exportable`.
@@ -93,8 +93,8 @@ On the source: make sure every item's bytes up to `endOffset` are admitted throu
 ### `agent_data.diverged {refs, cutId}`
 On the receiver, before import: compare this Mac's copy with the cut. Reply: `{refs: [{state}]}`, in request order.
 - **States:**
-  - `at_cut`: this Mac's copy is a prefix of the cut, or absent.
-  - `advanced`: this Mac has data past where the cut starts that the cut doesn't contain. That includes host data past an external `check`.
+  - `at_cut`: this Mac has nothing for these refs that the cut doesn't contain, or holds nothing at all. For an append-only stream, that means this Mac's copy is a byte prefix of the cut. For a row store, it means this Mac's newest rows for the ref are exactly those in the last cut this Mac exported or imported for it (for OpenCode, the newest message and part).
+  - `advanced`: this Mac has something for these refs that the cut doesn't contain. That includes host data past an external `check`.
   - `unknown`.
 - `advanced` anywhere stops the move and shows the operator the fork choice. `unknown` blocks too, and is never read as `at_cut`.
 - May refuse `external_not_present`.
@@ -108,7 +108,7 @@ On the receiver: read the cut through the door (`cut.read`, then `session.read` 
 
 ### `agent_data.activate {refs, cutId}`
 On the receiver: make the staged data live. Reply: `{}`.
-- Refuses `external_not_present` until the host data matches its `check`; the participant stays at `imported` meanwhile.
+- Refuses `external_not_present` until the host data matches its `check`, and `busy` while something is running for these refs here (for example a run reopened on an archived session). Both are retried; the participant stays at `imported` meanwhile.
 - Step: `imported` → `activated`.
 
 ### `agent_data.abort {refs, cutId}`
@@ -118,7 +118,9 @@ On either side, only before the move record reads `activated`. The source unfree
 - Step: any earlier step → `aborted`.
 
 ### `agent_data.release {refs, cutId, holder}`
-On the source, after the move record reads `activated`. The freeze becomes a durable tombstone naming the new holder (`holder` is its author pseudonym). Later local writes for these refs are refused, naming the holder, on the participant's own wire. Reply: `{}`.
+On the source, after the move record reads `activated`. The freeze becomes a durable tombstone naming the new holder (`holder` is its author pseudonym). Reply: `{enforced: bool}`.
+- `enforced: true`: later local writes for these refs are refused, naming the holder, on the participant's own wire.
+- `enforced: false`: the participant can't block writes (OpenCode without a per-prompt hook). It records the tombstone and hides the old copy, but anything written there later becomes a fork, which `diverged` finds on the next move back.
 - Step: `exported` → `released`.
 
 ## A move back
