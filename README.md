@@ -20,6 +20,8 @@ ck projects resolve <dir>           which project owns a directory
 ck projects register <name> <dir>   register a project rooted at a directory
 ck projects remove <project>        remove a project from the registry
 ck projects verify                  check the store against its journal
+ck projects log status              local state of the shared identity log
+ck projects log name <display name> name this Mac in the shared log
 
 ck workspaces list                          workspaces known to the registry
 ck workspaces assign <project> <workspace>  put a project in a workspace
@@ -33,15 +35,19 @@ ck agents tag <agent> <text>
 ck agents labels <agent> <label>...         replace the whole label set
 ck agents labels <agent> --none             clear the label set
 ck agents repair-workspaces [--yes]         preview correction; --yes sends the write
+ck agents where <agent> [--refresh]         which Mac holds the agent, from the cache
+
+ck roles read <role>                        which Mac holds a role, from the cache
+ck roles take <role> --reason <text>        make this Mac the role's holder
 ```
 
-`ck projects`, `ck workspaces` or `ck agents` on its own prints the full usage,
+`ck projects`, `ck workspaces`, `ck agents` or `ck roles` on its own prints the full usage,
 including the roles and options `create` accepts. `--json` prints the raw
 response. `ck-entorhinal --manifest` prints the module manifest as JSON without
 connecting to anything, for offline checks such as `ck fleet lint`.
 
 An agent write from `ck agents` lands only after the operator approves it at a
-Touch ID prompt that names the exact change. The subc daemon shows the prompt,
+Touch ID prompt that names the exact change; so does `ck roles take`. The subc daemon shows the prompt,
 one at a time, and a write that would fail anyway is refused before any prompt
 appears. The write waits up to five minutes for the answer. If its outcome is
 unknown, for example after a timeout, the command prints a retry command that
@@ -114,6 +120,32 @@ carries that mark, so a flow can't borrow the executive's write access.
 | `agent.dispose` | mutate | Retire an agent; its id stays reserved. |
 | `agent.merge` | mutate | Merge one agent into another and retire the source. |
 | `agent.import` | mutate | Import the executive's agent registry once, at cutover. |
+| `agent.preview_repair_workspaces` | query | Preview the stored workspaces and name claims the operator's correction would change, including any refusal. |
+| `agent.repair_workspaces` | mutate | Clear heads' and hirees' stored workspaces and move live name claims to their project's workspace (operator only, after confirmation). |
+
+**Sessions, claims and roles**
+
+These operations report which of the operator's Macs holds an agent or a role. The claims behind them are read from engram (the module that stores CortexKit's shared records) and cached locally. Every read here answers from that cache, so it works offline and never waits on engram.
+
+| Operation | Kind | What it does |
+|---|---|---|
+| `agent.register_session` | mutate | Bind an agent's session to its host session; accepted only from the module the operator assigns the orchestrator or host role (`agent-orchestrator/v1` or `agent-host/v1` in the daemon's config). |
+| `agent.session_liveness` | query | Answer active, gone or unknown for up to 256 sessions, in request order. |
+| `agent.for_session` | query | Find the agent and session bound to a host session. |
+| `agent.where` | query | Which Mac holds an agent, from the cached claim. |
+| `agent.refresh_claims` | mutate | Refresh live agents' cached claims from engram (operator only). |
+| `role.read` | query | Which Mac holds a role, from the cached claim. |
+| `role.take` | mutate | Make this Mac a role's holder (operator only, after confirmation). |
+
+**Shared identity log**
+
+Agents, projects and workspaces are shared between the operator's Macs through an append-only log that engram stores. Each Mac keeps a full copy and answers reads from it; folder paths and approvals stay on each Mac.
+
+| Operation | Kind | What it does |
+|---|---|---|
+| `identity_log.status` | query | Local identity log state, progress and pending writes, without contacting engram. |
+| `identity_log.enable` | mutate | Enable or join the shared identity log (operator only). |
+| `member.set_name` | mutate | Name this Mac in the shared log (operator only). |
 
 ### macOS privacy permissions
 
