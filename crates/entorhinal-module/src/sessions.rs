@@ -330,9 +330,9 @@ struct SessionRef {
 /// `unknown` answer whose mirrored session carried one.
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub(super) struct LivenessAnswer {
-    state: &'static str,
+    pub(super) state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    cause: Option<String>,
+    pub(super) cause: Option<String>,
 }
 
 impl LivenessAnswer {
@@ -399,6 +399,46 @@ impl super::LivenessState {
 }
 
 impl ProjectsHandler {
+    /// Move relays must come from the provider of agent-orchestrator/v1. Reuse
+    /// the route cache and refresh a cached mismatch once, without resolving
+    /// the separate agent-host/v1 provider.
+    pub(super) async fn move_orchestrator(&self, admission: &super::RouteAdmission) -> bool {
+        let route = &admission.providers;
+        let _lookup = route.resolving.lock().await;
+        let cached = route
+            .cached
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if cached.invalidated {
+            return false;
+        }
+        let mut answer = match cached.orchestrator.clone() {
+            Some(answer) => answer,
+            None => self.resolve_session_provider(ORCHESTRATOR_CAPABILITY).await,
+        };
+        let matches = |answer: &ProviderResolution| match &admission.principal {
+            Some(Principal::Reserved { module_id }) => answer.sole() == Some(module_id.as_str()),
+            _ => false,
+        };
+        if !matches(&answer)
+            && cached.orchestrator.is_some()
+            && !matches!(answer, ProviderResolution::Transport(_))
+        {
+            answer = self.resolve_session_provider(ORCHESTRATOR_CAPABILITY).await;
+        }
+        let mut cache = route.cached.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.invalidated {
+            return false;
+        }
+        cache.orchestrator = if matches!(answer, ProviderResolution::Transport(_)) {
+            None
+        } else {
+            Some(answer.clone())
+        };
+        matches(&answer)
+    }
+
     /// A stalled catalog lookup admits no one, just like a transport failure.
     pub(super) async fn resolve_session_provider(
         &self,
@@ -606,7 +646,15 @@ impl ProjectsHandler {
             .iter()
             .map(|item| (item.ref_kind.as_str(), item.session_ref.as_str()))
             .collect();
-        let bindings = self.with_store(|store| store.session_bindings_for_refs(&refs))?;
+        let answers = self.read_session_liveness(&refs)?;
+        self.encode_read_result(json!({ "refs": answers }))
+    }
+
+    pub(super) fn read_session_liveness(
+        &self,
+        refs: &[(&str, &str)],
+    ) -> Result<Vec<LivenessAnswer>, HandlerError> {
+        let bindings = self.with_store(|store| store.session_bindings_for_refs(refs))?;
         let state = self
             .liveness
             .lock()
@@ -614,14 +662,20 @@ impl ProjectsHandler {
         let answers: Vec<LivenessAnswer> = bindings
             .iter()
             .map(|binding| match binding {
-                Some(binding) => {
-                    state.answer(&SessionKey::new(&binding.harness, &binding.session_id))
-                }
+                Some(binding) => match (&binding.harness, &binding.session_id) {
+                    (Some(harness), Some(session_id)) => {
+                        state.answer(&SessionKey::new(harness, session_id))
+                    }
+                    _ => LivenessAnswer {
+                        state: "gone",
+                        cause: None,
+                    },
+                },
                 None => LivenessAnswer::unknown(None),
             })
             .collect();
         drop(state);
-        self.encode_read_result(json!({ "refs": answers }))
+        Ok(answers)
     }
 }
 

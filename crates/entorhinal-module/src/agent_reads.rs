@@ -1578,6 +1578,7 @@ mod tests {
             "agent.import",
             "agent.register_session",
             "agent.refresh_claims",
+            "agent.move",
             "member.set_name",
             "role.take",
         ];

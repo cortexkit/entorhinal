@@ -65,7 +65,7 @@ use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{RegistryError, RegistryStore};
+use crate::{agent::AgentMutationError, move_record::MoveRef, RegistryError, RegistryStore};
 
 macro_rules! text_enum {
     ($name:ident { $($variant:ident => $text:literal),+ $(,)? }) => {
@@ -255,6 +255,117 @@ impl AgentMove {
 }
 
 impl RegistryStore {
+    pub fn move_authority_cut_over(&self) -> Result<bool, RegistryError> {
+        self.read(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT 1 FROM registry_journal WHERE op=?1 LIMIT 1",
+                    [crate::agent::IDENTITY_MARKER_OP],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some())
+        })
+    }
+
+    /// Targets are resolved only against persisted member names, not against
+    /// enrollment guesses or a display name saved in an earlier request.
+    pub fn resolve_move_member(&self, to: &str) -> Result<(String, String), AgentMutationError> {
+        let rows = self.read(|conn| {
+            let mut stmt = conn.prepare("SELECT author,display_name FROM member_name WHERE author=?1 OR display_name=?1 ORDER BY author")?;
+            let rows = stmt.query_map([to], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?.collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        }).map_err(|e| crate::session_refusal("storage_error", e.to_string(), None))?;
+        match rows.as_slice() {
+            [member] => Ok(member.clone()),
+            [] => Err(crate::session_refusal(
+                "unknown_member",
+                "target has no member_name row",
+                None,
+            )),
+            _ => Err(crate::session_refusal(
+                "invalid_request",
+                "target name is ambiguous",
+                None,
+            )),
+        }
+    }
+
+    /// Read the agent's bound (ref_kind, ref) pairs in stable order. Participants
+    /// move data by these pairs, not by the source Mac's host-session identifiers.
+    pub fn agent_bound_refs(&self, agent_id: &str) -> Result<Vec<MoveRef>, RegistryError> {
+        self.read(|conn| bound_refs(conn, agent_id))
+    }
+
+    /// Commit a fully checked source move. The key lookup and the registration
+    /// fence share the insert's transaction, so retries and new sessions cannot
+    /// slip between the final checks and the durable checkpoint.
+    pub fn admit_agent_move(
+        &self,
+        row: &AgentMove,
+        checked_refs: &[MoveRef],
+    ) -> Result<AgentMove, AgentMutationError> {
+        let outcome = self.db.with_conn_fenced(|tx| {
+            let check = || -> Result<AgentMove, AgentMutationError> {
+                if row.side != MoveSide::Source
+                    || row.step != MoveStep::Preparing
+                    || row.request_key.is_none()
+                    || row.request_body.is_none()
+                {
+                    return Err(crate::session_refusal(
+                        "invalid_request",
+                        "invalid admission checkpoint",
+                        None,
+                    ));
+                }
+                let existing = tx
+                    .query_row(
+                        &format!("SELECT {MOVE_COLUMNS} FROM agent_move WHERE request_key=?1"),
+                        [&row.request_key],
+                        AgentMove::from_row,
+                    )
+                    .optional()?;
+                if let Some(existing) = existing {
+                    return if existing.request_body == row.request_body {
+                        Ok(existing)
+                    } else {
+                        Err(crate::session_refusal(
+                            "request_key_reused",
+                            "request key belongs to a different move request",
+                            None,
+                        ))
+                    };
+                }
+                if bound_refs(tx, &row.agent_id)? != checked_refs {
+                    return Err(crate::session_refusal(
+                        "agent_busy",
+                        "a session started during the check",
+                        None,
+                    ));
+                }
+                let open = open_moves(tx)?;
+                if let Some(existing) = open.iter().find(|m| m.agent_id == row.agent_id) {
+                    return Err(crate::session_refusal(
+                        "move_in_progress",
+                        "agent has an open move",
+                        Some(move_detail(existing)),
+                    ));
+                }
+                if open.len() >= 4 {
+                    return Err(crate::session_refusal(
+                        "move_cap",
+                        "four moves are already open",
+                        None,
+                    ));
+                }
+                row.write(tx, true)?;
+                Ok(row.clone())
+            };
+            Ok(check())
+        });
+        outcome.map_err(|e| crate::session_refusal("storage_error", e.to_string(), None))?
+    }
+
     /// Insert a checkpoint, refusing duplicate cuts or request keys and a second
     /// non-terminal move for the same agent, on either side.
     pub fn insert_agent_move(&self, row: &AgentMove) -> Result<(), RegistryError> {
@@ -363,6 +474,77 @@ impl RegistryStore {
     }
 }
 
+fn bound_refs(conn: &rusqlite::Connection, agent_id: &str) -> rusqlite::Result<Vec<MoveRef>> {
+    let mut stmt = conn.prepare(
+        "SELECT ref_kind,ref FROM session_binding WHERE agent_id=?1 ORDER BY ref_kind,ref",
+    )?;
+    let rows = stmt
+        .query_map([agent_id], |r| {
+            Ok(MoveRef {
+                ref_kind: r.get(0)?,
+                reference: r.get(1)?,
+            })
+        })?
+        .collect();
+    rows
+}
+
+fn open_moves(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<AgentMove>> {
+    let mut stmt = conn.prepare(&format!("SELECT {MOVE_COLUMNS} FROM agent_move WHERE step NOT IN ('released','aborted','done','taken_over') ORDER BY cut_id"))?;
+    let rows = stmt.query_map([], AgentMove::from_row)?.collect();
+    rows
+}
+
+pub(crate) fn move_detail(row: &AgentMove) -> Value {
+    serde_json::json!({"cut_id": row.cut_id, "side": row.side, "step": row.step})
+}
+
+/// Refuse session registration that could write past an open move's cut. Check
+/// in the registration transaction, including incoming receiver-plan references
+/// that have not yet been bound to their destination agent.
+pub(crate) fn check_moving_registration(
+    conn: &rusqlite::Connection,
+    request: &crate::SessionRegistration<'_>,
+) -> Result<(), AgentMutationError> {
+    for row in open_moves(conn)? {
+        let blocks_agent = row.agent_id == request.agent_id
+            && (row.side == MoveSide::Source
+                || matches!(
+                    row.step,
+                    MoveStep::PickedUp
+                        | MoveStep::Imported
+                        | MoveStep::Staged
+                        | MoveStep::Claimed
+                        | MoveStep::Activating
+                ));
+        let reserves_ref = row.side == MoveSide::Receiver
+            && row.agent_id != request.agent_id
+            && row
+                .plan
+                .get("participants")
+                .and_then(Value::as_array)
+                .is_some_and(|participants| {
+                    participants.iter().any(|p| {
+                        p.get("refs").and_then(Value::as_array).is_some_and(|refs| {
+                            refs.iter().any(|r| {
+                                r.get("ref_kind").and_then(Value::as_str) == Some(request.ref_kind)
+                                    && r.get("ref").and_then(Value::as_str)
+                                        == Some(request.session_ref)
+                            })
+                        })
+                    })
+                });
+        if blocks_agent || reserves_ref {
+            return Err(crate::session_refusal(
+                "agent_moving",
+                "a move fences this session registration",
+                Some(move_detail(&row)),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,6 +619,156 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 2,
         }
+    }
+
+    fn registration(agent: &str) -> crate::SessionRegistration<'_> {
+        crate::SessionRegistration {
+            agent_id: agent,
+            ref_kind: "session",
+            session_ref: "r",
+            harness: "host",
+            session_id: "s",
+            project_root: "/project",
+            registered_by: "host",
+            now_ms: 1,
+        }
+    }
+
+    #[test]
+    fn admission_commit_registration_orders_and_restart_checkpoint() {
+        let f = Fixture::new();
+        let row = checkpoint("cut", MoveSide::Source);
+        assert!(
+            f.store.list_open_agent_moves().unwrap().is_empty(),
+            "a crash before commit leaves nothing"
+        );
+        // Check the move-specific registration refusal directly. Module tests
+        // also exercise it through registration of a real, cut-over agent.
+        f.store.db.with_conn_fenced(|tx| {
+            tx.execute("INSERT INTO session_binding VALUES('session','r','agent-1','host','s','','host',1)", [])?;
+            Ok(())
+        }).unwrap();
+        assert_eq!(
+            f.store.admit_agent_move(&row, &[]).unwrap_err().code,
+            "agent_busy"
+        );
+        assert!(f.store.list_open_agent_moves().unwrap().is_empty());
+        let refs = f.store.agent_bound_refs("agent-1").unwrap();
+        let admitted = f.store.admit_agent_move(&row, &refs).unwrap();
+        f.store
+            .db
+            .with_conn_fenced(|tx| {
+                assert_eq!(
+                    check_moving_registration(tx, &registration("agent-1"))
+                        .unwrap_err()
+                        .code,
+                    "agent_moving"
+                );
+                Ok(())
+            })
+            .unwrap();
+        let Fixture {
+            store,
+            descriptor,
+            _cleanup,
+        } = f;
+        drop(store);
+        let store = RegistryStore::open(&descriptor).unwrap();
+        assert_eq!(
+            store.list_open_agent_moves().unwrap(),
+            vec![admitted.clone()]
+        );
+        assert_eq!(
+            store.admit_agent_move(&row, &[]).unwrap(),
+            admitted,
+            "resend returns persisted plan before stale checks"
+        );
+        let mut reused = row;
+        reused.request_body = Some(json!({"agent_id":"agent-1", "to":"renamed target"}));
+        assert_eq!(
+            store.admit_agent_move(&reused, &[]).unwrap_err().code,
+            "request_key_reused"
+        );
+    }
+
+    #[test]
+    fn registration_fences_source_receiver_steps_and_other_agents_plan_refs() {
+        let f = Fixture::new();
+        for side in [MoveSide::Source, MoveSide::Receiver] {
+            let steps = if side == MoveSide::Source {
+                vec![
+                    MoveStep::Preparing,
+                    MoveStep::Exported,
+                    MoveStep::Sealed,
+                    MoveStep::Published,
+                    MoveStep::Releasing,
+                    MoveStep::Released,
+                ]
+            } else {
+                vec![
+                    MoveStep::PickedUp,
+                    MoveStep::Imported,
+                    MoveStep::Staged,
+                    MoveStep::Claimed,
+                    MoveStep::Activating,
+                    MoveStep::Activated,
+                    MoveStep::Done,
+                ]
+            };
+            let mut row = checkpoint(
+                if side == MoveSide::Source {
+                    "source"
+                } else {
+                    "receiver"
+                },
+                side,
+            );
+            row.step = steps[0];
+            f.store.insert_agent_move(&row).unwrap();
+            for step in steps {
+                row.step = step;
+                f.store.update_agent_move(&row).unwrap();
+                f.store
+                    .db
+                    .with_conn_fenced(|tx| {
+                        let answer = check_moving_registration(tx, &registration("agent-1"));
+                        let blocks = !step.is_terminal() && step != MoveStep::Activated;
+                        assert_eq!(answer.is_err(), blocks, "{side:?} {step:?}");
+                        if blocks {
+                            assert_eq!(answer.unwrap_err().detail, Some(move_detail(&row)));
+                        }
+                        let other = check_moving_registration(tx, &registration("other"));
+                        assert_eq!(
+                            other.is_err(),
+                            side == MoveSide::Receiver && !step.is_terminal()
+                        );
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn admission_commit_rechecks_open_agent_and_cap_before_insert() {
+        let f = Fixture::new();
+        for n in 0..4 {
+            let mut row = checkpoint(&format!("cut-{n}"), MoveSide::Receiver);
+            row.agent_id = format!("other-{n}");
+            f.store.insert_agent_move(&row).unwrap();
+        }
+        let row = checkpoint("new", MoveSide::Source);
+        assert_eq!(
+            f.store.admit_agent_move(&row, &[]).unwrap_err().code,
+            "move_cap"
+        );
+        let mut same_agent = row.clone();
+        same_agent.agent_id = "other-0".into();
+        assert_eq!(
+            f.store.admit_agent_move(&same_agent, &[]).unwrap_err().code,
+            "move_in_progress"
+        );
+        assert_eq!(f.store.list_open_agent_moves().unwrap().len(), 4);
     }
 
     #[test]

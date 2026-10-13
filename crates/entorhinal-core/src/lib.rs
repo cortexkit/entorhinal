@@ -915,8 +915,8 @@ pub struct SessionBinding {
     pub ref_kind: String,
     #[serde(rename = "ref")]
     pub session_ref: String,
-    pub harness: String,
-    pub session_id: String,
+    pub harness: Option<String>,
+    pub session_id: Option<String>,
     pub project_root: Option<String>,
     pub registered_by: String,
     pub registered_at_ms: i64,
@@ -1013,6 +1013,7 @@ impl RegistryStore {
         if let Some(gone) = row.gone() {
             return Err(session_refusal("gone", "agent is gone", Some(gone)));
         }
+        move_store::check_moving_registration(tx, request)?;
         claim_cache::check_registration_claim(tx, request.agent_id)?;
         let by_ref = tx
             .query_row(
@@ -1074,8 +1075,8 @@ impl RegistryStore {
             agent_id: request.agent_id.into(),
             ref_kind: request.ref_kind.into(),
             session_ref: request.session_ref.into(),
-            harness: request.harness.into(),
-            session_id: request.session_id.into(),
+            harness: Some(request.harness.into()),
+            session_id: Some(request.session_id.into()),
             project_root: Some(request.project_root.into()),
             registered_by: request.registered_by.into(),
             registered_at_ms: request.now_ms,

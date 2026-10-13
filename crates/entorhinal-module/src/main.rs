@@ -76,6 +76,7 @@ mod fake_daemon;
 mod fake_door;
 mod incarnation;
 mod member;
+mod move_admission;
 // The client for engram's identity log. Only writes to shared state and
 // catch-up call it, and it opens its route on first use, so startup and every
 // read work with engram absent. It has no callers until the shared write path
@@ -438,6 +439,7 @@ struct ProjectsHandler {
     writer: Arc<tokio::sync::Mutex<()>>,
     catch_up_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     record_client: record_client::RecordClient,
+    participant_discovery: Arc<dyn participant_discovery::ParticipantDiscovery>,
     claim_refresh: Arc<claims::RefreshQueue>,
     claim_refresh_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     role_refresh: Arc<tokio::sync::Notify>,
@@ -522,6 +524,7 @@ const MUTATING_METHODS: &[&str] = &[
     "agent.refresh_claims",
     "member.set_name",
     "role.take",
+    "agent.move",
 ];
 
 /// Mutations that `authorize_write` passes through because each is admitted
@@ -536,6 +539,7 @@ const SELF_ADMITTED_METHODS: &[&str] = &[
     claims::REFRESH,
     member::SET_NAME,
     roles::TAKE,
+    move_admission::MOVE,
 ];
 
 /// Admit project/workspace mutations from the operator (`Direct`: the `ck`
@@ -687,6 +691,11 @@ impl ProjectsHandler {
             writer: Arc::new(tokio::sync::Mutex::new(())),
             catch_up_task: Mutex::new(None),
             record_client: record_client::RecordClient::new(record_connector),
+            participant_discovery: Arc::new(participant_discovery::SubcParticipantDiscovery::new(
+                Arc::new(log_client::SubcConnector::from_args(
+                    std::env::args_os().skip(1),
+                )),
+            )),
             claim_refresh: Arc::new(claims::RefreshQueue::default()),
             claim_refresh_task: Mutex::new(None),
             role_refresh: Arc::new(tokio::sync::Notify::new()),
@@ -1036,6 +1045,8 @@ impl ProjectsHandler {
             self.take_role(request.params, key, received).await
         } else if request.method == claims::REFRESH {
             self.refresh_agent_claims(request.params, key).await
+        } else if request.method == move_admission::MOVE {
+            self.admit_move(request.params, key, received).await
         } else {
             self.write_wait(request, key, received).await
         };
@@ -1150,6 +1161,10 @@ impl ProjectsHandler {
             claims::REFRESH => Err(HandlerError::new(
                 "served_path_required",
                 "claim refresh requires the asynchronous served path",
+            )),
+            move_admission::MOVE => Err(HandlerError::new(
+                "served_path_required",
+                "agent.move requires the asynchronous served path",
             )),
             method if agent_ops::MUTATING_METHODS.contains(&method) => {
                 self.agent_mutation(method, request.params, &principal)
@@ -1900,6 +1915,8 @@ fn manifest() -> ModuleManifest {
                 management_operation(method, ManagementOperationKind::Query, "Read a cached role claim without waiting for engram.")
             })).chain(std::iter::once(roles::TAKE).map(|method| {
                 management_operation(method, ManagementOperationKind::Mutate, "Take a role from Direct with operator confirmation and an idempotent request id.")
+            })).chain(std::iter::once(move_admission::MOVE).map(|method| {
+                management_operation(method, ManagementOperationKind::Mutate, agent_operation_description(method))
             })).collect(),
             config_schema: json!({"type": "object"}),
             observability: Vec::new(),
@@ -2008,6 +2025,7 @@ fn agent_operation_description(method: &str) -> &'static str {
         "agent.session_liveness" => "Answer active, gone or unknown for up to 256 session references, in request order.",
         "agent.where" => "Answer an agent's cached claim, including whether it is known and which device holds it.",
         "agent.refresh_claims" => "Refresh live agents' claim records from engram without waiting for the shared-log writer.",
+        "agent.move" => "Admit an idle agent move to a named member, with Direct confirmation, an orchestrator relay or enabled lid-close moves.",
         "member.set_name" => "Set this identity-log member's display name (Direct only).",
         _ => "",
     }
@@ -2245,6 +2263,7 @@ mod tests {
                 "agent.refresh_claims",
                 "member.set_name",
                 "role.take",
+                "agent.move",
             ]
         );
         for method in SELF_ADMITTED_METHODS {

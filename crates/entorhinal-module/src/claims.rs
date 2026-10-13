@@ -261,6 +261,13 @@ impl ProjectsHandler {
                 "claim refresh requires the identity log enabled",
             ));
         }
+        encode_result(self.wait_claim_refresh().await?)
+    }
+
+    /// Wait for a queue pass, including requests made while another pass is in
+    /// flight. Move admission also needs this for module callers, not only
+    /// operator routes with a Direct principal.
+    pub(super) async fn wait_claim_refresh(&self) -> Result<RefreshCounts, HandlerError> {
         self.start_claim_refresh();
         let (sender, receiver) = oneshot::channel();
         self.claim_refresh
@@ -270,7 +277,7 @@ impl ProjectsHandler {
         let result = receiver
             .await
             .map_err(|_| HandlerError::new("storage_unavailable", "claim refresh stopped"))??;
-        encode_result(result)
+        Ok(result)
     }
 
     pub(super) fn agent_where(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
