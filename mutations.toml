@@ -3299,3 +3299,248 @@ package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 expect_red = ["tool_provider::tests::catalog_digest_only_and_composition_are_stable_and_unsupported_inputs_refuse"]
 expect_message = "expected refusal"
+
+# Cingulate acquisition, recovery and capture contracts.
+[[control]]
+id = "cingulate-external-key"
+guards = "External consent keys hash the canonical agent, tool and caller key tuple"
+file = "crates/entorhinal-module/src/consent.rs"
+old = 'json!([key.agent_id, key.tool, key.request_key])'
+new = 'json!([key.request_key]) /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/consent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["consent::tests::every_card_matches_frozen_cingulate_decoder_and_external_key_vector"]
+
+[[control]]
+id = "cingulate-carrier-scope"
+guards = "The real SDK carrier uses the caller's scope epoch on the Cingulate management target"
+file = "crates/entorhinal-module/src/consent_client.rs"
+old = 'scope_epoch: Some(stamp.scope_epoch),'
+new = 'scope_epoch: Some(0), // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/consent_wire_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["consent_client::tests::production_client_opens_scoped_cingulate_target_sends_envelope_and_closes"]
+
+[[control]]
+id = "cingulate-await-budget"
+guards = "Await holds the card for 100000 milliseconds before detach"
+file = "crates/entorhinal-module/src/consent_client.rs"
+old = 'pub(super) const AWAIT_MS: i64 = 100_000;'
+new = 'pub(super) const AWAIT_MS: i64 = 120_000; // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/consent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["consent::tests::awaits_100000_then_detaches_and_closes_the_stamped_carrier"]
+
+[[control]]
+id = "cingulate-detach-settlement"
+guards = "A settled detach is consumed in the same held call rather than returning pending"
+file = "crates/entorhinal-module/src/consent.rs"
+old = '''if let RecordDecision::Settled(decision) =
+            inspect_record(call.store, &current, &record, (call.now_ms)())?
+        {
+            return Ok(decision);
+        }'''
+new = '''if let RecordDecision::Settled(_decision) =
+            inspect_record(call.store, &current, &record, (call.now_ms)())?
+        {
+            // NON-VACUITY BREAK: discard the answer that raced detach.
+        }'''
+test_file = "crates/entorhinal-module/src/consent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["consent::tests::settled_detach_is_consumed_in_the_same_call"]
+
+[[control]]
+id = "cingulate-ambiguous-no-resend"
+guards = "An ambiguous request with no saved card id is recovered from answers, never resent"
+file = "crates/entorhinal-module/src/consent.rs"
+old = '''let mut current = row.clone();
+    if inserted {'''
+new = '''let mut current = row.clone();
+    if inserted || current.elicitation_id.is_none() { // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-module/src/consent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["consent::tests::ambiguous_request_captures_before_deciding_and_never_resends"]
+
+[[control]]
+id = "cingulate-ambiguous-cutoff"
+guards = "A never committed ambiguous request is pending until eleven minutes, then lost"
+file = "crates/entorhinal-module/src/consent.rs"
+old = 'pub(super) const AMBIGUOUS_LIFETIME_MS: i64 = 660_000;'
+new = 'pub(super) const AMBIGUOUS_LIFETIME_MS: i64 = 600_000; // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/consent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["consent::tests::never_committed_request_waits_eleven_minutes_and_captures_even_at_cutoff"]
+
+[[control]]
+id = "cingulate-record-binding"
+guards = "Requester reads cannot authorize a request with a mismatched card binding"
+file = "crates/entorhinal-module/src/consent.rs"
+old = 'record.get("binding") != Some(&json!(Binding::for_request(row)))'
+new = 'false /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/consent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["consent::tests::binding_mismatch_cannot_authorize_read_or_ambiguous_feed_recovery"]
+
+[[control]]
+id = "cingulate-feed-record-before-ack"
+guards = "Every awaiting answer is durably captured before cumulative acknowledgement can hide it"
+file = "crates/entorhinal-module/src/consent.rs"
+old = '''tx.record_settlement(
+                    &key,
+                    &binding.args_digest,
+                    &owner.scope_ref,
+                    owner.epoch,
+                    &answer,
+                )?;'''
+new = 'let _ = (&key, &binding, &answer); // NON-VACUITY BREAK: cursor only, answers lost'
+test_file = "crates/entorhinal-module/src/consent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["consent::tests::reversed_retries_and_restart_preserve_other_answer_before_cumulative_ack"]
+
+[[control]]
+id = "cingulate-ack-page-boundary"
+guards = "A page acknowledgement never covers an unread settlement on the next page"
+file = "crates/entorhinal-module/src/consent.rs"
+old = 'json!({"cursor":cursor}), deadline'
+new = 'json!({"cursor":cursor+1}), deadline /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/consent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["consent::tests::reversed_retries_and_restart_preserve_other_answer_before_cumulative_ack"]
+
+[[control]]
+id = "cingulate-awaiting-epoch"
+guards = "An awaiting request cannot borrow consent authority from a new scope epoch"
+file = "crates/entorhinal-module/src/consent.rs"
+old = 'if row.scope_ref != owner.scope_ref || row.scope_epoch != owner.epoch {'
+new = 'if false /* NON-VACUITY BREAK */ {'
+test_file = "crates/entorhinal-module/src/consent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["consent::tests::terminal_replay_ignores_ack_retention_and_epoch_but_awaiting_does_not"]
+
+[[control]]
+id = "cingulate-terminal-replay"
+guards = "Terminal requests replay their outcome before retention and epoch checks, with no Cingulate calls"
+file = "crates/entorhinal-module/src/consent.rs"
+old = 'if row.state != RequestState::Awaiting {'
+new = 'if false /* NON-VACUITY BREAK */ {'
+test_file = "crates/entorhinal-module/src/consent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["consent::tests::terminal_replay_ignores_ack_retention_and_epoch_but_awaiting_does_not"]
+
+[[control]]
+id = "cingulate-recorded-retention"
+guards = "An awaiting recorded settlement beyond Cingulate retention cannot approve a mutation"
+file = "crates/entorhinal-module/src/consent.rs"
+old = 'if now.saturating_sub(answer.settled_at_ms) >= RETENTION_MS {'
+new = 'if false /* NON-VACUITY BREAK */ {'
+test_file = "crates/entorhinal-module/src/consent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["consent::tests::recorded_retention_loss_and_missing_card_refuse_without_reraising"]
+
+[[control]]
+id = "cingulate-shared-deadline"
+guards = "Answers and acknowledgement hangs end at the original shared call deadline"
+file = "crates/entorhinal-module/src/consent_client.rs"
+old = 'timeout_at(deadline, route.call(method, params, deadline))'
+new = 'timeout_at(deadline + Duration::from_secs(5), route.call(method, params, deadline)) /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/consent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["consent::tests::feed_hangs_share_deadline_and_do_not_change_committed_outcome"]
+
+[[control]]
+id = "cingulate-request-lease"
+guards = "Only one call per namespaced key holds consent authority through the executor's commit"
+file = "crates/entorhinal-module/src/consent.rs"
+old = 'active.insert(key.clone()).then(|| RequestLease {'
+new = '{ active.insert(key.clone()); true }.then(|| RequestLease { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/consent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["consent::tests::lease_serializes_same_key_through_commit_but_not_two_tools_with_one_key"]
+
+[[control]]
+id = "cingulate-cancelled-ambiguous"
+guards = "A cancelled card mutation retains its awaiting row rather than treating cancellation as definite refusal"
+file = "crates/entorhinal-module/src/consent.rs"
+old = 'Err(ConsentError::Refused(code)) if code != "cancelled" => {'
+new = 'Err(ConsentError::Refused(_code)) => { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/consent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["consent::tests::definite_refusal_deletes_row_but_cancelled_preserves_ambiguous_request"]
+
+[[control]]
+id = "cingulate-fake-owner-dedup"
+guards = "The fake deduplicates pending keys only within the raising owner"
+file = "crates/entorhinal-module/src/fake_cingulate.rs"
+old = '&c.owner == owner && c.state == "pending" && c.body["dedup_key"] == key'
+new = 'c.state == "pending" && c.body["dedup_key"] == key /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/consent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["consent::tests::fake_enforces_owner_dedup_cumulative_ack_tombstones_and_nonunique_reference"]
+
+[[control]]
+id = "cingulate-fake-ack-owner"
+guards = "The fake's cumulative acknowledgement cannot consume another owner's settlements"
+file = "crates/entorhinal-module/src/fake_cingulate.rs"
+old = 'if &c.owner == owner && c.cursor.is_some_and(|pos| pos <= cursor) {'
+new = 'if c.cursor.is_some_and(|pos| pos <= cursor) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/consent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["consent::tests::fake_enforces_owner_dedup_cumulative_ack_tombstones_and_nonunique_reference"]
+
+[[control]]
+id = "cingulate-fake-tombstone"
+guards = "The fake returns bindingless tombstones, not retained approvals, after twenty-four hours"
+file = "crates/entorhinal-module/src/fake_cingulate.rs"
+old = 'if s.now - c.settled.unwrap() >= RETENTION_MS {'
+new = 'if false /* NON-VACUITY BREAK */ {'
+test_file = "crates/entorhinal-module/src/consent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["consent::tests::fake_enforces_owner_dedup_cumulative_ack_tombstones_and_nonunique_reference"]
+
+[[control]]
+id = "cingulate-fake-nonunique-ref"
+guards = "The fake selects pending cards by dedup_key, never by nonunique requester_ref"
+file = "crates/entorhinal-module/src/fake_cingulate.rs"
+old = 'let key = body["dedup_key"].as_str();'
+new = 'let key = body["requester_ref"].as_str(); // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/consent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["consent::tests::fake_enforces_owner_dedup_cumulative_ack_tombstones_and_nonunique_reference"]

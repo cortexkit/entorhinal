@@ -61,6 +61,12 @@ mod catch_up;
 mod claim_codec;
 mod claims;
 mod cli;
+// Agent write execution asks for consent while holding the caller's tool call,
+// before committing any authorized mutation.
+#[allow(dead_code)]
+mod consent;
+#[allow(dead_code)]
+mod consent_client;
 mod current_directory;
 #[cfg(test)]
 mod cut_barrier_rehearsal;
@@ -69,6 +75,8 @@ mod cut_barrier_rehearsal;
 #[allow(dead_code)]
 mod door_client;
 mod enable;
+#[cfg(test)]
+mod fake_cingulate;
 #[cfg(test)]
 mod fake_daemon;
 #[cfg(test)]
