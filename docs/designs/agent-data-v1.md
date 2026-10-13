@@ -1,6 +1,6 @@
 # `agent-data/v1`: the participant contract for agent moves
 
-Status: second draft, with the crate review (agent-sync posts 396-415) folded in. SUBC, BROCA, THALAMUS and MC have approved it; OC and PI have not reviewed yet. The binding version will be a commons role crate, `cortexkit-role-agent-data` (CONTRACT.md, typed structs, test vectors), which SUBC builds and publishes from this note. Implementers pin the crate, not this note.
+Status: approved by SUBC (capability owner) and every implementer: MC, BROCA, THALAMUS, OC and PI (agent-sync posts 396-422). The binding version will be a commons role crate, `cortexkit-role-agent-data` (CONTRACT.md, typed structs, test vectors), which SUBC builds and publishes from this note. Implementers pin the crate, not this note.
 
 An agent's data lives in several modules. When entorhinal moves an agent from one Mac to another, it asks each of those modules, the participants, to stop the agent's data at a cut, ship it through engram's session door, and bring it up on the other side. This note pins the wire contract entorhinal calls. The move protocol itself (the move record and its states) is in entorhinal's part 2 spec. The door ops (`cut.*`, `session.*`) are engram's.
 
