@@ -1811,8 +1811,8 @@ expect_red = [
 
 [[control]]
 id = "sessions-v8-unique-session-key"
-guards = "The V8 schema makes a host session key bind at most one session reference"
-file = "crates/entorhinal-core/src/lib.rs"
+guards = "The session_binding schema makes a host session key bind at most one session reference (migration 9 rebuilds the table, so its index is the one that lands)"
+file = "crates/entorhinal-core/src/move_store.rs"
 old = "CREATE UNIQUE INDEX session_binding_session ON session_binding(harness, session_id);"
 new = "CREATE INDEX session_binding_session ON session_binding(harness, session_id); -- NON-VACUITY BREAK"
 test_file = "crates/entorhinal-core/src/lib.rs"
