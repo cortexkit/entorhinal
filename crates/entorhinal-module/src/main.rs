@@ -77,10 +77,16 @@ mod member;
 #[allow(dead_code)]
 mod fake_log;
 #[cfg(test)]
+#[allow(dead_code)]
+mod fake_participant;
+#[cfg(test)]
 mod fake_record;
 #[allow(dead_code)]
 mod log_client;
 mod record_client;
+// Participant calls are invoked by the move driver, not at module startup.
+#[allow(dead_code)]
+mod participant_client;
 // The move driver uses discovery on admission, not at module startup.
 #[allow(dead_code)]
 mod participant_discovery;
