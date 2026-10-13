@@ -64,9 +64,16 @@ mod cli;
 mod current_directory;
 #[cfg(test)]
 mod cut_barrier_rehearsal;
+// Agent moves open engram's session-door route lazily so reads and startup
+// continue to work while engram is unavailable.
+#[allow(dead_code)]
+mod door_client;
 mod enable;
 #[cfg(test)]
 mod fake_daemon;
+#[cfg(test)]
+#[allow(dead_code)]
+mod fake_door;
 mod incarnation;
 mod member;
 // The client for engram's identity log. Only writes to shared state and
