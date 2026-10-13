@@ -24,6 +24,7 @@ mod binding;
 pub mod claim_cache;
 pub mod enable_state;
 mod log_schema;
+pub mod move_record;
 pub mod move_store;
 mod mutations;
 mod ownership;
