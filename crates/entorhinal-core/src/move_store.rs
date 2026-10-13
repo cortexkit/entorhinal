@@ -112,6 +112,19 @@ text_enum!(MoveStep {
 });
 
 impl MoveStep {
+    pub fn before_boundary(self, side: MoveSide) -> bool {
+        match side {
+            MoveSide::Source => matches!(
+                self,
+                Self::Preparing | Self::Exported | Self::Sealed | Self::Published
+            ),
+            MoveSide::Receiver => matches!(
+                self,
+                Self::PickedUp | Self::Imported | Self::Staged | Self::Claimed
+            ),
+        }
+    }
+
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
@@ -434,6 +447,131 @@ impl RegistryStore {
             .map_err(RegistryError::Store)
     }
 
+    /// Checkpoint against operator edits in the same fenced transaction. An
+    /// accepted abort wins the race with entry into the irreversible boundary.
+    /// Background accept diagnostics belong to their own task and are preserved.
+    pub fn checkpoint_agent_move(
+        &self,
+        row: &AgentMove,
+        clear_abort: bool,
+    ) -> Result<AgentMove, RegistryError> {
+        self.db
+            .with_conn_fenced(|tx| {
+                let current = load_move(tx, &row.cut_id)?;
+                if row.step == MoveStep::Activating
+                    && current.step == MoveStep::Claimed
+                    && current.abort_requested.is_some()
+                {
+                    return Ok(current);
+                }
+                let mut next = row.clone();
+                if clear_abort {
+                    next.abort_requested = None;
+                } else if current.abort_requested.is_some() {
+                    next.abort_requested = current.abort_requested;
+                }
+                next.cut_accept = current.cut_accept;
+                next.write(tx, false)?;
+                Ok(next)
+            })
+            .map_err(RegistryError::Store)
+    }
+
+    /// Decide an operator abort without a read/write gap. Refusal leaves every
+    /// column untouched, including timestamps, so recovery cannot turn it into cleanup.
+    pub fn request_agent_move_abort(
+        &self,
+        cut_id: &str,
+        now_ms: i64,
+    ) -> Result<AgentMove, AgentMutationError> {
+        self.db
+            .with_conn_fenced(|tx| {
+                let mut row = load_move(tx, cut_id)?;
+                if row.step == MoveStep::Aborted {
+                    return Ok(Ok(row));
+                }
+                if !row.step.before_boundary(row.side) {
+                    return Ok(Err(crate::session_refusal(
+                        "invalid_state",
+                        "move has crossed the abort boundary",
+                        Some(move_detail(&row)),
+                    )));
+                }
+                row.abort_requested = Some(serde_json::json!({"reason":"operator","detail":null}));
+                row.updated_at_ms = now_ms;
+                row.write(tx, false)?;
+                Ok(Ok(row))
+            })
+            .map_err(|e| crate::session_refusal("storage_error", e.to_string(), None))?
+    }
+
+    /// Record activation and ref ownership together. Existing bindings for this
+    /// agent retain their host metadata; new ones have no local host session yet.
+    pub fn activate_agent_move(
+        &self,
+        row: &AgentMove,
+        refs: &[MoveRef],
+    ) -> Result<AgentMove, AgentMutationError> {
+        self.db.with_conn_fenced(|tx| {
+            let current = load_move(tx, &row.cut_id)?;
+            if current.side != MoveSide::Receiver || current.step != MoveStep::Activating
+                || row.step != MoveStep::Activated || row.activated_at_ms.is_none() {
+                return Ok(Err(crate::session_refusal("invalid_state", "invalid activation checkpoint", Some(move_detail(&current)))));
+            }
+            // Check all owners before inserting anything: a refusal must not
+            // leave a partial set of moved-in bindings.
+            for r in refs {
+                let owner: Option<String> = tx.query_row("SELECT agent_id FROM session_binding WHERE ref_kind=?1 AND ref=?2",
+                    params![r.ref_kind, r.reference], |r| r.get(0)).optional()?;
+                if owner.is_some_and(|id| id != row.agent_id) {
+                    return Ok(Err(crate::session_refusal("ref_bound_elsewhere", "incoming reference has another owner", Some(serde_json::json!({"ref_kind":r.ref_kind,"ref":r.reference})))));
+                }
+            }
+            for r in refs {
+                tx.execute("INSERT INTO session_binding(ref_kind,ref,agent_id,harness,session_id,project_root,registered_by,registered_at_ms)
+                    VALUES(?1,?2,?3,NULL,NULL,'','move',?4) ON CONFLICT(ref_kind,ref) DO NOTHING",
+                    params![r.ref_kind, r.reference, row.agent_id, row.activated_at_ms])?;
+            }
+            let mut next = row.clone();
+            next.abort_requested = current.abort_requested;
+            next.cut_accept = Some(serde_json::json!({"state":"pending","attempts":0,"retry_at_ms":0}));
+            next.write(tx, false)?;
+            Ok(Ok(next))
+        }).map_err(|e| crate::session_refusal("storage_error", e.to_string(), None))?
+    }
+
+    pub fn set_move_cut_accept(
+        &self,
+        cut_id: &str,
+        accept: &Value,
+        now_ms: i64,
+    ) -> Result<(), RegistryError> {
+        self.db
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "UPDATE agent_move SET cut_accept=?2, updated_at_ms=?3 WHERE cut_id=?1",
+                    params![cut_id, accept.to_string(), now_ms],
+                )?;
+                Ok(())
+            })
+            .map_err(RegistryError::Store)
+    }
+
+    /// Pending accepts survive terminal move steps and are not limited to the
+    /// recent-history window used by operator-facing move lists.
+    pub fn list_pending_cut_accepts(&self) -> Result<Vec<AgentMove>, RegistryError> {
+        Ok(self
+            .list_agent_moves()?
+            .into_iter()
+            .filter(|r| {
+                r.side == MoveSide::Receiver
+                    && r.cut_accept
+                        .as_ref()
+                        .is_some_and(|a| a["state"] == "pending")
+            })
+            .collect())
+    }
+
     pub fn agent_move(&self, cut_id: &str) -> Result<Option<AgentMove>, RegistryError> {
         self.db
             .with_conn_fenced(|conn| {
@@ -539,6 +677,14 @@ fn bound_refs(conn: &rusqlite::Connection, agent_id: &str) -> rusqlite::Result<V
     rows
 }
 
+fn load_move(conn: &rusqlite::Connection, cut_id: &str) -> rusqlite::Result<AgentMove> {
+    conn.query_row(
+        &format!("SELECT {MOVE_COLUMNS} FROM agent_move WHERE cut_id=?1"),
+        [cut_id],
+        AgentMove::from_row,
+    )
+}
+
 fn open_moves(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<AgentMove>> {
     let mut stmt = conn.prepare(&format!("SELECT {MOVE_COLUMNS} FROM agent_move WHERE step NOT IN ('released','aborted','done','taken_over') ORDER BY cut_id"))?;
     let rows = stmt.query_map([], AgentMove::from_row)?.collect();
@@ -568,6 +714,7 @@ pub(crate) fn check_moving_registration(
                         | MoveStep::Activating
                 ));
         let reserves_ref = row.side == MoveSide::Receiver
+            && (row.step.before_boundary(MoveSide::Receiver) || row.step == MoveStep::Activating)
             && row.agent_id != request.agent_id
             && row
                 .plan
@@ -669,6 +816,148 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 2,
         }
+    }
+
+    #[test]
+    fn abort_boundary_refuses_without_writes_for_both_sides() {
+        for (side, steps) in [
+            (
+                MoveSide::Source,
+                vec![MoveStep::Releasing, MoveStep::Released],
+            ),
+            (
+                MoveSide::Receiver,
+                vec![
+                    MoveStep::Activating,
+                    MoveStep::Activated,
+                    MoveStep::Done,
+                    MoveStep::TakenOver,
+                ],
+            ),
+        ] {
+            for step in steps {
+                let f = Fixture::new();
+                let mut row = checkpoint("cut", side);
+                row.step = step;
+                row.abort_requested = None;
+                f.store.insert_agent_move(&row).unwrap();
+                let error = f.store.request_agent_move_abort("cut", 300).unwrap_err();
+                assert_eq!(error.code, "invalid_state");
+                assert_eq!(error.detail.unwrap()["step"], json!(step));
+                assert_eq!(f.store.agent_move("cut").unwrap().unwrap(), row);
+            }
+        }
+    }
+
+    #[test]
+    fn abort_and_activation_boundary_race_has_one_fenced_winner() {
+        for abort_first in [true, false] {
+            let f = Fixture::new();
+            let mut row = checkpoint("cut", MoveSide::Receiver);
+            row.step = MoveStep::Claimed;
+            row.abort_requested = None;
+            f.store.insert_agent_move(&row).unwrap();
+            let mut next = row.clone();
+            next.step = MoveStep::Activating;
+            if abort_first {
+                let accepted = f.store.request_agent_move_abort("cut", 99).unwrap();
+                assert!(accepted.abort_requested.is_some());
+                assert_eq!(
+                    f.store.checkpoint_agent_move(&next, false).unwrap(),
+                    accepted
+                );
+            } else {
+                assert_eq!(
+                    f.store.checkpoint_agent_move(&next, false).unwrap().step,
+                    MoveStep::Activating
+                );
+                assert_eq!(
+                    f.store
+                        .request_agent_move_abort("cut", 99)
+                        .unwrap_err()
+                        .code,
+                    "invalid_state"
+                );
+            }
+        }
+        for _ in 0..8 {
+            let f = Fixture::new();
+            let mut row = checkpoint("cut", MoveSide::Receiver);
+            row.step = MoveStep::Claimed;
+            row.abort_requested = None;
+            f.store.insert_agent_move(&row).unwrap();
+            row.step = MoveStep::Activating;
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let store = f.store.clone();
+            let start = barrier.clone();
+            let thread = std::thread::spawn(move || {
+                start.wait();
+                store.request_agent_move_abort("cut", 99)
+            });
+            barrier.wait();
+            let saved = f.store.checkpoint_agent_move(&row, false).unwrap();
+            let abort = thread.join().unwrap();
+            match abort {
+                Ok(_) => {
+                    assert_eq!(saved.step, MoveStep::Claimed);
+                    assert!(saved.abort_requested.is_some());
+                }
+                Err(error) => {
+                    assert_eq!(error.code, "invalid_state");
+                    assert_eq!(saved.step, MoveStep::Activating);
+                    assert!(saved.abort_requested.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn activation_binding_transaction_refuses_all_writes_on_owner_conflict_and_preserves_accept_diagnostics(
+    ) {
+        let f = Fixture::new();
+        let mut row = checkpoint("cut", MoveSide::Receiver);
+        row.step = MoveStep::Activating;
+        row.abort_requested = None;
+        row.cut_accept = None;
+        f.store.insert_agent_move(&row).unwrap();
+        f.store.db.with_conn_fenced(|tx| tx.execute_batch("INSERT INTO session_binding(ref_kind,ref,agent_id,harness,session_id,project_root,registered_by,registered_at_ms) VALUES('session','z','other',NULL,NULL,'','move',1)")).unwrap();
+        let mut next = row.clone();
+        next.step = MoveStep::Activated;
+        next.activated_at_ms = Some(123);
+        let refs = vec![
+            MoveRef {
+                ref_kind: "session".into(),
+                reference: "r".into(),
+            },
+            MoveRef {
+                ref_kind: "session".into(),
+                reference: "z".into(),
+            },
+        ];
+        assert_eq!(
+            f.store.activate_agent_move(&next, &refs).unwrap_err().code,
+            "ref_bound_elsewhere"
+        );
+        assert_eq!(f.store.agent_move("cut").unwrap().unwrap(), row);
+        assert!(f
+            .store
+            .session_bindings_for_refs(&[("session", "r")])
+            .unwrap()[0]
+            .is_none());
+        let activated = f.store.activate_agent_move(&next, &refs[..1]).unwrap();
+        assert_eq!(activated.step, MoveStep::Activated);
+        assert_eq!(activated.activated_at_ms, Some(123));
+        let accepted = json!({"state":"refused","code":"cut_not_published"});
+        f.store.set_move_cut_accept("cut", &accepted, 200).unwrap();
+        let mut stale = activated;
+        stale.step = MoveStep::Done;
+        assert_eq!(
+            f.store
+                .checkpoint_agent_move(&stale, false)
+                .unwrap()
+                .cut_accept,
+            Some(accepted)
+        );
     }
 
     #[test]
@@ -869,10 +1158,7 @@ mod tests {
                             assert_eq!(answer.unwrap_err().detail, Some(move_detail(&row)));
                         }
                         let other = check_moving_registration(tx, &registration("other"));
-                        assert_eq!(
-                            other.is_err(),
-                            side == MoveSide::Receiver && !step.is_terminal()
-                        );
+                        assert_eq!(other.is_err(), side == MoveSide::Receiver && blocks);
                         Ok(())
                     })
                     .unwrap();

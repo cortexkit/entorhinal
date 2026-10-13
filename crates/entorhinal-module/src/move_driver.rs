@@ -2,7 +2,7 @@
 
 use crate::{
     door_client::DoorClient,
-    move_receiver::{poll_inbox, Receiver},
+    move_receiver::{poll_inbox, CutAccept, Receiver},
     move_source::Source,
     participant_discovery::ParticipantDiscovery,
     record_client::RecordClient,
@@ -41,6 +41,7 @@ pub(crate) struct Worker {
     pub(crate) door: DoorClient,
     pub(crate) discovery: Arc<dyn ParticipantDiscovery>,
     pub(crate) health: Arc<HealthGauges>,
+    #[cfg(test)]
     pub(crate) writer: Arc<tokio::sync::Mutex<()>>,
     pub(crate) clock: fn() -> i64,
     pub(crate) wake: Arc<tokio::sync::Notify>,
@@ -70,30 +71,20 @@ impl Worker {
             .ok_or_else(|| HandlerError::new("invalid_state", "move row is gone"))
     }
 
-    /// Serialize checkpoints with local operator edits. Preserve an abort that
-    /// arrived while the remote call was in flight unless the source is already
-    /// releasing or the receiver has advanced beyond published.
+    /// Serialize checkpoints with local operator edits in the fenced writer,
+    /// without waiting for journal catch-up's shared writer lock.
     pub(crate) async fn save(
         &self,
         row: &mut AgentMove,
         clear_abort: bool,
     ) -> Result<(), HandlerError> {
-        let _writer = self.writer.lock().await;
         let mut next = row.clone();
         next.updated_at_ms = (self.clock)();
         if clear_abort {
             next.abort_requested = None;
         }
         let saved = self
-            .sql(move |s| {
-                if let Some(current) = s.agent_move(&next.cut_id)? {
-                    if !clear_abort && current.abort_requested.is_some() {
-                        next.abort_requested = current.abort_requested;
-                    }
-                }
-                s.update_agent_move(&next)?;
-                Ok(next)
-            })
+            .sql(move |s| s.checkpoint_agent_move(&next, clear_abort))
             .await?;
         *row = saved;
         self.gauges().await
@@ -146,6 +137,7 @@ impl ProjectsHandler {
             door: self.door_client.clone(),
             discovery: self.participant_discovery.clone(),
             health: self.health.clone(),
+            #[cfg(test)]
             writer: self.writer.clone(),
             clock: self.clock,
             wake: self.move_wake.clone(),
@@ -162,7 +154,7 @@ impl ProjectsHandler {
                     _ = interval.tick() => {},
                     _ = wake.notified() => {},
                     Some(result) = tasks.join_next(), if !tasks.is_empty() => {
-                        if let Ok(cut) = result { owners.remove(&cut); }
+                        if let Ok(owner) = result { owners.remove(&owner); }
                     }
                 }
                 if worker.store.upgrade().is_none() {
@@ -174,7 +166,7 @@ impl ProjectsHandler {
                 };
                 let _ = worker.gauges().await;
                 for row in rows {
-                    if owners.insert(row.cut_id.clone()) {
+                    if owners.insert((row.cut_id.clone(), false)) {
                         let worker = worker.clone();
                         let liveness = liveness.clone();
                         tasks.spawn(async move {
@@ -187,8 +179,20 @@ impl ProjectsHandler {
                                     Receiver::new(worker, cut.clone(), liveness).run().await
                                 }
                             }
-                            cut
+                            (cut, false)
                         });
+                    }
+                }
+                if let Ok(rows) = worker.sql(RegistryStore::list_pending_cut_accepts).await {
+                    for row in rows {
+                        if owners.insert((row.cut_id.clone(), true)) {
+                            let worker = worker.clone();
+                            tasks.spawn(async move {
+                                let cut = row.cut_id;
+                                CutAccept::new(worker, cut.clone()).run().await;
+                                (cut, true)
+                            });
+                        }
                     }
                 }
             }

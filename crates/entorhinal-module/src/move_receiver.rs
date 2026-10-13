@@ -206,6 +206,10 @@ struct Progress {
     take_failed: bool,
     #[serde(default)]
     contract_violation: Option<Value>,
+    #[serde(default)]
+    activation_fork: Option<Value>,
+    #[serde(default)]
+    takeover_sent: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct PendingCall {
@@ -414,8 +418,14 @@ impl Receiver {
                 row.abort_requested = Some(json!({"reason":row.reason,"detail":row.detail}));
                 self.save(&mut row, &progress).await?;
             }
-            if progress.contract_violation.is_some() {
+            if progress.contract_violation.is_some() || progress.activation_fork.is_some() {
                 return Ok(POLL);
+            }
+            // Completion is independent of retry deadlines and accept failures.
+            if row.step == Step::Activated && observed.state == State::Released {
+                Self::step(&mut row, &mut progress, Step::Done);
+                self.save(&mut row, &progress).await?;
+                return Ok(Duration::ZERO);
             }
             if (self.worker.clock)() < progress.retry_at_ms {
                 return Ok(Duration::from_millis(
@@ -446,7 +456,16 @@ impl Receiver {
                     delay
                 },
             )),
-            Err(f) => {
+            Err(mut f) => {
+                let irreversible = !row.step.before_boundary(MoveSide::Receiver);
+                if irreversible {
+                    f.reason = None;
+                    f.diagnostic = true;
+                    if f.code == "local_advanced" {
+                        f.detail["note"] = json!("Local data advanced after import; operator fork resolution is required");
+                        progress.activation_fork = Some(f.detail.clone());
+                    }
+                }
                 if f.violation || f.diagnostic || f.reason == Some(MoveReason::ClaimMoved) {
                     progress.errors.push(f.detail.clone());
                 }
@@ -708,6 +727,12 @@ impl Receiver {
                         .await
                         .map_err(|e| Failure::participant(&p.module_id, &pending.op, e))?;
                 }
+                "agent_data.activate" => {
+                    client
+                        .activate(&self.request(p))
+                        .await
+                        .map_err(|e| Failure::participant(&p.module_id, &pending.op, e))?;
+                }
                 _ => {}
             }
             progress.pending = None;
@@ -802,12 +827,111 @@ impl Receiver {
             }
             Step::Claimed => {
                 self.apply_claim(row).await?;
+                self.local_writers(plan).await?;
+                Self::step(row, progress, Step::Activating);
+                self.save(row, progress).await?;
             }
-            // This driver stops at the last reversible checkpoint; it does not
-            // activate participant data or perform the post-activation handoff.
-            _ => {
-                return Ok(());
+            Step::Activating => {
+                self.settle_pending(row, plan, progress).await?;
+                for p in &plan.participants {
+                    let client = self.client(&p.module_id).await?;
+                    progress.pending = Some(PendingCall {
+                        module: p.module_id.clone(),
+                        op: "agent_data.activate".into(),
+                    });
+                    self.save(row, progress).await?;
+                    let answer = client.activate(&self.request(p)).await;
+                    if !matches!(answer, Err(ClientError::OutcomeUnknown)) {
+                        progress.pending = None;
+                        self.save(row, progress).await?;
+                    }
+                    answer.map_err(|e| {
+                        Failure::participant(&p.module_id, "agent_data.activate", e)
+                    })?;
+                }
+                // Resend activation even if its CAS landed before a crash. The
+                // pinned participant operations are idempotent for this cut.
+                if observed.state == State::Claimed {
+                    self.cas_move(row, plan, State::Claimed, State::Activated)
+                        .await?;
+                } else if !matches!(observed.state, State::Activated | State::Released) {
+                    return Err(Failure::hold(
+                        "invalid_state",
+                        json!({"state":observed.state}),
+                    ));
+                }
+                let mut next = row.clone();
+                let mut activated_progress = progress.clone();
+                Self::step(&mut next, &mut activated_progress, Step::Activated);
+                next.activated_at_ms = Some((self.worker.clock)());
+                next.updated_at_ms = (self.worker.clock)();
+                next.plan["_receiver"] = serde_json::to_value(&activated_progress).unwrap();
+                let refs = plan
+                    .participants
+                    .iter()
+                    .flat_map(|p| p.refs.clone())
+                    .collect::<Vec<_>>();
+                *row = self
+                    .worker
+                    .sql(move |s| Ok(s.activate_agent_move(&next, &refs)))
+                    .await?
+                    .map_err(HandlerError::from)?;
+                *progress = activated_progress;
+                self.worker.gauges().await?;
+                self.worker.wake.notify_one();
+                remove_inbox(&self.worker, &plan.to, &self.cut).await?;
             }
+            Step::Activated => {
+                remove_inbox(&self.worker, &plan.to, &self.cut).await?;
+                let activated = row
+                    .activated_at_ms
+                    .ok_or_else(|| Failure::hold("activated_time_missing", Value::Null))?;
+                if (self.worker.clock)() < activated.saturating_add(600_000) {
+                    return Ok(());
+                }
+                let request = DoorCut {
+                    cut_id: self.cut.clone(),
+                };
+                let state = if progress.takeover_sent {
+                    self.worker
+                        .door
+                        .status(&request)
+                        .await
+                        .map_err(door_failure)?
+                        .takeover
+                        .map(|p| p.state)
+                        .unwrap_or(crate::door_client::TakeoverState::NotStarted)
+                } else {
+                    crate::door_client::TakeoverState::NotStarted
+                };
+                let state = if matches!(
+                    state,
+                    crate::door_client::TakeoverState::NotStarted
+                        | crate::door_client::TakeoverState::Failed
+                ) {
+                    progress.takeover_sent = true;
+                    self.save(row, progress).await?;
+                    self.worker
+                        .door
+                        .takeover(&request)
+                        .await
+                        .map_err(door_failure)?
+                        .takeover
+                } else {
+                    state
+                };
+                match state {
+                    crate::door_client::TakeoverState::Taken => {
+                        Self::step(row, progress, Step::TakenOver);
+                        self.save(row, progress).await?;
+                    }
+                    crate::door_client::TakeoverState::Failed => {
+                        return Err(Failure::hold("failed", json!({"op":"cut.takeover"})))
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -1089,6 +1213,89 @@ impl Receiver {
     }
 }
 
+fn door_failure(e: crate::door_client::DoorError) -> Failure {
+    Failure::hold(
+        e.code(),
+        json!({"op":"cut.takeover","error":format!("{e:?}")}),
+    )
+}
+
+/// Accept is a diagnostic task, not a move checkpoint. It can outlive a finished
+/// move, and even a hung door call cannot prevent release or timed takeover.
+pub(crate) struct CutAccept {
+    worker: Worker,
+    cut: String,
+}
+
+impl CutAccept {
+    pub(crate) fn new(worker: Worker, cut: String) -> Self {
+        Self { worker, cut }
+    }
+
+    pub(crate) async fn run(self) {
+        let mut delay = Duration::ZERO;
+        loop {
+            tokio::select! { _ = tokio::time::sleep(delay) => {}, _ = self.worker.wake.notified() => {} }
+            if self.worker.store.upgrade().is_none() {
+                return;
+            }
+            match self.tick().await {
+                Ok(Some(next)) => delay = next,
+                Ok(None) => return,
+                Err(_) => delay = POLL,
+            }
+        }
+    }
+
+    pub(crate) async fn tick(&self) -> Result<Option<Duration>, HandlerError> {
+        let row = self.worker.row(&self.cut).await?;
+        let Some(accept) = row.cut_accept.filter(|a| a["state"] == "pending") else {
+            return Ok(None);
+        };
+        let now = (self.worker.clock)();
+        let retry_at = accept["retry_at_ms"].as_i64().unwrap_or(0);
+        if now < retry_at {
+            return Ok(Some(
+                Duration::from_millis((retry_at - now) as u64).min(POLL),
+            ));
+        }
+        let own = row.plan["to"]
+            .as_str()
+            .ok_or_else(|| error("plan_malformed"))?;
+        remove_inbox(&self.worker, own, &self.cut).await?;
+        let attempts = accept["attempts"].as_i64().unwrap_or(0).saturating_add(1);
+        let result = self
+            .worker
+            .door
+            .accept(&DoorCut {
+                cut_id: self.cut.clone(),
+            })
+            .await;
+        let (state, delay) = match result {
+            Ok(reply) => (json!({"state":"accepted","lifted":reply.lifted}), None),
+            Err(e) if e.code() == "unavailable" => {
+                let delay = backoff(attempts);
+                (
+                    json!({"state":"pending","code":e.code(),"attempts":attempts,
+                    "retry_at_ms":(self.worker.clock)().saturating_add(delay.as_millis() as i64)}),
+                    Some(delay.min(POLL)),
+                )
+            }
+            Err(e) => (
+                json!({"state":"refused","code":e.code(),"detail":format!("{e:?}")}),
+                None,
+            ),
+        };
+        let cut = self.cut.clone();
+        let now = (self.worker.clock)();
+        self.worker
+            .sql(move |s| s.set_move_cut_accept(&cut, &state, now))
+            .await?;
+        self.worker.gauges().await?;
+        Ok(delay)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1136,6 +1343,7 @@ mod tests {
     struct Discovery {
         daemon: FakeDaemon,
         participant: Arc<Peer>,
+        others: Mutex<BTreeMap<String, Arc<Peer>>>,
     }
     #[async_trait]
     impl ParticipantDiscovery for Discovery {
@@ -1150,7 +1358,13 @@ mod tests {
             module: &str,
         ) -> Result<Arc<dyn LogTransport>, TransportError> {
             self.daemon.open_participant(module).await?;
-            Ok(self.participant.clone())
+            Ok(self
+                .others
+                .lock()
+                .unwrap()
+                .get(module)
+                .cloned()
+                .unwrap_or_else(|| self.participant.clone()))
         }
     }
     struct Peer {
@@ -1180,6 +1394,7 @@ mod tests {
         hit: tokio::sync::Semaphore,
         inbox_reads: tokio::sync::Semaphore,
         abort_on_claimed: AtomicBool,
+        crash_activated: AtomicBool,
     }
     struct Connector(Arc<Records>);
     #[async_trait]
@@ -1255,8 +1470,17 @@ mod tests {
                     FROM,
                 );
             }
+            let activated = method == "record.cas"
+                && params["write_id"]
+                    == crate::log_client::encode_hex(&wire::move_write_id(
+                        CUT,
+                        MoveSide::Receiver,
+                        State::Activated,
+                    ));
             let reply = self.fake.call(method, params).await;
-            if crash.is_some_and(|(_, after)| after) {
+            if crash.is_some_and(|(_, after)| after)
+                || activated && self.crash_activated.swap(false, Ordering::Relaxed)
+            {
                 self.hit.add_permits(1);
                 std::future::pending::<()>().await;
             }
@@ -1312,6 +1536,7 @@ mod tests {
                 hit: tokio::sync::Semaphore::new(0),
                 inbox_reads: tokio::sync::Semaphore::new(0),
                 abort_on_claimed: AtomicBool::new(false),
+                crash_activated: AtomicBool::new(false),
             });
             let participant = Arc::new(FakeParticipant::new(
                 &["session"],
@@ -1320,6 +1545,7 @@ mod tests {
             participant.unknown_busy_for_unheld(true);
             let discovery = Arc::new(Discovery {
                 daemon: FakeDaemon::new(snapshot(true)),
+                others: Mutex::new(BTreeMap::new()),
                 participant: Arc::new(Peer {
                     fake: participant,
                     write_after_diverged: AtomicBool::new(false),
@@ -2089,6 +2315,644 @@ mod tests {
             .take()
             .unwrap()
             .abort();
+    }
+
+    #[tokio::test]
+    async fn receiver_activation_checkpoint_does_not_wait_for_shared_writer() {
+        let f = Fixture::new(false).await;
+        f.pickup().await;
+        let mut receiver = f.receiver();
+        f.until(&mut receiver, Step::Claimed).await;
+        let _catchup = f.worker.writer.lock().await;
+        tokio::time::timeout(Duration::from_secs(5), receiver.tick())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(f.row().step, Step::Activating);
+    }
+
+    #[tokio::test]
+    async fn receiver_activation_rechecks_local_writers_before_boundary() {
+        let f = Fixture::new(true).await;
+        f.pickup().await;
+        let mut receiver = f.receiver();
+        f.until(&mut receiver, Step::Claimed).await;
+        f.discovery.participant.fake.set_busy(
+            reference(),
+            BusyRef::new(BusyState::Busy).with_reason_code("local_writer"),
+        );
+        receiver.tick().await.unwrap();
+        assert_eq!(f.row().step, Step::Claimed);
+        assert_eq!(f.row().hold.unwrap()["reason_code"], "local_writer");
+        assert!(!f
+            .discovery
+            .participant
+            .fake
+            .calls()
+            .iter()
+            .any(|r| matches!(r, Request::Activate(_))));
+        f.discovery
+            .participant
+            .fake
+            .set_busy(reference(), BusyRef::new(BusyState::Idle));
+        f.until(&mut receiver, Step::Activated).await;
+        assert!(f.row().hold.is_none());
+    }
+
+    #[tokio::test]
+    async fn receiver_activation_boundary_retries_busy_and_external_without_abort() {
+        for code in [
+            "busy",
+            "external_not_present",
+            "unavailable",
+            "invalid_state",
+        ] {
+            let f = Fixture::new(false).await;
+            f.pickup().await;
+            let mut receiver = f.receiver();
+            f.until(&mut receiver, Step::Activating).await;
+            f.refuse("agent_data.activate", code);
+            receiver.tick().await.unwrap();
+            let row = f.row();
+            assert_eq!(row.step, Step::Activating);
+            assert!(row.abort_requested.is_none());
+            assert_eq!(row.hold.unwrap()["code"], code);
+            assert_eq!(row.plan["_receiver"]["retry_at_ms"], clock() + 1000);
+            let calls = f.discovery.participant.fake.calls().len();
+            receiver.tick().await.unwrap();
+            assert_eq!(calls, f.discovery.participant.fake.calls().len());
+            let mut restarted = f.receiver();
+            f.until(&mut restarted, Step::Activated).await;
+            assert_eq!(f.claim_cas_count(), 1);
+            assert!(!f
+                .discovery
+                .participant
+                .fake
+                .calls()
+                .iter()
+                .any(|r| matches!(r, Request::Abort(_))));
+        }
+    }
+
+    #[tokio::test]
+    async fn receiver_activation_fork_and_contract_violation_hold_without_retry_across_restart() {
+        for code in ["local_advanced", "unexpected_code"] {
+            let f = Fixture::new(false).await;
+            f.pickup().await;
+            let mut receiver = f.receiver();
+            f.until(&mut receiver, Step::Activating).await;
+            f.refuse("agent_data.activate", code);
+            receiver.tick().await.unwrap();
+            let row = f.row();
+            assert_eq!(row.step, Step::Activating);
+            assert!(row.abort_requested.is_none());
+            assert_eq!(row.hold.as_ref().unwrap()["module_id"], "data");
+            assert!(row.hold.as_ref().unwrap()["move_error"].as_bool().unwrap());
+            if code == "local_advanced" {
+                assert!(row.plan["_receiver"]["activation_fork"].is_object());
+            } else {
+                assert!(row.plan["_receiver"]["contract_violation"].is_object());
+            }
+            let calls = f.discovery.participant.fake.calls().len();
+            let mut restarted = f.receiver();
+            advance_clock();
+            restarted.tick().await.unwrap();
+            assert_eq!(calls, f.discovery.participant.fake.calls().len());
+            assert_eq!(f.claim_cas_count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn receiver_partial_activation_calls_only_pinned_participants_and_resends_after_restart()
+    {
+        let f = Fixture::new(false).await;
+        let second = Arc::new(FakeParticipant::new(&["session"], vec![]));
+        let mut snap = snapshot(true);
+        snap.supervisor.modules.push(serde_json::from_value(json!({"module_id":"second","state":"running","enabled":true,"live":true,"health":"ok"})).unwrap());
+        let mut entry = snap.catalog.modules[0].clone();
+        entry.module_id = "second".into();
+        snap.catalog.modules.push(entry);
+        f.discovery.daemon.restart(snap);
+        f.discovery.others.lock().unwrap().insert(
+            "second".into(),
+            Arc::new(Peer {
+                fake: second.clone(),
+                write_after_diverged: AtomicBool::new(false),
+            }),
+        );
+        let reply = f.worker.records.read(&format!("move:{CUT}")).await.unwrap();
+        let mut record =
+            wire::decode_move_record(&format!("move:{CUT}"), reply.body.as_deref().unwrap())
+                .unwrap();
+        let mut p = record.participants[0].clone();
+        p.module_id = "second".into();
+        record.participants.push(p);
+        f.put_move(&record, FROM, 1);
+        f.pickup().await;
+        let mut receiver = f.receiver();
+        f.until(&mut receiver, Step::Activating).await;
+        second.script(
+            "agent_data.activate",
+            Effect::Refuse(Refusal {
+                code: "external_not_present".into(),
+                detail: None,
+            }),
+        );
+        receiver.tick().await.unwrap();
+        assert!(f
+            .discovery
+            .participant
+            .fake
+            .calls()
+            .iter()
+            .any(|r| matches!(r, Request::Activate(_))));
+        assert_eq!(f.row().hold.unwrap()["module_id"], "second");
+        assert!(f.store().request_agent_move_abort(CUT, clock()).is_err());
+        let mut restarted = f.receiver();
+        f.until(&mut restarted, Step::Activated).await;
+        for fake in [&f.discovery.participant.fake, &second] {
+            assert_eq!(
+                fake.calls()
+                    .iter()
+                    .filter(|r| matches!(r, Request::Activate(_)))
+                    .count(),
+                2
+            );
+            assert!(!fake.calls().iter().any(|r| matches!(r, Request::Abort(_))));
+        }
+        assert_eq!(f.store().agent_bound_refs(AGENT).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn receiver_restart_after_activated_cas_resends_activate_and_records_bindings() {
+        let f = Fixture::new(false).await;
+        f.pickup().await;
+        let mut receiver = f.receiver();
+        f.until(&mut receiver, Step::Activating).await;
+        f.records.crash_activated.store(true, Ordering::Relaxed);
+        let task = tokio::spawn(async move { receiver.tick().await });
+        tokio::time::timeout(Duration::from_secs(5), f.records.hit.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(f.row().step, Step::Activating);
+        assert!(f.store().agent_bound_refs(AGENT).unwrap().is_empty());
+        let mut restarted = f.receiver();
+        f.until(&mut restarted, Step::Activated).await;
+        assert_eq!(
+            f.discovery
+                .participant
+                .fake
+                .calls()
+                .iter()
+                .filter(|r| matches!(r, Request::Activate(_)))
+                .count(),
+            2
+        );
+        assert_eq!(f.row().activated_at_ms, Some(clock()));
+        assert_eq!(f.store().agent_bound_refs(AGENT).unwrap().len(), 1);
+        assert!(inbox(&f.worker, TO).await.unwrap().1.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn receiver_moved_bindings_are_gone_replaceable_and_preserve_existing_hosts() {
+        for held in [false, true] {
+            let f = Fixture::new(held).await;
+            if held {
+                f.store().apply_entry("fixture", "{}", "fixture", None, |tx| tx.execute_batch("UPDATE session_binding SET harness='host',session_id='old',project_root='/old',registered_by='host';")).unwrap();
+                f.liveness
+                    .lock()
+                    .unwrap()
+                    .gone
+                    .insert(SessionKey::new("host", "old"));
+                f.liveness.lock().unwrap().stale = false;
+            }
+            let before = f
+                .store()
+                .session_bindings_for_refs(&[("session", "r")])
+                .unwrap()[0]
+                .clone();
+            f.pickup().await;
+            let mut receiver = f.receiver();
+            f.until(&mut receiver, Step::Activated).await;
+            let binding = f
+                .store()
+                .session_bindings_for_refs(&[("session", "r")])
+                .unwrap()[0]
+                .clone()
+                .unwrap();
+            if let Some(before) = before {
+                assert_eq!(binding, before);
+            } else {
+                assert!(
+                    binding.harness.is_none()
+                        && binding.session_id.is_none()
+                        && binding.project_root.is_none()
+                );
+                assert_eq!(binding.registered_by, "move");
+            }
+            let mut handler = crate::ProjectsHandler::with_runtime("moved-bindings".into(), clock);
+            handler.store = f.slot.clone();
+            handler.liveness = f.liveness.clone();
+            assert_eq!(
+                handler.read_session_liveness(&[("session", "r")]).unwrap()[0].state,
+                "gone"
+            );
+            f.store().apply_entry("fixture", "{}", "fixture", None, |tx| tx.execute_batch("INSERT INTO agent(agent_id,name,tag,role,created_at_ms,updated_at_ms) VALUES('agent_abcdef0123456789','Other','O','assistant',1,1);")).unwrap();
+            let request = entorhinal_core::SessionRegistration {
+                agent_id: "agent_abcdef0123456789",
+                ref_kind: "session",
+                session_ref: "r",
+                harness: "host",
+                session_id: "new",
+                project_root: "/new",
+                registered_by: "host",
+                now_ms: clock(),
+            };
+            let e = f.store().register_session(&request).unwrap_err();
+            assert_eq!(HandlerError::from(e).code, "ref_bound_elsewhere");
+            let request = entorhinal_core::SessionRegistration {
+                agent_id: AGENT,
+                ..request
+            };
+            let registered = f.store().register_session(&request).unwrap();
+            assert_eq!(registered.harness.as_deref(), Some("host"));
+            assert_eq!(registered.session_id.as_deref(), Some("new"));
+            assert_eq!(registered.registered_by, "host");
+        }
+    }
+
+    fn takeover(state: crate::door_client::TakeoverState) -> crate::fake_door::Effect {
+        crate::fake_door::Effect::Takeover(crate::door_client::TakeoverProgress {
+            state,
+            session_ref: None,
+            code: None,
+        })
+    }
+
+    struct HungAcceptDoor {
+        door: FakeDoor,
+        hit: tokio::sync::Semaphore,
+    }
+    #[async_trait]
+    impl LogTransport for HungAcceptDoor {
+        async fn call(&self, method: &str, params: Value) -> Result<Vec<u8>, TransportError> {
+            if method == "cut.accept" {
+                self.hit.add_permits(1);
+                std::future::pending::<()>().await;
+            }
+            self.door.call(method, params).await
+        }
+    }
+    struct AcceptConnector(Arc<HungAcceptDoor>);
+    #[async_trait]
+    impl LogConnector for AcceptConnector {
+        async fn connect(&self) -> Result<Arc<dyn LogTransport>, TransportError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn receiver_hung_accept_cannot_block_released_or_takeover() {
+        for released in [true, false] {
+            let mut f = Fixture::new(false).await;
+            let gate = Arc::new(HungAcceptDoor {
+                door: f.door.for_author([2; 16]),
+                hit: tokio::sync::Semaphore::new(0),
+            });
+            f.worker.door =
+                crate::door_client::DoorClient::new(Arc::new(AcceptConnector(gate.clone())));
+            f.pickup().await;
+            let mut receiver = f.receiver();
+            f.until(&mut receiver, Step::Activated).await;
+            let accept = CutAccept::new(f.worker.clone(), CUT.into());
+            let task = tokio::spawn(async move { accept.tick().await });
+            tokio::time::timeout(Duration::from_secs(5), gate.hit.acquire())
+                .await
+                .unwrap()
+                .unwrap()
+                .forget();
+            if released {
+                let mut plan = f.plan();
+                plan.state = State::Released;
+                f.put_move(&plan, FROM, 5);
+            } else {
+                NOW.with(|n| n.set(f.row().activated_at_ms.unwrap() + 600_000));
+                f.door.for_author([2; 16]).script(
+                    "cut.takeover",
+                    takeover(crate::door_client::TakeoverState::Taken),
+                );
+            }
+            tokio::time::timeout(Duration::from_secs(5), receiver.tick())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                f.row().step,
+                if released {
+                    Step::Done
+                } else {
+                    Step::TakenOver
+                }
+            );
+            assert!(!task.is_finished());
+            assert!(f.row().hold.is_none());
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        }
+    }
+
+    #[tokio::test]
+    async fn receiver_takeover_uses_persisted_handler_clock_deadline_and_retries_failed() {
+        use crate::door_client::TakeoverState;
+        let f = Fixture::new(false).await;
+        f.pickup().await;
+        let mut receiver = f.receiver();
+        f.until(&mut receiver, Step::Activated).await;
+        let activated = f.row().activated_at_ms.unwrap();
+        let mut restarted = f.receiver();
+        NOW.with(|n| n.set(activated + 599_999));
+        restarted.tick().await.unwrap();
+        assert!(!f
+            .door
+            .calls()
+            .iter()
+            .any(|c| matches!(c.request, DoorRequest::Takeover(_))));
+        NOW.with(|n| n.set(activated + 600_000));
+        f.door
+            .for_author([2; 16])
+            .script("cut.takeover", takeover(TakeoverState::Failed));
+        restarted.tick().await.unwrap();
+        assert_eq!(f.row().step, Step::Activated);
+        assert_eq!(f.row().hold.unwrap()["code"], "failed");
+        f.door
+            .for_author([2; 16])
+            .script("cut.takeover", takeover(TakeoverState::InProgress));
+        NOW.with(|n| n.set(activated + 601_000));
+        let mut restarted = f.receiver();
+        restarted.tick().await.unwrap();
+        assert_eq!(f.row().step, Step::Activated);
+        f.door
+            .for_author([2; 16])
+            .script("cut.status", takeover(TakeoverState::Taken));
+        restarted.tick().await.unwrap();
+        assert_eq!(f.row().step, Step::TakenOver);
+        assert!(f.row().hold.is_none());
+        assert_eq!(
+            f.door
+                .calls()
+                .iter()
+                .filter(|c| matches!(c.request, DoorRequest::Takeover(_)))
+                .count(),
+            2
+        );
+        assert_eq!(f.row().activated_at_ms, Some(activated));
+        assert_eq!(f.plan().state, State::Published);
+        let observed = f.worker.records.read(&format!("move:{CUT}")).await.unwrap();
+        assert_eq!(
+            wire::decode_move_record(&format!("move:{CUT}"), observed.body.as_deref().unwrap())
+                .unwrap()
+                .state,
+            State::Activated
+        );
+    }
+
+    #[tokio::test]
+    async fn receiver_cut_accept_failures_never_delay_released_or_takeover() {
+        use crate::door_client::TakeoverState;
+        for code in ["unavailable", "cut_not_published"] {
+            for released in [true, false] {
+                let f = Fixture::new(false).await;
+                f.pickup().await;
+                let mut receiver = f.receiver();
+                f.until(&mut receiver, Step::Activated).await;
+                f.door
+                    .for_author([2; 16])
+                    .script("cut.accept", crate::fake_door::Effect::Refuse(code.into()));
+                CutAccept::new(f.worker.clone(), CUT.into())
+                    .tick()
+                    .await
+                    .unwrap();
+                assert_eq!(f.row().cut_accept.as_ref().unwrap()["code"], code);
+                assert!(f.row().hold.is_none());
+                assert_eq!(f.worker.health.move_errors.load(Ordering::Relaxed), 1);
+                if released {
+                    let mut plan = f.plan();
+                    plan.state = State::Released;
+                    f.put_move(&plan, FROM, 5);
+                } else {
+                    NOW.with(|n| n.set(f.row().activated_at_ms.unwrap() + 600_000));
+                    f.door
+                        .for_author([2; 16])
+                        .script("cut.takeover", takeover(TakeoverState::Taken));
+                }
+                let mut restarted = f.receiver();
+                restarted.tick().await.unwrap();
+                assert_eq!(
+                    f.row().step,
+                    if released {
+                        Step::Done
+                    } else {
+                        Step::TakenOver
+                    }
+                );
+                assert!(f.row().hold.is_none());
+                assert_eq!(f.row().cut_accept.as_ref().unwrap()["code"], code);
+                assert!(inbox(&f.worker, TO).await.unwrap().1.pending.is_empty());
+                if code == "unavailable" {
+                    advance_clock();
+                    let accept = CutAccept::new(f.worker.clone(), CUT.into());
+                    accept.tick().await.unwrap();
+                    assert_eq!(
+                        f.row().cut_accept.unwrap(),
+                        json!({"state":"accepted","lifted":[]})
+                    );
+                } else {
+                    assert!(f.store().list_pending_cut_accepts().unwrap().is_empty());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn receiver_cut_accept_backoff_survives_terminal_steps_and_restart_and_caps_at_five_minutes(
+    ) {
+        let f = Fixture::new(false).await;
+        f.pickup().await;
+        let mut receiver = f.receiver();
+        f.until(&mut receiver, Step::Activated).await;
+        let mut plan = f.plan();
+        plan.state = State::Released;
+        f.put_move(&plan, FROM, 5);
+        receiver.tick().await.unwrap();
+        assert_eq!(f.row().step, Step::Done);
+        for attempt in 1..=12 {
+            let before = f
+                .door
+                .calls()
+                .iter()
+                .filter(|c| matches!(c.request, DoorRequest::Accept(_)))
+                .count();
+            f.door.for_author([2; 16]).script(
+                "cut.accept",
+                crate::fake_door::Effect::Refuse("unavailable".into()),
+            );
+            CutAccept::new(f.worker.clone(), CUT.into())
+                .tick()
+                .await
+                .unwrap();
+            let accept = f.row().cut_accept.unwrap();
+            assert_eq!(accept["attempts"], attempt);
+            assert_eq!(
+                accept["retry_at_ms"],
+                clock() + backoff(attempt).as_millis() as i64
+            );
+            assert!(f.row().hold.is_none());
+            CutAccept::new(f.worker.clone(), CUT.into())
+                .tick()
+                .await
+                .unwrap();
+            assert_eq!(
+                f.door
+                    .calls()
+                    .iter()
+                    .filter(|c| matches!(c.request, DoorRequest::Accept(_)))
+                    .count(),
+                before + 1
+            );
+            assert_eq!(f.store().list_pending_cut_accepts().unwrap().len(), 1);
+            NOW.with(|n| n.set(accept["retry_at_ms"].as_i64().unwrap()));
+        }
+        assert_eq!(backoff(12), Duration::from_secs(300));
+        CutAccept::new(f.worker.clone(), CUT.into())
+            .tick()
+            .await
+            .unwrap();
+        assert_eq!(f.row().cut_accept.unwrap()["state"], "accepted");
+        assert!(f.store().list_pending_cut_accepts().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn receiver_move_back_accepts_incoming_cut_and_lifts_earlier_session_refs() {
+        let f = Fixture::new(true).await;
+        let old_cut = "abcdef0123456789abcdef0123456789";
+        let old_source = f.door.for_author([2; 16]);
+        let item = crate::door_client::CutItem {
+            session_ref: "a".repeat(32),
+            stream: "reserved:data".into(),
+            end_offset: 42,
+            digest: "a".repeat(64),
+        };
+        old_source.set_stream(item.clone());
+        old_source.script(
+            "cut.seal",
+            crate::fake_door::Effect::Seal(crate::door_client::SealState::Published, None),
+        );
+        old_source
+            .client()
+            .seal(&SealRequest {
+                cut_id: old_cut.into(),
+                items: vec![item],
+            })
+            .await
+            .unwrap();
+        old_source.script(
+            "cut.handoff",
+            crate::fake_door::Effect::Handoff(crate::door_client::HandoffReply {
+                state: crate::door_client::HandoffState::Released,
+                session_ref: None,
+                code: None,
+            }),
+        );
+        old_source
+            .client()
+            .handoff(&DoorCut {
+                cut_id: old_cut.into(),
+            })
+            .await
+            .unwrap();
+        f.pickup().await;
+        let mut receiver = f.receiver();
+        f.until(&mut receiver, Step::Activated).await;
+        CutAccept::new(f.worker.clone(), CUT.into())
+            .tick()
+            .await
+            .unwrap();
+        assert_eq!(
+            f.row().cut_accept.unwrap(),
+            json!({"state":"accepted","lifted":["a".repeat(32)]})
+        );
+        let calls = f.door.calls();
+        let accept = calls
+            .iter()
+            .find(|c| matches!(c.request, DoorRequest::Accept(_)))
+            .unwrap();
+        assert_eq!(accept.request.cut_id(), CUT);
+        assert_eq!(accept.author, TO);
+    }
+
+    #[tokio::test]
+    async fn receiver_abort_at_every_irreversible_step_writes_nothing_and_restart_never_cleans_up()
+    {
+        for step in [
+            Step::Activating,
+            Step::Activated,
+            Step::Done,
+            Step::TakenOver,
+        ] {
+            let f = Fixture::new(false).await;
+            f.pickup().await;
+            let mut receiver = f.receiver();
+            f.until(
+                &mut receiver,
+                if step == Step::Activating {
+                    step
+                } else {
+                    Step::Activated
+                },
+            )
+            .await;
+            if step.is_terminal() {
+                f.edit(|r| r.step = step);
+            }
+            let before = f.row();
+            let reply = f
+                .store()
+                .request_agent_move_abort(CUT, clock() + 1)
+                .unwrap_err();
+            let reply = HandlerError::from(reply);
+            assert_eq!(reply.code, "invalid_state");
+            assert_eq!(
+                reply.detail.unwrap()["step"],
+                serde_json::to_value(step).unwrap()
+            );
+            assert_eq!(f.row(), before);
+            drop(receiver);
+            let mut restarted = f.receiver();
+            if step == Step::Activating {
+                f.until(&mut restarted, Step::Activated).await;
+            }
+            if !step.is_terminal() {
+                let mut plan = f.plan();
+                plan.state = State::Released;
+                f.put_move(&plan, FROM, 5);
+                restarted.tick().await.unwrap();
+                assert_eq!(f.row().step, Step::Done);
+            } else {
+                assert!(restarted.tick().await.unwrap().is_none());
+            }
+            assert_eq!(f.claim_cas_count(), 1);
+            assert!(!f
+                .discovery
+                .participant
+                .fake
+                .calls()
+                .iter()
+                .any(|r| matches!(r, Request::Abort(_))));
+        }
     }
 
     #[tokio::test]
