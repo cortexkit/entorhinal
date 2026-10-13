@@ -902,6 +902,7 @@ pub struct SessionRegistration<'a> {
     pub session_ref: &'a str,
     pub harness: &'a str,
     pub session_id: &'a str,
+    pub project_root: &'a str,
     /// `orchestrator` or `host`.
     pub registered_by: &'a str,
     pub now_ms: i64,
@@ -916,6 +917,7 @@ pub struct SessionBinding {
     pub session_ref: String,
     pub harness: String,
     pub session_id: String,
+    pub project_root: Option<String>,
     pub registered_by: String,
     pub registered_at_ms: i64,
 }
@@ -928,14 +930,15 @@ impl SessionBinding {
             session_ref: row.get(2)?,
             harness: row.get(3)?,
             session_id: row.get(4)?,
-            registered_by: row.get(5)?,
-            registered_at_ms: row.get(6)?,
+            project_root: row.get(5)?,
+            registered_by: row.get(6)?,
+            registered_at_ms: row.get(7)?,
         })
     }
 }
 
 const SESSION_BINDING_COLUMNS: &str =
-    "agent_id,ref_kind,ref,harness,session_id,registered_by,registered_at_ms";
+    "agent_id,ref_kind,ref,harness,session_id,NULLIF(project_root,''),registered_by,registered_at_ms";
 
 fn session_refusal(
     code: &str,
@@ -1051,17 +1054,18 @@ impl RegistryStore {
             }
         }
         tx.execute(
-            "INSERT INTO session_binding(agent_id,ref_kind,ref,harness,session_id,registered_by,registered_at_ms)
-             VALUES(?1,?2,?3,?4,?5,?6,?7)
+            "INSERT INTO session_binding(agent_id,ref_kind,ref,harness,session_id,project_root,registered_by,registered_at_ms)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
              ON CONFLICT(ref_kind,ref) DO UPDATE SET harness=excluded.harness,
-                 session_id=excluded.session_id, registered_by=excluded.registered_by,
-                 registered_at_ms=excluded.registered_at_ms",
+                 session_id=excluded.session_id, project_root=excluded.project_root,
+                 registered_by=excluded.registered_by, registered_at_ms=excluded.registered_at_ms",
             params![
                 request.agent_id,
                 request.ref_kind,
                 request.session_ref,
                 request.harness,
                 request.session_id,
+                request.project_root,
                 request.registered_by,
                 request.now_ms
             ],
@@ -1072,6 +1076,7 @@ impl RegistryStore {
             session_ref: request.session_ref.into(),
             harness: request.harness.into(),
             session_id: request.session_id.into(),
+            project_root: Some(request.project_root.into()),
             registered_by: request.registered_by.into(),
             registered_at_ms: request.now_ms,
         })
@@ -1510,6 +1515,7 @@ mod tests {
                     "agent_id",
                     "harness",
                     "session_id",
+                    "project_root",
                     "registered_by",
                     "registered_at_ms",
                 ],

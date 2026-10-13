@@ -47,13 +47,14 @@ CREATE TABLE session_binding_v9 (
     agent_id TEXT NOT NULL,
     harness TEXT NULL,
     session_id TEXT NULL,
+    project_root TEXT NOT NULL,
     registered_by TEXT NOT NULL CHECK(registered_by IN ('orchestrator','host','move')),
     registered_at_ms INTEGER NOT NULL,
     PRIMARY KEY (ref_kind, ref)
 );
 INSERT INTO session_binding_v9
-    (ref_kind, ref, agent_id, harness, session_id, registered_by, registered_at_ms)
-    SELECT ref_kind, ref, agent_id, harness, session_id, registered_by, registered_at_ms
+    (ref_kind, ref, agent_id, harness, session_id, project_root, registered_by, registered_at_ms)
+    SELECT ref_kind, ref, agent_id, harness, session_id, '', registered_by, registered_at_ms
     FROM session_binding;
 DROP TABLE session_binding;
 ALTER TABLE session_binding_v9 RENAME TO session_binding;
@@ -459,27 +460,34 @@ mod tests {
         drop(store);
         let store = RegistryStore::open(&descriptor).unwrap();
         store.db.with_conn_fenced(|conn| {
-            let rows = conn.prepare("SELECT ref_kind,ref,agent_id,harness,session_id,registered_by,registered_at_ms FROM session_binding ORDER BY ref")?
+            let rows = conn.prepare("SELECT ref_kind,ref,agent_id,harness,session_id,project_root,registered_by,registered_at_ms FROM session_binding ORDER BY ref")?
                 .query_map([], |row| Ok((
                     row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?, row.get::<_, i64>(6)?,
+                    row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?, row.get::<_, i64>(7)?,
                 )))?.collect::<Result<Vec<_>, _>>()?;
             assert_eq!(rows, vec![
-                ("session".into(), "r1".into(), "a1".into(), "host-a".into(), "s1".into(), "host".into(), 11),
-                ("session".into(), "r2".into(), "a2".into(), "host-b".into(), "s2".into(), "orchestrator".into(), 22),
+                ("session".into(), "r1".into(), "a1".into(), "host-a".into(), "s1".into(), "".into(), "host".into(), 11),
+                ("session".into(), "r2".into(), "a2".into(), "host-b".into(), "s2".into(), "".into(), "orchestrator".into(), 22),
             ]);
             let index_sql: String = conn.query_row("SELECT sql FROM sqlite_master WHERE name='session_binding_session'", [], |row| row.get(0))?;
             assert!(index_sql.contains("UNIQUE INDEX"));
             assert!(index_sql.contains("session_binding(harness, session_id)"));
-            assert!(conn.execute("INSERT INTO session_binding VALUES ('session','collision','a3','host-a','s1','host',33)", []).is_err());
+            assert!(conn.execute("INSERT INTO session_binding VALUES ('session','collision','a3','host-a','s1','','host',33)", []).is_err());
             conn.execute_batch("INSERT INTO session_binding VALUES
-                ('session','m1','a1',NULL,NULL,'move',44),
-                ('session','m2','a1',NULL,NULL,'move',55);")?;
+                ('session','m1','a1',NULL,NULL,'','move',44),
+                ('session','m2','a1',NULL,NULL,'','move',55);")?;
             let moved: i64 = conn.query_row("SELECT COUNT(*) FROM session_binding WHERE registered_by='move' AND harness IS NULL AND session_id IS NULL", [], |row| row.get(0))?;
             assert_eq!(moved, 2);
-            assert!(conn.execute("INSERT INTO session_binding VALUES ('session','bad','a1',NULL,NULL,'other',66)", []).is_err());
+            assert!(conn.execute("INSERT INTO session_binding VALUES ('session','bad','a1',NULL,NULL,'','other',66)", []).is_err());
             Ok(())
         }).unwrap();
+        let legacy = store.session_binding_for("host-a", "s1").unwrap().unwrap();
+        assert_eq!(
+            legacy.project_root, None,
+            "an old binding has no known project root"
+        );
+        assert!(serde_json::to_value(&legacy).unwrap()["project_root"].is_null());
         assert_eq!(
             store.move_setting().unwrap(),
             MoveSetting {

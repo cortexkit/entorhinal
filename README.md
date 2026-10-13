@@ -134,6 +134,7 @@ These operations report which of the operator's Macs holds an agent or a role. T
 | `agent.register_session` | mutate | Bind an agent's session to its host session; accepted only from the module the operator assigns the orchestrator or host role (`agent-orchestrator/v1` or `agent-host/v1` in the daemon's config). |
 | `agent.session_liveness` | query | Answer active, gone or unknown for up to 256 sessions, in request order. |
 | `agent.for_session` | query | Find the agent and session bound to a host session. |
+| `agent.session_for_ref` | query | Resolve a session reference to its registered agent, host session and project root. |
 | `agent.where` | query | Which Mac holds an agent, from the cached claim. |
 | `agent.refresh_claims` | mutate | Refresh live agents' cached claims from engram (operator only). |
 | `role.read` | query | Which Mac holds a role, from the cached claim. |

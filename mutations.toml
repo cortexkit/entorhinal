@@ -2951,3 +2951,16 @@ runner = "cargo"
 package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 expect_red = ["roles::tests::role_take_refuses_missing_presence_epoch_conflict_and_invalid_requests"]
+
+# Resolving a session ref must use the caller's exact ref, not a fallback.
+[[control]]
+id = "session-ref-lookup-key"
+guards = "A session reference resolves only the binding selected by its ref kind and ref"
+file = "crates/entorhinal-module/src/sessions.rs"
+old = "request.session_ref.as_str()"
+new = "\"unrelated-session-ref\" /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-module/src/sessions.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["sessions::tests::session_for_ref_returns_the_matching_binding_and_tracks_reregistration"]

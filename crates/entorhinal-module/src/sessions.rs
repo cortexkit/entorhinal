@@ -28,9 +28,10 @@ use super::{encode_result, HandlerError, ProjectsHandler, SessionKey};
 
 pub(super) const REGISTER_SESSION: &str = "agent.register_session";
 pub(super) const FOR_SESSION: &str = "agent.for_session";
+pub(super) const SESSION_FOR_REF: &str = "agent.session_for_ref";
 pub(super) const SESSION_LIVENESS: &str = "agent.session_liveness";
 /// The session reads, open to every caller like the other reads.
-pub(super) const READ_METHODS: &[&str] = &[FOR_SESSION, SESSION_LIVENESS];
+pub(super) const READ_METHODS: &[&str] = &[FOR_SESSION, SESSION_FOR_REF, SESSION_LIVENESS];
 
 /// The module that owns an agent's work and registers the sessions it starts.
 pub(super) const ORCHESTRATOR_CAPABILITY: &str = "agent-orchestrator/v1";
@@ -46,6 +47,7 @@ const REF_KIND_MAX: usize = 64;
 const REF_MAX: usize = 512;
 const HARNESS_MAX: usize = 32;
 const SESSION_ID_MAX: usize = 256;
+const PROJECT_ROOT_MAX: usize = 4096;
 const LIVENESS_REFS_MAX: usize = 256;
 
 /// What the daemon answered when asked which module provides a capability.
@@ -292,6 +294,7 @@ struct RegisterSessionRequest {
     session_ref: String,
     harness: String,
     session_id: String,
+    project_root: String,
 }
 
 #[derive(Deserialize)]
@@ -299,6 +302,14 @@ struct RegisterSessionRequest {
 struct ForSessionRequest {
     harness: String,
     session_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionForRefRequest {
+    ref_kind: String,
+    #[serde(rename = "ref")]
+    session_ref: String,
 }
 
 #[derive(Deserialize)]
@@ -520,6 +531,7 @@ impl ProjectsHandler {
         let request: RegisterSessionRequest = decode(params)?;
         ref_bounds(&request.ref_kind, &request.session_ref)?;
         session_key_bounds(&request.harness, &request.session_id)?;
+        bounded("project_root", &request.project_root, PROJECT_ROOT_MAX)?;
         let binding = self.with_agent_store(|store| {
             store.register_session(&SessionRegistration {
                 agent_id: &request.agent_id,
@@ -527,6 +539,7 @@ impl ProjectsHandler {
                 session_ref: &request.session_ref,
                 harness: &request.harness,
                 session_id: &request.session_id,
+                project_root: &request.project_root,
                 registered_by: role.as_str(),
                 now_ms: (self.clock)(),
             })
@@ -549,6 +562,31 @@ impl ProjectsHandler {
             "agent_id": binding.agent_id,
             "ref_kind": binding.ref_kind,
             "ref": binding.session_ref,
+        }))
+    }
+
+    pub(super) fn session_for_ref(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
+        let request: SessionForRefRequest = decode(params)?;
+        ref_bounds(&request.ref_kind, &request.session_ref)?;
+        let refs = [(request.ref_kind.as_str(), request.session_ref.as_str())];
+        let binding = self
+            .with_store(|store| store.session_bindings_for_refs(&refs))?
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| {
+                HandlerError::new(
+                    "not_found",
+                    "no agent session is registered under this reference",
+                )
+            })?;
+        self.encode_read_result(json!({
+            "agent_id": binding.agent_id,
+            "ref_kind": binding.ref_kind,
+            "ref": binding.session_ref,
+            "harness": binding.harness,
+            "session_id": binding.session_id,
+            "project_root": binding.project_root,
         }))
     }
 
@@ -818,8 +856,25 @@ mod tests {
         ProviderResolution::Provider(module_id.into())
     }
 
+    fn registration_with_root(
+        agent_id: &str,
+        session_ref: &str,
+        harness: &str,
+        session_id: &str,
+        project_root: &str,
+    ) -> Value {
+        json!({
+            "agent_id":agent_id,
+            "ref_kind":"pi",
+            "ref":session_ref,
+            "harness":harness,
+            "session_id":session_id,
+            "project_root":project_root,
+        })
+    }
+
     fn registration(agent_id: &str, session_ref: &str, harness: &str, session_id: &str) -> Value {
-        json!({"agent_id":agent_id,"ref_kind":"pi","ref":session_ref,"harness":harness,"session_id":session_id})
+        registration_with_root(agent_id, session_ref, harness, session_id, "/project")
     }
 
     /// A host provider that is not the executive can register through
@@ -838,7 +893,7 @@ mod tests {
         );
         assert_eq!(
             reply,
-            json!({"agent_id":agent,"ref_kind":"pi","ref":"r1","harness":"pi","session_id":"s1","registered_by":"host","registered_at_ms":NOW})
+            json!({"agent_id":agent,"ref_kind":"pi","ref":"r1","harness":"pi","session_id":"s1","project_root":"/project","registered_by":"host","registered_at_ms":NOW})
         );
         assert_eq!(f.binding("pi", "s1").unwrap().registered_by, "host");
         assert_eq!(
@@ -1199,14 +1254,17 @@ mod tests {
         let long = |n: usize| "x".repeat(n);
         let mut bad_registrations = vec![
             json!({"agent_id":agent,"ref_kind":"pi","ref":"r1","harness":"pi"}),
-            json!({"agent_id":agent,"ref_kind":"pi","ref":"r1","harness":"pi","session_id":"s1","extra":1}),
-            json!({"agent_id":agent,"ref_kind":"pi","ref":"r1","harness":"pi","session_id":7}),
+            json!({"agent_id":agent,"ref_kind":"pi","ref":"r1","harness":"pi","session_id":"s1"}),
+            json!({"agent_id":agent,"ref_kind":"pi","ref":"r1","harness":"pi","session_id":"s1","project_root":"/project","extra":1}),
+            json!({"agent_id":agent,"ref_kind":"pi","ref":"r1","harness":"pi","session_id":7,"project_root":"/project"}),
+            json!({"agent_id":agent,"ref_kind":"pi","ref":"r1","harness":"pi","session_id":"s1","project_root":7}),
         ];
         for (field, max) in [
             ("ref_kind", 64),
             ("ref", 512),
             ("harness", 32),
             ("session_id", 256),
+            ("project_root", PROJECT_ROOT_MAX),
         ] {
             for size in [0, max + 1] {
                 let mut params = registration(&agent, "r1", "pi", "s1");
@@ -1235,6 +1293,20 @@ mod tests {
                 "{params}"
             );
         }
+        let mut multibyte_at_limit =
+            registration(&agent, "multibyte-limit", "pi", "multibyte-limit");
+        multibyte_at_limit["project_root"] = json!("é".repeat(PROJECT_ROOT_MAX / 2));
+        assert!(matches!(
+            f.register(EXECUTIVE, multibyte_at_limit).await,
+            HandlerOutcome::Response(_)
+        ));
+        let mut multibyte_over_limit =
+            registration(&agent, "multibyte-over", "pi", "multibyte-over");
+        multibyte_over_limit["project_root"] = json!("é".repeat(PROJECT_ROOT_MAX / 2 + 1));
+        assert_eq!(
+            code(f.register(EXECUTIVE, multibyte_over_limit).await),
+            "invalid_request"
+        );
         for params in [
             json!({"harness":"pi"}),
             json!({"harness":"pi","session_id":"s1","agent_id":agent}),
@@ -1248,6 +1320,30 @@ mod tests {
                 "{params}"
             );
         }
+        for params in [
+            json!({}),
+            json!({"ref_kind":"pi"}),
+            json!({"ref":"r1"}),
+            json!({"ref_kind":"pi","ref":"r1","extra":true}),
+            json!({"ref_kind":"","ref":"r1"}),
+            json!({"ref_kind":long(65),"ref":"r1"}),
+            json!({"ref_kind":"pi","ref":""}),
+            json!({"ref_kind":"pi","ref":long(513)}),
+        ] {
+            assert_eq!(
+                code(f.sync(CALLER, SESSION_FOR_REF, params.clone())),
+                "invalid_request",
+                "{params}"
+            );
+        }
+        assert_eq!(
+            code(f.sync(
+                CALLER,
+                SESSION_FOR_REF,
+                json!({"ref_kind":long(64),"ref":long(512)})
+            )),
+            "not_found"
+        );
         let one = json!({"ref_kind":"pi","ref":"r1"});
         for params in [
             json!({"refs":[]}),
@@ -1337,6 +1433,82 @@ mod tests {
                 json!({"harness":"opencode","session_id":"c1"})
             )),
             "not_found"
+        );
+    }
+
+    /// A reference selects one registration even when other sessions share its
+    /// reference kind; re-registering it replaces its host session and root.
+    #[tokio::test]
+    async fn session_for_ref_returns_the_matching_binding_and_tracks_reregistration() {
+        let f = Fixture::new("session-for-ref", true);
+        let agent = f.create("ReverseLookup");
+        f.providers(provider("prefrontal-core"), ProviderResolution::Unprovided);
+        assert_eq!(
+            code(f.sync(
+                CALLER,
+                SESSION_FOR_REF,
+                json!({"ref_kind":"pi","ref":"missing"})
+            )),
+            "not_found"
+        );
+        result(
+            f.register(
+                EXECUTIVE,
+                registration_with_root(&agent, "r1", "pi", "s1", "/first"),
+            )
+            .await,
+        );
+        let root = "  /workspace/../project  ";
+        result(
+            f.register(
+                EXECUTIVE,
+                registration_with_root(&agent, "r2", "pi", "s2", root),
+            )
+            .await,
+        );
+        let params = json!({"ref_kind":"pi","ref":"r2"});
+        let expected = json!({
+            "agent_id":agent,
+            "ref_kind":"pi",
+            "ref":"r2",
+            "harness":"pi",
+            "session_id":"s2",
+            "project_root":root,
+            "incarnation":"0123456789abcdef",
+        });
+        for principal in [
+            None,
+            Some(Principal::Direct),
+            Some(reserved("another-module")),
+        ] {
+            for flow in [false, true] {
+                f.bind(CALLER, principal.clone(), flow);
+                assert_eq!(f.sync_ok(CALLER, SESSION_FOR_REF, params.clone()), expected);
+                assert_eq!(
+                    result(f.served(CALLER, SESSION_FOR_REF, params.clone()).await),
+                    expected
+                );
+            }
+        }
+
+        result(
+            f.register(
+                EXECUTIVE,
+                registration_with_root(&agent, "r2", "pi", "s3", " /new-root/ "),
+            )
+            .await,
+        );
+        assert_eq!(
+            f.sync_ok(CALLER, SESSION_FOR_REF, params),
+            json!({
+                "agent_id":agent,
+                "ref_kind":"pi",
+                "ref":"r2",
+                "harness":"pi",
+                "session_id":"s3",
+                "project_root":" /new-root/ ",
+                "incarnation":"0123456789abcdef",
+            })
         );
     }
 

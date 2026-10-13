@@ -1139,6 +1139,7 @@ impl ProjectsHandler {
                 None => Err(sessions::orchestrator_unbound(providers)),
             },
             sessions::FOR_SESSION => self.for_session(request.params),
+            sessions::SESSION_FOR_REF => self.session_for_ref(request.params),
             sessions::SESSION_LIVENESS => self.agent_session_liveness(request.params),
             roles::READ => self.role_read(request.params),
             roles::TAKE => Err(HandlerError::new(
@@ -2003,6 +2004,7 @@ fn agent_operation_description(method: &str) -> &'static str {
         "agent.import" => "Import the executive's agent registry once, at cutover. Accepted only from the executive.",
         "agent.register_session" => "Bind an agent's session reference to its host session. Accepted only from the provider of agent-orchestrator/v1 or agent-host/v1.",
         "agent.for_session" => "Find the agent and session reference bound to a host session.",
+        "agent.session_for_ref" => "Resolve a session reference to its registered agent, host session and project root.",
         "agent.session_liveness" => "Answer active, gone or unknown for up to 256 session references, in request order.",
         "agent.where" => "Answer an agent's cached claim, including whether it is known and which device holds it.",
         "agent.refresh_claims" => "Refresh live agents' claim records from engram without waiting for the shared-log writer.",

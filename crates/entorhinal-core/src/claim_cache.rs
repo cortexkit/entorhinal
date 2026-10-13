@@ -388,6 +388,7 @@ mod tests {
             session_ref: "ref",
             harness: "pi",
             session_id: "session",
+            project_root: "/project",
             registered_by: "host",
             now_ms: 10,
         }

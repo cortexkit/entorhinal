@@ -1541,6 +1541,7 @@ mod tests {
             "agent.snapshot",
             "agent.changes",
             "agent.for_session",
+            "agent.session_for_ref",
             "agent.session_liveness",
             "agent.where",
             "role.read",
