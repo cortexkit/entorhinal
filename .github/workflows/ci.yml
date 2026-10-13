@@ -36,6 +36,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Check that nothing internal under .cortexkit/ is tracked
+        run: scripts/check-cortexkit-layout.sh
+
       - name: Format check
         run: cargo fmt --all -- --check
 

@@ -4,26 +4,12 @@ target/
 # Local editor and OS files
 .DS_Store
 
-# Per-run scratch written by the agent tooling: gathered copies of other
-# repositories' files, and the task briefs handed to delegated workers. Neither
-# is source. A committed gather copy makes this repository's code search answer
-# with another repository's details, and a worker brief is already summarized by
-# the commit it produced.
-#
-# The two config files beside these directories are NOT ignored on purpose:
-# .cortexkit/alfonso.jsonc chooses where this repository's delegated workers
-# run, and .cortexkit/WORKER.md is the instruction file every one of them
-# receives. Both change how work is done here, so they are reviewed and
-# versioned like any other config.
-.cortexkit/alfonso/context/
-.cortexkit/alfonso/prompts/
-.cortexkit/alfonso/task-outputs/
-.cortexkit/magic-context/
-
-# Also scratch: markers the tooling leaves when it copies drafts and specs into a
-# worker's checkout, and one-off reports extracted for a single review. The
-# reviewed specs and the drafts themselves are versioned, because a campaign's
-# slices are cut from them and later readers need the text the work followed.
-.cortexkit/alfonso/**/.hydrated
-.cortexkit/alfonso/.hydrated
-.cortexkit/alfonso/reports/
+# CortexKit layout: see WORKSPACE.md "Where files go". Internal documents and
+# tool state under .cortexkit/ stay out of git. Only release notes, agent skills
+# and rules, and WORKER.md (the build and test guidance every worker receives)
+# are tracked. scripts/check-cortexkit-layout.sh enforces this in CI.
+/.cortexkit/*
+!/.cortexkit/release-notes/
+!/.cortexkit/skills/
+!/.cortexkit/rules/
+!/.cortexkit/WORKER.md

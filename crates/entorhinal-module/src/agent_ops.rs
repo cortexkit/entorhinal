@@ -530,8 +530,7 @@ mod tests {
     // same conversion its serve loop does, then decode that body independently.
     // A refusal's structured fields must arrive in `detail`; a test that only
     // inspected the in-process error could pass while the wire carried prose.
-    // Source: subc-client-rs 0.26.1 src/lib.rs, ErrorWithDetail serve arm;
-    // docs/designs/agent-identity-pinned-facts.md, "The pinned SDK".
+    // Source: subc-client-rs 0.26.1 src/lib.rs, ErrorWithDetail serve arm.
     fn wire_error(outcome: HandlerOutcome) -> ErrorBody {
         let body = match outcome {
             HandlerOutcome::Error { code, message } => ErrorBody::new(code, message),
