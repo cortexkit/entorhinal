@@ -1,6 +1,6 @@
 # `agent-data/v1`: the participant contract for agent moves
 
-Status: second draft, folding the reviews from SUBC (capability owner) and the implementers MC, BROCA and THALAMUS (agent-sync channel, posts 396-403). OC and PI haven't reviewed yet. The binding version will be a commons role crate, `cortexkit-role-agent-data` (CONTRACT.md, typed structs, test vectors), which SUBC builds and publishes from this note. Implementers pin the crate, not this note.
+Status: second draft, with the crate review (agent-sync posts 396-415) folded in. SUBC, BROCA, THALAMUS and MC have approved it; OC and PI have not reviewed yet. The binding version will be a commons role crate, `cortexkit-role-agent-data` (CONTRACT.md, typed structs, test vectors), which SUBC builds and publishes from this note. Implementers pin the crate, not this note.
 
 An agent's data lives in several modules. When entorhinal moves an agent from one Mac to another, it asks each of those modules, the participants, to stop the agent's data at a cut, ship it through engram's session door, and bring it up on the other side. This note pins the wire contract entorhinal calls. The move protocol itself (the move record and its states) is in entorhinal's part 2 spec. The door ops (`cut.*`, `session.*`) are engram's.
 
@@ -22,7 +22,8 @@ An agent's data lives in several modules. When entorhinal moves an agent from on
 ### `cutId`, idempotency and lost replies
 
 - **`cutId`:** 16 random bytes in lowercase hex, minted by entorhinal per move. Every op except `describe` and `busy` carries one.
-- **Idempotency:** every op that changes state (`prepare`, `export`, `import`, `activate`, `abort`, `release`) is keyed by `(cutId, op)`, and the whole request is compared. A repeat with identical fields returns the first reply. A repeat with any field different (refs, `holder`) is refused `id_reused`. The reads `describe`, `busy`, `status` and `diverged` are exempt.
+- **Idempotency:** every op that changes state (`prepare`, `export`, `import`, `activate`, `abort`, `release`) is keyed by `(cutId, op)`, and the whole request is compared, with `refs` compared as a set. A repeat with the same fields returns the first reply. A repeat with any field different (the ref set, `holder`) is refused `id_reused`. Only successful replies are recorded, so a refusal (`busy`, `cut_not_ready`) is decided again on retry. The reads `describe`, `busy`, `status` and `diverged` are exempt.
+- **Ref sets:** a request's refs are distinct; a duplicate is `invalid_request`. An empty list is allowed. Every op after the first for a `cutId` must name exactly the ref set that `cutId` started with: `export`, `release` and the source's `abort` against `prepare`, and `activate` and the receiver's `abort` against `import`. A mismatch is `invalid_request`, with the expected set in `detail`. Otherwise part of an agent could stay staged on the receiver, or writable on the source, after the move.
 - **Lost replies:** a transport failure, timeout or connection drop means the outcome is unknown, never "not done". The driver resolves it with `status`, or by sending the same op again, which idempotency makes safe. A participant makes every op safe to repeat after a crash between doing it and replying.
 - **Durability:** the freeze `prepare` makes and the tombstone `release` makes are durable before those ops reply, so a participant restart can't let a write land past the cut.
 
