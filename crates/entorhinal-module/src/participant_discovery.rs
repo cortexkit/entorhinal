@@ -8,28 +8,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use cortexkit_role_agent_data::{PROVIDES, REQUIRED_OPS, SERVICE_ID};
 use serde_json::{json, Value};
 use subc_client_rs::{CatalogList, SupervisorListResponse};
 use subc_protocol::{manifest::ProviderRole, RouteTarget};
 
 use super::log_client::{service_call_error, LogTransport, SubcConnector, TransportError};
-
-// The discovery capability, service id, provider role and ten method names are
-// copied from agent-data/v1 because cortexkit-role-agent-data is not yet published.
-pub(crate) const CAPABILITY: &str = "agent-data/v1";
-pub(crate) const SERVICE_ID: &str = "agent-data";
-pub(crate) const OPERATIONS: [&str; 10] = [
-    "agent_data.describe",
-    "agent_data.busy",
-    "agent_data.prepare",
-    "agent_data.export",
-    "agent_data.diverged",
-    "agent_data.import",
-    "agent_data.activate",
-    "agent_data.release",
-    "agent_data.abort",
-    "agent_data.status",
-];
 
 pub(crate) fn provider_role() -> ProviderRole {
     serde_json::from_value(json!({
@@ -37,9 +21,9 @@ pub(crate) fn provider_role() -> ProviderRole {
         "service_id": SERVICE_ID,
         "transport": "bulk",
         "agent_facing": false,
-        "operations": OPERATIONS,
+        "operations": REQUIRED_OPS,
     }))
-    .expect("the copied agent-data provider role is valid")
+    .expect("the agent-data provider role is valid")
 }
 
 pub(crate) fn participant_target(module_id: &str) -> RouteTarget {
@@ -96,7 +80,7 @@ impl ParticipantDiscovery for SubcParticipantDiscovery {
         module_id: &str,
     ) -> Result<Arc<dyn LogTransport>, TransportError> {
         self.connector
-            .open_internal_service(participant_target(module_id), "agent-data")
+            .open_internal_service(participant_target(module_id), SERVICE_ID)
             .await
     }
 }
@@ -164,7 +148,7 @@ pub(crate) async fn discover_participants(
         if !entry
             .capabilities
             .as_ref()
-            .is_some_and(|capabilities| capabilities.provides.iter().any(|name| name == CAPABILITY))
+            .is_some_and(|capabilities| capabilities.provides.iter().any(|name| name == PROVIDES))
         {
             continue;
         }
@@ -216,7 +200,7 @@ mod tests {
     fn participant(module_id: &str) -> Value {
         json!({
             "module_id": module_id, "ready": true, "roles": [provider_role()],
-            "control_ops": [], "capabilities": {"provides": [CAPABILITY], "requires": []},
+            "control_ops": [], "capabilities": {"provides": [PROVIDES], "requires": []},
         })
     }
 
@@ -234,17 +218,13 @@ mod tests {
     }
 
     #[test]
-    fn copied_provider_role_pins_service_transport_and_all_ten_operations() {
+    fn provider_role_pins_service_transport_and_all_ten_operations() {
         let role = serde_json::to_value(provider_role()).unwrap();
         assert_eq!(
             role,
             json!({
-                "role": "internal_service", "service_id": "agent-data", "transport": "bulk",
-                "agent_facing": false, "operations": [
-                    "agent_data.describe", "agent_data.busy", "agent_data.prepare", "agent_data.export",
-                    "agent_data.diverged", "agent_data.import", "agent_data.activate", "agent_data.release",
-                    "agent_data.abort", "agent_data.status",
-                ],
+                "role": "internal_service", "service_id": SERVICE_ID, "transport": "bulk",
+                "agent_facing": false, "operations": REQUIRED_OPS,
             })
         );
     }
@@ -268,7 +248,7 @@ mod tests {
         );
         participants[0]
             .transport
-            .call("agent_data.describe", json!({}))
+            .call(cortexkit_role_agent_data::ops::DESCRIBE, json!({}))
             .await
             .unwrap();
         assert_eq!(
@@ -279,25 +259,25 @@ mod tests {
                 DaemonCall::Open {
                     target: RouteTarget::InternalService {
                         module_id: "alpha".into(),
-                        service_id: "agent-data".into(),
+                        service_id: SERVICE_ID.into(),
                     },
                     principal: "reserved:entorhinal".into()
                 },
                 DaemonCall::Open {
                     target: RouteTarget::InternalService {
                         module_id: "zeta".into(),
-                        service_id: "agent-data".into(),
+                        service_id: SERVICE_ID.into(),
                     },
                     principal: "reserved:entorhinal".into()
                 },
                 DaemonCall::Request {
                     target: RouteTarget::InternalService {
                         module_id: "alpha".into(),
-                        service_id: "agent-data".into(),
+                        service_id: SERVICE_ID.into(),
                     },
                     principal: "reserved:entorhinal".into(),
                     body: json!({
-                        "method": "agent_data.describe", "params": {},
+                        "method": cortexkit_role_agent_data::ops::DESCRIBE, "params": {},
                     })
                 },
             ]
@@ -392,7 +372,7 @@ mod tests {
             json!([]),
             json!([{
                 "role": "internal_service", "service_id": "another-service", "transport": "bulk",
-                "agent_facing": false, "operations": ["agent_data.describe"],
+                "agent_facing": false, "operations": [cortexkit_role_agent_data::ops::DESCRIBE],
             }]),
         ] {
             let mut entry = participant("wrong-role");
@@ -403,7 +383,7 @@ mod tests {
                 json!({
                     "module_id": "wrong-role", "state": "running", "route_refusal": {
                         "code": "service_not_provided", "detail": {
-                            "module_id": "wrong-role", "service_id": "agent-data",
+                            "module_id": "wrong-role", "service_id": SERVICE_ID,
                         },
                     },
                 })
@@ -482,21 +462,21 @@ mod tests {
             let _wire = crate::fake_daemon::WireDaemon::start(fake.clone(), &connection_file).await;
             let participants = discover_participants(&production).await.unwrap();
             assert_eq!(participants.len(), 1, "initial connect failure must not be cached");
-            for method in OPERATIONS {
+            for method in REQUIRED_OPS {
                 participants[0].transport.call(method, json!({})).await.unwrap();
             }
             let calls = fake.calls();
             assert_eq!(&calls[..3], &[
                 DaemonCall::SupervisorList, DaemonCall::CatalogList,
                 DaemonCall::Open { target: RouteTarget::InternalService {
-                    module_id: "participant".into(), service_id: "agent-data".into(),
+                    module_id: "participant".into(), service_id: SERVICE_ID.into(),
                 }, principal: "reserved:entorhinal".into() },
             ]);
             assert_eq!(calls.len(), 13, "one route shared by ten calls");
-            for (call, method) in calls[3..].iter().zip(OPERATIONS) {
+            for (call, method) in calls[3..].iter().zip(REQUIRED_OPS) {
                 assert_eq!(call, &DaemonCall::Request {
                     target: RouteTarget::InternalService {
-                        module_id: "participant".into(), service_id: "agent-data".into(),
+                        module_id: "participant".into(), service_id: SERVICE_ID.into(),
                     }, principal: "reserved:entorhinal".into(),
                     body: json!({"method": method, "params": {}}),
                 });
@@ -507,7 +487,7 @@ mod tests {
             fake.restart(DaemonSnapshot::new(2, vec![configured("bad-role", true, "running")], vec![bad_role]));
             assert_eq!(unavailable(&production).await, json!({
                 "module_id": "bad-role", "state": "running", "route_refusal": {
-                    "code": "service_not_provided", "detail": {"module_id": "bad-role", "service_id": "agent-data"},
+                    "code": "service_not_provided", "detail": {"module_id": "bad-role", "service_id": SERVICE_ID},
                 },
             }));
         }).await.expect("production adapter probe exceeded its deadline");
