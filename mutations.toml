@@ -3752,6 +3752,224 @@ package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 expect_red = ["tool_provider::writes::tests::retry_refuses_saved_plan_without_target_label_as_consent_lost"]
 
+[[control]]
+id = "permissions-provider-admission"
+guards = "Permission inventory and revoke admit only Direct and reserved:cingulate before body decoding"
+file = "crates/entorhinal-module/src/permissions.rs"
+old = 'LIST | REVOKE => ('
+new = 'LIST | REVOKE if false => ( // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/permissions_tests.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["permissions::tests::provider_admission_precedes_decode_and_never_prompts"]
+
+[[control]]
+id = "permissions-agent-filter"
+guards = "The optional agent_id filters the live grant inventory"
+file = "crates/entorhinal-module/src/permissions.rs"
+old = '.is_some_and(|id| *id != grant.holder_agent_id)'
+new = '.is_some_and(|id| { let _ = id; false }) /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/permissions_tests.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["permissions::tests::provider_vectors_list_scopes_filter_and_refresh_in_place"]
+
+[[control]]
+id = "permissions-revoked-grants-hidden"
+guards = "Revoked grants disappear from the provider inventory"
+file = "crates/entorhinal-module/src/permissions.rs"
+old = '|| grant.revoked_at_ms.is_some()'
+new = '|| false /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/permissions_tests.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["permissions::tests::provider_revoke_vectors_are_idempotent_local_and_prompt_free"]
+
+[[control]]
+id = "permissions-ended-holder-hidden"
+guards = "A retained grant is not listed after its holder retires"
+file = "crates/entorhinal-module/src/permissions.rs"
+old = 'if !holder_live {'
+new = 'if false && !holder_live { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/permissions_tests.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["permissions::tests::provider_drops_grants_when_holder_or_subject_ends"]
+
+[[control]]
+id = "permissions-project-subject"
+guards = "A grant names its own live project, never an unrelated remaining project"
+file = "crates/entorhinal-module/src/permissions.rs"
+old = '.find(|p| p.project_id == grant.scope_id)'
+new = '.find(|_| true) /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/permissions_tests.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["permissions::tests::provider_drops_grants_when_holder_or_subject_ends"]
+
+[[control]]
+id = "permissions-workspace-subject"
+guards = "A grant names its own live workspace, never an unrelated remaining workspace"
+file = "crates/entorhinal-module/src/permissions.rs"
+old = '.find(|w| w.workspace_id == grant.scope_id)'
+new = '.find(|_| true) /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/permissions_tests.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["permissions::tests::provider_drops_grants_when_holder_or_subject_ends"]
+
+[[control]]
+id = "permissions-revoke-persisted"
+guards = "Revocation persists and a repeated revoke returns not_found instead of claiming another change"
+file = "crates/entorhinal-module/src/permissions.rs"
+old = 'store.consent_transaction(|tx| tx.revoke_grant(&request.id, (self.clock)()))?'
+new = 'store.consent_transaction(|_| Ok(true))? /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/permissions_tests.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["permissions::tests::provider_revoke_vectors_are_idempotent_local_and_prompt_free"]
+
+[[control]]
+id = "permissions-revoke-local-writer"
+guards = "Prompt-free local revocation does not queue behind the shared writer"
+file = "crates/entorhinal-module/src/main.rs"
+old = '''} else if request.method == permissions::REVOKE {
+            self.execute(request, key)'''
+new = '''} else if request.method == permissions::REVOKE {
+            self.write_wait(request, key, received).await // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-module/src/permissions_tests.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["permissions::tests::provider_revoke_vectors_are_idempotent_local_and_prompt_free"]
+
+[[control]]
+id = "agent-audit-admission"
+guards = "Only Direct and reserved:callosum can read the local authorization audit"
+file = "crates/entorhinal-module/src/permissions.rs"
+old = 'AUDIT => ('
+new = 'AUDIT if false => ( // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/permissions_tests.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["permissions::tests::audit_admission_is_operator_or_callosum_only_before_decode"]
+
+[[control]]
+id = "agent-audit-wire-cursor"
+guards = "The audit wire cursor resumes after the last row across tied timestamps"
+file = "crates/entorhinal-module/src/permissions.rs"
+old = 's.agent_audit_page(request.since_ms, request.limit, request.cursor.as_deref())'
+new = 's.agent_audit_page(request.since_ms, request.limit, None) // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/permissions_tests.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["permissions::tests::audit_wire_pages_tied_timestamps_once_with_inclusive_since"]
+
+[[control]]
+id = "agent-audit-wire-since"
+guards = "Audit pages preserve the inclusive since_ms lower bound"
+file = "crates/entorhinal-module/src/permissions.rs"
+old = 's.agent_audit_page(request.since_ms, request.limit, request.cursor.as_deref())'
+new = 's.agent_audit_page(None, request.limit, request.cursor.as_deref()) // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/permissions_tests.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["permissions::tests::audit_wire_pages_tied_timestamps_once_with_inclusive_since"]
+
+[[control]]
+id = "agent-audit-wire-limit"
+guards = "Audit pages honor the requested page size, never more than 200 rows"
+file = "crates/entorhinal-module/src/permissions.rs"
+old = 's.agent_audit_page(request.since_ms, request.limit, request.cursor.as_deref())'
+new = 's.agent_audit_page(request.since_ms, None, request.cursor.as_deref()) // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/permissions_tests.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["permissions::tests::audit_wire_pages_tied_timestamps_once_with_inclusive_since"]
+
+[[control]]
+id = "hire-cap-direct-admission"
+guards = "Hire cap changes admit only the local operator before validation or prompting"
+file = "crates/entorhinal-module/src/permissions.rs"
+old = 'SET_CAP => ('
+new = 'SET_CAP if false => ( // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/permissions_tests.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["permissions::tests::hire_cap_admission_validation_and_confirmation_guard_every_write"]
+
+[[control]]
+id = "hire-cap-confirmation-cancellation"
+guards = "Route closure cancels hire cap confirmation without changing the cap"
+file = "crates/entorhinal-module/src/permissions.rs"
+old = '_ = guard.cancelled.wait_for(|closed| *closed) => return Err(OperatorConfirmError::Declined.into()),'
+new = '_ = std::future::pending::<()>() => return Err(OperatorConfirmError::Declined.into()), // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/permissions_tests.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["permissions::tests::hire_cap_cancelled_or_expired_confirmation_never_writes"]
+
+[[control]]
+id = "hire-cap-confirmation-bound"
+guards = "An unanswered presence prompt expires at the receipt-relative operator bound"
+file = "crates/entorhinal-module/src/permissions.rs"
+old = 'timeout_at(received + OPERATOR_BOUND, self.operator_confirmer.confirm_operator(&summary, key))'
+new = 'timeout_at(received + OPERATOR_BOUND * 2, self.operator_confirmer.confirm_operator(&summary, key)) /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/permissions_tests.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["permissions::tests::hire_cap_cancelled_or_expired_confirmation_never_writes"]
+
+[[control]]
+id = "hire-cap-negative-preprompt"
+guards = "A negative hire cap refuses before any presence prompt"
+file = "crates/entorhinal-module/src/permissions.rs"
+old = 'if request.cap < 0 {'
+new = 'if false && request.cap < 0 { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/permissions_tests.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["permissions::tests::hire_cap_admission_validation_and_confirmation_guard_every_write"]
+
+[[control]]
+id = "hire-cap-flow-admission"
+guards = "Even a Direct flow cannot change a project's hire cap"
+file = "crates/entorhinal-module/src/permissions.rs"
+old = 'super::refuse_flow_write(SET_CAP, admission.flow_id.as_deref())?;'
+new = 'let _ = &admission.flow_id; // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/permissions_tests.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["permissions::tests::hire_cap_admission_validation_and_confirmation_guard_every_write"]
+
+[[control]]
+id = "hire-cap-presence-confirmation"
+guards = "Every Direct hire cap change actually asks for operator presence"
+file = "crates/entorhinal-module/src/permissions.rs"
+old = 'self.operator_confirmer.confirm_operator(&summary, key)'
+new = 'async { let _ = &summary; Ok::<(), OperatorConfirmError>(()) } /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/permissions_tests.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["permissions::tests::hire_cap_admission_validation_and_confirmation_guard_every_write"]
+
 # Two-machine move acceptance and transactional admission.
 [[control]]
 id = "s11-same-key-preflight-replay"

@@ -110,6 +110,7 @@ mod participant_client;
 // The move driver uses discovery on admission, not at module startup.
 #[allow(dead_code)]
 mod participant_discovery;
+mod permissions;
 mod roles;
 #[cfg(test)]
 mod served_vectors;
@@ -554,6 +555,8 @@ const MUTATING_METHODS: &[&str] = &[
     "agent.move",
     "agent.move_abort",
     "agent.set_lid_close_moves",
+    permissions::REVOKE,
+    permissions::SET_CAP,
 ];
 
 /// Mutations that `authorize_write` passes through because each is admitted
@@ -571,6 +574,8 @@ const SELF_ADMITTED_METHODS: &[&str] = &[
     move_admission::MOVE,
     move_ops::ABORT,
     move_ops::SET_LID,
+    permissions::REVOKE,
+    permissions::SET_CAP,
 ];
 
 /// Admit project/workspace mutations from the operator (`Direct`: the `ck`
@@ -805,6 +810,7 @@ impl ProjectsHandler {
         providers: Option<&sessions::ResolvedProviders>,
     ) -> Result<(RouteAdmission, Option<sessions::SessionRole>), HandlerError> {
         let admission = self.admission_for(key);
+        permissions::admit(method, admission.principal.as_ref())?;
         refuse_flow_write(method, admission.flow_id.as_deref())?;
         authorize_write(method, admission.principal.as_ref())?;
         if method == "projects.session_liveness" {
@@ -1121,6 +1127,10 @@ impl ProjectsHandler {
         } else if request.method == move_ops::SET_LID {
             self.set_lid_close_moves(request.params, key, received)
                 .await
+        } else if request.method == permissions::SET_CAP {
+            self.set_hire_cap(request.params, key, received).await
+        } else if request.method == permissions::REVOKE {
+            self.execute(request, key)
         } else {
             self.write_wait(request, key, received).await
         };
@@ -1219,6 +1229,13 @@ impl ProjectsHandler {
             "unapprove_project" => self.set_project_approval(request.params, false, &principal),
             "verify" => self.verify(),
             "rebuild" => self.rebuild(),
+            permissions::LIST => self.permissions_list(request.params),
+            permissions::REVOKE => self.permissions_revoke(request.params),
+            permissions::AUDIT => self.agent_audit_list(request.params),
+            permissions::SET_CAP => Err(HandlerError::new(
+                "served_path_required",
+                "hire cap changes require operator confirmation on the served path",
+            )),
             sessions::REGISTER_SESSION => match session_role {
                 Some(role) => self.register_session(request.params, role),
                 None => Err(sessions::orchestrator_unbound(providers)),
@@ -1828,6 +1845,14 @@ fn manifest() -> ModuleManifest {
                     ManagementOperationKind::Query,
                     "Resolve a filesystem path to its registered or implicit project identity.",
                 ),
+                management_operation(permissions::LIST, ManagementOperationKind::Query,
+                    "List live local standing grants (Direct or reserved:cingulate only)."),
+                management_operation(permissions::REVOKE, ManagementOperationKind::Mutate,
+                    "Revoke a local standing grant without prompting (Direct or reserved:cingulate only)."),
+                management_operation(permissions::AUDIT, ManagementOperationKind::Query,
+                    "Page the local agent authorization audit (Direct or reserved:callosum only)."),
+                management_operation(permissions::SET_CAP, ManagementOperationKind::Mutate,
+                    "Set a project's local hire cap (Direct only, with operator confirmation)."),
                 management_operation(
                     "resolve_project_id",
                     ManagementOperationKind::Query,
@@ -2021,6 +2046,7 @@ fn manifest() -> ModuleManifest {
     // surface require a new capability version.
     .capabilities(Some(CapabilityDeclarations {
         provides: vec![PROJECT_IDENTITY_CAPABILITY.to_owned(), "agent-identity/v1".to_owned(),
+            permissions::CAPABILITY.to_owned(),
             cortexkit_role_tool_provider::PROVIDES.to_owned(),
             cortexkit_role_tool_provider::CALL_MODES_CAPABILITY.to_owned()],
         // Entorhinal calls engram (the module hosting the shared identity log)
@@ -2358,6 +2384,8 @@ mod tests {
                 "agent.move",
                 "agent.move_abort",
                 "agent.set_lid_close_moves",
+                "permissions.revoke",
+                "agent.set_hire_cap",
             ]
         );
         for method in SELF_ADMITTED_METHODS {
@@ -4083,6 +4111,7 @@ mod tests {
             serde_json::json!([
                 "project-identity/v1",
                 "agent-identity/v1",
+                "permissions/v1",
                 "tool-provider/v1",
                 "call-modes/v1"
             ])

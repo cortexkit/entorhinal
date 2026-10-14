@@ -1522,6 +1522,8 @@ mod tests {
         assert_eq!(surfaces[1]["role"], "tool_provider");
         let operations = surfaces[0]["operations"].as_array().unwrap();
         let expected_queries = [
+            "permissions.list",
+            "agent.audit_list",
             "agent.preview_repair_workspaces",
             "resolve",
             "resolve_project_id",
@@ -1551,6 +1553,8 @@ mod tests {
             "role.read",
         ];
         let expected_mutations = [
+            "permissions.revoke",
+            "agent.set_hire_cap",
             "agent.repair_workspaces",
             "register",
             "assign_workspace",
@@ -1610,6 +1614,7 @@ mod tests {
             json!([
                 "project-identity/v1",
                 "agent-identity/v1",
+                "permissions/v1",
                 "tool-provider/v1",
                 "call-modes/v1"
             ])
