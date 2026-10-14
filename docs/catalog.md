@@ -53,14 +53,17 @@ limit applies even without Content-Length. The total deadline spans all redirect
 and body chunks. Archive reading and digest checks use `entorhinal-catalog`, not
 another tar implementation.
 
-`publish_unavailable` and `status_key_unavailable` HTTP 503 refusals are typed
+`publish_unavailable`, `status_key_unavailable`, and `status_unavailable` HTTP 503 refusals are typed
 `NetworkError::Retryable` values, carrying the registry refusal kind and parsed
 `Retry-After` advice. Delta-seconds and HTTP-date values are capped at one hour;
 a missing header uses the named `DefaultMissing` policy and an invalid header
 uses `DefaultInvalid`, both defaulting to 60 seconds. Past HTTP dates give zero
 delay. Error response bodies use the JSON reply cap. The client never retries
 these refusals internally: the caller chooses whether and when to repeat the
-same request unchanged. A 410 with `feed_after_unavailable` is separately typed
+same request unchanged. For withdraw and unwithdraw, `status_unavailable` means
+nothing committed, so the identical `after_sequence` compare-and-set can be
+retried. A lost race remains the non-retryable HTTP 409 `status_sequence_conflict`,
+even when a `Retry-After` header is present. A 410 with `feed_after_unavailable` is separately typed
 as `NetworkError::FeedAfterUnavailable`, so a feed caller can request the full
 feed when the registry's 30-day incremental history has expired. This transport
 does not ingest feeds or perform that fallback internally.

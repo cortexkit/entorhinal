@@ -389,6 +389,7 @@ async fn retryable_503_is_typed_and_never_retries_inside_client() {
     for (code, expected) in [
         ("publish_unavailable", Unavailable::Publish),
         ("status_key_unavailable", Unavailable::StatusKey),
+        ("status_unavailable", Unavailable::Status),
     ] {
         a.calls.lock().unwrap().clear();
         a.serve(
@@ -543,4 +544,79 @@ fn module_factory_passes_default_limits_and_module_clock() {
     assert_eq!((client.clock)(), 999);
     handler.store.lock().unwrap().take();
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn status_write_unavailable_is_retryable_but_sequence_conflict_is_not() {
+    let _clock = hold_paused_clock();
+    let a = FakeRegistry::start().await;
+    let c = client(&a);
+    for action in ["withdraw", "unwithdraw"] {
+        let path = format!("/v1/packages/example/hello-skill/1.0.0/{action}");
+        a.calls.lock().unwrap().clear();
+        a.serve(
+            &path,
+            Reply {
+                status: 503,
+                headers: vec![("Retry-After".into(), "17".into())],
+                ..Reply::bytes(
+                    br#"{"error":{"code":"status_unavailable","message":"nothing committed"}}"#
+                        .to_vec(),
+                )
+            },
+        );
+        let refusal = c.fetch_json(&path[1..]).await.unwrap_err();
+        assert_eq!(refusal.code(), "status_unavailable");
+        let NetworkError::Retryable {
+            unavailable,
+            retry_after,
+        } = refusal
+        else {
+            panic!("uncommitted status write must be retryable");
+        };
+        assert_eq!(unavailable, Unavailable::Status);
+        assert_eq!(
+            retry_after,
+            RetryAfter {
+                delay: Duration::from_secs(17),
+                source: RetryAfterSource::DeltaSeconds
+            }
+        );
+        assert_eq!(*a.calls.lock().unwrap(), vec![path.clone()]);
+        tokio::time::advance(retry_after.delay).await;
+        assert_eq!(*a.calls.lock().unwrap(), vec![path.clone()]);
+        a.serve(&path,Reply {
+            status:409,
+            headers:vec![("Retry-After".into(),"17".into())],
+            ..Reply::bytes(br#"{"error":{"code":"status_sequence_conflict","message":"after_sequence changed"}}"#.to_vec())
+        });
+        let conflict = c.fetch_json(&path[1..]).await.unwrap_err();
+        assert_eq!(conflict.code(), "status_sequence_conflict");
+        assert!(matches!(conflict, NetworkError::Failed(_)));
+        assert_eq!(*a.calls.lock().unwrap(), vec![path.clone(), path.clone()]);
+        tokio::time::advance(Duration::from_secs(17)).await;
+        assert_eq!(*a.calls.lock().unwrap(), vec![path.clone(), path]);
+    }
+    a.serve(
+        "/wrong-code",
+        Reply {
+            status: 503,
+            ..Reply::bytes(br#"{"error":{"code":"status_sequence_conflict"}}"#.to_vec())
+        },
+    );
+    assert!(matches!(
+        c.fetch_json("wrong-code").await.unwrap_err(),
+        NetworkError::Failed(_)
+    ));
+    a.serve(
+        "/wrong-status",
+        Reply {
+            status: 409,
+            ..Reply::bytes(br#"{"error":{"code":"status_unavailable"}}"#.to_vec())
+        },
+    );
+    assert!(matches!(
+        c.fetch_json("wrong-status").await.unwrap_err(),
+        NetworkError::Failed(_)
+    ));
 }

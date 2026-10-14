@@ -5680,3 +5680,29 @@ runner = "cargo"
 package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 expect_red = ["catalog_network::tests::module_factory_passes_default_limits_and_module_clock"]
+
+[[control]]
+id = "catalog-status-write-retryable"
+guards = "Uncommitted status_unavailable replies carry the same typed retry advice as other 503 refusals"
+file = "crates/entorhinal-module/src/catalog_network.rs"
+old = 'Some("status_unavailable") => Some(Unavailable::Status),'
+new = 'Some("status_unavailable") => None, // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_network_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_network::tests::status_write_unavailable_is_retryable_but_sequence_conflict_is_not"]
+
+[[control]]
+id = "catalog-status-sequence-conflict-permanent"
+guards = "A status compare-and-set race remains a named permanent 409 refusal"
+file = "crates/entorhinal-module/src/catalog_network.rs"
+old = '''if status == reqwest::StatusCode::CONFLICT
+                    && code == Some("status_sequence_conflict")'''
+new = '''if false && status == reqwest::StatusCode::CONFLICT
+                    && code == Some("status_sequence_conflict") /* NON-VACUITY BREAK */'''
+test_file = "crates/entorhinal-module/src/catalog_network_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_network::tests::status_write_unavailable_is_retryable_but_sequence_conflict_is_not"]

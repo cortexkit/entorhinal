@@ -9,6 +9,7 @@ pub const MAX_RETRY_AFTER_SECONDS: u64 = 3600;
 pub enum Unavailable {
     Publish,
     StatusKey,
+    Status,
 }
 #[cfg_attr(not(test), allow(dead_code))]
 impl Unavailable {
@@ -16,6 +17,7 @@ impl Unavailable {
         match self {
             Self::Publish => "publish_unavailable",
             Self::StatusKey => "status_key_unavailable",
+            Self::Status => "status_unavailable",
         }
     }
 }
@@ -340,6 +342,7 @@ impl RegistryClient {
                     let unavailable = match code {
                         Some("publish_unavailable") => Some(Unavailable::Publish),
                         Some("status_key_unavailable") => Some(Unavailable::StatusKey),
+                        Some("status_unavailable") => Some(Unavailable::Status),
                         _ => None,
                     };
                     if let Some(unavailable) = unavailable {
@@ -348,6 +351,14 @@ impl RegistryClient {
                             retry_after: retry,
                         });
                     }
+                }
+                if status == reqwest::StatusCode::CONFLICT
+                    && code == Some("status_sequence_conflict")
+                {
+                    return Err(NetworkError::new(
+                        "status_sequence_conflict",
+                        "the status compare-and-set lost its sequence race",
+                    ));
                 }
                 if status == reqwest::StatusCode::GONE && code == Some("feed_after_unavailable") {
                     return Err(NetworkError::FeedAfterUnavailable);
