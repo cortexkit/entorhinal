@@ -5,6 +5,7 @@ use entorhinal_core::agent::consent::{
     AuditRow, Authorization, ConsentCommit, ConsentRequest, RequestIdentity, RequestState,
     StandingGrant,
 };
+use entorhinal_core::agent::{consent::ConsentWrite, AgentMutationError};
 use entorhinal_core::RegistryStore;
 use tokio::time::Instant;
 
@@ -16,13 +17,74 @@ fn pending(id: Option<String>) -> HandlerError {
     }
 }
 
+fn consent_lost(message: impl Into<String>) -> HandlerError {
+    HandlerError::new("consent_lost", message)
+}
+
+fn load_request(
+    store: &RegistryStore,
+    identity: &RequestIdentity,
+) -> Result<Option<ConsentRequest>, HandlerError> {
+    store
+        .consent_request(identity)
+        .map_err(|error| consent_lost(format!("stored consent request could not be read: {error}")))
+}
+
+fn terminal_outcome(row: &ConsentRequest) -> Result<Value, HandlerError> {
+    row.outcome
+        .clone()
+        .ok_or_else(|| consent_lost("stored terminal consent request has no outcome"))
+}
+
+fn core_result(body: &[u8]) -> Result<Value, HandlerError> {
+    let envelope: Value = serde_json::from_slice(body).map_err(|error| {
+        HandlerError::new(
+            "invalid_reply",
+            format!("core returned invalid JSON: {error}"),
+        )
+    })?;
+    envelope
+        .get("result")
+        .filter(|result| result.is_object())
+        .cloned()
+        .ok_or_else(|| HandlerError::new("invalid_reply", "core reply has no result object"))
+}
+
+fn validate_plan(plan: &ConsentWrite, tool: AgentTool, digest: &str) -> Result<(), HandlerError> {
+    if plan.tool != tool.name || composition_digest(&plan.arguments).ok().as_deref() != Some(digest)
+    {
+        return Err(consent_lost(
+            "stored consent plan does not match its request arguments",
+        ));
+    }
+    let required = match tool.name {
+        "projects_create_workspace" => Some(&plan.target["workspace_id"]),
+        "projects_register" => Some(&plan.target["dir"]),
+        "agents_create_head" => Some(&plan.target["placement"]["project_id"]),
+        _ => None,
+    };
+    if required.is_some_and(|value| value.as_str().is_none()) {
+        return Err(consent_lost(
+            "stored consent plan is missing its write target",
+        ));
+    }
+    Ok(())
+}
+
 fn replay(value: Value) -> Result<Vec<u8>, HandlerError> {
+    if !value.is_object() {
+        return Err(consent_lost("stored consent outcome is not an object"));
+    }
     if let Some(error) = value.get("error") {
         return Err(HandlerError {
-            code: error["code"].as_str().unwrap_or("consent_stale").into(),
+            code: error["code"]
+                .as_str()
+                .filter(|code| !code.is_empty())
+                .ok_or_else(|| consent_lost("stored refusal has no error code"))?
+                .into(),
             message: error["message"]
                 .as_str()
-                .unwrap_or("request refused")
+                .ok_or_else(|| consent_lost("stored refusal has no error message"))?
                 .into(),
             detail: error.get("detail").cloned().filter(|v| !v.is_null()),
         });
@@ -38,12 +100,15 @@ impl ProjectsHandler {
         admission: RouteAdmission,
         deadline: Instant,
     ) -> Result<Vec<u8>, HandlerError> {
-        let stamp = admission.scope.as_ref().expect("admitted agent scope");
+        let stamp = admission
+            .scope
+            .as_ref()
+            .expect("admit_agent_tool established a stamped agent scope for this call");
         let caller = stamp
             .attributes
             .agent_id
             .as_deref()
-            .expect("admitted agent");
+            .expect("admit_agent_tool established a nonempty stamped caller agent id");
         let store = self.with_store(|s| Ok(s.clone()))?;
         if !tool.writes {
             let mut hires = Vec::new();
@@ -53,17 +118,42 @@ impl ProjectsHandler {
                     "agent.list",
                     json!({"role":"hiree","limit":200,"cursor":cursor}),
                 )?;
-                let page: Value =
-                    serde_json::from_slice::<Value>(&body).expect("core reply")["result"].clone();
-                for agent in page["agents"].as_array().expect("agent list") {
-                    let row = store.agent_row(agent["agent_id"].as_str().unwrap())?;
+                let page = core_result(&body)?;
+                let agents = page["agents"].as_array().ok_or_else(|| {
+                    HandlerError::new("invalid_reply", "core agent.list reply has no agents array")
+                })?;
+                for agent in agents {
+                    let id = agent["agent_id"]
+                        .as_str()
+                        .filter(|id| !id.is_empty())
+                        .ok_or_else(|| {
+                            HandlerError::new(
+                                "invalid_reply",
+                                "core agent.list row has no string agent_id",
+                            )
+                        })?;
+                    let row = store.agent_row(id)?;
                     if row.is_some_and(|row| {
                         row.status == "live" && row.supervisor_agent_id.as_deref() == Some(caller)
                     }) {
                         hires.push(agent.clone());
                     }
                 }
-                cursor = page["next_cursor"].as_str().map(str::to_owned);
+                cursor = match page.get("next_cursor") {
+                    None => None,
+                    Some(value) => Some(
+                        value
+                            .as_str()
+                            .filter(|cursor| !cursor.is_empty())
+                            .ok_or_else(|| {
+                                HandlerError::new(
+                                    "invalid_reply",
+                                    "core agent.list next_cursor must be a nonempty string",
+                                )
+                            })?
+                            .to_owned(),
+                    ),
+                };
                 if cursor.is_none() {
                     break;
                 }
@@ -75,14 +165,14 @@ impl ProjectsHandler {
             tool: tool.name.into(),
             request_key: arguments
                 .remove("request_key")
-                .expect("validated key")
+                .expect("validate_request_key established the request_key field")
                 .as_str()
-                .unwrap()
+                .expect("validate_request_key established that request_key is a string")
                 .into(),
         };
         let arguments = Value::Object(arguments);
-        let digest = composition_digest(&arguments).expect("canonical arguments");
-        let saved = store.consent_request(&identity)?;
+        let digest = composition_digest(&arguments).expect("arguments is a serde_json::Value parsed from valid JSON, which has a canonical encoding");
+        let saved = load_request(&store, &identity)?;
         if let Some(saved) = &saved {
             if saved.args_digest != digest {
                 return Err(HandlerError::new(
@@ -91,17 +181,22 @@ impl ProjectsHandler {
                 ));
             }
             if saved.state != RequestState::Awaiting {
-                return replay(saved.outcome.clone().expect("terminal outcome"));
+                return replay(terminal_outcome(saved)?);
             }
         }
-        let mut checked = arguments.as_object().expect("tool arguments").clone();
+        let mut checked = arguments
+            .as_object()
+            .expect("arguments were constructed as Value::Object in this call")
+            .clone();
         checked.insert("request_key".into(), json!(identity.request_key));
         validate_arguments(tool, &checked)?;
         let Some(lease) = self.consent_coordinator.try_lease(&identity) else {
             return Err(pending(saved.and_then(|r| r.elicitation_id)));
         };
         let plan = if let Some(saved) = &saved {
-            match store.consent_write_plan(&identity)? {
+            match store.consent_write_plan(&identity).map_err(|error| {
+                consent_lost(format!("stored consent plan could not be read: {error}"))
+            })? {
                 Some(plan) => plan,
                 None => {
                     return self.refuse_agent_write(
@@ -123,6 +218,13 @@ impl ProjectsHandler {
         } else {
             store.precheck_consent_write(caller, tool.name, arguments, (self.clock)())?
         };
+        validate_plan(&plan, tool, &digest)?;
+        let target_kind = plan.target["kind"]
+            .as_str()
+            .ok_or_else(|| consent_lost("stored consent plan has no string target.kind"))?;
+        let target_label = plan.target["label"]
+            .as_str()
+            .ok_or_else(|| consent_lost("stored consent plan has no string target.label"))?;
         let row = ConsentRequest {
             identity,
             args_digest: digest,
@@ -150,11 +252,14 @@ impl ProjectsHandler {
         } else if let Some(grant) = grant {
             Authorization::Grant { id: grant.id }
         } else {
-            let caller_name = store.agent_row(caller)?.expect("admitted caller").name;
+            let caller_name = store
+                .agent_row(caller)?
+                .ok_or_else(|| consent_lost("requesting agent row disappeared before consent"))?
+                .name;
             let context = CardContext {
                 caller_label: caller_name,
-                target_kind: plan.target["kind"].as_str().unwrap().into(),
-                target_label: plan.target["label"].as_str().unwrap().into(),
+                target_kind: target_kind.into(),
+                target_label: target_label.into(),
                 target_scope: plan.target.clone(),
             };
             attempt = Some(
@@ -174,7 +279,13 @@ impl ProjectsHandler {
                     )
                     .await?,
             );
-            match &attempt.as_ref().unwrap().decision {
+            match &attempt
+                .as_ref()
+                .expect(
+                    "this call assigned a consent attempt immediately before reading its decision",
+                )
+                .decision
+            {
                 ConsentDecision::Pending(id) => return Err(pending(id.clone())),
                 ConsentDecision::Replay(outcome) => return replay(outcome.clone()),
                 ConsentDecision::Refused("consent_unavailable") => {
@@ -184,9 +295,9 @@ impl ProjectsHandler {
                     ))
                 }
                 ConsentDecision::Refused(code) => {
-                    let saved = store
-                        .consent_request(&row.identity)?
-                        .expect("consent request retained");
+                    let saved = load_request(&store, &row.identity)?.ok_or_else(|| {
+                        consent_lost("consent request disappeared before its refusal was recorded")
+                    })?;
                     let auth = Authorization::Card {
                         id: saved.elicitation_id.unwrap_or_default(),
                         answer: saved
@@ -204,6 +315,29 @@ impl ProjectsHandler {
                     );
                 }
                 ConsentDecision::Approved(answer) => {
+                    let choice = answer
+                        .choice
+                        .as_deref()
+                        .filter(|choice| {
+                            matches!(
+                                *choice,
+                                "approve_once"
+                                    | "approve_always_workspace"
+                                    | "approve_always_project"
+                            )
+                        })
+                        .ok_or_else(|| {
+                            HandlerError::new(
+                                "invalid_reply",
+                                "approved consent settlement has no approval choice",
+                            )
+                        })?;
+                    if answer.elicitation_id.is_empty() {
+                        return Err(HandlerError::new(
+                            "invalid_reply",
+                            "approved consent settlement has no card id",
+                        ));
+                    }
                     if matches!(
                         answer.choice.as_deref(),
                         Some("approve_always_workspace" | "approve_always_project")
@@ -211,11 +345,20 @@ impl ProjectsHandler {
                         granted = Some(StandingGrant {
                             id: format!("grant:{}", crate::consent::external_key(&row.identity)),
                             holder_agent_id: caller.into(),
-                            class: plan
-                                .grant_class
+                            class: plan.grant_class.clone().ok_or_else(|| {
+                                consent_lost(
+                                    "stored consent plan has no grant class for an always approval",
+                                )
+                            })?,
+                            scope_id: plan
+                                .scope_id
                                 .clone()
-                                .expect("always option has grant class"),
-                            scope_id: plan.scope_id.clone().expect("always option has scope"),
+                                .filter(|scope| !scope.is_empty())
+                                .ok_or_else(|| {
+                                    consent_lost(
+                                        "stored consent plan has no scope for an always approval",
+                                    )
+                                })?,
                             granted_at_ms: (self.clock)(),
                             card_ref: answer.elicitation_id.clone(),
                             revoked_at_ms: None,
@@ -223,7 +366,7 @@ impl ProjectsHandler {
                     }
                     Authorization::Card {
                         id: answer.elicitation_id.clone(),
-                        answer: answer.choice.clone().expect("approved choice"),
+                        answer: choice.into(),
                     }
                 }
             }
@@ -243,11 +386,13 @@ impl ProjectsHandler {
             .consent_write_wait(plan.clone(), commit, deadline)
             .await;
         let outcome = match result {
-            Ok(body) => {
-                let envelope: Value =
-                    serde_json::from_slice(&body).map_err(crate::invalid_params)?;
-                replay(envelope["result"].clone())
-            }
+            Ok(body) => replay(core_result(&body)?).map_err(|error| {
+                if error.code == "consent_lost" {
+                    HandlerError::new("invalid_reply", error.message)
+                } else {
+                    error
+                }
+            }),
             Err(error)
                 if matches!(
                     error.code.as_str(),
@@ -290,9 +435,25 @@ impl ProjectsHandler {
         let outcome =
             json!({"error":{"code":error.code,"message":error.message,"detail":error.detail}});
         let saved_outcome = store.consent_transaction(|tx| {
-            let saved = tx.begin_request(row)?;
+            let saved = tx.begin_request(row).map_err(|error| {
+                if error.code == "request_key_conflict" {
+                    error
+                } else {
+                    AgentMutationError {
+                        code: "consent_lost".into(),
+                        message: format!(
+                            "stored consent request could not be read or retained: {error}"
+                        ),
+                        detail: None,
+                    }
+                }
+            })?;
             if saved.state != RequestState::Awaiting {
-                return Ok(saved.outcome.expect("terminal outcome"));
+                return saved.outcome.ok_or_else(|| AgentMutationError {
+                    code: "consent_lost".into(),
+                    message: "stored terminal consent request has no outcome".into(),
+                    detail: None,
+                });
             }
             tx.finish_request(
                 &row.identity,

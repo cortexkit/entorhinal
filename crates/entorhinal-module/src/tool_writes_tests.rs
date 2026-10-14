@@ -798,3 +798,72 @@ async fn assistant_role_and_grant_scope_are_rechecked_inside_commit() {
         "consent_stale"
     );
 }
+
+#[tokio::test]
+async fn retry_refuses_saved_plan_without_target_label_as_consent_lost() {
+    let (f, fake) = fixture(2);
+    let args = hire("missing-label", "Worker");
+    assert_eq!(
+        error_code(f.call("agents_hire", args.clone()).await),
+        "consent_pending"
+    );
+    let conn = rusqlite::Connection::open(f.root.join("store.db")).unwrap();
+    assert_eq!(conn.execute(
+        "UPDATE consent_write_plan SET plan_json=json_remove(plan_json,'$.target.label') WHERE agent_id=?1 AND tool='agents_hire' AND request_key='missing-label'",
+        [&f.agents[2]],
+    ).unwrap(), 1);
+    drop(conn);
+    let before = f.counts();
+    let calls = fake.calls().len();
+    assert_eq!(
+        error_code(f.call("agents_hire", args).await),
+        "consent_lost"
+    );
+    assert_eq!(f.counts(), before);
+    assert_eq!(
+        fake.calls().len(),
+        calls,
+        "an unreadable target must not reach Cingulate"
+    );
+}
+
+#[test]
+fn malformed_core_reply_envelopes_are_invalid_reply() {
+    for body in [
+        b"not JSON".as_slice(),
+        b"{}",
+        b"{\"result\":null}",
+        b"{\"result\":[]}",
+    ] {
+        assert_eq!(core_result(body).unwrap_err().code, "invalid_reply");
+    }
+    assert_eq!(
+        core_result(b"{\"result\":{\"agents\":[]}}").unwrap()["agents"],
+        json!([])
+    );
+}
+
+#[test]
+fn malformed_terminal_outcomes_are_consent_lost() {
+    let (f, _) = fixture(2);
+    let plan = store(&f)
+        .precheck_consent_write(
+            &f.agents[2],
+            "agents_hire",
+            json!({"name":"Worker","tag":"worker","labels":[]}),
+            100,
+        )
+        .unwrap();
+    let mut row = approved_commit(&f, &plan, "terminal", 2, Authorization::OwnHire).request;
+    row.state = RequestState::Applied;
+    assert_eq!(terminal_outcome(&row).unwrap_err().code, "consent_lost");
+    for outcome in [
+        Value::Null,
+        json!([]),
+        json!({"error":{}}),
+        json!({"error":{"code":42,"message":"bad"}}),
+        json!({"error":{"code":"consent_declined"}}),
+    ] {
+        assert_eq!(replay(outcome).unwrap_err().code, "consent_lost");
+    }
+}

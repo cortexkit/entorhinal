@@ -3562,7 +3562,7 @@ expect_red = ["tool_provider::writes::tests::request_conflict_and_crash_after_co
 id = "agent-tool-terminal-outcome"
 guards = "A committed terminal request replays after restart and a new epoch without reminting permission"
 file = "crates/entorhinal-module/src/tool_writes.rs"
-old = 'return replay(saved.outcome.clone().expect("terminal outcome"));'
+old = 'return replay(terminal_outcome(saved)?);'
 new = 'return Err(HandlerError::new("consent_lost", "NON-VACUITY BREAK: discard terminal outcome"));'
 test_file = "crates/entorhinal-module/src/tool_writes_tests.rs"
 runner = "cargo"
@@ -3737,3 +3737,15 @@ expect_red = ["move_record::tests::move_codec_preserves_unknown_abort_reason_opa
 only = false
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "agent-tool-saved-target-label-refusal"
+guards = "A retry refuses an unreadable saved target label with consent_lost instead of panicking"
+file = "crates/entorhinal-module/src/tool_writes.rs"
+old = '.ok_or_else(|| consent_lost("stored consent plan has no string target.label"))?'
+new = '.unwrap() /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/tool_writes_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tool_provider::writes::tests::retry_refuses_saved_plan_without_target_label_as_consent_lost"]
