@@ -1226,36 +1226,12 @@ async fn status_refusal_precedes_package_shape_and_invalid_status_does_not_fetch
         .any(|path| path == "/v1/registry/keys"));
 }
 
+/// The once-per-document decision is asserted on the walker's own record of
+/// logged documents. Counting emitted tracing events instead was flaky in
+/// parallel runs, because tracing caches each callsite's interest globally and
+/// another test thread can register it first without this test's subscriber.
 #[tokio::test]
 async fn refused_chain_links_log_once_per_distinct_document() {
-    struct Capture(std::sync::Arc<std::sync::atomic::AtomicUsize>);
-    impl tracing::Subscriber for Capture {
-        fn register_callsite(
-            &self,
-            _: &'static tracing::Metadata<'static>,
-        ) -> tracing::subscriber::Interest {
-            tracing::subscriber::Interest::sometimes()
-        }
-        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
-            Some(tracing::level_filters::LevelFilter::TRACE)
-        }
-        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-            *metadata.level() == tracing::Level::WARN
-                && metadata.target().ends_with("catalog_trust")
-        }
-        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-        fn event(&self, _: &tracing::Event<'_>) {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-        fn enter(&self, _: &tracing::span::Id) {}
-        fn exit(&self, _: &tracing::span::Id) {}
-    }
-    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let _subscriber = tracing::subscriber::set_default(Capture(count.clone()));
     let f = Fixture::new(0).await;
     let mut trust = f.trust();
     let mut reply: Value =
@@ -1270,7 +1246,7 @@ async fn refused_chain_links_log_once_per_distinct_document() {
             None,
         );
     }
-    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(trust.refused_links.len(), 1);
     reply["keys"][0]["signature"] = "01".repeat(64).into();
     f.fake
         .serve("/v1/registry/keys", Reply::bytes(reply.to_string()));
@@ -1279,5 +1255,5 @@ async fn refused_chain_links_log_once_per_distinct_document() {
         "signature_invalid",
         None,
     );
-    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(trust.refused_links.len(), 2);
 }
