@@ -1027,7 +1027,6 @@ mod tests {
                         "create_head",
                         "create_hire",
                         "dispose_agent",
-                        "agent.set_hire_cap",
                         "grants.list",
                         "grants.revoke",
                         "grants.would_ask",

@@ -385,6 +385,7 @@ usage: ck agents <verb> [args] [--subc <connection file>] [--json]
   tag <agent> <text>
   labels <agent> <label>...   replace the whole label set
   labels <agent> --none      clear the label set
+  hire-cap <project> <n>     set this Mac's hiring cap (project id; Touch ID required)
   list [--project <id>] [--workspace <id>]
   show <agent>               a live digest or a retired/merged identity
   repair-workspaces [--yes]   preview the correction; --yes asks for confirmation
@@ -748,11 +749,13 @@ fn agent_write(method: &str) -> bool {
             | "agent.move"
             | "agent.move_abort"
             | "agent.set_lid_close_moves"
+            | "agent.set_hire_cap"
     )
 }
 
 fn build_agents(command: &Command) -> Result<(String, Value), String> {
     let mut method = match command.verb.as_str() {
+        "hire-cap" => "agent.set_hire_cap",
         "repair-workspaces" => "agent.repair_workspaces",
         "create" => "agent.create",
         "rename" => "agent.rename",
@@ -777,7 +780,7 @@ fn build_agents(command: &Command) -> Result<(String, Value), String> {
             continue;
         }
         let allowed = match arg.as_str() {
-            "--request-key" => agent_write(method),
+            "--request-key" => agent_write(method) && command.verb != "hire-cap",
             "--role" | "--tag" | "--supervisor" => command.verb == "create",
             "--project" | "--workspace" => matches!(command.verb.as_str(), "create" | "list"),
             "--none" => command.verb == "labels",
@@ -803,7 +806,7 @@ fn build_agents(command: &Command) -> Result<(String, Value), String> {
     }
     let count_ok = match command.verb.as_str() {
         "list" | "moves" | "repair-workspaces" => positional.is_empty(),
-        "rename" | "tag" => positional.len() == 2,
+        "rename" | "tag" | "hire-cap" => positional.len() == 2,
         "labels" if flags.contains_key("--none") => positional.len() == 1,
         "labels" => positional.len() >= 2,
         _ => positional.len() == 1,
@@ -826,6 +829,18 @@ fn build_agents(command: &Command) -> Result<(String, Value), String> {
         }
     }
     match command.verb.as_str() {
+        "hire-cap" => {
+            if positional[1].is_empty() || !positional[1].bytes().all(|b| b.is_ascii_digit()) {
+                return Err("hire-cap needs a non-negative integer".into());
+            }
+            let cap: i64 = positional[1]
+                .parse()
+                .map_err(|_| "hire-cap integer is too large")?;
+            return Ok((
+                method.into(),
+                json!({"project_id":positional[0], "cap":cap}),
+            ));
+        }
         "create" => {
             let role = flags.get("--role").ok_or("create requires --role")?;
             if !matches!(
@@ -1129,6 +1144,8 @@ fn retry_args(command: &Command, params: &Value) -> Vec<String> {
                 args.extend([flag.into(), value.into()]);
             }
         }
+    } else if command.verb == "hire-cap" {
+        args.extend([text(&params["project_id"]), params["cap"].to_string()]);
     } else if command.verb == "repair-workspaces" {
         args.push("--yes".into());
     } else if command.verb == "move-abort" {
@@ -1159,7 +1176,9 @@ fn retry_args(command: &Command, params: &Value) -> Vec<String> {
             _ => (),
         }
     }
-    args.extend(["--request-key".into(), text(&params["request_key"])]);
+    if command.verb != "hire-cap" {
+        args.extend(["--request-key".into(), text(&params["request_key"])]);
+    }
     if let Some(path) = &command.connection {
         args.extend(["--subc".into(), path.to_string_lossy().into_owned()]);
     }
@@ -1533,6 +1552,13 @@ fn format_rebind(value: &Value) -> String {
 }
 
 fn format_agents(verb: &str, value: &Value) -> String {
+    if verb == "hire-cap" {
+        return format!(
+            "project:   {}\nhire cap:  {}",
+            text(&value["project_id"]),
+            value["cap"]
+        );
+    }
     if verb == "list" {
         let agents = value["agents"].as_array().expect("combined agent list");
         if agents.is_empty() {
@@ -3153,6 +3179,63 @@ mod agent_tests {
                 _ => panic!("unexpected streamed reply"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn hire_cap_cli_builds_nonnegative_local_write_and_requires_touch_id() {
+        let cmd = command(&["hire-cap", "P", "0"]);
+        let (method, params) = build(&cmd).unwrap();
+        assert_eq!(method, "agent.set_hire_cap");
+        assert_eq!(params, json!({"project_id":"P","cap":0}));
+        assert_eq!(retry_args(&cmd, &params), ["hire-cap", "P", "0"]);
+        for args in [
+            vec!["hire-cap", "P"],
+            vec!["hire-cap", "P", "1", "extra"],
+            vec!["hire-cap", "P", "1.5"],
+            vec!["hire-cap", "P", "+1"],
+            vec!["hire-cap", "P", "9223372036854775808"],
+            vec!["hire-cap", "P", "1", "--request-key", "unused"],
+        ] {
+            assert!(build(&command(&args)).is_err(), "{args:?}");
+        }
+        assert!(matches!(
+            parse(Face::Agents, &["hire-cap".into(), "P".into(), "-1".into()]),
+            Invocation::Refuse(_)
+        ));
+        let prompt = Arc::new(Confirm(AtomicUsize::new(0)));
+        let c = Served::new(Some(prompt.clone()));
+        c.store()
+            .register(entorhinal_core::RegisterRequest {
+                project_id: Some("P".into()),
+                name: "Project".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            execute(&c, &["hire-cap", "P", "0"]).await.unwrap(),
+            json!({"project_id":"P","cap":0})
+        );
+        assert_eq!(c.calls.lock().unwrap().as_slice(), ["agent.set_hire_cap"]);
+        assert_eq!(prompt.0.load(Ordering::SeqCst), 1);
+        assert_eq!(c.store().project_hire_cap("P").unwrap().cap, 0);
+        assert_eq!(
+            format_agents("hire-cap", &json!({"project_id":"P","cap":0})),
+            "project:   P\nhire cap:  0"
+        );
+        let c = Served::new(None);
+        c.store()
+            .register(entorhinal_core::RegisterRequest {
+                project_id: Some("P".into()),
+                name: "Project".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(execute(&c, &["hire-cap", "P", "0"])
+            .await
+            .unwrap_err()
+            .1
+            .starts_with("operator_presence_unavailable"));
+        assert_eq!(c.store().project_hire_cap("P").unwrap().cap, 10);
     }
 
     #[tokio::test]

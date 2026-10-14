@@ -35,6 +35,7 @@ ck agents retire <agent>
 ck agents tag <agent> <text>
 ck agents labels <agent> <label>...         replace the whole label set
 ck agents labels <agent> --none             clear the label set
+ck agents hire-cap <project> <n>            set this Mac's agent-hiring limit (Touch ID)
 ck agents repair-workspaces [--yes]         preview correction; --yes sends the write
 ck agents where <agent> [--refresh]         which Mac holds the agent, from the cache
 
@@ -54,7 +55,13 @@ appears. The write waits up to five minutes for the answer. If its outcome is
 unknown, for example after a timeout, the command prints a retry command that
 is safe to run: the retry can neither create a duplicate nor change a different
 agent. Until agent identity has moved from prefrontal-core to entorhinal, every
-write is refused with `authority_not_cut_over`, before any prompt.
+identity write is refused with `authority_not_cut_over`, before any prompt.
+
+`hire-cap` takes a project id and a non-negative integer. The default is 10 live
+hires per project; 0 stops agent hiring. Lowering the cap below the current count
+does not retire anyone. Only agent-requested hires are capped: operator creation,
+the executive relay, imports and synced identities are not. Caps are local to
+this Mac, and changing one always requires Touch ID.
 
 ## Operations
 
@@ -62,7 +69,8 @@ The registry store must be on a local disk. SQLite WAL and shared memory are
 not supported on network shares.
 
 Served to other modules through the subc daemon, which routes management calls
-between CortexKit modules. Reads are open to every caller.
+between CortexKit modules. Identity reads are open to every caller; permission
+inventory and the agent authorization audit have the operator-only rules below.
 Project writes are accepted from the operator (`ck`) or the executive
 (prefrontal-core). Agent writes are accepted from the executive, which relays
 the operator's own changes, and from the operator through `ck agents` once the
@@ -124,6 +132,46 @@ carries that mark, so a flow can't borrow the executive's write access.
 | `agent.import` | mutate | Import the executive's agent registry once, at cutover. |
 | `agent.preview_repair_workspaces` | query | Preview the stored workspaces and name claims the operator's correction would change, including any refusal. |
 | `agent.repair_workspaces` | mutate | Clear heads' and hirees' stored workspaces and move live name claims to their project's workspace (operator only, after confirmation). |
+| `agent.set_hire_cap {project_id, cap}` | mutate | Set this Mac's project hiring limit (Direct only, after Touch ID). |
+| `agent.audit_list {since_ms?, limit?, cursor?}` | query | Page local agent-authorized writes and refusals after consent was requested (the local operator's Direct route or `reserved:callosum` only). |
+
+**Agent tools and permissions**
+
+Entorhinal provides `tool-provider/v1` and `permissions/v1`. Tools take the caller
+from the daemon's agent stamp, never a body field. Assistants can request
+`projects_create_workspace`, `projects_register` and `agents_create_head`;
+project heads can request `agents_hire`, `agents_retire_hire` and
+`agents_list_hires`. Write tools require a `request_key` of 1–128 printable ASCII
+bytes. Reusing a key with different arguments refuses `request_key_conflict`;
+retrying the same request returns its stored terminal outcome or resumes consent.
+
+Workspace creation always asks on the phone. Project registration and head
+creation can be approved always for a workspace, separately; hiring can be
+approved always for a project. The inventory uses exactly `workspace_projects`,
+`workspace_heads` and `project_hires`, labelled with workspace or project names.
+A head can retire its own live hire immediately without a phone consent card (`own_hire`).
+Flows, unstamped callers and retired agents cannot use these tools.
+
+| Operation | Kind | What it does |
+|---|---|---|
+| `permissions.list {agent_id?}` | query | List live grants on this Mac, optionally for one agent. |
+| `permissions.revoke {id}` | mutate | Revoke a grant without prompting; unknown or already-ended grants return `not_found`. |
+
+Both permission operations admit only Direct and `reserved:cingulate`; everyone
+else, including agents and Callosum, gets `permissions_operator_required`.
+Cingulate aggregates the providers for the phone permissions page. Entorhinal
+does not implement that aggregator or its phone/simulator admission rules.
+Revocation never prompts and prevents the grant from covering the next request.
+Grants also cease covering requests when the holding agent is retired or merged,
+or when the workspace or project they cover is removed.
+
+The audit is ordered by time descending, then row id descending. `since_ms` is
+inclusive, `limit` defaults to 200 and must be 1–200, and `next_cursor` is opaque;
+pass it unchanged to resume after the last row, including across tied timestamps.
+Each row names the caller, action, target, outcome and authorization: a card and
+answer, a grant id or `own_hire`. Agent writes carry that same authorization in
+the identity journal, so verify and rebuild need no live card or grant. Grants,
+request state, feed cursors and audit rows stay machine-local and are not synced.
 
 **Sessions, claims and roles**
 

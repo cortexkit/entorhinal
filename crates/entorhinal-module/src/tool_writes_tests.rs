@@ -5,6 +5,7 @@ use crate::{
 };
 use entorhinal_core::{agent::consent::ConsentWrite, AssignWorkspaceRequest};
 use std::sync::Arc;
+use subc_protocol::Principal;
 
 fn clock() -> i64 {
     100
@@ -69,6 +70,167 @@ fn approved_commit(
         granted: None,
         now_ms: 100,
     }
+}
+
+async fn management(
+    f: &Fixture,
+    principal: Principal,
+    method: &str,
+    params: Value,
+) -> subc_client_rs::HandlerOutcome {
+    let route = (171, 1);
+    f.handler.route_admissions().insert(
+        route,
+        crate::RouteAdmission::from_bind(Some(principal), None),
+    );
+    f.handler
+        .handle_served_request(
+            &serde_json::to_vec(&json!({"method":method,"params":params})).unwrap(),
+            route,
+        )
+        .await
+}
+
+#[tokio::test]
+async fn permissions_revocation_and_audit_verify_rebuild_acceptance() {
+    struct Confirm;
+    #[async_trait::async_trait]
+    impl crate::agent_ops::OperatorConfirmer for Confirm {
+        async fn confirm_operator(
+            &self,
+            _: &str,
+            _: crate::RouteKey,
+        ) -> Result<(), crate::agent_ops::OperatorConfirmError> {
+            Ok(())
+        }
+    }
+    let (mut f, fake) = fixture(2);
+    f.handler.operator_confirmer = Arc::new(Confirm);
+    fake.script("consent.await", Effect::Answer("approve_always_project"));
+    let first = result(f.call("agents_hire", hire("first", "First")).await);
+    let id = first["agent"]["agent_id"].as_str().unwrap();
+    let cingulate = crate::tests::reserved("cingulate");
+    let listed =
+        result(management(&f, cingulate.clone(), crate::permissions::LIST, json!({})).await);
+    let grant = listed["grants"][0]["id"].as_str().unwrap();
+    assert_eq!(listed["grants"][0]["scope"], "project_hires");
+    assert_eq!(listed["grants"][0]["subject_label"], "Project");
+    let before = f.counts();
+    assert_eq!(
+        error_code(
+            management(
+                &f,
+                crate::tests::reserved("prefrontal"),
+                crate::permissions::REVOKE,
+                json!({"id":grant})
+            )
+            .await
+        ),
+        "permissions_operator_required"
+    );
+    assert_eq!(f.counts(), before);
+    result(f.call("agents_hire", hire("second", "Second")).await);
+    assert_eq!(fake.card_count(), 1);
+    assert_eq!(
+        result(
+            management(
+                &f,
+                cingulate.clone(),
+                crate::permissions::REVOKE,
+                json!({"id":grant})
+            )
+            .await
+        ),
+        json!({"outcome":"revoked"})
+    );
+    assert_eq!(
+        result(
+            management(
+                &f,
+                Principal::Direct,
+                crate::permissions::REVOKE,
+                json!({"id":grant})
+            )
+            .await
+        ),
+        json!({"outcome":"not_found"})
+    );
+    assert_eq!(
+        result(management(&f, cingulate, crate::permissions::LIST, json!({})).await),
+        json!({"grants":[]})
+    );
+    fake.script("consent.await", Effect::Answer("approve_once"));
+    result(f.call("agents_hire", hire("third", "Third")).await);
+    assert_eq!(
+        fake.card_count(),
+        2,
+        "revoked grant cannot cover the next hire"
+    );
+    result(
+        f.call(
+            "agents_retire_hire",
+            json!({"agent_id":id,"request_key":"retire"}),
+        )
+        .await,
+    );
+    assert_eq!(
+        result(
+            management(
+                &f,
+                Principal::Direct,
+                crate::permissions::SET_CAP,
+                json!({"project_id":"P","cap":1})
+            )
+            .await
+        ),
+        json!({"project_id":"P","cap":1})
+    );
+    assert_eq!(store(&f).project_hire_cap("P").unwrap().live_hires, 3);
+    assert_eq!(
+        error_code(f.call("agents_hire", hire("lowered", "Blocked")).await),
+        "hire_cap_reached"
+    );
+    assert_eq!(fake.card_count(), 2, "lowered cap refuses before any card");
+    let audit = result(
+        management(
+            &f,
+            crate::tests::reserved("callosum"),
+            crate::permissions::AUDIT,
+            json!({}),
+        )
+        .await,
+    );
+    assert_eq!(audit["rows"].as_array().unwrap().len(), 4);
+    assert_eq!(
+        audit["rows"][0]["authorization"],
+        json!({"kind":"own_hire"})
+    );
+    assert_eq!(audit["rows"][1]["authorization"]["kind"], "card");
+    assert_eq!(
+        audit["rows"][2]["authorization"],
+        json!({"kind":"grant","id":grant})
+    );
+    assert_eq!(
+        audit["rows"][3]["authorization"]["answer"],
+        "approve_always_project"
+    );
+    let changes = serde_json::to_value(store(&f).agent_changes(0, None).unwrap()).unwrap();
+    let rows = f.counts();
+    assert!(store(&f).verify().unwrap().ok);
+    store(&f).rebuild().unwrap();
+    assert!(store(&f).verify().unwrap().ok);
+    assert_eq!(
+        serde_json::to_value(store(&f).agent_changes(0, None).unwrap()).unwrap(),
+        changes
+    );
+    assert_eq!(f.counts(), rows);
+    assert_eq!(
+        result(management(&f, Principal::Direct, crate::permissions::AUDIT, json!({})).await),
+        audit
+    );
+    assert!(store(&f).consent_grants().unwrap()[0]
+        .revoked_at_ms
+        .is_some());
 }
 
 #[tokio::test]
