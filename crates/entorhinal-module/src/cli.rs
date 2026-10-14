@@ -1237,7 +1237,7 @@ async fn execute_agents(
                 }),
                 Some("live") => {
                     let listed = list_agents(caller, json!({})).await?;
-                    listed["agents"]
+                    let mut row = listed["agents"]
                         .as_array()
                         .unwrap()
                         .iter()
@@ -1246,7 +1246,25 @@ async fn execute_agents(
                         .ok_or_else(|| CallFailure::Refused {
                             code: "unknown_agent".into(),
                             message: token.into(),
-                        })
+                        })?;
+                    // Heads and hirees store no workspace of their own: theirs is
+                    // wherever their project is placed. Look that up so `show`
+                    // reports the workspace the agent actually belongs to.
+                    if row["workspace_id"].is_null() {
+                        if let Some(project) = row["project_id"].as_str() {
+                            let projects = agent_read(caller, "enumerate", json!({})).await?;
+                            let placed = projects["projects"].as_array().and_then(|all| {
+                                all.iter()
+                                    .find(|p| p["projectId"] == project)
+                                    .and_then(|p| p["workspaceId"].as_str())
+                                    .map(str::to_owned)
+                            });
+                            if let Some(workspace) = placed {
+                                row["workspace_from_project"] = json!(workspace);
+                            }
+                        }
+                    }
+                    Ok(row)
                 }
                 Some("retired" | "merged") => Ok(resolved),
                 _ => Err(CallFailure::Transport(
@@ -1588,7 +1606,11 @@ fn format_agents(verb: &str, value: &Value) -> String {
             text(&value["merged_into"])
         );
     }
-    format!("agent:     {}\nname:      {}\nrole:      {}\ntag:       {}\nproject:   {}\nworkspace: {}\nlabels:    {}", text(&value["agent_id"]), text(&value["name"]), text(&value["role"]), text(&value["tag"]), text(&value["project_id"]), text(&value["workspace_id"]), value["labels"])
+    let workspace = match value["workspace_from_project"].as_str() {
+        Some(placed) => format!("{placed} (from project)"),
+        None => text(&value["workspace_id"]),
+    };
+    format!("agent:     {}\nname:      {}\nrole:      {}\ntag:       {}\nproject:   {}\nworkspace: {}\nlabels:    {}", text(&value["agent_id"]), text(&value["name"]), text(&value["role"]), text(&value["tag"]), text(&value["project_id"]), workspace, value["labels"])
 }
 
 fn format_attach(value: &Value, confirmed: bool) -> String {
@@ -2994,6 +3016,42 @@ mod agent_tests {
             .starts_with("engram_unavailable"));
         assert_eq!(script.calls().len(), 1);
         assert!(build(&command(&["show", ID, "--refresh"])).is_err());
+    }
+
+    /// A head stores no workspace, so `show` reports its project's placement,
+    /// marked as derived. An unplaced project shows none, and an agent that
+    /// stores its own workspace (a workspace head) needs no project lookup.
+    #[tokio::test]
+    async fn agents_show_reports_a_heads_workspace_from_its_project() {
+        let head = json!({"agent_id":ID,"name":"Ada","role":"head","tag":"t","project_id":"P","workspace_id":null,"labels":[]});
+        let show = |projects: Value, row: Value| {
+            Script::new(vec![
+                Ok(json!({"agent_id":ID,"status":"live","gone":null,"merged_into":null})),
+                Ok(json!({"agents":[row]})),
+                Ok(projects),
+            ])
+        };
+        let script = show(
+            json!({"projects":[{"projectId":"Q","workspaceId":"other"},{"projectId":"P","workspaceId":"W"}]}),
+            head.clone(),
+        );
+        let shown = execute(&script, &["show", ID]).await.unwrap();
+        assert_eq!(script.calls()[2].0, "enumerate");
+        assert!(format_agents("show", &shown).contains("workspace: W (from project)"));
+
+        let script = show(json!({"projects":[{"projectId":"P"}]}), head);
+        let shown = execute(&script, &["show", ID]).await.unwrap();
+        let output = format_agents("show", &shown);
+        assert!(output.contains("workspace: -") && !output.contains("from project"));
+
+        let workspace_head = json!({"agent_id":ID,"name":"Ada","role":"workspace_head","tag":"t","project_id":null,"workspace_id":"W","labels":[]});
+        let script = Script::new(vec![
+            Ok(json!({"agent_id":ID,"status":"live","gone":null,"merged_into":null})),
+            Ok(json!({"agents":[workspace_head]})),
+        ]);
+        let shown = execute(&script, &["show", ID]).await.unwrap();
+        assert_eq!(script.calls().len(), 2);
+        assert!(format_agents("show", &shown).contains("workspace: W\n"));
     }
 
     #[tokio::test]
