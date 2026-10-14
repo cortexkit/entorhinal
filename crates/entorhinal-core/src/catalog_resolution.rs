@@ -103,7 +103,7 @@ impl RegistryStore {
                         if held.name != r.name
                             || held.version != r.version
                             || held.archive_sha256 != r.archive_sha256
-                            || held.publisher_key != r.public_key
+                            || Some(held.publisher_key.clone()) != key_fingerprint(&r.public_key)
                         {
                             return Err(refusal("record_mismatch"));
                         }

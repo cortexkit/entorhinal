@@ -112,24 +112,15 @@ impl RegistryStore {
         principal: &serde_json::Value,
     ) -> Result<String, CatalogWriteError> {
         self.catalog_transaction(|tx| {
-            let status = crate::agent::load_row(tx, &grant.placement_agent_id).map_err(store_error)?.map(|row| row.status);
+            let status = crate::agent::load_row(tx, &grant.placement_agent_id)
+                .map_err(store_error)?
+                .map(|row| row.status);
             match status.as_deref() {
                 None => return Err(CatalogWriteError::Refused("unknown_agent")),
                 Some("live") => (),
                 Some(_) => return Err(CatalogWriteError::Refused("gone")),
             }
-            let prior = read_grants(tx).map_err(store_error)?.into_iter().find(|g| g.publisher_fingerprint == grant.publisher_fingerprint && g.operation == grant.operation && g.placement_agent_id == grant.placement_agent_id);
-            let mut row = grant.clone();
-            let kind = if let Some(prior) = prior {
-                row.id = prior.id;
-                row.ceiling.extend(prior.ceiling);
-                "grant_refresh"
-            } else { "grant_insert" };
-            row.ceiling = row.ceiling.into_iter().collect::<BTreeSet<_>>().into_iter().collect();
-            row.revoked_at_ms = None;
-            tx.execute("INSERT INTO catalog_publisher_grant VALUES(?1,?2,?3,?4,?5,?6,?7,NULL) ON CONFLICT(publisher_fingerprint,operation,placement_agent_id) DO UPDATE SET ceiling_json=excluded.ceiling_json,granted_at_ms=excluded.granted_at_ms,card_ref=excluded.card_ref,revoked_at_ms=NULL", params![row.id,row.publisher_fingerprint,row.operation.as_str(),row.placement_agent_id,serde_json::to_string(&row.ceiling).unwrap(),row.granted_at_ms,row.card_ref]).map_err(store_error)?;
-            audit(tx, kind, &row, principal, row.granted_at_ms).map_err(store_error)?;
-            Ok(row.id)
+            put_grant(tx, grant, principal).map_err(store_error)
         })
     }
     pub fn publisher_grants(&self) -> Result<Vec<PublisherGrant>, RegistryError> {
@@ -168,6 +159,34 @@ impl RegistryStore {
         self.read(|conn| conn.prepare("SELECT at_ms,kind,grant_id,detail_json FROM catalog_audit ORDER BY id")?.query_map([], |r| Ok(serde_json::json!({"at_ms":r.get::<_,i64>(0)?,"kind":r.get::<_,String>(1)?,"grant_id":r.get::<_,String>(2)?,"detail":decode(r.get(3)?)?})))?.collect())
     }
 }
+pub(crate) fn put_grant(
+    tx: &rusqlite::Transaction<'_>,
+    grant: &PublisherGrant,
+    principal: &serde_json::Value,
+) -> rusqlite::Result<String> {
+    let prior = read_grants(tx)?.into_iter().find(|g| {
+        g.publisher_fingerprint == grant.publisher_fingerprint
+            && g.operation == grant.operation
+            && g.placement_agent_id == grant.placement_agent_id
+    });
+    let mut row = grant.clone();
+    let kind = if let Some(prior) = prior {
+        row.id = prior.id;
+        row.ceiling.extend(prior.ceiling);
+        "grant_refresh"
+    } else {
+        "grant_insert"
+    };
+    row.ceiling = row
+        .ceiling
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    tx.execute("INSERT INTO catalog_publisher_grant VALUES(?1,?2,?3,?4,?5,?6,?7,NULL) ON CONFLICT(publisher_fingerprint,operation,placement_agent_id) DO UPDATE SET ceiling_json=excluded.ceiling_json,granted_at_ms=excluded.granted_at_ms,card_ref=excluded.card_ref,revoked_at_ms=NULL", params![row.id,row.publisher_fingerprint,row.operation.as_str(),row.placement_agent_id,serde_json::to_string(&row.ceiling).unwrap(),row.granted_at_ms,row.card_ref])?;
+    audit(tx, kind, &row, principal, row.granted_at_ms)?;
+    Ok(row.id)
+}
 fn audit(
     tx: &rusqlite::Transaction<'_>,
     kind: &str,
@@ -187,7 +206,7 @@ fn decode(text: String) -> rusqlite::Result<serde_json::Value> {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
     })
 }
-fn read_grants(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<PublisherGrant>> {
+pub(crate) fn read_grants(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<PublisherGrant>> {
     conn.prepare("SELECT id,publisher_fingerprint,operation,placement_agent_id,ceiling_json,card_ref,granted_at_ms,revoked_at_ms FROM catalog_publisher_grant ORDER BY id")?.query_map([], |r| {
         let operation = serde_json::from_value(serde_json::json!(r.get::<_,String>(2)?)).map_err(|e| rusqlite::Error::FromSqlConversionFailure(2,rusqlite::types::Type::Text,Box::new(e)))?;
         let ceiling = serde_json::from_value(decode(r.get(4)?)?).map_err(|e| rusqlite::Error::FromSqlConversionFailure(4,rusqlite::types::Type::Text,Box::new(e)))?;

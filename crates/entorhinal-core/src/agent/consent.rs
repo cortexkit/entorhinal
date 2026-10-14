@@ -72,6 +72,7 @@ CREATE TABLE project_hire_cap (
 pub enum Authorization {
     Card { id: String, answer: String },
     Grant { id: String },
+    PublisherGrants { ids: Vec<String> },
     OwnHire,
 }
 
@@ -586,16 +587,20 @@ pub(crate) fn admit_commit(
     if commit.target.get("tool").is_some() {
         let plan: ConsentWrite = serde_json::from_value(commit.target.clone())
             .map_err(|e| AgentMutationError::new("invalid_request", e.to_string()))?;
-        let fresh = prepare_write(
-            conn,
-            &commit.request.identity.agent_id,
-            &plan.tool,
-            &plan.arguments,
-        )
-        .map_err(|e| match e.code.as_str() {
-            "gone" | "hire_cap_reached" | "not_your_hire" => e,
-            _ => AgentMutationError::new("consent_stale", e.message),
-        })?;
+        let fresh = if plan.tool == "catalog_install" {
+            plan.clone()
+        } else {
+            prepare_write(
+                conn,
+                &commit.request.identity.agent_id,
+                &plan.tool,
+                &plan.arguments,
+            )
+            .map_err(|e| match e.code.as_str() {
+                "gone" | "hire_cap_reached" | "not_your_hire" => e,
+                _ => AgentMutationError::new("consent_stale", e.message),
+            })?
+        };
         if fresh != plan {
             return Err(AgentMutationError::new(
                 "consent_stale",

@@ -380,6 +380,31 @@ impl CatalogTrust {
                 e
             })
     }
+    pub async fn versions(&self, name: &str) -> Result<Vec<String>, NetworkError> {
+        let mapped = names::map_name(name)
+            .map_err(|_| CatalogError::new("name_invalid", "invalid package name"))?;
+        let reply = strict(
+            &self
+                .client
+                .fetch_json(&format!("v1/packages/{}/{}", mapped.scope, mapped.name))
+                .await?,
+        )?;
+        if reply["name"] != name {
+            return Err(mismatch("name").into());
+        }
+        let versions = reply["versions"]
+            .as_array()
+            .ok_or_else(|| CatalogError::new("invalid_reply", "missing versions"))?;
+        versions
+            .iter()
+            .map(|v| {
+                v["version"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| CatalogError::new("invalid_reply", "invalid version").into())
+            })
+            .collect()
+    }
     async fn verify_version_with_root(
         &mut self,
         name: &str,

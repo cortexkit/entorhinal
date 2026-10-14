@@ -255,7 +255,8 @@ async fn read_blob_requires_daemon_consumer_capability() {
     f.bind(Some(reserved("consumer")), false);
     for capabilities in [
         json!({"provides":[],"requires":[]}),
-        json!({"provides":["ck-catalog-consumer/v10"],"requires":[]}),
+        json!({"provides":["ck-catalog-consumer/v1"],"requires":[]}),
+        json!({"provides":["ck-catalog-consumer-skill/v10"],"requires":[]}),
     ] {
         f.handler.participant_discovery = Arc::new(FakeDaemon::new(DaemonSnapshot::new(
             1,
@@ -269,22 +270,24 @@ async fn read_blob_requires_daemon_consumer_capability() {
             "catalog_consumer_required"
         );
     }
-    f.handler.participant_discovery = Arc::new(FakeDaemon::new(DaemonSnapshot::new(
-        1,
-        vec![],
-        vec![
-            json!({"module_id":"consumer","ready":true,"roles":[],"control_ops":[],"capabilities":{"provides":["ck-catalog-consumer/v1"],"requires":[]}}),
-        ],
-    )));
-    let reply = result(f.call(READ_BLOB, request).await);
-    use base64::Engine;
-    assert_eq!(
-        base64::engine::general_purpose::STANDARD
-            .decode(reply["bytes"].as_str().unwrap())
-            .unwrap(),
-        bytes
-    );
-    assert_eq!(reply["total"], bytes.len());
+    for capability in crate::catalog_consumer::CAPABILITIES {
+        f.handler.participant_discovery = Arc::new(FakeDaemon::new(DaemonSnapshot::new(
+            1,
+            vec![],
+            vec![
+                json!({"module_id":"consumer","ready":true,"roles":[],"control_ops":[],"capabilities":{"provides":[capability],"requires":[]}}),
+            ],
+        )));
+        let reply = result(f.call(READ_BLOB, request.clone()).await);
+        use base64::Engine;
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(reply["bytes"].as_str().unwrap())
+                .unwrap(),
+            bytes
+        );
+        assert_eq!(reply["total"], bytes.len());
+    }
     assert_eq!(f.store().generation().unwrap(), 0);
     for name in ["store.db", "store.db-wal"] {
         if let Ok(database) = std::fs::read(f.root.join(name)) {

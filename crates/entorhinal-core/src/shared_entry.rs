@@ -655,6 +655,7 @@ mod tests {
                     "catalog_publisher_grant",
                     "catalog_audit",
                     "catalog_plan",
+                    "catalog_prepared",
                     "catalog_generation",
                     "catalog_transition",
                 ];

@@ -57,7 +57,9 @@ const DEFAULT_STORAGE_NAMESPACE: &str = "default";
 
 mod agent_ops;
 mod agent_reads;
+mod catalog_agent;
 mod catalog_blob;
+mod catalog_consumer;
 mod catalog_grants;
 mod catalog_network;
 mod catalog_ops;
@@ -573,6 +575,7 @@ struct ProjectsHandler {
     catch_up_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     record_client: record_client::RecordClient,
     participant_discovery: Arc<dyn participant_discovery::ParticipantDiscovery>,
+    catalog_agent: catalog_agent::CatalogAgent,
     door_client: door_client::DoorClient,
     move_wake: Arc<move_driver::MoveWake>,
     move_driver_task: Mutex<Option<move_driver::MoveDriver>>,
@@ -652,6 +655,7 @@ const MUTATING_METHODS: &[&str] = &[
     catalog_ops::REPIN,
     catalog_ops::REMOVE,
     catalog_ops::PUBLISHER_TRUST,
+    catalog_agent::ACK_ACTIVATION,
     "remove_root",
     "attach_derived_parent",
     "approve_root",
@@ -685,6 +689,7 @@ const MUTATING_METHODS: &[&str] = &[
 /// name here would refuse a correctly bound provider.
 /// Claim refresh instead has its own Direct-only rule.
 const SELF_ADMITTED_METHODS: &[&str] = &[
+    catalog_agent::ACK_ACTIVATION,
     "projects.session_liveness",
     sessions::REGISTER_SESSION,
     claims::REFRESH,
@@ -896,6 +901,7 @@ impl ProjectsHandler {
                     std::env::args_os().skip(1),
                 )),
             )),
+            catalog_agent: catalog_agent::CatalogAgent::default(),
             claim_refresh: Arc::new(claims::RefreshQueue::default()),
             door_client: door_client::DoorClient::production(log_client::SubcConnector::from_args(
                 std::env::args_os().skip(1),
@@ -966,6 +972,12 @@ impl ProjectsHandler {
         permissions::admit(method, admission.principal.as_ref())?;
         refuse_flow_write(method, admission.flow_id.as_deref())?;
         authorize_write(method, admission.principal.as_ref())?;
+        if matches!(
+            method,
+            catalog_agent::AGENT_GENERATION | catalog_agent::ACK_ACTIVATION
+        ) {
+            self.admit_catalog_activation(key)?;
+        }
         if method == "projects.session_liveness" {
             sessions::admit_liveness_feed(providers, admission.principal.as_ref()).inspect_err(
                 |_| {
@@ -1285,6 +1297,12 @@ impl ProjectsHandler {
             Ok(request) => request,
             Err(_) => return self.handle_request_unmeasured(body, key),
         };
+        if request.method == catalog_agent::ACK_ACTIVATION {
+            return match self.execute(request, key) {
+                Ok(body) => HandlerOutcome::Response(body),
+                Err(error) => error.into_outcome(),
+            };
+        }
         if request.method == catalog_ops::READ_BLOB {
             return match self.catalog_read_blob(request.params, key).await {
                 Ok(body) => HandlerOutcome::Response(body),
@@ -1421,6 +1439,9 @@ impl ProjectsHandler {
             "resolve_root_key" => self.resolve_root_key(request.params),
             "preview_attach_root" => self.preview_attach_root(request.params),
             catalog_ops::LIST => self.catalog_registry_list(request.params),
+            catalog_agent::AGENT_GENERATION | catalog_agent::ACK_ACTIVATION => {
+                self.catalog_activation(&request.method, request.params, key)
+            }
             catalog_ops::ADD
             | catalog_ops::REPIN
             | catalog_ops::REMOVE
@@ -2103,7 +2124,9 @@ fn manifest() -> ModuleManifest {
                 management_operation(catalog_ops::REPIN, ManagementOperationKind::Mutate, "Append a replacement registry key (Direct only, operator confirmation)."),
                 management_operation(catalog_ops::REMOVE, ManagementOperationKind::Mutate, "Remove a registry, mappings and held state (Direct only, operator confirmation)."),
                 management_operation(catalog_ops::LIST, ManagementOperationKind::Query, "List this machine's catalog registries, scopes and pinned key chains."),
-                management_operation(catalog_ops::READ_BLOB, ManagementOperationKind::Query, "Read verified package chunks; requires ck-catalog-consumer/v1 in the daemon catalog."),
+                management_operation(catalog_ops::READ_BLOB, ManagementOperationKind::Query, "Read verified package chunks; requires a catalog consumer kind capability in the daemon catalog."),
+                management_operation(catalog_agent::AGENT_GENERATION, ManagementOperationKind::Query, "Core-only local read of active and newer ready package generations with closure and pin digests."),
+                management_operation(catalog_agent::ACK_ACTIVATION, ManagementOperationKind::Mutate, "Core-only acknowledgement that a ready package generation was rendered at a session boundary."),
                 management_operation(catalog_ops::PUBLISHER_TRUST, ManagementOperationKind::Mutate, "Trust a publisher for installs at one agent within its authenticated pinned capability ceiling (Direct only, operator confirmation)."),
                 management_operation(
                     "resolve",
@@ -2743,6 +2766,7 @@ mod tests {
         assert_eq!(
             SELF_ADMITTED_METHODS,
             [
+                "catalog.ack_activation",
                 "projects.session_liveness",
                 "agent.register_session",
                 "agent.refresh_claims",
@@ -4496,6 +4520,8 @@ mod tests {
             ("agent.moves", "query"),
             ("agent.move_abort", "mutate"),
             ("agent.set_lid_close_moves", "mutate"),
+            ("catalog.agent_generation", "query"),
+            ("catalog.ack_activation", "mutate"),
         ] {
             let matches: Vec<_> = operations.iter().filter(|op| op["name"] == name).collect();
             assert_eq!(matches.len(), 1, "{name} must be declared exactly once");
@@ -4507,6 +4533,55 @@ mod tests {
         assert!(subc_protocol::manifest::is_valid_capability_identifier(
             PROJECT_IDENTITY_CAPABILITY
         ));
+    }
+
+    #[test]
+    fn every_declared_and_checked_capability_fits_daemon_grammar() {
+        let value = serde_json::to_value(manifest()).unwrap();
+        let declared: Vec<_> = value["capabilities"]["provides"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(value["capabilities"]["requires"].as_array().unwrap())
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        let checked = [
+            sessions::ORCHESTRATOR_CAPABILITY,
+            sessions::HOST_CAPABILITY,
+            cortexkit_role_agent_data::PROVIDES,
+        ];
+        for name in declared
+            .into_iter()
+            .chain(checked)
+            .chain(catalog_consumer::CAPABILITIES.iter().copied())
+        {
+            assert!(
+                subc_protocol::manifest::is_valid_capability_identifier(name),
+                "invalid daemon capability: {name}"
+            );
+        }
+        assert_eq!(
+            catalog_consumer::CAPABILITIES,
+            &[
+                "ck-catalog-consumer-skill/v1",
+                "ck-catalog-consumer-persona/v1",
+                "ck-catalog-consumer-flow/v1",
+                "ck-catalog-consumer-memory-profile/v1"
+            ]
+        );
+        for (name, kind) in catalog_consumer::CAPABILITIES.iter().zip([
+            entorhinal_catalog::Kind::Skill,
+            entorhinal_catalog::Kind::Persona,
+            entorhinal_catalog::Kind::Flow,
+            entorhinal_catalog::Kind::MemoryProfile,
+        ]) {
+            assert_eq!(catalog_consumer::parse_kind(name), Some(kind));
+        }
+        assert_eq!(catalog_consumer::parse_kind("ck-catalog-consumer/v1"), None);
+        assert_eq!(
+            catalog_consumer::parse_kind("ck-catalog-consumer-skill/v10"),
+            None
+        );
     }
 
     #[test]
