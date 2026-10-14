@@ -1,0 +1,1854 @@
+{
+  "schema": "ck-catalog-v1/statements",
+  "signing": {
+    "signing_input": "ASCII schema string as the domain tag, one 0x00 byte, then the UTF-8 JCS bytes of the parsed statement",
+    "algorithm": "Ed25519 (RFC 8032, pure, deterministic)",
+    "key_windows": "half open: valid_from is inside, valid_until is not"
+  },
+  "keys": {
+    "WARNING": "Every key below is TEST-ONLY with a published seed. Each role has its own keys: the root, the registry status keys, @cortexkit publish keys and third-party publisher keys.",
+    "root": {
+      "WARNING": "TEST-ONLY KEY. The seed is published. Never trust anything signed by it outside these vectors.",
+      "label": "TEST-ONLY @cortexkit root key",
+      "seed_derivation": "SHA-256 of the UTF-8 bytes of seed_text",
+      "seed_text": "ck-catalog-v1 TEST-ONLY @cortexkit ROOT key. Published on purpose. Never trust anything it signs.",
+      "seed_hex": "c8e0b6c495e584c18e8c5e4b88b7fd3cace2701d169e2c1f1929e4b70ee0b0f5",
+      "public_key_hex": "2627e86928debd3e5f5a37687443683a643269ff32567a4cde4a962d9dccd82c",
+      "fingerprint": "aca385bc90addb9ed31a17b7b192396ab122815a4c5ed77069dda807a91c48c4"
+    },
+    "registry_status": [
+      {
+        "WARNING": "TEST-ONLY KEY. The seed is published. Never trust anything signed by it outside these vectors.",
+        "label": "TEST-ONLY registry status key 1",
+        "seed_derivation": "SHA-256 of the UTF-8 bytes of seed_text",
+        "seed_text": "ck-catalog-v1 TEST-ONLY registry status key 1. Published on purpose. Never trust anything it signs.",
+        "seed_hex": "b7c923c3cf0b018112d8d73268c4daabc86f4ba138feecb3af05e7da9788a375",
+        "public_key_hex": "96951ad4c9ce89883b6fa257901d21afed42fa84083ab91cf4b089c9c9717446",
+        "fingerprint": "be55844e99710ad19a031694f64817a22f75da98f95e08d23cf7137537c601ce"
+      },
+      {
+        "WARNING": "TEST-ONLY KEY. The seed is published. Never trust anything signed by it outside these vectors.",
+        "label": "TEST-ONLY registry status key 2",
+        "seed_derivation": "SHA-256 of the UTF-8 bytes of seed_text",
+        "seed_text": "ck-catalog-v1 TEST-ONLY registry status key 2. Published on purpose. Never trust anything it signs.",
+        "seed_hex": "64b816da76c14becd7571b872a8363445535da43ca16d39793a5ed56548a96c4",
+        "public_key_hex": "31551e595edb5f60a0ab4af39bb87084c72841414e29893582bb364a4052aa40",
+        "fingerprint": "0f59150e719807a8e2f73faa42cf48458d2f540a28ec7254e3f3257fa191b03c"
+      },
+      {
+        "WARNING": "TEST-ONLY KEY. The seed is published. Never trust anything signed by it outside these vectors.",
+        "label": "TEST-ONLY registry status key 3",
+        "seed_derivation": "SHA-256 of the UTF-8 bytes of seed_text",
+        "seed_text": "ck-catalog-v1 TEST-ONLY registry status key 3. Published on purpose. Never trust anything it signs.",
+        "seed_hex": "53ed220ce82aa72dd5bddd4c8d78d7a573cc045165bfe2e707e8cb8e7869f818",
+        "public_key_hex": "d1e8267cb6f09a5b54be727ae457f5f831b47cb46d03b27a3d2ee1e9ed5ffdd7",
+        "fingerprint": "0e9942285fe717f771efa9cd2f42ee2ba7afc0169cc161c3ca544906f5eba398"
+      }
+    ],
+    "cortexkit_publish": [
+      {
+        "WARNING": "TEST-ONLY KEY. The seed is published. Never trust anything signed by it outside these vectors.",
+        "label": "TEST-ONLY @cortexkit publish key 1",
+        "seed_derivation": "SHA-256 of the UTF-8 bytes of seed_text",
+        "seed_text": "ck-catalog-v1 TEST-ONLY @cortexkit publish key 1. Published on purpose. Never trust anything it signs.",
+        "seed_hex": "47578286d8a66688bbd52c95828e5ca0b0ba97a523b48d8bef41c7c089056e74",
+        "public_key_hex": "27543dcc1ba216946c1ea38d2d2adc2d47a5024c0bd4abd053fe6ea477a66dd4",
+        "fingerprint": "137af88167ddd3e764d8e0772c4c6fe5a9f0ce5ecc0eb891e2cc05b13b9d1b1b"
+      },
+      {
+        "WARNING": "TEST-ONLY KEY. The seed is published. Never trust anything signed by it outside these vectors.",
+        "label": "TEST-ONLY @cortexkit publish key 2",
+        "seed_derivation": "SHA-256 of the UTF-8 bytes of seed_text",
+        "seed_text": "ck-catalog-v1 TEST-ONLY @cortexkit publish key 2. Published on purpose. Never trust anything it signs.",
+        "seed_hex": "30199759a404398f65bdb0eca9efc747a6822749a5cc89f70a6be6a9c5b0437f",
+        "public_key_hex": "7662087c5e278d4105c230eaf461e494e87f057d6db3fdee3d032e0328476dae",
+        "fingerprint": "9d98373d94c9cec101024caad845bfcdd0f26a90c39947b3edf9dde10f2119ad"
+      }
+    ],
+    "publishers": [
+      {
+        "WARNING": "TEST-ONLY KEY. The seed is published. Never trust anything signed by it outside these vectors.",
+        "label": "TEST-ONLY publisher key 1",
+        "seed_derivation": "SHA-256 of the UTF-8 bytes of seed_text",
+        "seed_text": "ck-catalog-v1 TEST-ONLY key 1. Published on purpose. Never trust anything it signs.",
+        "seed_hex": "8622b406211e97ee01e56ff3ba32e444b4b4de74ea443f4d8051846fe413add1",
+        "public_key_hex": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+        "fingerprint": "e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d"
+      },
+      {
+        "WARNING": "TEST-ONLY KEY. The seed is published. Never trust anything signed by it outside these vectors.",
+        "label": "TEST-ONLY publisher key 2",
+        "seed_derivation": "SHA-256 of the UTF-8 bytes of seed_text",
+        "seed_text": "ck-catalog-v1 TEST-ONLY key 2. Published on purpose. Never trust anything it signs.",
+        "seed_hex": "cfc41c52fa2f3d55cc87491b151ee1665516174d8ec2d234789ad488c3a07393",
+        "public_key_hex": "9dfb817489437ec5ed58311f6ffc4bc4f2cd3d5c47721142209797f7c9a235d9",
+        "fingerprint": "bcad7ac96bb056fdbbc8a150e20f9a56aeb1eae1ae3eb6be1322340ed4930d49"
+      },
+      {
+        "WARNING": "TEST-ONLY KEY. The seed is published. Never trust anything signed by it outside these vectors.",
+        "label": "TEST-ONLY publisher key 3",
+        "seed_derivation": "SHA-256 of the UTF-8 bytes of seed_text",
+        "seed_text": "ck-catalog-v1 TEST-ONLY publisher key 3. Published on purpose. Never trust anything it signs.",
+        "seed_hex": "da43de06dfee4021fda6be6e6ffd352fda958303c928c2eab733a5270acf6c40",
+        "public_key_hex": "20bd8538eefc04b377f08fc55d923f0807579f0912058005a712ec1be5cf1a19",
+        "fingerprint": "ca4eaf8aa6e77bc7045a3ae613cf321892ccb3328b9db1a3dd7d81a30fbf2d73"
+      }
+    ]
+  },
+  "ck-registry-key/v1": {
+    "fields": [
+      "schema",
+      "registry",
+      "key_id",
+      "public_key",
+      "valid_from"
+    ],
+    "served_as": "GET /v1/registry/keys: {schema: 'ck-registry-keys/v1', registry, keys: [{statement, signature}]} in chain order from the first introduced key",
+    "rule": "each statement is signed by the newest key the client already holds for that registry, starting from the key pinned with the allowlist entry; a held key id or public key with other bytes is key_conflict; bytes already accepted are a duplicate",
+    "chain": [
+      {
+        "statement": {
+          "schema": "ck-registry-key/v1",
+          "registry": "https://registry.example.invalid",
+          "key_id": "test-registry-2",
+          "public_key": "31551e595edb5f60a0ab4af39bb87084c72841414e29893582bb364a4052aa40",
+          "valid_from": "2026-11-01T00:00:00Z"
+        },
+        "canonical": "{\"key_id\":\"test-registry-2\",\"public_key\":\"31551e595edb5f60a0ab4af39bb87084c72841414e29893582bb364a4052aa40\",\"registry\":\"https://registry.example.invalid\",\"schema\":\"ck-registry-key/v1\",\"valid_from\":\"2026-11-01T00:00:00Z\"}",
+        "canonical_sha256": "9c11ad2f00acc1a59a44719b7d1825548faa3ceb83f36c14c4a78e5c22493386",
+        "signing_input_hex": "636b2d72656769737472792d6b65792f7631007b226b65795f6964223a22746573742d72656769737472792d32222c227075626c69635f6b6579223a2233313535316535393565646235663630613061623461663339626238373038346337323834313431346532393839333538326262333634613430353261613430222c227265676973747279223a2268747470733a2f2f72656769737472792e6578616d706c652e696e76616c6964222c22736368656d61223a22636b2d72656769737472792d6b65792f7631222c2276616c69645f66726f6d223a22323032362d31312d30315430303a30303a30305a227d",
+        "signed_by": "test-registry-1",
+        "signature": "54a4f4eb763dfa2196b51b8b419df105bd87ae663ba88d97c79c41a5c75e654570fa2f17b4e5df794ef2ba306e63f558c2326ffed8a3bc69a82fa9f0c5dcb80e"
+      },
+      {
+        "statement": {
+          "schema": "ck-registry-key/v1",
+          "registry": "https://registry.example.invalid",
+          "key_id": "test-registry-3",
+          "public_key": "d1e8267cb6f09a5b54be727ae457f5f831b47cb46d03b27a3d2ee1e9ed5ffdd7",
+          "valid_from": "2027-05-01T00:00:00Z"
+        },
+        "canonical": "{\"key_id\":\"test-registry-3\",\"public_key\":\"d1e8267cb6f09a5b54be727ae457f5f831b47cb46d03b27a3d2ee1e9ed5ffdd7\",\"registry\":\"https://registry.example.invalid\",\"schema\":\"ck-registry-key/v1\",\"valid_from\":\"2027-05-01T00:00:00Z\"}",
+        "canonical_sha256": "06dcd5e217c5dc2b945444a7260c045f7e7fbf4b86c97c55bdeca9fd3a8d0966",
+        "signing_input_hex": "636b2d72656769737472792d6b65792f7631007b226b65795f6964223a22746573742d72656769737472792d33222c227075626c69635f6b6579223a2264316538323637636236663039613562353462653732376165343537663566383331623437636234366430336232376133643265653165396564356666646437222c227265676973747279223a2268747470733a2f2f72656769737472792e6578616d706c652e696e76616c6964222c22736368656d61223a22636b2d72656769737472792d6b65792f7631222c2276616c69645f66726f6d223a22323032372d30352d30315430303a30303a30305a227d",
+        "signed_by": "test-registry-2",
+        "signature": "297184a28fab8d39ea5915583adcc0fbe238f44e3e4837ce9a0a5dba5fd9347c0be259f0df885c37e58ac9138590316f76e497d21d759185fa209f8c0468500c"
+      }
+    ],
+    "cases": [
+      {
+        "name": "successor_signed_by_current",
+        "note": "key 2 introduced by pinned key 1",
+        "pinned": {
+          "registry": "https://registry.example.invalid",
+          "keys": [
+            {
+              "key_id": "test-registry-1",
+              "public_key": "96951ad4c9ce89883b6fa257901d21afed42fa84083ab91cf4b089c9c9717446",
+              "statement": null
+            }
+          ]
+        },
+        "statement_text": "{\"key_id\":\"test-registry-2\",\"public_key\":\"31551e595edb5f60a0ab4af39bb87084c72841414e29893582bb364a4052aa40\",\"registry\":\"https://registry.example.invalid\",\"schema\":\"ck-registry-key/v1\",\"valid_from\":\"2026-11-01T00:00:00Z\"}",
+        "signature": "54a4f4eb763dfa2196b51b8b419df105bd87ae663ba88d97c79c41a5c75e654570fa2f17b4e5df794ef2ba306e63f558c2326ffed8a3bc69a82fa9f0c5dcb80e",
+        "expect": {
+          "ok": true,
+          "result": "accepted"
+        }
+      },
+      {
+        "name": "next_link",
+        "note": "key 3 introduced by key 2, the newest key held",
+        "pinned": {
+          "registry": "https://registry.example.invalid",
+          "keys": [
+            {
+              "key_id": "test-registry-1",
+              "public_key": "96951ad4c9ce89883b6fa257901d21afed42fa84083ab91cf4b089c9c9717446",
+              "statement": null
+            },
+            {
+              "key_id": "test-registry-2",
+              "public_key": "31551e595edb5f60a0ab4af39bb87084c72841414e29893582bb364a4052aa40",
+              "statement": "{\"key_id\":\"test-registry-2\",\"public_key\":\"31551e595edb5f60a0ab4af39bb87084c72841414e29893582bb364a4052aa40\",\"registry\":\"https://registry.example.invalid\",\"schema\":\"ck-registry-key/v1\",\"valid_from\":\"2026-11-01T00:00:00Z\"}"
+            }
+          ]
+        },
+        "statement_text": "{\"key_id\":\"test-registry-3\",\"public_key\":\"d1e8267cb6f09a5b54be727ae457f5f831b47cb46d03b27a3d2ee1e9ed5ffdd7\",\"registry\":\"https://registry.example.invalid\",\"schema\":\"ck-registry-key/v1\",\"valid_from\":\"2027-05-01T00:00:00Z\"}",
+        "signature": "297184a28fab8d39ea5915583adcc0fbe238f44e3e4837ce9a0a5dba5fd9347c0be259f0df885c37e58ac9138590316f76e497d21d759185fa209f8c0468500c",
+        "expect": {
+          "ok": true,
+          "result": "accepted"
+        }
+      },
+      {
+        "name": "same_statement_again",
+        "note": "the chain is served whole on every fetch; links already held are no-ops",
+        "pinned": {
+          "registry": "https://registry.example.invalid",
+          "keys": [
+            {
+              "key_id": "test-registry-1",
+              "public_key": "96951ad4c9ce89883b6fa257901d21afed42fa84083ab91cf4b089c9c9717446",
+              "statement": null
+            },
+            {
+              "key_id": "test-registry-2",
+              "public_key": "31551e595edb5f60a0ab4af39bb87084c72841414e29893582bb364a4052aa40",
+              "statement": "{\"key_id\":\"test-registry-2\",\"public_key\":\"31551e595edb5f60a0ab4af39bb87084c72841414e29893582bb364a4052aa40\",\"registry\":\"https://registry.example.invalid\",\"schema\":\"ck-registry-key/v1\",\"valid_from\":\"2026-11-01T00:00:00Z\"}"
+            }
+          ]
+        },
+        "statement_text": "{\"key_id\":\"test-registry-2\",\"public_key\":\"31551e595edb5f60a0ab4af39bb87084c72841414e29893582bb364a4052aa40\",\"registry\":\"https://registry.example.invalid\",\"schema\":\"ck-registry-key/v1\",\"valid_from\":\"2026-11-01T00:00:00Z\"}",
+        "signature": "54a4f4eb763dfa2196b51b8b419df105bd87ae663ba88d97c79c41a5c75e654570fa2f17b4e5df794ef2ba306e63f558c2326ffed8a3bc69a82fa9f0c5dcb80e",
+        "expect": {
+          "ok": true,
+          "result": "duplicate"
+        }
+      },
+      {
+        "name": "skips_the_chain",
+        "note": "key 3 signed by key 1 while key 2 is the newest key held: only the chain counts",
+        "pinned": {
+          "registry": "https://registry.example.invalid",
+          "keys": [
+            {
+              "key_id": "test-registry-1",
+              "public_key": "96951ad4c9ce89883b6fa257901d21afed42fa84083ab91cf4b089c9c9717446",
+              "statement": null
+            },
+            {
+              "key_id": "test-registry-2",
+              "public_key": "31551e595edb5f60a0ab4af39bb87084c72841414e29893582bb364a4052aa40",
+              "statement": "{\"key_id\":\"test-registry-2\",\"public_key\":\"31551e595edb5f60a0ab4af39bb87084c72841414e29893582bb364a4052aa40\",\"registry\":\"https://registry.example.invalid\",\"schema\":\"ck-registry-key/v1\",\"valid_from\":\"2026-11-01T00:00:00Z\"}"
+            }
+          ]
+        },
+        "statement_text": "{\"key_id\":\"test-registry-3\",\"public_key\":\"d1e8267cb6f09a5b54be727ae457f5f831b47cb46d03b27a3d2ee1e9ed5ffdd7\",\"registry\":\"https://registry.example.invalid\",\"schema\":\"ck-registry-key/v1\",\"valid_from\":\"2027-05-01T00:00:00Z\"}",
+        "signature": "be3503f8358d908bc1e9cfc80d443e651e74fc6d406bc5e0f98b7fcfe49d2a8a446d582716a46d08c61ec0590c0652bef535027e00e877f1b96049498bf73306",
+        "expect": {
+          "ok": false,
+          "code": "signature_invalid"
+        }
+      },
+      {
+        "name": "self_signed",
+        "note": "a key cannot introduce itself",
+        "pinned": {
+          "registry": "https://registry.example.invalid",
+          "keys": [
+            {
+              "key_id": "test-registry-1",
+              "public_key": "96951ad4c9ce89883b6fa257901d21afed42fa84083ab91cf4b089c9c9717446",
+              "statement": null
+            }
+          ]
+        },
+        "statement_text": "{\"key_id\":\"test-registry-2\",\"public_key\":\"31551e595edb5f60a0ab4af39bb87084c72841414e29893582bb364a4052aa40\",\"registry\":\"https://registry.example.invalid\",\"schema\":\"ck-registry-key/v1\",\"valid_from\":\"2026-11-01T00:00:00Z\"}",
+        "signature": "33ee1d23857c5c1bb52e6f48cf5829790df310d74fcf54fc821592eae00d15a53b4df2217cc72b1c5fd94b06c60550ed0cdf32e662682367a447023d00125b0c",
+        "expect": {
+          "ok": false,
+          "code": "signature_invalid"
+        }
+      },
+      {
+        "name": "bit_flip",
+        "note": "first signature byte XOR 0x01",
+        "pinned": {
+          "registry": "https://registry.example.invalid",
+          "keys": [
+            {
+              "key_id": "test-registry-1",
+              "public_key": "96951ad4c9ce89883b6fa257901d21afed42fa84083ab91cf4b089c9c9717446",
+              "statement": null
+            }
+          ]
+        },
+        "statement_text": "{\"key_id\":\"test-registry-2\",\"public_key\":\"31551e595edb5f60a0ab4af39bb87084c72841414e29893582bb364a4052aa40\",\"registry\":\"https://registry.example.invalid\",\"schema\":\"ck-registry-key/v1\",\"valid_from\":\"2026-11-01T00:00:00Z\"}",
+        "signature": "55a4f4eb763dfa2196b51b8b419df105bd87ae663ba88d97c79c41a5c75e654570fa2f17b4e5df794ef2ba306e63f558c2326ffed8a3bc69a82fa9f0c5dcb80e",
+        "expect": {
+          "ok": false,
+          "code": "signature_invalid"
+        }
+      },
+      {
+        "name": "status_domain_tag",
+        "note": "signed under ck-status/v1 instead of ck-registry-key/v1",
+        "pinned": {
+          "registry": "https://registry.example.invalid",
+          "keys": [
+            {
+              "key_id": "test-registry-1",
+              "public_key": "96951ad4c9ce89883b6fa257901d21afed42fa84083ab91cf4b089c9c9717446",
+              "statement": null
+            }
+          ]
+        },
+        "statement_text": "{\"key_id\":\"test-registry-2\",\"public_key\":\"31551e595edb5f60a0ab4af39bb87084c72841414e29893582bb364a4052aa40\",\"registry\":\"https://registry.example.invalid\",\"schema\":\"ck-registry-key/v1\",\"valid_from\":\"2026-11-01T00:00:00Z\"}",
+        "signature": "a48a8c21510aebaddf0ebcaddb7bd0554ed7c09490a3c063c27eac0b1fe98edbeb270ae20dbc4f1192bdf19d7098eacb6f402c51dd22b5fbf151f800aa56fc04",
+        "expect": {
+          "ok": false,
+          "code": "signature_invalid"
+        }
+      },
+      {
+        "name": "other_registry",
+        "note": "a statement for another allowlisted registry",
+        "pinned": {
+          "registry": "https://registry.example.invalid",
+          "keys": [
+            {
+              "key_id": "test-registry-1",
+              "public_key": "96951ad4c9ce89883b6fa257901d21afed42fa84083ab91cf4b089c9c9717446",
+              "statement": null
+            }
+          ]
+        },
+        "statement_text": "{\"key_id\":\"test-registry-2\",\"public_key\":\"31551e595edb5f60a0ab4af39bb87084c72841414e29893582bb364a4052aa40\",\"registry\":\"https://other.example.invalid\",\"schema\":\"ck-registry-key/v1\",\"valid_from\":\"2026-11-01T00:00:00Z\"}",
+        "signature": "822d732d7ab91be79bffb8df707917ceb64590edc04f8e4437a9efc176f7cabf28ae9f2363f7a0707754ff0ad65fafee49b7ea931ff1d283bdcce619e9d4d30c",
+        "expect": {
+          "ok": false,
+          "code": "record_mismatch",
+          "field": "registry"
+        }
+      },
+      {
+        "name": "key_id_reused",
+        "note": "a held key id with another key",
+        "pinned": {
+          "registry": "https://registry.example.invalid",
+          "keys": [
+            {
+              "key_id": "test-registry-1",
+              "public_key": "96951ad4c9ce89883b6fa257901d21afed42fa84083ab91cf4b089c9c9717446",
+              "statement": null
+            },
+            {
+              "key_id": "test-registry-2",
+              "public_key": "31551e595edb5f60a0ab4af39bb87084c72841414e29893582bb364a4052aa40",
+              "statement": "{\"key_id\":\"test-registry-2\",\"public_key\":\"31551e595edb5f60a0ab4af39bb87084c72841414e29893582bb364a4052aa40\",\"registry\":\"https://registry.example.invalid\",\"schema\":\"ck-registry-key/v1\",\"valid_from\":\"2026-11-01T00:00:00Z\"}"
+            }
+          ]
+        },
+        "statement_text": "{\"key_id\":\"test-registry-2\",\"public_key\":\"d1e8267cb6f09a5b54be727ae457f5f831b47cb46d03b27a3d2ee1e9ed5ffdd7\",\"registry\":\"https://registry.example.invalid\",\"schema\":\"ck-registry-key/v1\",\"valid_from\":\"2027-05-01T00:00:00Z\"}",
+        "signature": "0bcf90fe8a44bc1e9383d05978013666d085023032c768c8eeb44a2e81f86182c57ea378ef1b15660dd67cc8bfb0c6dcb8f5a614c8bb3109e1c3b0ed8ca51202",
+        "expect": {
+          "ok": false,
+          "code": "key_conflict",
+          "field": "key_id"
+        }
+      },
+      {
+        "name": "public_key_reused",
+        "note": "a held public key under a new id",
+        "pinned": {
+          "registry": "https://registry.example.invalid",
+          "keys": [
+            {
+              "key_id": "test-registry-1",
+              "public_key": "96951ad4c9ce89883b6fa257901d21afed42fa84083ab91cf4b089c9c9717446",
+              "statement": null
+            }
+          ]
+        },
+        "statement_text": "{\"key_id\":\"test-registry-2\",\"public_key\":\"96951ad4c9ce89883b6fa257901d21afed42fa84083ab91cf4b089c9c9717446\",\"registry\":\"https://registry.example.invalid\",\"schema\":\"ck-registry-key/v1\",\"valid_from\":\"2026-11-01T00:00:00Z\"}",
+        "signature": "7c58ddb8116defb1af57a4e937853c0374c30efcb83b05653a66f053a80216538759cf338b558ecf35ecc67244b69ad3681b37dcd74a05302782839c113a840a",
+        "expect": {
+          "ok": false,
+          "code": "key_conflict",
+          "field": "public_key"
+        }
+      },
+      {
+        "name": "unknown_field",
+        "note": "",
+        "pinned": {
+          "registry": "https://registry.example.invalid",
+          "keys": [
+            {
+              "key_id": "test-registry-1",
+              "public_key": "96951ad4c9ce89883b6fa257901d21afed42fa84083ab91cf4b089c9c9717446",
+              "statement": null
+            }
+          ]
+        },
+        "statement_text": "{\"deadline\":\"2027-01-01T00:00:00Z\",\"key_id\":\"test-registry-2\",\"public_key\":\"31551e595edb5f60a0ab4af39bb87084c72841414e29893582bb364a4052aa40\",\"registry\":\"https://registry.example.invalid\",\"schema\":\"ck-registry-key/v1\",\"valid_from\":\"2026-11-01T00:00:00Z\"}",
+        "signature": "bc9ed5444ee58a02663edbaa2bd1a934c2a94dd6eb5bf4f5e8f967c2f2623943ec18af9216730305a1d6d0797e15a98466158653405d3aab4a09092641be3b0b",
+        "expect": {
+          "ok": false,
+          "code": "statement_invalid",
+          "field": "deadline"
+        }
+      },
+      {
+        "name": "uppercase_public_key",
+        "note": "",
+        "pinned": {
+          "registry": "https://registry.example.invalid",
+          "keys": [
+            {
+              "key_id": "test-registry-1",
+              "public_key": "96951ad4c9ce89883b6fa257901d21afed42fa84083ab91cf4b089c9c9717446",
+              "statement": null
+            }
+          ]
+        },
+        "statement_text": "{\"key_id\":\"test-registry-2\",\"public_key\":\"31551E595EDB5F60A0AB4AF39BB87084C72841414E29893582BB364A4052AA40\",\"registry\":\"https://registry.example.invalid\",\"schema\":\"ck-registry-key/v1\",\"valid_from\":\"2026-11-01T00:00:00Z\"}",
+        "signature": "c8c93086d086a10fd232a175cbd5abd1ff84c6c66f4a5bb1f05891067fee3e53ea0b7921a63546d876e33563a8d29ff505df2b350f1c20eb41b339e8319b090d",
+        "expect": {
+          "ok": false,
+          "code": "statement_invalid",
+          "field": "public_key"
+        }
+      },
+      {
+        "name": "timestamp_with_offset",
+        "note": "",
+        "pinned": {
+          "registry": "https://registry.example.invalid",
+          "keys": [
+            {
+              "key_id": "test-registry-1",
+              "public_key": "96951ad4c9ce89883b6fa257901d21afed42fa84083ab91cf4b089c9c9717446",
+              "statement": null
+            }
+          ]
+        },
+        "statement_text": "{\"key_id\":\"test-registry-2\",\"public_key\":\"31551e595edb5f60a0ab4af39bb87084c72841414e29893582bb364a4052aa40\",\"registry\":\"https://registry.example.invalid\",\"schema\":\"ck-registry-key/v1\",\"valid_from\":\"2026-11-01T01:00:00+01:00\"}",
+        "signature": "cc33ebab85b4406449dd037a6f74de1c2e1a0a6146307878095c2b52d65b74ca2604d898a11fdba6fc2cf35bc15aebea33ed73960a0558a311789701bb3ec406",
+        "expect": {
+          "ok": false,
+          "code": "statement_invalid",
+          "field": "valid_from"
+        }
+      }
+    ]
+  },
+  "ck-key-rotation/v1": {
+    "fields": [
+      "schema",
+      "scope",
+      "old_key",
+      "new_key"
+    ],
+    "served_as": "{statement, old_signature, new_signature}; both signatures over the same signing input",
+    "order": [
+      "statement_invalid",
+      "record_mismatch (scope)",
+      "signature_invalid (old_signature, then new_signature)",
+      "key_unknown / key_revoked / key_not_valid (old key must be current)",
+      "key_reused (registry only)"
+    ],
+    "valid": {
+      "statement": {
+        "schema": "ck-key-rotation/v1",
+        "scope": "example",
+        "old_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+        "new_key": "20bd8538eefc04b377f08fc55d923f0807579f0912058005a712ec1be5cf1a19"
+      },
+      "canonical": "{\"new_key\":\"20bd8538eefc04b377f08fc55d923f0807579f0912058005a712ec1be5cf1a19\",\"old_key\":\"0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4\",\"schema\":\"ck-key-rotation/v1\",\"scope\":\"example\"}",
+      "canonical_sha256": "5b723f9293faa56205cec62a82e146791776c6d613f3f3cc3fa4cd329d5b1646",
+      "signing_input_hex": "636b2d6b65792d726f746174696f6e2f7631007b226e65775f6b6579223a2232306264383533386565666330346233373766303866633535643932336630383037353739663039313230353830303561373132656331626535636631613139222c226f6c645f6b6579223a2230653937386536383838323165613236663637386235336433313835666139313964623835376533363939363930373466313732363838303237623063366634222c22736368656d61223a22636b2d6b65792d726f746174696f6e2f7631222c2273636f7065223a226578616d706c65227d",
+      "old_signature": "c04bf5b7a15e31c50dc9e2e05dcba2bcfb0233bbee71cea8147a723ac48ede9520fecba48af8d58d2387246c59e7bf306ab405d44e0d87fe25105f45c04b190b",
+      "new_signature": "efb443a5556edbad4350e91c38238e8975ad0ef25cd8fba5c7538e75b7a560fb718e49dff468bbee1e063090989769cf43ac098331b5fedb3f0d1ad5a7b61105"
+    },
+    "cases": [
+      {
+        "name": "cross_signed",
+        "note": "old key authorizes, new key proves possession",
+        "scope": "example",
+        "scope_keys": [
+          {
+            "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_until": null,
+            "revocation": null
+          }
+        ],
+        "ever_in_any_scope": [
+          "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4"
+        ],
+        "served": {
+          "statement": {
+            "schema": "ck-key-rotation/v1",
+            "scope": "example",
+            "old_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "new_key": "20bd8538eefc04b377f08fc55d923f0807579f0912058005a712ec1be5cf1a19"
+          },
+          "old_signature": "c04bf5b7a15e31c50dc9e2e05dcba2bcfb0233bbee71cea8147a723ac48ede9520fecba48af8d58d2387246c59e7bf306ab405d44e0d87fe25105f45c04b190b",
+          "new_signature": "efb443a5556edbad4350e91c38238e8975ad0ef25cd8fba5c7538e75b7a560fb718e49dff468bbee1e063090989769cf43ac098331b5fedb3f0d1ad5a7b61105"
+        },
+        "expect": {
+          "ok": true,
+          "result": "accepted"
+        }
+      },
+      {
+        "name": "old_signature_bit_flip",
+        "note": "",
+        "scope": "example",
+        "scope_keys": [
+          {
+            "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_until": null,
+            "revocation": null
+          }
+        ],
+        "ever_in_any_scope": [
+          "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4"
+        ],
+        "served": {
+          "statement": {
+            "schema": "ck-key-rotation/v1",
+            "scope": "example",
+            "old_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "new_key": "20bd8538eefc04b377f08fc55d923f0807579f0912058005a712ec1be5cf1a19"
+          },
+          "old_signature": "c14bf5b7a15e31c50dc9e2e05dcba2bcfb0233bbee71cea8147a723ac48ede9520fecba48af8d58d2387246c59e7bf306ab405d44e0d87fe25105f45c04b190b",
+          "new_signature": "efb443a5556edbad4350e91c38238e8975ad0ef25cd8fba5c7538e75b7a560fb718e49dff468bbee1e063090989769cf43ac098331b5fedb3f0d1ad5a7b61105"
+        },
+        "expect": {
+          "ok": false,
+          "code": "signature_invalid",
+          "field": "old_signature"
+        }
+      },
+      {
+        "name": "new_signature_by_old_key",
+        "note": "no proof that the submitter holds the new key",
+        "scope": "example",
+        "scope_keys": [
+          {
+            "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_until": null,
+            "revocation": null
+          }
+        ],
+        "ever_in_any_scope": [
+          "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4"
+        ],
+        "served": {
+          "statement": {
+            "schema": "ck-key-rotation/v1",
+            "scope": "example",
+            "old_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "new_key": "20bd8538eefc04b377f08fc55d923f0807579f0912058005a712ec1be5cf1a19"
+          },
+          "old_signature": "c04bf5b7a15e31c50dc9e2e05dcba2bcfb0233bbee71cea8147a723ac48ede9520fecba48af8d58d2387246c59e7bf306ab405d44e0d87fe25105f45c04b190b",
+          "new_signature": "c04bf5b7a15e31c50dc9e2e05dcba2bcfb0233bbee71cea8147a723ac48ede9520fecba48af8d58d2387246c59e7bf306ab405d44e0d87fe25105f45c04b190b"
+        },
+        "expect": {
+          "ok": false,
+          "code": "signature_invalid",
+          "field": "new_signature"
+        }
+      },
+      {
+        "name": "record_domain_tag",
+        "note": "both signatures made under ck-record/v1",
+        "scope": "example",
+        "scope_keys": [
+          {
+            "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_until": null,
+            "revocation": null
+          }
+        ],
+        "ever_in_any_scope": [
+          "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4"
+        ],
+        "served": {
+          "statement": {
+            "schema": "ck-key-rotation/v1",
+            "scope": "example",
+            "old_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "new_key": "20bd8538eefc04b377f08fc55d923f0807579f0912058005a712ec1be5cf1a19"
+          },
+          "old_signature": "31a83a944e6a6455e9094b44f632f81bc4acff662cc4d9b370fb8d15dfcbf39da8a8f800b216029a55758caad571a3fde86b9107452f936d692cac3240186400",
+          "new_signature": "8e49b82e466472eaafa5765493bbf20ae54ebcf800c1766f9978a26538f47b973116a5730bad8d4f63fbc799553bcac9be08cd2a245227255fab913e21933303"
+        },
+        "expect": {
+          "ok": false,
+          "code": "signature_invalid",
+          "field": "old_signature"
+        }
+      },
+      {
+        "name": "old_key_not_in_scope",
+        "note": "key 2 signs correctly but is not in @example's set",
+        "scope": "example",
+        "scope_keys": [
+          {
+            "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_until": null,
+            "revocation": null
+          }
+        ],
+        "ever_in_any_scope": [
+          "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4"
+        ],
+        "served": {
+          "statement": {
+            "schema": "ck-key-rotation/v1",
+            "scope": "example",
+            "old_key": "9dfb817489437ec5ed58311f6ffc4bc4f2cd3d5c47721142209797f7c9a235d9",
+            "new_key": "20bd8538eefc04b377f08fc55d923f0807579f0912058005a712ec1be5cf1a19"
+          },
+          "old_signature": "a7854a2f892157c3a5046d7040671aca6ebb0a7c5e523601753901bbb0f646cdb857557e1e123f9a93b2ce7235467d4db96d60459aa5ba5d24f5a6dd4cd50505",
+          "new_signature": "096ce7d418fe66a034288a80c454efb03edc138ded325f35f0c4918fab8aa38144890ab690ccb92e8b4d1528ba3495d74babcca86ccb4831e24fa7d3100fe40f"
+        },
+        "expect": {
+          "ok": false,
+          "code": "key_unknown"
+        }
+      },
+      {
+        "name": "old_key_revoked",
+        "note": "a revoked key cannot hand over its scope",
+        "scope": "example",
+        "scope_keys": [
+          {
+            "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_until": null,
+            "revocation": {
+              "reason": "key compromise",
+              "compromise_from": "2026-10-20T00:00:00Z"
+            }
+          }
+        ],
+        "ever_in_any_scope": [
+          "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4"
+        ],
+        "served": {
+          "statement": {
+            "schema": "ck-key-rotation/v1",
+            "scope": "example",
+            "old_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "new_key": "20bd8538eefc04b377f08fc55d923f0807579f0912058005a712ec1be5cf1a19"
+          },
+          "old_signature": "c04bf5b7a15e31c50dc9e2e05dcba2bcfb0233bbee71cea8147a723ac48ede9520fecba48af8d58d2387246c59e7bf306ab405d44e0d87fe25105f45c04b190b",
+          "new_signature": "efb443a5556edbad4350e91c38238e8975ad0ef25cd8fba5c7538e75b7a560fb718e49dff468bbee1e063090989769cf43ac098331b5fedb3f0d1ad5a7b61105"
+        },
+        "expect": {
+          "ok": false,
+          "code": "key_revoked"
+        }
+      },
+      {
+        "name": "old_key_retired",
+        "note": "only a current key can rotate",
+        "scope": "example",
+        "scope_keys": [
+          {
+            "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_until": "2026-06-01T00:00:00Z",
+            "revocation": null
+          }
+        ],
+        "ever_in_any_scope": [
+          "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4"
+        ],
+        "served": {
+          "statement": {
+            "schema": "ck-key-rotation/v1",
+            "scope": "example",
+            "old_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "new_key": "20bd8538eefc04b377f08fc55d923f0807579f0912058005a712ec1be5cf1a19"
+          },
+          "old_signature": "c04bf5b7a15e31c50dc9e2e05dcba2bcfb0233bbee71cea8147a723ac48ede9520fecba48af8d58d2387246c59e7bf306ab405d44e0d87fe25105f45c04b190b",
+          "new_signature": "efb443a5556edbad4350e91c38238e8975ad0ef25cd8fba5c7538e75b7a560fb718e49dff468bbee1e063090989769cf43ac098331b5fedb3f0d1ad5a7b61105"
+        },
+        "expect": {
+          "ok": false,
+          "code": "key_not_valid"
+        }
+      },
+      {
+        "name": "new_key_was_in_a_scope",
+        "note": "a key ever in any scope's set is never added again",
+        "scope": "example",
+        "scope_keys": [
+          {
+            "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_until": null,
+            "revocation": null
+          }
+        ],
+        "ever_in_any_scope": [
+          "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+          "20bd8538eefc04b377f08fc55d923f0807579f0912058005a712ec1be5cf1a19"
+        ],
+        "served": {
+          "statement": {
+            "schema": "ck-key-rotation/v1",
+            "scope": "example",
+            "old_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "new_key": "20bd8538eefc04b377f08fc55d923f0807579f0912058005a712ec1be5cf1a19"
+          },
+          "old_signature": "c04bf5b7a15e31c50dc9e2e05dcba2bcfb0233bbee71cea8147a723ac48ede9520fecba48af8d58d2387246c59e7bf306ab405d44e0d87fe25105f45c04b190b",
+          "new_signature": "efb443a5556edbad4350e91c38238e8975ad0ef25cd8fba5c7538e75b7a560fb718e49dff468bbee1e063090989769cf43ac098331b5fedb3f0d1ad5a7b61105"
+        },
+        "expect": {
+          "ok": false,
+          "code": "key_reused"
+        }
+      },
+      {
+        "name": "same_key",
+        "note": "",
+        "scope": "example",
+        "scope_keys": [
+          {
+            "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_until": null,
+            "revocation": null
+          }
+        ],
+        "ever_in_any_scope": [
+          "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4"
+        ],
+        "served": {
+          "statement": {
+            "schema": "ck-key-rotation/v1",
+            "scope": "example",
+            "old_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "new_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4"
+          },
+          "old_signature": "e153c7a72a39fe0f22d6d7e59392c817c4b1e032c0745b1ee7c494fa1d7dab2b45e61a14336be633c265da3e9101ea48f94e2380f5004cbab00c134571fae401",
+          "new_signature": "e153c7a72a39fe0f22d6d7e59392c817c4b1e032c0745b1ee7c494fa1d7dab2b45e61a14336be633c265da3e9101ea48f94e2380f5004cbab00c134571fae401"
+        },
+        "expect": {
+          "ok": false,
+          "code": "statement_invalid",
+          "field": "new_key"
+        }
+      },
+      {
+        "name": "other_scope",
+        "note": "submitted for @example but names @acme",
+        "scope": "example",
+        "scope_keys": [
+          {
+            "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_until": null,
+            "revocation": null
+          }
+        ],
+        "ever_in_any_scope": [
+          "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4"
+        ],
+        "served": {
+          "statement": {
+            "schema": "ck-key-rotation/v1",
+            "scope": "acme",
+            "old_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "new_key": "20bd8538eefc04b377f08fc55d923f0807579f0912058005a712ec1be5cf1a19"
+          },
+          "old_signature": "ff3c62012b37ad1f643f1946687f8513f07701f1525554c4f5186ebf83153537ae47d27e8d1228b8bf1bdb8ca2e48d294a503de5855deda4fef6c128bfb47b00",
+          "new_signature": "4a6119e6e163d88743711c8df2a995f3ce47af636abe0751221bdc5b91fc464b99c8c7cd9f9aa0a613d4b2e6523bd292a2b946b2dbd421cbce8bac8537189105"
+        },
+        "expect": {
+          "ok": false,
+          "code": "record_mismatch",
+          "field": "scope"
+        }
+      },
+      {
+        "name": "carries_valid_from",
+        "note": "the registry assigns valid_from; the statement may not",
+        "scope": "example",
+        "scope_keys": [
+          {
+            "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_until": null,
+            "revocation": null
+          }
+        ],
+        "ever_in_any_scope": [
+          "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4"
+        ],
+        "served": {
+          "statement": {
+            "schema": "ck-key-rotation/v1",
+            "scope": "example",
+            "old_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "new_key": "20bd8538eefc04b377f08fc55d923f0807579f0912058005a712ec1be5cf1a19",
+            "valid_from": "2026-10-14T09:00:00Z"
+          },
+          "old_signature": "e276ca1848e4cb03665bb8ffb3590dfd53c8f050d140ea337e974e30e6218c62c70d7e8a01e3e76b73b1501d47a178a7ba1b685e51ac73406014039b7e470c04",
+          "new_signature": "f49438a6f3bab48feeb8e2fb5a86e18e218dcdade4eae03aff0898d2f91d918ff95ccdec71df52593e3f2e4f3182b1fe9aaabc6b2315639b4d682444e257410c"
+        },
+        "expect": {
+          "ok": false,
+          "code": "statement_invalid",
+          "field": "valid_from"
+        }
+      }
+    ]
+  },
+  "ck-key-cert/v1": {
+    "fields": [
+      "schema",
+      "scope",
+      "public_key",
+      "valid_from",
+      "valid_until"
+    ],
+    "served_as": "{statement, signature} beside each @cortexkit key in GET /v1/scopes/cortexkit; verified against the compiled-in root public key",
+    "valid": [
+      {
+        "name": "bounded_cert",
+        "statement": {
+          "schema": "ck-key-cert/v1",
+          "scope": "cortexkit",
+          "public_key": "27543dcc1ba216946c1ea38d2d2adc2d47a5024c0bd4abd053fe6ea477a66dd4",
+          "valid_from": "2026-10-01T00:00:00Z",
+          "valid_until": "2027-04-01T00:00:00Z"
+        },
+        "canonical": "{\"public_key\":\"27543dcc1ba216946c1ea38d2d2adc2d47a5024c0bd4abd053fe6ea477a66dd4\",\"schema\":\"ck-key-cert/v1\",\"scope\":\"cortexkit\",\"valid_from\":\"2026-10-01T00:00:00Z\",\"valid_until\":\"2027-04-01T00:00:00Z\"}",
+        "canonical_sha256": "b33ed97e8a3650418ba38da6518a5f5ba29d3af05dba9f1864cf8c6d2de35716",
+        "signing_input_hex": "636b2d6b65792d636572742f7631007b227075626c69635f6b6579223a2232373534336463633162613231363934366331656133386432643261646332643437613530323463306264346162643035336665366561343737613636646434222c22736368656d61223a22636b2d6b65792d636572742f7631222c2273636f7065223a22636f727465786b6974222c2276616c69645f66726f6d223a22323032362d31302d30315430303a30303a30305a222c2276616c69645f756e74696c223a22323032372d30342d30315430303a30303a30305a227d",
+        "signature": "56153fad23b8c71a1d151b3d7e219bb08a06d75fcdb1caa30f2fe79806eb2168abd22377379c623a47fbb64712642aece5a19f27390dcd9982e0e73d7a1e4109"
+      },
+      {
+        "name": "open_ended_cert",
+        "statement": {
+          "schema": "ck-key-cert/v1",
+          "scope": "cortexkit",
+          "public_key": "7662087c5e278d4105c230eaf461e494e87f057d6db3fdee3d032e0328476dae",
+          "valid_from": "2027-03-01T00:00:00Z",
+          "valid_until": null
+        },
+        "canonical": "{\"public_key\":\"7662087c5e278d4105c230eaf461e494e87f057d6db3fdee3d032e0328476dae\",\"schema\":\"ck-key-cert/v1\",\"scope\":\"cortexkit\",\"valid_from\":\"2027-03-01T00:00:00Z\",\"valid_until\":null}",
+        "canonical_sha256": "9dcee077bd88d849d5ddc7b18b80fc2500d9d5de45e2dfa3ca2bd7ed7be22b24",
+        "signing_input_hex": "636b2d6b65792d636572742f7631007b227075626c69635f6b6579223a2237363632303837633565323738643431303563323330656166343631653439346538376630353764366462336664656533643033326530333238343736646165222c22736368656d61223a22636b2d6b65792d636572742f7631222c2273636f7065223a22636f727465786b6974222c2276616c69645f66726f6d223a22323032372d30332d30315430303a30303a30305a222c2276616c69645f756e74696c223a6e756c6c7d",
+        "signature": "312ecfed922ab42b9f1a678010db73e74afe7cb990c79b5876ae7a1b9e0e86b5291f6597fbc4adab07bfa5c143f7bb6709567fbb03ae1ae5da59ee5053591d08"
+      }
+    ],
+    "cases": [
+      {
+        "name": "bounded_cert",
+        "note": "",
+        "served": {
+          "statement": {
+            "schema": "ck-key-cert/v1",
+            "scope": "cortexkit",
+            "public_key": "27543dcc1ba216946c1ea38d2d2adc2d47a5024c0bd4abd053fe6ea477a66dd4",
+            "valid_from": "2026-10-01T00:00:00Z",
+            "valid_until": "2027-04-01T00:00:00Z"
+          },
+          "signature": "56153fad23b8c71a1d151b3d7e219bb08a06d75fcdb1caa30f2fe79806eb2168abd22377379c623a47fbb64712642aece5a19f27390dcd9982e0e73d7a1e4109"
+        },
+        "expect": {
+          "ok": true,
+          "result": "certified"
+        }
+      },
+      {
+        "name": "open_ended_cert",
+        "note": "valid_until null: valid until a later cert or a revocation",
+        "served": {
+          "statement": {
+            "schema": "ck-key-cert/v1",
+            "scope": "cortexkit",
+            "public_key": "7662087c5e278d4105c230eaf461e494e87f057d6db3fdee3d032e0328476dae",
+            "valid_from": "2027-03-01T00:00:00Z",
+            "valid_until": null
+          },
+          "signature": "312ecfed922ab42b9f1a678010db73e74afe7cb990c79b5876ae7a1b9e0e86b5291f6597fbc4adab07bfa5c143f7bb6709567fbb03ae1ae5da59ee5053591d08"
+        },
+        "expect": {
+          "ok": true,
+          "result": "certified"
+        }
+      },
+      {
+        "name": "self_certified",
+        "note": "signed by the certified key itself",
+        "served": {
+          "statement": {
+            "schema": "ck-key-cert/v1",
+            "scope": "cortexkit",
+            "public_key": "27543dcc1ba216946c1ea38d2d2adc2d47a5024c0bd4abd053fe6ea477a66dd4",
+            "valid_from": "2026-10-01T00:00:00Z",
+            "valid_until": "2027-04-01T00:00:00Z"
+          },
+          "signature": "1739ced4f99383f4d70843ac51c495b7bdec0581a65737aba87193fcbf5f37196efa9a45d11fde48edfe1ea33883b6272a6c095de09c0a25b8a947f59a56e405"
+        },
+        "expect": {
+          "ok": false,
+          "code": "signature_invalid"
+        }
+      },
+      {
+        "name": "signed_by_registry_key",
+        "note": "the registry can never make a key trusted",
+        "served": {
+          "statement": {
+            "schema": "ck-key-cert/v1",
+            "scope": "cortexkit",
+            "public_key": "27543dcc1ba216946c1ea38d2d2adc2d47a5024c0bd4abd053fe6ea477a66dd4",
+            "valid_from": "2026-10-01T00:00:00Z",
+            "valid_until": "2027-04-01T00:00:00Z"
+          },
+          "signature": "ca48961ee1714eb089caa3c2437b1a18946058f78bb69b22992e14beb65a23ae823cebf733b8dcb68654b5143df3ee72cbdcdbd8112646b942cbe7850916570a"
+        },
+        "expect": {
+          "ok": false,
+          "code": "signature_invalid"
+        }
+      },
+      {
+        "name": "signed_by_publisher_key",
+        "note": "",
+        "served": {
+          "statement": {
+            "schema": "ck-key-cert/v1",
+            "scope": "cortexkit",
+            "public_key": "27543dcc1ba216946c1ea38d2d2adc2d47a5024c0bd4abd053fe6ea477a66dd4",
+            "valid_from": "2026-10-01T00:00:00Z",
+            "valid_until": "2027-04-01T00:00:00Z"
+          },
+          "signature": "e67c79b7ec822e05bbf5bc0fefe67334f49d5a4f2bd8cac791ec44ec46b9c016aa09588d82066fec62104e3f6009e7a963d98f2cb56150468f7654d2c4cb6907"
+        },
+        "expect": {
+          "ok": false,
+          "code": "signature_invalid"
+        }
+      },
+      {
+        "name": "record_domain_tag",
+        "note": "root signature under ck-record/v1",
+        "served": {
+          "statement": {
+            "schema": "ck-key-cert/v1",
+            "scope": "cortexkit",
+            "public_key": "27543dcc1ba216946c1ea38d2d2adc2d47a5024c0bd4abd053fe6ea477a66dd4",
+            "valid_from": "2026-10-01T00:00:00Z",
+            "valid_until": "2027-04-01T00:00:00Z"
+          },
+          "signature": "c2b347e7fc7ba888390797d02d1a13e43572abe1f3083263d52c803f416566af89d01d24efdb8506de06438109be76f9fa0ab8d607de58f1bdab7abc1c30ca05"
+        },
+        "expect": {
+          "ok": false,
+          "code": "signature_invalid"
+        }
+      },
+      {
+        "name": "other_scope",
+        "note": "the root certifies @cortexkit keys only",
+        "served": {
+          "statement": {
+            "schema": "ck-key-cert/v1",
+            "scope": "example",
+            "public_key": "27543dcc1ba216946c1ea38d2d2adc2d47a5024c0bd4abd053fe6ea477a66dd4",
+            "valid_from": "2026-10-01T00:00:00Z",
+            "valid_until": "2027-04-01T00:00:00Z"
+          },
+          "signature": "2ae252fa7a13bdbd21b3606fc021fa677a28d1e517681649b2e2b196d528ad15dd2f840087932e660cdc186932cff617c864bd06ab41fcf0dc29bd1e303e990a"
+        },
+        "expect": {
+          "ok": false,
+          "code": "statement_invalid",
+          "field": "scope"
+        }
+      },
+      {
+        "name": "empty_window",
+        "note": "valid_until must be later than valid_from",
+        "served": {
+          "statement": {
+            "schema": "ck-key-cert/v1",
+            "scope": "cortexkit",
+            "public_key": "27543dcc1ba216946c1ea38d2d2adc2d47a5024c0bd4abd053fe6ea477a66dd4",
+            "valid_from": "2026-10-01T00:00:00Z",
+            "valid_until": "2026-10-01T00:00:00Z"
+          },
+          "signature": "bdbaeddbcf637e0efc47c32d9721cff86bea5849e07431dbef92bb0f69167f5692661b357be50d7523105dd102856f91cb3fb9982c4870785bcebf4d615e5d07"
+        },
+        "expect": {
+          "ok": false,
+          "code": "statement_invalid",
+          "field": "valid_until"
+        }
+      },
+      {
+        "name": "uppercase_public_key",
+        "note": "",
+        "served": {
+          "statement": {
+            "schema": "ck-key-cert/v1",
+            "scope": "cortexkit",
+            "public_key": "27543DCC1BA216946C1EA38D2D2ADC2D47A5024C0BD4ABD053FE6EA477A66DD4",
+            "valid_from": "2026-10-01T00:00:00Z",
+            "valid_until": "2027-04-01T00:00:00Z"
+          },
+          "signature": "66769d5cbdc5b334dd659fcfcd691a0fb129719c4990aff1277ec57a18951556d9cbc868d0ecf310107ef4dd39198666dae48b2f1a0a3b4772d99c6f8081d302"
+        },
+        "expect": {
+          "ok": false,
+          "code": "statement_invalid",
+          "field": "public_key"
+        }
+      },
+      {
+        "name": "unknown_field",
+        "note": "",
+        "served": {
+          "statement": {
+            "schema": "ck-key-cert/v1",
+            "scope": "cortexkit",
+            "public_key": "27543dcc1ba216946c1ea38d2d2adc2d47a5024c0bd4abd053fe6ea477a66dd4",
+            "valid_from": "2026-10-01T00:00:00Z",
+            "valid_until": "2027-04-01T00:00:00Z",
+            "name": "@cortexkit/swe-head"
+          },
+          "signature": "e2a359f2ed3be2d1494bff74b2deb38be62e8da9919b1d8c4b16648c8028e78e4b471881aeb299434a39abc92586d203e4292b01dc48852041a99cdf26cee909"
+        },
+        "expect": {
+          "ok": false,
+          "code": "statement_invalid",
+          "field": "name"
+        }
+      }
+    ],
+    "window_cases": [
+      {
+        "cert": "bounded_cert",
+        "published_at": "2026-09-30T23:59:59Z",
+        "expect": {
+          "ok": false,
+          "code": "key_not_valid"
+        }
+      },
+      {
+        "cert": "bounded_cert",
+        "published_at": "2026-10-01T00:00:00Z",
+        "expect": {
+          "ok": true
+        }
+      },
+      {
+        "cert": "bounded_cert",
+        "published_at": "2027-03-31T23:59:59Z",
+        "expect": {
+          "ok": true
+        }
+      },
+      {
+        "cert": "bounded_cert",
+        "published_at": "2027-04-01T00:00:00Z",
+        "expect": {
+          "ok": false,
+          "code": "key_not_valid"
+        }
+      },
+      {
+        "cert": "open_ended_cert",
+        "published_at": "2027-02-28T23:59:59Z",
+        "expect": {
+          "ok": false,
+          "code": "key_not_valid"
+        }
+      },
+      {
+        "cert": "open_ended_cert",
+        "published_at": "2030-01-01T00:00:00Z",
+        "expect": {
+          "ok": true
+        }
+      }
+    ]
+  },
+  "ck-status-request/v1": {
+    "fields": [
+      "schema",
+      "action",
+      "name",
+      "version",
+      "archive_sha256",
+      "reason",
+      "after_sequence"
+    ],
+    "served_as": "POST /v1/packages/{scope}/{name}/{version}/withdraw or /unwithdraw with body {statement, public_key, signature}",
+    "order": [
+      "statement_invalid",
+      "record_mismatch (action, name, version against the path)",
+      "signature_invalid",
+      "key_unknown / key_revoked / key_not_valid (a current key of the scope)",
+      "record_mismatch (archive_sha256)",
+      "status_sequence_conflict (after_sequence must equal the current sequence)",
+      "action_not_allowed (withdraw only from available, unwithdraw only from withdrawn)"
+    ],
+    "valid": [
+      {
+        "statement": {
+          "schema": "ck-status-request/v1",
+          "action": "withdraw",
+          "name": "@example/hello-skill",
+          "version": "1.0.0",
+          "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+          "reason": "The script prints the wrong greeting",
+          "after_sequence": 1
+        },
+        "canonical": "{\"action\":\"withdraw\",\"after_sequence\":1,\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"name\":\"@example/hello-skill\",\"reason\":\"The script prints the wrong greeting\",\"schema\":\"ck-status-request/v1\",\"version\":\"1.0.0\"}",
+        "canonical_sha256": "14d133277457a7d37d53e24848f19f692499a29e2a347893273569e5896a8fc5",
+        "signing_input_hex": "636b2d7374617475732d726571756573742f7631007b22616374696f6e223a227769746864726177222c2261667465725f73657175656e6365223a312c22617263686976655f736861323536223a2265323338646334316466663636313633323531386331323037353266336534643538313638616362333933666130636138663638383165373138653065333938222c226e616d65223a22406578616d706c652f68656c6c6f2d736b696c6c222c22726561736f6e223a2254686520736372697074207072696e7473207468652077726f6e67206772656574696e67222c22736368656d61223a22636b2d7374617475732d726571756573742f7631222c2276657273696f6e223a22312e302e30227d",
+        "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+        "signature": "b8c377b67be10b80762f00db0fd5339bf10122137545c8db03802cc5141baf31fb8f6323ec979086947db1df5329e1e080f55b6b2a3ef7c48d1f1ef8931ec607"
+      },
+      {
+        "statement": {
+          "schema": "ck-status-request/v1",
+          "action": "unwithdraw",
+          "name": "@example/hello-skill",
+          "version": "1.0.0",
+          "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+          "reason": null,
+          "after_sequence": 2
+        },
+        "canonical": "{\"action\":\"unwithdraw\",\"after_sequence\":2,\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"name\":\"@example/hello-skill\",\"reason\":null,\"schema\":\"ck-status-request/v1\",\"version\":\"1.0.0\"}",
+        "canonical_sha256": "3f59bbd28a7a53b5337cb8126b9a914cc1da8395315d6df16f9753209ff61a64",
+        "signing_input_hex": "636b2d7374617475732d726571756573742f7631007b22616374696f6e223a22756e7769746864726177222c2261667465725f73657175656e6365223a322c22617263686976655f736861323536223a2265323338646334316466663636313633323531386331323037353266336534643538313638616362333933666130636138663638383165373138653065333938222c226e616d65223a22406578616d706c652f68656c6c6f2d736b696c6c222c22726561736f6e223a6e756c6c2c22736368656d61223a22636b2d7374617475732d726571756573742f7631222c2276657273696f6e223a22312e302e30227d",
+        "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+        "signature": "d264233c0f01fcdd2e81b130fe28ac56c96d785cbe6a31b23a147cdd13db3ef8183bf84d878fdbfd9aaa9a26b041d78d51217b2c742897a70ce65a4e0da8e106"
+      }
+    ],
+    "cases": [
+      {
+        "name": "withdraw",
+        "note": "",
+        "path": {
+          "action": "withdraw",
+          "name": "@example/hello-skill",
+          "version": "1.0.0"
+        },
+        "request": {
+          "statement": {
+            "schema": "ck-status-request/v1",
+            "action": "withdraw",
+            "name": "@example/hello-skill",
+            "version": "1.0.0",
+            "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+            "reason": "The script prints the wrong greeting",
+            "after_sequence": 1
+          },
+          "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+          "signature": "b8c377b67be10b80762f00db0fd5339bf10122137545c8db03802cc5141baf31fb8f6323ec979086947db1df5329e1e080f55b6b2a3ef7c48d1f1ef8931ec607"
+        },
+        "current": {
+          "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+          "sequence": 1,
+          "state": "available"
+        },
+        "scope_keys": [
+          {
+            "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_until": null,
+            "revocation": null
+          }
+        ],
+        "expect": {
+          "ok": true,
+          "result": "applied",
+          "next": {
+            "sequence": 2,
+            "state": "withdrawn"
+          }
+        }
+      },
+      {
+        "name": "unwithdraw",
+        "note": "reason may be null when reversing a withdrawal",
+        "path": {
+          "action": "unwithdraw",
+          "name": "@example/hello-skill",
+          "version": "1.0.0"
+        },
+        "request": {
+          "statement": {
+            "schema": "ck-status-request/v1",
+            "action": "unwithdraw",
+            "name": "@example/hello-skill",
+            "version": "1.0.0",
+            "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+            "reason": null,
+            "after_sequence": 2
+          },
+          "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+          "signature": "d264233c0f01fcdd2e81b130fe28ac56c96d785cbe6a31b23a147cdd13db3ef8183bf84d878fdbfd9aaa9a26b041d78d51217b2c742897a70ce65a4e0da8e106"
+        },
+        "current": {
+          "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+          "sequence": 2,
+          "state": "withdrawn"
+        },
+        "scope_keys": [
+          {
+            "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_until": null,
+            "revocation": null
+          }
+        ],
+        "expect": {
+          "ok": true,
+          "result": "applied",
+          "next": {
+            "sequence": 3,
+            "state": "available"
+          }
+        }
+      },
+      {
+        "name": "replayed_withdraw",
+        "note": "the same signed request after it applied",
+        "path": {
+          "action": "withdraw",
+          "name": "@example/hello-skill",
+          "version": "1.0.0"
+        },
+        "request": {
+          "statement": {
+            "schema": "ck-status-request/v1",
+            "action": "withdraw",
+            "name": "@example/hello-skill",
+            "version": "1.0.0",
+            "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+            "reason": "The script prints the wrong greeting",
+            "after_sequence": 1
+          },
+          "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+          "signature": "b8c377b67be10b80762f00db0fd5339bf10122137545c8db03802cc5141baf31fb8f6323ec979086947db1df5329e1e080f55b6b2a3ef7c48d1f1ef8931ec607"
+        },
+        "current": {
+          "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+          "sequence": 2,
+          "state": "withdrawn"
+        },
+        "scope_keys": [
+          {
+            "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_until": null,
+            "revocation": null
+          }
+        ],
+        "expect": {
+          "ok": false,
+          "code": "status_sequence_conflict"
+        }
+      },
+      {
+        "name": "replayed_after_reversal",
+        "note": "the state would allow a withdrawal again, but the sequence has moved on",
+        "path": {
+          "action": "withdraw",
+          "name": "@example/hello-skill",
+          "version": "1.0.0"
+        },
+        "request": {
+          "statement": {
+            "schema": "ck-status-request/v1",
+            "action": "withdraw",
+            "name": "@example/hello-skill",
+            "version": "1.0.0",
+            "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+            "reason": "The script prints the wrong greeting",
+            "after_sequence": 1
+          },
+          "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+          "signature": "b8c377b67be10b80762f00db0fd5339bf10122137545c8db03802cc5141baf31fb8f6323ec979086947db1df5329e1e080f55b6b2a3ef7c48d1f1ef8931ec607"
+        },
+        "current": {
+          "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+          "sequence": 3,
+          "state": "available"
+        },
+        "scope_keys": [
+          {
+            "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_until": null,
+            "revocation": null
+          }
+        ],
+        "expect": {
+          "ok": false,
+          "code": "status_sequence_conflict"
+        }
+      },
+      {
+        "name": "after_sequence_ahead",
+        "note": "",
+        "path": {
+          "action": "withdraw",
+          "name": "@example/hello-skill",
+          "version": "1.0.0"
+        },
+        "request": {
+          "statement": {
+            "schema": "ck-status-request/v1",
+            "action": "withdraw",
+            "name": "@example/hello-skill",
+            "version": "1.0.0",
+            "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+            "reason": "The script prints the wrong greeting",
+            "after_sequence": 5
+          },
+          "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+          "signature": "86b10c4d4371a3b5715abb7e583da5d3a5beeaa159872b787c4d29945b41744515acc9dd986111baec9459055795a5afab8567f7056bcffe524a3ee12a1c1f03"
+        },
+        "current": {
+          "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+          "sequence": 1,
+          "state": "available"
+        },
+        "scope_keys": [
+          {
+            "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_until": null,
+            "revocation": null
+          }
+        ],
+        "expect": {
+          "ok": false,
+          "code": "status_sequence_conflict"
+        }
+      },
+      {
+        "name": "withdraw_withdrawn",
+        "note": "",
+        "path": {
+          "action": "withdraw",
+          "name": "@example/hello-skill",
+          "version": "1.0.0"
+        },
+        "request": {
+          "statement": {
+            "schema": "ck-status-request/v1",
+            "action": "withdraw",
+            "name": "@example/hello-skill",
+            "version": "1.0.0",
+            "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+            "reason": "The script prints the wrong greeting",
+            "after_sequence": 2
+          },
+          "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+          "signature": "cd83e6c1f7eeda5c2b90a925cdd7b803d2b38607cc9e666283e70ea9f771ee99e2c52fa126b1c4439c9cfcac2494db47809707f406082667b4dd71e71e50380a"
+        },
+        "current": {
+          "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+          "sequence": 2,
+          "state": "withdrawn"
+        },
+        "scope_keys": [
+          {
+            "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_until": null,
+            "revocation": null
+          }
+        ],
+        "expect": {
+          "ok": false,
+          "code": "action_not_allowed"
+        }
+      },
+      {
+        "name": "unwithdraw_available",
+        "note": "",
+        "path": {
+          "action": "unwithdraw",
+          "name": "@example/hello-skill",
+          "version": "1.0.0"
+        },
+        "request": {
+          "statement": {
+            "schema": "ck-status-request/v1",
+            "action": "unwithdraw",
+            "name": "@example/hello-skill",
+            "version": "1.0.0",
+            "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+            "reason": null,
+            "after_sequence": 1
+          },
+          "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+          "signature": "f92bbe717683d0d018c1a5c46ca552c6ee22b67f1cad15afadf6359aee4706bcb3dde35a187da51118b8ab72eb190bb966b9e6a5a7c46c462cd83466b02ec506"
+        },
+        "current": {
+          "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+          "sequence": 1,
+          "state": "available"
+        },
+        "scope_keys": [
+          {
+            "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_until": null,
+            "revocation": null
+          }
+        ],
+        "expect": {
+          "ok": false,
+          "code": "action_not_allowed"
+        }
+      },
+      {
+        "name": "withdraw_tombstoned",
+        "note": "",
+        "path": {
+          "action": "withdraw",
+          "name": "@example/hello-skill",
+          "version": "1.0.0"
+        },
+        "request": {
+          "statement": {
+            "schema": "ck-status-request/v1",
+            "action": "withdraw",
+            "name": "@example/hello-skill",
+            "version": "1.0.0",
+            "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+            "reason": "The script prints the wrong greeting",
+            "after_sequence": 4
+          },
+          "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+          "signature": "6fb16487425c7cb74b3a088f958c23ce66d409332b892bb1ed7011ee4143eafc36528b2da6610c1aace85beaac2eb3e1e6d42dbdcdfce4e0ff8e8226666a5405"
+        },
+        "current": {
+          "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+          "sequence": 4,
+          "state": "tombstoned"
+        },
+        "scope_keys": [
+          {
+            "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_until": null,
+            "revocation": null
+          }
+        ],
+        "expect": {
+          "ok": false,
+          "code": "action_not_allowed"
+        }
+      },
+      {
+        "name": "withdraw_without_reason",
+        "note": "",
+        "path": {
+          "action": "withdraw",
+          "name": "@example/hello-skill",
+          "version": "1.0.0"
+        },
+        "request": {
+          "statement": {
+            "schema": "ck-status-request/v1",
+            "action": "withdraw",
+            "name": "@example/hello-skill",
+            "version": "1.0.0",
+            "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+            "reason": null,
+            "after_sequence": 1
+          },
+          "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+          "signature": "5116f47058eb6538a7b2d8fd644be34aef7e902bcea5196fb1463ab8e74d3602ae317fd1b80752134bb454e9315fa4b9b78e7763d6e7db0ee59e58164dcd230e"
+        },
+        "current": {
+          "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+          "sequence": 1,
+          "state": "available"
+        },
+        "scope_keys": [
+          {
+            "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_until": null,
+            "revocation": null
+          }
+        ],
+        "expect": {
+          "ok": false,
+          "code": "statement_invalid",
+          "field": "reason"
+        }
+      },
+      {
+        "name": "unknown_action",
+        "note": "",
+        "path": {
+          "action": "withdraw",
+          "name": "@example/hello-skill",
+          "version": "1.0.0"
+        },
+        "request": {
+          "statement": {
+            "schema": "ck-status-request/v1",
+            "action": "delete",
+            "name": "@example/hello-skill",
+            "version": "1.0.0",
+            "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+            "reason": "The script prints the wrong greeting",
+            "after_sequence": 1
+          },
+          "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+          "signature": "7527db3db0381ff2043d049aecbcdf7b06589f94a712e6aca458c110e831c1eddb1b49d3712e4c96027dbdf4f66d900124871e4f637485a296cd57e4eee0170f"
+        },
+        "current": {
+          "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+          "sequence": 1,
+          "state": "available"
+        },
+        "scope_keys": [
+          {
+            "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_until": null,
+            "revocation": null
+          }
+        ],
+        "expect": {
+          "ok": false,
+          "code": "statement_invalid",
+          "field": "action"
+        }
+      },
+      {
+        "name": "after_sequence_zero",
+        "note": "",
+        "path": {
+          "action": "withdraw",
+          "name": "@example/hello-skill",
+          "version": "1.0.0"
+        },
+        "request": {
+          "statement": {
+            "schema": "ck-status-request/v1",
+            "action": "withdraw",
+            "name": "@example/hello-skill",
+            "version": "1.0.0",
+            "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+            "reason": "The script prints the wrong greeting",
+            "after_sequence": 0
+          },
+          "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+          "signature": "98955cc0b5fe823582db86f8f57b97cfc80e6bbdbf046b958cc17d7949db54db85baab2a41bce5954de8c1d172fc14ba678e3ffef1d7bb99039cd05d64e2720a"
+        },
+        "current": {
+          "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+          "sequence": 1,
+          "state": "available"
+        },
+        "scope_keys": [
+          {
+            "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_until": null,
+            "revocation": null
+          }
+        ],
+        "expect": {
+          "ok": false,
+          "code": "statement_invalid",
+          "field": "after_sequence"
+        }
+      },
+      {
+        "name": "posted_to_other_path",
+        "note": "a withdraw statement sent to /unwithdraw",
+        "path": {
+          "action": "unwithdraw",
+          "name": "@example/hello-skill",
+          "version": "1.0.0"
+        },
+        "request": {
+          "statement": {
+            "schema": "ck-status-request/v1",
+            "action": "withdraw",
+            "name": "@example/hello-skill",
+            "version": "1.0.0",
+            "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+            "reason": "The script prints the wrong greeting",
+            "after_sequence": 1
+          },
+          "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+          "signature": "b8c377b67be10b80762f00db0fd5339bf10122137545c8db03802cc5141baf31fb8f6323ec979086947db1df5329e1e080f55b6b2a3ef7c48d1f1ef8931ec607"
+        },
+        "current": {
+          "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+          "sequence": 1,
+          "state": "available"
+        },
+        "scope_keys": [
+          {
+            "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_until": null,
+            "revocation": null
+          }
+        ],
+        "expect": {
+          "ok": false,
+          "code": "record_mismatch",
+          "field": "action"
+        }
+      },
+      {
+        "name": "bit_flip",
+        "note": "",
+        "path": {
+          "action": "withdraw",
+          "name": "@example/hello-skill",
+          "version": "1.0.0"
+        },
+        "request": {
+          "statement": {
+            "schema": "ck-status-request/v1",
+            "action": "withdraw",
+            "name": "@example/hello-skill",
+            "version": "1.0.0",
+            "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+            "reason": "The script prints the wrong greeting",
+            "after_sequence": 1
+          },
+          "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+          "signature": "b9c377b67be10b80762f00db0fd5339bf10122137545c8db03802cc5141baf31fb8f6323ec979086947db1df5329e1e080f55b6b2a3ef7c48d1f1ef8931ec607"
+        },
+        "current": {
+          "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+          "sequence": 1,
+          "state": "available"
+        },
+        "scope_keys": [
+          {
+            "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_until": null,
+            "revocation": null
+          }
+        ],
+        "expect": {
+          "ok": false,
+          "code": "signature_invalid"
+        }
+      },
+      {
+        "name": "record_domain_tag",
+        "note": "signed under ck-record/v1",
+        "path": {
+          "action": "withdraw",
+          "name": "@example/hello-skill",
+          "version": "1.0.0"
+        },
+        "request": {
+          "statement": {
+            "schema": "ck-status-request/v1",
+            "action": "withdraw",
+            "name": "@example/hello-skill",
+            "version": "1.0.0",
+            "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+            "reason": "The script prints the wrong greeting",
+            "after_sequence": 1
+          },
+          "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+          "signature": "85f58f17bfbfb4e2a42e754a40bd8fb3182534614e91dc9c04e33edc3b148d3a92e239199f5b410b02fa253878448696843de17651a9ffc723e3be3fdabd1f0e"
+        },
+        "current": {
+          "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+          "sequence": 1,
+          "state": "available"
+        },
+        "scope_keys": [
+          {
+            "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_until": null,
+            "revocation": null
+          }
+        ],
+        "expect": {
+          "ok": false,
+          "code": "signature_invalid"
+        }
+      },
+      {
+        "name": "key_outside_scope",
+        "note": "valid signature by a key not in @example's set",
+        "path": {
+          "action": "withdraw",
+          "name": "@example/hello-skill",
+          "version": "1.0.0"
+        },
+        "request": {
+          "statement": {
+            "schema": "ck-status-request/v1",
+            "action": "withdraw",
+            "name": "@example/hello-skill",
+            "version": "1.0.0",
+            "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+            "reason": "The script prints the wrong greeting",
+            "after_sequence": 1
+          },
+          "public_key": "9dfb817489437ec5ed58311f6ffc4bc4f2cd3d5c47721142209797f7c9a235d9",
+          "signature": "f1c659f5f5124a57ba88187453fdc7820f18ebac2e9952c1d6642246b08b68f5d2997a5ee99d95fdc02a89096b10bf4ef422f198718361f7513b758fb0d75207"
+        },
+        "current": {
+          "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+          "sequence": 1,
+          "state": "available"
+        },
+        "scope_keys": [
+          {
+            "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_until": null,
+            "revocation": null
+          }
+        ],
+        "expect": {
+          "ok": false,
+          "code": "key_unknown"
+        }
+      },
+      {
+        "name": "revoked_key",
+        "note": "",
+        "path": {
+          "action": "withdraw",
+          "name": "@example/hello-skill",
+          "version": "1.0.0"
+        },
+        "request": {
+          "statement": {
+            "schema": "ck-status-request/v1",
+            "action": "withdraw",
+            "name": "@example/hello-skill",
+            "version": "1.0.0",
+            "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+            "reason": "The script prints the wrong greeting",
+            "after_sequence": 1
+          },
+          "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+          "signature": "b8c377b67be10b80762f00db0fd5339bf10122137545c8db03802cc5141baf31fb8f6323ec979086947db1df5329e1e080f55b6b2a3ef7c48d1f1ef8931ec607"
+        },
+        "current": {
+          "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+          "sequence": 1,
+          "state": "available"
+        },
+        "scope_keys": [
+          {
+            "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_until": null,
+            "revocation": {
+              "reason": "key compromise",
+              "compromise_from": "2026-10-20T00:00:00Z"
+            }
+          }
+        ],
+        "expect": {
+          "ok": false,
+          "code": "key_revoked"
+        }
+      },
+      {
+        "name": "retired_key",
+        "note": "a rotated-out key can no longer act for the scope",
+        "path": {
+          "action": "withdraw",
+          "name": "@example/hello-skill",
+          "version": "1.0.0"
+        },
+        "request": {
+          "statement": {
+            "schema": "ck-status-request/v1",
+            "action": "withdraw",
+            "name": "@example/hello-skill",
+            "version": "1.0.0",
+            "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+            "reason": "The script prints the wrong greeting",
+            "after_sequence": 1
+          },
+          "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+          "signature": "b8c377b67be10b80762f00db0fd5339bf10122137545c8db03802cc5141baf31fb8f6323ec979086947db1df5329e1e080f55b6b2a3ef7c48d1f1ef8931ec607"
+        },
+        "current": {
+          "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+          "sequence": 1,
+          "state": "available"
+        },
+        "scope_keys": [
+          {
+            "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_until": "2026-06-01T00:00:00Z",
+            "revocation": null
+          },
+          {
+            "public_key": "20bd8538eefc04b377f08fc55d923f0807579f0912058005a712ec1be5cf1a19",
+            "valid_from": "2026-06-01T00:00:00Z",
+            "valid_until": null,
+            "revocation": null
+          }
+        ],
+        "expect": {
+          "ok": false,
+          "code": "key_not_valid"
+        }
+      },
+      {
+        "name": "other_archive",
+        "note": "",
+        "path": {
+          "action": "withdraw",
+          "name": "@example/hello-skill",
+          "version": "1.0.0"
+        },
+        "request": {
+          "statement": {
+            "schema": "ck-status-request/v1",
+            "action": "withdraw",
+            "name": "@example/hello-skill",
+            "version": "1.0.0",
+            "archive_sha256": "89d6bee3b0bdffaf7646d000e4d98f60181df12e4894159b7cdba5e3ed6a4639",
+            "reason": "The script prints the wrong greeting",
+            "after_sequence": 1
+          },
+          "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+          "signature": "e95a30da3188e49fde744c04c7eedd9ceb864bc46ccdc7f24b72d0f71e5e4a6f03ba34faca76c231289c7b4bcb74641b1aab59ceef12bd963aa65aadceb05208"
+        },
+        "current": {
+          "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+          "sequence": 1,
+          "state": "available"
+        },
+        "scope_keys": [
+          {
+            "public_key": "0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_until": null,
+            "revocation": null
+          }
+        ],
+        "expect": {
+          "ok": false,
+          "code": "record_mismatch",
+          "field": "archive_sha256"
+        }
+      }
+    ]
+  }
+}

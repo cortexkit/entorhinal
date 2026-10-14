@@ -5181,3 +5181,76 @@ target = "--bin ck-entorhinal"
 select = "expected"
 expect_red = ["tool_provider::writes::tests::retry_refuses_saved_plan_without_target_label_as_consent_lost"]
 only = false
+
+# Pure CK catalog v1: each guard is replayed against the native Rust test target.
+[[control]]
+id = "catalog-duplicate-json-key"
+guards = "Signed JSON refuses duplicate object keys recursively before signature verification"
+file = "crates/entorhinal-catalog/src/jcs.rs"
+old = 'if m.contains_key(&k) {'
+new = 'if false && m.contains_key(&k) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-catalog/tests/guards.rs"
+runner = "cargo"
+package = "entorhinal-catalog"
+target = "--test guards"
+expect_red = ["duplicate_keys_are_refused"]
+
+[[control]]
+id = "catalog-tar-checksum"
+guards = "A tar header with altered metadata is refused before trusting its contents"
+file = "crates/entorhinal-catalog/src/archive.rs"
+old = 'if octal(&h[148..156]) != Some(sum) {'
+new = 'if false && octal(&h[148..156]) != Some(sum) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-catalog/tests/guards.rs"
+runner = "cargo"
+package = "entorhinal-catalog"
+target = "--test guards"
+expect_red = ["tar_header_checksum_is_verified"]
+
+[[control]]
+id = "catalog-status-key-epoch"
+guards = "Higher-sequence status cannot regress to an earlier registry signer epoch"
+file = "crates/entorhinal-catalog/src/status.rs"
+old = 'if index < prior.signer_index {'
+new = 'if false && index < prior.signer_index { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-catalog/tests/guards.rs"
+runner = "cargo"
+package = "entorhinal-catalog"
+target = "--test guards"
+expect_red = ["status_key_epoch_cannot_regress"]
+
+[[control]]
+id = "catalog-status-key-not-valid"
+guards = "The earliest later registry key retires every earlier key even after a future announcement"
+file = "crates/entorhinal-catalog/src/status.rs"
+old = 'if retirement.is_some_and(|at| s.changed_at.as_str() >= at) {'
+new = 'if false && retirement.is_some_and(|at| s.changed_at.as_str() >= at) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-catalog/tests/guards.rs"
+runner = "cargo"
+package = "entorhinal-catalog"
+target = "--test guards"
+expect_red = ["retired_status_keys_are_not_valid"]
+
+[[control]]
+id = "catalog-record-refusal-order"
+guards = "Bad signatures refuse before trust and cross-byte checks in record verification"
+file = "crates/entorhinal-catalog/src/record.rs"
+old = 'if !verify_signature(pk, "ck-record/v1", &canonical, sig) {'
+new = 'if false && !verify_signature(pk, "ck-record/v1", &canonical, sig) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-catalog/tests/guards.rs"
+runner = "cargo"
+package = "entorhinal-catalog"
+target = "--test guards"
+expect_red = ["record_refusal_order_is_preserved"]
+
+[[control]]
+id = "catalog-resolver-determinism"
+guards = "Resolver selects the highest eligible version independent of registry array ordering"
+file = "crates/entorhinal-catalog/src/resolver.rs"
+old = 'candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.version.cmp(&b.0.version)));'
+new = '// NON-VACUITY BREAK: retain registry array order instead of semver order'
+test_file = "crates/entorhinal-catalog/tests/guards.rs"
+runner = "cargo"
+package = "entorhinal-catalog"
+target = "--test guards"
+expect_red = ["resolver_is_deterministic"]

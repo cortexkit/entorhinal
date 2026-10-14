@@ -1,0 +1,1691 @@
+{
+  "schema": "ck-catalog-v1/resolver",
+  "rules": {
+    "versions": "SemVer 2.0.0 without build metadata",
+    "capability_token": "^cap\\/[a-z0-9]+(-[a-z0-9]+)*(\\.[a-z0-9]+(-[a-z0-9]+)*)?@[1-9][0-9]*$",
+    "range_grammar": "range := set (\"||\" set)*; set := comparator (whitespace comparator)*; comparator := \"*\" | op? partial; op := ^ ~ >= <= > < =; partial := N | N.N | N.N.N | N.N.N-prerelease",
+    "prerelease": "a prerelease version satisfies a range only when one ||-set is exactly that version (bare or =); a prerelease in any other comparator is range_invalid",
+    "eligibility": "status available, and every requires.capabilities token is declared by a local module (exact string match)",
+    "algorithm": "in passes: walk breadth-first from the root, dependencies in name order; pick each package once per pass as the highest eligible version satisfying every range recorded for it so far, then record that version's requires.packages ranges (keyed by requester name@version). Stop after a pass that records nothing new. Recorded ranges are never removed. Then check cycles, then body references.",
+    "refusal_detail": "ranges are listed sorted by requested_by; '(root)' is the spec's own range; other requesters are name@version",
+    "picks_order": "picks and moves are objects keyed by package name in ascending order"
+  },
+  "ranges": [
+    {
+      "range": "^1",
+      "version": "1.0.0",
+      "satisfies": true
+    },
+    {
+      "range": "^1",
+      "version": "1.9.3",
+      "satisfies": true
+    },
+    {
+      "range": "^1",
+      "version": "2.0.0",
+      "satisfies": false
+    },
+    {
+      "range": "^1",
+      "version": "0.9.0",
+      "satisfies": false
+    },
+    {
+      "range": "^1.2",
+      "version": "1.2.0",
+      "satisfies": true
+    },
+    {
+      "range": "^1.2",
+      "version": "1.1.9",
+      "satisfies": false
+    },
+    {
+      "range": "^1.2.3",
+      "version": "1.2.3",
+      "satisfies": true
+    },
+    {
+      "range": "^1.2.3",
+      "version": "1.2.2",
+      "satisfies": false
+    },
+    {
+      "range": "^1.2.3",
+      "version": "1.99.0",
+      "satisfies": true
+    },
+    {
+      "range": "^0.2.3",
+      "version": "0.2.9",
+      "satisfies": true
+    },
+    {
+      "range": "^0.2.3",
+      "version": "0.3.0",
+      "satisfies": false
+    },
+    {
+      "range": "^0.0.3",
+      "version": "0.0.3",
+      "satisfies": true
+    },
+    {
+      "range": "^0.0.3",
+      "version": "0.0.4",
+      "satisfies": false
+    },
+    {
+      "range": "^0.0",
+      "version": "0.0.9",
+      "satisfies": true
+    },
+    {
+      "range": "^0.0",
+      "version": "0.1.0",
+      "satisfies": false
+    },
+    {
+      "range": "^0",
+      "version": "0.9.9",
+      "satisfies": true
+    },
+    {
+      "range": "^0",
+      "version": "1.0.0",
+      "satisfies": false
+    },
+    {
+      "range": "~1",
+      "version": "1.9.0",
+      "satisfies": true
+    },
+    {
+      "range": "~1.2",
+      "version": "1.2.9",
+      "satisfies": true
+    },
+    {
+      "range": "~1.2",
+      "version": "1.3.0",
+      "satisfies": false
+    },
+    {
+      "range": "~1.2.3",
+      "version": "1.2.2",
+      "satisfies": false
+    },
+    {
+      "range": "~1.2.3",
+      "version": "1.2.9",
+      "satisfies": true
+    },
+    {
+      "range": "1",
+      "version": "1.5.0",
+      "satisfies": true
+    },
+    {
+      "range": "1.2",
+      "version": "1.2.7",
+      "satisfies": true
+    },
+    {
+      "range": "1.2",
+      "version": "1.3.0",
+      "satisfies": false
+    },
+    {
+      "range": "1.2.3",
+      "version": "1.2.3",
+      "satisfies": true
+    },
+    {
+      "range": "1.2.3",
+      "version": "1.2.4",
+      "satisfies": false
+    },
+    {
+      "range": "=1.2.3",
+      "version": "1.2.3",
+      "satisfies": true
+    },
+    {
+      "range": "=1.2",
+      "version": "1.2.5",
+      "satisfies": true
+    },
+    {
+      "range": ">=1.2.3",
+      "version": "2.0.0",
+      "satisfies": true
+    },
+    {
+      "range": ">1.2.3",
+      "version": "1.2.3",
+      "satisfies": false
+    },
+    {
+      "range": ">1.2",
+      "version": "1.2.9",
+      "satisfies": false
+    },
+    {
+      "range": ">1.2",
+      "version": "1.3.0",
+      "satisfies": true
+    },
+    {
+      "range": "<1.2",
+      "version": "1.1.9",
+      "satisfies": true
+    },
+    {
+      "range": "<1.2",
+      "version": "1.2.0",
+      "satisfies": false
+    },
+    {
+      "range": "<=1.2",
+      "version": "1.2.9",
+      "satisfies": true
+    },
+    {
+      "range": "<=1.2",
+      "version": "1.3.0",
+      "satisfies": false
+    },
+    {
+      "range": "<=1.2.3",
+      "version": "1.2.3",
+      "satisfies": true
+    },
+    {
+      "range": "<=1.2.3",
+      "version": "1.2.4",
+      "satisfies": false
+    },
+    {
+      "range": ">=1.2.0 <1.4.0",
+      "version": "1.3.9",
+      "satisfies": true
+    },
+    {
+      "range": ">=1.2.0 <1.4.0",
+      "version": "1.4.0",
+      "satisfies": false
+    },
+    {
+      "range": "^1 || ^3",
+      "version": "3.1.0",
+      "satisfies": true
+    },
+    {
+      "range": "^1 || ^3",
+      "version": "2.0.0",
+      "satisfies": false
+    },
+    {
+      "range": "^1||^3",
+      "version": "1.0.0",
+      "satisfies": true
+    },
+    {
+      "range": "*",
+      "version": "5.0.0",
+      "satisfies": true
+    },
+    {
+      "range": "*",
+      "version": "0.0.0",
+      "satisfies": true
+    },
+    {
+      "range": "*",
+      "version": "1.0.0-beta.1",
+      "satisfies": false
+    },
+    {
+      "range": "^1",
+      "version": "1.3.0-beta.1",
+      "satisfies": false
+    },
+    {
+      "range": "<1.3.0",
+      "version": "1.3.0-beta.1",
+      "satisfies": false
+    },
+    {
+      "range": "1.3.0",
+      "version": "1.3.0-beta.1",
+      "satisfies": false
+    },
+    {
+      "range": "1.3.0-beta.1",
+      "version": "1.3.0-beta.1",
+      "satisfies": true
+    },
+    {
+      "range": "=1.3.0-beta.1",
+      "version": "1.3.0-beta.1",
+      "satisfies": true
+    },
+    {
+      "range": "1.3.0-beta.1",
+      "version": "1.3.0-beta.2",
+      "satisfies": false
+    },
+    {
+      "range": "1.3.0-beta.1",
+      "version": "1.3.0",
+      "satisfies": false
+    },
+    {
+      "range": "1.3.0-beta.1 || ^2",
+      "version": "1.3.0-beta.1",
+      "satisfies": true
+    },
+    {
+      "range": "1.3.0-beta.1 >=1.0.0",
+      "version": "1.3.0-beta.1",
+      "satisfies": false
+    }
+  ],
+  "invalid_ranges": [
+    {
+      "range": "",
+      "code": "range_invalid"
+    },
+    {
+      "range": " ",
+      "code": "range_invalid"
+    },
+    {
+      "range": "latest",
+      "code": "range_invalid"
+    },
+    {
+      "range": "^",
+      "code": "range_invalid"
+    },
+    {
+      "range": "1.x",
+      "code": "range_invalid"
+    },
+    {
+      "range": "1.2.*",
+      "code": "range_invalid"
+    },
+    {
+      "range": "v1.2.3",
+      "code": "range_invalid"
+    },
+    {
+      "range": ">= 1.2.3",
+      "code": "range_invalid"
+    },
+    {
+      "range": "1.2 - 1.4",
+      "code": "range_invalid"
+    },
+    {
+      "range": "^1.2.3-beta.1",
+      "code": "range_invalid"
+    },
+    {
+      "range": ">=1.0.0-rc.1",
+      "code": "range_invalid"
+    },
+    {
+      "range": "~1.2.3-beta",
+      "code": "range_invalid"
+    },
+    {
+      "range": "1.2.3+build",
+      "code": "range_invalid"
+    },
+    {
+      "range": "01.2.3",
+      "code": "range_invalid"
+    },
+    {
+      "range": "* >1",
+      "code": "range_invalid"
+    },
+    {
+      "range": "1 ||",
+      "code": "range_invalid"
+    }
+  ],
+  "precedence_ascending": [
+    "1.0.0-alpha",
+    "1.0.0-alpha.1",
+    "1.0.0-alpha.beta",
+    "1.0.0-beta",
+    "1.0.0-beta.2",
+    "1.0.0-beta.11",
+    "1.0.0-rc.1",
+    "1.0.0",
+    "1.0.1",
+    "1.1.0",
+    "1.10.0",
+    "2.0.0"
+  ],
+  "invalid_versions": [
+    {
+      "version": "1.0",
+      "code": "version_invalid"
+    },
+    {
+      "version": "1",
+      "code": "version_invalid"
+    },
+    {
+      "version": "1.0.0+build.1",
+      "code": "version_invalid"
+    },
+    {
+      "version": "01.0.0",
+      "code": "version_invalid"
+    },
+    {
+      "version": "1.0.0-01",
+      "code": "version_invalid"
+    },
+    {
+      "version": "v1.0.0",
+      "code": "version_invalid"
+    },
+    {
+      "version": "1.0.0-",
+      "code": "version_invalid"
+    },
+    {
+      "version": "1.0.0-beta..1",
+      "code": "version_invalid"
+    },
+    {
+      "version": "1.0.0 ",
+      "code": "version_invalid"
+    }
+  ],
+  "capability_tokens": {
+    "valid": [
+      "cap/code.read@1",
+      "cap/shell@1",
+      "cap/flow.template@2",
+      "cap/memory-profile.read@1",
+      "cap/code.read@10"
+    ],
+    "invalid": [
+      "code.read@1",
+      "cap/code.read",
+      "cap/code.read@0",
+      "cap/code.read@01",
+      "cap/Code.read@1",
+      "cap/code.read.all@1",
+      "cap/code_read@1",
+      "flow-templates/v1",
+      "cap/.read@1",
+      "cap/code.@1"
+    ]
+  },
+  "cases": [
+    {
+      "name": "highest_in_range",
+      "note": "",
+      "local_capabilities": [],
+      "registry": {
+        "@x/head": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          },
+          {
+            "version": "1.2.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          },
+          {
+            "version": "2.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          }
+        ]
+      },
+      "root": {
+        "package": "@x/head",
+        "range": "^1"
+      },
+      "expect": {
+        "ok": true,
+        "picks": {
+          "@x/head": "1.2.0"
+        }
+      }
+    },
+    {
+      "name": "withdrawn_skipped",
+      "note": "",
+      "local_capabilities": [],
+      "registry": {
+        "@x/head": [
+          {
+            "version": "1.1.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          },
+          {
+            "version": "1.2.0",
+            "kind": "persona",
+            "status": "withdrawn",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          }
+        ]
+      },
+      "root": {
+        "package": "@x/head",
+        "range": "^1"
+      },
+      "expect": {
+        "ok": true,
+        "picks": {
+          "@x/head": "1.1.0"
+        }
+      }
+    },
+    {
+      "name": "tombstoned_and_revoked_skipped",
+      "note": "",
+      "local_capabilities": [],
+      "registry": {
+        "@x/head": [
+          {
+            "version": "1.1.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          },
+          {
+            "version": "1.2.0",
+            "kind": "persona",
+            "status": "revoked",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          },
+          {
+            "version": "1.3.0",
+            "kind": "persona",
+            "status": "tombstoned",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          }
+        ]
+      },
+      "root": {
+        "package": "@x/head",
+        "range": "^1"
+      },
+      "expect": {
+        "ok": true,
+        "picks": {
+          "@x/head": "1.1.0"
+        }
+      }
+    },
+    {
+      "name": "exact_range_on_withdrawn_version",
+      "note": "resolution skips a withdrawn version even when the range names it exactly; an existing pin to it keeps working, outside resolution",
+      "local_capabilities": [],
+      "registry": {
+        "@x/head": [
+          {
+            "version": "1.1.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          },
+          {
+            "version": "1.2.0",
+            "kind": "persona",
+            "status": "withdrawn",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          }
+        ]
+      },
+      "root": {
+        "package": "@x/head",
+        "range": "1.2.0"
+      },
+      "expect": {
+        "ok": false,
+        "refusal": {
+          "code": "no_matching_version",
+          "package": "@x/head",
+          "ranges": [
+            {
+              "requested_by": "(root)",
+              "range": "1.2.0"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "prerelease_not_picked_by_range",
+      "note": "",
+      "local_capabilities": [],
+      "registry": {
+        "@x/head": [
+          {
+            "version": "1.2.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          },
+          {
+            "version": "1.3.0-beta.1",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          }
+        ]
+      },
+      "root": {
+        "package": "@x/head",
+        "range": "^1"
+      },
+      "expect": {
+        "ok": true,
+        "picks": {
+          "@x/head": "1.2.0"
+        }
+      }
+    },
+    {
+      "name": "prerelease_named_exactly",
+      "note": "",
+      "local_capabilities": [],
+      "registry": {
+        "@x/head": [
+          {
+            "version": "1.2.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          },
+          {
+            "version": "1.3.0-beta.1",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          }
+        ]
+      },
+      "root": {
+        "package": "@x/head",
+        "range": "1.3.0-beta.1"
+      },
+      "expect": {
+        "ok": true,
+        "picks": {
+          "@x/head": "1.3.0-beta.1"
+        }
+      }
+    },
+    {
+      "name": "capability_filter",
+      "note": "1.3.0 needs a token no local module declares; tokens match by exact string",
+      "local_capabilities": [
+        "cap/flow.template@1"
+      ],
+      "registry": {
+        "@x/head": [
+          {
+            "version": "1.2.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [
+                "cap/flow.template@1"
+              ],
+              "packages": {}
+            }
+          },
+          {
+            "version": "1.3.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [
+                "cap/flow.template@2"
+              ],
+              "packages": {}
+            }
+          }
+        ]
+      },
+      "root": {
+        "package": "@x/head",
+        "range": "^1"
+      },
+      "expect": {
+        "ok": true,
+        "picks": {
+          "@x/head": "1.2.0"
+        }
+      }
+    },
+    {
+      "name": "capability_unmet",
+      "note": "",
+      "local_capabilities": [
+        "cap/flow.template@1"
+      ],
+      "registry": {
+        "@x/head": [
+          {
+            "version": "1.3.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [
+                "cap/flow.template@2"
+              ],
+              "packages": {}
+            }
+          }
+        ]
+      },
+      "root": {
+        "package": "@x/head",
+        "range": "^1"
+      },
+      "expect": {
+        "ok": false,
+        "refusal": {
+          "code": "no_matching_version",
+          "package": "@x/head",
+          "ranges": [
+            {
+              "requested_by": "(root)",
+              "range": "^1"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "persona_closure",
+      "note": "every body reference is in requires.packages and resolves to the kind its field expects",
+      "local_capabilities": [],
+      "registry": {
+        "@x/head": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {
+                "@x/base": "^1",
+                "@x/skill-a": "^2",
+                "@x/flow-a": "^4",
+                "@x/mason": "^1",
+                "@x/memory": "^1"
+              }
+            },
+            "refs": [
+              {
+                "field": "extends",
+                "package": "@x/base"
+              },
+              {
+                "field": "skills",
+                "package": "@x/skill-a"
+              },
+              {
+                "field": "flows",
+                "package": "@x/flow-a"
+              },
+              {
+                "field": "delegates_to",
+                "package": "@x/mason"
+              },
+              {
+                "field": "memory_profile",
+                "package": "@x/memory"
+              }
+            ]
+          }
+        ],
+        "@x/base": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          },
+          {
+            "version": "1.4.1",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          }
+        ],
+        "@x/skill-a": [
+          {
+            "version": "2.0.0",
+            "kind": "skill",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          },
+          {
+            "version": "2.1.0",
+            "kind": "skill",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          },
+          {
+            "version": "3.0.0",
+            "kind": "skill",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          }
+        ],
+        "@x/flow-a": [
+          {
+            "version": "4.2.0",
+            "kind": "flow",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          }
+        ],
+        "@x/mason": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          }
+        ],
+        "@x/memory": [
+          {
+            "version": "1.0.0",
+            "kind": "memory-profile",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          }
+        ]
+      },
+      "root": {
+        "package": "@x/head",
+        "range": "^1"
+      },
+      "expect": {
+        "ok": true,
+        "picks": {
+          "@x/base": "1.4.1",
+          "@x/flow-a": "4.2.0",
+          "@x/head": "1.0.0",
+          "@x/mason": "1.0.0",
+          "@x/memory": "1.0.0",
+          "@x/skill-a": "2.1.0"
+        }
+      }
+    },
+    {
+      "name": "shared_dependency_intersection",
+      "note": "one version per package: c must satisfy both ^1.2 and ~1.3",
+      "local_capabilities": [],
+      "registry": {
+        "@x/head": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {
+                "@x/a": "^1",
+                "@x/b": "^1"
+              }
+            }
+          }
+        ],
+        "@x/a": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {
+                "@x/c": "^1.2"
+              }
+            }
+          }
+        ],
+        "@x/b": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {
+                "@x/c": "~1.3"
+              }
+            }
+          }
+        ],
+        "@x/c": [
+          {
+            "version": "1.2.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          },
+          {
+            "version": "1.3.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          },
+          {
+            "version": "1.3.5",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          },
+          {
+            "version": "1.4.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          }
+        ]
+      },
+      "root": {
+        "package": "@x/head",
+        "range": "^1"
+      },
+      "expect": {
+        "ok": true,
+        "picks": {
+          "@x/a": "1.0.0",
+          "@x/b": "1.0.0",
+          "@x/c": "1.3.5",
+          "@x/head": "1.0.0"
+        }
+      }
+    },
+    {
+      "name": "conflicting_ranges",
+      "note": "each range alone has a version; together none: refused by name",
+      "local_capabilities": [],
+      "registry": {
+        "@x/head": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {
+                "@x/a": "^1",
+                "@x/b": "^1"
+              }
+            }
+          }
+        ],
+        "@x/a": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {
+                "@x/c": "^1"
+              }
+            }
+          }
+        ],
+        "@x/b": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {
+                "@x/c": "^2"
+              }
+            }
+          }
+        ],
+        "@x/c": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          },
+          {
+            "version": "2.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          }
+        ]
+      },
+      "root": {
+        "package": "@x/head",
+        "range": "^1"
+      },
+      "expect": {
+        "ok": false,
+        "refusal": {
+          "code": "range_conflict",
+          "package": "@x/c",
+          "ranges": [
+            {
+              "requested_by": "@x/a@1.0.0",
+              "range": "^1"
+            },
+            {
+              "requested_by": "@x/b@1.0.0",
+              "range": "^2"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "later_range_moves_pick_down",
+      "note": "a@1.1.0 asks for c ~1.0, so c resolves to 1.0.5, not the highest ^1 version",
+      "local_capabilities": [],
+      "registry": {
+        "@x/head": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {
+                "@x/a": "^1",
+                "@x/c": "^1"
+              }
+            }
+          }
+        ],
+        "@x/a": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          },
+          {
+            "version": "1.1.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {
+                "@x/c": "~1.0"
+              }
+            }
+          }
+        ],
+        "@x/c": [
+          {
+            "version": "1.0.5",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          },
+          {
+            "version": "1.1.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          }
+        ]
+      },
+      "root": {
+        "package": "@x/head",
+        "range": "^1"
+      },
+      "expect": {
+        "ok": true,
+        "picks": {
+          "@x/a": "1.1.0",
+          "@x/c": "1.0.5",
+          "@x/head": "1.0.0"
+        }
+      }
+    },
+    {
+      "name": "superseded_ranges_kept",
+      "note": "b@1.1.0 asked for a <1.1 before b moved down; that range stays, so a ends at 1.0.0 although a backtracking solver could pick a 1.1.0",
+      "local_capabilities": [],
+      "registry": {
+        "@x/head": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {
+                "@x/a": "^1",
+                "@x/b": "^1"
+              }
+            }
+          }
+        ],
+        "@x/a": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {
+                "@x/b": "<1.1"
+              }
+            }
+          },
+          {
+            "version": "1.1.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          }
+        ],
+        "@x/b": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          },
+          {
+            "version": "1.1.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {
+                "@x/a": "<1.1"
+              }
+            }
+          }
+        ]
+      },
+      "root": {
+        "package": "@x/head",
+        "range": "^1"
+      },
+      "expect": {
+        "ok": true,
+        "picks": {
+          "@x/a": "1.0.0",
+          "@x/b": "1.0.0",
+          "@x/head": "1.0.0"
+        }
+      }
+    },
+    {
+      "name": "cycle",
+      "note": "",
+      "local_capabilities": [],
+      "registry": {
+        "@x/head": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {
+                "@x/a": "^1"
+              }
+            }
+          }
+        ],
+        "@x/a": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {
+                "@x/b": "^1"
+              }
+            }
+          }
+        ],
+        "@x/b": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {
+                "@x/a": "^1"
+              }
+            }
+          }
+        ]
+      },
+      "root": {
+        "package": "@x/head",
+        "range": "^1"
+      },
+      "expect": {
+        "ok": false,
+        "refusal": {
+          "code": "dependency_cycle",
+          "cycle": [
+            "@x/a",
+            "@x/b",
+            "@x/a"
+          ]
+        }
+      }
+    },
+    {
+      "name": "self_dependency",
+      "note": "",
+      "local_capabilities": [],
+      "registry": {
+        "@x/head": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {
+                "@x/head": "^1"
+              }
+            }
+          }
+        ]
+      },
+      "root": {
+        "package": "@x/head",
+        "range": "^1"
+      },
+      "expect": {
+        "ok": false,
+        "refusal": {
+          "code": "dependency_cycle",
+          "cycle": [
+            "@x/head",
+            "@x/head"
+          ]
+        }
+      }
+    },
+    {
+      "name": "unknown_package",
+      "note": "",
+      "local_capabilities": [],
+      "registry": {
+        "@x/head": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {
+                "@x/missing": "^1"
+              }
+            }
+          }
+        ]
+      },
+      "root": {
+        "package": "@x/head",
+        "range": "^1"
+      },
+      "expect": {
+        "ok": false,
+        "refusal": {
+          "code": "package_not_found",
+          "package": "@x/missing"
+        }
+      }
+    },
+    {
+      "name": "invalid_dependency_range",
+      "note": "",
+      "local_capabilities": [],
+      "registry": {
+        "@x/head": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {
+                "@x/a": "1.x"
+              }
+            }
+          }
+        ],
+        "@x/a": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          }
+        ]
+      },
+      "root": {
+        "package": "@x/head",
+        "range": "^1"
+      },
+      "expect": {
+        "ok": false,
+        "refusal": {
+          "code": "range_invalid",
+          "package": "@x/a",
+          "range": "1.x",
+          "requested_by": "@x/head@1.0.0"
+        }
+      }
+    },
+    {
+      "name": "invalid_root_range",
+      "note": "",
+      "local_capabilities": [],
+      "registry": {
+        "@x/head": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          }
+        ]
+      },
+      "root": {
+        "package": "@x/head",
+        "range": "latest"
+      },
+      "expect": {
+        "ok": false,
+        "refusal": {
+          "code": "range_invalid",
+          "package": "@x/head",
+          "range": "latest",
+          "requested_by": "(root)"
+        }
+      }
+    },
+    {
+      "name": "body_ref_not_in_requires",
+      "note": "a body field names a package the dependency list lacks",
+      "local_capabilities": [],
+      "registry": {
+        "@x/head": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            },
+            "refs": [
+              {
+                "field": "skills",
+                "package": "@x/skill-a"
+              }
+            ]
+          }
+        ],
+        "@x/skill-a": [
+          {
+            "version": "1.0.0",
+            "kind": "skill",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          }
+        ]
+      },
+      "root": {
+        "package": "@x/head",
+        "range": "^1"
+      },
+      "expect": {
+        "ok": false,
+        "refusal": {
+          "code": "body_ref_missing",
+          "package": "@x/head",
+          "field": "skills",
+          "ref": "@x/skill-a"
+        }
+      }
+    },
+    {
+      "name": "body_ref_wrong_kind",
+      "note": "skills names a persona package",
+      "local_capabilities": [],
+      "registry": {
+        "@x/head": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {
+                "@x/skill-a": "^1"
+              }
+            },
+            "refs": [
+              {
+                "field": "skills",
+                "package": "@x/skill-a"
+              }
+            ]
+          }
+        ],
+        "@x/skill-a": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          }
+        ]
+      },
+      "root": {
+        "package": "@x/head",
+        "range": "^1"
+      },
+      "expect": {
+        "ok": false,
+        "refusal": {
+          "code": "kind_mismatch",
+          "package": "@x/head",
+          "field": "skills",
+          "ref": "@x/skill-a",
+          "expected": "skill",
+          "found": "persona"
+        }
+      }
+    },
+    {
+      "name": "downgrade_after_withdrawal",
+      "note": "the pinned 1.3.0 was withdrawn; an explicit upgrade re-resolves and the pin moves down",
+      "local_capabilities": [],
+      "registry": {
+        "@x/head": [
+          {
+            "version": "1.2.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {
+                "@x/a": "^1"
+              }
+            }
+          },
+          {
+            "version": "1.3.0",
+            "kind": "persona",
+            "status": "withdrawn",
+            "requires": {
+              "capabilities": [],
+              "packages": {
+                "@x/a": "~1.1"
+              }
+            }
+          }
+        ],
+        "@x/a": [
+          {
+            "version": "1.1.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          },
+          {
+            "version": "1.2.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          }
+        ]
+      },
+      "root": {
+        "package": "@x/head",
+        "range": "^1"
+      },
+      "current_pins": {
+        "@x/head": "1.3.0",
+        "@x/a": "1.1.0"
+      },
+      "expect": {
+        "ok": true,
+        "picks": {
+          "@x/a": "1.2.0",
+          "@x/head": "1.2.0"
+        },
+        "moves": {
+          "@x/a": {
+            "from": "1.1.0",
+            "to": "1.2.0",
+            "direction": "up"
+          },
+          "@x/head": {
+            "from": "1.3.0",
+            "to": "1.2.0",
+            "direction": "down"
+          }
+        }
+      }
+    },
+    {
+      "name": "dependency_dropped",
+      "note": "",
+      "local_capabilities": [],
+      "registry": {
+        "@x/head": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {
+                "@x/old": "^1"
+              }
+            }
+          },
+          {
+            "version": "1.1.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          }
+        ],
+        "@x/old": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          }
+        ]
+      },
+      "root": {
+        "package": "@x/head",
+        "range": "^1"
+      },
+      "current_pins": {
+        "@x/head": "1.0.0",
+        "@x/old": "1.0.0"
+      },
+      "expect": {
+        "ok": true,
+        "picks": {
+          "@x/head": "1.1.0"
+        },
+        "moves": {
+          "@x/head": {
+            "from": "1.0.0",
+            "to": "1.1.0",
+            "direction": "up"
+          },
+          "@x/old": {
+            "from": "1.0.0",
+            "to": null,
+            "direction": "removed"
+          }
+        }
+      }
+    }
+  ]
+}
