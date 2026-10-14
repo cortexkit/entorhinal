@@ -10,6 +10,7 @@ pub struct Reply {
     pub body: Vec<u8>,
     pub chunked: bool,
     pub release: Option<Arc<tokio::sync::Notify>>,
+    pub entered: Option<Arc<tokio::sync::Notify>>,
 }
 impl Reply {
     pub fn bytes(body: impl Into<Vec<u8>>) -> Self {
@@ -19,6 +20,7 @@ impl Reply {
             body: body.into(),
             chunked: false,
             release: None,
+            entered: None,
         }
     }
     pub fn redirect(url: &str) -> Self {
@@ -33,6 +35,7 @@ pub struct FakeRegistry {
     pub url: String,
     pub replies: Arc<Mutex<BTreeMap<String, Reply>>>,
     pub calls: Arc<Mutex<Vec<String>>>,
+    pub requests: Arc<Mutex<Vec<String>>>,
     task: tokio::task::JoinHandle<()>,
 }
 impl FakeRegistry {
@@ -41,11 +44,14 @@ impl FakeRegistry {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let replies = Arc::new(Mutex::new(BTreeMap::<String, Reply>::new()));
         let calls = Arc::new(Mutex::new(vec![]));
+        let request_texts = Arc::new(Mutex::new(vec![]));
+        let received = request_texts.clone();
         let (routes, requests) = (replies.clone(), calls.clone());
         let task = tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 let routes = routes.clone();
                 let requests = requests.clone();
+                let received = received.clone();
                 tokio::spawn(async move {
                     let mut request = Vec::new();
                     loop {
@@ -65,12 +71,16 @@ impl FakeRegistry {
                         }
                     }
                     let text = String::from_utf8_lossy(&request);
+                    received.lock().unwrap().push(text.to_string());
                     let path = text.split_whitespace().nth(1).unwrap_or("/").to_string();
                     requests.lock().unwrap().push(path.clone());
                     let reply = routes.lock().unwrap().get(&path).cloned().unwrap_or(Reply {
                         status: 404,
                         ..Reply::bytes(vec![])
                     });
+                    if let Some(entered) = &reply.entered {
+                        entered.notify_one();
+                    }
                     if let Some(release) = &reply.release {
                         release.notified().await;
                     }
@@ -103,6 +113,7 @@ impl FakeRegistry {
             url,
             replies,
             calls,
+            requests: request_texts,
             task,
         }
     }

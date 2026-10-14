@@ -5850,3 +5850,641 @@ runner = "cargo"
 package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 expect_red = ["move_receiver::tests::cut_accept_reconnect_polls_once_waiting_and_mid_poll"]
+
+# Catalog trust and local publisher authority. Each row selects the named test
+# that observes its disabled refusal, binding, ceiling or local-only boundary.
+
+[[control]]
+id = "ento3-incarnation"
+guards = "incarnation remains enforced"
+file = "crates/entorhinal-module/src/catalog_trust.rs"
+old = "|| expected.incarnation != current.incarnation"
+new = "|| false /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_trust::tests::same_clock_same_key_readd_refuses_old_incarnation"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-cutoff"
+guards = "cutoff remains enforced"
+file = "crates/entorhinal-module/src/catalog_trust.rs"
+old = "valid_from: Some(statement.valid_from),"
+new = "valid_from: None, // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_trust::tests::chain_walk_validates_held_links_and_persists_cutoffs"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-held-link"
+guards = "held link remains enforced"
+file = "crates/entorhinal-module/src/catalog_trust.rs"
+old = "statements::apply_registry_key(&mut pure, &text, sig)?;\n                                }"
+new = "// NON-VACUITY BREAK: skip held link validation\n                                }"
+test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_trust::tests::chain_walk_validates_held_links_and_persists_cutoffs"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-null-anchor"
+guards = "null anchor remains enforced"
+file = "crates/entorhinal-module/src/catalog_trust.rs"
+old = "statements::apply_registry_key(&mut validation, &text, sig)?;"
+new = "// NON-VACUITY BREAK: adopt unchecked anchor"
+test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_trust::tests::chain_null_anchor_and_refused_successor"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-unknown-key-fetch"
+guards = "unknown key fetch remains enforced"
+file = "crates/entorhinal-module/src/catalog_trust.rs"
+old = "Err(error) if error.code == \"key_unknown\" && !refreshed => {"
+new = "Err(error) if false && error.code == \"key_unknown\" && !refreshed => { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_trust::tests::unknown_status_key_fetches_once_and_cannot_self_authorize"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-stored-columns"
+guards = "stored columns remains enforced"
+file = "crates/entorhinal-module/src/catalog_trust.rs"
+old = "|| r.sequence != row.sequence"
+new = "|| false /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_trust::tests::stored_status_reopen_checks_columns_and_rollback"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-held-archive"
+guards = "held archive remains enforced"
+file = "crates/entorhinal-module/src/catalog_trust.rs"
+old = ".is_some_and(|h| h.record().archive_sha256 != pin.archive_sha256)"
+new = ".is_some_and(|_| false) /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_trust::tests::verify_status_identity_binding_and_separate_blob_publication"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-binding-time"
+guards = "binding time remains enforced"
+file = "crates/entorhinal-module/src/catalog_trust.rs"
+old = "if prior.record().published_at != applied.held.record().published_at {"
+new = "if false { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_trust::tests::feed_mixed_unheld_binding_guards_and_full_fallback"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-binding-publisher"
+guards = "binding publisher remains enforced"
+file = "crates/entorhinal-module/src/catalog_trust.rs"
+old = "if prior.record().publisher_key != applied.held.record().publisher_key {"
+new = "if false { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_trust::tests::feed_mixed_unheld_binding_guards_and_full_fallback"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-requested-scope"
+guards = "requested scope remains enforced"
+file = "crates/entorhinal-module/src/catalog_trust.rs"
+old = "if scope != format!(\"@{}\", mapped.scope) {"
+new = "if false { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_trust::tests::verify_status_identity_binding_and_separate_blob_publication"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-requested-name"
+guards = "requested name remains enforced"
+file = "crates/entorhinal-module/src/catalog_trust.rs"
+old = "if entry[\"record\"][\"name\"] != name {"
+new = "if false { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_trust::tests::verify_status_identity_binding_and_separate_blob_publication"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-requested-version"
+guards = "requested version remains enforced"
+file = "crates/entorhinal-module/src/catalog_trust.rs"
+old = "if entry[\"record\"][\"version\"] != version {"
+new = "if false { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_trust::tests::verify_status_identity_binding_and_separate_blob_publication"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-publisher-record-binding"
+guards = "publisher record binding remains enforced"
+file = "crates/entorhinal-module/src/catalog_trust.rs"
+old = "if Some(applied.held.record().publisher_key.clone())\n            != entorhinal_catalog::key_fingerprint(&served.public_key)\n        {"
+new = "if false { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_trust::tests::verify_status_identity_binding_and_separate_blob_publication"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-trust-before-bytes"
+guards = "trust before bytes remains enforced"
+file = "crates/entorhinal-module/src/catalog_trust.rs"
+old = "record::verify_record_trust(\n            &record_text,\n            entry[\"signature\"].as_str().unwrap_or(\"\"),\n            &trust,\n        )?;"
+new = "// NON-VACUITY BREAK: skip trust before fetching bytes"
+test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_trust::tests::record_trust_precedes_malformed_archive_and_never_fetches_untrusted_bytes"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-reapply-before-blob"
+guards = "reapply before blob remains enforced"
+file = "crates/entorhinal-module/src/catalog_trust.rs"
+old = "accept(current, held, &status_text, status_sig, &pin)?;\n                BlobStore::new(folder)?.publish(&archive)?;"
+new = "// NON-VACUITY BREAK: skip final status reapplication\n                BlobStore::new(folder)?.publish(&archive)?;"
+test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_trust::tests::archive_barrier_cannot_publish_after_newer_status"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-feed-cursor"
+guards = "feed cursor remains enforced"
+file = "crates/entorhinal-module/src/catalog_trust.rs"
+old = "if all_ok {"
+new = "if true { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_trust::tests::feed_mixed_unheld_binding_guards_and_full_fallback"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-feed-410-fallback"
+guards = "feed 410 fallback remains enforced"
+file = "crates/entorhinal-module/src/catalog_trust.rs"
+old = "Err(NetworkError::FeedAfterUnavailable) if mode == status::FeedMode::After => {"
+new = "Err(NetworkError::FeedAfterUnavailable) if false && mode == status::FeedMode::After => { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_trust::tests::feed_mixed_unheld_binding_guards_and_full_fallback"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-feed-rollback-fallback"
+guards = "feed rollback fallback remains enforced"
+file = "crates/entorhinal-module/src/catalog_trust.rs"
+old = "if outcome.fetch_full && mode == status::FeedMode::After {"
+new = "if false && outcome.fetch_full && mode == status::FeedMode::After { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_trust::tests::feed_mixed_unheld_binding_guards_and_full_fallback"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-feed-etag"
+guards = "feed etag remains enforced"
+file = "crates/entorhinal-module/src/catalog_trust.rs"
+old = "write.feed_etag = response.etag.clone();"
+new = "write.feed_etag = None; // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_trust::tests::feed_etag_304_preserves_cursor_and_status"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-scope-fingerprint"
+guards = "scope fingerprint remains enforced"
+file = "crates/entorhinal-module/src/catalog_trust.rs"
+old = "entorhinal_catalog::key_fingerprint(&entry.public_key).as_ref()\n                != Some(&entry.fingerprint)"
+new = "false /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_trust::tests::scope_rotations_keep_lineage_and_bound_revocation"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-rotation-retirement"
+guards = "rotation retirement remains enforced"
+file = "crates/entorhinal-module/src/catalog_trust.rs"
+old = "validation.valid_until = None;"
+new = "// NON-VACUITY BREAK: retain publication retirement for historical rotation"
+test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_trust::tests::scope_rotations_keep_lineage_and_bound_revocation"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-rotation-compromise"
+guards = "rotation compromise remains enforced"
+file = "crates/entorhinal-module/src/catalog_trust.rs"
+old = "validation.revocation = None;"
+new = "// NON-VACUITY BREAK: reject even rotations predating compromise"
+test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_trust::tests::scope_rotations_keep_lineage_and_bound_revocation"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-rotation-signatures"
+guards = "rotation signatures remains enforced"
+file = "crates/entorhinal-module/src/catalog_trust.rs"
+old = "if result.as_ref().is_ok_and(|r| r.new_key == key.public_key) {"
+new = "if true { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_trust::tests::scope_rotations_keep_lineage_and_bound_revocation"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-root-slot"
+guards = "root slot remains enforced"
+file = "crates/entorhinal-module/src/catalog_trust.rs"
+old = "pub const CORTEXKIT_ROOT: Option<&str> = None;"
+new = "pub const CORTEXKIT_ROOT: Option<&str> = Some(\"2627e86928debd3e5f5a37687443683a643269ff32567a4cde4a962d9dccd82c\"); // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_trust::tests::cortexkit_http_uses_only_explicit_root_and_refuses_production_slot"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-grant-live"
+guards = "grant live remains enforced"
+file = "crates/entorhinal-core/src/catalog_grants.rs"
+old = "let covered = agent_live"
+new = "let covered = true /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-module/src/catalog_grants_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_grants::tests::grants_coverage_refresh_revoke_inventory_audit_and_local_only"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-grant-scripts"
+guards = "grant scripts remains enforced"
+file = "crates/entorhinal-core/src/catalog_grants.rs"
+old = "&& !package.has_scripts"
+new = "&& true /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-module/src/catalog_grants_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_grants::tests::grants_coverage_refresh_revoke_inventory_audit_and_local_only"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-grant-revoked"
+guards = "grant revoked remains enforced"
+file = "crates/entorhinal-core/src/catalog_grants.rs"
+old = "grant.revoked_at_ms.is_none()"
+new = "true /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-module/src/catalog_grants_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_grants::tests::grants_coverage_refresh_revoke_inventory_audit_and_local_only"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-grant-key"
+guards = "grant key remains enforced"
+file = "crates/entorhinal-core/src/catalog_grants.rs"
+old = "&& grant.publisher_fingerprint == package.publisher_fingerprint"
+new = "&& true /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-module/src/catalog_grants_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_grants::tests::grants_coverage_refresh_revoke_inventory_audit_and_local_only"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-grant-operation"
+guards = "grant operation remains enforced"
+file = "crates/entorhinal-core/src/catalog_grants.rs"
+old = "&& grant.operation == operation"
+new = "&& true /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-module/src/catalog_grants_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_grants::tests::grants_coverage_refresh_revoke_inventory_audit_and_local_only"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-grant-placement"
+guards = "grant placement remains enforced"
+file = "crates/entorhinal-core/src/catalog_grants.rs"
+old = "&& grant.placement_agent_id == agent_id"
+new = "&& true /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-module/src/catalog_grants_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_grants::tests::grants_coverage_refresh_revoke_inventory_audit_and_local_only"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-grant-ceiling"
+guards = "grant ceiling remains enforced"
+file = "crates/entorhinal-core/src/catalog_grants.rs"
+old = ".all(|token| grant.ceiling.contains(token))"
+new = ".all(|_| true) /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-module/src/catalog_grants_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_grants::tests::grants_coverage_refresh_revoke_inventory_audit_and_local_only"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-grant-union"
+guards = "grant union remains enforced"
+file = "crates/entorhinal-core/src/catalog_grants.rs"
+old = "row.ceiling.extend(prior.ceiling);"
+new = "// NON-VACUITY BREAK: forget previous ceiling"
+test_file = "crates/entorhinal-module/src/catalog_grants_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_grants::tests::grants_coverage_refresh_revoke_inventory_audit_and_local_only"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-grant-audit-write"
+guards = "grant audit write remains enforced"
+file = "crates/entorhinal-core/src/catalog_grants.rs"
+old = "audit(tx, kind, &row, principal, row.granted_at_ms).map_err(store_error)?;"
+new = "// NON-VACUITY BREAK: omit grant write audit"
+test_file = "crates/entorhinal-module/src/catalog_grants_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_grants::tests::grants_coverage_refresh_revoke_inventory_audit_and_local_only"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-grant-audit-revoke"
+guards = "grant audit revoke remains enforced"
+file = "crates/entorhinal-core/src/catalog_grants.rs"
+old = "audit(tx, \"grant_revoke\", &grant, principal, now).map_err(store_error)?;"
+new = "// NON-VACUITY BREAK: omit revoke audit"
+test_file = "crates/entorhinal-module/src/catalog_grants_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_grants::tests::grants_coverage_refresh_revoke_inventory_audit_and_local_only"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-pin-set"
+guards = "pin set remains enforced"
+file = "crates/entorhinal-module/src/catalog_grants.rs"
+old = "if pins.is_empty() {"
+new = "if false { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/catalog_grants_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_grants::tests::publisher_trust_authenticates_pins_and_is_install_only"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-pin-manifest-digest"
+guards = "pin manifest digest remains enforced"
+file = "crates/entorhinal-module/src/catalog_grants.rs"
+old = "sha256_hex(&manifest) != pin.manifest_sha256"
+new = "false /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-module/src/catalog_grants_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_grants::tests::publisher_trust_authenticates_pins_and_is_install_only"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-pin-manifest-identity"
+guards = "pin manifest identity remains enforced"
+file = "crates/entorhinal-module/src/catalog_grants.rs"
+old = "if manifest.name != pin.name || manifest.version != pin.version {"
+new = "if false { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/catalog_grants_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_grants::tests::publisher_manifest_http_digest_strict_identity_and_cap"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-pin-recheck"
+guards = "pin recheck remains enforced"
+file = "crates/entorhinal-module/src/catalog_grants.rs"
+old = "if latest != pins {"
+new = "if false { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/catalog_grants_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_grants::tests::publisher_pins_must_stay_authenticated_through_confirmation"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-trust-admission"
+guards = "trust admission remains enforced"
+file = "crates/entorhinal-module/src/catalog_grants.rs"
+old = "self.admit(PUBLISHER_TRUST, key)?;"
+new = "// NON-VACUITY BREAK: omit Direct/flow admission"
+test_file = "crates/entorhinal-module/src/catalog_grants_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_grants::tests::publisher_trust_admission_decline_and_disposed_placement"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-restore-signature"
+guards = "restore signature remains enforced"
+file = "crates/entorhinal-catalog/src/status.rs"
+old = "if !verify_signature(&key.public_key, \"ck-status/v1\", &canonical, signature) {"
+new = "if false { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-catalog/src/status.rs"
+runner = "cargo"
+package = "entorhinal-catalog"
+target = "--lib"
+expect_red = ["status::restore_tests::restore_authenticates_bytes_and_signer_without_new_cutoffs"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-grants-local-only"
+guards = "Publisher grants and audit writes never enter the identity journal exported to another Mac"
+file = "crates/entorhinal-core/src/catalog_grants.rs"
+old = 'audit(tx, kind, &row, principal, row.granted_at_ms).map_err(store_error)?;'
+new = '''audit(tx, kind, &row, principal, row.granted_at_ms).map_err(store_error)?;
+            tx.execute("INSERT INTO registry_journal(op,payload_json,actor,created_at) VALUES('catalog.grant',?1,'test','2026-10-14T09:00:00Z')", [serde_json::to_string(&row).unwrap()]).map_err(store_error)?; // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-core/src/catalog_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["tests::catalog_tests::publisher_authority_never_enters_identity_journal_or_shared_snapshot"]
+expect_message = "publisher authority must never enter the identity journal"
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-publisher-status-time"
+guards = "Publisher key windows are evaluated at the registry-attested publication time before fetching bytes"
+file = "crates/entorhinal-module/src/catalog_trust.rs"
+old = 'published_at: Some(&applied.held.record().published_at),'
+new = 'published_at: None, // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_trust::tests::publisher_windows_use_status_time_through_http"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-status-before-package-shape"
+guards = "A status signature refusal precedes package shape validation and invalid status does not fetch chain keys"
+file = "crates/entorhinal-module/src/catalog_trust.rs"
+old = 'let record_text = document(&entry["record"])?;'
+new = '''let record_text = document(&entry["record"])?;
+        let _: record::Record = serde_json::from_value(entry["record"].clone()).map_err(|_| CatalogError::new("record_invalid", "invalid record"))?; // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_trust::tests::status_refusal_precedes_package_shape_and_invalid_status_does_not_fetch_keys"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-root-scripts-still-need-approval"
+guards = "Root certification never substitutes for approval of a package with scripts"
+file = "crates/entorhinal-core/src/catalog_grants.rs"
+old = '''if package.root_certified {
+            if package.has_scripts {'''
+new = '''if package.root_certified {
+            if false { // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-module/src/catalog_grants_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_grants::tests::grants_reopen_keep_revoked_history_and_no_root_publisher_grant"]
+select = "expected"
+only = false
+
+[[control]]
+id = "ento3-refused-link-log-dedup"
+guards = "A chain refusal is logged once per distinct served document during a walker's lifetime"
+file = "crates/entorhinal-module/src/catalog_trust.rs"
+old = 'if self.refused_links.insert(digest.clone()) {'
+new = 'if true { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_trust::tests::refused_chain_links_log_once_per_distinct_document"]
+select = "expected"
+only = false

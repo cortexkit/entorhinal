@@ -248,7 +248,9 @@ pub fn parse(face: Face, arguments: &[String]) -> Invocation {
                 args.push(argument.clone());
                 args.push(value.clone());
             }
-            "--scope" | "--key-id" | "--public-key" | "--valid-from" if face == Face::Catalog => {
+            "--scope" | "--key-id" | "--public-key" | "--valid-from" | "--agent"
+                if face == Face::Catalog =>
+            {
                 let Some(value) = rest.next().filter(|v| !v.is_empty() && !v.starts_with('-'))
                 else {
                     return Invocation::Refuse(format!("{argument} needs a value"));

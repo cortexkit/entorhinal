@@ -58,8 +58,10 @@ const DEFAULT_STORAGE_NAMESPACE: &str = "default";
 mod agent_ops;
 mod agent_reads;
 mod catalog_blob;
+mod catalog_grants;
 mod catalog_network;
 mod catalog_ops;
+mod catalog_trust;
 mod catch_up;
 mod claim_codec;
 mod claims;
@@ -649,6 +651,7 @@ const MUTATING_METHODS: &[&str] = &[
     catalog_ops::ADD,
     catalog_ops::REPIN,
     catalog_ops::REMOVE,
+    catalog_ops::PUBLISHER_TRUST,
     "remove_root",
     "attach_derived_parent",
     "approve_root",
@@ -1291,7 +1294,10 @@ impl ProjectsHandler {
         if !MUTATING_METHODS.contains(&request.method.as_str()) {
             return self.handle_request_wait(body, key).await;
         }
-        let result = if catalog_ops::WRITES.contains(&request.method.as_str()) {
+        let result = if request.method == catalog_ops::PUBLISHER_TRUST {
+            self.catalog_publisher_trust(request.params, key, received)
+                .await
+        } else if catalog_ops::WRITES.contains(&request.method.as_str()) {
             self.catalog_registry_write(&request.method, request.params, key, received)
                 .await
         } else if request.method == "identity_log.enable" {
@@ -1418,6 +1424,7 @@ impl ProjectsHandler {
             catalog_ops::ADD
             | catalog_ops::REPIN
             | catalog_ops::REMOVE
+            | catalog_ops::PUBLISHER_TRUST
             | catalog_ops::READ_BLOB => Err(HandlerError::new(
                 "served_path_required",
                 "catalog writes and blob reads require the asynchronous served path",
@@ -1464,7 +1471,7 @@ impl ProjectsHandler {
             "verify" => self.verify(),
             "rebuild" => self.rebuild(),
             permissions::LIST => self.permissions_list(request.params),
-            permissions::REVOKE => self.permissions_revoke(request.params),
+            permissions::REVOKE => self.permissions_revoke(request.params, key),
             permissions::AUDIT => self.agent_audit_list(request.params),
             permissions::SET_CAP => Err(HandlerError::new(
                 "served_path_required",
@@ -2097,6 +2104,7 @@ fn manifest() -> ModuleManifest {
                 management_operation(catalog_ops::REMOVE, ManagementOperationKind::Mutate, "Remove a registry, mappings and held state (Direct only, operator confirmation)."),
                 management_operation(catalog_ops::LIST, ManagementOperationKind::Query, "List this machine's catalog registries, scopes and pinned key chains."),
                 management_operation(catalog_ops::READ_BLOB, ManagementOperationKind::Query, "Read verified package chunks; requires ck-catalog-consumer/v1 in the daemon catalog."),
+                management_operation(catalog_ops::PUBLISHER_TRUST, ManagementOperationKind::Mutate, "Trust a publisher for installs at one agent within its authenticated pinned capability ceiling (Direct only, operator confirmation)."),
                 management_operation(
                     "resolve",
                     ManagementOperationKind::Query,

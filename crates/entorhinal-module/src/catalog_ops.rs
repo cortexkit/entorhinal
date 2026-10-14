@@ -17,7 +17,8 @@ pub const REPIN: &str = "catalog.registry_repin";
 pub const REMOVE: &str = "catalog.registry_remove";
 pub const LIST: &str = "catalog.registry_list";
 pub const READ_BLOB: &str = "catalog.read_blob";
-pub const WRITES: &[&str] = &[ADD, REPIN, REMOVE];
+pub const PUBLISHER_TRUST: &str = "catalog.publisher_trust";
+pub const WRITES: &[&str] = &[ADD, REPIN, REMOVE, PUBLISHER_TRUST];
 const CONFIRM_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl From<CatalogError> for HandlerError {
@@ -103,7 +104,7 @@ fn key_summary(verb: &str, url: &str, id: &str, key: &str) -> Result<String, Han
     }
     Ok(summary)
 }
-fn whole_second(text: &str) -> Result<(), HandlerError> {
+pub(crate) fn whole_second(text: &str) -> Result<(), HandlerError> {
     let parsed = DateTime::parse_from_rfc3339(text).map_err(|_| {
         HandlerError::new(
             "invalid_params",

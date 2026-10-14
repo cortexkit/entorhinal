@@ -2,9 +2,10 @@
 
 `ck-catalog` is another argv0 face of `ck-entorhinal`, like `ck-projects` and
 `ck-agents`. Placement must provide the `ck-catalog` link to expose `ck catalog`.
-This slice configures registry trust and transports bytes; it does not resolve or
-install packages, walk successor chains, ingest status feeds, or grant publisher
-trust.
+The module configures registry trust, verifies packages, walks successor chains,
+ingests status feeds, and holds local publisher grants. Plans, pins, installation,
+consumer activation calls and automatic polling are not exposed yet: this API
+cannot yet persist a selected dependency closure or install it for an agent.
 
 ```
 ck catalog registry add https://registry.example --scope @example --key-id status-1 --public-key <64-lowercase-hex>
@@ -12,6 +13,7 @@ ck catalog registry add https://fallback.example --default --key-id status-1 --p
 ck catalog registry repin https://registry.example --key-id status-2 --public-key <64-lowercase-hex> [--valid-from 2026-11-01T00:00:00Z]
 ck catalog registry list [--json]
 ck catalog registry remove https://registry.example
+ck catalog publisher trust <fingerprint> --agent <agent_id>
 ```
 
 A scope maps to exactly one registry. An explicit `@scope` mapping wins over the
@@ -20,6 +22,10 @@ remove, then add. Registry URLs must be HTTPS, without credentials, query, or
 fragment; URL parser canonicalization and a trailing-slash normalization identify
 an entry. Removal atomically clears its mappings, key chain, feed and status
 metadata, not its content-addressed blobs or publisher grant history.
+Each registry add receives a hidden random identifier, its incarnation, that
+distinguishes it from a removed entry even when URL, key and confirmation clock
+are identical. In-flight requests carry the old identifier and cannot write to
+the replacement. Repin preserves the identifier; registry list omits it.
 
 Writes are Direct-only, refused on flow routes, and require the daemon's operator
 confirmation on the asynchronous serving path. Prompts identify the URL, key id,
@@ -37,6 +43,74 @@ key chains, feeds, held status (including signer index), publisher grants (with
 retained revocation time), and audit. These tables never join the identity
 journal, shared state comparison, identity-change feed, or rebuild projections.
 There is no SQLite blob column or blob index.
+
+## Trust and durable status
+
+The chain walker fetches `/v1/registry/keys`, authenticates successors under the
+newest held key, and stores each statement's `valid_from`. Every served link that
+names a held identity is checked, including operator-pinned anchors without a
+statement. An authenticated prefix survives a refused later link; refusal stops
+the walk. Historical links before an operator's anchor cannot extend trust.
+An unknown status signer triggers one chain fetch before verification is retried.
+A replacement lacking the newest held key's signature needs an operator repin.
+
+Publisher keys from `/v1/scopes/{scope}` are used only for that scope at its
+selected registry; another registry's same-named key id cannot supply trust. Historical rotations
+check both signatures and lineage, ignoring a predecessor's retirement window
+and ignoring revocations whose compromise time is later than the successor's
+activation. Invalid rotations and their descendants are not trusted. Publisher
+windows remain half-open and are checked against the status-attested publication
+time. `CORTEXKIT_ROOT` is an empty compiled slot until the offline root ceremony;
+test-only roots are supplied explicitly, never installed in production trust.
+
+`verify_version` binds the scope and signed name/version to the request before
+accepting status. Held archive digests, publisher fingerprints and publication
+times cannot change. The status commits independently of manifests and blobs:
+an unavailable or tombstoned archive cannot erase an authenticated status.
+Restoration authenticates held bytes and their signer index and compares every
+denormalized column; later repins do not retroactively invalidate saved status
+records whose signature was accepted before the signer's retirement.
+Package shape, signature and publisher trust pass before package-byte requests.
+
+Feeds use the same binding boundary for held and previously unheld versions,
+without requesting packages. Polls refresh the registry chain. The cursor and
+strong ETag advance only when every record applies or is an authenticated
+duplicate. Partial acceptance keeps good records, but not the new cursor or ETag.
+Expired incremental history and rollback request a full feed; 304 changes nothing.
+Status writes reapply against current mapping, chain and holds inside the SQLite
+transaction. Verification rechecks again after downloads before publishing bytes.
+An in-flight request cannot overwrite newer version status or attach old
+signatures to a replacement registry's key chain.
+
+Blob publication is not a cross-resource transaction: status is already durable,
+and verified bytes are atomically renamed while the final status check is fenced.
+A storage failure keeps accepted status. A crash after rename may leave a verified
+orphan blob; every read still hashes the whole blob. An interrupted temporary file
+is not addressable as a blob, and no partial or unverified bytes become servable.
+
+## Publisher grants
+
+Publisher trust is Direct-only, forbidden on flow routes, and asks for operator
+confirmation naming **install**, the publisher fingerprint and the placement
+agent. It authorizes install only, not future upgrades. The ceiling is the sorted
+union of authenticated manifests in that agent's pins. A held archive supplies
+`ck.json`; otherwise the selected registry supplies the bounded manifest bytes.
+Their SHA-256 and strict manifest name/version must match the pin. Any failure
+returns `manifest_unavailable` with the package identity, without writing a grant.
+The production source cannot yet supply an agent's saved, authenticated package
+closure, so publisher trust deliberately refuses until that source exists;
+an absent authenticated pin set is not a legitimate empty capability ceiling.
+
+Empty ceilings cover token-free packages. Coverage otherwise requires the live
+fingerprint/operation/agent row, capabilities within its ceiling, and no scripts.
+Root-certified CortexKit packages never need publisher grants; their pins cannot
+be used to mint one. A different recovered publisher key inherits no grants.
+Refresh preserves the row id, unions ceilings, replaces time/card reference and
+clears revocation. Revocation retains history. Insert, refresh and revoke append
+`grant_insert`, `grant_refresh` and `grant_revoke` audit rows atomically, including
+the acting principal. `permissions/v1` lists them under `catalog_publisher` and
+revokes them; disposed agents and revoked rows are hidden. These rows never travel
+through the shared log. `agent.audit_list` does not expose catalog audit rows.
 
 ## Transport and blobs
 
@@ -98,6 +172,12 @@ check; Linux CI cannot establish it. The dependency inventory below records the
 additional lockfile packages introduced by the transport and base64 encoding.
 
 ## Dependency inventory
+
+Trust tests add `ed25519-dalek 2.2.0` as a module dev-dependency only, at the
+already locked version. No package versions or runtime dependencies are added.
+Extra signed HTTP replies use only published TEST-ONLY seeds from
+`crates/entorhinal-catalog/tests/vectors/ck-catalog-v1/statements.json`; those
+keys gain no trust merely because tests generated a signature.
 
 New direct module dependencies: `entorhinal-catalog` (workspace path),
 `reqwest 0.12.28` (default features off, `rustls-tls`), `base64 0.22.1`,
