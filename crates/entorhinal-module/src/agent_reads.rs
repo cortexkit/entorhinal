@@ -1522,6 +1522,8 @@ mod tests {
         assert_eq!(surfaces[1]["role"], "tool_provider");
         let operations = surfaces[0]["operations"].as_array().unwrap();
         let expected_queries = [
+            "catalog.registry_list",
+            "catalog.read_blob",
             "permissions.list",
             "agent.audit_list",
             "agent.preview_repair_workspaces",
@@ -1553,6 +1555,9 @@ mod tests {
             "role.read",
         ];
         let expected_mutations = [
+            "catalog.registry_add",
+            "catalog.registry_repin",
+            "catalog.registry_remove",
             "permissions.revoke",
             "agent.set_hire_cap",
             "agent.repair_workspaces",

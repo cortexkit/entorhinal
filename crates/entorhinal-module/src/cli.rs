@@ -1,9 +1,9 @@
 //! Operator surface for the registry: `ck projects <verb>` and
-//! `ck workspaces <verb>` and `ck agents <verb>`.
+//! `ck workspaces <verb>`, `ck agents <verb>`, `ck roles <verb>` and `ck catalog <verb>`.
 //!
-//! One binary, four names. `ck` runs an unknown domain as `ck-<domain>`, looked
+//! One binary, six names. `ck` runs an unknown domain as `ck-<domain>`, looked
 //! up in CortexKit's bin folder first, then on PATH. `ck-projects`,
-//! `ck-workspaces` and `ck-agents` are links to this module binary in that
+//! `ck-workspaces`, `ck-agents`, `ck-roles` and `ck-catalog` are links to this module binary in that
 //! folder, and argv[0] selects the face. Operators type `ck projects`, never
 //! `ck-projects`. The module id (entorhinal) is
 //! infrastructure and never part of the operator vocabulary -- a user thinks
@@ -26,6 +26,8 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+#[path = "catalog_cli.rs"]
+mod catalog;
 #[path = "retry_quote.rs"]
 mod retry_quote;
 
@@ -103,6 +105,8 @@ pub enum Face {
     Agents,
     /// `ck-roles`: cached role claims and operator-confirmed takes.
     Roles,
+    /// `ck-catalog`: local registry configuration.
+    Catalog,
     /// `ck-entorhinal`: the supervised module itself. Serves; its only
     /// operator surface is `--version`/`--help`, which point at the faces.
     Entorhinal,
@@ -123,6 +127,7 @@ pub fn face_from_argv0(argv0: Option<&str>) -> Face {
         "ck-workspaces" | "ckdev-workspaces" => Face::Workspaces,
         "ck-agents" | "ckdev-agents" => Face::Agents,
         "ck-roles" | "ckdev-roles" => Face::Roles,
+        "ck-catalog" | "ckdev-catalog" => Face::Catalog,
         _ => Face::Entorhinal,
     }
 }
@@ -243,6 +248,15 @@ pub fn parse(face: Face, arguments: &[String]) -> Invocation {
                 args.push(argument.clone());
                 args.push(value.clone());
             }
+            "--scope" | "--key-id" | "--public-key" | "--valid-from" if face == Face::Catalog => {
+                let Some(value) = rest.next().filter(|v| !v.is_empty() && !v.starts_with('-'))
+                else {
+                    return Invocation::Refuse(format!("{argument} needs a value"));
+                };
+                args.push(argument.clone());
+                args.push(value.clone());
+            }
+            "--default" if face == Face::Catalog => args.push(argument.clone()),
             "--reason" if face == Face::Roles => {
                 let Some(value) = rest.next() else {
                     return Invocation::Refuse("--reason needs a value".into());
@@ -312,6 +326,7 @@ fn binary_name(face: Face) -> &'static str {
         Face::Projects => "ck-projects",
         Face::Workspaces => "ck-workspaces",
         Face::Agents => "ck-agents",
+        Face::Catalog => "ck-catalog",
         Face::Roles => "ck-roles",
         Face::Entorhinal => "ck-entorhinal",
     }
@@ -319,6 +334,7 @@ fn binary_name(face: Face) -> &'static str {
 
 pub fn usage(face: Face) -> String {
     match face {
+        Face::Catalog => catalog::usage().to_string(),
         Face::Projects => "\
 ck projects — the project registry
 
@@ -499,6 +515,9 @@ fn build_failure_exit(message: &str) -> u8 {
 }
 
 fn build_at(command: &Command, cwd: &str) -> Result<(String, Value), String> {
+    if command.face == Face::Catalog {
+        return catalog::build(command);
+    }
     if command.face == Face::Roles {
         return build_roles(command);
     }
@@ -1353,7 +1372,9 @@ fn call(
             let body = serde_json::to_vec(&json!({"method":method,"params":params}))
                 .map_err(|error| (EXIT_TRANSPORT, format!("serialize request: {error}")))?;
             let options = placement_call_options(method);
-            if matches!(method, "assign_workspace" | "register") {
+            if matches!(method, "assign_workspace" | "register")
+                || super::catalog_ops::WRITES.contains(&method)
+            {
                 eprintln!("{AGENT_WRITE_NOTICE}");
             }
             let bytes = consumer
@@ -1390,6 +1411,12 @@ fn call(
 
 fn placement_call_options(method: &str) -> subc_client_rs::CallOptions {
     if matches!(method, "assign_workspace" | "register") {
+        return subc_client_rs::CallOptions {
+            timeout: Duration::from_secs(300),
+            ..subc_client_rs::CallOptions::default()
+        };
+    }
+    if super::catalog_ops::WRITES.contains(&method) {
         subc_client_rs::CallOptions {
             timeout: Duration::from_secs(300),
             ..subc_client_rs::CallOptions::default()
