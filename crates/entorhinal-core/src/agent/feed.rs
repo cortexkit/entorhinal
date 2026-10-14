@@ -378,6 +378,9 @@ mod tests {
         f.store
             .apply_entry("approve_root", "{}", "test", None, |_| Ok(()))
             .unwrap();
+        f.store
+            .apply_entry("catalog.pin", "{}", "test", None, |_| Ok(()))
+            .unwrap();
         create(&f, "A", "assistant", None, None);
         let mut cursor = 0;
         let mut consumed = Vec::new();
@@ -397,7 +400,7 @@ mod tests {
             consumed,
             vec![(1, "register".into()), (3, "approve_root".into())]
         );
-        assert_eq!(cursor, 4);
+        assert_eq!(cursor, 5);
         assert_eq!(f.store.journal_tail(0, 10).unwrap().entries.len(), 2);
     }
 

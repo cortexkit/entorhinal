@@ -6974,3 +6974,15 @@ package = "entorhinal-catalog"
 target = "--test reproduction"
 select = "expected"
 expect_red = ["reproduce_resolver"]
+
+[[control]]
+id = "catalog-pin-off-journal-tail"
+guards = "Catalog pin entries never appear in the project journal_tail feed"
+file = "crates/entorhinal-core/src/lib.rs"
+old = "                catalog_agent::PIN_OP,"
+new = "                \"\" /* NON-VACUITY BREAK */,"
+test_file = "crates/entorhinal-core/src/agent/feed.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["agent::feed::tests::journal_tail_returns_only_project_rows_and_advance_rule_passes_marker_and_agents"]

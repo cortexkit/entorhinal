@@ -686,11 +686,13 @@ impl RegistryStore {
             let mut statement = conn.prepare(&format!(
                 "SELECT seq, op, payload_json, actor, request_key, created_at, principal
                  FROM registry_journal
-                  WHERE seq > ?1 AND op NOT IN ({}, '{}')
+                  WHERE seq > ?1 AND op NOT IN ({}, '{}', '{}')
                  ORDER BY seq
                  LIMIT ?2",
                 agent::change_ops_sql(),
                 agent::IDENTITY_MARKER_OP,
+                // An agent's catalog pins are agent state, not project history.
+                catalog_agent::PIN_OP,
             ))?;
             let entries = statement
                 .query_map(params![after_seq, limit], |row| {

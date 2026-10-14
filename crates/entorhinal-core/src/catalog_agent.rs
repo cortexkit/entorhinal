@@ -7,6 +7,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 
+/// Journal op for a replacement of one agent's whole pin set. It is shared
+/// identity state, but never part of `agent.changes` (core's replica refuses
+/// ops it does not know) or of the project `journal_tail`.
+pub(crate) const PIN_OP: &str = "catalog.pin";
+
 pub(crate) const V12_CATALOG_AGENT: &str = r#"
 CREATE TABLE catalog_pin_set(agent_id TEXT PRIMARY KEY REFERENCES agent(agent_id), pin_digest TEXT NOT NULL);
 CREATE TABLE catalog_pin(agent_id TEXT NOT NULL REFERENCES catalog_pin_set(agent_id), name TEXT NOT NULL,
@@ -108,7 +113,7 @@ pub fn pin_digest(pins: &[CatalogPin]) -> rusqlite::Result<String> {
 }
 impl CatalogPinSet {
     pub fn validate(&self, conn: &Connection, require_live: bool) -> rusqlite::Result<()> {
-        if self.op != "catalog.pin" || self.pin_digest != pin_digest(&self.pins)? {
+        if self.op != PIN_OP || self.pin_digest != pin_digest(&self.pins)? {
             return Err(invalid("invalid catalog pin digest or op"));
         }
         let status: Option<String> =
@@ -161,7 +166,7 @@ pub(crate) fn validate_pin_projection(conn: &Connection) -> rusqlite::Result<()>
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for (agent_id, pin_digest) in sets {
         CatalogPinSet {
-            op: "catalog.pin".into(),
+            op: PIN_OP.into(),
             pins: read_pins(conn, &agent_id)?,
             agent_id,
             pin_digest,
@@ -191,9 +196,9 @@ impl JournalWriter<'_> {
     ) -> Result<Vec<u8>, RegistryError> {
         let mut req = req;
         req.pins.sort_by(|a, b| a.name.cmp(&b.name));
-        self.mutation("catalog.pin", req.request_key.as_deref(), |tx| {
+        self.mutation(PIN_OP, req.request_key.as_deref(), |tx| {
             let entry = CatalogPinSet {
-                op: "catalog.pin".into(),
+                op: PIN_OP.into(),
                 agent_id: req.agent_id.clone(),
                 pin_digest: pin_digest(&req.pins)?,
                 pins: req.pins.clone(),
