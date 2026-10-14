@@ -6738,6 +6738,45 @@ select = "expected"
 expect_red = ["reproduce_resolver"]
 
 [[control]]
+id = "catalog-capability-name-length"
+guards = "Capability manifest names are limited to 64 characters"
+file = "crates/entorhinal-catalog/src/resolver.rs"
+old = 'const CAPABILITY_NAME_MAX: usize = 64;'
+new = 'const CAPABILITY_NAME_MAX: usize = 65; // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-catalog/tests/reproduction.rs"
+runner = "cargo"
+package = "entorhinal-catalog"
+target = "--test reproduction"
+select = "expected"
+expect_red = ["reproduce_capability_manifest_mapping"]
+
+[[control]]
+id = "catalog-capability-token-no-hyphens"
+guards = "Capability token area and verb components contain no hyphens"
+file = "crates/entorhinal-catalog/src/resolver.rs"
+old = '''bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())'''
+new = '''bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-catalog/tests/reproduction.rs"
+runner = "cargo"
+package = "entorhinal-catalog"
+target = "--test reproduction"
+select = "expected"
+expect_red = ["reproduce_capability_manifest_mapping"]
+
+[[control]]
+id = "catalog-capability-manifest-round-trip"
+guards = "Reverse capability mapping must round-trip exactly before returning a token"
+file = "crates/entorhinal-catalog/src/resolver.rs"
+old = 'if capability_to_manifest(&token).as_deref() != Ok(manifest) {'
+new = 'if capability_to_manifest(&token).as_deref() == Ok(manifest) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-catalog/tests/reproduction.rs"
+runner = "cargo"
+package = "entorhinal-catalog"
+target = "--test reproduction"
+select = "expected"
+expect_red = ["reproduce_capability_manifest_mapping"]
+
+[[control]]
 id = "catalog-resolution-shared-dependencies"
 guards = "A named upgrade cannot move a dependency reachable from another root"
 file = "crates/entorhinal-catalog/src/resolver.rs"
