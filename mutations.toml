@@ -5196,6 +5196,18 @@ target = "--test guards"
 expect_red = ["duplicate_keys_are_refused"]
 
 [[control]]
+id = "catalog-signed-json-number-tokens"
+guards = "Signed documents refuse fraction, exponent and negative-zero number tokens before signatures"
+file = "crates/entorhinal-catalog/src/jcs.rs"
+old = 'if !integer_number_tokens(text) {'
+new = 'if false && !integer_number_tokens(text) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-catalog/tests/guards.rs"
+runner = "cargo"
+package = "entorhinal-catalog"
+target = "--test guards"
+expect_red = ["signed_json_requires_integer_tokens"]
+
+[[control]]
 id = "catalog-tar-checksum"
 guards = "A tar header with altered metadata is refused before trusting its contents"
 file = "crates/entorhinal-catalog/src/archive.rs"

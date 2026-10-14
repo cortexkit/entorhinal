@@ -78,7 +78,7 @@ export function jcs(value: unknown): string {
   throw new Error(`JCS: unsupported value of type ${typeof value}`)
 }
 
-// ─────────────────── strict JSON parser (duplicate keys refused) ───────────────────
+// ───────────── strict JSON parser (duplicate keys and number spellings) ─────────────
 
 // JSON.parse keeps the last of two equal keys. A signed record must be refused
 // instead, because two parsers that keep different duplicates would verify
@@ -148,8 +148,12 @@ export function parseStrictJson(text: string): unknown {
     if (c === '"') return str()
     const literal = /^(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)/.exec(text.slice(at))
     if (!literal) fail("unexpected token")
-    at += literal![0].length
-    return JSON.parse(literal![0])
+    const token = literal![0]
+    // Signed documents require integer tokens without fractions, exponents or negative zero.
+    // Check before JSON.parse discards the original number spelling.
+    if (token === "-0" || /^-?\d.*[.eE]/.test(token)) throw new Error(`strict JSON: non-canonical number token ${token} at offset ${at}`)
+    at += token.length
+    return JSON.parse(token)
   }
   const str = (): string => {
     const match = /^"(?:[^"\\\u0000-\u001f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"/.exec(text.slice(at))
@@ -760,6 +764,7 @@ export function verifyRecord(recordText: string, signatureHex: string, pkg: Vect
   try {
     parsed = parseStrictJson(recordText)
   } catch {
+    // Duplicate keys and non-canonical number tokens are both strict-parse failures.
     return { ok: false, code: "record_invalid", field: "json" }
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return { ok: false, code: "record_invalid", field: "json" }
@@ -950,6 +955,20 @@ function recordVectors() {
       signature: skillSigned.signature,
       expect: { ok: false, code: "record_invalid", field: "json" },
     },
+    ...[
+      ["json_number_fraction", "1.0"],
+      ["json_number_exponent_lower", "1e2"],
+      ["json_number_exponent_upper", "1E0"],
+      ["json_number_zero_exponent", "0e0"],
+      ["json_number_negative_zero", "-0"],
+    ].map(([name, token]): Case => ({
+      name,
+      note: `archive_bytes uses ${token}; strict parsing refuses it before checking the unchanged valid record's signature`,
+      package: "skill",
+      served_text: skillSigned.canonical.replace(/"archive_bytes":\d+/, `"archive_bytes":${token}`),
+      signature: skillSigned.signature,
+      expect: { ok: false, code: "record_invalid", field: "json" },
+    })),
     {
       name: "embedded_key_swapped",
       note: "record names key 2 but was signed by key 1",
@@ -1007,7 +1026,7 @@ function recordVectors() {
       algorithm: "Ed25519 (RFC 8032, pure, deterministic)",
       encodings: "digests, public keys and signatures are lowercase hex; key fingerprint is SHA-256 of the 32 raw public key bytes",
       verification_order: [
-        "record_invalid (strict parse, exact field set, field formats)",
+        "record_invalid (strict parse, including duplicate keys and fraction, exponent or -0 number tokens; exact field set; field formats)",
         "signature_invalid",
         "key_unknown",
         "record_mismatch (manifest_sha256, archive_sha256, archive_bytes)",
@@ -2148,6 +2167,8 @@ export function parseRange(text: string): Range | null {
     if (parts.length > 1 && parts.includes("*")) return null
     const bounds = parts.map(comparator)
     if (bounds.some((b) => b === null)) return null
+    // A prerelease must be the only comparator in its ||-set, even when other bounds are redundant.
+    if (bounds.length > 1 && bounds.some((b) => b?.exact?.pre.length)) return null
     sets.push(bounds as Bound[])
   }
   return sets
@@ -2328,7 +2349,7 @@ function resolverVectors() {
     ["*", "5.0.0", true], ["*", "0.0.0", true], ["*", "1.0.0-beta.1", false],
     ["^1", "1.3.0-beta.1", false], ["<1.3.0", "1.3.0-beta.1", false], ["1.3.0", "1.3.0-beta.1", false],
     ["1.3.0-beta.1", "1.3.0-beta.1", true], ["=1.3.0-beta.1", "1.3.0-beta.1", true], ["1.3.0-beta.1", "1.3.0-beta.2", false], ["1.3.0-beta.1", "1.3.0", false],
-    ["1.3.0-beta.1 || ^2", "1.3.0-beta.1", true], ["1.3.0-beta.1 >=1.0.0", "1.3.0-beta.1", false],
+    ["1.3.0-beta.1 || ^2", "1.3.0-beta.1", true],
   ]
   const ranges = rangeCases.map(([range, version, expected]) => {
     const r = parseRange(range)
@@ -2337,7 +2358,7 @@ function resolverVectors() {
     if (satisfies(ver, r) !== expected) throw new Error(`range vector ${range} ${version}: expected ${expected}`)
     return { range, version, satisfies: expected }
   })
-  const invalidRanges = ["", " ", "latest", "^", "1.x", "1.2.*", "v1.2.3", ">= 1.2.3", "1.2 - 1.4", "^1.2.3-beta.1", ">=1.0.0-rc.1", "~1.2.3-beta", "1.2.3+build", "01.2.3", "* >1", "1 ||"].map((range) => {
+  const invalidRanges = ["", " ", "latest", "^", "1.x", "1.2.*", "v1.2.3", ">= 1.2.3", "1.2 - 1.4", "^1.2.3-beta.1", ">=1.0.0-rc.1", "~1.2.3-beta", "1.3.0-beta.1 >=1.0.0", "1.2.3+build", "01.2.3", "* >1", "1 ||"].map((range) => {
     if (parseRange(range) !== null) throw new Error(`range ${JSON.stringify(range)} should be invalid`)
     return { range, code: "range_invalid" }
   })
@@ -2582,7 +2603,7 @@ function resolverVectors() {
       versions: "SemVer 2.0.0 without build metadata",
       capability_token: CAPABILITY_TOKEN.source,
       range_grammar: 'range := set ("||" set)*; set := comparator (whitespace comparator)*; comparator := "*" | op? partial; op := ^ ~ >= <= > < =; partial := N | N.N | N.N.N | N.N.N-prerelease',
-      prerelease: "a prerelease version satisfies a range only when one ||-set is exactly that version (bare or =); a prerelease in any other comparator is range_invalid",
+      prerelease: "a prerelease version satisfies a range only when one ||-set is exactly that version (bare or =); a prerelease anywhere else in a range is range_invalid",
       eligibility: "status available, and every requires.capabilities token is declared by a local module (exact string match)",
       algorithm: "in passes: walk breadth-first from the root, dependencies in name order; pick each package once per pass as the highest eligible version satisfying every range recorded for it so far, then record that version's requires.packages ranges (keyed by requester name@version). Stop after a pass that records nothing new. Recorded ranges are never removed. Then check cycles, then body references.",
       refusal_detail: "ranges are listed sorted by requested_by; '(root)' is the spec's own range; other requesters are name@version",

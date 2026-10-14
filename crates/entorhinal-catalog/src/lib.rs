@@ -193,7 +193,8 @@ pub(crate) fn shape(
     optional: &[&str],
     code: RefusalCode,
 ) -> Result<serde_json::Value, Refusal> {
-    let (v, source_keys) = jcs::parse_ordered(text).map_err(|_| Refusal::field(code, "json"))?;
+    let (v, source_keys) =
+        jcs::parse_signed_ordered(text).map_err(|_| Refusal::field(code, "json"))?;
     let o = v.as_object().ok_or_else(|| Refusal::field(code, "json"))?;
     for k in &source_keys {
         if !fields.contains(&k.as_str()) && !optional.contains(&k.as_str()) {

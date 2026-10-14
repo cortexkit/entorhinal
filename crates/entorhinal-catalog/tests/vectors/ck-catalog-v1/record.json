@@ -6,7 +6,7 @@
     "algorithm": "Ed25519 (RFC 8032, pure, deterministic)",
     "encodings": "digests, public keys and signatures are lowercase hex; key fingerprint is SHA-256 of the 32 raw public key bytes",
     "verification_order": [
-      "record_invalid (strict parse, exact field set, field formats)",
+      "record_invalid (strict parse, including duplicate keys and fraction, exponent or -0 number tokens; exact field set; field formats)",
       "signature_invalid",
       "key_unknown",
       "record_mismatch (manifest_sha256, archive_sha256, archive_bytes)",
@@ -266,6 +266,66 @@
       "note": "a lax parser keeps the last 'name' and the signature verifies; a strict parser must refuse",
       "package": "skill",
       "served_text": "{\"name\":\"@example/evil\",\"archive_bytes\":4608,\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"log_head\":null,\"manifest_sha256\":\"0e9589220c8da2a19847f8762998ff13edab94b268fc4ee75157b8337ebd91be\",\"name\":\"@example/hello-skill\",\"public_key\":\"0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4\",\"schema\":\"ck-record/v1\",\"version\":\"1.0.0\"}",
+      "signature": "5d30de600a1c0b317c4235eb6c82fa40bdd168beaad0f1c0d94052e5453778d4bd3514c04f6fe52f69e3fe15927ead2b620b189d0750c4f69cf8fd16f9385904",
+      "expect": {
+        "ok": false,
+        "code": "record_invalid",
+        "field": "json"
+      }
+    },
+    {
+      "name": "json_number_fraction",
+      "note": "archive_bytes uses 1.0; strict parsing refuses it before checking the unchanged valid record's signature",
+      "package": "skill",
+      "served_text": "{\"archive_bytes\":1.0,\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"log_head\":null,\"manifest_sha256\":\"0e9589220c8da2a19847f8762998ff13edab94b268fc4ee75157b8337ebd91be\",\"name\":\"@example/hello-skill\",\"public_key\":\"0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4\",\"schema\":\"ck-record/v1\",\"version\":\"1.0.0\"}",
+      "signature": "5d30de600a1c0b317c4235eb6c82fa40bdd168beaad0f1c0d94052e5453778d4bd3514c04f6fe52f69e3fe15927ead2b620b189d0750c4f69cf8fd16f9385904",
+      "expect": {
+        "ok": false,
+        "code": "record_invalid",
+        "field": "json"
+      }
+    },
+    {
+      "name": "json_number_exponent_lower",
+      "note": "archive_bytes uses 1e2; strict parsing refuses it before checking the unchanged valid record's signature",
+      "package": "skill",
+      "served_text": "{\"archive_bytes\":1e2,\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"log_head\":null,\"manifest_sha256\":\"0e9589220c8da2a19847f8762998ff13edab94b268fc4ee75157b8337ebd91be\",\"name\":\"@example/hello-skill\",\"public_key\":\"0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4\",\"schema\":\"ck-record/v1\",\"version\":\"1.0.0\"}",
+      "signature": "5d30de600a1c0b317c4235eb6c82fa40bdd168beaad0f1c0d94052e5453778d4bd3514c04f6fe52f69e3fe15927ead2b620b189d0750c4f69cf8fd16f9385904",
+      "expect": {
+        "ok": false,
+        "code": "record_invalid",
+        "field": "json"
+      }
+    },
+    {
+      "name": "json_number_exponent_upper",
+      "note": "archive_bytes uses 1E0; strict parsing refuses it before checking the unchanged valid record's signature",
+      "package": "skill",
+      "served_text": "{\"archive_bytes\":1E0,\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"log_head\":null,\"manifest_sha256\":\"0e9589220c8da2a19847f8762998ff13edab94b268fc4ee75157b8337ebd91be\",\"name\":\"@example/hello-skill\",\"public_key\":\"0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4\",\"schema\":\"ck-record/v1\",\"version\":\"1.0.0\"}",
+      "signature": "5d30de600a1c0b317c4235eb6c82fa40bdd168beaad0f1c0d94052e5453778d4bd3514c04f6fe52f69e3fe15927ead2b620b189d0750c4f69cf8fd16f9385904",
+      "expect": {
+        "ok": false,
+        "code": "record_invalid",
+        "field": "json"
+      }
+    },
+    {
+      "name": "json_number_zero_exponent",
+      "note": "archive_bytes uses 0e0; strict parsing refuses it before checking the unchanged valid record's signature",
+      "package": "skill",
+      "served_text": "{\"archive_bytes\":0e0,\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"log_head\":null,\"manifest_sha256\":\"0e9589220c8da2a19847f8762998ff13edab94b268fc4ee75157b8337ebd91be\",\"name\":\"@example/hello-skill\",\"public_key\":\"0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4\",\"schema\":\"ck-record/v1\",\"version\":\"1.0.0\"}",
+      "signature": "5d30de600a1c0b317c4235eb6c82fa40bdd168beaad0f1c0d94052e5453778d4bd3514c04f6fe52f69e3fe15927ead2b620b189d0750c4f69cf8fd16f9385904",
+      "expect": {
+        "ok": false,
+        "code": "record_invalid",
+        "field": "json"
+      }
+    },
+    {
+      "name": "json_number_negative_zero",
+      "note": "archive_bytes uses -0; strict parsing refuses it before checking the unchanged valid record's signature",
+      "package": "skill",
+      "served_text": "{\"archive_bytes\":-0,\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"log_head\":null,\"manifest_sha256\":\"0e9589220c8da2a19847f8762998ff13edab94b268fc4ee75157b8337ebd91be\",\"name\":\"@example/hello-skill\",\"public_key\":\"0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4\",\"schema\":\"ck-record/v1\",\"version\":\"1.0.0\"}",
       "signature": "5d30de600a1c0b317c4235eb6c82fa40bdd168beaad0f1c0d94052e5453778d4bd3514c04f6fe52f69e3fe15927ead2b620b189d0750c4f69cf8fd16f9385904",
       "expect": {
         "ok": false,

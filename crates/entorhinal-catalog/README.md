@@ -27,23 +27,25 @@ return `archive_invalid` plus a rule; caps return `archive_too_large` and
 `archive_invalid` with rule `ck_json_not_first`. `MemberKind` makes forbidden
 member inputs representable for refusal, without exposing raw header overrides.
 
-The ten pinned vector files are unchanged. Their README provides the six JSON
-checksums; integrity tests pin the four auxiliary checksums separately because
-a README cannot include its own SHA-256. No production code embeds the public
-TEST-ONLY seeds or keys.
+The ten vector files are pinned to prefrontal commit
+`10cc9ebb68446305d1451cf9ff3ef3bc98f49f99`. The README in
+`tests/vectors/ck-catalog-v1/` provides the six JSON checksums. Integrity tests
+separately pin that README, `SOURCE.txt`, `generate.ts`, and `generate.test.ts`,
+because a README cannot include its own SHA-256. No production code embeds the
+public TEST-ONLY seeds or keys.
 
-## Normative difference from the pinned vectors
+## Signed documents and vector coverage
 
-Contract §9.1 requires a prerelease range to be an exact singleton comparator
-set. The reference generator at `generate.ts:2331-2338` accepts
-`1.3.0-beta.1 >=1.0.0` but makes it unsatisfiable. This crate refuses that range;
-the resolver reproduction test explicitly asserts the known difference. Every
-other vector outcome is asserted structurally. The contract's final status-key
+Signed-document parsing rejects fraction and exponent number tokens and `-0`
+before canonicalization or signature verification. General JSON, including
+package manifests, retains RFC 8785 number handling. Contract §9.1 and the
+vectors both refuse prereleases outside exact singleton comparator sets.
+Every vector outcome is asserted structurally. The contract's final status-key
 retirement/time/epoch rules and reviewed slice specification extend the older
 generator's id-to-key-map status API; additional tests cover those rules.
 
 ## Verification
 
 From the workspace root use the worker guide's workspace format, clippy and test
-gates. `mutations.toml` contains six catalog controls with native cargo targets;
+gates. `mutations.toml` contains seven catalog controls with native cargo targets;
 replay each using `ckdev-mutate run --only <id>`.

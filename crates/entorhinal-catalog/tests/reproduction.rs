@@ -81,7 +81,7 @@ fn reproduce_readme() {
     let readme = fs::read(dir().join("README.md")).unwrap();
     assert_eq!(
         c::sha256_hex(&readme),
-        "a876517f54c029e16eb9bad085b05870e4487494d529a00e2ab7955a782280e9"
+        "5ce1c67252a867a5f82ec9d125313a45bfd0f2e161364a0a07dd02a824303cb4"
     );
     let text = String::from_utf8(readme).unwrap();
     let mut checked = 0;
@@ -105,24 +105,24 @@ fn reproduce_source() {
     let bytes = fs::read(dir().join("SOURCE.txt")).unwrap();
     assert_eq!(
         c::sha256_hex(&bytes),
-        "4994dd37177d02238f6a3f7ed2d7a9cb7764f396dd70070c6b402d99aaee54f2"
+        "2d80a697201c0e40ad1806b93ab27131fcad9d13fe5037a98ed0b066bf74eb8a"
     );
     assert!(String::from_utf8(bytes)
         .unwrap()
-        .contains("1ee4352d6c2a9f0a912287a75d75b7de6008149a"));
+        .contains("10cc9ebb68446305d1451cf9ff3ef3bc98f49f99"));
 }
 #[test]
 fn reproduce_generator() {
     assert_eq!(
         c::sha256_hex(fs::read(dir().join("generate.ts")).unwrap()),
-        "70cc1700032ae640567ac56afd7f5acedd131ba4fa0db397fc5477093e05d9a9"
+        "efc33f614e0621bb2cd0ff770ae12d79748245de8e515961e2a3c381198fdbbe"
     );
 }
 #[test]
 fn reproduce_generator_test() {
     assert_eq!(
         c::sha256_hex(fs::read(dir().join("generate.test.ts")).unwrap()),
-        "425ed73585cae7c209e76826bbb27cd70ecd907c9d35f54b25bf91284caf7aae"
+        "78ebd3a78d4a37eae8f7c28a8a337b9d8c71c36e656e6ed3f7c4495c5e0d3d9f"
     );
 }
 #[test]
@@ -240,16 +240,8 @@ fn reproduce_record() {
 #[test]
 fn reproduce_resolver() {
     let v = load("resolver.json");
-    let mut differences = 0;
     for case in a(&v["ranges"]) {
         let range = s(&case["range"]);
-        if range == "1.3.0-beta.1 >=1.0.0" {
-            // Contract §9.1 refuses this conjunction; the older generator accepts it but never satisfies it.
-            assert!(range.parse::<semver::Range>().is_err());
-            assert_eq!(case["satisfies"], false);
-            differences += 1;
-            continue;
-        }
         let r = range.parse::<semver::Range>().unwrap();
         assert_eq!(
             json!(r.satisfies(&s(&case["version"]).parse().unwrap())),
@@ -257,7 +249,6 @@ fn reproduce_resolver() {
             "{range}"
         );
     }
-    assert_eq!(differences, 1);
     for case in a(&v["invalid_ranges"]) {
         assert!(s(&case["range"]).parse::<semver::Range>().is_err());
         assert_eq!(case["code"], "range_invalid");

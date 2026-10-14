@@ -66,6 +66,106 @@ fn duplicate_keys_are_refused() {
     }
 }
 #[test]
+fn signed_json_requires_integer_tokens() {
+    let vectors = jcs::parse(include_str!("vectors/ck-catalog-v1/record.json")).unwrap();
+    let doc = &vectors["valid"][0];
+    let pkg = &vectors["packages"][doc["package"].as_str().unwrap()];
+    let members: Vec<_> = pkg["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            Member::regular(
+                m["path"].as_str().unwrap(),
+                m["content"].as_str().unwrap().as_bytes(),
+            )
+        })
+        .collect();
+    let bytes = archive::write(&members).unwrap();
+    let manifest = pkg["manifest_text"].as_str().unwrap().as_bytes();
+    let signer = SigningKey::from_bytes(
+        &c::decode_hex::<32>(vectors["keys"]["trusted"]["seed_hex"].as_str().unwrap()).unwrap(),
+    );
+    let keys = [c::statements::ScopeKey {
+        public_key: c::hex(&signer.verifying_key().to_bytes()),
+        valid_from: "2026-01-01T00:00:00Z".into(),
+        valid_until: None,
+        revocation: None,
+    }];
+    let trust = c::record::Trust {
+        keys: &keys,
+        published_at: None,
+    };
+    let record_text = doc["record"].to_string();
+    let status = status_record("r1", 1, "2026-06-01T00:00:00Z");
+    let cert = json!({"schema":"ck-key-cert/v1","scope":"cortexkit","public_key":keys[0].public_key,"valid_from":"2026-01-01T00:00:00Z","valid_until":null});
+    for token in ["1.0", "1e2", "1E0", "0e0", "-0"] {
+        // These tokens are valid general JSON, but their spelling is forbidden in signed documents.
+        assert!(jcs::parse(token).is_ok(), "{token}");
+        for text in [
+            token.to_owned(),
+            format!(r#"{{"n":{token}}}"#),
+            format!(r#"[{{"n":[{token}]}}]"#),
+        ] {
+            assert_eq!(
+                jcs::parse_signed(&text),
+                Err(jcs::JsonError::InvalidJson),
+                "{text}"
+            );
+        }
+        let text = record_text.replace(
+            "\"log_head\":null",
+            &format!(r#""log_head":{{"n":[{token}]}}"#),
+        );
+        for signature in [doc["signature"].as_str().unwrap(), "bad signature"] {
+            assert_eq!(
+                c::record::verify_record(&text, signature, manifest, &bytes, &trust).unwrap_err(),
+                c::Refusal::field(RefusalCode::RecordInvalid, "json"),
+                "record: {token}"
+            );
+        }
+        let text = status
+            .to_string()
+            .replace("\"sequence\":1", &format!(r#""sequence":{token}"#));
+        assert_eq!(
+            status::apply_status(None, &text, &sig(&status, &key(1)), &chain(), &pin())
+                .unwrap_err(),
+            c::Refusal::field(RefusalCode::StatusInvalid, "json"),
+            "status: {token}"
+        );
+        let text = cert
+            .to_string()
+            .replace("\"valid_until\":null", &format!(r#""valid_until":{token}"#));
+        assert_eq!(
+            c::statements::verify_key_cert(&text, &sig(&cert, &signer), &keys[0].public_key)
+                .unwrap_err(),
+            c::Refusal::field(RefusalCode::StatementInvalid, "json"),
+            "statement: {token}"
+        );
+    }
+    for token in ["0", "-1", "100"] {
+        let number = jcs::parse_signed(token).unwrap();
+        let nested = json!({"n":[number]});
+        let text = record_text.replace("\"log_head\":null", &format!(r#""log_head":{nested}"#));
+        let mut record = doc["record"].clone();
+        record["log_head"] = nested.clone();
+        assert_eq!(jcs::parse_signed(&text).unwrap(), record);
+        let verified =
+            c::record::verify_record(&text, &sig(&record, &signer), manifest, &bytes, &trust)
+                .unwrap();
+        assert_eq!(verified.record.log_head, nested);
+    }
+    for text in [
+        r#"{"1.0":"-0","nested":["1e2","1E0","0e0"]}"#,
+        r#"{"escaped":"\"1e2\" \\ -0","n":100}"#,
+    ] {
+        assert_eq!(jcs::parse_signed(text).unwrap(), jcs::parse(text).unwrap());
+    }
+    for text in [r#"{"n":0,"n":1}"#, r#"{"n":01}"#, r#"{"n":-}"#] {
+        assert_eq!(jcs::parse_signed(text), Err(jcs::JsonError::InvalidJson));
+    }
+}
+#[test]
 fn tar_header_checksum_is_verified() {
     let mut bytes = archive::write(&[Member::regular("ck.json", b"{}")]).unwrap();
     bytes[100] ^= 1;

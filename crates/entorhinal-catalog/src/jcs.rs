@@ -76,10 +76,52 @@ pub fn parse(text: &str) -> Result<Value, JsonError> {
         .map(|v| v.0)
         .map_err(|_| JsonError::InvalidJson)
 }
-pub(crate) fn parse_ordered(text: &str) -> Result<(Value, Vec<String>), JsonError> {
+/// Parse a signed document without normalizing fractional, exponent or negative-zero tokens.
+/// General JSON and RFC 8785 canonicalization still use `parse`.
+pub fn parse_signed(text: &str) -> Result<Value, JsonError> {
+    parse_signed_ordered(text).map(|v| v.0)
+}
+pub(crate) fn parse_signed_ordered(text: &str) -> Result<(Value, Vec<String>), JsonError> {
+    if !integer_number_tokens(text) {
+        return Err(JsonError::InvalidJson);
+    }
     serde_json::from_str::<Strict>(text)
         .map(|v| (v.0, v.1))
         .map_err(|_| JsonError::InvalidJson)
+}
+fn integer_number_tokens(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = i;
+                i += 1;
+                while i < bytes.len()
+                    && matches!(bytes[i], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+                {
+                    i += 1;
+                }
+                let token = &bytes[start..i];
+                if token == b"-0" || token.iter().any(|b| matches!(b, b'.' | b'e' | b'E')) {
+                    return false;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    // Serde checks JSON grammar and duplicate keys after this lexical check.
+    true
 }
 pub fn canonicalize(text: &str) -> Result<String, JsonError> {
     to_string(&parse(text)?)

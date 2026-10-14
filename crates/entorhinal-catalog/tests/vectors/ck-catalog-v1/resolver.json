@@ -4,7 +4,7 @@
     "versions": "SemVer 2.0.0 without build metadata",
     "capability_token": "^cap\\/[a-z0-9]+(-[a-z0-9]+)*(\\.[a-z0-9]+(-[a-z0-9]+)*)?@[1-9][0-9]*$",
     "range_grammar": "range := set (\"||\" set)*; set := comparator (whitespace comparator)*; comparator := \"*\" | op? partial; op := ^ ~ >= <= > < =; partial := N | N.N | N.N.N | N.N.N-prerelease",
-    "prerelease": "a prerelease version satisfies a range only when one ||-set is exactly that version (bare or =); a prerelease in any other comparator is range_invalid",
+    "prerelease": "a prerelease version satisfies a range only when one ||-set is exactly that version (bare or =); a prerelease anywhere else in a range is range_invalid",
     "eligibility": "status available, and every requires.capabilities token is declared by a local module (exact string match)",
     "algorithm": "in passes: walk breadth-first from the root, dependencies in name order; pick each package once per pass as the highest eligible version satisfying every range recorded for it so far, then record that version's requires.packages ranges (keyed by requester name@version). Stop after a pass that records nothing new. Recorded ranges are never removed. Then check cycles, then body references.",
     "refusal_detail": "ranges are listed sorted by requested_by; '(root)' is the spec's own range; other requesters are name@version",
@@ -285,11 +285,6 @@
       "range": "1.3.0-beta.1 || ^2",
       "version": "1.3.0-beta.1",
       "satisfies": true
-    },
-    {
-      "range": "1.3.0-beta.1 >=1.0.0",
-      "version": "1.3.0-beta.1",
-      "satisfies": false
     }
   ],
   "invalid_ranges": [
@@ -339,6 +334,10 @@
     },
     {
       "range": "~1.2.3-beta",
+      "code": "range_invalid"
+    },
+    {
+      "range": "1.3.0-beta.1 >=1.0.0",
       "code": "range_invalid"
     },
     {
