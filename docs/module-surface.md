@@ -38,7 +38,7 @@ Principals in the tables:
 | Name | Meaning |
 |---|---|
 | Direct | A local client such as `ck`. Every local process, including an agent's shell, connects as Direct. |
-| executive | `reserved:prefrontal-core`. |
+| executive | `reserved:prefrontal-core`, the module that registers repositories and relays the operator's agent changes. |
 | orchestrator, host | The daemon's sole provider of `agent-orchestrator/v1` or `agent-host/v1`, resolved per route. |
 | any | Every caller. |
 

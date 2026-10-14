@@ -80,8 +80,8 @@ Steps are closed. Source: `preparing` → `exported` → `sealed` → `published
 | receiver | `activating` | `agent_data.activate` on each participant, then write `activated`. |
 | receiver | `activated` | Finish when the record reads `released` (`done`) or the door reports takeover (`taken_over`). |
 
-At most one open move per agent on this Mac, on either side, and at most four
-open moves per Mac. A receiver's inbox holds at most 64 entries.
+Each Mac allows at most one open move per agent, whichever side it is on, and
+at most four open moves in total. A receiver's inbox holds at most 64 entries.
 
 Tests: `restarted_source_and_receiver_resume_at_every_recorded_step`,
 `full_move_three_participants_preserves_refs_claim_and_local_journals`,
@@ -158,7 +158,7 @@ Tests: `preconditions_refuse_in_order_with_named_codes`,
 5. **Refusals.** Each participant or door refusal maps to an action for the
    driver. A retryable refusal (for example the door's `cut_not_ready` or
    `unavailable`) is saved as a hold carrying its code and retried with
-   backoff. Before the boundary, a refusal that cannot be retried, including
+   backoff. Before the receiver's activation boundary, a refusal that cannot be retried, including
    an unknown code, aborts the move with a named reason such as
    `door_refused`. A refusal code the contract does not allow for that
    operation is a contract violation and is never retried. An import digest
@@ -179,7 +179,8 @@ Tests: `restarted_source_and_receiver_resume_at_every_recorded_step`,
 
 ## 6. Aborting
 
-`agent.move_abort {cut_id, request_key}` asks a side to clean up.
+`agent.move_abort {cut_id, request_key}` asks this Mac's side of the move to
+stop and undo its work. Either Mac can ask, within the limits below.
 
 1. **Who.** `Direct` with a Touch ID prompt, or the orchestrator without one.
    Others get `caller_forbidden`. `unknown_move` when this Mac has no such cut.
@@ -251,8 +252,8 @@ Not guaranteed:
   point becomes a fork.
 - That a move finishes while engram, the other Mac or a participant is
   unreachable. Transient failures are retried with a backoff that grows to
-  five minutes; refusals that cannot be retried before the boundary abort the
-  move.
+  five minutes; refusals that cannot be retried before the activation boundary
+  abort the move.
 
 ## 9. Status and the lid-close setting
 

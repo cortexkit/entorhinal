@@ -20,8 +20,9 @@ entorhinal has registered.
 
 ## Build and test
 
-These need nothing but a Rust toolchain. Every CortexKit dependency comes from
-crates.io, so a fresh clone builds on its own.
+These need only a Rust toolchain and a C compiler (SQLite is built from the
+bundled source). Every CortexKit dependency comes from crates.io, so a fresh
+clone builds on its own.
 
 ```sh
 cargo build --workspace --release

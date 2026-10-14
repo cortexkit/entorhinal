@@ -81,7 +81,8 @@ Approve at the Touch ID prompt. Run it on the Mac whose side can still stop:
 - On the **source**, only while the receiver has not yet staged the move. After
   that, the source's request is cleared and says the receiver must abort.
 
-Past that point the move always completes; the command refuses
+Once the receiver has started activating the agent, the move always
+completes; the command refuses
 `invalid_state` and changes nothing. Cancelling an already aborted move, or one
 whose cancellation is under way, just shows its status.
 
@@ -90,7 +91,8 @@ Verify: `ck agents moves` shows the move as `aborted` on both Macs, and
 
 ### Retry a stuck cancellation
 
-When a move shows `abort_stuck`, fix the module it names, then run the same
+When a move shows `abort_stuck`, fix the module named in its `diagnostic`
+(`module_id`), then run the same
 command again:
 
 ```sh
@@ -111,8 +113,8 @@ ck agents lid-close-moves on
 ck agents lid-close-moves off
 ```
 
-Changing the setting needs Touch ID; setting it to its current value does not
+Changing the lid-close setting needs Touch ID; setting it to its current value does not
 prompt. The default is off, and the setting is local to each Mac. engram's
 moves still pass every check above, including the idle check.
 
-Reverse: run the command with the other value.
+Reverse: run the command with `off` (or `on`).

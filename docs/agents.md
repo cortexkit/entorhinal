@@ -117,7 +117,7 @@ The preview never writes. If it reports a refusal (for example two agents
 whose names would collide in the target workspace), `--yes` will refuse the
 same way; resolve the collision first, for example by renaming one agent.
 
-Verify: run the preview again; it reports nothing to change.
+Verify: `ck agents repair-workspaces` (the preview) reports nothing to change.
 
 Reverse: none as a single command. The change is journaled; rename or move
 agents individually if needed.

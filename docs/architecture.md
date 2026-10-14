@@ -37,7 +37,7 @@ Other modules entorhinal talks to, always through daemon routes:
 ## How data flows
 
 **Startup.** The daemon spawns the module with `--subc <connection file>`.
-After the handshake it sends a storage descriptor; the module opens the store
+After the handshake the daemon sends a storage descriptor; the module opens the store
 (taking the single-writer lease, applying migrations) and starts the
 catch-up, claim refresh, role refresh and move driver tasks. Until the store is
 open, requests refuse `storage_unavailable`.

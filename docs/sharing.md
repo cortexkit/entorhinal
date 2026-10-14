@@ -24,7 +24,8 @@ Reads local state only: `state` (`disabled`, `enabling`, `joining` or
 
 ## Enable on the first Mac
 
-1. Make sure agent identity has been imported from the executive. If this
+1. Make sure agent identity has been imported from the executive (the
+   `prefrontal-core` module, which held agent identity before entorhinal). If this
    fleet has no agents at all, you will pass `--without-agents` instead.
 2. Enable:
 

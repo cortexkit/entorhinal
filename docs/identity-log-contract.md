@@ -37,7 +37,8 @@ Entry kinds are closed: `change` and `snapshot`. Entry operations are closed:
 | `change` | `agent.create`, `agent.rename`, `agent.update_tag`, `agent.set_labels`, `agent.set_avatar`, `agent.set_github_identity`, `agent.dispose`, `agent.merge`, `agent.set_namespace` | The complete after-image of one agent and its name claims. |
 | `snapshot` | `shared.snapshot` | One part of a complete copy of the shared state. |
 
-Any other kind, operation or envelope version (currently `1`) is refused.
+Any other kind or operation is refused, as is any entry envelope version other
+than `1`.
 
 Local log states are closed: `disabled`, `enabling`, `joining`, `enabled`.
 

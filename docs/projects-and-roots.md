@@ -116,7 +116,8 @@ A checkout with an owned GitHub remote matches the project that holds its
 `owner/repo` key; `--project <id>` is then only a cross-check, and a different
 project refuses `root_key_conflict`. A checkout without one needs both
 `--label <L>` and `--project <id>`, naming a label key that project already
-has. Attaching refuses `identity_log_disabled` while the log is off,
+has. Attaching refuses `identity_log_disabled` while the shared identity log
+is off,
 `root_key_not_found` when no project has the key, and `remotes_unreadable`
 when the checkout's git config cannot be read. A checkout whose `owner/repo`
 already belongs to another project cannot be registered as a new one
@@ -162,7 +163,8 @@ that change needs Touch ID, and it is refused if a moving name is taken in the
 target workspace. A workspace root is only what the operator sets; when none is
 set, none is reported.
 
-Reverse: assign the project back, or `clear-root`.
+Reverse: assign the project back, or run
+`ck workspaces clear-root <workspace-id>`.
 
 ## Check the store
 
