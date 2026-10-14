@@ -400,6 +400,7 @@ dependencies = [
  "cortexkit-role-tool-provider",
  "cortexkit-store-types",
  "cortexkit-test-support",
+ "ed25519-dalek",
  "entorhinal-catalog",
  "entorhinal-core",
  "getrandom 0.2.17",

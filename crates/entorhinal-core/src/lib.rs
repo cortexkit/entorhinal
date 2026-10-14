@@ -22,6 +22,8 @@ use serde::Serialize;
 pub mod agent;
 mod binding;
 pub mod catalog;
+pub mod catalog_grants;
+pub mod catalog_trust;
 pub mod claim_cache;
 pub mod enable_state;
 mod log_schema;

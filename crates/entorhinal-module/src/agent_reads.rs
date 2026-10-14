@@ -1556,6 +1556,7 @@ mod tests {
         ];
         let expected_mutations = [
             "catalog.registry_add",
+            "catalog.publisher_trust",
             "catalog.registry_repin",
             "catalog.registry_remove",
             "permissions.revoke",

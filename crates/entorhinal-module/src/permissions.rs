@@ -151,12 +151,31 @@ impl ProjectsHandler {
                     "granted_at_ms":grant.granted_at_ms, "card_ref":grant.card_ref,
                 }));
             }
+            for grant in store.publisher_grants()? {
+                if grant.revoked_at_ms.is_some()
+                    || request.agent_id.as_ref().is_some_and(|id| *id != grant.placement_agent_id)
+                    || !store.agent_row(&grant.placement_agent_id)?.is_some_and(|a| a.status == "live") {
+                    continue;
+                }
+                rows.push(json!({
+                    "id":grant.id,"agent_id":grant.placement_agent_id,
+                    "holder":{"kind":"agent","agent_id":grant.placement_agent_id},
+                    "module":super::MODULE_ID,"subject_label":grant.publisher_fingerprint,
+                    "scope":"catalog_publisher",
+                    "scope_label":format!("{} packages from publisher {}",grant.operation.as_str(),grant.publisher_fingerprint),
+                    "granted_at_ms":grant.granted_at_ms,"card_ref":grant.card_ref,
+                }));
+            }
             Ok(rows)
         })?;
         encode_result(json!({"grants":grants}))
     }
 
-    pub(super) fn permissions_revoke(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
+    pub(super) fn permissions_revoke(
+        &self,
+        params: Value,
+        key: RouteKey,
+    ) -> Result<Vec<u8>, HandlerError> {
         let request: RevokeRequest = parse(params)?;
         let store = self.with_store(|s| Ok(s.clone()))?;
         let grant = self.with_store(|s| {
@@ -170,7 +189,11 @@ impl ProjectsHandler {
         let revoked = if grant.is_some() {
             store.consent_transaction(|tx| tx.revoke_grant(&request.id, (self.clock)()))?
         } else {
-            false
+            store.revoke_publisher_grant(
+                &request.id,
+                (self.clock)(),
+                &json!(self.admission_for(key).principal),
+            )?
         };
         encode_result(json!({"outcome":if revoked { "revoked" } else { "not_found" }}))
     }

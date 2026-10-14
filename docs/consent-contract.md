@@ -141,6 +141,23 @@ agents included, gets `permissions_operator_required`. entorhinal is a
 provider of `permissions/v1`; aggregating providers for the phone is
 Cingulate's job.
 
+Publisher grants are a separate local inventory scope, `catalog_publisher`, not
+one of the agent-tool grant classes or card options above. Their holder is the
+placement agent and their subject label is the publisher fingerprint. Coverage
+requires a live matching fingerprint/operation/placement row, required
+capabilities within its ceiling, and no scripts; an empty ceiling is valid for
+token-free packages. Root-certified CortexKit packages do not receive grants.
+The operator's `ck catalog publisher trust` authorizes install only, using
+authenticated pinned manifests and operator confirmation. Pins are supplied by
+a local trait; until a production pin source exists it refuses
+`manifest_unavailable`, rather than trusting caller-supplied capabilities.
+Permissions admission is unchanged. Revoke sets `revoked_at_ms`, retains the row,
+and appends `grant_revoke`; refresh keeps its id and unions its capability ceiling.
+Grant writes append `grant_insert` or `grant_refresh`. Each catalog audit row
+includes fingerprint, operation, placement, ceiling and acting principal, and is
+not served by `agent.audit_list`. Publisher grant and audit state stays local
+through export and rebuild. No new consent-card option is wired here.
+
 Tests: `grants_refresh_in_place_and_revocation_blocks_a_new_write`,
 `provider_drops_grants_when_holder_or_subject_ends`,
 `provider_revoke_vectors_are_idempotent_local_and_prompt_free`,

@@ -156,6 +156,11 @@ pub struct RegistryClient {
     limits: Limits,
     clock: fn() -> i64,
 }
+pub(crate) struct RegistryReply {
+    pub bytes: Vec<u8>,
+    pub etag: Option<String>,
+    pub not_modified: bool,
+}
 #[allow(dead_code)]
 impl RegistryClient {
     pub fn new(registry: &str, allowlist: &[String], limits: Limits) -> Result<Self, CatalogError> {
@@ -243,6 +248,18 @@ impl RegistryClient {
         )
         .await
     }
+    pub(crate) async fn fetch_feed(
+        &self,
+        path: &str,
+        etag: Option<&str>,
+    ) -> Result<RegistryReply, NetworkError> {
+        tokio::time::timeout(
+            self.limits.json_timeout,
+            self.download_reply(path, self.limits.json_bytes, "json_too_large", etag),
+        )
+        .await
+        .map_err(|_| CatalogError::new("registry_timeout", "registry request timed out"))?
+    }
     pub async fn fetch_manifest(&self, path: &str) -> Result<Vec<u8>, NetworkError> {
         self.fetch(
             path,
@@ -252,7 +269,9 @@ impl RegistryClient {
         )
         .await
     }
-    pub async fn fetch_archive(&self, digest: &str) -> Result<Vec<u8>, NetworkError> {
+    // Record verification checks signed manifest/archive digests before tar
+    // structure, so these callers need bounded bytes without early tar checks.
+    pub(crate) async fn fetch_archive_bytes(&self, digest: &str) -> Result<Vec<u8>, NetworkError> {
         if !entorhinal_catalog::is_hex(digest, 64) {
             return Err(NetworkError::new(
                 "invalid_params",
@@ -267,6 +286,10 @@ impl RegistryClient {
                 "archive_too_large",
             )
             .await?;
+        Ok(bytes)
+    }
+    pub async fn fetch_archive(&self, digest: &str) -> Result<Vec<u8>, NetworkError> {
+        let bytes = self.fetch_archive_bytes(digest).await?;
         entorhinal_catalog::archive::read(&bytes).map_err(|e| CatalogError {
             code: e.code.as_str(),
             message: e.to_string(),
@@ -298,6 +321,15 @@ impl RegistryClient {
         cap: usize,
         cap_code: &'static str,
     ) -> Result<Vec<u8>, NetworkError> {
+        Ok(self.download_reply(path, cap, cap_code, None).await?.bytes)
+    }
+    async fn download_reply(
+        &self,
+        path: &str,
+        cap: usize,
+        cap_code: &'static str,
+        etag: Option<&str>,
+    ) -> Result<RegistryReply, NetworkError> {
         let mut base = self.registry.clone();
         base.set_path(&format!("{}/", base.path().trim_end_matches('/')));
         let mut url = base
@@ -305,12 +337,26 @@ impl RegistryClient {
             .map_err(|e| CatalogError::new("registry_url_invalid", e.to_string()))?;
         self.admit(&url)?;
         for _ in 0..=10 {
-            let response = self
-                .client
-                .get(url.clone())
-                .send()
-                .await
-                .map_err(transport)?;
+            let request = self.client.get(url.clone());
+            let request = if let Some(tag) = etag {
+                request.header(reqwest::header::IF_NONE_MATCH, tag)
+            } else {
+                request
+            };
+            let response = request.send().await.map_err(transport)?;
+            if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+                if etag.is_none() {
+                    return Err(NetworkError::new(
+                        "invalid_reply",
+                        "304 without a held ETag",
+                    ));
+                }
+                return Ok(RegistryReply {
+                    bytes: vec![],
+                    etag: etag.map(str::to_string),
+                    not_modified: true,
+                });
+            }
             if response.status().is_redirection() {
                 let location = response
                     .headers()
@@ -368,7 +414,17 @@ impl RegistryClient {
                     format!("HTTP {status}"),
                 ));
             }
-            return Self::read_reply(response, cap, cap_code).await;
+            let etag = response
+                .headers()
+                .get(reqwest::header::ETAG)
+                .and_then(|tag| tag.to_str().ok())
+                .filter(|tag| tag.starts_with('"') && tag.ends_with('"') && tag.len() <= 4096)
+                .map(str::to_string);
+            return Ok(RegistryReply {
+                bytes: Self::read_reply(response, cap, cap_code).await?,
+                etag,
+                not_modified: false,
+            });
         }
         Err(NetworkError::new(
             "registry_redirect_limit",
@@ -392,7 +448,7 @@ impl RegistryClient {
     }
 
     #[cfg(test)]
-    fn loopback(registry: &str, allowlist: &[String], limits: Limits) -> Self {
+    pub(crate) fn loopback(registry: &str, allowlist: &[String], limits: Limits) -> Self {
         let allowlist: Vec<Url> = allowlist.iter().map(|s| Url::parse(s).unwrap()).collect();
         assert!(allowlist
             .iter()

@@ -5,7 +5,7 @@ use serde::Serialize;
 
 pub(crate) const V11_CATALOG: &str = r#"
 CREATE TABLE catalog_registry(url TEXT PRIMARY KEY, added_at_ms INTEGER NOT NULL,
-    is_default INTEGER NOT NULL DEFAULT 0 CHECK(is_default IN (0,1)));
+    is_default INTEGER NOT NULL DEFAULT 0 CHECK(is_default IN (0,1)), incarnation TEXT NOT NULL);
 CREATE UNIQUE INDEX catalog_one_default ON catalog_registry(is_default) WHERE is_default=1;
 CREATE TABLE catalog_scope_map(scope TEXT PRIMARY KEY,
     registry_url TEXT NOT NULL REFERENCES catalog_registry(url) ON DELETE CASCADE);
@@ -44,7 +44,7 @@ impl std::fmt::Display for CatalogWriteError {
 }
 impl std::error::Error for CatalogWriteError {}
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct RegistryKey {
     pub chain_index: i64,
     pub key_id: String,
@@ -52,16 +52,18 @@ pub struct RegistryKey {
     pub statement: Option<String>,
     pub valid_from: Option<String>,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct CatalogRegistry {
     pub url: String,
     pub added_at_ms: i64,
     pub is_default: bool,
+    #[serde(skip_serializing)]
+    pub incarnation: String,
     pub scopes: Vec<String>,
     pub keys: Vec<RegistryKey>,
 }
 impl RegistryStore {
-    fn catalog_transaction<T>(
+    pub(crate) fn catalog_transaction<T>(
         &self,
         action: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T, CatalogWriteError>,
     ) -> Result<T, CatalogWriteError> {
@@ -99,7 +101,10 @@ impl RegistryStore {
                     return Err(CatalogWriteError::Refused("scope_already_mapped"));
                 }
             }
-            tx.execute("INSERT INTO catalog_registry VALUES(?1,?2,?3)", params![url,now,is_default]).map_err(store_error)?;
+            let mut random = [0u8; 16];
+            getrandom::getrandom(&mut random).map_err(|_| CatalogWriteError::Refused("store_error"))?;
+            let incarnation = random.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+            tx.execute("INSERT INTO catalog_registry VALUES(?1,?2,?3,?4)", params![url,now,is_default,incarnation]).map_err(store_error)?;
             for scope in scopes {
                 tx.execute("INSERT INTO catalog_scope_map VALUES(?1,?2)", params![scope,url]).map_err(store_error)?;
             }
@@ -146,38 +151,60 @@ impl RegistryStore {
         })
     }
     pub fn catalog_registries(&self) -> Result<Vec<CatalogRegistry>, RegistryError> {
-        self.read(|conn| {
-            let mut registries = conn.prepare("SELECT url,added_at_ms,is_default FROM catalog_registry ORDER BY url")?.query_map([], |r| Ok(CatalogRegistry {
-                url:r.get(0)?, added_at_ms:r.get(1)?, is_default:r.get(2)?, scopes:vec![], keys:vec![],
-            }))?.collect::<rusqlite::Result<Vec<_>>>()?;
-            for registry in &mut registries {
-                registry.scopes = conn.prepare("SELECT scope FROM catalog_scope_map WHERE registry_url=?1 ORDER BY scope")?.query_map([&registry.url], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
-                registry.keys = conn.prepare("SELECT chain_index,key_id,public_key,statement,valid_from FROM catalog_registry_key WHERE registry_url=?1 ORDER BY chain_index")?.query_map([&registry.url], |r| Ok(RegistryKey { chain_index:r.get(0)?, key_id:r.get(1)?, public_key:r.get(2)?, statement:r.get(3)?, valid_from:r.get(4)? }))?.collect::<rusqlite::Result<_>>()?;
-            }
-            Ok(registries)
-        })
+        self.read(read_registries)
     }
     pub fn catalog_registry_for_scope(&self, scope: &str) -> Result<Option<String>, RegistryError> {
-        self.read(|conn| {
-            let explicit = conn
-                .query_row(
-                    "SELECT registry_url FROM catalog_scope_map WHERE scope=?1",
-                    [scope],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if explicit.is_some() {
-                return Ok(explicit);
-            }
-            conn.query_row(
-                "SELECT url FROM catalog_registry WHERE is_default=1",
-                [],
-                |r| r.get(0),
-            )
-            .optional()
-        })
+        self.read(|conn| registry_for_scope(conn, scope))
     }
 }
-fn store_error(e: rusqlite::Error) -> CatalogWriteError {
+pub(crate) fn read_registries(
+    conn: &rusqlite::Connection,
+) -> rusqlite::Result<Vec<CatalogRegistry>> {
+    let mut registries = conn
+        .prepare(
+            "SELECT url,added_at_ms,is_default,incarnation FROM catalog_registry ORDER BY url",
+        )?
+        .query_map([], |r| {
+            Ok(CatalogRegistry {
+                url: r.get(0)?,
+                added_at_ms: r.get(1)?,
+                is_default: r.get(2)?,
+                incarnation: r.get(3)?,
+                scopes: vec![],
+                keys: vec![],
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for registry in &mut registries {
+        registry.scopes = conn
+            .prepare("SELECT scope FROM catalog_scope_map WHERE registry_url=?1 ORDER BY scope")?
+            .query_map([&registry.url], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        registry.keys = conn.prepare("SELECT chain_index,key_id,public_key,statement,valid_from FROM catalog_registry_key WHERE registry_url=?1 ORDER BY chain_index")?.query_map([&registry.url], |r| Ok(RegistryKey { chain_index:r.get(0)?, key_id:r.get(1)?, public_key:r.get(2)?, statement:r.get(3)?, valid_from:r.get(4)? }))?.collect::<rusqlite::Result<_>>()?;
+    }
+    Ok(registries)
+}
+pub(crate) fn registry_for_scope(
+    conn: &rusqlite::Connection,
+    scope: &str,
+) -> rusqlite::Result<Option<String>> {
+    let explicit = conn
+        .query_row(
+            "SELECT registry_url FROM catalog_scope_map WHERE scope=?1",
+            [scope],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if explicit.is_some() {
+        return Ok(explicit);
+    }
+    conn.query_row(
+        "SELECT url FROM catalog_registry WHERE is_default=1",
+        [],
+        |r| r.get(0),
+    )
+    .optional()
+}
+pub(crate) fn store_error(e: rusqlite::Error) -> CatalogWriteError {
     CatalogWriteError::Store(e.into())
 }

@@ -60,15 +60,13 @@ pub struct VerifiedPackage {
     pub manifest: Manifest,
     pub canonical_record: String,
 }
-pub fn verify_record(
+fn trusted_record(
     text: &str,
     sig: &str,
-    manifest_bytes: &[u8],
-    archive_bytes: &[u8],
     trust: &Trust<'_>,
-) -> Result<VerifiedPackage, Refusal> {
+) -> Result<(Value, String, u64, String), Refusal> {
     let invalid = |f| Refusal::field(RefusalCode::RecordInvalid, f);
-    let mut r = shape(
+    let r = shape(
         text,
         "ck-record/v1",
         &[
@@ -130,6 +128,24 @@ pub fn verify_record(
     {
         return Err(Refusal::new(RefusalCode::KeyNotValid));
     }
+    Ok((r, canonical, len, id))
+}
+/// Verify shape, signature and scope trust before the client fetches package bytes.
+/// The caller must still run full record verification before publishing any blob.
+pub fn verify_record_trust(text: &str, sig: &str, trust: &Trust<'_>) -> Result<Record, Refusal> {
+    let (mut r, _, len, _) = trusted_record(text, sig, trust)?;
+    r["archive_bytes"] = len.into();
+    serde_json::from_value(r).map_err(|_| Refusal::field(RefusalCode::RecordInvalid, "json"))
+}
+pub fn verify_record(
+    text: &str,
+    sig: &str,
+    manifest_bytes: &[u8],
+    archive_bytes: &[u8],
+    trust: &Trust<'_>,
+) -> Result<VerifiedPackage, Refusal> {
+    let (mut r, canonical, len, id) = trusted_record(text, sig, trust)?;
+    let invalid = |f| Refusal::field(RefusalCode::RecordInvalid, f);
     let mismatch = |f| Refusal::field(RefusalCode::RecordMismatch, f);
     if r["manifest_sha256"] != sha256_hex(manifest_bytes) {
         return Err(mismatch("manifest_sha256"));
@@ -156,10 +172,7 @@ pub fn verify_record(
     if members.get("ck.json").copied() != Some(manifest_bytes) {
         return Err(mismatch("ck.json"));
     }
-    let m = std::str::from_utf8(manifest_bytes)
-        .ok()
-        .and_then(|s| jcs::parse(s).ok())
-        .ok_or_else(|| Refusal::field(RefusalCode::ManifestInvalid, "json"))?;
+    let m = manifest_value(manifest_bytes)?;
     if m["name"] != r["name"] {
         return Err(mismatch("name"));
     }
@@ -207,6 +220,17 @@ pub fn verify_record(
         manifest,
         canonical_record: canonical,
     })
+}
+fn manifest_value(bytes: &[u8]) -> Result<Value, Refusal> {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|s| jcs::parse(s).ok())
+        .ok_or_else(|| Refusal::field(RefusalCode::ManifestInvalid, "json"))
+}
+/// Parse authenticated manifest bytes using the same rules as record verification.
+/// Authentication of the exact bytes remains the caller's responsibility.
+pub fn parse_manifest(bytes: &[u8]) -> Result<Manifest, Refusal> {
+    validate_manifest(manifest_value(bytes)?)
 }
 fn validate_manifest(v: Value) -> Result<Manifest, Refusal> {
     let err = |f: &str| Refusal::field(RefusalCode::ManifestInvalid, f);

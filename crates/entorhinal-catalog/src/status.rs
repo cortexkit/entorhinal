@@ -58,6 +58,30 @@ pub struct HeldStatus {
     signer_index: usize,
 }
 impl HeldStatus {
+    /// Authenticate a saved status with its original registry signer. A later
+    /// successor may retire that signer for new records, but cannot undo a status
+    /// already accepted before retirement. Callers compare stored index columns
+    /// (sequence, timestamps and identity) with the authenticated record.
+    pub fn restore(
+        text: &str,
+        signature: &str,
+        chain: &[StatusKey],
+        signer_index: usize,
+    ) -> Result<Self, Refusal> {
+        let (record, canonical) = parse(text)?;
+        let key = chain
+            .get(signer_index)
+            .filter(|key| key.key_id == record.registry_key_id)
+            .ok_or_else(|| Refusal::new(RefusalCode::KeyUnknown))?;
+        if !verify_signature(&key.public_key, "ck-status/v1", &canonical, signature) {
+            return Err(Refusal::new(RefusalCode::SignatureInvalid));
+        }
+        Ok(Self {
+            record,
+            canonical,
+            signer_index,
+        })
+    }
     pub fn record(&self) -> &StatusRecord {
         &self.record
     }
@@ -411,4 +435,63 @@ pub fn select_feed(
         feed_seq: current,
         records,
     })
+}
+
+#[cfg(test)]
+mod restore_tests {
+    use super::*;
+    #[test]
+    fn restore_authenticates_bytes_and_signer_without_new_cutoffs() {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/vectors/ck-catalog-v1/status.json"))
+                .unwrap();
+        let doc = &v["records"][0];
+        let key = StatusKey {
+            key_id: "test-registry-1".into(),
+            public_key: v["registry_keys"]["test-registry-1"]["public_key_hex"]
+                .as_str()
+                .unwrap()
+                .into(),
+            valid_from: None,
+        };
+        let chain = [
+            key,
+            StatusKey {
+                key_id: "new".into(),
+                public_key: "ab".repeat(32),
+                valid_from: Some("2020-01-01T00:00:00Z".into()),
+            },
+        ];
+        let canonical = doc["canonical"].as_str().unwrap();
+        let signature = doc["signature"].as_str().unwrap();
+        let held = HeldStatus::restore(canonical, signature, &chain, 0).unwrap();
+        assert_eq!(held.record().sequence, 1);
+        assert_eq!(held.signer_index(), 0);
+        assert_eq!(
+            HeldStatus::restore(canonical, signature, &chain, 1)
+                .unwrap_err()
+                .code,
+            RefusalCode::KeyUnknown
+        );
+        assert_eq!(
+            HeldStatus::restore(canonical, "00", &chain, 0)
+                .unwrap_err()
+                .code,
+            RefusalCode::SignatureInvalid
+        );
+        let tampered = canonical.replace("\"sequence\":1", "\"sequence\":2");
+        assert_eq!(
+            HeldStatus::restore(&tampered, signature, &chain, 0)
+                .unwrap_err()
+                .code,
+            RefusalCode::SignatureInvalid
+        );
+        let duplicate = canonical.replacen("{", "{\"sequence\":1,", 1);
+        assert_eq!(
+            HeldStatus::restore(&duplicate, signature, &chain, 0)
+                .unwrap_err()
+                .code,
+            RefusalCode::StatusInvalid
+        );
+    }
 }

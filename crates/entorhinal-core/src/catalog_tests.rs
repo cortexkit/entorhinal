@@ -1,13 +1,36 @@
 mod catalog_tests {
     use super::*;
     #[test]
+    fn publisher_authority_never_enters_identity_journal_or_shared_snapshot() {
+        use crate::catalog_grants::{Operation, PublisherGrant};
+        let scratch = TestStore::new("publisher-local-only");
+        let store = &scratch.store;
+        store.apply_entry("agent.cutover", "{}", "test", None, |_| Ok(())).unwrap();
+        let body = store.agent_mutation("agent.create", serde_json::json!({"name":"Agent","role":"assistant","tag":"test","request_key":"create"}), 100).unwrap();
+        let agent = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["result"]["agent"]["agent_id"].as_str().unwrap().to_owned();
+        let journal = || store.read(|conn| conn.prepare("SELECT payload_json,entry FROM registry_journal ORDER BY seq")?.query_map([], |r| Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()).unwrap();
+        let image = || serde_json::to_value(store.read(crate::shared_entry::SharedState::capture).unwrap().snapshot(vec![])).unwrap();
+        let before_journal = journal();
+        let before_image = image();
+        let generation = store.generation().unwrap();
+        let grant = PublisherGrant { id:"pg_local_only".into(),publisher_fingerprint:"ab".repeat(32),operation:Operation::Install,placement_agent_id:agent,ceiling:vec![],card_ref:None,granted_at_ms:100,revoked_at_ms:None };
+        store.insert_publisher_grant(&grant, &serde_json::json!({"kind":"direct"})).unwrap();
+        store.revoke_publisher_grant(&grant.id,101,&serde_json::json!({"kind":"direct"})).unwrap();
+        assert_eq!(journal(),before_journal,"publisher authority must never enter the identity journal");
+        assert_eq!(image(),before_image,"publisher authority must never enter a shared snapshot");
+        assert_eq!(store.generation().unwrap(),generation);
+        store.rebuild().unwrap();
+        assert_eq!(store.publisher_grants().unwrap()[0].revoked_at_ms,Some(101));
+        assert_eq!(store.catalog_audit().unwrap().len(),2);
+    }
+    #[test]
     fn catalog_v10_migration_and_local_rebuild() {
         let scratch = TestStore::new("catalog-migration");
         let descriptor = legacy_descriptor(&scratch, "v10.db");
         drop(RegistryStore::open_with_migrations(&descriptor, &MIGRATIONS[..10]).unwrap());
         let store = RegistryStore::open(&descriptor).unwrap();
         let expected: &[(&str, &[&str])] = &[
-            ("catalog_registry", &["url", "added_at_ms", "is_default"]),
+            ("catalog_registry", &["url", "added_at_ms", "is_default", "incarnation"]),
             ("catalog_scope_map", &["scope", "registry_url"]),
             (
                 "catalog_registry_key",

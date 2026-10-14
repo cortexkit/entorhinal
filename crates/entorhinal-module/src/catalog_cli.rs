@@ -2,10 +2,19 @@ use super::{Command, Value};
 use serde_json::json;
 
 pub(super) fn usage() -> &'static str {
-    "ck catalog — machine-local package registries\n\nusage: ck catalog registry <verb> [--subc <connection file>] [--json]\n\n  add <url> (--scope <@scope>... | --default) --key-id <id> --public-key <64 hex>\n  repin <url> --key-id <id> --public-key <64 hex> [--valid-from <RFC 3339 Z>]\n  remove <url>\n  list\n\nWrites require operator confirmation. Repin retains earlier keys; remove clears mappings and held state.\n"
+    "ck catalog — machine-local package registries\n\nusage: ck catalog registry <verb> [--subc <connection file>] [--json]\n\n  add <url> (--scope <@scope>... | --default) --key-id <id> --public-key <64 hex>\n  repin <url> --key-id <id> --public-key <64 hex> [--valid-from <RFC 3339 Z>]\n  remove <url>\n  list\n\nWrites require operator confirmation. Repin retains earlier keys; remove clears mappings and held state.\n\n  publisher trust <fingerprint> --agent <agent_id>\n\nPublisher trust grants install only, using authenticated pins. It refuses manifest_unavailable until the pin source is supplied.\n"
 }
 pub(super) fn build(command: &Command) -> Result<(String, Value), String> {
     let fail = || usage().to_string();
+    if command.verb == "publisher" {
+        if command.args.len() != 4 || command.args[0] != "trust" || command.args[2] != "--agent" {
+            return Err(fail());
+        }
+        return Ok((
+            crate::catalog_ops::PUBLISHER_TRUST.into(),
+            json!({"publisher_fingerprint":command.args[1],"agent_id":command.args[3]}),
+        ));
+    }
     if command.verb != "registry" {
         return Err(fail());
     }
@@ -85,6 +94,14 @@ mod tests {
             assert_eq!(face_from_argv0(Some(argv0)), Face::Catalog);
         }
         let key = "ab".repeat(32);
+        assert_eq!(
+            command(&["publisher", "trust", &key, "--agent", "ag_test"]).unwrap(),
+            (
+                crate::catalog_ops::PUBLISHER_TRUST.into(),
+                json!({"publisher_fingerprint":key,"agent_id":"ag_test"})
+            )
+        );
+        assert!(command(&["publisher", "trust", &key]).is_err());
         assert_eq!(
             command(&[
                 "registry",
