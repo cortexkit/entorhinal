@@ -2194,11 +2194,29 @@ export function satisfies(version: Version, range: Range): boolean {
 
 // ───────────────────────────── resolver ─────────────────────────────
 
-// Capability tokens: cap/<area>.<verb>@<major>, the verb optional when the
-// area is a single capability (cap/shell@1). Each part uses the package-name
-// part grammar. Tokens match by exact string, so @1 and @2 are different
-// capabilities.
-export const CAPABILITY_TOKEN = /^cap\/[a-z0-9]+(-[a-z0-9]+)*(\.[a-z0-9]+(-[a-z0-9]+)*)?@[1-9][0-9]*$/
+// Capability areas and verbs start with a lowercase letter and contain no
+// hyphens; @N versions are distinct capability tokens.
+export const CAPABILITY_TOKEN = /^cap\/[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)?@[1-9][0-9]*$/
+const CAPABILITY_NAME_MAX = 64
+const SUBC_CAPABILITY_NAME = /^[a-z][a-z0-9]*(-[a-z0-9]+)*\/v[1-9][0-9]*$/
+
+function capabilityTokenToManifest(token: string): string | null {
+  if (!CAPABILITY_TOKEN.test(token)) return null
+  const [tokenBody, version] = token.slice(4).split("@")
+  const [area, verb] = tokenBody.split(".")
+  const name = `cap-${area}${verb ? `-${verb}` : ""}`
+  if (name.length > CAPABILITY_NAME_MAX) return null
+  return `${name}/v${version}`
+}
+
+function capabilityManifestToToken(capability: string): string | null {
+  const match = /^cap-([a-z][a-z0-9]*)(?:-([a-z][a-z0-9]*))?\/v([1-9][0-9]*)$/.exec(capability)
+  if (!match) return null
+  const [, area, verb, version] = match
+  const name = capability.slice(0, capability.indexOf("/v"))
+  if (name.length > CAPABILITY_NAME_MAX) return null
+  return `cap/${area}${verb ? `.${verb}` : ""}@${version}`
+}
 
 type Kind = "persona" | "skill" | "flow" | "memory-profile"
 type RefField = "extends" | "skills" | "flows" | "memory_profile" | "delegates_to"
@@ -2794,12 +2812,39 @@ function resolverVectors() {
     }
     if (JSON.stringify(got) !== JSON.stringify(c.expect)) throw new Error(`resolver case ${c.name}: got ${JSON.stringify(got)}`)
   }
-  const tokenValid = ["cap/code.read@1", "cap/shell@1", "cap/flow.template@2", "cap/memory-profile.read@1", "cap/code.read@10"]
-  const tokenInvalid = ["code.read@1", "cap/code.read", "cap/code.read@0", "cap/code.read@01", "cap/Code.read@1", "cap/code.read.all@1", "cap/code_read@1", "flow-templates/v1", "cap/.read@1", "cap/code.@1"]
+  const tokenValid = ["cap/code.read@1", "cap/shell@1", "cap/flow.template@2", "cap/code.read@10"]
+  const tokenInvalid = ["code.read@1", "cap/code.read", "cap/code.read@0", "cap/code.read@01", "cap/Code.read@1", "cap/code.read.all@1", "cap/code_read@1", "flow-templates/v1", "cap/.read@1", "cap/code.@1", "cap/memory-profile.read@1", "cap/code-x.read@1", "cap/code.re-ad@1", "cap/1code.read@1", "cap/code.1read@1"]
   for (const t of tokenValid) if (!CAPABILITY_TOKEN.test(t)) throw new Error(`token ${t} should be valid`)
   for (const t of tokenInvalid) if (CAPABILITY_TOKEN.test(t)) throw new Error(`token ${t} should be invalid`)
   for (const c of cases) for (const t of [...c.local_capabilities, ...Object.values(c.registry).flatMap((vs) => vs.flatMap((x) => x.requires.capabilities))]) {
     if (!CAPABILITY_TOKEN.test(t)) throw new Error(`resolver case ${c.name}: token ${t} breaks the grammar`)
+  }
+  const capabilityPairs = [
+    { token: "cap/code.read@1", capability: "cap-code-read/v1" },
+    { token: "cap/shell@1", capability: "cap-shell/v1" },
+    { token: "cap/flow.template@2", capability: "cap-flow-template/v2" },
+    { token: "cap/code.read@10", capability: "cap-code-read/v10" },
+    { token: `cap/${"a".repeat(60)}@1`, capability: `cap-${"a".repeat(60)}/v1` },
+  ]
+  const tokenTooLong = `cap/${"a".repeat(61)}@1`
+  const capabilityNotAToken = ["cap-a-b-c/v1", "cap-/v1", "cap-code-/v1", "flow-scopes/v1", "cap-code-read/v0", "cap-Code-read/v1"]
+  for (const { token, capability } of capabilityPairs) {
+    const name = capability.slice(0, capability.indexOf("/v"))
+    if (capabilityTokenToManifest(token) !== capability) throw new Error(`capability mapping ${token} should produce ${capability}`)
+    if (capabilityManifestToToken(capability) !== token) throw new Error(`capability mapping ${capability} should produce ${token}`)
+    if (!SUBC_CAPABILITY_NAME.test(capability) || name.length > CAPABILITY_NAME_MAX) {
+      throw new Error(`capability mapping ${capability} does not satisfy the subc name rule`)
+    }
+  }
+  const tooLongName = `cap-${"a".repeat(61)}`
+  if (!CAPABILITY_TOKEN.test(tokenTooLong) || tooLongName.length !== 65 || capabilityTokenToManifest(tokenTooLong) !== null) {
+    throw new Error(`capability token ${tokenTooLong} should be refused for exceeding the manifest name limit`)
+  }
+  if (capabilityManifestToToken(`${tooLongName}/v1`) !== null) {
+    throw new Error("capability manifest name over 64 characters should not map to a token")
+  }
+  for (const capability of capabilityNotAToken) {
+    if (capabilityManifestToToken(capability) !== null) throw new Error(`capability ${capability} should not map to a token`)
   }
   return {
     schema: "ck-catalog-v1/resolver",
@@ -2819,6 +2864,7 @@ function resolverVectors() {
     precedence_ascending: precedence,
     invalid_versions: invalidVersions,
     capability_tokens: { valid: tokenValid, invalid: tokenInvalid },
+    capability_manifest_mapping: { pairs: capabilityPairs, token_too_long: tokenTooLong, capability_not_a_token: capabilityNotAToken },
     cases,
   }
 }

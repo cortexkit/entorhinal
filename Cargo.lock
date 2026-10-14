@@ -368,6 +368,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "subc-protocol",
 ]
 
 [[package]]

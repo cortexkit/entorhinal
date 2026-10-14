@@ -1,25 +1,110 @@
 //! Deterministic, non-backtracking closure resolution with accumulated ranges.
 use crate::{
-    names,
     semver::{Range, Version},
     status::State,
     Kind,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+const CAPABILITY_NAME_MAX: usize = 64;
+
+fn capability_part(s: &str) -> bool {
+    let mut bytes = s.bytes();
+    matches!(bytes.next(), Some(b'a'..=b'z'))
+        && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+fn capability_major(s: &str) -> bool {
+    !s.is_empty() && !s.starts_with('0') && s.bytes().all(|b| b.is_ascii_digit())
+}
+
 pub fn capability_token(s: &str) -> bool {
-    let Some((parts, major)) = s.strip_prefix("cap/").and_then(|s| s.split_once('@')) else {
+    let Some(body) = s.strip_prefix("cap/") else {
+        return false;
+    };
+    let Some((parts, major)) = body.split_once('@') else {
         return false;
     };
     let mut parts = parts.split('.');
-    let area = parts.next().unwrap_or("");
+    let Some(area) = parts.next() else {
+        return false;
+    };
     let verb = parts.next();
-    names::part(area)
-        && verb.is_none_or(names::part)
+    capability_part(area)
+        && verb.is_none_or(capability_part)
         && parts.next().is_none()
-        && !major.starts_with('0')
-        && !major.is_empty()
-        && major.bytes().all(|b| b.is_ascii_digit())
+        && capability_major(major)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "code", rename_all = "snake_case")]
+pub enum CapabilityError {
+    CapabilityNotAToken,
+    TokenTooLong,
+}
+
+impl std::fmt::Display for CapabilityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::CapabilityNotAToken => "capability_not_a_token",
+            Self::TokenTooLong => "token_too_long",
+        })
+    }
+}
+
+impl std::error::Error for CapabilityError {}
+
+pub fn capability_to_manifest(token: &str) -> Result<String, CapabilityError> {
+    if !capability_token(token) {
+        return Err(CapabilityError::CapabilityNotAToken);
+    }
+    let body = token
+        .strip_prefix("cap/")
+        .ok_or(CapabilityError::CapabilityNotAToken)?;
+    let (identifier, version) = body
+        .split_once('@')
+        .ok_or(CapabilityError::CapabilityNotAToken)?;
+    let (area, verb) = identifier
+        .split_once('.')
+        .map_or((identifier, None), |(area, verb)| (area, Some(verb)));
+    let name = match verb {
+        Some(verb) => format!("cap-{area}-{verb}"),
+        None => format!("cap-{area}"),
+    };
+    if name.len() > CAPABILITY_NAME_MAX {
+        return Err(CapabilityError::TokenTooLong);
+    }
+    Ok(format!("{name}/v{version}"))
+}
+
+pub fn manifest_to_capability(manifest: &str) -> Result<String, CapabilityError> {
+    let (name, version) = manifest
+        .split_once("/v")
+        .ok_or(CapabilityError::CapabilityNotAToken)?;
+    let body = name
+        .strip_prefix("cap-")
+        .ok_or(CapabilityError::CapabilityNotAToken)?;
+    let mut parts = body.split('-');
+    let area = parts.next().ok_or(CapabilityError::CapabilityNotAToken)?;
+    let verb = parts.next();
+    if parts.next().is_some()
+        || !capability_part(area)
+        || verb.is_some_and(|part| !capability_part(part))
+        || !capability_major(version)
+    {
+        return Err(CapabilityError::CapabilityNotAToken);
+    }
+    if name.len() > CAPABILITY_NAME_MAX {
+        return Err(CapabilityError::TokenTooLong);
+    }
+    let token = match verb {
+        Some(verb) => format!("cap/{area}.{verb}@{version}"),
+        None => format!("cap/{area}@{version}"),
+    };
+    if capability_to_manifest(&token).as_deref() != Ok(manifest) {
+        return Err(CapabilityError::CapabilityNotAToken);
+    }
+    Ok(token)
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
