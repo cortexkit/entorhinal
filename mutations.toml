@@ -3544,3 +3544,19 @@ runner = "cargo"
 package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 expect_red = ["consent::tests::fake_enforces_owner_dedup_cumulative_ack_tombstones_and_nonunique_reference"]
+
+[[control]]
+id = "move-record-unknown-reason"
+guards = "An unknown reason on an aborted move remains opaque through decode and encode"
+file = "crates/entorhinal-core/src/move_record.rs"
+old = "Ok(MoveReason::from(reason))"
+new = "Ok(MoveReason::Operator) // NON-VACUITY BREAK"
+edits = []
+test_file = "crates/entorhinal-core/src/move_record.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--lib", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["move_record::tests::move_codec_preserves_unknown_abort_reason_opaquely"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800

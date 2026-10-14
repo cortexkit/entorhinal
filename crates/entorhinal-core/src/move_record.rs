@@ -42,8 +42,7 @@ impl MoveRecordState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MoveReason {
     Operator,
     ReceiverInboxFull,
@@ -57,6 +56,66 @@ pub enum MoveReason {
     ProjectNotCheckedOut,
     Gone,
     ReceiverPrecondition,
+    Other(String),
+}
+
+impl From<String> for MoveReason {
+    fn from(reason: String) -> Self {
+        match reason.as_str() {
+            "operator" => Self::Operator,
+            "receiver_inbox_full" => Self::ReceiverInboxFull,
+            "move_too_large" => Self::MoveTooLarge,
+            "participant_refused" => Self::ParticipantRefused,
+            "door_refused" => Self::DoorRefused,
+            "cut_author_mismatch" => Self::CutAuthorMismatch,
+            "diverged" => Self::Diverged,
+            "incompatible_version" => Self::IncompatibleVersion,
+            "claim_moved" => Self::ClaimMoved,
+            "project_not_checked_out" => Self::ProjectNotCheckedOut,
+            "gone" => Self::Gone,
+            "receiver_precondition" => Self::ReceiverPrecondition,
+            _ => Self::Other(reason),
+        }
+    }
+}
+
+impl From<MoveReason> for String {
+    fn from(reason: MoveReason) -> Self {
+        match reason {
+            MoveReason::Operator => "operator".into(),
+            MoveReason::ReceiverInboxFull => "receiver_inbox_full".into(),
+            MoveReason::MoveTooLarge => "move_too_large".into(),
+            MoveReason::ParticipantRefused => "participant_refused".into(),
+            MoveReason::DoorRefused => "door_refused".into(),
+            MoveReason::CutAuthorMismatch => "cut_author_mismatch".into(),
+            MoveReason::Diverged => "diverged".into(),
+            MoveReason::IncompatibleVersion => "incompatible_version".into(),
+            MoveReason::ClaimMoved => "claim_moved".into(),
+            MoveReason::ProjectNotCheckedOut => "project_not_checked_out".into(),
+            MoveReason::Gone => "gone".into(),
+            MoveReason::ReceiverPrecondition => "receiver_precondition".into(),
+            MoveReason::Other(reason) => reason,
+        }
+    }
+}
+
+impl Serialize for MoveReason {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&String::from(self.clone()))
+    }
+}
+
+impl<'de> Deserialize<'de> for MoveReason {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let reason = String::deserialize(deserializer)?;
+        Ok(MoveReason::from(reason))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -241,6 +300,8 @@ fn validate_move(subject: &str, record: &MoveRecord) -> Result<(), CodecError> {
             return Err(CodecError::DetailTooLarge);
         }
     }
+    // Abort reasons are explanatory, so an older reader may preserve an unknown one.
+    // States, versions, and other fields affect safe behavior and remain strict.
     if (record.state != MoveRecordState::Aborted
         && (record.reason.is_some() || record.detail.is_some()))
         || (record.state == MoveRecordState::Aborted && record.reason.is_none())
@@ -564,6 +625,45 @@ mod tests {
     }
 
     #[test]
+    fn move_codec_preserves_unknown_abort_reason_opaquely() {
+        let literal = r#"{"v":1,"cut_id":"0123456789abcdef0123456789abcdef","agent_id":"agent-a","from":"mac-a","to":"mac-b","state":"aborted","claim_version":0,"participants":[],"reason":"some_future_reason","detail":null}"#;
+        let subject = "move:0123456789abcdef0123456789abcdef";
+        let body = decode_move_record(subject, literal.as_bytes()).unwrap();
+        assert_eq!(
+            body.reason,
+            Some(MoveReason::Other("some_future_reason".into()))
+        );
+        assert_eq!(
+            serde_json::to_value(&body).unwrap()["reason"],
+            "some_future_reason"
+        );
+        assert_eq!(
+            encode_move_record(subject, &body).unwrap(),
+            literal.as_bytes()
+        );
+    }
+
+    #[test]
+    fn move_codec_refuses_unknown_reason_on_non_aborted_state() {
+        let mut value: Value = serde_json::from_str(MOVE_FIXTURE).unwrap();
+        value["reason"] = json!("some_future_reason");
+        assert_eq!(
+            decode_move_record(SUBJECT, &serde_json::to_vec(&value).unwrap()),
+            Err(CodecError::MalformedBody)
+        );
+    }
+
+    #[test]
+    fn move_codec_refuses_unknown_state() {
+        let mut value: Value = serde_json::from_str(MOVE_FIXTURE).unwrap();
+        value["state"] = json!("future_state");
+        assert_eq!(
+            decode_move_record(SUBJECT, &serde_json::to_vec(&value).unwrap()),
+            Err(CodecError::MalformedBody)
+        );
+    }
+
+    #[test]
     fn move_codec_refuses_unknown_version_by_name() {
         let mut value = record();
         value.v = 2;
@@ -778,6 +878,7 @@ mod tests {
             MoveReason::ProjectNotCheckedOut,
             MoveReason::Gone,
             MoveReason::ReceiverPrecondition,
+            MoveReason::IncompatibleVersion,
         ];
         let details = [
             None,
@@ -788,7 +889,7 @@ mod tests {
         ];
         for reason in reasons {
             for detail in &details {
-                let aborted = aborted_record(&largest, reason, detail.as_ref());
+                let aborted = aborted_record(&largest, reason.clone(), detail.as_ref());
                 let body = encode_move_record(SUBJECT, &aborted).unwrap();
                 assert!(body.len() <= 65536, "{reason:?}");
                 assert_eq!(decode_move_record(SUBJECT, &body), Ok(aborted));

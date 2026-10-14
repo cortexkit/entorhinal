@@ -432,7 +432,7 @@ impl Receiver {
                 )
                 && row.abort_requested.is_none()
             {
-                row.reason = observed.reason.map(|r| {
+                row.reason = observed.reason.as_ref().map(|r| {
                     serde_json::to_value(r)
                         .unwrap()
                         .as_str()
@@ -519,7 +519,7 @@ impl Receiver {
                 if f.violation {
                     progress.contract_violation = Some(f.detail.clone());
                 }
-                if let Some(reason) = f.reason {
+                if let Some(reason) = f.reason.as_ref() {
                     row.reason = Some(
                         serde_json::to_value(reason)
                             .unwrap()

@@ -273,7 +273,7 @@ impl Source {
         if let Some((record, version)) = observed.as_ref().filter(|_| watching) {
             row.record_version = *version as i64;
             if record.state == State::Aborted && row.step != Step::Releasing {
-                let reason = record.reason.map(|r| {
+                let reason = record.reason.as_ref().map(|r| {
                     serde_json::to_value(r)
                         .unwrap()
                         .as_str()
@@ -874,7 +874,7 @@ impl Source {
         let reason: MoveReason =
             serde_json::from_value(request.get("reason").cloned().unwrap_or(json!("operator")))
                 .unwrap_or(MoveReason::Operator);
-        row.reason = serde_json::to_value(reason)
+        row.reason = serde_json::to_value(&reason)
             .unwrap()
             .as_str()
             .map(str::to_owned);
