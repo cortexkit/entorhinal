@@ -507,6 +507,280 @@ impl Drop for SessionFixture {
     }
 }
 
+fn json_string_contents(value: &str) -> String {
+    let encoded = serde_json::to_string(value).unwrap();
+    encoded[1..encoded.len() - 1].to_owned()
+}
+
+fn normalize_project_record(
+    mut record: String,
+    scratch_root: &str,
+    paths: &[(String, String)],
+    implicit_ids: &[(String, String)],
+    reply: &Value,
+) -> String {
+    for (actual, stable) in implicit_ids {
+        record = record.replace(actual, stable);
+    }
+    if let Some(root_records) = reply
+        .pointer("/result/rootRecords")
+        .and_then(Value::as_array)
+    {
+        for root_record in root_records {
+            if let Some(epoch) = root_record.get("registrationEpoch").and_then(Value::as_str) {
+                record = record.replace(epoch, "00000000000000000000000000000001");
+            }
+        }
+    }
+    let mut paths = paths.to_vec();
+    paths.sort_by_key(|(actual, _)| std::cmp::Reverse(actual.len()));
+    for (actual, stable) in paths {
+        record = record.replace(
+            &json_string_contents(&actual),
+            &json_string_contents(&stable),
+        );
+    }
+    record.replace(
+        &json_string_contents(scratch_root),
+        &json_string_contents("/fixture"),
+    )
+}
+
+#[tokio::test]
+async fn project_resolve_v1_records_match_published_files() {
+    let fixture = SessionFixture::new("served-project-resolve-v1").await;
+    fixture
+        .handler
+        .store
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .set_root_records(false);
+
+    let root = fixture.dir.join("root-checkout");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::write(root.join(".git/config"), "[core]\n\tbare = false\n").unwrap();
+    let root = crate::tests::canonical_test_path(&root)
+        .to_string_lossy()
+        .into_owned();
+    let subfolder = PathBuf::from(&root).join("subfolder");
+    std::fs::create_dir_all(&subfolder).unwrap();
+    let subfolder = crate::tests::canonical_test_path(subfolder)
+        .to_string_lossy()
+        .into_owned();
+
+    let gone_root = fixture.dir.join("gone-checkout");
+    std::fs::create_dir_all(gone_root.join(".git")).unwrap();
+    std::fs::write(gone_root.join(".git/config"), "[core]\n\tbare = false\n").unwrap();
+    let gone_root = crate::tests::canonical_test_path(&gone_root)
+        .to_string_lossy()
+        .into_owned();
+
+    for (project_id, name, workspace_id, project_root) in [
+        (
+            "pj-resolve-root",
+            "Resolve Root",
+            "ws-resolve",
+            root.as_str(),
+        ),
+        ("pj-gone-root", "Gone Root", "ws-gone", gone_root.as_str()),
+    ] {
+        let (_, reply) = fixture
+            .record(
+                SESSION_CORE,
+                WRITER_MODULE,
+                "register",
+                json!({
+                    "projectId":project_id,
+                    "name":name,
+                    "roots":[project_root],
+                    "workspaceId":workspace_id
+                }),
+            )
+            .await;
+        assert!(
+            reply.get("result").is_some(),
+            "fixture project registration failed: {reply}"
+        );
+    }
+
+    let worktree = fixture.dir.join("external-worktree");
+    let admin = PathBuf::from(&root)
+        .join(".git")
+        .join("worktrees")
+        .join("project-resolve-v1");
+    std::fs::create_dir_all(&admin).unwrap();
+    std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(
+        worktree.join(".git"),
+        format!("gitdir: {}\n", admin.display()),
+    )
+    .unwrap();
+    let worktree = crate::tests::canonical_test_path(worktree)
+        .to_string_lossy()
+        .into_owned();
+
+    std::fs::remove_dir_all(PathBuf::from(&gone_root)).unwrap();
+
+    let implicit = fixture.dir.join("implicit-folder");
+    std::fs::create_dir_all(&implicit).unwrap();
+    let implicit = crate::tests::canonical_test_path(implicit)
+        .to_string_lossy()
+        .into_owned();
+    let alias_source = fixture.dir.join("alias-source");
+    std::fs::create_dir_all(&alias_source).unwrap();
+    let alias_source = crate::tests::canonical_test_path(alias_source)
+        .to_string_lossy()
+        .into_owned();
+    let alias_id = entorhinal_core::implicit_project_id(&alias_source);
+    let alias_stable_id = entorhinal_core::implicit_project_id("/fixture/alias-source");
+    let (_, upgraded) = fixture
+        .record(
+            SESSION_CORE,
+            WRITER_MODULE,
+            "upgrade_implicit",
+            json!({
+                "implicitId":alias_id,
+                "projectId":"pj-alias-target",
+                "name":"Alias Target"
+            }),
+        )
+        .await;
+    assert!(
+        upgraded.get("result").is_some(),
+        "fixture alias creation failed: {upgraded}"
+    );
+
+    let fixed_token = "0123456789abcdef".repeat(4);
+    std::fs::write(
+        PathBuf::from(&root)
+            .join(".git")
+            .join("cortexkit-root-incarnation"),
+        format!("{fixed_token}\n"),
+    )
+    .unwrap();
+    {
+        let mut store = fixture.handler.store.lock().unwrap();
+        let store = store.as_mut().unwrap();
+        store.set_root_records(true);
+        store.bind_root(&root, "project-resolve-v1").unwrap();
+    }
+
+    let scratch_root = crate::tests::canonical_test_path(&fixture.dir)
+        .to_string_lossy()
+        .into_owned();
+    let paths = [
+        (root.clone(), "/fixture/root-checkout".to_string()),
+        (
+            subfolder.clone(),
+            "/fixture/root-checkout/subfolder".to_string(),
+        ),
+        (worktree.clone(), "/fixture/external-worktree".to_string()),
+        (implicit.clone(), "/fixture/implicit-folder".to_string()),
+        (gone_root.clone(), "/fixture/gone-checkout".to_string()),
+        (alias_source.clone(), "/fixture/alias-source".to_string()),
+    ];
+    let implicit_id = entorhinal_core::implicit_project_id(&implicit);
+    let implicit_stable_id = entorhinal_core::implicit_project_id("/fixture/implicit-folder");
+    let implicit_ids = [
+        (implicit_id, implicit_stable_id),
+        (alias_id.clone(), alias_stable_id),
+    ];
+
+    let mut resolve_records = Vec::new();
+    for path in [&root, &subfolder, &worktree, &implicit, &gone_root] {
+        let (record, reply) = fixture
+            .record(
+                SESSION_READER,
+                READER_MODULE,
+                "resolve",
+                json!({"canonicalRoot":path}),
+            )
+            .await;
+        resolve_records.push(normalize_project_record(
+            record,
+            &scratch_root,
+            &paths,
+            &implicit_ids,
+            &reply,
+        ));
+    }
+    let (malformed, malformed_reply) = fixture
+        .record(SESSION_READER, READER_MODULE, "resolve", json!({}))
+        .await;
+    assert_eq!(malformed_reply["code"], "invalid_params");
+    resolve_records.push(normalize_project_record(
+        malformed,
+        &scratch_root,
+        &paths,
+        &implicit_ids,
+        &malformed_reply,
+    ));
+    published_file("project-resolve-v1", "resolve.json", resolve_records);
+
+    let mut project_id_records = Vec::new();
+    for project_id in ["pj-resolve-root", alias_id.as_str(), "pj-no-such-project"] {
+        let (record, reply) = fixture
+            .record(
+                SESSION_READER,
+                READER_MODULE,
+                "resolve_project_id",
+                json!({"projectId":project_id}),
+            )
+            .await;
+        project_id_records.push(normalize_project_record(
+            record,
+            &scratch_root,
+            &paths,
+            &implicit_ids,
+            &reply,
+        ));
+    }
+    published_file(
+        "project-resolve-v1",
+        "resolve-project-id.json",
+        project_id_records,
+    );
+
+    let enumeration = SessionFixture::new("served-project-enumerate-v1").await;
+    for (project_id, name) in [
+        ("pj-dashboard-editor", "Editor"),
+        ("pj-dashboard-terminal", "Terminal"),
+    ] {
+        let (_, reply) = enumeration
+            .record(
+                SESSION_CORE,
+                WRITER_MODULE,
+                "register",
+                json!({
+                    "projectId":project_id,
+                    "name":name,
+                    "roots":[],
+                    "workspaceId":"ws-dashboard"
+                }),
+            )
+            .await;
+        assert!(
+            reply.get("result").is_some(),
+            "fixture project registration failed: {reply}"
+        );
+    }
+    enumeration
+        .handler
+        .store
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .set_root_records(true);
+    let (record, _) = enumeration
+        .record(SESSION_READER, READER_MODULE, "enumerate", json!({}))
+        .await;
+    published_file("project-resolve-v1", "enumerate.json", vec![record]);
+}
+
 #[tokio::test]
 async fn session_records_match_published_files() {
     let fixture = SessionFixture::new("served-sessions").await;
