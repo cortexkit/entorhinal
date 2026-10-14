@@ -111,7 +111,7 @@ jobs:
       fail-fast: false
       matrix:
         # Each shard owns a separate checkout; never replay concurrently in one tree.
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - uses: actions/checkout@v5
         with:
@@ -137,19 +137,19 @@ jobs:
         if: github.event_name == 'push' || github.event_name == 'pull_request'
         run: |
           mkdir -p target/mutations
-          ckdev-mutate run --diff origin/main --shard ${{ matrix.shard }}/4 --report target/mutations/diff.json
+          ckdev-mutate run --diff origin/main --shard ${{ matrix.shard }}/8 --report target/mutations/diff.json
 
       - name: Replay full catalogue on main
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
           mkdir -p target/mutations
-          ckdev-mutate run --all --shard ${{ matrix.shard }}/4 --report target/mutations/all.json
+          ckdev-mutate run --all --shard ${{ matrix.shard }}/8 --report target/mutations/all.json
 
       - name: Audit all package targets nightly or on demand
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: |
           mkdir -p target/mutations
-          ckdev-mutate run --all --broad --shard ${{ matrix.shard }}/4 --report target/mutations/broad.json
+          ckdev-mutate run --all --broad --shard ${{ matrix.shard }}/8 --report target/mutations/broad.json
 
       - uses: actions/upload-artifact@v4
         if: always()
