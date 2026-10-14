@@ -212,12 +212,14 @@ impl Source {
     }
 
     pub(crate) async fn run(mut self) {
+        let mut signals = self.worker.wake.subscribe();
         let mut delay = Duration::ZERO;
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(delay) => {},
-                _ = self.worker.wake.notified() => {},
+                _ = signals.notified() => {},
             }
+            signals.handled();
             if self.worker.store.upgrade().is_none() {
                 return;
             }
@@ -234,6 +236,8 @@ impl Source {
                 Ok(None) => return,
                 Err(_) => delay = POLL,
             }
+            #[cfg(test)]
+            signals.finished();
         }
     }
 
@@ -1408,7 +1412,7 @@ mod tests {
                 health: Arc::new(HealthGauges::default()),
                 writer: Arc::new(tokio::sync::Mutex::new(())),
                 clock,
-                wake: Arc::new(tokio::sync::Notify::new()),
+                wake: Arc::new(crate::move_driver::MoveWake::default()),
             };
             Self {
                 slot,
@@ -1508,6 +1512,37 @@ mod tests {
         fn drop(&mut self) {
             *self.slot.lock().unwrap() = None;
             let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn source_reconnect_polls_once_waiting_and_mid_poll() {
+        use crate::log_client::LogConnector;
+        for mid_poll in [false, true] {
+            let mut f = Fixture::new();
+            // A stored contract violation prevents participant calls, but a
+            // published source still reads move:<cut> each tick. That isolates
+            // the retry loop's reconnect and timer behavior from move progress.
+            f.edit(|row| {
+                row.step = Step::Published;
+                row.plan["_source"] = json!({"contract_violation":true});
+            });
+            let probe = crate::move_driver::reconnect_test::Connector::new(
+                f.records.clone(),
+                format!("move:{CUT}"),
+                mid_poll,
+            );
+            let connector = Arc::new(crate::move_driver::ReconnectConnector {
+                inner: probe.clone(),
+                wake: f.worker.wake.clone(),
+            });
+            connector.connect().await.unwrap();
+            f.worker.records = RecordClient::new(connector.clone());
+            let task = tokio::spawn(f.source().run());
+            probe.check_polling(&connector, mid_poll).await;
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            f.worker.sql_operations.wait().await;
         }
     }
 
