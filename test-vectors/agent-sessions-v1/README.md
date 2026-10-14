@@ -5,16 +5,23 @@ request path. Successful replies contain the exact UTF-8 JSON bytes returned by
 the handler, including the `result` envelope; refusals contain the handler's
 `code`, `message`, and `detail` (`null` when no detail was supplied). Each
 `request` is the complete request frame `{method, params}`, not just its params.
-The recorded principals identify which route was allowed to make each request.
+The recorded `principal` is the module ID stamped on the request route; it is not
+a capability name. The fixture's fake daemon catalog lists `prefrontal-core` as
+the provider of both `agent-host/v1` and `agent-orchestrator/v1`, and the
+registration route carries principal `prefrontal-core`. Admission compares the
+caller principal with whichever module the catalog lists for either role; it
+does not compare against a fixed module name. Since one module provides both
+roles here, it is admitted as the orchestrator. Read calls use the reserved
+`phone` route, and the refusal vector uses `plexus`, which provides neither
+role. Claim records and Mac display names are fixed in the scratch registry; no
+network or machine-local state is used.
 
-The fixture imports seven live agents with fixed IDs, uses the fixed clock
-`700` and incarnation `0123456789abcdef`, and registers through the reserved
-module `agent-host/v1`; the fixture's fake capability resolver maps the
-`agent-host/v1` capability to that module ID.
-Read calls use the reserved `phone` route. Claim records and Mac display names
-are fixed in the scratch registry; no network or machine-local state is used.
-`cortexkit-role-llm-runner` is not in entorhinal's dependency graph, so the
-`llm-runner` reference is the fixed 32-lowercase-hex value
+The fixture imports seven live agents with fixed IDs, uses clock `700` and
+incarnation `0123456789abcdef`. The closed `ref_kind` set is `pi-session`,
+`opencode-session`, `claude-code-session`, `broca-session`, and `agent` for core's
+own rows. These vectors pair `pi-session` with harness `pi` and
+`opencode-session` with harness `opencode`. `cortexkit-role-llm-runner` is not in
+entorhinal's dependency graph, so `ref` uses a fixed 32-lowercase-hex value
 `0123456789abcdef0123456789abcdef`, not a computed `session_ref`.
 
 ## Params schemas
@@ -27,10 +34,11 @@ objects deny unknown fields; a field outside the listed schema is an
   `{agent_id, ref_kind, ref, harness, session_id, project_root}`. The reference
   kind is 1–64 bytes, reference 1–512 bytes, harness 1–32 bytes, session ID
   1–256 bytes, and project root 1–4096 bytes. The success records register an
-  unclaimed live agent as `host`, then register the same reference again for
-  that agent. Refusals cover `ref_bound_elsewhere`, a cached `held_elsewhere`
-  claim with the other Mac's name, a `caller_forbidden` reader, and an unknown
-  field.
+  unclaimed live agent as `orchestrator`, then register the same reference again
+  for that agent. A separate OpenCode registration uses `opencode-session` and
+  the `opencode` harness. Refusals cover `ref_bound_elsewhere`, a cached
+  `held_elsewhere` claim with the other Mac's name, a `caller_forbidden` request
+  from `plexus`, and an unknown field.
 - `agent.for_session`: exactly `{harness, session_id}`. Harness is 1–32 bytes
   and session ID 1–256 bytes. The file includes a found binding and `not_found`.
 - `agent.session_for_ref`: exactly `{ref_kind, ref}`. Reference kind is 1–64
@@ -46,17 +54,28 @@ objects deny unknown fields; a field outside the listed schema is an
 
 ## Files
 
-- **`register-session.json`**: host registration success, same-reference
-  re-registration, `ref_bound_elsewhere`, `held_elsewhere`, `caller_forbidden`,
-  and rejection of an unknown registration field.
-- **`for-session.json`**: lookup of the re-registered session and a missing
-  harness/session key.
-- **`session-for-ref.json`**: current registration with `project_root`, a
-  migrated legacy row with a null root, and a missing reference.
+- **`register-session.json`**: orchestrator registration success, same-reference
+  re-registration, a distinct OpenCode session registration, `ref_bound_elsewhere`,
+  `held_elsewhere`, `caller_forbidden` from `plexus`, and rejection of an
+  unknown registration field.
+- **`for-session.json`**: Pi and OpenCode lookups of registered sessions and a
+  missing harness/session key.
+- **`session-for-ref.json`**: Pi and OpenCode registrations with
+  `project_root`, a migrated legacy row with a null root, and a missing
+  reference.
 - **`where.json`**: never-read/unclaimed, locally held, remotely held with a
   holder name, and unknown agent.
 - **`SHA256SUMS`**: SHA-256 hashes of the four JSON vector files, with names
   relative to this directory.
+
+## SHA-256 hashes
+
+| File | SHA-256 |
+| --- | --- |
+| `for-session.json` | `dd41914934a9b85b35670a815bef17de84752d8da7d05a1bf8833f3edbd1996b` |
+| `register-session.json` | `20015ad11322866712bf4e43666ba3356c87700b3905884b8deed67fb3d1edbb` |
+| `session-for-ref.json` | `f8314b13df331e185f2c4960a314a3e8fac97af5d8e9904150ba024973fbb69a` |
+| `where.json` | `da88d465b4a190dbf14f7224ed8fd4a6cae10a8639fbbc7953b7d8b1f11dce8d` |
 
 ## Reproduce and verify
 

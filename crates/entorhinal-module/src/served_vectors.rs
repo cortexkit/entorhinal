@@ -351,12 +351,14 @@ const WHERE_UNCLAIMED: &str = "agent_0000000000000105";
 const WHERE_HERE: &str = "agent_0000000000000106";
 const WHERE_ELSEWHERE: &str = "agent_0000000000000107";
 const SESSION_REF: &str = "0123456789abcdef0123456789abcdef";
+const OPENCODE_REF: &str = "abcdef0123456789abcdef0123456789";
 const SELF_AUTHOR: &str = "1111111111111111";
 const OTHER_AUTHOR: &str = "2222222222222222";
-const HOST_MODULE: &str = "agent-host/v1";
+const PLEXUS_MODULE: &str = "plexus";
 const SESSION_CORE: RouteKey = (904, 1);
-const SESSION_HOST: RouteKey = (905, 1);
+const SESSION_REGISTRAR: RouteKey = (905, 1);
 const SESSION_READER: RouteKey = (906, 1);
+const SESSION_FORBIDDEN: RouteKey = (907, 1);
 
 struct SessionFixture {
     dir: PathBuf,
@@ -373,7 +375,7 @@ impl SessionFixture {
         );
         resolver.set(
             crate::sessions::HOST_CAPABILITY,
-            crate::sessions::ProviderResolution::Provider(HOST_MODULE.into()),
+            crate::sessions::ProviderResolution::Provider(WRITER_MODULE.into()),
         );
         let mut handler = ProjectsHandler::with_runtime(INCARNATION.into(), || 700);
         handler.provider_resolver = resolver;
@@ -382,8 +384,9 @@ impl SessionFixture {
         install_store(&handler.store, &handler.health, Ok(store));
         for (route, module_id) in [
             (SESSION_CORE, WRITER_MODULE),
-            (SESSION_HOST, HOST_MODULE),
+            (SESSION_REGISTRAR, WRITER_MODULE),
             (SESSION_READER, READER_MODULE),
+            (SESSION_FORBIDDEN, PLEXUS_MODULE),
         ] {
             handler.route_admissions().insert(
                 route,
@@ -467,7 +470,7 @@ impl SessionFixture {
                 // Schema 8 rows predate project_root; migration 9 backfills an empty root for them.
                 tx.execute(
                     "INSERT INTO session_binding(ref_kind,ref,agent_id,harness,session_id,project_root,registered_by,registered_at_ms) VALUES(?1,?2,?3,?4,?5,'','host',700)",
-                    params!["llm-runner", "fedcba98765432100123456789abcdef", LEGACY_AGENT, "old-harness", "old-session"],
+                    params!["pi-session", "fedcba98765432100123456789abcdef", LEGACY_AGENT, "pi", "old-session"],
                 )?;
                 Ok(())
             })
@@ -533,7 +536,7 @@ async fn session_records_match_published_files() {
 
     let registration = json!({
         "agent_id":SESSION_AGENT,
-        "ref_kind":"llm-runner",
+        "ref_kind":"pi-session",
         "ref":SESSION_REF,
         "harness":"pi",
         "session_id":"session-001",
@@ -541,17 +544,17 @@ async fn session_records_match_published_files() {
     });
     let (register_record, registered) = fixture
         .record(
-            SESSION_HOST,
-            HOST_MODULE,
+            SESSION_REGISTRAR,
+            WRITER_MODULE,
             "agent.register_session",
             registration.clone(),
         )
         .await;
-    assert_eq!(registered["result"]["registered_by"], "host");
+    assert_eq!(registered["result"]["registered_by"], "orchestrator");
     assert_eq!(registered["result"]["registered_at_ms"], 700);
     let re_registration = json!({
         "agent_id":SESSION_AGENT,
-        "ref_kind":"llm-runner",
+        "ref_kind":"pi-session",
         "ref":SESSION_REF,
         "harness":"pi",
         "session_id":"session-002",
@@ -559,21 +562,39 @@ async fn session_records_match_published_files() {
     });
     let (reregister_record, reregistered) = fixture
         .record(
-            SESSION_HOST,
-            HOST_MODULE,
+            SESSION_REGISTRAR,
+            WRITER_MODULE,
             "agent.register_session",
             re_registration,
         )
         .await;
     assert_eq!(reregistered["result"]["session_id"], "session-002");
 
+    let opencode_registration = json!({
+        "agent_id":SESSION_AGENT,
+        "ref_kind":"opencode-session",
+        "ref":OPENCODE_REF,
+        "harness":"opencode",
+        "session_id":"opencode-session-001",
+        "project_root":"/workspace/session-vectors/opencode"
+    });
+    let (opencode_record, opencode_reply) = fixture
+        .record(
+            SESSION_REGISTRAR,
+            WRITER_MODULE,
+            "agent.register_session",
+            opencode_registration,
+        )
+        .await;
+    assert_eq!(opencode_reply["result"]["registered_by"], "orchestrator");
+
     let mut ref_collision = registration.clone();
     ref_collision["agent_id"] = json!(REF_OWNER);
     ref_collision["session_id"] = json!("owner-session");
     let (ref_collision_record, ref_collision_reply) = fixture
         .record(
-            SESSION_HOST,
-            HOST_MODULE,
+            SESSION_REGISTRAR,
+            WRITER_MODULE,
             "agent.register_session",
             ref_collision,
         )
@@ -586,8 +607,8 @@ async fn session_records_match_published_files() {
     held_collision["session_id"] = json!("held-session");
     let (held_collision_record, held_collision_reply) = fixture
         .record(
-            SESSION_HOST,
-            HOST_MODULE,
+            SESSION_REGISTRAR,
+            WRITER_MODULE,
             "agent.register_session",
             held_collision,
         )
@@ -596,8 +617,8 @@ async fn session_records_match_published_files() {
 
     let (forbidden_record, forbidden_reply) = fixture
         .record(
-            SESSION_READER,
-            READER_MODULE,
+            SESSION_FORBIDDEN,
+            PLEXUS_MODULE,
             "agent.register_session",
             registration.clone(),
         )
@@ -608,8 +629,8 @@ async fn session_records_match_published_files() {
     unknown_field["unexpected"] = json!(true);
     let (unknown_field_record, unknown_field_reply) = fixture
         .record(
-            SESSION_HOST,
-            HOST_MODULE,
+            SESSION_REGISTRAR,
+            WRITER_MODULE,
             "agent.register_session",
             unknown_field,
         )
@@ -621,6 +642,7 @@ async fn session_records_match_published_files() {
         vec![
             register_record,
             reregister_record,
+            opencode_record,
             ref_collision_record,
             held_collision_record,
             forbidden_record,
@@ -637,6 +659,15 @@ async fn session_records_match_published_files() {
         )
         .await;
     assert_eq!(found_session["result"]["agent_id"], SESSION_AGENT);
+    let (opencode_for_session, opencode_session) = fixture
+        .record(
+            SESSION_READER,
+            READER_MODULE,
+            "agent.for_session",
+            json!({"harness":"opencode","session_id":"opencode-session-001"}),
+        )
+        .await;
+    assert_eq!(opencode_session["result"]["agent_id"], SESSION_AGENT);
     let (for_session_missing, missing_session) = fixture
         .record(
             SESSION_READER,
@@ -649,7 +680,7 @@ async fn session_records_match_published_files() {
     published_file(
         "agent-sessions-v1",
         "for-session.json",
-        vec![for_session_found, for_session_missing],
+        vec![for_session_found, opencode_for_session, for_session_missing],
     );
 
     let (for_ref_found, found_ref) = fixture
@@ -657,7 +688,15 @@ async fn session_records_match_published_files() {
             SESSION_READER,
             READER_MODULE,
             "agent.session_for_ref",
-            json!({"ref_kind":"llm-runner","ref":SESSION_REF}),
+            json!({"ref_kind":"pi-session","ref":SESSION_REF}),
+        )
+        .await;
+    let (opencode_for_ref, opencode_ref_reply) = fixture
+        .record(
+            SESSION_READER,
+            READER_MODULE,
+            "agent.session_for_ref",
+            json!({"ref_kind":"opencode-session","ref":OPENCODE_REF}),
         )
         .await;
     let (legacy_ref, legacy_reply) = fixture
@@ -665,7 +704,7 @@ async fn session_records_match_published_files() {
             SESSION_READER,
             READER_MODULE,
             "agent.session_for_ref",
-            json!({"ref_kind":"llm-runner","ref":"fedcba98765432100123456789abcdef"}),
+            json!({"ref_kind":"pi-session","ref":"fedcba98765432100123456789abcdef"}),
         )
         .await;
     assert!(legacy_reply["result"]["project_root"].is_null());
@@ -674,18 +713,22 @@ async fn session_records_match_published_files() {
             SESSION_READER,
             READER_MODULE,
             "agent.session_for_ref",
-            json!({"ref_kind":"llm-runner","ref":"no-such-reference"}),
+            json!({"ref_kind":"pi-session","ref":"no-such-reference"}),
         )
         .await;
     assert_eq!(missing_ref["code"], "not_found");
     published_file(
         "agent-sessions-v1",
         "session-for-ref.json",
-        vec![for_ref_found, legacy_ref, for_ref_missing],
+        vec![for_ref_found, opencode_for_ref, legacy_ref, for_ref_missing],
     );
     assert_eq!(
         found_ref["result"]["project_root"],
         "/workspace/session-vectors/reopened"
+    );
+    assert_eq!(
+        opencode_ref_reply["result"]["project_root"],
+        "/workspace/session-vectors/opencode"
     );
 
     let mut where_records = Vec::new();
