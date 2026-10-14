@@ -247,8 +247,8 @@ pub struct RegistryStore {
     db: Arc<SqliteStore>,
     reader: Arc<read_connection::ReadConnection>,
     /// Whether replies carry the root-record fields and walk ancestors. Off,
-    /// every reply is byte-for-byte the pre-multi-root shape, so a consumer
-    /// that cannot read the new fields is never sent them.
+    /// legacy resolution precedence is preserved and root-record fields are
+    /// omitted; the shared-token worktree fallback is available in either mode.
     root_records: bool,
     ids: Arc<binding::IdSource>,
 }
@@ -451,6 +451,15 @@ impl RegistryStore {
                 return Ok(reply);
             }
 
+            if let Some(reply) = self.reply_for_worktree(
+                conn,
+                &query_path,
+                !path_exists,
+                self.generation_from_connection(conn)?,
+            )? {
+                return Ok(reply);
+            }
+
             Ok(ResolveReply {
                 project_id: implicit_project_id(&canonical_path),
                 workspace_id: None,
@@ -460,6 +469,7 @@ impl RegistryStore {
                 gone: !path_exists,
                 generation: self.generation_from_connection(conn)?,
                 canonical_root: Some(canonical_path),
+                worktree_of: None,
                 root_fields: None,
             })
         })
@@ -755,6 +765,7 @@ impl RegistryStore {
             gone,
             generation,
             canonical_root: None,
+            worktree_of: None,
             root_fields: None,
         })
     }
@@ -1189,7 +1200,11 @@ pub struct ResolveReply {
     pub gone: bool,
     pub generation: i64,
     pub canonical_root: Option<String>,
-    /// Present only when root records are enabled; see [`RootFields`].
+    /// The registered checkout whose current binding identifies this worktree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_of: Option<String>,
+    /// Present only when root records are enabled, except for worktree replies;
+    /// see [`RootFields`]. A main checkout's approval does not approve its worktrees.
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub root_fields: Option<RootFields>,
 }
