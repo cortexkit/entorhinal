@@ -2241,6 +2241,17 @@ mod moves {
             serde_json::from_slice(f.b.claim().await.body.as_deref().unwrap()).unwrap();
         assert_eq!(claim["holder"], B);
         assert_eq!(claim["epoch"], 1);
+        // Read the source's persisted cache before any further handler call.
+        // Release must have installed the receiver's claim without a refresh request.
+        let source_cache = f.a.store().cached_agent_claim(AGENT).unwrap();
+        assert_eq!(
+            source_cache
+                .as_ref()
+                .and_then(|claim| claim.holder.as_deref()),
+            Some(B),
+            "release must refresh the source claim cache to the receiver"
+        );
+        assert_eq!(source_cache.map(|claim| claim.epoch), Some(1));
         let a_where = f.a.where_().await;
         assert_eq!(a_where["status"], "held_elsewhere", "{a_where}");
         assert_eq!(a_where["holder"], B);
@@ -2427,8 +2438,36 @@ mod moves {
                     "Studio Mac"
                 }
             };
-            assert_eq!(f.a.admit_to(target, code).await.unwrap_err(), code);
-            assert!(f.a.store().list_agent_moves().unwrap().is_empty());
+            let admission = f.a.machine.handler.admit_move(
+                json!({"agent_id":AGENT,"to":target,"request_key":code}),
+                CORE,
+                tokio::time::Instant::now(),
+            );
+            tokio::pin!(admission);
+            let mut outcome = None;
+            // Bound cooperative polls rather than advancing the paused clock:
+            // SQLite's blocking worker must finish before network deadlines jump.
+            for _ in 0..1_000_000 {
+                tokio::select! {
+                    biased;
+                    result = &mut admission => {
+                        outcome = Some(result);
+                        break;
+                    }
+                    () = tokio::task::yield_now() => {}
+                }
+            }
+            let outcome = outcome.expect("admission exceeded its bounded cooperative poll budget");
+            assert!(
+                f.a.store().list_agent_moves().unwrap().is_empty(),
+                "{code} admission must remain read-only"
+            );
+            assert_eq!(
+                outcome
+                    .map(|_| "admitted".to_owned())
+                    .unwrap_or_else(|e| e.code),
+                code
+            );
             assert!(f.a.door.calls().is_empty());
             assert!(f.a.discovery.peers["pi"]
                 .calls()

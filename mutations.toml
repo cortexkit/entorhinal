@@ -3769,10 +3769,12 @@ expect_red = ["two_machine_acceptance::moves::admission_registration_orders_same
 
 [[control]]
 id = "s11-source-refresh-after-release"
-guards = "Source release refreshes the claim cache so where and registration immediately name the receiver"
+guards = "Source release of Broca data refreshes the persisted claim cache to the receiver before further handler calls"
 file = "crates/entorhinal-module/src/move_source.rs"
 old = "self.apply_claim(row, true).await?;"
-new = "// NON-VACUITY BREAK: retain the source's pre-move cache"
+new = '''if plan.participants.iter().all(|participant| participant.module_id != "broca") {
+            self.apply_claim(row, true).await?;
+        } // NON-VACUITY BREAK: leave Broca moves with the source's pre-move cache'''
 test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
 runner = "cargo"
 package = "entorhinal-module"
@@ -3805,12 +3807,10 @@ expect_red = ["two_machine_acceptance::moves::held_elsewhere_and_busy_admission_
 
 [[control]]
 id = "s11-source-busy-read-only"
-guards = "Busy admission refuses before prepare, door, move record, inbox or checkpoint side effects"
+guards = "An unknown participant busy verdict refuses admission before any move side effect while retaining the preflight reads"
 file = "crates/entorhinal-module/src/move_admission.rs"
-old = '''self.move_idle(&refs, &plan).await?;
-        let mut confirmation'''
-new = '''// NON-VACUITY BREAK: skip idle admission
-        let mut confirmation'''
+old = "if verdict.state != BusyState::Idle {"
+new = "if verdict.state == BusyState::Busy { // NON-VACUITY BREAK: admit unknown participant state"
 test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
 runner = "cargo"
 package = "entorhinal-module"
