@@ -163,12 +163,17 @@ impl ProjectsHandler {
         let identity = RequestIdentity {
             agent_id: caller.into(),
             tool: tool.name.into(),
-            request_key: arguments
-                .remove("request_key")
-                .expect("validate_request_key established the request_key field")
-                .as_str()
-                .expect("validate_request_key established that request_key is a string")
-                .into(),
+            // validate_request_key has already checked this field; refusing here
+            // too keeps a missing or non-string key from ever reaching a write.
+            request_key: match arguments.remove("request_key") {
+                Some(Value::String(key)) => key,
+                _ => {
+                    return Err(HandlerError::new(
+                        "invalid_request_key",
+                        "request_key must be a string",
+                    ))
+                }
+            },
         };
         let arguments = Value::Object(arguments);
         let digest = composition_digest(&arguments).expect("arguments is a serde_json::Value parsed from valid JSON, which has a canonical encoding");
