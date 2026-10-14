@@ -68,7 +68,7 @@ impl Binding {
 /// may contain any printable ASCII, including whichever delimiter was chosen.
 pub(super) fn external_key(key: &RequestIdentity) -> String {
     let digest = composition_digest(&json!([key.agent_id, key.tool, key.request_key]))
-        .expect("string tuple canonicalizes");
+        .expect("this function constructs only JSON strings, which have a canonical encoding");
     format!("ent1:{digest}")
 }
 
@@ -242,8 +242,14 @@ impl ConsentCoordinator {
                 _lease: None,
             });
         }
-        self.obtain_leased(call, row, context, None, lease.expect("lease acquired"))
-            .await
+        self.obtain_leased(
+            call,
+            row,
+            context,
+            None,
+            lease.expect("this function returned above if no lease was acquired"),
+        )
+        .await
     }
 }
 
@@ -254,7 +260,10 @@ fn recorded_decision(row: &ConsentRequest, now: i64) -> Option<ConsentDecision> 
     }
     Some(match (answer.state.as_str(), answer.choice.as_deref()) {
         ("answered", Some("approve_once")) => ConsentDecision::Approved(answer.clone()),
-        ("answered", Some(choice)) if Some(choice) == always_choice(&row.identity.tool) => {
+        ("answered", Some("approve_always_workspace" | "approve_always_project")) => {
+            // The executor checks the approval against the saved action's grant
+            // class and project or workspace scope. A mismatch commits a terminal
+            // refusal instead of a write or a broader standing permission.
             ConsentDecision::Approved(answer.clone())
         }
         ("answered", Some("deny")) => ConsentDecision::Refused("consent_declined"),
@@ -299,7 +308,8 @@ async fn resolve(
         _ => return Ok(unresolved(row, (call.now_ms)())),
     };
     let result = resolve_on_route(call, row, card, inserted, route.as_ref(), &owner).await;
-    // Closing has no bearing on the decision and shares the same call deadline.
+    // Closing the consent route does not change its resolved decision, and uses
+    // the tool call's remaining deadline so cleanup cannot prolong the call.
     let _ = timeout_at(call.deadline, route.close()).await;
     result
 }
@@ -342,8 +352,8 @@ async fn resolve_on_route(
                     .consent_transaction(|tx| tx.delete_awaiting(&row.identity))?;
                 return Ok(ConsentDecision::Refused("consent_unavailable"));
             }
-            // A cancelled or unreadable request reply may follow a committed card.
-            // Resending could raise another card after the first one settled.
+            // A cancelled or unreadable reply may arrive after Cingulate recorded
+            // the card. Resending could create a second card after the first was answered.
             Err(_) => return Ok(unresolved(row, (call.now_ms)())),
         }
     }
@@ -352,10 +362,12 @@ async fn resolve_on_route(
         if !capture.complete {
             return Ok(unresolved(row, (call.now_ms)()));
         }
-        let saved = call
-            .store
-            .consent_request(&row.identity)?
-            .expect("awaiting row exists");
+        let saved = call.store.consent_request(&row.identity)?.ok_or_else(|| {
+            domain_error(
+                "consent_lost",
+                "awaiting request disappeared during feed capture",
+            )
+        })?;
         return Ok(recorded_decision(&saved, (call.now_ms)())
             .unwrap_or_else(|| unresolved(&saved, (call.now_ms)())));
     };
@@ -397,8 +409,9 @@ async fn resolve_on_route(
             RecordDecision::Pending => {}
         }
     }
-    // Pending (or an ambiguous wait) must detach before releasing the held call.
-    // Detach may have raced an answer; that answer belongs to this same call.
+    // Detach a pending consent request before returning the tool call, so an
+    // answer cannot execute a write after its caller has left. If an answer races
+    // with detach, it still belongs to this call and can be applied before return.
     if let Ok(record) = bounded_call(
         route,
         "consent.detach",
@@ -437,6 +450,17 @@ fn inspect_record(
         return Ok(RecordDecision::Pending);
     }
     let Some(answer) = settlement(record) else {
+        if matches!(
+            record["state"].as_str(),
+            Some("answered" | "expired" | "withdrawn")
+        ) {
+            // The binding and card ID match this request, but a malformed final
+            // answer cannot authorize a write. Finish with refusal rather than
+            // repeatedly waiting for a card that has already been resolved.
+            return Ok(RecordDecision::Settled(ConsentDecision::Refused(
+                "invalid_reply",
+            )));
+        }
         return Ok(RecordDecision::Mismatch);
     };
     store.consent_transaction(|tx| {
@@ -450,14 +474,15 @@ fn inspect_record(
     })?;
     let saved = store
         .consent_request(&row.identity)?
-        .expect("awaiting request exists");
+        .ok_or_else(|| domain_error("consent_lost", "request disappeared after settlement"))?;
     Ok(RecordDecision::Settled(
         recorded_decision(&saved, now).unwrap_or(ConsentDecision::Refused("consent_lost")),
     ))
 }
 
 fn settlement(record: &Value) -> Option<RecordedSettlement> {
-    // Retention tombstones have no binding and their state is not an answer.
+    // Expired retention records keep only card identity, not the request binding
+    // or answer. They cannot authorize a write or settle a pending request.
     if record["kind"] != "consent" || !record.get("binding")?.is_object() {
         return None;
     }
@@ -483,9 +508,10 @@ pub(super) struct CaptureReport {
     pub complete: bool,
 }
 
-/// Capture is safe before a terminal commit and as best-effort maintenance after
-/// it. It changes neither request state nor outcome. All network work is bounded
-/// by the original tool call's deadline, including acknowledgement.
+/// Copy Cingulate's answer feed into local request settlements without applying
+/// writes or finishing requests. This is safe before or after the executor's
+/// terminal commit. Feed reads and acknowledgements share the tool call deadline;
+/// acknowledge only answers already saved, so reconnect cannot lose a decision.
 pub(super) async fn capture_feed(
     store: &RegistryStore,
     route: &dyn ConsentRoute,

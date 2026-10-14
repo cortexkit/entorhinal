@@ -630,7 +630,9 @@ mod tests {
                     "role_cache",
                     "role_take_request",
                     "self_identity",
-                    // Consent decisions, retry state, audit and hire limits stay local.
+                    // These machine-local consent and agent tables are never sent to other Macs:
+                    // consent_grant, consent_request, consent_write_plan, consent_feed_cursor,
+                    // agent_audit and project_hire_cap. They describe this Mac's permissions and retries.
                     "consent_grant",
                     "consent_request",
                     "consent_write_plan",

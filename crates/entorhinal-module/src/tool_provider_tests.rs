@@ -316,6 +316,80 @@ async fn retired_and_unknown_callers_are_refused_on_previously_bound_routes() {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn agent_tools_refuse_cached_claims_held_elsewhere_even_with_standing_grants() {
+    use entorhinal_core::{
+        agent::consent::{GrantClass, StandingGrant},
+        claim_cache::{CachedClaim, ClaimObservation},
+    };
+    let f = Fixture::new();
+    let store = f.handler.with_store(|s| Ok(s.clone())).unwrap();
+    let own = "01010101010101010101010101010101";
+    let elsewhere = "02020202020202020202020202020202";
+    let id = f.agents[2].clone();
+    f.admit(Some(&f.stamp(2)));
+    store
+        .consent_transaction(|tx| {
+            tx.put_grant(&StandingGrant {
+                id: "standing".into(),
+                holder_agent_id: id.clone(),
+                class: GrantClass::Hire,
+                scope_id: "P".into(),
+                granted_at_ms: 100,
+                card_ref: "card".into(),
+                revoked_at_ms: None,
+            })
+        })
+        .unwrap();
+    for holder in [None, Some(own), Some(elsewhere)] {
+        store
+            .cache_agent_claims(
+                &[(
+                    id.clone(),
+                    ClaimObservation::Present {
+                        claim: CachedClaim {
+                            holder: holder.map(str::to_owned),
+                            epoch: if holder.is_none() { 0 } else { 1 },
+                            cut_id: None,
+                            version: 1,
+                            read_at_ms: 100,
+                            stale: false,
+                            integrity_failed: false,
+                        },
+                        self_author: own.into(),
+                    },
+                )],
+                100,
+            )
+            .unwrap();
+        let admitted = f.handler.admit_agent_tool(
+            TOOLS
+                .iter()
+                .find(|t| t.name == "agents_hire")
+                .copied()
+                .unwrap(),
+            ROUTE,
+        );
+        if holder == Some(elsewhere) {
+            assert_eq!(admitted.unwrap_err().code, "held_elsewhere");
+            let before = f.counts();
+            assert_eq!(
+                error_code(
+                    f.call(
+                        "agents_hire",
+                        json!({"request_key":"old-Mac","name":"Hire","tag":"worker","labels":[]})
+                    )
+                    .await
+                ),
+                "held_elsewhere"
+            );
+            assert_eq!(f.counts(), before);
+        } else {
+            assert!(admitted.is_ok());
+        }
+    }
+}
+
 #[tokio::test]
 async fn every_write_validates_printable_ascii_request_keys_before_other_arguments() {
     let f = Fixture::new();

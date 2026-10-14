@@ -950,9 +950,9 @@ impl RegistryStore {
 }
 
 impl JournalWriter<'_> {
-    /// Validate the head, hire arguments and project cap without writing, before
-    /// asking for consent. Hiring repeats these checks inside its write transaction
-    /// so concurrent changes cannot bypass the project limit.
+    /// Before asking for consent, validate the requesting head agent, the hire
+    /// arguments and the project cap without writing. The hire write repeats the
+    /// cap check inside its transaction so concurrent changes cannot bypass it.
     pub fn precheck_agent_hire(
         &self,
         caller: &str,
@@ -969,8 +969,8 @@ impl JournalWriter<'_> {
     }
 
     /// Create a hire requested by a project head, subject to the project hire cap.
-    /// Creation by the operator or core's relay and journal replay use the existing
-    /// identity mutation methods, which do not impose this limit.
+    /// The operator, prefrontal-core relaying an operator's request, and journal
+    /// replay use the identity mutation methods, which do not impose this limit.
     pub fn agents_hire(
         &self,
         hire: &super::consent::HireRequest,

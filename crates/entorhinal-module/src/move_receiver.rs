@@ -88,7 +88,7 @@ fn pickup_row(record: &MoveRecord, entry: &PendingMove, version: i64, now: i64) 
         side: MoveSide::Receiver,
         peer: entry.from.clone(),
         step: Step::PickedUp,
-        plan: serde_json::to_value(record).unwrap(),
+        plan: json!(record),
         request_body: None,
         record_version: version,
         claim_version: Some(record.claim_version as i64),
@@ -124,73 +124,116 @@ pub(crate) async fn poll_inbox(worker: &Worker) -> Result<(), HandlerError> {
     };
     let (_, body) = inbox(worker, &own).await?;
     for entry in body.pending {
-        let cut = entry.cut_id.clone();
-        let existing = worker.sql(move |s| s.agent_move(&cut)).await?;
-        if let Some(row) = existing.as_ref() {
-            if row.step.is_terminal() || row.step == Step::Activated {
-                remove_inbox(worker, &own, &entry.cut_id).await?;
-            }
-            if row.step.is_terminal() || row.step == Step::Activated {
-                continue;
-            }
-        }
-        let subject = format!("move:{}", entry.cut_id);
-        let reply = worker.records.read(&subject).await.map_err(record_error)?;
-        if reply.stale || reply.absent {
-            continue;
-        }
-        let record = wire::decode_move_record(&subject, reply.body.as_deref().unwrap_or_default())
-            .map_err(|e| error(e.code()))?;
-        if record.to != own || matches!(record.state, State::Aborted | State::Released) {
-            remove_inbox(worker, &own, &entry.cut_id).await?;
-            continue;
-        }
-        if existing.is_some() {
-            continue;
-        }
-        if record.state != State::Published {
-            continue;
-        }
-        let rows = worker.sql(RegistryStore::list_open_agent_moves).await?;
-        if rows.len() >= 4 || rows.iter().any(|r| r.agent_id == entry.agent_id) {
-            continue;
-        }
-        let read = worker
-            .door
-            .read(&DoorCut {
-                cut_id: entry.cut_id.clone(),
-            })
-            .await
-            .map_err(|e| HandlerError::new(e.code(), format!("{e:?}")))?;
-        checked_version(record.claim_version)?;
-        let mut row = pickup_row(
-            &record,
-            &entry,
-            checked_version(reply.version)?,
-            (worker.clock)(),
-        );
-        let mismatch = reply.author.as_deref() != Some(&entry.from)
-            || record.from != entry.from
-            || read.author != entry.from
-            || record.agent_id != entry.agent_id;
-        if mismatch {
-            row.step = Step::Aborted;
-            row.reason = Some("cut_author_mismatch".into());
-        }
-        // The open-row list above only avoids unnecessary door reads. The
-        // core transaction rechecks the agent slot and cap against concurrent
-        // source admissions and inbox pickups before inserting a row.
-        let result = worker.sql(move |s| Ok(s.admit_received_move(&row))).await?;
-        match result {
-            Ok(row) if row.step == Step::Aborted => {
-                remove_inbox(worker, &own, &entry.cut_id).await?
-            }
-            Ok(_) => {}
-            Err(e) if matches!(e.code.as_str(), "move_in_progress" | "move_cap") => {}
-            Err(e) => return Err(e.into()),
+        // One unavailable cut must not delay unrelated published cuts behind it.
+        if let Err(e) = poll_entry(worker, &own, &entry).await {
+            eprintln!("move inbox {}: retrying after {}", entry.cut_id, e.code);
         }
     }
     worker.gauges().await
+}
+
+async fn reject_entry(
+    worker: &Worker,
+    own: &str,
+    cut: &str,
+    code: &str,
+) -> Result<(), HandlerError> {
+    remove_inbox(worker, own, cut).await?;
+    worker
+        .health
+        .move_inbox_rejected
+        .fetch_add(1, Ordering::Relaxed);
+    // Log only after removal, so repeated polls do not count or log the same rejection.
+    eprintln!("move inbox {cut}: removed permanently invalid entry ({code})");
+    Ok(())
+}
+
+async fn poll_entry(worker: &Worker, own: &str, entry: &PendingMove) -> Result<(), HandlerError> {
+    let cut = entry.cut_id.clone();
+    let existing = worker.sql(move |s| s.agent_move(&cut)).await?;
+    if let Some(row) = existing.as_ref() {
+        if row.step.is_terminal() || row.step == Step::Activated {
+            remove_inbox(worker, own, &entry.cut_id).await?;
+        }
+        if row.step.is_terminal() || row.step == Step::Activated {
+            return Ok(());
+        }
+    }
+    let subject = format!("move:{}", entry.cut_id);
+    let reply = worker.records.read(&subject).await.map_err(record_error)?;
+    if reply.stale {
+        return Ok(());
+    }
+    if reply.absent {
+        return reject_entry(worker, own, &entry.cut_id, "record_absent").await;
+    }
+    let record = match wire::decode_move_record(&subject, reply.body.as_deref().unwrap_or_default())
+    {
+        Ok(record) => record,
+        Err(e) => return reject_entry(worker, own, &entry.cut_id, e.code()).await,
+    };
+    if record.to != own || matches!(record.state, State::Aborted | State::Released) {
+        remove_inbox(worker, own, &entry.cut_id).await?;
+        return Ok(());
+    }
+    if existing.is_some() {
+        return Ok(());
+    }
+    if record.state != State::Published {
+        return Ok(());
+    }
+    let rows = worker.sql(RegistryStore::list_open_agent_moves).await?;
+    if rows.len() >= 4 || rows.iter().any(|r| r.agent_id == entry.agent_id) {
+        return Ok(());
+    }
+    let read = match worker
+        .door
+        .read(&DoorCut {
+            cut_id: entry.cut_id.clone(),
+        })
+        .await
+    {
+        Ok(read) => read,
+        Err(crate::door_client::DoorError::Refused { code, .. })
+            if matches!(
+                code.as_str(),
+                "not_found" | "cut_aborted" | "invalid_request" | "id_reused"
+            ) =>
+        {
+            return reject_entry(worker, own, &entry.cut_id, &code).await;
+        }
+        Err(e) => return Err(HandlerError::new(e.code(), format!("{e:?}"))),
+    };
+    if checked_version(record.claim_version).is_err() || checked_version(reply.version).is_err() {
+        return reject_entry(worker, own, &entry.cut_id, "record_version_unknown").await;
+    }
+    let mut row = pickup_row(
+        &record,
+        entry,
+        checked_version(reply.version)?,
+        (worker.clock)(),
+    );
+    let mismatch = reply.author.as_deref() != Some(&entry.from)
+        || record.from != entry.from
+        || read.author != entry.from
+        || record.agent_id != entry.agent_id;
+    if mismatch {
+        row.step = Step::Aborted;
+        row.reason = Some("cut_author_mismatch".into());
+    }
+    // The earlier open-move list avoids unnecessary reads from the door
+    // service. Before inserting a row, the core transaction rechecks the
+    // agent slot and move cap because source admissions and inbox pickups can race.
+    let result = worker.sql(move |s| Ok(s.admit_received_move(&row))).await?;
+    match result {
+        Ok(row) if row.step == Step::Aborted => {
+            reject_entry(worker, own, &entry.cut_id, "cut_author_mismatch").await?
+        }
+        Ok(_) => {}
+        Err(e) if matches!(e.code.as_str(), "move_in_progress" | "move_cap") => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -311,8 +354,9 @@ impl Receiver {
         }
     }
     /// Resume participant aborts after an operator repairs corrupted undo bytes.
-    /// A digest refusal pauses cleanup for this driver instance; restarting
-    /// retries once, then pauses again if the participant still refuses.
+    /// A participant's abort refusal with digest_mismatch means its undo data
+    /// is corrupted. Pause cleanup until repair and operator retry or restart;
+    /// restart retries once, then pauses again if the participant still refuses.
     pub(crate) fn retry_held_abort(&mut self) {
         self.abort_held = false;
     }
@@ -339,7 +383,8 @@ impl Receiver {
         }
     }
     async fn save(&self, row: &mut AgentMove, progress: &Progress) -> Result<(), Failure> {
-        row.plan["_receiver"] = serde_json::to_value(progress).unwrap();
+        row.plan["_receiver"] = serde_json::to_value(progress)
+            .map_err(|e| Failure::hold("plan_malformed", json!({"error":e.to_string()})))?;
         self.worker.save(row, false).await?;
         Ok(())
     }
@@ -387,17 +432,18 @@ impl Receiver {
         self.clients.insert(module.into(), client.clone());
         Ok(client)
     }
-    fn request(&self, p: &wire::MoveParticipant) -> CutRequest {
-        CutRequest::new(
+    fn request(&self, p: &wire::MoveParticipant) -> Result<CutRequest, Failure> {
+        Ok(CutRequest::new(
             Refs::new(
                 p.refs
                     .iter()
                     .map(|r| AgentRef::new(r.ref_kind.clone(), r.reference.clone()))
                     .collect(),
             )
-            .unwrap(),
-            cortexkit_role_agent_data::refs::CutId::new(self.cut.clone()).unwrap(),
-        )
+            .map_err(|_| Failure::hold("invalid_refs", json!({"op":"plan.read"})))?,
+            cortexkit_role_agent_data::refs::CutId::new(self.cut.clone())
+                .map_err(|_| Failure::hold("invalid_cut_id", json!({"op":"plan.read"})))?,
+        ))
     }
     fn step(row: &mut AgentMove, progress: &mut Progress, step: Step) {
         row.step = step;
@@ -432,13 +478,7 @@ impl Receiver {
                 )
                 && row.abort_requested.is_none()
             {
-                row.reason = observed.reason.as_ref().map(|r| {
-                    serde_json::to_value(r)
-                        .unwrap()
-                        .as_str()
-                        .unwrap()
-                        .to_owned()
-                });
+                row.reason = observed.reason.clone().map(String::from);
                 row.detail = observed.detail.clone();
                 row.abort_requested = Some(json!({"reason":row.reason,"detail":row.detail}));
                 self.save(&mut row, &progress).await?;
@@ -449,7 +489,8 @@ impl Receiver {
             if self.abort_held {
                 return Ok(POLL);
             }
-            // Completion is independent of retry deadlines and accept failures.
+            // Finish the move when the source reports release, even if accepting
+            // a previous move-back cut is still failing or waiting for its retry deadline.
             if row.step == Step::Activated && observed.state == State::Released {
                 Self::step(&mut row, &mut progress, Step::Done);
                 self.save(&mut row, &progress).await?;
@@ -520,13 +561,7 @@ impl Receiver {
                     progress.contract_violation = Some(f.detail.clone());
                 }
                 if let Some(reason) = f.reason.as_ref() {
-                    row.reason = Some(
-                        serde_json::to_value(reason)
-                            .unwrap()
-                            .as_str()
-                            .unwrap()
-                            .to_owned(),
-                    );
+                    row.reason = Some(String::from(reason.clone()));
                     row.detail = Some(f.detail.clone());
                     row.abort_requested = Some(json!({"reason":row.reason,"detail":row.detail}));
                     progress.retry_at_ms = 0;
@@ -539,11 +574,17 @@ impl Receiver {
                         json!({"code":f.code,"detail":f.detail,"move_error":f.violation || f.diagnostic}),
                     );
                     if let Some(module) = f.detail.get("module_id") {
-                        row.hold.as_mut().unwrap()["module_id"] = module.clone();
+                        row.hold
+                            .as_mut()
+                            .expect("this branch assigned Some(hold) immediately above")
+                            ["module_id"] = module.clone();
                     }
                     for key in ["ref", "reason_code", "reason", "op", "note"] {
                         if let Some(value) = f.detail.get(key) {
-                            row.hold.as_mut().unwrap()[key] = value.clone();
+                            row.hold
+                                .as_mut()
+                                .expect("this branch assigned Some(hold) immediately above")[key] =
+                                value.clone();
                         }
                     }
                 }
@@ -749,35 +790,35 @@ impl Receiver {
                 .ok_or_else(|| Failure::hold("plan_malformed", Value::Null))?;
             let client = self.client(&p.module_id).await?;
             client
-                .status(&self.request(p))
+                .status(&self.request(p)?)
                 .await
                 .map_err(|e| Failure::participant(&p.module_id, "agent_data.status", e))?;
-            // Recover the persisted participant operation's reply after restart.
-            // A lost import reply must be resolved before cleanup can safely
-            // abort the participant's staging state.
+            // Persisted progress names the participant calls already sent. After
+            // restart, recover a lost import reply before aborting staging: the
+            // import may still be changing the data that abort needs to discard.
             match pending.op.as_str() {
                 "agent_data.import" => {
                     client
-                        .import(&self.request(p))
+                        .import(&self.request(p)?)
                         .await
                         .map_err(|e| Failure::participant(&p.module_id, &pending.op, e))?;
                 }
                 "agent_data.diverged" => {
                     client
-                        .diverged(&self.request(p))
+                        .diverged(&self.request(p)?)
                         .await
                         .map_err(|e| Failure::participant(&p.module_id, &pending.op, e))?;
                 }
                 "agent_data.abort" => {
                     client
-                        .abort(&self.request(p))
+                        .abort(&self.request(p)?)
                         .await
                         .map_err(|e| Failure::participant(&p.module_id, &pending.op, e))?;
                     progress.aborted.push(p.module_id.clone());
                 }
                 "agent_data.activate" => {
                     client
-                        .activate(&self.request(p))
+                        .activate(&self.request(p)?)
                         .await
                         .map_err(|e| Failure::participant(&p.module_id, &pending.op, e))?;
                 }
@@ -809,7 +850,7 @@ impl Receiver {
                         progress.touched.push(p.module_id.clone());
                     }
                     self.save(row, progress).await?;
-                    let answer = client.diverged(&self.request(p)).await;
+                    let answer = client.diverged(&self.request(p)?).await;
                     if !matches!(answer, Err(ClientError::OutcomeUnknown)) {
                         progress.pending = None;
                         self.save(row, progress).await?;
@@ -826,8 +867,9 @@ impl Receiver {
                         ));
                     }
                 }
-                // A host or participant can write while diverged is in flight.
-                // Do not import until both ownership and local writers are checked again.
+                // Diverged asks each participant whether this Mac has data past
+                // the cut. A host can write while that call is in flight, so recheck
+                // session-binding ownership and active local writers before import.
                 self.local_writers(plan).await?;
                 for p in &plan.participants {
                     let client = self.client(&p.module_id).await?;
@@ -836,7 +878,7 @@ impl Receiver {
                         op: "agent_data.import".into(),
                     });
                     self.save(row, progress).await?;
-                    let answer = client.import(&self.request(p)).await;
+                    let answer = client.import(&self.request(p)?).await;
                     if !matches!(answer, Err(ClientError::OutcomeUnknown)) {
                         progress.pending = None;
                         self.save(row, progress).await?;
@@ -863,8 +905,8 @@ impl Receiver {
             Step::Staged => {
                 self.take_claim(row, plan, progress).await?;
                 // The move-record CAS to claimed can lose to a peer abort after
-                // the agent claim transferred. Return ownership to the source
-                // before marking the receiver row terminal.
+                // taking the agent claim. Cleanup must return that claim to the
+                // source before ending the receiver move, so ownership is not stranded.
                 if observed.state != State::Claimed {
                     self.cas_move(row, plan, State::Staged, State::Claimed)
                         .await?;
@@ -888,7 +930,7 @@ impl Receiver {
                         op: "agent_data.activate".into(),
                     });
                     self.save(row, progress).await?;
-                    let answer = client.activate(&self.request(p)).await;
+                    let answer = client.activate(&self.request(p)?).await;
                     if !matches!(answer, Err(ClientError::OutcomeUnknown)) {
                         progress.pending = None;
                         self.save(row, progress).await?;
@@ -913,7 +955,8 @@ impl Receiver {
                 Self::step(&mut next, &mut activated_progress, Step::Activated);
                 next.activated_at_ms = Some((self.worker.clock)());
                 next.updated_at_ms = (self.worker.clock)();
-                next.plan["_receiver"] = serde_json::to_value(&activated_progress).unwrap();
+                next.plan["_receiver"] = serde_json::to_value(&activated_progress)
+                    .map_err(|e| Failure::hold("plan_malformed", json!({"error":e.to_string()})))?;
                 let refs = plan
                     .participants
                     .iter()
@@ -1060,13 +1103,11 @@ impl Receiver {
                                 json!({"op":"claim.read","code":code}),
                             )
                         })?;
-                if claim.holder.as_deref() == Some(&plan.to)
-                    && claim.cut_id.as_deref() == Some(&self.cut)
-                {
+                if claim.epoch >= 1 && claim.holder.as_deref() != Some(&plan.from) {
                     progress.take_failed = true;
                     return Err(Failure::abort(
                         MoveReason::ClaimMoved,
-                        json!({"code":"claim_moved","cause":"no_persisted_take"}),
+                        json!({"code":"claim_moved","cause":"source_not_holder"}),
                     ));
                 }
                 claim.epoch
@@ -1081,7 +1122,10 @@ impl Receiver {
                 cut_id: Some(self.cut.clone()),
                 reason: None,
             };
-            row.claim_take_body = Some(serde_json::to_value(take).unwrap());
+            row.claim_take_body =
+                Some(serde_json::to_value(take).map_err(|e| {
+                    Failure::hold("claim_malformed", json!({"error":e.to_string()}))
+                })?);
             row.claim_take_version = Some(checked_version(plan.claim_version)?);
             self.save(row, progress).await?;
         }
@@ -1093,7 +1137,12 @@ impl Receiver {
                     json!({"code":"take_version_missing"}),
                 )
             })? as u64,
-            body: serde_json::to_vec(row.claim_take_body.as_ref().unwrap()).unwrap(),
+            body: serde_json::to_vec(
+                row.claim_take_body
+                    .as_ref()
+                    .ok_or_else(|| Failure::hold("take_body_missing", Value::Null))?,
+            )
+            .map_err(|e| Failure::hold("claim_malformed", json!({"error":e.to_string()})))?,
             write_id: wire::claim_write_id(&self.cut, wire::ClaimWrite::Take),
         };
         match self
@@ -1108,6 +1157,19 @@ impl Receiver {
                 Ok(())
             }
             CasSettlement::Moved(reply) => {
+                if reply
+                    .body
+                    .as_deref()
+                    .and_then(|b| AgentClaim::decode(&row.agent_id, b).ok())
+                    .is_some_and(|claim| claim.holder.as_deref() == Some(&plan.to))
+                {
+                    let mut failure = Failure::hold(
+                        "claim_moved",
+                        json!({"op":"claim.cas","cause":"receiver_still_holder"}),
+                    );
+                    failure.diagnostic = true;
+                    return Err(failure);
+                }
                 progress.take_failed = true;
                 Err(Failure::abort(
                     MoveReason::ClaimMoved,
@@ -1135,7 +1197,8 @@ impl Receiver {
         let request = CasRequest {
             subject: format!("claim:{}", row.agent_id),
             expected_version: version as u64,
-            body: serde_json::to_vec(&claim).unwrap(),
+            body: serde_json::to_vec(&claim)
+                .map_err(|e| Failure::hold("claim_malformed", json!({"error":e.to_string()})))?,
             write_id: wire::claim_write_id(&self.cut, wire::ClaimWrite::Return),
         };
         match self
@@ -1213,23 +1276,54 @@ impl Receiver {
         progress: &mut Progress,
     ) -> Result<(), Failure> {
         self.settle_pending(row, plan, progress).await?;
-        let request = row.abort_requested.clone().unwrap();
+        let request = row
+            .abort_requested
+            .clone()
+            .ok_or_else(|| Failure::hold("abort_request_missing", Value::Null))?;
         row.reason = request["reason"].as_str().map(str::to_owned);
         row.detail = request.get("detail").filter(|d| !d.is_null()).cloned();
-        if row.claim_take_body.is_some()
-            && row.claim_landed_version.is_none()
-            && !progress.take_failed
-        {
-            self.take_claim(row, plan, progress).await?;
+        if row.claim_take_body.is_some() && row.claim_landed_version.is_none() {
+            // The persisted failure flag is not proof that an unanswered take lost.
+            // Reconcile the exact attempt even when an earlier driver marked it failed.
+            if let Err(failure) = self.take_claim(row, plan, progress).await {
+                if failure.reason != Some(MoveReason::ClaimMoved) || !progress.take_failed {
+                    return Err(failure);
+                }
+            }
         }
         self.return_claim(row, plan).await?;
+        let claim_reply = self
+            .worker
+            .records
+            .read(&format!("claim:{}", row.agent_id))
+            .await?;
+        if claim_reply.stale {
+            return Err(Failure::hold(
+                "unavailable",
+                json!({"op":"claim.cleanup.read"}),
+            ));
+        }
+        if !claim_reply.absent {
+            let claim = AgentClaim::decode(
+                &row.agent_id,
+                claim_reply.body.as_deref().unwrap_or_default(),
+            )
+            .map_err(|code| Failure::hold(code, json!({"op":"claim.cleanup.read"})))?;
+            if claim.holder.as_deref() == Some(&plan.to) {
+                return Err(Failure::hold(
+                    "claim_moved",
+                    json!({"op":"claim.cleanup.read","cause":"receiver_still_holder"}),
+                ));
+            }
+        }
         for p in &plan.participants {
             if progress.aborted.contains(&p.module_id) {
                 continue;
             }
-            // A module absent before any diverged/import call cannot have staged
-            // data to discard. Persist which modules were called so a module
-            // that disappears after a call still must abort when it returns.
+            // Diverged checks for data past the cut; import stages received data.
+            // A participant missing before either call has nothing to undo. Save
+            // which modules we called so one that disappears afterward must
+            // discard its staged data when it returns, before abort can finish.
             if !progress.touched.contains(&p.module_id)
                 && row
                     .detail
@@ -1245,7 +1339,7 @@ impl Receiver {
             });
             self.save(row, progress).await?;
             client
-                .abort(&self.request(p))
+                .abort(&self.request(p)?)
                 .await
                 .map_err(|e| Failure::participant(&p.module_id, "agent_data.abort", e))?;
             progress.pending = None;
@@ -1424,10 +1518,23 @@ mod tests {
     struct Peer {
         fake: Arc<FakeParticipant>,
         write_after_diverged: AtomicBool,
+        panic_diverged: AtomicBool,
+        diverged_calls: tokio::sync::Semaphore,
+        other_activated: tokio::sync::Semaphore,
     }
     #[async_trait]
     impl LogTransport for Peer {
         async fn call(&self, method: &str, params: Value) -> Result<Vec<u8>, TransportError> {
+            if method == "agent_data.diverged" && params["cutId"] == CUT {
+                self.diverged_calls.add_permits(1);
+                assert!(
+                    !self.panic_diverged.swap(false, Ordering::Relaxed),
+                    "scripted participant panic"
+                );
+            }
+            if method == "agent_data.activate" && params["cutId"] != CUT {
+                self.other_activated.add_permits(1);
+            }
             let reply = self.fake.call(method, params).await;
             if method == "agent_data.diverged"
                 && self.write_after_diverged.swap(false, Ordering::Relaxed)
@@ -1449,6 +1556,8 @@ mod tests {
         inbox_reads: tokio::sync::Semaphore,
         abort_on_claimed: AtomicBool,
         crash_activated: AtomicBool,
+        stale_after_take: AtomicBool,
+        take_unanswered: AtomicBool,
     }
     struct Connector(Arc<Records>);
     #[async_trait]
@@ -1468,6 +1577,15 @@ mod tests {
                 self.inbox_reads.add_permits(1);
             }
             let is_claim = method == "record.cas" && params["subject"] == format!("claim:{AGENT}");
+            if method == "record.read"
+                && params["subject"] == format!("claim:{AGENT}")
+                && self.take_unanswered.load(Ordering::Relaxed)
+                && self.stale_after_take.swap(false, Ordering::Relaxed)
+            {
+                return Ok(serde_json::to_vec(&json!({"result":crate::record_client::wire_reply(&RecordReply {
+                    absent:true, version:0, body:None, author:None, self_author:TO.into(), stale:true,
+                })})).unwrap());
+            }
             if is_claim {
                 let slot = self.slot.upgrade().unwrap();
                 let store = slot.lock().unwrap().clone().unwrap();
@@ -1476,7 +1594,7 @@ mod tests {
                     row.claim_take_body.is_some(),
                     "take body must precede the CAS"
                 );
-                assert_eq!(row.claim_take_version, Some(0));
+                assert_eq!(row.claim_take_version, row.plan["claim_version"].as_i64());
             }
             let crash = {
                 let mut crash = self.crash.lock().unwrap();
@@ -1531,7 +1649,18 @@ mod tests {
                         MoveSide::Receiver,
                         State::Activated,
                     ));
+            let unanswered_take = is_claim
+                && self.stale_after_take.load(Ordering::Relaxed)
+                && params["write_id"]
+                    == crate::log_client::encode_hex(&wire::claim_write_id(
+                        CUT,
+                        wire::ClaimWrite::Take,
+                    ));
             let reply = self.fake.call(method, params).await;
+            if unanswered_take {
+                self.take_unanswered.store(true, Ordering::Relaxed);
+                return Err(TransportError::NoReply);
+            }
             if crash.is_some_and(|(_, after)| after)
                 || activated && self.crash_activated.swap(false, Ordering::Relaxed)
             {
@@ -1591,6 +1720,8 @@ mod tests {
                 inbox_reads: tokio::sync::Semaphore::new(0),
                 abort_on_claimed: AtomicBool::new(false),
                 crash_activated: AtomicBool::new(false),
+                stale_after_take: AtomicBool::new(false),
+                take_unanswered: AtomicBool::new(false),
             });
             let participant = Arc::new(FakeParticipant::new(
                 &["session"],
@@ -1603,6 +1734,9 @@ mod tests {
                 participant: Arc::new(Peer {
                     fake: participant,
                     write_after_diverged: AtomicBool::new(false),
+                    panic_diverged: AtomicBool::new(false),
+                    diverged_calls: tokio::sync::Semaphore::new(0),
+                    other_activated: tokio::sync::Semaphore::new(0),
                 }),
             });
             let door = FakeDoor::new([1; 16]);
@@ -1644,6 +1778,7 @@ mod tests {
                 liveness: Arc::new(Mutex::new(LivenessState::default())),
                 dir,
             };
+
             let record:MoveRecord = serde_json::from_value(json!({"v":1,"cut_id":CUT,"agent_id":AGENT,"from":FROM,"to":TO,"state":"published","claim_version":0,
                 "participants":[{"module_id":"data","refs":[{"ref_kind":"session","ref":"r"}],"external":[]}],"reason":null,"detail":null})).unwrap();
             f.put_move(&record, FROM, 1);
@@ -1780,6 +1915,305 @@ mod tests {
             State::Claimed
         ));
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn inbox_bad_entries_do_not_block_valid_pickup_and_transients_recover() {
+        const BAD: &str = "abcdef0123456789abcdef0123456789";
+        for case in [
+            "malformed",
+            "wrong_version",
+            "absent",
+            "version_range",
+            "door_permanent",
+            "door_transient",
+            "record_transient",
+        ] {
+            let f = Fixture::new(false).await;
+            let reply = f.worker.records.read(&format!("move:{CUT}")).await.unwrap();
+            let mut bad =
+                wire::decode_move_record(&format!("move:{CUT}"), reply.body.as_deref().unwrap())
+                    .unwrap();
+            bad.cut_id = BAD.into();
+            bad.agent_id = "agent_abcdef0123456789".into();
+            let subject = format!("move:{BAD}");
+            if case != "absent" {
+                let body = match case {
+                    "malformed" => b"not JSON".to_vec(),
+                    "wrong_version" => {
+                        let mut value = json!(bad);
+                        value["v"] = json!(2);
+                        serde_json::to_vec(&value).unwrap()
+                    }
+                    _ => wire::encode_move_record(&subject, &bad).unwrap(),
+                };
+                f.records.fake.put(
+                    &subject,
+                    if case == "version_range" { u64::MAX } else { 1 },
+                    body,
+                    FROM,
+                );
+            }
+            if matches!(
+                case,
+                "door_transient" | "record_transient" | "version_range"
+            ) {
+                f.door.script(
+                    "cut.seal",
+                    crate::fake_door::Effect::Seal(crate::door_client::SealState::Published, None),
+                );
+                f.door
+                    .client()
+                    .seal(&SealRequest {
+                        cut_id: BAD.into(),
+                        items: f.door.cut(CUT).unwrap().items,
+                    })
+                    .await
+                    .unwrap();
+            }
+            if case == "door_transient" {
+                f.door.for_author([2; 16]).script(
+                    "cut.read",
+                    crate::fake_door::Effect::Refuse("unavailable".into()),
+                );
+            }
+            if case == "record_transient" {
+                f.records.fake.error(&subject, Some("unavailable"));
+            }
+            f.set_inbox(vec![
+                PendingMove {
+                    cut_id: BAD.into(),
+                    from: FROM.into(),
+                    agent_id: bad.agent_id.clone(),
+                },
+                PendingMove {
+                    cut_id: CUT.into(),
+                    from: FROM.into(),
+                    agent_id: AGENT.into(),
+                },
+            ]);
+            f.pickup().await;
+            assert_eq!(f.row().step, Step::PickedUp, "{case}");
+            let transient = matches!(case, "door_transient" | "record_transient");
+            assert_eq!(
+                inbox(&f.worker, TO)
+                    .await
+                    .unwrap()
+                    .1
+                    .pending
+                    .iter()
+                    .any(|e| e.cut_id == BAD),
+                transient,
+                "{case}"
+            );
+            if case == "record_transient" {
+                f.records.fake.error(&subject, None);
+            }
+            f.pickup().await;
+            assert_eq!(f.row().step, Step::PickedUp);
+            if transient {
+                assert_eq!(
+                    f.store().agent_move(BAD).unwrap().unwrap().step,
+                    Step::PickedUp
+                );
+            } else {
+                assert!(f.store().agent_move(BAD).unwrap().is_none());
+            }
+            assert_eq!(
+                f.worker.health.move_inbox_rejected.load(Ordering::Relaxed),
+                u64::from(!transient),
+                "{case}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_take_settlement_is_held_then_returned_before_abort_even_with_failed_flag() {
+        let f = Fixture::new(false).await;
+        f.pickup().await;
+        let mut receiver = f.receiver();
+        f.until(&mut receiver, Step::Staged).await;
+        f.records.stale_after_take.store(true, Ordering::Relaxed);
+        receiver.tick().await.unwrap();
+        assert_eq!(f.row().step, Step::Staged);
+        assert!(f.row().claim_landed_version.is_none());
+        assert!(
+            f.row().abort_requested.is_none(),
+            "a stale read must not mark the take lost"
+        );
+        let claim = f.claim().await;
+        assert_eq!(
+            AgentClaim::decode(AGENT, claim.body.as_deref().unwrap())
+                .unwrap()
+                .holder
+                .as_deref(),
+            Some(TO)
+        );
+        f.edit(|row| {
+            row.abort_requested = Some(json!({"reason":"operator","detail":null}));
+            row.plan["_receiver"]["take_failed"] = json!(true);
+        });
+        f.until(&mut receiver, Step::Aborted).await;
+        assert_eq!(
+            AgentClaim::decode(AGENT, f.claim().await.body.as_deref().unwrap())
+                .unwrap()
+                .holder
+                .as_deref(),
+            Some(FROM)
+        );
+        assert_eq!(f.row().claim_landed_version, Some(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receiver_requires_source_holder_at_the_pinned_version_before_take() {
+        for holder in ["03030303030303030303030303030303"] {
+            let f = Fixture::new(false).await;
+            f.pickup().await;
+            let mut receiver = f.receiver();
+            f.until(&mut receiver, Step::Staged).await;
+            let mut plan = f.plan();
+            plan.claim_version = 1;
+            plan.state = State::Staged;
+            f.put_move(&plan, TO, 3);
+            f.edit(|row| {
+                row.plan["claim_version"] = json!(1);
+                row.claim_version = Some(1);
+            });
+            let claim = AgentClaim {
+                v: 1,
+                agent_id: AGENT.into(),
+                holder: Some(holder.into()),
+                epoch: 1,
+                cut_id: None,
+                reason: None,
+            };
+            f.records.fake.put(
+                &format!("claim:{AGENT}"),
+                1,
+                serde_json::to_vec(&claim).unwrap(),
+                FROM,
+            );
+            receiver.tick().await.unwrap();
+            assert_eq!(
+                f.claim_cas_count(),
+                0,
+                "wrong holder must be refused before CAS"
+            );
+            assert_eq!(f.row().reason.as_deref(), Some("claim_moved"));
+            f.until(&mut receiver, Step::Aborted).await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn corrupted_persisted_receiver_refs_return_a_named_error_without_panicking() {
+        let f = Fixture::new(false).await;
+        f.pickup().await;
+        let mut plan = f.plan();
+        let duplicate = plan.participants[0].refs[0].clone();
+        plan.participants[0].refs.push(duplicate);
+        assert_eq!(
+            f.receiver()
+                .request(&plan.participants[0])
+                .unwrap_err()
+                .code,
+            "invalid_refs"
+        );
+        let client = f
+            .receiver()
+            .client("data")
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.code));
+        assert!(matches!(
+            client.busy(&[reference(), reference()]).await,
+            Err(ClientError::InvalidReply(_))
+        ));
+    }
+    #[tokio::test(start_paused = true)]
+    async fn driver_redrives_a_panicked_receiver_while_another_cut_activates() {
+        const OTHER: &str = "abcdef0123456789abcdef0123456789";
+        let f = Fixture::new(false).await;
+        f.store().apply_entry("fixture", "{}", "fixture", None, |tx| tx.execute_batch(
+            "INSERT INTO agent(agent_id,name,tag,role,created_at_ms,updated_at_ms) VALUES('agent_abcdef0123456789','Other','O','assistant',1,1);"
+        )).unwrap();
+        let reply = f.worker.records.read(&format!("move:{CUT}")).await.unwrap();
+        let mut other =
+            wire::decode_move_record(&format!("move:{CUT}"), reply.body.as_deref().unwrap())
+                .unwrap();
+        other.cut_id = OTHER.into();
+        other.agent_id = "agent_abcdef0123456789".into();
+        other.participants[0].refs[0].reference = "other-ref".into();
+        f.records.fake.put(
+            &format!("move:{OTHER}"),
+            1,
+            wire::encode_move_record(&format!("move:{OTHER}"), &other).unwrap(),
+            FROM,
+        );
+        f.door.script(
+            "cut.seal",
+            crate::fake_door::Effect::Seal(crate::door_client::SealState::Published, None),
+        );
+        f.door
+            .client()
+            .seal(&SealRequest {
+                cut_id: OTHER.into(),
+                items: f.door.cut(CUT).unwrap().items,
+            })
+            .await
+            .unwrap();
+        f.set_inbox(vec![
+            PendingMove {
+                cut_id: CUT.into(),
+                from: FROM.into(),
+                agent_id: AGENT.into(),
+            },
+            PendingMove {
+                cut_id: OTHER.into(),
+                from: FROM.into(),
+                agent_id: other.agent_id,
+            },
+        ]);
+        f.discovery
+            .participant
+            .panic_diverged
+            .store(true, Ordering::Relaxed);
+        let mut handler = crate::ProjectsHandler::with_runtime("receiver-panic".into(), clock);
+        handler.store = f.slot.clone();
+        handler.record_client = f.worker.records.clone();
+        handler.door_client = f.worker.door.clone();
+        handler.participant_discovery = f.discovery.clone();
+        handler.health = f.worker.health.clone();
+        handler.liveness = f.liveness.clone();
+        handler.move_wake = f.worker.wake.clone();
+        handler.start_move_driver();
+        let progressed = tokio::time::timeout(Duration::from_secs(120), async {
+            f.discovery
+                .participant
+                .diverged_calls
+                .acquire_many(2)
+                .await
+                .unwrap()
+                .forget();
+            f.discovery
+                .participant
+                .other_activated
+                .acquire()
+                .await
+                .unwrap()
+                .forget();
+        })
+        .await;
+        handler.stop_move_driver().await;
+        assert!(
+            progressed.is_ok(),
+            "driver must retry the panicked cut without blocking the other cut"
+        );
+        assert_eq!(f.worker.health.move_task_panics.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            f.store().agent_move(OTHER).unwrap().unwrap().step,
+            Step::Activating | Step::Activated | Step::Done
+        ));
+        assert_ne!(f.row().step, Step::Aborted);
+    }
+
     #[tokio::test]
     async fn receiver_pickup_identity_mismatches_only_insert_terminal_row_and_remove_entry() {
         for mismatch in ["record_author", "body_from", "cut_author", "agent_id"] {
@@ -2279,7 +2713,7 @@ mod tests {
         assert!(f.row().hold.is_none());
     }
     #[tokio::test]
-    async fn receiver_wrong_author_wrong_epoch_or_no_persisted_take_aborts_claim_moved() {
+    async fn receiver_wrong_author_wrong_epoch_or_no_persisted_take_holds_claim_moved() {
         for mismatch in ["author", "epoch", "missing_take"] {
             let f = Fixture::new(false).await;
             f.pickup().await;
@@ -2309,8 +2743,11 @@ mod tests {
                 serde_json::to_vec(&actual).unwrap(),
                 if mismatch == "author" { FROM } else { TO },
             );
-            f.until(&mut receiver, Step::Aborted).await;
-            assert_eq!(f.row().reason.as_deref(), Some("claim_moved"));
+            for _ in 0..3 {
+                advance_clock();
+                receiver.tick().await.unwrap();
+            }
+            assert_ne!(f.row().step, Step::Aborted);
             assert!(f.row().claim_landed_version.is_none());
             let move_reply = f.worker.records.read(&format!("move:{CUT}")).await.unwrap();
             assert_eq!(
@@ -2320,7 +2757,7 @@ mod tests {
                 )
                 .unwrap()
                 .state,
-                State::Aborted
+                State::Staged
             );
             if mismatch == "missing_take" {
                 assert_eq!(f.claim_cas_count(), 0);
@@ -2607,6 +3044,9 @@ mod tests {
             Arc::new(Peer {
                 fake: second.clone(),
                 write_after_diverged: AtomicBool::new(false),
+                panic_diverged: AtomicBool::new(false),
+                diverged_calls: tokio::sync::Semaphore::new(0),
+                other_activated: tokio::sync::Semaphore::new(0),
             }),
         );
         let reply = f.worker.records.read(&format!("move:{CUT}")).await.unwrap();

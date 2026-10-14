@@ -203,34 +203,34 @@ impl AgentMove {
         };
         let violation = &progress["contract_violation"];
         let fork = &progress["activation_fork"];
-        let (status, detail, message) = if self.abort_stuck() {
-            let detail = self.hold.as_ref().unwrap();
-            let module = detail["module_id"].as_str().unwrap_or("the participant");
-            let message = if self.side == MoveSide::Source {
-                format!("abort stuck, agent frozen on this Mac until {module} is repaired")
+        let (status, detail, message) =
+            if let Some(detail) = self.hold.as_ref().filter(|_| self.abort_stuck()) {
+                let module = detail["module_id"].as_str().unwrap_or("the participant");
+                let message = if self.side == MoveSide::Source {
+                    format!("abort stuck, agent frozen on this Mac until {module} is repaired")
+                } else {
+                    format!("abort stuck, cleanup cannot finish until {module} is repaired")
+                };
+                ("abort_stuck", detail, message)
+            } else if self.side == MoveSide::Receiver
+                && self.step == MoveStep::Activating
+                && (!fork.is_null() || !violation.is_null())
+            {
+                let detail = if !fork.is_null() { fork } else { violation };
+                (
+                    "held_as_fork",
+                    detail,
+                    "held as a fork, awaiting the operator".into(),
+                )
+            } else if !violation.is_null() {
+                (
+                    "contract_violation",
+                    violation,
+                    "participant contract violation; operator repair is required".into(),
+                )
             } else {
-                format!("abort stuck, cleanup cannot finish until {module} is repaired")
+                return Value::Object(notices);
             };
-            ("abort_stuck", detail, message)
-        } else if self.side == MoveSide::Receiver
-            && self.step == MoveStep::Activating
-            && (!fork.is_null() || !violation.is_null())
-        {
-            let detail = if !fork.is_null() { fork } else { violation };
-            (
-                "held_as_fork",
-                detail,
-                "held as a fork, awaiting the operator".into(),
-            )
-        } else if !violation.is_null() {
-            (
-                "contract_violation",
-                violation,
-                "participant contract violation; operator repair is required".into(),
-            )
-        } else {
-            return Value::Object(notices);
-        };
         notices.insert("status".into(), status.into());
         notices.insert("message".into(), message.into());
         notices.insert("diagnostic".into(), detail.clone());
@@ -272,8 +272,9 @@ impl AgentMove {
 }
 
 fn public_move(conn: &rusqlite::Connection, row: &AgentMove) -> rusqlite::Result<Value> {
-    let mut value = serde_json::to_value(row).expect("move row serializes");
-    let object = value.as_object_mut().unwrap();
+    let mut value = serde_json::to_value(row)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    let object = value.as_object_mut().ok_or(rusqlite::Error::InvalidQuery)?;
     for key in [
         "plan",
         "request_body",
@@ -288,7 +289,9 @@ fn public_move(conn: &rusqlite::Connection, row: &AgentMove) -> rusqlite::Result
         "peer_name".into(),
         serde_json::json!(crate::claim_cache::holder_name(conn, Some(&row.peer))?),
     );
-    object.extend(row.notices().as_object().unwrap().clone());
+    if let Value::Object(notices) = row.notices() {
+        object.extend(notices);
+    }
     Ok(value)
 }
 
@@ -315,14 +318,17 @@ pub(crate) fn where_moves(
             if let Some(hold) = &row.hold {
                 value["hold"] = hold.clone();
             }
-            value.as_object_mut().unwrap().extend(
-                notices
-                    .as_object()
-                    .unwrap()
-                    .iter()
-                    .filter(|(key, _)| key.as_str() != "warnings")
-                    .map(|(key, value)| (key.clone(), value.clone())),
-            );
+            value
+                .as_object_mut()
+                .expect("this function just constructed an object with json!")
+                .extend(
+                    notices
+                        .as_object()
+                        .into_iter()
+                        .flatten()
+                        .filter(|(key, _)| key.as_str() != "warnings")
+                        .map(|(key, value)| (key.clone(), value.clone())),
+                );
             moving = Some(value);
         }
         for code in row.error_codes() {
@@ -681,7 +687,12 @@ impl RegistryStore {
                     )));
                 }
                 if row.abort_stuck() {
-                    row.abort_requested.as_mut().unwrap()["retry_pending"] = Value::Bool(true);
+                    let request = row
+                        .abort_requested
+                        .as_mut()
+                        .and_then(Value::as_object_mut)
+                        .ok_or(rusqlite::Error::InvalidQuery)?;
+                    request.insert("retry_pending".into(), Value::Bool(true));
                 } else if row.abort_requested.is_some() {
                     return Ok(Ok(row));
                 } else {
@@ -775,23 +786,19 @@ impl RegistryStore {
             .map_err(RegistryError::Store)
     }
 
-    /// Consume only this cut's explicit retry. Persisting the flag lets a
-    /// stopped driver honor the request after its next start.
+    /// Consume only this move's explicit operator request to retry a stuck abort.
+    /// Persisting the flag lets a stopped move driver honor it when it starts again.
     pub fn consume_move_abort_retry(&self, cut_id: &str) -> Result<bool, RegistryError> {
         self.db
             .with_conn_fenced(|tx| {
                 let mut row = load_move(tx, cut_id)?;
-                if row
+                if let Some(request) = row
                     .abort_requested
-                    .as_ref()
-                    .is_some_and(|v| v["retry_pending"] == true)
+                    .as_mut()
+                    .and_then(Value::as_object_mut)
+                    .filter(|v| v.get("retry_pending") == Some(&Value::Bool(true)))
                 {
-                    row.abort_requested
-                        .as_mut()
-                        .unwrap()
-                        .as_object_mut()
-                        .unwrap()
-                        .remove("retry_pending");
+                    request.remove("retry_pending");
                     row.write(tx, false)?;
                     Ok(true)
                 } else {
@@ -1499,8 +1506,8 @@ mod tests {
             f.store.list_open_agent_moves().unwrap().is_empty(),
             "a crash before commit leaves nothing"
         );
-        // Check the move-specific registration refusal directly. Module tests
-        // also exercise it through registration of a real, cut-over agent.
+        // Check directly that registering a session for an agent with an open
+        // move is refused. Module tests exercise registration of a cut-over agent too.
         f.store.db.with_conn_fenced(|tx| {
             tx.execute("INSERT INTO session_binding VALUES('session','r','agent-1','host','s','','host',1)", [])?;
             Ok(())
@@ -1627,6 +1634,12 @@ mod tests {
 
     #[test]
     fn migration_9_preserves_part1_bindings_and_session_index() {
+        type SchemaObject = (String, String, String, Option<String>);
+        fn binding_objects(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<SchemaObject>> {
+            conn.prepare("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE type IN ('index','trigger','view') AND (tbl_name='session_binding' OR (type='view' AND instr(sql,'session_binding')>0)) ORDER BY type,name")?
+                .query_map([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?
+                .collect()
+        }
         let Fixture {
             store,
             descriptor,
@@ -1643,9 +1656,18 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        let before = store
+            .db
+            .with_conn_fenced(|conn| binding_objects(conn))
+            .unwrap();
+        assert!(
+            !before.is_empty(),
+            "schema 8 must define objects to preserve"
+        );
         drop(store);
         let store = RegistryStore::open(&descriptor).unwrap();
         store.db.with_conn_fenced(|conn| {
+            assert_eq!(binding_objects(conn)?, before, "migration 9 lost or changed a schema-8 session_binding object");
             let rows = conn.prepare("SELECT ref_kind,ref,agent_id,harness,session_id,project_root,registered_by,registered_at_ms FROM session_binding ORDER BY ref")?
                 .query_map([], |row| Ok((
                     row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,

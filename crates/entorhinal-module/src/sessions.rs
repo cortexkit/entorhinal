@@ -399,9 +399,10 @@ impl super::LivenessState {
 }
 
 impl ProjectsHandler {
-    /// Move relays must come from the provider of agent-orchestrator/v1. Reuse
-    /// the route cache and refresh a cached mismatch once, without resolving
-    /// the separate agent-host/v1 provider.
+    /// The agent-orchestrator/v1 role relays moves confirmed by the operator's
+    /// phone; agent-host/v1 only registers host sessions and has no move authority.
+    /// Refresh a cached provider mismatch once because the orchestrator may have
+    /// changed since this route opened, without granting the host move authority.
     pub(super) async fn move_orchestrator(&self, admission: &super::RouteAdmission) -> bool {
         let move_route = &admission.providers;
         let _move_lookup = move_route.resolving.lock().await;

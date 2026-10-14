@@ -280,9 +280,9 @@ impl ProjectsHandler {
         encode_result(self.wait_claim_refresh().await?)
     }
 
-    /// Wait for a queue pass, including requests made while another pass is in
-    /// flight. Move admission also needs this for module callers, not only
-    /// operator routes with a Direct principal.
+    /// Wait for a claim-refresh pass, including requests made while another pass
+    /// is running. Move admission needs the same refresh for module callers as
+    /// for operator routes with a Direct principal, so both check current ownership.
     pub(super) async fn wait_claim_refresh(&self) -> Result<RefreshCounts, HandlerError> {
         self.start_claim_refresh();
         let (sender, receiver) = oneshot::channel();

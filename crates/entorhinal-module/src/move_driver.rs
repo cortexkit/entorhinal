@@ -14,7 +14,7 @@ use cortexkit_role_agent_data::{
 };
 use entorhinal_core::{move_store::AgentMove, RegistryError, RegistryStore};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex, Weak,
@@ -23,6 +23,68 @@ use std::{
 };
 
 pub(crate) const POLL: Duration = Duration::from_secs(30);
+
+type Owner = (String, bool);
+#[derive(Default)]
+struct TaskOwners {
+    active: HashSet<Owner>,
+    tasks: HashMap<tokio::task::Id, Owner>,
+    retry_at: HashMap<Owner, tokio::time::Instant>,
+}
+
+impl TaskOwners {
+    fn acquire(&mut self, owner: Owner) -> bool {
+        if self
+            .retry_at
+            .get(&owner)
+            .is_some_and(|at| tokio::time::Instant::now() < *at)
+        {
+            return false;
+        }
+        self.active.insert(owner)
+    }
+
+    fn track(&mut self, task: tokio::task::AbortHandle, owner: Owner) {
+        self.tasks.insert(task.id(), owner);
+    }
+
+    async fn joined(
+        &mut self,
+        worker: &Worker,
+        result: Result<(tokio::task::Id, Owner), tokio::task::JoinError>,
+    ) {
+        let (id, failure) = match result {
+            Ok((id, _)) => (id, None),
+            Err(error) => (error.id(), Some(error.to_string())),
+        };
+        let Some(owner) = self.tasks.remove(&id) else {
+            return;
+        };
+        self.active.remove(&owner);
+        if let Some(error) = failure {
+            worker
+                .health
+                .move_task_panics
+                .fetch_add(1, Ordering::Relaxed);
+            eprintln!("move task {} failed: {error}", owner.0);
+            let mut delay = backoff(1);
+            if let Ok(mut row) = worker.row(&owner.0).await {
+                row.attempts = row.attempts.saturating_add(1);
+                delay = backoff(row.attempts);
+                row.hold = Some(
+                    serde_json::json!({"code":"move_task_failed","error":error,"move_error":true,"cut_accept":owner.1}),
+                );
+                let _ = worker.save(&mut row, false).await;
+            }
+            // A panic must release ownership, but an immediate respawn could spin
+            // on the same corrupted row. The deadline also applies to wakeups.
+            self.retry_at
+                .insert(owner, tokio::time::Instant::now() + delay);
+        } else {
+            self.retry_at.remove(&owner);
+        }
+    }
+}
 
 pub(crate) fn participant_action(op: &str, code: &str) -> Option<DriverAction> {
     Op::ALL
@@ -245,15 +307,15 @@ impl ProjectsHandler {
         let driver = tokio::spawn(async move {
             let mut interval = tokio::time::interval(POLL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut owners = HashSet::new();
+            let mut owners = TaskOwners::default();
             let mut tasks = tokio::task::JoinSet::new();
             let poll = async {
                 loop {
                     tokio::select! {
                         _ = interval.tick() => {},
                         _ = wake.notified() => {},
-                        Some(result) = tasks.join_next(), if !tasks.is_empty() => {
-                            if let Ok(owner) = result { owners.remove(&owner); }
+                        Some(result) = tasks.join_next_with_id(), if !tasks.is_empty() => {
+                            owners.joined(&worker, result).await;
                         }
                     }
                     if worker.store.upgrade().is_none() {
@@ -265,10 +327,11 @@ impl ProjectsHandler {
                     };
                     let _ = worker.gauges().await;
                     for row in rows {
-                        if owners.insert((row.cut_id.clone(), false)) {
+                        let owner = (row.cut_id.clone(), false);
+                        if owners.acquire(owner.clone()) {
                             let worker = worker.clone();
                             let liveness = liveness.clone();
-                            tasks.spawn(async move {
+                            let task = tasks.spawn(async move {
                                 let cut = row.cut_id;
                                 match row.side {
                                     entorhinal_core::move_store::MoveSide::Source => {
@@ -280,17 +343,20 @@ impl ProjectsHandler {
                                 }
                                 (cut, false)
                             });
+                            owners.track(task, owner);
                         }
                     }
                     if let Ok(rows) = worker.sql(RegistryStore::list_pending_cut_accepts).await {
                         for row in rows {
-                            if owners.insert((row.cut_id.clone(), true)) {
+                            let owner = (row.cut_id.clone(), true);
+                            if owners.acquire(owner.clone()) {
                                 let worker = worker.clone();
-                                tasks.spawn(async move {
+                                let task = tasks.spawn(async move {
                                     let cut = row.cut_id;
                                     CutAccept::new(worker, cut.clone()).run().await;
                                     (cut, true)
                                 });
+                                owners.track(task, owner);
                             }
                         }
                     }
@@ -333,6 +399,124 @@ pub(crate) fn backoff(attempts: i64) -> Duration {
 mod tests {
     use super::*;
     use std::{future::Future, task::Poll};
+
+    #[tokio::test(start_paused = true)]
+    async fn panicked_cut_releases_owner_records_hold_and_redrives_after_backoff() {
+        let (dir, descriptor) = crate::tests::scratch_descriptor("move-driver-panic");
+        let store = RegistryStore::open(&descriptor).unwrap();
+        let row = |cut: &str| AgentMove {
+            cut_id: cut.into(),
+            agent_id: format!("agent-{cut}"),
+            side: entorhinal_core::move_store::MoveSide::Receiver,
+            peer: "peer".into(),
+            step: entorhinal_core::move_store::MoveStep::PickedUp,
+            plan: serde_json::json!({}),
+            request_body: None,
+            record_version: 1,
+            claim_version: None,
+            claim_take_body: None,
+            claim_take_version: None,
+            claim_landed_version: None,
+            seal_sent: false,
+            abort_requested: None,
+            hold: None,
+            cut_accept: None,
+            reason: None,
+            detail: None,
+            request_key: None,
+            attempts: 0,
+            activated_at_ms: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+        store.insert_agent_move(&row("bad")).unwrap();
+        store.insert_agent_move(&row("other")).unwrap();
+        let slot = Arc::new(Mutex::new(Some(store)));
+        let handler = ProjectsHandler::with_runtime("panic-test".into(), || 0);
+        let worker = Worker {
+            store: Arc::downgrade(&slot),
+            sql_operations: Arc::default(),
+            records: handler.record_client.clone(),
+            door: handler.door_client.clone(),
+            discovery: handler.participant_discovery.clone(),
+            health: handler.health.clone(),
+            writer: handler.writer.clone(),
+            clock: handler.clock,
+            wake: handler.move_wake.clone(),
+        };
+        let bad = ("bad".to_owned(), false);
+        let other = ("other".to_owned(), false);
+        let mut owners = TaskOwners::default();
+        let mut tasks = tokio::task::JoinSet::new();
+        assert!(owners.acquire(bad.clone()));
+        owners.track(
+            tasks.spawn(async {
+                panic!("scripted move task panic");
+                #[allow(unreachable_code)]
+                ("bad".into(), false)
+            }),
+            bad.clone(),
+        );
+        let (release, gate) = tokio::sync::oneshot::channel();
+        assert!(owners.acquire(other.clone()));
+        owners.track(
+            tasks.spawn(async {
+                gate.await.unwrap();
+                ("other".into(), false)
+            }),
+            other.clone(),
+        );
+        owners
+            .joined(&worker, tasks.join_next_with_id().await.unwrap())
+            .await;
+        let held = worker.row("bad").await.unwrap();
+        assert_eq!(held.hold.unwrap()["code"], "move_task_failed");
+        assert_eq!(worker.health.move_task_panics.load(Ordering::Relaxed), 1);
+        assert_eq!(worker.health.move_errors.load(Ordering::Relaxed), 1);
+        assert!(
+            !owners.acquire(bad.clone()),
+            "panic retries must honor the deadline"
+        );
+        assert!(
+            !owners.acquire(other.clone()),
+            "the other cut still owns its task"
+        );
+        release.send(()).unwrap();
+        owners
+            .joined(&worker, tasks.join_next_with_id().await.unwrap())
+            .await;
+        assert!(worker.row("other").await.unwrap().hold.is_none());
+        assert!(
+            owners.acquire(other),
+            "a healthy completion releases its slot"
+        );
+        tokio::time::advance(backoff(held.attempts)).await;
+        assert!(
+            owners.acquire(bad.clone()),
+            "panicked cut must be eligible for re-drive"
+        );
+        let redrive = worker.clone();
+        owners.track(
+            tasks.spawn(async move {
+                let mut row = redrive.row("bad").await.unwrap();
+                row.step = entorhinal_core::move_store::MoveStep::Done;
+                row.hold = None;
+                redrive.save(&mut row, false).await.unwrap();
+                ("bad".into(), false)
+            }),
+            bad,
+        );
+        owners
+            .joined(&worker, tasks.join_next_with_id().await.unwrap())
+            .await;
+        assert_eq!(
+            worker.row("bad").await.unwrap().step,
+            entorhinal_core::move_store::MoveStep::Done
+        );
+        assert_eq!(worker.health.move_errors.load(Ordering::Relaxed), 0);
+        drop(slot);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[tokio::test]
     async fn stop_move_driver_waits_for_blocking_sql_before_store_reopen() {

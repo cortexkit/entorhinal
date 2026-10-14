@@ -4827,3 +4827,303 @@ runner = "cargo"
 package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 expect_red = ["move_receiver::tests::receiver_cut_accept_backoff_survives_terminal_steps_and_restart_and_caps_at_five_minutes"]
+
+# Each inbound move progresses independently; reconcile the agent claim before
+# publishing abort, which lets the source resume participant data writes.
+[[control]]
+id = "move-inbox-entry-isolation"
+guards = "A transient failure on one inbox entry does not stop unrelated pickups"
+file = "crates/entorhinal-module/src/move_receiver.rs"
+old = 'eprintln!("move inbox {}: retrying after {}", entry.cut_id, e.code);'
+new = 'return Err(e); // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/move_receiver.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["move_receiver::tests::inbox_bad_entries_do_not_block_valid_pickup_and_transients_recover"]
+only = false
+
+[[control]]
+id = "move-inbox-permanent-removal"
+guards = "Permanently invalid and absent records leave the inbox and are counted once"
+file = "crates/entorhinal-module/src/move_receiver.rs"
+old = 'remove_inbox(worker, own, cut).await?;'
+new = '// NON-VACUITY BREAK: leave the rejected entry in the inbox'
+test_file = "crates/entorhinal-module/src/move_receiver.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["move_receiver::tests::inbox_bad_entries_do_not_block_valid_pickup_and_transients_recover"]
+only = false
+
+[[control]]
+id = "record-cas-stale-unsettled"
+guards = "Stale matching and nonmatching reads cannot settle agent, role or move writes"
+file = "crates/entorhinal-module/src/record_client.rs"
+old = 'if reply.stale {'
+new = 'if false && reply.stale { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/record_client.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["record_client::tests::stale_reads_never_settle_claim_role_or_move_cas"]
+only = false
+
+[[control]]
+id = "move-cleanup-resettles-failed-take"
+guards = "Cleanup reconciles and returns an unanswered landed take despite a persisted failed flag"
+file = "crates/entorhinal-module/src/move_receiver.rs"
+old = 'if row.claim_take_body.is_some() && row.claim_landed_version.is_none() {'
+new = 'if row.claim_take_body.is_some() && row.claim_landed_version.is_none() && !progress.take_failed { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/move_receiver.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["move_receiver::tests::stale_take_settlement_is_held_then_returned_before_abort_even_with_failed_flag"]
+only = false
+
+[[control]]
+id = "move-cleanup-refuses-receiver-held-claim"
+guards = "An unproven receiver-held claim cannot authorize publishing an abort"
+file = "crates/entorhinal-module/src/move_receiver.rs"
+old = 'if claim.holder.as_deref() == Some(&plan.to) {'
+new = 'if false && claim.holder.as_deref() == Some(&plan.to) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/move_receiver.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["move_receiver::tests::receiver_wrong_author_wrong_epoch_or_no_persisted_take_holds_claim_moved"]
+only = false
+
+[[control]]
+id = "move-source-abort-requires-local-claim"
+guards = "A shared abort cannot unfreeze the source while the receiver owns the agent"
+file = "crates/entorhinal-module/src/move_source.rs"
+old = '''if !require_present
+                && claim.epoch >= 1'''
+new = '''if false && !require_present // NON-VACUITY BREAK
+                && claim.epoch >= 1'''
+test_file = "crates/entorhinal-module/src/move_source.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["move_source::tests::source_shared_abort_cannot_unfreeze_while_receiver_holds_claim"]
+only = false
+
+[[control]]
+id = "move-driver-panic-releases-owner"
+guards = "A real receiver task panic is counted and redriven without blocking another cut"
+file = "crates/entorhinal-module/src/move_driver.rs"
+old = 'self.active.remove(&owner);'
+new = 'if failure.is_none() { self.active.remove(&owner); } // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/move_receiver.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["move_receiver::tests::driver_redrives_a_panicked_receiver_while_another_cut_activates"]
+only = false
+
+[[control]]
+id = "move-driver-panic-backoff"
+guards = "Wakeups cannot bypass the bounded retry deadline after a task panic"
+file = "crates/entorhinal-module/src/move_driver.rs"
+old = '.is_some_and(|at| tokio::time::Instant::now() < *at)'
+new = '.is_some_and(|_| false) /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/move_driver.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["move_driver::tests::panicked_cut_releases_owner_records_hold_and_redrives_after_backoff"]
+only = false
+
+[[control]]
+id = "participant-busy-invalid-refs-no-panic"
+guards = "Malformed ref data is a named participant client error, not a panic"
+file = "crates/entorhinal-module/src/participant_client.rs"
+old = '.map_err(|e| ClientError::InvalidReply(format!("invalid refs: {e}")))?'
+new = '.expect("NON-VACUITY BREAK: panic on malformed refs")'
+test_file = "crates/entorhinal-module/src/move_receiver.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["move_receiver::tests::corrupted_persisted_receiver_refs_return_a_named_error_without_panicking"]
+only = false
+
+[[control]]
+id = "move-receiver-invalid-refs-no-panic"
+guards = "Corrupted persisted receiver refs are refused without panicking"
+file = "crates/entorhinal-module/src/move_receiver.rs"
+old = '.map_err(|_| Failure::hold("invalid_refs", json!({"op":"plan.read"})))?'
+new = '.expect("NON-VACUITY BREAK: panic on persisted refs")'
+test_file = "crates/entorhinal-module/src/move_receiver.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["move_receiver::tests::corrupted_persisted_receiver_refs_return_a_named_error_without_panicking"]
+only = false
+
+[[control]]
+id = "move-source-invalid-refs-no-panic"
+guards = "Corrupted persisted source refs are refused without panicking"
+file = "crates/entorhinal-module/src/move_source.rs"
+old = '.map_err(|_| Failure::new("plan.read", "invalid_refs"))?'
+new = '.expect("NON-VACUITY BREAK: panic on persisted refs")'
+test_file = "crates/entorhinal-module/src/move_source.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["move_source::tests::source_unknown_abort_reason_and_corrupt_persisted_refs_do_not_panic"]
+only = false
+
+[[control]]
+id = "move-source-opaque-abort-reason"
+guards = "A peer's unknown abort reason remains intact through source cleanup"
+file = "crates/entorhinal-module/src/move_source.rs"
+old = 'let reason = record.reason.clone().map(String::from);'
+new = 'let reason = Some("operator".to_owned()); // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/move_source.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["move_source::tests::source_unknown_abort_reason_and_corrupt_persisted_refs_do_not_panic"]
+only = false
+
+[[control]]
+id = "consent-saved-strings-no-panic"
+guards = "Missing string fields in persisted workspace or project writes return consent_lost"
+file = "crates/entorhinal-core/src/agent/consent.rs"
+old = '''let text = |value: &Value, field: &str| {
+            value[field].as_str().map(str::to_owned).ok_or_else(|| {
+                AgentMutationError::new(
+                    "consent_lost",
+                    format!("saved consent plan has no string {field}"),
+                )
+            })
+        };'''
+new = '''let text = |value: &Value, field: &str| -> Result<String, AgentMutationError> {
+            Ok(value[field].as_str().expect("NON-VACUITY BREAK: panic on persisted strings").to_owned())
+        };'''
+test_file = "crates/entorhinal-module/src/tool_writes_tests.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["tool_provider::writes::tests::saved_write_string_fields_refuse_without_panicking"]
+only = false
+
+[[control]]
+id = "consent-always-choice-terminal-refusal"
+guards = "An unoffered always approval is refused terminally and never mints a grant"
+file = "crates/entorhinal-module/src/tool_writes.rs"
+old = 'if !valid || scope.is_none() {'
+new = 'if false && (!valid || scope.is_none()) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/tool_writes_tests.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["tool_provider::writes::tests::unoffered_always_approvals_are_terminal_refusals_and_replay_without_grants"]
+only = false
+
+[[control]]
+id = "consent-always-grant-class-and-scope"
+guards = "An always approval must match both the stored grant class and scope kind"
+file = "crates/entorhinal-module/src/tool_writes.rs"
+old = 'if !valid || scope.is_none() {'
+new = 'if false && (!valid || scope.is_none()) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/tool_writes_tests.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["tool_provider::writes::tests::always_approvals_validate_grant_class_and_saved_scope_kind"]
+only = false
+
+[[control]]
+id = "consent-malformed-final-answer-refusal"
+guards = "A malformed bound settled card finishes with refusal rather than staying awaiting"
+file = "crates/entorhinal-module/src/consent.rs"
+old = '''return Ok(RecordDecision::Settled(ConsentDecision::Refused(
+                "invalid_reply",
+            )));'''
+new = 'return Ok(RecordDecision::Mismatch); // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/tool_writes_tests.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["tool_provider::writes::tests::malformed_settled_approval_is_refused_and_replayed_without_waiting_forever"]
+only = false
+
+[[control]]
+id = "agent-tool-claim-holder-admission"
+guards = "A moved agent's cached claim prevents old-Mac tools using retained standing grants"
+file = "crates/entorhinal-module/src/tool_provider.rs"
+old = 'if claim.epoch >= 1 && (claim.holder.is_none() || claim.holder != own) {'
+new = 'if false && claim.epoch >= 1 && (claim.holder.is_none() || claim.holder != own) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/tool_provider_tests.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["tool_provider::tests::agent_tools_refuse_cached_claims_held_elsewhere_even_with_standing_grants"]
+only = false
+
+[[control]]
+id = "move-receiver-source-holder-before-cas"
+guards = "A claimed agent held by a third Mac is refused at the pinned version before CAS"
+file = "crates/entorhinal-module/src/move_receiver.rs"
+old = 'if claim.epoch >= 1 && claim.holder.as_deref() != Some(&plan.from) {'
+new = 'if false && claim.epoch >= 1 && claim.holder.as_deref() != Some(&plan.from) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/move_receiver.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["move_receiver::tests::receiver_requires_source_holder_at_the_pinned_version_before_take"]
+only = false
+
+[[control]]
+id = "migration-nine-binding-object-completeness"
+guards = "Migration 9 preserves every schema-8 session_binding index, trigger and view definition"
+file = "crates/entorhinal-core/src/move_store.rs"
+old = 'CREATE UNIQUE INDEX session_binding_session ON session_binding(harness, session_id);'
+new = 'CREATE UNIQUE INDEX session_binding_session ON session_binding(session_id, harness); -- NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/move_store.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--lib", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["move_store::tests::migration_9_preserves_part1_bindings_and_session_index"]
+only = false
+
+[[control]]
+id = "consent-unappliable-answer-finishes-request"
+guards = "A settled approval that cannot be applied records its terminal refusal in the request transaction"
+file = "crates/entorhinal-module/src/tool_writes.rs"
+old = '''Err(error) => {
+                            return self.refuse_agent_write(
+                                &store,
+                                &row,
+                                tool.name,
+                                &plan.target,
+                                Authorization::Card {
+                                    id: answer.elicitation_id.clone(),
+                                    answer: answer.choice.clone().unwrap_or_default(),
+                                },
+                                error,
+                            )
+                        }'''
+new = 'Err(error) => return Err(error), // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/tool_writes_tests.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["tool_provider::writes::tests::unoffered_always_approvals_are_terminal_refusals_and_replay_without_grants"]
+only = false
+
+[[control]]
+id = "consent-lost-plan-finishes-request"
+guards = "An unreadable saved target records consent_lost once and replays it terminally"
+file = "crates/entorhinal-module/src/tool_writes.rs"
+old = 'if let Some(saved) = saved.as_ref() {'
+new = 'if let Some(saved) = saved.as_ref().filter(|_| false /* NON-VACUITY BREAK */) {'
+test_file = "crates/entorhinal-module/src/tool_writes_tests.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
+test_count_pattern = "running {count} test"
+expect_red = ["tool_provider::writes::tests::retry_refuses_saved_plan_without_target_label_as_consent_lost"]
+only = false

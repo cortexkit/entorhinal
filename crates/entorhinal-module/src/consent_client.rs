@@ -138,7 +138,7 @@ impl ConsentRoute for SubcConsentRoute {
         deadline: Instant,
     ) -> Result<Value, ConsentError> {
         let bytes = serde_json::to_vec(&json!({"method":method, "params":params}))
-            .expect("JSON serializes");
+            .map_err(|_| ConsentError::InvalidReply)?;
         let reply = self
             .consumer
             .request(

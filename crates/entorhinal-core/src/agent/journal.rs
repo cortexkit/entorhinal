@@ -103,7 +103,8 @@ pub(crate) fn record(
 ) -> Result<Action, AgentMutationError> {
     entry.seq = append(tx, &entry.op, &json!({}), actor, key, now, principal)?;
     Ok(Action {
-        // Record identity state even when its stored values have not changed.
+        // Journal the agent row, labels and name claims even when their values
+        // are unchanged, so an accepted identity write still has a replayable entry.
         changed: true,
         seq: Some(entry.seq),
         value,

@@ -321,7 +321,8 @@ fn check_move_size(state: MoveRecordState, len: usize) -> Result<(), CodecError>
     }
 }
 
-/// Strict encoding: callers build aborts with `aborted_record` to bound detail.
+/// Strict encoding: use `aborted_record` to limit abort detail so it fits within
+/// the shared move record's size limit.
 pub fn encode_move_record(subject: &str, record: &MoveRecord) -> Result<Vec<u8>, CodecError> {
     validate_move(subject, record)?;
     let body = serde_json::to_vec(record).map_err(|_| CodecError::MalformedBody)?;
@@ -341,9 +342,9 @@ pub fn decode_move_record(subject: &str, body: &[u8]) -> Result<MoveRecord, Code
     Ok(record)
 }
 
-/// Keep the full diagnostic in the local row, and put only this bounded value
-/// in the shared record. Summary strings are themselves bounded so even a
-/// malformed peer diagnostic cannot consume the abort reserve.
+/// Keep the full diagnostic in the machine-local move row; send only bounded
+/// detail in the shared move record. Bound summary strings too, so a malformed
+/// peer diagnostic cannot use the space reserved for abort details.
 pub fn bounded_detail(detail: &Value) -> Value {
     if serde_json::to_vec(detail)
         .expect("JSON value serializes")
@@ -439,8 +440,9 @@ pub fn remove_inbox(inbox: &InboxRecord, cut_id: &str) -> Result<InboxRecord, Co
     Ok(removed)
 }
 
-/// `None` denotes an absent record. Claim settlement and the local activating
-/// boundary remain driver preconditions; the table only checks state and side.
+/// `None` means there is no move record. The driver must settle the claim and
+/// persist its local activation boundary before activation; this table checks
+/// only the record's state and which side is writing.
 pub fn check_transition(
     from: Option<MoveRecordState>,
     to: MoveRecordState,
@@ -490,8 +492,8 @@ pub fn check_record_author(record: &MoveRecord, author: &str) -> Result<(), Code
     }
 }
 
-/// Compare the immutable plan, not state or abort diagnostics. Subject/cut
-/// matching is checked by the codec before this later-read check is applied.
+/// Compare the immutable plan, not the state or abort diagnostics. The codec
+/// already checked the subject and cut before this function compares the plan.
 pub fn check_pinned_plan(pinned: &MoveRecord, current: &MoveRecord) -> Result<(), CodecError> {
     if pinned.agent_id == current.agent_id
         && pinned.from == current.from

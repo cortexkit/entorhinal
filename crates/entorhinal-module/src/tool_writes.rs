@@ -2,8 +2,8 @@ use super::*;
 use crate::consent::{CardContext, ConsentCall, ConsentDecision};
 use cortexkit_role_tool_provider::catalog::composition_digest;
 use entorhinal_core::agent::consent::{
-    AuditRow, Authorization, ConsentCommit, ConsentRequest, RequestIdentity, RequestState,
-    StandingGrant,
+    AuditRow, Authorization, ConsentCommit, ConsentRequest, GrantClass, RequestIdentity,
+    RequestState, StandingGrant,
 };
 use entorhinal_core::agent::{consent::ConsentWrite, AgentMutationError};
 use entorhinal_core::RegistryStore;
@@ -19,6 +19,35 @@ fn pending(id: Option<String>) -> HandlerError {
 
 fn consent_lost(message: impl Into<String>) -> HandlerError {
     HandlerError::new("consent_lost", message)
+}
+
+fn approval_grant(
+    plan: &ConsentWrite,
+    choice: &str,
+) -> Result<Option<(GrantClass, String)>, HandlerError> {
+    if choice == "approve_once" {
+        return Ok(None);
+    }
+    let scope = plan.scope_id.as_deref().filter(|s| !s.is_empty());
+    let valid = match (choice, plan.tool.as_str(), plan.grant_class.as_ref()) {
+        ("approve_always_workspace", "projects_register", Some(GrantClass::RegisterProject)) => {
+            scope == plan.target["workspace_id"].as_str()
+        }
+        ("approve_always_workspace", "agents_create_head", Some(GrantClass::CreateHead)) => {
+            scope == plan.target["placement"]["workspace_id"].as_str()
+        }
+        ("approve_always_project", "agents_hire", Some(GrantClass::Hire)) => {
+            scope == plan.target["placement"]["project_id"].as_str()
+        }
+        _ => false,
+    };
+    if !valid || scope.is_none() {
+        return Err(HandlerError::new(
+            "invalid_reply",
+            "approval choice does not match this action's grant class and scope",
+        ));
+    }
+    Ok(plan.grant_class.clone().zip(scope.map(str::to_owned)))
 }
 
 fn load_request(
@@ -199,11 +228,9 @@ impl ProjectsHandler {
             return Err(pending(saved.and_then(|r| r.elicitation_id)));
         };
         let plan = if let Some(saved) = &saved {
-            match store.consent_write_plan(&identity).map_err(|error| {
-                consent_lost(format!("stored consent plan could not be read: {error}"))
-            })? {
-                Some(plan) => plan,
-                None => {
+            match store.consent_write_plan(&identity) {
+                Ok(Some(plan)) => plan,
+                missing => {
                     return self.refuse_agent_write(
                         &store,
                         saved,
@@ -215,7 +242,9 @@ impl ProjectsHandler {
                         },
                         HandlerError::new(
                             "consent_lost",
-                            "awaiting request has no validated target",
+                            format!(
+                                "awaiting request has no readable validated target: {missing:?}"
+                            ),
                         ),
                     )
                 }
@@ -223,13 +252,39 @@ impl ProjectsHandler {
         } else {
             store.precheck_consent_write(caller, tool.name, arguments, (self.clock)())?
         };
-        validate_plan(&plan, tool, &digest)?;
-        let target_kind = plan.target["kind"]
-            .as_str()
-            .ok_or_else(|| consent_lost("stored consent plan has no string target.kind"))?;
-        let target_label = plan.target["label"]
-            .as_str()
-            .ok_or_else(|| consent_lost("stored consent plan has no string target.label"))?;
+        let validated = (|| {
+            validate_plan(&plan, tool, &digest)?;
+            let target_kind = plan.target["kind"]
+                .as_str()
+                .ok_or_else(|| consent_lost("stored consent plan has no string target.kind"))?;
+            let target_label = plan.target["label"]
+                .as_str()
+                .ok_or_else(|| consent_lost("stored consent plan has no string target.label"))?;
+            Ok::<_, HandlerError>((target_kind, target_label))
+        })();
+        let (target_kind, target_label) = match validated {
+            Ok(target) => target,
+            Err(error) => {
+                if let Some(saved) = saved.as_ref() {
+                    return self.refuse_agent_write(
+                        &store,
+                        saved,
+                        tool.name,
+                        &plan.target,
+                        Authorization::Card {
+                            id: saved.elicitation_id.clone().unwrap_or_default(),
+                            answer: saved
+                                .settlement
+                                .as_ref()
+                                .and_then(|s| s.choice.clone())
+                                .unwrap_or_default(),
+                        },
+                        error,
+                    );
+                }
+                return Err(error);
+            }
+        };
         let row = ConsentRequest {
             identity,
             args_digest: digest,
@@ -267,23 +322,45 @@ impl ProjectsHandler {
                 target_label: target_label.into(),
                 target_scope: plan.target.clone(),
             };
-            attempt = Some(
-                self.consent_coordinator
-                    .obtain_leased(
-                        ConsentCall {
-                            store: &store,
-                            connector: self.consent_connector.as_ref(),
-                            stamp,
-                            deadline,
-                            now_ms: &self.clock,
-                        },
-                        &row,
-                        &context,
-                        Some(&plan),
-                        lease,
-                    )
-                    .await?,
-            );
+            let obtained = self
+                .consent_coordinator
+                .obtain_leased(
+                    ConsentCall {
+                        store: &store,
+                        connector: self.consent_connector.as_ref(),
+                        stamp,
+                        deadline,
+                        now_ms: &self.clock,
+                    },
+                    &row,
+                    &context,
+                    Some(&plan),
+                    lease,
+                )
+                .await;
+            attempt = Some(match obtained {
+                Ok(attempt) => attempt,
+                Err(error) => {
+                    let error = HandlerError::from(error);
+                    if matches!(error.code.as_str(), "invalid_reply" | "consent_lost") {
+                        return self.refuse_agent_write(
+                            &store,
+                            &row,
+                            tool.name,
+                            &plan.target,
+                            Authorization::Card {
+                                id: saved
+                                    .as_ref()
+                                    .and_then(|s| s.elicitation_id.clone())
+                                    .unwrap_or_default(),
+                                answer: "deny".into(),
+                            },
+                            error,
+                        );
+                    }
+                    return Err(error);
+                }
+            });
             match &attempt
                 .as_ref()
                 .expect(
@@ -320,58 +397,65 @@ impl ProjectsHandler {
                     );
                 }
                 ConsentDecision::Approved(answer) => {
-                    let choice = answer
-                        .choice
-                        .as_deref()
-                        .filter(|choice| {
-                            matches!(
-                                *choice,
-                                "approve_once"
-                                    | "approve_always_workspace"
-                                    | "approve_always_project"
-                            )
-                        })
-                        .ok_or_else(|| {
-                            HandlerError::new(
-                                "invalid_reply",
-                                "approved consent settlement has no approval choice",
-                            )
-                        })?;
-                    if answer.elicitation_id.is_empty() {
-                        return Err(HandlerError::new(
-                            "invalid_reply",
-                            "approved consent settlement has no card id",
-                        ));
-                    }
-                    if matches!(
-                        answer.choice.as_deref(),
-                        Some("approve_always_workspace" | "approve_always_project")
-                    ) {
-                        granted = Some(StandingGrant {
-                            id: format!("grant:{}", crate::consent::external_key(&row.identity)),
-                            holder_agent_id: caller.into(),
-                            class: plan.grant_class.clone().ok_or_else(|| {
-                                consent_lost(
-                                    "stored consent plan has no grant class for an always approval",
+                    let approval = (|| {
+                        let choice = answer
+                            .choice
+                            .as_deref()
+                            .filter(|choice| {
+                                matches!(
+                                    *choice,
+                                    "approve_once"
+                                        | "approve_always_workspace"
+                                        | "approve_always_project"
                                 )
-                            })?,
-                            scope_id: plan
-                                .scope_id
-                                .clone()
-                                .filter(|scope| !scope.is_empty())
-                                .ok_or_else(|| {
-                                    consent_lost(
-                                        "stored consent plan has no scope for an always approval",
-                                    )
-                                })?,
-                            granted_at_ms: (self.clock)(),
-                            card_ref: answer.elicitation_id.clone(),
-                            revoked_at_ms: None,
-                        });
-                    }
+                            })
+                            .ok_or_else(|| {
+                                HandlerError::new(
+                                    "invalid_reply",
+                                    "approved consent settlement has no approval choice",
+                                )
+                            })?;
+                        if answer.elicitation_id.is_empty() {
+                            return Err(HandlerError::new(
+                                "invalid_reply",
+                                "approved consent settlement has no card id",
+                            ));
+                        }
+                        let grant =
+                            approval_grant(&plan, choice)?.map(|(class, scope_id)| StandingGrant {
+                                id: format!(
+                                    "grant:{}",
+                                    crate::consent::external_key(&row.identity)
+                                ),
+                                holder_agent_id: caller.into(),
+                                class,
+                                scope_id,
+                                granted_at_ms: (self.clock)(),
+                                card_ref: answer.elicitation_id.clone(),
+                                revoked_at_ms: None,
+                            });
+                        Ok::<_, HandlerError>((choice.to_owned(), grant))
+                    })();
+                    let (choice, grant) = match approval {
+                        Ok(approval) => approval,
+                        Err(error) => {
+                            return self.refuse_agent_write(
+                                &store,
+                                &row,
+                                tool.name,
+                                &plan.target,
+                                Authorization::Card {
+                                    id: answer.elicitation_id.clone(),
+                                    answer: answer.choice.clone().unwrap_or_default(),
+                                },
+                                error,
+                            )
+                        }
+                    };
+                    granted = grant;
                     Authorization::Card {
                         id: answer.elicitation_id.clone(),
-                        answer: choice.into(),
+                        answer: choice,
                     }
                 }
             }
@@ -410,11 +494,18 @@ impl ProjectsHandler {
                         | "invalid_role_shape"
                         | "project_exists"
                         | "workspace_exists"
+                        | "invalid_reply"
+                        | "consent_lost"
                 ) =>
             {
                 let error = if matches!(
                     error.code.as_str(),
-                    "gone" | "hire_cap_reached" | "not_your_hire" | "consent_stale"
+                    "gone"
+                        | "hire_cap_reached"
+                        | "not_your_hire"
+                        | "consent_stale"
+                        | "invalid_reply"
+                        | "consent_lost"
                 ) {
                     error
                 } else {

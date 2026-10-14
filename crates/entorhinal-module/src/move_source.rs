@@ -238,7 +238,8 @@ impl Source {
     }
 
     async fn save(&self, row: &mut AgentMove, plan: &Plan, clear: bool) -> Result<(), Failure> {
-        row.plan = serde_json::to_value(plan).expect("move plan serializes");
+        row.plan =
+            serde_json::to_value(plan).map_err(|_| Failure::new("plan.save", "plan_malformed"))?;
         self.worker.save(row, clear).await?;
         Ok(())
     }
@@ -273,13 +274,7 @@ impl Source {
         if let Some((record, version)) = observed.as_ref().filter(|_| watching) {
             row.record_version = *version as i64;
             if record.state == State::Aborted && row.step != Step::Releasing {
-                let reason = record.reason.as_ref().map(|r| {
-                    serde_json::to_value(r)
-                        .unwrap()
-                        .as_str()
-                        .unwrap()
-                        .to_owned()
-                });
+                let reason = record.reason.clone().map(String::from);
                 if row.reason != reason || row.abort_requested.is_none() {
                     row.detail = record.detail.clone();
                 }
@@ -417,9 +412,9 @@ impl Source {
             } else {
                 MoveReason::ParticipantRefused
             };
-            let reason = serde_json::to_value(reason).unwrap();
+            let reason = String::from(reason);
             row.abort_requested = Some(json!({"reason":reason,"detail":error.detail()}));
-            row.reason = reason.as_str().map(str::to_owned);
+            row.reason = Some(reason);
             row.detail = Some(error.detail());
             self.save(row, plan, false)
                 .await
@@ -454,8 +449,8 @@ impl Source {
         Ok(client)
     }
 
-    fn request(&self, participant: &MoveParticipant) -> CutRequest {
-        CutRequest::new(
+    fn request(&self, participant: &MoveParticipant) -> Result<CutRequest, Failure> {
+        Ok(CutRequest::new(
             Refs::new(
                 participant
                     .refs
@@ -463,9 +458,10 @@ impl Source {
                     .map(|r| AgentRef::new(r.ref_kind.clone(), r.reference.clone()))
                     .collect(),
             )
-            .expect("persisted refs are valid"),
-            CutId::new(self.cut.clone()).expect("persisted cut id is valid"),
-        )
+            .map_err(|_| Failure::new("plan.read", "invalid_refs"))?,
+            CutId::new(self.cut.clone())
+                .map_err(|_| Failure::new("plan.read", "invalid_cut_id"))?,
+        ))
     }
 
     async fn read_move(&self, plan: &Plan) -> Result<Option<(MoveRecord, u64)>, Failure> {
@@ -506,7 +502,7 @@ impl Source {
         let mut items = Vec::new();
         for participant in &mut participants {
             let client = self.client(&participant.module_id).await?;
-            let request = self.request(participant);
+            let request = self.request(participant)?;
             plan.source.pending = Some(PendingCall {
                 module_id: participant.module_id.clone(),
                 op: "agent_data.prepare".into(),
@@ -528,10 +524,11 @@ impl Source {
                 .external
                 .into_iter()
                 .map(|external| {
-                    serde_json::from_value::<ExternalRef>(serde_json::to_value(external).unwrap())
-                        .expect("external wire types agree")
+                    serde_json::to_value(external)
+                        .and_then(serde_json::from_value::<ExternalRef>)
+                        .map_err(|_| Failure::new("agent_data.prepare", "invalid_external_ref"))
                 })
-                .collect();
+                .collect::<Result<Vec<_>, _>>()?;
             items.extend(reply.items.into_iter().map(|item| CutItem {
                 session_ref: item.session_ref,
                 stream: item.stream,
@@ -568,7 +565,7 @@ impl Source {
                 op: "agent_data.export".into(),
             });
             self.save(row, plan, false).await?;
-            let result = client.export(&self.request(&participant)).await;
+            let result = client.export(&self.request(&participant)?).await;
             if let Err(e) = result {
                 let failure = Failure::participant("agent_data.export", &participant.module_id, e);
                 if !failure.unknown {
@@ -837,10 +834,10 @@ impl Source {
             .participants
             .iter()
             .find(|p| p.module_id == pending.module_id)
-            .expect("pending call names a pinned participant")
+            .ok_or_else(|| Failure::new("plan.read", "pending_participant_missing"))?
             .clone();
         let client = self.client(&pending.module_id).await?;
-        let request = self.request(&participant);
+        let request = self.request(&participant)?;
         client
             .status(&request)
             .await
@@ -874,10 +871,7 @@ impl Source {
         let reason: MoveReason =
             serde_json::from_value(request.get("reason").cloned().unwrap_or(json!("operator")))
                 .unwrap_or(MoveReason::Operator);
-        row.reason = serde_json::to_value(&reason)
-            .unwrap()
-            .as_str()
-            .map(str::to_owned);
+        row.reason = Some(String::from(reason.clone()));
         row.detail = request.get("detail").cloned().filter(|v| !v.is_null());
         self.save(row, plan, false).await?;
         let shared = matches!(row.step, Step::Sealed | Step::Published);
@@ -953,7 +947,7 @@ impl Source {
             }
             self.client(&participant.module_id)
                 .await?
-                .abort(&self.request(&participant))
+                .abort(&self.request(&participant)?)
                 .await
                 .map_err(|e| Failure::participant("agent_data.abort", &participant.module_id, e))?;
             plan.source.aborted.push(participant.module_id.clone());
@@ -984,6 +978,15 @@ impl Source {
                         failure.diagnostic = true;
                         failure
                     })?;
+            // A shared abort record says the move was cancelled. For a claimed
+            // agent, only a claim held here permits this Mac to resume writes;
+            // keep participant data read-only while another Mac holds it.
+            if !require_present
+                && claim.epoch >= 1
+                && claim.holder.as_deref() != Some(&reply.self_author)
+            {
+                return Err(Failure::new("claim.read", "claim_moved"));
+            }
             let version = i64::try_from(reply.version)
                 .map_err(|_| Failure::new("claim.read", "claim_version_unknown"))?;
             ClaimObservation::Present {
@@ -1062,7 +1065,7 @@ impl Source {
             }
         }
         for participant in plan.participants.clone() {
-            let request = self.request(&participant);
+            let request = self.request(&participant)?;
             let release = ReleaseRequest::new(request.refs, request.cut_id, plan.to.clone());
             let reply = self
                 .client(&participant.module_id)
@@ -1719,6 +1722,60 @@ mod tests {
             .position(|e| e.op == "agent_data.abort")
             .unwrap();
         assert!(door_abort < participant_abort);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn source_shared_abort_cannot_unfreeze_while_receiver_holds_claim() {
+        let f = Fixture::new();
+        let mut source = f.source();
+        f.published(&mut source).await;
+        let claim = AgentClaim {
+            v: 1,
+            agent_id: AGENT.into(),
+            holder: Some(TO.into()),
+            epoch: 1,
+            cut_id: Some(CUT.into()),
+            reason: None,
+        };
+        f.records.put(
+            &format!("claim:{AGENT}"),
+            1,
+            serde_json::to_vec(&claim).unwrap(),
+            TO,
+        );
+        f.state(State::Aborted, TO);
+        source.tick().await.unwrap();
+        assert_eq!(f.row().step, Step::Published);
+        assert!(
+            f.participants.iter().all(|p| !p.frozen().is_empty()),
+            "shared abort must not unfreeze participants while the receiver holds the claim"
+        );
+        assert_eq!(f.row().hold.unwrap()["code"], "claim_moved");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn source_unknown_abort_reason_and_corrupt_persisted_refs_do_not_panic() {
+        let f = Fixture::new();
+        let mut source = f.source();
+        f.published(&mut source).await;
+        let mut record = f.plan().record(CUT);
+        record.state = State::Aborted;
+        record.reason = Some(MoveReason::Other("future_peer_reason".into()));
+        f.records.put(
+            &format!("move:{CUT}"),
+            4,
+            wire::encode_move_record(&format!("move:{CUT}"), &record).unwrap(),
+            TO,
+        );
+        f.until(&mut source, Step::Aborted).await;
+        assert_eq!(f.row().reason.as_deref(), Some("future_peer_reason"));
+        let mut participant = f.plan().participants[0].clone();
+        let duplicate = participant.refs[0].clone();
+        participant.refs.push(duplicate);
+        assert_eq!(
+            source.request(&participant).unwrap_err().code,
+            "invalid_refs"
+        );
     }
 
     #[tokio::test(start_paused = true)]

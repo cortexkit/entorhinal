@@ -176,7 +176,8 @@ impl ParticipantClient {
     }
     pub(crate) async fn busy(&self, refs: &[AgentRef]) -> Result<BusyReply, ClientError> {
         let request = BusyRequest::new(
-            Refs::new(refs.to_vec()).expect("the client is given unique non-empty refs"),
+            Refs::new(refs.to_vec())
+                .map_err(|e| ClientError::InvalidReply(format!("invalid refs: {e}")))?,
         );
         let reply = self
             .call::<BusyReply>(Request::Busy(request.clone()))

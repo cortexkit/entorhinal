@@ -431,7 +431,8 @@ impl RegistryStore {
         }))?.collect())
     }
 
-    /// A retained grant row is not authority after its holder or subject ends.
+    /// Keep grants for audit and listing, but stop using them as authority when
+    /// the holder agent is retired or merged, or the workspace or project is removed.
     pub fn covering_consent_grant(
         &self,
         holder: &str,
@@ -510,8 +511,8 @@ impl RegistryStore {
     }
 }
 
-/// Optional completion attached to a journal writer. The mutation's journal,
-/// request outcome, audit and newly granted permission commit together.
+/// Optional consent completion records the request outcome, its audit row and
+/// any new standing grant in the same transaction as the agent's write and journal entry.
 #[derive(Debug, Clone)]
 pub struct ConsentCommit {
     pub request: ConsentRequest,
@@ -637,10 +638,9 @@ pub(crate) fn admit_commit(
     Ok(None)
 }
 
-/// A validated agent write. The target records the project and workspace ids
-/// (and their displayed names) that will appear on the consent card. Keeping that
-/// snapshot separate from arguments prevents a retry after a project move from
-/// applying approval for the old workspace to the new one.
+/// A validated agent write. Save the project and workspace IDs and names shown
+/// on the consent card separately from the arguments, so a retry after a project
+/// move cannot apply approval for the old workspace to a different workspace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsentWrite {
     pub tool: String,
@@ -780,8 +780,9 @@ fn prepare_write(
 }
 
 impl RegistryStore {
-    /// Run the real phase-one write on a disposable snapshot, always rolling it
-    /// back. No database writer lock remains held while consent is awaited.
+    /// Run the same create, register or hire path the operator uses on a disposable
+    /// snapshot, then roll it back. Checking before raising the consent card avoids
+    /// holding a database writer lock while waiting for the user.
     pub fn precheck_consent_write(
         &self,
         caller: &str,
@@ -846,9 +847,17 @@ impl JournalWriter<'_> {
             ));
         }
         let args = &plan.arguments;
+        let text = |value: &Value, field: &str| {
+            value[field].as_str().map(str::to_owned).ok_or_else(|| {
+                AgentMutationError::new(
+                    "consent_lost",
+                    format!("saved consent plan has no string {field}"),
+                )
+            })
+        };
         let result = match plan.tool.as_str() {
-            "projects_create_workspace" => self.create_workspace_at(crate::CreateWorkspaceRequest { workspace_id:plan.target["workspace_id"].as_str().unwrap().into(), name:args["name"].as_str().unwrap().into() }, now).map_err(Into::into),
-            "projects_register" => self.register_at(crate::RegisterRequest { name:args["name"].as_str().unwrap().into(), roots:vec![plan.target["dir"].as_str().unwrap().into()], workspace_id:plan.scope_id.clone(), ..Default::default() }, now).map_err(Into::into),
+            "projects_create_workspace" => self.create_workspace_at(crate::CreateWorkspaceRequest { workspace_id:text(&plan.target,"workspace_id")?, name:text(args,"name")? }, now).map_err(Into::into),
+            "projects_register" => self.register_at(crate::RegisterRequest { name:text(args,"name")?, roots:vec![text(&plan.target,"dir")?], workspace_id:plan.scope_id.clone(), ..Default::default() }, now).map_err(Into::into),
             "agents_create_head" => self.agent_mutation_with_id("agent.create", json!({"role":"head","name":args["name"],"tag":args["tag"],"project_id":plan.target["placement"]["project_id"],"request_key":commit.request.identity.request_key}), now, agent_id),
             "agents_hire" => self.agents_hire(&serde_json::from_value(args.clone()).map_err(|e| AgentMutationError::new("invalid_request", e.to_string()))?, now, agent_id),
             "agents_retire_hire" => self.agent_mutation("agent.dispose", json!({"agent_id":args["agent_id"],"request_key":commit.request.identity.request_key}), now),

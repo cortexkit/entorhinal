@@ -309,6 +309,8 @@ struct HealthGauges {
     self_author_conflicts: AtomicU64,
     moves_open: AtomicU64,
     move_errors: AtomicU64,
+    move_inbox_rejected: AtomicU64,
+    move_task_panics: AtomicU64,
     #[cfg(test)]
     claim_refresh_done: tokio::sync::Notify,
 }
@@ -1012,6 +1014,8 @@ impl ModuleHandler for ProjectsHandler {
         } else if self.health.log_state.load(Ordering::Relaxed) != 0
             || self.health.self_author_conflicts.load(Ordering::Relaxed) != 0
             || self.health.move_errors.load(Ordering::Relaxed) != 0
+            || self.health.move_inbox_rejected.load(Ordering::Relaxed) != 0
+            || self.health.move_task_panics.load(Ordering::Relaxed) != 0
         {
             HealthStatus::Degraded
         } else {
@@ -1054,6 +1058,8 @@ impl ModuleHandler for ProjectsHandler {
                 "selfAuthorConflicts": self.health.self_author_conflicts.load(Ordering::Relaxed),
                 "movesOpen": self.health.moves_open.load(Ordering::Relaxed),
                 "moveErrors": self.health.move_errors.load(Ordering::Relaxed),
+                "moveInboxRejected": self.health.move_inbox_rejected.load(Ordering::Relaxed),
+                "moveTaskPanics": self.health.move_task_panics.load(Ordering::Relaxed),
             })),
         }
     }

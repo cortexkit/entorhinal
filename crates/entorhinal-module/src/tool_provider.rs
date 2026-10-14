@@ -1,5 +1,8 @@
 //! Agent tools are a separate surface from the operator and executive's
-//! management methods. Admission uses only the daemon's saved route stamp.
+//! management methods. When a route opens, the daemon supplies a scope stamp
+//! that attests the agent's identity and authority. Save that stamp and use it
+//! to identify the caller; tool arguments and BindIdentity are caller-supplied
+//! and cannot establish authority for a different agent.
 
 use crate::{encode_result, HandlerError, ProjectsHandler, RouteAdmission, RouteKey};
 use cortexkit_role_tool_provider::{
@@ -104,7 +107,9 @@ pub(super) fn provider_role() -> ProviderRole {
                 schema: tool.schema(),
             })
             .collect(),
-        // Project and caller identity come from the scope stamp, not BindIdentity.
+        // The scope stamp saved when the daemon opened this route attests project
+        // and caller identity. BindIdentity is supplied by the caller instead,
+        // so trusting it would let callers impersonate a different agent.
         identity_scope: Vec::new(),
         concurrency: Concurrency::ModuleManaged,
         emits_push: false,
@@ -266,6 +271,26 @@ impl ProjectsHandler {
                 "role_forbidden",
                 "the stored agent role cannot use this tool",
             ));
+        }
+        let (claim, own) = self.with_store(|store| {
+            Ok((
+                store.cached_agent_claim(id)?,
+                store.persisted_self_author()?,
+            ))
+        })?;
+        if let Some(claim) = claim {
+            if claim.integrity_failed {
+                return Err(HandlerError::new(
+                    "claim_integrity_failed",
+                    "cached agent claim failed verification",
+                ));
+            }
+            if claim.epoch >= 1 && (claim.holder.is_none() || claim.holder != own) {
+                return Err(HandlerError::new(
+                    "held_elsewhere",
+                    "the stamped agent is held by another Mac",
+                ));
+            }
         }
         Ok((admission, caller))
     }

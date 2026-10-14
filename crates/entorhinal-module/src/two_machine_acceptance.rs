@@ -3456,9 +3456,17 @@ mod moves {
                 f.finish(&cut).await;
                 assert_eq!(f.b.claim().await.version, 1);
             } else {
-                f.b.receiver_until(&cut, MoveStep::Aborted).await;
-                assert_eq!(f.b.row(&cut).reason.as_deref(), Some("claim_moved"));
-                assert_eq!(f.b.record(&cut).await.state, MoveState::Aborted);
+                let mut receiver = f.b.receiver(&cut);
+                for _ in 0..3 {
+                    elapse(300_000);
+                    receiver.tick().await.unwrap();
+                }
+                // Without proof of our own claim take, returning ownership
+                // could overwrite another writer. Publishing abort while the
+                // receiver still owns the claim could let both Macs resume writes.
+                assert_eq!(f.b.row(&cut).step, MoveStep::Staged);
+                assert_eq!(f.b.record(&cut).await.state, MoveState::Staged);
+                assert!(f.b.row(&cut).hold.is_some());
                 assert!(!f.b.discovery.peers["pi"]
                     .calls()
                     .iter()

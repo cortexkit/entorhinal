@@ -978,15 +978,27 @@ async fn retry_refuses_saved_plan_without_target_label_as_consent_lost() {
     let before = f.counts();
     let calls = fake.calls().len();
     assert_eq!(
-        error_code(f.call("agents_hire", args).await),
+        error_code(f.call("agents_hire", args.clone()).await),
         "consent_lost"
     );
-    assert_eq!(f.counts(), before);
+    let mut after = before.clone();
+    after[3] += 1;
+    assert_eq!(f.counts(), after);
     assert_eq!(
         fake.calls().len(),
         calls,
         "an unreadable target must not reach Cingulate"
     );
+    assert_eq!(
+        request(&f, "agents_hire", "missing-label", 2).state,
+        RequestState::Refused
+    );
+    assert_eq!(
+        error_code(f.call("agents_hire", args).await),
+        "consent_lost"
+    );
+    assert_eq!(f.counts(), after);
+    assert_eq!(fake.calls().len(), calls);
 }
 
 #[test]
@@ -1003,6 +1015,141 @@ fn malformed_core_reply_envelopes_are_invalid_reply() {
         core_result(b"{\"result\":{\"agents\":[]}}").unwrap()["agents"],
         json!([])
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn unoffered_always_approvals_are_terminal_refusals_and_replay_without_grants() {
+    for (tool, choice) in [
+        ("projects_create_workspace", "approve_always_workspace"),
+        ("projects_register", "approve_always_project"),
+    ] {
+        let (f, fake) = fixture(0);
+        let args = if tool == "projects_create_workspace" {
+            json!({"request_key":"bad-always","workspace_id":"NEW","name":"New"})
+        } else {
+            let dir = f.root.join("unoffered-project");
+            std::fs::create_dir(&dir).unwrap();
+            let dir = crate::tests::canonical_test_path(dir);
+            json!({"request_key":"bad-always","workspace_id":"W","name":"NewProject","dir":dir})
+        };
+        fake.script("consent.await", Effect::Answer(choice));
+        assert_eq!(
+            error_code(f.call(tool, args.clone()).await),
+            "invalid_reply"
+        );
+        let saved = request(&f, tool, "bad-always", 0);
+        assert_eq!(saved.state, RequestState::Refused);
+        assert_eq!(saved.outcome.unwrap()["error"]["code"], "invalid_reply");
+        assert!(store(&f).consent_grants().unwrap().is_empty());
+        let before = f.counts();
+        let calls = fake.calls().len();
+        assert_eq!(error_code(f.call(tool, args).await), "invalid_reply");
+        assert_eq!(f.counts(), before);
+        assert_eq!(
+            fake.calls().len(),
+            calls,
+            "terminal refusal must replay without another card"
+        );
+    }
+}
+
+#[test]
+fn always_approvals_validate_grant_class_and_saved_scope_kind() {
+    let (f, _) = fixture(2);
+    let mut plan = store(&f)
+        .precheck_consent_write(
+            &f.agents[2],
+            "agents_hire",
+            json!({"name":"Hire","tag":"worker","labels":[]}),
+            100,
+        )
+        .unwrap();
+    assert!(approval_grant(&plan, "approve_always_project")
+        .unwrap()
+        .is_some());
+    assert!(approval_grant(&plan, "approve_once").unwrap().is_none());
+    assert!(approval_grant(&plan, "approve_always_workspace").is_err());
+    plan.scope_id = Some("W".into());
+    assert!(approval_grant(&plan, "approve_always_project").is_err());
+    plan.scope_id = Some("P".into());
+    plan.grant_class = Some(GrantClass::CreateHead);
+    assert!(approval_grant(&plan, "approve_always_project").is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn malformed_settled_approval_is_refused_and_replayed_without_waiting_forever() {
+    let (f, fake) = fixture(0);
+    let args = json!({"request_key":"malformed-answer","workspace_id":"NEW","name":"New"});
+    assert_eq!(
+        error_code(f.call("projects_create_workspace", args.clone()).await),
+        "consent_pending"
+    );
+    let saved = request(&f, "projects_create_workspace", "malformed-answer", 0);
+    let mut record = fake.record(saved.elicitation_id.as_deref().unwrap());
+    record["state"] = json!("answered");
+    record["answered_at_ms"] = json!(100);
+    record["answered_choice_id"] = Value::Null;
+    fake.script("consent.get", Effect::Record(record));
+    assert_eq!(
+        error_code(f.call("projects_create_workspace", args.clone()).await),
+        "invalid_reply"
+    );
+    assert_eq!(
+        request(&f, "projects_create_workspace", "malformed-answer", 0).state,
+        RequestState::Refused
+    );
+    let calls = fake.calls().len();
+    assert_eq!(
+        error_code(f.call("projects_create_workspace", args).await),
+        "invalid_reply"
+    );
+    assert_eq!(fake.calls().len(), calls);
+    assert!(store(&f).consent_grants().unwrap().is_empty());
+}
+
+#[test]
+fn saved_write_string_fields_refuse_without_panicking() {
+    let (f, _) = fixture(0);
+    for (tool, args, field) in [
+        (
+            "projects_create_workspace",
+            json!({"workspace_id":"NEW","name":"New"}),
+            "workspace_id",
+        ),
+        (
+            "projects_register",
+            json!({"workspace_id":"W","name":"NewProject","dir":crate::tests::canonical_test_path(f.root.clone())}),
+            "dir",
+        ),
+    ] {
+        let mut plan = store(&f)
+            .precheck_consent_write(&f.agents[0], tool, args, 100)
+            .unwrap();
+        plan.target[field] = Value::Null;
+        let commit = approved_commit(
+            &f,
+            &plan,
+            "bad-string",
+            0,
+            Authorization::Card {
+                id: "card".into(),
+                answer: "approve_once".into(),
+            },
+        );
+        let before = f.counts();
+        let saved_store = store(&f);
+        let writer = saved_store
+            .with_principal("agent")
+            .with_consent_commit(commit);
+        assert_eq!(
+            writer
+                .apply_consent_write(&plan, 100, None)
+                .unwrap_err()
+                .code,
+            "consent_lost"
+        );
+        assert_eq!(f.counts(), before);
+    }
 }
 
 #[test]

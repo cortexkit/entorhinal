@@ -1,8 +1,7 @@
 //! Entorhinal's cut operations on engram's `session-door` internal service.
 //!
-//! Wire contract: engram AGENT_SYNC.md at 8a96bc0, "The move: a durable
-//! transaction" (seal/status/abort/handoff) and "Resume on the new machine"
-//! (read/takeover/accept). The handler's progress objects include failure detail.
+//! Calls seven move operations: seal, status, abort, handoff, read, takeover and
+//! accept. Replies include progress and failure detail for the move driver.
 //!
 //! The move driver owns call ordering and retries refusals. This client settles
 //! lost transport replies with status before repeating the identical request.
@@ -221,8 +220,8 @@ pub(crate) enum DoorError {
 }
 
 impl DoorError {
-    // Cloud outages and unsettled handoff coverage leave the cut active, so the
-    // move driver can retry (AGENT_SYNC.md, handoff and Abort).
+    // A cloud outage or handoff_not_covered refusal leaves the cut active, so
+    // the move driver can retry without discarding the move.
     pub(crate) fn retryable(&self) -> bool {
         matches!(self, Self::OutcomeUnknown)
             || matches!(self, Self::Refused { code, .. }
@@ -263,8 +262,12 @@ impl DoorClient {
 
     async fn once<T: DeserializeOwned>(&self, request: &Request) -> Result<T, DoorError> {
         let transport = self.connector.connect().await.map_err(map_transport)?;
-        let mut params = serde_json::to_value(request).expect("door request serializes");
-        params.as_object_mut().unwrap().remove("op");
+        let mut params =
+            serde_json::to_value(request).map_err(|e| DoorError::InvalidReply(e.to_string()))?;
+        params
+            .as_object_mut()
+            .ok_or_else(|| DoorError::InvalidReply("door request is not an object".into()))?
+            .remove("op");
         let bytes = transport
             .call(request.op(), params)
             .await
