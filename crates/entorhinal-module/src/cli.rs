@@ -1084,6 +1084,31 @@ async fn agent_read(
     Ok(value)
 }
 
+/// Heads and hirees store no workspace of their own: theirs is wherever their
+/// project is placed. `show` looks that up for any live agent with no stored
+/// workspace, whether it was named by id or by name, so it reports the
+/// workspace the agent actually belongs to.
+async fn with_project_workspace(
+    caller: &impl CliCaller,
+    mut row: Value,
+) -> Result<Value, CallFailure> {
+    if row["workspace_id"].is_null() {
+        if let Some(project) = row["project_id"].as_str() {
+            let projects = agent_read(caller, "enumerate", json!({})).await?;
+            let placed = projects["projects"].as_array().and_then(|all| {
+                all.iter()
+                    .find(|p| p["projectId"] == project)
+                    .and_then(|p| p["workspaceId"].as_str())
+                    .map(str::to_owned)
+            });
+            if let Some(workspace) = placed {
+                row["workspace_from_project"] = json!(workspace);
+            }
+        }
+    }
+    Ok(row)
+}
+
 async fn resolve_agent(caller: &impl CliCaller, token: &str) -> Result<String, CallFailure> {
     if is_agent_id(token) {
         return Ok(token.into());
@@ -1225,9 +1250,10 @@ async fn execute_agents(
             let token = params["agent_id"].as_str().expect("built show target");
             if !is_agent_id(token) {
                 let value = agent_read(caller, "agent.resolve_name", json!({"name":token})).await?;
-                return value.get("digest").cloned().ok_or_else(|| {
+                let row = value.get("digest").cloned().ok_or_else(|| {
                     CallFailure::Transport("resolve_name reply has no digest".into())
-                });
+                })?;
+                return with_project_workspace(caller, row).await;
             }
             let resolved = agent_read(caller, "agent.resolve", params.clone()).await?;
             match resolved["status"].as_str() {
@@ -1237,7 +1263,7 @@ async fn execute_agents(
                 }),
                 Some("live") => {
                     let listed = list_agents(caller, json!({})).await?;
-                    let mut row = listed["agents"]
+                    let row = listed["agents"]
                         .as_array()
                         .unwrap()
                         .iter()
@@ -1247,24 +1273,7 @@ async fn execute_agents(
                             code: "unknown_agent".into(),
                             message: token.into(),
                         })?;
-                    // Heads and hirees store no workspace of their own: theirs is
-                    // wherever their project is placed. Look that up so `show`
-                    // reports the workspace the agent actually belongs to.
-                    if row["workspace_id"].is_null() {
-                        if let Some(project) = row["project_id"].as_str() {
-                            let projects = agent_read(caller, "enumerate", json!({})).await?;
-                            let placed = projects["projects"].as_array().and_then(|all| {
-                                all.iter()
-                                    .find(|p| p["projectId"] == project)
-                                    .and_then(|p| p["workspaceId"].as_str())
-                                    .map(str::to_owned)
-                            });
-                            if let Some(workspace) = placed {
-                                row["workspace_from_project"] = json!(workspace);
-                            }
-                        }
-                    }
-                    Ok(row)
+                    with_project_workspace(caller, row).await
                 }
                 Some("retired" | "merged") => Ok(resolved),
                 _ => Err(CallFailure::Transport(
@@ -3037,6 +3046,17 @@ mod agent_tests {
         );
         let shown = execute(&script, &["show", ID]).await.unwrap();
         assert_eq!(script.calls()[2].0, "enumerate");
+        assert!(format_agents("show", &shown).contains("workspace: W (from project)"));
+
+        // Named by name: resolve_name returns the digest directly, and the
+        // lookup must still run on it.
+        let script = Script::new(vec![
+            Ok(json!({"agent_id":ID,"digest":head.clone()})),
+            Ok(json!({"projects":[{"projectId":"P","workspaceId":"W"}]})),
+        ]);
+        let shown = execute(&script, &["show", "W/Ada"]).await.unwrap();
+        assert_eq!(script.calls()[0].0, "agent.resolve_name");
+        assert_eq!(script.calls()[1].0, "enumerate");
         assert!(format_agents("show", &shown).contains("workspace: W (from project)"));
 
         let script = show(json!({"projects":[{"projectId":"P"}]}), head);
