@@ -572,7 +572,7 @@ struct ProjectsHandler {
     record_client: record_client::RecordClient,
     participant_discovery: Arc<dyn participant_discovery::ParticipantDiscovery>,
     door_client: door_client::DoorClient,
-    move_wake: Arc<tokio::sync::Notify>,
+    move_wake: Arc<move_driver::MoveWake>,
     move_driver_task: Mutex<Option<move_driver::MoveDriver>>,
     claim_refresh: Arc<claims::RefreshQueue>,
     claim_refresh_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -856,7 +856,7 @@ impl ProjectsHandler {
         let record_connector: Arc<dyn log_client::LogConnector> = Arc::new(
             log_client::SubcConnector::from_args(std::env::args_os().skip(1)),
         );
-        let move_wake = Arc::new(tokio::sync::Notify::new());
+        let move_wake = Arc::new(move_driver::MoveWake::default());
         let clock_origin = module_started_at;
         let request_clock =
             Arc::new(move || clock_origin.elapsed().as_micros().min(u64::MAX as u128) as u64);

@@ -361,9 +361,11 @@ impl Receiver {
         self.abort_held = false;
     }
     pub(crate) async fn run(mut self) {
+        let mut signals = self.worker.wake.subscribe();
         let mut delay = Duration::ZERO;
         loop {
-            tokio::select! { _ = tokio::time::sleep(delay) => {}, _ = self.worker.wake.notified() => {} }
+            tokio::select! { _ = tokio::time::sleep(delay) => {}, _ = signals.notified() => {} }
+            signals.handled();
             if self.worker.store.upgrade().is_none() {
                 return;
             }
@@ -380,6 +382,8 @@ impl Receiver {
                 Ok(None) => return,
                 Err(_) => delay = POLL,
             }
+            #[cfg(test)]
+            signals.finished();
         }
     }
     async fn save(&self, row: &mut AgentMove, progress: &Progress) -> Result<(), Failure> {
@@ -1381,9 +1385,11 @@ impl CutAccept {
     }
 
     pub(crate) async fn run(self) {
+        let mut signals = self.worker.wake.subscribe();
         let mut delay = Duration::ZERO;
         loop {
-            tokio::select! { _ = tokio::time::sleep(delay) => {}, _ = self.worker.wake.notified() => {} }
+            tokio::select! { _ = tokio::time::sleep(delay) => {}, _ = signals.notified() => {} }
+            signals.handled();
             if self.worker.store.upgrade().is_none() {
                 return;
             }
@@ -1392,6 +1398,8 @@ impl CutAccept {
                 Ok(None) => return,
                 Err(_) => delay = POLL,
             }
+            #[cfg(test)]
+            signals.finished();
         }
     }
 
@@ -1553,7 +1561,6 @@ mod tests {
         slot: std::sync::Weak<Mutex<Option<RegistryStore>>>,
         crash: Mutex<Option<(wire::ClaimWrite, bool)>>,
         hit: tokio::sync::Semaphore,
-        inbox_reads: tokio::sync::Semaphore,
         abort_on_claimed: AtomicBool,
         crash_activated: AtomicBool,
         stale_after_take: AtomicBool,
@@ -1573,9 +1580,6 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((method.into(), params.clone()));
-            if method == "record.read" && params["subject"] == format!("inbox:{TO}") {
-                self.inbox_reads.add_permits(1);
-            }
             let is_claim = method == "record.cas" && params["subject"] == format!("claim:{AGENT}");
             if method == "record.read"
                 && params["subject"] == format!("claim:{AGENT}")
@@ -1717,7 +1721,6 @@ mod tests {
                 slot: Arc::downgrade(&slot),
                 crash: Mutex::new(None),
                 hit: tokio::sync::Semaphore::new(0),
-                inbox_reads: tokio::sync::Semaphore::new(0),
                 abort_on_claimed: AtomicBool::new(false),
                 crash_activated: AtomicBool::new(false),
                 stale_after_take: AtomicBool::new(false),
@@ -1767,7 +1770,7 @@ mod tests {
                 health: Arc::new(crate::HealthGauges::default()),
                 writer: Arc::new(tokio::sync::Mutex::new(())),
                 clock,
-                wake: Arc::new(tokio::sync::Notify::new()),
+                wake: Arc::new(crate::move_driver::MoveWake::default()),
             };
             let f = Self {
                 worker,
@@ -2896,31 +2899,89 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn receiver_driver_polls_inbox_at_startup_every_thirty_seconds_and_on_reconnect() {
+        check_driver_polling(false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receiver_driver_reconnect_mid_poll_gives_exactly_one_follow_up() {
+        check_driver_polling(true).await;
+    }
+
+    async fn check_driver_polling(mid_poll: bool) {
         let f = Fixture::new(false).await;
+        // An empty inbox starts no per-cut tasks, whose completion or receiver
+        // activation would independently wake the driver and obscure read counts.
+        f.set_inbox(vec![]);
         let mut handler = crate::ProjectsHandler::with_runtime("receiver-poll".into(), clock);
         handler.store = f.slot.clone();
         handler.participant_discovery = f.discovery.clone();
         handler.door_client = f.worker.door.clone();
+        let probe = crate::move_driver::reconnect_test::Connector::new(
+            f.records.clone(),
+            format!("inbox:{TO}"),
+            mid_poll,
+        );
         let connector = Arc::new(crate::move_driver::ReconnectConnector {
-            inner: Arc::new(Connector(f.records.clone())),
+            inner: probe.clone(),
             wake: handler.move_wake.clone(),
         });
         handler.record_client = RecordClient::new(connector.clone());
         handler.start_move_driver();
-        f.records
-            .inbox_reads
-            .acquire_many(2)
-            .await
-            .unwrap()
-            .forget();
-        assert!(f.store().agent_move(CUT).unwrap().is_some());
-        tokio::time::advance(Duration::from_secs(29)).await;
-        assert_eq!(f.records.inbox_reads.available_permits(), 0);
-        tokio::time::advance(Duration::from_secs(1)).await;
-        f.records.inbox_reads.acquire().await.unwrap().forget();
-        connector.connect().await.unwrap();
-        f.records.inbox_reads.acquire().await.unwrap().forget();
+        probe.check_polling(&connector, mid_poll).await;
         handler.stop_move_driver().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receiver_reconnect_polls_once_waiting_and_mid_poll() {
+        for mid_poll in [false, true] {
+            let mut f = Fixture::new(false).await;
+            f.pickup().await;
+            f.edit(|row| row.plan["_receiver"] = json!({"contract_violation":true}));
+            let probe = crate::move_driver::reconnect_test::Connector::new(
+                f.records.clone(),
+                format!("move:{CUT}"),
+                mid_poll,
+            );
+            let connector = Arc::new(crate::move_driver::ReconnectConnector {
+                inner: probe.clone(),
+                wake: f.worker.wake.clone(),
+            });
+            f.worker.records = RecordClient::new(connector.clone());
+            let task = tokio::spawn(f.receiver().run());
+            probe.check_polling(&connector, mid_poll).await;
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            f.worker.sql_operations.wait().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cut_accept_reconnect_polls_once_waiting_and_mid_poll() {
+        for mid_poll in [false, true] {
+            let mut f = Fixture::new(false).await;
+            f.pickup().await;
+            f.edit(|row| row.cut_accept = Some(json!({"state":"pending"})));
+            // CutAccept must remove the inbox entry before accepting the door cut.
+            // A failed inbox read leaves the cut pending for a 30-second retry.
+            f.records
+                .fake
+                .error(&format!("inbox:{TO}"), Some("unavailable"));
+            let probe = crate::move_driver::reconnect_test::Connector::new(
+                f.records.clone(),
+                format!("inbox:{TO}"),
+                mid_poll,
+            );
+            let connector = Arc::new(crate::move_driver::ReconnectConnector {
+                inner: probe.clone(),
+                wake: f.worker.wake.clone(),
+            });
+            f.worker.records = RecordClient::new(connector.clone());
+            let task = tokio::spawn(CutAccept::new(f.worker.clone(), CUT.into()).run());
+            probe.check_polling(&connector, mid_poll).await;
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            f.worker.sql_operations.wait().await;
+        }
     }
 
     #[tokio::test]

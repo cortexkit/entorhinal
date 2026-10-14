@@ -165,7 +165,92 @@ pub(crate) struct MoveDriver {
 
 pub(crate) struct ReconnectConnector {
     pub(crate) inner: Arc<dyn crate::log_client::LogConnector>,
-    pub(crate) wake: Arc<tokio::sync::Notify>,
+    pub(crate) wake: Arc<MoveWake>,
+}
+
+/// Operator and admission hints still use Notify's wake-one or wake-waiters
+/// behavior. Transport replacements reach every move worker independently,
+/// including workers mid-poll: they must poll again after using an old connection.
+pub(crate) struct MoveWake {
+    local: tokio::sync::Notify,
+    reconnect: tokio::sync::watch::Sender<u64>,
+    transport: std::sync::Mutex<Option<Arc<dyn crate::log_client::LogTransport>>>,
+    #[cfg(test)]
+    passes: tokio::sync::watch::Sender<usize>,
+}
+
+impl Default for MoveWake {
+    fn default() -> Self {
+        Self {
+            local: tokio::sync::Notify::new(),
+            reconnect: tokio::sync::watch::channel(0).0,
+            transport: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            passes: tokio::sync::watch::channel(0).0,
+        }
+    }
+}
+
+impl MoveWake {
+    pub(crate) fn notify_one(&self) {
+        self.local.notify_one();
+    }
+
+    pub(crate) fn notify_waiters(&self) {
+        self.local.notify_waiters();
+    }
+
+    fn connected(&self, transport: Arc<dyn crate::log_client::LogTransport>) {
+        let mut last = self.transport.lock().unwrap();
+        // RecordClient calls connect() for every request, even when the connector
+        // returns its cached transport. Only a replacement is a reconnect;
+        // the first acquisition belongs to startup.
+        // Keep a strong clone so an allocation cannot be recycled at the same
+        // address and mistaken for the previous transport. Failed connects never
+        // reach connected() and therefore leave the previous transport intact.
+        let replaced = last
+            .as_ref()
+            .is_some_and(|previous| !Arc::ptr_eq(previous, &transport));
+        *last = Some(transport);
+        if replaced {
+            self.reconnect.send_modify(|generation| {
+                *generation = generation.wrapping_add(1);
+            });
+        }
+    }
+
+    pub(crate) fn subscribe(self: &Arc<Self>) -> MoveSignals {
+        MoveSignals {
+            wake: self.clone(),
+            reconnect: self.reconnect.subscribe(),
+        }
+    }
+}
+
+pub(crate) struct MoveSignals {
+    wake: Arc<MoveWake>,
+    reconnect: tokio::sync::watch::Receiver<u64>,
+}
+
+impl MoveSignals {
+    pub(crate) async fn notified(&mut self) {
+        tokio::select! {
+            _ = self.wake.local.notified() => {},
+            _ = self.reconnect.changed() => {},
+        }
+    }
+
+    pub(crate) fn handled(&mut self) {
+        // Mark the latest reconnect generation before polling, even if a timer
+        // or local notification selected the poll. A replacement during the poll
+        // then leaves a newer, unseen generation for the next notified() call.
+        self.reconnect.borrow_and_update();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn finished(&self) {
+        self.wake.passes.send_modify(|passes| *passes += 1);
+    }
 }
 
 #[async_trait::async_trait]
@@ -174,8 +259,7 @@ impl crate::log_client::LogConnector for ReconnectConnector {
         &self,
     ) -> Result<Arc<dyn crate::log_client::LogTransport>, crate::log_client::TransportError> {
         let transport = self.inner.connect().await?;
-        self.wake.notify_waiters();
-        self.wake.notify_one();
+        self.wake.connected(transport.clone());
         Ok(transport)
     }
 }
@@ -191,7 +275,7 @@ pub(crate) struct Worker {
     #[cfg(test)]
     pub(crate) writer: Arc<tokio::sync::Mutex<()>>,
     pub(crate) clock: fn() -> i64,
-    pub(crate) wake: Arc<tokio::sync::Notify>,
+    pub(crate) wake: Arc<MoveWake>,
 }
 
 impl Worker {
@@ -302,7 +386,7 @@ impl ProjectsHandler {
             wake: self.move_wake.clone(),
         };
         let liveness = self.liveness.clone();
-        let wake = self.move_wake.clone();
+        let mut signals = self.move_wake.subscribe();
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let driver = tokio::spawn(async move {
             let mut interval = tokio::time::interval(POLL);
@@ -313,11 +397,12 @@ impl ProjectsHandler {
                 loop {
                     tokio::select! {
                         _ = interval.tick() => {},
-                        _ = wake.notified() => {},
+                        _ = signals.notified() => {},
                         Some(result) = tasks.join_next_with_id(), if !tasks.is_empty() => {
                             owners.joined(&worker, result).await;
                         }
                     }
+                    signals.handled();
                     if worker.store.upgrade().is_none() {
                         break;
                     }
@@ -360,6 +445,8 @@ impl ProjectsHandler {
                             }
                         }
                     }
+                    #[cfg(test)]
+                    signals.finished();
                 }
             };
             tokio::select! {
@@ -396,9 +483,192 @@ pub(crate) fn backoff(attempts: i64) -> Duration {
 }
 
 #[cfg(test)]
+pub(crate) mod reconnect_test {
+    use super::*;
+    use crate::log_client::{LogConnector, LogTransport, TransportError};
+    use std::sync::{atomic::AtomicBool, Mutex};
+
+    struct Probe {
+        inner: Arc<dyn LogTransport>,
+        subject: String,
+        reads: tokio::sync::watch::Sender<usize>,
+        blocked: AtomicBool,
+        release: tokio::sync::Semaphore,
+    }
+
+    struct Transport(Arc<Probe>);
+
+    #[async_trait::async_trait]
+    impl LogTransport for Transport {
+        async fn call(
+            &self,
+            method: &str,
+            params: serde_json::Value,
+        ) -> Result<Vec<u8>, TransportError> {
+            if method == "record.read" && params["subject"] == self.0.subject {
+                self.0.reads.send_modify(|reads| *reads += 1);
+                if self.0.blocked.swap(false, Ordering::Relaxed) {
+                    self.0.release.acquire().await.unwrap().forget();
+                }
+            }
+            self.0.inner.call(method, params).await
+        }
+    }
+
+    pub(crate) struct Connector {
+        probe: Arc<Probe>,
+        current: Mutex<Arc<dyn LogTransport>>,
+        pub(crate) fail: AtomicBool,
+    }
+
+    impl Connector {
+        pub(crate) fn new(
+            inner: Arc<dyn LogTransport>,
+            subject: String,
+            blocked: bool,
+        ) -> Arc<Self> {
+            let probe = Arc::new(Probe {
+                inner,
+                subject,
+                reads: tokio::sync::watch::channel(0).0,
+                blocked: AtomicBool::new(blocked),
+                release: tokio::sync::Semaphore::new(0),
+            });
+            Arc::new(Self {
+                current: Mutex::new(Arc::new(Transport(probe.clone()))),
+                probe,
+                fail: AtomicBool::new(false),
+            })
+        }
+
+        pub(crate) fn replace(&self) {
+            *self.current.lock().unwrap() = Arc::new(Transport(self.probe.clone()));
+        }
+
+        pub(crate) fn release(&self) {
+            self.probe.release.add_permits(1);
+        }
+
+        pub(crate) async fn wait_for_reads(&self, expected: usize) {
+            let mut reads = self.probe.reads.subscribe();
+            tokio::time::timeout(Duration::from_secs(5), reads.wait_for(|n| *n >= expected))
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for read {expected}"))
+                .unwrap();
+            assert_eq!(*reads.borrow(), expected, "unexpected extra record read");
+        }
+
+        pub(crate) async fn quiet_for(&self, expected: usize, duration: Duration) {
+            let mut reads = self.probe.reads.subscribe();
+            assert!(
+                tokio::time::timeout(duration, reads.wait_for(|n| *n > expected))
+                    .await
+                    .is_err(),
+                "unexpected record read before the poll interval"
+            );
+            assert_eq!(*reads.borrow(), expected);
+        }
+
+        pub(crate) async fn check_polling(&self, connector: &ReconnectConnector, mid_poll: bool) {
+            self.wait_for_reads(1).await;
+            let mut passes = connector.wake.passes.subscribe();
+            if !mid_poll {
+                tokio::time::timeout(Duration::from_secs(5), passes.wait_for(|n| *n >= 1))
+                    .await
+                    .expect("startup pass did not finish")
+                    .unwrap();
+            }
+            let start = tokio::time::Instant::now();
+            // Reusing the same transport is not a reconnect, even after a failed
+            // connection attempt; only replacing that transport warrants a poll.
+            connector.connect().await.unwrap();
+            self.fail.store(true, Ordering::Relaxed);
+            assert!(connector.connect().await.is_err());
+            self.fail.store(false, Ordering::Relaxed);
+            connector.connect().await.unwrap();
+            self.replace();
+            connector.connect().await.unwrap();
+            connector.connect().await.unwrap();
+            if mid_poll {
+                self.release();
+            }
+            self.wait_for_reads(2).await;
+            tokio::time::timeout(Duration::from_secs(5), passes.wait_for(|n| *n >= 2))
+                .await
+                .expect("reconnect pass did not finish")
+                .unwrap();
+            self.quiet_for(2, Duration::from_secs(29)).await;
+            assert_eq!(start.elapsed(), Duration::from_secs(29));
+            self.wait_for_reads(3).await;
+            assert_eq!(start.elapsed(), POLL);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LogConnector for Connector {
+        async fn connect(&self) -> Result<Arc<dyn LogTransport>, TransportError> {
+            if self.fail.load(Ordering::Relaxed) {
+                Err(TransportError::Unavailable)
+            } else {
+                Ok(self.current.lock().unwrap().clone())
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::{future::Future, task::Poll};
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_generations_broadcast_and_coalesce_independently() {
+        let wake = Arc::new(MoveWake::default());
+        let transport: Arc<dyn crate::log_client::LogTransport> =
+            crate::fake_record::FakeRecord::new([1; 16]);
+        let retained = Arc::downgrade(&transport);
+        let mut waiting = wake.subscribe();
+        let mut busy = wake.subscribe();
+        wake.connected(transport.clone());
+        drop(transport);
+        assert!(
+            retained.upgrade().is_some(),
+            "last transport must stay alive"
+        );
+        wake.connected(retained.upgrade().unwrap());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), waiting.notified())
+                .await
+                .is_err()
+        );
+        wake.connected(crate::fake_record::FakeRecord::new([2; 16]));
+        assert!(retained.upgrade().is_none());
+        tokio::time::timeout(Duration::from_secs(1), waiting.notified())
+            .await
+            .unwrap();
+        waiting.handled();
+        // The busy subscriber has not handled either replacement. Both updates
+        // collapse into one follow-up without consuming the waiting subscriber's wake.
+        wake.connected(crate::fake_record::FakeRecord::new([3; 16]));
+        tokio::time::timeout(Duration::from_secs(1), busy.notified())
+            .await
+            .unwrap();
+        busy.handled();
+        tokio::time::timeout(Duration::from_secs(1), waiting.notified())
+            .await
+            .unwrap();
+        waiting.handled();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), busy.notified())
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), waiting.notified())
+                .await
+                .is_err()
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn panicked_cut_releases_owner_records_hold_and_redrives_after_backoff() {

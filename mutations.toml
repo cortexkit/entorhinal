@@ -5769,3 +5769,84 @@ runner = "cargo"
 package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 expect_red = ["catalog_network::tests::status_write_unavailable_is_retryable_but_sequence_conflict_is_not"]
+
+[[control]]
+id = "move-reconnect-extra-notify-permit"
+guards = "Cached connection acquisition must not broadcast or leave an extra move poll permit"
+file = "crates/entorhinal-module/src/move_driver.rs"
+old = "self.wake.connected(transport.clone());"
+new = '''self.wake.connected(transport.clone());
+        self.wake.notify_waiters();
+        self.wake.notify_one(); // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-module/src/move_receiver.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["move_receiver::tests::receiver_driver_polls_inbox_at_startup_every_thirty_seconds_and_on_reconnect"]
+
+[[control]]
+id = "move-driver-forgets-mid-poll-reconnect"
+guards = "An inbox poll using the old transport retains one follow-up after replacement"
+file = "crates/entorhinal-module/src/move_driver.rs"
+old = "let _ = poll_inbox(&worker).await;"
+new = '''let _ = poll_inbox(&worker).await;
+                    signals.handled(); // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-module/src/move_receiver.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["move_receiver::tests::receiver_driver_reconnect_mid_poll_gives_exactly_one_follow_up"]
+
+[[control]]
+id = "move-source-forgets-busy-reconnect"
+guards = "A source retains its own reconnect subscription across in-flight ticks"
+file = "crates/entorhinal-module/src/move_source.rs"
+old = '''    pub(crate) async fn run(mut self) {
+        let mut signals = self.worker.wake.subscribe();
+        let mut delay = Duration::ZERO;
+        loop {'''
+new = '''    pub(crate) async fn run(mut self) {
+        let mut delay = Duration::ZERO;
+        loop {
+            let mut signals = self.worker.wake.subscribe(); // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-module/src/move_source.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["move_source::tests::source_reconnect_polls_once_waiting_and_mid_poll"]
+
+[[control]]
+id = "move-receiver-forgets-busy-reconnect"
+guards = "A receiver retains its own reconnect subscription across in-flight ticks"
+file = "crates/entorhinal-module/src/move_receiver.rs"
+old = '''    pub(crate) async fn run(mut self) {
+        let mut signals = self.worker.wake.subscribe();
+        let mut delay = Duration::ZERO;
+        loop {'''
+new = '''    pub(crate) async fn run(mut self) {
+        let mut delay = Duration::ZERO;
+        loop {
+            let mut signals = self.worker.wake.subscribe(); // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-module/src/move_receiver.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["move_receiver::tests::receiver_reconnect_polls_once_waiting_and_mid_poll"]
+
+[[control]]
+id = "move-cut-accept-forgets-busy-reconnect"
+guards = "A cut-accept task retains its own reconnect subscription across in-flight ticks"
+file = "crates/entorhinal-module/src/move_receiver.rs"
+old = '''    pub(crate) async fn run(self) {
+        let mut signals = self.worker.wake.subscribe();
+        let mut delay = Duration::ZERO;
+        loop {'''
+new = '''    pub(crate) async fn run(self) {
+        let mut delay = Duration::ZERO;
+        loop {
+            let mut signals = self.worker.wake.subscribe(); // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-module/src/move_receiver.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["move_receiver::tests::cut_accept_reconnect_polls_once_waiting_and_mid_poll"]
