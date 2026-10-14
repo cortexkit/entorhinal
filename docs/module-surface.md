@@ -13,6 +13,17 @@ tool-provider role). It requires none. It calls engram only to write or read
 shared state and serves every read without it, so declaring engram `required`
 would make the daemon refuse reads while engram is down.
 
+## Health
+
+`ck health entorhinal` reports cached health gauges and request latency without
+waiting for the store slot. The `latency` object has fixed `resolve`,
+`resolve_project_id`, `enumerate`, `agent.resolve` and `other` buckets; each
+contains `count`, `totalUs`, `maxUs`, `over500ms` and `over3s`. `storeUnavailable`
+counts requests refused before storage was ready, and `ready_after_ms` records
+the first successful store-open time from process start. Requests slower than
+500 ms also emit one fleet warning; a `resolve` warning includes its
+`canonical_root`.
+
 ## Admission, in general
 
 The daemon stamps each route with a principal when it opens. entorhinal

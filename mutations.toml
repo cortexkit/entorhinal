@@ -1227,8 +1227,8 @@ expect_red = ["startup_tests::serve_returns_the_refusal_or_the_serve_result"]
 id = "s1-store-unavailable"
 guards = "A bare served handler replies promptly with store_unavailable after startup refusal"
 file = "crates/entorhinal-module/src/main.rs"
-old = 'return HandlerError::new("store_unavailable", error).into_outcome();'
-new = 'return HandlerError::new("NON-VACUITY BREAK", error).into_outcome();'
+old = 'HandlerError::new("store_unavailable", error).into_outcome()'
+new = 'HandlerError::new("NON-VACUITY BREAK", error).into_outcome()'
 test_file = "crates/entorhinal-module/src/main.rs"
 runner = "cargo"
 package = "entorhinal-module"
@@ -5266,6 +5266,31 @@ runner = "cargo"
 package = "entorhinal-catalog"
 target = "--test guards"
 expect_red = ["resolver_is_deterministic"]
+
+
+[[control]]
+id = "request-latency-500ms-threshold"
+guards = "Requests exceeding 500 ms increment their operation bucket threshold counter"
+file = "crates/entorhinal-module/src/main.rs"
+old = "self.over_500ms.fetch_add(1, Ordering::Relaxed);"
+new = "self.over_500ms.fetch_add(0, Ordering::Relaxed); // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/main.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tests::request_latency_records_operation_counts_and_thresholds"]
+
+[[control]]
+id = "request-latency-operation-attribution"
+guards = "Resolve request latency is recorded in the resolve bucket, not another operation bucket"
+file = "crates/entorhinal-module/src/main.rs"
+old = "RequestOperation::Resolve => &self.resolve,"
+new = "RequestOperation::Resolve => &self.resolve_project_id, // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/main.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tests::request_latency_records_operation_counts_and_thresholds"]
 
 [[control]]
 id = "resolve-worktree-token-match"
