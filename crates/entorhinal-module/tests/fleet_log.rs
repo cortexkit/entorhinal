@@ -1,5 +1,5 @@
-//! Module mode logs through the fleet logger (docs/specs/fleet-logging.md in
-//! the subconscious repo): a dated segment under the module's data dir, which
+//! Module mode logs through the fleet logger (docs/logging.md in the
+//! subconscious repo): a dated segment under the module's data dir, which
 //! is what `ck module logs entorhinal` reads. Both arms spawn the real binary
 //! with an isolated environment, because the path is resolved by the child
 //! from its own environment and no shared test helper can isolate that.
