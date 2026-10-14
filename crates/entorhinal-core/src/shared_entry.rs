@@ -633,6 +633,7 @@ mod tests {
                     // Consent decisions, retry state, audit and hire limits stay local.
                     "consent_grant",
                     "consent_request",
+                    "consent_write_plan",
                     "consent_feed_cursor",
                     "agent_audit",
                     "project_hire_cap",

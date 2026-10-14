@@ -444,6 +444,8 @@ struct ProjectsHandler {
     /// Volatile reply token: never persisted in the request-key cache.
     incarnation: String,
     clock: fn() -> i64,
+    consent_coordinator: consent::ConsentCoordinator,
+    consent_connector: Arc<dyn consent_client::ConsentConnector>,
     commits: Arc<tokio::sync::Notify>,
     feed_waits: tokio::sync::Semaphore,
     feed_clock: Arc<dyn agent_reads::FeedClock>,
@@ -717,6 +719,12 @@ impl ProjectsHandler {
             route_admissions,
             incarnation,
             clock,
+            consent_coordinator: consent::ConsentCoordinator::default(),
+            consent_connector: Arc::new(consent_client::SubcCingulate {
+                connector: Arc::new(log_client::SubcConnector::from_args(
+                    std::env::args_os().skip(1),
+                )),
+            }),
             commits: Arc::new(tokio::sync::Notify::new()),
             feed_waits: tokio::sync::Semaphore::new(8),
             feed_clock: Arc::new(agent_reads::TokioFeedClock),
@@ -1084,7 +1092,7 @@ impl ProjectsHandler {
     async fn handle_served_request(&self, body: &[u8], key: RouteKey) -> HandlerOutcome {
         if let Ok(value) = serde_json::from_slice::<Value>(body) {
             if value.get("name").is_some() {
-                return self.handle_tool_request(value, key);
+                return self.handle_tool_request(value, key).await;
             }
         }
         let received = tokio::time::Instant::now();

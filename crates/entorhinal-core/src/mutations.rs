@@ -48,6 +48,12 @@ pub struct AssignWorkspaceRequest {
     pub actor: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateWorkspaceRequest {
+    pub workspace_id: String,
+    pub name: String,
+}
+
 /// Set or clear a workspace's root directory. `root: null` clears it.
 ///
 /// The root is operator-set data, never derived from member paths: prefrontal
@@ -413,6 +419,27 @@ impl RegistryStore {
 }
 
 impl super::JournalWriter<'_> {
+    pub fn create_workspace_at(
+        &self,
+        req: CreateWorkspaceRequest,
+        now: i64,
+    ) -> Result<Vec<u8>, RegistryError> {
+        let workspace_id = super::agent::validate_workspace_id(&req.workspace_id)
+            .map_err(|e| domain("invalid_workspace_id", e.to_string()))?;
+        let name = req.name.trim().to_owned();
+        if name.is_empty() {
+            return Err(domain("invalid_name", "workspace name must not be empty"));
+        }
+        let payload = json!({"workspace_id":workspace_id,"name":name});
+        self.mutation("create_workspace", None, |tx| {
+            if tx.query_row("SELECT EXISTS(SELECT 1 FROM workspace WHERE workspace_id=?1)", [&workspace_id], |r| r.get::<_,bool>(0))? {
+                return Err(domain("workspace_exists", &workspace_id));
+            }
+            let seq = append(tx, "create_workspace", &payload, "module", None, now, self.principal)?;
+            tx.execute("INSERT INTO workspace(workspace_id,name,created_at,updated_at) VALUES(?1,?2,?3,?3)", params![workspace_id,name,now])?;
+            Ok(Action { changed:true, seq:Some(seq), value:json!({"workspaceId":workspace_id,"name":name}), payload })
+        })
+    }
     pub(crate) fn mutation<F>(
         &self,
         op: &str,
@@ -453,6 +480,10 @@ impl super::JournalWriter<'_> {
             // log. The write records what it would carry in the probe.
             let copy = self.read(super::read_connection::copy_snapshot)?;
             let tx = copy.unchecked_transaction().map_err(RegistryError::from)?;
+            if let Some(commit) = &self.consent {
+                super::agent::consent::admit_commit(&tx, commit)
+                    .map_err(|e| E::from(RegistryError::from(e)))?;
+            }
             let outcome = action(&tx);
             tx.rollback().map_err(RegistryError::from)?;
             return outcome.map(|_| Vec::new());
@@ -1611,6 +1642,15 @@ fn replay(
     enabled: bool,
 ) -> rusqlite::Result<()> {
     if super::agent::replay_agent_entry(tx, op, &v)? {
+        return Ok(());
+    }
+    if op == "create_workspace" {
+        let req: CreateWorkspaceRequest =
+            serde_json::from_value(v).map_err(super::shared_entry::decode_error)?;
+        tx.execute(
+            "INSERT INTO workspace(workspace_id,name,created_at,updated_at) VALUES(?1,?2,?3,?3)",
+            params![req.workspace_id, req.name, now],
+        )?;
         return Ok(());
     }
     if super::binding::replay_binding_op(tx, seq, op, &v)?

@@ -2384,6 +2384,10 @@ mod tests {
 
 #[derive(Clone)]
 enum Write {
+    Consent(
+        entorhinal_core::agent::consent::ConsentWrite,
+        Box<entorhinal_core::agent::consent::ConsentCommit>,
+    ),
     Register(RegisterRequest),
     Assign(AssignWorkspaceRequest),
     Upgrade(UpgradeImplicitRequest),
@@ -2422,6 +2426,23 @@ impl Write {
         principal: &str,
     ) -> Result<Option<Vec<u8>>, HandlerError> {
         let key = match self {
+            Self::Consent(_, commit) => {
+                let row = store.consent_request(&commit.request.identity)?;
+                if let Some(row) = row {
+                    if row.args_digest != commit.request.args_digest {
+                        return Err(HandlerError::new(
+                            "request_key_conflict",
+                            "request key has different arguments",
+                        ));
+                    }
+                    if row.state != entorhinal_core::agent::consent::RequestState::Awaiting {
+                        return serde_json::to_vec(&json!({"result":row.outcome}))
+                            .map(Some)
+                            .map_err(invalid_params);
+                    }
+                }
+                return Ok(None);
+            }
             Self::Register(r) => r.request_key.as_deref(),
             Self::Assign(r) => r.request_key.as_deref(),
             Self::Upgrade(r) => r.request_key.as_deref(),
@@ -2451,6 +2472,12 @@ impl Write {
             .with_principal(principal)
             .with_confirmation(placement_confirmation(principal, approval));
         match self {
+            Self::Consent(plan, commit) => {
+                return writer
+                    .with_consent_commit(*commit)
+                    .apply_consent_write(&plan, now, (!agent_id.is_empty()).then_some(agent_id))
+                    .map_err(Into::into)
+            }
             Self::Register(r) => writer.register_at(r, now),
             Self::Assign(r) => writer.assign_workspace_at(r, now),
             Self::Upgrade(r) => writer.upgrade_implicit_at(r, now),
@@ -2566,25 +2593,62 @@ fn bootstrap_fence(
 }
 
 impl ProjectsHandler {
+    pub(super) async fn consent_write_wait(
+        &self,
+        plan: entorhinal_core::agent::consent::ConsentWrite,
+        commit: entorhinal_core::agent::consent::ConsentCommit,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, HandlerError> {
+        self.write_wait_inner(
+            WireRequest {
+                method: "agent.consent_write".into(),
+                params: Value::Null,
+            },
+            (0, 0),
+            Instant::now(),
+            Some(Write::Consent(plan, Box::new(commit))),
+            Some(deadline),
+        )
+        .await
+    }
+
     pub(super) async fn write_wait(
+        &self,
+        request: WireRequest,
+        key: RouteKey,
+        received: Instant,
+    ) -> Result<Vec<u8>, HandlerError> {
+        self.write_wait_inner(request, key, received, None, None)
+            .await
+    }
+
+    async fn write_wait_inner(
         &self,
         mut request: WireRequest,
         key: RouteKey,
         received: Instant,
+        consent: Option<Write>,
+        consent_deadline: Option<Instant>,
     ) -> Result<Vec<u8>, HandlerError> {
+        let agent_write = consent.is_some();
         // Only the served async path can confirm Direct. admit/execute remain
         // unconfirmed, including synchronous tests and non-confirmable methods.
         let admission = self.admission_for(key);
-        let direct = matches!(admission.principal, Some(Principal::Direct))
+        let direct = !agent_write
+            && matches!(admission.principal, Some(Principal::Direct))
             && agent_ops::CONFIRMABLE_METHODS.contains(&request.method.as_str());
         refuse_flow_write(&request.method, admission.flow_id.as_deref())?;
         if request.method == super::member::SET_NAME {
             super::member::admit(admission.principal.as_ref())?;
         }
-        if !direct {
+        if !direct && !agent_write {
             authorize_write(&request.method, admission.principal.as_ref())?;
         }
-        let principal = principal_label(admission.principal.as_ref());
+        let principal = if agent_write {
+            "agent".into()
+        } else {
+            principal_label(admission.principal.as_ref())
+        };
         // Liveness is volatile, not a SQLite mutation. It must not queue behind
         // a transaction waiting for the log.
         if request.method == "projects.session_liveness" {
@@ -2610,10 +2674,20 @@ impl ProjectsHandler {
             request.params = serde_json::to_value(name).expect("member name encodes");
         }
         let state = store.identity_log_status().map_err(storage_error)?.state;
-        let candidate = shared_candidate(&request.method);
-        let prepared = candidate
-            .then(|| Write::decode(&request.method, request.params.clone()))
-            .transpose()?;
+        let candidate = agent_write || shared_candidate(&request.method);
+        let prepared = if agent_write {
+            consent
+        } else {
+            candidate
+                .then(|| Write::decode(&request.method, request.params.clone()))
+                .transpose()?
+        };
+        if agent_write && matches!(state.as_str(), "enabling" | "joining") {
+            return Err(HandlerError::new(
+                "identity_log_enabling",
+                "identity log bootstrap is in progress",
+            ));
+        }
         bootstrap_fence(&store, &state, &request)?;
         let mut confirmation = None;
         let mut approval = None;
@@ -2673,7 +2747,9 @@ impl ProjectsHandler {
                 }
             }
         }
-        let deadline = if direct {
+        let deadline = if let Some(deadline) = consent_deadline {
+            deadline
+        } else if direct {
             (budget_start + DEADLINE).min(received + OPERATOR_BOUND)
         } else {
             received + DEADLINE
@@ -2693,8 +2769,21 @@ impl ProjectsHandler {
         })?;
         // Re-read after the lock: enable/join can change state while we queue.
         let state = store.identity_log_status().map_err(storage_error)?.state;
+        if agent_write && matches!(state.as_str(), "enabling" | "joining") {
+            return Err(HandlerError::new(
+                "identity_log_enabling",
+                "identity log bootstrap is in progress",
+            ));
+        }
         bootstrap_fence(&store, &state, &request)?;
         if state != "enabled" || !candidate {
+            if agent_write {
+                let body = prepared
+                    .unwrap()
+                    .run(&store, &principal, (self.clock)(), "", None)?;
+                self.commits.notify_waiters();
+                return self.record_mutation(Ok(body));
+            }
             if let Some(approval) = &approval {
                 let before = store.generation().map_err(storage_error)?;
                 let body = prepared.unwrap().run(
@@ -2735,12 +2824,16 @@ impl ProjectsHandler {
             };
         }
         let now = (self.clock)();
-        let agent_id = if request.method == "agent.create" {
+        let agent_id = if request.method == "agent.create"
+            || matches!(&write, Write::Consent(plan,_) if matches!(plan.tool.as_str(), "agents_hire" | "agents_create_head"))
+        {
             (self.agent_id_draw)()?
         } else {
             String::new()
         };
-        let settlement = if direct {
+        let settlement = if agent_write {
+            (received + SETTLEMENT).min(deadline)
+        } else if direct {
             (budget_start + SETTLEMENT).min(received + OPERATOR_BOUND)
         } else {
             received + SETTLEMENT

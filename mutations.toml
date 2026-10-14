@@ -1093,8 +1093,8 @@ expect_red = ["shared_write::tests::confirmation::served::unanswered_prompt_is_w
 id = "direct-nonconfirmable-avatar-admission"
 guards = "The served write path still authorizes a non-confirmable Direct agent method before decoding it"
 file = "crates/entorhinal-module/src/shared_write.rs"
-old = "if !direct {\n            authorize_write(&request.method, admission.principal.as_ref())?;\n        }"
-new = "if !direct && request.method != \"agent.set_avatar\" { // NON-VACUITY BREAK\n            authorize_write(&request.method, admission.principal.as_ref())?;\n        }"
+old = "if !direct && !agent_write {\n            authorize_write(&request.method, admission.principal.as_ref())?;\n        }"
+new = "if !direct && !agent_write && request.method != \"agent.set_avatar\" { // NON-VACUITY BREAK\n            authorize_write(&request.method, admission.principal.as_ref())?;\n        }"
 test_file = "crates/entorhinal-module/src/shared_write.rs"
 runner = "cargo"
 package = "entorhinal-module"
@@ -3544,3 +3544,180 @@ runner = "cargo"
 package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 expect_red = ["consent::tests::fake_enforces_owner_dedup_cumulative_ack_tombstones_and_nonunique_reference"]
+
+# Consent-authorized tool execution
+[[control]]
+id = "agent-tool-body-conflict"
+guards = "A reused request key cannot replay an outcome for different canonical arguments"
+file = "crates/entorhinal-module/src/tool_writes.rs"
+old = 'if saved.args_digest != digest {'
+new = 'if false && saved.args_digest != digest { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/tool_writes_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tool_provider::writes::tests::request_conflict_and_crash_after_commit_replay_do_not_remint_revoked_grant"]
+
+[[control]]
+id = "agent-tool-terminal-outcome"
+guards = "A committed terminal request replays after restart and a new epoch without reminting permission"
+file = "crates/entorhinal-module/src/tool_writes.rs"
+old = 'return replay(saved.outcome.clone().expect("terminal outcome"));'
+new = 'return Err(HandlerError::new("consent_lost", "NON-VACUITY BREAK: discard terminal outcome"));'
+test_file = "crates/entorhinal-module/src/tool_writes_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tool_provider::writes::tests::request_conflict_and_crash_after_commit_replay_do_not_remint_revoked_grant"]
+
+[[control]]
+id = "agent-tool-standing-grant-first"
+guards = "A live standing grant covers another write without raising another card"
+file = "crates/entorhinal-module/src/tool_writes.rs"
+old = 'let grant = if saved.is_none() {'
+new = 'let grant = if false && saved.is_none() { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/tool_writes_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tool_provider::writes::tests::hire_card_grant_cap_and_own_retirement_acceptance"]
+
+[[control]]
+id = "agent-tool-durable-card-target"
+guards = "The original card target survives a detached retry and restart"
+file = "crates/entorhinal-module/src/consent.rs"
+old = 'tx.save_write_plan(&row.identity, plan)?;'
+new = 'let _ = plan; // NON-VACUITY BREAK: forget the approved target'
+test_file = "crates/entorhinal-module/src/tool_writes_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tool_provider::writes::tests::detached_approval_keeps_its_original_placement_after_restart"]
+
+[[control]]
+id = "agent-tool-placement-at-commit"
+guards = "An approved card cannot authorize a write after its project moves to another workspace"
+file = "crates/entorhinal-core/src/agent/consent.rs"
+old = 'if fresh != plan {'
+new = 'if false && fresh != plan { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/tool_writes_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tool_provider::writes::tests::detached_approval_keeps_its_original_placement_after_restart"]
+
+[[control]]
+id = "agent-tool-role-at-commit"
+guards = "Workspace creation rechecks the stored assistant role inside the write transaction"
+file = "crates/entorhinal-core/src/agent/consent.rs"
+old = 'if caller.role != role {'
+new = 'if false && caller.role != role { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/tool_writes_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tool_provider::writes::tests::assistant_role_and_grant_scope_are_rechecked_inside_commit"]
+
+[[control]]
+id = "agent-tool-grant-target-at-commit"
+guards = "A live grant for another class and scope cannot authorize a hire"
+file = "crates/entorhinal-core/src/agent/consent.rs"
+old = '''if grant
+                .as_ref()
+                .map(|(class, scope)| (class.as_str(), scope.as_str()))
+                != plan
+                    .grant_class
+                    .as_ref()
+                    .zip(plan.scope_id.as_deref())
+                    .map(|(class, scope)| (class.as_str(), scope))'''
+new = '''if false && grant.as_ref().map(|(class, scope)| (class.as_str(), scope.as_str())) != plan.grant_class.as_ref().zip(plan.scope_id.as_deref()).map(|(class, scope)| (class.as_str(), scope)) /* NON-VACUITY BREAK */'''
+test_file = "crates/entorhinal-module/src/tool_writes_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tool_provider::writes::tests::assistant_role_and_grant_scope_are_rechecked_inside_commit"]
+
+[[control]]
+id = "agent-tool-existing-workspace-only"
+guards = "Agent project registration cannot implicitly create its workspace"
+file = "crates/entorhinal-core/src/agent/consent.rs"
+old = 'let label = workspace(&id)?;'
+new = 'let label = String::new(); // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/tool_writes_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tool_provider::writes::tests::validation_refusals_raise_no_cards_or_request_rows"]
+
+[[control]]
+id = "agent-tool-project-name-and-dir-unoccupied"
+guards = "Agent project registration neither reuses a taken name nor renames a directory owner"
+file = "crates/entorhinal-core/src/agent/consent.rs"
+old = '"SELECT EXISTS(SELECT 1 FROM project WHERE name=?1 UNION ALL SELECT 1 FROM project_root WHERE canonical_root=?2 UNION ALL SELECT 1 FROM derived_root_parent WHERE canonical_parent=?2)"'
+new = '"SELECT 0 FROM (SELECT ?1,?2)" /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/tool_writes_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tool_provider::writes::tests::validation_refusals_raise_no_cards_or_request_rows"]
+
+[[control]]
+id = "agent-tool-own-hire-only"
+guards = "A head cannot retire a hire it does not supervise"
+file = "crates/entorhinal-core/src/agent/consent.rs"
+old = '&& hire.supervisor_agent_id.as_deref() == Some(caller_id)'
+new = '&& true /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/tool_writes_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tool_provider::writes::tests::validation_refusals_raise_no_cards_or_request_rows"]
+
+[[control]]
+id = "agent-workspace-duplicate-refusal"
+guards = "Workspace creation refuses an existing id with workspace_exists and writes nothing"
+file = "crates/entorhinal-core/src/mutations.rs"
+old = '"SELECT EXISTS(SELECT 1 FROM workspace WHERE workspace_id=?1)"'
+new = '"SELECT 0 FROM (SELECT ?1)" /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/tool_writes_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tool_provider::writes::tests::workspace_writer_refuses_duplicates_and_round_trips_journal"]
+
+[[control]]
+id = "agent-workspace-name-validation"
+guards = "Workspace creation refuses an empty trimmed name before journaling"
+file = "crates/entorhinal-core/src/mutations.rs"
+old = 'if name.is_empty() {'
+new = 'if false && name.is_empty() { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/tool_writes_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tool_provider::writes::tests::workspace_writer_refuses_duplicates_and_round_trips_journal"]
+
+[[control]]
+id = "agent-workspace-id-validation"
+guards = "Workspace ids retain the trimmed nonempty and 512-byte identity validation rule"
+file = "crates/entorhinal-core/src/mutations.rs"
+old = '''let workspace_id = super::agent::validate_workspace_id(&req.workspace_id)
+            .map_err(|e| domain("invalid_workspace_id", e.to_string()))?;'''
+new = '''let workspace_id = if req.workspace_id.trim().is_empty() { return Err(domain("invalid_workspace_id", "empty")); } else { req.workspace_id.trim().to_owned() }; // NON-VACUITY BREAK: no byte cap'''
+test_file = "crates/entorhinal-module/src/tool_writes_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tool_provider::writes::tests::workspace_writer_refuses_duplicates_and_round_trips_journal"]
+
+[[control]]
+id = "agent-tool-shared-write-path"
+guards = "Consent writes use shared_attempt and replicate authorization evidence when sharing is enabled"
+file = "crates/entorhinal-module/src/shared_write.rs"
+old = 'let candidate = agent_write || shared_candidate(&request.method);'
+new = 'let candidate = !agent_write && shared_candidate(&request.method); // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::consent_workspace_and_hire_replicate_without_local_authority_rows"]

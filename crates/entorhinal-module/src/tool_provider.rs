@@ -270,7 +270,12 @@ impl ProjectsHandler {
         Ok((admission, caller))
     }
 
-    fn execute_tool_request(&self, value: Value, key: RouteKey) -> Result<Vec<u8>, HandlerError> {
+    async fn execute_tool_request(
+        &self,
+        value: Value,
+        key: RouteKey,
+    ) -> Result<Vec<u8>, HandlerError> {
+        let deadline = tokio::time::Instant::now() + crate::consent_client::CALL_BUDGET;
         let name = value
             .get("name")
             .and_then(Value::as_str)
@@ -322,14 +327,15 @@ impl ProjectsHandler {
                 ));
             }
         }
-        validate_arguments(tool, arguments)?;
-        // No admitted call falls through to the operator's mutation methods.
-        // Agent execution must supply consent and commit-time authorization.
-        Err(provider_error(errors::tool_disabled(&request.name)))
+        if !tool.writes {
+            validate_arguments(tool, arguments)?;
+        }
+        self.execute_agent_tool(tool, arguments.clone(), admission, deadline)
+            .await
     }
 
-    pub(super) fn handle_tool_request(&self, value: Value, key: RouteKey) -> HandlerOutcome {
-        match self.execute_tool_request(value, key) {
+    pub(super) async fn handle_tool_request(&self, value: Value, key: RouteKey) -> HandlerOutcome {
+        match self.execute_tool_request(value, key).await {
             Ok(body) => HandlerOutcome::Response(body),
             Err(error) => error.into_outcome(),
         }
@@ -347,3 +353,6 @@ fn provider_error(error: subc_protocol::ErrorBody) -> HandlerError {
 #[cfg(test)]
 #[path = "tool_provider_tests.rs"]
 mod tests;
+
+#[path = "tool_writes.rs"]
+mod writes;

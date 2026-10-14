@@ -1740,3 +1740,97 @@ async fn two_machines_carry_and_correct_once_and_refuse_forged_claim_owner() {
     assert_eq!(b.shared(), state);
     assert_eq!(b.store().generation().unwrap(), head);
 }
+
+#[tokio::test(start_paused = true)]
+async fn consent_workspace_and_hire_replicate_without_local_authority_rows() {
+    use crate::fake_cingulate::{Effect, FakeCingulate};
+    use entorhinal_core::agent::consent::Authorization;
+    let log = FakeLog::default();
+    let mut a = Machine::new("consent-shared-a", Arc::new(log.with_author([0x11; 16])));
+    let b = Machine::new("consent-shared-b", Arc::new(log.with_author([0x22; 16])));
+    a.enable_without_agents().await;
+    b.enable_without_agents().await;
+    let assistant = a
+        .call(
+            "agent.create",
+            json!({"role":"assistant","name":"Janitor","tag":"helper","request_key":"assistant"}),
+        )
+        .await
+        .unwrap()["agent"]["agent_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let fake = FakeCingulate::new();
+    fake.set_now(700);
+    a.handler.consent_connector = Arc::new(fake.clone());
+    let stamp = |id: &str| {
+        serde_json::from_value::<subc_protocol::scope::ScopeStamp>(json!({"owner":{"kind":"reserved","module_id":"prefrontal"},"ref":format!("head:{id}"),"scope_epoch":7,"kind":"head","attributes":{"agent_id":id},"owner_authorized":true})).unwrap()
+    };
+    let tool = (80, 2);
+    a.handler.route_admissions().insert(
+        tool,
+        RouteAdmission::from_bind(
+            Some(Principal::Reserved {
+                module_id: "prefrontal".into(),
+            }),
+            Some(&stamp(&assistant)),
+        ),
+    );
+    fake.script("consent.await", Effect::Answer("approve_once"));
+    let body = serde_json::to_vec(&json!({"name":"projects_create_workspace","arguments":{"workspace_id":"W","name":"Workspace","request_key":"workspace"}})).unwrap();
+    let outcome = drive(a.handler.handle_served_request(&body, tool)).await;
+    assert!(
+        matches!(outcome, HandlerOutcome::Response(_)),
+        "{outcome:?}"
+    );
+    b.catch_up().await;
+    assert_eq!(a.rows("workspace"), b.rows("workspace"));
+    a.call(
+        "register",
+        json!({"projectId":"P","name":"Project","workspaceId":"W","roots":[]}),
+    )
+    .await
+    .unwrap();
+    let head = a
+        .call(
+            "agent.create",
+            json!({"role":"head","name":"Head","tag":"head","project_id":"P","request_key":"head"}),
+        )
+        .await
+        .unwrap()["agent"]["agent_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    a.handler.route_admissions().insert(
+        tool,
+        RouteAdmission::from_bind(
+            Some(Principal::Reserved {
+                module_id: "prefrontal".into(),
+            }),
+            Some(&stamp(&head)),
+        ),
+    );
+    fake.script("consent.await", Effect::Answer("approve_always_project"));
+    let body = serde_json::to_vec(&json!({"name":"agents_hire","arguments":{"name":"Worker","tag":"worker","labels":["build"],"request_key":"hire"}})).unwrap();
+    let outcome = drive(a.handler.handle_served_request(&body, tool)).await;
+    assert!(
+        matches!(outcome, HandlerOutcome::Response(_)),
+        "{outcome:?}"
+    );
+    b.catch_up().await;
+    assert_eq!(a.rows("agent"), b.rows("agent"));
+    assert!(
+        matches!(b.store().agent_changes(0,None).unwrap().entries.last().unwrap().authorization,Some(Authorization::Card { ref answer, .. }) if answer == "approve_always_project")
+    );
+    for table in [
+        "consent_request",
+        "consent_write_plan",
+        "consent_grant",
+        "agent_audit",
+    ] {
+        assert!(b.rows(table).is_empty(), "local table {table} was synced");
+    }
+    assert_eq!(a.rows("consent_grant").len(), 1);
+    a.clean_rebuild().await;
+    b.clean_rebuild().await;
+}

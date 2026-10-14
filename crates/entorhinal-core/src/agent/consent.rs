@@ -41,6 +41,14 @@ CREATE TABLE consent_feed_cursor (
     cursor INTEGER NOT NULL,
     PRIMARY KEY(scope_ref,scope_epoch)
 );
+CREATE TABLE consent_write_plan (
+    agent_id TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    request_key TEXT NOT NULL,
+    plan_json TEXT NOT NULL,
+    PRIMARY KEY(agent_id,tool,request_key),
+    FOREIGN KEY(agent_id,tool,request_key) REFERENCES consent_request(agent_id,tool,request_key) ON DELETE CASCADE
+);
 CREATE TABLE agent_audit (
     row_id INTEGER PRIMARY KEY AUTOINCREMENT,
     time_ms INTEGER NOT NULL,
@@ -203,6 +211,15 @@ pub struct ConsentTransaction<'a, 'conn> {
     tx: &'a Transaction<'conn>,
 }
 impl ConsentTransaction<'_, '_> {
+    /// Preserve the target approved on the card across retries and restarts.
+    pub fn save_write_plan(
+        &self,
+        key: &RequestIdentity,
+        plan: &ConsentWrite,
+    ) -> Result<(), AgentMutationError> {
+        self.tx.execute("INSERT OR IGNORE INTO consent_write_plan(agent_id,tool,request_key,plan_json) VALUES(?1,?2,?3,?4)", params![key.agent_id,key.tool,key.request_key,encode(plan)?])?;
+        Ok(())
+    }
     pub fn request(
         &self,
         key: &RequestIdentity,
@@ -327,6 +344,12 @@ impl ConsentTransaction<'_, '_> {
 }
 
 impl RegistryStore {
+    pub fn consent_write_plan(
+        &self,
+        key: &RequestIdentity,
+    ) -> Result<Option<ConsentWrite>, RegistryError> {
+        self.read(|conn| conn.query_row("SELECT plan_json FROM consent_write_plan WHERE agent_id=?1 AND tool=?2 AND request_key=?3", params![key.agent_id,key.tool,key.request_key], |r| decode(r.get(0)?)).optional())
+    }
     pub fn agent_audit_page(
         &self,
         since_ms: Option<i64>,
@@ -527,7 +550,11 @@ pub(crate) fn complete(
         time_ms: commit.now_ms,
         agent_id: commit.request.identity.agent_id.clone(),
         action: commit.action.clone(),
-        target: commit.target.clone(),
+        target: commit
+            .target
+            .get("target")
+            .unwrap_or(&commit.target)
+            .clone(),
         authorization: commit.authorization.clone(),
         outcome: outcome.clone(),
     })?;
@@ -555,6 +582,49 @@ pub(crate) fn admit_commit(
             return Ok(request.outcome);
         }
     }
+    if commit.target.get("tool").is_some() {
+        let plan: ConsentWrite = serde_json::from_value(commit.target.clone())
+            .map_err(|e| AgentMutationError::new("invalid_request", e.to_string()))?;
+        let fresh = prepare_write(
+            conn,
+            &commit.request.identity.agent_id,
+            &plan.tool,
+            &plan.arguments,
+        )
+        .map_err(|e| match e.code.as_str() {
+            "gone" | "hire_cap_reached" | "not_your_hire" => e,
+            _ => AgentMutationError::new("consent_stale", e.message),
+        })?;
+        if fresh != plan {
+            return Err(AgentMutationError::new(
+                "consent_stale",
+                "approved target or placement changed",
+            ));
+        }
+        if let Authorization::Grant { id } = &commit.authorization {
+            let grant = conn
+                .query_row(
+                    "SELECT class,scope_id FROM consent_grant WHERE id=?1",
+                    [id],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            if grant
+                .as_ref()
+                .map(|(class, scope)| (class.as_str(), scope.as_str()))
+                != plan
+                    .grant_class
+                    .as_ref()
+                    .zip(plan.scope_id.as_deref())
+                    .map(|(class, scope)| (class.as_str(), scope))
+            {
+                return Err(AgentMutationError::new(
+                    "consent_stale",
+                    "grant no longer covers the target",
+                ));
+            }
+        }
+    }
     if let Authorization::Grant { id } = &commit.authorization {
         let live = grant_live(conn, id, &commit.request.identity.agent_id)?;
         if !live {
@@ -565,4 +635,241 @@ pub(crate) fn admit_commit(
         }
     }
     Ok(None)
+}
+
+/// A validated agent write. The target records the project and workspace ids
+/// (and their displayed names) that will appear on the consent card. Keeping that
+/// snapshot separate from arguments prevents a retry after a project move from
+/// applying approval for the old workspace to the new one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsentWrite {
+    pub tool: String,
+    pub arguments: Value,
+    pub target: Value,
+    pub grant_class: Option<GrantClass>,
+    pub scope_id: Option<String>,
+}
+
+fn prepare_write(
+    conn: &Connection,
+    caller_id: &str,
+    tool: &str,
+    arguments: &Value,
+) -> Result<ConsentWrite, AgentMutationError> {
+    super::store::require_cutover(conn)?;
+    let caller = load_row(conn, caller_id)?
+        .ok_or_else(|| AgentMutationError::new("unknown_agent", "unknown requesting agent"))?;
+    if caller.status != "live" {
+        return Err(AgentMutationError::new("gone", "requesting agent is gone"));
+    }
+    let role = match tool {
+        "projects_create_workspace" | "projects_register" | "agents_create_head" => "assistant",
+        "agents_hire" | "agents_retire_hire" => "head",
+        _ => return Err(AgentMutationError::new("unknown_tool", tool)),
+    };
+    if caller.role != role {
+        return Err(AgentMutationError::new(
+            "role_forbidden",
+            "stored role cannot perform this write",
+        ));
+    }
+    let text = |field: &str| {
+        arguments[field].as_str().ok_or_else(|| {
+            AgentMutationError::new("invalid_request", format!("missing string {field}"))
+        })
+    };
+    let workspace = |id: &str| -> Result<String, AgentMutationError> {
+        conn.query_row(
+            "SELECT name FROM workspace WHERE workspace_id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| AgentMutationError::new("unknown_workspace", "workspace must already exist"))
+    };
+    let project = |id: &str| -> Result<Value, AgentMutationError> {
+        conn.query_row("SELECT p.name,pw.workspace_id FROM project p LEFT JOIN project_workspace pw ON pw.project_id=p.project_id WHERE p.project_id=?1", [id], |r| Ok(json!({"project_id":id,"name":r.get::<_,String>(0)?,"workspace_id":r.get::<_,Option<String>>(1)?}))).optional()?.ok_or_else(|| AgentMutationError::new("unknown_project", "project must already exist"))
+    };
+    let (target, grant_class, scope_id) = match tool {
+        "projects_create_workspace" => {
+            let id = super::validate_workspace_id(text("workspace_id")?)
+                .map_err(|e| AgentMutationError::new("invalid_workspace_id", e.to_string()))?;
+            if conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workspace WHERE workspace_id=?1)",
+                [&id],
+                |r| r.get::<_, bool>(0),
+            )? {
+                return Err(AgentMutationError::new(
+                    "workspace_exists",
+                    "workspace already exists",
+                ));
+            }
+            (
+                json!({"kind":"workspace","label":text("name")?.trim(),"workspace_id":id}),
+                None,
+                None,
+            )
+        }
+        "projects_register" => {
+            let id = super::validate_workspace_id(text("workspace_id")?)
+                .map_err(|e| AgentMutationError::new("invalid_workspace_id", e.to_string()))?;
+            let label = workspace(&id)?;
+            let dir = crate::mutations::canonical(text("dir")?)?;
+            if conn.query_row("SELECT EXISTS(SELECT 1 FROM project WHERE name=?1 UNION ALL SELECT 1 FROM project_root WHERE canonical_root=?2 UNION ALL SELECT 1 FROM derived_root_parent WHERE canonical_parent=?2)", params![text("name")?,dir], |r| r.get::<_,bool>(0))? {
+                return Err(AgentMutationError::new("project_exists", "project name or directory already registered"));
+            }
+            (
+                json!({"kind":"project","label":text("name")?,"dir":dir,"workspace_id":id,"workspace_label":label}),
+                Some(GrantClass::RegisterProject),
+                Some(id),
+            )
+        }
+        "agents_create_head" => {
+            let id = super::validate_project_id(text("project_id")?)
+                .map_err(|e| AgentMutationError::new("invalid_project_id", e.to_string()))?;
+            let placement = project(&id)?;
+            let ws = placement["workspace_id"].as_str().ok_or_else(|| {
+                AgentMutationError::new("invalid_role_shape", "head requires a placed project")
+            })?;
+            let label = workspace(ws)?;
+            (
+                json!({"kind":"agent","label":text("name")?,"placement":placement,"workspace_label":label}),
+                Some(GrantClass::CreateHead),
+                Some(ws.to_owned()),
+            )
+        }
+        "agents_hire" => {
+            let id = caller.project_id.as_deref().ok_or_else(|| {
+                AgentMutationError::new("invalid_role_shape", "head requires a project")
+            })?;
+            check_hire_cap(conn, id)?;
+            (
+                json!({"kind":"agent","label":text("name")?,"placement":project(id)?}),
+                Some(GrantClass::Hire),
+                Some(id.to_owned()),
+            )
+        }
+        "agents_retire_hire" => {
+            let hire = load_row(conn, text("agent_id")?)?
+                .filter(|hire| {
+                    hire.status == "live"
+                        && hire.role == "hiree"
+                        && hire.supervisor_agent_id.as_deref() == Some(caller_id)
+                })
+                .ok_or_else(|| {
+                    AgentMutationError::new(
+                        "not_your_hire",
+                        "target must be the caller's live hire",
+                    )
+                })?;
+            (
+                json!({"kind":"agent","label":hire.name,"agent_id":hire.agent_id,"project_id":hire.project_id,"supervisor_agent_id":hire.supervisor_agent_id}),
+                None,
+                None,
+            )
+        }
+        _ => unreachable!(),
+    };
+    Ok(ConsentWrite {
+        tool: tool.into(),
+        arguments: arguments.clone(),
+        target,
+        grant_class,
+        scope_id,
+    })
+}
+
+impl RegistryStore {
+    /// Run the real phase-one write on a disposable snapshot, always rolling it
+    /// back. No database writer lock remains held while consent is awaited.
+    pub fn precheck_consent_write(
+        &self,
+        caller: &str,
+        tool: &str,
+        arguments: Value,
+        now: i64,
+    ) -> Result<ConsentWrite, AgentMutationError> {
+        let plan = self.read_agent(|conn| prepare_write(conn, caller, tool, &arguments))?;
+        let request = ConsentRequest {
+            identity: RequestIdentity {
+                agent_id: caller.into(),
+                tool: tool.into(),
+                request_key: "precheck".into(),
+            },
+            args_digest: String::new(),
+            scope_ref: String::new(),
+            scope_epoch: 0,
+            created_at_ms: now,
+            elicitation_id: None,
+            settlement: None,
+            state: RequestState::Awaiting,
+            outcome: None,
+        };
+        let summary = std::cell::RefCell::new(None);
+        let writer = JournalWriter {
+            store: self,
+            principal: "agent",
+            confirmation: super::PlacementConfirmation::NotRequired,
+            probe: Some(&summary),
+            consent: Some(ConsentCommit {
+                request,
+                authorization: Authorization::OwnHire,
+                action: tool.into(),
+                target: json!(plan),
+                granted: None,
+                now_ms: now,
+            }),
+        };
+        writer.apply_consent_write(&plan, now, None)?;
+        Ok(plan)
+    }
+}
+
+impl JournalWriter<'_> {
+    pub fn apply_consent_write(
+        &self,
+        plan: &ConsentWrite,
+        now: i64,
+        agent_id: Option<&str>,
+    ) -> Result<Vec<u8>, AgentMutationError> {
+        let commit = self
+            .consent
+            .as_ref()
+            .ok_or_else(|| AgentMutationError::new("invalid_request", "consent commit required"))?;
+        if commit.action != plan.tool
+            || commit.request.identity.tool != plan.tool
+            || commit.target != json!(plan)
+        {
+            return Err(AgentMutationError::new(
+                "invalid_request",
+                "write does not match its consent commit",
+            ));
+        }
+        let args = &plan.arguments;
+        let result = match plan.tool.as_str() {
+            "projects_create_workspace" => self.create_workspace_at(crate::CreateWorkspaceRequest { workspace_id:plan.target["workspace_id"].as_str().unwrap().into(), name:args["name"].as_str().unwrap().into() }, now).map_err(Into::into),
+            "projects_register" => self.register_at(crate::RegisterRequest { name:args["name"].as_str().unwrap().into(), roots:vec![plan.target["dir"].as_str().unwrap().into()], workspace_id:plan.scope_id.clone(), ..Default::default() }, now).map_err(Into::into),
+            "agents_create_head" => self.agent_mutation_with_id("agent.create", json!({"role":"head","name":args["name"],"tag":args["tag"],"project_id":plan.target["placement"]["project_id"],"request_key":commit.request.identity.request_key}), now, agent_id),
+            "agents_hire" => self.agents_hire(&serde_json::from_value(args.clone()).map_err(|e| AgentMutationError::new("invalid_request", e.to_string()))?, now, agent_id),
+            "agents_retire_hire" => self.agent_mutation("agent.dispose", json!({"agent_id":args["agent_id"],"request_key":commit.request.identity.request_key}), now),
+            _ => Err(AgentMutationError::new("unknown_tool", &plan.tool)),
+        };
+        result.map_err(|e| {
+            if self.probe.is_none()
+                && !matches!(
+                    e.code.as_str(),
+                    "gone"
+                        | "hire_cap_reached"
+                        | "not_your_hire"
+                        | "consent_stale"
+                        | "request_key_conflict"
+                        | "storage_error"
+                )
+            {
+                AgentMutationError::new("consent_stale", e.message)
+            } else {
+                e
+            }
+        })
+    }
 }

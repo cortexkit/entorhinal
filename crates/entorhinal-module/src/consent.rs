@@ -146,7 +146,7 @@ pub(super) struct ConsentAttempt {
     pub decision: ConsentDecision,
     _lease: Option<RequestLease>,
 }
-struct RequestLease {
+pub(super) struct RequestLease {
     active: Arc<Mutex<HashSet<RequestSlot>>>,
     key: RequestSlot,
 }
@@ -168,6 +168,42 @@ pub(super) struct ConsentCall<'a> {
 }
 
 impl ConsentCoordinator {
+    pub fn try_lease(&self, identity: &RequestIdentity) -> Option<RequestLease> {
+        let key = (
+            identity.agent_id.clone(),
+            identity.tool.clone(),
+            identity.request_key.clone(),
+        );
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        active.insert(key.clone()).then(|| RequestLease {
+            active: self.active.clone(),
+            key,
+        })
+    }
+
+    pub async fn obtain_leased(
+        &self,
+        call: ConsentCall<'_>,
+        row: &ConsentRequest,
+        context: &CardContext,
+        plan: Option<&entorhinal_core::agent::consent::ConsentWrite>,
+        lease: RequestLease,
+    ) -> Result<ConsentAttempt, AgentMutationError> {
+        let card = render_card(row, context)?;
+        let (saved, inserted) = call.store.consent_transaction(|tx| {
+            let inserted = tx.request(&row.identity)?.is_none();
+            let saved = tx.begin_request(row)?;
+            if let Some(plan) = plan {
+                tx.save_write_plan(&row.identity, plan)?;
+            }
+            Ok((saved, inserted))
+        })?;
+        let decision = resolve(&call, &saved, card, inserted).await?;
+        Ok(ConsentAttempt {
+            decision,
+            _lease: Some(lease),
+        })
+    }
     /// Call only after caller, key, target and cap validation. The supplied row
     /// describes that validated target; stamp identity comes from route admission.
     pub async fn obtain(
@@ -199,34 +235,15 @@ impl ConsentCoordinator {
                 "request key has different arguments",
             ));
         }
-        let key = (
-            row.identity.agent_id.clone(),
-            row.identity.tool.clone(),
-            row.identity.request_key.clone(),
-        );
-        let lease = {
-            let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-            active.insert(key.clone()).then(|| RequestLease {
-                active: self.active.clone(),
-                key,
-            })
-        };
+        let lease = self.try_lease(&row.identity);
         if lease.is_none() {
             return Ok(ConsentAttempt {
                 decision: ConsentDecision::Pending(saved.and_then(|saved| saved.elicitation_id)),
                 _lease: None,
             });
         }
-        let card = render_card(row, context)?;
-        let (saved, inserted) = store.consent_transaction(|tx| {
-            let inserted = tx.request(&row.identity)?.is_none();
-            Ok((tx.begin_request(row)?, inserted))
-        })?;
-        let decision = resolve(&call, &saved, card, inserted).await?;
-        Ok(ConsentAttempt {
-            decision,
-            _lease: lease,
-        })
+        self.obtain_leased(call, row, context, None, lease.expect("lease acquired"))
+            .await
     }
 }
 

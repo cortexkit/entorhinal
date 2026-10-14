@@ -6,6 +6,7 @@ use crate::{
 };
 use entorhinal_core::{RegisterRequest, RegistryStore};
 use std::path::PathBuf;
+use std::sync::Arc;
 use subc_client_rs::{ModuleHandler, RouteBindRequest, RouteHandle};
 use subc_protocol::{scope::ScopeStamp, BindIdentity, RouteTarget};
 
@@ -19,14 +20,43 @@ const TOOL_NAMES: &[&str] = &[
     "agents_list_hires",
 ];
 
-struct Fixture {
-    root: PathBuf,
-    handler: ProjectsHandler,
-    agents: Vec<String>,
+pub(super) struct Fixture {
+    pub(super) root: PathBuf,
+    pub(super) descriptor: crate::StorageDescriptor,
+    pub(super) handler: ProjectsHandler,
+    pub(super) agents: Vec<String>,
+}
+
+struct RejectConsent;
+#[async_trait::async_trait]
+impl crate::consent_client::ConsentConnector for RejectConsent {
+    async fn open(
+        &self,
+        _: &ScopeStamp,
+        _: tokio::time::Instant,
+    ) -> Result<Box<dyn crate::consent_client::ConsentRoute>, crate::consent_client::ConsentError>
+    {
+        Err(crate::consent_client::ConsentError::Refused(
+            "unavailable".into(),
+        ))
+    }
 }
 
 impl Fixture {
-    fn new() -> Self {
+    async fn admitted(&self, tool: &str, args: Value) {
+        let expected = match tool {
+            "projects_register" => "root_not_found",
+            "agents_create_head" => "agent_project_taken",
+            "agents_retire_hire" => "not_your_hire",
+            "agents_list_hires" => {
+                assert_eq!(result(self.call(tool, args).await)["agents"], json!([]));
+                return;
+            }
+            _ => "consent_unavailable",
+        };
+        self.refusal(tool, args, expected).await;
+    }
+    pub(super) fn new() -> Self {
         let (root, descriptor) = scratch_descriptor("agent-tool-provider");
         let store = RegistryStore::open(&descriptor).unwrap();
         store
@@ -64,16 +94,18 @@ impl Fixture {
                     .to_owned()
             })
             .collect();
-        let handler = ProjectsHandler::with_runtime("tool-incarnation".into(), unix_millis);
+        let mut handler = ProjectsHandler::with_runtime("tool-incarnation".into(), unix_millis);
+        handler.consent_connector = Arc::new(RejectConsent);
         *handler.store.lock().unwrap() = Some(store);
         Self {
             root,
+            descriptor,
             handler,
             agents,
         }
     }
 
-    fn stamp(&self, role: usize) -> ScopeStamp {
+    pub(super) fn stamp(&self, role: usize) -> ScopeStamp {
         serde_json::from_value(json!({
             "owner":{"kind":"reserved", "module_id":"prefrontal"},
             "ref":format!("head:{}", self.agents[role]), "scope_epoch":7,
@@ -82,14 +114,14 @@ impl Fixture {
         .unwrap()
     }
 
-    fn admit(&self, stamp: Option<&ScopeStamp>) {
+    pub(super) fn admit(&self, stamp: Option<&ScopeStamp>) {
         self.handler.route_admissions().insert(
             ROUTE,
             RouteAdmission::from_bind(Some(reserved("prefrontal")), stamp),
         );
     }
 
-    fn counts(&self) -> Vec<i64> {
+    pub(super) fn counts(&self) -> Vec<i64> {
         let connection = rusqlite::Connection::open_with_flags(
             self.root.join("store.db"),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -113,7 +145,7 @@ impl Fixture {
         .collect()
     }
 
-    async fn call(&self, name: &str, arguments: Value) -> HandlerOutcome {
+    pub(super) async fn call(&self, name: &str, arguments: Value) -> HandlerOutcome {
         self.handler
             .handle_served_request(
                 &serde_json::to_vec(&json!({"name":name, "arguments":arguments})).unwrap(),
@@ -155,7 +187,7 @@ fn arguments(name: &str) -> Value {
     }
 }
 
-fn error_code(outcome: HandlerOutcome) -> String {
+pub(super) fn error_code(outcome: HandlerOutcome) -> String {
     match outcome {
         HandlerOutcome::Error { code, .. } | HandlerOutcome::ErrorWithDetail { code, .. } => code,
         HandlerOutcome::Response(body) => {
@@ -165,7 +197,7 @@ fn error_code(outcome: HandlerOutcome) -> String {
     }
 }
 
-fn result(outcome: HandlerOutcome) -> Value {
+pub(super) fn result(outcome: HandlerOutcome) -> Value {
     match outcome {
         HandlerOutcome::Response(body) => {
             serde_json::from_slice::<Value>(&body).unwrap()["result"].clone()
@@ -185,7 +217,7 @@ async fn every_tool_admits_only_its_table_role_before_key_or_arguments() {
         for (index, tool) in TOOL_NAMES.iter().enumerate() {
             let allowed = if index < 3 { "assistant" } else { "head" };
             if *role == allowed {
-                f.refusal(tool, arguments(tool), "tool_disabled").await;
+                f.admitted(tool, arguments(tool)).await;
             } else {
                 f.refusal(tool, json!(null), "role_forbidden").await;
                 f.refusal(tool, arguments(tool), "role_forbidden").await;
@@ -258,7 +290,7 @@ async fn retired_and_unknown_callers_are_refused_on_previously_bound_routes() {
     f.refusal(
         "projects_create_workspace",
         arguments("projects_create_workspace"),
-        "tool_disabled",
+        "consent_unavailable",
     )
     .await;
     f.handler
@@ -319,12 +351,14 @@ async fn every_write_validates_printable_ascii_request_keys_before_other_argumen
         ] {
             let mut args = arguments(tool);
             args["request_key"] = json!(key);
-            f.refusal(tool, args, "tool_disabled").await;
+            f.admitted(tool, args).await;
         }
     }
     f.admit(Some(&f.stamp(2)));
-    f.refusal("agents_list_hires", json!({}), "tool_disabled")
-        .await;
+    assert_eq!(
+        result(f.call("agents_list_hires", json!({})).await)["agents"],
+        json!([])
+    );
     f.refusal(
         "agents_list_hires",
         json!({"request_key":"unexpected"}),
@@ -353,8 +387,12 @@ async fn bind_captures_scope_epoch_and_mode_and_route_gone_drops_authority() {
     assert_eq!(admission.scope, Some(stamp));
     assert_eq!(admission.call_mode, Some(CallMode::Codemode));
     assert_eq!(admission.handle, Some(handle));
-    f.refusal("agents_hire", arguments("agents_hire"), "tool_disabled")
-        .await;
+    f.refusal(
+        "agents_hire",
+        arguments("agents_hire"),
+        "consent_unavailable",
+    )
+    .await;
     f.handler.on_route_gone(&handle).await;
     f.refusal("agents_hire", arguments("agents_hire"), "caller_forbidden")
         .await;
@@ -393,7 +431,7 @@ async fn tool_arguments_match_the_flat_schemas_without_caller_or_role_overrides(
     }
     let mut hire = arguments("agents_hire");
     hire["labels"] = json!(["build", "test"]);
-    f.refusal("agents_hire", hire.clone(), "tool_disabled")
+    f.refusal("agents_hire", hire.clone(), "consent_unavailable")
         .await;
     for labels in [json!(null), json!("build"), json!(["build", 42])] {
         hire["labels"] = labels;
@@ -426,7 +464,7 @@ async fn schema_pins_and_call_modes_are_checked_after_agent_admission() {
     for (body, expected) in [
         (
             call(json!(pin.encode().unwrap()), json!("opaque-call")),
-            "tool_disabled",
+            "consent_unavailable",
         ),
         (
             call(json!(changed.encode().unwrap()), json!("opaque-call")),
@@ -470,7 +508,7 @@ async fn schema_pins_and_call_modes_are_checked_after_agent_admission() {
         CallMode::Unknown("future".into()),
     ] {
         let expected = if matches!(mode, CallMode::Classic | CallMode::Codemode) {
-            "tool_disabled"
+            "consent_unavailable"
         } else {
             "call_mode_unsupported"
         };
