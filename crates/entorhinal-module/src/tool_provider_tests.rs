@@ -58,6 +58,9 @@ impl Fixture {
     }
     pub(super) fn new() -> Self {
         let (root, descriptor) = scratch_descriptor("agent-tool-provider");
+        // Tests register directories under this root, and registration refuses
+        // a non-canonical path; macOS temp folders resolve through /private.
+        let root = crate::tests::canonical_test_path(root);
         let store = RegistryStore::open(&descriptor).unwrap();
         store
             .apply_entry("agent.cutover", "{}", "test", None, |_| Ok(()))
