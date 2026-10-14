@@ -130,6 +130,7 @@ mod two_machine_acceptance;
 // `serve`, claim the module's identity against the daemon, and sit there
 // looking healthy while doing nothing the operator asked for.
 fn main() -> std::process::ExitCode {
+    let module_started_at = Instant::now();
     // The user-facing command surface is `ck projects`, `ck workspaces` and `ck agents`,
     // which `ck` runs as `ck-projects` / `ck-workspaces` / `ck-agents`: links to this
     // binary in CortexKit's bin folder. argv[0] selects the face; the module identity (ck-entorhinal)
@@ -184,7 +185,7 @@ fn main() -> std::process::ExitCode {
                 }
             };
             tracing::info!("entorhinal module starting");
-            match serve_module() {
+            match serve_module(module_started_at) {
                 Ok(()) => std::process::ExitCode::SUCCESS,
                 Err(error) => report_module_exit(error, &mut std::io::stderr()),
             }
@@ -193,8 +194,10 @@ fn main() -> std::process::ExitCode {
 }
 
 #[tokio::main]
-async fn serve_module() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let handler = ProjectsHandler::new()?;
+async fn serve_module(
+    module_started_at: Instant,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let handler = ProjectsHandler::new_with_start(module_started_at)?;
     let refusal = handler.hello_refusal.clone();
     let confirmer = Arc::new(agent_ops::DaemonConfirmer::new(
         handler.route_admissions.clone(),
@@ -261,6 +264,103 @@ fn descriptor_from_ack(ack: &ModuleHelloAckBody) -> Result<StorageDescriptor, St
 const LEASE_HELD_RETRY_BUDGET: Duration = Duration::from_secs(10);
 const LEASE_HELD_RETRY_FIRST_DELAY: Duration = Duration::from_millis(50);
 const LEASE_HELD_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
+const SLOW_REQUEST_US: u64 = 500_000;
+const VERY_SLOW_REQUEST_US: u64 = 3_000_000;
+
+#[derive(Default)]
+struct LatencyCounters {
+    count: AtomicU64,
+    total_us: AtomicU64,
+    max_us: AtomicU64,
+    over_500ms: AtomicU64,
+    over_3s: AtomicU64,
+}
+
+impl LatencyCounters {
+    fn record(&self, elapsed_us: u64) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.total_us.fetch_add(elapsed_us, Ordering::Relaxed);
+        self.max_us.fetch_max(elapsed_us, Ordering::Relaxed);
+        if elapsed_us > SLOW_REQUEST_US {
+            self.over_500ms.fetch_add(1, Ordering::Relaxed);
+        }
+        if elapsed_us > VERY_SLOW_REQUEST_US {
+            self.over_3s.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn report(&self) -> Value {
+        json!({
+            "count": self.count.load(Ordering::Relaxed),
+            "totalUs": self.total_us.load(Ordering::Relaxed),
+            "maxUs": self.max_us.load(Ordering::Relaxed),
+            "over500ms": self.over_500ms.load(Ordering::Relaxed),
+            "over3s": self.over_3s.load(Ordering::Relaxed),
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RequestOperation {
+    Resolve,
+    ResolveProjectId,
+    Enumerate,
+    AgentResolve,
+    Other,
+}
+
+impl RequestOperation {
+    fn from_method(method: &str) -> Self {
+        match method {
+            "resolve" => Self::Resolve,
+            "resolve_project_id" => Self::ResolveProjectId,
+            "enumerate" => Self::Enumerate,
+            "agent.resolve" => Self::AgentResolve,
+            _ => Self::Other,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Resolve => "resolve",
+            Self::ResolveProjectId => "resolve_project_id",
+            Self::Enumerate => "enumerate",
+            Self::AgentResolve => "agent.resolve",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Default)]
+struct RequestLatency {
+    resolve: LatencyCounters,
+    resolve_project_id: LatencyCounters,
+    enumerate: LatencyCounters,
+    agent_resolve: LatencyCounters,
+    other: LatencyCounters,
+}
+
+impl RequestLatency {
+    fn counters(&self, operation: RequestOperation) -> &LatencyCounters {
+        match operation {
+            RequestOperation::Resolve => &self.resolve,
+            RequestOperation::ResolveProjectId => &self.resolve_project_id,
+            RequestOperation::Enumerate => &self.enumerate,
+            RequestOperation::AgentResolve => &self.agent_resolve,
+            RequestOperation::Other => &self.other,
+        }
+    }
+
+    fn report(&self) -> Value {
+        json!({
+            "resolve": self.resolve.report(),
+            "resolve_project_id": self.resolve_project_id.report(),
+            "enumerate": self.enumerate.report(),
+            "agent.resolve": self.agent_resolve.report(),
+            "other": self.other.report(),
+        })
+    }
+}
 
 #[derive(Default)]
 struct HealthGauges {
@@ -274,6 +374,10 @@ struct HealthGauges {
     resolve_count: AtomicU64,
     enumerate_count: AtomicU64,
     journal_tail_count: AtomicU64,
+    latency: RequestLatency,
+    store_unavailable: AtomicU64,
+    ready_after_ms: AtomicU64,
+    ready_recorded: AtomicBool,
     last_operation_ms: AtomicI64,
     liveness_batches: AtomicU64,
     liveness_gaps: AtomicU64,
@@ -447,6 +551,8 @@ struct ProjectsHandler {
     /// Volatile reply token: never persisted in the request-key cache.
     incarnation: String,
     clock: fn() -> i64,
+    request_clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    module_started_at: Instant,
     consent_coordinator: consent::ConsentCoordinator,
     consent_connector: Arc<dyn consent_client::ConsentConnector>,
     commits: Arc<tokio::sync::Notify>,
@@ -681,27 +787,56 @@ impl ProjectsHandler {
             .clone()
     }
 
+    #[cfg(test)]
     fn new() -> Result<Self, std::io::Error> {
+        Self::new_with_start(Instant::now())
+    }
+
+    fn new_with_start(module_started_at: Instant) -> Result<Self, std::io::Error> {
         let incarnation = incarnation::new_incarnation().map_err(|error| {
             std::io::Error::other(format!("cannot mint process incarnation: {error}"))
         })?;
-        Ok(Self::with_runtime(incarnation, unix_millis))
+        Ok(Self::with_runtime_started(
+            incarnation,
+            unix_millis,
+            module_started_at,
+        ))
     }
 
+    #[cfg(test)]
     fn with_runtime(incarnation: String, clock: fn() -> i64) -> Self {
-        Self::with_log_connector(
+        Self::with_runtime_started(incarnation, clock, Instant::now())
+    }
+
+    fn with_runtime_started(
+        incarnation: String,
+        clock: fn() -> i64,
+        module_started_at: Instant,
+    ) -> Self {
+        Self::with_log_connector_started(
             incarnation,
             clock,
             Arc::new(log_client::SubcConnector::from_args(
                 std::env::args_os().skip(1),
             )),
+            module_started_at,
         )
     }
 
+    #[cfg(test)]
     fn with_log_connector(
         incarnation: String,
         clock: fn() -> i64,
         connector: Arc<dyn log_client::LogConnector>,
+    ) -> Self {
+        Self::with_log_connector_started(incarnation, clock, connector, Instant::now())
+    }
+
+    fn with_log_connector_started(
+        incarnation: String,
+        clock: fn() -> i64,
+        connector: Arc<dyn log_client::LogConnector>,
+        module_started_at: Instant,
     ) -> Self {
         let route_admissions = Arc::new(Mutex::new(HashMap::new()));
         let operator_confirmer =
@@ -714,6 +849,9 @@ impl ProjectsHandler {
             log_client::SubcConnector::from_args(std::env::args_os().skip(1)),
         );
         let move_wake = Arc::new(tokio::sync::Notify::new());
+        let clock_origin = module_started_at;
+        let request_clock =
+            Arc::new(move || clock_origin.elapsed().as_micros().min(u64::MAX as u128) as u64);
         let record_connector = Arc::new(move_driver::ReconnectConnector {
             inner: record_connector,
             wake: move_wake.clone(),
@@ -726,6 +864,8 @@ impl ProjectsHandler {
             route_admissions,
             incarnation,
             clock,
+            request_clock,
+            module_started_at,
             consent_coordinator: consent::ConsentCoordinator::default(),
             consent_connector: Arc::new(consent_client::SubcCingulate {
                 connector: Arc::new(log_client::SubcConnector::from_args(
@@ -885,11 +1025,15 @@ impl ProjectsHandler {
 #[async_trait]
 impl ModuleHandler for ProjectsHandler {
     async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
-        if let Some(error) = self.startup_refusal() {
-            return HandlerError::new("store_unavailable", error).into_outcome();
-        }
-        self.handle_served_request(&body, route_key(&ctx.route_handle()))
-            .await
+        let started_us = (self.request_clock)();
+        let outcome = if let Some(error) = self.startup_refusal() {
+            HandlerError::new("store_unavailable", error).into_outcome()
+        } else {
+            self.handle_served_request(&body, route_key(&ctx.route_handle()))
+                .await
+        };
+        self.finish_request(&body, started_us, &outcome);
+        outcome
     }
 
     async fn on_bind(&self, request: &RouteBindRequest) -> BindDecision {
@@ -974,20 +1118,22 @@ impl ModuleHandler for ProjectsHandler {
                 let claim_refresh = self.claim_refresh.clone();
                 let role_refresh = self.role_refresh.clone();
                 let move_wake = self.move_wake.clone();
+                let module_started_at = self.module_started_at;
                 tokio::spawn(async move {
                     let outcome = retry_open_while_lease_held(&descriptor, retry_budget).await;
                     health.store_opening.store(false, Ordering::Relaxed);
-                    install_store(&store, &health, outcome);
+                    install_store_with_start(&store, &health, outcome, module_started_at);
                     claim_refresh.signal();
                     role_refresh.notify_one();
                     move_wake.notify_one();
                     move_wake.notify_waiters();
                 });
             }
-            outcome => install_store(
+            outcome => install_store_with_start(
                 &self.store,
                 &self.health,
                 outcome.map_err(|error| format!("opening projects storage: {error}")),
+                self.module_started_at,
             ),
         }
         self.start_catch_up();
@@ -1035,6 +1181,9 @@ impl ModuleHandler for ProjectsHandler {
                 "resolveCount": self.health.resolve_count.load(Ordering::Relaxed),
                 "enumerateCount": self.health.enumerate_count.load(Ordering::Relaxed),
                 "journalTailCount": self.health.journal_tail_count.load(Ordering::Relaxed),
+                "latency": self.health.latency.report(),
+                "storeUnavailable": self.health.store_unavailable.load(Ordering::Relaxed),
+                "ready_after_ms": self.health.ready_after_ms.load(Ordering::Relaxed),
                 "lastOperationMs": self.health.last_operation_ms.load(Ordering::Relaxed),
                 "livenessBatches": self.health.liveness_batches.load(Ordering::Relaxed),
                 "livenessGaps": self.health.liveness_gaps.load(Ordering::Relaxed),
@@ -1110,7 +1259,7 @@ impl ProjectsHandler {
         let received = tokio::time::Instant::now();
         let request = match serde_json::from_slice::<WireRequest>(body) {
             Ok(request) => request,
-            Err(_) => return self.handle_request(body, key),
+            Err(_) => return self.handle_request_unmeasured(body, key),
         };
         if !MUTATING_METHODS.contains(&request.method.as_str()) {
             return self.handle_request_wait(body, key).await;
@@ -1149,6 +1298,13 @@ impl ProjectsHandler {
     /// The same envelope/admission/response path serves SUBC and the route seam
     /// used by tests, without constructing a transport or inventing a principal.
     fn handle_request(&self, body: &[u8], key: RouteKey) -> HandlerOutcome {
+        let started_us = (self.request_clock)();
+        let outcome = self.handle_request_unmeasured(body, key);
+        self.finish_request(body, started_us, &outcome);
+        outcome
+    }
+
+    fn handle_request_unmeasured(&self, body: &[u8], key: RouteKey) -> HandlerOutcome {
         let request = match serde_json::from_slice::<WireRequest>(body) {
             Ok(request) => request,
             Err(error) => {
@@ -1162,6 +1318,40 @@ impl ProjectsHandler {
         match self.execute(request, key) {
             Ok(body) => HandlerOutcome::Response(body),
             Err(error) => error.into_outcome(),
+        }
+    }
+
+    fn finish_request(&self, body: &[u8], started_us: u64, outcome: &HandlerOutcome) {
+        let elapsed_us = (self.request_clock)().saturating_sub(started_us);
+        let (operation, canonical_root) = request_operation(body);
+        self.health.latency.counters(operation).record(elapsed_us);
+        if matches!(
+            outcome,
+            HandlerOutcome::Error { code, .. }
+                | HandlerOutcome::ErrorWithDetail { code, .. }
+                if code == "store_unavailable"
+        ) {
+            self.health
+                .store_unavailable
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if elapsed_us > SLOW_REQUEST_US {
+            if matches!(operation, RequestOperation::Resolve) {
+                tracing::warn!(
+                    target: "fleet",
+                    op = operation.label(),
+                    elapsed_ms = elapsed_us as f64 / 1_000.0,
+                    canonical_root = canonical_root.as_deref().unwrap_or("<missing>"),
+                    "slow entorhinal request"
+                );
+            } else {
+                tracing::warn!(
+                    target: "fleet",
+                    op = operation.label(),
+                    elapsed_ms = elapsed_us as f64 / 1_000.0,
+                    "slow entorhinal request"
+                );
+            }
         }
     }
 
@@ -1782,6 +1972,24 @@ struct WireRequest {
     params: Value,
 }
 
+fn request_operation(body: &[u8]) -> (RequestOperation, Option<String>) {
+    let Ok(request) = serde_json::from_slice::<WireRequest>(body) else {
+        return (RequestOperation::Other, None);
+    };
+    let operation = RequestOperation::from_method(&request.method);
+    let canonical_root = matches!(operation, RequestOperation::Resolve)
+        .then(|| {
+            request
+                .params
+                .get("canonicalRoot")
+                .or_else(|| request.params.get("canonical_root"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .flatten();
+    (operation, canonical_root)
+}
+
 #[derive(Debug, Deserialize)]
 struct ResolveParams {
     #[serde(rename = "canonicalRoot", alias = "canonical_root")]
@@ -2160,11 +2368,21 @@ fn management_operation(
     }
 }
 
-/// Publishes an open outcome into the shared store slot and the health gauges.
+#[cfg(test)]
 fn install_store(
     store: &Mutex<Option<RegistryStore>>,
     health: &HealthGauges,
     outcome: Result<RegistryStore, String>,
+) {
+    install_store_with_start(store, health, outcome, Instant::now());
+}
+
+/// Publishes an open outcome into the shared store slot and the health gauges.
+fn install_store_with_start(
+    store: &Mutex<Option<RegistryStore>>,
+    health: &HealthGauges,
+    outcome: Result<RegistryStore, String>,
+    module_started_at: Instant,
 ) {
     let mut guard = store
         .lock()
@@ -2182,6 +2400,16 @@ fn install_store(
             health
                 .generation
                 .store(opened.generation().unwrap_or(0), Ordering::Relaxed);
+            if !health.ready_recorded.load(Ordering::Relaxed) {
+                health.ready_after_ms.store(
+                    module_started_at
+                        .elapsed()
+                        .as_millis()
+                        .min(u64::MAX as u128) as u64,
+                    Ordering::Relaxed,
+                );
+                health.ready_recorded.store(true, Ordering::Relaxed);
+            }
             health.store_ready.store(true, Ordering::Relaxed);
             health.store_failed.store(false, Ordering::Relaxed);
             *guard = Some(opened);
@@ -2262,6 +2490,70 @@ fn unix_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn request_latency_records_operation_counts_and_thresholds() {
+        let mut handler = ProjectsHandler::new().unwrap();
+        let ticks = Arc::new(Mutex::new(std::collections::VecDeque::from([
+            0, 500_001, 1_000_000, 1_500_000, 2_000_000, 5_000_001, 9_000_000, 9_010_000,
+        ])));
+        let clock_ticks = Arc::clone(&ticks);
+        handler.request_clock = Arc::new(move || {
+            clock_ticks
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("request clock has a start and finish tick for every request")
+        });
+
+        handler.handle_request(
+            br#"{"method":"resolve","params":{"canonicalRoot":"/tmp/latency-root"}}"#,
+            (770, 1),
+        );
+        handler.handle_request(
+            br#"{"method":"resolve_project_id","params":{"projectId":"project-test"}}"#,
+            (770, 1),
+        );
+        handler.handle_request(br#"{"method":"agent.resolve","params":{}}"#, (770, 1));
+        handler.handle_request(b"not json", (770, 1));
+
+        let metrics = handler.health().await.metrics.unwrap();
+        assert_eq!(metrics["latency"]["resolve"]["count"], 1);
+        assert_eq!(metrics["latency"]["resolve"]["totalUs"], 500_001);
+        assert_eq!(metrics["latency"]["resolve"]["maxUs"], 500_001);
+        assert_eq!(metrics["latency"]["resolve"]["over500ms"], 1);
+        assert_eq!(metrics["latency"]["resolve"]["over3s"], 0);
+        assert_eq!(metrics["latency"]["resolve_project_id"]["count"], 1);
+        assert_eq!(metrics["latency"]["resolve_project_id"]["over500ms"], 0);
+        assert_eq!(metrics["latency"]["enumerate"]["count"], 0);
+        assert_eq!(metrics["latency"]["agent.resolve"]["count"], 1);
+        assert_eq!(metrics["latency"]["agent.resolve"]["totalUs"], 3_000_001);
+        assert_eq!(metrics["latency"]["agent.resolve"]["maxUs"], 3_000_001);
+        assert_eq!(metrics["latency"]["agent.resolve"]["over500ms"], 1);
+        assert_eq!(metrics["latency"]["agent.resolve"]["over3s"], 1);
+        assert_eq!(metrics["latency"]["other"]["count"], 1);
+    }
+
+    #[test]
+    fn health_reads_latency_without_locking_the_store_slot() {
+        let handler = Arc::new(ProjectsHandler::new().unwrap());
+        let store_slot = handler.store.lock().unwrap();
+        let handler_for_health = Arc::clone(&handler);
+        let (finished, result) = std::sync::mpsc::channel();
+        let health_thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let report = runtime.block_on(handler_for_health.health());
+            finished.send(report).unwrap();
+        });
+        let report = result
+            .recv_timeout(Duration::from_secs(1))
+            .expect("health must answer while the store slot is held");
+        drop(store_slot);
+        health_thread.join().unwrap();
+        assert_eq!(report.metrics.unwrap()["latency"]["resolve"]["count"], 0);
+    }
 
     pub(super) fn canonical_test_path(path: impl AsRef<std::path::Path>) -> PathBuf {
         PathBuf::from(
@@ -4238,6 +4530,7 @@ mod startup_tests {
         use subc_client_rs::test_support::{ModuleHarness, OperatorAnswer};
         let handler = ProjectsHandler::new().unwrap();
         let store = handler.store.clone();
+        let health = handler.health.clone();
         let refusal = handler.hello_refusal.clone();
         let mut module =
             ModuleHarness::start(move |_| handler, std::iter::empty::<OperatorAnswer>()).await;
@@ -4273,6 +4566,8 @@ mod startup_tests {
         let body: Value = serde_json::from_slice(&frame.body).unwrap();
         assert_eq!(body["code"], "store_unavailable");
         assert!(store.lock().unwrap().is_none());
+        assert_eq!(health.store_unavailable.load(Ordering::Relaxed), 1);
+        assert_eq!(health.latency.enumerate.count.load(Ordering::Relaxed), 1);
     }
 
     #[test]
