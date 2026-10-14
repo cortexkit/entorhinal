@@ -1,6 +1,9 @@
 use std::{collections::BTreeMap, path::PathBuf};
 
-use entorhinal_core::RegistryStore;
+use entorhinal_core::{
+    claim_cache::{CachedClaim, ClaimObservation},
+    RegistryStore,
+};
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use subc_client_rs::HandlerOutcome;
@@ -206,9 +209,10 @@ fn assert_avatar_reply(actual: &Value, expected: &Value) {
     );
 }
 
-fn published_file(name: &str, records: Vec<String>) {
+fn published_file(directory: &str, name: &str, records: Vec<String>) {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../test-vectors/agent-identity-reads-v1")
+        .join("../../test-vectors")
+        .join(directory)
         .join(name);
     let served = format!("[\n{}\n]\n", records.join(",\n"));
     if std::env::var("ENTO_WRITE_SERVED_VECTORS").as_deref() == Ok("1") {
@@ -296,6 +300,7 @@ async fn served_records_match_published_files() {
         .await;
     assert_eq!(unknown["code"], "invalid_request");
     published_file(
+        "agent-identity-reads-v1",
         "fleet-identity.json",
         vec![full_record, unchanged_record, unknown_record],
     );
@@ -335,7 +340,383 @@ async fn served_records_match_published_files() {
         assert_eq!(error["code"], "invalid_request");
         records.push(record);
     }
-    published_file("avatar-read.json", records);
+    published_file("agent-identity-reads-v1", "avatar-read.json", records);
+}
+
+const SESSION_AGENT: &str = "agent_0000000000000101";
+const REF_OWNER: &str = "agent_0000000000000102";
+const CLAIMED_AGENT: &str = "agent_0000000000000103";
+const LEGACY_AGENT: &str = "agent_0000000000000104";
+const WHERE_UNCLAIMED: &str = "agent_0000000000000105";
+const WHERE_HERE: &str = "agent_0000000000000106";
+const WHERE_ELSEWHERE: &str = "agent_0000000000000107";
+const SESSION_REF: &str = "0123456789abcdef0123456789abcdef";
+const SELF_AUTHOR: &str = "1111111111111111";
+const OTHER_AUTHOR: &str = "2222222222222222";
+const HOST_MODULE: &str = "agent-host/v1";
+const SESSION_CORE: RouteKey = (904, 1);
+const SESSION_HOST: RouteKey = (905, 1);
+const SESSION_READER: RouteKey = (906, 1);
+
+struct SessionFixture {
+    dir: PathBuf,
+    handler: ProjectsHandler,
+}
+
+impl SessionFixture {
+    async fn new(label: &str) -> Self {
+        let (dir, descriptor) = crate::tests::scratch_descriptor(label);
+        let resolver = crate::sessions::FakeResolver::new();
+        resolver.set(
+            crate::sessions::ORCHESTRATOR_CAPABILITY,
+            crate::sessions::ProviderResolution::Provider(WRITER_MODULE.into()),
+        );
+        resolver.set(
+            crate::sessions::HOST_CAPABILITY,
+            crate::sessions::ProviderResolution::Provider(HOST_MODULE.into()),
+        );
+        let mut handler = ProjectsHandler::with_runtime(INCARNATION.into(), || 700);
+        handler.provider_resolver = resolver;
+        let mut store = RegistryStore::open(&descriptor).unwrap();
+        store.set_root_records(true);
+        install_store(&handler.store, &handler.health, Ok(store));
+        for (route, module_id) in [
+            (SESSION_CORE, WRITER_MODULE),
+            (SESSION_HOST, HOST_MODULE),
+            (SESSION_READER, READER_MODULE),
+        ] {
+            handler.route_admissions().insert(
+                route,
+                RouteAdmission::from_bind(Some(reserved(module_id)), None),
+            );
+        }
+        Self { dir, handler }
+    }
+
+    fn snapshot(&self) -> Connection {
+        let source = Connection::open(self.dir.join("session-snapshot.db")).unwrap();
+        for migration in MIGRATIONS {
+            source.execute_batch(migration).unwrap();
+        }
+        source
+    }
+
+    async fn import(&self) -> HandlerOutcome {
+        let body = serde_json::to_vec(&json!({
+            "method":"agent.import",
+            "params":{
+                "snapshot_path":self.dir.join("session-snapshot.db"),
+                "request_key":"session-vector-import"
+            }
+        }))
+        .unwrap();
+        self.handler
+            .handle_served_request(&body, SESSION_CORE)
+            .await
+    }
+
+    fn store(&self) -> RegistryStore {
+        self.handler.store.lock().unwrap().as_ref().unwrap().clone()
+    }
+
+    fn cache_claims(&self) {
+        let store = self.store();
+        let observations = [
+            (CLAIMED_AGENT, OTHER_AUTHOR),
+            (WHERE_HERE, SELF_AUTHOR),
+            (WHERE_ELSEWHERE, OTHER_AUTHOR),
+        ]
+        .into_iter()
+        .map(|(agent_id, holder)| {
+            (
+                agent_id.to_owned(),
+                ClaimObservation::Present {
+                    claim: CachedClaim {
+                        holder: Some(holder.to_owned()),
+                        epoch: 1,
+                        cut_id: None,
+                        version: 1,
+                        read_at_ms: 700,
+                        stale: false,
+                        integrity_failed: false,
+                    },
+                    self_author: SELF_AUTHOR.to_owned(),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+        store.cache_agent_claims(&observations, 700).unwrap();
+        store
+            .apply_entry("fixture.member_names", "{}", "fixture", None, |tx| {
+                tx.execute(
+                    "INSERT INTO member_name(author,display_name) VALUES(?1,?2)",
+                    params![SELF_AUTHOR, "This Mac"],
+                )?;
+                tx.execute(
+                    "INSERT INTO member_name(author,display_name) VALUES(?1,?2)",
+                    params![OTHER_AUTHOR, "Other Mac"],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn seed_legacy_binding(&self) {
+        self.store()
+            .apply_entry("fixture.legacy_session", "{}", "fixture", None, |tx| {
+                // Schema 8 rows predate project_root; migration 9 backfills an empty root for them.
+                tx.execute(
+                    "INSERT INTO session_binding(ref_kind,ref,agent_id,harness,session_id,project_root,registered_by,registered_at_ms) VALUES(?1,?2,?3,?4,?5,'','host',700)",
+                    params!["llm-runner", "fedcba98765432100123456789abcdef", LEGACY_AGENT, "old-harness", "old-session"],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    async fn record(
+        &self,
+        route: RouteKey,
+        principal: &str,
+        method: &str,
+        params: Value,
+    ) -> (String, Value) {
+        let request = serde_json::to_vec(&json!({"method":method,"params":params})).unwrap();
+        let outcome = self.handler.handle_served_request(&request, route).await;
+        let reply = match outcome {
+            HandlerOutcome::Response(bytes) => String::from_utf8(bytes).unwrap(),
+            refused => serde_json::to_string(&refusal(refused)).unwrap(),
+        };
+        let decoded = serde_json::from_str(&reply).unwrap();
+        let record = format!(
+            "  {{\"request\":{},\"principal\":{},\"reply\":{reply}}}",
+            String::from_utf8(request).unwrap(),
+            json!({"kind":"reserved","moduleId":principal}),
+        );
+        (record, decoded)
+    }
+}
+
+impl Drop for SessionFixture {
+    fn drop(&mut self) {
+        self.handler.store.lock().unwrap().take();
+        std::fs::remove_dir_all(&self.dir).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn session_records_match_published_files() {
+    let fixture = SessionFixture::new("served-sessions").await;
+    let source = fixture.snapshot();
+    for (id, name) in [
+        (SESSION_AGENT, "Session Agent"),
+        (REF_OWNER, "Reference Owner"),
+        (CLAIMED_AGENT, "Claimed Agent"),
+        (LEGACY_AGENT, "Legacy Agent"),
+        (WHERE_UNCLAIMED, "Unclaimed Agent"),
+        (WHERE_HERE, "Here Agent"),
+        (WHERE_ELSEWHERE, "Elsewhere Agent"),
+    ] {
+        seed_agent(&source, id, name, None, false, false);
+    }
+    drop(source);
+    let imported = fixture.import().await;
+    let HandlerOutcome::Response(imported) = imported else {
+        panic!("session-vector import refused: {}", refusal(imported));
+    };
+    assert_eq!(
+        serde_json::from_slice::<Value>(&imported).unwrap()["result"]["agents_imported"],
+        7
+    );
+    fixture.cache_claims();
+    fixture.seed_legacy_binding();
+
+    let registration = json!({
+        "agent_id":SESSION_AGENT,
+        "ref_kind":"llm-runner",
+        "ref":SESSION_REF,
+        "harness":"pi",
+        "session_id":"session-001",
+        "project_root":"/workspace/session-vectors"
+    });
+    let (register_record, registered) = fixture
+        .record(
+            SESSION_HOST,
+            HOST_MODULE,
+            "agent.register_session",
+            registration.clone(),
+        )
+        .await;
+    assert_eq!(registered["result"]["registered_by"], "host");
+    assert_eq!(registered["result"]["registered_at_ms"], 700);
+    let re_registration = json!({
+        "agent_id":SESSION_AGENT,
+        "ref_kind":"llm-runner",
+        "ref":SESSION_REF,
+        "harness":"pi",
+        "session_id":"session-002",
+        "project_root":"/workspace/session-vectors/reopened"
+    });
+    let (reregister_record, reregistered) = fixture
+        .record(
+            SESSION_HOST,
+            HOST_MODULE,
+            "agent.register_session",
+            re_registration,
+        )
+        .await;
+    assert_eq!(reregistered["result"]["session_id"], "session-002");
+
+    let mut ref_collision = registration.clone();
+    ref_collision["agent_id"] = json!(REF_OWNER);
+    ref_collision["session_id"] = json!("owner-session");
+    let (ref_collision_record, ref_collision_reply) = fixture
+        .record(
+            SESSION_HOST,
+            HOST_MODULE,
+            "agent.register_session",
+            ref_collision,
+        )
+        .await;
+    assert_eq!(ref_collision_reply["code"], "ref_bound_elsewhere");
+
+    let mut held_collision = registration.clone();
+    held_collision["agent_id"] = json!(CLAIMED_AGENT);
+    held_collision["ref"] = json!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    held_collision["session_id"] = json!("held-session");
+    let (held_collision_record, held_collision_reply) = fixture
+        .record(
+            SESSION_HOST,
+            HOST_MODULE,
+            "agent.register_session",
+            held_collision,
+        )
+        .await;
+    assert_eq!(held_collision_reply["code"], "held_elsewhere");
+
+    let (forbidden_record, forbidden_reply) = fixture
+        .record(
+            SESSION_READER,
+            READER_MODULE,
+            "agent.register_session",
+            registration.clone(),
+        )
+        .await;
+    assert_eq!(forbidden_reply["code"], "caller_forbidden");
+
+    let mut unknown_field = registration;
+    unknown_field["unexpected"] = json!(true);
+    let (unknown_field_record, unknown_field_reply) = fixture
+        .record(
+            SESSION_HOST,
+            HOST_MODULE,
+            "agent.register_session",
+            unknown_field,
+        )
+        .await;
+    assert_eq!(unknown_field_reply["code"], "invalid_request");
+    published_file(
+        "agent-sessions-v1",
+        "register-session.json",
+        vec![
+            register_record,
+            reregister_record,
+            ref_collision_record,
+            held_collision_record,
+            forbidden_record,
+            unknown_field_record,
+        ],
+    );
+
+    let (for_session_found, found_session) = fixture
+        .record(
+            SESSION_READER,
+            READER_MODULE,
+            "agent.for_session",
+            json!({"harness":"pi","session_id":"session-002"}),
+        )
+        .await;
+    assert_eq!(found_session["result"]["agent_id"], SESSION_AGENT);
+    let (for_session_missing, missing_session) = fixture
+        .record(
+            SESSION_READER,
+            READER_MODULE,
+            "agent.for_session",
+            json!({"harness":"pi","session_id":"not-registered"}),
+        )
+        .await;
+    assert_eq!(missing_session["code"], "not_found");
+    published_file(
+        "agent-sessions-v1",
+        "for-session.json",
+        vec![for_session_found, for_session_missing],
+    );
+
+    let (for_ref_found, found_ref) = fixture
+        .record(
+            SESSION_READER,
+            READER_MODULE,
+            "agent.session_for_ref",
+            json!({"ref_kind":"llm-runner","ref":SESSION_REF}),
+        )
+        .await;
+    let (legacy_ref, legacy_reply) = fixture
+        .record(
+            SESSION_READER,
+            READER_MODULE,
+            "agent.session_for_ref",
+            json!({"ref_kind":"llm-runner","ref":"fedcba98765432100123456789abcdef"}),
+        )
+        .await;
+    assert!(legacy_reply["result"]["project_root"].is_null());
+    let (for_ref_missing, missing_ref) = fixture
+        .record(
+            SESSION_READER,
+            READER_MODULE,
+            "agent.session_for_ref",
+            json!({"ref_kind":"llm-runner","ref":"no-such-reference"}),
+        )
+        .await;
+    assert_eq!(missing_ref["code"], "not_found");
+    published_file(
+        "agent-sessions-v1",
+        "session-for-ref.json",
+        vec![for_ref_found, legacy_ref, for_ref_missing],
+    );
+    assert_eq!(
+        found_ref["result"]["project_root"],
+        "/workspace/session-vectors/reopened"
+    );
+
+    let mut where_records = Vec::new();
+    for (agent_id, status, holder_name) in [
+        (WHERE_UNCLAIMED, "unclaimed", Value::Null),
+        (WHERE_HERE, "held_here", json!("This Mac")),
+        (WHERE_ELSEWHERE, "held_elsewhere", json!("Other Mac")),
+    ] {
+        let (record, answer) = fixture
+            .record(
+                SESSION_READER,
+                READER_MODULE,
+                "agent.where",
+                json!({"agent_id":agent_id}),
+            )
+            .await;
+        assert_eq!(answer["result"]["status"], status);
+        assert_eq!(answer["result"]["holder_name"], holder_name);
+        where_records.push(record);
+    }
+    let (unknown_agent, unknown_agent_reply) = fixture
+        .record(
+            SESSION_READER,
+            READER_MODULE,
+            "agent.where",
+            json!({"agent_id":"agent_ffffffffffffffff"}),
+        )
+        .await;
+    assert_eq!(unknown_agent_reply["code"], "unknown_agent");
+    where_records.push(unknown_agent);
+    published_file("agent-sessions-v1", "where.json", where_records);
 }
 
 #[tokio::test]
