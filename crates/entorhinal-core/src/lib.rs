@@ -22,7 +22,9 @@ use serde::Serialize;
 pub mod agent;
 mod binding;
 pub mod catalog;
+pub mod catalog_agent;
 pub mod catalog_grants;
+pub mod catalog_resolution;
 pub mod catalog_trust;
 pub mod claim_cache;
 pub mod enable_state;
@@ -201,7 +203,7 @@ CREATE TABLE member_name (
 );
 "#;
 
-const MIGRATIONS: [Migration; 11] = [
+const MIGRATIONS: [Migration; 12] = [
     Migration {
         version: 1,
         statements: V1_SCHEMA,
@@ -245,6 +247,10 @@ const MIGRATIONS: [Migration; 11] = [
     Migration {
         version: 11,
         statements: catalog::V11_CATALOG,
+    },
+    Migration {
+        version: 12,
+        statements: catalog_agent::V12_CATALOG_AGENT,
     },
 ];
 

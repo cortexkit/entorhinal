@@ -615,3 +615,25 @@ fn statement_and_status_shape_refusals_are_typed() {
         );
     }
 }
+
+#[test]
+fn several_roots_validate_subjects_and_do_not_leak_synthetic_requesters() {
+    use c::resolver::{self, ResolveError};
+    let roots = BTreeMap::from([("@x/a".into(), "^1".into())]);
+    let registry = BTreeMap::new();
+    let pins = BTreeMap::new();
+    assert!(
+        matches!(resolver::synthetic_root_ranges(&registry,&roots,&["@x/b".into()],&pins),Err(ResolveError::PackageNotFound {package}) if package=="@x/b")
+    );
+    assert!(
+        matches!(resolver::synthetic_root_ranges(&registry,&roots,&[],&pins),Err(ResolveError::PackageNotFound {package}) if package=="@x/a")
+    );
+    let registry=serde_json::from_value(json!({"@x/a":[{"version":"1.0.0","kind":"skill","status":"available","requires":{"capabilities":[],"packages":{}}}]})).unwrap();
+    let roots = BTreeMap::from([("@x/a".into(), "^2".into())]);
+    let error =
+        resolver::resolve_roots(&registry, &roots, &["@x/a".into()], &pins, &[]).unwrap_err();
+    assert_eq!(
+        serde_json::to_value(error).unwrap(),
+        json!({"code":"no_matching_version","package":"@x/a","ranges":[{"requested_by":"(root)","range":"^2"}]})
+    );
+}

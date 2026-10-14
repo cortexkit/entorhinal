@@ -20,6 +20,8 @@ pub const PROJECT_SHARED_TABLES: &[&str] = &[
     "project_workspace",
     "project_alias",
     "project_root_key",
+    "catalog_pin_set",
+    "catalog_pin",
 ];
 pub const AGENT_SHARED_TABLES: &[&str] = &["agent", "agent_name_claim"];
 pub const MEMBER_SHARED_TABLES: &[&str] = &["member_name"];
@@ -306,7 +308,7 @@ pub(crate) fn record_local_entry(
             entry.agents = agents;
             attribution(&mut entry)?;
             canonical_bytes(&entry)
-        } else if op.starts_with("agent.") || op == "member.set_name" {
+        } else if op.starts_with("agent.") || matches!(op, "member.set_name" | "catalog.pin") {
             canonical_bytes(payload.get("entry").unwrap_or(&payload))
         } else {
             let mut entry = before.project_delta(after, tx)?;
@@ -391,6 +393,11 @@ impl ProjectEntry {
             return Err(invalid("unsupported project entry op"));
         }
         for (table, changes) in &self.tables {
+            if self.op == "project.shared"
+                && matches!(table.as_str(), "catalog_pin" | "catalog_pin_set")
+            {
+                return Err(invalid("pin changes require catalog.pin"));
+            }
             if !PROJECT_SHARED_TABLES.contains(&table.as_str()) {
                 return Err(invalid(format!("unknown shared table {table}")));
             }
@@ -469,6 +476,7 @@ impl ProjectEntry {
                 &serde_json::to_value(agent).map_err(decode_error)?,
             )?;
         }
+        crate::catalog_agent::validate_pin_projection(tx)?;
         // Which workspace a project belongs to is shared; `workspace_member` is
         // this machine's own index of it, so rebuild its local rows from the
         // shared placement. Rows of other kinds, written by older versions,
@@ -646,6 +654,9 @@ mod tests {
                     "catalog_status",
                     "catalog_publisher_grant",
                     "catalog_audit",
+                    "catalog_plan",
+                    "catalog_generation",
+                    "catalog_transition",
                 ];
                 let schema = conn
                     .prepare("SELECT name FROM sqlite_schema WHERE type='table'")?

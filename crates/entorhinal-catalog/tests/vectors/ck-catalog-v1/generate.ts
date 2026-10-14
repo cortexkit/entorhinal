@@ -2221,25 +2221,30 @@ const byName = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0)
 // version has asked for a range, that range stays for the rest of the
 // resolution even if the asker's own pick later moves. The candidate set for a
 // package therefore only shrinks, picks only move down, and the loop ends.
+type RootInput = { package: string; range: string } | { packages: Record<string, string> }
+
 export function resolve(
   registry: Record<string, RegistryVersion[]>,
-  root: { package: string; range: string },
+  root: RootInput,
   localCapabilities: string[],
   currentPins?: Record<string, string>,
 ): Resolution {
   const ROOT = "(root)"
-  const ranges = new Map<string, Map<string, string>>([[root.package, new Map([[ROOT, root.range]])]])
+  const rootPackages = "packages" in root ? root.packages : { [root.package]: root.range }
+  const rootNames = Object.keys(rootPackages).sort(byName)
+  const ranges = new Map<string, Map<string, string>>()
+  for (const pkg of rootNames) ranges.set(pkg, new Map([[ROOT, rootPackages[pkg]]]))
   const eligible = (pkg: string) =>
     registry[pkg].filter((rv) => rv.status === "available" && rv.requires.capabilities.every((t) => localCapabilities.includes(t)))
   let picks = new Map<string, RegistryVersion>()
   for (;;) {
-    // One pass: walk breadth-first from the root through this pass's picks,
-    // dependencies in name order. Each package is picked against every range
-    // recorded so far, and its own ranges are recorded before its
+    // One pass: walk breadth-first from the synthetic root through this pass's
+    // picks, dependencies in name order. Each package is picked against every
+    // range recorded so far, and its own ranges are recorded before its
     // dependencies are visited.
     picks = new Map()
     let added = false
-    const queue = [root.package]
+    const queue = [...rootNames]
     while (queue.length) {
       const pkg = queue.shift()!
       if (picks.has(pkg)) continue
@@ -2275,8 +2280,9 @@ export function resolve(
     if (!added) break
   }
 
-  // Cycles: depth-first from the root, dependencies in name order; the first
-  // back edge found is reported as the path that closes it.
+  // Cycles: depth-first from each synthetic-root package, in name order;
+  // dependencies in name order; the first back edge is reported as the path
+  // that closes it.
   const stack: string[] = []
   const done = new Set<string>()
   const findCycle = (pkg: string): string[] | null => {
@@ -2292,8 +2298,10 @@ export function resolve(
     done.add(pkg)
     return null
   }
-  const cycle = findCycle(root.package)
-  if (cycle) return { ok: false, refusal: { code: "dependency_cycle", cycle } }
+  for (const pkg of rootNames) {
+    const cycle = findCycle(pkg)
+    if (cycle) return { ok: false, refusal: { code: "dependency_cycle", cycle } }
+  }
 
   // Body fields may only name packages from the same manifest's dependency
   // list, and each must resolve to the kind that field expects.
@@ -2321,6 +2329,88 @@ export function resolve(
     moves[pkg] = { from, to, direction }
   }
   return { ok: true, picks: out, moves }
+}
+
+function buildSyntheticRootRanges(
+  registry: Record<string, RegistryVersion[]>,
+  roots: Record<string, string>,
+  subjectRoots: string[],
+  currentPins: Record<string, string>,
+): Record<string, string> {
+  const rootNames = Object.keys(roots).sort(byName)
+  const subjects = new Set(subjectRoots)
+  for (const subject of subjects) {
+    if (!Object.hasOwn(roots, subject)) throw new Error(`subject root ${subject} is not in roots`)
+  }
+
+  const pinnedClosure = (startingRoots: string[]) => {
+    const reached = new Set<string>()
+    const queue = [...startingRoots].sort(byName)
+    while (queue.length) {
+      const pkg = queue.shift()!
+      if (reached.has(pkg)) continue
+      reached.add(pkg)
+      const pinnedVersion = currentPins[pkg]
+      if (pinnedVersion === undefined) continue
+      const pinned = registry[pkg]?.find((version) => version.version === pinnedVersion)
+      if (!pinned) continue
+      queue.push(...Object.keys(pinned.requires.packages).filter((dep) => currentPins[dep] !== undefined).sort(byName))
+    }
+    return reached
+  }
+
+  const nonSubjectReachable = pinnedClosure(rootNames.filter((root) => !subjects.has(root)))
+  const subjectSet = new Set(subjectRoots)
+  for (const pkg of Object.keys(currentPins)) {
+    if (!Object.hasOwn(roots, pkg) && !nonSubjectReachable.has(pkg)) subjectSet.add(pkg)
+  }
+
+  const rootRanges: Record<string, string> = {}
+  for (const root of rootNames) {
+    if (subjects.has(root)) {
+      rootRanges[root] = roots[root]
+    } else {
+      const pinnedVersion = currentPins[root]
+      if (pinnedVersion === undefined) throw new Error(`non-subject root ${root} has no current pin`)
+      rootRanges[root] = `=${pinnedVersion}`
+    }
+  }
+  for (const pkg of Object.keys(currentPins).sort(byName)) {
+    if (!subjectSet.has(pkg)) rootRanges[pkg] = `=${currentPins[pkg]}`
+  }
+  return Object.fromEntries(Object.entries(rootRanges).sort(([a], [b]) => byName(a, b)))
+}
+
+function resolveSeveralRoots(
+  registry: Record<string, RegistryVersion[]>,
+  roots: Record<string, string>,
+  subjectRoots: string[],
+  currentPins: Record<string, string>,
+  localCapabilities: string[],
+): { rootRanges: Record<string, string>; result: Resolution } {
+  const rootRanges = buildSyntheticRootRanges(registry, roots, subjectRoots, currentPins)
+  const result = resolve(registry, { packages: rootRanges }, localCapabilities, currentPins)
+  if (result.ok || (result.refusal.code !== "range_conflict" && result.refusal.code !== "no_matching_version")) return { rootRanges, result }
+
+  const pkg = result.refusal.package
+  if (typeof pkg !== "string") return { rootRanges, result }
+  const pinnedVersion = currentPins[pkg]
+  if (pinnedVersion === undefined || rootRanges[pkg] !== `=${pinnedVersion}`) return { rootRanges, result }
+  const pinned = parseVersion(pinnedVersion)
+  const constraints = Array.isArray(result.refusal.ranges) ? result.refusal.ranges as { requested_by: string; range: string }[] : []
+  const conflict = constraints.find(({ requested_by, range }) => {
+    if (requested_by === "(root)" && range === `=${pinnedVersion}`) return false
+    const parsed = parseRange(range)
+    return pinned !== null && parsed !== null && !satisfies(pinned, parsed)
+  })
+  if (!conflict) return { rootRanges, result }
+  return {
+    rootRanges,
+    result: {
+      ok: false,
+      refusal: { code: "pin_conflict", package: pkg, pinned_version: pinnedVersion, range: conflict.range, requested_by: conflict.requested_by },
+    },
+  }
 }
 
 function resolverVectors() {
@@ -2371,7 +2461,21 @@ function resolverVectors() {
     return { version, code: "version_invalid" }
   })
 
-  type Case = { name: string; note: string; local_capabilities: string[]; registry: Record<string, RegistryVersion[]>; root: { package: string; range: string }; current_pins?: Record<string, string>; expect: Resolution }
+  type Case = {
+    name: string
+    note: string
+    local_capabilities: string[]
+    registry: Record<string, RegistryVersion[]>
+    expect: Resolution
+  } & (
+    | { root: { package: string; range: string }; current_pins?: Record<string, string> }
+    | {
+        roots: Record<string, string>
+        subject_roots: string[]
+        current_pins: Record<string, string>
+        synthetic_root: { requires: { packages: Record<string, string> } }
+      }
+  )
   const head = "@x/head"
   const caps: string[] = []
   const cases: Case[] = [
@@ -2585,9 +2689,109 @@ function resolverVectors() {
       current_pins: { [head]: "1.0.0", "@x/old": "1.0.0" },
       expect: { ok: true, picks: { [head]: "1.1.0" }, moves: { [head]: { from: "1.0.0", to: "1.1.0", direction: "up" }, "@x/old": { from: "1.0.0", to: null, direction: "removed" } } },
     },
+    {
+      name: "install_preserves_existing_pins",
+      note: "installing B pins existing root A and shared dependency D exactly, while B and its new dependency E are added",
+      local_capabilities: caps,
+      registry: {
+        "@x/a": [rv("1.0.0", { deps: { "@x/d": "^1.0.0" } })],
+        "@x/b": [rv("1.0.0", { deps: { "@x/d": "^1.0.0", "@x/e": "^1.0.0" } })],
+        "@x/d": [rv("1.0.0"), rv("1.1.0")],
+        "@x/e": [rv("1.0.0")],
+      },
+      roots: { "@x/a": "^1.0.0", "@x/b": "^1.0.0" },
+      subject_roots: ["@x/b"],
+      current_pins: { "@x/a": "1.0.0", "@x/d": "1.0.0" },
+      synthetic_root: { requires: { packages: { "@x/a": "=1.0.0", "@x/b": "^1.0.0", "@x/d": "=1.0.0" } } },
+      expect: {
+        ok: true,
+        picks: { "@x/a": "1.0.0", "@x/b": "1.0.0", "@x/d": "1.0.0", "@x/e": "1.0.0" },
+        moves: {
+          "@x/a": { from: "1.0.0", to: "1.0.0", direction: "same" },
+          "@x/b": { from: null, to: "1.0.0", direction: "added" },
+          "@x/d": { from: "1.0.0", to: "1.0.0", direction: "same" },
+          "@x/e": { from: null, to: "1.0.0", direction: "added" },
+        },
+      },
+    },
+    {
+      name: "install_pin_conflict",
+      note: "B's D range conflicts with D's exact installed pin, so install refuses instead of moving D",
+      local_capabilities: caps,
+      registry: {
+        "@x/a": [rv("1.0.0", { deps: { "@x/d": "^1.0.0" } })],
+        "@x/b": [rv("1.0.0", { deps: { "@x/d": "^1.1.0", "@x/e": "^1.0.0" } })],
+        "@x/d": [rv("1.0.0"), rv("1.1.0")],
+        "@x/e": [rv("1.0.0")],
+      },
+      roots: { "@x/a": "^1.0.0", "@x/b": "^1.0.0" },
+      subject_roots: ["@x/b"],
+      current_pins: { "@x/a": "1.0.0", "@x/d": "1.0.0" },
+      synthetic_root: { requires: { packages: { "@x/a": "=1.0.0", "@x/b": "^1.0.0", "@x/d": "=1.0.0" } } },
+      expect: {
+        ok: false,
+        refusal: { code: "pin_conflict", package: "@x/d", pinned_version: "1.0.0", range: "^1.1.0", requested_by: "@x/b@1.0.0" },
+      },
+    },
+    {
+      name: "named_upgrade_keeps_shared_dependency_pinned",
+      note: "upgrading A lets A move, but C also reaches D so D remains pinned at 1.0.0",
+      local_capabilities: caps,
+      registry: {
+        "@x/a": [rv("1.0.0", { deps: { "@x/d": "^1.0.0" } }), rv("1.1.0", { deps: { "@x/d": "^1.0.0" } })],
+        "@x/c": [rv("1.0.0", { deps: { "@x/d": "^1.0.0" } })],
+        "@x/d": [rv("1.0.0"), rv("1.1.0")],
+      },
+      roots: { "@x/a": "^1.0.0", "@x/c": "^1.0.0" },
+      subject_roots: ["@x/a"],
+      current_pins: { "@x/a": "1.0.0", "@x/c": "1.0.0", "@x/d": "1.0.0" },
+      synthetic_root: { requires: { packages: { "@x/a": "^1.0.0", "@x/c": "=1.0.0", "@x/d": "=1.0.0" } } },
+      expect: {
+        ok: true,
+        picks: { "@x/a": "1.1.0", "@x/c": "1.0.0", "@x/d": "1.0.0" },
+        moves: {
+          "@x/a": { from: "1.0.0", to: "1.1.0", direction: "up" },
+          "@x/c": { from: "1.0.0", to: "1.0.0", direction: "same" },
+          "@x/d": { from: "1.0.0", to: "1.0.0", direction: "same" },
+        },
+      },
+    },
+    {
+      name: "upgrade_all_moves_shared_dependency",
+      note: "both roots are subjects, so no root outside the upgrade pins shared dependency D",
+      local_capabilities: caps,
+      registry: {
+        "@x/a": [rv("1.0.0", { deps: { "@x/d": "^1.0.0" } }), rv("1.1.0", { deps: { "@x/d": "^1.0.0" } })],
+        "@x/c": [rv("1.0.0", { deps: { "@x/d": "^1.0.0" } })],
+        "@x/d": [rv("1.0.0"), rv("1.1.0")],
+      },
+      roots: { "@x/a": "^1.0.0", "@x/c": "^1.0.0" },
+      subject_roots: ["@x/a", "@x/c"],
+      current_pins: { "@x/a": "1.0.0", "@x/c": "1.0.0", "@x/d": "1.0.0" },
+      synthetic_root: { requires: { packages: { "@x/a": "^1.0.0", "@x/c": "^1.0.0" } } },
+      expect: {
+        ok: true,
+        picks: { "@x/a": "1.1.0", "@x/c": "1.0.0", "@x/d": "1.1.0" },
+        moves: {
+          "@x/a": { from: "1.0.0", to: "1.1.0", direction: "up" },
+          "@x/c": { from: "1.0.0", to: "1.0.0", direction: "same" },
+          "@x/d": { from: "1.0.0", to: "1.1.0", direction: "up" },
+        },
+      },
+    },
   ]
   for (const c of cases) {
-    const got = resolve(c.registry, c.root, c.local_capabilities, c.current_pins)
+    let got: Resolution
+    if ("root" in c) {
+      got = resolve(c.registry, c.root, c.local_capabilities, c.current_pins)
+    } else {
+      const { rootRanges, result } = resolveSeveralRoots(c.registry, c.roots, c.subject_roots, c.current_pins, c.local_capabilities)
+      const expectedRanges = c.synthetic_root.requires.packages
+      if (JSON.stringify(rootRanges) !== JSON.stringify(expectedRanges)) {
+        throw new Error(`resolver case ${c.name}: synthetic root ranges ${JSON.stringify(rootRanges)} did not match ${JSON.stringify(expectedRanges)}`)
+      }
+      got = result
+    }
     if (JSON.stringify(got) !== JSON.stringify(c.expect)) throw new Error(`resolver case ${c.name}: got ${JSON.stringify(got)}`)
   }
   const tokenValid = ["cap/code.read@1", "cap/shell@1", "cap/flow.template@2", "cap/memory-profile.read@1", "cap/code.read@10"]
@@ -2606,6 +2810,7 @@ function resolverVectors() {
       prerelease: "a prerelease version satisfies a range only when one ||-set is exactly that version (bare or =); a prerelease anywhere else in a range is range_invalid",
       eligibility: "status available, and every requires.capabilities token is declared by a local module (exact string match)",
       algorithm: "in passes: walk breadth-first from the root, dependencies in name order; pick each package once per pass as the highest eligible version satisfying every range recorded for it so far, then record that version's requires.packages ranges (keyed by requester name@version). Stop after a pass that records nothing new. Recorded ranges are never removed. Then check cycles, then body references.",
+      pin_stability: "the synthetic root requires every current pin at =version except subject roots and pinned dependencies no non-subject root reaches; install subjects only the new root, named upgrade subjects that root, and upgrade all subjects every root. A conflicting exact pin refuses pin_conflict.",
       refusal_detail: "ranges are listed sorted by requested_by; '(root)' is the spec's own range; other requesters are name@version",
       picks_order: "picks and moves are objects keyed by package name in ascending order",
     },

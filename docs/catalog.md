@@ -1,11 +1,12 @@
-# Machine-local package catalog
+# Package catalog storage
 
 `ck-catalog` is another argv0 face of `ck-entorhinal`, like `ck-projects` and
 `ck-agents`. Placement must provide the `ck-catalog` link to expose `ck catalog`.
 The module configures registry trust, verifies packages, walks successor chains,
-ingests status feeds, and holds local publisher grants. Plans, pins, installation,
-consumer activation calls and automatic polling are not exposed yet: this API
-cannot yet persist a selected dependency closure or install it for an agent.
+ingests status feeds, and holds local publisher grants. The core store also holds
+shared agent pins and local plans/generations. Agent tools, approval cards,
+consumer activation calls, generation RPCs and automatic polling are not exposed
+yet; the store APIs do not by themselves install a skill in a consumer.
 
 ```
 ck catalog registry add https://registry.example --scope @example --key-id status-1 --public-key <64-lowercase-hex>
@@ -270,3 +271,79 @@ packages, including optional and non-Linux target dependencies:
 - `zerotrie 0.2.5`
 - `zerovec 0.11.8`
 - `zerovec-derive 0.11.6`
+
+## Agent pin sets and local execution state
+
+Migration 12 adds `catalog_pin_set` (one stored `pin_digest` per agent) and
+`catalog_pin` (one row per agent/name). Pins contain name, version, kind, manifest
+and archive SHA-256, publisher fingerprint, `root` and `range`. They contain no
+machine-local generation id. A root has a requested range; a non-root has null
+range. An empty set has the digest of the empty JCS array.
+
+The digest is **lowercase SHA-256 of a JCS array sorted by name**. Each object has
+exactly `{name, version, manifest_sha256, archive_sha256,
+publisher_fingerprint, root, range}`; `root` is a boolean and `range` is a string
+or null. Agent id and kind are excluded. A fixed two-pin golden pins this encoding
+and proves that changing root metadata changes the digest. One core validator and
+one digest function serve local writes, remote apply, snapshots, verify and rebuild.
+
+`catalog.pin` replaces one complete set, with shared entry shape
+`{op: "catalog.pin", agent_id, pins, pin_digest}`. With the identity log enabled,
+the module records a pending log append before committing its journal and pin
+projection together, so an uncertain network reply can be retried with the same
+bytes. This internal write helper adds no public pin RPC. Remote changes require an existing live agent,
+unique canonical names, valid versions/ranges and lowercase 64-hex digests.
+Snapshots may retain pins of terminal agents for identity history. Generic
+`project.shared` changes cannot write pin tables. Pins participate in shared
+snapshots and journal replay, but never in `IDENTITY_CHANGE_OPS` or `agent.changes`.
+
+`catalog_plan`, `catalog_generation` and `catalog_transition` are machine-local,
+not journal projections. Plan creation is self-targeted, live-agent-only, and
+accepts install/upgrade for the calling agent, not `hire` (creating another agent)
+or workspace/project-wide placement targets. A ready closure containing
+any non-skill member becomes failed with `kind_not_yet_supported` and its package
+name. Plans start pending and become ready or failed. Approval of a ready plan
+creates one approved generation; installed is reserved for consumer bookkeeping.
+Readiness, activation and degradation are separate store transactions. Approval
+checks the base pin digest and held closure status snapshot (`plan_stale`); changes
+outside the closure do not stale it. Revoked/tombstoned closure members block
+activation. These functions do not call consumers or write shared pins themselves;
+the later approval coordinator must use the shared pin-write path.
+
+Every applied transition records its original result and argument digest locally.
+Repeats return that result, even after a later transition; reuse with different
+arguments is `request_key_conflict`. A partial unique index permits at most one
+active generation per agent. Activation supersedes the previous active (including
+a degraded former active) and activates the ready replacement in one transaction.
+The old row and closure remain available while consumers finish switching away
+from the old packages. **Superseded is local bookkeeping,
+never a catalog wire state**; the future generation read exposes only the contract's
+installed/approved/ready/active/degraded states.
+
+## Multi-root resolver adapter
+
+Contract §9.3 defines how multiple roots become one resolver input. The pure
+crate's `synthetic_root_ranges(registry, roots, subject_roots, current_pins)`
+constructs the root requirements from the pinned versions' own dependency graph.
+Core passes root metadata and held-status-overlaid candidates to the pure
+`resolve_roots` entry point; there is no second range builder or conflict mapper. Callers supply locally verified
+record/manifest candidates (including the manifests of current pins); core overlays
+held `catalog_status` eligibility and the caller's local capability tokens. Unheld
+versions are not candidates. No network or content-store I/O runs under the store
+read snapshot.
+
+- Install makes the named spec the subject root. Non-subject roots and their
+  pinned dependencies get exact `=<version>` synthetic-root ranges.
+- A named upgrade makes that root and its dependencies not reachable from any
+  other root the subject. Its requested range replaces its old range. Packages
+  outside that set remain exact pins.
+- Upgrade-all uses every root's recorded range, releasing all dependencies.
+
+Subject dependencies are computed from current pinned manifests, not from newer
+candidates. Subject dependency packages are not synthetic roots, so a dependency
+is removed when no remaining root needs it. The synthetic root is stripped from
+closure and moves. The pure resolver computes up/down/same/added/removed against
+all current pins. An exact-pin range conflict becomes `pin_conflict`, identifying
+the package, `pinned_version`, requesting package and incompatible range from the
+resolver refusal; other resolver refusals retain their codes. Install never moves
+an unrelated pin, and a named upgrade cannot move a shared dependency.

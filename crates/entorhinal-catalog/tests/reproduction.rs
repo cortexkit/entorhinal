@@ -81,7 +81,7 @@ fn reproduce_readme() {
     let readme = fs::read(dir().join("README.md")).unwrap();
     assert_eq!(
         c::sha256_hex(&readme),
-        "5ce1c67252a867a5f82ec9d125313a45bfd0f2e161364a0a07dd02a824303cb4"
+        "6132c87fe19f7f817bbbfe6cb8765a0ebbc6c4d29491264348c1f5d4f474a850"
     );
     let text = String::from_utf8(readme).unwrap();
     let mut checked = 0;
@@ -105,17 +105,15 @@ fn reproduce_source() {
     let bytes = fs::read(dir().join("SOURCE.txt")).unwrap();
     assert_eq!(
         c::sha256_hex(&bytes),
-        "ffbb8645eb5c3eaa4c37a85486a4acaad16deed9df8309ad067c1c9d1f8de117"
+        "924322f132c4b60a8ea6cde4348665d06bfaba922601a902cd922268b8bfd59b"
     );
-    assert!(String::from_utf8(bytes)
-        .unwrap()
-        .contains("10cc9ebb68446305d1451cf9ff3ef3bc98f49f99"));
+    assert!(String::from_utf8(bytes).unwrap().contains("5aa18cb13"));
 }
 #[test]
 fn reproduce_generator() {
     assert_eq!(
         c::sha256_hex(fs::read(dir().join("generate.ts")).unwrap()),
-        "efc33f614e0621bb2cd0ff770ae12d79748245de8e515961e2a3c381198fdbbe"
+        "b3e9e77b5193ff6ab15e80135c6537985be21e991836060faf1da9c2b8363a2d"
     );
 }
 #[test]
@@ -272,12 +270,27 @@ fn reproduce_resolver() {
     }
     for case in a(&v["cases"]) {
         let registry = serde_json::from_value(case["registry"].clone()).unwrap();
-        let root = serde_json::from_value(case["root"].clone()).unwrap();
         let caps: Vec<String> = serde_json::from_value(case["local_capabilities"].clone()).unwrap();
         let pins: Option<BTreeMap<String, String>> = case
             .get("current_pins")
             .map(|v| serde_json::from_value(v.clone()).unwrap());
-        let got = match resolver::resolve(&registry, &root, &caps, pins.as_ref()) {
+        let result = if case.get("roots").is_some() {
+            let roots = serde_json::from_value(case["roots"].clone()).unwrap();
+            let subjects: Vec<String> =
+                serde_json::from_value(case["subject_roots"].clone()).unwrap();
+            let pins = pins.as_ref().unwrap();
+            assert_eq!(
+                json!(resolver::synthetic_root_ranges(&registry, &roots, &subjects, pins).unwrap()),
+                case["synthetic_root"]["requires"]["packages"],
+                "{} synthetic root",
+                case["name"]
+            );
+            resolver::resolve_roots(&registry, &roots, &subjects, pins, &caps)
+        } else {
+            let root = serde_json::from_value(case["root"].clone()).unwrap();
+            resolver::resolve(&registry, &root, &caps, pins.as_ref())
+        };
+        let got = match result {
             Ok(r) => outcome::<_, Value>(Ok(r)),
             Err(e) => json!({"ok":false,"refusal":e}),
         };

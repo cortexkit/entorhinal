@@ -1392,6 +1392,8 @@ impl RegistryStore {
 // Machine-local driver checkpoints and settings (agent_move, move_setting) are
 // deliberately excluded: the identity journal cannot reconstruct them.
 const DERIVED_TABLES: &[&str] = &[
+    "catalog_pin",
+    "catalog_pin_set",
     "member_name",
     "agent_name_claim",
     "agent",
@@ -1493,6 +1495,8 @@ fn delete_and_replay(tx: &Transaction<'_>) -> rusqlite::Result<()> {
             // an `agent.set_namespace` row (the correction's last one).
             if op == "member.set_name" {
                 super::shared_entry::replay_member_name(tx, image)?;
+            } else if op == "catalog.pin" {
+                super::catalog_agent::replay_pin(tx, image)?;
             } else if op.starts_with("agent.") && image["op"] != "project.shared" {
                 super::agent::replay_agent_entry(tx, &op, &image)?;
             } else {
@@ -1641,6 +1645,9 @@ fn replay(
     now: i64,
     enabled: bool,
 ) -> rusqlite::Result<()> {
+    if op == "catalog.pin" {
+        return super::catalog_agent::replay_pin(tx, v);
+    }
     if super::agent::replay_agent_entry(tx, op, &v)? {
         return Ok(());
     }

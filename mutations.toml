@@ -6488,3 +6488,489 @@ target = "--bin ck-entorhinal"
 expect_red = ["catalog_trust::tests::refused_chain_links_log_once_per_distinct_document"]
 select = "expected"
 only = false
+
+# Shared catalog identities and machine-local preparation/activation guards.
+[[control]]
+id = "catalog-pin-format"
+guards = "Shared pins reject duplicate names, invalid identifiers, versions, hashes and root ranges"
+file = "crates/entorhinal-core/src/catalog_agent.rs"
+old = 'return Err(invalid("invalid catalog pin set"));'
+new = 'continue; // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/catalog_agent/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_agent::tests::malformed_pins_are_refused"]
+
+[[control]]
+id = "catalog-pin-digest"
+guards = "Remote pin changes require the canonical pin digest"
+file = "crates/entorhinal-core/src/catalog_agent.rs"
+old = 'return Err(invalid("invalid catalog pin digest or op"));'
+new = '// NON-VACUITY BREAK: accept inconsistent digest'
+test_file = "crates/entorhinal-core/src/catalog_agent/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_agent::tests::remote_pin_apply_refuses_unknown_terminal_digest_and_shape_atomically"]
+
+[[control]]
+id = "catalog-pin-live-agent"
+guards = "Remote pin changes require an existing live agent"
+file = "crates/entorhinal-core/src/catalog_agent.rs"
+old = 'return Err(invalid("catalog pin agent is missing or not live"));'
+new = '// NON-VACUITY BREAK: accept terminal agents'
+test_file = "crates/entorhinal-core/src/catalog_agent/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_agent::tests::remote_pin_apply_refuses_unknown_terminal_digest_and_shape_atomically"]
+
+[[control]]
+id = "catalog-pin-feed-fence"
+guards = "A pin shared entry cannot poison the agent replica page on a second node"
+file = "crates/entorhinal-core/src/agent/feed.rs"
+old = 'WHERE seq>?1 AND op IN ({})'
+new = "WHERE seq>?1 AND (op IN ({}) OR op='catalog.pin') /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::catalog_pins_round_trip_shared_writer_and_stay_out_of_agent_feed"]
+
+[[control]]
+id = "catalog-pin-project-bypass"
+guards = "Generic project changes cannot bypass pin validation"
+file = "crates/entorhinal-core/src/shared_entry.rs"
+old = 'return Err(invalid("pin changes require catalog.pin"));'
+new = '// NON-VACUITY BREAK: allow generic pin table changes'
+test_file = "crates/entorhinal-core/src/catalog_agent/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_agent::tests::project_delta_cannot_bypass_pin_entry_validation"]
+
+[[control]]
+id = "catalog-pin-snapshot-validation"
+guards = "Pin snapshots pass the same validator and digest check as pin changes"
+file = "crates/entorhinal-core/src/shared_entry.rs"
+old = 'crate::catalog_agent::validate_pin_projection(tx)?;'
+new = '// NON-VACUITY BREAK: skip snapshot pin validation'
+test_file = "crates/entorhinal-core/src/catalog_agent/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_agent::tests::snapshot_pins_use_the_same_validator_and_digest"]
+
+[[control]]
+id = "catalog-pin-verify-coverage"
+guards = "Verification compares pin digest projections instead of ignoring corruption"
+file = "crates/entorhinal-core/src/mutations.rs"
+old = '    "catalog_pin_set",'
+new = '// NON-VACUITY BREAK: omit the pin digest projection'
+test_file = "crates/entorhinal-core/src/catalog_agent/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_agent::tests::corrupted_pin_projection_is_detected_and_rebuild_repairs_it"]
+
+[[control]]
+id = "catalog-transition-receipts"
+guards = "An idempotent repeat returns the original applied transition result"
+file = "crates/entorhinal-core/src/catalog_agent.rs"
+old = 'if let Some((old, result)) = saved {'
+new = 'if let Some((old, result)) = saved.filter(|_| false) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/catalog_agent/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_agent::tests::plan_and_generation_transitions_replay_the_original_results"]
+
+[[control]]
+id = "catalog-transition-args"
+guards = "Reusing a transition id with different arguments is refused"
+file = "crates/entorhinal-core/src/catalog_agent.rs"
+old = 'if old != digest {'
+new = 'if false && old != digest { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/catalog_agent/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_agent::tests::transition_guards_reject_cross_owner_wrong_state_and_reused_ids"]
+
+[[control]]
+id = "catalog-transition-owner"
+guards = "Only the owning agent can read or change its plans and generations"
+file = "crates/entorhinal-core/src/catalog_agent.rs"
+old = 'if agent != caller {'
+new = 'if false && agent != caller { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/catalog_agent/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_agent::tests::transition_guards_reject_cross_owner_wrong_state_and_reused_ids"]
+
+[[control]]
+id = "catalog-transition-live"
+guards = "A retired agent cannot prepare or activate package execution state"
+file = "crates/entorhinal-core/src/catalog_agent.rs"
+old = 'if status.as_deref() != Some("live") {'
+new = 'if false && status.as_deref() != Some("live") { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/catalog_agent/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_agent::tests::kind_operation_scope_and_liveness_gates"]
+
+[[control]]
+id = "catalog-plan-operation"
+guards = "Hire is refused before creating local plan state"
+file = "crates/entorhinal-core/src/catalog_agent.rs"
+old = 'if !matches!(operation, "install" | "upgrade") {'
+new = 'if false && !matches!(operation, "install" | "upgrade") { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/catalog_agent/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_agent::tests::kind_operation_scope_and_liveness_gates"]
+
+[[control]]
+id = "catalog-plan-kind"
+guards = "Any non-skill in a closure fails the plan with its package name"
+file = "crates/entorhinal-core/src/catalog_agent.rs"
+old = 'pins.iter().find(|p| p.kind != Kind::Skill)'
+new = 'pins.iter().find(|_| false /* NON-VACUITY BREAK */)'
+test_file = "crates/entorhinal-core/src/catalog_agent/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_agent::tests::kind_operation_scope_and_liveness_gates"]
+
+[[control]]
+id = "catalog-plan-ready-base"
+guards = "A changed pin base cannot become a ready plan"
+file = "crates/entorhinal-core/src/catalog_agent.rs"
+old = 'if current_digest(tx,&plan.agent_id).map_err(store_error)? != plan.base_pin_digest { return Err(CatalogWriteError::Refused("plan_stale")); }'
+new = '// NON-VACUITY BREAK: ready a plan against a changed pin base'
+test_file = "crates/entorhinal-core/src/catalog_agent/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_agent::tests::ready_plan_refuses_a_changed_base_and_transition_state_is_closed"]
+
+[[control]]
+id = "catalog-approval-stale"
+guards = "Approval rechecks the pin base and held status snapshot atomically"
+file = "crates/entorhinal-core/src/catalog_agent.rs"
+old = 'if current_digest(tx,&plan.agent_id).map_err(store_error)? != plan.base_pin_digest || decode::<Value>(saved).map_err(store_error)? != status_snapshot(tx,pins).map_err(store_error)? {'
+new = 'if false && (current_digest(tx,&plan.agent_id).map_err(store_error)? != plan.base_pin_digest || decode::<Value>(saved).map_err(store_error)? != status_snapshot(tx,pins).map_err(store_error)?) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/catalog_agent/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_agent::tests::stale_pin_and_status_changes_refuse_approval_and_block_activation"]
+
+[[control]]
+id = "catalog-generation-transition"
+guards = "Activation requires a ready generation and degradation requires an active one"
+file = "crates/entorhinal-core/src/catalog_agent.rs"
+old = 'if !allowed { return Err(CatalogWriteError::Refused("invalid_transition")); }'
+new = '// NON-VACUITY BREAK: accept out-of-order generation transitions'
+test_file = "crates/entorhinal-core/src/catalog_agent/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_agent::tests::transition_guards_reject_cross_owner_wrong_state_and_reused_ids"]
+
+[[control]]
+id = "catalog-activation-blocked"
+guards = "A tombstoned or revoked closure cannot displace the current active generation"
+file = "crates/entorhinal-core/src/catalog_agent.rs"
+old = 'if blocked(tx,&generation.closure).map_err(store_error)? { return Err(CatalogWriteError::Refused("activation_blocked")); }'
+new = '// NON-VACUITY BREAK: activate a blocked closure'
+test_file = "crates/entorhinal-core/src/catalog_agent/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_agent::tests::stale_pin_and_status_changes_refuse_approval_and_block_activation"]
+
+[[control]]
+id = "catalog-single-active-schema"
+guards = "SQLite itself refuses two active generations for the same agent"
+file = "crates/entorhinal-core/src/catalog_agent.rs"
+old = "CREATE UNIQUE INDEX catalog_one_active ON catalog_generation(agent_id) WHERE state='active';"
+new = "-- NON-VACUITY BREAK: no single-active constraint"
+test_file = "crates/entorhinal-core/src/catalog_agent/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_agent::tests::single_active_swap_keeps_superseded_and_schema_refuses_second_active"]
+
+[[control]]
+id = "catalog-resolution-fixed-pins"
+guards = "Installing a root preserves unrelated pinned roots and dependencies"
+file = "crates/entorhinal-catalog/src/resolver.rs"
+old = 'if !subject_set.contains(package) {'
+new = 'if false && !subject_set.contains(package) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-catalog/tests/reproduction.rs"
+runner = "cargo"
+package = "entorhinal-catalog"
+target = "--test reproduction"
+select = "expected"
+expect_red = ["reproduce_resolver"]
+
+[[control]]
+id = "catalog-resolution-shared-dependencies"
+guards = "A named upgrade cannot move a dependency reachable from another root"
+file = "crates/entorhinal-catalog/src/resolver.rs"
+old = 'if !roots.contains_key(package) && !non_subject_reachable.contains(package) {'
+new = 'if !roots.contains_key(package) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-catalog/tests/reproduction.rs"
+runner = "cargo"
+package = "entorhinal-catalog"
+target = "--test reproduction"
+select = "expected"
+expect_red = ["reproduce_resolver"]
+
+[[control]]
+id = "catalog-resolution-status"
+guards = "Held withdrawn versions are ineligible even when their capabilities are present"
+file = "crates/entorhinal-core/src/catalog_resolution.rs"
+old = 'status: held.state,'
+new = 'status: entorhinal_catalog::status::State::Available, // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/catalog_resolution/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_resolution::tests::held_status_and_capabilities_control_eligibility_and_kind_gate"]
+
+[[control]]
+id = "catalog-resolution-kind"
+guards = "Resolver closure members of unsupported kinds are refused before planning"
+file = "crates/entorhinal-core/src/catalog_resolution.rs"
+old = 'if package.manifest.kind != Kind::Skill {'
+new = 'if false && package.manifest.kind != Kind::Skill { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/catalog_resolution/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_resolution::tests::held_status_and_capabilities_control_eligibility_and_kind_gate"]
+
+[[control]]
+id = "catalog-resolution-conflict-detail"
+guards = "Pin conflict detail names the incompatible subject range rather than another satisfied range"
+file = "crates/entorhinal-catalog/src/resolver.rs"
+old = '.is_ok_and(|r| !r.satisfies(&pinned))'
+new = '.is_ok_and(|r| r.satisfies(&pinned)) /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-catalog/tests/reproduction.rs"
+runner = "cargo"
+package = "entorhinal-catalog"
+target = "--test reproduction"
+select = "expected"
+expect_red = ["reproduce_resolver"]
+
+[[control]]
+id = "catalog-plan-target"
+guards = "A placement tier is refused instead of accepted as an agent target"
+file = "crates/entorhinal-core/src/catalog_agent.rs"
+old = '''let CatalogTarget::Agent(agent) = target else {
+            return Err(CatalogWriteError::Refused("operation_not_yet_supported"));
+        };'''
+new = '''let agent = match target { CatalogTarget::Agent(id) | CatalogTarget::Tier(id) => id }; // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-core/src/catalog_agent/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_agent::tests::kind_operation_scope_and_liveness_gates"]
+
+[[control]]
+id = "catalog-plan-shape"
+guards = "Plan identifiers, package names and ranges must be well formed"
+file = "crates/entorhinal-core/src/catalog_agent.rs"
+old = 'return Err(CatalogWriteError::Refused("invalid_request"));'
+new = '// NON-VACUITY BREAK: accept malformed plan inputs'
+test_file = "crates/entorhinal-core/src/catalog_agent/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_agent::tests::plan_request_shape_and_approval_state_are_validated"]
+
+[[control]]
+id = "catalog-plan-ready-transition"
+guards = "A failed plan cannot become ready"
+file = "crates/entorhinal-core/src/catalog_agent.rs"
+old = 'if plan.state != "pending" { return Err(CatalogWriteError::Refused("invalid_transition")); }'
+new = '// NON-VACUITY BREAK: ready a failed plan'
+test_file = "crates/entorhinal-core/src/catalog_agent/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_agent::tests::transition_guards_reject_cross_owner_wrong_state_and_reused_ids"]
+
+[[control]]
+id = "catalog-plan-failed-transition"
+guards = "A ready plan cannot be overwritten by a failed preparation"
+file = "crates/entorhinal-core/src/catalog_agent.rs"
+old = '''if plan.state != "pending" {
+                    return Err(CatalogWriteError::Refused("invalid_transition"));
+                }'''
+new = '// NON-VACUITY BREAK: fail a ready plan'
+test_file = "crates/entorhinal-core/src/catalog_agent/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_agent::tests::ready_plan_refuses_a_changed_base_and_transition_state_is_closed"]
+
+[[control]]
+id = "catalog-approval-state"
+guards = "Only a ready plan can create an approved generation"
+file = "crates/entorhinal-core/src/catalog_agent.rs"
+old = 'if plan.state != "ready" { return Err(CatalogWriteError::Refused("invalid_transition")); }'
+new = '// NON-VACUITY BREAK: approve an unready plan'
+test_file = "crates/entorhinal-core/src/catalog_agent/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_agent::tests::plan_request_shape_and_approval_state_are_validated"]
+
+[[control]]
+id = "catalog-approval-one-generation"
+guards = "A plan creates one generation and generation ids are nonempty"
+file = "crates/entorhinal-core/src/catalog_agent.rs"
+old = 'if existing || generation_id.is_empty() { return Err(CatalogWriteError::Refused("request_key_conflict")); }'
+new = 'let _ = existing; // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/catalog_agent/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_agent::tests::plan_request_shape_and_approval_state_are_validated"]
+
+[[control]]
+id = "catalog-resolution-live"
+guards = "Only a live existing agent may resolve its local catalog pins"
+file = "crates/entorhinal-core/src/catalog_resolution.rs"
+old = 'if status.as_deref() != Some("live") {'
+new = 'if false && status.as_deref() != Some("live") { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/catalog_resolution/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_resolution::tests::resolver_refuses_missing_live_root_manifests_unheld_and_mismatched_records"]
+
+[[control]]
+id = "catalog-resolution-upgrade-root"
+guards = "A named upgrade must identify an existing root pin"
+file = "crates/entorhinal-core/src/catalog_resolution.rs"
+old = 'return Err(refusal("root_not_found"));'
+new = '// NON-VACUITY BREAK: upgrade an absent root'
+test_file = "crates/entorhinal-core/src/catalog_resolution/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_resolution::tests::resolver_refuses_missing_live_root_manifests_unheld_and_mismatched_records"]
+
+[[control]]
+id = "catalog-resolution-record-identity"
+guards = "Candidate records and manifests must name the same package version"
+file = "crates/entorhinal-core/src/catalog_resolution.rs"
+old = 'if r.name != m.name || r.version != m.version {'
+new = 'if false && (r.name != m.name || r.version != m.version) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/catalog_resolution/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_resolution::tests::resolver_refuses_missing_live_root_manifests_unheld_and_mismatched_records"]
+
+[[control]]
+id = "catalog-resolution-pinned-identity"
+guards = "A candidate cannot replace a pinned version's immutable byte identities"
+file = "crates/entorhinal-core/src/catalog_resolution.rs"
+old = 'if pin.manifest_sha256 != r.manifest_sha256'
+new = 'if false && pin.manifest_sha256 != r.manifest_sha256 // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/catalog_resolution/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_resolution::tests::pinned_candidate_bytes_and_kind_cannot_change"]
+
+[[control]]
+id = "catalog-resolution-duplicate"
+guards = "Conflicting duplicate package-version candidates are refused"
+file = "crates/entorhinal-core/src/catalog_resolution.rs"
+old = '.is_some()'
+new = '.is_some() && false /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-core/src/catalog_resolution/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_resolution::tests::resolver_refuses_missing_live_root_manifests_unheld_and_mismatched_records"]
+
+[[control]]
+id = "catalog-resolution-manifest-coverage"
+guards = "Resolution needs the verified manifest of every current pin"
+file = "crates/entorhinal-core/src/catalog_resolution.rs"
+old = 'return Err(refusal("pinned_manifest_missing"));'
+new = '// NON-VACUITY BREAK: permit absent pinned manifests'
+test_file = "crates/entorhinal-core/src/catalog_resolution/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_resolution::tests::resolver_refuses_missing_live_root_manifests_unheld_and_mismatched_records"]
+
+[[control]]
+id = "catalog-synthetic-subject"
+guards = "The pure range builder refuses a subject not present among the roots"
+file = "crates/entorhinal-catalog/src/resolver.rs"
+old = 'if !roots.contains_key(subject) {'
+new = 'if false && !roots.contains_key(subject) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-catalog/tests/guards.rs"
+runner = "cargo"
+package = "entorhinal-catalog"
+target = "--test guards"
+select = "expected"
+expect_red = ["several_roots_validate_subjects_and_do_not_leak_synthetic_requesters"]
+
+[[control]]
+id = "catalog-synthetic-hidden"
+guards = "The artificial root is never part of a returned package closure"
+file = "crates/entorhinal-catalog/src/resolver.rs"
+old = 'result.picks.remove(SYNTHETIC);'
+new = '// NON-VACUITY BREAK: leak artificial package into picks'
+test_file = "crates/entorhinal-catalog/tests/reproduction.rs"
+runner = "cargo"
+package = "entorhinal-catalog"
+target = "--test reproduction"
+select = "expected"
+expect_red = ["reproduce_resolver"]

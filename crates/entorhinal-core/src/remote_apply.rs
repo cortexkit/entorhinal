@@ -46,6 +46,7 @@ enum Decoded {
     Project(ProjectEntry),
     Agent(Box<AgentChangeEntry>),
     Member(crate::shared_entry::MemberName),
+    Pins(crate::catalog_agent::CatalogPinSet),
 }
 
 #[derive(Deserialize)]
@@ -569,6 +570,12 @@ fn apply(tx: &Transaction<'_>, entry: &RemoteEntry) -> rusqlite::Result<i64> {
             }
             Decoded::Member(member.name)
         }
+        ("change", "catalog.pin") => {
+            let pins: crate::catalog_agent::CatalogPinSet =
+                serde_json::from_value(value).map_err(decode_error)?;
+            pins.validate(tx, true)?;
+            Decoded::Pins(pins)
+        }
         ("change", op) if AGENT_OPS.contains(&op) => {
             let agent: AgentChangeEntry = serde_json::from_value(value).map_err(decode_error)?;
             check_agent_entry(tx, &agent)?;
@@ -598,6 +605,13 @@ fn apply(tx: &Transaction<'_>, entry: &RemoteEntry) -> rusqlite::Result<i64> {
         // the same snapshot. Validate those references against the final state.
         tx.execute_batch("PRAGMA defer_foreign_keys=ON;")?;
         match decoded {
+            Decoded::Pins(pins) => {
+                let payload = json!({"entry":pins});
+                let seq = append(tx, "catalog.pin", &payload, "log", None, 0, "entorhinal")?;
+                pins.restore(tx)?;
+                tag(tx, seq, entry, &payload)?;
+                seq
+            }
             Decoded::Project(project) => {
                 if project.op == "shared.snapshot" {
                     for mut agent in project.agents.clone() {

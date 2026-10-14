@@ -1,1 +1,1 @@
-Copy of prefrontal test-vectors/ck-catalog-v1 at 10cc9ebb68446305d1451cf9ff3ef3bc98f49f99, byte-identical except this file.
+Copy of prefrontal test-vectors/ck-catalog-v1 at 5aa18cb13, byte-identical except this file.

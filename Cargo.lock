@@ -379,6 +379,7 @@ dependencies = [
  "cortexkit-paths",
  "cortexkit-store",
  "cortexkit-store-types",
+ "entorhinal-catalog",
  "getrandom 0.2.17",
  "icu_casemap",
  "icu_normalizer 1.5.0",

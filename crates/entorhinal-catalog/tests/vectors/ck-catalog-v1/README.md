@@ -85,5 +85,5 @@ The table below is rewritten by `generate.ts`; the check fails if it is stale.
 | archive.json | `e5ac9b06742cc3dd6fae5aac1d707c51d603350348d02a66beecb024305a1191` |
 | status.json | `6e07ced5fe7178ccd76cca415644f8bf36ef44e532f0155a70345de939d6644b` |
 | statements.json | `89780229b796d1cb4ac25c3c8fe742c3dc19ce0fe6dbe51f336c134b51989d0f` |
-| resolver.json | `81e66df076cfb9c467f9339c55d7f67ecf79ca4843015e41079dcf59510279ee` |
+| resolver.json | `8ef338e4fb68abe808215a27d6a58ba1c0a90b0abbd1683cccc21a7d8d00ee72` |
 <!-- sha256:end -->

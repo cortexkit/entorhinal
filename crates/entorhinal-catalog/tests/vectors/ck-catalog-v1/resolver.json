@@ -7,6 +7,7 @@
     "prerelease": "a prerelease version satisfies a range only when one ||-set is exactly that version (bare or =); a prerelease anywhere else in a range is range_invalid",
     "eligibility": "status available, and every requires.capabilities token is declared by a local module (exact string match)",
     "algorithm": "in passes: walk breadth-first from the root, dependencies in name order; pick each package once per pass as the highest eligible version satisfying every range recorded for it so far, then record that version's requires.packages ranges (keyed by requester name@version). Stop after a pass that records nothing new. Recorded ranges are never removed. Then check cycles, then body references.",
+    "pin_stability": "the synthetic root requires every current pin at =version except subject roots and pinned dependencies no non-subject root reaches; install subjects only the new root, named upgrade subjects that root, and upgrade all subjects every root. A conflicting exact pin refuses pin_conflict.",
     "refusal_detail": "ranges are listed sorted by requested_by; '(root)' is the spec's own range; other requesters are name@version",
     "picks_order": "picks and moves are objects keyed by package name in ascending order"
   },
@@ -1682,6 +1683,437 @@
             "from": "1.0.0",
             "to": null,
             "direction": "removed"
+          }
+        }
+      }
+    },
+    {
+      "name": "install_preserves_existing_pins",
+      "note": "installing B pins existing root A and shared dependency D exactly, while B and its new dependency E are added",
+      "local_capabilities": [],
+      "registry": {
+        "@x/a": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {
+                "@x/d": "^1.0.0"
+              }
+            }
+          }
+        ],
+        "@x/b": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {
+                "@x/d": "^1.0.0",
+                "@x/e": "^1.0.0"
+              }
+            }
+          }
+        ],
+        "@x/d": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          },
+          {
+            "version": "1.1.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          }
+        ],
+        "@x/e": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          }
+        ]
+      },
+      "roots": {
+        "@x/a": "^1.0.0",
+        "@x/b": "^1.0.0"
+      },
+      "subject_roots": [
+        "@x/b"
+      ],
+      "current_pins": {
+        "@x/a": "1.0.0",
+        "@x/d": "1.0.0"
+      },
+      "synthetic_root": {
+        "requires": {
+          "packages": {
+            "@x/a": "=1.0.0",
+            "@x/b": "^1.0.0",
+            "@x/d": "=1.0.0"
+          }
+        }
+      },
+      "expect": {
+        "ok": true,
+        "picks": {
+          "@x/a": "1.0.0",
+          "@x/b": "1.0.0",
+          "@x/d": "1.0.0",
+          "@x/e": "1.0.0"
+        },
+        "moves": {
+          "@x/a": {
+            "from": "1.0.0",
+            "to": "1.0.0",
+            "direction": "same"
+          },
+          "@x/b": {
+            "from": null,
+            "to": "1.0.0",
+            "direction": "added"
+          },
+          "@x/d": {
+            "from": "1.0.0",
+            "to": "1.0.0",
+            "direction": "same"
+          },
+          "@x/e": {
+            "from": null,
+            "to": "1.0.0",
+            "direction": "added"
+          }
+        }
+      }
+    },
+    {
+      "name": "install_pin_conflict",
+      "note": "B's D range conflicts with D's exact installed pin, so install refuses instead of moving D",
+      "local_capabilities": [],
+      "registry": {
+        "@x/a": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {
+                "@x/d": "^1.0.0"
+              }
+            }
+          }
+        ],
+        "@x/b": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {
+                "@x/d": "^1.1.0",
+                "@x/e": "^1.0.0"
+              }
+            }
+          }
+        ],
+        "@x/d": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          },
+          {
+            "version": "1.1.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          }
+        ],
+        "@x/e": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          }
+        ]
+      },
+      "roots": {
+        "@x/a": "^1.0.0",
+        "@x/b": "^1.0.0"
+      },
+      "subject_roots": [
+        "@x/b"
+      ],
+      "current_pins": {
+        "@x/a": "1.0.0",
+        "@x/d": "1.0.0"
+      },
+      "synthetic_root": {
+        "requires": {
+          "packages": {
+            "@x/a": "=1.0.0",
+            "@x/b": "^1.0.0",
+            "@x/d": "=1.0.0"
+          }
+        }
+      },
+      "expect": {
+        "ok": false,
+        "refusal": {
+          "code": "pin_conflict",
+          "package": "@x/d",
+          "pinned_version": "1.0.0",
+          "range": "^1.1.0",
+          "requested_by": "@x/b@1.0.0"
+        }
+      }
+    },
+    {
+      "name": "named_upgrade_keeps_shared_dependency_pinned",
+      "note": "upgrading A lets A move, but C also reaches D so D remains pinned at 1.0.0",
+      "local_capabilities": [],
+      "registry": {
+        "@x/a": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {
+                "@x/d": "^1.0.0"
+              }
+            }
+          },
+          {
+            "version": "1.1.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {
+                "@x/d": "^1.0.0"
+              }
+            }
+          }
+        ],
+        "@x/c": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {
+                "@x/d": "^1.0.0"
+              }
+            }
+          }
+        ],
+        "@x/d": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          },
+          {
+            "version": "1.1.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          }
+        ]
+      },
+      "roots": {
+        "@x/a": "^1.0.0",
+        "@x/c": "^1.0.0"
+      },
+      "subject_roots": [
+        "@x/a"
+      ],
+      "current_pins": {
+        "@x/a": "1.0.0",
+        "@x/c": "1.0.0",
+        "@x/d": "1.0.0"
+      },
+      "synthetic_root": {
+        "requires": {
+          "packages": {
+            "@x/a": "^1.0.0",
+            "@x/c": "=1.0.0",
+            "@x/d": "=1.0.0"
+          }
+        }
+      },
+      "expect": {
+        "ok": true,
+        "picks": {
+          "@x/a": "1.1.0",
+          "@x/c": "1.0.0",
+          "@x/d": "1.0.0"
+        },
+        "moves": {
+          "@x/a": {
+            "from": "1.0.0",
+            "to": "1.1.0",
+            "direction": "up"
+          },
+          "@x/c": {
+            "from": "1.0.0",
+            "to": "1.0.0",
+            "direction": "same"
+          },
+          "@x/d": {
+            "from": "1.0.0",
+            "to": "1.0.0",
+            "direction": "same"
+          }
+        }
+      }
+    },
+    {
+      "name": "upgrade_all_moves_shared_dependency",
+      "note": "both roots are subjects, so no root outside the upgrade pins shared dependency D",
+      "local_capabilities": [],
+      "registry": {
+        "@x/a": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {
+                "@x/d": "^1.0.0"
+              }
+            }
+          },
+          {
+            "version": "1.1.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {
+                "@x/d": "^1.0.0"
+              }
+            }
+          }
+        ],
+        "@x/c": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {
+                "@x/d": "^1.0.0"
+              }
+            }
+          }
+        ],
+        "@x/d": [
+          {
+            "version": "1.0.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          },
+          {
+            "version": "1.1.0",
+            "kind": "persona",
+            "status": "available",
+            "requires": {
+              "capabilities": [],
+              "packages": {}
+            }
+          }
+        ]
+      },
+      "roots": {
+        "@x/a": "^1.0.0",
+        "@x/c": "^1.0.0"
+      },
+      "subject_roots": [
+        "@x/a",
+        "@x/c"
+      ],
+      "current_pins": {
+        "@x/a": "1.0.0",
+        "@x/c": "1.0.0",
+        "@x/d": "1.0.0"
+      },
+      "synthetic_root": {
+        "requires": {
+          "packages": {
+            "@x/a": "^1.0.0",
+            "@x/c": "^1.0.0"
+          }
+        }
+      },
+      "expect": {
+        "ok": true,
+        "picks": {
+          "@x/a": "1.1.0",
+          "@x/c": "1.0.0",
+          "@x/d": "1.1.0"
+        },
+        "moves": {
+          "@x/a": {
+            "from": "1.0.0",
+            "to": "1.1.0",
+            "direction": "up"
+          },
+          "@x/c": {
+            "from": "1.0.0",
+            "to": "1.0.0",
+            "direction": "same"
+          },
+          "@x/d": {
+            "from": "1.0.0",
+            "to": "1.1.0",
+            "direction": "up"
           }
         }
       }

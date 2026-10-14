@@ -8,6 +8,7 @@ publish = false
 description = "Pure domain and journal-spine store for the ck-entorhinal registry."
 
 [dependencies]
+entorhinal-catalog = { path = "../entorhinal-catalog" }
 blake3 = { workspace = true }
 cortexkit-paths = { workspace = true }
 cortexkit-lease = { workspace = true }

@@ -67,6 +67,12 @@ pub struct AskedRange {
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "code", rename_all = "snake_case")]
 pub enum ResolveError {
+    PinConflict {
+        package: String,
+        pinned_version: String,
+        range: String,
+        requested_by: String,
+    },
     PackageNotFound {
         package: String,
     },
@@ -346,5 +352,177 @@ pub fn worker_provider(
             contract: contract.into(),
             providers,
         }),
+    }
+}
+
+/// Build multi-root requirements using dependency edges from each pin's own
+/// version, never from the highest candidate. Non-subject roots and everything
+/// they reach stay exact pins; subject roots retain their requested ranges and
+/// dependencies not reached by another root are free to resolve or disappear.
+pub fn synthetic_root_ranges(
+    registry: &BTreeMap<String, Vec<RegistryVersion>>,
+    roots: &BTreeMap<String, String>,
+    subject_roots: &[String],
+    current_pins: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, ResolveError> {
+    let subjects: BTreeSet<_> = subject_roots.iter().cloned().collect();
+    for subject in &subjects {
+        if !roots.contains_key(subject) {
+            return Err(ResolveError::PackageNotFound {
+                package: subject.clone(),
+            });
+        }
+    }
+    let mut non_subject_reachable = BTreeSet::new();
+    let mut queue: VecDeque<_> = roots
+        .keys()
+        .filter(|r| !subjects.contains(*r))
+        .cloned()
+        .collect();
+    while let Some(package) = queue.pop_front() {
+        if !non_subject_reachable.insert(package.clone()) {
+            continue;
+        }
+        if let Some(pinned) = current_pins.get(&package).and_then(|version| {
+            registry
+                .get(&package)?
+                .iter()
+                .find(|r| &r.version == version)
+        }) {
+            queue.extend(
+                pinned
+                    .requires
+                    .packages
+                    .keys()
+                    .filter(|p| current_pins.contains_key(*p))
+                    .cloned(),
+            );
+        }
+    }
+    let mut subject_set = subjects.clone();
+    for package in current_pins.keys() {
+        if !roots.contains_key(package) && !non_subject_reachable.contains(package) {
+            subject_set.insert(package.clone());
+        }
+    }
+    let mut ranges = BTreeMap::new();
+    for (root, range) in roots {
+        let range = if subjects.contains(root) {
+            range.clone()
+        } else {
+            format!(
+                "={}",
+                current_pins
+                    .get(root)
+                    .ok_or_else(|| ResolveError::PackageNotFound {
+                        package: root.clone()
+                    })?
+            )
+        };
+        ranges.insert(root.clone(), range);
+    }
+    for (package, version) in current_pins {
+        if !subject_set.contains(package) {
+            ranges.insert(package.clone(), format!("={version}"));
+        }
+    }
+    Ok(ranges)
+}
+
+/// Resolve several roots with the single-root algorithm. The artificial package
+/// never appears in returned picks/moves; its constraints are attributed to
+/// `(root)`. An incompatible exact pin becomes the contract's pin_conflict.
+pub fn resolve_roots(
+    registry: &BTreeMap<String, Vec<RegistryVersion>>,
+    roots: &BTreeMap<String, String>,
+    subject_roots: &[String],
+    current_pins: &BTreeMap<String, String>,
+    caps: &[String],
+) -> Result<Resolution, ResolveError> {
+    const SYNTHETIC: &str = "\0catalog-roots";
+    let ranges = synthetic_root_ranges(registry, roots, subject_roots, current_pins)?;
+    let mut input = registry.clone();
+    input.insert(
+        SYNTHETIC.into(),
+        vec![RegistryVersion {
+            version: "0.0.0".into(),
+            kind: Kind::Skill,
+            status: State::Available,
+            requires: crate::record::Requires {
+                capabilities: vec![],
+                packages: ranges.clone(),
+            },
+            refs: vec![],
+        }],
+    );
+    match resolve(
+        &input,
+        &Root {
+            package: SYNTHETIC.into(),
+            range: "*".into(),
+        },
+        caps,
+        Some(current_pins),
+    ) {
+        Ok(mut result) => {
+            result.picks.remove(SYNTHETIC);
+            result
+                .moves
+                .as_mut()
+                .expect("pins produce moves")
+                .remove(SYNTHETIC);
+            Ok(result)
+        }
+        Err(mut error) => {
+            let asked = match &mut error {
+                ResolveError::RangeConflict { ranges, .. }
+                | ResolveError::NoMatchingVersion { ranges, .. } => Some(ranges),
+                ResolveError::RangeInvalid { requested_by, .. } => {
+                    if requested_by == &format!("{SYNTHETIC}@0.0.0") {
+                        *requested_by = "(root)".into();
+                    }
+                    None
+                }
+                _ => None,
+            };
+            if let Some(asked) = asked {
+                for constraint in asked {
+                    if constraint.requested_by == format!("{SYNTHETIC}@0.0.0") {
+                        constraint.requested_by = "(root)".into();
+                    }
+                }
+            }
+            if let ResolveError::RangeConflict {
+                package,
+                ranges: asked,
+            }
+            | ResolveError::NoMatchingVersion {
+                package,
+                ranges: asked,
+            } = &error
+            {
+                if let Some(version) = current_pins
+                    .get(package)
+                    .filter(|v| ranges.get(package) == Some(&format!("={v}")))
+                {
+                    if let Ok(pinned) = version.parse::<Version>() {
+                        if let Some(conflict) = asked.iter().find(|a| {
+                            !(a.requested_by == "(root)" && a.range == format!("={version}"))
+                                && a.range
+                                    .parse::<Range>()
+                                    .is_ok_and(|r| !r.satisfies(&pinned))
+                        }) {
+                            return Err(ResolveError::PinConflict {
+                                package: package.clone(),
+                                pinned_version: version.clone(),
+                                range: conflict.range.clone(),
+                                requested_by: conflict.requested_by.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+            Err(error)
+        }
     }
 }

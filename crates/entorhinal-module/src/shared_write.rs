@@ -2397,6 +2397,7 @@ enum Write {
     Attach(entorhinal_core::AttachRootRequest),
     Agent(String, Value),
     Member(entorhinal_core::shared_entry::MemberName),
+    Pins(entorhinal_core::catalog_agent::PinWriteRequest),
 }
 
 impl Write {
@@ -2451,6 +2452,7 @@ impl Write {
             Self::Add(_) => None,
             Self::Attach(r) => r.request_key.as_deref(),
             Self::Member(_) => None,
+            Self::Pins(r) => r.request_key.as_deref(),
             Self::Agent(op, params) => {
                 return store
                     .with_principal(principal)
@@ -2479,6 +2481,7 @@ impl Write {
                     .map_err(Into::into)
             }
             Self::Register(r) => writer.register_at(r, now),
+            Self::Pins(r) => writer.catalog_set_pins(r, now),
             Self::Assign(r) => writer.assign_workspace_at(r, now),
             Self::Upgrade(r) => writer.upgrade_implicit_at(r, now),
             Self::Remove(r) => writer.remove_at(r, now),
@@ -2593,6 +2596,28 @@ fn bootstrap_fence(
 }
 
 impl ProjectsHandler {
+    // Append approved pin changes to the shared identity log and commit their
+    // projection together. This is not a public RPC: catalog tools must first
+    // check caller identity, ownership and approval before invoking it.
+    #[allow(dead_code)]
+    pub(super) async fn catalog_pins_write_wait(
+        &self,
+        pins: entorhinal_core::catalog_agent::PinWriteRequest,
+        key: RouteKey,
+        received: Instant,
+    ) -> Result<Vec<u8>, HandlerError> {
+        self.write_wait_inner(
+            WireRequest {
+                method: "catalog.pin".into(),
+                params: Value::Null,
+            },
+            key,
+            received,
+            Some(Write::Pins(pins)),
+            None,
+        )
+        .await
+    }
     pub(super) async fn consent_write_wait(
         &self,
         plan: entorhinal_core::agent::consent::ConsentWrite,

@@ -83,6 +83,7 @@ journal:
 | `agent` | Agent identity: name, tag, labels, role, placement, avatar, GitHub identity, supervisor, and retirement or merge. |
 | `agent_name_claim` | Active and released name claims, one active claim per agent and per name in a namespace. |
 | `member_name` | Display names of the Macs in the identity log, keyed by author. |
+| `catalog_pin_set`, `catalog_pin` | An agent's shared package pins, root ranges and canonical pin digest. `catalog.pin` is never an identity-feed op. |
 
 **Local and derived.** Rebuilt from the journal, never shared:
 
@@ -112,6 +113,8 @@ journal:
 | `consent_grant`, `consent_request`, `consent_write_plan`, `consent_feed_cursor` | Consent state. |
 | `agent_audit` | The agent tool audit. |
 | `project_hire_cap` | Per-project hire caps. No row means the default of 10. |
+| `catalog_registry`, `catalog_scope_map`, `catalog_registry_key`, `catalog_feed`, `catalog_status`, `catalog_publisher_grant`, `catalog_audit` | Local catalog trust, authenticated status and publisher authority. |
+| `catalog_plan`, `catalog_generation`, `catalog_transition` | Local catalog preparation, activation and idempotent transition receipts; never journaled or exported. |
 
 Tests: `consent_state_is_local_persistent_and_not_rebuilt_or_exported`,
 `remote_cascades_retire_bindings_move_keys_and_clear_workspace_paths`.
@@ -150,6 +153,8 @@ before the module was named entorhinal; changing it would re-run migration 1).
 | 8 | Session bindings, claim and role caches, role takes, self identity, member names. |
 | 9 | Move checkpoints and the lid-close setting; session bindings may lack a session key. |
 | 10 | Consent state, the audit and hire caps. |
+| 11 | Catalog registry trust, held status, publisher grants and audit. |
+| 12 | Shared catalog pin sets and pins; local plans, generations and transition receipts. |
 
 Opening a store applies every migration it lacks, once. A store whose recorded
 version is ahead of the binary's highest migration is refused ("registry store

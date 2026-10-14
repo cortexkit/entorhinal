@@ -19,6 +19,8 @@ const SHARED: &[&str] = &[
     "agent_name_claim",
     "project_root_key",
     "member_name",
+    "catalog_pin_set",
+    "catalog_pin",
 ];
 const LOCAL: &[&str] = &[
     "project_root",
@@ -3790,6 +3792,70 @@ async fn consent_workspace_and_hire_replicate_without_local_authority_rows() {
         assert!(b.rows(table).is_empty(), "local table {table} was synced");
     }
     assert_eq!(a.rows("consent_grant").len(), 1);
+    a.clean_rebuild().await;
+    b.clean_rebuild().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn catalog_pins_round_trip_shared_writer_and_stay_out_of_agent_feed() {
+    use entorhinal_core::catalog_agent::{CatalogPin, PinWriteRequest};
+    let log = Arc::new(FakeLog::default());
+    let (a, b) = pair("catalog-pins", log.clone()).await;
+    let created = a
+        .call(
+            "agent.create",
+            json!({"role":"assistant","name":"Ada","tag":"catalog","request_key":"create"}),
+        )
+        .await
+        .unwrap();
+    let id = created["agent"]["agent_id"].as_str().unwrap();
+    b.catch_up().await;
+    let cursor = b.store().agent_snapshot().unwrap().generation;
+    let pins = vec![CatalogPin {
+        name: "@acme/a".into(),
+        version: "1.0.0".into(),
+        kind: entorhinal_catalog::Kind::Skill,
+        manifest_sha256: "11".repeat(32),
+        archive_sha256: "22".repeat(32),
+        publisher_fingerprint: "33".repeat(32),
+        root: true,
+        range: Some("^1".into()),
+    }];
+    let req = PinWriteRequest {
+        agent_id: id.into(),
+        pins: pins.clone(),
+        request_key: Some("pins".into()),
+    };
+    let reply = drive(a.handler.catalog_pins_write_wait(
+        req.clone(),
+        CORE,
+        tokio::time::Instant::now(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        reply,
+        drive(
+            a.handler
+                .catalog_pins_write_wait(req, CORE, tokio::time::Instant::now())
+        )
+        .await
+        .unwrap()
+    );
+    b.catch_up().await;
+    assert_eq!(a.store().catalog_pins(id).unwrap(), pins);
+    assert_eq!(b.store().catalog_pins(id).unwrap(), pins);
+    assert_eq!(
+        a.store().catalog_pin_digest(id).unwrap(),
+        b.store().catalog_pin_digest(id).unwrap()
+    );
+    let feed = b.store().agent_changes(cursor, Some(1)).unwrap();
+    assert!(
+        feed.entries.is_empty(),
+        "catalog pin escaped into identity feed"
+    );
+    assert!(feed.cursor > cursor);
+    assert_eq!(a.shared(), b.shared());
     a.clean_rebuild().await;
     b.clean_rebuild().await;
 }
