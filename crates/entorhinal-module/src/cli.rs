@@ -2357,6 +2357,7 @@ mod tests {
             gone: false,
             generation: 2,
             canonical_root: Some("/tmp/x".to_string()),
+            worktree_of: None,
             root_fields: None,
         })
         .unwrap();
@@ -2393,6 +2394,7 @@ mod tests {
             gone: false,
             generation: 2,
             canonical_root: Some("/tmp/x".to_string()),
+            worktree_of: None,
             root_fields: None,
         })
         .unwrap();

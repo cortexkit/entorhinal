@@ -947,8 +947,51 @@ impl super::JournalWriter<'_> {
 }
 
 impl RegistryStore {
+    /// Share project identity, but not root approval, with a checkout whose token
+    /// is held by a current registered binding. No filesystem result is cached:
+    /// rebinding a main checkout must immediately stop identifying old worktrees.
+    pub(crate) fn reply_for_worktree(
+        &self,
+        conn: &Connection,
+        query: &Path,
+        gone: bool,
+        generation: i64,
+    ) -> rusqlite::Result<Option<ResolveReply>> {
+        let Some(checkout) = query
+            .ancestors()
+            .find(|dir| fs::symlink_metadata(dir.join(".git")).is_ok())
+        else {
+            return Ok(None);
+        };
+        let Ok(common) = git_common_dir(checkout) else {
+            return Ok(None);
+        };
+        let DiskIdentity::Token(token) = read_token(&common) else {
+            return Ok(None);
+        };
+        let matched = conn
+            .query_row(
+                "SELECT r.canonical_root, r.project_id
+                 FROM root_binding AS b
+                 JOIN project_root AS r ON r.canonical_root = b.canonical_root
+                     AND r.project_id = b.project_id
+                 WHERE b.incarnation = ?1 AND r.canonical_root <> ?2
+                 ORDER BY r.canonical_root LIMIT 1",
+                params![token, checkout.to_string_lossy()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((root, project_id)) = matched else {
+            return Ok(None);
+        };
+        let mut reply = self.reply_for_project(conn, &project_id, "worktree", gone, generation)?;
+        reply.canonical_root = Some(query.to_string_lossy().into_owned());
+        reply.worktree_of = Some(root);
+        Ok(Some(reply))
+    }
+
     /// Resolve with ancestor walking and root records. Used when root records
-    /// are enabled; otherwise `resolve` answers in the legacy shape.
+    /// are enabled; otherwise `resolve` omits the root-record fields.
     ///
     /// From the query upward, at each directory: a registered root answers
     /// (`root` at the query itself, `walk` above it); a `.git` file inside an
@@ -965,14 +1008,14 @@ impl RegistryStore {
         let (canonical_path, path_exists) = canonical_query_path(Path::new(raw_path))?;
         self.read(|conn| {
             let generation = self.generation_from_connection(conn)?;
-            let binding_status = match binding {
-                Some(binding) => Some(binding_status(conn, binding)?),
-                None => None,
-            };
             let with_fields = |mut reply: ResolveReply,
                                matched: Option<String>,
                                source: Option<String>,
                                records: Vec<RootRecord>| {
+                let binding_status = match binding {
+                    Some(binding) => Some(binding_status(conn, binding)?),
+                    None => None,
+                };
                 reply.canonical_root = Some(canonical_path.clone());
                 reply.root_fields = Some(RootFields {
                     matched_root: matched,
@@ -980,7 +1023,7 @@ impl RegistryStore {
                     root_records: records,
                     binding_status,
                 });
-                reply
+                Ok(reply)
             };
             let containers = containers(conn)?;
             let query = PathBuf::from(&canonical_path);
@@ -999,7 +1042,7 @@ impl RegistryStore {
                     let reply =
                         self.reply_for_project(conn, &project_id, via, !path_exists, generation)?;
                     let records = root_records(conn, &project_id)?;
-                    return Ok(with_fields(reply, Some(key), None, records));
+                    return with_fields(reply, Some(key), None, records);
                 }
                 if fs::symlink_metadata(current.join(".git")).is_ok() {
                     let is_worktree_pointer = current.join(".git").is_file();
@@ -1024,12 +1067,12 @@ impl RegistryStore {
                             container.source_root.as_deref(),
                             container.epoch.as_deref(),
                         )?;
-                        return Ok(with_fields(
+                        return with_fields(
                             reply,
                             Some(key),
                             container.source_root.clone(),
                             vec![record],
-                        ));
+                        );
                     }
                     break;
                 }
@@ -1047,7 +1090,10 @@ impl RegistryStore {
                     !path_exists,
                     generation,
                 )?;
-                return Ok(with_fields(reply, None, None, Vec::new()));
+                return with_fields(reply, None, None, Vec::new());
+            }
+            if let Some(reply) = self.reply_for_worktree(conn, &query, !path_exists, generation)? {
+                return Ok(reply);
             }
             let reply = ResolveReply {
                 project_id: implicit_project_id(&canonical_path),
@@ -1058,9 +1104,10 @@ impl RegistryStore {
                 gone: !path_exists,
                 generation,
                 canonical_root: None,
+                worktree_of: None,
                 root_fields: None,
             };
-            Ok(with_fields(reply, None, None, Vec::new()))
+            with_fields(reply, None, None, Vec::new())
         })
     }
 }
@@ -1720,6 +1767,244 @@ mod tests {
     fn bind(fixture: &Fixture, root: &str) -> String {
         let value = result(&fixture.store.bind_root(root, "test").unwrap());
         value["registrationEpoch"].as_str().unwrap().to_string()
+    }
+
+    fn resolve_modes(fixture: &mut Fixture, path: &str, check: impl Fn(ResolveReply, bool)) {
+        for root_records in [false, true] {
+            fixture.store.set_root_records(root_records);
+            check(
+                fixture.store.resolve_with_binding(path, None).unwrap(),
+                root_records,
+            );
+        }
+    }
+
+    fn assert_implicit(reply: ResolveReply, path: &str) {
+        assert_eq!(reply.via, "implicit");
+        assert_eq!(reply.project_id, implicit_project_id(path));
+        assert_eq!(reply.canonical_root.as_deref(), Some(path));
+        assert!(reply.worktree_of.is_none());
+        assert!(serde_json::to_value(reply)
+            .unwrap()
+            .get("worktreeOf")
+            .is_none());
+    }
+
+    #[test]
+    fn external_worktree_resolves_current_project_without_root_approval() {
+        let mut f = store("external-worktree");
+        let root = repo(&f, "main", None);
+        register(&f, "pj-main", root.clone());
+        let epoch = bind(&f, &root);
+        f.store.approve_root(&root, "test").unwrap();
+        let workspace_root = f.dir("workspace");
+        f.store
+            .assign_workspace(crate::AssignWorkspaceRequest {
+                project_id: "pj-main".into(),
+                workspace_id: "ws-main".into(),
+                workspace_name: Some("Workspace".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        f.store
+            .set_workspace_root(crate::SetWorkspaceRootRequest {
+                workspace_id: "ws-main".into(),
+                root: Some(workspace_root.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        let worker = f.dir("workers/task");
+        worktree(&root, &worker, "task");
+        let deep = child_dir(&worker, &["src", "nested"]);
+        let missing = child_path(&deep, &["not-yet-created"]);
+        let captured = ExecutionBinding {
+            root: root.clone(),
+            incarnation: token_of(&root),
+            registration_epoch: epoch,
+        };
+        for path in [&worker, &deep, &missing] {
+            resolve_modes(&mut f, path, |reply, _| {
+                assert_eq!(reply.project_id, "pj-main");
+                assert_eq!(reply.project_name.as_deref(), Some("pj-main"));
+                assert_eq!(reply.via, "worktree");
+                assert_eq!(reply.canonical_root.as_deref(), Some(path.as_str()));
+                assert_eq!(reply.worktree_of.as_deref(), Some(root.as_str()));
+                assert_eq!(reply.workspace_id.as_deref(), Some("ws-main"));
+                assert_eq!(
+                    reply.workspace_root.as_deref(),
+                    Some(workspace_root.as_str())
+                );
+                assert_eq!(reply.gone, path == &missing);
+                assert!(reply.root_fields.is_none());
+                let json = serde_json::to_value(reply).unwrap();
+                assert_eq!(json["worktreeOf"], root);
+                for field in ["matchedRoot", "sourceRoot", "rootRecords", "bindingStatus"] {
+                    assert!(
+                        json.get(field).is_none(),
+                        "worktrees must not inherit {field}"
+                    );
+                }
+            });
+            let reply = f.store.resolve_with_binding(path, Some(&captured)).unwrap();
+            assert_eq!(reply.via, "worktree");
+            assert!(reply.root_fields.is_none());
+        }
+    }
+
+    #[test]
+    fn external_worktree_with_unbound_main_stays_implicit() {
+        let mut f = store("external-unbound");
+        let root = f.dir("main");
+        register(&f, "pj-main", root.clone());
+        repo(&f, "main", None);
+        let worker = f.dir("worker");
+        worktree(&root, &worker, "task");
+        resolve_modes(&mut f, &worker, |reply, _| assert_implicit(reply, &worker));
+    }
+
+    #[test]
+    fn external_worktree_with_unmatched_token_stays_implicit() {
+        let mut f = store("external-unmatched");
+        let root = repo(&f, "main", None);
+        register(&f, "pj-main", root.clone());
+        bind(&f, &root);
+        let other = repo(&f, "unregistered", None);
+        fs::write(
+            Path::new(&other).join(".git").join(INCARNATION_FILE),
+            format!("{}\n", "f".repeat(64)),
+        )
+        .unwrap();
+        assert!(matches!(
+            disk_identity(Path::new(&other)),
+            DiskIdentity::Token(_)
+        ));
+        assert_ne!(token_of(&root), "f".repeat(64));
+        let worker = f.dir("worker");
+        worktree(&other, &worker, "task");
+        resolve_modes(&mut f, &worker, |reply, _| assert_implicit(reply, &worker));
+    }
+
+    #[test]
+    fn external_worktree_with_retired_token_stays_implicit_after_rebind() {
+        let mut f = store("external-retired");
+        let root = repo(&f, "main", None);
+        register(&f, "pj-main", root.clone());
+        let old_epoch = bind(&f, &root);
+        let worker = f.dir("worker");
+        worktree(&root, &worker, "task");
+        resolve_modes(&mut f, &worker, |reply, _| {
+            assert_eq!(reply.via, "worktree")
+        });
+        // Preserve the old repository and its token, as when a checkout is replaced.
+        let old_git = Path::new(&root).with_file_name("old-git");
+        fs::rename(Path::new(&root).join(".git"), &old_git).unwrap();
+        fs::write(
+            Path::new(&worker).join(".git"),
+            format!("gitdir: {}\n", old_git.join("worktrees/task").display()),
+        )
+        .unwrap();
+        repo(&f, "main", None);
+        let new_epoch = bind(&f, &root);
+        assert_ne!(new_epoch, old_epoch);
+        resolve_modes(&mut f, &worker, |reply, _| assert_implicit(reply, &worker));
+    }
+
+    #[test]
+    fn external_worktree_with_unverifiable_metadata_stays_implicit() {
+        let mut f = store("external-unverifiable");
+        let root = repo(&f, "main", None);
+        register(&f, "pj-main", root.clone());
+        bind(&f, &root);
+        let worker = f.dir("worker");
+        worktree(&root, &worker, "task");
+        let commondir = Path::new(&root).join(".git/worktrees/task/commondir");
+        fs::remove_file(&commondir).unwrap();
+        // A directory cannot be read as a commondir file, even by a privileged test runner.
+        fs::create_dir(&commondir).unwrap();
+        resolve_modes(&mut f, &worker, |reply, _| assert_implicit(reply, &worker));
+        fs::remove_dir(&commondir).unwrap();
+        fs::write(&commondir, "../missing-common\n").unwrap();
+        resolve_modes(&mut f, &worker, |reply, _| assert_implicit(reply, &worker));
+        fs::write(&commondir, "../..\n").unwrap();
+        fs::write(
+            Path::new(&root).join(".git").join(INCARNATION_FILE),
+            "invalid-token\n",
+        )
+        .unwrap();
+        resolve_modes(&mut f, &worker, |reply, _| assert_implicit(reply, &worker));
+    }
+
+    #[test]
+    fn external_worktree_fallback_preserves_registered_and_unrelated_paths() {
+        let mut f = store("external-unchanged");
+        let root = repo(&f, "main", None);
+        f.store
+            .register(RegisterRequest {
+                project_id: Some("pj-main".into()),
+                name: "pj-main".into(),
+                roots: vec![root.clone()],
+                derived_root_parents: vec![root.clone()],
+                ..Default::default()
+            })
+            .unwrap();
+        bind(&f, &root);
+        let deep = child_dir(&root, &["src", "nested"]);
+        let admin = RegistryStore::canonical_mutation_root(&child_path(&root, &[".git"])).unwrap();
+        for path in [&root, &deep, &admin] {
+            resolve_modes(&mut f, path, |reply, root_records| {
+                assert_eq!(reply.project_id, "pj-main");
+                assert_eq!(
+                    reply.via,
+                    if path == &root {
+                        "root"
+                    } else if root_records {
+                        "walk"
+                    } else {
+                        "containment"
+                    }
+                );
+                assert!(reply.worktree_of.is_none());
+                assert!(serde_json::to_value(reply)
+                    .unwrap()
+                    .get("worktreeOf")
+                    .is_none());
+            });
+        }
+        let unrelated = f.dir("unrelated");
+        resolve_modes(&mut f, &unrelated, |reply, _| {
+            assert_implicit(reply, &unrelated)
+        });
+        let worker = f.dir("worker");
+        worktree(&root, &worker, "task");
+        let nested = repo(&f, "worker/nested", None);
+        let query = child_dir(&nested, &["src"]);
+        resolve_modes(&mut f, &query, |reply, _| assert_implicit(reply, &query));
+    }
+
+    #[test]
+    fn external_worktree_fallback_accepts_shared_separate_git_directory() {
+        let mut f = store("external-separate");
+        let root = repo(&f, "main", None);
+        let common = Path::new(&root).with_file_name("common");
+        fs::rename(Path::new(&root).join(".git"), &common).unwrap();
+        fs::write(
+            Path::new(&root).join(".git"),
+            format!("gitdir: {}\n", common.display()),
+        )
+        .unwrap();
+        register(&f, "pj-main", root.clone());
+        bind(&f, &root);
+        let checkout = f.dir("separate-checkout");
+        fs::write(
+            Path::new(&checkout).join(".git"),
+            format!("gitdir: {}\n", common.display()),
+        )
+        .unwrap();
+        resolve_modes(&mut f, &checkout, |reply, _| {
+            assert_eq!(reply.project_id, "pj-main");
+            assert_eq!(reply.via, "worktree");
+            assert_eq!(reply.worktree_of.as_deref(), Some(root.as_str()));
+        });
     }
 
     fn remove(fixture: &Fixture, id: &str) {

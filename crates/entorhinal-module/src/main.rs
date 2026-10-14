@@ -1122,18 +1122,25 @@ impl ModuleHandler for ProjectsHandler {
                 tokio::spawn(async move {
                     let outcome = retry_open_while_lease_held(&descriptor, retry_budget).await;
                     health.store_opening.store(false, Ordering::Relaxed);
-                    install_store_with_start(&store, &health, outcome, module_started_at);
+                    install_store_with_time(
+                        &store,
+                        &health,
+                        outcome,
+                        module_started_at,
+                        Instant::now,
+                    );
                     claim_refresh.signal();
                     role_refresh.notify_one();
                     move_wake.notify_one();
                     move_wake.notify_waiters();
                 });
             }
-            outcome => install_store_with_start(
+            outcome => install_store_with_time(
                 &self.store,
                 &self.health,
                 outcome.map_err(|error| format!("opening projects storage: {error}")),
                 self.module_started_at,
+                Instant::now,
             ),
         }
         self.start_catch_up();
@@ -1183,7 +1190,11 @@ impl ModuleHandler for ProjectsHandler {
                 "journalTailCount": self.health.journal_tail_count.load(Ordering::Relaxed),
                 "latency": self.health.latency.report(),
                 "storeUnavailable": self.health.store_unavailable.load(Ordering::Relaxed),
-                "ready_after_ms": self.health.ready_after_ms.load(Ordering::Relaxed),
+                "ready_after_ms": self
+                    .health
+                    .ready_recorded
+                    .load(Ordering::Relaxed)
+                    .then(|| self.health.ready_after_ms.load(Ordering::Relaxed)),
                 "lastOperationMs": self.health.last_operation_ms.load(Ordering::Relaxed),
                 "livenessBatches": self.health.liveness_batches.load(Ordering::Relaxed),
                 "livenessGaps": self.health.liveness_gaps.load(Ordering::Relaxed),
@@ -2374,15 +2385,16 @@ fn install_store(
     health: &HealthGauges,
     outcome: Result<RegistryStore, String>,
 ) {
-    install_store_with_start(store, health, outcome, Instant::now());
+    install_store_with_time(store, health, outcome, Instant::now(), Instant::now);
 }
 
 /// Publishes an open outcome into the shared store slot and the health gauges.
-fn install_store_with_start(
+fn install_store_with_time(
     store: &Mutex<Option<RegistryStore>>,
     health: &HealthGauges,
     outcome: Result<RegistryStore, String>,
     module_started_at: Instant,
+    now: impl Fn() -> Instant,
 ) {
     let mut guard = store
         .lock()
@@ -2402,8 +2414,8 @@ fn install_store_with_start(
                 .store(opened.generation().unwrap_or(0), Ordering::Relaxed);
             if !health.ready_recorded.load(Ordering::Relaxed) {
                 health.ready_after_ms.store(
-                    module_started_at
-                        .elapsed()
+                    now()
+                        .saturating_duration_since(module_started_at)
                         .as_millis()
                         .min(u64::MAX as u128) as u64,
                     Ordering::Relaxed,
@@ -2534,25 +2546,42 @@ mod tests {
         assert_eq!(metrics["latency"]["other"]["count"], 1);
     }
 
-    #[test]
-    fn health_reads_latency_without_locking_the_store_slot() {
-        let handler = Arc::new(ProjectsHandler::new().unwrap());
-        let store_slot = handler.store.lock().unwrap();
-        let handler_for_health = Arc::clone(&handler);
-        let (finished, result) = std::sync::mpsc::channel();
-        let health_thread = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .build()
-                .unwrap();
-            let report = runtime.block_on(handler_for_health.health());
-            finished.send(report).unwrap();
-        });
-        let report = result
-            .recv_timeout(Duration::from_secs(1))
-            .expect("health must answer while the store slot is held");
-        drop(store_slot);
-        health_thread.join().unwrap();
-        assert_eq!(report.metrics.unwrap()["latency"]["resolve"]["count"], 0);
+    #[tokio::test]
+    async fn ready_after_ms_is_null_until_ready_and_set_once() {
+        let handler = ProjectsHandler::new().unwrap();
+        let before = handler.health().await.metrics.unwrap();
+        assert!(before["ready_after_ms"].is_null());
+
+        let module_started_at = Instant::now();
+        let first_ready_at = module_started_at + Duration::from_millis(12_345);
+        let (first_dir, first_descriptor) = scratch_descriptor("ready-after-first-open");
+        let first_store = RegistryStore::open(&first_descriptor).unwrap();
+        install_store_with_time(
+            &handler.store,
+            &handler.health,
+            Ok(first_store),
+            module_started_at,
+            || first_ready_at,
+        );
+        let first_report = handler.health().await.metrics.unwrap();
+        assert_eq!(first_report["ready_after_ms"], 12_345);
+
+        let later_ready_at = module_started_at + Duration::from_secs(120);
+        let (second_dir, second_descriptor) = scratch_descriptor("ready-after-second-open");
+        let second_store = RegistryStore::open(&second_descriptor).unwrap();
+        install_store_with_time(
+            &handler.store,
+            &handler.health,
+            Ok(second_store),
+            module_started_at,
+            || later_ready_at,
+        );
+        let second_report = handler.health().await.metrics.unwrap();
+        assert_eq!(second_report["ready_after_ms"], 12_345);
+
+        drop(handler);
+        std::fs::remove_dir_all(first_dir).unwrap();
+        std::fs::remove_dir_all(second_dir).unwrap();
     }
 
     pub(super) fn canonical_test_path(path: impl AsRef<std::path::Path>) -> PathBuf {

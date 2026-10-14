@@ -50,6 +50,14 @@ ck projects resolve ~/src/my-app     # project id, name, workspace
 ck projects trust ~/src/my-app       # each root's identity and approval
 ```
 
+A linked git worktree outside registered roots and worker containers resolves to
+its main checkout's project when its shared git common directory contains a token
+held by a current registered binding. The reply uses `via: "worktree"`, keeps the
+queried path in `canonicalRoot`, and names the main root in `worktreeOf`. Workspace
+fields follow the project, but root approval and binding fields are omitted: a
+worktree is not approved merely because its main checkout is. Missing, unreadable
+or unmatched tokens (including retired bindings) leave the path implicit.
+
 Reverse: `ck projects remove <project-id>`. The id stops resolving, its
 bindings are retired and approvals go with them. Removing a project that still
 has live agents bound to it is refused.

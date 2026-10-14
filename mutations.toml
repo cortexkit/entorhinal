@@ -5291,3 +5291,29 @@ runner = "cargo"
 package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 expect_red = ["tests::request_latency_records_operation_counts_and_thresholds"]
+
+[[control]]
+id = "resolve-worktree-token-match"
+guards = "A valid but unmatched worktree token cannot borrow a registered project's identity"
+file = "crates/entorhinal-core/src/binding.rs"
+old = 'WHERE b.incarnation = ?1 AND r.canonical_root <> ?2'
+new = 'WHERE ?1 IS NOT NULL AND r.canonical_root <> ?2 /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-core/src/binding.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["binding::tests::external_worktree_with_unmatched_token_stays_implicit"]
+
+[[control]]
+id = "resolve-worktree-current-binding-only"
+guards = "A worktree of a replaced checkout cannot resolve through the retired binding's token"
+file = "crates/entorhinal-core/src/binding.rs"
+old = 'FROM root_binding AS b'
+new = 'FROM (SELECT canonical_root, project_id, incarnation FROM root_binding UNION ALL SELECT canonical_root, project_id, incarnation FROM retired_binding) AS b /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-core/src/binding.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["binding::tests::external_worktree_with_retired_token_stays_implicit_after_rebind"]
