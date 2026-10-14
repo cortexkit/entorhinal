@@ -3227,7 +3227,9 @@ runner = "cargo"
 package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 expect_red = ["tool_provider::tests::tool_arguments_match_the_flat_schemas_without_caller_or_role_overrides"]
-expect_message = "invalid_request"
+# Without the schema check a malformed call now runs to completion, so the
+# test fails on its "expected refusal" assertion rather than on a refusal code.
+expect_message = "expected refusal"
 
 [[control]]
 id = "agent-tools-schema-pin"
@@ -3749,3 +3751,861 @@ runner = "cargo"
 package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 expect_red = ["tool_provider::writes::tests::retry_refuses_saved_plan_without_target_label_as_consent_lost"]
+
+# Two-machine move acceptance and transactional admission.
+[[control]]
+id = "s11-same-key-preflight-replay"
+guards = "A concurrent same-key admission replays after claim refresh rather than refusing its own open row"
+file = "crates/entorhinal-module/src/move_admission.rs"
+old = '''if error.code == "move_in_progress" {
+                // Another resend can commit'''
+new = '''if false { // NON-VACUITY BREAK
+                // Another resend can commit'''
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::admission_registration_orders_same_key_and_unique_index_use_real_transactions"]
+
+[[control]]
+id = "s11-source-refresh-after-release"
+guards = "Source release refreshes the claim cache so where and registration immediately name the receiver"
+file = "crates/entorhinal-module/src/move_source.rs"
+old = "self.apply_claim(row, true).await?;"
+new = "// NON-VACUITY BREAK: retain the source's pre-move cache"
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::full_move_three_participants_preserves_refs_claim_and_local_journals"]
+
+[[control]]
+id = "s11-epoch-zero-record-version"
+guards = "Epoch-zero admission uses the record's version rather than the cache's zero version"
+file = "crates/entorhinal-module/src/move_admission.rs"
+old = "let version = i64::try_from(read.version).map_err(|_| {"
+new = "let version = i64::try_from(cached.version as u64).map_err(|_| { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::version_three_epoch_zero_uses_record_version_not_cache_version"]
+
+[[control]]
+id = "s11-not-holder"
+guards = "A refreshed claim held by another Mac refuses admission before any move write"
+file = "crates/entorhinal-module/src/move_admission.rs"
+old = "if cached.epoch >= 1 && cached.holder.as_ref() != Some(&own) {"
+new = "if false && cached.epoch >= 1 && cached.holder.as_ref() != Some(&own) { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::held_elsewhere_and_busy_admission_have_no_move_side_effects"]
+
+[[control]]
+id = "s11-source-busy-read-only"
+guards = "Busy admission refuses before prepare, door, move record, inbox or checkpoint side effects"
+file = "crates/entorhinal-module/src/move_admission.rs"
+old = '''self.move_idle(&refs, &plan).await?;
+        let mut confirmation'''
+new = '''// NON-VACUITY BREAK: skip idle admission
+        let mut confirmation'''
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::held_elsewhere_and_busy_admission_have_no_move_side_effects"]
+
+[[control]]
+id = "s11-busy-prepare-eight-retries"
+guards = "Prepare busy retries at most eight times and the ninth refusal aborts with its detail"
+file = "crates/entorhinal-module/src/move_source.rs"
+old = "&& row.attempts < 8;"
+new = "&& row.attempts < 7; // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::retry_refusals_busy_nine_failed_seal_and_unknown_code_have_named_outcomes"]
+
+[[control]]
+id = "s11-source-record-author"
+guards = "A forged activated author never causes source handoff or participant release"
+file = "crates/entorhinal-module/src/move_source.rs"
+old = "wire::check_record_author(&record, reply.author.as_deref().unwrap_or_default())?;"
+new = "// NON-VACUITY BREAK: accept an unattested record writer"
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::forged_activated_author_or_plan_cannot_release_source_participants"]
+
+[[control]]
+id = "s11-source-pinned-plan"
+guards = "A later record cannot rewrite the target or agent in the pinned move plan"
+file = "crates/entorhinal-module/src/move_source.rs"
+old = "wire::check_pinned_plan(&plan.record(&self.cut), &record)?;"
+new = "// NON-VACUITY BREAK: accept a changed plan"
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::forged_activated_author_or_plan_cannot_release_source_participants"]
+
+[[control]]
+id = "s11-receiver-pickup-author"
+guards = "Wrong-author pickup creates only a terminal mismatch row without touching participants or the move record"
+file = "crates/entorhinal-module/src/move_receiver.rs"
+old = "if mismatch {"
+new = "if false && mismatch { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::wrong_author_and_foreign_to_pickup_do_not_touch_participants_or_move_record"]
+
+[[control]]
+id = "s11-receiver-foreign-inbox"
+guards = "An inbox entry for another receiver is removed without a local move row"
+file = "crates/entorhinal-module/src/move_receiver.rs"
+old = "if record.to != own || matches!(record.state, State::Aborted | State::Released) {"
+new = "if matches!(record.state, State::Aborted | State::Released) { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::wrong_author_and_foreign_to_pickup_do_not_touch_participants_or_move_record"]
+
+[[control]]
+id = "s11-ref-owner-before-import"
+guards = "An incoming ref owned by another agent refuses before receiver import"
+file = "crates/entorhinal-module/src/move_receiver.rs"
+old = "if binding.agent_id != plan.agent_id {"
+new = "if false && binding.agent_id != plan.agent_id { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::receiver_ref_ownership_and_registration_windows_are_transactional"]
+
+[[control]]
+id = "s11-unheld-receiver-busy"
+guards = "A fresh receiver never asks busy about refs it does not locally bind"
+file = "crates/entorhinal-module/src/move_receiver.rs"
+old = ".filter(|r| held.contains(*r))"
+new = ".filter(|_| true) // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::receiver_diverged_lagging_identity_and_external_data_obey_pickup_policy"]
+
+[[control]]
+id = "s11-diverged-before-import"
+guards = "Advanced or unknown receiver data aborts before import"
+file = "crates/entorhinal-module/src/move_receiver.rs"
+old = "matches!(r.state, DivergedState::Advanced | DivergedState::Unknown)"
+new = "false && matches!(r.state, DivergedState::Advanced | DivergedState::Unknown) /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::receiver_diverged_lagging_identity_and_external_data_obey_pickup_policy"]
+
+[[control]]
+id = "s11-import-local-writer-recheck"
+guards = "A writer appearing while diverged is in flight holds import and forces diverged to run again"
+file = "crates/entorhinal-module/src/move_receiver.rs"
+old = '''self.local_writers(plan).await?;
+                for p in &plan.participants {'''
+new = '''// NON-VACUITY BREAK: omit the post-diverged writer check
+                for p in &plan.participants {'''
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::writer_appearing_after_diverged_holds_import_and_diverged_runs_again"]
+
+[[control]]
+id = "s11-claim-version-moved"
+guards = "A changed claim before any persisted take aborts without a claim CAS"
+file = "crates/entorhinal-module/src/move_receiver.rs"
+old = "if reply.version != plan.claim_version {"
+new = "if false && reply.version != plan.claim_version { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::moved_claim_aborts_without_take_and_claimed_abort_returns_epoch_two_to_a"]
+
+[[control]]
+id = "s11-claim-persist-before-cas"
+guards = "A take body and expected version survive a crash immediately before the claim CAS"
+file = "crates/entorhinal-module/src/move_receiver.rs"
+old = '''row.claim_take_version = Some(checked_version(plan.claim_version)?);
+            self.save(row, progress).await?;'''
+new = '''row.claim_take_version = Some(checked_version(plan.claim_version)?);
+            // NON-VACUITY BREAK: take intent is not durable before CAS'''
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::crashes_on_both_sides_of_take_and_return_cas_never_strand_or_retake_claim"]
+
+[[control]]
+id = "s11-registration-moving"
+guards = "Source and pre-activation receiver rows fence registration, including another agent's incoming refs"
+file = "crates/entorhinal-core/src/move_store.rs"
+old = "if blocks_agent || reserves_ref {"
+new = "if false && (blocks_agent || reserves_ref) { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::receiver_ref_ownership_and_registration_windows_are_transactional"]
+
+[[control]]
+id = "s11-irreversible-abort"
+guards = "Every boundary and terminal abort refusal leaves the row untouched across restart"
+file = "crates/entorhinal-core/src/move_store.rs"
+old = "if !row.step.before_boundary(row.side) {"
+new = "if false && !row.step.before_boundary(row.side) { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::boundary_abort_matrix_writes_nothing_then_restart_completes"]
+
+[[control]]
+id = "s11-takeover-recorded-instant"
+guards = "Takeover waits for exactly ten minutes on the persisted handler clock, also after restart"
+file = "crates/entorhinal-module/src/move_receiver.rs"
+old = "activated.saturating_add(600_000)"
+new = "activated.saturating_add(599_999) /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::takeover_and_accept_diagnostics_do_not_delay_finish_across_restart"]
+
+[[control]]
+id = "s11-receiver-bindings"
+guards = "Activation installs moved-in bindings with no host and a move back carries them even without a session"
+file = "crates/entorhinal-core/src/move_store.rs"
+old = '''for r in refs {
+                tx.execute("INSERT INTO session_binding'''
+new = '''for r in refs.iter().take(0) { // NON-VACUITY BREAK
+                tx.execute("INSERT INTO session_binding'''
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::shared_kind_fans_out_and_move_back_without_host_carries_every_ref"]
+
+[[control]]
+id = "s11-authority-precondition"
+guards = "Source admission refuses authority_not_cut_over before log, agent, claim or participant checks"
+file = "crates/entorhinal-module/src/move_admission.rs"
+old = "if !self.with_store(RegistryStore::move_authority_cut_over)? {"
+new = "if false && !self.with_store(RegistryStore::move_authority_cut_over)? { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/move_admission.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["move_admission::tests::preconditions_refuse_in_order_with_named_codes"]
+
+[[control]]
+id = "s11-log-precondition"
+guards = "Source admission refuses identity_log_disabled before identity and claim checks"
+file = "crates/entorhinal-module/src/move_admission.rs"
+old = 'if self.with_store(RegistryStore::identity_log_status)?.state != "enabled" {'
+new = 'if false && self.with_store(RegistryStore::identity_log_status)?.state != "enabled" { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/move_admission.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["move_admission::tests::preconditions_refuse_in_order_with_named_codes"]
+
+[[control]]
+id = "s11-gone-precondition"
+guards = "A gone source agent cannot be moved"
+file = "crates/entorhinal-module/src/move_admission.rs"
+old = "if let Some(gone) = agent.gone() {"
+new = "if let Some(gone) = agent.gone().filter(|_| false) { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/move_admission.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["move_admission::tests::preconditions_refuse_in_order_with_named_codes"]
+
+[[control]]
+id = "s11-stale-precondition"
+guards = "A stale claim refresh cannot admit a move"
+file = "crates/entorhinal-module/src/move_admission.rs"
+old = "if counts.failed != 0 || cached.stale {"
+new = "if false && (counts.failed != 0 || cached.stale) { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::held_elsewhere_and_busy_admission_have_no_move_side_effects"]
+
+[[control]]
+id = "s11-integrity-precondition"
+guards = "An integrity-marked claim refuses admission"
+file = "crates/entorhinal-module/src/move_admission.rs"
+old = "if cached.integrity_failed {"
+new = "if false && cached.integrity_failed { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/move_admission.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["move_admission::tests::preconditions_refuse_in_order_with_named_codes"]
+
+[[control]]
+id = "s11-self-target"
+guards = "Source admission refuses a target resolving to the local author"
+file = "crates/entorhinal-module/src/move_admission.rs"
+old = "if peer == own {"
+new = "if false && peer == own { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/move_admission.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["move_admission::tests::preconditions_refuse_in_order_with_named_codes"]
+
+[[control]]
+id = "s11-registration-admission-race"
+guards = "A registration committed before admission makes the checked ref-set comparison refuse with no row"
+file = "crates/entorhinal-core/src/move_store.rs"
+old = "if bound_refs(tx, &row.agent_id)? != checked_refs {"
+new = "if false && bound_refs(tx, &row.agent_id)? != checked_refs { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/move_store.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["move_store::tests::admission_commit_registration_orders_and_restart_checkpoint"]
+
+[[control]]
+id = "s11-abort-activation-race"
+guards = "An accepted claimed abort wins a concurrent checkpoint into activating"
+file = "crates/entorhinal-core/src/move_store.rs"
+old = "&& current.abort_requested.is_some()"
+new = "&& false && current.abort_requested.is_some() // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/move_store.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["move_store::tests::abort_and_activation_boundary_race_has_one_fenced_winner"]
+
+[[control]]
+id = "s11-source-cap"
+guards = "The source admission transaction cannot overfill the four open-move slots"
+file = "crates/entorhinal-core/src/move_store.rs"
+old = '''if open.len() >= 4 {
+                    return Err(crate::session_refusal('''
+new = '''if false && open.len() >= 4 { // NON-VACUITY BREAK
+                    return Err(crate::session_refusal('''
+test_file = "crates/entorhinal-core/src/move_store.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["move_store::tests::admission_commit_rechecks_open_agent_and_cap_before_insert"]
+
+[[control]]
+id = "s11-receiver-cap"
+guards = "Receiver pickup rechecks the shared four-slot cap in its insert transaction"
+file = "crates/entorhinal-core/src/move_store.rs"
+old = '''if open.len() >= 4 {
+                        return Err(crate::session_refusal('''
+new = '''if false && open.len() >= 4 { // NON-VACUITY BREAK
+                        return Err(crate::session_refusal('''
+test_file = "crates/entorhinal-core/src/move_store.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["move_store::tests::received_move_acquires_slot_and_refuses_open_agent_and_cap"]
+
+[[control]]
+id = "s11-discovery-enabled"
+guards = "Disabled configured modules do not prevent a move"
+file = "crates/entorhinal-module/src/participant_discovery.rs"
+old = ".filter(|entry| entry.enabled)"
+new = ".filter(|_| true) // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/participant_discovery.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["participant_discovery::tests::disabled_modules_are_ignored_even_when_absent_or_not_ready"]
+
+[[control]]
+id = "s11-discovery-ready"
+guards = "A participant not ready in the catalogue refuses with its reason and no route open"
+file = "crates/entorhinal-module/src/participant_discovery.rs"
+old = "if !entry.ready {"
+new = "if false && !entry.ready { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/participant_discovery.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["participant_discovery::tests::not_ready_participant_preserves_reason_and_opens_no_routes"]
+
+[[control]]
+id = "s11-discovery-provider-role"
+guards = "A capability without the internal agent-data role refuses as participant_unavailable with the route refusal"
+file = "crates/entorhinal-module/src/fake_daemon.rs"
+old = "if !entry.roles.iter().any(|role| {"
+new = "if false && !entry.roles.iter().any(|role| { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::discovery_missing_not_ready_role_and_unlisted_modules_obey_pinned_plan"]
+
+[[control]]
+id = "s11-codec-version"
+guards = "Move and inbox records reject unknown wire versions"
+file = "crates/entorhinal-core/src/move_record.rs"
+old = "if v == 1 {"
+new = "if v >= 1 { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/move_record.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["move_record::tests::move_codec_refuses_unknown_version_by_name"]
+
+[[control]]
+id = "s11-codec-subject"
+guards = "The cut id in a move body must match the record subject"
+file = "crates/entorhinal-core/src/move_record.rs"
+old = 'if subject.strip_prefix("move:") != Some(record.cut_id.as_str()) {'
+new = 'if false && subject.strip_prefix("move:") != Some(record.cut_id.as_str()) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/move_record.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["move_record::tests::move_codec_refuses_subject_cut_mismatch_by_name"]
+
+[[control]]
+id = "s11-codec-duplicate-participant"
+guards = "A move record cannot list a participant twice"
+file = "crates/entorhinal-core/src/move_record.rs"
+old = "if !modules.insert(&participant.module_id) {"
+new = "if false && !modules.insert(&participant.module_id) { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/move_record.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["move_record::tests::move_codec_refuses_duplicate_participants_by_name"]
+
+[[control]]
+id = "s11-codec-duplicate-ref"
+guards = "One participant cannot contain the same ref twice; the same ref under different participants is valid"
+file = "crates/entorhinal-core/src/move_record.rs"
+old = "if !refs.insert(reference) {"
+new = "if false && !refs.insert(reference) { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/move_record.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["move_record::tests::move_codec_refuses_the_same_ref_twice_within_one_participant"]
+
+[[control]]
+id = "s11-codec-size-reserve"
+guards = "Publication reserves 4096 bytes for an abort and refuses oversized prepare before export or seal"
+file = "crates/entorhinal-core/src/move_record.rs"
+old = "pub const ABORT_RESERVE: usize = 4096;"
+new = "pub const ABORT_RESERVE: usize = 0; // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::oversized_prepare_aborts_before_export_or_seal_and_abort_detail_is_bounded"]
+
+[[control]]
+id = "s11-codec-bounded-abort-detail"
+guards = "A shared aborted record truncates oversized detail while retaining the full machine-local diagnostic"
+file = "crates/entorhinal-module/src/move_receiver.rs"
+old = "body.detail = row.detail.as_ref().map(wire::bounded_detail);"
+new = "body.detail = row.detail.clone(); // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::oversized_prepare_aborts_before_export_or_seal_and_abort_detail_is_bounded"]
+
+[[control]]
+id = "s11-codec-inbox-cap"
+guards = "An inbox holds at most 64 distinct pending moves, with idempotent full-inbox resends"
+file = "crates/entorhinal-core/src/move_record.rs"
+old = "if inbox.pending.len() > INBOX_CAP {"
+new = "if false && inbox.pending.len() > INBOX_CAP { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/move_record.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["move_record::tests::inbox_caps_at_64_and_allows_resend_when_full"]
+
+[[control]]
+id = "s11-codec-inbox-idempotency"
+guards = "Appending the same cut to an inbox is a no-op even when full"
+file = "crates/entorhinal-core/src/move_record.rs"
+old = "if inbox.pending.iter().any(|old| old.cut_id == entry.cut_id) {"
+new = "if false && inbox.pending.iter().any(|old| old.cut_id == entry.cut_id) { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/move_record.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["move_record::tests::inbox_wire_fixture_and_idempotent_content_edits"]
+
+[[control]]
+id = "s11-codec-transition-table"
+guards = "Every unlisted state/side transition refuses, including source abort after staging"
+file = "crates/entorhinal-core/src/move_record.rs"
+old = "_ => Err(CodecError::InvalidTransition),"
+new = "_ => Ok(()), // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/move_record.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["move_record::tests::transition_table_exhaustively_refuses_every_unlisted_row"]
+
+[[control]]
+id = "s11-unknown-member"
+guards = "A target without a member_name row refuses unknown_member"
+file = "crates/entorhinal-core/src/move_store.rs"
+old = '''[] => Err(crate::session_refusal(
+                "unknown_member",
+                "target has no member_name row",
+                None,
+            )),'''
+new = '''[] => Ok((to.to_owned(), to.to_owned())), // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::held_elsewhere_and_busy_admission_have_no_move_side_effects"]
+
+[[control]]
+id = "s11-ambiguous-member-name"
+guards = "Two members sharing a display name refuse rather than selecting the first"
+file = "crates/entorhinal-core/src/move_store.rs"
+old = "[member] => Ok(member.clone()),"
+new = "[member, ..] => Ok(member.clone()), // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::held_elsewhere_and_busy_admission_have_no_move_side_effects"]
+
+[[control]]
+id = "s11-one-open-move-index"
+guards = "The unique index prevents a second open move for the agent on either side"
+file = "crates/entorhinal-core/src/move_store.rs"
+old = "CREATE UNIQUE INDEX agent_move_open_agent ON agent_move(agent_id)"
+new = "CREATE INDEX agent_move_open_agent ON agent_move(agent_id) -- NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::admission_registration_orders_same_key_and_unique_index_use_real_transactions"]
+
+[[control]]
+id = "s11-accept-unavailable-retries-terminal"
+guards = "An unavailable cut.accept remains pending and retries after completion and restart"
+file = "crates/entorhinal-module/src/move_receiver.rs"
+old = 'Err(e) if e.code() == "unavailable" => {'
+new = 'Err(e) if false && e.code() == "unavailable" => { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::takeover_and_accept_diagnostics_do_not_delay_finish_across_restart"]
+
+[[control]]
+id = "s11-caller-admission"
+guards = "Only Direct, the orchestrator and enabled lid-close engram can admit moves"
+file = "crates/entorhinal-module/src/move_admission.rs"
+old = "} else if !direct && !self.move_orchestrator(&admission).await {"
+new = "} else if false && !direct && !self.move_orchestrator(&admission).await { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/move_admission.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["move_admission::tests::served_arm_callers_confirmation_summary_and_writer_isolation"]
+
+[[control]]
+id = "s11-engram-standing-setting"
+guards = "Engram's move path remains distinct from the orchestrator relay and requires the lid-close setting"
+file = "crates/entorhinal-module/src/move_admission.rs"
+old = "if engram {"
+new = "if false && engram { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/move_admission.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["move_admission::tests::engram_requires_setting_and_idle_while_orchestrator_never_prompts"]
+
+[[control]]
+id = "s11-codec-participant-order"
+guards = "The move record lists participants in strictly sorted module-id order"
+file = "crates/entorhinal-core/src/move_record.rs"
+old = ".any(|pair| pair[0].module_id > pair[1].module_id)"
+new = ".any(|pair| false && pair[0].module_id > pair[1].module_id) // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/move_record.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["move_record::tests::move_codec_refuses_unsorted_participants_by_name"]
+
+[[control]]
+id = "s11-codec-ref-order"
+guards = "Refs are sorted within each participant"
+file = "crates/entorhinal-core/src/move_record.rs"
+old = "if participant.refs.windows(2).any(|pair| pair[0] > pair[1]) {"
+new = "if false && participant.refs.windows(2).any(|pair| pair[0] > pair[1]) { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/move_record.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["move_record::tests::move_codec_refuses_unsorted_refs_by_name"]
+
+[[control]]
+id = "s11-codec-required-abort-fields"
+guards = "Reason and detail must be present on the wire, including explicit nulls"
+file = "crates/entorhinal-core/src/move_record.rs"
+old = 'if value.get("reason").is_none() || value.get("detail").is_none() {'
+new = 'if false && (value.get("reason").is_none() || value.get("detail").is_none()) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/move_record.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["move_record::tests::move_codec_refuses_malformed_bodies_by_name"]
+
+[[control]]
+id = "s11-codec-writer-table"
+guards = "Every record state is attested by its designated writer"
+file = "crates/entorhinal-core/src/move_record.rs"
+old = "if matches {"
+new = "if true || matches { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/move_record.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["move_record::tests::author_check_maps_every_state_to_its_required_writer"]
+
+[[control]]
+id = "s11-codec-immutable-plan"
+guards = "Later reads preserve every immutable plan field, including external checks"
+file = "crates/entorhinal-core/src/move_record.rs"
+old = "if pinned.agent_id == current.agent_id"
+new = "if true || pinned.agent_id == current.agent_id // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/move_record.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["move_record::tests::pinned_plan_checks_each_immutable_field_including_external_data"]
+
+[[control]]
+id = "s11-fake-fixed-ref-set"
+guards = "Every later participant op names the cut's exact starting refs"
+file = "crates/entorhinal-module/src/fake_participant.rs"
+old = "if existing.refs != refs {"
+new = "if false && existing.refs != refs { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/fake_participant.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["fake_participant::tests::every_later_op_requires_the_fixed_ref_set"]
+
+[[control]]
+id = "s11-fake-idempotent-request-body"
+guards = "A successful participant resend compares the full canonical request and holder"
+file = "crates/entorhinal-module/src/fake_participant.rs"
+old = "return if first == &canonical {"
+new = "return if true || first == &canonical { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/fake_participant.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["fake_participant::tests::idempotency_compares_ref_sets_and_holder_and_returns_first_reply_after_later_steps"]
+
+[[control]]
+id = "s11-fake-participant-abort-boundary"
+guards = "Participant abort refuses after activation or release on either independent machine"
+file = "crates/entorhinal-module/src/fake_participant.rs"
+old = "if matches!(step, Step::Activated | Step::Released) {"
+new = "if false && matches!(step, Step::Activated | Step::Released) { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/fake_participant.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["fake_participant::tests::source_and_receiver_step_machines_and_abort_boundaries_are_independent"]
+
+[[control]]
+id = "s11-writer-isolation"
+guards = "Move progress does not depend on acquiring the shared catch-up writer"
+file = "crates/entorhinal-module/src/move_source.rs"
+old = '''pub(crate) async fn tick(&mut self) -> Result<Option<Duration>, HandlerError> {
+        let mut row = self.worker.row(&self.cut).await?;'''
+new = '''pub(crate) async fn tick(&mut self) -> Result<Option<Duration>, HandlerError> {
+        #[cfg(test)]
+        if self.worker.writer.try_lock().is_err() {
+            return Err(HandlerError::new("writer_busy", "NON-VACUITY BREAK"));
+        }
+        let mut row = self.worker.row(&self.cut).await?;'''
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::hung_shared_writer_cannot_delay_admission_or_full_move"]
+
+[[control]]
+id = "s11-journal-isolation"
+guards = "Admitting and completing a move never appends to the identity journal"
+file = "crates/entorhinal-module/src/move_admission.rs"
+old = '''let row = self.with_agent_store(|s| s.admit_agent_move(&row, &refs))?;
+        reply(&row)'''
+new = '''let row = self.with_agent_store(|s| s.admit_agent_move(&row, &refs))?;
+        self.with_store(|s| s.apply_entry("NON-VACUITY BREAK", "{}", "fixture", None, |_| Ok(())))?;
+        reply(&row)'''
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::full_move_three_participants_preserves_refs_claim_and_local_journals"]
+
+[[control]]
+id = "s11-shared-kind-fanout"
+guards = "Every available declaring participant receives a shared ref, not just the first module"
+file = "crates/entorhinal-module/src/participant_client.rs"
+old = "for participant in available.values() {"
+new = "for participant in available.values().take(1) { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::shared_kind_fans_out_and_move_back_without_host_carries_every_ref"]
+
+[[control]]
+id = "s11-ref-kind-routing"
+guards = "A participant only receives refs of kinds its describe declares"
+file = "crates/entorhinal-module/src/participant_client.rs"
+old = ".filter(|r| description.ref_kinds.contains(&r.ref_kind))"
+new = ".filter(|_| true) // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::full_move_three_participants_preserves_refs_claim_and_local_journals"]
+
+[[control]]
+id = "s11-receiver-project-root"
+guards = "A project agent requires a checked-out root while an assistant without a project skips that check"
+file = "crates/entorhinal-module/src/move_receiver.rs"
+old = "if count == 0 {"
+new = "if false && count == 0 { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/move_receiver.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["move_receiver::tests::receiver_preconditions_abort_or_hold_with_named_codes"]
+
+[[control]]
+id = "s11-seal-failed-aborts"
+guards = "A failed seal aborts with door_refused and leaves no participant frozen"
+file = "crates/entorhinal-module/src/move_source.rs"
+old = "SealState::Published => {"
+new = "SealState::Published | SealState::Failed => { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::retry_refusals_busy_nine_failed_seal_and_unknown_code_have_named_outcomes"]
+
+[[control]]
+id = "s11-unavailable-retry"
+guards = "Temporary unavailability before the boundary retries instead of aborting"
+file = "crates/entorhinal-module/src/move_source.rs"
+old = "|| error.retryable()"
+new = "|| false && error.retryable() // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::retry_refusals_busy_nine_failed_seal_and_unknown_code_have_named_outcomes"]
+
+[[control]]
+id = "s11-unknown-code-aborts"
+guards = "An out-of-contract prepare refusal is not retried and aborts naming the unknown code"
+file = "crates/entorhinal-module/src/move_source.rs"
+old = '''let retry = !error.contract_violation
+            && (error.diagnostic
+                || error.unknown
+                || error.retryable()
+                || busy_retry
+                || cleanup
+                || row.step == Step::Releasing);'''
+new = '''let retry = error.contract_violation || (!error.contract_violation
+            && (error.diagnostic
+                || error.unknown
+                || error.retryable()
+                || busy_retry
+                || cleanup
+                || row.step == Step::Releasing)); // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::retry_refusals_busy_nine_failed_seal_and_unknown_code_have_named_outcomes"]
+
+[[control]]
+id = "s11-inbox-concurrent-cas-retry"
+guards = "Concurrent inbox appends reread and reapply after version_moved rather than losing a source entry"
+file = "crates/entorhinal-module/src/move_source.rs"
+old = 'Err(e) if e.code() == "version_moved" || e.code() == "unavailable" => continue,'
+new = 'Err(e) if e.code() == "unavailable" => continue, // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::concurrent_sources_append_one_inbox_without_overwriting_each_other"]
+
+[[control]]
+id = "s11-inbox-lost-append-rereads-move"
+guards = "A lost append whose receiver has advanced is not re-appended on retry or restart"
+file = "crates/entorhinal-module/src/move_source.rs"
+old = '''if record.state != State::Published {
+                return Ok(());'''
+new = '''if false && record.state != State::Published { // NON-VACUITY BREAK
+                return Ok(());'''
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::lost_append_with_receiver_finishing_before_retry_never_readds_inbox_entry"]
+
+[[control]]
+id = "s11-handoff-not-covered-retries"
+guards = "Handoff not covered keeps the source frozen and retries until the door confirms release"
+file = "crates/entorhinal-module/src/move_source.rs"
+old = '.map_err(|e| Failure::door("cut.handoff", e))?;'
+new = '.unwrap_or(crate::door_client::HandoffReply { state:HandoffState::Released, session_ref:None, code:None }); // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::retry_refusals_busy_nine_failed_seal_and_unknown_code_have_named_outcomes"]
+
+[[control]]
+id = "s11-backoff-five-minute-cap"
+guards = "Retry backoff doubles but never exceeds five minutes, including terminal cut.accept retries"
+file = "crates/entorhinal-module/src/move_driver.rs"
+old = ".min(300),"
+new = ".min(600), // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/move_receiver.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["move_receiver::tests::receiver_cut_accept_backoff_survives_terminal_steps_and_restart_and_caps_at_five_minutes"]

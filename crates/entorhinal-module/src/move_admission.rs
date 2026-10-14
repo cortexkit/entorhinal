@@ -72,15 +72,8 @@ impl ProjectsHandler {
         // The submitted target string, not its current resolved display name,
         // identifies a resend. A rename cannot redirect an admitted request.
         let request_body = json!({"agent_id":request.agent_id,"to":request.to});
-        if let Some(row) = self.with_store(|s| s.agent_move_by_request_key(&request.request_key))? {
-            return if row.request_body.as_ref() == Some(&request_body) {
-                reply(&row)
-            } else {
-                Err(HandlerError::new(
-                    "request_key_reused",
-                    "request key belongs to a different move request",
-                ))
-            };
+        if let Some(bytes) = self.move_replay(&request.request_key, &request_body)? {
+            return Ok(bytes);
         }
         if !self.with_store(RegistryStore::move_authority_cut_over)? {
             return Err(HandlerError::new(
@@ -109,7 +102,16 @@ impl ProjectsHandler {
         if peer == own {
             return Err(HandlerError::new("invalid_request", "target is this Mac"));
         }
-        self.move_open_check(&request.agent_id)?;
+        if let Err(error) = self.move_open_check(&request.agent_id) {
+            if error.code == "move_in_progress" {
+                // Another resend can commit while claim refresh is awaiting its
+                // record read. Replay that key before refusing the occupied slot.
+                if let Some(bytes) = self.move_replay(&request.request_key, &request_body)? {
+                    return Ok(bytes);
+                }
+            }
+            return Err(error);
+        }
         let refs = self.with_store(|s| s.agent_bound_refs(&request.agent_id))?;
         let available = discover_participants(self.participant_discovery.as_ref())
             .await
@@ -162,10 +164,23 @@ impl ProjectsHandler {
                 self.move_idle(&refs, &plan).await?;
                 Ok::<_, HandlerError>(version)
             };
-            claim_version = tokio::select! {
+            let rechecked = tokio::select! {
                 biased;
                 _ = guard.cancelled.wait_for(|closed| *closed) => return Err(OperatorConfirmError::Declined.into()),
-                result = recheck => result?,
+                result = recheck => result,
+            };
+            claim_version = match rechecked {
+                Ok(version) => version,
+                Err(error) => {
+                    if error.code == "move_in_progress" {
+                        if let Some(bytes) =
+                            self.move_replay(&request.request_key, &request_body)?
+                        {
+                            return Ok(bytes);
+                        }
+                    }
+                    return Err(error);
+                }
             };
             confirmation = Some(guard);
         }
@@ -218,6 +233,19 @@ impl ProjectsHandler {
         }
         let row = self.with_agent_store(|s| s.admit_agent_move(&row, &refs))?;
         reply(&row)
+    }
+
+    fn move_replay(&self, key: &str, body: &Value) -> Result<Option<Vec<u8>>, HandlerError> {
+        let Some(row) = self.with_store(|s| s.agent_move_by_request_key(key))? else {
+            return Ok(None);
+        };
+        if row.request_body.as_ref() != Some(body) {
+            return Err(HandlerError::new(
+                "request_key_reused",
+                "request key belongs to a different move request",
+            ));
+        }
+        reply(&row).map(Some)
     }
 
     fn move_open_check(&self, agent_id: &str) -> Result<(), HandlerError> {
