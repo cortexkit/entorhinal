@@ -81,7 +81,7 @@ fn reproduce_readme() {
     let readme = fs::read(dir().join("README.md")).unwrap();
     assert_eq!(
         c::sha256_hex(&readme),
-        "6132c87fe19f7f817bbbfe6cb8765a0ebbc6c4d29491264348c1f5d4f474a850"
+        "77ad44e3973baa0fa61f92316d183d1562e122758de49f3f86fd4a901b408e43"
     );
     let text = String::from_utf8(readme).unwrap();
     let mut checked = 0;
@@ -105,15 +105,15 @@ fn reproduce_source() {
     let bytes = fs::read(dir().join("SOURCE.txt")).unwrap();
     assert_eq!(
         c::sha256_hex(&bytes),
-        "924322f132c4b60a8ea6cde4348665d06bfaba922601a902cd922268b8bfd59b"
+        "1cc258e3a713283bfc7177e1365deedf25692968361fa83c1e0244b65cd5d718"
     );
-    assert!(String::from_utf8(bytes).unwrap().contains("5aa18cb13"));
+    assert!(String::from_utf8(bytes).unwrap().contains("610329529"));
 }
 #[test]
 fn reproduce_generator() {
     assert_eq!(
         c::sha256_hex(fs::read(dir().join("generate.ts")).unwrap()),
-        "b3e9e77b5193ff6ab15e80135c6537985be21e991836060faf1da9c2b8363a2d"
+        "0b796b2f48289e6b3842eafead93579e19bc82e8dc62e76d61644c017154c652"
     );
 }
 #[test]
@@ -295,6 +295,53 @@ fn reproduce_resolver() {
             Err(e) => json!({"ok":false,"refusal":e}),
         };
         assert_eq!(got, case["expect"], "{}", case["name"]);
+    }
+}
+
+#[test]
+fn reproduce_capability_manifest_mapping() {
+    let v = load("resolver.json");
+    for token in a(&v["capability_tokens"]["valid"]) {
+        assert!(resolver::capability_token(s(token)), "{}", s(token));
+    }
+    for token in a(&v["capability_tokens"]["invalid"]) {
+        assert!(!resolver::capability_token(s(token)), "{}", s(token));
+        assert_eq!(
+            serde_json::to_value(resolver::capability_to_manifest(s(token)).unwrap_err()).unwrap(),
+            json!({"code": "capability_not_a_token"})
+        );
+    }
+
+    let mapping = &v["capability_manifest_mapping"];
+    for pair in a(&mapping["pairs"]) {
+        let token = s(&pair["token"]);
+        let capability = s(&pair["capability"]);
+        assert_eq!(resolver::capability_to_manifest(token).unwrap(), capability);
+        assert_eq!(resolver::manifest_to_capability(capability).unwrap(), token);
+        assert!(subc_protocol::manifest::is_valid_capability_identifier(
+            capability
+        ));
+    }
+
+    let too_long_token = s(&mapping["token_too_long"]);
+    assert!(resolver::capability_token(too_long_token));
+    assert_eq!(
+        resolver::capability_to_manifest(too_long_token),
+        Err(resolver::CapabilityError::TokenTooLong)
+    );
+    let too_long_name = format!("cap-{}/v1", "a".repeat(61));
+    assert_eq!(
+        resolver::manifest_to_capability(&too_long_name),
+        Err(resolver::CapabilityError::TokenTooLong)
+    );
+    for capability in a(&mapping["capability_not_a_token"]) {
+        assert_eq!(
+            serde_json::to_value(resolver::manifest_to_capability(s(capability)).unwrap_err())
+                .unwrap(),
+            json!({"code": "capability_not_a_token"}),
+            "{}",
+            s(capability)
+        );
     }
 }
 

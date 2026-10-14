@@ -2,7 +2,7 @@
   "schema": "ck-catalog-v1/resolver",
   "rules": {
     "versions": "SemVer 2.0.0 without build metadata",
-    "capability_token": "^cap\\/[a-z0-9]+(-[a-z0-9]+)*(\\.[a-z0-9]+(-[a-z0-9]+)*)?@[1-9][0-9]*$",
+    "capability_token": "^cap\\/[a-z][a-z0-9]*(\\.[a-z][a-z0-9]*)?@[1-9][0-9]*$",
     "range_grammar": "range := set (\"||\" set)*; set := comparator (whitespace comparator)*; comparator := \"*\" | op? partial; op := ^ ~ >= <= > < =; partial := N | N.N | N.N.N | N.N.N-prerelease",
     "prerelease": "a prerelease version satisfies a range only when one ||-set is exactly that version (bare or =); a prerelease anywhere else in a range is range_invalid",
     "eligibility": "status available, and every requires.capabilities token is declared by a local module (exact string match)",
@@ -415,7 +415,6 @@
       "cap/code.read@1",
       "cap/shell@1",
       "cap/flow.template@2",
-      "cap/memory-profile.read@1",
       "cap/code.read@10"
     ],
     "invalid": [
@@ -428,7 +427,45 @@
       "cap/code_read@1",
       "flow-templates/v1",
       "cap/.read@1",
-      "cap/code.@1"
+      "cap/code.@1",
+      "cap/memory-profile.read@1",
+      "cap/code-x.read@1",
+      "cap/code.re-ad@1",
+      "cap/1code.read@1",
+      "cap/code.1read@1"
+    ]
+  },
+  "capability_manifest_mapping": {
+    "pairs": [
+      {
+        "token": "cap/code.read@1",
+        "capability": "cap-code-read/v1"
+      },
+      {
+        "token": "cap/shell@1",
+        "capability": "cap-shell/v1"
+      },
+      {
+        "token": "cap/flow.template@2",
+        "capability": "cap-flow-template/v2"
+      },
+      {
+        "token": "cap/code.read@10",
+        "capability": "cap-code-read/v10"
+      },
+      {
+        "token": "cap/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@1",
+        "capability": "cap-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/v1"
+      }
+    ],
+    "token_too_long": "cap/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@1",
+    "capability_not_a_token": [
+      "cap-a-b-c/v1",
+      "cap-/v1",
+      "cap-code-/v1",
+      "flow-scopes/v1",
+      "cap-code-read/v0",
+      "cap-Code-read/v1"
     ]
   },
   "cases": [

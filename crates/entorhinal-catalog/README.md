@@ -28,7 +28,7 @@ return `archive_invalid` plus a rule; caps return `archive_too_large` and
 member inputs representable for refusal, without exposing raw header overrides.
 
 The ten vector files are pinned to prefrontal commit
-`5aa18cb13`. The README in
+`610329529`. The README in
 `tests/vectors/ck-catalog-v1/` provides the six JSON checksums. Integrity tests
 separately pin that README, `SOURCE.txt`, `generate.ts`, and `generate.test.ts`,
 because a README cannot include its own SHA-256. No production code embeds the
