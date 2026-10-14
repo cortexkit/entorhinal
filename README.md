@@ -38,6 +38,10 @@ ck agents labels <agent> --none             clear the label set
 ck agents hire-cap <project> <n>            set this Mac's agent-hiring limit (Touch ID)
 ck agents repair-workspaces [--yes]         preview correction; --yes sends the write
 ck agents where <agent> [--refresh]         which Mac holds the agent, from the cache
+ck agents move <agent> --to <mac>           move an idle agent to another named Mac (Touch ID)
+ck agents moves                             open moves and the last 32 finished ones
+ck agents move-abort <cut_id>               cancel a move before it activates (Touch ID)
+ck agents lid-close-moves on|off            allow or deny engram's lid-close moves (Touch ID)
 
 ck roles read <role>                        which Mac holds a role, from the cache
 ck roles take <role> --reason <text>        make this Mac the role's holder
@@ -187,6 +191,18 @@ These operations report which of the operator's Macs holds an agent or a role. T
 | `agent.refresh_claims` | mutate | Refresh live agents' cached claims from engram (operator only). |
 | `role.read` | query | Which Mac holds a role, from the cached claim. |
 | `role.take` | mutate | Make this Mac a role's holder (operator only, after confirmation). |
+
+**Moving agents between Macs**
+
+A move hands an idle agent, with its sessions and their data, from the Mac that holds it to another of the operator's Macs. The two Macs coordinate through an encrypted record in engram. Each module that keeps agent data takes part through `agent-data/v1`. A move can be cancelled until the receiving Mac activates the agent; after that it always completes. If both Macs changed the agent, the move holds and reports a fork instead of choosing a side.
+
+| Operation | Kind | What it does |
+|---|---|---|
+| `agent.move` | mutate | Start moving an idle agent to a named Mac: the operator with Touch ID, a phone-confirmed request relayed by the orchestrator, or engram's lid-close move when the operator has enabled it. |
+| `agent.move_status` | query | One move's progress, holds, warnings and diagnostics, from local state. |
+| `agent.moves` | query | Open moves, then the last 32 finished ones. |
+| `agent.move_abort` | mutate | Cancel a move before activation (the operator with Touch ID, or the orchestrator); only the operator can retry a stuck cleanup. |
+| `agent.set_lid_close_moves` | mutate | Allow or deny engram's lid-close moves on this Mac (operator only, with Touch ID). |
 
 **Shared identity log**
 
