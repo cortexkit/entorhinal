@@ -1,1 +1,1 @@
-Frozen copy of prefrontal test-vectors/ck-catalog-v1 at 10cc9ebb68446305d1451cf9ff3ef3bc98f49f99. Read-only evidence; not published.
+Copy of prefrontal test-vectors/ck-catalog-v1 at 10cc9ebb68446305d1451cf9ff3ef3bc98f49f99, byte-identical except this file.

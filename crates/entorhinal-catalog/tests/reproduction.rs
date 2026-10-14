@@ -105,7 +105,7 @@ fn reproduce_source() {
     let bytes = fs::read(dir().join("SOURCE.txt")).unwrap();
     assert_eq!(
         c::sha256_hex(&bytes),
-        "2d80a697201c0e40ad1806b93ab27131fcad9d13fe5037a98ed0b066bf74eb8a"
+        "ffbb8645eb5c3eaa4c37a85486a4acaad16deed9df8309ad067c1c9d1f8de117"
     );
     assert!(String::from_utf8(bytes)
         .unwrap()
