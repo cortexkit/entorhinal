@@ -1740,3 +1740,1915 @@ async fn two_machines_carry_and_correct_once_and_refuse_forged_claim_owner() {
     assert_eq!(b.shared(), state);
     assert_eq!(b.store().generation().unwrap(), head);
 }
+
+mod moves {
+    use super::*;
+    use crate::{
+        door_client::{CutItem, Request as DoorRequest, SealState},
+        fake_daemon::{DaemonSnapshot, FakeDaemon},
+        fake_door::{Effect as DoorEffect, FakeDoor},
+        fake_participant::{Effect, FakeParticipant},
+        fake_record::FakeRecord,
+        move_driver::{SqlOperations, Worker},
+        move_receiver::{poll_inbox, CutAccept, Receiver},
+        move_source::Source,
+        participant_client::{AgentRef, BusyRef, BusyState, PrepareReply, Refusal, Request},
+        participant_discovery::{provider_role, ParticipantDiscovery},
+        record_client::{RecordClient, RecordReply},
+        sessions::{FakeResolver, ProviderResolution, ORCHESTRATOR_CAPABILITY},
+    };
+    use async_trait::async_trait;
+    use entorhinal_core::{
+        claim_cache::ClaimObservation,
+        move_record::{self as wire, MoveRecord, MoveRecordState as MoveState},
+        move_store::{AgentMove, MoveStep},
+        SessionRegistration,
+    };
+    use subc_client_rs::{CatalogList, SupervisorListResponse};
+
+    use std::collections::BTreeSet;
+
+    const AGENT: &str = "agent_0123456789abcdef";
+    const A: &str = "01010101010101010101010101010101";
+    const B: &str = "02020202020202020202020202020202";
+    thread_local! { static NOW: std::cell::Cell<i64> = const { std::cell::Cell::new(1000) }; }
+    fn clock() -> i64 {
+        NOW.with(|n| n.get())
+    }
+    fn elapse(ms: i64) {
+        NOW.with(|n| n.set(n.get() + ms));
+    }
+
+    fn snapshot(modules: &[(&str, &str)], ready: bool, role: bool) -> DaemonSnapshot {
+        DaemonSnapshot::new(1,
+            modules.iter().map(|(module, _)| json!({"module_id":module,"state":"running","enabled":true,"live":true,"health":"ok"})).collect(),
+            modules.iter().map(|(module, _)| json!({"module_id":module,"ready":ready,"not_ready":null,"control_ops":[],"roles":if role { vec![provider_role()] } else { vec![] },
+                "capabilities":{"provides":["agent-data/v1"],"requires":[],"must_never_reach":[]}})).collect())
+    }
+
+    struct PeerGate {
+        trap: Mutex<Option<(String, String, bool)>>,
+        hit: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+    }
+    struct PeerTransport {
+        module: String,
+        fake: Arc<FakeParticipant>,
+        gate: Arc<PeerGate>,
+    }
+    #[async_trait]
+    impl LogTransport for PeerTransport {
+        async fn call(&self, method: &str, params: Value) -> Result<Vec<u8>, TransportError> {
+            let trap = {
+                let mut t = self.gate.trap.lock().unwrap();
+                if t.as_ref()
+                    .is_some_and(|(module, op, _)| module == &self.module && op == method)
+                {
+                    t.take()
+                } else {
+                    None
+                }
+            };
+            if trap.as_ref().is_some_and(|(_, _, after)| !after) {
+                self.gate.hit.add_permits(1);
+                self.gate.release.acquire().await.unwrap().forget();
+            }
+            let reply = self.fake.call(method, params).await;
+            if trap.is_some_and(|(_, _, after)| after) {
+                self.gate.hit.add_permits(1);
+                self.gate.release.acquire().await.unwrap().forget();
+            }
+            reply
+        }
+    }
+    struct Discovery {
+        daemon: FakeDaemon,
+        peers: BTreeMap<String, Arc<FakeParticipant>>,
+        gate: Arc<PeerGate>,
+    }
+    #[async_trait]
+    impl ParticipantDiscovery for Discovery {
+        async fn supervisor_list(&self) -> Result<SupervisorListResponse, TransportError> {
+            self.daemon.supervisor_list().await
+        }
+        async fn catalog_list(&self) -> Result<CatalogList, TransportError> {
+            self.daemon.catalog_list().await
+        }
+        async fn open_participant(
+            &self,
+            module: &str,
+        ) -> Result<Arc<dyn LogTransport>, TransportError> {
+            self.daemon.open_participant(module).await?;
+            Ok(Arc::new(PeerTransport {
+                module: module.into(),
+                fake: self.peers[module].clone(),
+                gate: self.gate.clone(),
+            }))
+        }
+    }
+
+    struct Trap {
+        method: String,
+        subject: String,
+        after: bool,
+    }
+    struct Records {
+        fake: Arc<FakeRecord>,
+        calls: Mutex<Vec<(String, Value)>>,
+        trap: Mutex<Option<Trap>>,
+        append_barrier: Mutex<Option<Arc<tokio::sync::Barrier>>>,
+        hit: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+    }
+    #[async_trait]
+    impl LogTransport for Records {
+        async fn call(&self, method: &str, params: Value) -> Result<Vec<u8>, TransportError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((method.into(), params.clone()));
+            let trap = {
+                let mut trap = self.trap.lock().unwrap();
+                if trap
+                    .as_ref()
+                    .is_some_and(|t| t.method == method && params["subject"] == t.subject)
+                {
+                    trap.take()
+                } else {
+                    None
+                }
+            };
+            if trap.as_ref().is_some_and(|t| !t.after) {
+                self.hit.add_permits(1);
+                self.release.acquire().await.unwrap().forget();
+            }
+            let barrier = if method == "record.cas"
+                && params["subject"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with("inbox:"))
+            {
+                self.append_barrier.lock().unwrap().take()
+            } else {
+                None
+            };
+            if let Some(barrier) = barrier {
+                barrier.wait().await;
+            }
+            let reply = self.fake.call(method, params).await;
+            if trap.as_ref().is_some_and(|t| t.after) {
+                self.hit.add_permits(1);
+                self.release.acquire().await.unwrap().forget();
+                return Err(TransportError::Unavailable);
+            }
+            reply
+        }
+    }
+    struct Connector(Arc<Records>);
+    #[async_trait]
+    impl LogConnector for Connector {
+        async fn connect(&self) -> Result<Arc<dyn LogTransport>, TransportError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    struct Mac {
+        machine: Machine,
+        log: Arc<dyn LogConnector>,
+        records: Arc<Records>,
+        discovery: Arc<Discovery>,
+        door: FakeDoor,
+    }
+    impl Mac {
+        fn configure(&mut self) {
+            self.machine.handler.clock = clock;
+            self.machine.handler.participant_discovery = self.discovery.clone();
+            self.machine.handler.door_client = self.door.client();
+            let resolver = FakeResolver::new();
+            resolver.set(
+                ORCHESTRATOR_CAPABILITY,
+                ProviderResolution::Provider(WRITER_MODULE.into()),
+            );
+            self.machine.handler.provider_resolver = resolver;
+        }
+        fn worker(&self) -> Worker {
+            let h = &self.machine.handler;
+            Worker {
+                store: Arc::downgrade(&h.store),
+                sql_operations: Arc::new(SqlOperations::default()),
+                records: h.record_client.clone(),
+                door: h.door_client.clone(),
+                discovery: h.participant_discovery.clone(),
+                health: h.health.clone(),
+                writer: h.writer.clone(),
+                clock,
+                wake: h.move_wake.clone(),
+            }
+        }
+        async fn restart(&mut self) {
+            self.machine.handler.stop_move_driver().await;
+            self.machine.handler.store.lock().unwrap().take();
+            self.machine.handler = Machine::open_with_record(
+                &self.machine.descriptor,
+                self.log.clone(),
+                Some(RecordClient::new(Arc::new(Connector(self.records.clone())))),
+            );
+            self.configure();
+        }
+        fn store(&self) -> RegistryStore {
+            self.machine.store()
+        }
+        fn row(&self, cut: &str) -> AgentMove {
+            self.store().agent_move(cut).unwrap().unwrap()
+        }
+        fn source(&self, cut: &str) -> Source {
+            Source::new(self.worker(), cut.into())
+        }
+        fn receiver(&self, cut: &str) -> Receiver {
+            Receiver::new(
+                self.worker(),
+                cut.into(),
+                self.machine.handler.liveness.clone(),
+            )
+        }
+        async fn admit_to(&self, to: &str, key: &str) -> Result<String, String> {
+            // Admission is the real handler arm. The test owns scheduling so it
+            // can stop at durable checkpoints without racing the polling task.
+            let bytes = drive(self.machine.handler.admit_move(
+                json!({"agent_id":AGENT,"to":to,"request_key":key}),
+                CORE,
+                tokio::time::Instant::now(),
+            ))
+            .await
+            .map_err(|e| e.code)?;
+            Ok(
+                serde_json::from_slice::<Value>(&bytes).unwrap()["result"]["cut_id"]
+                    .as_str()
+                    .unwrap()
+                    .into(),
+            )
+        }
+        async fn pickup(&self) {
+            drive(poll_inbox(&self.worker())).await.unwrap();
+        }
+        fn abort(&self, cut: &str) {
+            self.store().request_agent_move_abort(cut, clock()).unwrap();
+        }
+        async fn where_(&self) -> Value {
+            self.machine
+                .call("agent.where", json!({"agent_id":AGENT}))
+                .await
+                .unwrap()
+        }
+        async fn claim(&self) -> RecordReply {
+            self.machine
+                .handler
+                .record_client
+                .read(&format!("claim:{AGENT}"))
+                .await
+                .unwrap()
+        }
+        async fn record(&self, cut: &str) -> MoveRecord {
+            let subject = format!("move:{cut}");
+            let reply = self
+                .machine
+                .handler
+                .record_client
+                .read(&subject)
+                .await
+                .unwrap();
+            wire::decode_move_record(&subject, reply.body.as_deref().unwrap()).unwrap()
+        }
+        fn register(
+            &self,
+            agent: &str,
+            kind: &str,
+            reference: &str,
+        ) -> Result<entorhinal_core::SessionBinding, entorhinal_core::agent::AgentMutationError>
+        {
+            self.store().register_session(&SessionRegistration {
+                agent_id: agent,
+                ref_kind: kind,
+                session_ref: reference,
+                harness: "host",
+                session_id: reference,
+                project_root: "/project",
+                registered_by: "host",
+                now_ms: clock(),
+            })
+        }
+        fn refuse(&self, module: &str, op: &str, code: &str) {
+            self.discovery.peers[module].script(
+                op,
+                Effect::Refuse(Refusal {
+                    code: code.into(),
+                    detail: None,
+                }),
+            );
+        }
+        async fn source_until(&self, cut: &str, target: MoveStep) {
+            if target == MoveStep::Released {
+                self.door.script(
+                    "cut.handoff",
+                    DoorEffect::Handoff(crate::door_client::HandoffReply {
+                        state: crate::door_client::HandoffState::Released,
+                        session_ref: None,
+                        code: None,
+                    }),
+                );
+            }
+            let mut driver = self.source(cut);
+            for _ in 0..24 {
+                if self.row(cut).step == target {
+                    return;
+                }
+                let before = self.row(cut).step;
+                drive(driver.tick()).await.unwrap();
+                if self.row(cut).step == before {
+                    elapse(300_000);
+                }
+            }
+            let row = self.row(cut);
+            panic!(
+                "source did not reach {target:?}: step={:?} reason={:?} detail={:?}",
+                row.step, row.reason, row.detail
+            );
+        }
+        async fn receiver_until(&self, cut: &str, target: MoveStep) {
+            let mut driver = self.receiver(cut);
+            for _ in 0..24 {
+                if self.row(cut).step == target {
+                    return;
+                }
+                let before = self.row(cut).step;
+                drive(driver.tick()).await.unwrap();
+                if self.row(cut).step == before {
+                    elapse(300_000);
+                }
+            }
+            let row = self.row(cut);
+            panic!(
+                "receiver did not reach {target:?}: step={:?} reason={:?} detail={:?}",
+                row.step, row.reason, row.detail
+            );
+        }
+    }
+
+    struct Pair {
+        a: Mac,
+        b: Mac,
+        modules: Vec<(String, String)>,
+    }
+    impl Pair {
+        async fn new(modules: &[(&str, &str)]) -> Self {
+            Self::with_receiver_refs(modules, false).await
+        }
+        async fn with_receiver_refs(modules: &[(&str, &str)], receiver_held: bool) -> Self {
+            NOW.with(|n| n.set(1000));
+            let log = FakeLog::default();
+            let record = FakeRecord::new([1; 16]);
+            let mut b_record = record.restart();
+            Arc::get_mut(&mut b_record).unwrap().author = B.into();
+            let door = FakeDoor::new([1; 16]);
+            let mut macs = Vec::new();
+            for (index, author, fake) in [(1, A, record), (2, B, b_record)] {
+                let log: Arc<dyn LogConnector> = Arc::new(log.with_author([index; 16]));
+                let records = Arc::new(Records {
+                    fake,
+                    calls: Mutex::new(vec![]),
+                    trap: Mutex::new(None),
+                    append_barrier: Mutex::new(None),
+                    hit: tokio::sync::Semaphore::new(0),
+                    release: tokio::sync::Semaphore::new(0),
+                });
+                let machine = Machine::new_with_record(
+                    "move-acceptance",
+                    log.clone(),
+                    RecordClient::new(Arc::new(Connector(records.clone()))),
+                );
+                let discovery = Arc::new(Discovery { daemon:FakeDaemon::new(snapshot(modules, true, true)), gate:Arc::new(PeerGate { trap:Mutex::new(None),hit:tokio::sync::Semaphore::new(0), release:tokio::sync::Semaphore::new(0) }), peers:modules.iter().enumerate().map(|(module_index,(module, kind))| {
+                    let reference = AgentRef::new(*kind, format!("ref-{kind}"));
+                    let peer = Arc::new(FakeParticipant::new(&[*kind], if index == 1 || receiver_held { vec![reference] } else { vec![] }));
+                    peer.unknown_busy_for_unheld(true);
+                    let session_ref = format!("{:032x}", module_index+16);
+                    let item = CutItem { session_ref:session_ref.clone(), stream:format!("reserved:{module}"), end_offset:42, digest:"a".repeat(64) };
+                    door.for_author([index;16]).set_stream(item.clone());
+                    peer.set_prepare(serde_json::from_value(json!({"items":[{"ref_kind":kind,"ref":format!("ref-{kind}"),"sessionRef":session_ref,"stream":item.stream,"endOffset":42,"digest":item.digest,"format":"v1","frozen":true}],"external":[]})).unwrap());
+                    (module.to_string(), peer)
+                }).collect() });
+                let mut mac = Mac {
+                    machine,
+                    log,
+                    records,
+                    discovery,
+                    door: door.for_author([index; 16]),
+                };
+                mac.configure();
+                // Both stores begin with the same assistant identity and an
+                // identity-log authority marker. Bindings and move checkpoints
+                // remain local. Setup precedes generation snapshots so later
+                // assertions detect any identity-journal append by the move.
+                mac.store().apply_entry("agent.cutover", "{}", "fixture", None, |tx| tx.execute_batch(
+                    "INSERT INTO agent(agent_id,name,tag,role,created_at_ms,updated_at_ms) VALUES('agent_0123456789abcdef','ENTO','E','assistant',1,1); UPDATE identity_log_state SET state='enabled';"
+                )).unwrap();
+                mac.store()
+                    .cache_agent_claims(
+                        &[(
+                            AGENT.into(),
+                            ClaimObservation::Absent {
+                                stale: false,
+                                self_author: author.into(),
+                            },
+                        )],
+                        clock(),
+                    )
+                    .unwrap();
+                for (member, name) in [(A, "Desk Mac"), (B, "Studio Mac")] {
+                    mac.store()
+                        .set_member_name(
+                            entorhinal_core::shared_entry::MemberName {
+                                author: member.into(),
+                                display_name: name.into(),
+                            },
+                            "fixture",
+                        )
+                        .unwrap();
+                }
+                if index == 1 {
+                    for kind in modules
+                        .iter()
+                        .map(|(_, kind)| *kind)
+                        .collect::<BTreeSet<_>>()
+                    {
+                        mac.store().apply_entry("fixture", "{}", "fixture", None, |tx| { tx.execute("INSERT INTO session_binding(ref_kind,ref,agent_id,harness,session_id,project_root,registered_by,registered_at_ms) VALUES(?1,?2,?3,NULL,NULL,'','move',1)", (kind, format!("ref-{kind}"), AGENT))?; Ok(()) }).unwrap();
+                    }
+                }
+                macs.push(mac);
+            }
+            let b = macs.pop().unwrap();
+            let a = macs.pop().unwrap();
+            Self {
+                a,
+                b,
+                modules: modules
+                    .iter()
+                    .map(|(m, k)| (m.to_string(), k.to_string()))
+                    .collect(),
+            }
+        }
+        async fn published(&self, key: &str) -> String {
+            self.a
+                .door
+                .script("cut.seal", DoorEffect::Seal(SealState::Published, None));
+            let cut = self.a.admit_to(B, key).await.unwrap();
+            self.a.source_until(&cut, MoveStep::Published).await;
+            cut
+        }
+        async fn finish(&self, cut: &str) {
+            self.b.pickup().await;
+            self.b.receiver_until(cut, MoveStep::Activated).await;
+            drive(CutAccept::new(self.b.worker(), cut.into()).tick())
+                .await
+                .unwrap();
+            self.a.source_until(cut, MoveStep::Released).await;
+            self.b.receiver_until(cut, MoveStep::Done).await;
+        }
+        fn clean(&self) {
+            for mac in [&self.a, &self.b] {
+                for peer in mac.discovery.peers.values() {
+                    assert!(peer.frozen().is_empty());
+                    assert!(peer.staged().is_empty());
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_move_three_participants_preserves_refs_claim_and_local_journals() {
+        let f = Pair::new(&[
+            ("broca", "broca-session"),
+            ("pi", "pi-session"),
+            ("thalamus", "host-session"),
+        ])
+        .await;
+        let generations = (
+            f.a.store().generation().unwrap(),
+            f.b.store().generation().unwrap(),
+        );
+        let cut = f.published("full").await;
+        f.finish(&cut).await;
+        assert_eq!(f.a.record(&cut).await.state, MoveState::Released);
+        let claim: Value =
+            serde_json::from_slice(f.b.claim().await.body.as_deref().unwrap()).unwrap();
+        assert_eq!(claim["holder"], B);
+        assert_eq!(claim["epoch"], 1);
+        let a_where = f.a.where_().await;
+        assert_eq!(a_where["status"], "held_elsewhere", "{a_where}");
+        assert_eq!(a_where["holder"], B);
+        assert_eq!(f.b.where_().await["status"], "held_here");
+        assert_eq!(
+            f.a.register(AGENT, "pi-session", "new").unwrap_err().code,
+            "held_elsewhere"
+        );
+        for (module, kind) in &f.modules {
+            let expected = BTreeSet::from([AgentRef::new(kind, format!("ref-{kind}"))]);
+            assert_eq!(
+                f.a.discovery.peers[module].cut(&cut).unwrap().refs,
+                expected
+            );
+            assert_eq!(
+                f.b.discovery.peers[module].cut(&cut).unwrap().refs,
+                expected
+            );
+            assert_eq!(
+                f.a.discovery.peers[module].tombstones()
+                    [&AgentRef::new(kind, format!("ref-{kind}"))],
+                B
+            );
+        }
+        assert_eq!(
+            generations,
+            (
+                f.a.store().generation().unwrap(),
+                f.b.store().generation().unwrap()
+            )
+        );
+        f.clean();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_kind_fans_out_and_move_back_without_host_carries_every_ref() {
+        let mut f = Pair::new(&[("alpha", "pi-session"), ("beta", "pi-session")]).await;
+        let cut = f.published("out").await;
+        f.finish(&cut).await;
+        let record = f.a.record(&cut).await;
+        assert_eq!(record.participants.len(), 2);
+        assert_eq!(record.participants[0].refs, record.participants[1].refs);
+        for module in ["alpha", "beta"] {
+            for (mac, ops) in [
+                (
+                    &f.a,
+                    vec![
+                        "agent_data.prepare",
+                        "agent_data.export",
+                        "agent_data.release",
+                    ],
+                ),
+                (
+                    &f.b,
+                    vec![
+                        "agent_data.diverged",
+                        "agent_data.import",
+                        "agent_data.activate",
+                    ],
+                ),
+            ] {
+                for op in ops {
+                    assert!(
+                        mac.discovery.peers[module]
+                            .calls()
+                            .iter()
+                            .any(|r| r.op().method() == op),
+                        "missing {module} {op}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            f.b.machine
+                .query("SELECT harness,session_id,registered_by FROM session_binding"),
+            vec![vec![Cell::Null, Cell::Null, Cell::Text("move".into())]]
+        );
+        assert_eq!(
+            f.b.machine
+                .call(
+                    "agent.session_liveness",
+                    json!({"refs":[{"ref_kind":"pi-session","ref":"ref-pi-session"}]})
+                )
+                .await
+                .unwrap()["refs"][0]["state"],
+            "gone"
+        );
+        let old_bindings = f.a.machine.rows("session_binding");
+        f.a.restart().await;
+        f.b.restart().await;
+        f.b.door
+            .script("cut.seal", DoorEffect::Seal(SealState::Published, None));
+        let back = f.b.admit_to(A, "back").await.unwrap();
+        f.b.source_until(&back, MoveStep::Published).await;
+        f.a.pickup().await;
+        f.a.receiver_until(&back, MoveStep::Activated).await;
+        drive(CutAccept::new(f.a.worker(), back.clone()).tick())
+            .await
+            .unwrap();
+        f.b.source_until(&back, MoveStep::Released).await;
+        f.a.receiver_until(&back, MoveStep::Done).await;
+        assert_eq!(f.a.machine.rows("session_binding"), old_bindings);
+        for module in ["alpha", "beta"] {
+            assert_eq!(
+                f.b.discovery.peers[module].cut(&back).unwrap().refs,
+                f.a.discovery.peers[module].cut(&cut).unwrap().refs
+            );
+            assert!(f.a.discovery.peers[module].tombstones().is_empty());
+        }
+        assert!(f.a.door.calls().iter().any(
+            |c| c.author == A && matches!(&c.request,DoorRequest::Accept(r) if r.cut_id==back)
+        ));
+        for item in f.a.door.cut(&cut).unwrap().items {
+            assert!(f.a.door.admit(&item.session_ref).is_ok());
+        }
+        assert_eq!(f.a.where_().await["status"], "held_here");
+        assert_eq!(f.b.where_().await["holder"], A);
+    }
+
+    fn put_claim(
+        mac: &Mac,
+        version: u64,
+        holder: Option<&str>,
+        epoch: i64,
+        cut: Option<&str>,
+        author: &str,
+    ) {
+        mac.records.fake.put(&format!("claim:{AGENT}"),version,serde_json::to_vec(&json!({"v":1,"agent_id":AGENT,"holder":holder,"epoch":epoch,"cut_id":cut,"reason":null})).unwrap(),author);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn version_three_epoch_zero_uses_record_version_not_cache_version() {
+        let f = Pair::new(&[("pi", "pi-session")]).await;
+        put_claim(&f.a, 3, None, 0, None, A);
+        let cut = f.published("epoch-zero").await;
+        assert_eq!(f.a.row(&cut).claim_version, Some(3));
+        f.finish(&cut).await;
+        let claim = f.b.claim().await;
+        assert_eq!(claim.version, 4);
+        assert_eq!(
+            serde_json::from_slice::<Value>(claim.body.as_deref().unwrap()).unwrap()["epoch"],
+            1
+        );
+    }
+    #[tokio::test(start_paused = true)]
+    async fn held_elsewhere_and_busy_admission_have_no_move_side_effects() {
+        for code in [
+            "not_holder",
+            "agent_busy",
+            "unknown_member",
+            "invalid_request",
+            "claim_stale",
+        ] {
+            let f = Pair::new(&[("pi", "pi-session")]).await;
+            let target = match code {
+                "not_holder" => {
+                    put_claim(&f.a, 1, Some(B), 1, None, B);
+                    B
+                }
+                "agent_busy" => {
+                    f.a.discovery.peers["pi"].set_busy(
+                        AgentRef::new("pi-session", "ref-pi-session"),
+                        BusyRef::new(BusyState::Unknown).with_reason_code("run_active"),
+                    );
+                    B
+                }
+                "unknown_member" => "03030303030303030303030303030303",
+                "claim_stale" => {
+                    f.a.store().apply_entry("fixture", "{}", "fixture", None, |tx| tx.execute_batch("INSERT INTO agent(agent_id,name,tag,role,created_at_ms,updated_at_ms) VALUES('agent_1111111111111111','Other','','assistant',1,1);")).unwrap();
+                    f.a.records
+                        .fake
+                        .error("claim:agent_1111111111111111", Some("unavailable"));
+                    B
+                }
+                _ => {
+                    f.a.store()
+                        .set_member_name(
+                            entorhinal_core::shared_entry::MemberName {
+                                author: "03030303030303030303030303030303".into(),
+                                display_name: "Studio Mac".into(),
+                            },
+                            "fixture",
+                        )
+                        .unwrap();
+                    "Studio Mac"
+                }
+            };
+            assert_eq!(f.a.admit_to(target, code).await.unwrap_err(), code);
+            assert!(f.a.store().list_agent_moves().unwrap().is_empty());
+            assert!(f.a.door.calls().is_empty());
+            assert!(f.a.discovery.peers["pi"]
+                .calls()
+                .iter()
+                .all(|r| matches!(r, Request::Describe(_) | Request::Busy(_))));
+            assert!(f
+                .a
+                .records
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(op, p)| op == "record.read_many"
+                    || op == "record.read" && p["subject"] == format!("claim:{AGENT}")));
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn moved_claim_aborts_without_take_and_claimed_abort_returns_epoch_two_to_a() {
+        for claimed in [false, true] {
+            let f = Pair::new(&[("pi", "pi-session")]).await;
+            let cut = f.published("abort-claim").await;
+            f.b.pickup().await;
+            f.b.receiver_until(
+                &cut,
+                if claimed {
+                    MoveStep::Claimed
+                } else {
+                    MoveStep::Staged
+                },
+            )
+            .await;
+            if claimed {
+                f.b.abort(&cut);
+            } else {
+                put_claim(&f.a, 1, Some(A), 1, None, A);
+            }
+            f.b.receiver_until(&cut, MoveStep::Aborted).await;
+            f.a.source_until(&cut, MoveStep::Aborted).await;
+            assert_eq!(
+                f.b.row(&cut).reason.as_deref(),
+                Some(if claimed { "operator" } else { "claim_moved" })
+            );
+            let body: Value =
+                serde_json::from_slice(f.b.claim().await.body.as_deref().unwrap()).unwrap();
+            assert_eq!(body["holder"], A);
+            assert_eq!(body["epoch"], if claimed { 2 } else { 1 });
+            assert_eq!(f.a.where_().await["status"], "held_here");
+            assert_eq!(f.b.where_().await["status"], "held_elsewhere");
+            assert_eq!(
+                f.b.register(AGENT, "pi-session", "new").unwrap_err().code,
+                "held_elsewhere"
+            );
+            if !claimed {
+                assert!(!f
+                    .b
+                    .records
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(op, p)| op == "record.cas" && p["subject"] == format!("claim:{AGENT}")));
+            }
+            f.clean();
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn abort_matrix_cleans_every_pre_boundary_checkpoint_across_restarts() {
+        for source_step in [
+            MoveStep::Preparing,
+            MoveStep::Exported,
+            MoveStep::Sealed,
+            MoveStep::Published,
+        ] {
+            let mut f = Pair::new(&[("pi", "pi-session")]).await;
+            f.a.door
+                .script("cut.seal", DoorEffect::Seal(SealState::Published, None));
+            let cut = f.a.admit_to(B, "source-abort").await.unwrap();
+            f.a.source_until(&cut, source_step).await;
+            f.a.abort(&cut);
+            f.a.restart().await;
+            f.a.source_until(&cut, MoveStep::Aborted).await;
+            f.b.pickup().await;
+            assert!(f.b.store().list_agent_moves().unwrap().is_empty());
+            assert_eq!(f.a.row(&cut).reason.as_deref(), Some("operator"));
+            if let Some(seal) = f.a.door.cut(&cut) {
+                for item in seal.items {
+                    assert!(f.a.door.admit(&item.session_ref).is_ok());
+                }
+            }
+            f.clean();
+        }
+        for step in [
+            MoveStep::PickedUp,
+            MoveStep::Imported,
+            MoveStep::Staged,
+            MoveStep::Claimed,
+        ] {
+            let mut f = Pair::new(&[("pi", "pi-session")]).await;
+            let cut = f.published("receiver-abort").await;
+            f.b.pickup().await;
+            f.b.receiver_until(&cut, step).await;
+            f.b.abort(&cut);
+            f.b.restart().await;
+            f.b.receiver_until(&cut, MoveStep::Aborted).await;
+            f.a.restart().await;
+            f.a.source_until(&cut, MoveStep::Aborted).await;
+            assert_eq!(f.a.record(&cut).await.state, MoveState::Aborted);
+            assert_eq!(f.a.row(&cut).reason.as_deref(), Some("operator"));
+            f.clean();
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn source_abort_request_at_staged_cannot_unfreeze_receiver_take() {
+        let f = Pair::new(&[("pi", "pi-session")]).await;
+        let cut = f.published("staged-race").await;
+        f.b.pickup().await;
+        f.b.receiver_until(&cut, MoveStep::Staged).await;
+        f.a.abort(&cut);
+        f.b.receiver_until(&cut, MoveStep::Claimed).await;
+        drive(f.a.source(&cut).tick()).await.unwrap();
+        let row = f.a.row(&cut);
+        assert!(row.abort_requested.is_none());
+        assert_eq!(row.detail.unwrap()["code"], "invalid_state");
+        assert!(!f.a.discovery.peers["pi"].frozen().is_empty());
+        f.finish(&cut).await;
+    }
+    #[tokio::test(start_paused = true)]
+    async fn activation_hold_survives_crash_and_every_boundary_abort_is_read_only() {
+        let mut f = Pair::new(&[("alpha", "a-session"), ("beta", "b-session")]).await;
+        let cut = f.published("boundary").await;
+        f.b.pickup().await;
+        f.b.receiver_until(&cut, MoveStep::Activating).await;
+        f.b.refuse("beta", "agent_data.activate", "external_not_present");
+        drive(f.b.receiver(&cut).tick()).await.unwrap();
+        assert_eq!(f.b.row(&cut).step, MoveStep::Activating);
+        assert_eq!(f.b.row(&cut).hold.unwrap()["code"], "external_not_present");
+        assert_eq!(
+            f.b.discovery.peers["alpha"].cut(&cut).unwrap().step,
+            crate::participant_client::Step::Activated
+        );
+        let before = f.b.row(&cut);
+        assert_eq!(
+            f.b.machine
+                .bytes_on(
+                    CORE,
+                    "agent.move_abort",
+                    json!({"cut_id":cut,"request_key":"boundary"})
+                )
+                .await
+                .unwrap_err(),
+            "invalid_state"
+        );
+        assert_eq!(f.b.row(&cut), before);
+        f.b.restart().await;
+        elapse(300_000);
+        f.finish(&cut).await;
+        for mac in [&f.a, &f.b] {
+            let before = mac.row(&cut);
+            assert_eq!(
+                mac.machine
+                    .bytes_on(
+                        CORE,
+                        "agent.move_abort",
+                        json!({"cut_id":cut,"request_key":"terminal"})
+                    )
+                    .await
+                    .unwrap_err(),
+                "invalid_state"
+            );
+            assert_eq!(mac.row(&cut), before);
+            assert!(!mac
+                .discovery
+                .peers
+                .values()
+                .any(|p| p.calls().iter().any(|r| matches!(r, Request::Abort(_)))));
+        }
+        f.a.restart().await;
+        f.b.restart().await;
+        assert!(f.a.store().list_open_agent_moves().unwrap().is_empty());
+        assert!(f.b.store().list_open_agent_moves().unwrap().is_empty());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn restarted_source_and_receiver_resume_at_every_recorded_step() {
+        let mut f = Pair::new(&[("pi", "pi-session")]).await;
+        f.a.door
+            .script("cut.seal", DoorEffect::Seal(SealState::Published, None));
+        let cut = f.a.admit_to(B, "restarts").await.unwrap();
+        for step in [
+            MoveStep::Preparing,
+            MoveStep::Exported,
+            MoveStep::Sealed,
+            MoveStep::Published,
+        ] {
+            f.a.source_until(&cut, step).await;
+            f.a.restart().await;
+            assert_eq!(
+                f.a.register(AGENT, "pi-session", "new").unwrap_err().code,
+                "agent_moving"
+            );
+        }
+        f.b.pickup().await;
+        for step in [
+            MoveStep::PickedUp,
+            MoveStep::Imported,
+            MoveStep::Staged,
+            MoveStep::Claimed,
+            MoveStep::Activating,
+            MoveStep::Activated,
+        ] {
+            f.b.receiver_until(&cut, step).await;
+            f.b.restart().await;
+            if step != MoveStep::Activated {
+                assert_eq!(
+                    f.b.register(AGENT, "pi-session", "new").unwrap_err().code,
+                    "agent_moving"
+                );
+            }
+        }
+        f.a.records
+            .fake
+            .error(&format!("claim:{AGENT}"), Some("unavailable"));
+        drive(f.a.source(&cut).tick()).await.unwrap();
+        assert_eq!(f.a.row(&cut).step, MoveStep::Releasing);
+        f.a.restart().await;
+        f.a.records.fake.error(&format!("claim:{AGENT}"), None);
+        elapse(300_000);
+        f.a.source_until(&cut, MoveStep::Released).await;
+        f.a.restart().await;
+        f.b.receiver_until(&cut, MoveStep::Done).await;
+        f.b.restart().await;
+        assert_eq!(f.a.record(&cut).await.state, MoveState::Released);
+        let claim = f.b.claim().await;
+        assert_eq!(claim.version, 1);
+        assert_eq!(
+            f.a.register(AGENT, "pi-session", "new").unwrap_err().code,
+            "held_elsewhere"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn crashes_on_both_sides_of_take_and_return_cas_never_strand_or_retake_claim() {
+        for returning in [false, true] {
+            for after in [false, true] {
+                let mut f = Pair::new(&[("pi", "pi-session")]).await;
+                let cut = f.published("cas-crash").await;
+                f.b.pickup().await;
+                f.b.receiver_until(
+                    &cut,
+                    if returning {
+                        MoveStep::Claimed
+                    } else {
+                        MoveStep::Staged
+                    },
+                )
+                .await;
+                if returning {
+                    f.b.abort(&cut);
+                }
+                *f.b.records.trap.lock().unwrap() = Some(Trap {
+                    method: "record.cas".into(),
+                    subject: format!("claim:{AGENT}"),
+                    after,
+                });
+                let mut driver = f.b.receiver(&cut);
+                let mut future = Box::pin(driver.tick());
+                drive(async { tokio::select! { result=&mut future => panic!("CAS did not reach crash gate: {result:?}"), permit=f.b.records.hit.acquire() => permit.unwrap().forget() } }).await;
+                drop(future);
+                drop(driver);
+                f.b.restart().await;
+                if returning {
+                    f.b.receiver_until(&cut, MoveStep::Aborted).await;
+                    f.a.source_until(&cut, MoveStep::Aborted).await;
+                } else {
+                    f.finish(&cut).await;
+                }
+                let claim = f.b.claim().await;
+                assert_eq!(claim.version, if returning { 2 } else { 1 });
+                let body: Value = serde_json::from_slice(claim.body.as_deref().unwrap()).unwrap();
+                assert_eq!(body["holder"], if returning { A } else { B });
+                assert_eq!(body["epoch"], if returning { 2 } else { 1 });
+                f.clean();
+            }
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn operator_abort_during_prepare_pending_seal_and_lost_publish_recovers_cleanup() {
+        for phase in ["prepare", "seal", "publish"] {
+            let mut f = Pair::new(&[("alpha", "a-session"), ("beta", "b-session")]).await;
+            let cut = f.a.admit_to(B, phase).await.unwrap();
+            if phase == "prepare" {
+                *f.a.discovery.gate.trap.lock().unwrap() =
+                    Some(("alpha".into(), "agent_data.prepare".into(), true));
+                let mut driver = f.a.source(&cut);
+                let mut future = Box::pin(driver.tick());
+                drive(async {tokio::select! { result=&mut future=>panic!("prepare gate not reached: {result:?}"), permit=f.a.discovery.gate.hit.acquire()=>permit.unwrap().forget() }}).await;
+                f.a.abort(&cut);
+                assert!(!f.a.discovery.peers["alpha"].frozen().is_empty());
+                assert!(!f
+                    .a
+                    .discovery
+                    .peers
+                    .values()
+                    .any(|p| p.calls().iter().any(|r| matches!(r, Request::Abort(_)))));
+                drop(future);
+                drop(driver);
+            } else {
+                f.a.source_until(&cut, MoveStep::Exported).await;
+                if phase == "seal" {
+                    drive(f.a.source(&cut).tick()).await.unwrap();
+                    assert!(f.a.row(&cut).seal_sent);
+                    assert_eq!(f.a.door.cut(&cut).unwrap().state, SealState::Pending);
+                } else {
+                    f.a.door
+                        .script("cut.status", DoorEffect::Seal(SealState::Published, None));
+                    f.a.source_until(&cut, MoveStep::Sealed).await;
+                    *f.a.records.trap.lock().unwrap() = Some(Trap {
+                        method: "record.cas".into(),
+                        subject: format!("move:{cut}"),
+                        after: true,
+                    });
+                    let mut driver = f.a.source(&cut);
+                    let mut future = Box::pin(driver.tick());
+                    drive(async {tokio::select! {result=&mut future=>panic!("publish gate not reached: {result:?}"),permit=f.a.records.hit.acquire()=>permit.unwrap().forget()}}).await;
+                    drop(future);
+                    drop(driver);
+                    assert_eq!(f.a.record(&cut).await.state, MoveState::Published);
+                }
+                f.a.abort(&cut);
+            }
+            f.a.restart().await;
+            elapse(300_000);
+            *f.a.discovery.gate.trap.lock().unwrap() =
+                Some(("alpha".into(), "agent_data.abort".into(), true));
+            let mut driver = f.a.source(&cut);
+            let mut future = Box::pin(async {
+                for _ in 0..8 {
+                    driver.tick().await.unwrap();
+                    elapse(300_000);
+                }
+                panic!("cleanup gate not reached in {phase}")
+            });
+            drive(async {tokio::select! {()=&mut future=>panic!("cleanup unexpectedly completed"),permit=f.a.discovery.gate.hit.acquire()=>permit.unwrap().forget()}}).await;
+            drop(future);
+            drop(driver);
+            f.a.restart().await;
+            f.a.source_until(&cut, MoveStep::Aborted).await;
+            assert_eq!(f.a.row(&cut).reason.as_deref(), Some("operator"));
+            for peer in f.a.discovery.peers.values() {
+                assert!(peer.frozen().is_empty());
+            }
+            if let Some(seal) = f.a.door.cut(&cut) {
+                for item in seal.items {
+                    assert!(f.a.door.admit(&item.session_ref).is_ok());
+                }
+            }
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn takeover_and_accept_diagnostics_do_not_delay_finish_across_restart() {
+        for takeover in [false, true] {
+            for code in ["cut_not_published", "unavailable"] {
+                let mut f = Pair::new(&[("pi", "pi-session")]).await;
+                let cut = f.published("accept").await;
+                f.b.pickup().await;
+                f.b.receiver_until(&cut, MoveStep::Activated).await;
+                f.b.door
+                    .script("cut.accept", DoorEffect::Refuse(code.into()));
+                drive(CutAccept::new(f.b.worker(), cut.clone()).tick())
+                    .await
+                    .unwrap();
+                assert!(f.b.row(&cut).hold.is_none());
+                assert_eq!(f.b.row(&cut).cut_accept.unwrap()["code"], code);
+                for reply in [
+                    f.b.machine
+                        .call("agent.move_status", json!({"cut_id":cut}))
+                        .await
+                        .unwrap(),
+                    f.b.machine.call("agent.moves", json!({})).await.unwrap(),
+                    f.b.where_().await,
+                ] {
+                    assert!(reply.to_string().contains(code), "{reply}");
+                }
+                f.b.restart().await;
+                if takeover {
+                    let deadline = f.b.row(&cut).activated_at_ms.unwrap() + 600_000;
+                    elapse(deadline - clock() - 1);
+                    drive(f.b.receiver(&cut).tick()).await.unwrap();
+                    assert!(!f.b.door.calls().iter().any(|call| matches!(&call.request,DoorRequest::Takeover(request) if request.cut_id==cut)));
+                    assert_eq!(f.b.row(&cut).step, MoveStep::Activated);
+                    f.b.door.script(
+                        "cut.takeover",
+                        DoorEffect::Takeover(crate::door_client::TakeoverProgress {
+                            state: crate::door_client::TakeoverState::Taken,
+                            session_ref: None,
+                            code: None,
+                        }),
+                    );
+                    elapse(1);
+                    f.b.receiver_until(&cut, MoveStep::TakenOver).await;
+                } else {
+                    f.a.source_until(&cut, MoveStep::Released).await;
+                    f.b.receiver_until(&cut, MoveStep::Done).await;
+                }
+                assert!(f.b.row(&cut).hold.is_none());
+                if code == "unavailable" {
+                    elapse(300_000);
+                    drive(CutAccept::new(f.b.worker(), cut.clone()).tick())
+                        .await
+                        .unwrap();
+                    assert_eq!(f.b.row(&cut).cut_accept.unwrap()["state"], "accepted");
+                }
+                if takeover {
+                    f.b.door
+                        .script("cut.seal", DoorEffect::Seal(SealState::Published, None));
+                    let back = f.b.admit_to(A, "post-takeover").await.unwrap();
+                    assert_eq!(f.b.row(&back).step, MoveStep::Preparing);
+                    f.a.source_until(&cut, MoveStep::Released).await;
+                }
+            }
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn receiver_ref_ownership_and_registration_windows_are_transactional() {
+        for conflict in [false, true] {
+            let f = Pair::new(&[("pi", "pi-session")]).await;
+            f.b.store().apply_entry("fixture","{}","fixture",None,|tx| tx.execute_batch("INSERT INTO agent(agent_id,name,tag,role,created_at_ms,updated_at_ms) VALUES('agent_1111111111111111','Other','','assistant',1,1);")).unwrap();
+            if conflict {
+                f.b.register("agent_1111111111111111", "pi-session", "ref-pi-session")
+                    .unwrap();
+            }
+            let cut = f.published("ownership").await;
+            f.b.pickup().await;
+            if conflict {
+                f.b.receiver_until(&cut, MoveStep::Aborted).await;
+                assert_eq!(f.b.row(&cut).detail.unwrap()["code"], "ref_bound_elsewhere");
+                assert!(!f.b.discovery.peers["pi"]
+                    .calls()
+                    .iter()
+                    .any(|r| matches!(r, Request::Import(_))));
+                f.a.source_until(&cut, MoveStep::Aborted).await;
+            } else {
+                assert_eq!(
+                    f.b.register("agent_1111111111111111", "pi-session", "ref-pi-session")
+                        .unwrap_err()
+                        .code,
+                    "agent_moving"
+                );
+                f.finish(&cut).await;
+                assert_eq!(
+                    f.b.register("agent_1111111111111111", "pi-session", "ref-pi-session")
+                        .unwrap_err()
+                        .code,
+                    "ref_bound_elsewhere"
+                );
+                let binding = f.b.register(AGENT, "pi-session", "ref-pi-session").unwrap();
+                assert_eq!(binding.harness.as_deref(), Some("host"));
+                assert_eq!(binding.session_id.as_deref(), Some("ref-pi-session"));
+            }
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn receiver_inbox_discards_sixty_four_abandoned_moves_without_creating_rows() {
+        let f = Pair::new(&[("pi", "pi-session")]).await;
+        for n in 0..64 {
+            let cut = f.published(&format!("abandoned-{n}")).await;
+            f.a.abort(&cut);
+            f.a.source_until(&cut, MoveStep::Aborted).await;
+        }
+        let subject = format!("inbox:{B}");
+        let reply =
+            f.b.machine
+                .handler
+                .record_client
+                .read(&subject)
+                .await
+                .unwrap();
+        assert_eq!(
+            wire::decode_inbox_record(reply.body.as_deref().unwrap())
+                .unwrap()
+                .pending
+                .len(),
+            64
+        );
+        f.b.pickup().await;
+        let reply =
+            f.b.machine
+                .handler
+                .record_client
+                .read(&subject)
+                .await
+                .unwrap();
+        assert!(wire::decode_inbox_record(reply.body.as_deref().unwrap())
+            .unwrap()
+            .pending
+            .is_empty());
+        assert!(f.b.store().list_agent_moves().unwrap().is_empty());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn receiver_diverged_lagging_identity_and_external_data_obey_pickup_policy() {
+        for mode in ["diverged", "lagging", "external"] {
+            let f = Pair::with_receiver_refs(&[("pi", "pi-session")], mode == "diverged").await;
+            let cut = f.published(mode).await;
+            if mode == "lagging" {
+                f.b.store()
+                    .apply_entry("fixture", "{}", "fixture", None, |tx| {
+                        tx.execute_batch("DELETE FROM agent;")
+                    })
+                    .unwrap();
+            }
+            f.b.pickup().await;
+            if mode == "diverged" {
+                f.b.discovery.peers["pi"].set_diverged(
+                    AgentRef::new("pi-session", "ref-pi-session"),
+                    crate::participant_client::DivergedState::Advanced,
+                );
+            }
+            if mode == "external" {
+                f.b.refuse("pi", "agent_data.diverged", "external_not_present");
+            }
+            drive(f.b.receiver(&cut).tick()).await.unwrap();
+            if mode == "diverged" {
+                f.b.receiver_until(&cut, MoveStep::Aborted).await;
+                f.a.source_until(&cut, MoveStep::Aborted).await;
+                assert_eq!(f.b.row(&cut).reason.as_deref(), Some("diverged"));
+                assert!(!f.b.discovery.peers["pi"]
+                    .calls()
+                    .iter()
+                    .any(|r| matches!(r, Request::Import(_))));
+            } else {
+                assert_eq!(f.b.row(&cut).step, MoveStep::PickedUp);
+                assert_eq!(
+                    f.b.row(&cut).hold.unwrap()["code"],
+                    if mode == "lagging" {
+                        "unknown_agent"
+                    } else {
+                        "external_not_present"
+                    }
+                );
+                if mode == "lagging" {
+                    f.b.store().apply_entry("fixture","{}","fixture",None,|tx| tx.execute_batch("INSERT INTO agent(agent_id,name,tag,role,created_at_ms,updated_at_ms) VALUES('agent_0123456789abcdef','ENTO','E','assistant',1,1);")).unwrap();
+                }
+                elapse(300_000);
+                f.finish(&cut).await;
+                assert!(
+                    !f.b.discovery.peers["pi"]
+                        .calls()
+                        .iter()
+                        .any(|r| matches!(r, Request::Busy(_))),
+                    "unheld refs must skip busy"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_refusals_busy_nine_failed_seal_and_unknown_code_have_named_outcomes() {
+        for mode in [
+            "unavailable",
+            "handoff_not_covered",
+            "busy",
+            "failed",
+            "frobnicated",
+        ] {
+            let f = Pair::new(&[("pi", "pi-session")]).await;
+            f.a.door.script(
+                "cut.seal",
+                DoorEffect::Seal(
+                    if mode == "failed" {
+                        SealState::Failed
+                    } else {
+                        SealState::Published
+                    },
+                    None,
+                ),
+            );
+            let cut = f.a.admit_to(B, mode).await.unwrap();
+            if mode == "unavailable" {
+                for _ in 0..2 {
+                    f.a.refuse("pi", "agent_data.prepare", mode);
+                }
+            }
+            if mode == "busy" {
+                for _ in 0..9 {
+                    f.a.refuse("pi", "agent_data.prepare", mode);
+                }
+            }
+            if mode == "frobnicated" {
+                f.a.refuse("pi", "agent_data.prepare", mode);
+            }
+            if ["busy", "failed", "frobnicated"].contains(&mode) {
+                f.a.source_until(&cut, MoveStep::Aborted).await;
+                let row = f.a.row(&cut);
+                assert_eq!(
+                    row.reason.as_deref(),
+                    Some(if mode == "failed" {
+                        "door_refused"
+                    } else {
+                        "participant_refused"
+                    })
+                );
+                assert_eq!(row.detail.unwrap()["code"], mode);
+                if mode == "busy" {
+                    assert_eq!(
+                        f.a.discovery.peers["pi"]
+                            .calls()
+                            .iter()
+                            .filter(|r| matches!(r, Request::Prepare(_)))
+                            .count(),
+                        9
+                    );
+                }
+                f.clean();
+            } else {
+                f.a.source_until(&cut, MoveStep::Published).await;
+                f.b.pickup().await;
+                f.b.receiver_until(&cut, MoveStep::Activated).await;
+                if mode == "handoff_not_covered" {
+                    for _ in 0..2 {
+                        f.a.door
+                            .script("cut.handoff", DoorEffect::Refuse(mode.into()));
+                    }
+                }
+                f.a.source_until(&cut, MoveStep::Released).await;
+                f.b.receiver_until(&cut, MoveStep::Done).await;
+                if mode == "handoff_not_covered" {
+                    assert_eq!(f.a.door.calls().iter().filter(|call| matches!(&call.request,DoorRequest::Handoff(request) if request.cut_id==cut)).count(),3);
+                }
+            }
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn discovery_missing_not_ready_role_and_unlisted_modules_obey_pinned_plan() {
+        for mode in ["missing", "not-ready", "no-role", "unlisted"] {
+            let mut f = Pair::new(&[("pi", "pi-session")]).await;
+            if mode == "no-role" {
+                f.a.discovery
+                    .daemon
+                    .restart(snapshot(&[("pi", "pi-session")], true, false));
+                assert_eq!(
+                    f.a.admit_to(B, mode).await.unwrap_err(),
+                    "participant_unavailable"
+                );
+                assert!(f.a.store().list_agent_moves().unwrap().is_empty());
+                continue;
+            }
+            let cut = f.published(mode).await;
+            f.b.discovery.daemon.restart(snapshot(
+                if mode == "missing" {
+                    &[]
+                } else {
+                    &[("pi", "pi-session")]
+                },
+                mode != "not-ready",
+                true,
+            ));
+            let extra = Arc::new(FakeParticipant::new(&["pi-session"], vec![]));
+            if mode == "unlisted" {
+                let mut peers = f.b.discovery.peers.clone();
+                peers.insert("extra".into(), extra.clone());
+                f.b.discovery = Arc::new(Discovery {
+                    daemon: FakeDaemon::new(snapshot(
+                        &[("pi", "pi-session"), ("extra", "pi-session")],
+                        true,
+                        true,
+                    )),
+                    peers,
+                    gate: f.b.discovery.gate.clone(),
+                });
+                f.b.configure();
+            }
+            f.b.pickup().await;
+            drive(f.b.receiver(&cut).tick()).await.unwrap();
+            match mode {
+                "missing" => {
+                    f.b.receiver_until(&cut, MoveStep::Aborted).await;
+                    assert_eq!(f.b.row(&cut).detail.unwrap()["module_id"], "pi");
+                    f.a.source_until(&cut, MoveStep::Aborted).await;
+                }
+                "not-ready" => {
+                    assert_eq!(f.b.row(&cut).step, MoveStep::PickedUp);
+                    assert!(f.b.row(&cut).hold.is_some());
+                    f.b.discovery
+                        .daemon
+                        .restart(snapshot(&[("pi", "pi-session")], true, true));
+                    elapse(300_000);
+                    f.finish(&cut).await;
+                }
+                _ => {
+                    f.finish(&cut).await;
+                    assert!(extra.calls().is_empty());
+                }
+            }
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn wrong_author_and_foreign_to_pickup_do_not_touch_participants_or_move_record() {
+        for mode in ["author", "to"] {
+            let f = Pair::new(&[("pi", "pi-session")]).await;
+            let cut = f.published(mode).await;
+            let mut record = f.a.record(&cut).await;
+            if mode == "to" {
+                record.to = "03030303030303030303030303030303".into();
+            }
+            f.a.records.fake.put(
+                &format!("move:{cut}"),
+                2,
+                wire::encode_move_record(&format!("move:{cut}"), &record).unwrap(),
+                if mode == "author" {
+                    "03030303030303030303030303030303"
+                } else {
+                    A
+                },
+            );
+            f.b.pickup().await;
+            if mode == "author" {
+                assert_eq!(f.b.row(&cut).reason.as_deref(), Some("cut_author_mismatch"));
+            } else {
+                assert!(f.b.store().agent_move(&cut).unwrap().is_none());
+            }
+            assert!(f.b.discovery.peers["pi"].calls().is_empty());
+            assert!(!f
+                .b
+                .records
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(op, p)| op == "record.cas" && p["subject"] == format!("move:{cut}")));
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn forged_activated_author_or_plan_cannot_release_source_participants() {
+        for mode in ["author", "to", "agent"] {
+            let f = Pair::new(&[("pi", "pi-session")]).await;
+            let cut = f.published(mode).await;
+            f.b.pickup().await;
+            f.b.receiver_until(&cut, MoveStep::Activated).await;
+            let good = f.b.record(&cut).await;
+            let mut forged = good.clone();
+            if mode == "to" {
+                forged.to = "03030303030303030303030303030303".into();
+            }
+            if mode == "agent" {
+                forged.agent_id = "agent_1111111111111111".into();
+            }
+            f.a.records.fake.put(
+                &format!("move:{cut}"),
+                5,
+                wire::encode_move_record(&format!("move:{cut}"), &forged).unwrap(),
+                if mode == "author" { A } else { B },
+            );
+            drive(f.a.source(&cut).tick()).await.unwrap();
+            assert_eq!(f.a.row(&cut).step, MoveStep::Published);
+            assert!(f.a.discovery.peers["pi"].tombstones().is_empty());
+            assert!(!f.a.discovery.peers["pi"].frozen().is_empty());
+            assert!(f.a.where_().await.get("moveErrors").is_some());
+            f.a.records.fake.put(
+                &format!("move:{cut}"),
+                6,
+                wire::encode_move_record(&format!("move:{cut}"), &good).unwrap(),
+                B,
+            );
+            elapse(300_000);
+            f.finish(&cut).await;
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn oversized_prepare_aborts_before_export_or_seal_and_abort_detail_is_bounded() {
+        let f = Pair::new(&[("pi", "pi-session")]).await;
+        let prepare:PrepareReply=serde_json::from_value(json!({"items":[],"external":[{"ref_kind":"pi-session","ref":"ref-pi-session","note":"x".repeat(61_440),"check":{}}]})).unwrap();
+        f.a.discovery.peers["pi"].set_prepare(prepare);
+        let cut = f.a.admit_to(B, "size").await.unwrap();
+        f.a.source_until(&cut, MoveStep::Aborted).await;
+        assert_eq!(f.a.row(&cut).reason.as_deref(), Some("move_too_large"));
+        assert!(f.a.door.calls().is_empty());
+        assert!(!f.a.discovery.peers["pi"]
+            .calls()
+            .iter()
+            .any(|r| matches!(r, Request::Export(_))));
+        f.clean();
+        let f = Pair::new(&[("pi", "pi-session")]).await;
+        let cut = f.published("detail").await;
+        f.b.pickup().await;
+        f.b.discovery.peers["pi"].script(
+            "agent_data.import",
+            Effect::Refuse(Refusal {
+                code: "incompatible_version".into(),
+                detail: Some(json!({"found":"x".repeat(10_000),"required":"v2"})),
+            }),
+        );
+        f.b.receiver_until(&cut, MoveStep::Aborted).await;
+        f.a.source_until(&cut, MoveStep::Aborted).await;
+        let record = f.a.record(&cut).await;
+        assert_eq!(record.state, MoveState::Aborted);
+        assert_eq!(record.detail.unwrap()["truncated"], true);
+        assert!(f.b.row(&cut).detail.unwrap().to_string().len() > 2048);
+        f.clean();
+    }
+    #[tokio::test(start_paused = true)]
+    async fn admission_registration_orders_same_key_and_unique_index_use_real_transactions() {
+        for before_insert in [false, true] {
+            let mut f = Pair::new(&[("pi", "pi-session")]).await;
+            if before_insert {
+                *f.a.discovery.gate.trap.lock().unwrap() =
+                    Some(("pi".into(), "agent_data.busy".into(), true));
+                let mut future = Box::pin(f.a.admit_to(B, "racing"));
+                drive(async {tokio::select! {result=&mut future=>panic!("admission gate not reached: {result:?}"),permit=f.a.discovery.gate.hit.acquire()=>permit.unwrap().forget()}}).await;
+                f.a.register(AGENT, "pi-session", "new").unwrap();
+                drop(future);
+                assert!(f.a.store().list_agent_moves().unwrap().is_empty());
+                f.a.restart().await;
+                assert_eq!(f.a.admit_to(B, "racing").await.unwrap_err(), "agent_busy");
+            } else {
+                *f.a.records.trap.lock().unwrap() = Some(Trap {
+                    method: "record.read".into(),
+                    subject: format!("claim:{AGENT}"),
+                    after: false,
+                });
+                let mut first = Box::pin(f.a.admit_to(B, "same"));
+                drive(async {tokio::select! {result=&mut first=>panic!("preflight gate not reached: {result:?}"),permit=f.a.records.hit.acquire()=>permit.unwrap().forget()}}).await;
+                let cut = f.a.admit_to(B, "same").await.unwrap();
+                f.a.records.release.add_permits(1);
+                assert_eq!(drive(&mut first).await.unwrap(), cut);
+                drop(first);
+                assert_eq!(f.a.store().list_agent_moves().unwrap().len(), 1);
+                assert_eq!(
+                    f.a.register(AGENT, "pi-session", "new").unwrap_err().code,
+                    "agent_moving"
+                );
+                let mut second = f.a.row(&cut);
+                second.cut_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into();
+                second.request_key = None;
+                assert!(f.a.store().insert_agent_move(&second).is_err());
+                second.side = entorhinal_core::move_store::MoveSide::Receiver;
+                second.step = MoveStep::PickedUp;
+                assert!(f.a.store().insert_agent_move(&second).is_err());
+                f.a.store()
+                    .set_member_name(
+                        entorhinal_core::shared_entry::MemberName {
+                            author: B.into(),
+                            display_name: "Renamed Mac".into(),
+                        },
+                        "fixture",
+                    )
+                    .unwrap();
+                assert_eq!(f.a.admit_to(B, "same").await.unwrap(), cut);
+                f.a.restart().await;
+                assert_eq!(f.a.admit_to(B, "same").await.unwrap(), cut);
+            }
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn hung_shared_writer_cannot_delay_admission_or_full_move() {
+        let f = Pair::new(&[("pi", "pi-session")]).await;
+        let _writer = f.a.machine.handler.writer.lock().await;
+        let generations = (
+            f.a.store().generation().unwrap(),
+            f.b.store().generation().unwrap(),
+        );
+        let cut = f.published("writer").await;
+        f.finish(&cut).await;
+        assert_eq!(
+            generations,
+            (
+                f.a.store().generation().unwrap(),
+                f.b.store().generation().unwrap()
+            )
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn boundary_abort_matrix_writes_nothing_then_restart_completes() {
+        for step in [
+            MoveStep::Activating,
+            MoveStep::Activated,
+            MoveStep::Done,
+            MoveStep::TakenOver,
+            MoveStep::Releasing,
+            MoveStep::Released,
+        ] {
+            let mut f = Pair::new(&[("pi", "pi-session")]).await;
+            let cut = f.published("boundary-matrix").await;
+            f.b.pickup().await;
+            f.b.receiver_until(
+                &cut,
+                if step == MoveStep::Activating {
+                    step
+                } else {
+                    MoveStep::Activated
+                },
+            )
+            .await;
+            if step == MoveStep::Releasing {
+                f.a.records
+                    .fake
+                    .error(&format!("claim:{AGENT}"), Some("unavailable"));
+                drive(f.a.source(&cut).tick()).await.unwrap();
+            } else if step == MoveStep::TakenOver {
+                f.b.door.script(
+                    "cut.takeover",
+                    DoorEffect::Takeover(crate::door_client::TakeoverProgress {
+                        state: crate::door_client::TakeoverState::Taken,
+                        session_ref: None,
+                        code: None,
+                    }),
+                );
+                elapse(600_000);
+                f.b.receiver_until(&cut, step).await;
+            } else if matches!(step, MoveStep::Released | MoveStep::Done) {
+                f.a.source_until(&cut, MoveStep::Released).await;
+                if step == MoveStep::Done {
+                    f.b.receiver_until(&cut, step).await;
+                }
+            }
+            let mac = if matches!(step, MoveStep::Releasing | MoveStep::Released) {
+                &f.a
+            } else {
+                &f.b
+            };
+            assert_eq!(mac.row(&cut).step, step);
+            let before = mac.row(&cut);
+            assert_eq!(
+                mac.store()
+                    .request_agent_move_abort(&cut, clock())
+                    .unwrap_err()
+                    .code,
+                "invalid_state"
+            );
+            assert_eq!(mac.row(&cut), before);
+            assert_eq!(
+                mac.machine
+                    .bytes_on(
+                        CORE,
+                        "agent.move_abort",
+                        json!({"cut_id":cut,"request_key":"boundary"})
+                    )
+                    .await
+                    .unwrap_err(),
+                "invalid_state"
+            );
+            assert_eq!(mac.row(&cut), before);
+            f.a.records.fake.error(&format!("claim:{AGENT}"), None);
+            f.a.restart().await;
+            f.b.restart().await;
+            elapse(300_000);
+            if !f.b.row(&cut).step.is_terminal() {
+                f.b.receiver_until(&cut, MoveStep::Activated).await;
+            }
+            f.a.source_until(&cut, MoveStep::Released).await;
+            if f.b.row(&cut).step != MoveStep::TakenOver {
+                f.b.receiver_until(&cut, MoveStep::Done).await;
+            }
+            for mac in [&f.a, &f.b] {
+                assert!(!mac.discovery.peers["pi"]
+                    .calls()
+                    .iter()
+                    .any(|r| matches!(r, Request::Abort(_))));
+            }
+            assert_eq!(f.b.claim().await.version, 1);
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn settlement_requires_persisted_take_exact_body_and_receiver_author() {
+        for mode in ["matching", "wrong-author", "wrong-epoch", "no-take"] {
+            let f = Pair::new(&[("pi", "pi-session")]).await;
+            let cut = f.published(mode).await;
+            f.b.pickup().await;
+            f.b.receiver_until(&cut, MoveStep::Staged).await;
+            if mode != "no-take" {
+                let mut row = f.b.row(&cut);
+                row.claim_take_body = Some(
+                    json!({"v":1,"agent_id":AGENT,"holder":B,"epoch":1,"cut_id":cut,"reason":null}),
+                );
+                row.claim_take_version = Some(0);
+                f.b.store().update_agent_move(&row).unwrap();
+            }
+            put_claim(
+                &f.b,
+                1,
+                Some(B),
+                if mode == "wrong-epoch" { 2 } else { 1 },
+                Some(&cut),
+                if mode == "wrong-author" { A } else { B },
+            );
+            if mode == "matching" {
+                f.finish(&cut).await;
+                assert_eq!(f.b.claim().await.version, 1);
+            } else {
+                f.b.receiver_until(&cut, MoveStep::Aborted).await;
+                assert_eq!(f.b.row(&cut).reason.as_deref(), Some("claim_moved"));
+                assert_eq!(f.b.record(&cut).await.state, MoveState::Aborted);
+                assert!(!f.b.discovery.peers["pi"]
+                    .calls()
+                    .iter()
+                    .any(|r| matches!(r, Request::Activate(_))));
+            }
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn writer_appearing_after_diverged_holds_import_and_diverged_runs_again() {
+        let f = Pair::with_receiver_refs(&[("pi", "pi-session")], true).await;
+        f.b.store().apply_entry("fixture","{}","fixture",None,|tx|tx.execute_batch("INSERT INTO session_binding(ref_kind,ref,agent_id,harness,session_id,project_root,registered_by,registered_at_ms) VALUES('pi-session','ref-pi-session','agent_0123456789abcdef',NULL,NULL,'','move',1);")).unwrap();
+        let cut = f.published("writer-after-diverged").await;
+        f.b.pickup().await;
+        *f.b.discovery.gate.trap.lock().unwrap() =
+            Some(("pi".into(), "agent_data.diverged".into(), true));
+        let mut driver = f.b.receiver(&cut);
+        let mut future = Box::pin(driver.tick());
+        drive(async {tokio::select! {result=&mut future=>panic!("diverged gate not reached: {result:?}"),permit=f.b.discovery.gate.hit.acquire()=>permit.unwrap().forget()}}).await;
+        let reference = AgentRef::new("pi-session", "ref-pi-session");
+        f.b.discovery.peers["pi"].set_busy(
+            reference.clone(),
+            BusyRef::new(BusyState::Busy).with_reason_code("run_active"),
+        );
+        f.b.discovery.gate.release.add_permits(1);
+        drive(&mut future).await.unwrap();
+        drop(future);
+        drop(driver);
+        assert_eq!(f.b.row(&cut).step, MoveStep::PickedUp);
+        assert!(f.b.row(&cut).hold.is_some());
+        assert!(!f.b.discovery.peers["pi"]
+            .calls()
+            .iter()
+            .any(|r| matches!(r, Request::Import(_))));
+        f.b.discovery.peers["pi"].set_busy(reference, BusyRef::new(BusyState::Idle));
+        elapse(300_000);
+        f.finish(&cut).await;
+        assert_eq!(
+            f.b.discovery.peers["pi"]
+                .calls()
+                .iter()
+                .filter(|r| matches!(r, Request::Diverged(_)))
+                .count(),
+            2
+        );
+    }
+    #[tokio::test(start_paused = true)]
+    async fn lost_append_with_receiver_finishing_before_retry_never_readds_inbox_entry() {
+        let mut f = Pair::new(&[("pi", "pi-session")]).await;
+        f.a.door
+            .script("cut.seal", DoorEffect::Seal(SealState::Published, None));
+        let cut = f.a.admit_to(B, "lost-append").await.unwrap();
+        f.a.source_until(&cut, MoveStep::Sealed).await;
+        *f.a.records.trap.lock().unwrap() = Some(Trap {
+            method: "record.cas".into(),
+            subject: format!("inbox:{B}"),
+            after: true,
+        });
+        let mut driver = f.a.source(&cut);
+        let mut future = Box::pin(driver.tick());
+        drive(async {tokio::select! {result=&mut future=>panic!("append gate not reached: {result:?}"),permit=f.a.records.hit.acquire()=>permit.unwrap().forget()}}).await;
+        f.b.pickup().await;
+        f.b.receiver_until(&cut, MoveStep::Activated).await;
+        f.a.records.release.add_permits(1);
+        drive(&mut future).await.unwrap();
+        let after_retry =
+            f.a.machine
+                .handler
+                .record_client
+                .read(&format!("inbox:{B}"))
+                .await
+                .unwrap();
+        assert!(
+            wire::decode_inbox_record(after_retry.body.as_deref().unwrap())
+                .unwrap()
+                .pending
+                .is_empty()
+        );
+        drop(future);
+        drop(driver);
+        f.a.restart().await;
+        f.a.source_until(&cut, MoveStep::Released).await;
+        f.b.receiver_until(&cut, MoveStep::Done).await;
+        f.a.restart().await;
+        drive(f.a.source(&cut).tick()).await.unwrap();
+        f.b.pickup().await;
+        let inbox =
+            f.a.machine
+                .handler
+                .record_client
+                .read(&format!("inbox:{B}"))
+                .await
+                .unwrap();
+        assert!(wire::decode_inbox_record(inbox.body.as_deref().unwrap())
+            .unwrap()
+            .pending
+            .is_empty());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn lost_participant_and_record_replies_settle_without_duplicate_claim_epochs() {
+        for op in [
+            "agent_data.prepare",
+            "agent_data.export",
+            "agent_data.import",
+            "agent_data.activate",
+            "agent_data.release",
+            "record.cas",
+        ] {
+            let f = Pair::new(&[("pi", "pi-session")]).await;
+            if op == "record.cas" {
+                f.a.records.fake.drop_reply.store(true, Ordering::Relaxed);
+            } else {
+                let mac = if ["agent_data.import", "agent_data.activate"].contains(&op) {
+                    &f.b
+                } else {
+                    &f.a
+                };
+                mac.discovery.peers["pi"].script(op, Effect::LoseReply(TransportError::NoReply));
+            }
+            let cut = f.published(op).await;
+            f.finish(&cut).await;
+            assert_eq!(f.b.claim().await.version, 1);
+            if op != "record.cas" {
+                let mac = if ["agent_data.import", "agent_data.activate"].contains(&op) {
+                    &f.b
+                } else {
+                    &f.a
+                };
+                assert!(mac.discovery.peers["pi"]
+                    .calls()
+                    .iter()
+                    .any(|r| matches!(r, Request::Status(_))));
+            }
+            f.clean();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_sources_append_one_inbox_without_overwriting_each_other() {
+        let f = Pair::with_receiver_refs(&[("pi", "pi-session")], true).await;
+        let target = "03030303030303030303030303030303";
+        for mac in [&f.a, &f.b] {
+            mac.store()
+                .set_member_name(
+                    entorhinal_core::shared_entry::MemberName {
+                        author: target.into(),
+                        display_name: "Third Mac".into(),
+                    },
+                    "fixture",
+                )
+                .unwrap();
+            mac.door
+                .script("cut.seal", DoorEffect::Seal(SealState::Published, None));
+        }
+        let a = f.a.admit_to(target, "append-a").await.unwrap();
+        let b = f.b.admit_to(target, "append-b").await.unwrap();
+        f.a.source_until(&a, MoveStep::Sealed).await;
+        f.b.source_until(&b, MoveStep::Sealed).await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        *f.a.records.append_barrier.lock().unwrap() = Some(barrier.clone());
+        *f.b.records.append_barrier.lock().unwrap() = Some(barrier);
+        let mut a_driver = f.a.source(&a);
+        let mut b_driver = f.b.source(&b);
+        let (one, two) = drive(async { tokio::join!(a_driver.tick(), b_driver.tick()) }).await;
+        one.unwrap();
+        two.unwrap();
+        let inbox =
+            f.a.machine
+                .handler
+                .record_client
+                .read(&format!("inbox:{target}"))
+                .await
+                .unwrap();
+        let pending = wire::decode_inbox_record(inbox.body.as_deref().unwrap())
+            .unwrap()
+            .pending;
+        assert_eq!(
+            pending
+                .iter()
+                .map(|p| p.cut_id.clone())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([a, b])
+        );
+        assert_eq!(pending.len(), 2);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn largest_admitted_body_still_fits_operator_abort_and_oversized_refusal() {
+        for refusal in [false, true] {
+            let f = Pair::new(&[("pi", "pi-session")]).await;
+            let base = json!({"v":1,"cut_id":"0".repeat(32),"agent_id":AGENT,"from":A,"to":B,"state":"published","claim_version":0,"participants":[{"module_id":"pi","refs":[{"ref_kind":"pi-session","ref":"ref-pi-session"}],"external":[{"ref_kind":"pi-session","ref":"ref-pi-session","note":"","check":null}]}],"reason":null,"detail":null});
+            let padding = 61_440 - serde_json::to_vec(&base).unwrap().len();
+            f.a.discovery.peers["pi"].set_prepare(serde_json::from_value(json!({"items":[{"ref_kind":"pi-session","ref":"ref-pi-session","sessionRef":"00000000000000000000000000000010","stream":"reserved:pi","endOffset":42,"digest":"a".repeat(64),"format":"v1","frozen":true}],"external":[{"ref_kind":"pi-session","ref":"ref-pi-session","note":"n".repeat(padding),"check":null}]})).unwrap());
+            let cut = f.published("largest").await;
+            let published =
+                f.a.machine
+                    .handler
+                    .record_client
+                    .read(&format!("move:{cut}"))
+                    .await
+                    .unwrap();
+            assert_eq!(published.body.as_deref().unwrap().len(), 61_440);
+            if refusal {
+                f.b.pickup().await;
+                f.b.discovery.peers["pi"].script(
+                    "agent_data.import",
+                    Effect::Refuse(Refusal {
+                        code: "incompatible_version".into(),
+                        detail: Some(json!({"found":"f".repeat(10_000),"required":"v2"})),
+                    }),
+                );
+                f.b.receiver_until(&cut, MoveStep::Aborted).await;
+            } else {
+                f.a.abort(&cut);
+            }
+            f.a.source_until(&cut, MoveStep::Aborted).await;
+            let aborted =
+                f.a.machine
+                    .handler
+                    .record_client
+                    .read(&format!("move:{cut}"))
+                    .await
+                    .unwrap();
+            assert!(aborted.body.as_deref().unwrap().len() <= 65_536);
+            assert_eq!(
+                wire::decode_move_record(&format!("move:{cut}"), aborted.body.as_deref().unwrap())
+                    .unwrap()
+                    .state,
+                MoveState::Aborted
+            );
+            f.clean();
+        }
+    }
+}
