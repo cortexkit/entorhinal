@@ -1198,10 +1198,12 @@ impl ModuleHandler for ProjectsHandler {
                 "journalTailCount": self.health.journal_tail_count.load(Ordering::Relaxed),
                 "latency": self.health.latency.report(),
                 "storeUnavailable": self.health.store_unavailable.load(Ordering::Relaxed),
-                "ready_after_ms": self
+                // Acquire pairs with the Release store below, so a reader that
+                // sees the flag also sees the elapsed time written before it.
+                "readyAfterMs": self
                     .health
                     .ready_recorded
-                    .load(Ordering::Relaxed)
+                    .load(Ordering::Acquire)
                     .then(|| self.health.ready_after_ms.load(Ordering::Relaxed)),
                 "lastOperationMs": self.health.last_operation_ms.load(Ordering::Relaxed),
                 "livenessBatches": self.health.liveness_batches.load(Ordering::Relaxed),
@@ -2450,7 +2452,7 @@ fn install_store_with_time(
                         .min(u64::MAX as u128) as u64,
                     Ordering::Relaxed,
                 );
-                health.ready_recorded.store(true, Ordering::Relaxed);
+                health.ready_recorded.store(true, Ordering::Release);
             }
             health.store_ready.store(true, Ordering::Relaxed);
             health.store_failed.store(false, Ordering::Relaxed);
@@ -2580,7 +2582,7 @@ mod tests {
     async fn ready_after_ms_is_null_until_ready_and_set_once() {
         let handler = ProjectsHandler::new().unwrap();
         let before = handler.health().await.metrics.unwrap();
-        assert!(before["ready_after_ms"].is_null());
+        assert!(before["readyAfterMs"].is_null());
 
         let module_started_at = Instant::now();
         let first_ready_at = module_started_at + Duration::from_millis(12_345);
@@ -2594,7 +2596,7 @@ mod tests {
             || first_ready_at,
         );
         let first_report = handler.health().await.metrics.unwrap();
-        assert_eq!(first_report["ready_after_ms"], 12_345);
+        assert_eq!(first_report["readyAfterMs"], 12_345);
 
         let later_ready_at = module_started_at + Duration::from_secs(120);
         let (second_dir, second_descriptor) = scratch_descriptor("ready-after-second-open");
@@ -2607,7 +2609,7 @@ mod tests {
             || later_ready_at,
         );
         let second_report = handler.health().await.metrics.unwrap();
-        assert_eq!(second_report["ready_after_ms"], 12_345);
+        assert_eq!(second_report["readyAfterMs"], 12_345);
 
         drop(handler);
         std::fs::remove_dir_all(first_dir).unwrap();

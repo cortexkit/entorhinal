@@ -19,7 +19,7 @@ would make the daemon refuse reads while engram is down.
 waiting for the store slot. The `latency` object has fixed `resolve`,
 `resolve_project_id`, `enumerate`, `agent.resolve` and `other` buckets; each
 contains `count`, `totalUs`, `maxUs`, `over500ms` and `over3s`. `storeUnavailable`
-counts requests refused before storage was ready, and `ready_after_ms` records
+counts requests refused before storage was ready, and `readyAfterMs` records
 the first successful store-open time from process start. Requests slower than
 500 ms also emit one fleet warning; a `resolve` warning includes its
 `canonical_root`.
