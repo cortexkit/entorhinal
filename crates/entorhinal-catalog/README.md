@@ -40,12 +40,15 @@ Signed-document parsing rejects fraction and exponent number tokens and `-0`
 before canonicalization or signature verification. General JSON, including
 package manifests, retains RFC 8785 number handling. Contract §9.1 and the
 vectors both refuse prereleases outside exact singleton comparator sets.
-Every vector outcome is asserted structurally. The contract's final status-key
-retirement/time/epoch rules and reviewed slice specification extend the older
-generator's id-to-key-map status API; additional tests cover those rules.
+Every vector outcome is asserted structurally. The vector generator models a
+registry's status keys as a plain id-to-key map. This crate instead applies the
+contract's full key-chain rules (a retired key can't sign records dated after
+its successor's `valid_from`, and the signer's position in the chain can't move
+backwards), and its own tests cover those rules.
 
 ## Verification
 
-From the workspace root use the worker guide's workspace format, clippy and test
-gates. `mutations.toml` contains seven catalog controls with native cargo targets;
-replay each using `ckdev-mutate run --only <id>`.
+From the workspace root, run the gates listed in `CONTRIBUTING.md` (format,
+clippy and the workspace tests). The catalog's deliberate-break controls are the
+`catalog-*` rows in the root `mutations.toml`; replay one with
+`ckdev-mutate run --only <id>`.
