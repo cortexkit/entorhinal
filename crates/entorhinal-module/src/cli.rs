@@ -362,7 +362,7 @@ ck workspaces — group projects into workspaces
 usage: ck workspaces <verb> [args] [--subc <connection file>] [--json]
 
   list                    workspaces known to the registry
-  assign <project> <workspace>
+  assign <project-id> <workspace-id>
                           put a project in a workspace (moves it if already in another)
   set-root <workspace> <directory>
                           record the workspace's root directory
@@ -726,7 +726,7 @@ fn build_at(command: &Command, cwd: &str) -> Result<(String, Value), String> {
         // `workspace` as a projects-verb was the pre-rename surface.
         (Face::Projects, "workspace") => {
             return Err(format!(
-                "'workspace' moved: use 'ck workspaces assign <project> <workspace>'\n\n{}",
+                "'workspace' moved: use 'ck workspaces assign <project-id> <workspace-id>'\n\n{}",
                 usage(Face::Workspaces)
             ))
         }
