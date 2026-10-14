@@ -239,9 +239,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-test-support"
-version = "0.1.6"
+version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f84b343e667b4735c2cdea1786795b773c586cda13a4dce8efc5b2ac02492d3"
+checksum = "a7a60133958623a529fa46d2b7a6e7f296566822706a3600c9c84df10f25393a"
 dependencies = [
  "rustix",
  "sha2",
@@ -424,7 +424,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1152,7 +1152,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1325,7 +1325,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
