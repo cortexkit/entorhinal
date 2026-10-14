@@ -639,6 +639,13 @@ mod tests {
                     "consent_feed_cursor",
                     "agent_audit",
                     "project_hire_cap",
+                    "catalog_registry",
+                    "catalog_scope_map",
+                    "catalog_registry_key",
+                    "catalog_feed",
+                    "catalog_status",
+                    "catalog_publisher_grant",
+                    "catalog_audit",
                 ];
                 let schema = conn
                     .prepare("SELECT name FROM sqlite_schema WHERE type='table'")?

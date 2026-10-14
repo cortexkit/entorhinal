@@ -57,10 +57,15 @@ const DEFAULT_STORAGE_NAMESPACE: &str = "default";
 
 mod agent_ops;
 mod agent_reads;
+mod catalog_blob;
+mod catalog_network;
+mod catalog_ops;
 mod catch_up;
 mod claim_codec;
 mod claims;
 mod cli;
+#[cfg(test)]
+mod fake_registry;
 // Agent write execution asks for consent while holding the caller's tool call,
 // before committing any authorized mutation.
 #[allow(dead_code)]
@@ -535,6 +540,9 @@ const MUTATING_METHODS: &[&str] = &[
     "rebind_root",
     "attach_root",
     "identity_log.enable",
+    catalog_ops::ADD,
+    catalog_ops::REPIN,
+    catalog_ops::REMOVE,
     "remove_root",
     "attach_derived_parent",
     "approve_root",
@@ -596,7 +604,7 @@ fn authorize_write(method: &str, principal: Option<&Principal>) -> Result<(), Ha
     if SELF_ADMITTED_METHODS.contains(&method) {
         return Ok(());
     }
-    if method == "identity_log.enable" {
+    if method == "identity_log.enable" || catalog_ops::WRITES.contains(&method) {
         return match principal {
             Some(Principal::Direct) => Ok(()),
             other => Err(HandlerError::new(
@@ -1112,10 +1120,19 @@ impl ProjectsHandler {
             Ok(request) => request,
             Err(_) => return self.handle_request(body, key),
         };
+        if request.method == catalog_ops::READ_BLOB {
+            return match self.catalog_read_blob(request.params, key).await {
+                Ok(body) => HandlerOutcome::Response(body),
+                Err(error) => error.into_outcome(),
+            };
+        }
         if !MUTATING_METHODS.contains(&request.method.as_str()) {
             return self.handle_request_wait(body, key).await;
         }
-        let result = if request.method == "identity_log.enable" {
+        let result = if catalog_ops::WRITES.contains(&request.method.as_str()) {
+            self.catalog_registry_write(&request.method, request.params, key, received)
+                .await
+        } else if request.method == "identity_log.enable" {
             self.enable_log(request.params, key, received).await
         } else if request.method == roles::TAKE {
             self.take_role(request.params, key, received).await
@@ -1194,6 +1211,14 @@ impl ProjectsHandler {
             "resolve_remote" => self.resolve_remote(request.params),
             "resolve_root_key" => self.resolve_root_key(request.params),
             "preview_attach_root" => self.preview_attach_root(request.params),
+            catalog_ops::LIST => self.catalog_registry_list(request.params),
+            catalog_ops::ADD
+            | catalog_ops::REPIN
+            | catalog_ops::REMOVE
+            | catalog_ops::READ_BLOB => Err(HandlerError::new(
+                "served_path_required",
+                "catalog writes and blob reads require the asynchronous served path",
+            )),
             "identity_log.status" => self.identity_log_status(),
             member::SET_NAME => {
                 let store = self.with_store(|s| Ok(s.clone()))?;
@@ -1846,6 +1871,11 @@ fn manifest() -> ModuleManifest {
     .protocol_ver(PROTOCOL_VERSION)
     .provides(vec![ProviderRole::ManagementSurface {
             operations: vec![
+                management_operation(catalog_ops::ADD, ManagementOperationKind::Mutate, "Add a machine-local HTTPS registry and pinned key (Direct only, operator confirmation)."),
+                management_operation(catalog_ops::REPIN, ManagementOperationKind::Mutate, "Append a replacement registry key (Direct only, operator confirmation)."),
+                management_operation(catalog_ops::REMOVE, ManagementOperationKind::Mutate, "Remove a registry, mappings and held state (Direct only, operator confirmation)."),
+                management_operation(catalog_ops::LIST, ManagementOperationKind::Query, "List this machine's catalog registries, scopes and pinned key chains."),
+                management_operation(catalog_ops::READ_BLOB, ManagementOperationKind::Query, "Read verified package chunks; requires ck-catalog-consumer/v1 in the daemon catalog."),
                 management_operation(
                     "resolve",
                     ManagementOperationKind::Query,
@@ -2351,7 +2381,7 @@ mod tests {
                 assert!(direct.is_ok(), "{method} from direct");
             }
             let executive = authorize_write(method, Some(&reserved(WRITER_MODULE)));
-            if *method == "identity_log.enable" {
+            if *method == "identity_log.enable" || catalog_ops::WRITES.contains(method) {
                 assert_eq!(executive.unwrap_err().code, "write_not_permitted");
             } else if *method == "agent.repair_workspaces" {
                 assert_eq!(executive.unwrap_err().code, "direct_caller_required");

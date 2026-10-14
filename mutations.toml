@@ -163,7 +163,7 @@ expect_message = "called `Result::unwrap_err()` on an `Ok` value"
 id = "admission-enable-direct-only"
 guards = "Only an operator's Direct route may enable the identity log"
 file = "crates/entorhinal-module/src/main.rs"
-old = "if method == \"identity_log.enable\" {"
+old = 'if method == "identity_log.enable" || catalog_ops::WRITES.contains(&method) {'
 new = "if false /* NON-VACUITY BREAK */ {"
 test_file = "crates/entorhinal-module/src/main.rs"
 runner = "cargo"
@@ -5292,3 +5292,455 @@ package = "entorhinal-core"
 target = "--lib"
 select = "expected"
 expect_red = ["binding::tests::external_worktree_with_retired_token_stays_implicit_after_rebind"]
+
+# The catalog controls below select library or binary test targets for ckdev-mutate.
+# Direct cargo mutation runs include --workspace so shared dependencies use the
+# same feature combinations as the workspace's normal lint and test gates.
+[[control]]
+id = "catalog-scope-collision"
+guards = "A scope already mapped to a registry is refused by name"
+file = "crates/entorhinal-core/src/catalog.rs"
+old = 'if exists("SELECT EXISTS(SELECT 1 FROM catalog_scope_map WHERE scope=?1)", scope)? {'
+new = 'if false && exists("SELECT EXISTS(SELECT 1 FROM catalog_scope_map WHERE scope=?1)", scope)? { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/catalog_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["tests::catalog_tests::catalog_scope_default_collision_and_remove"]
+
+[[control]]
+id = "catalog-one-default"
+guards = "A second default registry is refused as default_already_set"
+file = "crates/entorhinal-core/src/catalog.rs"
+old = 'if is_default && exists("SELECT EXISTS(SELECT 1 FROM catalog_registry WHERE is_default=1 AND ?1 IS NOT NULL)", url)? {'
+new = 'if false && is_default && exists("SELECT EXISTS(SELECT 1 FROM catalog_registry WHERE is_default=1 AND ?1 IS NOT NULL)", url)? { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/catalog_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["tests::catalog_tests::catalog_scope_default_collision_and_remove"]
+
+[[control]]
+id = "catalog-scope-precedence"
+guards = "An explicit scope mapping wins over the default registry"
+file = "crates/entorhinal-core/src/catalog.rs"
+old = 'if explicit.is_some() {'
+new = 'if false && explicit.is_some() { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/catalog_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["tests::catalog_tests::catalog_scope_default_collision_and_remove"]
+
+[[control]]
+id = "catalog-key-conflict"
+guards = "Repin refuses a reused key id or public key without replacing retired keys"
+file = "crates/entorhinal-core/src/catalog.rs"
+old = 'if conflict { return Err(CatalogWriteError::Refused("key_conflict")); }'
+new = 'if false && conflict { return Err(CatalogWriteError::Refused("key_conflict")); } // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/catalog_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["tests::catalog_tests::catalog_scope_default_collision_and_remove"]
+
+[[control]]
+id = "catalog-repin-valid-from"
+guards = "The replacement key carries the exact whole-second retirement cutoff"
+file = "crates/entorhinal-core/src/catalog.rs"
+old = 'params![url,index+1,key_id,public_key,valid_from]'
+new = 'params![url,index+1,key_id,public_key,{ let _ = valid_from; "2025-01-01T00:00:00Z" }] /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-core/src/catalog_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["tests::catalog_tests::catalog_scope_default_collision_and_remove"]
+
+[[control]]
+id = "catalog-local-rebuild"
+guards = "Catalog state remains outside replay drift and rebuild projections"
+file = "crates/entorhinal-core/src/mutations.rs"
+old = 'const DERIVED_TABLES: &[&str] = &['
+new = 'const DERIVED_TABLES: &[&str] = &["catalog_registry", /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-core/src/catalog_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["tests::catalog_tests::catalog_v10_migration_and_local_rebuild"]
+
+[[control]]
+id = "catalog-grant-unique-reservation"
+guards = "The reserved publisher grant schema rejects duplicate triples"
+file = "crates/entorhinal-core/src/catalog.rs"
+old = '    UNIQUE(publisher_fingerprint,operation,placement_agent_id));'
+new = '    CHECK(1)); -- NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/catalog_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["tests::catalog_tests::catalog_v10_migration_and_local_rebuild"]
+
+[[control]]
+id = "catalog-direct-admission"
+guards = "Catalog mutations require the Direct operator rather than the executive relay"
+file = "crates/entorhinal-module/src/main.rs"
+old = 'if method == "identity_log.enable" || catalog_ops::WRITES.contains(&method) {'
+new = 'if method == "identity_log.enable" { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_ops_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_ops::tests::registry_direct_flow_decline_and_sync_guards"]
+
+[[control]]
+id = "catalog-flow-admission"
+guards = "Flow routes are refused before catalog parameters are decoded"
+file = "crates/entorhinal-module/src/main.rs"
+old = '    catalog_ops::ADD,'
+new = '    // catalog_ops::ADD, NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_ops_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_ops::tests::registry_direct_flow_decline_and_sync_guards"]
+
+[[control]]
+id = "catalog-declined-prompt"
+guards = "Declining an operator prompt writes no registry, key or removal"
+file = "crates/entorhinal-module/src/catalog_ops.rs"
+old = 'result.map_err(|_| HandlerError::from(OperatorConfirmError::Declined))??;'
+new = 'let _ = result; // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_ops_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_ops::tests::registry_direct_flow_decline_and_sync_guards"]
+
+[[control]]
+id = "catalog-confirmation-through-write"
+guards = "A dropped caller retains confirmation exclusion until its blocking write finishes"
+file = "crates/entorhinal-module/src/catalog_ops.rs"
+old = 'let (_writer, _confirmation) = (writer, guard);'
+new = 'let _writer = writer; drop(guard); // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_ops_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_ops::tests::confirmation_exclusion_survives_dropped_catalog_write"]
+
+[[control]]
+id = "catalog-prompt-bound"
+guards = "Complete URL, key id and fingerprint prompts fit the daemon ceiling"
+file = "crates/entorhinal-module/src/catalog_ops.rs"
+old = 'if summary.chars().count() > 200 || remove.chars().count() > 200 {'
+new = 'if false && (summary.chars().count() > 200 || remove.chars().count() > 200) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_ops_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_ops::tests::registry_invalid_inputs_write_nothing"]
+
+[[control]]
+id = "catalog-repin-whole-second"
+guards = "Repin accepts only real UTC whole-second Z cutoffs"
+file = "crates/entorhinal-module/src/catalog_ops.rs"
+old = '''    if text.len() != 20
+        || !text.ends_with('Z')
+        || parsed
+            .with_timezone(&Utc)
+            .to_rfc3339_opts(SecondsFormat::Secs, true)
+            != text
+    {'''
+new = '''    let _ = parsed;
+    if false { // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-module/src/catalog_ops_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_ops::tests::repin_whole_second_boundaries"]
+
+[[control]]
+id = "catalog-consumer-capability"
+guards = "Blob bytes are served only to modules declaring the exact consumer capability"
+file = "crates/entorhinal-module/src/catalog_ops.rs"
+old = 'if !admitted {'
+new = 'if false && !admitted { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_ops_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_ops::tests::read_blob_requires_daemon_consumer_capability"]
+
+[[control]]
+id = "catalog-https-only"
+guards = "Production registry construction refuses HTTP endpoints"
+file = "crates/entorhinal-module/src/catalog_network.rs"
+old = 'url.scheme() != "https"'
+new = 'false /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/catalog_network_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_network::tests::production_https_bundled_roots_and_limits"]
+
+[[control]]
+id = "catalog-redirect-allowlist"
+guards = "Every redirect rechecks the registry origin, port and base path before contact"
+file = "crates/entorhinal-module/src/catalog_network.rs"
+old = '            self.admit(&url)?;'
+new = '            // self.admit(&url)?; NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_network_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_network::tests::redirect_rechecks_host_port_and_path"]
+
+[[control]]
+id = "catalog-streamed-cap"
+guards = "Streamed archives, JSON and manifests cannot exceed constructor caps"
+file = "crates/entorhinal-module/src/catalog_network.rs"
+old = 'if chunk.len() > cap.saturating_sub(bytes.len()) {'
+new = 'if false && chunk.len() > cap.saturating_sub(bytes.len()) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_network_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_network::tests::archive_manifest_json_caps_and_chunked_cap"]
+
+[[control]]
+id = "catalog-total-timeout"
+guards = "A registry request settles at the supplied Tokio total deadline"
+file = "crates/entorhinal-module/src/catalog_network.rs"
+old = 'tokio::time::timeout(timeout, self.download(path, cap, cap_code))'
+new = 'tokio::time::timeout(timeout + Duration::from_secs(1), self.download(path, cap, cap_code)) // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_network_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_network::tests::registry_total_timeout_uses_tokio_clock"]
+
+[[control]]
+id = "catalog-connect-timeout"
+guards = "Connection timeout also bounds a stalled TLS handshake"
+file = "crates/entorhinal-module/src/catalog_network.rs"
+old = '''            .https_only(true)
+            .redirect(Policy::none())
+            .connect_timeout(limits.connect)'''
+new = '''            .https_only(true)
+            .redirect(Policy::none())
+            .connect_timeout(limits.connect + Duration::from_secs(1)) /* NON-VACUITY BREAK */'''
+test_file = "crates/entorhinal-module/src/catalog_network_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_network::tests::registry_connect_timeout_bounds_tls_handshake"]
+
+[[control]]
+id = "catalog-archive-digest"
+guards = "Transport archives must hash to the requested content address"
+file = "crates/entorhinal-module/src/catalog_network.rs"
+old = 'if entorhinal_catalog::sha256_hex(&bytes) != digest {'
+new = 'if false && entorhinal_catalog::sha256_hex(&bytes) != digest { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_network_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_network::tests::archive_digest_and_redirect_hop_limit"]
+
+[[control]]
+id = "catalog-blob-digest"
+guards = "Corrupted content-addressed files cannot be served as chunks"
+file = "crates/entorhinal-module/src/catalog_blob.rs"
+old = 'if sha256_hex(&bytes) != digest {'
+new = 'if false && sha256_hex(&bytes) != digest { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_blob.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_blob::tests::corrupted_blob_is_refused"]
+
+[[control]]
+id = "catalog-blob-address"
+guards = "Only canonical digest filenames can be requested"
+file = "crates/entorhinal-module/src/catalog_blob.rs"
+old = 'if !is_hex(digest, 64) {'
+new = 'if false && !is_hex(digest, 64) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_blob.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_blob::tests::blob_roundtrip_and_chunks"]
+
+[[control]]
+id = "catalog-blob-chunk-cap"
+guards = "Blob requests have a nonzero bounded length and cannot overflow their range"
+file = "crates/entorhinal-module/src/catalog_blob.rs"
+old = 'if length == 0 || length > CHUNK_LIMIT || offset.checked_add(length).is_none() {'
+new = 'if false && (length == 0 || length > CHUNK_LIMIT || offset.checked_add(length).is_none()) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_blob.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_blob::tests::blob_roundtrip_and_chunks"]
+
+[[control]]
+id = "catalog-blob-file-cap"
+guards = "A stored blob cannot exceed the archive byte cap"
+file = "crates/entorhinal-module/src/catalog_blob.rs"
+old = 'if bytes.len() > 10_485_760 {'
+new = 'if false && bytes.len() > 10_485_760 { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_blob.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_blob::tests::oversized_stored_file_is_bounded_and_refused"]
+
+[[control]]
+id = "catalog-blob-regular-file"
+guards = "A symlink cannot stand in for a verified regular blob file"
+file = "crates/entorhinal-module/src/catalog_blob.rs"
+old = 'if !metadata.file_type().is_file() {'
+new = 'if false && !metadata.file_type().is_file() { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_blob.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_blob::tests::symlink_blob_is_not_a_verified_regular_file"]
+
+[[control]]
+id = "catalog-strict-archive-reader"
+guards = "Downloaded archives use the pure crate's strict tar reader before publication"
+file = "crates/entorhinal-module/src/catalog_network.rs"
+old = '''        entorhinal_catalog::archive::read(&bytes).map_err(|e| CatalogError {
+            code: e.code.as_str(),
+            message: e.to_string(),
+            detail: serde_json::to_value(&e).ok(),
+        })?;'''
+new = '        // Strict archive read omitted. NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_network_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_network::tests::frozen_archives_all_failure_vectors_through_transport"]
+
+[[control]]
+id = "catalog-redirect-hop-bound"
+guards = "Registry redirects have a finite ten-hop budget"
+file = "crates/entorhinal-module/src/catalog_network.rs"
+old = 'for _ in 0..=10 {'
+new = 'for _ in 0..=11 { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_network_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_network::tests::archive_digest_and_redirect_hop_limit"]
+
+[[control]]
+id = "catalog-prompt-key-fingerprint"
+guards = "Operator confirms the SHA-256 fingerprint of the raw public key"
+file = "crates/entorhinal-module/src/catalog_ops.rs"
+old = 'let fingerprint = key_fingerprint(key).ok_or_else(|| {'
+new = 'let fingerprint = Some(entorhinal_catalog::sha256_hex(key)).ok_or_else(|| { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_ops_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_ops::tests::registry_confirmed_lifecycle_and_prompts"]
+
+[[control]]
+id = "catalog-retryable-503"
+guards = "Publish and status-key 503 replies preserve typed retry advice without an internal retry"
+file = "crates/entorhinal-module/src/catalog_network.rs"
+old = 'if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {'
+new = 'if false && status == reqwest::StatusCode::SERVICE_UNAVAILABLE { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_network_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_network::tests::retryable_503_is_typed_and_never_retries_inside_client"]
+
+[[control]]
+id = "catalog-feed-history-fallback"
+guards = "A 410 feed_after_unavailable is distinguished from generic HTTP errors"
+file = "crates/entorhinal-module/src/catalog_network.rs"
+old = 'if status == reqwest::StatusCode::GONE && code == Some("feed_after_unavailable") {'
+new = 'if false && status == reqwest::StatusCode::GONE && code == Some("feed_after_unavailable") { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_network_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_network::tests::old_feed_410_is_typed_without_hidden_fallback"]
+
+[[control]]
+id = "catalog-retry-after-delta-cap"
+guards = "Delta-seconds Retry-After values are capped at one hour"
+file = "crates/entorhinal-module/src/catalog_network.rs"
+old = 'seconds.min(MAX_RETRY_AFTER_SECONDS)'
+new = 'seconds /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/catalog_network_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_network::tests::retry_after_parses_caps_and_names_defaults"]
+
+[[control]]
+id = "catalog-retry-after-date-cap"
+guards = "HTTP-date Retry-After values are capped at one hour"
+file = "crates/entorhinal-module/src/catalog_network.rs"
+old = 'millis.min(MAX_RETRY_AFTER_SECONDS * 1000)'
+new = 'millis /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/catalog_network_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_network::tests::retry_after_parses_caps_and_names_defaults"]
+
+[[control]]
+id = "catalog-module-default-limits"
+guards = "The module factory passes the declared transport caps rather than a different configuration"
+file = "crates/entorhinal-module/src/catalog_network.rs"
+old = 'RegistryClient::for_scope(&store, scope, Limits::MODULE)?'
+new = 'RegistryClient::for_scope(&store, scope, Limits { json_bytes: 1, ..Limits::MODULE })? /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/catalog_network_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_network::tests::module_factory_passes_default_limits_and_module_clock"]
+
+[[control]]
+id = "catalog-module-retry-clock"
+guards = "HTTP-date retry advice uses the module's injected clock"
+file = "crates/entorhinal-module/src/catalog_network.rs"
+old = 'client.clock = self.clock;'
+new = 'client.clock = || 0; // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_network_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_network::tests::module_factory_passes_default_limits_and_module_clock"]
+
+[[control]]
+id = "catalog-status-write-retryable"
+guards = "Uncommitted status_unavailable replies carry the same typed retry advice as other 503 refusals"
+file = "crates/entorhinal-module/src/catalog_network.rs"
+old = 'Some("status_unavailable") => Some(Unavailable::Status),'
+new = 'Some("status_unavailable") => None, // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_network_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_network::tests::status_write_unavailable_is_retryable_but_sequence_conflict_is_not"]
+
+[[control]]
+id = "catalog-status-sequence-conflict-permanent"
+guards = "A status compare-and-set race remains a named permanent 409 refusal"
+file = "crates/entorhinal-module/src/catalog_network.rs"
+old = '''if status == reqwest::StatusCode::CONFLICT
+                    && code == Some("status_sequence_conflict")'''
+new = '''if false && status == reqwest::StatusCode::CONFLICT
+                    && code == Some("status_sequence_conflict") /* NON-VACUITY BREAK */'''
+test_file = "crates/entorhinal-module/src/catalog_network_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_network::tests::status_write_unavailable_is_retryable_but_sequence_conflict_is_not"]

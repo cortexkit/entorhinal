@@ -21,6 +21,7 @@ use serde::Serialize;
 
 pub mod agent;
 mod binding;
+pub mod catalog;
 pub mod claim_cache;
 pub mod enable_state;
 mod log_schema;
@@ -198,7 +199,7 @@ CREATE TABLE member_name (
 );
 "#;
 
-const MIGRATIONS: [Migration; 10] = [
+const MIGRATIONS: [Migration; 11] = [
     Migration {
         version: 1,
         statements: V1_SCHEMA,
@@ -239,12 +240,17 @@ const MIGRATIONS: [Migration; 10] = [
         version: 10,
         statements: agent::consent::V10_CONSENT,
     },
+    Migration {
+        version: 11,
+        statements: catalog::V11_CATALOG,
+    },
 ];
 
 /// A store opened from the descriptor resolved by subc.
 #[derive(Clone)]
 pub struct RegistryStore {
     db: Arc<SqliteStore>,
+    store_folder: std::path::PathBuf,
     reader: Arc<read_connection::ReadConnection>,
     /// Whether replies carry the root-record fields and walk ancestors. Off,
     /// legacy resolution precedence is preserved and root-record fields are
@@ -351,12 +357,27 @@ impl RegistryStore {
                 outcome.recorded, outcome.chain_max
             )));
         }
+        let cortexkit_store_types::StorageBackend::Sqlite { path } = &descriptor.backend else {
+            return Err(RegistryError::Database(
+                "registry requires SQLite storage".into(),
+            ));
+        };
+        let store_folder = std::path::Path::new(path)
+            .parent()
+            .ok_or_else(|| RegistryError::Database("store has no parent directory".into()))?
+            .to_path_buf();
         Ok(Self {
+            store_folder,
             reader: Arc::new(read_connection::ReadConnection::open(descriptor)?),
             db: Arc::new(db),
             root_records: false,
             ids: Arc::new(binding::IdSource::Random),
         })
+    }
+
+    /// Folder containing this machine's SQLite store and catalog blobs.
+    pub fn store_folder(&self) -> &std::path::Path {
+        &self.store_folder
     }
 
     /// Read the journal head. A query never changes this value.
@@ -1432,6 +1453,7 @@ pub(crate) mod scratch_cleanup;
 
 #[cfg(test)]
 mod tests {
+    include!("catalog_tests.rs");
     use super::*;
     use std::{
         fs,
