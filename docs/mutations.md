@@ -13,24 +13,30 @@ catalogue's header and CI pin the runner version and commit.
 
 ## Install the runner
 
-Use the commit CI pins (`CK_MUTATE_REV` in `.github/workflows/ci.yml`):
+Use ckdev-mutate 0.12.1 at the commit CI pins (`CK_MUTATE_REV` in
+`.github/workflows/ci.yml`):
 
 ```sh
 cargo install --locked --git https://github.com/cortexkit/commons \
-  --rev 0c99c7e16d8ae22b6e114136b6b7b68be6f1394e cortexkit-mutate
+  --rev 9d6b663dac487bb982c7bfd18a96eee2292164ad cortexkit-mutate
 ckdev-mutate --version
 ```
 
 ## Check the catalogue
 
 ```sh
-ckdev-mutate check
+ckdev-mutate check --strict
 ```
 
 This is part of the CI gate ([CONTRIBUTING.md](../CONTRIBUTING.md)). It
 confirms that every row's anchor text still appears in its file and that every
-named test exists under its exact full name, without changing any source. Run
-it after any change to code a row anchors on.
+named Cargo test exists under its exact full name for active rows, without
+changing any source. Custom command rows use their runner's selection rules
+through `list_command`. Strict mode rejects active command rows without one.
+Test-name verification skips rows whose `platforms` exclude the host, or whose
+`unreachable` or `desk_only` fields document why automation cannot replay them
+(for example, a proof requiring a human or physical hardware). Run the check
+after any change to code a row anchors on.
 
 ## Run rows
 
@@ -46,6 +52,9 @@ ckdev-mutate run --all --report target/mutations/all.json
 request, every row on `main`, and adds `--broad` on the nightly run to watch
 every package target rather than only the row's own. CI splits the work with
 `--shard N/8`; give each shard its own checkout.
+
+Rows with `select = "expected"` keep their exact `expect_red` selection even
+under `--broad`; omit `select` to audit the full target instead.
 
 A replay applies the break, builds, runs the named tests, and restores the
 file. A row passes when its expected tests fail; its `only` field decides
@@ -79,8 +88,10 @@ expect_message = "a flow must not change the registry"
 | `file`, `old`, `new` | The break: `old` must occur exactly once in `file` and is replaced by `new`. |
 | `edits` | Instead of `file`/`old`/`new`, a list of `{file, old, new}` edits applied together, for a break that needs several. |
 | `test_file` | Where the expected tests live. |
-| `runner` | `cargo`, with `package` and `target` (for example `--lib`, `--bin ck-entorhinal`, `--test replay_verification`); or `command`, with a `command` array that contains `{test}` and a `test_count_pattern` that confirms the test ran. |
+| `runner` | Prefer `cargo`, with `package` and `target` (for example `--lib`, `--bin ck-entorhinal`, `--test replay_verification`). Use `command` only for a custom runner, with a `command` array that contains `{test}` and a `test_count_pattern` that confirms the test ran. |
+| `list_command` | Required for active named-test `command` rows: an argument array with `{test}` as one whole argument exactly once. The command must discover the same tests as `command` and print one JSON array of selected test names, so `check --strict` can verify `expect_red`. |
 | `expect_red` | The exact test names that must fail. |
+| `select` | Optional `"expected"` for cargo rows that should run only the exact `expect_red` tests, not the full target. Cannot be combined with `only = true`, `hub` or `hub_targets`. |
 | `expect_message` | Optional text the failure output must contain, so the test fails for the reason it claims. |
 | `only` | `true` requires that no other test in the target fails; `false` lets related assertions in the same target fail too. |
 | `hub`, `hub_targets` | For a property several tests guard by design: the shared property, and the targets those tests live in. |
@@ -110,7 +121,7 @@ expect_message = "a flow must not change the registry"
 7. **Check and replay it.**
 
    ```sh
-   ckdev-mutate check
+   ckdev-mutate check --strict
    ckdev-mutate run --only <id> --report target/mutations/one.json
    ```
 

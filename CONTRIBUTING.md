@@ -15,7 +15,7 @@ scripts/check-cortexkit-layout.sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --all-targets --locked
-ckdev-mutate check
+ckdev-mutate check --strict
 ```
 
 - `scripts/check-cortexkit-layout.sh` confirms that nothing under
@@ -30,8 +30,12 @@ ckdev-mutate check
   Linux, macOS and Windows; the macOS and Windows jobs use `--no-fail-fast`.
   Some tests only run on one platform (for example the Windows ACL tests in
   `crates/entorhinal-module/tests/windows_owner_only.rs`).
-- `ckdev-mutate check` validates the mutation catalogue in `mutations.toml`:
-  every anchor must still match the source and every named test must exist.
+- `ckdev-mutate check --strict` validates the mutation catalogue in
+  `mutations.toml`: every anchor must still match the source and every named
+  test in an active row must exist. Active command rows must supply a
+  `list_command`. Rows restricted to another host by `platforms`, or marked
+  `unreachable` or `desk_only` with a reason automation cannot replay them,
+  are exempt from test-name verification.
   See [docs/mutations.md](docs/mutations.md) for installing the runner and
   for what the catalogue is.
 

@@ -18,7 +18,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: never
-  CK_MUTATE_REV: 0c99c7e16d8ae22b6e114136b6b7b68be6f1394e
+  CK_MUTATE_REV: 9d6b663dac487bb982c7bfd18a96eee2292164ad
 
 jobs:
   test:
@@ -61,7 +61,7 @@ jobs:
       - name: Check mutation anchors and exact test names
         run: |
           ckdev-mutate --version
-          ckdev-mutate check
+          ckdev-mutate check --strict
 
   native:
     name: Native (${{ matrix.os }})

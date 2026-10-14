@@ -1,8 +1,9 @@
-# Mutation proofs for ckdev-mutate 0.9.8 (commons 0c99c7e16d8ae22b6e114136b6b7b68be6f1394e).
+# Mutation proofs for ckdev-mutate 0.12.1 (commons 9d6b663dac487bb982c7bfd18a96eee2292164ad).
 # Anchors are copied from production code; named tests must turn red, not time out.
 # Defaults allow 1800 s to build and 600 s to test on a clean CI runner.
 # Reports belong under the already gitignored target/mutations/.
-# only=false allows related assertions in the same target; nightly --broad audits other targets.
+# only=false allows related assertions in the same target. CI's nightly --broad
+# audits all package targets, except rows narrowed with select="expected".
 
 [[control]]
 id = "move-digest-receiver-no-auto-retry"
@@ -3732,9 +3733,10 @@ old = "Ok(MoveReason::from(reason))"
 new = "Ok(MoveReason::Operator) // NON-VACUITY BREAK"
 edits = []
 test_file = "crates/entorhinal-core/src/move_record.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--lib", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
 expect_red = ["move_record::tests::move_codec_preserves_unknown_abort_reason_opaquely"]
 only = false
 timeout_s = 600
@@ -3772,9 +3774,10 @@ file = "crates/entorhinal-module/src/permissions.rs"
 old = 'LIST | REVOKE => ('
 new = 'LIST | REVOKE if false => ( // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/permissions_tests.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["permissions::tests::provider_admission_precedes_decode_and_never_prompts"]
 
 [[control]]
@@ -3784,9 +3787,10 @@ file = "crates/entorhinal-module/src/permissions.rs"
 old = '.is_some_and(|id| *id != grant.holder_agent_id)'
 new = '.is_some_and(|id| { let _ = id; false }) /* NON-VACUITY BREAK */'
 test_file = "crates/entorhinal-module/src/permissions_tests.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["permissions::tests::provider_vectors_list_scopes_filter_and_refresh_in_place"]
 
 [[control]]
@@ -3796,9 +3800,10 @@ file = "crates/entorhinal-module/src/permissions.rs"
 old = '|| grant.revoked_at_ms.is_some()'
 new = '|| false /* NON-VACUITY BREAK */'
 test_file = "crates/entorhinal-module/src/permissions_tests.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["permissions::tests::provider_revoke_vectors_are_idempotent_local_and_prompt_free"]
 
 [[control]]
@@ -3808,9 +3813,10 @@ file = "crates/entorhinal-module/src/permissions.rs"
 old = 'if !holder_live {'
 new = 'if false && !holder_live { // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/permissions_tests.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["permissions::tests::provider_drops_grants_when_holder_or_subject_ends"]
 
 [[control]]
@@ -3820,9 +3826,10 @@ file = "crates/entorhinal-module/src/permissions.rs"
 old = '.find(|p| p.project_id == grant.scope_id)'
 new = '.find(|_| true) /* NON-VACUITY BREAK */'
 test_file = "crates/entorhinal-module/src/permissions_tests.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["permissions::tests::provider_drops_grants_when_holder_or_subject_ends"]
 
 [[control]]
@@ -3832,9 +3839,10 @@ file = "crates/entorhinal-module/src/permissions.rs"
 old = '.find(|w| w.workspace_id == grant.scope_id)'
 new = '.find(|_| true) /* NON-VACUITY BREAK */'
 test_file = "crates/entorhinal-module/src/permissions_tests.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["permissions::tests::provider_drops_grants_when_holder_or_subject_ends"]
 
 [[control]]
@@ -3844,9 +3852,10 @@ file = "crates/entorhinal-module/src/permissions.rs"
 old = 'store.consent_transaction(|tx| tx.revoke_grant(&request.id, (self.clock)()))?'
 new = 'store.consent_transaction(|_| Ok(true))? /* NON-VACUITY BREAK */'
 test_file = "crates/entorhinal-module/src/permissions_tests.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["permissions::tests::provider_revoke_vectors_are_idempotent_local_and_prompt_free"]
 
 [[control]]
@@ -3858,9 +3867,10 @@ old = '''} else if request.method == permissions::REVOKE {
 new = '''} else if request.method == permissions::REVOKE {
             self.write_wait(request, key, received).await // NON-VACUITY BREAK'''
 test_file = "crates/entorhinal-module/src/permissions_tests.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["permissions::tests::provider_revoke_vectors_are_idempotent_local_and_prompt_free"]
 
 [[control]]
@@ -3870,9 +3880,10 @@ file = "crates/entorhinal-module/src/permissions.rs"
 old = 'AUDIT => ('
 new = 'AUDIT if false => ( // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/permissions_tests.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["permissions::tests::audit_admission_is_operator_or_callosum_only_before_decode"]
 
 [[control]]
@@ -3882,9 +3893,10 @@ file = "crates/entorhinal-module/src/permissions.rs"
 old = 's.agent_audit_page(request.since_ms, request.limit, request.cursor.as_deref())'
 new = 's.agent_audit_page(request.since_ms, request.limit, None) // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/permissions_tests.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["permissions::tests::audit_wire_pages_tied_timestamps_once_with_inclusive_since"]
 
 [[control]]
@@ -3894,9 +3906,10 @@ file = "crates/entorhinal-module/src/permissions.rs"
 old = 's.agent_audit_page(request.since_ms, request.limit, request.cursor.as_deref())'
 new = 's.agent_audit_page(None, request.limit, request.cursor.as_deref()) // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/permissions_tests.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["permissions::tests::audit_wire_pages_tied_timestamps_once_with_inclusive_since"]
 
 [[control]]
@@ -3906,9 +3919,10 @@ file = "crates/entorhinal-module/src/permissions.rs"
 old = 's.agent_audit_page(request.since_ms, request.limit, request.cursor.as_deref())'
 new = 's.agent_audit_page(request.since_ms, None, request.cursor.as_deref()) // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/permissions_tests.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["permissions::tests::audit_wire_pages_tied_timestamps_once_with_inclusive_since"]
 
 [[control]]
@@ -3918,9 +3932,10 @@ file = "crates/entorhinal-module/src/permissions.rs"
 old = 'SET_CAP => ('
 new = 'SET_CAP if false => ( // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/permissions_tests.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["permissions::tests::hire_cap_admission_validation_and_confirmation_guard_every_write"]
 
 [[control]]
@@ -3930,9 +3945,10 @@ file = "crates/entorhinal-module/src/permissions.rs"
 old = '_ = guard.cancelled.wait_for(|closed| *closed) => return Err(OperatorConfirmError::Declined.into()),'
 new = '_ = std::future::pending::<()>() => return Err(OperatorConfirmError::Declined.into()), // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/permissions_tests.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["permissions::tests::hire_cap_cancelled_or_expired_confirmation_never_writes"]
 
 [[control]]
@@ -3942,9 +3958,10 @@ file = "crates/entorhinal-module/src/permissions.rs"
 old = 'timeout_at(received + OPERATOR_BOUND, self.operator_confirmer.confirm_operator(&summary, key))'
 new = 'timeout_at(received + OPERATOR_BOUND * 2, self.operator_confirmer.confirm_operator(&summary, key)) /* NON-VACUITY BREAK */'
 test_file = "crates/entorhinal-module/src/permissions_tests.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["permissions::tests::hire_cap_cancelled_or_expired_confirmation_never_writes"]
 
 [[control]]
@@ -3954,9 +3971,10 @@ file = "crates/entorhinal-module/src/permissions.rs"
 old = 'if request.cap < 0 {'
 new = 'if false && request.cap < 0 { // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/permissions_tests.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["permissions::tests::hire_cap_admission_validation_and_confirmation_guard_every_write"]
 
 [[control]]
@@ -3966,9 +3984,10 @@ file = "crates/entorhinal-module/src/permissions.rs"
 old = 'super::refuse_flow_write(SET_CAP, admission.flow_id.as_deref())?;'
 new = 'let _ = &admission.flow_id; // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/permissions_tests.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["permissions::tests::hire_cap_admission_validation_and_confirmation_guard_every_write"]
 
 [[control]]
@@ -3978,9 +3997,10 @@ file = "crates/entorhinal-module/src/permissions.rs"
 old = 'self.operator_confirmer.confirm_operator(&summary, key)'
 new = 'async { let _ = &summary; Ok::<(), OperatorConfirmError>(()) } /* NON-VACUITY BREAK */'
 test_file = "crates/entorhinal-module/src/permissions_tests.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["permissions::tests::hire_cap_admission_validation_and_confirmation_guard_every_write"]
 
 # Two-machine move acceptance and transactional admission.
@@ -4850,9 +4870,10 @@ file = "crates/entorhinal-module/src/move_receiver.rs"
 old = 'eprintln!("move inbox {}: retrying after {}", entry.cut_id, e.code);'
 new = 'return Err(e); // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/move_receiver.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["move_receiver::tests::inbox_bad_entries_do_not_block_valid_pickup_and_transients_recover"]
 only = false
 
@@ -4863,9 +4884,10 @@ file = "crates/entorhinal-module/src/move_receiver.rs"
 old = 'remove_inbox(worker, own, cut).await?;'
 new = '// NON-VACUITY BREAK: leave the rejected entry in the inbox'
 test_file = "crates/entorhinal-module/src/move_receiver.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["move_receiver::tests::inbox_bad_entries_do_not_block_valid_pickup_and_transients_recover"]
 only = false
 
@@ -4876,9 +4898,10 @@ file = "crates/entorhinal-module/src/record_client.rs"
 old = 'if reply.stale {'
 new = 'if false && reply.stale { // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/record_client.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["record_client::tests::stale_reads_never_settle_claim_role_or_move_cas"]
 only = false
 
@@ -4889,9 +4912,10 @@ file = "crates/entorhinal-module/src/move_receiver.rs"
 old = 'if row.claim_take_body.is_some() && row.claim_landed_version.is_none() {'
 new = 'if row.claim_take_body.is_some() && row.claim_landed_version.is_none() && !progress.take_failed { // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/move_receiver.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["move_receiver::tests::stale_take_settlement_is_held_then_returned_before_abort_even_with_failed_flag"]
 only = false
 
@@ -4902,9 +4926,10 @@ file = "crates/entorhinal-module/src/move_receiver.rs"
 old = 'if claim.holder.as_deref() == Some(&plan.to) {'
 new = 'if false && claim.holder.as_deref() == Some(&plan.to) { // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/move_receiver.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["move_receiver::tests::receiver_wrong_author_wrong_epoch_or_no_persisted_take_holds_claim_moved"]
 only = false
 
@@ -4917,9 +4942,10 @@ old = '''if !require_present
 new = '''if false && !require_present // NON-VACUITY BREAK
                 && claim.epoch >= 1'''
 test_file = "crates/entorhinal-module/src/move_source.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["move_source::tests::source_shared_abort_cannot_unfreeze_while_receiver_holds_claim"]
 only = false
 
@@ -4930,9 +4956,10 @@ file = "crates/entorhinal-module/src/move_driver.rs"
 old = 'self.active.remove(&owner);'
 new = 'if failure.is_none() { self.active.remove(&owner); } // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/move_receiver.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["move_receiver::tests::driver_redrives_a_panicked_receiver_while_another_cut_activates"]
 only = false
 
@@ -4943,9 +4970,10 @@ file = "crates/entorhinal-module/src/move_driver.rs"
 old = '.is_some_and(|at| tokio::time::Instant::now() < *at)'
 new = '.is_some_and(|_| false) /* NON-VACUITY BREAK */'
 test_file = "crates/entorhinal-module/src/move_driver.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["move_driver::tests::panicked_cut_releases_owner_records_hold_and_redrives_after_backoff"]
 only = false
 
@@ -4956,9 +4984,10 @@ file = "crates/entorhinal-module/src/participant_client.rs"
 old = '.map_err(|e| ClientError::InvalidReply(format!("invalid refs: {e}")))?'
 new = '.expect("NON-VACUITY BREAK: panic on malformed refs")'
 test_file = "crates/entorhinal-module/src/move_receiver.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["move_receiver::tests::corrupted_persisted_receiver_refs_return_a_named_error_without_panicking"]
 only = false
 
@@ -4969,9 +4998,10 @@ file = "crates/entorhinal-module/src/move_receiver.rs"
 old = '.map_err(|_| Failure::hold("invalid_refs", json!({"op":"plan.read"})))?'
 new = '.expect("NON-VACUITY BREAK: panic on persisted refs")'
 test_file = "crates/entorhinal-module/src/move_receiver.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["move_receiver::tests::corrupted_persisted_receiver_refs_return_a_named_error_without_panicking"]
 only = false
 
@@ -4982,9 +5012,10 @@ file = "crates/entorhinal-module/src/move_source.rs"
 old = '.map_err(|_| Failure::new("plan.read", "invalid_refs"))?'
 new = '.expect("NON-VACUITY BREAK: panic on persisted refs")'
 test_file = "crates/entorhinal-module/src/move_source.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["move_source::tests::source_unknown_abort_reason_and_corrupt_persisted_refs_do_not_panic"]
 only = false
 
@@ -4995,9 +5026,10 @@ file = "crates/entorhinal-module/src/move_source.rs"
 old = 'let reason = record.reason.clone().map(String::from);'
 new = 'let reason = Some("operator".to_owned()); // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/move_source.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["move_source::tests::source_unknown_abort_reason_and_corrupt_persisted_refs_do_not_panic"]
 only = false
 
@@ -5017,9 +5049,10 @@ new = '''let text = |value: &Value, field: &str| -> Result<String, AgentMutation
             Ok(value[field].as_str().expect("NON-VACUITY BREAK: panic on persisted strings").to_owned())
         };'''
 test_file = "crates/entorhinal-module/src/tool_writes_tests.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["tool_provider::writes::tests::saved_write_string_fields_refuse_without_panicking"]
 only = false
 
@@ -5030,9 +5063,10 @@ file = "crates/entorhinal-module/src/tool_writes.rs"
 old = 'if !valid || scope.is_none() {'
 new = 'if false && (!valid || scope.is_none()) { // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/tool_writes_tests.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["tool_provider::writes::tests::unoffered_always_approvals_are_terminal_refusals_and_replay_without_grants"]
 only = false
 
@@ -5043,9 +5077,10 @@ file = "crates/entorhinal-module/src/tool_writes.rs"
 old = 'if !valid || scope.is_none() {'
 new = 'if false && (!valid || scope.is_none()) { // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/tool_writes_tests.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["tool_provider::writes::tests::always_approvals_validate_grant_class_and_saved_scope_kind"]
 only = false
 
@@ -5058,9 +5093,10 @@ old = '''return Ok(RecordDecision::Settled(ConsentDecision::Refused(
             )));'''
 new = 'return Ok(RecordDecision::Mismatch); // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/tool_writes_tests.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["tool_provider::writes::tests::malformed_settled_approval_is_refused_and_replayed_without_waiting_forever"]
 only = false
 
@@ -5071,9 +5107,10 @@ file = "crates/entorhinal-module/src/tool_provider.rs"
 old = 'if claim.epoch >= 1 && (claim.holder.is_none() || claim.holder != own) {'
 new = 'if false && claim.epoch >= 1 && (claim.holder.is_none() || claim.holder != own) { // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/tool_provider_tests.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["tool_provider::tests::agent_tools_refuse_cached_claims_held_elsewhere_even_with_standing_grants"]
 only = false
 
@@ -5084,9 +5121,10 @@ file = "crates/entorhinal-module/src/move_receiver.rs"
 old = 'if claim.epoch >= 1 && claim.holder.as_deref() != Some(&plan.from) {'
 new = 'if false && claim.epoch >= 1 && claim.holder.as_deref() != Some(&plan.from) { // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/move_receiver.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["move_receiver::tests::receiver_requires_source_holder_at_the_pinned_version_before_take"]
 only = false
 
@@ -5097,9 +5135,10 @@ file = "crates/entorhinal-core/src/move_store.rs"
 old = 'CREATE UNIQUE INDEX session_binding_session ON session_binding(harness, session_id);'
 new = 'CREATE UNIQUE INDEX session_binding_session ON session_binding(session_id, harness); -- NON-VACUITY BREAK'
 test_file = "crates/entorhinal-core/src/move_store.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--lib", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
 expect_red = ["move_store::tests::migration_9_preserves_part1_bindings_and_session_index"]
 only = false
 
@@ -5122,9 +5161,10 @@ old = '''Err(error) => {
                         }'''
 new = 'Err(error) => return Err(error), // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/tool_writes_tests.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["tool_provider::writes::tests::unoffered_always_approvals_are_terminal_refusals_and_replay_without_grants"]
 only = false
 
@@ -5135,8 +5175,9 @@ file = "crates/entorhinal-module/src/tool_writes.rs"
 old = 'if let Some(saved) = saved.as_ref() {'
 new = 'if let Some(saved) = saved.as_ref().filter(|_| false /* NON-VACUITY BREAK */) {'
 test_file = "crates/entorhinal-module/src/tool_writes_tests.rs"
-runner = "command"
-command = ["cargo", "test", "--workspace", "--locked", "--bin", "ck-entorhinal", "{test}", "--", "--exact"]
-test_count_pattern = "running {count} test"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
 expect_red = ["tool_provider::writes::tests::retry_refuses_saved_plan_without_target_label_as_consent_lost"]
 only = false
