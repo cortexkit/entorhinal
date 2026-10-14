@@ -1,0 +1,506 @@
+{
+  "schema": "ck-catalog-v1/names",
+  "rules": {
+    "part_grammar": "^[a-z0-9]+(-[a-z0-9]+)*$",
+    "scope_max_bytes": 39,
+    "package_name_max_bytes": 64,
+    "check_order": "split on the single '/', then the scope (grammar and length), then the name (grammar and length); name_invalid names the first part that fails",
+    "reserved_scopes": [
+      "cortexkit",
+      "ck",
+      "catalog",
+      "registry"
+    ],
+    "scope_claim_order": "fold ASCII case; grammar and length (name_invalid); reserved list on the folded scope (scope_reserved); the claimed text must equal the folded text (name_not_canonical)",
+    "input_folding": "ASCII A-Z to a-z only, before validation; nothing else is normalized or trimmed",
+    "short_form": "<scope>--<name>",
+    "basal_id_max_bytes": 46,
+    "hashed_form": "first 29 bytes of the short form, '_', first 16 lowercase hex chars of SHA-256(UTF-8 of canonical '@scope/name')"
+  },
+  "valid": [
+    {
+      "input": "@cortexkit/swe-head",
+      "note": "ordinary first-party persona name",
+      "canonical": "@cortexkit/swe-head",
+      "input_is_canonical": true,
+      "short": "cortexkit--swe-head",
+      "short_bytes": 19,
+      "sha256_of_canonical": "77dac924b9a62d92b320454f702fbfc7b52cbaf82381ff2a970e04bd204f59f7",
+      "form": "short",
+      "basal_id": "cortexkit--swe-head",
+      "basal_id_bytes": 19
+    },
+    {
+      "input": "@cortexkit/memory-swe",
+      "note": "the memory profile id used for memory rows",
+      "canonical": "@cortexkit/memory-swe",
+      "input_is_canonical": true,
+      "short": "cortexkit--memory-swe",
+      "short_bytes": 21,
+      "sha256_of_canonical": "a669b4e84f0303f362110641bc861df03b92538dec5927716ce8b7701fb96f94",
+      "form": "short",
+      "basal_id": "cortexkit--memory-swe",
+      "basal_id_bytes": 21
+    },
+    {
+      "input": "@a/b",
+      "note": "shortest possible name",
+      "canonical": "@a/b",
+      "input_is_canonical": true,
+      "short": "a--b",
+      "short_bytes": 4,
+      "sha256_of_canonical": "c93bbe639bd62f472b37ac0a76d6f1ca85aa11e72d6f6258b285140810cfcfd9",
+      "form": "short",
+      "basal_id": "a--b",
+      "basal_id_bytes": 4
+    },
+    {
+      "input": "@0/9",
+      "note": "digits only",
+      "canonical": "@0/9",
+      "input_is_canonical": true,
+      "short": "0--9",
+      "short_bytes": 4,
+      "sha256_of_canonical": "7a440ffe040a91282bc77a56e6255a00d92a9d39bcb918481d2d2da8227c4b2d",
+      "form": "short",
+      "basal_id": "0--9",
+      "basal_id_bytes": 4
+    },
+    {
+      "input": "@xyz/a-b-c",
+      "note": "single hyphens inside a part",
+      "canonical": "@xyz/a-b-c",
+      "input_is_canonical": true,
+      "short": "xyz--a-b-c",
+      "short_bytes": 10,
+      "sha256_of_canonical": "a71b89b750cbd5a55bb2cbc2a7cc53cd5c7dc649f867467d4ed8725745e932c6",
+      "form": "short",
+      "basal_id": "xyz--a-b-c",
+      "basal_id_bytes": 10
+    },
+    {
+      "input": "@CortexKit/Swe-Head",
+      "note": "ASCII upper case folds to the same id; the registry still refuses it as a published name",
+      "canonical": "@cortexkit/swe-head",
+      "input_is_canonical": false,
+      "short": "cortexkit--swe-head",
+      "short_bytes": 19,
+      "sha256_of_canonical": "77dac924b9a62d92b320454f702fbfc7b52cbaf82381ff2a970e04bd204f59f7",
+      "form": "short",
+      "basal_id": "cortexkit--swe-head",
+      "basal_id_bytes": 19
+    },
+    {
+      "input": "@cortexkit/abcdefghij-klmnopqrst-uvwxyz-012345",
+      "note": "short form exactly 46 bytes: stays short",
+      "canonical": "@cortexkit/abcdefghij-klmnopqrst-uvwxyz-012345",
+      "input_is_canonical": true,
+      "short": "cortexkit--abcdefghij-klmnopqrst-uvwxyz-012345",
+      "short_bytes": 46,
+      "sha256_of_canonical": "3cfebb670511b1d5392ebda17ca2d0fba76c285ff0cdad48026988e2101582d1",
+      "form": "short",
+      "basal_id": "cortexkit--abcdefghij-klmnopqrst-uvwxyz-012345",
+      "basal_id_bytes": 46
+    },
+    {
+      "input": "@cortexkit/abcdefghij-klmnopqrst-uvwxyz-0123456",
+      "note": "short form 47 bytes: hashed",
+      "canonical": "@cortexkit/abcdefghij-klmnopqrst-uvwxyz-0123456",
+      "input_is_canonical": true,
+      "short": "cortexkit--abcdefghij-klmnopqrst-uvwxyz-0123456",
+      "short_bytes": 47,
+      "sha256_of_canonical": "e2e519c9f9b7d9d53b487689bd89a6fe6a626a9f6cde8e6bf938c3aaa8843273",
+      "form": "hashed",
+      "basal_id": "cortexkit--abcdefghij-klmnopq_e2e519c9f9b7d9d5",
+      "basal_id_bytes": 46
+    },
+    {
+      "input": "@cortexkit/a-very-long-package-name-that-needs-hashing",
+      "note": "hashed form",
+      "canonical": "@cortexkit/a-very-long-package-name-that-needs-hashing",
+      "input_is_canonical": true,
+      "short": "cortexkit--a-very-long-package-name-that-needs-hashing",
+      "short_bytes": 54,
+      "sha256_of_canonical": "6c425ad00b478de39abb6a178015711955769b19abd48d3879cef5c9ee2650a5",
+      "form": "hashed",
+      "basal_id": "cortexkit--a-very-long-packag_6c425ad00b478de3",
+      "basal_id_bytes": 46
+    },
+    {
+      "input": "@cortexkit/a-very-long-package-name-that-needs-hashing-too",
+      "note": "same first 29 bytes as the previous name, different id",
+      "canonical": "@cortexkit/a-very-long-package-name-that-needs-hashing-too",
+      "input_is_canonical": true,
+      "short": "cortexkit--a-very-long-package-name-that-needs-hashing-too",
+      "short_bytes": 58,
+      "sha256_of_canonical": "9c4575cd55f9cba03258c5aad46235a81b3532af8ddb4aa92070e0e6dae1be8e",
+      "form": "hashed",
+      "basal_id": "cortexkit--a-very-long-packag_9c4575cd55f9cba0",
+      "basal_id_bytes": 46
+    },
+    {
+      "input": "@cortexkit/abcdefghijklmnopq-rstuvwxyz-0123456789",
+      "note": "hashed form whose 29-byte prefix ends on a hyphen inside the name",
+      "canonical": "@cortexkit/abcdefghijklmnopq-rstuvwxyz-0123456789",
+      "input_is_canonical": true,
+      "short": "cortexkit--abcdefghijklmnopq-rstuvwxyz-0123456789",
+      "short_bytes": 49,
+      "sha256_of_canonical": "d85d47c4431b95a8b428f19d052300b2910c49bb0c97036cf398906a9a34d612",
+      "form": "hashed",
+      "basal_id": "cortexkit--abcdefghijklmnopq-_d85d47c4431b95a8",
+      "basal_id_bytes": 46
+    },
+    {
+      "input": "@abcdefghijklmnopqrstuvwxyz0/a-very-long-tail-name",
+      "note": "29-byte prefix ends on the separator hyphen",
+      "canonical": "@abcdefghijklmnopqrstuvwxyz0/a-very-long-tail-name",
+      "input_is_canonical": true,
+      "short": "abcdefghijklmnopqrstuvwxyz0--a-very-long-tail-name",
+      "short_bytes": 50,
+      "sha256_of_canonical": "3fae6b03006127c032509992696f65256cc738bf3acd59c0d80841ba87071940",
+      "form": "hashed",
+      "basal_id": "abcdefghijklmnopqrstuvwxyz0--_3fae6b03006127c0",
+      "basal_id_bytes": 46
+    },
+    {
+      "input": "@abcdefghij-klmnopqrst-uvwxyz-0123456789/a",
+      "note": "scope exactly 39 bytes, the scope limit",
+      "canonical": "@abcdefghij-klmnopqrst-uvwxyz-0123456789/a",
+      "input_is_canonical": true,
+      "short": "abcdefghij-klmnopqrst-uvwxyz-0123456789--a",
+      "short_bytes": 42,
+      "sha256_of_canonical": "27d2914bdb769f9954455d75053de95056974a729f7ef4e771ac5d52c8591a92",
+      "form": "short",
+      "basal_id": "abcdefghij-klmnopqrst-uvwxyz-0123456789--a",
+      "basal_id_bytes": 42
+    },
+    {
+      "input": "@a/package-name-at-the-sixty-four-byte-limit-abcdefghijklmnopqrstuv",
+      "note": "package name exactly 64 bytes, the name limit",
+      "canonical": "@a/package-name-at-the-sixty-four-byte-limit-abcdefghijklmnopqrstuv",
+      "input_is_canonical": true,
+      "short": "a--package-name-at-the-sixty-four-byte-limit-abcdefghijklmnopqrstuv",
+      "short_bytes": 67,
+      "sha256_of_canonical": "8af3d4a4ca01cb683f6a8d927fe03a224f35ebca665e5f9f509fb29c15ac431d",
+      "form": "hashed",
+      "basal_id": "a--package-name-at-the-sixty-_8af3d4a4ca01cb68",
+      "basal_id_bytes": 46
+    },
+    {
+      "input": "@abcdefghij-klmnopqrst-uvwxyz-0123456789/package-name-at-the-sixty-four-byte-limit-abcdefghijklmnopqrstuv",
+      "note": "both parts at their limits: the longest valid name (105 bytes), hashed",
+      "canonical": "@abcdefghij-klmnopqrst-uvwxyz-0123456789/package-name-at-the-sixty-four-byte-limit-abcdefghijklmnopqrstuv",
+      "input_is_canonical": true,
+      "short": "abcdefghij-klmnopqrst-uvwxyz-0123456789--package-name-at-the-sixty-four-byte-limit-abcdefghijklmnopqrstuv",
+      "short_bytes": 105,
+      "sha256_of_canonical": "9d0b1190b299e3a19c6238ff10d513433f5307f065d8f7bdf35a6c578fea1d39",
+      "form": "hashed",
+      "basal_id": "abcdefghij-klmnopqrst-uvwxyz-_9d0b1190b299e3a1",
+      "basal_id_bytes": 46
+    }
+  ],
+  "refused": [
+    {
+      "input": "",
+      "note": "empty",
+      "code": "name_invalid",
+      "part": "whole"
+    },
+    {
+      "input": "cortexkit/swe-head",
+      "note": "missing @",
+      "code": "name_invalid",
+      "part": "whole"
+    },
+    {
+      "input": "@cortexkit",
+      "note": "missing /name",
+      "code": "name_invalid",
+      "part": "whole"
+    },
+    {
+      "input": "@cortexkit/swe/head",
+      "note": "two slashes",
+      "code": "name_invalid",
+      "part": "whole"
+    },
+    {
+      "input": "@@cortexkit/swe-head",
+      "note": "doubled @",
+      "code": "name_invalid",
+      "part": "scope"
+    },
+    {
+      "input": " @cortexkit/swe-head",
+      "note": "leading space; nothing is trimmed",
+      "code": "name_invalid",
+      "part": "whole"
+    },
+    {
+      "input": "@/swe-head",
+      "note": "empty scope",
+      "code": "name_invalid",
+      "part": "scope"
+    },
+    {
+      "input": "@cortexkit/",
+      "note": "empty name",
+      "code": "name_invalid",
+      "part": "name"
+    },
+    {
+      "input": "@-a/b",
+      "note": "leading hyphen in scope",
+      "code": "name_invalid",
+      "part": "scope"
+    },
+    {
+      "input": "@a-/b",
+      "note": "trailing hyphen in scope (R1 example)",
+      "code": "name_invalid",
+      "part": "scope"
+    },
+    {
+      "input": "@a/-b",
+      "note": "leading hyphen in name (R1 example)",
+      "code": "name_invalid",
+      "part": "name"
+    },
+    {
+      "input": "@a/b-",
+      "note": "trailing hyphen in name",
+      "code": "name_invalid",
+      "part": "name"
+    },
+    {
+      "input": "@a--b/c",
+      "note": "doubled hyphen in scope",
+      "code": "name_invalid",
+      "part": "scope"
+    },
+    {
+      "input": "@a/b--c",
+      "note": "doubled hyphen in name",
+      "code": "name_invalid",
+      "part": "name"
+    },
+    {
+      "input": "@a/b_c",
+      "note": "underscore: only the hashed id form may contain _",
+      "code": "name_invalid",
+      "part": "name"
+    },
+    {
+      "input": "@a/b.c",
+      "note": "dot",
+      "code": "name_invalid",
+      "part": "name"
+    },
+    {
+      "input": "@a/b c",
+      "note": "space",
+      "code": "name_invalid",
+      "part": "name"
+    },
+    {
+      "input": "@ä/b",
+      "note": "non-ASCII letter",
+      "code": "name_invalid",
+      "part": "scope"
+    },
+    {
+      "input": "@Ä/b",
+      "note": "non-ASCII upper case is not folded",
+      "code": "name_invalid",
+      "part": "scope"
+    },
+    {
+      "input": "@abcdefghij-klmnopqrst-uvwxyz-01234567890/a",
+      "note": "scope 40 bytes, one over the limit",
+      "code": "name_invalid",
+      "part": "scope"
+    },
+    {
+      "input": "@a/package-name-at-the-sixty-four-byte-limit-abcdefghijklmnopqrstuvw",
+      "note": "package name 65 bytes, one over the limit",
+      "code": "name_invalid",
+      "part": "name"
+    },
+    {
+      "input": "@abcdefghij-klmnopqrst-uvwxyz-01234567890/package-name-at-the-sixty-four-byte-limit-abcdefghijklmnopqrstuvw",
+      "note": "both parts too long: the scope is checked first",
+      "code": "name_invalid",
+      "part": "scope"
+    }
+  ],
+  "binding": [
+    {
+      "name": "first_publish_binds",
+      "note": "id is free: the publish binds it",
+      "table": {},
+      "publish": "@acme/tools",
+      "expect": {
+        "ok": true,
+        "id": "acme--tools",
+        "new_binding": true
+      }
+    },
+    {
+      "name": "same_name_again",
+      "note": "a later version of the same package reuses its binding",
+      "table": {
+        "acme--tools": "@acme/tools"
+      },
+      "publish": "@acme/tools",
+      "expect": {
+        "ok": true,
+        "id": "acme--tools",
+        "new_binding": false
+      }
+    },
+    {
+      "name": "short_id_bound_to_other_name",
+      "note": "PLANTED ROW: no two valid names share a short id, so this table can only arise from a corrupt or migrated row; the check must read the stored table, not recompute",
+      "table": {
+        "acme--tools": "@acme-legacy/tools"
+      },
+      "publish": "@acme/tools",
+      "expect": {
+        "ok": false,
+        "code": "id_bound",
+        "id": "acme--tools",
+        "bound_to": "@acme-legacy/tools"
+      }
+    },
+    {
+      "name": "hashed_id_bound_to_other_name",
+      "note": "PLANTED ROW standing in for a 64-bit truncated-hash collision, which cannot be computed: the binding refuses the second name",
+      "table": {
+        "cortexkit--a-very-long-packag_6c425ad00b478de3": "@cortexkit/a-very-long-package-name-that-needs-hashing-x"
+      },
+      "publish": "@cortexkit/a-very-long-package-name-that-needs-hashing",
+      "expect": {
+        "ok": false,
+        "code": "id_bound",
+        "id": "cortexkit--a-very-long-packag_6c425ad00b478de3",
+        "bound_to": "@cortexkit/a-very-long-package-name-that-needs-hashing-x"
+      }
+    },
+    {
+      "name": "upper_case_publish_refused",
+      "note": "the mapping folds case, but a published name must already be canonical",
+      "table": {
+        "acme--tools": "@acme/tools"
+      },
+      "publish": "@Acme/Tools",
+      "expect": {
+        "ok": false,
+        "code": "name_not_canonical"
+      }
+    },
+    {
+      "name": "invalid_name_refused",
+      "note": "grammar refusal comes before the binding check",
+      "table": {},
+      "publish": "@acme/to_ols",
+      "expect": {
+        "ok": false,
+        "code": "name_invalid"
+      }
+    }
+  ],
+  "scope_claims": [
+    {
+      "scope": "acme",
+      "note": "ordinary claim",
+      "expect": {
+        "ok": true
+      }
+    },
+    {
+      "scope": "cortexkit",
+      "note": "reserved: held by CortexKit under its compiled root",
+      "expect": {
+        "ok": false,
+        "code": "scope_reserved"
+      }
+    },
+    {
+      "scope": "ck",
+      "note": "reserved",
+      "expect": {
+        "ok": false,
+        "code": "scope_reserved"
+      }
+    },
+    {
+      "scope": "catalog",
+      "note": "reserved",
+      "expect": {
+        "ok": false,
+        "code": "scope_reserved"
+      }
+    },
+    {
+      "scope": "registry",
+      "note": "reserved",
+      "expect": {
+        "ok": false,
+        "code": "scope_reserved"
+      }
+    },
+    {
+      "scope": "CortexKit",
+      "note": "a case variant of a reserved scope is reported as reserved",
+      "expect": {
+        "ok": false,
+        "code": "scope_reserved"
+      }
+    },
+    {
+      "scope": "ck-tools",
+      "note": "only exact reserved names are reserved",
+      "expect": {
+        "ok": true
+      }
+    },
+    {
+      "scope": "catalogs",
+      "note": "only exact reserved names are reserved",
+      "expect": {
+        "ok": true
+      }
+    },
+    {
+      "scope": "abcdefghij-klmnopqrst-uvwxyz-0123456789",
+      "note": "39 bytes: at the limit",
+      "expect": {
+        "ok": true
+      }
+    },
+    {
+      "scope": "abcdefghij-klmnopqrst-uvwxyz-01234567890",
+      "note": "40 bytes: over the limit",
+      "expect": {
+        "ok": false,
+        "code": "name_invalid"
+      }
+    },
+    {
+      "scope": "ac_me",
+      "note": "outside the grammar",
+      "expect": {
+        "ok": false,
+        "code": "name_invalid"
+      }
+    },
+    {
+      "scope": "Acme",
+      "note": "a claimed scope must already be canonical",
+      "expect": {
+        "ok": false,
+        "code": "name_not_canonical"
+      }
+    }
+  ]
+}

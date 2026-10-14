@@ -1,0 +1,1263 @@
+{
+  "schema": "ck-catalog-v1/status",
+  "signing": {
+    "domain_tag": "ck-status/v1",
+    "signing_input": "ASCII domain tag, one 0x00 byte, then the UTF-8 JCS bytes of the parsed status record",
+    "algorithm": "Ed25519"
+  },
+  "registry_keys": {
+    "NOTE": "Status records are signed by the TEST-ONLY registry status key, never by a publisher key; the signed_by_publisher_key case shows a publisher signature refused. record_domain_signature shows the registry key's own signature refused under the ck-record/v1 tag.",
+    "test-registry-1": {
+      "WARNING": "TEST-ONLY KEY. The seed is published. Never trust anything signed by it outside these vectors.",
+      "label": "TEST-ONLY registry status key 1",
+      "seed_derivation": "SHA-256 of the UTF-8 bytes of seed_text",
+      "seed_text": "ck-catalog-v1 TEST-ONLY registry status key 1. Published on purpose. Never trust anything it signs.",
+      "seed_hex": "b7c923c3cf0b018112d8d73268c4daabc86f4ba138feecb3af05e7da9788a375",
+      "public_key_hex": "96951ad4c9ce89883b6fa257901d21afed42fa84083ab91cf4b089c9c9717446",
+      "fingerprint": "be55844e99710ad19a031694f64817a22f75da98f95e08d23cf7137537c601ce"
+    }
+  },
+  "allowed_next_state": {
+    "available": [
+      "available",
+      "withdrawn",
+      "tombstoned",
+      "revoked"
+    ],
+    "withdrawn": [
+      "available",
+      "withdrawn",
+      "tombstoned",
+      "revoked"
+    ],
+    "revoked": [
+      "revoked",
+      "tombstoned"
+    ],
+    "tombstoned": [
+      "tombstoned"
+    ]
+  },
+  "records": [
+    {
+      "id": "s1",
+      "record": {
+        "schema": "ck-status/v1",
+        "registry_key_id": "test-registry-1",
+        "name": "@example/hello-skill",
+        "version": "1.0.0",
+        "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+        "publisher_key": "e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d",
+        "sequence": 1,
+        "state": "available",
+        "reason": null,
+        "compromise_from": null,
+        "published_at": "2026-10-14T09:00:00Z",
+        "changed_at": "2026-10-14T09:00:00Z"
+      },
+      "canonical": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-14T09:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":null,\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":1,\"state\":\"available\",\"version\":\"1.0.0\"}",
+      "canonical_sha256": "9ca53b8f7a8de50350bbedfbd42819e8bda37cca1b5d148c33912f4c9cc76de5",
+      "signing_input_hex": "636b2d7374617475732f7631007b22617263686976655f736861323536223a2265323338646334316466663636313633323531386331323037353266336534643538313638616362333933666130636138663638383165373138653065333938222c226368616e6765645f6174223a22323032362d31302d31345430393a30303a30305a222c22636f6d70726f6d6973655f66726f6d223a6e756c6c2c226e616d65223a22406578616d706c652f68656c6c6f2d736b696c6c222c227075626c69736865645f6174223a22323032362d31302d31345430393a30303a30305a222c227075626c69736865725f6b6579223a2265353961626134343064626463666561643430653339353130353766323636623233313962613934353132356135643535316333363962386461613234323364222c22726561736f6e223a6e756c6c2c2272656769737472795f6b65795f6964223a22746573742d72656769737472792d31222c22736368656d61223a22636b2d7374617475732f7631222c2273657175656e6365223a312c227374617465223a22617661696c61626c65222c2276657273696f6e223a22312e302e30227d",
+      "signature": "bbcf57f2860c880266f59c0e168c1a60e4a48be6b63a057f67c2749c840b34ef83ad9f6bbef062690c2da9a927ffb5c116cec8addc83a65ba42c1571dd52630c"
+    },
+    {
+      "id": "s2",
+      "record": {
+        "schema": "ck-status/v1",
+        "registry_key_id": "test-registry-1",
+        "name": "@example/hello-skill",
+        "version": "1.0.0",
+        "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+        "publisher_key": "e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d",
+        "sequence": 2,
+        "state": "withdrawn",
+        "reason": "Withdrawn by the publisher: the script prints the wrong greeting",
+        "compromise_from": null,
+        "published_at": "2026-10-14T09:00:00Z",
+        "changed_at": "2026-10-15T10:00:00Z"
+      },
+      "canonical": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-15T10:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Withdrawn by the publisher: the script prints the wrong greeting\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":2,\"state\":\"withdrawn\",\"version\":\"1.0.0\"}",
+      "canonical_sha256": "6e5e22a7c054f3aad06dbffcbd2054bdc89ea4674b434b253dfe9fa744c35ed3",
+      "signing_input_hex": "636b2d7374617475732f7631007b22617263686976655f736861323536223a2265323338646334316466663636313633323531386331323037353266336534643538313638616362333933666130636138663638383165373138653065333938222c226368616e6765645f6174223a22323032362d31302d31355431303a30303a30305a222c22636f6d70726f6d6973655f66726f6d223a6e756c6c2c226e616d65223a22406578616d706c652f68656c6c6f2d736b696c6c222c227075626c69736865645f6174223a22323032362d31302d31345430393a30303a30305a222c227075626c69736865725f6b6579223a2265353961626134343064626463666561643430653339353130353766323636623233313962613934353132356135643535316333363962386461613234323364222c22726561736f6e223a2257697468647261776e20627920746865207075626c69736865723a2074686520736372697074207072696e7473207468652077726f6e67206772656574696e67222c2272656769737472795f6b65795f6964223a22746573742d72656769737472792d31222c22736368656d61223a22636b2d7374617475732f7631222c2273657175656e6365223a322c227374617465223a2277697468647261776e222c2276657273696f6e223a22312e302e30227d",
+      "signature": "72e0dbfcb461dae02466f3ae3482ee558a136d47e1e2d9404ba2d3df9ddf931025e5881788ec2a6c4b2a40e23892e2543ebdd351b9c93a981e8b45855453f904"
+    },
+    {
+      "id": "s2b",
+      "record": {
+        "schema": "ck-status/v1",
+        "registry_key_id": "test-registry-1",
+        "name": "@example/hello-skill",
+        "version": "1.0.0",
+        "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+        "publisher_key": "e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d",
+        "sequence": 2,
+        "state": "available",
+        "reason": null,
+        "compromise_from": null,
+        "published_at": "2026-10-14T09:00:00Z",
+        "changed_at": "2026-10-15T10:00:00Z"
+      },
+      "canonical": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-15T10:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":null,\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":2,\"state\":\"available\",\"version\":\"1.0.0\"}",
+      "canonical_sha256": "d86eea6f96bf130f23cd7bcbca988c153fb7b7232edc0a0f4f9e3c26d43182a6",
+      "signing_input_hex": "636b2d7374617475732f7631007b22617263686976655f736861323536223a2265323338646334316466663636313633323531386331323037353266336534643538313638616362333933666130636138663638383165373138653065333938222c226368616e6765645f6174223a22323032362d31302d31355431303a30303a30305a222c22636f6d70726f6d6973655f66726f6d223a6e756c6c2c226e616d65223a22406578616d706c652f68656c6c6f2d736b696c6c222c227075626c69736865645f6174223a22323032362d31302d31345430393a30303a30305a222c227075626c69736865725f6b6579223a2265353961626134343064626463666561643430653339353130353766323636623233313962613934353132356135643535316333363962386461613234323364222c22726561736f6e223a6e756c6c2c2272656769737472795f6b65795f6964223a22746573742d72656769737472792d31222c22736368656d61223a22636b2d7374617475732f7631222c2273657175656e6365223a322c227374617465223a22617661696c61626c65222c2276657273696f6e223a22312e302e30227d",
+      "signature": "e20fa1d0f40b3f974857060ac4760b82dc67cb7847766d860ff5c6441e409a590f873e23cce1cca3082b1bc0a4ccd3d3ef89478fff408873a6002dae9c243208"
+    },
+    {
+      "id": "s3",
+      "record": {
+        "schema": "ck-status/v1",
+        "registry_key_id": "test-registry-1",
+        "name": "@example/hello-skill",
+        "version": "1.0.0",
+        "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+        "publisher_key": "e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d",
+        "sequence": 3,
+        "state": "available",
+        "reason": "Withdrawal reversed by the publisher",
+        "compromise_from": null,
+        "published_at": "2026-10-14T09:00:00Z",
+        "changed_at": "2026-10-16T08:00:00Z"
+      },
+      "canonical": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-16T08:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Withdrawal reversed by the publisher\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":3,\"state\":\"available\",\"version\":\"1.0.0\"}",
+      "canonical_sha256": "39bd7b17a8e3a0519c7a1e184f3c0940eb9290b057066a1f27b7eb9733d16ba0",
+      "signing_input_hex": "636b2d7374617475732f7631007b22617263686976655f736861323536223a2265323338646334316466663636313633323531386331323037353266336534643538313638616362333933666130636138663638383165373138653065333938222c226368616e6765645f6174223a22323032362d31302d31365430383a30303a30305a222c22636f6d70726f6d6973655f66726f6d223a6e756c6c2c226e616d65223a22406578616d706c652f68656c6c6f2d736b696c6c222c227075626c69736865645f6174223a22323032362d31302d31345430393a30303a30305a222c227075626c69736865725f6b6579223a2265353961626134343064626463666561643430653339353130353766323636623233313962613934353132356135643535316333363962386461613234323364222c22726561736f6e223a225769746864726177616c20726576657273656420627920746865207075626c6973686572222c2272656769737472795f6b65795f6964223a22746573742d72656769737472792d31222c22736368656d61223a22636b2d7374617475732f7631222c2273657175656e6365223a332c227374617465223a22617661696c61626c65222c2276657273696f6e223a22312e302e30227d",
+      "signature": "608750e6d0a6c083e4442dc4fbcdda5a6fb4878852d124a261ff566ab1541fb88659bad6851193c2e9cbc5157498770a02bd4d825b75346c3d2fd6e78ab71a06"
+    },
+    {
+      "id": "s4",
+      "record": {
+        "schema": "ck-status/v1",
+        "registry_key_id": "test-registry-1",
+        "name": "@example/hello-skill",
+        "version": "1.0.0",
+        "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+        "publisher_key": "e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d",
+        "sequence": 4,
+        "state": "tombstoned",
+        "reason": "Removed by the registry: malware",
+        "compromise_from": null,
+        "published_at": "2026-10-14T09:00:00Z",
+        "changed_at": "2026-10-17T12:00:00Z"
+      },
+      "canonical": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-17T12:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Removed by the registry: malware\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":4,\"state\":\"tombstoned\",\"version\":\"1.0.0\"}",
+      "canonical_sha256": "73671a79e8dc8c1a0bb691cbb98f1ce92a606b6030230c97afb4f38bcfe8590f",
+      "signing_input_hex": "636b2d7374617475732f7631007b22617263686976655f736861323536223a2265323338646334316466663636313633323531386331323037353266336534643538313638616362333933666130636138663638383165373138653065333938222c226368616e6765645f6174223a22323032362d31302d31375431323a30303a30305a222c22636f6d70726f6d6973655f66726f6d223a6e756c6c2c226e616d65223a22406578616d706c652f68656c6c6f2d736b696c6c222c227075626c69736865645f6174223a22323032362d31302d31345430393a30303a30305a222c227075626c69736865725f6b6579223a2265353961626134343064626463666561643430653339353130353766323636623233313962613934353132356135643535316333363962386461613234323364222c22726561736f6e223a2252656d6f766564206279207468652072656769737472793a206d616c77617265222c2272656769737472795f6b65795f6964223a22746573742d72656769737472792d31222c22736368656d61223a22636b2d7374617475732f7631222c2273657175656e6365223a342c227374617465223a22746f6d6273746f6e6564222c2276657273696f6e223a22312e302e30227d",
+      "signature": "95c2280c0b29eeb564d4763d48277238cb25d5759f630414778f424c5ef1aa3a9b724ac74adcc7d21aeb3f497f34597c0533ed90604f72560793f52fcb5b6f0a"
+    },
+    {
+      "id": "f1",
+      "record": {
+        "schema": "ck-status/v1",
+        "registry_key_id": "test-registry-1",
+        "name": "@example/hello-flow",
+        "version": "1.0.0",
+        "archive_sha256": "89d6bee3b0bdffaf7646d000e4d98f60181df12e4894159b7cdba5e3ed6a4639",
+        "publisher_key": "e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d",
+        "sequence": 1,
+        "state": "available",
+        "reason": null,
+        "compromise_from": null,
+        "published_at": "2026-10-21T09:00:00Z",
+        "changed_at": "2026-10-21T09:00:00Z"
+      },
+      "canonical": "{\"archive_sha256\":\"89d6bee3b0bdffaf7646d000e4d98f60181df12e4894159b7cdba5e3ed6a4639\",\"changed_at\":\"2026-10-21T09:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-flow\",\"published_at\":\"2026-10-21T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":null,\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":1,\"state\":\"available\",\"version\":\"1.0.0\"}",
+      "canonical_sha256": "f6860c497e01da7939e32d7063cca4b83e3519a83fe725280c62931bb00534ea",
+      "signing_input_hex": "636b2d7374617475732f7631007b22617263686976655f736861323536223a2238396436626565336230626466666166373634366430303065346439386636303138316466313265343839343135396237636462613565336564366134363339222c226368616e6765645f6174223a22323032362d31302d32315430393a30303a30305a222c22636f6d70726f6d6973655f66726f6d223a6e756c6c2c226e616d65223a22406578616d706c652f68656c6c6f2d666c6f77222c227075626c69736865645f6174223a22323032362d31302d32315430393a30303a30305a222c227075626c69736865725f6b6579223a2265353961626134343064626463666561643430653339353130353766323636623233313962613934353132356135643535316333363962386461613234323364222c22726561736f6e223a6e756c6c2c2272656769737472795f6b65795f6964223a22746573742d72656769737472792d31222c22736368656d61223a22636b2d7374617475732f7631222c2273657175656e6365223a312c227374617465223a22617661696c61626c65222c2276657273696f6e223a22312e302e30227d",
+      "signature": "839825a7698ad36a37035d2f5ee9e0bdf3d6178e0cf25965f090d1c783cba5ee6b5a751a788de4dc8c42b4aabd595c043e7c58e0697323b8b6c4ef23f3ca6306"
+    },
+    {
+      "id": "f2",
+      "record": {
+        "schema": "ck-status/v1",
+        "registry_key_id": "test-registry-1",
+        "name": "@example/hello-flow",
+        "version": "1.0.0",
+        "archive_sha256": "89d6bee3b0bdffaf7646d000e4d98f60181df12e4894159b7cdba5e3ed6a4639",
+        "publisher_key": "e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d",
+        "sequence": 2,
+        "state": "revoked",
+        "reason": "Publisher key revoked: key compromise",
+        "compromise_from": "2026-10-20T00:00:00Z",
+        "published_at": "2026-10-21T09:00:00Z",
+        "changed_at": "2026-10-22T09:00:00Z"
+      },
+      "canonical": "{\"archive_sha256\":\"89d6bee3b0bdffaf7646d000e4d98f60181df12e4894159b7cdba5e3ed6a4639\",\"changed_at\":\"2026-10-22T09:00:00Z\",\"compromise_from\":\"2026-10-20T00:00:00Z\",\"name\":\"@example/hello-flow\",\"published_at\":\"2026-10-21T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Publisher key revoked: key compromise\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":2,\"state\":\"revoked\",\"version\":\"1.0.0\"}",
+      "canonical_sha256": "eae26113cc27e43b2a6d836e838cac72c4047f60c2329cd2bec213a06df5d538",
+      "signing_input_hex": "636b2d7374617475732f7631007b22617263686976655f736861323536223a2238396436626565336230626466666166373634366430303065346439386636303138316466313265343839343135396237636462613565336564366134363339222c226368616e6765645f6174223a22323032362d31302d32325430393a30303a30305a222c22636f6d70726f6d6973655f66726f6d223a22323032362d31302d32305430303a30303a30305a222c226e616d65223a22406578616d706c652f68656c6c6f2d666c6f77222c227075626c69736865645f6174223a22323032362d31302d32315430393a30303a30305a222c227075626c69736865725f6b6579223a2265353961626134343064626463666561643430653339353130353766323636623233313962613934353132356135643535316333363962386461613234323364222c22726561736f6e223a225075626c6973686572206b6579207265766f6b65643a206b657920636f6d70726f6d697365222c2272656769737472795f6b65795f6964223a22746573742d72656769737472792d31222c22736368656d61223a22636b2d7374617475732f7631222c2273657175656e6365223a322c227374617465223a227265766f6b6564222c2276657273696f6e223a22312e302e30227d",
+      "signature": "2d45a9c65f42f9aadd5dc29214bdcd427c297a9430754b0fa1a889e868367c6a498d361200534e8a70f7da8059780dfed64e569c88a30dc08968ad08f95fbc0c"
+    },
+    {
+      "id": "f3",
+      "record": {
+        "schema": "ck-status/v1",
+        "registry_key_id": "test-registry-1",
+        "name": "@example/hello-flow",
+        "version": "1.0.0",
+        "archive_sha256": "89d6bee3b0bdffaf7646d000e4d98f60181df12e4894159b7cdba5e3ed6a4639",
+        "publisher_key": "e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d",
+        "sequence": 3,
+        "state": "tombstoned",
+        "reason": "Removed by the registry: malware",
+        "compromise_from": null,
+        "published_at": "2026-10-21T09:00:00Z",
+        "changed_at": "2026-10-23T09:00:00Z"
+      },
+      "canonical": "{\"archive_sha256\":\"89d6bee3b0bdffaf7646d000e4d98f60181df12e4894159b7cdba5e3ed6a4639\",\"changed_at\":\"2026-10-23T09:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-flow\",\"published_at\":\"2026-10-21T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Removed by the registry: malware\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":3,\"state\":\"tombstoned\",\"version\":\"1.0.0\"}",
+      "canonical_sha256": "1e20a857ce5eb6da16542ebf031331f191eac76d340c9a220e3cf008ecce3ba1",
+      "signing_input_hex": "636b2d7374617475732f7631007b22617263686976655f736861323536223a2238396436626565336230626466666166373634366430303065346439386636303138316466313265343839343135396237636462613565336564366134363339222c226368616e6765645f6174223a22323032362d31302d32335430393a30303a30305a222c22636f6d70726f6d6973655f66726f6d223a6e756c6c2c226e616d65223a22406578616d706c652f68656c6c6f2d666c6f77222c227075626c69736865645f6174223a22323032362d31302d32315430393a30303a30305a222c227075626c69736865725f6b6579223a2265353961626134343064626463666561643430653339353130353766323636623233313962613934353132356135643535316333363962386461613234323364222c22726561736f6e223a2252656d6f766564206279207468652072656769737472793a206d616c77617265222c2272656769737472795f6b65795f6964223a22746573742d72656769737472792d31222c22736368656d61223a22636b2d7374617475732f7631222c2273657175656e6365223a332c227374617465223a22746f6d6273746f6e6564222c2276657273696f6e223a22312e302e30227d",
+      "signature": "498cb24a64ff35d27103208adf29e0c6edbb857b09d40ab357a26a3b7b53b82bb783893afc48c6636d352028075b894b9d285ff2e928ce14277cc76ac6b1970e"
+    }
+  ],
+  "apply_cases": [
+    {
+      "name": "first_record",
+      "pinned": {
+        "name": "@example/hello-skill",
+        "version": "1.0.0",
+        "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398"
+      },
+      "held": null,
+      "incoming_text": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-14T09:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":null,\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":1,\"state\":\"available\",\"version\":\"1.0.0\"}",
+      "signature": "bbcf57f2860c880266f59c0e168c1a60e4a48be6b63a057f67c2749c840b34ef83ad9f6bbef062690c2da9a927ffb5c116cec8addc83a65ba42c1571dd52630c",
+      "expect": {
+        "ok": true,
+        "result": "applied"
+      }
+    },
+    {
+      "name": "withdraw",
+      "pinned": {
+        "name": "@example/hello-skill",
+        "version": "1.0.0",
+        "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398"
+      },
+      "held": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-14T09:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":null,\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":1,\"state\":\"available\",\"version\":\"1.0.0\"}",
+      "incoming_text": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-15T10:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Withdrawn by the publisher: the script prints the wrong greeting\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":2,\"state\":\"withdrawn\",\"version\":\"1.0.0\"}",
+      "signature": "72e0dbfcb461dae02466f3ae3482ee558a136d47e1e2d9404ba2d3df9ddf931025e5881788ec2a6c4b2a40e23892e2543ebdd351b9c93a981e8b45855453f904",
+      "expect": {
+        "ok": true,
+        "result": "applied"
+      }
+    },
+    {
+      "name": "reverse_withdrawal",
+      "pinned": {
+        "name": "@example/hello-skill",
+        "version": "1.0.0",
+        "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398"
+      },
+      "held": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-15T10:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Withdrawn by the publisher: the script prints the wrong greeting\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":2,\"state\":\"withdrawn\",\"version\":\"1.0.0\"}",
+      "incoming_text": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-16T08:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Withdrawal reversed by the publisher\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":3,\"state\":\"available\",\"version\":\"1.0.0\"}",
+      "signature": "608750e6d0a6c083e4442dc4fbcdda5a6fb4878852d124a261ff566ab1541fb88659bad6851193c2e9cbc5157498770a02bd4d825b75346c3d2fd6e78ab71a06",
+      "expect": {
+        "ok": true,
+        "result": "applied"
+      }
+    },
+    {
+      "name": "sequence_gap_allowed",
+      "pinned": {
+        "name": "@example/hello-skill",
+        "version": "1.0.0",
+        "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398"
+      },
+      "held": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-14T09:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":null,\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":1,\"state\":\"available\",\"version\":\"1.0.0\"}",
+      "incoming_text": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-17T12:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Removed by the registry: malware\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":4,\"state\":\"tombstoned\",\"version\":\"1.0.0\"}",
+      "signature": "95c2280c0b29eeb564d4763d48277238cb25d5759f630414778f424c5ef1aa3a9b724ac74adcc7d21aeb3f497f34597c0533ed90604f72560793f52fcb5b6f0a",
+      "expect": {
+        "ok": true,
+        "result": "applied"
+      }
+    },
+    {
+      "name": "lower_sequence_refused",
+      "pinned": {
+        "name": "@example/hello-skill",
+        "version": "1.0.0",
+        "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398"
+      },
+      "held": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-16T08:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Withdrawal reversed by the publisher\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":3,\"state\":\"available\",\"version\":\"1.0.0\"}",
+      "incoming_text": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-15T10:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Withdrawn by the publisher: the script prints the wrong greeting\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":2,\"state\":\"withdrawn\",\"version\":\"1.0.0\"}",
+      "signature": "72e0dbfcb461dae02466f3ae3482ee558a136d47e1e2d9404ba2d3df9ddf931025e5881788ec2a6c4b2a40e23892e2543ebdd351b9c93a981e8b45855453f904",
+      "expect": {
+        "ok": false,
+        "code": "feed_rollback",
+        "reason": "lower_sequence"
+      }
+    },
+    {
+      "name": "same_record_again",
+      "pinned": {
+        "name": "@example/hello-skill",
+        "version": "1.0.0",
+        "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398"
+      },
+      "held": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-15T10:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Withdrawn by the publisher: the script prints the wrong greeting\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":2,\"state\":\"withdrawn\",\"version\":\"1.0.0\"}",
+      "incoming_text": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-15T10:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Withdrawn by the publisher: the script prints the wrong greeting\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":2,\"state\":\"withdrawn\",\"version\":\"1.0.0\"}",
+      "signature": "72e0dbfcb461dae02466f3ae3482ee558a136d47e1e2d9404ba2d3df9ddf931025e5881788ec2a6c4b2a40e23892e2543ebdd351b9c93a981e8b45855453f904",
+      "expect": {
+        "ok": true,
+        "result": "duplicate"
+      }
+    },
+    {
+      "name": "same_sequence_other_bytes",
+      "pinned": {
+        "name": "@example/hello-skill",
+        "version": "1.0.0",
+        "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398"
+      },
+      "held": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-15T10:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Withdrawn by the publisher: the script prints the wrong greeting\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":2,\"state\":\"withdrawn\",\"version\":\"1.0.0\"}",
+      "incoming_text": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-15T10:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":null,\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":2,\"state\":\"available\",\"version\":\"1.0.0\"}",
+      "signature": "e20fa1d0f40b3f974857060ac4760b82dc67cb7847766d860ff5c6441e409a590f873e23cce1cca3082b1bc0a4ccd3d3ef89478fff408873a6002dae9c243208",
+      "expect": {
+        "ok": false,
+        "code": "feed_rollback",
+        "reason": "same_sequence_other_bytes"
+      }
+    },
+    {
+      "name": "leave_tombstone_refused",
+      "pinned": {
+        "name": "@example/hello-skill",
+        "version": "1.0.0",
+        "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398"
+      },
+      "held": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-17T12:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Removed by the registry: malware\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":4,\"state\":\"tombstoned\",\"version\":\"1.0.0\"}",
+      "incoming_text": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-18T12:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":null,\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":5,\"state\":\"available\",\"version\":\"1.0.0\"}",
+      "signature": "5e8f57ff06678563cdb60643e4ca9cc85e01a16ef552d6db849c6eaa7065ac209e24d120c425072ca4da86302627bf30ed7ad95ecc348dc3f8a029c9974f3c04",
+      "expect": {
+        "ok": false,
+        "code": "status_terminal"
+      }
+    },
+    {
+      "name": "revoked_then_tombstoned",
+      "pinned": {
+        "name": "@example/hello-flow",
+        "version": "1.0.0",
+        "archive_sha256": "89d6bee3b0bdffaf7646d000e4d98f60181df12e4894159b7cdba5e3ed6a4639"
+      },
+      "held": "{\"archive_sha256\":\"89d6bee3b0bdffaf7646d000e4d98f60181df12e4894159b7cdba5e3ed6a4639\",\"changed_at\":\"2026-10-22T09:00:00Z\",\"compromise_from\":\"2026-10-20T00:00:00Z\",\"name\":\"@example/hello-flow\",\"published_at\":\"2026-10-21T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Publisher key revoked: key compromise\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":2,\"state\":\"revoked\",\"version\":\"1.0.0\"}",
+      "incoming_text": "{\"archive_sha256\":\"89d6bee3b0bdffaf7646d000e4d98f60181df12e4894159b7cdba5e3ed6a4639\",\"changed_at\":\"2026-10-23T09:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-flow\",\"published_at\":\"2026-10-21T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Removed by the registry: malware\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":3,\"state\":\"tombstoned\",\"version\":\"1.0.0\"}",
+      "signature": "498cb24a64ff35d27103208adf29e0c6edbb857b09d40ab357a26a3b7b53b82bb783893afc48c6636d352028075b894b9d285ff2e928ce14277cc76ac6b1970e",
+      "expect": {
+        "ok": true,
+        "result": "applied"
+      }
+    },
+    {
+      "name": "revoked_back_to_available_refused",
+      "pinned": {
+        "name": "@example/hello-flow",
+        "version": "1.0.0",
+        "archive_sha256": "89d6bee3b0bdffaf7646d000e4d98f60181df12e4894159b7cdba5e3ed6a4639"
+      },
+      "held": "{\"archive_sha256\":\"89d6bee3b0bdffaf7646d000e4d98f60181df12e4894159b7cdba5e3ed6a4639\",\"changed_at\":\"2026-10-22T09:00:00Z\",\"compromise_from\":\"2026-10-20T00:00:00Z\",\"name\":\"@example/hello-flow\",\"published_at\":\"2026-10-21T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Publisher key revoked: key compromise\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":2,\"state\":\"revoked\",\"version\":\"1.0.0\"}",
+      "incoming_text": "{\"archive_sha256\":\"89d6bee3b0bdffaf7646d000e4d98f60181df12e4894159b7cdba5e3ed6a4639\",\"changed_at\":\"2026-10-24T09:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-flow\",\"published_at\":\"2026-10-21T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":null,\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":4,\"state\":\"available\",\"version\":\"1.0.0\"}",
+      "signature": "6fd01ce52d6daba349326c6726a1d3d8c98a0366cd32d696f64901525277edb60547f6216cf466d8bf7ed8a42ced59b29d353d38acb2af436a89b7b5fe1ecf0c",
+      "expect": {
+        "ok": false,
+        "code": "status_terminal"
+      }
+    },
+    {
+      "name": "bad_signature",
+      "pinned": {
+        "name": "@example/hello-skill",
+        "version": "1.0.0",
+        "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398"
+      },
+      "held": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-14T09:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":null,\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":1,\"state\":\"available\",\"version\":\"1.0.0\"}",
+      "incoming_text": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-15T10:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Withdrawn by the publisher: the script prints the wrong greeting\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":2,\"state\":\"withdrawn\",\"version\":\"1.0.0\"}",
+      "signature": "73e0dbfcb461dae02466f3ae3482ee558a136d47e1e2d9404ba2d3df9ddf931025e5881788ec2a6c4b2a40e23892e2543ebdd351b9c93a981e8b45855453f904",
+      "expect": {
+        "ok": false,
+        "code": "signature_invalid"
+      }
+    },
+    {
+      "name": "record_domain_signature",
+      "pinned": {
+        "name": "@example/hello-skill",
+        "version": "1.0.0",
+        "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398"
+      },
+      "held": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-14T09:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":null,\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":1,\"state\":\"available\",\"version\":\"1.0.0\"}",
+      "incoming_text": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-15T10:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Withdrawn by the publisher: the script prints the wrong greeting\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":2,\"state\":\"withdrawn\",\"version\":\"1.0.0\"}",
+      "signature": "fc9334aa1e0794264a0b819fd8754603202adef1f6922de6fdf77d73b1ef30dde246e893b075f308e06f4b92eb44ccd4efe462fc2aa31534eff0b5a8e066f909",
+      "expect": {
+        "ok": false,
+        "code": "signature_invalid"
+      }
+    },
+    {
+      "name": "signed_by_publisher_key",
+      "pinned": {
+        "name": "@example/hello-skill",
+        "version": "1.0.0",
+        "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398"
+      },
+      "held": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-14T09:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":null,\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":1,\"state\":\"available\",\"version\":\"1.0.0\"}",
+      "incoming_text": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-15T10:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Withdrawn by the publisher: the script prints the wrong greeting\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":2,\"state\":\"withdrawn\",\"version\":\"1.0.0\"}",
+      "signature": "72fff45df81ac10d18248c2690063095f16918b15a381071d6fa9d2469cf776e0771cb9fef09a151fc66b59217ddfde6e8a131df35c1b0a954aad4b867c72403",
+      "expect": {
+        "ok": false,
+        "code": "signature_invalid"
+      }
+    },
+    {
+      "name": "unknown_registry_key",
+      "pinned": {
+        "name": "@example/hello-skill",
+        "version": "1.0.0",
+        "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398"
+      },
+      "held": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-14T09:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":null,\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":1,\"state\":\"available\",\"version\":\"1.0.0\"}",
+      "incoming_text": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-15T10:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Withdrawn by the publisher: the script prints the wrong greeting\",\"registry_key_id\":\"test-registry-9\",\"schema\":\"ck-status/v1\",\"sequence\":2,\"state\":\"withdrawn\",\"version\":\"1.0.0\"}",
+      "signature": "ca9872f5fe23dfcddc00b187e1f2e6c3b5103b8bc639e1a15f16a2bce8e8a7defed5b0a042266ddc5a6d2d56e2510dfa88c793041da1cac9955d2658e3539c0e",
+      "expect": {
+        "ok": false,
+        "code": "key_unknown"
+      }
+    },
+    {
+      "name": "other_archive",
+      "pinned": {
+        "name": "@example/hello-skill",
+        "version": "1.0.0",
+        "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398"
+      },
+      "held": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-14T09:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":null,\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":1,\"state\":\"available\",\"version\":\"1.0.0\"}",
+      "incoming_text": "{\"archive_sha256\":\"89d6bee3b0bdffaf7646d000e4d98f60181df12e4894159b7cdba5e3ed6a4639\",\"changed_at\":\"2026-10-15T10:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Withdrawn by the publisher: the script prints the wrong greeting\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":2,\"state\":\"withdrawn\",\"version\":\"1.0.0\"}",
+      "signature": "e8f2b04c9aed90ba9856d82ad367916c4445d02c98445101cc2732ab32b16ae80bd606691f75f042e7cba764b5edc59381ce3bfd6e001409471222cdd68e6d07",
+      "expect": {
+        "ok": false,
+        "code": "record_mismatch"
+      }
+    },
+    {
+      "name": "revoked_without_compromise_from",
+      "pinned": {
+        "name": "@example/hello-flow",
+        "version": "1.0.0",
+        "archive_sha256": "89d6bee3b0bdffaf7646d000e4d98f60181df12e4894159b7cdba5e3ed6a4639"
+      },
+      "held": "{\"archive_sha256\":\"89d6bee3b0bdffaf7646d000e4d98f60181df12e4894159b7cdba5e3ed6a4639\",\"changed_at\":\"2026-10-21T09:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-flow\",\"published_at\":\"2026-10-21T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":null,\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":1,\"state\":\"available\",\"version\":\"1.0.0\"}",
+      "incoming_text": "{\"archive_sha256\":\"89d6bee3b0bdffaf7646d000e4d98f60181df12e4894159b7cdba5e3ed6a4639\",\"changed_at\":\"2026-10-22T09:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-flow\",\"published_at\":\"2026-10-21T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Publisher key revoked: key compromise\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":2,\"state\":\"revoked\",\"version\":\"1.0.0\"}",
+      "signature": "093cec59f1e02ecb44309c6dc734613262ccf35a688a56be40f6827d43424311802fb51b6af28a8a27959098b9bcc2548a86a8799a275fad5704ec10078de309",
+      "expect": {
+        "ok": false,
+        "code": "status_invalid",
+        "field": "compromise_from"
+      }
+    },
+    {
+      "name": "withdrawn_without_reason",
+      "pinned": {
+        "name": "@example/hello-skill",
+        "version": "1.0.0",
+        "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398"
+      },
+      "held": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-14T09:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":null,\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":1,\"state\":\"available\",\"version\":\"1.0.0\"}",
+      "incoming_text": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-15T10:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":null,\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":2,\"state\":\"withdrawn\",\"version\":\"1.0.0\"}",
+      "signature": "70f985963d51c9fbaac867aa64f44ec21e28dad17cee2089af3e869d519c70d09ff68e28c140cd4db500af8370684610c5badcc481427d5a1ccc169235080f04",
+      "expect": {
+        "ok": false,
+        "code": "status_invalid",
+        "field": "reason"
+      }
+    },
+    {
+      "name": "timestamp_with_offset",
+      "pinned": {
+        "name": "@example/hello-skill",
+        "version": "1.0.0",
+        "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398"
+      },
+      "held": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-14T09:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":null,\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":1,\"state\":\"available\",\"version\":\"1.0.0\"}",
+      "incoming_text": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-15T12:00:00+02:00\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Withdrawn by the publisher: the script prints the wrong greeting\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":2,\"state\":\"withdrawn\",\"version\":\"1.0.0\"}",
+      "signature": "9dee461544c1d264f8573f5ce4ad77b0d0e4d807612cdbf9fa43c035949929b882e4ca1b19ce0e258ff3d4c9771dddc4f4da6f131ee6a10931c9de1882d13106",
+      "expect": {
+        "ok": false,
+        "code": "status_invalid",
+        "field": "changed_at"
+      }
+    }
+  ],
+  "feed": {
+    "rules": {
+      "feed_seq": "scope-wide, strictly increasing, one per status write in the scope; unsigned feed metadata",
+      "full_feed": "GET /v1/scopes/{scope}/status: the latest record of every version in the scope, ordered by feed_seq; the reply's feed_seq is the scope's current one",
+      "after": "?after=N: only versions whose latest record has feed_seq > N; 410 feed_after_unavailable when N is above the current feed_seq or below the oldest point the registry serves; 200 with no records when nothing is newer",
+      "client": "keep the highest feed_seq applied per scope and the highest status sequence per version; a lower feed_seq, a lower sequence, or the same sequence with other bytes is feed_rollback; advance feed_seq only when every record applied or was a duplicate; first fetch, feed_rollback and feed_after_unavailable in an incremental poll fall back to the full feed"
+    },
+    "oldest_servable_after": 2,
+    "log": [
+      {
+        "feed_seq": 1,
+        "id": "s1"
+      },
+      {
+        "feed_seq": 2,
+        "id": "s2"
+      },
+      {
+        "feed_seq": 3,
+        "id": "s3"
+      },
+      {
+        "feed_seq": 4,
+        "id": "s4"
+      },
+      {
+        "feed_seq": 5,
+        "id": "f1"
+      },
+      {
+        "feed_seq": 6,
+        "id": "f2"
+      },
+      {
+        "feed_seq": 7,
+        "id": "f3"
+      }
+    ],
+    "views": [
+      {
+        "name": "full_at_5",
+        "note": "the default: latest record of every version",
+        "log_up_to": 5,
+        "after": null,
+        "expect": {
+          "status": 200,
+          "feed_seq": 5,
+          "records": [
+            {
+              "feed_seq": 4,
+              "id": "s4"
+            },
+            {
+              "feed_seq": 5,
+              "id": "f1"
+            }
+          ]
+        },
+        "request": "GET /v1/scopes/example/status"
+      },
+      {
+        "name": "after_3_at_5",
+        "note": "",
+        "log_up_to": 5,
+        "after": 3,
+        "expect": {
+          "status": 200,
+          "feed_seq": 5,
+          "records": [
+            {
+              "feed_seq": 4,
+              "id": "s4"
+            },
+            {
+              "feed_seq": 5,
+              "id": "f1"
+            }
+          ]
+        },
+        "request": "GET /v1/scopes/example/status?after=3"
+      },
+      {
+        "name": "after_4_at_5",
+        "note": "",
+        "log_up_to": 5,
+        "after": 4,
+        "expect": {
+          "status": 200,
+          "feed_seq": 5,
+          "records": [
+            {
+              "feed_seq": 5,
+              "id": "f1"
+            }
+          ]
+        },
+        "request": "GET /v1/scopes/example/status?after=4"
+      },
+      {
+        "name": "nothing_newer",
+        "note": "200 with no records and the current feed_seq, never 304 (304 answers only If-None-Match)",
+        "log_up_to": 5,
+        "after": 5,
+        "expect": {
+          "status": 200,
+          "feed_seq": 5,
+          "records": []
+        },
+        "request": "GET /v1/scopes/example/status?after=5"
+      },
+      {
+        "name": "after_above_current",
+        "note": "a stale edge copy or a registry rollback; the registry does not tell them apart",
+        "log_up_to": 5,
+        "after": 6,
+        "expect": {
+          "status": 410,
+          "code": "feed_after_unavailable"
+        },
+        "request": "GET /v1/scopes/example/status?after=6"
+      },
+      {
+        "name": "after_below_kept_history",
+        "note": "this registry serves ?after= only from 2 on",
+        "log_up_to": 5,
+        "after": 1,
+        "expect": {
+          "status": 410,
+          "code": "feed_after_unavailable"
+        },
+        "request": "GET /v1/scopes/example/status?after=1"
+      },
+      {
+        "name": "after_5_at_7",
+        "note": "f2 (feed_seq 6) is skipped: f3 is the flow version's latest record",
+        "log_up_to": 7,
+        "after": 5,
+        "expect": {
+          "status": 200,
+          "feed_seq": 7,
+          "records": [
+            {
+              "feed_seq": 7,
+              "id": "f3"
+            }
+          ]
+        },
+        "request": "GET /v1/scopes/example/status?after=5"
+      },
+      {
+        "name": "full_at_7",
+        "note": "",
+        "log_up_to": 7,
+        "after": null,
+        "expect": {
+          "status": 200,
+          "feed_seq": 7,
+          "records": [
+            {
+              "feed_seq": 4,
+              "id": "s4"
+            },
+            {
+              "feed_seq": 7,
+              "id": "f3"
+            }
+          ]
+        },
+        "request": "GET /v1/scopes/example/status"
+      }
+    ],
+    "example_reply": {
+      "request": "GET /v1/scopes/example/status?after=5",
+      "status": 200,
+      "body": {
+        "schema": "ck-status-feed/v1",
+        "scope": "example",
+        "feed_seq": 7,
+        "records": [
+          {
+            "feed_seq": 7,
+            "record": {
+              "schema": "ck-status/v1",
+              "registry_key_id": "test-registry-1",
+              "name": "@example/hello-flow",
+              "version": "1.0.0",
+              "archive_sha256": "89d6bee3b0bdffaf7646d000e4d98f60181df12e4894159b7cdba5e3ed6a4639",
+              "publisher_key": "e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d",
+              "sequence": 3,
+              "state": "tombstoned",
+              "reason": "Removed by the registry: malware",
+              "compromise_from": null,
+              "published_at": "2026-10-21T09:00:00Z",
+              "changed_at": "2026-10-23T09:00:00Z"
+            },
+            "signature": "498cb24a64ff35d27103208adf29e0c6edbb857b09d40ab357a26a3b7b53b82bb783893afc48c6636d352028075b894b9d285ff2e928ce14277cc76ac6b1970e"
+          }
+        ]
+      }
+    },
+    "client_cases": [
+      {
+        "name": "first_fetch_is_full",
+        "note": "no feed_seq held for the scope yet, so the client fetches the full feed",
+        "state": {
+          "feed_seq": null,
+          "held": {}
+        },
+        "mode": "full",
+        "reply": {
+          "status": 200,
+          "feed_seq": 5,
+          "records": [
+            {
+              "id": "s4",
+              "record_text": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-17T12:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Removed by the registry: malware\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":4,\"state\":\"tombstoned\",\"version\":\"1.0.0\"}",
+              "signature": "95c2280c0b29eeb564d4763d48277238cb25d5759f630414778f424c5ef1aa3a9b724ac74adcc7d21aeb3f497f34597c0533ed90604f72560793f52fcb5b6f0a"
+            },
+            {
+              "id": "f1",
+              "record_text": "{\"archive_sha256\":\"89d6bee3b0bdffaf7646d000e4d98f60181df12e4894159b7cdba5e3ed6a4639\",\"changed_at\":\"2026-10-21T09:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-flow\",\"published_at\":\"2026-10-21T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":null,\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":1,\"state\":\"available\",\"version\":\"1.0.0\"}",
+              "signature": "839825a7698ad36a37035d2f5ee9e0bdf3d6178e0cf25965f090d1c783cba5ee6b5a751a788de4dc8c42b4aabd595c043e7c58e0697323b8b6c4ef23f3ca6306"
+            }
+          ]
+        },
+        "expect": {
+          "refusal": null,
+          "records": [
+            {
+              "id": "s4",
+              "result": {
+                "ok": true,
+                "result": "applied"
+              }
+            },
+            {
+              "id": "f1",
+              "result": {
+                "ok": true,
+                "result": "applied"
+              }
+            }
+          ],
+          "next_state": {
+            "feed_seq": 5,
+            "held": {
+              "@example/hello-skill@1.0.0": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-17T12:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Removed by the registry: malware\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":4,\"state\":\"tombstoned\",\"version\":\"1.0.0\"}",
+              "@example/hello-flow@1.0.0": "{\"archive_sha256\":\"89d6bee3b0bdffaf7646d000e4d98f60181df12e4894159b7cdba5e3ed6a4639\",\"changed_at\":\"2026-10-21T09:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-flow\",\"published_at\":\"2026-10-21T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":null,\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":1,\"state\":\"available\",\"version\":\"1.0.0\"}"
+            }
+          },
+          "next_step": "done"
+        }
+      },
+      {
+        "name": "incremental_poll",
+        "note": "?after=5 at feed_seq 7",
+        "state": {
+          "feed_seq": 5,
+          "held": {
+            "@example/hello-skill@1.0.0": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-17T12:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Removed by the registry: malware\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":4,\"state\":\"tombstoned\",\"version\":\"1.0.0\"}",
+            "@example/hello-flow@1.0.0": "{\"archive_sha256\":\"89d6bee3b0bdffaf7646d000e4d98f60181df12e4894159b7cdba5e3ed6a4639\",\"changed_at\":\"2026-10-21T09:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-flow\",\"published_at\":\"2026-10-21T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":null,\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":1,\"state\":\"available\",\"version\":\"1.0.0\"}"
+          }
+        },
+        "mode": "after",
+        "reply": {
+          "status": 200,
+          "feed_seq": 7,
+          "records": [
+            {
+              "id": "f3",
+              "record_text": "{\"archive_sha256\":\"89d6bee3b0bdffaf7646d000e4d98f60181df12e4894159b7cdba5e3ed6a4639\",\"changed_at\":\"2026-10-23T09:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-flow\",\"published_at\":\"2026-10-21T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Removed by the registry: malware\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":3,\"state\":\"tombstoned\",\"version\":\"1.0.0\"}",
+              "signature": "498cb24a64ff35d27103208adf29e0c6edbb857b09d40ab357a26a3b7b53b82bb783893afc48c6636d352028075b894b9d285ff2e928ce14277cc76ac6b1970e"
+            }
+          ]
+        },
+        "expect": {
+          "refusal": null,
+          "records": [
+            {
+              "id": "f3",
+              "result": {
+                "ok": true,
+                "result": "applied"
+              }
+            }
+          ],
+          "next_state": {
+            "feed_seq": 7,
+            "held": {
+              "@example/hello-skill@1.0.0": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-17T12:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Removed by the registry: malware\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":4,\"state\":\"tombstoned\",\"version\":\"1.0.0\"}",
+              "@example/hello-flow@1.0.0": "{\"archive_sha256\":\"89d6bee3b0bdffaf7646d000e4d98f60181df12e4894159b7cdba5e3ed6a4639\",\"changed_at\":\"2026-10-23T09:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-flow\",\"published_at\":\"2026-10-21T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Removed by the registry: malware\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":3,\"state\":\"tombstoned\",\"version\":\"1.0.0\"}"
+            }
+          },
+          "next_step": "done"
+        }
+      },
+      {
+        "name": "nothing_newer",
+        "note": "",
+        "state": {
+          "feed_seq": 7,
+          "held": {
+            "@example/hello-skill@1.0.0": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-17T12:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Removed by the registry: malware\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":4,\"state\":\"tombstoned\",\"version\":\"1.0.0\"}",
+            "@example/hello-flow@1.0.0": "{\"archive_sha256\":\"89d6bee3b0bdffaf7646d000e4d98f60181df12e4894159b7cdba5e3ed6a4639\",\"changed_at\":\"2026-10-23T09:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-flow\",\"published_at\":\"2026-10-21T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Removed by the registry: malware\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":3,\"state\":\"tombstoned\",\"version\":\"1.0.0\"}"
+          }
+        },
+        "mode": "after",
+        "reply": {
+          "status": 200,
+          "feed_seq": 7,
+          "records": []
+        },
+        "expect": {
+          "refusal": null,
+          "records": [],
+          "next_state": {
+            "feed_seq": 7,
+            "held": {
+              "@example/hello-skill@1.0.0": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-17T12:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Removed by the registry: malware\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":4,\"state\":\"tombstoned\",\"version\":\"1.0.0\"}",
+              "@example/hello-flow@1.0.0": "{\"archive_sha256\":\"89d6bee3b0bdffaf7646d000e4d98f60181df12e4894159b7cdba5e3ed6a4639\",\"changed_at\":\"2026-10-23T09:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-flow\",\"published_at\":\"2026-10-21T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Removed by the registry: malware\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":3,\"state\":\"tombstoned\",\"version\":\"1.0.0\"}"
+            }
+          },
+          "next_step": "done"
+        }
+      },
+      {
+        "name": "feed_seq_rollback_incremental",
+        "note": "a stale copy answers with feed_seq 5 after the client applied 7: refused, nothing applied, fall back to the full feed",
+        "state": {
+          "feed_seq": 7,
+          "held": {
+            "@example/hello-skill@1.0.0": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-17T12:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Removed by the registry: malware\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":4,\"state\":\"tombstoned\",\"version\":\"1.0.0\"}",
+            "@example/hello-flow@1.0.0": "{\"archive_sha256\":\"89d6bee3b0bdffaf7646d000e4d98f60181df12e4894159b7cdba5e3ed6a4639\",\"changed_at\":\"2026-10-23T09:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-flow\",\"published_at\":\"2026-10-21T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Removed by the registry: malware\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":3,\"state\":\"tombstoned\",\"version\":\"1.0.0\"}"
+          }
+        },
+        "mode": "after",
+        "reply": {
+          "status": 200,
+          "feed_seq": 5,
+          "records": [
+            {
+              "id": "f1",
+              "record_text": "{\"archive_sha256\":\"89d6bee3b0bdffaf7646d000e4d98f60181df12e4894159b7cdba5e3ed6a4639\",\"changed_at\":\"2026-10-21T09:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-flow\",\"published_at\":\"2026-10-21T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":null,\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":1,\"state\":\"available\",\"version\":\"1.0.0\"}",
+              "signature": "839825a7698ad36a37035d2f5ee9e0bdf3d6178e0cf25965f090d1c783cba5ee6b5a751a788de4dc8c42b4aabd595c043e7c58e0697323b8b6c4ef23f3ca6306"
+            }
+          ]
+        },
+        "expect": {
+          "refusal": {
+            "code": "feed_rollback",
+            "field": "feed_seq"
+          },
+          "records": [],
+          "next_state": {
+            "feed_seq": 7,
+            "held": {
+              "@example/hello-skill@1.0.0": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-17T12:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Removed by the registry: malware\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":4,\"state\":\"tombstoned\",\"version\":\"1.0.0\"}",
+              "@example/hello-flow@1.0.0": "{\"archive_sha256\":\"89d6bee3b0bdffaf7646d000e4d98f60181df12e4894159b7cdba5e3ed6a4639\",\"changed_at\":\"2026-10-23T09:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-flow\",\"published_at\":\"2026-10-21T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Removed by the registry: malware\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":3,\"state\":\"tombstoned\",\"version\":\"1.0.0\"}"
+            }
+          },
+          "next_step": "fetch_full_feed"
+        }
+      },
+      {
+        "name": "feed_seq_rollback_full",
+        "note": "the full feed itself is behind: refused and logged; the client keeps what it holds",
+        "state": {
+          "feed_seq": 7,
+          "held": {
+            "@example/hello-skill@1.0.0": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-17T12:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Removed by the registry: malware\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":4,\"state\":\"tombstoned\",\"version\":\"1.0.0\"}",
+            "@example/hello-flow@1.0.0": "{\"archive_sha256\":\"89d6bee3b0bdffaf7646d000e4d98f60181df12e4894159b7cdba5e3ed6a4639\",\"changed_at\":\"2026-10-23T09:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-flow\",\"published_at\":\"2026-10-21T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Removed by the registry: malware\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":3,\"state\":\"tombstoned\",\"version\":\"1.0.0\"}"
+          }
+        },
+        "mode": "full",
+        "reply": {
+          "status": 200,
+          "feed_seq": 5,
+          "records": [
+            {
+              "id": "s4",
+              "record_text": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-17T12:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Removed by the registry: malware\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":4,\"state\":\"tombstoned\",\"version\":\"1.0.0\"}",
+              "signature": "95c2280c0b29eeb564d4763d48277238cb25d5759f630414778f424c5ef1aa3a9b724ac74adcc7d21aeb3f497f34597c0533ed90604f72560793f52fcb5b6f0a"
+            },
+            {
+              "id": "f1",
+              "record_text": "{\"archive_sha256\":\"89d6bee3b0bdffaf7646d000e4d98f60181df12e4894159b7cdba5e3ed6a4639\",\"changed_at\":\"2026-10-21T09:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-flow\",\"published_at\":\"2026-10-21T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":null,\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":1,\"state\":\"available\",\"version\":\"1.0.0\"}",
+              "signature": "839825a7698ad36a37035d2f5ee9e0bdf3d6178e0cf25965f090d1c783cba5ee6b5a751a788de4dc8c42b4aabd595c043e7c58e0697323b8b6c4ef23f3ca6306"
+            }
+          ]
+        },
+        "expect": {
+          "refusal": {
+            "code": "feed_rollback",
+            "field": "feed_seq"
+          },
+          "records": [],
+          "next_state": {
+            "feed_seq": 7,
+            "held": {
+              "@example/hello-skill@1.0.0": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-17T12:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Removed by the registry: malware\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":4,\"state\":\"tombstoned\",\"version\":\"1.0.0\"}",
+              "@example/hello-flow@1.0.0": "{\"archive_sha256\":\"89d6bee3b0bdffaf7646d000e4d98f60181df12e4894159b7cdba5e3ed6a4639\",\"changed_at\":\"2026-10-23T09:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-flow\",\"published_at\":\"2026-10-21T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Removed by the registry: malware\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":3,\"state\":\"tombstoned\",\"version\":\"1.0.0\"}"
+            }
+          },
+          "next_step": "done"
+        }
+      },
+      {
+        "name": "record_rollback",
+        "note": "a reply whose feed_seq is newer but which carries a lower status sequence than the one applied (s2 after s3)",
+        "state": {
+          "feed_seq": 3,
+          "held": {
+            "@example/hello-skill@1.0.0": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-16T08:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Withdrawal reversed by the publisher\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":3,\"state\":\"available\",\"version\":\"1.0.0\"}"
+          }
+        },
+        "mode": "after",
+        "reply": {
+          "status": 200,
+          "feed_seq": 6,
+          "records": [
+            {
+              "id": "s2",
+              "record_text": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-15T10:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Withdrawn by the publisher: the script prints the wrong greeting\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":2,\"state\":\"withdrawn\",\"version\":\"1.0.0\"}",
+              "signature": "72e0dbfcb461dae02466f3ae3482ee558a136d47e1e2d9404ba2d3df9ddf931025e5881788ec2a6c4b2a40e23892e2543ebdd351b9c93a981e8b45855453f904"
+            }
+          ]
+        },
+        "expect": {
+          "refusal": {
+            "code": "feed_rollback",
+            "field": "record"
+          },
+          "records": [
+            {
+              "id": "s2",
+              "result": {
+                "ok": false,
+                "code": "feed_rollback",
+                "reason": "lower_sequence"
+              }
+            }
+          ],
+          "next_state": {
+            "feed_seq": 3,
+            "held": {
+              "@example/hello-skill@1.0.0": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-16T08:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Withdrawal reversed by the publisher\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":3,\"state\":\"available\",\"version\":\"1.0.0\"}"
+            }
+          },
+          "next_step": "fetch_full_feed"
+        }
+      },
+      {
+        "name": "same_sequence_other_bytes",
+        "note": "s2b has s2's sequence with other bytes: an equivocating registry or a forged copy",
+        "state": {
+          "feed_seq": 2,
+          "held": {
+            "@example/hello-skill@1.0.0": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-15T10:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Withdrawn by the publisher: the script prints the wrong greeting\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":2,\"state\":\"withdrawn\",\"version\":\"1.0.0\"}"
+          }
+        },
+        "mode": "after",
+        "reply": {
+          "status": 200,
+          "feed_seq": 4,
+          "records": [
+            {
+              "id": "s2b",
+              "record_text": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-15T10:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":null,\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":2,\"state\":\"available\",\"version\":\"1.0.0\"}",
+              "signature": "e20fa1d0f40b3f974857060ac4760b82dc67cb7847766d860ff5c6441e409a590f873e23cce1cca3082b1bc0a4ccd3d3ef89478fff408873a6002dae9c243208"
+            }
+          ]
+        },
+        "expect": {
+          "refusal": {
+            "code": "feed_rollback",
+            "field": "record"
+          },
+          "records": [
+            {
+              "id": "s2b",
+              "result": {
+                "ok": false,
+                "code": "feed_rollback",
+                "reason": "same_sequence_other_bytes"
+              }
+            }
+          ],
+          "next_state": {
+            "feed_seq": 2,
+            "held": {
+              "@example/hello-skill@1.0.0": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-15T10:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Withdrawn by the publisher: the script prints the wrong greeting\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":2,\"state\":\"withdrawn\",\"version\":\"1.0.0\"}"
+            }
+          },
+          "next_step": "fetch_full_feed"
+        }
+      },
+      {
+        "name": "after_unavailable",
+        "note": "410 feed_after_unavailable: fall back to the full feed",
+        "state": {
+          "feed_seq": 1,
+          "held": {
+            "@example/hello-skill@1.0.0": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-14T09:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":null,\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":1,\"state\":\"available\",\"version\":\"1.0.0\"}"
+          }
+        },
+        "mode": "after",
+        "reply": {
+          "status": 410,
+          "code": "feed_after_unavailable"
+        },
+        "expect": {
+          "refusal": {
+            "code": "feed_after_unavailable"
+          },
+          "records": [],
+          "next_state": {
+            "feed_seq": 1,
+            "held": {
+              "@example/hello-skill@1.0.0": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-14T09:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":null,\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":1,\"state\":\"available\",\"version\":\"1.0.0\"}"
+            }
+          },
+          "next_step": "fetch_full_feed"
+        }
+      },
+      {
+        "name": "full_feed_fallback",
+        "note": "the fallback fetch: applied through the same monotonic checks",
+        "state": {
+          "feed_seq": 1,
+          "held": {
+            "@example/hello-skill@1.0.0": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-14T09:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":null,\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":1,\"state\":\"available\",\"version\":\"1.0.0\"}"
+          }
+        },
+        "mode": "full",
+        "reply": {
+          "status": 200,
+          "feed_seq": 5,
+          "records": [
+            {
+              "id": "s4",
+              "record_text": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-17T12:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Removed by the registry: malware\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":4,\"state\":\"tombstoned\",\"version\":\"1.0.0\"}",
+              "signature": "95c2280c0b29eeb564d4763d48277238cb25d5759f630414778f424c5ef1aa3a9b724ac74adcc7d21aeb3f497f34597c0533ed90604f72560793f52fcb5b6f0a"
+            },
+            {
+              "id": "f1",
+              "record_text": "{\"archive_sha256\":\"89d6bee3b0bdffaf7646d000e4d98f60181df12e4894159b7cdba5e3ed6a4639\",\"changed_at\":\"2026-10-21T09:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-flow\",\"published_at\":\"2026-10-21T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":null,\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":1,\"state\":\"available\",\"version\":\"1.0.0\"}",
+              "signature": "839825a7698ad36a37035d2f5ee9e0bdf3d6178e0cf25965f090d1c783cba5ee6b5a751a788de4dc8c42b4aabd595c043e7c58e0697323b8b6c4ef23f3ca6306"
+            }
+          ]
+        },
+        "expect": {
+          "refusal": null,
+          "records": [
+            {
+              "id": "s4",
+              "result": {
+                "ok": true,
+                "result": "applied"
+              }
+            },
+            {
+              "id": "f1",
+              "result": {
+                "ok": true,
+                "result": "applied"
+              }
+            }
+          ],
+          "next_state": {
+            "feed_seq": 5,
+            "held": {
+              "@example/hello-skill@1.0.0": "{\"archive_sha256\":\"e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398\",\"changed_at\":\"2026-10-17T12:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-skill\",\"published_at\":\"2026-10-14T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":\"Removed by the registry: malware\",\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":4,\"state\":\"tombstoned\",\"version\":\"1.0.0\"}",
+              "@example/hello-flow@1.0.0": "{\"archive_sha256\":\"89d6bee3b0bdffaf7646d000e4d98f60181df12e4894159b7cdba5e3ed6a4639\",\"changed_at\":\"2026-10-21T09:00:00Z\",\"compromise_from\":null,\"name\":\"@example/hello-flow\",\"published_at\":\"2026-10-21T09:00:00Z\",\"publisher_key\":\"e59aba440dbdcfead40e3951057f266b2319ba945125a5d551c369b8daa2423d\",\"reason\":null,\"registry_key_id\":\"test-registry-1\",\"schema\":\"ck-status/v1\",\"sequence\":1,\"state\":\"available\",\"version\":\"1.0.0\"}"
+            }
+          },
+          "next_step": "done"
+        }
+      }
+    ]
+  },
+  "revocation_time": [
+    {
+      "compromise_from": "2026-10-20T00:00:00Z",
+      "published_at": "2026-10-19T23:59:59Z",
+      "blocked": false
+    },
+    {
+      "compromise_from": "2026-10-20T00:00:00Z",
+      "published_at": "2026-10-20T00:00:00Z",
+      "blocked": true
+    },
+    {
+      "compromise_from": "2026-10-20T00:00:00Z",
+      "published_at": "2026-10-21T09:00:00Z",
+      "blocked": true
+    }
+  ],
+  "effects": [
+    {
+      "kind": "persona",
+      "state": "available",
+      "user_notice": "none",
+      "resolution": "eligible",
+      "exact_fetch": "allowed",
+      "activation": "allowed",
+      "running": "continues",
+      "core_flow_revocation": false,
+      "scripts_may_start": null
+    },
+    {
+      "kind": "persona",
+      "state": "withdrawn",
+      "user_notice": "notice",
+      "resolution": "skipped",
+      "exact_fetch": "allowed",
+      "activation": "allowed",
+      "running": "continues",
+      "core_flow_revocation": false,
+      "scripts_may_start": null
+    },
+    {
+      "kind": "persona",
+      "state": "tombstoned",
+      "user_notice": "blocking",
+      "resolution": "skipped",
+      "exact_fetch": "gone",
+      "activation": "blocked",
+      "running": "sessions_get_blocking_notice",
+      "core_flow_revocation": false,
+      "scripts_may_start": null
+    },
+    {
+      "kind": "persona",
+      "state": "revoked",
+      "user_notice": "blocking",
+      "resolution": "skipped",
+      "exact_fetch": "allowed",
+      "activation": "blocked",
+      "running": "sessions_get_blocking_notice",
+      "core_flow_revocation": false,
+      "scripts_may_start": null
+    },
+    {
+      "kind": "skill",
+      "state": "available",
+      "user_notice": "none",
+      "resolution": "eligible",
+      "exact_fetch": "allowed",
+      "activation": "allowed",
+      "running": "continues",
+      "core_flow_revocation": false,
+      "scripts_may_start": true
+    },
+    {
+      "kind": "skill",
+      "state": "withdrawn",
+      "user_notice": "notice",
+      "resolution": "skipped",
+      "exact_fetch": "allowed",
+      "activation": "allowed",
+      "running": "continues",
+      "core_flow_revocation": false,
+      "scripts_may_start": true
+    },
+    {
+      "kind": "skill",
+      "state": "tombstoned",
+      "user_notice": "blocking",
+      "resolution": "skipped",
+      "exact_fetch": "gone",
+      "activation": "blocked",
+      "running": "sessions_get_blocking_notice",
+      "core_flow_revocation": false,
+      "scripts_may_start": false
+    },
+    {
+      "kind": "skill",
+      "state": "revoked",
+      "user_notice": "blocking",
+      "resolution": "skipped",
+      "exact_fetch": "allowed",
+      "activation": "blocked",
+      "running": "sessions_get_blocking_notice",
+      "core_flow_revocation": false,
+      "scripts_may_start": false
+    },
+    {
+      "kind": "flow",
+      "state": "available",
+      "user_notice": "none",
+      "resolution": "eligible",
+      "exact_fetch": "allowed",
+      "activation": "allowed",
+      "running": "continues",
+      "core_flow_revocation": false,
+      "scripts_may_start": null
+    },
+    {
+      "kind": "flow",
+      "state": "withdrawn",
+      "user_notice": "notice",
+      "resolution": "skipped",
+      "exact_fetch": "allowed",
+      "activation": "allowed",
+      "running": "continues",
+      "core_flow_revocation": false,
+      "scripts_may_start": null
+    },
+    {
+      "kind": "flow",
+      "state": "tombstoned",
+      "user_notice": "blocking",
+      "resolution": "skipped",
+      "exact_fetch": "gone",
+      "activation": "blocked",
+      "running": "runs_stop_at_next_activation",
+      "core_flow_revocation": true,
+      "scripts_may_start": null
+    },
+    {
+      "kind": "flow",
+      "state": "revoked",
+      "user_notice": "blocking",
+      "resolution": "skipped",
+      "exact_fetch": "allowed",
+      "activation": "blocked",
+      "running": "runs_stop_at_next_activation",
+      "core_flow_revocation": true,
+      "scripts_may_start": null
+    },
+    {
+      "kind": "memory-profile",
+      "state": "available",
+      "user_notice": "none",
+      "resolution": "eligible",
+      "exact_fetch": "allowed",
+      "activation": "allowed",
+      "running": "continues",
+      "core_flow_revocation": false,
+      "scripts_may_start": null
+    },
+    {
+      "kind": "memory-profile",
+      "state": "withdrawn",
+      "user_notice": "notice",
+      "resolution": "skipped",
+      "exact_fetch": "allowed",
+      "activation": "allowed",
+      "running": "continues",
+      "core_flow_revocation": false,
+      "scripts_may_start": null
+    },
+    {
+      "kind": "memory-profile",
+      "state": "tombstoned",
+      "user_notice": "blocking",
+      "resolution": "skipped",
+      "exact_fetch": "gone",
+      "activation": "blocked",
+      "running": "sessions_get_blocking_notice",
+      "core_flow_revocation": false,
+      "scripts_may_start": null
+    },
+    {
+      "kind": "memory-profile",
+      "state": "revoked",
+      "user_notice": "blocking",
+      "resolution": "skipped",
+      "exact_fetch": "allowed",
+      "activation": "blocked",
+      "running": "sessions_get_blocking_notice",
+      "core_flow_revocation": false,
+      "scripts_may_start": null
+    }
+  ]
+}
