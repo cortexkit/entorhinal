@@ -8809,4 +8809,4 @@ runner = "cargo"
 package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
-expect_red = ["cli::tests::attach_cli_refuses_malformed_flags_and_maps_log_commands"]
+expect_red = ["cli::tests::log_enable_cli_request_enables_through_operator_route"]
