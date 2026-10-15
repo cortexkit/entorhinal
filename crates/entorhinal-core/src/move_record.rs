@@ -379,6 +379,20 @@ pub fn bounded_detail(detail: &Value) -> Value {
     if detail.get("module_id").and_then(Value::as_str).is_some() {
         summary["module_id"] = summary_string(detail.get("module_id"));
     }
+    if matches!(
+        detail.get("state").and_then(Value::as_str),
+        Some("unknown" | "advanced")
+    ) {
+        // The validated reason fits in the summary even when the ref is unusually long.
+        for key in ["ref", "state"] {
+            if detail.get(key).and_then(Value::as_str).is_some() {
+                summary[key] = summary_string(detail.get(key));
+            }
+        }
+        if detail.get("reason").and_then(Value::as_str).is_some() {
+            summary["reason"] = detail["reason"].clone();
+        }
+    }
     summary
 }
 
@@ -927,6 +941,18 @@ mod tests {
             bounded_detail(&json!("x".repeat(2048))),
             json!({"truncated":true,"op":null,"code":null})
         );
+        let reason = "x".repeat(256);
+        let diverged = json!({
+            "module_id":"alpha",
+            "ref":"r".repeat(4096),
+            "state":"unknown",
+            "reason":reason,
+        });
+        let summary = bounded_detail(&diverged);
+        assert_eq!(summary["reason"], reason);
+        assert_eq!(summary["state"], "unknown");
+        assert!(summary["ref"].as_str().unwrap().len() <= 512);
+        assert!(serde_json::to_vec(&summary).unwrap().len() <= DETAIL_CAP);
     }
 
     #[test]
