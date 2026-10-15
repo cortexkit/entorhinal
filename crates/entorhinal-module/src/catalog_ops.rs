@@ -287,13 +287,13 @@ impl ProjectsHandler {
                 && entry.capabilities.as_ref().is_some_and(|c| {
                     c.provides
                         .iter()
-                        .any(|name| name == "ck-catalog-consumer/v1")
+                        .any(|name| crate::catalog_consumer::parse_kind(name).is_some())
                 })
         });
         if !admitted {
             return Err(HandlerError::new(
                 "catalog_consumer_required",
-                "module does not declare ck-catalog-consumer/v1",
+                "module does not declare a catalog consumer kind capability",
             ));
         }
         let p: ReadBlob = parse(params)?;

@@ -2384,6 +2384,7 @@ mod tests {
 
 #[derive(Clone)]
 enum Write {
+    CatalogInstall(String, Box<entorhinal_core::agent::consent::ConsentCommit>),
     Consent(
         entorhinal_core::agent::consent::ConsentWrite,
         Box<entorhinal_core::agent::consent::ConsentCommit>,
@@ -2427,7 +2428,7 @@ impl Write {
         principal: &str,
     ) -> Result<Option<Vec<u8>>, HandlerError> {
         let key = match self {
-            Self::Consent(_, commit) => {
+            Self::Consent(_, commit) | Self::CatalogInstall(_, commit) => {
                 let row = store.consent_request(&commit.request.identity)?;
                 if let Some(row) = row {
                     if row.args_digest != commit.request.args_digest {
@@ -2474,6 +2475,12 @@ impl Write {
             .with_principal(principal)
             .with_confirmation(placement_confirmation(principal, approval));
         match self {
+            Self::CatalogInstall(id, commit) => {
+                return writer
+                    .with_consent_commit(*commit)
+                    .catalog_install(&id, now)
+                    .map_err(storage_error)
+            }
             Self::Consent(plan, commit) => {
                 return writer
                     .with_consent_commit(*commit)
@@ -2596,6 +2603,24 @@ fn bootstrap_fence(
 }
 
 impl ProjectsHandler {
+    pub(super) async fn catalog_install_write_wait(
+        &self,
+        id: String,
+        commit: entorhinal_core::agent::consent::ConsentCommit,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, HandlerError> {
+        self.write_wait_inner(
+            WireRequest {
+                method: "catalog.pin".into(),
+                params: Value::Null,
+            },
+            (0, 0),
+            Instant::now(),
+            Some(Write::CatalogInstall(id, Box::new(commit))),
+            Some(deadline),
+        )
+        .await
+    }
     // Append approved pin changes to the shared identity log and commit their
     // projection together. This is not a public RPC: catalog tools must first
     // check caller identity, ownership and approval before invoking it.

@@ -20,11 +20,11 @@ const TOOL_NAMES: &[&str] = &[
     "agents_list_hires",
 ];
 
-pub(super) struct Fixture {
-    pub(super) root: PathBuf,
-    pub(super) descriptor: crate::StorageDescriptor,
-    pub(super) handler: ProjectsHandler,
-    pub(super) agents: Vec<String>,
+pub(crate) struct Fixture {
+    pub(crate) root: PathBuf,
+    pub(crate) descriptor: crate::StorageDescriptor,
+    pub(crate) handler: ProjectsHandler,
+    pub(crate) agents: Vec<String>,
 }
 
 struct RejectConsent;
@@ -56,7 +56,7 @@ impl Fixture {
         };
         self.refusal(tool, args, expected).await;
     }
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let (root, descriptor) = scratch_descriptor("agent-tool-provider");
         // Tests register directories under this root, and registration refuses
         // a non-canonical path; macOS temp folders resolve through /private.
@@ -108,7 +108,7 @@ impl Fixture {
         }
     }
 
-    pub(super) fn stamp(&self, role: usize) -> ScopeStamp {
+    pub(crate) fn stamp(&self, role: usize) -> ScopeStamp {
         serde_json::from_value(json!({
             "owner":{"kind":"reserved", "module_id":"prefrontal"},
             "ref":format!("head:{}", self.agents[role]), "scope_epoch":7,
@@ -117,14 +117,14 @@ impl Fixture {
         .unwrap()
     }
 
-    pub(super) fn admit(&self, stamp: Option<&ScopeStamp>) {
+    pub(crate) fn admit(&self, stamp: Option<&ScopeStamp>) {
         self.handler.route_admissions().insert(
             ROUTE,
             RouteAdmission::from_bind(Some(reserved("prefrontal")), stamp),
         );
     }
 
-    pub(super) fn counts(&self) -> Vec<i64> {
+    pub(crate) fn counts(&self) -> Vec<i64> {
         let connection = rusqlite::Connection::open_with_flags(
             self.root.join("store.db"),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -148,7 +148,7 @@ impl Fixture {
         .collect()
     }
 
-    pub(super) async fn call(&self, name: &str, arguments: Value) -> HandlerOutcome {
+    pub(crate) async fn call(&self, name: &str, arguments: Value) -> HandlerOutcome {
         self.handler
             .handle_served_request(
                 &serde_json::to_vec(&json!({"name":name, "arguments":arguments})).unwrap(),
@@ -190,7 +190,7 @@ fn arguments(name: &str) -> Value {
     }
 }
 
-pub(super) fn error_code(outcome: HandlerOutcome) -> String {
+pub(crate) fn error_code(outcome: HandlerOutcome) -> String {
     match outcome {
         HandlerOutcome::Error { code, .. } | HandlerOutcome::ErrorWithDetail { code, .. } => code,
         HandlerOutcome::Response(body) => {
@@ -200,7 +200,7 @@ pub(super) fn error_code(outcome: HandlerOutcome) -> String {
     }
 }
 
-pub(super) fn result(outcome: HandlerOutcome) -> Value {
+pub(crate) fn result(outcome: HandlerOutcome) -> Value {
     match outcome {
         HandlerOutcome::Response(body) => {
             serde_json::from_slice::<Value>(&body).unwrap()["result"].clone()
@@ -632,6 +632,15 @@ async fn provider_discovery_catalog_and_hello_agree_on_exact_tool_table() {
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>(),
         TOOL_NAMES
+            .iter()
+            .copied()
+            .chain([
+                "catalog_prepare",
+                "catalog_plan",
+                "catalog_install",
+                "catalog_generation"
+            ])
+            .collect::<Vec<_>>()
     );
     assert!(catalog.capabilities.is_empty());
     let expected_fields = [
@@ -640,6 +649,10 @@ async fn provider_discovery_catalog_and_hello_agree_on_exact_tool_table() {
         vec!["project_id", "name", "tag"],
         vec!["name", "tag"],
         vec!["agent_id"],
+        vec![],
+        vec!["spec"],
+        vec!["plan_id"],
+        vec!["plan_id"],
         vec![],
     ];
     let hello = crate::manifest();
@@ -654,20 +667,23 @@ async fn provider_discovery_catalog_and_hello_agree_on_exact_tool_table() {
             }
         })
         .unwrap();
-    assert_eq!(hello_tools.len(), 6);
+    assert_eq!(hello_tools.len(), 10);
     for (index, (tool, fields)) in catalog.tools.iter().zip(expected_fields).enumerate() {
         let mut properties: Map<String, Value> = fields
             .iter()
             .map(|field| ((*field).into(), json!({"type":"string"})))
             .collect();
         let mut required = fields;
+        if index == 6 {
+            properties.insert("spec".into(),json!({"type":"object","properties":{"operation":{"type":"string","enum":["install","upgrade"]},"target":{"type":"object","properties":{"agent_id":{"type":"string"}},"required":["agent_id"],"additionalProperties":false},"package":{"type":"string"},"range":{"type":"string"}},"required":["operation","target","package","range"],"additionalProperties":false}));
+        }
         if index == 3 {
             properties.insert(
                 "labels".into(),
                 json!({"type":"array", "items":{"type":"string"}}),
             );
         }
-        if index < 5 {
+        if index < 5 || index == 6 {
             required.push("request_key");
             properties.insert("request_key".into(), json!({"type":"string", "minLength":1, "maxLength":128, "pattern":"^[ -~]+$", "not":{"pattern":"[^ -~]"},
                 "description":"A caller-chosen key for this write. Reuse it only with the same arguments."}));
@@ -692,7 +708,7 @@ async fn provider_discovery_catalog_and_hello_agree_on_exact_tool_table() {
         assert_eq!(hello_tools[index].schema, tool.input_schema);
         assert_eq!(
             hello_tools[index].execution_mode,
-            if index < 5 {
+            if index < 5 || index == 6 || index == 8 {
                 ExecutionMode::Mutating
             } else {
                 ExecutionMode::Pure

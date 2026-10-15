@@ -79,7 +79,7 @@ fn setup(
                     name: v.record.name.clone(),
                     version: v.record.version.clone(),
                     archive_sha256: v.record.archive_sha256.clone(),
-                    publisher_key: v.record.public_key.clone(),
+                    publisher_key: key_fingerprint(&v.record.public_key).unwrap(),
                     sequence: 1,
                     state: State::Available,
                     reason: None,

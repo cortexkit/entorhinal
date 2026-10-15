@@ -96,6 +96,7 @@ pub(super) fn render_card(
         "projects_register" => "register project",
         "agents_create_head" => "create project head",
         "agents_hire" => "hire agent",
+        "catalog_install" => "install catalog packages",
         _ => {
             return Err(domain_error(
                 "invalid_request",
@@ -112,9 +113,19 @@ pub(super) fn render_card(
         };
         options.push(json!({"id":choice, "label":label, "effect":"grant"}));
     }
+    if row.identity.tool == "catalog_install"
+        && context.target_scope["operation"] == "install"
+        && context.target_scope["target"]["prepared"]["packages"]
+            .as_array()
+            .is_some_and(|packages| {
+                !packages.is_empty() && packages.iter().all(|p| p["root_certified"] == false)
+            })
+    {
+        options.push(json!({"id":"approve_always_publisher","label":"Always allow installs from these publishers for this agent","effect":"grant"}));
+    }
     options.push(json!({"id":"deny", "label":"Deny", "effect":"decline"}));
     let key = external_key(&row.identity);
-    Ok(json!({
+    let mut card = json!({
         "kind":"consent",
         "title":format!("{}: {} {}", context.caller_label, action, context.target_label),
         "prompt":format!("{} requests permission to {} {}.", context.caller_label, action, context.target_label),
@@ -123,7 +134,52 @@ pub(super) fn render_card(
         "material_damage":false, "late_execution":"notify_only", "expires_in_ms":CARD_LIFETIME_MS,
         "scope":{"action":row.identity.tool, "target":context.target_scope},
         "dedup_key":key, "requester_ref":key, "binding":Binding::for_request(row),
-    }))
+    });
+    if row.identity.tool == "catalog_install" {
+        let checks: Vec<entorhinal_core::catalog_agent::ConsumerCheck> =
+            serde_json::from_value(context.target_scope["target"]["prepared"]["checks"].clone())
+                .map_err(|_| {
+                    domain_error("consumer_contract_violation", "missing human card sections")
+                })?;
+        card["facts"] = catalog_facts(&checks)?;
+        check_catalog_card_size(&card)?;
+    }
+    Ok(card)
+}
+
+pub(super) const CATALOG_CARD_MAX_BYTES: usize = 1_310_720;
+pub(super) fn check_catalog_card_size(card: &Value) -> Result<(), AgentMutationError> {
+    // Cingulate's generic decoder (crates/cingulate-decode/src/lib.rs) requires
+    // nonblank facts but has no per-field limits. ck-cingulate/src/lib.rs:647
+    // limits the entire method/params envelope to 1,310,720 bytes.
+    let bytes = crate::consent_client::request_bytes("consent.request", card)
+        .map_err(|_| domain_error("card_too_large", "card cannot be encoded"))?;
+    if bytes.len() > CATALOG_CARD_MAX_BYTES {
+        return Err(domain_error(
+            "card_too_large",
+            "composite consent request exceeds Cingulate's envelope limit",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn catalog_facts(
+    checks: &[entorhinal_core::catalog_agent::ConsumerCheck],
+) -> Result<Value, AgentMutationError> {
+    if checks.iter().any(|c| c.card_section.trim().is_empty()) {
+        return Err(domain_error(
+            "consumer_contract_violation",
+            "consumer section must be nonblank",
+        ));
+    }
+    let mut checks: Vec<_> = checks.iter().collect();
+    checks.sort_by(|a, b| a.module_id.cmp(&b.module_id));
+    let facts:Vec<_> = checks.into_iter().map(|check| {
+        let mut kinds:Vec<_> = check.kinds.iter().map(|k|match k { entorhinal_catalog::Kind::Skill => "Skills",entorhinal_catalog::Kind::Persona => "Personas",entorhinal_catalog::Kind::Flow => "Flows",entorhinal_catalog::Kind::MemoryProfile => "Memory profiles" }).collect();
+        kinds.sort_unstable(); kinds.dedup();
+        json!({"label":format!("{} ({})",kinds.join(", "),check.module_id),"value":check.card_section})
+    }).collect();
+    Ok(json!(facts))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -260,7 +316,12 @@ fn recorded_decision(row: &ConsentRequest, now: i64) -> Option<ConsentDecision> 
     }
     Some(match (answer.state.as_str(), answer.choice.as_deref()) {
         ("answered", Some("approve_once")) => ConsentDecision::Approved(answer.clone()),
-        ("answered", Some("approve_always_workspace" | "approve_always_project")) => {
+        (
+            "answered",
+            Some(
+                "approve_always_workspace" | "approve_always_project" | "approve_always_publisher",
+            ),
+        ) => {
             // The executor checks the approval against the saved action's grant
             // class and project or workspace scope. A mismatch commits a terminal
             // refusal instead of a write or a broader standing permission.

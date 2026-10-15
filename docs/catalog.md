@@ -4,9 +4,10 @@
 `ck-agents`. Placement must provide the `ck-catalog` link to expose `ck catalog`.
 The module configures registry trust, verifies packages, walks successor chains,
 ingests status feeds, and holds local publisher grants. The core store also holds
-shared agent pins and local plans/generations. Agent tools, approval cards,
-consumer activation calls, generation RPCs and automatic polling are not exposed
-yet; the store APIs do not by themselves install a skill in a consumer.
+shared agent pins and local plans/generations. Agent tools prepare verified skill
+closures, obtain user consent and stage generations for consumer prefetch and
+core's activation acknowledgement. Automatic background polling, move integration,
+publishing and non-skill installation are not exposed yet.
 
 ```
 ck catalog registry add https://registry.example --scope @example --key-id status-1 --public-key <64-lowercase-hex>
@@ -153,7 +154,9 @@ package data is written to SQLite or to the identity journal.
 
 `catalog.read_blob {sha256, offset, length}` is asynchronous and requires a
 `reserved:<module>` caller whose current daemon catalog entry declares the exact
-`ck-catalog-consumer/v1` capability in `provides`. It rechecks the daemon catalog
+one of `ck-catalog-consumer-skill/v1`, `ck-catalog-consumer-persona/v1`,
+`ck-catalog-consumer-flow/v1`, or `ck-catalog-consumer-memory-profile/v1` in
+`provides`. There is no generic consumer capability. It rechecks the daemon catalog
 on every call rather than caching a possibly stale admission. `length` must be
 1..=1,048,576, the range cannot overflow, and offset must not exceed the total
 length. The response is `{bytes: <standard-base64>, offset, total}`. Reads clip at
@@ -307,8 +310,11 @@ creates one approved generation; installed is reserved for consumer bookkeeping.
 Readiness, activation and degradation are separate store transactions. Approval
 checks the base pin digest and held closure status snapshot (`plan_stale`); changes
 outside the closure do not stale it. Revoked/tombstoned closure members block
-activation. These functions do not call consumers or write shared pins themselves;
-the later approval coordinator must use the shared pin-write path.
+activation. The agent approval coordinator uses the shared pin writer in the same
+transaction as the local generation, consent receipt and optional publisher grant.
+When sharing is enabled, all these writes wait for the identity-log append to be
+confirmed; a refusal rolls them all back. Journal authorization evidence is checked
+on replay, not interpreted as fresh authority on another machine.
 
 Every applied transition records its original result and argument digest locally.
 Repeats return that result, even after a later transition; reuse with different
@@ -317,8 +323,122 @@ active generation per agent. Activation supersedes the previous active (includin
 a degraded former active) and activates the ready replacement in one transaction.
 The old row and closure remain available while consumers finish switching away
 from the old packages. **Superseded is local bookkeeping,
-never a catalog wire state**; the future generation read exposes only the contract's
+never a catalog wire state**; generation reads expose only the contract's
 installed/approved/ready/active/degraded states.
+
+## Agent tools and consumer protocol
+
+These tools are on `tool-provider/v1`, not management aliases. Every agent role
+may install only for its own daemon-stamped identity. Worker scopes, flow scopes,
+unowned scopes, nondelegating runs, terminal agents and claims held elsewhere are
+refused by the existing agent-tool admission rules. Caller/role arguments grant
+no authority.
+
+- `catalog_prepare {spec, request_key}` accepts
+  `spec: {operation: "install" | "upgrade", target: {agent_id}, package, range}`.
+  The target must equal the stamped caller; hire and tier installs refuse
+  `operation_not_yet_supported`. Invalid names and ranges fail before a job starts.
+  The result is `{plan_id, state:"pending"}` without waiting for any network work.
+  The same agent/request key and spec return the same plan; another spec is
+  `request_key_conflict`. Repeating a pending prepare after restart resumes it.
+- The background job refreshes every involved scope's authenticated status feed,
+  enumerates bounded candidates, verifies records/manifests/archives through
+  `verify_version`, publishes verified archives to the blob store, and runs the
+  pure local resolver. It never holds a store write lock across network requests.
+  There are at most 256 package names and 1024 verified candidate versions per job.
+- `catalog_plan {plan_id}` returns pending, failed with a named refusal, or ready
+  with the exact closure, publisher trust, moves, consumer checks and composite card.
+  Migration 12 stores the verified metadata, capability ceilings, moves and checked
+  consumer sections in machine-local `catalog_prepared`, outside replay/export.
+- `catalog_install {plan_id}` accepts only ready plans; otherwise it
+  refuses `plan_not_ready` or `plan_failed`. Idempotence is **per plan_id**; no
+  additional request key is accepted. Approval binds exact closure digests,
+  the base pin digest and the consumer text. Both base pins and held closure status
+  are revalidated inside the shared writer transaction (`plan_stale`).
+- `catalog_generation {}` reads the caller's current and pending local generations.
+  It never exposes the old `superseded` bookkeeping rows.
+
+Consumer discovery reads the daemon's supervisor list and catalog, then opens the
+enabled, ready modules' `catalog-consumer` internal service. Each of the four kind
+capabilities above declares exactly that kind; no marker means no ownership of
+that kind. All declaring consumers of a needed kind must participate. Missing,
+unready or unroutable consumers refuse `consumer_unavailable` with the module named
+(skills require prefrontal-core when no skill consumer is declared).
+
+Alongside each kind capability, a consumer must declare this exact provider role
+in its manifest's `provides` list:
+
+```json
+{"role":"internal_service","service_id":"catalog-consumer","transport":"bulk","agent_facing":false,"operations":["catalog_consumer.check","catalog_consumer.prefetch"]}
+```
+
+The service id has no identifier grammar and is compared by exact bytes. Entorhinal
+uses one `catalog_consumer::SERVICE` constant for routing and fake consumer roles.
+A kind capability without the role cannot open a route: preparation fails, or an
+approved generation stays held, with `consumer_unavailable`, the module id and
+the daemon's original route refusal code/detail. Missing roles never imply success.
+
+- `catalog_consumer.check {plan_id, packages}` receives only that consumer's kinds,
+  with exact pin identities, publisher fingerprint/trust and verified capabilities.
+  It returns `{ok:true, card_section:"human text"}` or
+  `{ok:false, refusals:[{package, version, code, message}]}`. A non-string or blank
+  section is `consumer_contract_violation`, naming the module. Consumers read bytes
+  through `catalog.read_blob` and independently verify them.
+- `catalog_consumer.prefetch {generation_id, packages}` returns `{ready:true}` only
+  after durable caching and verification. Every checked consumer must still be
+  present with its checked kinds, and every current covering consumer must report
+  ready. Otherwise the generation stays approved with a named error; retrying the
+  install retries prefetch without another card or pin write.
+
+The composite card uses Cingulate's existing generic-consent facts, sorted by
+module id, with human labels such as `Skills (prefrontal-core)` and exactly the
+consumer's section text. The exact `consent.request` method/params envelope is
+bounded to 1,310,720 bytes at prepare and again before requesting consent. An
+oversized card fails `card_too_large`, naming its consumers; nothing is truncated.
+No separate fact-count or field-length ceilings are invented.
+
+Options are `approve_once`, `approve_always_publisher` and `deny`. Always-publisher
+is offered only for installs, never for a closure containing root-certified
+`@cortexkit` packages. It records one install-only, self-placement grant per
+publisher, with that publisher's union of verified capability tokens as the ceiling.
+Coverage is evaluated by the shared `coverage()` function, including mandatory
+approval for scripts, and rechecked before commit. Fully covered closures install
+without a card. Consent settlements are recorded before acknowledgement using the
+existing consent coordinator; terminal retries replay the committed outcome once.
+
+### Local capability declarations
+
+`LocalCapabilities` supplies the resolver's local `cap/<area>[.<verb>]@<major>`
+tokens and remains injectable for tests. The production source reads the daemon
+catalog and unions the declarations of **ready** modules. Names beginning `cap-`
+pass through the pure crate's `manifest_to_capability` adapter: `cap-code-read/v1`
+becomes `cap/code.read@1`, and `cap-shell/v1` becomes `cap/shell@1`. Malformed names
+are ignored and logged once per distinct name, never accepted as tokens. Missing
+capabilities still fail the resolver's normal eligibility path, naming the package
+and token. No new consumer operation or ad hoc spelling conversion is introduced.
+
+### Core activation operations
+
+`catalog.agent_generation {agent_id}` and
+`catalog.ack_activation {agent_id, generation_id}` admit only
+`reserved:prefrontal-core`, never Direct or a flow-scoped route. The read returns
+`{active, ready}` with closure digests and `pin_digest`; ready includes only newer
+generations. Acknowledgement is idempotent and refuses a generation that is not
+ready or whose held status blocks activation. Both operations use local state
+only: no registry, daemon discovery or consumer request runs on this path. Core
+retains its last active generation when Entorhinal is unavailable at session start.
+
+### Integration decisions
+
+The agent-targeted prepare shape resolves the placement-tier ambiguity for this
+skill-only implementation; the consumer kind capabilities follow the daemon's
+actual grammar rather than the earlier proposed slash-separated markers. Check and
+prefetch share one consumer interface, human sections use existing Cingulate fields,
+and activation uses the existing reserved-core admission identity. Existing
+resolver rules remain authoritative: re-resolved subjects choose the highest
+eligible version, unrelated pins remain fixed, replacing a root replaces its range,
+and status changes stale a ready plan. Moves, workspace tiers, hire and additional
+package kinds remain separate work.
 
 ## Multi-root resolver adapter
 

@@ -9,7 +9,7 @@ use entorhinal_core::agent::{consent::ConsentWrite, AgentMutationError};
 use entorhinal_core::RegistryStore;
 use tokio::time::Instant;
 
-fn pending(id: Option<String>) -> HandlerError {
+pub(crate) fn pending(id: Option<String>) -> HandlerError {
     HandlerError {
         code: "consent_pending".into(),
         message: "consent has not settled; retry with the same request key".into(),
@@ -100,7 +100,7 @@ fn validate_plan(plan: &ConsentWrite, tool: AgentTool, digest: &str) -> Result<(
     Ok(())
 }
 
-fn replay(value: Value) -> Result<Vec<u8>, HandlerError> {
+pub(crate) fn replay(value: Value) -> Result<Vec<u8>, HandlerError> {
     if !value.is_object() {
         return Err(consent_lost("stored consent outcome is not an object"));
     }
@@ -519,7 +519,7 @@ impl ProjectsHandler {
         outcome
     }
 
-    fn refuse_agent_write(
+    pub(crate) fn refuse_agent_write(
         &self,
         store: &RegistryStore,
         row: &ConsentRequest,

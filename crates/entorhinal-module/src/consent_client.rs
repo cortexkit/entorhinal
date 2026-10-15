@@ -21,6 +21,10 @@ pub(super) struct Owner {
     pub scope_ref: String,
     pub epoch: i64,
 }
+pub(super) fn request_bytes(method: &str, params: &Value) -> Result<Vec<u8>, ConsentError> {
+    serde_json::to_vec(&json!({"method":method,"params":params}))
+        .map_err(|_| ConsentError::InvalidReply)
+}
 
 impl Owner {
     pub fn from_stamp(stamp: &ScopeStamp) -> Result<Self, ConsentError> {
@@ -137,8 +141,7 @@ impl ConsentRoute for SubcConsentRoute {
         params: Value,
         deadline: Instant,
     ) -> Result<Value, ConsentError> {
-        let bytes = serde_json::to_vec(&json!({"method":method, "params":params}))
-            .map_err(|_| ConsentError::InvalidReply)?;
+        let bytes = request_bytes(method, &params)?;
         let reply = self
             .consumer
             .request(

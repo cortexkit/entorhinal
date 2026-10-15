@@ -3189,9 +3189,9 @@ expect_message = "gone"
 
 [[control]]
 id = "agent-tools-table-roles"
-guards = "Each of the six tools admits only its table's stored role, before keys or arguments"
+guards = "The six identity-management tools retain their table role gate; catalog tools accept all agent roles"
 file = "crates/entorhinal-module/src/tool_provider.rs"
-old = "if caller.role != tool.role {"
+old = 'if tool.role != "*" && caller.role != tool.role {'
 new = "if false /* NON-VACUITY BREAK */ {"
 test_file = "crates/entorhinal-module/src/tool_provider_tests.rs"
 runner = "cargo"
@@ -5486,7 +5486,7 @@ expect_red = ["catalog_ops::tests::repin_whole_second_boundaries"]
 
 [[control]]
 id = "catalog-consumer-capability"
-guards = "Blob bytes are served only to modules declaring the exact consumer capability"
+guards = "Blob bytes are served only to modules declaring one of the four catalog consumer kind capabilities"
 file = "crates/entorhinal-module/src/catalog_ops.rs"
 old = 'if !admitted {'
 new = 'if false && !admitted { // NON-VACUITY BREAK'
@@ -6306,7 +6306,7 @@ only = false
 id = "ento3-grant-audit-write"
 guards = "grant audit write remains enforced"
 file = "crates/entorhinal-core/src/catalog_grants.rs"
-old = "audit(tx, kind, &row, principal, row.granted_at_ms).map_err(store_error)?;"
+old = "audit(tx, kind, &row, principal, row.granted_at_ms)?;"
 new = "// NON-VACUITY BREAK: omit grant write audit"
 test_file = "crates/entorhinal-module/src/catalog_grants_tests.rs"
 runner = "cargo"
@@ -6418,9 +6418,9 @@ only = false
 id = "ento3-grants-local-only"
 guards = "Publisher grants and audit writes never enter the identity journal exported to another Mac"
 file = "crates/entorhinal-core/src/catalog_grants.rs"
-old = 'audit(tx, kind, &row, principal, row.granted_at_ms).map_err(store_error)?;'
-new = '''audit(tx, kind, &row, principal, row.granted_at_ms).map_err(store_error)?;
-            tx.execute("INSERT INTO registry_journal(op,payload_json,actor,created_at) VALUES('catalog.grant',?1,'test','2026-10-14T09:00:00Z')", [serde_json::to_string(&row).unwrap()]).map_err(store_error)?; // NON-VACUITY BREAK'''
+old = 'audit(tx, kind, &row, principal, row.granted_at_ms)?;'
+new = '''audit(tx, kind, &row, principal, row.granted_at_ms)?;
+            tx.execute("INSERT INTO registry_journal(op,payload_json,actor,created_at) VALUES('catalog.grant',?1,'test','2026-10-14T09:00:00Z')", [serde_json::to_string(&row).unwrap()])?; // NON-VACUITY BREAK'''
 test_file = "crates/entorhinal-core/src/catalog_tests.rs"
 runner = "cargo"
 package = "entorhinal-core"
@@ -7037,3 +7037,406 @@ runner = "cargo"
 package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 expect_red = ["served_vectors::project_resolve_v1_records_match_published_files"]
+
+id = "catalog-agent-self-target"
+guards = "Prepare cannot install for an agent other than the daemon-stamped caller"
+file = "crates/entorhinal-module/src/catalog_agent.rs"
+old = 'if spec.target != json!({"agent_id":caller}) {'
+new = 'if false && spec.target != json!({"agent_id":caller}) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_prepare_idempotence_validation_and_admission"]
+
+[[control]]
+id = "catalog-agent-core-admission"
+guards = "Only the reserved core principal may read or acknowledge activation"
+file = "crates/entorhinal-module/src/catalog_agent.rs"
+old = '|| !matches!(admission.principal,Some(subc_protocol::Principal::Reserved {ref module_id}) if module_id == crate::WRITER_MODULE)'
+new = '|| false /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_prepare_idempotence_validation_and_admission"]
+
+[[control]]
+id = "catalog-agent-install-base"
+guards = "Approval rechecks current pins inside the shared writer transaction"
+file = "crates/entorhinal-core/src/catalog_agent.rs"
+old = 'current_digest(conn, caller).map_err(store_error)? != plan.base_pin_digest'
+new = 'false /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_commit_revalidates_base_under_writer_lock"]
+
+[[control]]
+id = "catalog-agent-install-status"
+guards = "A held closure status change invalidates a ready plan before consent"
+file = "crates/entorhinal-core/src/catalog_agent.rs"
+old = '''decode::<Value>(saved).map_err(store_error)?
+            != status_snapshot(conn, plan.closure.as_deref().unwrap_or_default())
+                .map_err(store_error)?'''
+new = 'false /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_status_change_after_readiness_is_stale"]
+
+[[control]]
+id = "catalog-agent-publisher-recheck"
+guards = "A publisher permission revoked while waiting for the writer cannot authorize pins"
+file = "crates/entorhinal-core/src/catalog_agent.rs"
+old = ') != crate::catalog_grants::Coverage::Covered'
+new = ') == crate::catalog_grants::Coverage::Covered /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_commit_revalidates_publisher_coverage_under_writer_lock"]
+
+[[control]]
+id = "catalog-agent-publisher-grant"
+guards = "Always-publisher approval persists an install-only self-placement grant"
+file = "crates/entorhinal-core/src/catalog_agent.rs"
+old = 'if always {'
+new = 'if false && always { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_always_publisher_then_covers_next_install"]
+
+[[control]]
+id = "catalog-agent-consumer-coverage"
+guards = "Every closure kind needs a declared covering consumer"
+file = "crates/entorhinal-module/src/catalog_consumer.rs"
+old = '''if !consumers
+            .iter()
+            .any(|c| c.kinds.contains(&package.pin.kind))'''
+new = '''if false /* NON-VACUITY BREAK */ && !consumers
+            .iter()
+            .any(|c| c.kinds.contains(&package.pin.kind))'''
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_missing_unready_and_wrong_kind_consumer_fail_plan"]
+
+[[control]]
+id = "catalog-agent-consumer-ready"
+guards = "An unready declared consumer fails preparation by module name"
+file = "crates/entorhinal-module/src/catalog_consumer.rs"
+old = 'if !entry.ready {'
+new = 'if false && !entry.ready { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_missing_unready_and_wrong_kind_consumer_fail_plan"]
+
+[[control]]
+id = "catalog-agent-consumer-refusal"
+guards = "Consumer dry-run refusals fail the entire plan before any card"
+file = "crates/entorhinal-module/src/catalog_consumer.rs"
+old = 'if reply["ok"] != true {'
+new = 'if false && reply["ok"] != true { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_consumer_refusal_names_module_and_package"]
+
+[[control]]
+id = "catalog-agent-consumer-section"
+guards = "A consumer must supply nonblank human text, never a structured or empty section"
+file = "crates/entorhinal-module/src/catalog_consumer.rs"
+old = '''let section = reply["card_section"]
+            .as_str()
+            .filter(|v| !v.trim().is_empty())
+            .ok_or_else(|| HandlerError {
+                code: "consumer_contract_violation".into(),
+                message: format!("{} returned no human card text", consumer.module),
+                detail: Some(json!({"module_id":consumer.module,"field":"card_section"})),
+            })?
+            .to_owned();'''
+new = 'let section = "accepted".to_owned(); // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_consumer_sections_must_be_nonblank_human_text_and_fit"]
+
+[[control]]
+id = "catalog-agent-card-envelope"
+guards = "The exact Cingulate request envelope must fit its byte limit without truncation"
+file = "crates/entorhinal-module/src/consent.rs"
+old = 'if bytes.len() > CATALOG_CARD_MAX_BYTES {'
+new = 'if false && bytes.len() > CATALOG_CARD_MAX_BYTES { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_card_envelope_exact_byte_boundary"]
+
+[[control]]
+id = "catalog-agent-prefetch-ready"
+guards = "A generation cannot become ready before each consumer confirms durable prefetch"
+file = "crates/entorhinal-module/src/catalog_consumer.rs"
+old = 'if reply["ready"] != true {'
+new = 'if false && reply["ready"] != true { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_prefetch_requires_all_checked_consumers_and_retries"]
+
+[[control]]
+id = "catalog-agent-generations-private"
+guards = "Superseded handoff bookkeeping must never appear as a catalog generation wire state"
+file = "crates/entorhinal-core/src/catalog_agent.rs"
+old = "AND state!='superseded'"
+new = "/* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_generations_hide_superseded_and_activation_needs_no_network"]
+
+[[control]]
+id = "catalog-agent-resolver-fingerprint"
+guards = "Resolver status binding compares the publisher fingerprint, not the raw signing key"
+file = "crates/entorhinal-core/src/catalog_resolution.rs"
+old = 'Some(held.publisher_key.clone()) != key_fingerprint(&r.public_key)'
+new = 'held.publisher_key != r.public_key /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_prepare_install_card_pins_ready_ack_active"]
+
+[[control]]
+id = "catalog-agent-checked-consumers"
+guards = "Losing a checked consumer cannot be hidden by another consumer covering the same kind"
+file = "crates/entorhinal-module/src/catalog_consumer.rs"
+old = 'if !consumers.iter().any(|c| {'
+new = 'if false && !consumers.iter().any(|c| { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_losing_one_of_two_checked_consumers_holds_generation"]
+
+[[control]]
+id = "catalog-agent-approved-target"
+guards = "The transaction's exact closure and consumer sections must match the approved saved target"
+file = "crates/entorhinal-core/src/catalog_agent.rs"
+old = 'if commit.action != "catalog_install" || commit.target["target"] != expected {'
+new = 'if false && (commit.action != "catalog_install" || commit.target["target"] != expected) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_commit_requires_exact_approved_target"]
+
+[[control]]
+id = "catalog-agent-recorded-approval"
+guards = "Card authority requires the exact recorded answered settlement before pins can be written"
+file = "crates/entorhinal-core/src/catalog_agent.rs"
+old = 'if !saved.and_then(|r| r.settlement).is_some_and(|s| {'
+new = 'if false && !saved.and_then(|r| r.settlement).is_some_and(|s| { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_commit_requires_recorded_approval"]
+
+[[control]]
+id = "catalog-agent-always-install-only"
+guards = "Publisher always-allow is not offered for upgrades"
+file = "crates/entorhinal-module/src/consent.rs"
+old = 'context.target_scope["operation"] == "install"'
+new = 'context.target_scope["operation"] != "install" /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_always_choice_is_install_only_and_never_root_certified"]
+
+[[control]]
+id = "catalog-agent-always-not-root"
+guards = "Root-certified publishers are never offered an always-publisher choice"
+file = "crates/entorhinal-module/src/consent.rs"
+old = 'packages.iter().all(|p| p["root_certified"] == false)'
+new = 'packages.iter().all(|_| true) /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_always_choice_is_install_only_and_never_root_certified"]
+
+[[control]]
+id = "catalog-agent-capability-grammar"
+guards = "Every declared or checked capability string is accepted by the daemon grammar"
+file = "crates/entorhinal-module/src/catalog_consumer.rs"
+old = 'pub const SKILL: &str = "ck-catalog-consumer-skill/v1";'
+new = 'pub const SKILL: &str = "ck-catalog-consumer/kind/skill"; // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/main.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["tests::every_declared_and_checked_capability_fits_daemon_grammar"]
+
+[[control]]
+id = "catalog-agent-covered-no-card"
+guards = "A fully publisher-covered install applies without asking for another consent card"
+file = "crates/entorhinal-module/src/catalog_agent.rs"
+old = 'let authorization = if covered {'
+new = 'let authorization = if false && covered { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_covered_install_no_card_and_retry_once"]
+
+[[control]]
+id = "catalog-agent-terminal-replay"
+guards = "An applied install retry resumes pending consumer prefetch while replaying the same generation"
+file = "crates/entorhinal-module/src/catalog_agent.rs"
+old = 'if row.state != RequestState::Awaiting {'
+new = 'if false && row.state != RequestState::Awaiting { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_prefetch_requires_all_checked_consumers_and_retries"]
+
+[[control]]
+id = "catalog-agent-capabilities-ready-only"
+guards = "Only ready daemon modules contribute local capability tokens"
+file = "crates/entorhinal-module/src/catalog_agent.rs"
+old = '.filter(|module| module.ready)'
+new = '.filter(|_| true) /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_daemon_capabilities_use_only_ready_valid_tokens_and_warn_once"]
+
+[[control]]
+id = "catalog-agent-capabilities-prefix"
+guards = "Only cap-prefixed daemon declarations are examined as catalog capability tokens"
+file = "crates/entorhinal-module/src/catalog_agent.rs"
+old = '.filter(|name| name.starts_with("cap-"))'
+new = '.filter(|_| true) /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_daemon_capabilities_use_only_ready_valid_tokens_and_warn_once"]
+
+[[control]]
+id = "catalog-agent-capabilities-malformed"
+guards = "Malformed cap-prefixed declarations never confer a local capability token"
+file = "crates/entorhinal-module/src/catalog_agent.rs"
+old = 'Err(_) => {'
+new = 'Err(_) => { tokens.insert("cap/invalid@1".into()); // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_daemon_capabilities_use_only_ready_valid_tokens_and_warn_once"]
+
+[[control]]
+id = "catalog-agent-capabilities-warn-once"
+guards = "An invalid declaration is logged only once per distinct name across catalog refreshes"
+file = "crates/entorhinal-module/src/catalog_agent.rs"
+old = 'if self.bad_names.lock().unwrap().insert(name.clone()) {'
+new = 'if true || self.bad_names.lock().unwrap().insert(name.clone()) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_daemon_capabilities_use_only_ready_valid_tokens_and_warn_once"]
+
+[[control]]
+id = "catalog-agent-consumer-service-id"
+guards = "The internal consumer service id is an exact byte contract, not a grammar-validated identifier"
+file = "crates/entorhinal-module/src/catalog_consumer.rs"
+old = 'pub const SERVICE: &str = "catalog-consumer";'
+new = 'pub const SERVICE: &str = "catalog-consumre"; // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/main.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["tests::every_declared_and_checked_capability_fits_daemon_grammar"]
+
+[[control]]
+id = "catalog-agent-consumer-route-refusal"
+guards = "A refused consumer route retains the daemon refusal name and module in plan and generation errors"
+file = "crates/entorhinal-module/src/catalog_consumer.rs"
+old = 'TransportError::Refusal { code, detail } => json!({"code":code,"detail":detail}),'
+new = 'TransportError::Refusal { code: _, detail } => json!({"code":"unavailable","detail":detail}), // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_refused_consumer_route_fails_plan_and_holds_generation"]
+
+[[control]]
+id = "catalog-agent-install-plan-key-schema"
+guards = "catalog_install takes only plan_id, which is its idempotence key, not a second caller request key"
+file = "crates/entorhinal-module/src/tool_provider.rs"
+old = 'if self.writes && self.name != "catalog_install" {'
+new = 'if self.writes { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_covered_install_no_card_and_retry_once"]
+
+[[control]]
+id = "catalog-agent-install-plan-key-admission"
+guards = "Install admission uses the canonical plan key and does not require a request_key argument"
+file = "crates/entorhinal-module/src/tool_provider.rs"
+old = 'if tool.writes && tool.name != "catalog_install" {'
+new = 'if tool.writes { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_covered_install_no_card_and_retry_once"]

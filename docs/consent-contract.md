@@ -46,6 +46,11 @@ tool argument never names the caller. On every call, including retries:
    (`0x20`–`0x7e`); otherwise `invalid_request_key`. This is checked before
    any other argument.
 
+The [catalog tools](catalog.md#agent-tools-and-consumer-protocol) reuse these stamp,
+claim and consent checks but admit every live agent role for self-installation.
+`catalog_install {plan_id}` is the request-key exception: the plan id itself is
+the persisted consent/replay key, so it accepts no additional `request_key`.
+
 Admission is decided from the stamp saved when the route was bound. A route
 that closes loses its authority.
 

@@ -1524,6 +1524,7 @@ mod tests {
         let expected_queries = [
             "catalog.registry_list",
             "catalog.read_blob",
+            "catalog.agent_generation",
             "permissions.list",
             "agent.audit_list",
             "agent.preview_repair_workspaces",
@@ -1559,6 +1560,7 @@ mod tests {
             "catalog.publisher_trust",
             "catalog.registry_repin",
             "catalog.registry_remove",
+            "catalog.ack_activation",
             "permissions.revoke",
             "agent.set_hire_cap",
             "agent.repair_workspaces",

@@ -156,9 +156,14 @@ Tests: `agent_principal_matrix_precedes_decode_keys_and_cached_replies_before_an
 
 The tools (`projects_create_workspace`, `projects_register`,
 `agents_create_head`, `agents_hire`, `agents_retire_hire`,
-`agents_list_hires`) are served through `tool-provider/v1`, with the caller
+`agents_list_hires`, `catalog_prepare`, `catalog_plan`, `catalog_install`,
+`catalog_generation`) are served through `tool-provider/v1`, with the caller
 taken from the daemon's scope stamp. Their rules are in
 [consent-contract.md](consent-contract.md).
+Catalog tools are available to all live agent roles, self-targeted only; preparation
+is asynchronous, installation reuses the consent coordinator, and generation reads
+omit superseded handoff bookkeeping. See [catalog.md](catalog.md#agent-tools-and-consumer-protocol)
+for schemas, consumer kinds, refusals, idempotence and capability-token declarations.
 
 | Operation | Kind | Who | What it does |
 |---|---|---|---|
@@ -166,10 +171,12 @@ taken from the daemon's scope stamp. Their rules are in
 | `permissions.revoke {id}` | mutate | Direct, `reserved:cingulate` | Revoke a grant without prompting. |
 | `agent.audit_list {since_ms?, limit?, cursor?}` | query | Direct, `reserved:callosum` | Page the local audit of agent tool writes. |
 | `agent.set_hire_cap {project_id, cap}` | mutate | Direct, with Touch ID | Set this Mac's hiring limit for a project. |
+| `catalog.agent_generation {agent_id}` | query | `reserved:prefrontal-core` only | Read active and newer ready package generations and exact pin digests from local state. |
+| `catalog.ack_activation {agent_id, generation_id}` | mutate | `reserved:prefrontal-core` only | Idempotently activate a ready generation after core renders it. No network or consumer discovery. |
 
 Refusals: `permissions_operator_required`, `audit_operator_required`,
-`direct_caller_required`. These are the only queries that are not open to
-every caller.
+`direct_caller_required`, `caller_forbidden`. These permission and catalog reads
+are not open to every caller.
 
 ## Sessions, claims and roles
 

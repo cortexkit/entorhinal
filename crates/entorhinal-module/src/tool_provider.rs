@@ -50,6 +50,10 @@ const TOOLS: &[AgentTool] = &[
         fields: &["agent_id"] },
     AgentTool { name: "agents_list_hires", role: "head", writes: false,
         description: "List your live hires.", fields: &[] },
+    AgentTool {name:"catalog_prepare",role:"*",writes:true,description:"Prepare a verified package closure for your own agent in the background; returns a local plan immediately.",fields:&["spec"]},
+    AgentTool {name:"catalog_plan",role:"*",writes:false,description:"Read your catalog plan's state, exact package digests, consumer checks, moves and named refusal.",fields:&["plan_id"]},
+    AgentTool {name:"catalog_install",role:"*",writes:true,description:"Approve and install your ready catalog plan; retrying the plan returns the same generation.",fields:&["plan_id"]},
+    AgentTool {name:"catalog_generation",role:"*",writes:false,description:"Read your current and pending local package generations and consumer readiness errors.",fields:&[]},
 ];
 
 impl AgentTool {
@@ -60,13 +64,16 @@ impl AgentTool {
             properties.insert((*field).into(), json!({"type":"string"}));
             required.push(*field);
         }
+        if self.name == "catalog_prepare" {
+            properties.insert("spec".into(),json!({"type":"object","properties":{"operation":{"type":"string","enum":["install","upgrade"]},"target":{"type":"object","properties":{"agent_id":{"type":"string"}},"required":["agent_id"],"additionalProperties":false},"package":{"type":"string"},"range":{"type":"string"}},"required":["operation","target","package","range"],"additionalProperties":false}));
+        }
         if self.name == "agents_hire" {
             properties.insert(
                 "labels".into(),
                 json!({"type":"array", "items":{"type":"string"}}),
             );
         }
-        if self.writes {
+        if self.writes && self.name != "catalog_install" {
             // Some regex engines let `$` precede a final newline. The negative
             // character check rejects controls there as well as inside the key.
             properties.insert("request_key".into(), json!({"type":"string", "minLength":1,
@@ -212,6 +219,7 @@ fn validate_arguments(tool: AgentTool, arguments: &Map<String, Value>) -> Result
             .get(field)
             .is_some_and(|property| match property["type"].as_str() {
                 Some("string") => value.is_string(),
+                Some("object") => value.is_object(),
                 Some("array") => value
                     .as_array()
                     .is_some_and(|values| values.iter().all(Value::is_string)),
@@ -266,7 +274,7 @@ impl ProjectsHandler {
                 "the stamped agent is no longer live",
             ));
         }
-        if caller.role != tool.role {
+        if tool.role != "*" && caller.role != tool.role {
             return Err(HandlerError::new(
                 "role_forbidden",
                 "the stored agent role cannot use this tool",
@@ -308,7 +316,7 @@ impl ProjectsHandler {
         let tool = TOOLS.iter().find(|tool| tool.name == name).copied();
         let admission = if let Some(tool) = tool {
             let (admission, _caller) = self.admit_agent_tool(tool, key)?;
-            if tool.writes {
+            if tool.writes && tool.name != "catalog_install" {
                 validate_request_key(&value["arguments"])?;
             }
             Some(admission)
@@ -352,8 +360,13 @@ impl ProjectsHandler {
                 ));
             }
         }
-        if !tool.writes {
+        if !tool.writes || tool.name.starts_with("catalog_") {
             validate_arguments(tool, arguments)?;
+        }
+        if tool.name.starts_with("catalog_") {
+            return self
+                .execute_catalog_tool(tool.name, arguments.clone(), admission, deadline)
+                .await;
         }
         self.execute_agent_tool(tool, arguments.clone(), admission, deadline)
             .await
@@ -377,7 +390,7 @@ fn provider_error(error: subc_protocol::ErrorBody) -> HandlerError {
 
 #[cfg(test)]
 #[path = "tool_provider_tests.rs"]
-mod tests;
+pub(crate) mod tests;
 
 #[path = "tool_writes.rs"]
-mod writes;
+pub(crate) mod writes;

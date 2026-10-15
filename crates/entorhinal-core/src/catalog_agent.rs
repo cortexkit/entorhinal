@@ -12,6 +12,49 @@ use std::collections::BTreeSet;
 /// ops it does not know) or of the project `journal_tail`.
 pub(crate) const PIN_OP: &str = "catalog.pin";
 
+/// Package identities and privileges authenticated before consumers inspect the
+/// bytes and render consent text. Capabilities bound any new publisher permission.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparedPackage {
+    #[serde(flatten)]
+    pub pin: CatalogPin,
+    pub trust: String,
+    pub capabilities: Vec<String>,
+    pub has_scripts: bool,
+    pub root_certified: bool,
+}
+impl PreparedPackage {
+    pub fn coverage(&self) -> crate::catalog_grants::CoveragePackage {
+        crate::catalog_grants::CoveragePackage {
+            name: self.pin.name.clone(),
+            publisher_fingerprint: self.pin.publisher_fingerprint.clone(),
+            capabilities: self.capabilities.clone(),
+            has_scripts: self.has_scripts,
+            root_certified: self.root_certified,
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsumerCheck {
+    pub module_id: String,
+    pub kinds: Vec<Kind>,
+    pub card_section: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparedPlan {
+    pub packages: Vec<PreparedPackage>,
+    pub moves: Value,
+    pub checks: Vec<ConsumerCheck>,
+}
+
+fn prepared(conn: &Connection, id: &str) -> rusqlite::Result<PreparedPlan> {
+    decode(conn.query_row(
+        "SELECT detail FROM catalog_prepared WHERE plan_id=?1",
+        [id],
+        |r| r.get(0),
+    )?)
+}
+
 pub(crate) const V12_CATALOG_AGENT: &str = r#"
 CREATE TABLE catalog_pin_set(agent_id TEXT PRIMARY KEY REFERENCES agent(agent_id), pin_digest TEXT NOT NULL);
 CREATE TABLE catalog_pin(agent_id TEXT NOT NULL REFERENCES catalog_pin_set(agent_id), name TEXT NOT NULL,
@@ -21,7 +64,8 @@ CREATE TABLE catalog_pin(agent_id TEXT NOT NULL REFERENCES catalog_pin_set(agent
 CREATE TABLE catalog_plan(plan_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL,
  operation TEXT NOT NULL CHECK(operation IN ('install','upgrade')), spec TEXT NOT NULL,
  state TEXT NOT NULL CHECK(state IN ('pending','ready','failed')), closure TEXT, refusal TEXT,
- base_pin_digest TEXT NOT NULL, status_snapshot TEXT, created_at_ms INTEGER NOT NULL, ready_at_ms INTEGER);
+  base_pin_digest TEXT NOT NULL, status_snapshot TEXT, created_at_ms INTEGER NOT NULL, ready_at_ms INTEGER);
+CREATE TABLE catalog_prepared(plan_id TEXT PRIMARY KEY REFERENCES catalog_plan(plan_id), detail TEXT NOT NULL);
 CREATE TABLE catalog_generation(generation_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL,
  plan_id TEXT NOT NULL UNIQUE REFERENCES catalog_plan(plan_id),
  state TEXT NOT NULL CHECK(state IN ('installed','approved','ready','active','degraded','superseded')),
@@ -176,8 +220,27 @@ pub(crate) fn validate_pin_projection(conn: &Connection) -> rusqlite::Result<()>
     Ok(())
 }
 pub(crate) fn replay_pin(tx: &Transaction<'_>, value: Value) -> rusqlite::Result<()> {
-    let entry: CatalogPinSet = serde_json::from_value(value.get("entry").cloned().unwrap_or(value))
+    let mut value = value.get("entry").cloned().unwrap_or(value);
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| invalid("invalid catalog pin entry"))?;
+    let caller = object.remove("requesting_agent_id");
+    let authorization = object.remove("authorization");
+    let caller = caller
+        .map(serde_json::from_value::<String>)
+        .transpose()
         .map_err(crate::shared_entry::decode_error)?;
+    let authorization = authorization
+        .map(serde_json::from_value::<crate::agent::consent::Authorization>)
+        .transpose()
+        .map_err(crate::shared_entry::decode_error)?;
+    let entry: CatalogPinSet =
+        serde_json::from_value(value).map_err(crate::shared_entry::decode_error)?;
+    if caller.is_some() != authorization.is_some()
+        || caller.is_some_and(|caller| caller != entry.agent_id)
+    {
+        return Err(invalid("invalid catalog pin authorization evidence"));
+    }
     entry.restore(tx)
 }
 impl RegistryStore {
@@ -197,41 +260,50 @@ impl JournalWriter<'_> {
         let mut req = req;
         req.pins.sort_by(|a, b| a.name.cmp(&b.name));
         self.mutation(PIN_OP, req.request_key.as_deref(), |tx| {
-            let entry = CatalogPinSet {
-                op: PIN_OP.into(),
-                agent_id: req.agent_id.clone(),
-                pin_digest: pin_digest(&req.pins)?,
-                pins: req.pins.clone(),
-            };
-            entry.validate(tx, true)?;
-            let old = read_pins(tx, &req.agent_id)?;
-            if old == entry.pins && current_digest(tx, &req.agent_id)? == entry.pin_digest {
-                return Ok(crate::mutations::Action {
-                    seq: None,
-                    changed: false,
-                    value: json!({"pin_digest":entry.pin_digest}),
-                    payload: json!({}),
-                });
-            }
-            let payload = json!({"entry":entry});
-            let seq = crate::mutations::append(
-                tx,
-                "catalog.pin",
-                &payload,
-                "catalog",
-                req.request_key.as_deref(),
-                now,
-                self.principal,
-            )?;
-            entry.restore(tx)?;
-            Ok(crate::mutations::Action {
-                seq: Some(seq),
-                changed: true,
-                value: json!({"pin_digest":entry.pin_digest}),
-                payload,
-            })
+            write_pins(tx, &req, now, self.principal)
         })
     }
+}
+
+fn write_pins(
+    tx: &Transaction<'_>,
+    req: &PinWriteRequest,
+    now: i64,
+    principal: &str,
+) -> Result<crate::mutations::Action, RegistryError> {
+    let entry = CatalogPinSet {
+        op: PIN_OP.into(),
+        agent_id: req.agent_id.clone(),
+        pin_digest: pin_digest(&req.pins)?,
+        pins: req.pins.clone(),
+    };
+    entry.validate(tx, true)?;
+    let old = read_pins(tx, &req.agent_id)?;
+    if old == entry.pins && current_digest(tx, &req.agent_id)? == entry.pin_digest {
+        return Ok(crate::mutations::Action {
+            seq: None,
+            changed: false,
+            value: json!({"pin_digest":entry.pin_digest}),
+            payload: json!({}),
+        });
+    }
+    let payload = json!({"entry":entry});
+    let seq = crate::mutations::append(
+        tx,
+        "catalog.pin",
+        &payload,
+        "catalog",
+        req.request_key.as_deref(),
+        now,
+        principal,
+    )?;
+    entry.restore(tx)?;
+    Ok(crate::mutations::Action {
+        seq: Some(seq),
+        changed: true,
+        value: json!({"pin_digest":entry.pin_digest}),
+        payload,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -366,6 +438,63 @@ fn blocked(conn: &Connection, pins: &[CatalogPin]) -> rusqlite::Result<bool> {
 }
 
 impl RegistryStore {
+    pub fn catalog_save_prepared(
+        &self,
+        id: &str,
+        caller: &str,
+        detail: &PreparedPlan,
+    ) -> Result<(), CatalogWriteError> {
+        self.catalog_transaction(|tx| {
+            let plan = read_plan(tx, id).map_err(store_error)?;
+            owner(&plan.agent_id, caller)?;
+            if plan.state.as_str() != "pending" { return Err(CatalogWriteError::Refused("invalid_transition")); }
+            tx.execute("INSERT INTO catalog_prepared VALUES(?1,?2) ON CONFLICT(plan_id) DO UPDATE SET detail=excluded.detail", params![id,serde_json::to_string(detail).unwrap()]).map_err(store_error)?;
+            Ok(())
+        })
+    }
+    pub fn catalog_prepared(
+        &self,
+        id: &str,
+        caller: &str,
+    ) -> Result<PreparedPlan, CatalogWriteError> {
+        self.catalog_plan(id, caller)?;
+        self.read(|conn| prepared(conn, id))
+            .map_err(CatalogWriteError::Store)
+    }
+    pub fn catalog_install_target(
+        &self,
+        id: &str,
+        caller: &str,
+    ) -> Result<Value, CatalogWriteError> {
+        self.catalog_transaction(|tx| {
+            let plan = installable(tx, id, caller)?;
+            Ok(json!({"plan_id":id,"base_pin_digest":plan.base_pin_digest,"prepared":prepared(tx,id).map_err(store_error)?}))
+        })
+    }
+    /// Omit superseded generations from protocol replies. Their closures remain
+    /// stored locally until consumers finish switching to the replacement.
+    pub fn catalog_agent_generations(
+        &self,
+        agent: &str,
+    ) -> Result<Vec<CatalogGeneration>, RegistryError> {
+        self.read(|conn| {
+            let ids = conn.prepare("SELECT generation_id FROM catalog_generation WHERE agent_id=?1 AND state!='superseded' ORDER BY created_at_ms,generation_id")?.query_map([agent], |r| r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            ids.iter().map(|id| read_generation(conn,id)).collect()
+        })
+    }
+    pub fn catalog_prefetch_error(
+        &self,
+        id: &str,
+        caller: &str,
+        error: Value,
+    ) -> Result<(), CatalogWriteError> {
+        self.catalog_transaction(|tx| {
+            let generation = read_generation(tx, id).map_err(store_error)?;
+            owner(&generation.agent_id, caller)?;
+            tx.execute("UPDATE catalog_generation SET error=?2 WHERE generation_id=?1 AND state IN ('approved','installed')", params![id,error.to_string()]).map_err(store_error)?;
+            Ok(())
+        })
+    }
     pub fn catalog_plan(&self, id: &str, caller: &str) -> Result<CatalogPlan, CatalogWriteError> {
         let plan = self
             .read(|conn| read_plan(conn, id))
@@ -541,6 +670,200 @@ impl RegistryStore {
                 tx.execute("UPDATE catalog_generation SET state=?1,error=?2,activated_at_ms=CASE WHEN ?1='active' THEN ?3 ELSE activated_at_ms END WHERE generation_id=?4",params![step,error.map(|e|e.to_string()),now,id]).map_err(store_error)?;
                 read_generation(tx,id).map_err(store_error)
             })
+        })
+    }
+}
+
+fn installable(
+    conn: &Connection,
+    id: &str,
+    caller: &str,
+) -> Result<CatalogPlan, CatalogWriteError> {
+    let plan = read_plan(conn, id).map_err(store_error)?;
+    owner(&plan.agent_id, caller)?;
+    live(conn, caller)?;
+    match plan.state.as_str() {
+        "pending" => return Err(CatalogWriteError::Refused("plan_not_ready")),
+        "failed" => return Err(CatalogWriteError::Refused("plan_failed")),
+        "ready" => (),
+        _ => return Err(CatalogWriteError::Refused("invalid_transition")),
+    }
+    let saved: String = conn
+        .query_row(
+            "SELECT status_snapshot FROM catalog_plan WHERE plan_id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .map_err(store_error)?;
+    if current_digest(conn, caller).map_err(store_error)? != plan.base_pin_digest
+        || decode::<Value>(saved).map_err(store_error)?
+            != status_snapshot(conn, plan.closure.as_deref().unwrap_or_default())
+                .map_err(store_error)?
+    {
+        return Err(CatalogWriteError::Refused("plan_stale"));
+    }
+    Ok(plan)
+}
+fn registry_error(error: CatalogWriteError) -> RegistryError {
+    match error {
+        CatalogWriteError::Store(e) => e,
+        CatalogWriteError::Refused(code) => crate::mutations::domain(code, code),
+    }
+}
+impl JournalWriter<'_> {
+    /// Pin replacement, generation, publisher permissions and consent receipt
+    /// commit together. If identity sharing is enabled, the module confirms the
+    /// shared log append before allowing this transaction to commit.
+    pub fn catalog_install(&self, plan_id: &str, now: i64) -> Result<Vec<u8>, RegistryError> {
+        let commit = self.consent.as_ref().ok_or_else(|| {
+            crate::mutations::domain("caller_forbidden", "catalog install requires authorization")
+        })?;
+        let caller = &commit.request.identity.agent_id;
+        self.mutation(PIN_OP, None, |tx| {
+            let plan = installable(tx, plan_id, caller).map_err(registry_error)?;
+            let detail = prepared(tx, plan_id)?;
+            let expected =
+                json!({"plan_id":plan_id,"base_pin_digest":plan.base_pin_digest,"prepared":detail});
+            if commit.action != "catalog_install" || commit.target["target"] != expected {
+                return Err(crate::mutations::domain(
+                    "plan_stale",
+                    "approved closure changed",
+                ));
+            }
+            let packages: Vec<_> = detail
+                .packages
+                .iter()
+                .map(PreparedPackage::coverage)
+                .collect();
+            let operation = if plan.operation == "install" {
+                crate::catalog_grants::Operation::Install
+            } else {
+                crate::catalog_grants::Operation::Upgrade
+            };
+            let always = match &commit.authorization {
+                crate::agent::consent::Authorization::Card { id, answer } => {
+                    let saved = crate::agent::consent::load_request(tx, &commit.request.identity)?;
+                    if !saved.and_then(|r| r.settlement).is_some_and(|s| {
+                        s.elicitation_id == *id
+                            && s.state == "answered"
+                            && s.choice.as_ref() == Some(answer)
+                    }) {
+                        return Err(crate::mutations::domain(
+                            "consent_lost",
+                            "approval was not recorded",
+                        ));
+                    }
+                    match answer.as_str() {
+                        "approve_once" => false,
+                        "approve_always_publisher"
+                            if plan.operation == "install"
+                                && detail.packages.iter().all(|p| !p.root_certified) =>
+                        {
+                            true
+                        }
+                        _ => {
+                            return Err(crate::mutations::domain(
+                                "invalid_reply",
+                                "approval choice not offered",
+                            ))
+                        }
+                    }
+                }
+                crate::agent::consent::Authorization::PublisherGrants { .. } => {
+                    if crate::catalog_grants::coverage(
+                        &packages,
+                        &crate::catalog_grants::read_grants(tx)?,
+                        operation,
+                        caller,
+                        true,
+                    ) != crate::catalog_grants::Coverage::Covered
+                    {
+                        return Err(crate::mutations::domain(
+                            "plan_stale",
+                            "publisher coverage changed",
+                        ));
+                    }
+                    false
+                }
+                _ => {
+                    return Err(crate::mutations::domain(
+                        "caller_forbidden",
+                        "invalid catalog authorization",
+                    ))
+                }
+            };
+            let pins = plan
+                .closure
+                .ok_or_else(|| crate::mutations::domain("plan_not_ready", "no closure"))?;
+            if detail
+                .packages
+                .iter()
+                .map(|p| p.pin.clone())
+                .collect::<Vec<_>>()
+                != pins
+            {
+                return Err(crate::mutations::domain(
+                    "plan_stale",
+                    "checked closure changed",
+                ));
+            }
+            let generation_id = format!("generation:{plan_id}");
+            tx.execute(
+                "INSERT INTO catalog_generation VALUES(?1,?2,?3,'approved',?4,?5,?6,NULL,NULL)",
+                params![
+                    generation_id,
+                    caller,
+                    plan_id,
+                    serde_json::to_string(&pins).unwrap(),
+                    pin_digest(&pins)?,
+                    now
+                ],
+            )?;
+            if always {
+                let mut ceilings = std::collections::BTreeMap::<String, BTreeSet<String>>::new();
+                for p in &detail.packages {
+                    ceilings
+                        .entry(p.pin.publisher_fingerprint.clone())
+                        .or_default()
+                        .extend(p.capabilities.clone());
+                }
+                for (fingerprint, ceiling) in ceilings {
+                    let grant = crate::catalog_grants::PublisherGrant {
+                        id: format!("publisher:{plan_id}:{fingerprint}"),
+                        publisher_fingerprint: fingerprint,
+                        operation: crate::catalog_grants::Operation::Install,
+                        placement_agent_id: caller.clone(),
+                        ceiling: ceiling.into_iter().collect(),
+                        card_ref: commit.request.elicitation_id.clone().or_else(|| {
+                            match &commit.authorization {
+                                crate::agent::consent::Authorization::Card { id, .. } => {
+                                    Some(id.clone())
+                                }
+                                _ => None,
+                            }
+                        }),
+                        granted_at_ms: now,
+                        revoked_at_ms: None,
+                    };
+                    crate::catalog_grants::put_grant(
+                        tx,
+                        &grant,
+                        &json!({"requesting_agent_id":caller,"authorization":commit.authorization}),
+                    )?;
+                }
+            }
+            let mut action = write_pins(
+                tx,
+                &PinWriteRequest {
+                    agent_id: caller.clone(),
+                    pins,
+                    request_key: None,
+                },
+                now,
+                self.principal,
+            )?;
+            action.value = json!({"generation_id":generation_id});
+            Ok(action)
         })
     }
 }
