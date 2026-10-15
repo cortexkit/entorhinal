@@ -21,15 +21,37 @@ type TrustFactory = dyn Fn(RegistryStore, &str) -> Result<CatalogTrust, CatalogE
 pub const AGENT_GENERATION: &str = "catalog.agent_generation";
 pub const ACK_ACTIVATION: &str = "catalog.ack_activation";
 pub trait LocalCapabilities: Send + Sync {
-    fn tokens(&self) -> Vec<String>;
+    fn tokens(&self, catalog: &subc_client_rs::CatalogList) -> Vec<String>;
 }
-/// No daemon API currently declares catalog tokens. Daemon capabilities use
-/// <name>/v<N>, not cap/<area>.<verb>@<major>, so return no satisfied tokens
-/// rather than guessing a mapping that could authorize unavailable privileges.
-pub struct UnsettledCapabilities;
-impl LocalCapabilities for UnsettledCapabilities {
-    fn tokens(&self) -> Vec<String> {
-        Vec::new()
+/// Convert only ready modules' declared cap-* capabilities through the shared
+/// catalog adapter. Malformed declarations confer nothing and warn once per name.
+#[derive(Default)]
+pub struct DaemonCapabilities {
+    bad_names: Mutex<BTreeSet<String>>,
+}
+impl LocalCapabilities for DaemonCapabilities {
+    fn tokens(&self, catalog: &subc_client_rs::CatalogList) -> Vec<String> {
+        let mut tokens = BTreeSet::new();
+        for module in catalog.modules.iter().filter(|module| module.ready) {
+            for name in module
+                .capabilities
+                .iter()
+                .flat_map(|caps| &caps.provides)
+                .filter(|name| name.starts_with("cap-"))
+            {
+                match entorhinal_catalog::resolver::manifest_to_capability(name) {
+                    Ok(token) => {
+                        tokens.insert(token);
+                    }
+                    Err(_) => {
+                        if self.bad_names.lock().unwrap().insert(name.clone()) {
+                            tracing::warn!(capability = %name, "ignoring malformed catalog capability declaration");
+                        }
+                    }
+                }
+            }
+        }
+        tokens.into_iter().collect()
     }
 }
 pub struct CatalogAgent {
@@ -47,7 +69,7 @@ impl Default for CatalogAgent {
                 crate::log_client::SubcConnector::from_args(std::env::args_os().skip(1)),
             ))),
             sources: Arc::new(CatalogTrust::for_scope),
-            capabilities: Arc::new(UnsettledCapabilities),
+            capabilities: Arc::new(DaemonCapabilities::default()),
             running: Arc::default(),
             #[cfg(test)]
             finished: Arc::default(),
@@ -201,7 +223,12 @@ async fn prepare(
             candidates.push(verified);
         }
     }
-    let caps = capabilities.tokens();
+    let catalog = daemon.catalog_list().await.map_err(|e| HandlerError {
+        code: "consumer_unavailable".into(),
+        message: format!("daemon catalog: {e:?}"),
+        detail: Some(json!({"module_id":"daemon"})),
+    })?;
+    let caps = capabilities.tokens(&catalog);
     let subject = if plan.operation == "install" {
         CatalogSubject::Install(plan.spec.clone())
     } else {

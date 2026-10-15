@@ -11,9 +11,12 @@ use subc_client_rs::{CatalogList, SupervisorListResponse};
 
 const NAME: &str = "@example/hello-skill";
 const URL: &str = "https://registry.example.invalid";
+fn consumer_role() -> Value {
+    json!({"role":"internal_service","service_id":catalog_consumer::SERVICE,"transport":"bulk","agent_facing":false,"operations":["catalog_consumer.check","catalog_consumer.prefetch"]})
+}
 struct TestCapabilities;
 impl LocalCapabilities for TestCapabilities {
-    fn tokens(&self) -> Vec<String> {
+    fn tokens(&self, _: &CatalogList) -> Vec<String> {
         vec!["cap/example.read@1".into()]
     }
 }
@@ -125,6 +128,7 @@ struct FakeConsumers {
     ready: AtomicBool,
     capability: Mutex<String>,
     extra: Mutex<Option<Arc<FakeConsumer>>>,
+    has_role: AtomicBool,
 }
 #[async_trait]
 impl ConsumerDiscovery for FakeConsumers {
@@ -138,19 +142,30 @@ impl ConsumerDiscovery for FakeConsumers {
         Ok(crate::fake_daemon::DaemonSnapshot::new(1, configured, vec![]).supervisor)
     }
     async fn catalog_list(&self) -> Result<CatalogList, TransportError> {
+        let roles = if self.has_role.load(Ordering::SeqCst) {
+            vec![consumer_role()]
+        } else {
+            vec![]
+        };
         let mut modules = if self.available.load(Ordering::SeqCst) {
             vec![
-                json!({"module_id":crate::WRITER_MODULE,"ready":self.ready.load(Ordering::SeqCst),"roles":[],"control_ops":[],"capabilities":{"provides":[*self.capability.lock().unwrap()],"requires":[]}}),
+                json!({"module_id":crate::WRITER_MODULE,"ready":self.ready.load(Ordering::SeqCst),"roles":roles,"control_ops":[],"capabilities":{"provides":[*self.capability.lock().unwrap()],"requires":[]}}),
             ]
         } else {
             vec![]
         };
         if self.extra.lock().unwrap().is_some() {
-            modules.push(json!({"module_id":"zeta","ready":true,"roles":[],"control_ops":[],"capabilities":{"provides":[catalog_consumer::SKILL],"requires":[]}}));
+            modules.push(json!({"module_id":"zeta","ready":true,"roles":roles,"control_ops":[],"capabilities":{"provides":[catalog_consumer::SKILL],"requires":[]}}));
         }
         Ok(crate::fake_daemon::DaemonSnapshot::new(1, vec![], modules).catalog)
     }
     async fn open(&self, module: &str) -> Result<Arc<dyn LogTransport>, TransportError> {
+        if !self.has_role.load(Ordering::SeqCst) {
+            return Err(TransportError::Refusal {
+                code: "service_not_provided".into(),
+                detail: Some(json!({"service_id":catalog_consumer::SERVICE})),
+            });
+        }
         if module == "zeta" {
             return Ok(self.extra.lock().unwrap().as_ref().unwrap().clone());
         }
@@ -214,6 +229,7 @@ impl Fixture {
             ready: AtomicBool::new(true),
             capability: Mutex::new(catalog_consumer::SKILL.into()),
             extra: Mutex::default(),
+            has_role: AtomicBool::new(true),
         });
         tools.handler.catalog_agent.consumers = consumers.clone();
         tools.handler.catalog_agent.capabilities = Arc::new(TestCapabilities);
@@ -245,10 +261,7 @@ impl Fixture {
     }
     async fn install(&self, plan: &Value) -> subc_client_rs::HandlerOutcome {
         self.tools
-            .call(
-                "catalog_install",
-                json!({"plan_id":plan["plan_id"],"request_key":"install"}),
-            )
+            .call("catalog_install", json!({"plan_id":plan["plan_id"]}))
             .await
     }
     async fn op(
@@ -509,6 +522,57 @@ async fn catalog_missing_unready_and_wrong_kind_consumer_fail_plan() {
 }
 
 #[tokio::test]
+async fn catalog_refused_consumer_route_fails_plan_and_holds_generation() {
+    let f = Fixture::new().await;
+    assert_eq!(
+        consumer_role(),
+        json!({"role":"internal_service","service_id":"catalog-consumer","transport":"bulk","agent_facing":false,"operations":["catalog_consumer.check","catalog_consumer.prefetch"]})
+    );
+    f.consumers.has_role.store(false, Ordering::SeqCst);
+    let plan = f.prepare("no-service-role").await;
+    assert_eq!(plan["state"], "failed");
+    assert_eq!(plan["refusal"]["code"], "consumer_unavailable");
+    assert_eq!(plan["refusal"]["detail"]["module_id"], crate::WRITER_MODULE);
+    assert_eq!(
+        plan["refusal"]["detail"]["route_refusal"]["code"],
+        "service_not_provided"
+    );
+    assert_eq!(
+        plan["refusal"]["detail"]["route_refusal"]["detail"]["service_id"],
+        catalog_consumer::SERVICE
+    );
+    assert_eq!(f.cingulate.card_count(), 0);
+    f.consumers.has_role.store(true, Ordering::SeqCst);
+    f.grant();
+    let plan = f.prepare("role-lost-after-check").await;
+    assert_eq!(plan["state"], "ready", "{plan}");
+    f.consumers.has_role.store(false, Ordering::SeqCst);
+    let installed = result(f.install(&plan).await);
+    let id = installed["generation_id"].as_str().unwrap();
+    let generation = f
+        .store()
+        .catalog_generation(id, &f.tools.agents[0])
+        .unwrap();
+    assert_eq!(generation.state, "approved");
+    let error = generation.error.unwrap();
+    assert_eq!(error["code"], "consumer_unavailable");
+    assert_eq!(error["detail"]["module_id"], crate::WRITER_MODULE);
+    assert_eq!(
+        error["detail"]["route_refusal"]["code"],
+        "service_not_provided"
+    );
+    f.consumers.has_role.store(true, Ordering::SeqCst);
+    assert_eq!(result(f.install(&plan).await), installed);
+    assert_eq!(
+        f.store()
+            .catalog_generation(id, &f.tools.agents[0])
+            .unwrap()
+            .state,
+        "ready"
+    );
+}
+
+#[tokio::test]
 async fn catalog_prefetch_requires_all_checked_consumers_and_retries() {
     let f = Fixture::new().await;
     f.grant();
@@ -561,6 +625,17 @@ async fn catalog_prefetch_requires_all_checked_consumers_and_retries() {
 async fn catalog_prepare_idempotence_validation_and_admission() {
     let f = Fixture::new().await;
     let plan = f.prepare("repeat").await;
+    assert_eq!(
+        error_code(
+            f.tools
+                .call(
+                    "catalog_install",
+                    json!({"plan_id":plan["plan_id"],"request_key":"not-in-schema"})
+                )
+                .await
+        ),
+        "invalid_request"
+    );
     let repeated = result(f.tools.call("catalog_prepare", f.spec("repeat")).await);
     assert_eq!(repeated["plan_id"], plan["plan_id"]);
     let mut other = f.spec("repeat");
@@ -595,10 +670,7 @@ async fn catalog_prepare_idempotence_validation_and_admission() {
     for (tool, args) in [
         ("catalog_prepare", f.spec("no-stamp")),
         ("catalog_plan", json!({"plan_id":plan["plan_id"]})),
-        (
-            "catalog_install",
-            json!({"plan_id":plan["plan_id"],"request_key":"x"}),
-        ),
+        ("catalog_install", json!({"plan_id":plan["plan_id"]})),
         ("catalog_generation", json!({})),
     ] {
         assert_eq!(
@@ -639,7 +711,7 @@ async fn catalog_prepare_idempotence_validation_and_admission() {
 #[tokio::test]
 async fn catalog_production_capabilities_fail_closed_by_token() {
     let mut f = Fixture::new().await;
-    f.tools.handler.catalog_agent.capabilities = Arc::new(UnsettledCapabilities);
+    f.tools.handler.catalog_agent.capabilities = Arc::new(DaemonCapabilities::default());
     let plan = f.prepare("empty-caps").await;
     assert_eq!(plan["state"], "failed");
     assert_eq!(plan["refusal"]["code"], "no_matching_version");
@@ -649,6 +721,76 @@ async fn catalog_production_capabilities_fail_closed_by_token() {
     );
     assert!(f.consumers.consumer.calls.lock().unwrap().is_empty());
     assert_eq!(f.cingulate.card_count(), 0);
+}
+
+#[test]
+fn catalog_daemon_capabilities_use_only_ready_valid_tokens_and_warn_once() {
+    struct Warnings(Arc<Mutex<Vec<String>>>);
+    impl tracing::Subscriber for Warnings {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Fields(String);
+            impl tracing::field::Visit for Fields {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push_str(&format!("{}={value:?};", field.name()));
+                }
+            }
+            if *event.metadata().level() == tracing::Level::WARN {
+                let mut fields = Fields(String::new());
+                event.record(&mut fields);
+                self.0.lock().unwrap().push(fields.0);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+    let module = |name, ready, provides| json!({"module_id":name,"ready":ready,"roles":[],"control_ops":[],"capabilities":{"provides":provides,"requires":[]}});
+    let catalog = crate::fake_daemon::DaemonSnapshot::new(
+        1,
+        vec![],
+        vec![
+            module(
+                "first",
+                true,
+                json!([
+                    "cap-code-read/v1",
+                    "cap-shell/v1",
+                    "cap-code-read-extra/v1",
+                    catalog_consumer::SKILL
+                ]),
+            ),
+            module(
+                "second",
+                true,
+                json!(["cap-code-read/v1", "cap-code-read-extra/v1"]),
+            ),
+            module("unready", false, json!(["cap-unready/v1"])),
+        ],
+    )
+    .catalog;
+    let source = DaemonCapabilities::default();
+    let warnings = Arc::new(Mutex::new(Vec::new()));
+    let _subscriber = tracing::subscriber::set_default(Warnings(warnings.clone()));
+    for _ in 0..2 {
+        assert_eq!(
+            source.tokens(&catalog),
+            vec!["cap/code.read@1", "cap/shell@1"]
+        );
+    }
+    let captured = warnings.lock().unwrap();
+    assert_eq!(captured.len(), 1, "{captured:?}");
+    assert!(captured[0].contains("cap-code-read-extra/v1"));
 }
 
 #[tokio::test]

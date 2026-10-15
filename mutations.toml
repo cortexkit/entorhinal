@@ -7325,3 +7325,107 @@ package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
 expect_red = ["catalog_agent::tests::catalog_prefetch_requires_all_checked_consumers_and_retries"]
+
+[[control]]
+id = "catalog-agent-capabilities-ready-only"
+guards = "Only ready daemon modules contribute local capability tokens"
+file = "crates/entorhinal-module/src/catalog_agent.rs"
+old = '.filter(|module| module.ready)'
+new = '.filter(|_| true) /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_daemon_capabilities_use_only_ready_valid_tokens_and_warn_once"]
+
+[[control]]
+id = "catalog-agent-capabilities-prefix"
+guards = "Only cap-prefixed daemon declarations are examined as catalog capability tokens"
+file = "crates/entorhinal-module/src/catalog_agent.rs"
+old = '.filter(|name| name.starts_with("cap-"))'
+new = '.filter(|_| true) /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_daemon_capabilities_use_only_ready_valid_tokens_and_warn_once"]
+
+[[control]]
+id = "catalog-agent-capabilities-malformed"
+guards = "Malformed cap-prefixed declarations never confer a local capability token"
+file = "crates/entorhinal-module/src/catalog_agent.rs"
+old = 'Err(_) => {'
+new = 'Err(_) => { tokens.insert("cap/invalid@1".into()); // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_daemon_capabilities_use_only_ready_valid_tokens_and_warn_once"]
+
+[[control]]
+id = "catalog-agent-capabilities-warn-once"
+guards = "An invalid declaration is logged only once per distinct name across catalog refreshes"
+file = "crates/entorhinal-module/src/catalog_agent.rs"
+old = 'if self.bad_names.lock().unwrap().insert(name.clone()) {'
+new = 'if true || self.bad_names.lock().unwrap().insert(name.clone()) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_daemon_capabilities_use_only_ready_valid_tokens_and_warn_once"]
+
+[[control]]
+id = "catalog-agent-consumer-service-id"
+guards = "The internal consumer service id is an exact byte contract, not a grammar-validated identifier"
+file = "crates/entorhinal-module/src/catalog_consumer.rs"
+old = 'pub const SERVICE: &str = "catalog-consumer";'
+new = 'pub const SERVICE: &str = "catalog-consumre"; // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/main.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["tests::every_declared_and_checked_capability_fits_daemon_grammar"]
+
+[[control]]
+id = "catalog-agent-consumer-route-refusal"
+guards = "A refused consumer route retains the daemon refusal name and module in plan and generation errors"
+file = "crates/entorhinal-module/src/catalog_consumer.rs"
+old = 'TransportError::Refusal { code, detail } => json!({"code":code,"detail":detail}),'
+new = 'TransportError::Refusal { code: _, detail } => json!({"code":"unavailable","detail":detail}), // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_refused_consumer_route_fails_plan_and_holds_generation"]
+
+[[control]]
+id = "catalog-agent-install-plan-key-schema"
+guards = "catalog_install takes only plan_id, which is its idempotence key, not a second caller request key"
+file = "crates/entorhinal-module/src/tool_provider.rs"
+old = 'if self.writes && self.name != "catalog_install" {'
+new = 'if self.writes { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_covered_install_no_card_and_retry_once"]
+
+[[control]]
+id = "catalog-agent-install-plan-key-admission"
+guards = "Install admission uses the canonical plan key and does not require a request_key argument"
+file = "crates/entorhinal-module/src/tool_provider.rs"
+old = 'if tool.writes && tool.name != "catalog_install" {'
+new = 'if tool.writes { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_covered_install_no_card_and_retry_once"]

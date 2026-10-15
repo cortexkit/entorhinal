@@ -163,7 +163,7 @@ taken from the daemon's scope stamp. Their rules are in
 Catalog tools are available to all live agent roles, self-targeted only; preparation
 is asynchronous, installation reuses the consent coordinator, and generation reads
 omit superseded handoff bookkeeping. See [catalog.md](catalog.md#agent-tools-and-consumer-protocol)
-for schemas, consumer kinds, refusals, idempotence and the production capability-token limitation.
+for schemas, consumer kinds, refusals, idempotence and capability-token declarations.
 
 | Operation | Kind | Who | What it does |
 |---|---|---|---|

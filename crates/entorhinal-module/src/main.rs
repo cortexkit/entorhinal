@@ -4537,6 +4537,8 @@ mod tests {
 
     #[test]
     fn every_declared_and_checked_capability_fits_daemon_grammar() {
+        // Service ids have no identifier grammar; routing compares their exact bytes.
+        assert_eq!(catalog_consumer::SERVICE, "catalog-consumer");
         let value = serde_json::to_value(manifest()).unwrap();
         let declared: Vec<_> = value["capabilities"]["provides"]
             .as_array()

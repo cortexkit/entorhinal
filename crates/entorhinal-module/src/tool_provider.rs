@@ -73,7 +73,7 @@ impl AgentTool {
                 json!({"type":"array", "items":{"type":"string"}}),
             );
         }
-        if self.writes {
+        if self.writes && self.name != "catalog_install" {
             // Some regex engines let `$` precede a final newline. The negative
             // character check rejects controls there as well as inside the key.
             properties.insert("request_key".into(), json!({"type":"string", "minLength":1,
@@ -316,7 +316,7 @@ impl ProjectsHandler {
         let tool = TOOLS.iter().find(|tool| tool.name == name).copied();
         let admission = if let Some(tool) = tool {
             let (admission, _caller) = self.admit_agent_tool(tool, key)?;
-            if tool.writes {
+            if tool.writes && tool.name != "catalog_install" {
                 validate_request_key(&value["arguments"])?;
             }
             Some(admission)

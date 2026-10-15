@@ -70,6 +70,18 @@ fn unavailable(module: &str, reason: impl std::fmt::Debug) -> HandlerError {
         detail: Some(json!({"module_id":module,"reason":format!("{reason:?}")})),
     }
 }
+fn route_unavailable(module: &str, error: TransportError) -> HandlerError {
+    let mut refusal = unavailable(module, &error);
+    refusal
+        .detail
+        .as_mut()
+        .expect("unavailable carries module detail")["route_refusal"] = match error {
+        TransportError::Refusal { code, detail } => json!({"code":code,"detail":detail}),
+        TransportError::Unavailable => json!({"code":"unavailable"}),
+        TransportError::NoReply => json!({"code":"outcome_unknown"}),
+    };
+    refusal
+}
 pub struct Consumer {
     module: String,
     kinds: Vec<Kind>,
@@ -117,7 +129,7 @@ pub async fn discover(
         let route = daemon
             .open(&module.module_id)
             .await
-            .map_err(|e| unavailable(&module.module_id, e))?;
+            .map_err(|e| route_unavailable(&module.module_id, e))?;
         consumers.push(Consumer {
             module: module.module_id.clone(),
             kinds,

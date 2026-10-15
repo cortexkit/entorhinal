@@ -350,9 +350,9 @@ no authority.
   with the exact closure, publisher trust, moves, consumer checks and composite card.
   Migration 12 stores the verified metadata, capability ceilings, moves and checked
   consumer sections in machine-local `catalog_prepared`, outside replay/export.
-- `catalog_install {plan_id, request_key}` accepts only ready plans; otherwise it
-  refuses `plan_not_ready` or `plan_failed`. Idempotence is **per plan_id**, even if
-  a retry uses a different caller request key. Approval binds exact closure digests,
+- `catalog_install {plan_id}` accepts only ready plans; otherwise it
+  refuses `plan_not_ready` or `plan_failed`. Idempotence is **per plan_id**; no
+  additional request key is accepted. Approval binds exact closure digests,
   the base pin digest and the consumer text. Both base pins and held closure status
   are revalidated inside the shared writer transaction (`plan_stale`).
 - `catalog_generation {}` reads the caller's current and pending local generations.
@@ -364,6 +364,19 @@ capabilities above declares exactly that kind; no marker means no ownership of
 that kind. All declaring consumers of a needed kind must participate. Missing,
 unready or unroutable consumers refuse `consumer_unavailable` with the module named
 (skills require prefrontal-core when no skill consumer is declared).
+
+Alongside each kind capability, a consumer must declare this exact provider role
+in its manifest's `provides` list:
+
+```json
+{"role":"internal_service","service_id":"catalog-consumer","transport":"bulk","agent_facing":false,"operations":["catalog_consumer.check","catalog_consumer.prefetch"]}
+```
+
+The service id has no identifier grammar and is compared by exact bytes. Entorhinal
+uses one `catalog_consumer::SERVICE` constant for routing and fake consumer roles.
+A kind capability without the role cannot open a route: preparation fails, or an
+approved generation stays held, with `consumer_unavailable`, the module id and
+the daemon's original route refusal code/detail. Missing roles never imply success.
 
 - `catalog_consumer.check {plan_id, packages}` receives only that consumer's kinds,
   with exact pin identities, publisher fingerprint/trust and verified capabilities.
@@ -393,15 +406,16 @@ approval for scripts, and rechecked before commit. Fully covered closures instal
 without a card. Consent settlements are recorded before acknowledgement using the
 existing consent coordinator; terminal retries replay the committed outcome once.
 
-### Local capability declaration limitation
+### Local capability declarations
 
-`LocalCapabilities` supplies the resolver's local `cap/<area>.<verb>@<major>` tokens.
-The production source deliberately returns **no tokens**: the daemon only accepts
-`<lowercase-hyphen-name>/v<N>` manifest capabilities, and the catalog contract has
-not yet fixed how its differently shaped tokens are declared. No automatic mapping
-or new consumer wire op is invented. Packages requiring capabilities therefore
-fail normal resolver eligibility, with missing tokens and packages in the refusal.
-Tests inject the signed vectors' tokens and also exercise the production empty set.
+`LocalCapabilities` supplies the resolver's local `cap/<area>[.<verb>]@<major>`
+tokens and remains injectable for tests. The production source reads the daemon
+catalog and unions the declarations of **ready** modules. Names beginning `cap-`
+pass through the pure crate's `manifest_to_capability` adapter: `cap-code-read/v1`
+becomes `cap/code.read@1`, and `cap-shell/v1` becomes `cap/shell@1`. Malformed names
+are ignored and logged once per distinct name, never accepted as tokens. Missing
+capabilities still fail the resolver's normal eligibility path, naming the package
+and token. No new consumer operation or ad hoc spelling conversion is introduced.
 
 ### Core activation operations
 

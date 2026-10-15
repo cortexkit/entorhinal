@@ -683,7 +683,7 @@ async fn provider_discovery_catalog_and_hello_agree_on_exact_tool_table() {
                 json!({"type":"array", "items":{"type":"string"}}),
             );
         }
-        if index < 5 || index == 6 || index == 8 {
+        if index < 5 || index == 6 {
             required.push("request_key");
             properties.insert("request_key".into(), json!({"type":"string", "minLength":1, "maxLength":128, "pattern":"^[ -~]+$", "not":{"pattern":"[^ -~]"},
                 "description":"A caller-chosen key for this write. Reuse it only with the same arguments."}));
