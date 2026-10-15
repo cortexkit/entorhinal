@@ -50,6 +50,8 @@ struct Progress {
     enforced: BTreeMap<String, bool>,
     #[serde(default)]
     contract_violation: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    published_at_ms: Option<i64>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -65,6 +67,8 @@ struct Plan {
     to: String,
     claim_version: u64,
     participants: Vec<MoveParticipant>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pin_digest: Option<String>,
     #[serde(default, rename = "_source")]
     source: Progress,
 }
@@ -79,6 +83,7 @@ impl Plan {
             to: self.to.clone(),
             claim_version: self.claim_version,
             participants: self.participants.clone(),
+            pin_digest: self.pin_digest.clone(),
             state: State::Published,
             reason: None,
             detail: None,
@@ -701,6 +706,9 @@ impl Source {
                     }
                 }
                 self.append_inbox(plan).await?;
+                plan.source
+                    .published_at_ms
+                    .get_or_insert_with(|| (self.worker.clock)());
                 Self::change_step(row, plan, Step::Published);
                 self.save(row, plan, false).await?;
                 Ok(Duration::ZERO)
@@ -1409,6 +1417,7 @@ mod tests {
                     trace: trace.clone(),
                 })),
                 discovery: Arc::new(Discovery { peers }),
+                catalog: None,
                 health: Arc::new(HealthGauges::default()),
                 writer: Arc::new(tokio::sync::Mutex::new(())),
                 clock,

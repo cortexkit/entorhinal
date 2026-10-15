@@ -61,6 +61,7 @@ mod catalog_agent;
 mod catalog_blob;
 mod catalog_consumer;
 mod catalog_grants;
+mod catalog_move;
 mod catalog_network;
 mod catalog_ops;
 mod catalog_poll;
@@ -580,6 +581,7 @@ struct ProjectsHandler {
     participant_discovery: Arc<dyn participant_discovery::ParticipantDiscovery>,
     catalog_agent: catalog_agent::CatalogAgent,
     catalog_publish: catalog_publish::Publisher,
+    catalog_move_lock: Arc<tokio::sync::Mutex<()>>,
     catalog_poll_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     catalog_poll_wake: Arc<tokio::sync::Notify>,
     door_client: door_client::DoorClient,
@@ -913,6 +915,7 @@ impl ProjectsHandler {
             )),
             catalog_agent: catalog_agent::CatalogAgent::default(),
             catalog_publish: catalog_publish::Publisher::default(),
+            catalog_move_lock: Arc::new(tokio::sync::Mutex::new(())),
             catalog_poll_task: Mutex::new(None),
             catalog_poll_wake: Arc::default(),
             claim_refresh: Arc::new(claims::RefreshQueue::default()),
@@ -1318,6 +1321,28 @@ impl ProjectsHandler {
             Ok(request) => request,
             Err(_) => return self.handle_request_unmeasured(body, key),
         };
+        if cortexkit_role_agent_data::REQUIRED_OPS.contains(&request.method.as_str()) {
+            let admission = self.admission_for(key);
+            if !matches!(admission.principal, Some(Principal::Reserved { ref module_id }) if module_id == "entorhinal")
+                || admission.scope.is_some()
+                || admission.flow_id.is_some()
+            {
+                return HandlerError::new(
+                    "caller_forbidden",
+                    "agent-data requires an unscoped entorhinal route",
+                )
+                .into_outcome();
+            }
+            return match self
+                .catalog_move_context()
+                .execute(&request.method, request.params)
+                .await
+                .and_then(encode_result)
+            {
+                Ok(body) => HandlerOutcome::Response(body),
+                Err(error) => error.into_outcome(),
+            };
+        }
         if request.method == catalog_agent::ACK_ACTIVATION {
             return match self.execute(request, key) {
                 Ok(body) => HandlerOutcome::Response(body),
@@ -2342,7 +2367,7 @@ fn manifest() -> ModuleManifest {
             // Registry ops use short SQLite locks. Change-feed waits suspend
             // their task outside that lock and are capped by the module.
             concurrency: Concurrency::ModuleManaged,
-        }, tool_provider::provider_role()])
+        }, tool_provider::provider_role(), participant_discovery::provider_role()])
     // Entorhinal serves requests but emits no autonomous self-signals.
     .self_signals(None)
     // Which source commit and wire version this binary is, so `ck provenance
@@ -2361,6 +2386,7 @@ fn manifest() -> ModuleManifest {
         provides: vec![PROJECT_IDENTITY_CAPABILITY.to_owned(), "agent-identity/v1".to_owned(),
             permissions::CAPABILITY.to_owned(),
             cortexkit_role_tool_provider::PROVIDES.to_owned(),
+            cortexkit_role_agent_data::PROVIDES.to_owned(),
             cortexkit_role_tool_provider::CALL_MODES_CAPABILITY.to_owned()],
         // Entorhinal calls engram (the module hosting the shared identity log)
         // only to write shared state, and serves every read without it. So
@@ -4533,6 +4559,7 @@ mod tests {
                 "agent-identity/v1",
                 "permissions/v1",
                 "tool-provider/v1",
+                "agent-data/v1",
                 "call-modes/v1"
             ])
         );

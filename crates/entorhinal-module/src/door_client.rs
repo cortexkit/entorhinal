@@ -335,6 +335,20 @@ impl DoorClient {
     pub(crate) async fn read(&self, cut: &CutRequest) -> Result<ReadReply, DoorError> {
         self.call(Request::Read(cut.clone())).await
     }
+    pub(crate) async fn session(&self, method: &str, params: Value) -> Result<Value, DoorError> {
+        debug_assert!(matches!(
+            method,
+            "session.admit" | "session.cover" | "session.read"
+        ));
+        let transport = self.connector.connect().await.map_err(map_transport)?;
+        let bytes = transport
+            .call(method, params)
+            .await
+            .map_err(map_transport)?;
+        serde_json::from_slice::<Envelope<Value>>(&bytes)
+            .map(|reply| reply.result)
+            .map_err(|error| DoorError::InvalidReply(error.to_string()))
+    }
     pub(crate) async fn handoff(&self, cut: &CutRequest) -> Result<HandoffReply, DoorError> {
         self.call(Request::Handoff(cut.clone())).await
     }

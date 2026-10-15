@@ -4172,8 +4172,10 @@ id = "s11-import-local-writer-recheck"
 guards = "A writer appearing while diverged is in flight holds import and forces diverged to run again"
 file = "crates/entorhinal-module/src/move_receiver.rs"
 old = '''self.local_writers(plan).await?;
+                self.catalog_preflight(plan).await?;
                 for p in &plan.participants {'''
 new = '''// NON-VACUITY BREAK: omit the post-diverged writer check
+                self.catalog_preflight(plan).await?;
                 for p in &plan.participants {'''
 test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
 runner = "cargo"
@@ -8022,3 +8024,354 @@ package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
 expect_red = ["cli::catalog_publish_cli_tests::publish_path_is_shared_canonical_and_flags_are_closed"]
+
+
+[[control]]
+id = "catalog-move-frame-magic"
+guards = "Package streams must carry the exact versioned magic before any blob is published"
+file = "crates/entorhinal-module/src/catalog_move/stream.rs"
+old = 'if exact::<22>(&mut reader)?.as_slice() != MAGIC {'
+new = 'if exact::<22>(&mut reader)?.as_slice() != MAGIC && false { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_move/stream.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_move::stream::tests::package_closure_bad_magic"]
+
+[[control]]
+id = "catalog-move-frame-count"
+guards = "The stream blob count must equal the unique pinned digest count"
+file = "crates/entorhinal-module/src/catalog_move/stream.rs"
+old = 'if count != wanted.len() || count > 512 {'
+new = 'if (count != wanted.len() || count > 512) && false { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_move/stream.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_move::stream::tests::package_closure_bad_count"]
+
+[[control]]
+id = "catalog-move-frame-duplicate"
+guards = "A package stream cannot repeat a digest"
+file = "crates/entorhinal-module/src/catalog_move/stream.rs"
+old = 'if previous.is_some_and(|p| p >= digest) {'
+new = 'if previous.is_some_and(|p| p > digest) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_move/stream.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_move::stream::tests::package_closure_duplicate_digest"]
+
+[[control]]
+id = "catalog-move-frame-order"
+guards = "Unique package digests must be ascending, not merely duplicate-free"
+file = "crates/entorhinal-module/src/catalog_move/stream.rs"
+old = 'if previous.is_some_and(|p| p >= digest) {'
+new = 'if previous.is_some_and(|p| p == digest) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_move/stream.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_move::stream::tests::package_closure_nonascending_digest"]
+
+[[control]]
+id = "catalog-move-frame-length"
+guards = "Each frame is bounded by the archive cap before allocation"
+file = "crates/entorhinal-module/src/catalog_move/stream.rs"
+old = 'if length > BLOB_CAP {'
+new = 'if length > BLOB_CAP + 1 { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_move/stream.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_move::stream::tests::package_closure_oversized_length"]
+
+[[control]]
+id = "catalog-move-frame-hash"
+guards = "Every staged manifest and archive must hash to its pinned digest"
+file = "crates/entorhinal-module/src/catalog_move/stream.rs"
+old = 'if sha256_hex(&bytes) != digest {'
+new = 'if sha256_hex(&bytes) != digest && false { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_move/stream.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_move::stream::tests::package_closure_hash_mismatch"]
+
+[[control]]
+id = "catalog-move-frame-pinned-set"
+guards = "A valid blob is still refused when it is outside the receiver's pinned closure"
+file = "crates/entorhinal-module/src/catalog_move/stream.rs"
+old = 'if !wanted.contains(&digest) {'
+new = 'if !wanted.contains(&digest) && false { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_move/stream.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_move::stream::tests::package_closure_wrong_pinned_set"]
+
+[[control]]
+id = "catalog-move-frame-tail"
+guards = "The last blob must end the package closure stream exactly"
+file = "crates/entorhinal-module/src/catalog_move/stream.rs"
+old = 'if reader.read(&mut tail).map_err(io)? != 0 {'
+new = 'if reader.read(&mut tail).map_err(io)? != 0 && false { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_move/stream.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_move::stream::tests::package_closure_trailing_bytes"]
+
+[[control]]
+id = "catalog-move-log-catchup"
+guards = "A receiver behind on shared pins catches up before refusing the move"
+file = "crates/entorhinal-module/src/catalog_move.rs"
+old = 'self.catch_up.for_move().await?;'
+new = '// NON-VACUITY BREAK: do not read the remaining identity log'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/catalog_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_pin_digest_catches_up_before_import"]
+
+[[control]]
+id = "catalog-move-pin-mismatch"
+guards = "A persistent pin digest difference aborts before import or claim take"
+file = "crates/entorhinal-module/src/catalog_move.rs"
+old = 'if actual != expected {'
+new = 'if actual != expected && false { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/catalog_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_persistent_pin_mismatch_aborts_before_claim"]
+
+[[control]]
+id = "catalog-move-local-trust"
+guards = "Missing target publisher trust aborts ordinary and lid-close moves before staging"
+file = "crates/entorhinal-module/src/catalog_move.rs"
+old = 'if !missing.is_empty() {'
+new = 'if !missing.is_empty() && false { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/catalog_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_missing_local_trust_aborts_before_staging_including_lid_close"]
+
+[[control]]
+id = "catalog-move-import-trust"
+guards = "The participant rechecks target trust before creating import staging files"
+file = "crates/entorhinal-module/src/catalog_move.rs"
+old = 'let pins = self.local_preflight(agent, expected).await?;'
+new = 'let pins = self.store()?.catalog_pins(agent)?; // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/catalog_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_participant_rechecks_trust_before_import_staging"]
+
+[[control]]
+id = "catalog-move-preclaim-trust"
+guards = "A local trust revocation after staging still prevents claim take"
+file = "crates/entorhinal-module/src/move_receiver.rs"
+old = '''Step::Staged => {
+                self.catalog_preflight(plan).await?;'''
+new = '''Step::Staged => {
+                // NON-VACUITY BREAK: skip the last target trust and pin check'''
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/catalog_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_rechecks_trust_before_claim_and_discards_ready_generation"]
+
+[[control]]
+id = "catalog-move-cut-hash"
+guards = "Import verifies the overall sealed stream hash as well as each pinned blob"
+file = "crates/entorhinal-module/src/catalog_move.rs"
+old = 'if hex(&hash.finalize()) != item.digest {'
+new = 'if hex(&hash.finalize()) != item.digest && false { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/catalog_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_tampered_cut_digest_refuses_before_publish"]
+
+[[control]]
+id = "catalog-move-source-digest"
+guards = "Source admission records the current nonempty catalog pin digest in its immutable plan"
+file = "crates/entorhinal-module/src/move_admission.rs"
+old = 'move_plan["pin_digest"] = json!(digest);'
+new = 'move_plan["omitted_pin_digest"] = json!(digest); // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/catalog_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_transfers_verified_blobs_prefetches_ready_and_chunks"]
+
+[[control]]
+id = "catalog-move-legacy-empty-pins"
+guards = "Unpinned move records retain their fixed pre-catalog bytes for older closed decoders"
+file = "crates/entorhinal-core/src/move_record.rs"
+old = '''#[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin_digest: Option<String>,'''
+new = '''#[serde(default)] // NON-VACUITY BREAK
+    pub pin_digest: Option<String>,'''
+test_file = "crates/entorhinal-core/src/move_record.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["move_record::tests::catalog_move_optional_digest_preserves_legacy_bytes_and_pins_plan"]
+
+[[control]]
+id = "catalog-move-new-container"
+guards = "Every move gets a fresh package container rather than reusing a handed-off session"
+file = "crates/entorhinal-module/src/catalog_move.rs"
+old = 'format!("{FORMAT}:{agent}:{cut}")'
+new = 'format!("{FORMAT}:{agent}") /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/catalog_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_back_uses_a_new_session_container"]
+
+[[control]]
+id = "catalog-move-admit-cap"
+guards = "Package blob admissions never exceed the session door's exact payload cap"
+file = "crates/entorhinal-module/src/catalog_move/stream.rs"
+old = 'pub(super) const ADMIT_CAP: usize = 3_145_692;'
+new = 'pub(super) const ADMIT_CAP: usize = 3_145_693; // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/catalog_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_transfers_verified_blobs_prefetches_ready_and_chunks"]
+
+[[control]]
+id = "catalog-move-abort-generation"
+guards = "An aborted receiver move cannot leave its imported generation ready for activation"
+file = "crates/entorhinal-module/src/catalog_move.rs"
+old = '.catalog_discard_move_generation(id, agent)'
+new = '.catalog_discard_move_generation("other-cut", agent) /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/catalog_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_rechecks_trust_before_claim_and_discards_ready_generation"]
+
+[[control]]
+id = "catalog-move-root-local-certification"
+guards = "A CortexKit publisher is trusted only when the receiver verifies its certificate against its own root"
+file = "crates/entorhinal-module/src/catalog_move.rs"
+old = '''root_keys.iter().any(|key| {
+                    entorhinal_catalog::key_fingerprint(&key.public_key).as_deref()
+                        == Some(&pin.publisher_fingerprint)
+                        && key.revocation.is_none()
+                })'''
+new = 'true /* NON-VACUITY BREAK: accept the scope name without local certification */'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/catalog_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_root_trust_uses_receiver_root_not_source_grants"]
+
+[[control]]
+id = "catalog-move-participant-caller"
+guards = "The package-closure internal service accepts only unscoped daemon-attested entorhinal calls"
+file = "crates/entorhinal-module/src/main.rs"
+old = '''if !matches!(admission.principal, Some(Principal::Reserved { ref module_id }) if module_id == "entorhinal")
+                || admission.scope.is_some()
+                || admission.flow_id.is_some()'''
+new = 'if false /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/catalog_move.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_move::tests::catalog_move_participant_is_declared_and_rejects_unattested_callers"]
+
+[[control]]
+id = "catalog-move-stored-trust-pins"
+guards = "The target publisher-trust command reads the authenticated shared pin set rather than an unavailable placeholder"
+file = "crates/entorhinal-module/src/catalog_grants.rs"
+old = '.filter(|p| p.publisher_fingerprint == publisher)'
+new = '.filter(|p| p.publisher_fingerprint == publisher && false) /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/catalog_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_operator_trusts_real_stored_pins_then_retries"]
+
+[[control]]
+id = "catalog-move-pinned-plan-digest"
+guards = "The shared move record cannot change its admitted catalog digest between steps"
+file = "crates/entorhinal-core/src/move_record.rs"
+old = '&& pinned.pin_digest == current.pin_digest'
+new = '&& true /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-core/src/move_record.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["move_record::tests::catalog_move_optional_digest_preserves_legacy_bytes_and_pins_plan"]
+
+[[control]]
+id = "catalog-move-wire-digest-shape"
+guards = "A present catalog digest must be a lower-case SHA256 rather than arbitrary text"
+file = "crates/entorhinal-core/src/move_record.rs"
+old = 'if record.pin_digest.as_ref().is_some_and(|digest| {'
+new = 'if false && record.pin_digest.as_ref().is_some_and(|digest| { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/move_record.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["move_record::tests::catalog_move_optional_digest_preserves_legacy_bytes_and_pins_plan"]
+
+[[control]]
+id = "catalog-move-abort-checkpoint"
+guards = "Aborting a cut before import persists a terminal participant checkpoint across a restart"
+file = "crates/entorhinal-module/src/catalog_move.rs"
+old = '''state.step = "aborted".into();
+                self.save(id, state)?;'''
+new = '''state.step = "aborted".into();
+                // NON-VACUITY BREAK: forget the terminal checkpoint'''
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/catalog_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_none_status_and_aborted_cut_cannot_import"]
+
+[[control]]
+id = "catalog-move-internal-refusal-vocabulary"
+guards = "Content-store failures use the role's retryable vocabulary instead of escaping as contract violations"
+file = "crates/entorhinal-module/src/catalog_move.rs"
+old = 'error.code = "unavailable".into();'
+new = '// NON-VACUITY BREAK: leak the storage refusal code to the participant client'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/catalog_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_content_store_errors_use_allowed_retry_refusals"]

@@ -34,13 +34,27 @@ pub trait PinSource: Send + Sync {
         publisher: &str,
     ) -> Result<Vec<PublisherPin>, CatalogError>;
 }
-struct UnavailablePins;
-impl PinSource for UnavailablePins {
-    fn pins(&self, _: &RegistryStore, _: &str, _: &str) -> Result<Vec<PublisherPin>, CatalogError> {
-        Err(CatalogError::new(
-            "manifest_unavailable",
-            "authenticated pins are not available yet",
-        ))
+struct StoredPins;
+impl PinSource for StoredPins {
+    fn pins(
+        &self,
+        store: &RegistryStore,
+        agent: &str,
+        publisher: &str,
+    ) -> Result<Vec<PublisherPin>, CatalogError> {
+        Ok(store
+            .catalog_pins(agent)
+            .map_err(|e| CatalogError::new("storage_error", e.to_string()))?
+            .into_iter()
+            .filter(|p| p.publisher_fingerprint == publisher)
+            .map(|p| PublisherPin {
+                name: p.name,
+                version: p.version,
+                publisher_fingerprint: p.publisher_fingerprint,
+                manifest_sha256: p.manifest_sha256,
+                archive_sha256: p.archive_sha256,
+            })
+            .collect())
     }
 }
 #[derive(Deserialize)]
@@ -121,7 +135,7 @@ impl ProjectsHandler {
         key: RouteKey,
         received: Instant,
     ) -> Result<Vec<u8>, HandlerError> {
-        self.catalog_publisher_trust_from(params, key, received, &UnavailablePins)
+        self.catalog_publisher_trust_from(params, key, received, &StoredPins)
             .await
     }
     pub(crate) async fn catalog_publisher_trust_from(

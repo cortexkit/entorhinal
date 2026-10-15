@@ -52,6 +52,21 @@ Every other row is refused. "Source" means the record's `from` Mac and
 Mac is not acted on. A record or inbox body that is malformed, has an unknown
 version or state, or exceeds its size bound is refused by name.
 
+For an agent with catalog package pins, the immutable plan also includes
+`pin_digest`, the digest reported by `catalog.agent_generation`. The source
+captures it at admission and checks that the selection did not change before
+committing the checkpoint. An empty pin set omits the field entirely, retaining
+the original record bytes for older Macs. Updated entorhinal decoders accept
+records both with and without `pin_digest`.
+Moving an agent with catalog pins requires **both Macs to support catalog
+moves**. Older record decoders reject fields they do not recognize, including
+`pin_digest`, so they do not pick up a pinned-package move. The source remains
+at `published`, with status `waiting_for_target`,
+the message "waiting for the target Mac to pick up the move", `waiting_since_ms`
+and elapsed `waiting_ms` in move status and `agent.where`. It never interprets
+an absent inbox entry as evidence of rejection. The operator can abort this wait
+with the existing move-abort command, upgrade the target, and retry.
+
 Tests: `transition_table_exhaustively_refuses_every_unlisted_row`,
 `author_check_maps_every_state_to_its_required_writer`,
 `move_codec_refuses_unknown_state`,
@@ -272,3 +287,64 @@ It defaults to off and is local to the Mac.
 Tests: `moves_view_orders_open_first_and_limits_finished_to_latest_32`,
 `served_move_controls_admit_confirm_and_bypass_shared_writer`,
 `move_controls_presence_failure_and_aborted_noop_preserve_state`.
+
+## 10. Catalog package closures
+
+Catalog pins are shared `catalog.pin` identity-log entries; a move does not copy
+them. For a nonempty selection the saved participant plan contains one synthetic
+`package-closure` ref, whose `ref` is the agent ID. Entorhinal handles the package
+blob export and import for this ref. It is not
+a session binding and never enters session liveness. An unpinned agent does not
+include this participant, even if daemon discovery finds entorhinal advertising
+`agent-data/v1`: there are no package bytes for it to carry.
+
+Before divergence checks or import, the receiver compares its own pin digest
+with the plan's digest. On a difference it catches up the identity log once and
+compares again. A persistent difference aborts with `pin_digest_mismatch`, naming
+`source_pin_digest` and `receiver_pin_digest`. The receiver checks local publisher
+trust before staging and repeats its preflight before taking the claim. Missing
+trust aborts with `trust_missing`, listing publisher scopes and key fingerprints;
+it also refuses moves initiated automatically when the source Mac's lid closes,
+rather than parking them until trust changes. Trust keys on the target with
+`ck catalog publisher trust <fingerprint> --agent <agent_id>` and retry.
+These are move abort reasons, not new participant refusal codes.
+
+Publisher grants and source approvals never travel. Non-CortexKit publishers
+need a live target-local install grant for that agent. CortexKit keys must be
+certified against the receiver's own built-in root through its configured
+registry's existing key-chain verifier. The built-in CortexKit publishing root,
+`catalog_trust::CORTEXKIT_ROOT`, is currently empty, so these keys refuse
+`trust_missing` until that root is provisioned; the scope
+name alone never grants trust.
+
+Entorhinal exports an immutable snapshot of the pinned content-store blobs on
+its `reserved:entorhinal` session-door stream. Each cut has a new, deterministic
+session container derived from the agent ID and cut ID, so a later move cannot
+reuse a container fenced by an earlier handoff. Prepare durably saves the
+snapshot, admits it, and checks cloud coverage; export confirms coverage before
+the driver seals the ordinary cut. Lease and offline errors map to the existing
+retryable participant `unavailable` refusal. Lost admits are reconciled by
+checking the already admitted prefix, not by duplicating bytes.
+
+The opaque stream format is `package-closure/v1`: ASCII
+`ck-package-closure/v1\n`, a big-endian u32 blob count, then ascending unique
+raw SHA-256 digests (32 bytes), each followed by a big-endian u64 byte length and
+the raw blob bytes. There are no pins, permissions or generation IDs in it.
+The source includes each selected manifest and archive digest once. Admissions
+are at most 3,145,692 bytes, and a blob may span admissions. The receiver hashes
+the stream incrementally, checks its sealed cut digest, then verifies every
+frame in bounded staging files before publishing any blob. Bad magic/count,
+nonascending or duplicate digests, blobs over 10 MiB, hash mismatches, trailing
+bytes, or a digest set different from the local pinned closure refuse the
+existing `digest_mismatch` code. A local generation is built from those pins and
+the verified manifests, checked and prefetched to catalog consumers, then marked
+`ready`. Aborting before activation removes its eligibility for activation but
+does not change shared pins or local publisher grants.
+
+Participant checkpoints live under `catalog/move-checkpoints`, separately from
+the payloads under `catalog/moves`. An abort is durable even when import never
+started, without staging any package bytes. `agent_data.status` returns `none`
+when this participant has no checkpoint for the requested cut;
+a fresh participant instance still reports an aborted cut as `aborted` and
+refuses to import it again. Internal storage errors use the participant's
+existing retryable `unavailable` code, not private catalog refusal codes.

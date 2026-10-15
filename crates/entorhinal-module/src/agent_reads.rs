@@ -1517,9 +1517,17 @@ mod tests {
     fn manifest_pins_exact_authority_surface_capabilities_and_protocol_dependencies() {
         let manifest = serde_json::to_value(crate::manifest()).unwrap();
         let surfaces = manifest["provides"].as_array().unwrap();
-        assert_eq!(surfaces.len(), 2, "management and agent tool surfaces");
+        assert_eq!(
+            surfaces.len(),
+            3,
+            "management, agent tools and package move participant"
+        );
         assert_eq!(surfaces[0]["role"], "management_surface");
         assert_eq!(surfaces[1]["role"], "tool_provider");
+        assert_eq!(
+            surfaces[2],
+            serde_json::to_value(crate::participant_discovery::provider_role()).unwrap()
+        );
         let operations = surfaces[0]["operations"].as_array().unwrap();
         let expected_queries = [
             "catalog.registry_list",
@@ -1625,6 +1633,7 @@ mod tests {
                 "agent-identity/v1",
                 "permissions/v1",
                 "tool-provider/v1",
+                "agent-data/v1",
                 "call-modes/v1"
             ])
         );

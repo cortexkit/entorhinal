@@ -627,6 +627,7 @@ impl Receiver {
                 json!({"code":"identity_log_disabled"}),
             ));
         }
+        self.catalog_preflight(plan).await?;
         let supervisor = self.worker.discovery.supervisor_list().await.map_err(|e| {
             Failure::hold(
                 "unavailable",
@@ -694,11 +695,33 @@ impl Receiver {
         self.local_writers(plan).await
     }
 
+    async fn catalog_preflight(&self, plan: &MoveRecord) -> Result<(), Failure> {
+        let Some(expected) = &plan.pin_digest else {
+            return Ok(());
+        };
+        let catalog = self.worker.catalog.as_ref().ok_or_else(|| Failure::abort(MoveReason::IncompatibleVersion, json!({"code":"incompatible_version","module_id":"entorhinal","note":"Both Macs need catalog move support"})))?;
+        catalog
+            .preflight(&plan.agent_id, expected)
+            .await
+            .map(|_| ())
+            .map_err(|e| match e.code.as_str() {
+                "pin_digest_mismatch" => Failure::abort(
+                    MoveReason::PinDigestMismatch,
+                    e.detail.unwrap_or(Value::Null),
+                ),
+                "trust_missing" => {
+                    Failure::abort(MoveReason::TrustMissing, e.detail.unwrap_or(Value::Null))
+                }
+                _ => Failure::hold(&e.code, json!({"message":e.message,"detail":e.detail})),
+            })
+    }
+
     async fn local_writers(&mut self, plan: &MoveRecord) -> Result<(), Failure> {
         let refs: Vec<_> = plan
             .participants
             .iter()
             .flat_map(|p| p.refs.clone())
+            .filter(|r| r.ref_kind != "package-closure")
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect();
@@ -875,6 +898,7 @@ impl Receiver {
                 // the cut. A host can write while that call is in flight, so recheck
                 // session-binding ownership and active local writers before import.
                 self.local_writers(plan).await?;
+                self.catalog_preflight(plan).await?;
                 for p in &plan.participants {
                     let client = self.client(&p.module_id).await?;
                     progress.pending = Some(PendingCall {
@@ -894,6 +918,7 @@ impl Receiver {
                 self.save(row, progress).await?;
             }
             Step::Imported => {
+                self.catalog_preflight(plan).await?;
                 if observed.state == State::Published {
                     self.cas_move(row, plan, State::Published, State::Staged)
                         .await?;
@@ -907,6 +932,7 @@ impl Receiver {
                 self.save(row, progress).await?;
             }
             Step::Staged => {
+                self.catalog_preflight(plan).await?;
                 self.take_claim(row, plan, progress).await?;
                 // The move-record CAS to claimed can lose to a peer abort after
                 // taking the agent claim. Cleanup must return that claim to the
@@ -965,6 +991,7 @@ impl Receiver {
                     .participants
                     .iter()
                     .flat_map(|p| p.refs.clone())
+                    .filter(|r| r.ref_kind != "package-closure")
                     .collect::<Vec<_>>();
                 *row = self
                     .worker
@@ -1767,6 +1794,7 @@ mod tests {
                 records: RecordClient::new(Arc::new(Connector(records.clone()))),
                 door: door.for_author([2; 16]).client(),
                 discovery: discovery.clone(),
+                catalog: None,
                 health: Arc::new(crate::HealthGauges::default()),
                 writer: Arc::new(tokio::sync::Mutex::new(())),
                 clock,
