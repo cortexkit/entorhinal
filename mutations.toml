@@ -7639,3 +7639,16 @@ package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
 expect_red = ["catalog_agent::tests::catalog_status_news_views_and_prepare_named_refusal"]
+
+[[control]]
+id = "catalog-poll-completion-order"
+guards = "Test observers distinguish every completed poll pass, including results sent before waiting"
+file = "crates/entorhinal-module/src/catalog_poll.rs"
+old = 'let number = self.completed_passes.fetch_add(1, Ordering::Relaxed) + 1;'
+new = 'let number = 0; // NON-VACUITY BREAK: erase causal pass identity'
+test_file = "crates/entorhinal-module/src/catalog_poll_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_poll::tests::completed_passes_are_buffered_with_their_results_and_gauges"]

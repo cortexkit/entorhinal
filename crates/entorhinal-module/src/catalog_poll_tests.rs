@@ -103,9 +103,62 @@ impl Fixture {
             }),
         }
     }
-    async fn done(&self) {
-        self.health.catalog.done.notified().await;
+}
+async fn completed_pass(
+    receiver: &mut tokio::sync::mpsc::UnboundedReceiver<CompletedPass>,
+    number: u64,
+    result: Result<(), &'static str>,
+) -> Value {
+    let paused_at = tokio::time::Instant::now();
+    // Real time only bounds a broken test; it never drives the simulated schedule.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let completion = loop {
+        match receiver.try_recv() {
+            Ok(completion) => break completion,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                panic!("poll completion channel closed before pass {number}")
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "poll pass {number} did not complete"
+        );
+        // Keep socket I/O runnable instead of letting paused Tokio time jump to
+        // the HTTP timeout. Only explicit advance calls drive the poll schedule.
+        tokio::task::yield_now().await;
+    };
+    assert_eq!(completion.number, number, "unexpected completed poll pass");
+    assert_eq!(completion.result, result, "poll pass {number}");
+    assert_eq!(
+        tokio::time::Instant::now(),
+        paused_at,
+        "HTTP completion advanced the paused clock"
+    );
+    completion.gauges
+}
+#[test]
+fn completed_passes_are_buffered_with_their_results_and_gauges() {
+    let gauges = Gauges::default();
+    let mut completions = gauges.completions();
+    gauges.finish(Ok(()), 100);
+    gauges.finish(Err("status_unavailable"), 200);
+    gauges.finish(Ok(()), 300);
+    for (number, result, success, failures) in [
+        (1, Ok(()), 100, 0),
+        (2, Err("status_unavailable"), 100, 1),
+        (3, Ok(()), 300, 0),
+    ] {
+        let pass = completions.try_recv().unwrap();
+        assert_eq!(pass.number, number);
+        assert_eq!(pass.result, result);
+        assert_eq!(pass.gauges["catalogLastSuccessMs"], success);
+        assert_eq!(pass.gauges["catalogConsecutiveFailures"], failures);
     }
+    assert!(matches!(
+        completions.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -122,16 +175,17 @@ async fn startup_hourly_offset_and_backoff_recovers() {
         );
     }
     let f = Fixture::new().await;
+    let mut completions = f.health.catalog.completions();
     assert!(f.health.catalog.report()["catalogLastSuccessMs"].is_null());
     let task = tokio::spawn(f.worker().run());
-    f.done().await;
-    assert_eq!(f.health.catalog.report()["catalogScopesPolled"], 1);
-    assert_eq!(f.health.catalog.report()["catalogLastSuccessMs"], 600_000);
+    let first = completed_pass(&mut completions, 1, Ok(())).await;
+    assert_eq!(first["catalogScopesPolled"], 1);
+    assert_eq!(first["catalogLastSuccessMs"], 600_000);
     tokio::time::advance(Duration::from_millis(HOUR_MS - 1)).await;
     assert_eq!(f.health.catalog.report()["catalogScopesPolled"], 1);
     tokio::time::advance(Duration::from_millis(1)).await;
-    f.done().await;
-    assert_eq!(f.health.catalog.report()["catalogScopesPolled"], 2);
+    let hourly = completed_pass(&mut completions, 2, Ok(())).await;
+    assert_eq!(hourly["catalogScopesPolled"], 2);
     f.fake.serve(
         "/v1/scopes/example/status?after=1",
         Reply {
@@ -141,24 +195,19 @@ async fn startup_hourly_offset_and_backoff_recovers() {
     );
     for (hours, count) in [(1, 1), (2, 2), (4, 3), (6, 4)] {
         tokio::time::advance(Duration::from_secs(hours * 3600)).await;
-        f.done().await;
-        assert_eq!(
-            f.health.catalog.report()["catalogConsecutiveFailures"],
-            count
-        );
-        assert!(f.health.catalog.report()["catalogLastError"].is_string());
+        let failed = completed_pass(&mut completions, count + 2, Err("registry_http_error")).await;
+        assert_eq!(failed["catalogConsecutiveFailures"], count);
+        assert_eq!(failed["catalogLastError"], "registry_http_error");
     }
     f.feed();
     tokio::time::advance(Duration::from_secs(6 * 3600)).await;
-    f.done().await;
-    assert_eq!(f.health.catalog.report()["catalogConsecutiveFailures"], 0);
-    assert!(f.health.catalog.report()["catalogLastError"].is_null());
-    let count = f.health.catalog.report()["catalogScopesPolled"]
-        .as_u64()
-        .unwrap();
+    let recovered = completed_pass(&mut completions, 7, Ok(())).await;
+    assert_eq!(recovered["catalogConsecutiveFailures"], 0);
+    assert!(recovered["catalogLastError"].is_null());
+    let count = recovered["catalogScopesPolled"].as_u64().unwrap();
     tokio::time::advance(Duration::from_secs(3600)).await;
-    f.done().await;
-    assert_eq!(f.health.catalog.report()["catalogScopesPolled"], count + 1);
+    let hourly = completed_pass(&mut completions, 8, Ok(())).await;
+    assert_eq!(hourly["catalogScopesPolled"], count + 1);
     task.abort();
     task.await.unwrap_err();
     assert_eq!(delay(0, 600_000, 0), Duration::from_secs(600));
@@ -213,8 +262,14 @@ async fn gated_http_holds_neither_store_nor_handler_lease() {
         },
     );
     let worker = f.worker();
-    let task = tokio::spawn(async move { worker.pass().await });
-    entered.notified().await;
+    let entry = entered.notified();
+    tokio::pin!(entry);
+    entry.as_mut().enable();
+    let mut task = tokio::spawn(async move { worker.pass().await });
+    tokio::select! {
+        () = &mut entry => {},
+        result = &mut task => panic!("HTTP poll completed before reaching its reply gate: {result:?}"),
+    }
     f.slot.lock().unwrap().take();
     let reopened =
         RegistryStore::open(&f.descriptor).expect("an HTTP await retained the store lease");
@@ -230,17 +285,13 @@ async fn hello_ack_starts_catalog_poll_once() {
     let sources = f.worker().sources;
     f.slot.lock().unwrap().take();
     let mut handler = ProjectsHandler::with_runtime("0123456789abcdef".into(), clock);
+    let mut completions = handler.health.catalog.completions();
     handler.catalog_agent.sources = sources;
     handler
         .on_hello_ack(&crate::tests::hello_ack(&f.descriptor))
         .await;
-    tokio::time::timeout(
-        Duration::from_secs(1),
-        handler.health.catalog.done.notified(),
-    )
-    .await
-    .expect("HELLO_ACK did not schedule the startup status poll");
-    assert_eq!(handler.health.catalog.report()["catalogScopesPolled"], 1);
+    let first = completed_pass(&mut completions, 1, Ok(())).await;
+    assert_eq!(first["catalogScopesPolled"], 1);
     handler.start_catalog_poll();
     assert_eq!(handler.health.catalog.report()["catalogScopesPolled"], 1);
     assert_eq!(

@@ -47,9 +47,24 @@ pub(crate) struct Gauges {
     failures: AtomicU64,
     scopes: AtomicU64,
     #[cfg(test)]
-    done: tokio::sync::Notify,
+    completed_passes: AtomicU64,
+    #[cfg(test)]
+    completed: Mutex<Option<tokio::sync::mpsc::UnboundedSender<CompletedPass>>>,
+}
+#[cfg(test)]
+#[derive(Debug)]
+struct CompletedPass {
+    number: u64,
+    result: Result<(), &'static str>,
+    gauges: serde_json::Value,
 }
 impl Gauges {
+    #[cfg(test)]
+    fn completions(&self) -> tokio::sync::mpsc::UnboundedReceiver<CompletedPass> {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        assert!(self.completed.lock().unwrap().replace(sender).is_none());
+        receiver
+    }
     pub(crate) fn report(&self) -> serde_json::Value {
         let succeeded = self.succeeded.load(Ordering::Acquire);
         let success = self.last_success.load(Ordering::Relaxed);
@@ -80,7 +95,16 @@ impl Gauges {
             }
         };
         #[cfg(test)]
-        self.done.notify_one();
+        {
+            let number = self.completed_passes.fetch_add(1, Ordering::Relaxed) + 1;
+            if let Some(sender) = self.completed.lock().unwrap().as_ref() {
+                let _ = sender.send(CompletedPass {
+                    number,
+                    result,
+                    gauges: self.report(),
+                });
+            }
+        }
         failures
     }
 }
