@@ -310,7 +310,12 @@ impl RegistryStore {
                 })
             })
             .map_err(|cause| error.into_inner().unwrap_or(RegistryError::Store(cause)))?;
-        Ok(b"{\"ok\":true}".to_vec())
+        // Every registry reply is wrapped in `result`, which the CLI requires;
+        // echo the stored (trimmed) name so the operator sees what was saved.
+        Ok(serde_json::to_vec(&serde_json::json!({
+            "result": {"display_name": name.display_name}
+        }))
+        .expect("a JSON object with one string field always encodes"))
     }
 
     /// Install all snapshot parts atomically, preserving each part's authorship

@@ -8797,3 +8797,16 @@ package = "entorhinal-core"
 target = "--lib"
 select = "expected"
 expect_red = ["agent::avatars::tests::avatar_manifest_summary_refuses_overlong_type_without_truncation"]
+
+[[control]]
+id = "member-name-reply-envelope"
+guards = "Naming a Mac replies inside the result envelope the CLI unwraps, so a saved name never prints a transport error"
+file = "crates/entorhinal-core/src/remote_apply.rs"
+old = '"result": {"display_name": name.display_name}'
+new = '"ok": true, "display_name": name.display_name // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/cli.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["cli::tests::attach_cli_refuses_malformed_flags_and_maps_log_commands"]

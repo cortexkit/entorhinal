@@ -2409,9 +2409,14 @@ mod tests {
                 tokio::select! { result = &mut response => break result, () = tokio::task::yield_now() => {} }
             }
         };
-        assert!(
-            matches!(result, crate::HandlerOutcome::Response(_)),
-            "{result:?}"
+        let crate::HandlerOutcome::Response(bytes) = result else {
+            panic!("log name was refused: {result:?}")
+        };
+        // The CLI unwraps every reply's `result`; a reply without it printed a
+        // transport error even though the name was saved.
+        assert_eq!(
+            unwrap_result(serde_json::from_slice(&bytes).unwrap()).unwrap(),
+            json!({"display_name":"Studio"})
         );
         assert_eq!(log.head(), 2);
         let cortexkit_store_types::StorageBackend::Sqlite { path } = &descriptor.backend else {
