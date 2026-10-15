@@ -209,13 +209,18 @@ pub fn decode_github_identity(value: Value) -> Result<Option<GithubIdentity>, Ag
     })
 }
 
-/// Return the fixed genome length for the supported `creature.classic` layout,
-/// refusing unknown avatar types rather than guessing their layout.
-/// Source: prefrontal 873870be8,
-/// crates/prefrontal-core-module/src/agent_registry_ops.rs:835-842.
+/// Return the fixed genome length, in hex characters, for each supported avatar
+/// type, refusing unknown types rather than guessing their layout. Each type
+/// reads its own byte layout, so a genome minted for one type must never be
+/// stored under another; the differing lengths refuse that on sight.
+/// `creature.classic` is 1,024 bytes (prefrontal 873870be8,
+/// crates/prefrontal-core-module/src/agent_registry_ops.rs:835-842).
+/// `creature.wild` is 16,384 bytes, per the avatar genome layout that reserves
+/// regions later representations will read.
 fn avatar_layout_hex_chars(avatar_type: &str) -> Result<usize, AgentRegistryError> {
     match avatar_type {
         "creature.classic" => Ok(2048),
+        "creature.wild" => Ok(32_768),
         _ => Err(AgentRegistryError::invalid_request(format!(
             "unknown avatar type '{avatar_type}'"
         ))),
@@ -240,7 +245,8 @@ pub fn validate_agent_avatar(
     // stores. The length measurement remains UTF-8 bytes, as in core.
     if genome.len() != expected_hex_chars {
         return Err(AgentRegistryError::invalid_request(format!(
-            "avatar genome for type '{avatar_type}' must be exactly 1024 bytes ({expected_hex_chars} hex chars); received {} hex chars",
+            "avatar genome for type '{avatar_type}' must be exactly {} bytes ({expected_hex_chars} hex chars); received {} hex chars",
+            expected_hex_chars / 2,
             genome.len()
         )));
     }
@@ -445,6 +451,38 @@ mod tests {
                 .unwrap_err()
                 .code(),
             "invalid_request"
+        );
+    }
+
+    // A wild genome is 16,384 bytes (32,768 hex characters). Each type accepts
+    // only its own length, so a classic genome cannot be stored as wild and a
+    // wild genome cannot be stored as classic.
+    #[test]
+    fn avatar_lengths_are_per_type() {
+        assert_eq!(
+            validate_agent_avatar(&"a".repeat(32_768), Some("creature.wild")),
+            Ok(())
+        );
+        for (genome, avatar_type) in [
+            ("a".repeat(2048), "creature.wild"),
+            ("a".repeat(32_767), "creature.wild"),
+            ("a".repeat(32_769), "creature.wild"),
+            ("a".repeat(32_768), "creature.classic"),
+        ] {
+            let error = validate_agent_avatar(&genome, Some(avatar_type)).unwrap_err();
+            assert_eq!(
+                error.code(),
+                "invalid_request",
+                "{avatar_type} {}",
+                genome.len()
+            );
+        }
+        let message = validate_agent_avatar(&"a".repeat(2048), Some("creature.wild"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("16384 bytes (32768 hex chars)"),
+            "{message}"
         );
     }
 

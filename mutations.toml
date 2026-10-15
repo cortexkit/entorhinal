@@ -8375,3 +8375,16 @@ package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
 expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_content_store_errors_use_allowed_retry_refusals"]
+
+[[control]]
+id = "avatar-wild-length"
+guards = "A creature.wild genome must be exactly 32,768 hex characters, so classic and wild genomes cannot cross types"
+file = "crates/entorhinal-core/src/agent/validate.rs"
+old = '"creature.wild" => Ok(32_768),'
+new = '"creature.wild" => Ok(2048), // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/agent/validate.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["agent::validate::tests::avatar_lengths_are_per_type"]
