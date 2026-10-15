@@ -8,8 +8,13 @@ use base64::Engine;
 use entorhinal_core::catalog_agent::{CatalogPin, PinWriteRequest};
 use tokio::time::Instant;
 
+/// Stand-in consumer that checks prefetched bytes against the content store.
+/// It keeps only the store's folder, never a `RegistryStore`: the handler
+/// owns this consumer, so a store handle here would keep the SQLite files
+/// open after the test closes the store, and Windows then refuses to delete
+/// the scratch folder.
 struct Consumer {
-    store: RegistryStore,
+    folder: std::path::PathBuf,
     calls: Mutex<Vec<String>>,
 }
 #[async_trait]
@@ -20,7 +25,7 @@ impl LogTransport for Consumer {
             for pin in params["packages"].as_array().unwrap() {
                 for field in ["manifest_sha256", "archive_sha256"] {
                     let digest = pin[field].as_str().unwrap();
-                    let bytes = BlobStore::new(self.store.store_folder())
+                    let bytes = BlobStore::new(self.folder.clone())
                         .unwrap()
                         .read_verified(digest)
                         .unwrap();
@@ -125,7 +130,7 @@ async fn catalog_pair(
     let (pin, archive) = package(large);
     for mac in [&mut pair.a, &mut pair.b] {
         let consumer = Arc::new(Consumer {
-            store: mac.store(),
+            folder: mac.store().store_folder().to_path_buf(),
             calls: Mutex::new(vec![]),
         });
         mac.machine.handler.catalog_agent.consumers = Arc::new(Consumers(consumer));
@@ -148,7 +153,7 @@ async fn catalog_pair(
         grant(&pair.b, &pin, "receiver-only");
     }
     let consumer = Arc::new(Consumer {
-        store: pair.b.store(),
+        folder: pair.b.store().store_folder().to_path_buf(),
         calls: Mutex::new(vec![]),
     });
     pair.b.machine.handler.catalog_agent.consumers = Arc::new(Consumers(consumer.clone()));

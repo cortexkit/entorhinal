@@ -290,7 +290,19 @@ impl Machine {
 impl Drop for Machine {
     fn drop(&mut self) {
         self.handler.store.lock().unwrap().take();
-        std::fs::remove_dir_all(&self.dir).unwrap();
+        let removed = std::fs::remove_dir_all(&self.dir);
+        // A second panic while a test is already failing aborts the whole test
+        // binary (on Windows, 0xc0000409), hiding every later result. So while
+        // unwinding, only report the leftover folder; otherwise fail loudly,
+        // since a folder Windows can't delete means a store handle outlived
+        // the store.
+        if std::thread::panicking() {
+            if let Err(error) = removed {
+                eprintln!("scratch folder {} not removed: {error}", self.dir.display());
+            }
+        } else {
+            removed.unwrap();
+        }
     }
 }
 
