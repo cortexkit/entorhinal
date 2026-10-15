@@ -484,30 +484,6 @@ fn run_with_directory(
         }
     };
 
-    // Project mutation and attach replies carry an ID, but not the project's
-    // display name. Use the same registry listing as `ck projects list` for
-    // text output; JSON output remains the untouched module reply.
-    let projects = if !command.json
-        && command.face == Face::Projects
-        && matches!(command.verb.as_str(), "attach" | "approve" | "unapprove")
-    {
-        match call(
-            command.connection.as_deref(),
-            &command,
-            "enumerate",
-            json!({}),
-            &cwd,
-        ) {
-            Ok(projects) => Some(projects),
-            Err((code, message)) => {
-                let _ = writeln!(stderr, "{message}");
-                return ExitCode::from(code);
-            }
-        }
-    } else {
-        None
-    };
-
     match call(
         command.connection.as_deref(),
         &command,
@@ -516,10 +492,26 @@ fn run_with_directory(
         &cwd,
     ) {
         Ok(mut value) => {
-            if let Some(projects) = projects {
-                value["projectName"] = project_name_from_list(&projects, &value["projectId"])
-                    .map(Value::String)
-                    .unwrap_or(Value::Null);
+            // Attach and approval replies carry the project's id but not its
+            // name. For text output, look the name up afterwards with the same
+            // listing `ck projects list` uses. The write has already happened,
+            // so a failed lookup only leaves the name out; it never fails or
+            // blocks the command. JSON output stays the untouched module reply.
+            if !command.json
+                && command.face == Face::Projects
+                && matches!(command.verb.as_str(), "attach" | "approve" | "unapprove")
+            {
+                if let Ok(projects) = call(
+                    command.connection.as_deref(),
+                    &command,
+                    "enumerate",
+                    json!({}),
+                    &cwd,
+                ) {
+                    if let Some(name) = project_name_from_list(&projects, &value["projectId"]) {
+                        value["projectName"] = Value::String(name);
+                    }
+                }
             }
             render(&command, &value);
             ExitCode::SUCCESS
@@ -1661,7 +1653,7 @@ fn render(command: &Command, value: &Value) {
         (Face::Projects, "approve" | "unapprove") => {
             for line in format_project_approval(
                 value,
-                &text(&value["projectName"]),
+                value["projectName"].as_str(),
                 command.verb == "approve",
             ) {
                 println!("{line}");
@@ -1673,7 +1665,7 @@ fn render(command: &Command, value: &Value) {
             "{}",
             format_attach(
                 value,
-                &text(&value["projectName"]),
+                value["projectName"].as_str(),
                 command.args.iter().any(|arg| arg == "--yes"),
             )
         ),
@@ -1836,9 +1828,14 @@ fn format_agent_moves(value: &Value) -> String {
         .join("\n")
 }
 
-fn format_attach(value: &Value, project_name: &str, confirmed: bool) -> String {
+/// `project_name` is absent when the name lookup failed; the line is then left
+/// out rather than printed as a placeholder that looks like a real name.
+fn format_attach(value: &Value, project_name: Option<&str>, confirmed: bool) -> String {
+    let name = project_name
+        .map(|name| format!("name:      {name}\n"))
+        .unwrap_or_default();
     format!(
-        "project:   {}\nname:      {project_name}\nroot key:  {}:{}\nroot:      {}\n{}",
+        "project:   {}\n{name}root key:  {}:{}\nroot:      {}\n{}",
         text(&value["projectId"]),
         text(&value["rootKey"]["kind"]),
         text(&value["rootKey"]["rootKey"]),
@@ -1851,16 +1848,24 @@ fn format_attach(value: &Value, project_name: &str, confirmed: bool) -> String {
     )
 }
 
-fn format_project_approval(value: &Value, project_name: &str, approve: bool) -> Vec<String> {
+fn format_project_approval(
+    value: &Value,
+    project_name: Option<&str>,
+    approve: bool,
+) -> Vec<String> {
     let action = if approve { "approved" } else { "unapproved" };
     let project_id = text(&value["projectId"]);
+    let project = match project_name {
+        Some(name) => format!("{name}, {project_id}"),
+        None => project_id,
+    };
     value["roots"]
         .as_array()
         .into_iter()
         .flatten()
         .map(|root| {
             format!(
-                "{action} {} (project {project_name}, {project_id}){}",
+                "{action} {} (project {project}){}",
                 text(&root["root"]),
                 if root["noop"].as_bool() == Some(true) {
                     " (unchanged)"
@@ -2381,7 +2386,7 @@ mod tests {
             let value = unwrap_result(value).unwrap();
             let projects = json!({"projects":[{"projectId":"p","name":"move-scratch"}]});
             let project_name = project_name_from_list(&projects, &value["projectId"]).unwrap();
-            let rendered = format_attach(&value, &project_name, confirmed);
+            let rendered = format_attach(&value, Some(&project_name), confirmed);
             assert!(
                 rendered.contains("project:   p\nname:      move-scratch\nroot key:  label:local"),
                 "{rendered}"
@@ -2451,19 +2456,26 @@ mod tests {
         let project_name = project_name_from_list(&projects, &approval["projectId"]).unwrap();
 
         assert_eq!(
-            format_project_approval(&approval, &project_name, true),
+            format_project_approval(&approval, Some(&project_name), true),
             [
                 "approved /src/move-scratch (project move-scratch, pj-17)",
                 "approved /src/move-scratch/worktree (project move-scratch, pj-17) (unchanged)"
             ]
         );
         assert_eq!(
-            format_project_approval(&approval, &project_name, false),
+            format_project_approval(&approval, Some(&project_name), false),
             [
                 "unapproved /src/move-scratch (project move-scratch, pj-17)",
                 "unapproved /src/move-scratch/worktree (project move-scratch, pj-17) (unchanged)"
             ]
         );
+        // A failed name lookup never invents a name: the id stands alone.
+        assert_eq!(
+            format_project_approval(&approval, None, true)[0],
+            "approved /src/move-scratch (project pj-17)"
+        );
+        let attach = json!({"projectId":"pj-17","rootKey":{"kind":"remote","rootKey":"o/r"},"root":"/src/move-scratch"});
+        assert!(!format_attach(&attach, None, true).contains("name:"));
     }
 
     #[test]
