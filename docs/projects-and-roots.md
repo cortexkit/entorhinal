@@ -70,8 +70,10 @@ ck projects approve ~/src/my-app
 
 This approves every root of the project the directory belongs to. It is
 refused unless every root is identified (`bound`): a `replaced` root refuses
-`root_replaced`, an unbound one `root_not_bound`. Already approved roots print
-`(unchanged)`.
+`root_replaced`, an unbound one `root_not_bound`. The text reply names each
+folder and project (`approved <root> (project <name>, <id>)`); already approved
+roots add `(unchanged)`. `unapprove` prints `unapproved` with the same folder
+and project identity.
 
 Verify: `ck projects trust ~/src/my-app` shows `approved` on every root.
 

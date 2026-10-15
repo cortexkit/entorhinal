@@ -484,6 +484,30 @@ fn run_with_directory(
         }
     };
 
+    // Project mutation and attach replies carry an ID, but not the project's
+    // display name. Use the same registry listing as `ck projects list` for
+    // text output; JSON output remains the untouched module reply.
+    let projects = if !command.json
+        && command.face == Face::Projects
+        && matches!(command.verb.as_str(), "attach" | "approve" | "unapprove")
+    {
+        match call(
+            command.connection.as_deref(),
+            &command,
+            "enumerate",
+            json!({}),
+            &cwd,
+        ) {
+            Ok(projects) => Some(projects),
+            Err((code, message)) => {
+                let _ = writeln!(stderr, "{message}");
+                return ExitCode::from(code);
+            }
+        }
+    } else {
+        None
+    };
+
     match call(
         command.connection.as_deref(),
         &command,
@@ -491,7 +515,12 @@ fn run_with_directory(
         params,
         &cwd,
     ) {
-        Ok(value) => {
+        Ok(mut value) => {
+            if let Some(projects) = projects {
+                value["projectName"] = project_name_from_list(&projects, &value["projectId"])
+                    .map(Value::String)
+                    .unwrap_or(Value::Null);
+            }
             render(&command, &value);
             ExitCode::SUCCESS
         }
@@ -1630,20 +1659,23 @@ fn render(command: &Command, value: &Value) {
             }
         }
         (Face::Projects, "approve" | "unapprove") => {
-            for root in value["roots"].as_array().cloned().unwrap_or_default() {
-                let already = root["noop"].as_bool() == Some(true);
-                println!(
-                    "{}{}",
-                    text(&root["root"]),
-                    if already { "  (unchanged)" } else { "" }
-                );
+            for line in format_project_approval(
+                value,
+                &text(&value["projectName"]),
+                command.verb == "approve",
+            ) {
+                println!("{line}");
             }
         }
         (Face::Projects, "rebind") => println!("{}", format_rebind(value)),
         (Face::Projects, "verify") => println!("{}", format_verify(value)),
         (Face::Projects, "attach") => println!(
             "{}",
-            format_attach(value, command.args.iter().any(|arg| arg == "--yes"))
+            format_attach(
+                value,
+                &text(&value["projectName"]),
+                command.args.iter().any(|arg| arg == "--yes"),
+            )
         ),
         (Face::Projects, "owned-remotes") => println!("{}", format_owned_remotes(value)),
         _ => println!(
@@ -1804,9 +1836,9 @@ fn format_agent_moves(value: &Value) -> String {
         .join("\n")
 }
 
-fn format_attach(value: &Value, confirmed: bool) -> String {
+fn format_attach(value: &Value, project_name: &str, confirmed: bool) -> String {
     format!(
-        "project:   {}\nroot key:  {}:{}\nroot:      {}\n{}",
+        "project:   {}\nname:      {project_name}\nroot key:  {}:{}\nroot:      {}\n{}",
         text(&value["projectId"]),
         text(&value["rootKey"]["kind"]),
         text(&value["rootKey"]["rootKey"]),
@@ -1817,6 +1849,38 @@ fn format_attach(value: &Value, confirmed: bool) -> String {
             "preview only; pass --yes to attach (unapproved)"
         },
     )
+}
+
+fn format_project_approval(value: &Value, project_name: &str, approve: bool) -> Vec<String> {
+    let action = if approve { "approved" } else { "unapproved" };
+    let project_id = text(&value["projectId"]);
+    value["roots"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|root| {
+            format!(
+                "{action} {} (project {project_name}, {project_id}){}",
+                text(&root["root"]),
+                if root["noop"].as_bool() == Some(true) {
+                    " (unchanged)"
+                } else {
+                    ""
+                }
+            )
+        })
+        .collect()
+}
+
+fn project_name_from_list(projects: &Value, project_id: &Value) -> Option<String> {
+    let project_id = project_id.as_str()?;
+    projects["projects"]
+        .as_array()?
+        .iter()
+        .find(|project| project["projectId"].as_str() == Some(project_id))?
+        .get("name")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 fn format_owned_remotes(value: &Value) -> String {
@@ -2315,9 +2379,11 @@ mod tests {
             )
             .unwrap();
             let value = unwrap_result(value).unwrap();
-            let rendered = format_attach(&value, confirmed);
+            let projects = json!({"projects":[{"projectId":"p","name":"move-scratch"}]});
+            let project_name = project_name_from_list(&projects, &value["projectId"]).unwrap();
+            let rendered = format_attach(&value, &project_name, confirmed);
             assert!(
-                rendered.contains("project:   p\nroot key:  label:local"),
+                rendered.contains("project:   p\nname:      move-scratch\nroot key:  label:local"),
                 "{rendered}"
             );
             assert!(
@@ -2368,6 +2434,36 @@ mod tests {
         }
         drop(handler);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn project_approval_text_names_folder_and_project_from_registry_replies() {
+        let projects = json!({
+            "projects": [{"projectId":"pj-17", "name":"move-scratch"}]
+        });
+        let approval = json!({
+            "projectId":"pj-17",
+            "roots":[
+                {"root":"/src/move-scratch", "registrationEpoch":7, "noop":false},
+                {"root":"/src/move-scratch/worktree", "registrationEpoch":8, "noop":true}
+            ]
+        });
+        let project_name = project_name_from_list(&projects, &approval["projectId"]).unwrap();
+
+        assert_eq!(
+            format_project_approval(&approval, &project_name, true),
+            [
+                "approved /src/move-scratch (project move-scratch, pj-17)",
+                "approved /src/move-scratch/worktree (project move-scratch, pj-17) (unchanged)"
+            ]
+        );
+        assert_eq!(
+            format_project_approval(&approval, &project_name, false),
+            [
+                "unapproved /src/move-scratch (project move-scratch, pj-17)",
+                "unapproved /src/move-scratch/worktree (project move-scratch, pj-17) (unchanged)"
+            ]
+        );
     }
 
     #[test]
