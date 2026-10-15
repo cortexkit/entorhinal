@@ -12,7 +12,11 @@ use std::{
 
 pub(super) const MAGIC: &[u8] = b"ck-package-closure/v1\n";
 pub(super) const BLOB_CAP: u64 = 10_485_760;
-pub(super) const ADMIT_CAP: usize = 3_145_692;
+/// The session door's per-call cap on raw bytes, for both `session.admit`
+/// `bytes` and `session.read` `limit`. The door carries bytes hex-encoded in
+/// JSON, so one full call is about 2 MiB on the wire, inside the daemon's
+/// 4 MiB frame limit. Larger package files are sent and read in chunks.
+pub(super) const ADMIT_CAP: usize = 1_048_576;
 pub(super) fn digests(pins: &[CatalogPin]) -> BTreeSet<String> {
     pins.iter()
         .flat_map(|p| [p.manifest_sha256.clone(), p.archive_sha256.clone()])

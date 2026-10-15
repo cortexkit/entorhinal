@@ -212,10 +212,12 @@ async fn catalog_move_transfers_verified_blobs_prefetches_ready_and_chunks() {
         .into_iter()
         .filter(|(m, _)| m == "session.admit")
         .collect::<Vec<_>>();
-    assert!(admits.len() >= 2);
+    // The 3 MiB archive crosses the door's 1 MiB per-call cap, so it must
+    // arrive in several admits, none over the cap.
+    assert!(admits.len() >= 3);
     assert!(admits
         .iter()
-        .all(|(_, p)| p["bytes"].as_str().unwrap().len() / 2 <= 3_145_692));
+        .all(|(_, p)| p["bytes"].as_str().unwrap().len() / 2 <= 1_048_576));
 }
 #[tokio::test(start_paused = true)]
 async fn catalog_move_pin_digest_catches_up_before_import() {

@@ -234,8 +234,10 @@ fn session(
                     .ok_or_else(|| refuse("invalid_request", None))?,
             )
             .map_err(|_| refuse("invalid_request", None))?;
-            if bytes.len() > 3_145_692 {
-                return Err(refuse("record_too_large", Some(json!({"cap":3_145_692}))));
+            // Engram's own per-call cap, written out here rather than shared
+            // with entorhinal's constant, so a wrong client cap fails a test.
+            if bytes.len() > 1_048_576 {
+                return Err(refuse("record_too_large", Some(json!({"cap":1_048_576}))));
             }
             let payload = state.payloads.entry(key).or_default();
             if params["fromOffset"].as_u64() != Some(payload.len() as u64) {
@@ -291,8 +293,8 @@ fn session(
                 .ok_or_else(|| refuse("unavailable", None))?;
             let from = params["fromOffset"].as_u64().unwrap() as usize;
             let limit = params["limit"].as_u64().unwrap() as usize;
-            if limit > 3_145_692 {
-                return Err(refuse("record_too_large", None));
+            if limit > 1_048_576 {
+                return Err(refuse("record_too_large", Some(json!({"cap":1_048_576}))));
             }
             if from > end {
                 return Err(refuse("offset_out_of_range", None));

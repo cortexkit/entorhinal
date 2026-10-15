@@ -8275,8 +8275,8 @@ expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_back_u
 id = "catalog-move-admit-cap"
 guards = "Package blob admissions never exceed the session door's exact payload cap"
 file = "crates/entorhinal-module/src/catalog_move/stream.rs"
-old = 'pub(super) const ADMIT_CAP: usize = 3_145_692;'
-new = 'pub(super) const ADMIT_CAP: usize = 3_145_693; // NON-VACUITY BREAK'
+old = 'pub(super) const ADMIT_CAP: usize = 1_048_576;'
+new = 'pub(super) const ADMIT_CAP: usize = 1_048_577; // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/catalog_moves.rs"
 runner = "cargo"
 package = "entorhinal-module"
