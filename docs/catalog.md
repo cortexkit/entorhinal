@@ -7,7 +7,8 @@ ingests status feeds, and holds local publisher grants. The core store also hold
 shared agent pins and local plans/generations. Agent tools prepare verified skill
 closures, obtain user consent and stage generations for consumer prefetch and
 core's activation acknowledgement. Background status polling protects held skill
-generations. Move integration, publishing and non-skill installation are not exposed yet.
+generations. Agent moves carry pinned package bytes through entorhinal's own
+`agent-data/v1` participant. Publishing and non-skill installation are not exposed yet.
 
 ```
 ck catalog registry add https://registry.example --scope @example --key-id status-1 --public-key <64-lowercase-hex>

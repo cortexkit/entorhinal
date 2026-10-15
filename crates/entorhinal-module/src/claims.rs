@@ -307,7 +307,14 @@ impl ProjectsHandler {
         if !entorhinal_core::agent::valid_agent_id(&request.agent_id) {
             return Err(HandlerError::new("invalid_request", "invalid agent_id"));
         }
-        encode_result(self.with_agent_store(|store| store.agent_where(&request.agent_id))?)
+        let mut value = serde_json::to_value(
+            self.with_agent_store(|store| store.agent_where(&request.agent_id))?,
+        )
+        .map_err(crate::invalid_params)?;
+        if let Some(moving) = value.get_mut("moving") {
+            crate::move_ops::elapsed(moving, (self.clock)());
+        }
+        encode_result(value)
     }
 }
 

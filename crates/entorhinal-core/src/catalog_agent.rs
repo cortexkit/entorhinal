@@ -710,6 +710,19 @@ impl RegistryStore {
     ) -> Result<CatalogGeneration, CatalogWriteError> {
         self.catalog_generation_step(id, caller, "ready", None, 0)
     }
+    /// An aborted move must not leave a generation eligible for activation.
+    /// Shared pins and locally granted publisher permissions are untouched.
+    pub fn catalog_discard_move_generation(
+        &self,
+        cut: &str,
+        agent: &str,
+    ) -> Result<(), CatalogWriteError> {
+        let generation = format!("generation:move:{cut}");
+        self.catalog_transaction(|tx| {
+            tx.execute("DELETE FROM catalog_generation WHERE generation_id=?1 AND agent_id=?2 AND state IN ('approved','installed','ready')", params![generation,agent]).map_err(store_error)?;
+            Ok(())
+        })
+    }
     pub fn catalog_activate_generation(
         &self,
         id: &str,

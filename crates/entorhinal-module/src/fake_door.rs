@@ -41,6 +41,8 @@ pub(crate) struct Cut {
 
 #[derive(Default)]
 struct State {
+    payloads: BTreeMap<(String, String), Vec<u8>>,
+    session_calls: Vec<(String, Value)>,
     streams: BTreeMap<(String, String, String), CutItem>,
     cuts: BTreeMap<String, Cut>,
     handed_off: BTreeMap<(String, String), String>,
@@ -85,7 +87,9 @@ impl FakeDoor {
     }
 
     pub(crate) fn script(&self, op: &str, effect: Effect) {
-        assert!(OPS.contains(&op));
+        assert!(
+            OPS.contains(&op) || ["session.admit", "session.read", "session.cover"].contains(&op)
+        );
         self.state
             .lock()
             .unwrap()
@@ -97,6 +101,24 @@ impl FakeDoor {
 
     pub(crate) fn calls(&self) -> Vec<DoorCall> {
         self.state.lock().unwrap().calls.clone()
+    }
+    pub(crate) fn session_calls(&self) -> Vec<(String, Value)> {
+        self.state.lock().unwrap().session_calls.clone()
+    }
+    pub(crate) fn replace_payload(&self, cut: &str, bytes: Vec<u8>, rehash: bool) {
+        let mut state = self.state.lock().unwrap();
+        let record = state.cuts.get_mut(cut).unwrap();
+        let item = record
+            .items
+            .iter_mut()
+            .find(|i| i.stream == "reserved:entorhinal")
+            .unwrap();
+        if rehash {
+            item.digest = entorhinal_catalog::sha256_hex(&bytes);
+            item.end_offset = bytes.len() as u64;
+        }
+        let key = (record.author.clone(), item.session_ref.clone());
+        state.payloads.insert(key, bytes);
     }
     pub(crate) fn cut(&self, cut_id: &str) -> Option<Cut> {
         self.state.lock().unwrap().cuts.get(cut_id).cloned()
@@ -139,6 +161,27 @@ impl FakeDoor {
         if caller != "reserved:entorhinal" {
             return Err(refuse("caller_forbidden", None));
         }
+        if method.starts_with("session.") {
+            if method == "session.admit" {
+                self.admit(params["sessionRef"].as_str().unwrap_or_default())?;
+            }
+            let mut state = self.state.lock().unwrap();
+            state.session_calls.push((method.into(), params.clone()));
+            let effect = state
+                .scripts
+                .get_mut(&(self.author.clone(), method.into()))
+                .and_then(VecDeque::pop_front);
+            match &effect {
+                Some(Effect::Refuse(code)) => return Err(refuse(code, None)),
+                Some(Effect::FailBefore(e)) => return Err(e.clone()),
+                _ => {}
+            }
+            let reply = session(&mut state, &self.author, method, &params)?;
+            if let Some(Effect::LoseReply(e)) = effect {
+                return Err(e);
+            }
+            return Ok(serde_json::to_vec(&json!({"result":reply})).unwrap());
+        }
         let mut object = params
             .as_object()
             .cloned()
@@ -169,6 +212,102 @@ impl FakeDoor {
             return Err(error);
         }
         Ok(serde_json::to_vec(&json!({"result":reply})).unwrap())
+    }
+}
+
+fn session(
+    state: &mut State,
+    author: &str,
+    method: &str,
+    params: &Value,
+) -> Result<Value, TransportError> {
+    let session = params["sessionRef"]
+        .as_str()
+        .filter(|s| s.len() == 32)
+        .ok_or_else(|| refuse("invalid_request", None))?;
+    let key = (author.to_string(), session.to_string());
+    match method {
+        "session.admit" => {
+            let bytes = crate::catalog_move::stream_bytes(
+                params["bytes"]
+                    .as_str()
+                    .ok_or_else(|| refuse("invalid_request", None))?,
+            )
+            .map_err(|_| refuse("invalid_request", None))?;
+            if bytes.len() > 3_145_692 {
+                return Err(refuse("record_too_large", Some(json!({"cap":3_145_692}))));
+            }
+            let payload = state.payloads.entry(key).or_default();
+            if params["fromOffset"].as_u64() != Some(payload.len() as u64) {
+                return Err(refuse(
+                    "offset_mismatch",
+                    Some(json!({"expectedOffset":payload.len()})),
+                ));
+            }
+            payload.extend(bytes);
+            let end = payload.len();
+            let item = CutItem {
+                session_ref: session.into(),
+                stream: "reserved:entorhinal".into(),
+                end_offset: end as u64,
+                digest: entorhinal_catalog::sha256_hex(payload),
+            };
+            state
+                .streams
+                .insert((author.into(), session.into(), item.stream.clone()), item);
+            Ok(json!({"durableOffset":end,"cloudOffset":end}))
+        }
+        "session.cover" => {
+            let end = state.payloads.get(&key).map_or(0, Vec::len);
+            Ok(json!({"durableOffset":end,"cloudOffset":end}))
+        }
+        "session.read" => {
+            let (owner, end, digest) = if let Some(cut) = params["cutId"].as_str() {
+                let record = state
+                    .cuts
+                    .get(cut)
+                    .filter(|r| r.state == SealState::Published && !r.aborted)
+                    .ok_or_else(|| refuse("not_found", None))?;
+                let item = record
+                    .items
+                    .iter()
+                    .find(|i| i.session_ref == session && i.stream == "reserved:entorhinal")
+                    .ok_or_else(|| refuse("cut_item_missing", None))?;
+                (
+                    record.author.clone(),
+                    item.end_offset as usize,
+                    Some(item.digest.clone()),
+                )
+            } else {
+                (
+                    author.into(),
+                    state.payloads.get(&key).map_or(0, Vec::len),
+                    None,
+                )
+            };
+            let payload = state
+                .payloads
+                .get(&(owner, session.into()))
+                .ok_or_else(|| refuse("unavailable", None))?;
+            let from = params["fromOffset"].as_u64().unwrap() as usize;
+            let limit = params["limit"].as_u64().unwrap() as usize;
+            if limit > 3_145_692 {
+                return Err(refuse("record_too_large", None));
+            }
+            if from > end {
+                return Err(refuse("offset_out_of_range", None));
+            }
+            let stop = end.min(from.saturating_add(limit));
+            let bytes = payload
+                .get(from..stop)
+                .ok_or_else(|| refuse("unavailable", None))?;
+            let mut reply = json!({"bytes":entorhinal_catalog::hex(bytes),"fromOffset":from,"endOffset":stop,"streamEnd":end});
+            if let Some(digest) = digest {
+                reply["digest"] = json!(digest);
+            }
+            Ok(reply)
+        }
+        _ => Err(refuse("invalid_request", None)),
     }
 }
 

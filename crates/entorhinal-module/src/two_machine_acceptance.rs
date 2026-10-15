@@ -1827,6 +1827,7 @@ mod moves {
         daemon: FakeDaemon,
         peers: BTreeMap<String, Arc<FakeParticipant>>,
         gate: Arc<PeerGate>,
+        catalog: Mutex<Option<Arc<crate::catalog_move::CatalogMove>>>,
     }
     #[async_trait]
     impl ParticipantDiscovery for Discovery {
@@ -1841,6 +1842,11 @@ mod moves {
             module: &str,
         ) -> Result<Arc<dyn LogTransport>, TransportError> {
             self.daemon.open_participant(module).await?;
+            if module == "entorhinal" {
+                return Ok(Arc::new(CatalogTransport(
+                    self.catalog.lock().unwrap().as_ref().unwrap().clone(),
+                )));
+            }
             Ok(Arc::new(PeerTransport {
                 module: module.into(),
                 fake: self.peers[module].clone(),
@@ -1940,6 +1946,7 @@ mod moves {
                 records: h.record_client.clone(),
                 door: h.door_client.clone(),
                 discovery: h.participant_discovery.clone(),
+                catalog: Some(Arc::new(h.catalog_move_context())),
                 health: h.health.clone(),
                 writer: h.writer.clone(),
                 clock,
@@ -2127,7 +2134,7 @@ mod moves {
                     log.clone(),
                     RecordClient::new(Arc::new(Connector(records.clone()))),
                 );
-                let discovery = Arc::new(Discovery { daemon:FakeDaemon::new(snapshot(modules, true, true)), gate:Arc::new(PeerGate { trap:Mutex::new(None),hit:tokio::sync::Semaphore::new(0), release:tokio::sync::Semaphore::new(0) }), peers:modules.iter().enumerate().map(|(module_index,(module, kind))| {
+                let discovery = Arc::new(Discovery { catalog:Mutex::new(None), daemon:FakeDaemon::new(snapshot(modules, true, true)), gate:Arc::new(PeerGate { trap:Mutex::new(None),hit:tokio::sync::Semaphore::new(0), release:tokio::sync::Semaphore::new(0) }), peers:modules.iter().enumerate().map(|(module_index,(module, kind))| {
                     let reference = AgentRef::new(*kind, format!("ref-{kind}"));
                     let peer = Arc::new(FakeParticipant::new(&[*kind], if index == 1 || receiver_held { vec![reference] } else { vec![] }));
                     peer.unknown_busy_for_unheld(true);
@@ -2223,6 +2230,22 @@ mod moves {
             }
         }
     }
+
+    struct CatalogTransport(Arc<crate::catalog_move::CatalogMove>);
+    #[async_trait]
+    impl LogTransport for CatalogTransport {
+        async fn call(&self, method: &str, params: Value) -> Result<Vec<u8>, TransportError> {
+            self.0
+                .execute(method, params)
+                .await
+                .map(|result| serde_json::to_vec(&json!({"result":result})).unwrap())
+                .map_err(|e| TransportError::Refusal {
+                    code: e.code,
+                    detail: e.detail,
+                })
+        }
+    }
+    mod catalog_moves;
 
     #[tokio::test(start_paused = true)]
     async fn full_move_three_participants_preserves_refs_claim_and_local_journals() {
@@ -3137,6 +3160,7 @@ mod moves {
                     )),
                     peers,
                     gate: f.b.discovery.gate.clone(),
+                    catalog: Mutex::new(None),
                 });
                 f.b.configure();
             }

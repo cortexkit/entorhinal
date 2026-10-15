@@ -176,6 +176,20 @@ impl AgentMove {
     /// checkpoints, without exposing the private recovery plan or claim bodies.
     pub fn notices(&self) -> Value {
         let mut notices = serde_json::Map::new();
+        if self.side == MoveSide::Source && self.step == MoveStep::Published {
+            notices.insert("status".into(), "waiting_for_target".into());
+            notices.insert(
+                "message".into(),
+                "waiting for the target Mac to pick up the move".into(),
+            );
+            notices.insert(
+                "waiting_since_ms".into(),
+                self.plan["_source"]["published_at_ms"]
+                    .as_i64()
+                    .unwrap_or(self.updated_at_ms)
+                    .into(),
+            );
+        }
         let diagnostics: Vec<_> = ["_source", "_receiver"]
             .into_iter()
             .flat_map(|key| {
@@ -542,6 +556,19 @@ impl RegistryStore {
                     return Err(crate::session_refusal(
                         "agent_busy",
                         "a session started during the check",
+                        None,
+                    ));
+                }
+                let pins = crate::catalog_agent::read_pins(tx, &row.agent_id)?;
+                let digest = if pins.is_empty() {
+                    None
+                } else {
+                    Some(crate::catalog_agent::pin_digest(&pins)?)
+                };
+                if row.plan["pin_digest"].as_str() != digest.as_deref() {
+                    return Err(crate::session_refusal(
+                        "agent_busy",
+                        "catalog pins changed during the move check",
                         None,
                     ));
                 }

@@ -113,17 +113,32 @@ impl ProjectsHandler {
             return Err(error);
         }
         let refs = self.with_store(|s| s.agent_bound_refs(&request.agent_id))?;
-        let available = discover_participants(self.participant_discovery.as_ref())
+        let pins = self.with_store(|s| s.catalog_pins(&request.agent_id))?;
+        let pin_digest = if pins.is_empty() {
+            None
+        } else {
+            Some(
+                entorhinal_core::catalog_agent::pin_digest(&pins)
+                    .map_err(|e| HandlerError::new("storage_error", e.to_string()))?,
+            )
+        };
+        let mut available = discover_participants(self.participant_discovery.as_ref())
             .await
             .map_err(|e| HandlerError {
                 code: e.code().into(),
                 message: "participant unavailable".into(),
                 detail: Some(e.detail),
             })?;
-        let wire_refs: Vec<_> = refs
+        if pin_digest.is_none() {
+            available.retain(|p| p.module_id != "entorhinal");
+        }
+        let mut wire_refs: Vec<_> = refs
             .iter()
             .map(|r| AgentRef::new(r.ref_kind.clone(), r.reference.clone()))
             .collect();
+        if pin_digest.is_some() {
+            wire_refs.push(AgentRef::new("package-closure", request.agent_id.clone()));
+        }
         let plan = participant_client::plan_participants(&available, &wire_refs).await.map_err(|e| {
             let detail = match e {
                 participant_client::PlanError::RefKindUnavailable(kind) => json!({"ref_kind":kind}),
@@ -203,13 +218,17 @@ impl ProjectsHandler {
         getrandom::getrandom(&mut random)
             .map_err(|e| HandlerError::new("storage_error", e.to_string()))?;
         let now = (self.clock)();
+        let mut move_plan = json!({"agent_id":agent.agent_id,"from":own,"to":peer,"claim_version":claim_version,"participants":participants});
+        if let Some(digest) = pin_digest {
+            move_plan["pin_digest"] = json!(digest);
+        }
         let row = AgentMove {
             cut_id: super::log_client::encode_hex(&random),
             agent_id: request.agent_id,
             side: MoveSide::Source,
             peer: peer.clone(),
             step: MoveStep::Preparing,
-            plan: json!({"agent_id":agent.agent_id,"from":own,"to":peer,"claim_version":claim_version,"participants":participants}),
+            plan: move_plan,
             request_body: Some(request_body),
             record_version: 0,
             claim_version: Some(claim_version),

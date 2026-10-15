@@ -56,6 +56,8 @@ pub enum MoveReason {
     ProjectNotCheckedOut,
     Gone,
     ReceiverPrecondition,
+    PinDigestMismatch,
+    TrustMissing,
     Other(String),
 }
 
@@ -74,6 +76,8 @@ impl From<String> for MoveReason {
             "project_not_checked_out" => Self::ProjectNotCheckedOut,
             "gone" => Self::Gone,
             "receiver_precondition" => Self::ReceiverPrecondition,
+            "pin_digest_mismatch" => Self::PinDigestMismatch,
+            "trust_missing" => Self::TrustMissing,
             _ => Self::Other(reason),
         }
     }
@@ -94,6 +98,8 @@ impl From<MoveReason> for String {
             MoveReason::ProjectNotCheckedOut => "project_not_checked_out".into(),
             MoveReason::Gone => "gone".into(),
             MoveReason::ReceiverPrecondition => "receiver_precondition".into(),
+            MoveReason::PinDigestMismatch => "pin_digest_mismatch".into(),
+            MoveReason::TrustMissing => "trust_missing".into(),
             MoveReason::Other(reason) => reason,
         }
     }
@@ -156,6 +162,10 @@ pub struct MoveRecord {
     pub state: MoveRecordState,
     pub claim_version: u64,
     pub participants: Vec<MoveParticipant>,
+    /// Catalog package pins are shared version-and-digest selections. Omit this
+    /// field when that set is empty: older Macs reject unknown record fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin_digest: Option<String>,
     pub reason: Option<MoveReason>,
     pub detail: Option<Value>,
 }
@@ -267,6 +277,14 @@ fn validate_move(subject: &str, record: &MoveRecord) -> Result<(), CodecError> {
         return Err(CodecError::CutIdMismatch);
     }
     if !valid_cut_id(&record.cut_id) {
+        return Err(CodecError::MalformedBody);
+    }
+    if record.pin_digest.as_ref().is_some_and(|digest| {
+        digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }) {
         return Err(CodecError::MalformedBody);
     }
     let mut modules = BTreeSet::new();
@@ -500,6 +518,7 @@ pub fn check_pinned_plan(pinned: &MoveRecord, current: &MoveRecord) -> Result<()
         && pinned.to == current.to
         && pinned.claim_version == current.claim_version
         && pinned.participants == current.participants
+        && pinned.pin_digest == current.pin_digest
     {
         Ok(())
     } else {
@@ -554,6 +573,7 @@ mod tests {
             to: "mac-b".into(),
             state: MoveRecordState::Published,
             claim_version: 3,
+            pin_digest: None,
             participants: vec![
                 MoveParticipant {
                     module_id: "alpha".into(),
@@ -579,6 +599,66 @@ mod tests {
             ],
             reason: None,
             detail: None,
+        }
+    }
+
+    #[test]
+    fn catalog_move_optional_digest_preserves_legacy_bytes_and_pins_plan() {
+        #[derive(Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyMoveRecord {
+            v: u64,
+            cut_id: String,
+            agent_id: String,
+            from: String,
+            to: String,
+            state: MoveRecordState,
+            claim_version: u64,
+            participants: Vec<MoveParticipant>,
+            reason: Option<MoveReason>,
+            detail: Option<Value>,
+        }
+        let mut current = record();
+        let subject = format!("move:{}", current.cut_id);
+        assert_eq!(
+            encode_move_record(&subject, &current).unwrap(),
+            MOVE_FIXTURE.as_bytes()
+        );
+        current.pin_digest = Some("ab".repeat(32));
+        let bytes = encode_move_record(&subject, &current).unwrap();
+        assert!(serde_json::from_slice::<LegacyMoveRecord>(&bytes)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("unknown field `pin_digest`"));
+        assert!(serde_json::from_str::<LegacyMoveRecord>(MOVE_FIXTURE).is_ok());
+        assert_eq!(decode_move_record(&subject, &bytes).unwrap(), current);
+        assert_eq!(
+            check_pinned_plan(&record(), &current),
+            Err(CodecError::PlanMismatch)
+        );
+        let mut unknown = serde_json::from_slice::<Value>(&bytes).unwrap();
+        unknown["pin_digest"] = json!("invalid");
+        assert_eq!(
+            decode_move_record(&subject, &serde_json::to_vec(&unknown).unwrap()),
+            Err(CodecError::MalformedBody)
+        );
+    }
+
+    #[test]
+    fn catalog_move_abort_reason_literals_are_preserved() {
+        for (literal, reason) in [
+            ("pin_digest_mismatch", MoveReason::PinDigestMismatch),
+            ("trust_missing", MoveReason::TrustMissing),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<MoveReason>(&format!("\"{literal}\"")).unwrap(),
+                reason
+            );
+            assert_eq!(
+                serde_json::to_string(&reason).unwrap(),
+                format!("\"{literal}\"")
+            );
         }
     }
 

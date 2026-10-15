@@ -112,7 +112,7 @@ impl Drop for Fixture {
 async fn publisher_trust_authenticates_pins_and_is_install_only() {
     let f = Fixture::new(Ok(()));
     assert_eq!(
-        f.trust(&UnavailablePins).await.unwrap_err().code,
+        f.trust(&StoredPins).await.unwrap_err().code,
         "manifest_unavailable"
     );
     assert_eq!(

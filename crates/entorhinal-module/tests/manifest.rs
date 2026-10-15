@@ -34,8 +34,19 @@ fn manifest_flag_prints_the_manifest_with_the_provided_capability() {
             "agent-identity/v1",
             "permissions/v1",
             "tool-provider/v1",
+            "agent-data/v1",
             "call-modes/v1"
         ])
+    );
+    assert_eq!(
+        manifest["provides"][2],
+        serde_json::json!({
+            "role":"internal_service",
+            "service_id":"agent-data",
+            "transport":"bulk",
+            "agent_facing":false,
+            "operations":["agent_data.describe","agent_data.busy","agent_data.status","agent_data.prepare","agent_data.export","agent_data.diverged","agent_data.import","agent_data.activate","agent_data.abort","agent_data.release"]
+        })
     );
     let operations = manifest["provides"][0]["operations"].as_array().unwrap();
     let rebind: Vec<_> = operations

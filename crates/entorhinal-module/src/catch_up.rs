@@ -3,15 +3,15 @@
 
 use super::{log_client, HandlerError, HealthGauges, ProjectsHandler};
 use entorhinal_core::{remote_apply::RemoteEntry, RegistryError, RegistryStore};
-use std::sync::{atomic::Ordering, Arc, Mutex};
+use std::sync::{atomic::Ordering, Arc, Mutex, Weak};
 use std::time::Duration;
 use tokio::time::{timeout_at, Instant};
 
 const INTERVAL: Duration = Duration::from_secs(30);
 pub(super) const READ_DEADLINE: Duration = Duration::from_secs(25);
 
-struct Worker {
-    store: Arc<Mutex<Option<RegistryStore>>>,
+pub(crate) struct Worker {
+    store: Weak<Mutex<Option<RegistryStore>>>,
     health: Arc<HealthGauges>,
     log: log_client::LogClient,
     writer: Arc<tokio::sync::Mutex<()>>,
@@ -21,9 +21,9 @@ struct Worker {
 }
 
 impl ProjectsHandler {
-    fn catch_up_worker(&self) -> Worker {
+    pub(crate) fn catch_up_worker(&self) -> Worker {
         Worker {
-            store: self.store.clone(),
+            store: Arc::downgrade(&self.store),
             health: self.health.clone(),
             log: self.log_client.clone(),
             writer: self.writer.clone(),
@@ -91,6 +91,19 @@ fn remote(entry: log_client::LogEntry) -> Result<RemoteEntry, HandlerError> {
 }
 
 impl Worker {
+    pub(crate) async fn for_move(&self) -> Result<(), HandlerError> {
+        let deadline = Instant::now() + READ_DEADLINE;
+        let _writer = timeout_at(deadline, self.writer.lock())
+            .await
+            .map_err(|_| HandlerError::new("unavailable", "identity log writer is busy"))?;
+        let store = self
+            .store
+            .upgrade()
+            .and_then(|s| s.lock().unwrap().clone())
+            .ok_or_else(|| HandlerError::new("storage_unavailable", "identity store is gone"))?;
+        self.run(&store, deadline).await
+    }
+
     async fn background(self) {
         let mut ticks = tokio::time::interval(INTERVAL);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -100,7 +113,11 @@ impl Worker {
             let Ok(_writer) = timeout_at(deadline, self.writer.lock()).await else {
                 continue;
             };
-            let store = self.store.lock().unwrap().clone();
+            let Some(slot) = self.store.upgrade() else {
+                break;
+            };
+            let store = slot.lock().unwrap().clone();
+            drop(slot);
             if let Some(store) = store {
                 // Disabled stores never contact engram. An enabling store has
                 // snapshot parts saved in SQLite with their entry ids and bytes:

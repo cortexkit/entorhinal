@@ -271,6 +271,7 @@ pub(crate) struct Worker {
     pub(crate) records: RecordClient,
     pub(crate) door: DoorClient,
     pub(crate) discovery: Arc<dyn ParticipantDiscovery>,
+    pub(crate) catalog: Option<Arc<crate::catalog_move::CatalogMove>>,
     pub(crate) health: Arc<HealthGauges>,
     #[cfg(test)]
     pub(crate) writer: Arc<tokio::sync::Mutex<()>>,
@@ -379,6 +380,7 @@ impl ProjectsHandler {
             records: self.record_client.clone(),
             door: self.door_client.clone(),
             discovery: self.participant_discovery.clone(),
+            catalog: Some(Arc::new(self.catalog_move_context())),
             health: self.health.clone(),
             #[cfg(test)]
             writer: self.writer.clone(),
@@ -709,6 +711,7 @@ mod tests {
             records: handler.record_client.clone(),
             door: handler.door_client.clone(),
             discovery: handler.participant_discovery.clone(),
+            catalog: None,
             health: handler.health.clone(),
             writer: handler.writer.clone(),
             clock: handler.clock,
@@ -811,6 +814,7 @@ mod tests {
             records: handler.record_client.clone(),
             door: handler.door_client.clone(),
             discovery: handler.participant_discovery.clone(),
+            catalog: None,
             health: handler.health.clone(),
             writer: handler.writer.clone(),
             clock: handler.clock,

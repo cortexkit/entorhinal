@@ -20,6 +20,7 @@ test = false
 [dependencies]
 entorhinal-core = { path = "../entorhinal-core" }
 base64 = "0.22"
+sha2 = "0.10.9"
 entorhinal-catalog = { path = "../entorhinal-catalog" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }

@@ -58,15 +58,20 @@ fn unknown_move() -> HandlerError {
 impl ProjectsHandler {
     pub(super) fn move_status(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
         let request: StatusRequest = parse(params)?;
-        let row = self
+        let mut row = self
             .with_store(|s| s.move_status_view(&request.cut_id))?
             .ok_or_else(unknown_move)?;
+        elapsed(&mut row, (self.clock)());
         encode_result(row)
     }
 
     pub(super) fn moves(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
         let _: EmptyRequest = parse(params)?;
-        encode_result(json!({"moves":self.with_store(RegistryStore::moves_view)?}))
+        let mut rows = self.with_store(RegistryStore::moves_view)?;
+        for row in &mut rows {
+            elapsed(row, (self.clock)());
+        }
+        encode_result(json!({"moves":rows}))
     }
 
     async fn confirm_move_control(
@@ -194,6 +199,11 @@ impl ProjectsHandler {
             self.with_store(|s| s.set_move_setting(setting))?;
         }
         encode_result(setting)
+    }
+}
+pub(crate) fn elapsed(value: &mut Value, now: i64) {
+    if let Some(since) = value["waiting_since_ms"].as_i64() {
+        value["waiting_ms"] = json!(now.saturating_sub(since).max(0));
     }
 }
 
