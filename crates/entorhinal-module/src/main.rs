@@ -4065,7 +4065,12 @@ mod tests {
             settled_after < Duration::from_secs(3),
             "the retry must pick the lease up promptly after release, not at the budget (took {settled_after:?})"
         );
-        stop_catch_up(&handler).await;
+        // Opening the store starts every background task, and the catalog
+        // poll's first pass runs on the other runtime thread with its own
+        // store handle. Stop and await all of them before deleting the folder:
+        // a handle still open in that pass makes Windows refuse the delete
+        // (OS error 32), which Linux and macOS never show.
+        stop_store_tasks(&handler).await;
         drop(handler);
         std::fs::remove_dir_all(dir).unwrap();
     }
