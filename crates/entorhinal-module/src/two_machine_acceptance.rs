@@ -3048,6 +3048,92 @@ mod moves {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn diverged_reason_is_durable_and_visible_in_move_views() {
+        for (key, expected_reason) in [
+            ("with-reason", Some("cut failed verify_failed")),
+            ("without-reason", None),
+        ] {
+            let pair = Pair::with_receiver_refs(&[("pi", "pi-session")], true).await;
+            let cut = pair.published(key).await;
+            let reference = AgentRef::new("pi-session", "ref-pi-session");
+            if let Some(reason) = expected_reason {
+                pair.b.discovery.peers["pi"].set_diverged_reason(
+                    reference,
+                    crate::participant_client::DivergedState::Unknown,
+                    reason,
+                );
+            } else {
+                pair.b.discovery.peers["pi"]
+                    .set_diverged(reference, crate::participant_client::DivergedState::Unknown);
+            }
+            pair.b.pickup().await;
+
+            drive(pair.b.receiver(&cut).tick()).await.unwrap();
+            let status = pair
+                .b
+                .machine
+                .call("agent.move_status", json!({"cut_id":cut}))
+                .await
+                .unwrap();
+            assert_ne!(status["step"], "imported");
+            assert_eq!(status["detail"]["module_id"], "pi");
+            assert_eq!(status["detail"]["ref"], "ref-pi-session");
+            assert_eq!(status["detail"]["state"], "unknown");
+            match expected_reason {
+                Some(reason) => assert_eq!(status["detail"]["reason"], reason),
+                None => assert!(status["detail"].get("reason").is_none()),
+            }
+
+            let moves = pair.b.machine.call("agent.moves", json!({})).await.unwrap();
+            let move_row = moves["moves"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["cut_id"] == cut)
+                .unwrap();
+            assert_eq!(move_row["detail"]["module_id"], "pi");
+            match expected_reason {
+                Some(reason) => assert_eq!(move_row["detail"]["reason"], reason),
+                None => assert!(move_row["detail"].get("reason").is_none()),
+            }
+
+            let where_ = pair.b.where_().await;
+            assert_eq!(where_["moving"]["detail"]["ref"], "ref-pi-session");
+            match expected_reason {
+                Some(reason) => assert_eq!(where_["moving"]["detail"]["reason"], reason),
+                None => assert!(where_["moving"]["detail"].get("reason").is_none()),
+            }
+
+            pair.b.receiver_until(&cut, MoveStep::Aborted).await;
+            pair.a.source_until(&cut, MoveStep::Aborted).await;
+            let source_status = pair
+                .a
+                .machine
+                .call("agent.move_status", json!({"cut_id":cut}))
+                .await
+                .unwrap();
+            assert_eq!(source_status["detail"]["module_id"], "pi");
+            match expected_reason {
+                Some(reason) => assert_eq!(source_status["detail"]["reason"], reason),
+                None => assert!(source_status["detail"].get("reason").is_none()),
+            }
+            let source_where = pair.a.where_().await;
+            let diagnostic = source_where["moveDiagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["cut_id"] == cut)
+                .unwrap();
+            assert_eq!(diagnostic["module_id"], "pi");
+            assert_eq!(diagnostic["ref"], "ref-pi-session");
+            match expected_reason {
+                Some(reason) => assert_eq!(diagnostic["reason"], reason),
+                None => assert!(diagnostic.get("reason").is_none()),
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn retry_refusals_busy_nine_failed_seal_and_unknown_code_have_named_outcomes() {
         for mode in [
             "unavailable",

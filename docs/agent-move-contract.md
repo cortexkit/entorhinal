@@ -228,6 +228,12 @@ Tests: `abort_boundary_refuses_without_writes_for_both_sides`,
 A hold is saved on the checkpoint and reported in the move's status. The
 driver stops retrying a held move until something changes.
 
+Before import, a participant's `diverged` answer of `unknown` or `advanced`
+blocks the move and causes an abort. Either answer may include an optional
+human-readable `reason`. Entorhinal stores and displays it with the participant
+and ref; it never interprets the text. An absent reason stays absent, and a
+malformed reason remains a participant contract violation.
+
 | Status | When | What clears it |
 |---|---|---|
 | `abort_stuck` | A participant refused `agent_data.abort` with an operator-retry action. The source agent stays frozen. | An operator retry (`ck agents move-abort <cut_id>` again, `Direct` only, with Touch ID), which retries once; or one fresh attempt after the driver restarts. A second refusal holds again. |
@@ -278,7 +284,9 @@ first, then the 32 most recently finished. Each entry shows `cut_id`,
 `agent_id`, `side`, `peer` and `peer_name`, `step`, `reason`, `detail`,
 `hold`, `attempts` and timestamps, plus `warnings`, `diagnostics` and a
 `status` with `message` when a hold applies. Saved plans and claim bodies are
-not shown.
+not shown. A participant's optional `diverged` explanation appears in `detail`
+next to its `module_id`, `ref` and state, and is also included in `agent.where`
+while the move is open or in its move diagnostics after completion.
 
 `agent.set_lid_close_moves {enabled, request_key}` is `Direct` only
 (`caller_forbidden` otherwise) and asks for Touch ID when the value changes.

@@ -1545,6 +1545,7 @@ fn render(command: &Command, value: &Value) {
     }
     match (command.face, command.verb.as_str()) {
         (Face::Agents, "list" | "show") => println!("{}", format_agents(&command.verb, value)),
+        (Face::Agents, "moves") => println!("{}", format_agent_moves(value)),
         (Face::Agents, "avatars") => println!("{}", format_avatar_manifest(value)),
         (Face::Workspaces, "list") => {
             let workspaces = value["workspaces"].as_array().cloned().unwrap_or_default();
@@ -1760,6 +1761,47 @@ fn format_agents(verb: &str, value: &Value) -> String {
         None => text(&value["workspace_id"]),
     };
     format!("agent:     {}\nname:      {}\nrole:      {}\ntag:       {}\nproject:   {}\nworkspace: {}\nlabels:    {}", text(&value["agent_id"]), text(&value["name"]), text(&value["role"]), text(&value["tag"]), text(&value["project_id"]), workspace, value["labels"])
+}
+
+fn format_agent_moves(value: &Value) -> String {
+    let moves = value["moves"].as_array().cloned().unwrap_or_default();
+    if moves.is_empty() {
+        return "no moves".into();
+    }
+    moves
+        .iter()
+        .map(|row| {
+            let mut lines = vec![format!(
+                "move {}  {} {}  agent {}  peer {}",
+                text(&row["cut_id"]),
+                text(&row["side"]),
+                text(&row["step"]),
+                text(&row["agent_id"]),
+                text(&row["peer_name"])
+            )];
+            if row["reason"] == "diverged" {
+                let detail = &row["detail"];
+                if detail.is_object() {
+                    let mut line = format!(
+                        "  participant {}, ref {} ({})",
+                        text(&detail["module_id"]),
+                        text(&detail["ref"]),
+                        text(&detail["state"])
+                    );
+                    if let Some(reason) = detail["reason"].as_str() {
+                        line.push_str(" — ");
+                        line.push_str(reason);
+                    }
+                    lines.push(line);
+                }
+            }
+            if let Some(message) = row["message"].as_str() {
+                lines.push(format!("  {message}"));
+            }
+            lines.join("\n")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn format_attach(value: &Value, confirmed: bool) -> String {
@@ -3351,6 +3393,28 @@ mod agent_tests {
             .unwrap_err()
             .1
             .starts_with("name_unknown"));
+    }
+
+    #[test]
+    fn agent_moves_render_diverged_reason_with_participant_and_ref() {
+        let with_reason = json!({"moves":[{
+            "cut_id":"cut-1","side":"receiver","step":"picked_up",
+            "agent_id":"agent-1","peer_name":"Studio","reason":"diverged",
+            "detail":{"module_id":"broca","ref":"session-1","state":"unknown","reason":"cut failed verify_failed"}
+        }]});
+        let rendered = format_agent_moves(&with_reason);
+        assert!(rendered
+            .contains("participant broca, ref session-1 (unknown) — cut failed verify_failed"));
+
+        let without_reason = json!({"moves":[{
+            "cut_id":"cut-1","side":"receiver","step":"picked_up",
+            "agent_id":"agent-1","peer_name":"Studio","reason":"diverged",
+            "detail":{"module_id":"broca","ref":"session-1","state":"unknown"}
+        }]});
+        let rendered = format_agent_moves(&without_reason);
+        assert!(rendered.contains("participant broca, ref session-1 (unknown)"));
+        assert!(!rendered.contains("cut failed"));
+        assert!(!rendered.contains("none"));
     }
 
     struct Confirm(AtomicUsize);

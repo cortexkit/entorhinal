@@ -29,7 +29,7 @@ struct State {
     held: BTreeSet<AgentRef>,
     unknown_busy_for_unheld: bool,
     busy: BTreeMap<AgentRef, BusyRef>,
-    diverged: BTreeMap<AgentRef, DivergedState>,
+    diverged: BTreeMap<AgentRef, DivergedRef>,
     prepare: PrepareReply,
     import: ImportReply,
     enforced: bool,
@@ -92,7 +92,20 @@ impl FakeParticipant {
         self.state.lock().unwrap().busy.insert(reference, busy);
     }
     pub(crate) fn set_diverged(&self, reference: AgentRef, state: DivergedState) {
-        self.state.lock().unwrap().diverged.insert(reference, state);
+        self.state
+            .lock()
+            .unwrap()
+            .diverged
+            .insert(reference, DivergedRef::new(state));
+    }
+    pub(crate) fn set_diverged_reason(
+        &self,
+        reference: AgentRef,
+        state: DivergedState,
+        reason: impl Into<String>,
+    ) {
+        let entry = DivergedRef::with_reason(state, reason).expect("test reason is valid");
+        self.state.lock().unwrap().diverged.insert(reference, entry);
     }
     pub(crate) fn unknown_busy_for_unheld(&self, enabled: bool) {
         self.state.lock().unwrap().unknown_busy_for_unheld = enabled;
@@ -270,15 +283,15 @@ fn execute(state: &mut State, request: Request) -> Result<Value, TransportError>
                 .refs
                 .iter()
                 .map(|reference| {
-                    DivergedRef::new(if state.held.contains(reference) {
+                    if state.held.contains(reference) {
                         state
                             .diverged
                             .get(reference)
-                            .copied()
-                            .unwrap_or(DivergedState::AtCut)
+                            .cloned()
+                            .unwrap_or_else(|| DivergedRef::new(DivergedState::AtCut))
                     } else {
-                        DivergedState::AtCut
-                    })
+                        DivergedRef::new(DivergedState::AtCut)
+                    }
                 })
                 .collect(),
         )),

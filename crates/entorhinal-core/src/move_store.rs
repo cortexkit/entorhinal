@@ -329,6 +329,12 @@ pub(crate) fn where_moves(
         let notices = row.notices();
         if !row.step.is_terminal() {
             let mut value = serde_json::json!({"cut_id":row.cut_id,"side":row.side,"step":row.step,"peer":row.peer,"peer_name":crate::claim_cache::holder_name(conn, Some(&row.peer))?});
+            if row.reason.as_deref() == Some("diverged") {
+                if let Some(detail) = &row.detail {
+                    value["detail"] = detail.clone();
+                    value["reason"] = serde_json::json!(row.reason);
+                }
+            }
             if let Some(hold) = &row.hold {
                 value["hold"] = hold.clone();
             }
@@ -347,6 +353,13 @@ pub(crate) fn where_moves(
         }
         for code in row.error_codes() {
             errors.push(serde_json::json!({"cut_id":row.cut_id,"code":code}));
+        }
+        if row.reason.as_deref() == Some("diverged") {
+            if let Some(detail) = &row.detail {
+                let mut item = detail.clone();
+                item["cut_id"] = serde_json::json!(row.cut_id);
+                diagnostics.push(item);
+            }
         }
         if let Some(items) = notices["warnings"].as_array() {
             for item in items {

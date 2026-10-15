@@ -888,10 +888,13 @@ impl Receiver {
                     if let Some((reference, r)) = p.refs.iter().zip(&answer.refs).find(|(_, r)| {
                         matches!(r.state, DivergedState::Advanced | DivergedState::Unknown)
                     }) {
-                        return Err(Failure::abort(
-                            MoveReason::Diverged,
-                            json!({"module_id":p.module_id,"ref":reference.reference,"state":r.state}),
-                        ));
+                        // Preserve the participant's validated reason in the checkpoint and shared abort detail
+                        // so either Mac can show it beside the participant and ref.
+                        let mut detail = json!({"module_id":p.module_id,"ref":reference.reference,"state":r.state});
+                        if let Some(reason) = &r.reason {
+                            detail["reason"] = json!(reason);
+                        }
+                        return Err(Failure::abort(MoveReason::Diverged, detail));
                     }
                 }
                 // Diverged asks each participant whether this Mac has data past

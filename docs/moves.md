@@ -58,6 +58,11 @@ Verify the result: `ck agents where <agent> --refresh` names the target Mac.
 
 Things a move can report:
 
+- A receiver participant's `diverged` answer of `unknown` or `advanced` blocks
+  import and aborts the move. If the participant supplies a human-readable
+  reason, `ck agents moves` shows it next to that participant and ref; the
+  reason is also retained in move status and `ck agents where`. No reason is
+  shown when the participant did not provide one.
 - `release_not_enforced` warning: a module on the old Mac cannot block writes
   to the agent's data. Do not use the agent on the old Mac; anything written
   there becomes a fork.

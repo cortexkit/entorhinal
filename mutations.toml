@@ -4168,6 +4168,22 @@ target = "--bin ck-entorhinal"
 expect_red = ["two_machine_acceptance::moves::receiver_diverged_lagging_identity_and_external_data_obey_pickup_policy"]
 
 [[control]]
+id = "s11-diverged-reason-visible"
+guards = "An optional diverged reason is retained with its participant and ref"
+file = "crates/entorhinal-module/src/move_receiver.rs"
+old = '''if let Some(reason) = &r.reason {
+                            detail["reason"] = json!(reason);
+                        }'''
+new = '''if let Some(_reason) = &r.reason {
+                            // NON-VACUITY BREAK: omit the participant explanation
+                        }'''
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["two_machine_acceptance::moves::diverged_reason_is_durable_and_visible_in_move_views"]
+
+[[control]]
 id = "s11-import-local-writer-recheck"
 guards = "A writer appearing while diverged is in flight holds import and forces diverged to run again"
 file = "crates/entorhinal-module/src/move_receiver.rs"

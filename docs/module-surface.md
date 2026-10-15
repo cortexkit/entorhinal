@@ -203,7 +203,7 @@ the cache, so it works offline and never waits on engram.
 | `agent.for_session` | query | any | The agent and reference bound to a host session. |
 | `agent.session_for_ref` | query | any | The agent, host session and project root bound to a reference. |
 | `agent.session_liveness` | query | any | `active`, `gone` or `unknown` for up to 256 references, in order. |
-| `agent.where` | query | any | Which Mac holds an agent, from the cached claim. |
+| `agent.where` | query | any | Which Mac holds an agent, from the cached claim, plus any blocked move's participant and ref explanation. |
 | `agent.refresh_claims` | mutate | Direct | Refresh live agents' cached claims from engram. |
 | `role.read` | query | any | Which Mac holds a role, from the cached claim. |
 | `role.take` | mutate | Direct, with Touch ID | Make this Mac the role's holder. |
@@ -225,8 +225,8 @@ Rules are in [agent-move-contract.md](agent-move-contract.md); the guide is
 | Operation | Kind | Who | What it does |
 |---|---|---|---|
 | `agent.move {agent_id, to, request_key}` | mutate | Direct with Touch ID; orchestrator; `reserved:engram` while lid-close moves are on | Start moving an idle agent to a named Mac. |
-| `agent.move_status {cut_id}` | query | any | One move's local checkpoint, holds, warnings and diagnostics. |
-| `agent.moves` | query | any | Open moves, then the 32 most recently finished. |
+| `agent.move_status {cut_id}` | query | any | One move's local checkpoint, including any optional participant explanation for a diverged block. |
+| `agent.moves` | query | any | Open moves, then the 32 most recently finished, including optional participant explanations for diverged blocks. |
 | `agent.move_abort {cut_id, request_key}` | mutate | Direct with Touch ID; orchestrator | Cancel a move before its boundary. Only Direct can retry a stuck abort. |
 | `agent.set_lid_close_moves {enabled, request_key}` | mutate | Direct with Touch ID | Allow or deny engram's lid-close moves on this Mac. |
 

@@ -486,6 +486,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn diverged_reason_vectors_decode_and_reject_malformed_reasons() {
+        use cortexkit_role_agent_data::vectors;
+
+        let vectors: Value = serde_json::from_str(
+            vectors::file("diverged-reasons.json").expect("published diverged reason vectors"),
+        )
+        .unwrap();
+        let cut = cut();
+        let params = serde_json::to_value(&cut).unwrap();
+        let client_for = |result| {
+            ParticipantClient::new(&Participant {
+                module_id: "vector-fixture".into(),
+                transport: Arc::new(VectorTransport {
+                    method: cortexkit_role_agent_data::ops::DIVERGED.into(),
+                    params: params.clone(),
+                    result,
+                }),
+            })
+        };
+
+        for vector in vectors["valid"].as_array().unwrap() {
+            let reply = client_for(vector["reply"].clone())
+                .diverged(&cut)
+                .await
+                .unwrap_or_else(|error| panic!("{}: {error:?}", vector["name"]));
+            assert_eq!(
+                reply.refs[0].reason.as_deref(),
+                vector["reply"]["refs"][0]["reason"].as_str(),
+                "{}",
+                vector["name"]
+            );
+        }
+
+        for vector in vectors["refused"].as_array().unwrap() {
+            assert!(
+                matches!(
+                    client_for(vector["reply"].clone()).diverged(&cut).await,
+                    Err(ClientError::InvalidReply(_))
+                ),
+                "{} must remain a participant contract violation",
+                vector["name"]
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn all_ten_ops_round_trip_literal_contract_fixtures() {
         let fixtures = Arc::new(FixtureTransport {
             fixtures: Mutex::new(VecDeque::from([

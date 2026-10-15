@@ -25,7 +25,7 @@ sha2 = "0.10.9"
 entorhinal-catalog = { path = "../entorhinal-catalog" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
-cortexkit-role-agent-data = "0.1"
+cortexkit-role-agent-data = "0.2"
 cortexkit-role-tool-provider = "=0.7.3"
 cortexkit-store-types = { workspace = true }
 cortexkit-log = { workspace = true }
@@ -41,7 +41,7 @@ getrandom = { workspace = true }
 [dev-dependencies]
 ed25519-dalek = "2.2.0"
 cortexkit-test-support = "0.1.0"
-cortexkit-role-agent-data = { version = "0.1", features = ["test-vectors"] }
+cortexkit-role-agent-data = { version = "0.2", features = ["test-vectors"] }
 rusqlite = { workspace = true }
 # The e2e test spawns the daemon and the module as child processes, which
 # needs tokio's process feature. Declared here because nothing else in the
