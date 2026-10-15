@@ -17,7 +17,8 @@ use std::{
 };
 use tokio::time::Instant;
 
-type TrustFactory = dyn Fn(RegistryStore, &str) -> Result<CatalogTrust, CatalogError> + Send + Sync;
+pub(crate) type TrustFactory =
+    dyn Fn(RegistryStore, &str) -> Result<CatalogTrust, CatalogError> + Send + Sync;
 pub const AGENT_GENERATION: &str = "catalog.agent_generation";
 pub const ACK_ACTIVATION: &str = "catalog.ack_activation";
 pub trait LocalCapabilities: Send + Sync {
@@ -161,6 +162,14 @@ impl CatalogAgent {
 #[cfg(test)]
 #[path = "catalog_agent_tests.rs"]
 mod tests;
+fn generation_reply(generation: &entorhinal_core::catalog_agent::CatalogGeneration) -> Value {
+    let mut reply = serde_json::to_value(generation).unwrap();
+    let statuses = &generation.pinned_status;
+    if !statuses.is_empty() {
+        reply["pinned_status"] = json!(statuses.iter().map(|s| json!({"name":s["name"],"version":s["version"],"state":s["state"],"reason":s["reason"]})).collect::<Vec<_>>());
+    }
+    reply
+}
 async fn prepare(
     store: &RegistryStore,
     plan: &entorhinal_core::catalog_agent::CatalogPlan,
@@ -189,6 +198,9 @@ async fn prepare(
             refresh(&mut trust).await?;
             entry.insert(trust);
         }
+    }
+    if let Some(status) = store.catalog_blocked_pin(&pins)? {
+        return Err(status_refusal(&status));
     }
     let mut seen = BTreeSet::new();
     let mut candidates = Vec::<VerifiedPackage>::new();
@@ -288,6 +300,20 @@ async fn prepare(
     preview_card(store, plan, &detail)?;
     Ok(detail)
 }
+fn status_refusal(status: &Value) -> HandlerError {
+    HandlerError {
+        code: if status["state"] == "tombstoned" {
+            "version_tombstoned"
+        } else {
+            "version_revoked"
+        }
+        .into(),
+        message: "pinned package status blocks preparation".into(),
+        detail: Some(
+            json!({"name":status["name"],"version":status["version"],"reason":status["reason"]}),
+        ),
+    }
+}
 fn preview_card(
     store: &RegistryStore,
     plan: &entorhinal_core::catalog_agent::CatalogPlan,
@@ -380,8 +406,19 @@ impl ProjectsHandler {
                 &args.generation_id,
                 &args.agent_id,
                 (self.clock)(),
-            )?;
-            return encode_result(json!({"generation":generation}));
+            ).map_err(|e| {
+                let mut error = HandlerError::from(e);
+                if error.code == "activation_blocked" {
+                    if let Ok(g) = store.catalog_generation(&args.generation_id, &args.agent_id) {
+                        if let Ok(Some(status)) = store.catalog_blocked_pin(&g.closure) {
+                            error.detail = Some(json!({"name":status["name"],"version":status["version"],"reason":status["reason"]}));
+                        }
+                    }
+                }
+                error
+            })?;
+            let generation = store.catalog_generation(&generation.generation_id, &args.agent_id)?;
+            return encode_result(json!({"generation":generation_reply(&generation)}));
         }
         let args: Read = serde_json::from_value(params).map_err(crate::invalid_params)?;
         let generations = store.catalog_agent_generations(&args.agent_id)?;
@@ -397,7 +434,9 @@ impl ProjectsHandler {
                     })
             })
             .collect::<Vec<_>>();
-        encode_result(json!({"active":active,"ready":ready}))
+        encode_result(
+            json!({"active":active.map(generation_reply),"ready":ready.into_iter().map(generation_reply).collect::<Vec<_>>()}),
+        )
     }
     pub async fn execute_catalog_tool(
         &self,
@@ -474,9 +513,9 @@ impl ProjectsHandler {
                 }
                 encode_result(value)
             }
-            "catalog_generation" => {
-                encode_result(json!({"generations":store.catalog_agent_generations(caller)?}))
-            }
+            "catalog_generation" => encode_result(
+                json!({"generations":store.catalog_agent_generations(caller)?.iter().map(generation_reply).collect::<Vec<_>>()}),
+            ),
             "catalog_install" => {
                 self.install_catalog_plan(
                     &store,

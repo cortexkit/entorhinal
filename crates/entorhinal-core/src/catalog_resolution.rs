@@ -59,6 +59,9 @@ impl RegistryStore {
                         read_pins(conn, agent).map_err(|e| CatalogResolveError::Store(e.into()))?;
                     crate::catalog_agent::validate_pins(&pins)
                         .map_err(|e| CatalogResolveError::Store(e.into()))?;
+                    if let Some(s) = crate::catalog_agent::blocked_status(conn, &pins).map_err(|e| CatalogResolveError::Store(e.into()))? {
+                        return Err(CatalogResolveError::Refusal(json!({"code":if s["state"] == "tombstoned" {"version_tombstoned"} else {"version_revoked"},"name":s["name"],"version":s["version"],"reason":s["reason"]})));
+                    }
                     if let CatalogSubject::Upgrade(spec) = &subject {
                         if !pins.iter().any(|p| p.root && p.name == spec.package) {
                             return Err(refusal("root_not_found"));
@@ -67,6 +70,7 @@ impl RegistryStore {
                     let mut registry: BTreeMap<String, Vec<RegistryVersion>> = BTreeMap::new();
                     let mut by_version = BTreeMap::new();
                     let mut dependencies = BTreeMap::new();
+                    let mut news = BTreeMap::new();
                     for candidate in candidates {
                         let r = &candidate.record;
                         let m = &candidate.manifest;
@@ -100,6 +104,7 @@ impl RegistryStore {
                         };
                         let held: StatusRecord =
                             serde_json::from_str(&text).map_err(|_| refusal("status_invalid"))?;
+                        news.insert((r.name.clone(),r.version.clone()), serde_json::to_value(&held).unwrap());
                         if held.name != r.name
                             || held.version != r.version
                             || held.archive_sha256 != r.archive_sha256
@@ -121,7 +126,7 @@ impl RegistryStore {
                             .push(RegistryVersion {
                                 version: r.version.clone(),
                                 kind: m.kind,
-                                status: held.state,
+                                status: if held.state == entorhinal_catalog::status::State::Revoked && !crate::catalog_agent::status_blocks(&serde_json::to_value(&held).unwrap()) { entorhinal_catalog::status::State::Available } else { held.state },
                                 requires: m.requires.clone(),
                                 refs: vec![],
                             });
@@ -153,6 +158,15 @@ impl RegistryStore {
                     let resolution =
                         resolver::resolve_roots(&registry, &roots, &subjects, &previous, caps)
                             .map_err(|e| {
+                                if let resolver::ResolveError::NoMatchingVersion { package: name, ranges } = &e {
+                                    let ranges = ranges.iter().map(|r| r.range.parse::<entorhinal_catalog::semver::Range>().expect("validated dependency range")).collect::<Vec<_>>();
+                                    let matching = registry.get(name).into_iter().flatten().filter(|v| ranges.iter().all(|range| range.satisfies(&v.version.parse().expect("verified version")))).collect::<Vec<_>>();
+                                    if !matching.iter().any(|v| v.status == entorhinal_catalog::status::State::Available) {
+                                        if let Some(s) = matching.iter().filter_map(|v| news.get(&(name.clone(),v.version.clone()))).find(|s| crate::catalog_agent::status_blocks(s)) {
+                                            return CatalogResolveError::Refusal(json!({"code":if s["state"] == "tombstoned" {"version_tombstoned"} else {"version_revoked"},"name":s["name"],"version":s["version"],"reason":s["reason"]}));
+                                        }
+                                    }
+                                }
                                 CatalogResolveError::Refusal(serde_json::to_value(e).unwrap())
                             })?;
                     let mut closure = Vec::new();

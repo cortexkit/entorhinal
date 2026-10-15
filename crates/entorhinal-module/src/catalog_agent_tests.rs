@@ -1296,3 +1296,89 @@ async fn catalog_always_choice_is_install_only_and_never_root_certified() {
         preview_card(&f.store(), &stored, &detail).unwrap()
     ));
 }
+
+fn serve_status_news(f: &Fixture, state: &str, seq: u64) {
+    let mut status: Value =
+        serde_json::from_str(&f.store().catalog_statuses(URL).unwrap()[0].canonical).unwrap();
+    status["state"] = json!(state);
+    status["sequence"] = json!(seq);
+    status["reason"] = json!("registry security notice");
+    status["compromise_from"] = if state == "revoked" {
+        status["published_at"].clone()
+    } else {
+        Value::Null
+    };
+    let signed = signed(status, &vectors("statements")["keys"]["registry_status"][0]);
+    let feed = json!({"schema":"ck-status-feed/v1","scope":"example","feed_seq":seq,"records":[{"feed_seq":seq,"record":signed["record"],"signature":signed["signature"]}]});
+    let after = f.store().catalog_feed_seq("@example").unwrap().unwrap();
+    f.registry.serve(
+        &format!("/v1/scopes/example/status?after={after}"),
+        Reply::bytes(feed.to_string()),
+    );
+    f.registry.serve(
+        &format!("/v1/scopes/example/status?after={seq}"),
+        Reply::bytes(feed.to_string()),
+    );
+}
+#[tokio::test]
+async fn catalog_status_news_views_and_prepare_named_refusal() {
+    let f = Fixture::new().await;
+    f.grant();
+    let plan = f.prepare("status-plan").await;
+    let installed = result(f.install(&plan).await);
+    let id = installed["generation_id"].as_str().unwrap();
+    let agent = &f.tools.agents[0];
+    let available = result(
+        f.op(
+            crate::tests::reserved(crate::WRITER_MODULE),
+            AGENT_GENERATION,
+            json!({"agent_id":agent}),
+        )
+        .await,
+    );
+    assert!(available["ready"][0].get("pinned_status").is_none());
+    let before_news = f.store().catalog_generation(id, agent).unwrap();
+    serve_status_news(&f, "withdrawn", 2);
+    let mut trust = (f.tools.handler.catalog_agent.sources)(f.store(), "@example").unwrap();
+    refresh(&mut trust).await.unwrap();
+    assert!(generation_reply(&before_news)
+        .get("pinned_status")
+        .is_none());
+    let withdrawn = result(f.tools.call("catalog_generation", json!({})).await);
+    assert_eq!(withdrawn["generations"][0]["state"], "ready");
+    assert_eq!(
+        withdrawn["generations"][0]["pinned_status"][0]["state"],
+        "withdrawn"
+    );
+    assert_eq!(
+        withdrawn["generations"][0]["pinned_status"][0]["reason"],
+        "registry security notice"
+    );
+    result(
+        f.op(
+            crate::tests::reserved(crate::WRITER_MODULE),
+            ACK_ACTIVATION,
+            json!({"agent_id":agent,"generation_id":id}),
+        )
+        .await,
+    );
+    serve_status_news(&f, "revoked", 3);
+    refresh(&mut trust).await.unwrap();
+    let degraded = result(
+        f.op(
+            crate::tests::reserved(crate::WRITER_MODULE),
+            AGENT_GENERATION,
+            json!({"agent_id":agent}),
+        )
+        .await,
+    );
+    assert_eq!(degraded["active"]["state"], "degraded");
+    assert_eq!(
+        degraded["active"]["error"],
+        json!({"code":"pinned_revoked","name":NAME,"version":"1.0.0","reason":"registry security notice"})
+    );
+    let refused = f.prepare("revoked-plan").await;
+    assert_eq!(refused["state"], "failed");
+    assert_eq!(refused["refusal"]["code"], "version_revoked");
+    assert_eq!(refused["refusal"]["detail"]["name"], NAME);
+}

@@ -645,3 +645,157 @@ fn plan_request_shape_and_approval_state_are_validated() {
         "invalid_transition",
     );
 }
+
+fn status_news(
+    store: &RegistryStore,
+    state: &str,
+    published: Option<&str>,
+    compromise: Option<&str>,
+    seq: u64,
+) -> Result<(), CatalogWriteError> {
+    use crate::catalog_trust::{CatalogStatus, TrustWrite};
+    let canonical = json!({"name":"@acme/a","version":"1.0.0","state":state,"reason":"security notice","archive_sha256":"22".repeat(32),"published_at":published,"compromise_from":compromise}).to_string();
+    store.catalog_trust_transaction("@acme", |r, _, _| {
+        Ok((
+            (),
+            TrustWrite {
+                statuses: vec![CatalogStatus {
+                    name: "@acme/a".into(),
+                    version: "1.0.0".into(),
+                    registry_url: r.url.clone(),
+                    sequence: seq,
+                    changed_at: "2026-01-01T00:00:00Z".into(),
+                    published_at: published.unwrap_or("").into(),
+                    signer_index: 0,
+                    canonical,
+                    signature: "test".into(),
+                }],
+                ..Default::default()
+            },
+        ))
+    })
+}
+fn status_registry(store: &RegistryStore) {
+    store
+        .catalog_registry_add(
+            "https://catalog.example",
+            &["@acme".into()],
+            false,
+            "test",
+            &"11".repeat(32),
+            1,
+        )
+        .unwrap();
+}
+#[test]
+fn status_news_withdrawal_revocation_ready_and_active() {
+    let f = Fixture::new("status-effects");
+    let id = agent(&f.store);
+    status_registry(&f.store);
+    generation(&f.store, "g", &id);
+    f.store.catalog_generation_ready("g", &id).unwrap();
+    status_news(&f.store, "withdrawn", Some("2026-01-01T00:00:00Z"), None, 1).unwrap();
+    assert_eq!(
+        f.store
+            .catalog_pin_statuses(&[pin("@acme/a", "1.0.0", true)])
+            .unwrap()[0]["state"],
+        "withdrawn"
+    );
+    assert_eq!(
+        f.store
+            .catalog_activate_generation("g", &id, 6)
+            .unwrap()
+            .state,
+        "active"
+    );
+    status_news(
+        &f.store,
+        "revoked",
+        Some("2026-01-01T00:00:00Z"),
+        Some("2026-01-01T00:00:00Z"),
+        2,
+    )
+    .unwrap();
+    let g = f.store.catalog_generation("g", &id).unwrap();
+    assert_eq!(g.state, "degraded");
+    assert_eq!(
+        g.error.unwrap(),
+        json!({"code":"pinned_revoked","name":"@acme/a","version":"1.0.0","reason":"security notice"})
+    );
+    refused(
+        f.store.catalog_activate_generation("g", &id, 7),
+        "activation_blocked",
+    );
+    generation(&f.store, "ready", &id);
+    f.store.catalog_generation_ready("ready", &id).unwrap();
+    refused(
+        f.store.catalog_activate_generation("ready", &id, 7),
+        "activation_blocked",
+    );
+}
+#[test]
+fn status_news_revocation_time_and_tombstone() {
+    for (published, compromise, blocked) in [
+        (Some("2025-12-31T23:59:59Z"), "2026-01-01T00:00:00Z", false),
+        (Some("2026-01-01T00:00:00Z"), "2026-01-01T00:00:00Z", true),
+        (Some("2026-01-01T00:00:01Z"), "2026-01-01T00:00:00Z", true),
+        (None, "2026-01-01T00:00:00Z", true),
+    ] {
+        let f = Fixture::new("status-timing");
+        let id = agent(&f.store);
+        status_registry(&f.store);
+        generation(&f.store, "g", &id);
+        f.store.catalog_generation_ready("g", &id).unwrap();
+        f.store.catalog_activate_generation("g", &id, 6).unwrap();
+        status_news(&f.store, "revoked", published, Some(compromise), 1).unwrap();
+        assert_eq!(
+            f.store.catalog_generation("g", &id).unwrap().state,
+            if blocked { "degraded" } else { "active" }
+        );
+    }
+    let f = Fixture::new("status-tombstone");
+    let id = agent(&f.store);
+    status_registry(&f.store);
+    generation(&f.store, "g", &id);
+    f.store.catalog_generation_ready("g", &id).unwrap();
+    f.store.catalog_activate_generation("g", &id, 6).unwrap();
+    status_news(
+        &f.store,
+        "tombstoned",
+        Some("2025-01-01T00:00:00Z"),
+        None,
+        1,
+    )
+    .unwrap();
+    assert_eq!(
+        f.store.catalog_generation("g", &id).unwrap().error.unwrap()["code"],
+        "pinned_tombstoned"
+    );
+}
+#[test]
+fn status_news_crash_rolls_back_status_and_effect() {
+    let f = Fixture::new("status-atomic");
+    let id = agent(&f.store);
+    status_registry(&f.store);
+    generation(&f.store, "g", &id);
+    f.store.catalog_generation_ready("g", &id).unwrap();
+    f.store.catalog_activate_generation("g", &id, 6).unwrap();
+    f.store.db.with_conn_fenced(|tx| tx.execute_batch("CREATE TRIGGER crash_effect BEFORE UPDATE ON catalog_generation BEGIN SELECT RAISE(ABORT,'crash before effect'); END;")).unwrap();
+    assert!(status_news(
+        &f.store,
+        "revoked",
+        Some("2026-01-01T00:00:00Z"),
+        Some("2026-01-01T00:00:00Z"),
+        1
+    )
+    .is_err());
+    assert!(f
+        .store
+        .catalog_statuses("https://catalog.example")
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        f.store.catalog_generation("g", &id).unwrap().state,
+        "active"
+    );
+}

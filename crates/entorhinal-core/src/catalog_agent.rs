@@ -343,6 +343,10 @@ pub struct CatalogGeneration {
     pub created_at_ms: i64,
     pub activated_at_ms: Option<i64>,
     pub error: Option<Value>,
+    /// Non-available pin statuses read in the same transaction as the generation.
+    /// The module serializes only their public notice fields and omits an empty list.
+    #[serde(skip)]
+    pub pinned_status: Vec<Value>,
 }
 fn decode<T: serde::de::DeserializeOwned>(s: String) -> rusqlite::Result<T> {
     serde_json::from_str(&s).map_err(crate::shared_entry::decode_error)
@@ -353,9 +357,11 @@ fn read_plan(conn: &Connection, id: &str) -> rusqlite::Result<CatalogPlan> {
     }))
 }
 fn read_generation(conn: &Connection, id: &str) -> rusqlite::Result<CatalogGeneration> {
-    conn.query_row("SELECT generation_id,agent_id,plan_id,state,closure,pin_digest,created_at_ms,activated_at_ms,error FROM catalog_generation WHERE generation_id=?1",[id],|r| Ok(CatalogGeneration {
-        generation_id:r.get(0)?,agent_id:r.get(1)?,plan_id:r.get(2)?,state:r.get(3)?,closure:decode(r.get(4)?)?,pin_digest:r.get(5)?,created_at_ms:r.get(6)?,activated_at_ms:r.get(7)?,error:r.get::<_,Option<String>>(8)?.map(decode).transpose()?
-    }))
+    let mut generation = conn.query_row("SELECT generation_id,agent_id,plan_id,state,closure,pin_digest,created_at_ms,activated_at_ms,error FROM catalog_generation WHERE generation_id=?1",[id],|r| Ok(CatalogGeneration {
+        generation_id:r.get(0)?,agent_id:r.get(1)?,plan_id:r.get(2)?,state:r.get(3)?,closure:decode(r.get(4)?)?,pin_digest:r.get(5)?,created_at_ms:r.get(6)?,activated_at_ms:r.get(7)?,error:r.get::<_,Option<String>>(8)?.map(decode).transpose()?,pinned_status:Vec::new()
+    }))?;
+    generation.pinned_status = pin_statuses(conn, &generation.closure)?;
+    Ok(generation)
 }
 fn live(conn: &Connection, agent: &str) -> Result<(), CatalogWriteError> {
     let status: Option<String> = crate::agent::load_row(conn, agent)
@@ -418,7 +424,20 @@ fn status_snapshot(conn: &Connection, pins: &[CatalogPin]) -> rusqlite::Result<V
     }
     Ok(Value::Object(out))
 }
-fn blocked(conn: &Connection, pins: &[CatalogPin]) -> rusqlite::Result<bool> {
+/// A publication time from the registry's signed status exempts a version only
+/// when it is strictly earlier than the compromise cutoff. Unknown times block.
+pub(crate) fn status_blocks(value: &Value) -> bool {
+    match value["state"].as_str() {
+        Some("tombstoned") => true,
+        Some("revoked") => entorhinal_catalog::status::revoked_at(
+            value["published_at"].as_str(),
+            value["compromise_from"].as_str().unwrap_or(""),
+        ),
+        _ => false,
+    }
+}
+pub(crate) fn pin_statuses(conn: &Connection, pins: &[CatalogPin]) -> rusqlite::Result<Vec<Value>> {
+    let mut statuses = Vec::new();
     for pin in pins {
         let text: Option<String> = conn
             .query_row(
@@ -429,15 +448,81 @@ fn blocked(conn: &Connection, pins: &[CatalogPin]) -> rusqlite::Result<bool> {
             .optional()?;
         if let Some(text) = text {
             let value: Value = decode(text)?;
-            if matches!(value["state"].as_str(), Some("revoked" | "tombstoned")) {
-                return Ok(true);
+            if value["state"] != "available" {
+                statuses.push(value);
             }
         }
     }
-    Ok(false)
+    Ok(statuses)
+}
+pub(crate) fn blocked_status(
+    conn: &Connection,
+    pins: &[CatalogPin],
+) -> rusqlite::Result<Option<Value>> {
+    Ok(pin_statuses(conn, pins)?.into_iter().find(status_blocks))
+}
+/// The trust transaction calls this after writing status rows, so degradation
+/// of active skills and its blocking reason commit together with the status.
+pub(crate) fn apply_status_effects(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    let ids = tx
+        .prepare(
+            "SELECT generation_id FROM catalog_generation WHERE state IN ('active','degraded')",
+        )?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for id in ids {
+        let generation = read_generation(tx, &id)?;
+        let skills = generation
+            .closure
+            .into_iter()
+            .filter(|p| p.kind == Kind::Skill)
+            .collect::<Vec<_>>();
+        if let Some(status) = blocked_status(tx, &skills)? {
+            let code = if status["state"] == "tombstoned" {
+                "pinned_tombstoned"
+            } else {
+                "pinned_revoked"
+            };
+            let error = json!({"code":code,"name":status["name"],"version":status["version"],"reason":status["reason"]});
+            tx.execute(
+                "UPDATE catalog_generation SET state='degraded',error=?1 WHERE generation_id=?2",
+                params![error.to_string(), id],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 impl RegistryStore {
+    pub fn catalog_pin_statuses(&self, pins: &[CatalogPin]) -> Result<Vec<Value>, RegistryError> {
+        self.read(|conn| pin_statuses(conn, pins))
+    }
+    pub fn catalog_blocked_pin(&self, pins: &[CatalogPin]) -> Result<Option<Value>, RegistryError> {
+        self.read(|conn| blocked_status(conn, pins))
+    }
+    pub fn catalog_pinned_scopes(&self) -> Result<Vec<String>, RegistryError> {
+        self.read(|conn| {
+            let names = conn
+                .prepare("SELECT DISTINCT name FROM catalog_pin ORDER BY name")?
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(names
+                .into_iter()
+                .filter_map(|n| names::map_name(&n).ok().map(|n| format!("@{}", n.scope)))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect())
+        })
+    }
+    /// Save this store's hourly poll phase once. Unlike agent pins, the phase
+    /// never enters the identity journal or replication to other Macs.
+    pub fn catalog_poll_offset(&self, candidate: u64) -> Result<u64, RegistryError> {
+        self.catalog_transaction(|tx| {
+            tx.execute_batch("CREATE TABLE IF NOT EXISTS catalog_poll_clock(id INTEGER PRIMARY KEY CHECK(id=1), offset_ms INTEGER NOT NULL CHECK(offset_ms>=0 AND offset_ms<3600000))").map_err(store_error)?;
+            tx.execute("INSERT OR IGNORE INTO catalog_poll_clock VALUES(1,?1)", [candidate % 3_600_000]).map_err(store_error)?;
+            tx.query_row("SELECT offset_ms FROM catalog_poll_clock WHERE id=1", [], |r| r.get(0)).map_err(store_error)
+        }).map_err(registry_error)
+    }
     pub fn catalog_save_prepared(
         &self,
         id: &str,
@@ -652,6 +737,9 @@ impl RegistryStore {
         self.catalog_transaction(|tx| {
             let generation = read_generation(tx,id).map_err(store_error)?;
             owner(&generation.agent_id,caller)?;
+            if step == "active" && blocked_status(tx,&generation.closure).map_err(store_error)?.is_some() {
+                return Err(CatalogWriteError::Refused("activation_blocked"));
+            }
             transition(tx,"generation",id,step,json!(error),|| {
                 live(tx,&generation.agent_id)?;
                 let allowed = match step {
@@ -662,7 +750,6 @@ impl RegistryStore {
                 };
                 if !allowed { return Err(CatalogWriteError::Refused("invalid_transition")); }
                 if step == "active" {
-                    if blocked(tx,&generation.closure).map_err(store_error)? { return Err(CatalogWriteError::Refused("activation_blocked")); }
                     // Release the unique active slot before taking it. Keep the old
                     // closure so consumers can finish switching away from its packages.
                     tx.execute("UPDATE catalog_generation SET state='superseded' WHERE agent_id=?1 AND state IN ('active','degraded')",[&generation.agent_id]).map_err(store_error)?;

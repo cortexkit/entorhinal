@@ -63,6 +63,7 @@ mod catalog_consumer;
 mod catalog_grants;
 mod catalog_network;
 mod catalog_ops;
+mod catalog_poll;
 mod catalog_trust;
 mod catch_up;
 mod claim_codec;
@@ -373,6 +374,7 @@ impl RequestLatency {
 
 #[derive(Default)]
 struct HealthGauges {
+    catalog: catalog_poll::Gauges,
     store_ready: AtomicBool,
     store_failed: AtomicBool,
     /// True while the open is being retried against a lease a predecessor
@@ -576,6 +578,8 @@ struct ProjectsHandler {
     record_client: record_client::RecordClient,
     participant_discovery: Arc<dyn participant_discovery::ParticipantDiscovery>,
     catalog_agent: catalog_agent::CatalogAgent,
+    catalog_poll_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    catalog_poll_wake: Arc<tokio::sync::Notify>,
     door_client: door_client::DoorClient,
     move_wake: Arc<move_driver::MoveWake>,
     move_driver_task: Mutex<Option<move_driver::MoveDriver>>,
@@ -902,6 +906,8 @@ impl ProjectsHandler {
                 )),
             )),
             catalog_agent: catalog_agent::CatalogAgent::default(),
+            catalog_poll_task: Mutex::new(None),
+            catalog_poll_wake: Arc::default(),
             claim_refresh: Arc::new(claims::RefreshQueue::default()),
             door_client: door_client::DoorClient::production(log_client::SubcConnector::from_args(
                 std::env::args_os().skip(1),
@@ -1142,6 +1148,7 @@ impl ModuleHandler for ProjectsHandler {
                 let role_refresh = self.role_refresh.clone();
                 let move_wake = self.move_wake.clone();
                 let module_started_at = self.module_started_at;
+                let catalog_poll_wake = self.catalog_poll_wake.clone();
                 tokio::spawn(async move {
                     let outcome = retry_open_while_lease_held(&descriptor, retry_budget).await;
                     health.store_opening.store(false, Ordering::Relaxed);
@@ -1156,6 +1163,7 @@ impl ModuleHandler for ProjectsHandler {
                     role_refresh.notify_one();
                     move_wake.notify_one();
                     move_wake.notify_waiters();
+                    catalog_poll_wake.notify_one();
                 });
             }
             outcome => install_store_with_time(
@@ -1167,6 +1175,7 @@ impl ModuleHandler for ProjectsHandler {
             ),
         }
         self.start_catch_up();
+        self.start_catalog_poll();
         self.start_claim_refresh();
         self.claim_refresh.signal();
         self.start_role_refresh();
@@ -1202,11 +1211,16 @@ impl ModuleHandler for ProjectsHandler {
         } else {
             (!ready).then(|| "projects storage is not ready".to_string())
         };
+        let catalog = self.health.catalog.report();
         HealthReport {
             status,
             detail,
             metrics: Some(json!({
                 "storeReady": ready,
+                "catalogLastSuccessMs": catalog["catalogLastSuccessMs"],
+                "catalogLastError": catalog["catalogLastError"],
+                "catalogConsecutiveFailures": catalog["catalogConsecutiveFailures"],
+                "catalogScopesPolled": catalog["catalogScopesPolled"],
                 "generation": self.health.generation.load(Ordering::Relaxed),
                 "resolveCount": self.health.resolve_count.load(Ordering::Relaxed),
                 "enumerateCount": self.health.enumerate_count.load(Ordering::Relaxed),
@@ -2665,6 +2679,7 @@ mod tests {
         stop_catch_up(handler).await;
         handler.stop_move_driver().await;
         handler.stop_claim_refresh().await;
+        handler.stop_catalog_poll().await;
         handler.stop_role_refresh().await;
     }
 

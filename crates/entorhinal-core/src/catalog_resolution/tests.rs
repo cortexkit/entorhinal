@@ -374,3 +374,55 @@ fn pinned_candidate_bytes_and_kind_cannot_change() {
         assert_eq!(error["code"], "record_mismatch");
     }
 }
+
+#[test]
+fn revoked_new_root_is_named_and_early_publication_remains_eligible() {
+    let f = Fixture::new("catalog-resolve-revocation");
+    let id = agent(&f.store);
+    let versions = vec![candidate("a", "1.0.0", &[])];
+    setup(&f.store, &id, vec![], &versions);
+    for state in ["revoked", "tombstoned"] {
+        f.store.db.with_conn_fenced(|tx|tx.execute("UPDATE catalog_status SET canonical=json_set(canonical,'$.state',?1,'$.compromise_from','2026-01-01T00:00:00Z','$.published_at','2026-01-01T00:00:00Z','$.reason','security notice')",[state])).unwrap();
+        let Err(CatalogResolveError::Refusal(error)) =
+            f.store
+                .catalog_resolve(&id, CatalogSubject::Install(spec("a")), &versions, &[])
+        else {
+            panic!("blocked new root was resolved")
+        };
+        assert_eq!(
+            error,
+            json!({"code":if state == "revoked" {"version_revoked"} else {"version_tombstoned"},"name":"@acme/a","version":"1.0.0","reason":"security notice"})
+        );
+    }
+    f.store.db.with_conn_fenced(|tx|tx.execute("UPDATE catalog_status SET canonical=json_set(canonical,'$.state','revoked','$.published_at','2025-12-31T23:59:59Z')",[])).unwrap();
+    assert_eq!(
+        f.store
+            .catalog_resolve(&id, CatalogSubject::Install(spec("a")), &versions, &[])
+            .unwrap()
+            .closure[0]
+            .version,
+        "1.0.0"
+    );
+}
+
+#[test]
+fn revoked_new_dependency_is_named() {
+    let f = Fixture::new("catalog-resolve-dependency-revocation");
+    let id = agent(&f.store);
+    let versions = vec![
+        candidate("a", "1.0.0", &[("b", "^1")]),
+        candidate("b", "1.0.0", &[]),
+    ];
+    setup(&f.store, &id, vec![], &versions);
+    f.store.db.with_conn_fenced(|tx|tx.execute("UPDATE catalog_status SET canonical=json_set(canonical,'$.state','revoked','$.compromise_from','2026-01-01T00:00:00Z','$.published_at','2026-01-01T00:00:00Z','$.reason','security notice') WHERE name='@acme/b'",[])).unwrap();
+    let Err(CatalogResolveError::Refusal(error)) =
+        f.store
+            .catalog_resolve(&id, CatalogSubject::Install(spec("a")), &versions, &[])
+    else {
+        panic!("revoked dependency resolved")
+    };
+    assert_eq!(
+        error,
+        json!({"code":"version_revoked","name":"@acme/b","version":"1.0.0","reason":"security notice"})
+    );
+}

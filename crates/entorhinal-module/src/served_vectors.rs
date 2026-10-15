@@ -218,6 +218,7 @@ fn published_file(directory: &str, name: &str, records: Vec<String>) {
     if std::env::var("ENTO_WRITE_SERVED_VECTORS").as_deref() == Ok("1") {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, served).unwrap();
+        println!("wrote {directory}/{name}");
     } else {
         let published = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(
@@ -1359,4 +1360,177 @@ async fn repair_preview_is_open_and_cutover_refusal_precedes_confirmation() {
             .unwrap(),
         before
     );
+}
+
+#[tokio::test]
+async fn catalog_generation_v1_records_match_published_files() {
+    use entorhinal_core::catalog_agent::{CatalogPin, CatalogSpec, CatalogTarget};
+    use entorhinal_core::catalog_trust::{CatalogStatus, TrustWrite};
+    let f = Fixture::new("catalog-generation-vectors").await;
+    let source = f.snapshot();
+    seed_agent(&source, ASSISTANT, "Catalog assistant", None, false, false);
+    drop(source);
+    assert!(matches!(f.import().await, HandlerOutcome::Response(_)));
+    let store = f.handler.with_store(|s| Ok(s.clone())).unwrap();
+    let pin = CatalogPin {
+        name: "@example/hello-skill".into(),
+        version: "1.0.0".into(),
+        kind: entorhinal_catalog::Kind::Skill,
+        manifest_sha256: "11".repeat(32),
+        archive_sha256: "22".repeat(32),
+        publisher_fingerprint: "33".repeat(32),
+        root: true,
+        range: Some("^1.0.0".into()),
+    };
+    store
+        .catalog_registry_add(
+            "https://registry.example.invalid",
+            &["@example".into()],
+            false,
+            "test-status-key",
+            &"44".repeat(32),
+            1,
+        )
+        .unwrap();
+    let generation = |id: &str| {
+        let plan = format!("plan:{id}");
+        store
+            .catalog_create_plan(
+                &plan,
+                ASSISTANT,
+                CatalogTarget::Agent(ASSISTANT.into()),
+                "install",
+                CatalogSpec {
+                    package: pin.name.clone(),
+                    range: "^1.0.0".into(),
+                },
+                100,
+            )
+            .unwrap();
+        store
+            .catalog_plan_ready(&plan, ASSISTANT, vec![pin.clone()], 200)
+            .unwrap();
+        store
+            .catalog_approve_plan(&plan, ASSISTANT, id, 300)
+            .unwrap();
+        store.catalog_generation_ready(id, ASSISTANT).unwrap();
+    };
+    let status = |state: &str, seq: u64| {
+        let canonical = json!({"name":pin.name,"version":pin.version,"state":state,"reason":"publisher security notice","archive_sha256":pin.archive_sha256,"published_at":"2026-01-01T00:00:00Z","compromise_from":if state == "revoked" {json!("2026-01-01T00:00:00Z")} else {Value::Null}}).to_string();
+        store
+            .catalog_trust_transaction::<_, entorhinal_core::catalog::CatalogWriteError>(
+                "@example",
+                |r, _, _| {
+                    Ok((
+                        (),
+                        TrustWrite {
+                            statuses: vec![CatalogStatus {
+                                name: pin.name.clone(),
+                                version: pin.version.clone(),
+                                registry_url: r.url.clone(),
+                                sequence: seq,
+                                changed_at: "2026-01-01T00:00:00Z".into(),
+                                published_at: "2026-01-01T00:00:00Z".into(),
+                                signer_index: 0,
+                                canonical,
+                                signature: "fixture".into(),
+                            }],
+                            ..Default::default()
+                        },
+                    ))
+                },
+            )
+            .unwrap();
+    };
+    let mut records = Vec::new();
+    async fn record(
+        f: &Fixture,
+        records: &mut Vec<String>,
+        case: &str,
+        method: &str,
+        params: Value,
+    ) -> Value {
+        let request = serde_json::to_vec(&json!({"method":method,"params":params})).unwrap();
+        let outcome = f.handler.handle_served_request(&request, CORE).await;
+        let (kind, reply) = match outcome {
+            HandlerOutcome::Response(bytes) => ("response", String::from_utf8(bytes).unwrap()),
+            other => ("error", refusal(other).to_string()),
+        };
+        let decoded: Value = serde_json::from_str(&reply).unwrap();
+        records.push(format!(
+            "  {{\"case\":{},\"request_bytes\":{},\"outcome\":{},\"reply_bytes\":{}}}",
+            json!(case),
+            json!(String::from_utf8(request).unwrap()),
+            json!(kind),
+            json!(reply)
+        ));
+        decoded
+    }
+    generation("generation:available");
+    let ready = record(
+        &f,
+        &mut records,
+        "ready",
+        "catalog.agent_generation",
+        json!({"agent_id":ASSISTANT}),
+    )
+    .await;
+    assert_eq!(ready["result"]["ready"][0]["state"], "ready");
+    record(
+        &f,
+        &mut records,
+        "ack_success",
+        "catalog.ack_activation",
+        json!({"agent_id":ASSISTANT,"generation_id":"generation:available"}),
+    )
+    .await;
+    let active = record(
+        &f,
+        &mut records,
+        "active_available",
+        "catalog.agent_generation",
+        json!({"agent_id":ASSISTANT}),
+    )
+    .await;
+    assert!(active["result"]["active"].get("pinned_status").is_none());
+    status("withdrawn", 1);
+    let withdrawn = record(
+        &f,
+        &mut records,
+        "active_withdrawn",
+        "catalog.agent_generation",
+        json!({"agent_id":ASSISTANT}),
+    )
+    .await;
+    assert_eq!(withdrawn["result"]["active"]["state"], "active");
+    assert_eq!(
+        withdrawn["result"]["active"]["pinned_status"][0]["state"],
+        "withdrawn"
+    );
+    generation("generation:blocked");
+    status("revoked", 2);
+    let degraded = record(
+        &f,
+        &mut records,
+        "degraded_and_ready_blocked",
+        "catalog.agent_generation",
+        json!({"agent_id":ASSISTANT}),
+    )
+    .await;
+    assert_eq!(degraded["result"]["active"]["state"], "degraded");
+    assert_eq!(
+        degraded["result"]["active"]["error"]["code"],
+        "pinned_revoked"
+    );
+    let refused = record(
+        &f,
+        &mut records,
+        "ack_blocked",
+        "catalog.ack_activation",
+        json!({"agent_id":ASSISTANT,"generation_id":"generation:blocked"}),
+    )
+    .await;
+    assert_eq!(refused["code"], "activation_blocked");
+    assert_eq!(refused["detail"]["name"], pin.name);
+    published_file("catalog-generation-v1", "records.json", records);
 }

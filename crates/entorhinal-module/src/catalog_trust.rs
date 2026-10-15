@@ -176,13 +176,32 @@ fn scope_path(scope: &str) -> Result<&str, CatalogError> {
     Ok(part)
 }
 pub struct CatalogTrust {
-    store: RegistryStore,
+    store: StoreAccess,
     client: RegistryClient,
     scope: String,
     registry: CatalogRegistry,
     refused_links: std::collections::BTreeSet<String>,
 }
+enum StoreAccess {
+    Held(RegistryStore),
+    Weak(std::sync::Weak<std::sync::Mutex<Option<RegistryStore>>>),
+}
 impl CatalogTrust {
+    pub(crate) fn use_weak_store(
+        &mut self,
+        store: std::sync::Weak<std::sync::Mutex<Option<RegistryStore>>>,
+    ) {
+        self.store = StoreAccess::Weak(store);
+    }
+    fn store(&self) -> Result<RegistryStore, CatalogError> {
+        match &self.store {
+            StoreAccess::Held(store) => Ok(store.clone()),
+            StoreAccess::Weak(slot) => slot
+                .upgrade()
+                .and_then(|s| s.lock().unwrap().clone())
+                .ok_or_else(|| CatalogError::new("store_unavailable", "catalog store was closed")),
+        }
+    }
     pub fn for_scope(store: RegistryStore, scope: &str) -> Result<Self, CatalogError> {
         scope_path(scope)?;
         let registry = store
@@ -197,7 +216,7 @@ impl CatalogTrust {
             .collect::<Vec<_>>();
         let client = RegistryClient::new(&registry.url, &allowlist, Limits::MODULE)?;
         Ok(Self {
-            store,
+            store: StoreAccess::Held(store),
             client,
             scope: scope.into(),
             registry,
@@ -222,7 +241,7 @@ impl CatalogTrust {
             .find(|r| r.url == url)
             .ok_or_else(|| CatalogError::new("registry_unknown", "unknown registry"))?;
         Ok(Self {
-            store,
+            store: StoreAccess::Held(store),
             client,
             scope: scope.into(),
             registry,
@@ -245,98 +264,94 @@ impl CatalogTrust {
         let scope = self.scope.clone();
         // Accepted prefix links survive a later refusal. The refusal is returned
         // after the transaction commits that prefix, never by rolling it back.
-        let (registry, refusal) =
-            self.store
-                .catalog_trust_transaction::<_, CatalogError>(&scope, |current, _, _| {
-                    identity(&expected, current)?;
-                    let mut next = current.clone();
-                    let mut pure = statements::RegistryChain {
-                        registry: current.url.clone(),
-                        keys: current
+        let (registry, refusal) = self.store()?.catalog_trust_transaction::<_, CatalogError>(
+            &scope,
+            |current, _, _| {
+                identity(&expected, current)?;
+                let mut next = current.clone();
+                let mut pure = statements::RegistryChain {
+                    registry: current.url.clone(),
+                    keys: current
+                        .keys
+                        .iter()
+                        .map(|k| statements::RegistryKey {
+                            key_id: k.key_id.clone(),
+                            public_key: k.public_key.clone(),
+                            statement: k.statement.clone(),
+                        })
+                        .collect(),
+                };
+                let anchor = links.iter().rposition(|link| {
+                    current
+                        .keys
+                        .iter()
+                        .any(|key| link["statement"]["key_id"] == key.key_id)
+                });
+                let mut refusal = None;
+                for (position, link) in links.iter().enumerate() {
+                    let result = (|| {
+                        let text = document(&link["statement"])?;
+                        let sig = link["signature"].as_str().ok_or_else(|| {
+                            CatalogError::new("statement_invalid", "missing registry key signature")
+                        })?;
+                        let known = next
                             .keys
                             .iter()
-                            .map(|k| statements::RegistryKey {
-                                key_id: k.key_id.clone(),
-                                public_key: k.public_key.clone(),
-                                statement: k.statement.clone(),
-                            })
-                            .collect(),
-                    };
-                    let anchor = links.iter().rposition(|link| {
-                        current
-                            .keys
-                            .iter()
-                            .any(|key| link["statement"]["key_id"] == key.key_id)
-                    });
-                    let mut refusal = None;
-                    for (position, link) in links.iter().enumerate() {
-                        let result = (|| {
-                            let text = document(&link["statement"])?;
-                            let sig = link["signature"].as_str().ok_or_else(|| {
-                                CatalogError::new(
-                                    "statement_invalid",
-                                    "missing registry key signature",
-                                )
-                            })?;
-                            let known = next
-                                .keys
-                                .iter()
-                                .position(|k| link["statement"]["key_id"] == k.key_id);
-                            if known.is_none() && anchor.is_some_and(|a| position < a) {
-                                return Ok(());
-                            }
-                            if let Some(index) = known {
-                                if next.keys[index].statement.is_none() {
-                                    let mut validation = pure.clone();
-                                    validation.keys[index].statement = Some(text.clone());
-                                    statements::apply_registry_key(&mut validation, &text, sig)?;
-                                    if link["statement"]["public_key"]
-                                        != next.keys[index].public_key
-                                    {
-                                        return Err(Refusal::new(RefusalCode::KeyConflict).into());
-                                    }
-                                    pure = validation;
-                                    next.keys[index].statement = Some(text);
-                                } else {
-                                    statements::apply_registry_key(&mut pure, &text, sig)?;
+                            .position(|k| link["statement"]["key_id"] == k.key_id);
+                        if known.is_none() && anchor.is_some_and(|a| position < a) {
+                            return Ok(());
+                        }
+                        if let Some(index) = known {
+                            if next.keys[index].statement.is_none() {
+                                let mut validation = pure.clone();
+                                validation.keys[index].statement = Some(text.clone());
+                                statements::apply_registry_key(&mut validation, &text, sig)?;
+                                if link["statement"]["public_key"] != next.keys[index].public_key {
+                                    return Err(Refusal::new(RefusalCode::KeyConflict).into());
                                 }
+                                pure = validation;
+                                next.keys[index].statement = Some(text);
                             } else {
                                 statements::apply_registry_key(&mut pure, &text, sig)?;
-                                let statement: statements::RegistryKeyStatement =
-                                    serde_json::from_value(link["statement"].clone()).map_err(
-                                        |_| {
-                                            CatalogError::new(
-                                                "statement_invalid",
-                                                "invalid registry statement",
-                                            )
-                                        },
-                                    )?;
-                                next.keys.push(RegistryKey {
-                                    chain_index: next.keys.len() as i64,
-                                    key_id: statement.key_id,
-                                    public_key: statement.public_key,
-                                    statement: pure.keys.last().and_then(|k| k.statement.clone()),
-                                    valid_from: Some(statement.valid_from),
-                                });
                             }
-                            Ok::<_, CatalogError>(())
-                        })();
-                        if let Err(e) = result {
-                            refusal = Some((
-                                e,
-                                entorhinal_catalog::sha256_hex(link.to_string().as_bytes()),
-                            ));
-                            break;
+                        } else {
+                            statements::apply_registry_key(&mut pure, &text, sig)?;
+                            let statement: statements::RegistryKeyStatement =
+                                serde_json::from_value(link["statement"].clone()).map_err(
+                                    |_| {
+                                        CatalogError::new(
+                                            "statement_invalid",
+                                            "invalid registry statement",
+                                        )
+                                    },
+                                )?;
+                            next.keys.push(RegistryKey {
+                                chain_index: next.keys.len() as i64,
+                                key_id: statement.key_id,
+                                public_key: statement.public_key,
+                                statement: pure.keys.last().and_then(|k| k.statement.clone()),
+                                valid_from: Some(statement.valid_from),
+                            });
                         }
+                        Ok::<_, CatalogError>(())
+                    })();
+                    if let Err(e) = result {
+                        refusal = Some((
+                            e,
+                            entorhinal_catalog::sha256_hex(link.to_string().as_bytes()),
+                        ));
+                        break;
                     }
-                    Ok((
-                        (next.clone(), refusal),
-                        TrustWrite {
-                            keys: Some(next.keys),
-                            ..Default::default()
-                        },
-                    ))
-                })?;
+                }
+                Ok((
+                    (next.clone(), refusal),
+                    TrustWrite {
+                        keys: Some(next.keys),
+                        ..Default::default()
+                    },
+                ))
+            },
+        )?;
         self.registry = registry;
         if let Some((e, digest)) = refusal {
             if self.refused_links.insert(digest.clone()) {
@@ -451,7 +466,7 @@ impl CatalogTrust {
         };
         let mut refreshed = false;
         let applied = loop {
-            let result = self.store.catalog_trust_transaction::<_, CatalogError>(
+            let result = self.store()?.catalog_trust_transaction::<_, CatalogError>(
                 &self.scope,
                 |current, held, _| {
                     identity(&expected, current)?;
@@ -506,16 +521,16 @@ impl CatalogTrust {
             &archive,
             &trust,
         )?;
-        let folder = self.store.store_folder();
+        let folder = self.store()?.store_folder().to_path_buf();
         // Recheck this version's current status and selected registry after
         // downloads. A higher status sequence or a replacement registry makes
         // the earlier acceptance stale, so its bytes must not be published.
-        self.store.catalog_trust_transaction::<_, CatalogError>(
+        self.store()?.catalog_trust_transaction::<_, CatalogError>(
             &self.scope,
             |current, held, _| {
                 identity(&expected, current)?;
                 accept(current, held, &status_text, status_sig, &pin)?;
-                BlobStore::new(folder)?.publish(&archive)?;
+                BlobStore::new(&folder)?.publish(&archive)?;
                 Ok(((), TrustWrite::default()))
             },
         )?;
@@ -524,11 +539,11 @@ impl CatalogTrust {
     pub async fn apply_scope_feed(&mut self) -> Result<FeedApply, NetworkError> {
         self.refresh_registry_keys().await?;
         let etag = self
-            .store
+            .store()?
             .catalog_feed_etag(&self.scope)
             .map_err(store_error)?;
         let after = self
-            .store
+            .store()?
             .catalog_feed_seq(&self.scope)
             .map_err(store_error)?;
         let mut mode = if after.is_some() {
@@ -565,7 +580,7 @@ impl CatalogTrust {
                 other => other?,
             };
             if response.not_modified {
-                self.store.catalog_trust_transaction::<_, CatalogError>(
+                self.store()?.catalog_trust_transaction::<_, CatalogError>(
                     &self.scope,
                     |current, _, _| {
                         identity(&self.registry, current)?;
@@ -604,7 +619,7 @@ impl CatalogTrust {
                 .collect::<Result<Vec<_>, CatalogError>>()?;
             let expected = self.registry.clone();
             let scope = self.scope.clone();
-            let outcome = self.store.catalog_trust_transaction::<_, CatalogError>(
+            let outcome = self.store()?.catalog_trust_transaction::<_, CatalogError>(
                 &scope,
                 |current, rows, cursor| {
                     identity(&expected, current)?;

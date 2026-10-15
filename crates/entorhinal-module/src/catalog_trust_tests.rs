@@ -209,7 +209,8 @@ async fn registry_statement_vectors_over_http() {
         let pinned: statements::RegistryChain =
             serde_json::from_value(case["pinned"].clone()).unwrap();
         trust
-            .store
+            .store()
+            .unwrap()
             .catalog_trust_transaction::<_, CatalogError>("@example", |_, _, _| {
                 Ok((
                     (),
@@ -233,7 +234,12 @@ async fn registry_statement_vectors_over_http() {
                 ))
             })
             .unwrap();
-        trust.registry = trust.store.catalog_registries().unwrap().remove(0);
+        trust.registry = trust
+            .store()
+            .unwrap()
+            .catalog_registries()
+            .unwrap()
+            .remove(0);
         let text = case["statement_text"].as_str().unwrap();
         let envelope = format!("{{\"schema\":\"ck-registry-keys/v1\",\"registry\":\"{URL}\",\"keys\":[{{\"statement\":{text},\"signature\":{}}}]}}",case["signature"]);
         f.fake.serve("/v1/registry/keys", Reply::bytes(envelope));
@@ -266,7 +272,12 @@ async fn verify_status_identity_binding_and_separate_blob_publication() {
         "record_mismatch",
         Some("name"),
     );
-    assert!(trust.store.catalog_statuses(URL).unwrap().is_empty());
+    assert!(trust
+        .store()
+        .unwrap()
+        .catalog_statuses(URL)
+        .unwrap()
+        .is_empty());
     let mut package = package_doc();
     package["versions"][0]["record"]["version"] = "2.0.0".into();
     serve_package(&f.fake, &package);
@@ -275,17 +286,27 @@ async fn verify_status_identity_binding_and_separate_blob_publication() {
         "record_mismatch",
         Some("version"),
     );
-    assert!(trust.store.catalog_statuses(URL).unwrap().is_empty());
+    assert!(trust
+        .store()
+        .unwrap()
+        .catalog_statuses(URL)
+        .unwrap()
+        .is_empty());
     package = package_doc();
     package["versions"][0]["status"]["signature"] = "00".repeat(64).into();
     serve_package(&f.fake, &package);
     let e = trust.verify_version(NAME, VERSION).await.unwrap_err();
     assert_eq!(e.detail().unwrap()["name"], NAME);
     error(e, "signature_invalid", None);
-    assert!(trust.store.catalog_statuses(URL).unwrap().is_empty());
+    assert!(trust
+        .store()
+        .unwrap()
+        .catalog_statuses(URL)
+        .unwrap()
+        .is_empty());
     serve_package(&f.fake, &package_doc());
     trust.verify_version(NAME, VERSION).await.unwrap();
-    let held = trust.store.catalog_statuses(URL).unwrap()[0]
+    let held = trust.store().unwrap().catalog_statuses(URL).unwrap()[0]
         .canonical
         .clone();
     let mut other_publisher = package_doc();
@@ -328,7 +349,7 @@ async fn verify_status_identity_binding_and_separate_blob_publication() {
             .iter()
             .any(|p| p.starts_with("/v1/archives/")));
         assert_eq!(
-            trust.store.catalog_statuses(URL).unwrap()[0].canonical,
+            trust.store().unwrap().catalog_statuses(URL).unwrap()[0].canonical,
             held
         );
     }
@@ -358,8 +379,10 @@ async fn verify_status_identity_binding_and_separate_blob_publication() {
         None,
     );
     assert_eq!(
-        serde_json::from_str::<Value>(&trust.store.catalog_statuses(URL).unwrap()[0].canonical)
-            .unwrap()["state"],
+        serde_json::from_str::<Value>(
+            &trust.store().unwrap().catalog_statuses(URL).unwrap()[0].canonical
+        )
+        .unwrap()["state"],
         "tombstoned"
     );
     serve_package(&f.fake, &package_doc());
@@ -382,7 +405,7 @@ async fn feed_mixed_unheld_binding_guards_and_full_fallback() {
         .unwrap()
         .iter()
         .any(|p| p.contains("packages") || p.contains("archives")));
-    let before = trust.store.catalog_statuses(URL).unwrap()[0]
+    let before = trust.store().unwrap().catalog_statuses(URL).unwrap()[0]
         .canonical
         .clone();
     for field in ["published_at", "publisher_key"] {
@@ -415,7 +438,7 @@ async fn feed_mixed_unheld_binding_guards_and_full_fallback() {
             field
         );
         assert_eq!(
-            trust.store.catalog_statuses(URL).unwrap()[0].canonical,
+            trust.store().unwrap().catalog_statuses(URL).unwrap()[0].canonical,
             before
         );
     }
@@ -435,7 +458,10 @@ async fn feed_mixed_unheld_binding_guards_and_full_fallback() {
         outcome.results[1].1.as_ref().unwrap_err().code,
         "signature_invalid"
     );
-    assert_eq!(trust.store.catalog_feed_seq("@example").unwrap(), Some(1));
+    assert_eq!(
+        trust.store().unwrap().catalog_feed_seq("@example").unwrap(),
+        Some(1)
+    );
     f.fake.serve(
         "/v1/scopes/example/status?after=1",
         Reply {
@@ -480,7 +506,12 @@ async fn unknown_status_key_fetches_once_and_cannot_self_authorize() {
             .count(),
         1
     );
-    assert!(trust.store.catalog_statuses(URL).unwrap().is_empty());
+    assert!(trust
+        .store()
+        .unwrap()
+        .catalog_statuses(URL)
+        .unwrap()
+        .is_empty());
 }
 #[tokio::test]
 async fn stored_status_reopen_checks_columns_and_rollback() {
@@ -491,9 +522,10 @@ async fn stored_status_reopen_checks_columns_and_rollback() {
     drop(trust);
     let mut trust = f.trust();
     trust.verify_version(NAME, VERSION).await.unwrap();
-    let rows = trust.store.catalog_statuses(URL).unwrap();
+    let rows = trust.store().unwrap().catalog_statuses(URL).unwrap();
     trust
-        .store
+        .store()
+        .unwrap()
         .catalog_trust_transaction::<_, CatalogError>("@example", |_, _, _| {
             let mut bad = rows[0].clone();
             bad.sequence += 1;
@@ -735,7 +767,7 @@ async fn in_flight_verification_rechecks_status_repin_and_registry_identity() {
                 ..Reply::bytes(package_doc().to_string())
             },
         );
-        let store = trust.store.clone();
+        let store = trust.store().unwrap().clone();
         let task = tokio::spawn(async move { trust.verify_version(NAME, VERSION).await });
         entered.notified().await;
         match race {
@@ -836,9 +868,12 @@ async fn record_trust_precedes_malformed_archive_and_never_fetches_untrusted_byt
         .unwrap()
         .iter()
         .any(|p| p.contains("archives") || p.ends_with("ck.json")));
-    assert_eq!(trust.store.catalog_statuses(URL).unwrap().len(), 1);
     assert_eq!(
-        BlobStore::new(trust.store.store_folder())
+        trust.store().unwrap().catalog_statuses(URL).unwrap().len(),
+        1
+    );
+    assert_eq!(
+        BlobStore::new(trust.store().unwrap().store_folder())
             .unwrap()
             .read_verified(digest)
             .unwrap_err()
@@ -978,7 +1013,7 @@ async fn archive_barrier_cannot_publish_after_newer_status() {
             ..original
         },
     );
-    let store = trust.store.clone();
+    let store = trust.store().unwrap().clone();
     let task = tokio::spawn(async move { trust.verify_version(NAME, VERSION).await });
     entered.notified().await;
     let mut other = CatalogTrust::with_client(
@@ -1029,13 +1064,14 @@ async fn feed_etag_304_preserves_cursor_and_status() {
     trust.apply_scope_feed().await.unwrap();
     assert_eq!(
         trust
-            .store
+            .store()
+            .unwrap()
             .catalog_feed_etag("@example")
             .unwrap()
             .as_deref(),
         Some("\"feed-one\"")
     );
-    let before = trust.store.catalog_statuses(URL).unwrap()[0]
+    let before = trust.store().unwrap().catalog_statuses(URL).unwrap()[0]
         .canonical
         .clone();
     f.fake.serve(
@@ -1056,10 +1092,13 @@ async fn feed_etag_304_preserves_cursor_and_status() {
         .to_ascii_lowercase()
         .contains("if-none-match: \"feed-one\""));
     assert_eq!(
-        trust.store.catalog_statuses(URL).unwrap()[0].canonical,
+        trust.store().unwrap().catalog_statuses(URL).unwrap()[0].canonical,
         before
     );
-    assert_eq!(trust.store.catalog_feed_seq("@example").unwrap(), Some(1));
+    assert_eq!(
+        trust.store().unwrap().catalog_feed_seq("@example").unwrap(),
+        Some(1)
+    );
 }
 
 #[tokio::test]
@@ -1082,7 +1121,7 @@ async fn same_clock_same_key_readd_refuses_old_incarnation() {
             ..Reply::bytes(package_doc().to_string())
         },
     );
-    let store = trust.store.clone();
+    let store = trust.store().unwrap().clone();
     let task = tokio::spawn(async move { trust.verify_version(NAME, VERSION).await });
     entered.notified().await;
     store.catalog_registry_remove(URL).unwrap();
@@ -1141,8 +1180,14 @@ async fn feed_records_two_held_and_one_unheld_without_package_requests() {
     );
     f.fake.calls.lock().unwrap().clear();
     assert!(trust.apply_scope_feed().await.unwrap().cursor_advanced);
-    assert_eq!(trust.store.catalog_statuses(URL).unwrap().len(), 3);
-    assert_eq!(trust.store.catalog_feed_seq("@example").unwrap(), Some(3));
+    assert_eq!(
+        trust.store().unwrap().catalog_statuses(URL).unwrap().len(),
+        3
+    );
+    assert_eq!(
+        trust.store().unwrap().catalog_feed_seq("@example").unwrap(),
+        Some(3)
+    );
     assert!(!f
         .fake
         .calls
@@ -1198,7 +1243,12 @@ async fn status_refusal_precedes_package_shape_and_invalid_status_does_not_fetch
         "signature_invalid",
         None,
     );
-    assert!(trust.store.catalog_statuses(URL).unwrap().is_empty());
+    assert!(trust
+        .store()
+        .unwrap()
+        .catalog_statuses(URL)
+        .unwrap()
+        .is_empty());
     package["versions"][0]["status"]["signature"] = status_doc()["signature"].clone();
     serve_package(&f.fake, &package);
     error(
@@ -1206,7 +1256,10 @@ async fn status_refusal_precedes_package_shape_and_invalid_status_does_not_fetch
         "record_invalid",
         None,
     );
-    assert_eq!(trust.store.catalog_statuses(URL).unwrap().len(), 1);
+    assert_eq!(
+        trust.store().unwrap().catalog_statuses(URL).unwrap().len(),
+        1
+    );
     let mut package = package_doc();
     package["versions"][0]["status"]["record"]["registry_key_id"] = "unknown".into();
     package["versions"][0]["status"]["record"]["sequence"] = 0.into();

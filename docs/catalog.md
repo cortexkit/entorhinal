@@ -6,8 +6,8 @@ The module configures registry trust, verifies packages, walks successor chains,
 ingests status feeds, and holds local publisher grants. The core store also holds
 shared agent pins and local plans/generations. Agent tools prepare verified skill
 closures, obtain user consent and stage generations for consumer prefetch and
-core's activation acknowledgement. Automatic background polling, move integration,
-publishing and non-skill installation are not exposed yet.
+core's activation acknowledgement. Background status polling protects held skill
+generations. Move integration, publishing and non-skill installation are not exposed yet.
 
 ```
 ck catalog registry add https://registry.example --scope @example --key-id status-1 --public-key <64-lowercase-hex>
@@ -427,6 +427,71 @@ generations. Acknowledgement is idempotent and refuses a generation that is not
 ready or whose held status blocks activation. Both operations use local state
 only: no registry, daemon discovery or consumer request runs on this path. Core
 retains its last active generation when Entorhinal is unavailable at session start.
+
+All three generation surfaces (`catalog_generation`, `catalog.agent_generation`,
+and a successful `catalog.ack_activation`) use one generation serializer. A generation
+optionally includes `pinned_status: [{name, version, state, reason}]`, listing only
+closure versions whose held status is not `available`. The field is **absent**, not
+an empty list, when there is no status news. Pin identities and digests do not change.
+
+For a **withdrawn** pin, core sees the same `active` (or `ready`) generation, its
+nonblocking `pinned_status` notice, and no new error. Existing pins remain usable;
+withdrawal does not degrade a generation or block acknowledgement. For an applicable
+**revoked** pin, core sees its active generation become `degraded`, with
+`error: {code: "pinned_revoked", name, version, reason}` and the revoked pin in
+`pinned_status`. Tombstones have the same blocking effect with `pinned_tombstoned`.
+Core can show the blocking notice and omit the affected skill on its next render;
+Entorhinal does not rewrite a running session's rendered files. A ready generation
+remains ready but cannot be activated: acknowledgement refuses `activation_blocked`
+with `detail: {name, version, reason}`. Even a retry of an old successful ack cannot
+replay past newly learned blocking status. Prepare fails with `version_revoked` or
+`version_tombstoned`, naming the blocked version, rather than silently reusing it.
+
+The revocation test uses only registry-attested `published_at`: at or after
+`compromise_from` is blocked, strictly earlier remains usable, and an unknown
+publication time is blocked. A tombstone is unconditional. Status ingestion and
+its effects on active skill generations commit in the **same SQLite transaction**,
+whether the status came from a background feed or version verification during
+prepare. Failed effects roll back status, feed cursor and ETag together. Health
+and core generation reads never need HTTP.
+
+The byte-exact reserved-core examples are in
+[`test-vectors/catalog-generation-v1`](../test-vectors/catalog-generation-v1/README.md).
+
+### Background status polling
+
+After module startup opens its local store, one background task polls each distinct
+scope in the shared local pin set, including with a default registry mapping. Each
+poll refreshes registry keys and reuses the status-feed verifier, held ETag and
+`?after=` cursor. Existing full-feed recovery rules handle history older than 30
+days or feed rollback. A 304 changes no held status, cursor, ETag or generation.
+Prepare retains its existing immediate refresh for requested and pinned scopes;
+it does not enqueue a duplicate background pass.
+
+The hourly phase is a random millisecond offset in `[0, 3600000)`, saved once in
+machine-local `catalog_poll_clock` storage, not the shared identity journal. Startup
+polls immediately; subsequent successful passes align to that wall-clock phase.
+One failed pass backs off for 2 hours, then 4, then 6 (capped), measured by Tokio's
+monotonic timer. A successful pass resets failures and returns to the next hourly
+phase. Scopes are rediscovered each pass; one scope's failure does not skip others.
+The poller holds only a weak store slot, and opens transient store handles solely
+for synchronous database work, never across an HTTP await.
+
+Health reads only atomic gauges: `catalogLastSuccessMs` (null before a successful
+pass), `catalogLastError` (null or a named code), `catalogConsecutiveFailures`
+(failed passes since the last successful pass), and `catalogScopesPolled`
+(cumulative scope attempts). A pass with no pinned scopes is successful local work.
+The last error is cleared on success. These gauges do not independently change the
+module's health status and do not include the foreground prepare refresh.
+
+Implementation decisions where the contract leaves details open: one schedule and
+backoff apply to a whole pass; an empty pinned set is a successful pass; the first
+retry is 2 hours; success realigns to the hourly phase rather than retaining retry
+drift; the first blocked pin in closure order supplies a generation's single error
+while `pinned_status` lists all status news; an already degraded generation updates
+its blocking reason on subsequent status news. The local scheduling table is
+created lazily for stores predating polling. The offset belongs to this local store
+and is never replicated to other Macs through the shared identity journal.
 
 ### Integration decisions
 

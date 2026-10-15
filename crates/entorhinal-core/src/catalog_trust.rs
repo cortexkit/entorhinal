@@ -53,11 +53,15 @@ impl RegistryStore {
                         tx.execute("INSERT INTO catalog_registry_key VALUES(?1,?2,?3,?4,?5,?6)", params![url,key.chain_index,key.key_id,key.public_key,key.statement,key.valid_from]).map_err(sql)?;
                     }
                 }
+                let status_changed = !write.statuses.is_empty();
                 for row in write.statuses {
                     if row.registry_url != url {
                         return Err(E::from(CatalogWriteError::Refused("registry_changed")));
                     }
                     tx.execute("INSERT INTO catalog_status VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(name,version) DO UPDATE SET registry_url=excluded.registry_url,sequence=excluded.sequence,changed_at=excluded.changed_at,published_at=excluded.published_at,signer_index=excluded.signer_index,canonical=excluded.canonical,signature=excluded.signature", params![row.name,row.version,url,row.sequence,row.changed_at,row.published_at,row.signer_index,row.canonical,row.signature]).map_err(sql)?;
+                }
+                if status_changed {
+                    crate::catalog_agent::apply_status_effects(tx).map_err(sql)?;
                 }
                 if let Some(seq) = write.feed_seq {
                     tx.execute("INSERT INTO catalog_feed(scope,registry_url,feed_seq,etag) VALUES(?1,?2,?3,?4) ON CONFLICT(scope) DO UPDATE SET registry_url=excluded.registry_url,feed_seq=excluded.feed_seq,etag=excluded.etag", params![scope,url,seq,write.feed_etag]).map_err(sql)?;

@@ -171,8 +171,8 @@ for schemas, consumer kinds, refusals, idempotence and capability-token declarat
 | `permissions.revoke {id}` | mutate | Direct, `reserved:cingulate` | Revoke a grant without prompting. |
 | `agent.audit_list {since_ms?, limit?, cursor?}` | query | Direct, `reserved:callosum` | Page the local audit of agent tool writes. |
 | `agent.set_hire_cap {project_id, cap}` | mutate | Direct, with Touch ID | Set this Mac's hiring limit for a project. |
-| `catalog.agent_generation {agent_id}` | query | `reserved:prefrontal-core` only | Read active and newer ready package generations and exact pin digests from local state. |
-| `catalog.ack_activation {agent_id, generation_id}` | mutate | `reserved:prefrontal-core` only | Idempotently activate a ready generation after core renders it. No network or consumer discovery. |
+| `catalog.agent_generation {agent_id}` | query | `reserved:prefrontal-core` only | Read active/degraded and newer ready package generations and exact pin digests from local state. Optional `pinned_status` lists non-available pins; a degradation error identifies the revoked skill by name, version and reason. |
+| `catalog.ack_activation {agent_id, generation_id}` | mutate | `reserved:prefrontal-core` only | Idempotently activate a ready generation after core renders it. `activation_blocked` names a revoked/tombstoned pin; withdrawn pins remain usable. No network or consumer discovery. |
 
 Refusals: `permissions_operator_required`, `audit_operator_required`,
 `direct_caller_required`, `caller_forbidden`. These permission and catalog reads

@@ -5886,7 +5886,7 @@ only = false
 id = "ento3-held-link"
 guards = "held link remains enforced"
 file = "crates/entorhinal-module/src/catalog_trust.rs"
-old = "statements::apply_registry_key(&mut pure, &text, sig)?;\n                                }"
+old = "statements::apply_registry_key(&mut pure, &text, sig)?;\n                            }"
 new = "// NON-VACUITY BREAK: skip held link validation\n                                }"
 test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
 runner = "cargo"
@@ -6054,8 +6054,8 @@ only = false
 id = "ento3-reapply-before-blob"
 guards = "reapply before blob remains enforced"
 file = "crates/entorhinal-module/src/catalog_trust.rs"
-old = "accept(current, held, &status_text, status_sig, &pin)?;\n                BlobStore::new(folder)?.publish(&archive)?;"
-new = "// NON-VACUITY BREAK: skip final status reapplication\n                BlobStore::new(folder)?.publish(&archive)?;"
+old = "accept(current, held, &status_text, status_sig, &pin)?;\n                BlobStore::new(&folder)?.publish(&archive)?;"
+new = "// NON-VACUITY BREAK: skip final status reapplication\n                BlobStore::new(&folder)?.publish(&archive)?;"
 test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
 runner = "cargo"
 package = "entorhinal-module"
@@ -6702,7 +6702,9 @@ expect_red = ["catalog_agent::tests::transition_guards_reject_cross_owner_wrong_
 id = "catalog-activation-blocked"
 guards = "A tombstoned or revoked closure cannot displace the current active generation"
 file = "crates/entorhinal-core/src/catalog_agent.rs"
-old = 'if blocked(tx,&generation.closure).map_err(store_error)? { return Err(CatalogWriteError::Refused("activation_blocked")); }'
+old = '''if step == "active" && blocked_status(tx,&generation.closure).map_err(store_error)?.is_some() {
+                return Err(CatalogWriteError::Refused("activation_blocked"));
+            }'''
 new = '// NON-VACUITY BREAK: activate a blocked closure'
 test_file = "crates/entorhinal-core/src/catalog_agent/tests.rs"
 runner = "cargo"
@@ -6793,7 +6795,7 @@ expect_red = ["reproduce_resolver"]
 id = "catalog-resolution-status"
 guards = "Held withdrawn versions are ineligible even when their capabilities are present"
 file = "crates/entorhinal-core/src/catalog_resolution.rs"
-old = 'status: held.state,'
+old = 'status: if held.state == entorhinal_catalog::status::State::Revoked && !crate::catalog_agent::status_blocks(&serde_json::to_value(&held).unwrap()) { entorhinal_catalog::status::State::Available } else { held.state },'
 new = 'status: entorhinal_catalog::status::State::Available, // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-core/src/catalog_resolution/tests.rs"
 runner = "cargo"
@@ -7441,3 +7443,199 @@ package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
 expect_red = ["catalog_agent::tests::catalog_covered_install_no_card_and_retry_once"]
+
+[[control]]
+id = "catalog-poll-start"
+guards = "Module startup schedules a status poll of every locally pinned scope"
+file = "crates/entorhinal-module/src/main.rs"
+old = 'self.start_catalog_poll();'
+new = '// NON-VACUITY BREAK: omit module startup status polling'
+test_file = "crates/entorhinal-module/src/catalog_poll_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_poll::tests::hello_ack_starts_catalog_poll_once"]
+
+[[control]]
+id = "catalog-poll-hourly"
+guards = "Successful polling returns to the stored hourly phase"
+file = "crates/entorhinal-module/src/catalog_poll.rs"
+old = 'HOUR_MS - (now.rem_euclid(HOUR_MS as i64) as u64 + HOUR_MS - offset) % HOUR_MS'
+new = '2 * HOUR_MS - (now.rem_euclid(HOUR_MS as i64) as u64 + HOUR_MS - offset) % HOUR_MS /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/catalog_poll_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_poll::tests::startup_hourly_offset_and_backoff_recovers"]
+
+[[control]]
+id = "catalog-poll-offset"
+guards = "The random machine-local offset survives restarts rather than being redrawn"
+file = "crates/entorhinal-core/src/catalog_agent.rs"
+old = 'INSERT OR IGNORE INTO catalog_poll_clock VALUES(1,?1)'
+new = 'INSERT OR REPLACE INTO catalog_poll_clock VALUES(1,?1) /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/catalog_poll_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_poll::tests::stored_offset_survives_reopen_and_not_modified_changes_nothing"]
+
+[[control]]
+id = "catalog-poll-backoff"
+guards = "Repeated failures back off exponentially and cap at six hours"
+file = "crates/entorhinal-module/src/catalog_poll.rs"
+old = 'HOUR_MS * (1u64 << failures.min(3)).min(6)'
+new = 'HOUR_MS * (1u64 << failures.min(3)).min(4) /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/catalog_poll_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_poll::tests::startup_hourly_offset_and_backoff_recovers"]
+
+[[control]]
+id = "catalog-poll-reset"
+guards = "A successful pass clears the consecutive-failure health gauge"
+file = "crates/entorhinal-module/src/catalog_poll.rs"
+old = 'self.failures.store(0, Ordering::Relaxed);'
+new = '// NON-VACUITY BREAK: retain stale failures after success'
+test_file = "crates/entorhinal-module/src/catalog_poll_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_poll::tests::startup_hourly_offset_and_backoff_recovers"]
+
+[[control]]
+id = "catalog-poll-weak-store"
+guards = "The background verifier releases all strong store handles before awaiting HTTP"
+file = "crates/entorhinal-module/src/catalog_poll.rs"
+old = 'trust.use_weak_store(self.store.clone());'
+new = '// NON-VACUITY BREAK: keep the registry store alive across HTTP'
+test_file = "crates/entorhinal-module/src/catalog_poll_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_poll::tests::gated_http_holds_neither_store_nor_handler_lease"]
+
+[[control]]
+id = "catalog-status-effects"
+guards = "Authenticated status ingestion degrades active generations before committing"
+file = "crates/entorhinal-core/src/catalog_trust.rs"
+old = 'crate::catalog_agent::apply_status_effects(tx).map_err(sql)?;'
+new = '// NON-VACUITY BREAK: record status without updating generations'
+test_file = "crates/entorhinal-core/src/catalog_agent/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_agent::tests::status_news_withdrawal_revocation_ready_and_active"]
+
+[[control]]
+id = "catalog-status-atomic"
+guards = "A crash while applying generation effects rolls status back in the same transaction"
+file = "crates/entorhinal-core/src/catalog_trust.rs"
+old = 'crate::catalog_agent::apply_status_effects(tx).map_err(sql)?;'
+new = '// NON-VACUITY BREAK: skip the transactional effect boundary'
+test_file = "crates/entorhinal-core/src/catalog_agent/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_agent::tests::status_news_crash_rolls_back_status_and_effect"]
+
+[[control]]
+id = "catalog-status-time"
+guards = "Registry-attested publication strictly before compromise remains usable"
+file = "crates/entorhinal-core/src/catalog_agent.rs"
+old = 'value["published_at"].as_str(),'
+new = 'None, // NON-VACUITY BREAK: discard attested publication time'
+test_file = "crates/entorhinal-core/src/catalog_agent/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_agent::tests::status_news_revocation_time_and_tombstone"]
+
+[[control]]
+id = "catalog-status-prepare"
+guards = "Preparation names a revoked current pin before attempting to reuse it"
+file = "crates/entorhinal-module/src/catalog_agent.rs"
+old = 'if let Some(status) = store.catalog_blocked_pin(&pins)? {'
+new = 'if let Some(status) = None::<Value> { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_status_news_views_and_prepare_named_refusal"]
+
+[[control]]
+id = "catalog-generation-served-status"
+guards = "Published reserved-core generation bytes include nonblocking withdrawal and blocking revocation news"
+file = "crates/entorhinal-module/src/catalog_agent.rs"
+old = 'if !statuses.is_empty() {'
+new = 'if false && !statuses.is_empty() { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/served_vectors.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["served_vectors::catalog_generation_v1_records_match_published_files"]
+
+[[control]]
+id = "catalog-status-new-root-name"
+guards = "A revoked or tombstoned new root refuses preparation with a named version code"
+file = "crates/entorhinal-core/src/catalog_resolution.rs"
+old = 'if !matching.iter().any(|v| v.status == entorhinal_catalog::status::State::Available) {'
+new = 'if false && !matching.iter().any(|v| v.status == entorhinal_catalog::status::State::Available) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/catalog_resolution/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_resolution::tests::revoked_new_root_is_named_and_early_publication_remains_eligible"]
+
+[[control]]
+id = "catalog-status-resolution-time"
+guards = "The resolver keeps registry-attested pre-compromise versions eligible"
+file = "crates/entorhinal-core/src/catalog_resolution.rs"
+old = '!crate::catalog_agent::status_blocks(&serde_json::to_value(&held).unwrap())'
+new = 'false /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-core/src/catalog_resolution/tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["catalog_resolution::tests::revoked_new_root_is_named_and_early_publication_remains_eligible"]
+
+[[control]]
+id = "catalog-generation-served-bytes"
+guards = "Generation vectors byte-compare the actual serialized handler reply without normalizing it"
+file = "crates/entorhinal-module/src/catalog_agent.rs"
+old = 'let mut reply = serde_json::to_value(generation).unwrap();'
+new = '''let mut reply = serde_json::to_value(generation).unwrap();
+    reply["pin_digest"] = json!("NON-VACUITY BREAK");'''
+test_file = "crates/entorhinal-module/src/served_vectors.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["served_vectors::catalog_generation_v1_records_match_published_files"]
+
+[[control]]
+id = "catalog-status-snapshot"
+guards = "A generation read captures its pinned status projection in the same store snapshot"
+file = "crates/entorhinal-core/src/catalog_agent.rs"
+old = 'generation.pinned_status = pin_statuses(conn, &generation.closure)?;'
+new = 'generation.pinned_status.clear(); // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_status_news_views_and_prepare_named_refusal"]
