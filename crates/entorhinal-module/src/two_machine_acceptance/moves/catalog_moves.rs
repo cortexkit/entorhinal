@@ -25,7 +25,7 @@ impl LogTransport for Consumer {
             for pin in params["packages"].as_array().unwrap() {
                 for field in ["manifest_sha256", "archive_sha256"] {
                     let digest = pin[field].as_str().unwrap();
-                    let bytes = BlobStore::new(self.folder.clone())
+                    let bytes = BlobStore::new(&self.folder)
                         .unwrap()
                         .read_verified(digest)
                         .unwrap();
