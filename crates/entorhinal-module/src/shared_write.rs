@@ -2384,6 +2384,7 @@ mod tests {
 
 #[derive(Clone)]
 enum Write {
+    ManifestAvatar(Arc<agent_ops::AvatarBatchApproval>, usize),
     CatalogInstall(String, Box<entorhinal_core::agent::consent::ConsentCommit>),
     Consent(
         entorhinal_core::agent::consent::ConsentWrite,
@@ -2428,6 +2429,7 @@ impl Write {
         principal: &str,
     ) -> Result<Option<Vec<u8>>, HandlerError> {
         let key = match self {
+            Self::ManifestAvatar(approval, index) => return approval.probe(store, *index),
             Self::Consent(_, commit) | Self::CatalogInstall(_, commit) => {
                 let row = store.consent_request(&commit.request.identity)?;
                 if let Some(row) = row {
@@ -2475,6 +2477,7 @@ impl Write {
             .with_principal(principal)
             .with_confirmation(placement_confirmation(principal, approval));
         match self {
+            Self::ManifestAvatar(approval, index) => return approval.apply(store, index, now),
             Self::CatalogInstall(id, commit) => {
                 return writer
                     .with_consent_commit(*commit)
@@ -2603,6 +2606,25 @@ fn bootstrap_fence(
 }
 
 impl ProjectsHandler {
+    pub(super) async fn avatar_manifest_entry_wait(
+        &self,
+        approval: Arc<agent_ops::AvatarBatchApproval>,
+        index: usize,
+        key: RouteKey,
+    ) -> Result<Vec<u8>, HandlerError> {
+        self.write_wait_inner(
+            WireRequest {
+                method: "agent.set_avatar".into(),
+                params: Value::Null,
+            },
+            key,
+            Instant::now(),
+            Some(Write::ManifestAvatar(approval, index)),
+            None,
+        )
+        .await
+    }
+
     pub(super) async fn catalog_install_write_wait(
         &self,
         id: String,

@@ -3883,3 +3883,226 @@ async fn catalog_pins_round_trip_shared_writer_and_stay_out_of_agent_feed() {
     a.clean_rebuild().await;
     b.clean_rebuild().await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn two_machines_receive_every_avatar_manifest_entry() {
+    let log = Arc::new(FakeLog::default());
+    let mut a = Machine::new("avatar-manifest-a", log.clone());
+    let b = Machine::new("avatar-manifest-b", log.clone());
+    let confirmer = Arc::new(crate::served_vectors::Approve {
+        summaries: std::sync::Mutex::new(vec![]),
+    });
+    a.handler.operator_confirmer = confirmer.clone();
+    let source = a.dir.join("empty-agents.db");
+    Connection::open(&source)
+        .unwrap()
+        .execute_batch("CREATE TABLE empty_snapshot(id INTEGER)")
+        .unwrap();
+    a.call(
+        "agent.import",
+        json!({"snapshot_path":source,"request_key":"import"}),
+    )
+    .await
+    .unwrap();
+    let ada = a
+        .call(
+            "agent.create",
+            json!({"role":"assistant","name":"Ada","tag":"helper","request_key":"ada"}),
+        )
+        .await
+        .unwrap()["agent"]["agent_id"]
+        .clone();
+    let grace = a
+        .call(
+            "agent.create",
+            json!({"role":"assistant","name":"Grace","tag":"helper","request_key":"grace"}),
+        )
+        .await
+        .unwrap()["agent"]["agent_id"]
+        .clone();
+    a.enable().await;
+    b.enable().await;
+    assert_eq!(a.shared(), b.shared());
+    let cursor = b.store().generation().unwrap();
+    let head = log.head();
+    let params = json!({"request_key":"avatars","entries":[
+        {"agent_id":ada,"avatar_genome":"a".repeat(32_768),"avatar_type":"creature.wild","avatar_version":1},
+        {"agent_id":grace,"avatar_genome":"b".repeat(32_768),"avatar_type":"creature.wild","avatar_version":1}
+    ]});
+    let first = a
+        .bytes_on(DIRECT, "agent.apply_avatar_manifest", params.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&first).unwrap()["result"]["applied"],
+        2
+    );
+    assert_eq!(
+        log.head(),
+        head + 2,
+        "each avatar uses a standard shared write"
+    );
+    b.catch_up().await;
+    assert_eq!(a.shared(), b.shared());
+    let entries = b.store().agent_changes(cursor, None).unwrap().entries;
+    assert_eq!(entries.len(), 2);
+    for (id, genome) in [(&ada, "a".repeat(32_768)), (&grace, "b".repeat(32_768))] {
+        let change = entries
+            .iter()
+            .find(|change| json!(change.agent_id) == *id)
+            .unwrap();
+        assert_eq!(change.op, "agent.set_avatar");
+        let avatar = change.row.avatar.as_ref().unwrap();
+        assert_eq!(avatar.genome, genome);
+        assert_eq!(avatar.avatar_type, "creature.wild");
+        assert_eq!(avatar.version, Some(1));
+    }
+    assert_eq!(
+        a.bytes_on(DIRECT, "agent.apply_avatar_manifest", params)
+            .await
+            .unwrap(),
+        first
+    );
+    assert_eq!(log.head(), head + 2);
+    assert_eq!(confirmer.summaries.lock().unwrap().len(), 1);
+    assert!(a.store().verify().unwrap().ok);
+    assert!(b.store().verify().unwrap().ok);
+    a.clean_rebuild().await;
+    b.clean_rebuild().await;
+}
+
+#[derive(Clone)]
+struct InterruptAvatarLog {
+    log: Arc<FakeLog>,
+    remaining: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl LogConnector for InterruptAvatarLog {
+    async fn connect(&self) -> Result<Arc<dyn LogTransport>, TransportError> {
+        Ok(Arc::new(self.clone()))
+    }
+}
+
+#[async_trait]
+impl LogTransport for InterruptAvatarLog {
+    async fn call(&self, method: &str, params: Value) -> Result<Vec<u8>, TransportError> {
+        if method == log_client::APPEND
+            && self
+                .remaining
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                == Ok(1)
+        {
+            // A definitive refusal stops settlement immediately without advancing
+            // the paused clock; the next attempt uses the healthy log again.
+            self.log.on_append(crate::fake_log::Action::Refuse {
+                code: "id_reused".into(),
+                detail: None,
+            });
+        }
+        self.log.call(method, params).await
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn two_machines_resume_interrupted_avatar_manifest_without_duplicates() {
+    let log = Arc::new(FakeLog::default());
+    let connector = Arc::new(InterruptAvatarLog {
+        log: log.clone(),
+        remaining: Arc::new(AtomicUsize::new(0)),
+    });
+    let mut a = Machine::new("avatar-resume-a", connector.clone());
+    let b = Machine::new("avatar-resume-b", log.clone());
+    let confirmer = Arc::new(crate::served_vectors::Approve {
+        summaries: std::sync::Mutex::new(vec![]),
+    });
+    a.handler.operator_confirmer = confirmer.clone();
+    let source = a.dir.join("empty-agents.db");
+    Connection::open(&source)
+        .unwrap()
+        .execute_batch("CREATE TABLE empty_snapshot(id INTEGER)")
+        .unwrap();
+    a.call(
+        "agent.import",
+        json!({"snapshot_path":source,"request_key":"import"}),
+    )
+    .await
+    .unwrap();
+    let ada = a
+        .call(
+            "agent.create",
+            json!({"role":"assistant","name":"Ada","tag":"helper","request_key":"ada"}),
+        )
+        .await
+        .unwrap()["agent"]["agent_id"]
+        .clone();
+    let grace = a
+        .call(
+            "agent.create",
+            json!({"role":"assistant","name":"Grace","tag":"helper","request_key":"grace"}),
+        )
+        .await
+        .unwrap()["agent"]["agent_id"]
+        .clone();
+    a.enable().await;
+    b.enable().await;
+    let cursor = b.store().generation().unwrap();
+    let head = log.head();
+    let params = json!({"request_key":"avatars","replace":true,"entries":[
+        {"agent_id":ada,"avatar_genome":"a".repeat(32_768),"avatar_type":"creature.wild","avatar_version":1},
+        {"agent_id":grace,"avatar_genome":"b".repeat(32_768),"avatar_type":"creature.wild","avatar_version":1}
+    ]});
+    connector.remaining.store(2, Ordering::SeqCst);
+    let body = serde_json::to_vec(&json!({"method":"agent.apply_avatar_manifest","params":params}))
+        .unwrap();
+    let outcome = drive(a.handler.handle_served_request(&body, DIRECT)).await;
+    let HandlerOutcome::ErrorWithDetail {
+        message, detail, ..
+    } = outcome
+    else {
+        panic!("expected interruption")
+    };
+    assert_eq!(detail["batch"]["written"].as_array().unwrap().len(), 1);
+    assert_eq!(detail["batch"]["remaining"].as_array().unwrap().len(), 1);
+    assert!(
+        message.contains("written:")
+            && message.contains("remaining:")
+            && message.contains("Ada")
+            && message.contains("Grace")
+    );
+    assert_eq!(log.head(), head + 1);
+    b.catch_up().await;
+    assert_eq!(
+        b.store().agent_changes(cursor, None).unwrap().entries.len(),
+        1
+    );
+    let resumed = a
+        .bytes_on(DIRECT, "agent.apply_avatar_manifest", params.clone())
+        .await
+        .unwrap();
+    let reply: Value = serde_json::from_slice(&resumed).unwrap();
+    assert_eq!(reply["result"]["written"].as_array().unwrap().len(), 2);
+    assert!(reply["result"]["remaining"].as_array().unwrap().is_empty());
+    assert_eq!(log.head(), head + 2);
+    b.catch_up().await;
+    let entries = b.store().agent_changes(cursor, None).unwrap().entries;
+    assert_eq!(entries.len(), 2);
+    assert!(entries.iter().all(|e| e.op == "agent.set_avatar"));
+    assert_ne!(entries[0].agent_id, entries[1].agent_id);
+    assert_eq!(a.shared(), b.shared());
+    assert_eq!(
+        confirmer.summaries.lock().unwrap().len(),
+        2,
+        "interrupted batch confirms its remaining work once"
+    );
+    assert_eq!(
+        a.bytes_on(DIRECT, "agent.apply_avatar_manifest", params)
+            .await
+            .unwrap(),
+        resumed
+    );
+    assert_eq!(log.head(), head + 2);
+    assert_eq!(confirmer.summaries.lock().unwrap().len(), 2);
+    a.clean_rebuild().await;
+    b.clean_rebuild().await;
+}

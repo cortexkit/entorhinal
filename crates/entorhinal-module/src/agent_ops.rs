@@ -6,6 +6,7 @@
 //! identity rule.
 
 use entorhinal_core::agent::AgentMutationError;
+use entorhinal_core::agent::{AvatarManifestPlan, OperatorApproval};
 use serde_json::Value;
 
 use super::RouteKey;
@@ -23,6 +24,7 @@ pub(super) const CONFIRMABLE_METHODS: &[&str] = &[
     "upgrade_implicit",
     "seed_import",
     "agent.repair_workspaces",
+    "agent.apply_avatar_manifest",
     "agent.create",
     "agent.rename",
     "agent.dispose",
@@ -164,6 +166,7 @@ impl Drop for ConfirmationGuard {
 
 pub(super) const MUTATING_METHODS: &[&str] = &[
     "agent.repair_workspaces",
+    "agent.apply_avatar_manifest",
     "agent.create",
     "agent.rename",
     "agent.update_tag",
@@ -186,6 +189,76 @@ impl From<AgentMutationError> for HandlerError {
 }
 
 impl ProjectsHandler {
+    pub(super) async fn apply_avatar_manifest(
+        &self,
+        params: Value,
+        key: RouteKey,
+        received: tokio::time::Instant,
+    ) -> Result<Vec<u8>, HandlerError> {
+        let admission = self.admission_for(key);
+        super::refuse_flow_write("agent.apply_avatar_manifest", admission.flow_id.as_deref())?;
+        if !matches!(admission.principal, Some(subc_protocol::Principal::Direct)) {
+            super::authorize_write("agent.apply_avatar_manifest", admission.principal.as_ref())?;
+        }
+        let store = self.with_store(|s| Ok(s.clone()))?;
+        let plan = store.plan_avatar_manifest(params)?;
+        let mut report = plan.report();
+        let pending = plan.pending();
+        if pending.is_empty() {
+            return self.attach_incarnation(super::encode_result(report)?);
+        }
+        let summary = plan.summary()?;
+        let mut guard = ConfirmationGuard::take(&self.confirmation_slot, key)?;
+        if !self.route_admissions().contains_key(&key) {
+            return Err(OperatorConfirmError::Declined.into());
+        }
+        let deadline = received + std::time::Duration::from_secs(270);
+        tokio::select! {
+            biased;
+            _ = guard.cancelled.wait_for(|closed| *closed) => return Err(OperatorConfirmError::Declined.into()),
+            result = tokio::time::timeout_at(deadline, self.operator_confirmer.confirm_operator(&summary, key)) => {
+                result.map_err(|_|HandlerError::from(OperatorConfirmError::Declined))??;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(OperatorConfirmError::Declined.into());
+        }
+        // AvatarBatchApproval authorizes the individual avatar writes below;
+        // create it only after the operator has approved the complete plan.
+        let approval = Arc::new(AvatarBatchApproval {
+            plan,
+            approval: OperatorApproval::new(summary),
+        });
+        for index in pending {
+            let cancelled =
+                *guard.cancelled.borrow() || !self.route_admissions().contains_key(&key);
+            let result = if cancelled {
+                Err(OperatorConfirmError::Declined.into())
+            } else {
+                self.avatar_manifest_entry_wait(approval.clone(), index, key)
+                    .await
+            };
+            let bytes = match result {
+                Ok(bytes) => bytes,
+                Err(mut error) => {
+                    error.message = format!("{}\n{}", error.message, manifest_progress(&report));
+                    error.detail = Some(serde_json::json!({"batch":report,"cause":error.detail}));
+                    return Err(error);
+                }
+            };
+            let reply: Value = serde_json::from_slice(&bytes)
+                .map_err(|e| HandlerError::new("decode_failed", e.to_string()))?;
+            report["written"]
+                .as_array_mut()
+                .unwrap()
+                .push(reply["result"]["agent"].clone());
+            report["remaining"].as_array_mut().unwrap().remove(0);
+            report["applied"] = serde_json::json!(report["written"].as_array().unwrap().len());
+            report["generation"] = reply["result"]["generation"].clone();
+        }
+        self.attach_incarnation(super::encode_result(report)?)
+    }
+
     // Serving installs the daemon connection; tests can install prompt stubs.
     pub(super) fn with_operator_confirmer(mut self, confirmer: Arc<dyn OperatorConfirmer>) -> Self {
         self.operator_confirmer = confirmer;
@@ -228,6 +301,61 @@ impl ProjectsHandler {
     }
 }
 
+/// Proof that the operator approved a validated avatar batch. Only the batch
+/// confirmation path constructs it; the per-agent shared-write entry point
+/// requires this type instead of trusting approval fields in a wire request.
+pub(super) struct AvatarBatchApproval {
+    plan: AvatarManifestPlan,
+    approval: OperatorApproval,
+}
+
+impl AvatarBatchApproval {
+    pub(super) fn probe(
+        &self,
+        store: &entorhinal_core::RegistryStore,
+        index: usize,
+    ) -> Result<Option<Vec<u8>>, HandlerError> {
+        self.plan.probe_entry(store, index).map_err(Into::into)
+    }
+    pub(super) fn apply(
+        &self,
+        store: &entorhinal_core::RegistryStore,
+        index: usize,
+        now: i64,
+    ) -> Result<Vec<u8>, HandlerError> {
+        store
+            .with_principal("direct")
+            .apply_avatar_manifest_entry(&self.plan, index, &self.approval, now)
+            .map_err(Into::into)
+    }
+}
+
+fn manifest_progress(report: &Value) -> String {
+    ["written", "remaining"]
+        .into_iter()
+        .map(|field| {
+            let agents = report[field]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|agent| {
+                    format!(
+                        "{} ({})",
+                        agent["name"].as_str().unwrap_or("?"),
+                        agent["agent_id"].as_str().unwrap_or("?")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "{field}: {}",
+                if agents.is_empty() { "none" } else { &agents }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -262,6 +390,201 @@ mod tests {
         async fn confirm_operator(&self, _: &str, _: RouteKey) -> Result<(), OperatorConfirmError> {
             Ok(())
         }
+    }
+
+    struct ManifestConfirm(std::sync::Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl OperatorConfirmer for ManifestConfirm {
+        async fn confirm_operator(
+            &self,
+            summary: &str,
+            _: RouteKey,
+        ) -> Result<(), OperatorConfirmError> {
+            self.0.lock().unwrap().push(summary.to_owned());
+            Ok(())
+        }
+    }
+
+    async fn served(f: &Fixture, route: RouteKey, method: &str, params: Value) -> HandlerOutcome {
+        f.handler
+            .handle_served_request(
+                &serde_json::to_vec(&json!({"method":method,"params":params})).unwrap(),
+                route,
+            )
+            .await
+    }
+
+    fn served_value(outcome: HandlerOutcome) -> Value {
+        let HandlerOutcome::Response(body) = outcome else {
+            panic!("expected response")
+        };
+        serde_json::from_slice::<Value>(&body).unwrap()["result"].clone()
+    }
+
+    struct ManifestDecline;
+    #[async_trait]
+    impl OperatorConfirmer for ManifestDecline {
+        async fn confirm_operator(&self, _: &str, _: RouteKey) -> Result<(), OperatorConfirmError> {
+            Err(OperatorConfirmError::Declined)
+        }
+    }
+
+    #[tokio::test]
+    async fn avatar_manifest_declined_approval_writes_nothing() {
+        let mut f = Fixture::new();
+        f.cut_over();
+        let id = f.create("Ada", "ada");
+        f.handler.operator_confirmer = Arc::new(ManifestDecline);
+        let mut params = f.params("agent.apply_avatar_manifest", Some("declined"));
+        params["entries"][0]["agent_id"] = json!(id);
+        let before = f.head();
+        assert_eq!(
+            wire_error(served(&f, DIRECT, "agent.apply_avatar_manifest", params).await).code,
+            "operator_declined"
+        );
+        assert_eq!(f.head(), before);
+    }
+
+    #[tokio::test]
+    async fn avatar_manifest_requires_cutover_before_prompt() {
+        let mut f = Fixture::new();
+        let confirmer = Arc::new(ManifestConfirm(std::sync::Mutex::new(vec![])));
+        f.handler.operator_confirmer = confirmer.clone();
+        let params = f.params("agent.apply_avatar_manifest", Some("before-cutover"));
+        assert_eq!(
+            wire_error(served(&f, DIRECT, "agent.apply_avatar_manifest", params).await).code,
+            "authority_not_cut_over"
+        );
+        assert!(confirmer.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn avatar_manifest_one_prompt_cached_retry_and_zero_change_success() {
+        let mut f = Fixture::new();
+        f.cut_over();
+        let a = f.create("Ada", "ada");
+        let b = f.create("Grace", "grace");
+        let confirmer = Arc::new(ManifestConfirm(std::sync::Mutex::new(vec![])));
+        f.handler.operator_confirmer = confirmer.clone();
+        let params = json!({"request_key":"avatars","replace":true,"entries":[
+            {"agent_id":a,"avatar_genome":"a".repeat(32_768),"avatar_type":"creature.wild","avatar_version":1},
+            {"agent_id":b,"avatar_genome":"b".repeat(32_768),"avatar_type":"creature.wild","avatar_version":1}
+        ]});
+        let before = f.head();
+        let first =
+            served_value(served(&f, DIRECT, "agent.apply_avatar_manifest", params.clone()).await);
+        assert_eq!(first["applied"], 2);
+        assert_eq!(f.head(), before + 2);
+        let replay =
+            served_value(served(&f, DIRECT, "agent.apply_avatar_manifest", params.clone()).await);
+        assert_eq!(first, replay);
+        assert_eq!(f.head(), before + 2);
+        assert_eq!(
+            confirmer.0.lock().unwrap().len(),
+            1,
+            "one prompt for a batch, none for retry"
+        );
+        assert!(confirmer.0.lock().unwrap()[0].contains("2 agents (creature.wild)"));
+        assert!(confirmer.0.lock().unwrap()[0].chars().count() <= 200);
+        assert_eq!(wire_error(served(&f, DIRECT, "agent.set_avatar", json!({"agentId":a,"genome":"c".repeat(32_768),"type":"creature.wild","version":1,"request_key":"plain-direct"})).await).code, "direct_identity_write_not_admitted");
+        assert_eq!(
+            confirmer.0.lock().unwrap().len(),
+            1,
+            "a batch capability cannot authorize a public Direct setter"
+        );
+        let mut seed = params;
+        seed["replace"] = json!(false);
+        seed["request_key"] = json!("steady-state");
+        for _ in 0..2 {
+            let noop =
+                served_value(served(&f, DIRECT, "agent.apply_avatar_manifest", seed.clone()).await);
+            assert_eq!(noop["applied"], 0);
+            assert_eq!(noop["skipped"].as_array().unwrap().len(), 2);
+            assert!(noop["seq"].is_null());
+            assert_eq!(
+                f.head(),
+                before + 2,
+                "an all-skipped batch must journal nothing"
+            );
+            assert_eq!(
+                confirmer.0.lock().unwrap().len(),
+                1,
+                "an all-skipped batch must not prompt"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn avatar_manifest_admission_and_all_validation_precede_prompt() {
+        let mut f = Fixture::new();
+        f.cut_over();
+        let a = f.create("Ada", "ada");
+        let confirmer = Arc::new(ManifestConfirm(std::sync::Mutex::new(vec![])));
+        f.handler.operator_confirmer = confirmer.clone();
+        let good = json!({"agent_id":a,"avatar_genome":"a".repeat(32_768),"avatar_type":"creature.wild","avatar_version":1});
+        let mut invalid = good.clone();
+        invalid["avatar_genome"] = json!("short");
+        let mut unknown = good.clone();
+        unknown["agent_id"] = json!("missing");
+        let mut mixed = good.clone();
+        mixed["avatar_type"] = json!("creature.classic");
+        mixed["avatar_genome"] = json!("a".repeat(2048));
+        let mut unknown_type = good.clone();
+        unknown_type["avatar_type"] = json!("unknown.type");
+        let before = f.head();
+        for entries in [
+            json!([]),
+            json!({}),
+            json!([good, invalid]),
+            json!([unknown]),
+            json!([good, mixed]),
+            json!([good, good]),
+            json!([unknown_type]),
+        ] {
+            let error = wire_error(
+                served(
+                    &f,
+                    DIRECT,
+                    "agent.apply_avatar_manifest",
+                    json!({"entries":entries,"request_key":"bad"}),
+                )
+                .await,
+            );
+            assert!(
+                matches!(
+                    error.code.as_str(),
+                    "invalid_request" | "invalid_avatar_manifest"
+                ),
+                "{error:?}"
+            );
+        }
+        for (principal, flow, code) in [
+            (
+                Some(reserved(WRITER_MODULE)),
+                false,
+                "direct_caller_required",
+            ),
+            (Some(reserved("other")), false, "direct_caller_required"),
+            (Some(Principal::Direct), true, "flow_scope_not_admitted"),
+        ] {
+            f.bind(principal, flow);
+            assert_eq!(
+                wire_error(
+                    served(
+                        &f,
+                        CALLER,
+                        "agent.apply_avatar_manifest",
+                        json!({"entries":[good],"request_key":"denied"})
+                    )
+                    .await
+                )
+                .code,
+                code
+            );
+        }
+        assert_eq!(confirmer.0.lock().unwrap().len(), 0);
+        assert_eq!(f.head(), before);
     }
 
     #[test]
@@ -394,7 +717,12 @@ mod tests {
         }
 
         fn outcome(&self, route: RouteKey, method: &str, params: Value) -> HandlerOutcome {
-            if route == DIRECT && method == "agent.repair_workspaces" {
+            if route == DIRECT
+                && matches!(
+                    method,
+                    "agent.repair_workspaces" | "agent.apply_avatar_manifest"
+                )
+            {
                 return tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -412,7 +740,10 @@ mod tests {
 
         fn success(&self, method: &str, params: Value) -> Value {
             let body = match self.outcome(
-                if method == "agent.repair_workspaces" {
+                if matches!(
+                    method,
+                    "agent.repair_workspaces" | "agent.apply_avatar_manifest"
+                ) {
                     DIRECT
                 } else {
                     OPERATOR
@@ -452,6 +783,9 @@ mod tests {
             // Source: prefrontal 873870be8 crates/prefrontal-core-module/src/agent_registry_ops.rs:548-732.
             let mut value = match method {
                 "agent.repair_workspaces" => json!({}),
+                "agent.apply_avatar_manifest" => {
+                    json!({"entries":[{"agent_id":A,"avatar_genome":"b".repeat(32_768),"avatar_type":"creature.wild","avatar_version":1}]})
+                }
                 "agent.create" => json!({"role":"assistant","name":"Alice","tag":"test"}),
                 "agent.rename" => json!({"agent_id":A,"name":"Renamed"}),
                 "agent.update_tag" => json!({"agent_id":A,"tag":"changed"}),
@@ -593,6 +927,13 @@ mod tests {
         let created = f.success("agent.create", create.clone());
         let id = created["agent"]["agent_id"].as_str().unwrap();
         committed.push(("agent.create", create, created.clone()));
+        let mut manifest = f.params(
+            "agent.apply_avatar_manifest",
+            Some("committed-agent.apply_avatar_manifest"),
+        );
+        manifest["entries"][0]["agent_id"] = json!(id);
+        let applied = f.success("agent.apply_avatar_manifest", manifest.clone());
+        committed.push(("agent.apply_avatar_manifest", manifest, applied));
         for method in [
             "agent.rename",
             "agent.update_tag",
@@ -616,7 +957,7 @@ mod tests {
             json!({"agent_id":source,"into_agent_id":target,"request_key":"committed-agent.merge"});
         let result = f.success("agent.merge", params.clone());
         committed.push(("agent.merge", params, result));
-        assert_eq!(committed.len(), 10);
+        assert_eq!(committed.len(), 11);
         committed
     }
 
@@ -661,7 +1002,10 @@ mod tests {
     fn agent_principal_matrix_precedes_decode_keys_and_cached_replies_before_and_after_cutover() {
         let f = Fixture::new();
         for method in MUTATING_METHODS {
-            if *method != "agent.import" && *method != "agent.repair_workspaces" {
+            if !matches!(
+                *method,
+                "agent.import" | "agent.repair_workspaces" | "agent.apply_avatar_manifest"
+            ) {
                 f.refusal(
                     OPERATOR,
                     method,
@@ -679,13 +1023,18 @@ mod tests {
                 f.bind(principal.clone(), false);
                 for method in MUTATING_METHODS {
                     if principal == Some(reserved(WRITER_MODULE))
-                        && *method != "agent.repair_workspaces"
+                        && !matches!(
+                            *method,
+                            "agent.repair_workspaces" | "agent.apply_avatar_manifest"
+                        )
                     {
                         assert!(f.handler.admit(method, CALLER).is_ok());
                         continue;
                     }
-                    let code = if *method == "agent.repair_workspaces"
-                        && principal != Some(Principal::Direct)
+                    let code = if matches!(
+                        *method,
+                        "agent.repair_workspaces" | "agent.apply_avatar_manifest"
+                    ) && principal != Some(Principal::Direct)
                     {
                         "direct_caller_required"
                     } else if principal == Some(Principal::Direct) {
@@ -737,7 +1086,10 @@ mod tests {
                 f.cut_over();
             }
             for method in MUTATING_METHODS {
-                let route = if *method == "agent.repair_workspaces" {
+                let route = if matches!(
+                    *method,
+                    "agent.repair_workspaces" | "agent.apply_avatar_manifest"
+                ) {
                     DIRECT
                 } else {
                     OPERATOR

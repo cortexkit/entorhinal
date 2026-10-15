@@ -152,11 +152,13 @@ mod tests {
         // it yet. The sources are every production file that journals agent
         // ops, including the placement writes that journal carried agents.
         // Only request methods that are never journal ops are exempt, by name.
-        const REQUEST_METHODS: &[&str] = &["agent.repair_workspaces"];
+        const REQUEST_METHODS: &[&str] =
+            &["agent.repair_workspaces", "agent.apply_avatar_manifest"];
         for (file, source) in [
             ("store.rs", include_str!("store.rs")),
             ("import.rs", include_str!("import.rs")),
             ("carry.rs", include_str!("carry.rs")),
+            ("avatars.rs", include_str!("avatars.rs")),
             ("mutations.rs", include_str!("../mutations.rs")),
         ] {
             // Test modules start at a `#[cfg(test)]` module; a test-only

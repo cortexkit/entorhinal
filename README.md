@@ -56,7 +56,7 @@ ck projects list | resolve | register | remove | add-root | attach | remove-root
             log status | log name | log enable
 ck workspaces list | assign | set-root | clear-root
 ck agents   create | rename | retire | tag | labels | hire-cap | list | show
-            repair-workspaces | where | move | moves | move-abort | lid-close-moves
+            avatars | repair-workspaces | where | move | moves | move-abort | lid-close-moves
 ck roles    read | take
 ```
 
