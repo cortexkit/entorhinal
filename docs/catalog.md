@@ -7,7 +7,8 @@ ingests status feeds, and holds local publisher grants. The core store also hold
 shared agent pins and local plans/generations. Agent tools prepare verified skill
 closures, obtain user consent and stage generations for consumer prefetch and
 core's activation acknowledgement. Background status polling protects held skill
-generations. Move integration, publishing and non-skill installation are not exposed yet.
+generations. Non-skill installation is not exposed yet. Direct operators can publish
+packages; publishing remains unavailable until the vault's signing key is provisioned.
 
 ```
 ck catalog registry add https://registry.example --scope @example --key-id status-1 --public-key <64-lowercase-hex>
@@ -16,7 +17,52 @@ ck catalog registry repin https://registry.example --key-id status-2 --public-ke
 ck catalog registry list [--json]
 ck catalog registry remove https://registry.example
 ck catalog publisher trust <fingerprint> --agent <agent_id>
+ck catalog publish <package dir> --registry <url> --scope <scope>
 ```
+
+## Publishing
+
+`catalog.publish` accepts the CLI-canonicalized absolute package directory, an
+allowlisted HTTPS registry URL, and the package's canonical `@scope`. Only a
+Direct operator route can invoke it; flow-scoped routes and other modules cannot.
+Packing uses the pure crate's deterministic ustar writer: `ck.json` first, then
+regular files ordered by path, with fixed metadata. Links and special files are
+refused. Local caps, archive/manifest shape, scope, exhaustive file digests and
+flow identity are checked before the operator prompt or any vault call. Checks
+requiring registry state (scope grants, version reservations and quotas) remain
+the registry's responsibility.
+
+The Touch ID prompt names the package, version, kind and complete archive SHA-256.
+A summary over 200 characters is refused, never truncated. Approval gates signing,
+not just upload. The published `cortexkit-claustrum-client` opens the vault route
+as `reserved:entorhinal` with the supervised launch identity. It reads public key
+metadata and signs the pure crate's `ck-record/v1` domain-separated JCS input with
+`signing:cortexkit-publish:1`. Entorhinal never requests or stores a private key.
+The client owns bounded transient/transport retries; an audit `store_error` is
+never accepted as a signature. Key-id mismatch or strict signature failure refuses
+before storage or upload.
+
+Signed records are fsynced and atomically persisted under
+`catalog/publishes/<request digest>.json` in the local store folder **before** the
+first upload. The internal request digest binds registry URL, scope and archive
+SHA-256; it is not a new HTTP field or CLI flag. Every retry re-packs the directory
+and checks the cached record/signature against its current bytes and vault public
+key. Identical bytes reuse the signature after a lost upload reply, including a
+module restart. Changed package bytes get a different request digest and require
+fresh signing. Publish calls are serialized within the module.
+
+Upload uses the existing allowlisted registry client, sending `PUT` archive bytes,
+`application/x-tar`, base64url-unpadded JCS in `CK-Record`, and lowercase hex in
+`CK-Signature`. Only 307/308 redirects may preserve the upload, and they must remain
+on the original origin and within the configured base path. Replies are bounded
+and decoded as the contract's known publish fields, never passed through raw. A
+malformed or mismatched success reply is `invalid_reply` with outcome unknown.
+The initial status must bind the archive and publisher fingerprint, and its
+signature is authenticated with the configured registry status-key chain.
+`publish_unavailable` carries Retry-After advice; repeat the identical command to
+resend the durable bytes (there is no internal upload retry or real sleep).
+An existing version with different bytes is reported as `version_exists`.
+Registry-identical publication is idempotent and returns its original reply.
 
 A scope maps to exactly one registry. An explicit `@scope` mapping wins over the
 single optional default; otherwise an unmapped scope is refused. Remapping means

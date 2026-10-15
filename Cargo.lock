@@ -165,6 +165,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
+name = "cortexkit-claustrum-client"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9af3cac7efedb93152beabeee2b21468dd9d7244bd4d1994b490b49767e6788e"
+dependencies = [
+ "base64 0.22.1",
+ "serde_json",
+ "sha2",
+ "subc-os",
+ "subc-protocol",
+ "subc-transport",
+ "tokio",
+]
+
+[[package]]
 name = "cortexkit-lease"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -397,6 +412,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "chrono",
+ "cortexkit-claustrum-client",
  "cortexkit-log",
  "cortexkit-role-agent-data",
  "cortexkit-role-tool-provider",
@@ -425,7 +441,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1153,7 +1169,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1326,7 +1342,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1568,9 +1584,9 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.15"
+version = "0.1.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f998e16bbee599d83ef7ee0a37ca29c7d40d4b631b26c1d5d90662c91198dbe3"
+checksum = "220f78f6f9d641e8695df7f6ef585962416c594f985e3280f765df365bab7597"
 dependencies = [
  "libc",
  "rustix",

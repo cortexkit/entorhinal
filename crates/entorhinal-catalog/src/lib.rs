@@ -4,6 +4,7 @@
 pub mod archive;
 pub mod jcs;
 pub mod names;
+pub mod publish;
 pub mod record;
 pub mod resolver;
 pub mod semver;
@@ -37,6 +38,7 @@ pub enum RefusalCode {
     ManifestInvalid,
     BodyRefMissing,
     FilesMismatch,
+    FlowIdMismatch,
     StatusInvalid,
     FeedRollback,
     StatusTerminal,
@@ -69,6 +71,7 @@ impl RefusalCode {
             Self::ManifestInvalid => "manifest_invalid",
             Self::BodyRefMissing => "body_ref_missing",
             Self::FilesMismatch => "files_mismatch",
+            Self::FlowIdMismatch => "flow_id_mismatch",
             Self::StatusInvalid => "status_invalid",
             Self::FeedRollback => "feed_rollback",
             Self::StatusTerminal => "status_terminal",

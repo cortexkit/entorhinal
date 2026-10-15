@@ -163,7 +163,10 @@ expect_message = "called `Result::unwrap_err()` on an `Ok` value"
 id = "admission-enable-direct-only"
 guards = "Only an operator's Direct route may enable the identity log"
 file = "crates/entorhinal-module/src/main.rs"
-old = 'if method == "identity_log.enable" || catalog_ops::WRITES.contains(&method) {'
+old = '''if method == "identity_log.enable"
+        || catalog_ops::WRITES.contains(&method)
+        || method == catalog_publish::PUBLISH
+    {'''
 new = "if false /* NON-VACUITY BREAK */ {"
 test_file = "crates/entorhinal-module/src/main.rs"
 runner = "cargo"
@@ -5409,7 +5412,10 @@ expect_red = ["tests::catalog_tests::catalog_v10_migration_and_local_rebuild"]
 id = "catalog-direct-admission"
 guards = "Catalog mutations require the Direct operator rather than the executive relay"
 file = "crates/entorhinal-module/src/main.rs"
-old = 'if method == "identity_log.enable" || catalog_ops::WRITES.contains(&method) {'
+old = '''if method == "identity_log.enable"
+        || catalog_ops::WRITES.contains(&method)
+        || method == catalog_publish::PUBLISH
+    {'''
 new = 'if method == "identity_log.enable" { // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/catalog_ops_tests.rs"
 runner = "cargo"
@@ -7652,3 +7658,367 @@ package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
 expect_red = ["catalog_poll::tests::completed_passes_are_buffered_with_their_results_and_gauges"]
+
+[[control]]
+id = "publish-direct-only"
+guards = "Only a Direct operator can authorize publication"
+file = "crates/entorhinal-module/src/main.rs"
+old = '        || method == catalog_publish::PUBLISH'
+new = '        || false // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_publish/tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_publish::tests::publish_direct_only"]
+
+[[control]]
+id = "publish-flow-route"
+guards = "Flow-scoped routes cannot publish even with a Direct principal"
+file = "crates/entorhinal-module/src/main.rs"
+old = '    catalog_publish::PUBLISH,'
+new = '    // catalog_publish::PUBLISH, NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_publish/tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_publish::tests::publish_flow_refused"]
+
+[[control]]
+id = "publish-canonical-directory"
+guards = "The module rejects a non-canonical package directory"
+file = "crates/entorhinal-module/src/catalog_publish/mod.rs"
+old = 'if canonical != request.package_dir {'
+new = 'if false { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_publish/tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_publish::tests::publish_relative_and_noncanonical_paths_refused"]
+
+[[control]]
+id = "publish-summary-cap"
+guards = "The complete confirmation summary is refused rather than truncated over 200 characters"
+file = "crates/entorhinal-module/src/catalog_publish/mod.rs"
+old = 'if summary.chars().count() > 200 {'
+new = 'if false { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_publish/tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_publish::tests::publish_complete_summary_never_truncated"]
+
+[[control]]
+id = "publish-decline"
+guards = "An operator decline gates the signature, not merely upload"
+file = "crates/entorhinal-module/src/catalog_publish/mod.rs"
+old = 'result.map_err(|_| HandlerError::from(OperatorConfirmError::Declined))??;'
+new = 'let _ = result; // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_publish/tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_publish::tests::publish_decline_signs_nothing"]
+
+[[control]]
+id = "publish-local-file-digests"
+guards = "Local file lengths and digests pass before any card or vault call"
+file = "crates/entorhinal-catalog/src/publish.rs"
+old = 'bytes.len() as u64 != file.bytes || sha256_hex(bytes) != file.sha256'
+new = 'false // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_publish/tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_publish::tests::publish_local_checks_before_card_or_vault"]
+
+[[control]]
+id = "publish-scope-binding"
+guards = "The requested scope matches the package's canonical name before signing"
+file = "crates/entorhinal-catalog/src/publish.rs"
+old = 'if format!("@{}", mapped.scope) != scope {'
+new = 'if false { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_publish/tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_publish::tests::publish_local_scope_refused_before_sign"]
+
+[[control]]
+id = "publish-exhaustive-files"
+guards = "Unlisted regular members cannot be signed"
+file = "crates/entorhinal-catalog/src/publish.rs"
+old = 'if path != "ck.json" && !listed.contains(path.as_str()) {'
+new = 'if false { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_publish/tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_publish::tests::publish_extra_file_refused_before_sign"]
+
+[[control]]
+id = "publish-flow-id"
+guards = "A flow's authored id matches the mapped package id"
+file = "crates/entorhinal-catalog/src/publish.rs"
+old = 'if flow["id"] != mapped.id {'
+new = 'if false { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_publish/tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_publish::tests::publish_flow_id_checked_after_file_digests"]
+
+[[control]]
+id = "publish-exact-signing-input"
+guards = "The vault signs the pure crate's domain-separated JCS bytes exactly"
+file = "crates/entorhinal-module/src/catalog_publish/mod.rs"
+old = 'let input = catalog::signing_input("ck-record/v1", &canonical);'
+new = 'let input = canonical.as_bytes().to_vec(); // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_publish/tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_publish::tests::publish_vectors_exact_vault_bytes"]
+
+[[control]]
+id = "publish-key-id"
+guards = "The signature key id must equal the vault public-key id"
+file = "crates/entorhinal-module/src/catalog_publish/mod.rs"
+old = '        || signed.key_id != public.key_id'
+new = '        || false // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_publish/tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_publish::tests::publish_key_id_mismatch_before_upload"]
+
+[[control]]
+id = "publish-strict-signature"
+guards = "Strict local Ed25519 verification refuses a bad vault signature before upload"
+file = "crates/entorhinal-module/src/catalog_publish/mod.rs"
+old = '''        || !catalog::verify_signature(
+            &public.public_key_hex,
+            "ck-record/v1",
+            &signed.canonical,
+            &signed.signature,
+        )'''
+new = '        || false // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_publish/tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_publish::tests::publish_bad_signature_before_upload"]
+
+[[control]]
+id = "publish-cached-record-verification"
+guards = "Cached records are verified against freshly packed bytes rather than blindly resent"
+file = "crates/entorhinal-module/src/catalog_publish/mod.rs"
+old = '''if let Some(signed) = storage::load(&path)? {
+        verify(&signed, checked, &public)?;'''
+new = '''if let Some(signed) = storage::load(&path)? {
+        // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-module/src/catalog_publish/tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_publish::tests::publish_cached_tamper_refused"]
+
+[[control]]
+id = "publish-reuse-signature"
+guards = "A retry loads the signed record without another vault signature"
+file = "crates/entorhinal-module/src/catalog_publish/mod.rs"
+old = 'if let Some(signed) = storage::load(&path)? {'
+new = 'if let Some(signed) = None::<Signed> { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_publish/tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_publish::tests::publish_unavailable_reuses_signed_bytes"]
+
+[[control]]
+id = "publish-durable-before-upload"
+guards = "A signed record is persisted before an upload whose reply can be lost"
+file = "crates/entorhinal-module/src/catalog_publish/mod.rs"
+old = 'storage::save(&path, &signed)?;'
+new = 'let _ = &path; // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_publish/tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_publish::tests::publish_lost_reply_durable_across_restart"]
+
+[[control]]
+id = "publish-store-error-not-signed"
+guards = "A vault audit store error must not be accepted as a successful signature"
+file = "crates/entorhinal-module/src/catalog_publish/mod.rs"
+old = 'let signature = vault.sign(CREDENTIAL, &input).await.map_err(vault_error)?;'
+new = '''let signature = vault.sign(CREDENTIAL, &input).await.unwrap_or(cortexkit_claustrum_client::CredentialSignature { signature_hex: "5d30de600a1c0b317c4235eb6c82fa40bdd168beaad0f1c0d94052e5453778d4bd3514c04f6fe52f69e3fe15927ead2b620b189d0750c4f69cf8fd16f9385904".into(), key_id: public.key_id.clone() }); // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-module/src/catalog_publish/tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_publish::tests::publish_persistent_store_error_never_signed"]
+
+[[control]]
+id = "publish-cross-origin-fence"
+guards = "An upload never follows a redirect to a second origin even when both origins are allowlisted"
+file = "crates/entorhinal-module/src/catalog_publish/network.rs"
+old = 'if next.origin() != self.registry.origin() {'
+new = 'if false { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_publish/tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_publish::tests::publish_cross_origin_redirect_never_sent"]
+
+[[control]]
+id = "publish-redirect-allowlist"
+guards = "Same-origin upload redirects still respect configured base-path boundaries"
+file = "crates/entorhinal-module/src/catalog_publish/network.rs"
+old = 'self.admit(&next)?;'
+new = 'let _ = &next; // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_publish/tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_publish::tests::publish_same_origin_redirect_outside_base_refused"]
+
+[[control]]
+id = "publish-record-header"
+guards = "CK-Record is unpadded base64url of exactly the signed JCS record"
+file = "crates/entorhinal-module/src/catalog_publish/network.rs"
+old = 'URL_SAFE_NO_PAD.encode(signed.canonical.as_bytes())'
+new = 'base64::engine::general_purpose::STANDARD.encode(signed.canonical.as_bytes()) // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_publish/tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_publish::tests::publish_happy_path"]
+
+[[control]]
+id = "publish-archive-body"
+guards = "The PUT body is the deterministic archive bound by the record"
+file = "crates/entorhinal-module/src/catalog_publish/network.rs"
+old = '.body(archive.to_vec())'
+new = '.body(vec![0u8]) // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_publish/tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_publish::tests::publish_happy_path"]
+
+[[control]]
+id = "publish-unavailable-retryable"
+guards = "The publish_unavailable refusal is typed retryable rather than generic HTTP failure"
+file = "crates/entorhinal-module/src/catalog_publish/network.rs"
+old = 'if status.as_u16() == 503 && code == Some("publish_unavailable") {'
+new = 'if false { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_publish/tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_publish::tests::publish_unavailable_reuses_signed_bytes"]
+
+[[control]]
+id = "publish-version-exists"
+guards = "A version reservation conflict preserves the contract's version_exists code"
+file = "crates/entorhinal-module/src/catalog_publish/network.rs"
+old = 'Some("version_exists") => "version_exists",'
+new = 'Some("version_exists") => "registry_http_error", // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_publish/tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_publish::tests::publish_version_exists_named"]
+
+[[control]]
+id = "publish-reply-binding"
+guards = "A decoded success reply must bind the exact signed publication"
+file = "crates/entorhinal-module/src/catalog_publish/network.rs"
+old = 'if !reply.matches(signed) {'
+new = 'if false { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_publish/tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_publish::tests::publish_reply_binds_request"]
+
+[[control]]
+id = "publish-reply-cap"
+guards = "Publish replies are bounded by the existing registry JSON response limit"
+file = "crates/entorhinal-module/src/catalog_publish/network.rs"
+old = 'Self::read_reply(response, self.limits.json_bytes, "json_too_large").await?'
+new = 'Self::read_reply(response, usize::MAX, "json_too_large").await? /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/catalog_publish/tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_publish::tests::publish_reply_cap_enforced"]
+
+[[control]]
+id = "publish-status-signature"
+guards = "The registry's initial status is authenticated before publication success is reported"
+file = "crates/entorhinal-module/src/catalog_publish/mod.rs"
+old = '''catalog::status::apply_status(None, &status, &reply.status.signature, &keys, &pin)
+            .map_err(|e| {
+                error(
+                    e.code.as_str(),
+                    format!("publish outcome unknown: unauthenticated registry status: {e}"),
+                )
+            })?;'''
+new = 'let _ = catalog::status::apply_status(None, &status, &reply.status.signature, &keys, &pin); // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_publish/tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_publish::tests::publish_reply_status_authenticated"]
+
+[[control]]
+id = "publish-cached-record-cap"
+guards = "A durable record exceeding the local record cap is refused before resend"
+file = "crates/entorhinal-module/src/catalog_publish/storage.rs"
+old = 'if bytes.len() > 1_048_576 {'
+new = 'if false { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_publish/tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_publish::tests::publish_cached_record_cap_refused"]
+
+[[control]]
+id = "publish-cli-canonical-path"
+guards = "The CLI resolves the package directory with the shared canonicalizer before crossing the wire"
+file = "crates/entorhinal-module/src/cli.rs"
+old = '"package_dir": cli_path(&command.args[0], cwd, true)?,'
+new = '"package_dir": command.args[0].clone(), // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/cli.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["cli::catalog_publish_cli_tests::publish_path_is_shared_canonical_and_flags_are_closed"]

@@ -984,17 +984,20 @@ mod tests {
                 f.bind(principal.clone(), false);
                 for method in crate::MUTATING_METHODS
                     .iter()
-                    // Operator-only log and catalog changes have their own confirmation tests.
+                    // Operator-only log changes have their own confirmation tests.
                     // Self-admitted methods have their own rule, covered in sessions.rs.
                     .filter(|method| {
                         !MUTATING_METHODS.contains(method)
                             && **method != "identity_log.enable"
-                            && !crate::catalog_ops::WRITES.contains(method)
                             && !crate::SELF_ADMITTED_METHODS.contains(method)
                     })
                 {
+                    let direct_only = crate::catalog_ops::WRITES
+                        .iter()
+                        .chain(std::iter::once(&crate::catalog_publish::PUBLISH))
+                        .any(|candidate| candidate == method);
                     if principal == Some(Principal::Direct)
-                        || principal == Some(reserved(WRITER_MODULE))
+                        || (!direct_only && principal == Some(reserved(WRITER_MODULE)))
                     {
                         assert!(f.handler.admit(method, CALLER).is_ok());
                     } else {

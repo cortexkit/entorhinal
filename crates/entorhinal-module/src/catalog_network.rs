@@ -494,3 +494,6 @@ fn transport(e: reqwest::Error) -> CatalogError {
 #[cfg(test)]
 #[path = "catalog_network_tests.rs"]
 mod tests;
+
+#[path = "catalog_publish/network.rs"]
+mod publish;

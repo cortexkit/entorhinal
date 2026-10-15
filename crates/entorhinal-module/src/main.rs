@@ -64,6 +64,7 @@ mod catalog_grants;
 mod catalog_network;
 mod catalog_ops;
 mod catalog_poll;
+mod catalog_publish;
 mod catalog_trust;
 mod catch_up;
 mod claim_codec;
@@ -578,6 +579,7 @@ struct ProjectsHandler {
     record_client: record_client::RecordClient,
     participant_discovery: Arc<dyn participant_discovery::ParticipantDiscovery>,
     catalog_agent: catalog_agent::CatalogAgent,
+    catalog_publish: catalog_publish::Publisher,
     catalog_poll_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     catalog_poll_wake: Arc<tokio::sync::Notify>,
     door_client: door_client::DoorClient,
@@ -659,6 +661,7 @@ const MUTATING_METHODS: &[&str] = &[
     catalog_ops::REPIN,
     catalog_ops::REMOVE,
     catalog_ops::PUBLISHER_TRUST,
+    catalog_publish::PUBLISH,
     catalog_agent::ACK_ACTIVATION,
     "remove_root",
     "attach_derived_parent",
@@ -722,7 +725,10 @@ fn authorize_write(method: &str, principal: Option<&Principal>) -> Result<(), Ha
     if SELF_ADMITTED_METHODS.contains(&method) {
         return Ok(());
     }
-    if method == "identity_log.enable" || catalog_ops::WRITES.contains(&method) {
+    if method == "identity_log.enable"
+        || catalog_ops::WRITES.contains(&method)
+        || method == catalog_publish::PUBLISH
+    {
         return match principal {
             Some(Principal::Direct) => Ok(()),
             other => Err(HandlerError::new(
@@ -906,6 +912,7 @@ impl ProjectsHandler {
                 )),
             )),
             catalog_agent: catalog_agent::CatalogAgent::default(),
+            catalog_publish: catalog_publish::Publisher::default(),
             catalog_poll_task: Mutex::new(None),
             catalog_poll_wake: Arc::default(),
             claim_refresh: Arc::new(claims::RefreshQueue::default()),
@@ -1326,7 +1333,9 @@ impl ProjectsHandler {
         if !MUTATING_METHODS.contains(&request.method.as_str()) {
             return self.handle_request_wait(body, key).await;
         }
-        let result = if request.method == catalog_ops::PUBLISHER_TRUST {
+        let result = if request.method == catalog_publish::PUBLISH {
+            self.catalog_publish(request.params, key, received).await
+        } else if request.method == catalog_ops::PUBLISHER_TRUST {
             self.catalog_publisher_trust(request.params, key, received)
                 .await
         } else if catalog_ops::WRITES.contains(&request.method.as_str()) {
@@ -1460,6 +1469,7 @@ impl ProjectsHandler {
             | catalog_ops::REPIN
             | catalog_ops::REMOVE
             | catalog_ops::PUBLISHER_TRUST
+            | catalog_publish::PUBLISH
             | catalog_ops::READ_BLOB => Err(HandlerError::new(
                 "served_path_required",
                 "catalog writes and blob reads require the asynchronous served path",
@@ -2142,6 +2152,7 @@ fn manifest() -> ModuleManifest {
                 management_operation(catalog_agent::AGENT_GENERATION, ManagementOperationKind::Query, "Core-only local read of active and newer ready package generations with closure and pin digests."),
                 management_operation(catalog_agent::ACK_ACTIVATION, ManagementOperationKind::Mutate, "Core-only acknowledgement that a ready package generation was rendered at a session boundary."),
                 management_operation(catalog_ops::PUBLISHER_TRUST, ManagementOperationKind::Mutate, "Trust a publisher for installs at one agent within its authenticated pinned capability ceiling (Direct only, operator confirmation)."),
+                management_operation(catalog_publish::PUBLISH, ManagementOperationKind::Mutate, "Pack and check a local package, confirm publication with the operator, sign through the vault and upload durably retryable bytes (Direct only)."),
                 management_operation(
                     "resolve",
                     ManagementOperationKind::Query,
@@ -2750,7 +2761,10 @@ mod tests {
                 assert!(direct.is_ok(), "{method} from direct");
             }
             let executive = authorize_write(method, Some(&reserved(WRITER_MODULE)));
-            if *method == "identity_log.enable" || catalog_ops::WRITES.contains(method) {
+            if *method == "identity_log.enable"
+                || catalog_ops::WRITES.contains(method)
+                || *method == catalog_publish::PUBLISH
+            {
                 assert_eq!(executive.unwrap_err().code, "write_not_permitted");
             } else if *method == "agent.repair_workspaces" {
                 assert_eq!(executive.unwrap_err().code, "direct_caller_required");
@@ -4537,6 +4551,7 @@ mod tests {
             ("agent.set_lid_close_moves", "mutate"),
             ("catalog.agent_generation", "query"),
             ("catalog.ack_activation", "mutate"),
+            ("catalog.publish", "mutate"),
         ] {
             let matches: Vec<_> = operations.iter().filter(|op| op["name"] == name).collect();
             assert_eq!(matches.len(), 1, "{name} must be declared exactly once");

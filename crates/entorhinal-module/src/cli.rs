@@ -248,7 +248,7 @@ pub fn parse(face: Face, arguments: &[String]) -> Invocation {
                 args.push(argument.clone());
                 args.push(value.clone());
             }
-            "--scope" | "--key-id" | "--public-key" | "--valid-from" | "--agent"
+            "--scope" | "--key-id" | "--public-key" | "--valid-from" | "--agent" | "--registry"
                 if face == Face::Catalog =>
             {
                 let Some(value) = rest.next().filter(|v| !v.is_empty() && !v.starts_with('-'))
@@ -336,7 +336,7 @@ fn binary_name(face: Face) -> &'static str {
 
 pub fn usage(face: Face) -> String {
     match face {
-        Face::Catalog => catalog::usage().to_string(),
+        Face::Catalog => format!("{}\n  ck catalog publish <package dir> --registry <url> --scope <scope>\n", catalog::usage()),
         Face::Projects => "\
 ck projects — the project registry
 
@@ -518,6 +518,30 @@ fn build_failure_exit(message: &str) -> u8 {
 
 fn build_at(command: &Command, cwd: &str) -> Result<(String, Value), String> {
     if command.face == Face::Catalog {
+        if command.verb == "publish" {
+            if command.json || command.args.len() != 5 {
+                return Err("publish needs <package dir> --registry <url> --scope <scope>".into());
+            }
+            let mut registry = None;
+            let mut scope = None;
+            for pair in command.args[1..].as_chunks::<2>().0 {
+                match pair[0].as_str() {
+                    "--registry" if registry.is_none() => registry = Some(pair[1].clone()),
+                    "--scope" if scope.is_none() => scope = Some(pair[1].clone()),
+                    _ => {
+                        return Err("publish accepts only --registry and --scope, once each".into())
+                    }
+                }
+            }
+            return Ok((
+                super::catalog_publish::PUBLISH.into(),
+                json!({
+                    "package_dir": cli_path(&command.args[0], cwd, true)?,
+                    "registry": registry.ok_or("publish needs --registry")?,
+                    "scope": scope.ok_or("publish needs --scope")?,
+                }),
+            ));
+        }
         return catalog::build(command);
     }
     if command.face == Face::Roles {
@@ -1385,6 +1409,7 @@ fn call(
             let options = placement_call_options(method);
             if matches!(method, "assign_workspace" | "register")
                 || super::catalog_ops::WRITES.contains(&method)
+                || method == super::catalog_publish::PUBLISH
             {
                 eprintln!("{AGENT_WRITE_NOTICE}");
             }
@@ -3919,5 +3944,57 @@ mod role_tests {
         assert!(
             matches!(parse(Face::Roles,&["--ck-domain".into()]),Invocation::Report(text) if text.starts_with("ck roles"))
         );
+    }
+}
+
+#[cfg(test)]
+mod catalog_publish_cli_tests {
+    use super::*;
+    #[test]
+    fn publish_path_is_shared_canonical_and_flags_are_closed() {
+        let (root, _) = crate::tests::scratch_descriptor("publish-cli");
+        let arguments = [
+            "publish",
+            ".",
+            "--registry",
+            "https://registry.example",
+            "--scope",
+            "@example",
+        ]
+        .map(String::from);
+        let Invocation::Command(command) = parse(Face::Catalog, &arguments) else {
+            panic!("expected command");
+        };
+        let (_, params) = build_at(&command, root.to_str().unwrap()).unwrap();
+        assert_eq!(
+            params["package_dir"],
+            entorhinal_core::RegistryStore::canonical_mutation_root(root.to_str().unwrap())
+                .unwrap()
+        );
+        for tail in [
+            vec!["--scope", "@example", "--scope", "@example"],
+            vec!["--registry", "https://registry.example", "--default", "x"],
+            vec![
+                "--registry",
+                "https://registry.example",
+                "--scope",
+                "@example",
+                "--json",
+            ],
+        ] {
+            let args = [vec!["publish", root.to_str().unwrap()], tail]
+                .concat()
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>();
+            match parse(Face::Catalog, &args) {
+                Invocation::Command(command) => {
+                    assert!(build_at(&command, root.to_str().unwrap()).is_err())
+                }
+                Invocation::Refuse(_) => {}
+                _ => panic!("expected refusal"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 }
