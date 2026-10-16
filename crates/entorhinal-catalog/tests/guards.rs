@@ -500,7 +500,7 @@ fn verifies_all_package_kinds_and_checks_manifest_files() {
         ),
         (
             "persona",
-            json!({"prompt":"body.txt","implements":[],"delegates_to":{},"capabilities":{"required":[],"optional":[]},"skills":[],"flows":[],"memory_scope":"project"}),
+            json!({"prompt":"body.txt","implements":[],"delegates_to":{},"capabilities":{"required":[],"optional":[]},"skills":[],"flows":[]}),
         ),
         ("memory-profile", json!({"arbitrary":{"value":true}})),
         ("flow", json!({"manifest":"body.txt","script":"script.sh"})),

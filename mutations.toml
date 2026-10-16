@@ -10029,3 +10029,19 @@ package = "entorhinal-module"
 target = "--test manifest"
 select = "expected"
 expect_red = ["manifest_flag_prints_the_manifest_with_the_provided_capability"]
+
+[[control]]
+id = "catalog-persona-body-closed-memory-scope"
+guards = "A persona body declaring memory_scope is refused: memory authorization is the host's, not the package's"
+file = "crates/entorhinal-catalog/src/record.rs"
+old = '''            "memory_profile",
+        ],'''
+new = '''            "memory_profile",
+            "memory_scope", // NON-VACUITY BREAK
+        ],'''
+test_file = "crates/entorhinal-catalog/tests/reproduction.rs"
+runner = "cargo"
+package = "entorhinal-catalog"
+target = "--test reproduction"
+select = "expected"
+expect_red = ["starter_bundle_persona_manifest_cases"]

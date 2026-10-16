@@ -318,7 +318,6 @@ fn validate_manifest(v: Value) -> Result<Manifest, Refusal> {
             "skills",
             "flows",
             "memory_profile",
-            "memory_scope",
         ],
         Kind::MemoryProfile => return Ok(m),
     };
@@ -381,12 +380,6 @@ fn validate_manifest(v: Value) -> Result<Manifest, Refusal> {
                 )
             {
                 return Err(err("body.capabilities"));
-            }
-            if !["project", "workspace", "global"]
-                .iter()
-                .any(|s| m.body["memory_scope"] == *s)
-            {
-                return Err(err("body.memory_scope"));
             }
             if m.body.get("routing").is_some_and(|v| !v.is_object())
                 || m.body.get("activation").is_some_and(|v| {

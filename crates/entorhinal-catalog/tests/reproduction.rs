@@ -154,6 +154,20 @@ fn starter_bundle_other_refusals() {
         starter_case(name);
     }
 }
+/// Persona bodies are closed: memory authorization is decided by the host, so a
+/// persona that still declares `memory_scope` is refused. The valid starter
+/// bundle above carries a persona without it, which covers the accepted side.
+#[test]
+fn starter_bundle_persona_manifest_cases() {
+    let vector = load("starter-bundle.json");
+    let cases = a(&vector["persona_manifest_cases"]);
+    assert!(!cases.is_empty());
+    for case in cases {
+        let got = success(record::parse_manifest(s(&case["manifest_text"]).as_bytes()));
+        assert_eq!(got["ok"], case["expect"]["ok"], "{}", case["name"]);
+        assert_eq!(got["code"], case["expect"]["code"], "{}", case["name"]);
+    }
+}
 fn package_members(v: &Value) -> Vec<Member<'_>> {
     a(&v["members"])
         .iter()
@@ -165,7 +179,7 @@ fn reproduce_readme() {
     let readme = fs::read(dir().join("README.md")).unwrap();
     assert_eq!(
         c::sha256_hex(&readme),
-        "9db4410b3e97c4406c0ac6884835d4112eaef8086dcab73e9b95b4fadd3568ab"
+        "132414d99c639927ece46fe5b204c84c9a0d2cb150bdce38e7899d13baeefef5"
     );
     let text = String::from_utf8(readme).unwrap();
     let mut checked = 0;
@@ -189,7 +203,7 @@ fn reproduce_source() {
     let bytes = fs::read(dir().join("SOURCE.txt")).unwrap();
     assert_eq!(
         c::sha256_hex(&bytes),
-        "3269a664109e5ab951ee06e299b8fb8d94180821ab7e4b3bba2252dd33279e51"
+        "a67e6a0539bacee290d536b5d52dd72f5e40ba012b3fc8fc3a72fe8dab6fac1d"
     );
     assert!(String::from_utf8(bytes).unwrap().contains("610329529"));
 }
