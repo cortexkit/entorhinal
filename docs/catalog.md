@@ -203,9 +203,12 @@ union of authenticated manifests in that agent's pins. A held archive supplies
 `ck.json`; otherwise the selected registry supplies the bounded manifest bytes.
 Their SHA-256 and strict manifest name/version must match the pin. Any failure
 returns `manifest_unavailable` with the package identity, without writing a grant.
-The production source cannot yet supply an agent's saved, authenticated package
-closure, so publisher trust deliberately refuses until that source exists;
-an absent authenticated pin set is not a legitimate empty capability ceiling.
+Production uses the agent's stored authenticated pins (`StoredPins`), filtered
+by publisher fingerprint. An absent authenticated pin set refuses rather than
+minting an empty capability ceiling. The Touch ID summary includes the complete
+granted capability ceiling (or `none`) when the identity and tokens fit within
+200 characters. Otherwise it retains the full publisher and placement identity:
+an unbounded token list cannot fit without truncating the authorization facts.
 
 A grant's ceiling is the list of capability tokens it allows. An empty ceiling
 covers packages that need no capability tokens. Coverage otherwise requires an

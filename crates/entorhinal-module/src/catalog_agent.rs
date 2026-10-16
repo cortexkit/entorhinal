@@ -259,6 +259,7 @@ async fn prepare(
     let mut seen = BTreeSet::new();
     let mut candidates = Vec::<VerifiedPackage>::new();
     let mut first_party = BTreeMap::<(String, String), bool>::new();
+    let mut excluded = BTreeMap::<String, Vec<HandlerError>>::new();
     while let Some(name) = queue.pop_front() {
         if !seen.insert(name.clone()) {
             continue;
@@ -288,9 +289,14 @@ async fn prepare(
                     "too many candidate versions",
                 ));
             }
-            let (verified, root_certified) = trust
-                .verify_version_with_provenance(&name, &version)
-                .await?;
+            let (verified, root_certified) =
+                match trust.verify_version_with_provenance(&name, &version).await {
+                    Ok(package) => package,
+                    Err(error) => {
+                        excluded.entry(name.clone()).or_default().push(error.into());
+                        continue;
+                    }
+                };
             queue.extend(verified.manifest.requires.packages.keys().cloned());
             first_party.insert((name.clone(), version), root_certified);
             candidates.push(verified);
@@ -317,6 +323,46 @@ async fn prepare(
     })
     .await
     .map_err(|mut error| {
+        // Only surface an excluded candidate's failure when resolution needs
+        // that package. Unselected versions and their dependencies may fail.
+        let needed = error
+            .detail
+            .as_ref()
+            .and_then(|v| v["package"].as_str())
+            .map(str::to_owned)
+            .or_else(|| {
+                (error.code == "pinned_manifest_missing")
+                    .then(|| {
+                        pins.iter()
+                            .find(|p| {
+                                !candidates.iter().any(|v| {
+                                    v.record.name == p.name && v.record.version == p.version
+                                })
+                            })
+                            .map(|p| p.name.clone())
+                    })
+                    .flatten()
+            });
+        if let Some(errors) = needed
+            .as_ref()
+            .filter(|_| {
+                matches!(
+                    error.code.as_str(),
+                    "package_not_found" | "no_matching_version" | "pinned_manifest_missing"
+                )
+            })
+            .and_then(|name| excluded.get_mut(name))
+        {
+            if !errors.is_empty() {
+                let preferred = errors
+                    .iter()
+                    .position(|e| {
+                        matches!(e.code.as_str(), "version_tombstoned" | "version_revoked")
+                    })
+                    .unwrap_or(0);
+                return errors.remove(preferred);
+            }
+        }
         let missing: Vec<_> = candidates
             .iter()
             .flat_map(|p| {
@@ -336,6 +382,11 @@ async fn prepare(
     let db = store.clone();
     let grants =
         catalog_sql::run(move || db.publisher_grants().map_err(HandlerError::from)).await?;
+    let operation = entorhinal_core::catalog_grants::authorization_operation(
+        &plan.operation,
+        &pins,
+        &resolved.closure,
+    );
     let mut packages = Vec::new();
     for pin in resolved.closure {
         let verified = candidates
@@ -346,20 +397,27 @@ async fn prepare(
             .get(&(pin.name.clone(), pin.version.clone()))
             .copied()
             .unwrap_or(false);
-        let trusted = root_certified
-            || grants.iter().any(|g| {
-                g.publisher_fingerprint == pin.publisher_fingerprint && g.revoked_at_ms.is_none()
-            });
         let scripts = &verified.manifest.body["scripts"];
         let has_scripts = scripts.as_array().is_some_and(|a| !a.is_empty())
             || scripts.as_object().is_some_and(|a| !a.is_empty());
-        packages.push(PreparedPackage {
+        let mut package = PreparedPackage {
             pin,
-            trust: if trusted { "trusted" } else { "first_contact" }.into(),
+            trust: "first_contact".into(),
             capabilities: verified.manifest.requires.capabilities.clone(),
             has_scripts,
             root_certified,
-        });
+        };
+        if entorhinal_core::catalog_grants::coverage(
+            &[package.coverage()],
+            &grants,
+            operation,
+            &plan.agent_id,
+            true,
+        ) == entorhinal_core::catalog_grants::Coverage::Covered
+        {
+            package.trust = "trusted".into();
+        }
+        packages.push(package);
     }
     let consumers = catalog_consumer::discover(daemon, &packages).await?;
     let checks = catalog_consumer::check(&consumers, &plan.plan_id, &packages).await?;
@@ -413,6 +471,15 @@ fn preview_card(
         state: RequestState::Awaiting,
         outcome: None,
     };
+    let operation = entorhinal_core::catalog_grants::authorization_operation(
+        &plan.operation,
+        &store.catalog_pins(&plan.agent_id)?,
+        &detail
+            .packages
+            .iter()
+            .map(|p| p.pin.clone())
+            .collect::<Vec<_>>(),
+    );
     let context = crate::consent::CardContext {
         caller_label: store
             .agent_row(&plan.agent_id)?
@@ -420,7 +487,7 @@ fn preview_card(
             .name,
         target_kind: "catalog_plan".into(),
         target_label: plan.plan_id.clone(),
-        target_scope: json!({"operation":plan.operation,"target":{"plan_id":plan.plan_id,"base_pin_digest":plan.base_pin_digest,"prepared":detail}}),
+        target_scope: json!({"operation":operation.as_str(),"target":{"plan_id":plan.plan_id,"base_pin_digest":plan.base_pin_digest,"prepared":detail}}),
     };
     crate::consent::render_card(&row,&context).map_err(|e| {
         let mut e = HandlerError::from(e);
@@ -796,10 +863,19 @@ impl ProjectsHandler {
         let db = store.clone();
         let plan_id = id.to_owned();
         let agent = caller.to_owned();
-        let (operation, grants, caller_label) =
+        let next = detail
+            .packages
+            .iter()
+            .map(|p| p.pin.clone())
+            .collect::<Vec<_>>();
+        let (op, grants, caller_label) =
             catalog_sql::until(deadline, "catalog install authorization", move || {
                 Ok((
-                    db.catalog_plan(&plan_id, &agent)?.operation,
+                    entorhinal_core::catalog_grants::authorization_operation(
+                        &db.catalog_plan(&plan_id, &agent)?.operation,
+                        &db.catalog_pins(&agent)?,
+                        &next,
+                    ),
                     db.publisher_grants()?,
                     db.agent_row(&agent)?
                         .ok_or_else(|| HandlerError::new("gone", "agent disappeared"))?
@@ -807,11 +883,6 @@ impl ProjectsHandler {
                 ))
             })
             .await?;
-        let op = if operation == "install" {
-            entorhinal_core::catalog_grants::Operation::Install
-        } else {
-            entorhinal_core::catalog_grants::Operation::Upgrade
-        };
 
         let covered = saved.is_none()
             && entorhinal_core::catalog_grants::coverage(
@@ -843,7 +914,7 @@ impl ProjectsHandler {
                 caller_label,
                 target_kind: "catalog_plan".into(),
                 target_label: id.into(),
-                target_scope: json!({"operation":operation,"target":plan.target}),
+                target_scope: json!({"operation":op.as_str(),"target":plan.target}),
             };
             attempt = Some(
                 self.consent_coordinator
@@ -968,6 +1039,15 @@ fn activation_on_store(
             error
         })?;
         let generation = store.catalog_generation(&generation.generation_id, &args.agent_id)?;
+        if generation.state == "superseded" {
+            return Err(HandlerError::new(
+                "invalid_transition",
+                format!(
+                    "generation {} is superseded; a newer generation is active",
+                    args.generation_id
+                ),
+            ));
+        }
         return encode_result(json!({"generation":generation_reply(&generation)}));
     }
     let args: Read = serde_json::from_value(params).map_err(crate::invalid_params)?;

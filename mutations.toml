@@ -6,6 +6,176 @@
 # audits all package targets, except rows narrowed with select="expected".
 
 [[control]]
+id = "catalog-install-pin-delta-authority"
+guards = "Replacing a held root or dependency requires upgrade authority even when requested as install"
+file = "crates/entorhinal-core/src/catalog_grants.rs"
+old = '.any(|held| !next.iter().any(|pin| pin == held))'
+new = '.any(|held| false /* NON-VACUITY BREAK */ && !next.iter().any(|pin| pin == held))'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_install_replacement_needs_upgrade_authority"]
+
+[[control]]
+id = "catalog-prepare-version-isolation"
+guards = "A refused listed version does not poison healthy candidate versions"
+file = "crates/entorhinal-module/src/catalog_agent.rs"
+old = '''Err(error) => {
+                        excluded.entry(name.clone()).or_default().push(error.into());
+                        continue;
+                    }'''
+new = '''Err(error) => return Err(error.into()), // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_prepare_isolates_failed_versions_and_names_last_refusal"]
+
+[[control]]
+id = "catalog-ack-superseded-refuses"
+guards = "Retrying an old activation acknowledgment never exposes the local superseded state"
+file = "crates/entorhinal-module/src/catalog_agent.rs"
+old = 'if generation.state == "superseded" {'
+new = 'if false && generation.state == "superseded" { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_superseded_activation_retry_refuses_without_wire_state"]
+
+[[control]]
+id = "catalog-prepare-blocking-reason"
+guards = "Preparation reports the blocking status reason instead of a generic resolver or unrelated version failure"
+file = "crates/entorhinal-module/src/catalog_agent.rs"
+old = 'return errors.remove(preferred);'
+new = 'return HandlerError::new("resolution_failed", "NON-VACUITY BREAK: lost candidate refusal");'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_prepare_status_refusals_are_isolated_and_named"]
+
+[[control]]
+id = "catalog-consent-trust-needs-coverage"
+guards = "Consent trust labels require the publisher grant's placement, operation and ceiling"
+file = "crates/entorhinal-module/src/catalog_agent.rs"
+old = '''if entorhinal_core::catalog_grants::coverage(
+            &[package.coverage()],'''
+new = '''if true /* NON-VACUITY BREAK */ || entorhinal_core::catalog_grants::coverage(
+            &[package.coverage()],'''
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_trust_label_requires_placement_operation_and_ceiling"]
+
+[[control]]
+id = "catalog-blob-tombstone-refusal"
+guards = "Consumers cannot read archive or manifest bytes bound only to tombstoned versions"
+file = "crates/entorhinal-module/src/catalog_ops.rs"
+old = 'if let Some(status) = store.catalog_blob_tombstone(&p.sha256)? {'
+new = 'if let Some(status) = None::<Value> { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_blob_reads_refuse_only_tombstoned_bindings"]
+
+[[control]]
+id = "catalog-publisher-pins-off-runtime"
+guards = "Publisher pin-source reads run on the blocking pool rather than the async worker"
+file = "crates/entorhinal-module/src/catalog_grants.rs"
+old = 'let publisher = p.publisher_fingerprint.clone();'
+new = '''let publisher = p.publisher_fingerprint.clone();
+        let _ = initial_source.pins(&db, &agent_id, &publisher)?; // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-module/src/catalog_grants_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_grants::tests::publisher_pin_and_blob_reads_are_counted_blocking_jobs"]
+
+[[control]]
+id = "catalog-publisher-blobs-off-runtime"
+guards = "Publisher ceiling archive reads and hashing run on the blocking pool"
+edits = [
+    { file = "crates/entorhinal-module/src/catalog_grants.rs", old = 'let manifest = match crate::catalog_sql::run(move || {', new = 'let manifest = match std::future::ready((move || { // NON-VACUITY BREAK' },
+    { file = "crates/entorhinal-module/src/catalog_grants.rs", old = '''cached_manifest(&folder, &held)
+            })''', new = '''cached_manifest(&folder, &held)
+            })())''' },
+]
+test_file = "crates/entorhinal-module/src/catalog_grants_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_grants::tests::publisher_pin_and_blob_reads_are_counted_blocking_jobs"]
+
+[[control]]
+id = "catalog-publish-preparation-off-runtime"
+guards = "Packing and registry reads queue on the blocking pool within the publish deadline"
+edits = [
+    { file = "crates/entorhinal-module/src/catalog_publish/mod.rs", old = 'crate::catalog_sql::until(deadline, "catalog publish preparation", move || {', new = 'std::future::ready((move || { // NON-VACUITY BREAK' },
+    { file = "crates/entorhinal-module/src/catalog_publish/mod.rs", old = '''                    registries,
+                ))
+            })''', new = '''                    registries,
+                ))
+            })())''' },
+]
+test_file = "crates/entorhinal-module/src/catalog_publish/tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_publish::tests::publish_preparation_is_off_runtime_counted_and_bounded"]
+
+[[control]]
+id = "catalog-publish-preparation-counted"
+guards = "Shutdown waits for publish preparation jobs that outlive the reply deadline"
+file = "crates/entorhinal-module/src/catalog_publish/mod.rs"
+old = 'let sql_guard = self.catalog_sql.begin();'
+new = 'let sql_guard = (); // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_publish/tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_publish::tests::publish_preparation_is_off_runtime_counted_and_bounded"]
+
+[[control]]
+id = "catalog-publisher-confirmation-ceiling"
+guards = "Publisher confirmation includes the complete granted capability ceiling when it fits"
+file = "crates/entorhinal-module/src/catalog_grants.rs"
+old = 'let summary = trust_summary(summary, &ceiling);'
+new = 'let summary = summary; // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_grants_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_grants::tests::publisher_confirmation_includes_complete_ceiling_when_it_fits"]
+
+[[control]]
+id = "catalog-publisher-stored-pins-docs"
+guards = "Publisher trust documentation describes the production StoredPins source"
+file = "docs/catalog.md"
+old = "Production uses the agent's stored authenticated pins (`StoredPins`), filtered"
+new = 'Production has no pin source. <!-- NON-VACUITY BREAK -->'
+test_file = "crates/entorhinal-module/src/catalog_grants_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_grants::tests::publisher_confirmation_includes_complete_ceiling_when_it_fits"]
+
+[[control]]
 id = "move-digest-receiver-no-auto-retry"
 guards = "A stuck receiver abort sends no further participant calls until an explicit retry or driver restart"
 file = "crates/entorhinal-module/src/move_receiver.rs"
@@ -7752,7 +7922,7 @@ expect_red = ["catalog_publish::tests::publish_flow_refused"]
 id = "publish-canonical-directory"
 guards = "The module rejects a non-canonical package directory"
 file = "crates/entorhinal-module/src/catalog_publish/mod.rs"
-old = 'if canonical != request.package_dir {'
+old = 'if canonical != package_dir {'
 new = 'if false { // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/catalog_publish/tests.rs"
 runner = "cargo"
@@ -7887,9 +8057,11 @@ expect_red = ["catalog_publish::tests::publish_bad_signature_before_upload"]
 id = "publish-cached-record-verification"
 guards = "Cached records are verified against freshly packed bytes rather than blindly resent"
 file = "crates/entorhinal-module/src/catalog_publish/mod.rs"
-old = '''if let Some(signed) = storage::load(&path)? {
+old = '''    .await?
+    {
         verify(&signed, checked, &public)?;'''
-new = '''if let Some(signed) = storage::load(&path)? {
+new = '''    .await?
+    {
         // NON-VACUITY BREAK'''
 test_file = "crates/entorhinal-module/src/catalog_publish/tests.rs"
 runner = "cargo"
@@ -7902,8 +8074,8 @@ expect_red = ["catalog_publish::tests::publish_cached_tamper_refused"]
 id = "publish-reuse-signature"
 guards = "A retry loads the signed record without another vault signature"
 file = "crates/entorhinal-module/src/catalog_publish/mod.rs"
-old = 'if let Some(signed) = storage::load(&path)? {'
-new = 'if let Some(signed) = None::<Signed> { // NON-VACUITY BREAK'
+old = 'storage::load(&held_path)'
+new = 'Ok::<_, HandlerError>(None::<Signed>) // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/catalog_publish/tests.rs"
 runner = "cargo"
 package = "entorhinal-module"
@@ -7915,8 +8087,8 @@ expect_red = ["catalog_publish::tests::publish_unavailable_reuses_signed_bytes"]
 id = "publish-durable-before-upload"
 guards = "A signed record is persisted before an upload whose reply can be lost"
 file = "crates/entorhinal-module/src/catalog_publish/mod.rs"
-old = 'storage::save(&path, &signed)?;'
-new = 'let _ = &path; // NON-VACUITY BREAK'
+old = 'storage::save(&path, &saved)'
+new = 'Ok::<_, HandlerError>(()) // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/catalog_publish/tests.rs"
 runner = "cargo"
 package = "entorhinal-module"

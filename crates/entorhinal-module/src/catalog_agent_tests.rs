@@ -24,11 +24,15 @@ impl LocalCapabilities for TestCapabilities {
 }
 
 fn script_free_package(registry: &FakeRegistry) -> Value {
+    script_free_version(registry, "1.0.0")["status"].clone()
+}
+fn script_free_version(registry: &FakeRegistry, version: &str) -> Value {
     use base64::Engine;
     let records = vectors("record");
     let package = &records["packages"]["skill"];
     let mut manifest: Value =
         serde_json::from_str(package["manifest_text"].as_str().unwrap()).unwrap();
+    manifest["version"] = json!(version);
     manifest["body"]["scripts"] = json!([]);
     manifest["files"]
         .as_array_mut()
@@ -66,15 +70,22 @@ fn script_free_package(registry: &FakeRegistry) -> Value {
         .unwrap()["record"]
         .clone();
     record["archive_sha256"] = json!(entorhinal_catalog::sha256_hex(&archive));
+    record["version"] = json!(version);
     record["archive_bytes"] = json!(archive.len());
     record["manifest_sha256"] = json!(entorhinal_catalog::sha256_hex(manifest_text.as_bytes()));
     let record_doc = signed(record.clone(), &records["keys"]["trusted"]);
     let mut status = vectors("status")["records"][0]["record"].clone();
+    status["version"] = json!(version);
     status["archive_sha256"] = record["archive_sha256"].clone();
     let doc = signed(status, &vectors("statements")["keys"]["registry_status"][0]);
-    registry.serve("/v1/packages/example/hello-skill",Reply::bytes(json!({"name":NAME,"versions":[{"version":"1.0.0","record":record,"signature":record_doc["signature"],"status":doc}]}).to_string()));
+    let entry =
+        json!({"version":version,"record":record,"signature":record_doc["signature"],"status":doc});
     registry.serve(
-        "/v1/packages/example/hello-skill/1.0.0/ck.json",
+        "/v1/packages/example/hello-skill",
+        Reply::bytes(json!({"name":NAME,"versions":[entry]}).to_string()),
+    );
+    registry.serve(
+        &format!("/v1/packages/example/hello-skill/{version}/ck.json"),
         Reply::bytes(manifest_text),
     );
     registry.serve(
@@ -84,7 +95,7 @@ fn script_free_package(registry: &FakeRegistry) -> Value {
         ),
         Reply::bytes(archive),
     );
-    doc
+    entry
 }
 
 struct FakeConsumer {
@@ -252,7 +263,10 @@ impl Fixture {
         json!({"spec":{"operation":"install","target":{"agent_id":self.tools.agents[0]},"package":NAME,"range":"^1.0.0"},"request_key":key})
     }
     async fn prepare(&self, key: &str) -> Value {
-        let prepared = tool_result(self.tools.call("catalog_prepare", self.spec(key)).await);
+        self.prepare_spec(self.spec(key)).await
+    }
+    async fn prepare_spec(&self, spec: Value) -> Value {
+        let prepared = tool_result(self.tools.call("catalog_prepare", spec).await);
         assert_eq!(prepared["state"], "pending");
         self.tools.handler.catalog_agent.finished.notified().await;
         tool_result(
@@ -286,6 +300,18 @@ impl Fixture {
             .await
     }
     fn grant(&self) {
+        self.grant_for(
+            entorhinal_core::catalog_grants::Operation::Install,
+            &self.tools.agents[0],
+            vec!["cap/example.read@1".into()],
+        );
+    }
+    fn grant_for(
+        &self,
+        operation: entorhinal_core::catalog_grants::Operation,
+        agent: &str,
+        ceiling: Vec<String>,
+    ) {
         let record = vectors("record");
         self.store()
             .insert_publisher_grant(
@@ -295,9 +321,9 @@ impl Fixture {
                         .as_str()
                         .unwrap()
                         .into(),
-                    operation: entorhinal_core::catalog_grants::Operation::Install,
-                    placement_agent_id: self.tools.agents[0].clone(),
-                    ceiling: vec!["cap/example.read@1".into()],
+                    operation,
+                    placement_agent_id: agent.into(),
+                    ceiling,
                     card_ref: Some("prior-card".into()),
                     granted_at_ms: 1,
                     revoked_at_ms: None,
@@ -393,6 +419,197 @@ async fn catalog_covered_install_no_card_and_retry_once() {
         1
     );
     assert_eq!(f.cingulate.card_count(), 0);
+}
+
+#[tokio::test]
+async fn catalog_install_replacement_needs_upgrade_authority() {
+    let f = Fixture::new().await;
+    f.grant();
+    let first = f.prepare("initial-version").await;
+    tool_result(f.install(&first).await);
+    let old = script_free_version(&f.registry, "1.0.0");
+    let new = script_free_version(&f.registry, "1.1.0");
+    f.registry.serve(
+        "/v1/packages/example/hello-skill",
+        Reply::bytes(json!({"name":NAME,"versions":[old,new]}).to_string()),
+    );
+    let replacement = f.prepare("replacement-as-install").await;
+    assert_eq!(replacement["state"], "ready", "{replacement}");
+    assert_eq!(replacement["closure"][0]["version"], "1.1.0");
+    let mut commit = forged_commit(&f, &replacement);
+    commit.authorization = entorhinal_core::agent::consent::Authorization::PublisherGrants {
+        ids: vec!["test-grant".into()],
+    };
+    let error = f
+        .store()
+        .with_principal("agent")
+        .with_consent_commit(commit)
+        .catalog_install(replacement["plan_id"].as_str().unwrap(), 100)
+        .unwrap_err();
+    assert_eq!(HandlerError::from(error).code, "plan_stale");
+    assert_eq!(
+        f.store().catalog_pins(&f.tools.agents[0]).unwrap()[0].version,
+        "1.0.0"
+    );
+
+    assert_eq!(replacement["closure"][0]["trust"], "first_contact");
+    assert!(!replacement["card"]["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|o| o["id"] == "approve_always_publisher"));
+    let mut explicit = f.spec("explicit-upgrade");
+    explicit["spec"]["operation"] = json!("upgrade");
+    let upgrade = f.prepare_spec(explicit).await;
+    assert_eq!(upgrade["state"], "ready", "{upgrade}");
+    assert_eq!(upgrade["closure"][0]["trust"], "first_contact");
+    let mut commit = forged_commit(&f, &upgrade);
+    commit.authorization = entorhinal_core::agent::consent::Authorization::PublisherGrants {
+        ids: vec!["test-grant".into()],
+    };
+    let error = f
+        .store()
+        .with_principal("agent")
+        .with_consent_commit(commit)
+        .catalog_install(upgrade["plan_id"].as_str().unwrap(), 100)
+        .unwrap_err();
+    assert_eq!(HandlerError::from(error).code, "plan_stale");
+    f.cingulate
+        .script("consent.await", Effect::Answer("approve_once"));
+    tool_result(f.install(&replacement).await);
+    assert_eq!(
+        f.cingulate.card_count(),
+        1,
+        "a replacement must not use an install-only grant"
+    );
+    assert_eq!(
+        f.store().catalog_pins(&f.tools.agents[0]).unwrap()[0].version,
+        "1.1.0"
+    );
+}
+
+#[tokio::test]
+async fn catalog_prepare_isolates_failed_versions_and_names_last_refusal() {
+    for healthy in [true, false] {
+        let f = Fixture::new().await;
+        let good = script_free_version(&f.registry, "1.0.0");
+        let mut bad = script_free_version(&f.registry, "1.1.0");
+        bad["signature"] = json!("00".repeat(64));
+        let versions = if healthy { vec![bad, good] } else { vec![bad] };
+        f.registry.serve(
+            "/v1/packages/example/hello-skill",
+            Reply::bytes(json!({"name":NAME,"versions":versions}).to_string()),
+        );
+        let plan = f.prepare("isolate-version").await;
+        if healthy {
+            assert_eq!(
+                plan["state"], "ready",
+                "a failed version must not poison healthy candidates: {plan}"
+            );
+            assert_eq!(plan["closure"][0]["version"], "1.0.0");
+        } else {
+            assert_eq!(plan["state"], "failed");
+            assert_eq!(plan["refusal"]["code"], "signature_invalid");
+            assert_eq!(plan["refusal"]["detail"]["name"], NAME);
+            assert_eq!(plan["refusal"]["detail"]["version"], "1.1.0");
+        }
+        assert!(!f
+            .registry
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.contains("/1.1.0/ck.json")));
+    }
+}
+
+#[tokio::test]
+async fn catalog_prepare_status_refusals_are_isolated_and_named() {
+    for state in ["tombstoned", "revoked"] {
+        for healthy in [true, false] {
+            let f = Fixture::new().await;
+            let good = script_free_version(&f.registry, "1.0.0");
+            let mut blocked = script_free_version(&f.registry, "1.1.0");
+            let mut status = blocked["status"]["record"].clone();
+            status["state"] = json!(state);
+            status["reason"] = json!("version excluded by registry");
+            status["compromise_from"] = if state == "revoked" {
+                status["published_at"].clone()
+            } else {
+                Value::Null
+            };
+            blocked["status"] =
+                signed(status, &vectors("statements")["keys"]["registry_status"][0]);
+            let blocked_archive = blocked["record"]["archive_sha256"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let mut invalid = script_free_version(&f.registry, "1.2.0");
+            invalid["signature"] = json!("00".repeat(64));
+            let versions = if healthy {
+                vec![invalid, blocked, good]
+            } else {
+                vec![invalid, blocked]
+            };
+            f.registry.serve(
+                "/v1/packages/example/hello-skill",
+                Reply::bytes(json!({"name":NAME,"versions":versions}).to_string()),
+            );
+            let plan = f.prepare("status-isolation").await;
+            if healthy {
+                assert_eq!(plan["state"], "ready", "{state}: {plan}");
+                assert_eq!(plan["closure"][0]["version"], "1.0.0");
+            } else {
+                assert_eq!(plan["state"], "failed");
+                assert_eq!(plan["refusal"]["code"], format!("version_{state}"));
+                assert_eq!(plan["refusal"]["detail"]["name"], NAME);
+                assert_eq!(plan["refusal"]["detail"]["version"], "1.1.0");
+                assert_eq!(
+                    plan["refusal"]["detail"]["reason"],
+                    "version excluded by registry"
+                );
+            }
+            let calls = f.registry.calls.lock().unwrap();
+            assert!(
+                !calls.iter().any(
+                    |path| path.ends_with("/1.1.0/ck.json") || path.ends_with(&blocked_archive)
+                ),
+                "status-ineligible bytes were requested: {calls:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn catalog_trust_label_requires_placement_operation_and_ceiling() {
+    use entorhinal_core::catalog_grants::Operation;
+    for missing in ["placement", "operation", "ceiling", "none"] {
+        let f = Fixture::new().await;
+        f.grant_for(
+            if missing == "operation" {
+                Operation::Upgrade
+            } else {
+                Operation::Install
+            },
+            &f.tools.agents[usize::from(missing == "placement")],
+            if missing == "ceiling" {
+                vec![]
+            } else {
+                vec!["cap/example.read@1".into()]
+            },
+        );
+        let plan = f.prepare("label").await;
+        assert_eq!(plan["state"], "ready", "{plan}");
+        assert_eq!(
+            plan["closure"][0]["trust"],
+            if missing == "none" {
+                "trusted"
+            } else {
+                "first_contact"
+            },
+            "{missing}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1103,6 +1320,144 @@ async fn catalog_generations_hide_superseded_and_activation_needs_no_network() {
     );
     assert_eq!(core["active"]["generation_id"], new["generation_id"]);
     assert_eq!(f.consumers.consumer.calls.lock().unwrap().len(), before);
+}
+
+#[tokio::test]
+async fn catalog_superseded_activation_retry_refuses_without_wire_state() {
+    use subc_client_rs::HandlerOutcome;
+    let f = Fixture::new().await;
+    f.grant();
+    let mut ids = Vec::new();
+    for key in ["old-ack", "new-ack"] {
+        let plan = f.prepare(key).await;
+        let generation = tool_result(f.install(&plan).await)["generation_id"].clone();
+        let ack = json!({"agent_id":f.tools.agents[0],"generation_id":generation});
+        let first = result(
+            f.op(
+                crate::tests::reserved(crate::WRITER_MODULE),
+                ACK_ACTIVATION,
+                ack.clone(),
+            )
+            .await,
+        );
+        assert_eq!(first["generation"]["state"], "active");
+        assert_eq!(
+            result(
+                f.op(
+                    crate::tests::reserved(crate::WRITER_MODULE),
+                    ACK_ACTIVATION,
+                    ack
+                )
+                .await
+            ),
+            first
+        );
+        ids.push(generation);
+    }
+    let retry = f
+        .op(
+            crate::tests::reserved(crate::WRITER_MODULE),
+            ACK_ACTIVATION,
+            json!({"agent_id":f.tools.agents[0],"generation_id":ids[0]}),
+        )
+        .await;
+    match retry {
+        HandlerOutcome::Error { code, message }
+        | HandlerOutcome::ErrorWithDetail { code, message, .. } => {
+            assert_eq!(code, "invalid_transition");
+            assert!(message.contains(ids[0].as_str().unwrap()));
+            assert!(message.contains("newer generation is active"));
+        }
+        other => panic!("superseded acknowledgment must refuse, not expose local state: {other:?}"),
+    }
+    assert_eq!(
+        f.store()
+            .catalog_generation(ids[1].as_str().unwrap(), &f.tools.agents[0])
+            .unwrap()
+            .state,
+        "active"
+    );
+}
+
+#[tokio::test]
+async fn catalog_blob_reads_refuse_only_tombstoned_bindings() {
+    use crate::fake_daemon::{DaemonSnapshot, FakeDaemon};
+    let mut f = Fixture::new().await;
+    f.tools.handler.participant_discovery = Arc::new(FakeDaemon::new(DaemonSnapshot::new(
+        1,
+        vec![],
+        vec![
+            json!({"module_id":crate::WRITER_MODULE,"ready":true,"roles":[],"control_ops":[],"capabilities":{"provides":[catalog_consumer::SKILL],"requires":[]}}),
+        ],
+    )));
+    f.grant();
+    let plan = f.prepare("blob-status").await;
+    let installed = tool_result(f.install(&plan).await);
+    result(
+        f.op(
+            crate::tests::reserved(crate::WRITER_MODULE),
+            ACK_ACTIVATION,
+            json!({"agent_id":f.tools.agents[0],"generation_id":installed["generation_id"]}),
+        )
+        .await,
+    );
+    let blobs = crate::catalog_blob::BlobStore::new(f.store().store_folder()).unwrap();
+    let archive = blobs
+        .read_verified(plan["closure"][0]["archive_sha256"].as_str().unwrap())
+        .unwrap();
+    let members = entorhinal_catalog::archive::read(&archive).unwrap();
+    blobs.publish(members.get("ck.json").unwrap()).unwrap();
+    for state in ["withdrawn", "tombstoned"] {
+        serve_status_news(&f, state, if state == "withdrawn" { 2 } else { 3 });
+        let mut trust = (f.tools.handler.catalog_agent.sources)(f.store(), "@example").unwrap();
+        refresh(&mut trust).await.unwrap();
+        for field in ["archive_sha256", "manifest_sha256"] {
+            let answer = f
+                .op(
+                    crate::tests::reserved(crate::WRITER_MODULE),
+                    crate::catalog_ops::READ_BLOB,
+                    json!({"sha256":plan["closure"][0][field],"offset":0,"length":1}),
+                )
+                .await;
+            if state == "withdrawn" {
+                assert!(result(answer)["total"].as_u64().unwrap() > 0);
+            } else {
+                match answer {
+                    subc_client_rs::HandlerOutcome::ErrorWithDetail { code, detail, .. } => {
+                        assert_eq!(code, "version_tombstoned");
+                        assert_eq!(detail["name"], NAME);
+                        assert_eq!(detail["reason"], "registry security notice");
+                    }
+                    other => panic!("tombstoned bytes must not be served: {other:?}"),
+                }
+            }
+        }
+    }
+    let mut pins = f.store().catalog_pins(&f.tools.agents[0]).unwrap();
+    let mut shared = pins[0].clone();
+    shared.name = "@example/healthy-shared".into();
+    pins.push(shared);
+    f.store()
+        .with_principal("test")
+        .catalog_set_pins(
+            entorhinal_core::catalog_agent::PinWriteRequest {
+                agent_id: f.tools.agents[0].clone(),
+                pins,
+                request_key: None,
+            },
+            101,
+        )
+        .unwrap();
+    for field in ["archive_sha256", "manifest_sha256"] {
+        result(
+            f.op(
+                crate::tests::reserved(crate::WRITER_MODULE),
+                crate::catalog_ops::READ_BLOB,
+                json!({"sha256":plan["closure"][0][field],"offset":0,"length":1}),
+            )
+            .await,
+        );
+    }
 }
 
 #[tokio::test]

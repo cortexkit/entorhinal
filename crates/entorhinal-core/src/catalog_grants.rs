@@ -12,6 +12,23 @@ pub enum Operation {
     Install,
     Upgrade,
 }
+/// Adding pins is an install; changing or removing any held pin needs upgrade
+/// authority, even when the request calls itself an install.
+pub fn authorization_operation(
+    requested: &str,
+    previous: &[crate::catalog_agent::CatalogPin],
+    next: &[crate::catalog_agent::CatalogPin],
+) -> Operation {
+    if requested != "install"
+        || previous
+            .iter()
+            .any(|held| !next.iter().any(|pin| pin == held))
+    {
+        Operation::Upgrade
+    } else {
+        Operation::Install
+    }
+}
 impl Operation {
     pub fn as_str(self) -> &'static str {
         match self {
