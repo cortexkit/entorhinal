@@ -318,10 +318,21 @@ rather than parking them until trust changes. Trust keys on the target with
 These are move abort reasons, not new participant refusal codes.
 
 Publisher grants and source approvals never travel. Non-CortexKit publishers
-need a live target-local install grant for that agent. CortexKit keys must be
-certified against the receiver's own built-in root through its configured
-registry's existing key-chain verifier, against the built-in CortexKit root
-`catalog_trust::CORTEXKIT_ROOT`. The scope name alone never grants trust.
+need a live target-local install grant for that agent whose capability ceiling
+covers the package. The receiver calls the normal install `coverage()` policy
+on the staged manifests, including its scripts and live-agent rules, and checks
+again from verified local blobs before taking the claim. Refusals name each
+publisher, package and missing permission. CortexKit certification is verified
+against `catalog_trust::CORTEXKIT_ROOT`, and its key window must cover the
+authenticated package publication time. When no registry is mapped, a persisted
+starter-bundle proof can supply this certification and initial status. The scope
+name alone never grants trust, and certification is carried into the prepared
+generation rather than inferred from the package name.
+
+For every mapped pinned scope, preflight refreshes authenticated status before
+import, generation approval and claim take. Revoked and tombstoned versions
+refuse with `trust_missing`. Unknown status or an unreachable registry holds the
+move for retry (`trust_unavailable`), never aborts it or authorizes activation.
 
 Entorhinal exports an immutable snapshot of the pinned content-store blobs on
 its `reserved:entorhinal` session-door stream. Each cut has a new, deterministic
@@ -344,8 +355,9 @@ the stream incrementally, checks its sealed cut digest, then verifies every
 frame in bounded staging files before publishing any blob. Bad magic/count,
 nonascending or duplicate digests, blobs over 10 MiB, hash mismatches, trailing
 bytes, or a digest set different from the local pinned closure refuse the
-existing `digest_mismatch` code. A local generation is built from those pins and
-the verified manifests, checked and prefetched to catalog consumers, then marked
+existing `digest_mismatch` code. The verified, authorized blobs are published
+before consumer checks so consumers can read both digests. Only successful checks
+allow generation approval; successful prefetch and a final preflight mark it
 `ready`. Aborting before activation removes its eligibility for activation but
 does not change shared pins or local publisher grants.
 
@@ -356,3 +368,10 @@ when this participant has no checkpoint for the requested cut;
 a fresh participant instance still reports an aborted cut as `aborted` and
 refuses to import it again. Internal storage errors use the participant's
 existing retryable `unavailable` code, not private catalog refusal codes.
+
+Each catalog participant request and receiver preflight has a 30-second total
+deadline. Local generation writes and aborts allow at most one second for mutex
+admission; no move mutex or store handle is held across network I/O. Transfers
+are admitted per cut, while status and abort bypass transfer admission. Deadline
+or admission refusals use retryable `unavailable`; an aborted checkpoint cannot
+be overwritten by a late transfer completion.

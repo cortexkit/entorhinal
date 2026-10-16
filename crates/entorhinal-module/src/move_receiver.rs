@@ -709,6 +709,10 @@ impl Receiver {
                     MoveReason::PinDigestMismatch,
                     e.detail.unwrap_or(Value::Null),
                 ),
+                "trust_unavailable" => Failure::hold(
+                    "trust_unavailable",
+                    json!({"message":e.message,"detail":e.detail}),
+                ),
                 "trust_missing" => {
                     Failure::abort(MoveReason::TrustMissing, e.detail.unwrap_or(Value::Null))
                 }

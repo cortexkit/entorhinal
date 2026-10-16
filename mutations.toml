@@ -8220,9 +8220,9 @@ expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_persis
 [[control]]
 id = "catalog-move-local-trust"
 guards = "Missing target publisher trust aborts ordinary and lid-close moves before staging"
-file = "crates/entorhinal-module/src/catalog_move.rs"
-old = 'if !missing.is_empty() {'
-new = 'if !missing.is_empty() && false { // NON-VACUITY BREAK'
+file = "crates/entorhinal-module/src/catalog_move/trust.rs"
+old = 'if missing.is_empty() {'
+new = 'if true { // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/catalog_moves.rs"
 runner = "cargo"
 package = "entorhinal-module"
@@ -8234,8 +8234,10 @@ expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_missin
 id = "catalog-move-import-trust"
 guards = "The participant rechecks target trust before creating import staging files"
 file = "crates/entorhinal-module/src/catalog_move.rs"
-old = 'let pins = self.local_preflight(agent, expected).await?;'
-new = 'let pins = self.store()?.catalog_pins(agent)?; // NON-VACUITY BREAK'
+old = '''"agent_data.import" => {
+                let checked = self.local_preflight(agent, expected).await?;'''
+new = '''"agent_data.import" => {
+                let checked = trust::Preflight { pins: self.store()?.catalog_pins(agent)?, certified: Default::default() }; // NON-VACUITY BREAK'''
 test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/catalog_moves.rs"
 runner = "cargo"
 package = "entorhinal-module"
@@ -8341,13 +8343,9 @@ expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_rechec
 [[control]]
 id = "catalog-move-root-local-certification"
 guards = "A CortexKit publisher is trusted only when the receiver verifies its certificate against its own root"
-file = "crates/entorhinal-module/src/catalog_move.rs"
-old = '''root_keys.iter().any(|key| {
-                    entorhinal_catalog::key_fingerprint(&key.public_key).as_deref()
-                        == Some(&pin.publisher_fingerprint)
-                        && key.revocation.is_none()
-                })'''
-new = 'true /* NON-VACUITY BREAK: accept the scope name without local certification */'
+file = "crates/entorhinal-module/src/catalog_move/trust.rs"
+old = 'if !valid {'
+new = 'if false && !valid { // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/catalog_moves.rs"
 runner = "cargo"
 package = "entorhinal-module"
@@ -9476,3 +9474,149 @@ package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
 expect_red = ["catalog_seed::tests::stopping_the_catalog_waits_for_a_running_seed_job"]
+
+[[control]]
+id = "catalog-move-grant-coverage"
+guards = "Receiver grants must cover capabilities and cannot authorize scripts in a moved closure"
+file = "crates/entorhinal-module/src/catalog_move/trust.rs"
+old = 'if missing.is_empty() {'
+new = 'if true { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/catalog_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_receiver_enforces_grant_ceiling_and_scripts"]
+
+[[control]]
+id = "catalog-move-refresh-status"
+guards = "The receiver ingests fresh registry status even when it has not polled before a move"
+file = "crates/entorhinal-module/src/catalog_move/trust.rs"
+old = 'let applied = trust.apply_scope_feed().await.map_err(network)?;'
+new = 'let applied = crate::catalog_trust::FeedApply { results: vec![], refusal: None, fetch_full: false, cursor_advanced: false }; // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/catalog_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_refreshes_blocking_status_before_import_and_claim"]
+
+[[control]]
+id = "catalog-move-status-refusal"
+guards = "Authenticated revoked and tombstoned pins refuse the move before the claim"
+file = "crates/entorhinal-module/src/catalog_move/trust.rs"
+old = '''if matches!(
+                    status.state,'''
+new = '''if false && matches!( // NON-VACUITY BREAK
+                    status.state,'''
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/catalog_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_refreshes_blocking_status_before_import_and_claim"]
+
+[[control]]
+id = "catalog-move-trust-outage-holds"
+guards = "Unknown registry trust is retryable, not a verified publisher refusal that aborts a move"
+file = "crates/entorhinal-module/src/catalog_move/trust.rs"
+old = 'HandlerError::new("trust_unavailable", format!("{error:?}"))'
+new = 'HandlerError::new("trust_missing", format!("{error:?}")) // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/catalog_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_registry_outage_holds_and_recovers"]
+
+[[control]]
+id = "catalog-move-starter-root-fallback"
+guards = "A receiving Mac can authenticate starter-bundle pins without a mapped registry or a publisher grant"
+file = "crates/entorhinal-module/src/catalog_move/trust.rs"
+old = 'if scope != "@cortexkit" {'
+new = 'if true { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/catalog_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_starter_proof_authorizes_offline_root_and_carries_certification"]
+
+[[control]]
+id = "catalog-move-publish-before-check"
+guards = "Consumer checks can read the verified manifests and archives before generation approval"
+file = "crates/entorhinal-module/src/catalog_move.rs"
+old = 'blobs.publish(&bytes)?;'
+new = 'let _ = &bytes; // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/catalog_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_consumer_reads_published_blobs_before_approval_and_retries"]
+
+[[control]]
+id = "catalog-move-certification-provenance"
+guards = "Prepared generations retain receiver-verified root certification rather than guessing it from a scope name"
+file = "crates/entorhinal-module/src/catalog_move.rs"
+old = 'root_certified: checked.certified.contains(&pin.name),'
+new = 'root_certified: false, // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/catalog_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_starter_proof_authorizes_offline_root_and_carries_certification"]
+
+[[control]]
+id = "catalog-move-certificate-window"
+guards = "Root certification must cover package publication, including both validity boundaries"
+file = "crates/entorhinal-module/src/catalog_move/trust.rs"
+old = '&& key.covers(&status.published_at)'
+new = '&& true /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/catalog_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_root_certificate_must_cover_publication_time"]
+
+[[control]]
+id = "catalog-move-network-lock"
+guards = "Stalled network work cannot own the global move mutex and block status or abort"
+file = "crates/entorhinal-module/src/catalog_move.rs"
+old = 'async fn execute_inner(&self, method: &str, params: Value) -> Result<Value, HandlerError> {'
+new = '''async fn execute_inner(&self, method: &str, params: Value) -> Result<Value, HandlerError> {
+        let _guard = self.lock.lock().await; // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/catalog_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_stalled_network_does_not_block_status_or_abort_and_has_deadline"]
+
+[[control]]
+id = "catalog-move-request-deadline"
+guards = "The total participant deadline bounds even a still-pending registry request"
+file = "crates/entorhinal-module/src/catalog_move.rs"
+old = 'tokio::time::timeout(self.request_timeout, self.execute_inner(method, params))'
+new = 'tokio::time::timeout(Duration::from_secs(300), self.execute_inner(method, params)) // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/catalog_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_stalled_network_does_not_block_status_or_abort_and_has_deadline"]
+
+[[control]]
+id = "catalog-move-mutex-deadline"
+guards = "A busy local generation-write mutex returns a named retryable refusal within one second"
+file = "crates/entorhinal-module/src/catalog_move.rs"
+old = 'tokio::time::timeout(Duration::from_secs(1), self.lock.clone().lock_owned())'
+new = 'tokio::time::timeout(Duration::from_secs(30), self.lock.clone().lock_owned()) // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/catalog_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_mutex_admission_is_bounded"]
