@@ -49,7 +49,10 @@ impl Fixture {
             "agents_create_head" => "agent_project_taken",
             "agents_retire_hire" => "not_your_hire",
             "agents_list_hires" => {
-                assert_eq!(result(self.call(tool, args).await)["agents"], json!([]));
+                assert_eq!(
+                    tool_result(self.call(tool, args).await)["agents"],
+                    json!([])
+                );
                 return;
             }
             _ => "consent_unavailable",
@@ -200,13 +203,19 @@ pub(crate) fn error_code(outcome: HandlerOutcome) -> String {
     }
 }
 
-pub(crate) fn result(outcome: HandlerOutcome) -> Value {
+pub(crate) fn response_body(outcome: HandlerOutcome) -> Vec<u8> {
     match outcome {
-        HandlerOutcome::Response(body) => {
-            serde_json::from_slice::<Value>(&body).unwrap()["result"].clone()
-        }
+        HandlerOutcome::Response(body) => body,
         _ => panic!("expected provider response"),
     }
+}
+
+pub(crate) fn tool_result(outcome: HandlerOutcome) -> Value {
+    serde_json::from_slice(&response_body(outcome)).unwrap()
+}
+
+pub(crate) fn module_result(outcome: HandlerOutcome) -> Value {
+    serde_json::from_slice::<Value>(&response_body(outcome)).unwrap()["result"].clone()
 }
 
 #[tokio::test]
@@ -433,7 +442,7 @@ async fn every_write_validates_printable_ascii_request_keys_before_other_argumen
     }
     f.admit(Some(&f.stamp(2)));
     assert_eq!(
-        result(f.call("agents_list_hires", json!({})).await)["agents"],
+        tool_result(f.call("agents_list_hires", json!({})).await)["agents"],
         json!([])
     );
     f.refusal(
@@ -612,14 +621,36 @@ async fn schema_pins_and_call_modes_are_checked_after_agent_admission() {
 #[tokio::test]
 async fn provider_discovery_catalog_and_hello_agree_on_exact_tool_table() {
     let f = Fixture::new();
-    let role: RoleDescribe =
-        serde_json::from_value(result(f.call("role.describe", json!({})).await)).unwrap();
+    let role_body = response_body(f.call("role.describe", json!({})).await);
+    let role: RoleDescribe = serde_json::from_slice(&role_body).unwrap();
     assert_eq!(role.majors.len(), 1);
     assert_eq!(role.majors[0].version, "tool-provider/v1");
     assert_eq!(role.majors[0].ops, vec!["role.describe", "tool.catalog"]);
     assert!(role.capabilities.is_empty());
-    let catalog: CatalogAnswer =
-        serde_json::from_value(result(f.call("tool.catalog", json!({})).await)).unwrap();
+    let catalog_body = response_body(f.call("tool.catalog", json!({})).await);
+    let catalog: CatalogAnswer = serde_json::from_slice(&catalog_body).unwrap();
+    for (name, tag) in [
+        ("projects_create_workspace", "entorhinal:agents.create/v1"),
+        ("projects_register", "entorhinal:agents.create/v1"),
+        ("agents_create_head", "entorhinal:agents.create/v1"),
+        ("agents_hire", "entorhinal:agents.hire/v1"),
+        ("agents_retire_hire", "entorhinal:agents.hire/v1"),
+        ("agents_list_hires", "entorhinal:agents.hire/v1"),
+        ("catalog_prepare", "entorhinal:catalog.install/v1"),
+        ("catalog_plan", "entorhinal:catalog.install/v1"),
+        ("catalog_install", "entorhinal:catalog.install/v1"),
+        ("catalog_generation", "entorhinal:catalog.install/v1"),
+    ] {
+        let tool = catalog.tools.iter().find(|tool| tool.name == name).unwrap();
+        assert_eq!(tool.capabilities, vec![tag.to_owned()], "{name}");
+    }
+    for tag in catalog
+        .tools
+        .iter()
+        .flat_map(|tool| tool.capabilities.iter())
+    {
+        cortexkit_role_tool_provider::check_capability_tag(tag).unwrap();
+    }
     for tool in &catalog.tools {
         cortexkit_role_tool_provider::catalog::check_flat_schema(&tool.input_schema).unwrap();
         cortexkit_role_tool_provider::catalog::check_modes(tool).unwrap();
@@ -727,24 +758,37 @@ async fn provider_discovery_catalog_and_hello_agree_on_exact_tool_table() {
 }
 
 #[tokio::test]
+async fn catalog_reply_has_top_level_tools() {
+    let f = Fixture::new();
+    let body = response_body(f.call("tool.catalog", json!({})).await);
+    let reply: Value = serde_json::from_slice(&body).unwrap();
+    assert!(reply.get("tools").is_some_and(Value::is_array));
+    let catalog: CatalogAnswer = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        reply["tools"].as_array().unwrap().len(),
+        catalog.tools.len()
+    );
+}
+
+#[tokio::test]
 async fn catalog_digest_only_and_composition_are_stable_and_unsupported_inputs_refuse() {
     let f = Fixture::new();
     for input in [
         json!({}),
         json!({"composition":{"provider":"entorhinal", "params":{}}}),
     ] {
-        let full = result(f.call("tool.catalog", input.clone()).await);
+        let full = tool_result(f.call("tool.catalog", input.clone()).await);
         let mut digest_only = input.clone();
         digest_only["digest_only"] = json!(true);
-        let digest = result(f.call("tool.catalog", digest_only).await);
+        let digest = tool_result(f.call("tool.catalog", digest_only).await);
         assert_eq!(
             digest,
             json!({"generation":full["generation"], "catalog_digest":full["catalog_digest"]})
         );
-        assert_eq!(full, result(f.call("tool.catalog", input).await));
+        assert_eq!(full, tool_result(f.call("tool.catalog", input).await));
     }
-    let full = result(f.call("tool.catalog", json!({})).await);
-    let composed = result(f.call("tool.catalog", json!({"composition":{"x":1}})).await);
+    let full = tool_result(f.call("tool.catalog", json!({})).await);
+    let composed = tool_result(f.call("tool.catalog", json!({"composition":{"x":1}})).await);
     assert_ne!(full["catalog_digest"], composed["catalog_digest"]);
     assert_eq!(full["generation"], full["catalog_digest"]);
     assert!(full.get("composition_digest").is_none());

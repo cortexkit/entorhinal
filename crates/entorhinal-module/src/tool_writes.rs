@@ -118,7 +118,7 @@ pub(crate) fn replay(value: Value) -> Result<Vec<u8>, HandlerError> {
             detail: error.get("detail").cloned().filter(|v| !v.is_null()),
         });
     }
-    encode_result(value)
+    encode_tool_reply(value)
 }
 
 impl ProjectsHandler {
@@ -187,7 +187,7 @@ impl ProjectsHandler {
                     break;
                 }
             }
-            return encode_result(json!({"agents":hires}));
+            return encode_tool_reply(json!({"agents":hires}));
         }
         let identity = RequestIdentity {
             agent_id: caller.into(),

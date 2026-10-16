@@ -4,7 +4,9 @@ use crate::catalog_trust::tests::{signed, vectors};
 use crate::fake_cingulate::{Effect, FakeCingulate};
 use crate::fake_registry::{FakeRegistry, Reply};
 use crate::log_client::{LogTransport, TransportError};
-use crate::tool_provider::tests::{error_code, result, Fixture as Tools};
+use crate::tool_provider::tests::{
+    error_code, module_result as result, tool_result, Fixture as Tools,
+};
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicBool, Ordering};
 use subc_client_rs::{CatalogList, SupervisorListResponse};
@@ -250,10 +252,10 @@ impl Fixture {
         json!({"spec":{"operation":"install","target":{"agent_id":self.tools.agents[0]},"package":NAME,"range":"^1.0.0"},"request_key":key})
     }
     async fn prepare(&self, key: &str) -> Value {
-        let prepared = result(self.tools.call("catalog_prepare", self.spec(key)).await);
+        let prepared = tool_result(self.tools.call("catalog_prepare", self.spec(key)).await);
         assert_eq!(prepared["state"], "pending");
         self.tools.handler.catalog_agent.finished.notified().await;
-        result(
+        tool_result(
             self.tools
                 .call("catalog_plan", json!({"plan_id":prepared["plan_id"]}))
                 .await,
@@ -316,7 +318,7 @@ async fn catalog_prepare_install_card_pins_ready_ack_active() {
     assert!(plan["moves"].is_object());
     f.cingulate
         .script("consent.await", Effect::Answer("approve_once"));
-    let installed = result(f.install(&plan).await);
+    let installed = tool_result(f.install(&plan).await);
     let generation = installed["generation_id"].as_str().unwrap();
     assert_eq!(f.cingulate.card_count(), 1);
     let card = f
@@ -332,7 +334,7 @@ async fn catalog_prepare_install_card_pins_ready_ack_active() {
         f.store().catalog_pins(&f.tools.agents[0]).unwrap()[0].archive_sha256,
         plan["closure"][0]["archive_sha256"]
     );
-    let generations = result(f.tools.call("catalog_generation", json!({})).await);
+    let generations = tool_result(f.tools.call("catalog_generation", json!({})).await);
     assert_eq!(generations["generations"][0]["state"], "ready");
     let read = result(
         f.op(
@@ -378,10 +380,10 @@ async fn catalog_covered_install_no_card_and_retry_once() {
     let plan = f.prepare("covered").await;
     assert_eq!(plan["state"], "ready", "{plan}");
     let before = f.store().generation().unwrap();
-    let installed = result(f.install(&plan).await);
+    let installed = tool_result(f.install(&plan).await);
     let after = f.store().generation().unwrap();
     assert!(after > before);
-    assert_eq!(result(f.install(&plan).await), installed);
+    assert_eq!(tool_result(f.install(&plan).await), installed);
     assert_eq!(f.store().generation().unwrap(), after);
     assert_eq!(
         f.store()
@@ -399,7 +401,7 @@ async fn catalog_always_publisher_then_covers_next_install() {
     let plan = f.prepare("always").await;
     f.cingulate
         .script("consent.await", Effect::Answer("approve_always_publisher"));
-    result(f.install(&plan).await);
+    tool_result(f.install(&plan).await);
     let grants = f.store().publisher_grants().unwrap();
     assert_eq!(grants.len(), 1);
     assert_eq!(grants[0].placement_agent_id, f.tools.agents[0]);
@@ -410,7 +412,7 @@ async fn catalog_always_publisher_then_covers_next_install() {
     assert_eq!(grants[0].ceiling, vec!["cap/example.read@1"]);
     let second = f.prepare("second").await;
     assert_eq!(second["state"], "ready", "{second}");
-    result(f.install(&second).await);
+    tool_result(f.install(&second).await);
     assert_eq!(f.cingulate.card_count(), 1);
     assert_eq!(
         f.store()
@@ -547,7 +549,7 @@ async fn catalog_refused_consumer_route_fails_plan_and_holds_generation() {
     let plan = f.prepare("role-lost-after-check").await;
     assert_eq!(plan["state"], "ready", "{plan}");
     f.consumers.has_role.store(false, Ordering::SeqCst);
-    let installed = result(f.install(&plan).await);
+    let installed = tool_result(f.install(&plan).await);
     let id = installed["generation_id"].as_str().unwrap();
     let generation = f
         .store()
@@ -562,7 +564,7 @@ async fn catalog_refused_consumer_route_fails_plan_and_holds_generation() {
         "service_not_provided"
     );
     f.consumers.has_role.store(true, Ordering::SeqCst);
-    assert_eq!(result(f.install(&plan).await), installed);
+    assert_eq!(tool_result(f.install(&plan).await), installed);
     assert_eq!(
         f.store()
             .catalog_generation(id, &f.tools.agents[0])
@@ -578,7 +580,7 @@ async fn catalog_prefetch_requires_all_checked_consumers_and_retries() {
     f.grant();
     let plan = f.prepare("prefetch").await;
     f.consumers.consumer.ready.store(false, Ordering::SeqCst);
-    let installed = result(f.install(&plan).await);
+    let installed = tool_result(f.install(&plan).await);
     let generation = installed["generation_id"].as_str().unwrap();
     let row = f
         .store()
@@ -602,7 +604,7 @@ async fn catalog_prefetch_requires_all_checked_consumers_and_retries() {
     );
     f.consumers.consumer.ready.store(true, Ordering::SeqCst);
     f.consumers.available.store(false, Ordering::SeqCst);
-    result(f.install(&plan).await);
+    tool_result(f.install(&plan).await);
     assert_eq!(
         f.store()
             .catalog_generation(generation, &f.tools.agents[0])
@@ -611,7 +613,7 @@ async fn catalog_prefetch_requires_all_checked_consumers_and_retries() {
         "approved"
     );
     f.consumers.available.store(true, Ordering::SeqCst);
-    assert_eq!(result(f.install(&plan).await), installed);
+    assert_eq!(tool_result(f.install(&plan).await), installed);
     let row = f
         .store()
         .catalog_generation(generation, &f.tools.agents[0])
@@ -636,7 +638,7 @@ async fn catalog_prepare_idempotence_validation_and_admission() {
         ),
         "invalid_request"
     );
-    let repeated = result(f.tools.call("catalog_prepare", f.spec("repeat")).await);
+    let repeated = tool_result(f.tools.call("catalog_prepare", f.spec("repeat")).await);
     assert_eq!(repeated["plan_id"], plan["plan_id"]);
     let mut other = f.spec("repeat");
     other["spec"]["range"] = json!("^2.0.0");
@@ -860,14 +862,14 @@ async fn catalog_third_party_scripts_force_card_despite_grant() {
     assert_eq!(plan["closure"][0]["has_scripts"], true);
     f.cingulate
         .script("consent.await", Effect::Answer("approve_once"));
-    result(f.install(&plan).await);
+    tool_result(f.install(&plan).await);
     assert_eq!(f.cingulate.card_count(), 1);
 }
 
 #[tokio::test]
 async fn catalog_pending_and_corrupt_bytes_never_raise_card() {
     let f = Fixture::new().await;
-    let created = result(f.tools.call("catalog_prepare", f.spec("pending")).await);
+    let created = tool_result(f.tools.call("catalog_prepare", f.spec("pending")).await);
     assert_eq!(error_code(f.install(&created).await), "plan_not_ready");
     f.tools.handler.catalog_agent.finished.notified().await;
     let f = Fixture::new().await;
@@ -982,7 +984,7 @@ async fn catalog_atomic_pin_failure_rolls_back_generation_grant_and_receipt() {
         .is_empty());
     assert!(f.store().catalog_audit().unwrap().is_empty());
     sql.execute_batch("DROP TRIGGER fail_pins").unwrap();
-    result(f.install(&plan).await);
+    tool_result(f.install(&plan).await);
     assert_eq!(f.cingulate.card_count(), 1);
     assert_eq!(f.store().publisher_grants().unwrap().len(), 1);
     assert_eq!(
@@ -1038,9 +1040,9 @@ async fn catalog_shared_install_appends_identity_log_once() {
         .unwrap();
     f.grant();
     let plan = f.prepare("shared-success").await;
-    let installed = result(f.install(&plan).await);
+    let installed = tool_result(f.install(&plan).await);
     assert_eq!(log.head(), 1);
-    assert_eq!(result(f.install(&plan).await), installed);
+    assert_eq!(tool_result(f.install(&plan).await), installed);
     assert_eq!(log.head(), 1);
     assert_eq!(f.store().catalog_pins(&f.tools.agents[0]).unwrap().len(), 1);
     assert!(f.store().verify().unwrap().ok);
@@ -1071,7 +1073,7 @@ async fn catalog_generations_hide_superseded_and_activation_needs_no_network() {
     let f = Fixture::new().await;
     f.grant();
     let first = f.prepare("old").await;
-    let old = result(f.install(&first).await);
+    let old = tool_result(f.install(&first).await);
     result(
         f.op(
             crate::tests::reserved(crate::WRITER_MODULE),
@@ -1081,7 +1083,7 @@ async fn catalog_generations_hide_superseded_and_activation_needs_no_network() {
         .await,
     );
     let second = f.prepare("new").await;
-    let new = result(f.install(&second).await);
+    let new = tool_result(f.install(&second).await);
     let before = f.consumers.consumer.calls.lock().unwrap().len();
     f.consumers.available.store(false, Ordering::SeqCst);
     result(
@@ -1092,7 +1094,7 @@ async fn catalog_generations_hide_superseded_and_activation_needs_no_network() {
         )
         .await,
     );
-    let generations = result(f.tools.call("catalog_generation", json!({})).await);
+    let generations = tool_result(f.tools.call("catalog_generation", json!({})).await);
     assert_eq!(generations["generations"].as_array().unwrap().len(), 1);
     assert_eq!(
         generations["generations"][0]["generation_id"],
@@ -1118,7 +1120,7 @@ async fn catalog_all_agent_roles_need_authorized_nonflow_nonworker_stamps() {
         let stamp = f.tools.stamp(role);
         f.tools.admit(Some(&stamp));
         assert_eq!(
-            result(f.tools.call("catalog_generation", json!({})).await),
+            tool_result(f.tools.call("catalog_generation", json!({})).await),
             json!({"generations":[]})
         );
         let mut unauthorized = stamp.clone();
@@ -1156,7 +1158,7 @@ async fn catalog_losing_one_of_two_checked_consumers_holds_generation() {
     assert_eq!(plan["card"]["facts"][0]["value"], "Verified skill section");
     assert_eq!(plan["card"]["facts"][1]["value"], "Additional skill checks");
     *f.consumers.extra.lock().unwrap() = None;
-    let installed = result(f.install(&plan).await);
+    let installed = tool_result(f.install(&plan).await);
     let id = installed["generation_id"].as_str().unwrap();
     let generation = f
         .store()
@@ -1165,7 +1167,7 @@ async fn catalog_losing_one_of_two_checked_consumers_holds_generation() {
     assert_eq!(generation.state, "approved");
     assert_eq!(generation.error.unwrap()["detail"]["module_id"], "zeta");
     *f.consumers.extra.lock().unwrap() = Some(extra.clone());
-    assert_eq!(result(f.install(&plan).await), installed);
+    assert_eq!(tool_result(f.install(&plan).await), installed);
     assert_eq!(
         f.store()
             .catalog_generation(id, &f.tools.agents[0])
@@ -1325,7 +1327,7 @@ async fn catalog_status_news_views_and_prepare_named_refusal() {
     let f = Fixture::new().await;
     f.grant();
     let plan = f.prepare("status-plan").await;
-    let installed = result(f.install(&plan).await);
+    let installed = tool_result(f.install(&plan).await);
     let id = installed["generation_id"].as_str().unwrap();
     let agent = &f.tools.agents[0];
     let available = result(
@@ -1344,7 +1346,7 @@ async fn catalog_status_news_views_and_prepare_named_refusal() {
     assert!(generation_reply(&before_news)
         .get("pinned_status")
         .is_none());
-    let withdrawn = result(f.tools.call("catalog_generation", json!({})).await);
+    let withdrawn = tool_result(f.tools.call("catalog_generation", json!({})).await);
     assert_eq!(withdrawn["generations"][0]["state"], "ready");
     assert_eq!(
         withdrawn["generations"][0]["pinned_status"][0]["state"],
