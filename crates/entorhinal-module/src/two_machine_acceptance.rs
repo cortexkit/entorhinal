@@ -3874,16 +3874,22 @@ async fn consent_workspace_and_hire_replicate_without_local_authority_rows() {
     )
     .await
     .unwrap();
+    fake.script("consent.await", Effect::Answer("approve_once"));
+    let body = serde_json::to_vec(&json!({"name":"agents_create_head","arguments":{"name":"Head","tag":"head","project_id":"P","request_key":"head"}})).unwrap();
+    let outcome = drive(a.handler.handle_served_request(&body, tool)).await;
+    assert!(
+        matches!(outcome, HandlerOutcome::Response(_)),
+        "{outcome:?}"
+    );
     let head = a
-        .call(
-            "agent.create",
-            json!({"role":"head","name":"Head","tag":"head","project_id":"P","request_key":"head"}),
-        )
-        .await
-        .unwrap()["agent"]["agent_id"]
-        .as_str()
+        .store()
+        .agent_snapshot()
         .unwrap()
-        .to_owned();
+        .agents
+        .into_iter()
+        .find(|row| row.role == "head")
+        .unwrap()
+        .agent_id;
     a.handler.route_admissions().insert(
         tool,
         RouteAdmission::from_bind(
@@ -3902,6 +3908,21 @@ async fn consent_workspace_and_hire_replicate_without_local_authority_rows() {
     );
     b.catch_up().await;
     assert_eq!(a.rows("agent"), b.rows("agent"));
+    let snapshot = b.store().agent_snapshot().unwrap();
+    assert_eq!(snapshot.agents.len(), 3);
+    for row in &snapshot.agents {
+        crate::shared_write::assert_wild_avatar(&serde_json::to_value(&row.avatar).unwrap());
+        let changes = b.store().agent_changes(0, None).unwrap();
+        let entries: Vec<_> = changes
+            .entries
+            .iter()
+            .filter(|entry| entry.agent_id == row.agent_id)
+            .collect();
+        assert_eq!(entries.len(), 1, "avatar must arrive in the create entry");
+        assert_eq!(entries[0].op, "agent.create");
+        assert_eq!(entries[0].row.avatar, row.avatar);
+        assert_eq!(row.agent_generation, 1);
+    }
     assert!(
         matches!(b.store().agent_changes(0,None).unwrap().entries.last().unwrap().authorization,Some(Authorization::Card { ref answer, .. }) if answer == "approve_always_project")
     );
@@ -4023,7 +4044,9 @@ async fn two_machines_receive_every_avatar_manifest_entry() {
     assert_eq!(a.shared(), b.shared());
     let cursor = b.store().generation().unwrap();
     let head = log.head();
-    let params = json!({"request_key":"avatars","entries":[
+    // New agents already have avatars, so exercise manifest replication by
+    // explicitly replacing those defaults rather than skipping seeded rows.
+    let params = json!({"request_key":"avatars","replace":true,"entries":[
         {"agent_id":ada,"avatar_genome":"a".repeat(32_768),"avatar_type":"creature.wild","avatar_version":1},
         {"agent_id":grace,"avatar_genome":"b".repeat(32_768),"avatar_type":"creature.wild","avatar_version":1}
     ]});

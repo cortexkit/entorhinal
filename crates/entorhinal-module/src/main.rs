@@ -597,6 +597,7 @@ struct ProjectsHandler {
     role_refresh_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     role_refresh_sql: Arc<move_driver::SqlOperations>,
     agent_id_draw: fn() -> Result<String, HandlerError>,
+    agent_avatar_draw: fn() -> Result<entorhinal_core::agent::StoredAgentAvatar, HandlerError>,
     /// Names the module providing each session capability on first use of a
     /// route, and once more before refusing a cached mismatch or unbound answer.
     provider_resolver: Arc<dyn sessions::ProviderResolver>,
@@ -945,6 +946,7 @@ impl ProjectsHandler {
             role_refresh_task: Mutex::new(None),
             role_refresh_sql: Arc::default(),
             agent_id_draw: shared_write::draw_agent_id,
+            agent_avatar_draw: shared_write::draw_agent_avatar,
             provider_resolver: Arc::new(sessions::SubcProviderResolver::from_args(
                 std::env::args_os().skip(1),
             )),

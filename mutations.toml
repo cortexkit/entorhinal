@@ -3734,6 +3734,21 @@ target = "--bin ck-entorhinal"
 expect_red = ["two_machine_acceptance::consent_workspace_and_hire_replicate_without_local_authority_rows"]
 
 [[control]]
+id = "create-avatar-fallback-validates-length"
+guards = "A supplied default genome passes the same per-type length validation as an explicit avatar"
+file = "crates/entorhinal-core/src/agent/store.rs"
+old = '''                    validate_agent_avatar(&avatar.genome, Some(&avatar.avatar_type))?;
+                    prepared.row.avatar = Some(avatar.clone());'''
+new = '''                    // NON-VACUITY BREAK: omit default genome validation.
+                    prepared.row.avatar = Some(avatar.clone());'''
+test_file = "crates/entorhinal-module/src/shared_write.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["shared_write::tests::create_defaults_are_atomic_explicit_avatars_win_and_entropy_failure_refuses"]
+
+[[control]]
 id = "move-record-unknown-reason"
 guards = "An unknown reason on an aborted move remains opaque through decode and encode"
 file = "crates/entorhinal-core/src/move_record.rs"
@@ -9101,3 +9116,82 @@ runner = "cargo"
 package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 expect_red = ["tool_provider::tests::catalog_reply_has_top_level_tools"]
+
+# Creation must carry its first avatar in the original identity after-image.
+[[control]]
+id = "create-avatar-default-after-image"
+guards = "A missing avatar is filled in the create transaction, not in a later identity change"
+file = "crates/entorhinal-core/src/agent/store.rs"
+old = 'prepared.row.avatar = Some(avatar.clone());'
+new = 'prepared.row.avatar = None; // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/shared_write.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["shared_write::tests::create_defaults_are_atomic_explicit_avatars_win_and_entropy_failure_refuses"]
+
+[[control]]
+id = "create-avatar-explicit-wins"
+guards = "An explicit create avatar is preserved without drawing fallback entropy"
+file = "crates/entorhinal-core/src/agent/store.rs"
+old = 'avatar: r.avatar.clone(),'
+new = 'avatar: None, // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/shared_write.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["shared_write::tests::create_defaults_are_atomic_explicit_avatars_win_and_entropy_failure_refuses"]
+
+[[control]]
+id = "create-avatar-entropy-fail-closed"
+guards = "Failed OS entropy refuses creation rather than storing an avatarless agent"
+file = "crates/entorhinal-module/src/shared_write.rs"
+old = 'Some((self.agent_avatar_draw)()?)'
+new = '(self.agent_avatar_draw)().ok() // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/shared_write.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["shared_write::tests::create_defaults_are_atomic_explicit_avatars_win_and_entropy_failure_refuses"]
+
+[[control]]
+id = "create-avatar-draw-once"
+guards = "A head-moved retry reuses the original genome rather than drawing again"
+file = "crates/entorhinal-module/src/shared_write.rs"
+old = 'let stable_avatar = avatar.clone();'
+new = 'let stable_avatar = Some((self.agent_avatar_draw)()?); // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/shared_write.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["shared_write::tests::head_moved_uses_new_entry_id_but_agent_id_drawn_once_before_attempts"]
+
+[[control]]
+id = "create-avatar-direct-writer"
+guards = "A Touch ID approved Direct create supplies the pre-drawn avatar to the same writer"
+file = "crates/entorhinal-module/src/shared_write.rs"
+old = '.with_create_avatar(avatar)'
+new = '.with_create_avatar(None) // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/shared_write.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["shared_write::tests::confirmation::served::confirmed_direct_create_commits_with_the_exact_summary_and_route"]
+
+[[control]]
+id = "create-avatar-consent-tools"
+guards = "Consent-approved hire and head creation both draw a default avatar that the second Mac receives"
+file = "crates/entorhinal-module/src/shared_write.rs"
+old = '|| matches!(&prepared, Some(Write::Consent(plan,_)) if matches!(plan.tool.as_str(), "agents_hire" | "agents_create_head"));'
+new = '|| false; // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::consent_workspace_and_hire_replicate_without_local_authority_rows"]
