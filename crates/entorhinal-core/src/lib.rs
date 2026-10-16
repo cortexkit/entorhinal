@@ -293,6 +293,7 @@ pub struct JournalWriter<'a> {
     /// carry here instead of checking `confirmation`.
     probe: Option<&'a std::cell::RefCell<Option<String>>>,
     consent: Option<agent::consent::ConsentCommit>,
+    create_avatar: Option<agent::StoredAgentAvatar>,
 }
 
 impl std::ops::Deref for JournalWriter<'_> {
@@ -337,6 +338,7 @@ impl RegistryStore {
             confirmation: agent::PlacementConfirmation::NotRequired,
             probe: None,
             consent: None,
+            create_avatar: None,
         }
     }
 

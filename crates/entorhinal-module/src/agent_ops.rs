@@ -902,6 +902,30 @@ mod tests {
         ]
     }
 
+    #[tokio::test]
+    async fn import_and_rebuild_never_invent_an_avatar() {
+        fn no_entropy() -> Result<entorhinal_core::agent::StoredAgentAvatar, HandlerError> {
+            panic!("imports must not draw an avatar")
+        }
+        let mut f = Fixture::new();
+        f.handler.agent_avatar_draw = no_entropy;
+        f.source_sql("INSERT INTO agent(agent_id,name,tag,role,created_at_ms,updated_at_ms) VALUES('agent_0000000000000001','Imported','','assistant',10,10); INSERT INTO agent_name_claim(agent_id,namespace_kind,namespace_key,normalized_name,display_name,claimed_at_ms) VALUES('agent_0000000000000001','assistant','global','imported','Imported',10);");
+        let body = serde_json::to_vec(&json!({"method":"agent.import","params":f.params("agent.import",Some("import-without-avatar"))})).unwrap();
+        let outcome = f.handler.handle_served_request(&body, OPERATOR).await;
+        assert!(
+            matches!(outcome, HandlerOutcome::Response(_)),
+            "{outcome:?}"
+        );
+        f.handler
+            .with_store(|store| {
+                assert!(store.agent_row(A).unwrap().unwrap().avatar.is_none());
+                store.rebuild()?;
+                assert!(store.agent_row(A).unwrap().unwrap().avatar.is_none());
+                Ok(())
+            })
+            .unwrap();
+    }
+
     /// Commit a real key for every op; later admission tests must not read those
     /// cache entries, even when their bodies would otherwise decode or succeed.
     fn commit_every_mutation(f: &Fixture) -> Vec<(&'static str, Value, Value)> {

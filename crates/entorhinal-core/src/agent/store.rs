@@ -235,7 +235,7 @@ macro_rules! request {
         struct $name { $($field:$ty,)* request_key:Option<String>, actor:Option<String> }
     };
 }
-request!(Create { role:Role, name:String, tag:String, project_id:Option<String>, workspace_id:Option<String>, supervisor_agent_id:Option<String> });
+request!(Create { role:Role, name:String, tag:String, project_id:Option<String>, workspace_id:Option<String>, supervisor_agent_id:Option<String>, avatar:Option<StoredAgentAvatar> });
 request!(Rename {
     agent_id: String,
     name: String
@@ -490,6 +490,9 @@ fn validate_create(
         key: key.into(),
         name: name.clone(),
     };
+    if let Some(avatar) = &r.avatar {
+        validate_agent_avatar(&avatar.genome, Some(&avatar.avatar_type))?;
+    }
     let row = AgentRow {
         agent_id: String::new(),
         name: name.stored_name.clone(),
@@ -508,7 +511,7 @@ fn validate_create(
         } else {
             None
         },
-        avatar: None,
+        avatar: r.avatar.clone(),
         github_identity: None,
         status: "live".into(),
         merged_into: None,
@@ -953,6 +956,13 @@ impl RegistryStore {
 }
 
 impl JournalWriter<'_> {
+    /// Supply a pre-drawn avatar for creates that do not specify one. Keeping
+    /// entropy outside the transaction lets shared-log retries reuse the genome.
+    pub fn with_create_avatar(mut self, avatar: Option<StoredAgentAvatar>) -> Self {
+        self.create_avatar = avatar;
+        self
+    }
+
     /// Before asking for consent, validate the requesting head agent, the hire
     /// arguments and the project cap without writing. The hire write repeats the
     /// cap check inside its transaction so concurrent changes cannot bypass it.
@@ -1080,6 +1090,12 @@ impl JournalWriter<'_> {
         self.mutation_with_error(op, Some(key), |tx| {
             require_cutover(tx)?;
             let mut prepared = validate(tx, &request, now)?;
+            if prepared.previous.is_none() && prepared.row.avatar.is_none() {
+                if let Some(avatar) = &self.create_avatar {
+                    validate_agent_avatar(&avatar.genome, Some(&avatar.avatar_type))?;
+                    prepared.row.avatar = Some(avatar.clone());
+                }
+            }
             if let Some(labels) = initial_labels {
                 prepared.row.labels = validate_agent_labels(labels)?;
             }

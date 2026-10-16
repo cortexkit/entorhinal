@@ -61,6 +61,13 @@ mod tests {
         DRAWS.fetch_add(1, Ordering::SeqCst);
         Ok("agent_0123456789abcdef".into())
     }
+    fn fixed_avatar() -> Result<entorhinal_core::agent::StoredAgentAvatar, HandlerError> {
+        Ok(entorhinal_core::agent::StoredAgentAvatar {
+            genome: "ab".repeat(16_384),
+            avatar_type: "creature.wild".into(),
+            version: Some(1),
+        })
+    }
 
     /// Require a result on the first poll, without waiting for another async task.
     /// Tests use this while a write holds the lock or waits for the log's reply,
@@ -183,8 +190,9 @@ mod tests {
             descriptor: &StorageDescriptor,
             connector: Arc<dyn LogConnector>,
         ) -> ProjectsHandler {
-            let handler =
+            let mut handler =
                 ProjectsHandler::with_log_connector("0123456789abcdef".into(), || 700, connector);
+            handler.agent_avatar_draw = fixed_avatar;
             *handler.store.lock().unwrap() = Some(RegistryStore::open(descriptor).unwrap());
             handler.health.store_ready.store(true, Ordering::Relaxed);
             handler.route_admissions().insert(
@@ -584,10 +592,16 @@ mod tests {
 
     #[tokio::test]
     async fn head_moved_uses_new_entry_id_but_agent_id_drawn_once_before_attempts() {
+        static AVATAR_DRAWS: AtomicUsize = AtomicUsize::new(0);
+        fn counting_avatar() -> Result<entorhinal_core::agent::StoredAgentAvatar, HandlerError> {
+            AVATAR_DRAWS.fetch_add(1, Ordering::SeqCst);
+            draw_agent_avatar()
+        }
         DRAWS.store(0, Ordering::SeqCst);
         let tap = Tap::new(1);
         let mut f = Fixture::new("write-race", connector(&tap));
         f.handler.agent_id_draw = fixed_draw;
+        f.handler.agent_avatar_draw = counting_avatar;
         let body: Value =
             serde_json::from_slice(&f.call("agent.create", agent("new-agent")).await.unwrap())
                 .unwrap();
@@ -596,6 +610,7 @@ mod tests {
             "agent_0123456789abcdef"
         );
         assert_eq!(DRAWS.load(Ordering::SeqCst), 1);
+        assert_eq!(AVATAR_DRAWS.load(Ordering::SeqCst), 1);
         let sends = tap.sends();
         assert_eq!(sends.len(), 2);
         assert_ne!(sends[0]["entry_id"], sends[1]["entry_id"]);
@@ -606,10 +621,124 @@ mod tests {
             .unwrap();
             assert_eq!(entry["agent_id"], "agent_0123456789abcdef");
             assert_eq!(entry["row"]["created_at_ms"], 700);
+            assert_wild_avatar(&entry["row"]["avatar"]);
+            assert_eq!(
+                entry["row"]["avatar"]["genome"],
+                f.store().agent_snapshot().unwrap().agents[0]
+                    .avatar
+                    .as_ref()
+                    .unwrap()
+                    .genome
+            );
         }
         assert_eq!(f.pending(), 0);
         assert_eq!(f.store().agent_snapshot().unwrap().agents.len(), 1);
         assert!(f.store().verify().unwrap().ok);
+    }
+
+    #[tokio::test]
+    async fn avatar_create_lost_reply_resends_identical_bytes() {
+        let tap = Tap::new(0);
+        tap.fake.on_append(Action::DropReply);
+        let mut f = Fixture::new("avatar-create-lost", connector(&tap));
+        f.handler.agent_avatar_draw = draw_agent_avatar;
+        f.call("agent.create", agent("avatar-lost")).await.unwrap();
+        let sends = tap.sends();
+        assert_eq!(sends.len(), 2);
+        assert_eq!(sends[0], sends[1]);
+        let entry: Value = serde_json::from_slice(
+            &log_client::decode_hex(sends[0]["entry"]["data"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_wild_avatar(&entry["row"]["avatar"]);
+        assert_eq!(f.store().agent_changes(0, None).unwrap().entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_defaults_are_atomic_explicit_avatars_win_and_entropy_failure_refuses() {
+        fn failed_entropy() -> Result<entorhinal_core::agent::StoredAgentAvatar, HandlerError> {
+            Err(HandlerError::new("storage_error", "entropy unavailable"))
+        }
+        fn malformed_genome() -> Result<entorhinal_core::agent::StoredAgentAvatar, HandlerError> {
+            Ok(entorhinal_core::agent::StoredAgentAvatar {
+                genome: "ab".into(),
+                avatar_type: "creature.wild".into(),
+                version: Some(1),
+            })
+        }
+        for enabled in [false, true] {
+            let log = Arc::new(FakeLog::default());
+            let mut f = Fixture::new("create-avatars", log.clone());
+            if !enabled {
+                f.store()
+                    .apply_entry("disable", "{}", "test", None, |tx| {
+                        tx.execute("UPDATE identity_log_state SET state='disabled'", [])?;
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            f.handler.agent_avatar_draw = draw_agent_avatar;
+            let created: Value =
+                serde_json::from_slice(&f.call("agent.create", agent("wild")).await.unwrap())
+                    .unwrap();
+            let id = created["result"]["agent"]["agent_id"].as_str().unwrap();
+            let row = f.store().agent_row(id).unwrap().unwrap();
+            assert_wild_avatar(&serde_json::to_value(&row.avatar).unwrap());
+            let feed = f.store().agent_changes(0, None).unwrap();
+            assert_eq!(feed.entries.len(), 1);
+            assert_eq!(feed.entries[0].op, "agent.create");
+            assert_eq!(feed.entries[0].row.avatar, row.avatar);
+            assert_eq!(row.agent_generation, 1);
+            f.handler.agent_avatar_draw = failed_entropy;
+            let mut explicit = agent("explicit");
+            explicit["name"] = json!("Explicit");
+            explicit["avatar"] =
+                json!({"type":"creature.classic","version":2,"genome":"cd".repeat(1024)});
+            let reply: Value =
+                serde_json::from_slice(&f.call("agent.create", explicit.clone()).await.unwrap())
+                    .unwrap();
+            let id = reply["result"]["agent"]["agent_id"].as_str().unwrap();
+            assert_eq!(
+                serde_json::to_value(f.store().agent_row(id).unwrap().unwrap().avatar).unwrap(),
+                explicit["avatar"]
+            );
+            let before = serde_json::to_value(f.store().agent_snapshot().unwrap()).unwrap();
+            let mut no_entropy = agent("no-entropy");
+            no_entropy["name"] = json!("No entropy");
+            assert_eq!(
+                f.call("agent.create", no_entropy).await.unwrap_err().code,
+                "storage_error"
+            );
+            assert_eq!(
+                serde_json::to_value(f.store().agent_snapshot().unwrap()).unwrap(),
+                before
+            );
+            let mut malformed = agent("malformed");
+            malformed["name"] = json!("Malformed");
+            malformed["avatar"] = json!({"type":"creature.wild","version":1,"genome":"ab"});
+            assert_eq!(
+                f.call("agent.create", malformed).await.unwrap_err().code,
+                "invalid_request"
+            );
+            assert_eq!(
+                serde_json::to_value(f.store().agent_snapshot().unwrap()).unwrap(),
+                before
+            );
+            f.handler.agent_avatar_draw = malformed_genome;
+            let mut malformed_default = agent("malformed-default");
+            malformed_default["name"] = json!("Malformed default");
+            assert_eq!(
+                f.call("agent.create", malformed_default)
+                    .await
+                    .unwrap_err()
+                    .code,
+                "invalid_request"
+            );
+            assert_eq!(
+                serde_json::to_value(f.store().agent_snapshot().unwrap()).unwrap(),
+                before
+            );
+        }
     }
 
     #[tokio::test]
@@ -2290,6 +2419,12 @@ mod tests {
                 assert_eq!(journal[0].principal.as_deref(), Some("direct"));
                 let payload: Value = serde_json::from_str(&journal[0].payload_json).unwrap();
                 assert_eq!(payload["operator_confirmed"], true);
+                assert_wild_avatar(&payload["entry"]["row"]["avatar"]);
+                assert_eq!(
+                    serde_json::to_value(f.store().agent_row(&agent).unwrap().unwrap().avatar)
+                        .unwrap(),
+                    payload["entry"]["row"]["avatar"]
+                );
                 assert!(f.store().generation().unwrap() > generation);
                 assert!(serde_json::to_string(&f.store().agent_snapshot().unwrap())
                     .unwrap()
@@ -2471,10 +2606,12 @@ impl Write {
         principal: &str,
         now: i64,
         agent_id: &str,
+        avatar: Option<entorhinal_core::agent::StoredAgentAvatar>,
         approval: Option<&OperatorApproval>,
     ) -> Result<Vec<u8>, HandlerError> {
         let writer = store
             .with_principal(principal)
+            .with_create_avatar(avatar)
             .with_confirmation(placement_confirmation(principal, approval));
         match self {
             Self::ManifestAvatar(approval, index) => return approval.apply(store, index, now),
@@ -2551,6 +2688,31 @@ pub(super) fn draw_agent_id() -> Result<String, HandlerError> {
     getrandom::getrandom(&mut random)
         .map_err(|e| HandlerError::new("storage_error", e.to_string()))?;
     Ok(format!("agent_{}", log_client::encode_hex(&random)))
+}
+
+pub(super) fn draw_agent_avatar() -> Result<entorhinal_core::agent::StoredAgentAvatar, HandlerError>
+{
+    let mut random = [0u8; 16_384];
+    getrandom::getrandom(&mut random)
+        .map_err(|e| HandlerError::new("storage_error", e.to_string()))?;
+    Ok(entorhinal_core::agent::StoredAgentAvatar {
+        genome: log_client::encode_hex(&random),
+        avatar_type: "creature.wild".into(),
+        version: Some(1),
+    })
+}
+
+#[cfg(test)]
+pub(super) fn assert_wild_avatar(avatar: &Value) {
+    assert_eq!(avatar["type"], "creature.wild");
+    assert_eq!(avatar["version"], 1);
+    let genome = avatar["genome"]
+        .as_str()
+        .expect("a create must carry an avatar genome");
+    assert_eq!(genome.len(), 32_768);
+    assert!(genome
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
 }
 
 impl From<RegistryError> for HandlerError {
@@ -2870,22 +3032,56 @@ impl ProjectsHandler {
             ));
         }
         bootstrap_fence(&store, &state, &request)?;
+        // Draw identity and appearance once, before either a local write or the
+        // first shared attempt. A head-moved retry must retain both after-images.
+        let creating = request.method == "agent.create"
+            || matches!(&prepared, Some(Write::Consent(plan,_)) if matches!(plan.tool.as_str(), "agents_hire" | "agents_create_head"));
+        if creating {
+            if let Some(body) =
+                prepared
+                    .as_ref()
+                    .unwrap()
+                    .probe(&store, &request.method, &principal)?
+            {
+                return if request.method.starts_with("agent.") {
+                    self.attach_incarnation(body)
+                } else {
+                    Ok(body)
+                };
+            }
+        }
+        let agent_id = if creating {
+            (self.agent_id_draw)()?
+        } else {
+            String::new()
+        };
+        let avatar = if creating && request.params.get("avatar").is_none_or(Value::is_null) {
+            Some((self.agent_avatar_draw)()?)
+        } else {
+            None
+        };
         if state != "enabled" || !candidate {
             if agent_write {
-                let body = prepared
-                    .unwrap()
-                    .run(&store, &principal, (self.clock)(), "", None)?;
+                let body = prepared.unwrap().run(
+                    &store,
+                    &principal,
+                    (self.clock)(),
+                    &agent_id,
+                    avatar,
+                    None,
+                )?;
                 self.commits.notify_waiters();
                 return self.record_mutation(Ok(body));
             }
-            if let Some(approval) = &approval {
+            if approval.is_some() || creating {
                 let before = store.generation().map_err(storage_error)?;
                 let body = prepared.unwrap().run(
                     &store,
                     &principal,
                     (self.clock)(),
-                    "",
-                    Some(approval),
+                    &agent_id,
+                    avatar,
+                    approval.as_ref(),
                 )?;
                 // Confirmed local commits wake the identity feed just like
                 // execute does; a cached reply must not wake idle readers.
@@ -2918,13 +3114,6 @@ impl ProjectsHandler {
             };
         }
         let now = (self.clock)();
-        let agent_id = if request.method == "agent.create"
-            || matches!(&write, Write::Consent(plan,_) if matches!(plan.tool.as_str(), "agents_hire" | "agents_create_head"))
-        {
-            (self.agent_id_draw)()?
-        } else {
-            String::new()
-        };
         let settlement = if agent_write {
             (received + SETTLEMENT).min(deadline)
         } else if direct {
@@ -2946,6 +3135,7 @@ impl ProjectsHandler {
             let operation = write.clone();
             let principal = principal.clone();
             let stable_id = agent_id.clone();
+            let stable_avatar = avatar.clone();
             let approval = approval.clone();
             let health = self.health.clone();
             #[cfg(test)]
@@ -2986,6 +3176,7 @@ impl ProjectsHandler {
                             &principal,
                             now,
                             &stable_id,
+                            stable_avatar,
                             approval.as_ref(),
                         )
                     },

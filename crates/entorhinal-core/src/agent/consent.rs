@@ -817,6 +817,7 @@ impl RegistryStore {
             principal: "agent",
             confirmation: super::PlacementConfirmation::NotRequired,
             probe: Some(&summary),
+            create_avatar: None,
             consent: Some(ConsentCommit {
                 request,
                 authorization: Authorization::OwnHire,

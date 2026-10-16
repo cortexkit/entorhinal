@@ -1310,6 +1310,7 @@ impl RegistryStore {
             confirmation: PlacementConfirmation::NotRequired,
             probe: Some(&summary),
             consent: None,
+            create_avatar: None,
         };
         let cached = |key: Option<&str>| self.shared_request_cache(op, key);
         macro_rules! probe {
