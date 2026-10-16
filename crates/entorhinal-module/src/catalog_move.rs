@@ -4,7 +4,9 @@
 //! permissions. The receiver already has the agent's shared pins (the exact
 //! package versions and digests recorded for the agent and replicated to every
 //! Mac through the identity log), and it reads only content that matches them.
+mod request;
 mod stream;
+mod trust;
 
 use crate::{
     catalog_blob::BlobStore,
@@ -17,7 +19,7 @@ use cortexkit_role_agent_data::{
     refs::Ref,
     request::CutRequest,
 };
-use entorhinal_catalog::{hex, names, record, sha256_hex};
+use entorhinal_catalog::{hex, record, sha256_hex};
 use entorhinal_core::{
     catalog_agent::{CatalogPin, CatalogSpec, CatalogTarget, PreparedPackage, PreparedPlan},
     RegistryStore,
@@ -69,6 +71,7 @@ pub(crate) struct CatalogMove {
     clock: fn() -> i64,
     sources: Arc<crate::catalog_agent::TrustFactory>,
     root: Option<String>,
+    request_timeout: Duration,
 }
 impl ProjectsHandler {
     pub(crate) fn catalog_move_context(&self) -> CatalogMove {
@@ -81,6 +84,7 @@ impl ProjectsHandler {
             clock: self.clock,
             sources: self.catalog_agent.sources.clone(),
             root: crate::catalog_trust::CORTEXKIT_ROOT.map(str::to_owned),
+            request_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -88,6 +92,11 @@ impl CatalogMove {
     #[cfg(test)]
     pub(crate) fn with_test_root(mut self, root: String) -> Self {
         self.root = Some(root);
+        self
+    }
+    #[cfg(test)]
+    pub(crate) fn with_test_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
         self
     }
     fn store(&self) -> Result<RegistryStore, HandlerError> {
@@ -123,6 +132,10 @@ impl CatalogMove {
         }
     }
     fn save(&self, cut: &str, state: &Checkpoint) -> Result<(), HandlerError> {
+        let _write = request::CheckpointWrite::take(self.directory(cut)?)?;
+        if state.step != "aborted" {
+            self.not_aborted(cut)?;
+        }
         let path = self
             .catalog_path("move-checkpoints", cut)?
             .with_extension("json");
@@ -150,6 +163,15 @@ impl CatalogMove {
         agent: &str,
         expected: &str,
     ) -> Result<Vec<CatalogPin>, HandlerError> {
+        tokio::time::timeout(self.request_timeout, self.preflight_inner(agent, expected))
+            .await
+            .map_err(|_| unavailable("catalog move preflight deadline exceeded"))?
+    }
+    async fn preflight_inner(
+        &self,
+        agent: &str,
+        expected: &str,
+    ) -> Result<Vec<CatalogPin>, HandlerError> {
         let store = self.store()?;
         let local_agent = agent.to_owned();
         let local = crate::catalog_sql::run(move || {
@@ -161,17 +183,17 @@ impl CatalogMove {
         if local != expected {
             self.catch_up.for_move().await?;
         }
-        self.local_preflight(agent, expected).await
+        self.local_preflight(agent, expected).await.map(|p| p.pins)
     }
     async fn local_preflight(
         &self,
         agent: &str,
         expected: &str,
-    ) -> Result<Vec<CatalogPin>, HandlerError> {
+    ) -> Result<trust::Preflight, HandlerError> {
         let store = self.store()?;
         let local_agent = agent.to_owned();
-        let (pins, grants) = crate::catalog_sql::run(move || {
-            Ok::<_, HandlerError>((store.catalog_pins(&local_agent)?, store.publisher_grants()?))
+        let pins = crate::catalog_sql::run(move || {
+            store.catalog_pins(&local_agent).map_err(HandlerError::from)
         })
         .await?;
         let actual = entorhinal_core::catalog_agent::pin_digest(&pins).map_err(unavailable)?;
@@ -182,55 +204,9 @@ impl CatalogMove {
                 detail: Some(json!({"source_pin_digest":expected,"receiver_pin_digest":actual})),
             });
         }
-
-        let root_keys =
-            if pins.iter().any(|p| p.name.starts_with("@cortexkit/")) && self.root.is_some() {
-                let store = self.store()?;
-                let sources = self.sources.clone();
-                match crate::catalog_sql::run(move || sources(store, "@cortexkit")).await {
-                    Ok(mut trust) => {
-                        trust.use_weak_store(self.store.clone());
-                        trust
-                            .scope_keys(self.root.as_deref())
-                            .await
-                            .unwrap_or_default()
-                    }
-                    Err(_) => vec![],
-                }
-            } else {
-                vec![]
-            };
-        let mut missing = std::collections::BTreeSet::new();
-        for pin in &pins {
-            let trusted = if pin.name.starts_with("@cortexkit/") {
-                root_keys.iter().any(|key| {
-                    entorhinal_catalog::key_fingerprint(&key.public_key).as_deref()
-                        == Some(&pin.publisher_fingerprint)
-                        && key.revocation.is_none()
-                })
-            } else {
-                grants.iter().any(|g| {
-                    g.publisher_fingerprint == pin.publisher_fingerprint
-                        && g.placement_agent_id == agent
-                        && g.operation == entorhinal_core::catalog_grants::Operation::Install
-                        && g.revoked_at_ms.is_none()
-                })
-            };
-            if !trusted {
-                let publisher = names::map_name(&pin.name).map_err(unavailable)?.scope;
-                missing.insert((format!("@{publisher}"), pin.publisher_fingerprint.clone()));
-            }
-        }
-        if !missing.is_empty() {
-            return Err(HandlerError {
-                code: "trust_missing".into(),
-                message: "trust these publishers on the target Mac and retry".into(),
-                detail: Some(
-                    json!({"publishers":missing.into_iter().map(|(publisher,publisher_fingerprint)| json!({"publisher":publisher,"publisher_fingerprint":publisher_fingerprint})).collect::<Vec<_>>()}),
-                ),
-            });
-        }
-        Ok(pins)
+        let checked = self.current_trust(pins).await?;
+        self.coverage(agent, &checked, None).await?;
+        Ok(checked)
     }
     async fn expected(&self, cut: &str, agent: &str) -> Result<String, HandlerError> {
         let store = self.store()?;
@@ -258,8 +234,9 @@ impl CatalogMove {
             .into_iter()
             .find(|op| op.method() == method)
             .ok_or_else(|| HandlerError::new("invalid_request", "unknown agent-data operation"))?;
-        self.execute_inner(method, params)
+        tokio::time::timeout(self.request_timeout, self.execute_inner(method, params))
             .await
+            .unwrap_or_else(|_| Err(unavailable("catalog move request deadline exceeded")))
             .map_err(|mut error| {
                 if matches!(error.code.as_str(), "trust_missing" | "pin_digest_mismatch") {
                     error.detail = Some(json!({"reason":error.code,"detail":error.detail}));
@@ -274,7 +251,6 @@ impl CatalogMove {
             })
     }
     async fn execute_inner(&self, method: &str, params: Value) -> Result<Value, HandlerError> {
-        let _guard = self.lock.lock().await;
         if method == "agent_data.describe" {
             let _: cortexkit_role_agent_data::describe::DescribeRequest =
                 serde_json::from_value(params)
@@ -325,7 +301,15 @@ impl CatalogMove {
             }
             return Ok(json!({"step":saved.map_or("none".into(), |s| s.step)}));
         }
+        let _admission = if method == "agent_data.abort" {
+            None
+        } else {
+            Some(request::Admission::take(self.directory(id)?)?)
+        };
         let expected = self.expected(id, agent).await?;
+        if method != "agent_data.abort" {
+            self.not_aborted(id)?;
+        }
         if saved
             .as_ref()
             .is_some_and(|s| s.agent != agent || s.pin_digest != expected)
@@ -363,13 +347,16 @@ impl CatalogMove {
                     .await?;
                     let store = self.store()?;
                     let dir = self.directory(id)?;
-                    private_dir(&dir)?;
-                    let (end_offset, digest) = stream::encode(
-                        &dir.join("payload"),
-                        &BlobStore::new(store.store_folder())?,
-                        &pins,
-                    )
-                    .map_err(|e| HandlerError::new("not_exportable", e.message))?;
+                    let (end_offset, digest) = crate::catalog_sql::run(move || {
+                        private_dir(&dir)?;
+                        stream::encode(
+                            &dir.join("payload"),
+                            &BlobStore::new(store.store_folder())?,
+                            &pins,
+                        )
+                        .map_err(|e| HandlerError::new("not_exportable", e.message))
+                    })
+                    .await?;
                     let state = Checkpoint {
                         agent: agent.into(),
                         pin_digest: expected.into(),
@@ -419,7 +406,7 @@ impl CatalogMove {
                 Ok(json!({"refs":[{"state":"at_cut"}]}))
             }
             "agent_data.import" => {
-                let pins = self.local_preflight(agent, expected).await?;
+                let checked = self.local_preflight(agent, expected).await?;
                 if saved
                     .as_ref()
                     .is_some_and(|s| matches!(s.step.as_str(), "imported" | "activated"))
@@ -449,9 +436,20 @@ impl CatalogMove {
                 let stage = dir.join("staging");
                 private_dir(&stage)?;
                 self.download(id, &item, &dir.join("payload")).await?;
-                stream::decode(&dir.join("payload"), &stage, &pins)?;
-                let packages = staged_packages(&stage, &pins)?;
-                self.local_preflight(agent, expected).await?;
+                let payload = dir.join("payload");
+                let worker_stage = stage.clone();
+                crate::catalog_sql::run(move || {
+                    stream::decode(&payload, &worker_stage, &checked.pins)
+                })
+                .await?;
+                let checked = self.local_preflight(agent, expected).await?;
+                let worker_stage = stage.clone();
+                let (checked, packages) = crate::catalog_sql::run(move || {
+                    let packages = staged_packages(&worker_stage, &checked)?;
+                    Ok::<_, HandlerError>((checked, packages))
+                })
+                .await?;
+                self.coverage(agent, &checked, Some(&packages)).await?;
                 self.install(id, agent, &stage, packages).await?;
                 let state = Checkpoint {
                     agent: agent.into(),
@@ -480,6 +478,8 @@ impl CatalogMove {
                 Ok(json!({}))
             }
             "agent_data.abort" => {
+                let guard = self.admit().await?;
+                *saved = self.load(id)?;
                 if saved
                     .as_ref()
                     .is_some_and(|s| matches!(s.step.as_str(), "activated" | "released"))
@@ -489,15 +489,6 @@ impl CatalogMove {
                         "catalog cut cannot abort",
                     ));
                 }
-                let store = self.store()?;
-                let cut = id.to_owned();
-                let local_agent = agent.to_owned();
-                crate::catalog_sql::run(move || {
-                    store
-                        .catalog_discard_move_generation(&cut, &local_agent)
-                        .map_err(unavailable)
-                })
-                .await?;
                 let state = saved.get_or_insert_with(|| Checkpoint {
                     agent: agent.into(),
                     pin_digest: expected.into(),
@@ -511,6 +502,16 @@ impl CatalogMove {
                 });
                 state.step = "aborted".into();
                 self.save(id, state)?;
+                let store = self.store()?;
+                let cut = id.to_owned();
+                let local_agent = agent.to_owned();
+                crate::catalog_sql::run(move || {
+                    let _guard = guard;
+                    store
+                        .catalog_discard_move_generation(&cut, &local_agent)
+                        .map_err(unavailable)
+                })
+                .await?;
                 Ok(json!({}))
             }
             "agent_data.release" => {
@@ -634,6 +635,20 @@ impl CatalogMove {
         file.sync_all().map_err(unavailable)?;
         Ok(())
     }
+    async fn admit(&self) -> Result<tokio::sync::OwnedMutexGuard<()>, HandlerError> {
+        tokio::time::timeout(Duration::from_secs(1), self.lock.clone().lock_owned())
+            .await
+            .map_err(|_| unavailable("catalog move admission deadline exceeded"))
+    }
+    fn not_aborted(&self, cut: &str) -> Result<(), HandlerError> {
+        if self.load(cut)?.is_some_and(|s| s.step == "aborted") {
+            return Err(HandlerError::new(
+                "invalid_state",
+                "catalog cut was aborted",
+            ));
+        }
+        Ok(())
+    }
     async fn install(
         &self,
         cut: &str,
@@ -643,28 +658,12 @@ impl CatalogMove {
     ) -> Result<(), HandlerError> {
         let plan_id = format!("move:{cut}");
         let generation_id = format!("generation:{plan_id}");
-        let consumers = catalog_consumer::discover(self.consumers.as_ref(), &packages)
-            .await
-            .map_err(unavailable)?;
-        let checks = catalog_consumer::check(&consumers, &plan_id, &packages)
-            .await
-            .map_err(unavailable)?;
         let store = self.store()?;
         let stage = stage.to_path_buf();
-        let worker_plan = plan_id.clone();
-        let worker_generation = generation_id.clone();
-        let agent_id = agent.to_owned();
-        let clock = self.clock;
         let worker_packages = packages.clone();
-        let worker_checks = checks.clone();
         crate::catalog_sql::run(move || {
-            let plan_id = worker_plan;
-            let generation_id = worker_generation;
-            let agent = agent_id.as_str();
-            let packages = worker_packages;
-            let checks = worker_checks;
             let blobs = BlobStore::new(store.store_folder())?;
-            let pins: Vec<_> = packages.iter().map(|p| p.pin.clone()).collect();
+            let pins: Vec<_> = worker_packages.iter().map(|p| p.pin.clone()).collect();
             for digest in stream::digests(&pins) {
                 let bytes = fs::read(stage.join(&digest)).map_err(unavailable)?;
                 if sha256_hex(&bytes) != digest {
@@ -672,6 +671,39 @@ impl CatalogMove {
                 }
                 blobs.publish(&bytes)?;
             }
+            Ok::<_, HandlerError>(())
+        })
+        .await?;
+        let consumers = catalog_consumer::discover(self.consumers.as_ref(), &packages)
+            .await
+            .map_err(unavailable)?;
+        let checks = catalog_consumer::check(&consumers, &plan_id, &packages)
+            .await
+            .map_err(unavailable)?;
+        let worker_plan = plan_id.clone();
+        let worker_generation = generation_id.clone();
+        let agent_id = agent.to_owned();
+        let clock = self.clock;
+        let worker_packages = packages.clone();
+        let worker_checks = checks.clone();
+        let digest = entorhinal_core::catalog_agent::pin_digest(
+            &packages.iter().map(|p| p.pin.clone()).collect::<Vec<_>>(),
+        )
+        .map_err(unavailable)?;
+        self.local_preflight(agent, &digest).await?;
+        let guard = self.admit().await?;
+        self.not_aborted(cut)?;
+        let store = self.store()?;
+        crate::catalog_sql::run(move || {
+            // The blocking write may outlive a cancelled request. Keep admission
+            // until the write finishes so abort cannot race a late approval.
+            let _guard = guard;
+            let plan_id = worker_plan;
+            let generation_id = worker_generation;
+            let agent = agent_id.as_str();
+            let packages = worker_packages;
+            let checks = worker_checks;
+            let pins: Vec<_> = packages.iter().map(|p| p.pin.clone()).collect();
             let first = pins
                 .first()
                 .ok_or_else(|| invalid("empty catalog closure"))?;
@@ -724,9 +756,13 @@ impl CatalogMove {
         )
         .await
         .map_err(unavailable)?;
+        self.local_preflight(agent, &digest).await?;
+        let guard = self.admit().await?;
+        self.not_aborted(cut)?;
         let store = self.store()?;
         let agent = agent.to_owned();
         crate::catalog_sql::run(move || {
+            let _guard = guard;
             store
                 .catalog_generation_ready(&generation_id, &agent)
                 .map_err(unavailable)
@@ -737,9 +773,11 @@ impl CatalogMove {
 }
 fn staged_packages(
     stage: &Path,
-    pins: &[CatalogPin],
+    checked: &trust::Preflight,
 ) -> Result<Vec<PreparedPackage>, HandlerError> {
-    pins.iter()
+    checked
+        .pins
+        .iter()
         .map(|pin| {
             let manifest_bytes = fs::read(stage.join(&pin.manifest_sha256)).map_err(unavailable)?;
             let manifest =
@@ -761,7 +799,7 @@ fn staged_packages(
                 capabilities: manifest.requires.capabilities,
                 has_scripts: scripts.as_object().is_some_and(|s| !s.is_empty())
                     || scripts.as_array().is_some_and(|s| !s.is_empty()),
-                root_certified: pin.name.starts_with("@cortexkit/"),
+                root_certified: checked.certified.contains(&pin.name),
             })
         })
         .collect()
