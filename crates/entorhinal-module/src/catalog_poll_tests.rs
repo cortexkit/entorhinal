@@ -217,7 +217,7 @@ async fn startup_hourly_offset_and_backoff_recovers() {
 #[tokio::test]
 async fn stored_offset_survives_reopen_and_not_modified_changes_nothing() {
     let f = Fixture::new().await;
-    assert_eq!(f.worker().offset().unwrap(), 600_000);
+    assert_eq!(f.worker().offset().await.unwrap(), 600_000);
     f.worker().pass().await.unwrap();
     f.slot.lock().unwrap().take();
     let store = RegistryStore::open(&f.descriptor).unwrap();
@@ -300,4 +300,22 @@ async fn hello_ack_starts_catalog_poll_once() {
     );
     crate::tests::stop_store_tasks(&handler).await;
     handler.store.lock().unwrap().take();
+}
+
+#[tokio::test(start_paused = true)]
+async fn catalog_poll_clock_sql_does_not_occupy_runtime() {
+    use crate::catalog_sql::tests::{finish, poll, responsive, started, tracked, HeldSql};
+    let f = finish(Fixture::new()).await;
+    let worker = f.worker();
+    let store = worker.store().unwrap();
+    let handler = ProjectsHandler::with_runtime("poll-held-sql".into(), clock);
+    *handler.store.lock().unwrap() = Some(store.clone());
+    let held = HeldSql::new(store).await;
+    let (request, entered) = tracked(worker.offset());
+    let mut request = Box::pin(request);
+    started(request.as_mut(), &entered).await;
+    assert!(poll(request.as_mut()).is_pending());
+    responsive(&handler).await;
+    held.finish().await;
+    assert_eq!(finish(request).await.unwrap(), 600_000);
 }

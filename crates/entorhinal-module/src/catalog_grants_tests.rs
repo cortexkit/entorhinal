@@ -488,3 +488,27 @@ async fn publisher_pins_must_stay_authenticated_through_confirmation() {
     assert!(f.store().catalog_audit().unwrap().is_empty());
     assert_eq!(f.prompt.calls.lock().unwrap().len(), 1);
 }
+
+#[tokio::test(start_paused = true)]
+async fn catalog_grant_sql_is_off_runtime_and_bounded() {
+    use crate::catalog_sql::tests::{finish, poll, responsive, started, tracked, HeldSql};
+    let f = Fixture::new(Ok(()));
+    let pins = f.pins();
+    let held = HeldSql::new(f.store()).await;
+    let (request, entered) = tracked(f.trust(&pins));
+    let mut request = Box::pin(request);
+    started(request.as_mut(), &entered).await;
+    assert!(poll(request.as_mut()).is_pending());
+    responsive(&f.handler).await;
+    tokio::time::advance(std::time::Duration::from_millis(60_001)).await;
+    let answer = poll(request.as_mut());
+    assert!(f.handler.writer.try_lock().is_err());
+    assert!(f.handler.confirmation_slot.lock().unwrap().is_some());
+    held.finish().await;
+    let _writer = finish(f.handler.writer.lock()).await;
+    assert!(
+        matches!(answer, std::task::Poll::Ready(Err(error)) if error.code == "catalog_timeout")
+    );
+    assert_eq!(f.store().publisher_grants().unwrap().len(), 1);
+    assert_eq!(f.prompt.calls.lock().unwrap().len(), 1);
+}

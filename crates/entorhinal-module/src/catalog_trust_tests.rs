@@ -1313,3 +1313,40 @@ async fn refused_chain_links_log_once_per_distinct_document() {
     );
     assert_eq!(trust.refused_links.len(), 2);
 }
+
+#[tokio::test(start_paused = true)]
+async fn trust_status_sql_does_not_occupy_runtime() {
+    use crate::catalog_sql::tests::{finish, poll, responsive, started, tracked, HeldSql};
+    let f = Fixture::new(0).await;
+    let mut trust = f.trust();
+    let store = trust.store().unwrap();
+    let handler = crate::ProjectsHandler::with_runtime("trust-held-sql".into(), || 0);
+    *handler.store.lock().unwrap() = Some(store.clone());
+    let held = HeldSql::new(store.clone()).await;
+    let (refresh, entered) = tracked(trust.refresh_registry_keys());
+    let mut refresh = Box::pin(refresh);
+    started(refresh.as_mut(), &entered).await;
+    assert!(poll(refresh.as_mut()).is_pending());
+    responsive(&handler).await;
+    held.finish().await;
+    finish(refresh).await.unwrap();
+
+    let held = HeldSql::new(store.clone()).await;
+    let (verify, entered) = tracked(trust.verify_version(NAME, VERSION));
+    let mut verify = Box::pin(verify);
+    started(verify.as_mut(), &entered).await;
+    assert!(poll(verify.as_mut()).is_pending());
+    responsive(&handler).await;
+    held.finish().await;
+    finish(verify).await.unwrap();
+
+    serve_feed(&f.fake, 1, vec![status_doc()], "/v1/scopes/example/status");
+    let held = HeldSql::new(store).await;
+    let (feed, entered) = tracked(trust.apply_scope_feed());
+    let mut feed = Box::pin(feed);
+    started(feed.as_mut(), &entered).await;
+    assert!(poll(feed.as_mut()).is_pending());
+    responsive(&handler).await;
+    held.finish().await;
+    finish(feed).await.unwrap();
+}

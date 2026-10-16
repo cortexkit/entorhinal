@@ -331,11 +331,16 @@ impl ProjectsHandler {
         value: Value,
         key: RouteKey,
     ) -> Result<Vec<u8>, HandlerError> {
-        let deadline = tokio::time::Instant::now() + crate::consent_client::CALL_BUDGET;
         let name = value
             .get("name")
             .and_then(Value::as_str)
             .ok_or_else(|| HandlerError::new("invalid_request", "tool name must be a string"))?;
+        let deadline = tokio::time::Instant::now()
+            + if name.starts_with("catalog_") {
+                std::time::Duration::from_secs(110)
+            } else {
+                crate::consent_client::CALL_BUDGET
+            };
         let tool = TOOLS.iter().find(|tool| tool.name == name).copied();
         let admission = if let Some(tool) = tool {
             let (admission, _caller) = self.admit_agent_tool(tool, key)?;

@@ -246,14 +246,20 @@ impl ConsentCoordinator {
         lease: RequestLease,
     ) -> Result<ConsentAttempt, AgentMutationError> {
         let card = render_card(row, context)?;
-        let (saved, inserted) = call.store.consent_transaction(|tx| {
-            let inserted = tx.request(&row.identity)?.is_none();
-            let saved = tx.begin_request(row)?;
-            if let Some(plan) = plan {
-                tx.save_write_plan(&row.identity, plan)?;
-            }
-            Ok((saved, inserted))
-        })?;
+        let saved_row = row.clone();
+        let plan = plan.cloned();
+        let (saved, inserted) = sql(call.store, call.deadline, move |store| {
+            store.consent_transaction(|tx| {
+                let row = &saved_row;
+                let inserted = tx.request(&row.identity)?.is_none();
+                let saved = tx.begin_request(row)?;
+                if let Some(plan) = &plan {
+                    tx.save_write_plan(&row.identity, plan)?;
+                }
+                Ok((saved, inserted))
+            })
+        })
+        .await?;
         let decision = resolve(&call, &saved, card, inserted).await?;
         Ok(ConsentAttempt {
             decision,
@@ -362,8 +368,11 @@ async fn resolve(
     {
         Ok(Ok(route)) => route,
         _ if inserted => {
-            call.store
-                .consent_transaction(|tx| tx.delete_awaiting(&row.identity))?;
+            let identity = row.identity.clone();
+            sql(call.store, call.deadline, move |store| {
+                store.consent_transaction(|tx| tx.delete_awaiting(&identity))
+            })
+            .await?;
             return Ok(ConsentDecision::Refused("consent_unavailable"));
         }
         _ => return Ok(unresolved(row, (call.now_ms)())),
@@ -404,13 +413,20 @@ async fn resolve_on_route(
                 else {
                     return Ok(unresolved(row, (call.now_ms)()));
                 };
-                call.store
-                    .consent_transaction(|tx| tx.set_elicitation(&row.identity, id))?;
+                let identity = row.identity.clone();
+                let saved_id = id.to_owned();
+                sql(call.store, call.deadline, move |store| {
+                    store.consent_transaction(|tx| tx.set_elicitation(&identity, &saved_id))
+                })
+                .await?;
                 current.elicitation_id = Some(id.to_owned());
             }
             Err(ConsentError::Refused(code)) if code != "cancelled" => {
-                call.store
-                    .consent_transaction(|tx| tx.delete_awaiting(&row.identity))?;
+                let identity = row.identity.clone();
+                sql(call.store, call.deadline, move |store| {
+                    store.consent_transaction(|tx| tx.delete_awaiting(&identity))
+                })
+                .await?;
                 return Ok(ConsentDecision::Refused("consent_unavailable"));
             }
             // A cancelled or unreadable reply may arrive after Cingulate recorded
@@ -423,7 +439,12 @@ async fn resolve_on_route(
         if !capture.complete {
             return Ok(unresolved(row, (call.now_ms)()));
         }
-        let saved = call.store.consent_request(&row.identity)?.ok_or_else(|| {
+        let identity = row.identity.clone();
+        let saved = sql(call.store, call.deadline, move |store| {
+            store.consent_request(&identity)
+        })
+        .await?
+        .ok_or_else(|| {
             domain_error(
                 "consent_lost",
                 "awaiting request disappeared during feed capture",
@@ -441,7 +462,7 @@ async fn resolve_on_route(
         )
         .await
         {
-            Ok(record) => match inspect_record(call.store, &current, &record, (call.now_ms)())? {
+            Ok(record) => match inspect_record_wait(call, &current, &record).await? {
                 RecordDecision::Settled(decision) => return Ok(decision),
                 RecordDecision::Mismatch => {
                     return Ok(ConsentDecision::Pending(Some(id.to_owned())))
@@ -464,7 +485,7 @@ async fn resolve_on_route(
     )
     .await;
     if let Ok(record) = awaited {
-        match inspect_record(call.store, &current, &record, (call.now_ms)())? {
+        match inspect_record_wait(call, &current, &record).await? {
             RecordDecision::Settled(decision) => return Ok(decision),
             RecordDecision::Mismatch => return Ok(ConsentDecision::Pending(Some(id.to_owned()))),
             RecordDecision::Pending => {}
@@ -482,7 +503,7 @@ async fn resolve_on_route(
     .await
     {
         if let RecordDecision::Settled(decision) =
-            inspect_record(call.store, &current, &record, (call.now_ms)())?
+            inspect_record_wait(call, &current, &record).await?
         {
             return Ok(decision);
         }
@@ -579,7 +600,13 @@ pub(super) async fn capture_feed(
     owner: &Owner,
     deadline: Instant,
 ) -> CaptureReport {
-    let Ok(mut cursor) = store.consent_feed_cursor(&owner.scope_ref, owner.epoch) else {
+    let scope_ref = owner.scope_ref.clone();
+    let epoch = owner.epoch;
+    let Ok(mut cursor) = sql(store, deadline, move |store| {
+        Ok(store.consent_feed_cursor(&scope_ref, epoch)?)
+    })
+    .await
+    else {
         return CaptureReport {
             cursor: 0,
             complete: false,
@@ -615,29 +642,34 @@ pub(super) async fn capture_feed(
                 complete: false,
             };
         }
-        let commit = store.consent_transaction(|tx| {
-            for record in records {
-                let Some(answer) = settlement(record) else {
-                    continue;
-                };
-                let Ok(binding) = serde_json::from_value::<Binding>(record["binding"].clone())
-                else {
-                    continue;
-                };
-                let key = binding.identity();
-                if key.validate().is_err() {
-                    continue;
+        let records = records.clone();
+        let owner = owner.clone();
+        let commit = sql(store, deadline, move |store| {
+            store.consent_transaction(|tx| {
+                for record in &records {
+                    let Some(answer) = settlement(record) else {
+                        continue;
+                    };
+                    let Ok(binding) = serde_json::from_value::<Binding>(record["binding"].clone())
+                    else {
+                        continue;
+                    };
+                    let key = binding.identity();
+                    if key.validate().is_err() {
+                        continue;
+                    }
+                    tx.record_settlement(
+                        &key,
+                        &binding.args_digest,
+                        &owner.scope_ref,
+                        owner.epoch,
+                        &answer,
+                    )?;
                 }
-                tx.record_settlement(
-                    &key,
-                    &binding.args_digest,
-                    &owner.scope_ref,
-                    owner.epoch,
-                    &answer,
-                )?;
-            }
-            tx.save_feed_cursor(&owner.scope_ref, owner.epoch, next)
-        });
+                tx.save_feed_cursor(&owner.scope_ref, owner.epoch, next)
+            })
+        })
+        .await;
         if commit.is_err() {
             return CaptureReport {
                 cursor,
@@ -666,3 +698,35 @@ pub(super) async fn capture_feed(
 #[cfg(test)]
 #[path = "consent_tests.rs"]
 mod tests;
+
+// Keep transactions out of async consent waits, including catalog installation.
+async fn sql<T: Send + 'static>(
+    store: &RegistryStore,
+    deadline: Instant,
+    work: impl FnOnce(&RegistryStore) -> Result<T, AgentMutationError> + Send + 'static,
+) -> Result<T, AgentMutationError> {
+    let store = store.clone();
+    crate::catalog_sql::until(deadline, "consent SQL", move || {
+        work(&store).map_err(crate::HandlerError::from)
+    })
+    .await
+    .map_err(|error| AgentMutationError {
+        code: error.code,
+        message: error.message,
+        detail: error.detail,
+    })
+}
+
+async fn inspect_record_wait(
+    call: &ConsentCall<'_>,
+    row: &ConsentRequest,
+    record: &Value,
+) -> Result<RecordDecision, AgentMutationError> {
+    let row = row.clone();
+    let record = record.clone();
+    let now = (call.now_ms)();
+    sql(call.store, call.deadline, move |store| {
+        inspect_record(store, &row, &record, now)
+    })
+    .await
+}

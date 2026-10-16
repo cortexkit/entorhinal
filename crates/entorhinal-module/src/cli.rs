@@ -1528,6 +1528,12 @@ fn call(
 }
 
 fn placement_call_options(method: &str) -> subc_client_rs::CallOptions {
+    if method == super::catalog_seed::SEED {
+        return subc_client_rs::CallOptions {
+            timeout: Duration::from_secs(120),
+            ..subc_client_rs::CallOptions::default()
+        };
+    }
     if matches!(method, "assign_workspace" | "register") {
         return subc_client_rs::CallOptions {
             timeout: Duration::from_secs(300),
@@ -4311,6 +4317,10 @@ mod catalog_publish_cli_tests {
         };
         let (method, params) = build_at(&command, root.to_str().unwrap()).unwrap();
         assert_eq!(method, crate::catalog_seed::SEED);
+        assert_eq!(
+            placement_call_options(&method).timeout,
+            Duration::from_secs(120)
+        );
         assert_eq!(
             params["bundle_file"],
             crate::tests::canonical_test_path(root.join("starter.tar"))

@@ -3,6 +3,7 @@
 //! subsequent inbound catalog_install call.
 use crate::catalog_blob::CatalogError;
 use crate::catalog_consumer::{self, ConsumerDiscovery};
+use crate::catalog_sql;
 use crate::catalog_trust::CatalogTrust;
 use crate::{
     encode_result, tool_provider::encode_tool_reply, HandlerError, ProjectsHandler, RouteAdmission,
@@ -64,6 +65,8 @@ pub struct CatalogAgent {
     running: Arc<Mutex<BTreeSet<String>>>,
     #[cfg(test)]
     finished: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    authorized: tokio::sync::Notify,
 }
 impl Default for CatalogAgent {
     fn default() -> Self {
@@ -76,6 +79,8 @@ impl Default for CatalogAgent {
             running: Arc::default(),
             #[cfg(test)]
             finished: Arc::default(),
+            #[cfg(test)]
+            authorized: tokio::sync::Notify::new(),
         }
     }
 }
@@ -132,27 +137,41 @@ impl CatalogAgent {
                 &store,
                 &plan,
                 consumers.as_ref(),
-                sources.as_ref(),
+                &sources,
                 capabilities.as_ref(),
             )
             .await;
             let result = match result {
-                Ok(detail) => store
-                    .catalog_save_prepared(&plan.plan_id, &plan.agent_id, &detail)
-                    .and_then(|()| {
-                        store.catalog_plan_ready(
-                            &plan.plan_id,
-                            &plan.agent_id,
-                            detail.packages.into_iter().map(|p| p.pin).collect(),
-                            clock(),
-                        )
+                Ok(detail) => {
+                    let store = store.clone();
+                    let plan = plan.clone();
+                    catalog_sql::run(move || {
+                        store
+                            .catalog_save_prepared(&plan.plan_id, &plan.agent_id, &detail)
+                            .and_then(|()| {
+                                store.catalog_plan_ready(
+                                    &plan.plan_id,
+                                    &plan.agent_id,
+                                    detail.packages.into_iter().map(|p| p.pin).collect(),
+                                    clock(),
+                                )
+                            })
+                            .map(|_| ())
+                            .map_err(HandlerError::from)
                     })
-                    .map(|_| ())
-                    .map_err(HandlerError::from),
+                    .await
+                }
                 Err(e) => Err(e),
             };
             if let Err(error) = result {
-                let _ = store.catalog_plan_failed(&plan.plan_id, &plan.agent_id, failure(&error));
+                let store = store.clone();
+                let plan = plan.clone();
+                let _ = catalog_sql::run(move || {
+                    store
+                        .catalog_plan_failed(&plan.plan_id, &plan.agent_id, failure(&error))
+                        .map_err(HandlerError::from)
+                })
+                .await;
             }
             running.lock().unwrap().remove(&plan.plan_id);
             #[cfg(test)]
@@ -199,10 +218,13 @@ async fn prepare(
     store: &RegistryStore,
     plan: &entorhinal_core::catalog_agent::CatalogPlan,
     daemon: &dyn ConsumerDiscovery,
-    factory: &TrustFactory,
+    factory: &Arc<TrustFactory>,
     capabilities: &dyn LocalCapabilities,
 ) -> Result<PreparedPlan, HandlerError> {
-    let pins = store.catalog_pins(&plan.agent_id)?;
+    let db = store.clone();
+    let agent = plan.agent_id.clone();
+    let pins =
+        catalog_sql::run(move || db.catalog_pins(&agent).map_err(HandlerError::from)).await?;
     let mut queue: VecDeque<_> = pins
         .iter()
         .map(|p| p.name.clone())
@@ -219,12 +241,19 @@ async fn prepare(
                 .scope
         );
         if let std::collections::btree_map::Entry::Vacant(entry) = scopes.entry(scope.clone()) {
-            let mut trust = factory(store.clone(), &scope)?;
+            let db = store.clone();
+            let factory = factory.clone();
+            let factory_scope = scope.clone();
+            let mut trust = catalog_sql::run(move || factory(db, &factory_scope)).await?;
             refresh(&mut trust).await?;
             entry.insert(trust);
         }
     }
-    if let Some(status) = store.catalog_blocked_pin(&pins)? {
+    let db = store.clone();
+    let held = pins.clone();
+    if let Some(status) =
+        catalog_sql::run(move || db.catalog_blocked_pin(&held).map_err(HandlerError::from)).await?
+    {
         return Err(status_refusal(&status));
     }
     let mut seen = BTreeSet::new();
@@ -244,7 +273,10 @@ async fn prepare(
                 .scope
         );
         if !scopes.contains_key(&scope) {
-            let mut trust = factory(store.clone(), &scope)?;
+            let db = store.clone();
+            let factory = factory.clone();
+            let factory_scope = scope.clone();
+            let mut trust = catalog_sql::run(move || factory(db, &factory_scope)).await?;
             refresh(&mut trust).await?;
             scopes.insert(scope.clone(), trust);
         }
@@ -275,28 +307,35 @@ async fn prepare(
     } else {
         CatalogSubject::Upgrade(plan.spec.clone())
     };
-    let resolved = store
-        .catalog_resolve(&plan.agent_id, subject, &candidates, &caps)
-        .map_err(|e| {
-            let mut error = HandlerError::from(e);
-            let missing: Vec<_> = candidates
-                .iter()
-                .flat_map(|p| {
-                    p.manifest
-                        .requires
-                        .capabilities
-                        .iter()
-                        .filter(|t| !caps.contains(t))
-                        .map(|t| json!({"package":p.record.name,"capability":t}))
-                })
-                .collect();
-            if !missing.is_empty() {
-                error.detail.get_or_insert_with(|| json!({}))["missing_capabilities"] =
-                    json!(missing);
-            }
-            error
-        })?;
-    let grants = store.publisher_grants()?;
+    let db = store.clone();
+    let agent = plan.agent_id.clone();
+    let resolved_candidates = candidates.clone();
+    let resolved_caps = caps.clone();
+    let resolved = catalog_sql::run(move || {
+        db.catalog_resolve(&agent, subject, &resolved_candidates, &resolved_caps)
+            .map_err(HandlerError::from)
+    })
+    .await
+    .map_err(|mut error| {
+        let missing: Vec<_> = candidates
+            .iter()
+            .flat_map(|p| {
+                p.manifest
+                    .requires
+                    .capabilities
+                    .iter()
+                    .filter(|t| !caps.contains(t))
+                    .map(|t| json!({"package":p.record.name,"capability":t}))
+            })
+            .collect();
+        if !missing.is_empty() {
+            error.detail.get_or_insert_with(|| json!({}))["missing_capabilities"] = json!(missing);
+        }
+        error
+    })?;
+    let db = store.clone();
+    let grants =
+        catalog_sql::run(move || db.publisher_grants().map_err(HandlerError::from)).await?;
     let mut packages = Vec::new();
     for pin in resolved.closure {
         let verified = candidates
@@ -329,7 +368,10 @@ async fn prepare(
         moves: serde_json::to_value(resolved.resolution.moves).unwrap(),
         checks,
     };
-    preview_card(store, plan, &detail)?;
+    let db = store.clone();
+    let preview_plan = plan.clone();
+    let preview_detail = detail.clone();
+    catalog_sql::run(move || preview_card(&db, &preview_plan, &preview_detail)).await?;
     Ok(detail)
 }
 fn status_refusal(status: &Value) -> HandlerError {
@@ -420,55 +462,29 @@ impl ProjectsHandler {
         key: crate::RouteKey,
     ) -> Result<Vec<u8>, HandlerError> {
         self.admit_catalog_activation(key)?;
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Read {
-            agent_id: String,
-        }
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Ack {
-            agent_id: String,
-            generation_id: String,
-        }
-        let store = self.with_store(|s| Ok(s.clone()))?;
-        if method == ACK_ACTIVATION {
-            let args: Ack = serde_json::from_value(params).map_err(crate::invalid_params)?;
-            let generation = store.catalog_activate_generation(
-                &args.generation_id,
-                &args.agent_id,
-                (self.clock)(),
-            ).map_err(|e| {
-                let mut error = HandlerError::from(e);
-                if error.code == "activation_blocked" {
-                    if let Ok(g) = store.catalog_generation(&args.generation_id, &args.agent_id) {
-                        if let Ok(Some(status)) = store.catalog_blocked_pin(&g.closure) {
-                            error.detail = Some(json!({"name":status["name"],"version":status["version"],"reason":status["reason"]}));
-                        }
-                    }
-                }
-                error
-            })?;
-            let generation = store.catalog_generation(&generation.generation_id, &args.agent_id)?;
-            return encode_result(json!({"generation":generation_reply(&generation)}));
-        }
-        let args: Read = serde_json::from_value(params).map_err(crate::invalid_params)?;
-        let generations = store.catalog_agent_generations(&args.agent_id)?;
-        let active = generations
-            .iter()
-            .find(|g| matches!(g.state.as_str(), "active" | "degraded"));
-        let ready = generations
-            .iter()
-            .filter(|g| {
-                g.state == "ready"
-                    && active.is_none_or(|a| {
-                        (g.created_at_ms, &g.generation_id) > (a.created_at_ms, &a.generation_id)
-                    })
-            })
-            .collect::<Vec<_>>();
-        encode_result(
-            json!({"active":active.map(generation_reply),"ready":ready.into_iter().map(generation_reply).collect::<Vec<_>>()}),
+        activation_on_store(
+            &self.with_store(|s| Ok(s.clone()))?,
+            method,
+            params,
+            (self.clock)(),
         )
+    }
+    pub(super) async fn catalog_activation_wait(
+        &self,
+        method: String,
+        params: Value,
+        key: crate::RouteKey,
+        received: Instant,
+    ) -> Result<Vec<u8>, HandlerError> {
+        self.admit_catalog_activation(key)?;
+        let store = self.with_store(|s| Ok(s.clone()))?;
+        let now = (self.clock)();
+        catalog_sql::until(
+            received + std::time::Duration::from_secs(25),
+            "catalog activation",
+            move || activation_on_store(&store, &method, params, now),
+        )
+        .await
     }
     pub async fn execute_catalog_tool(
         &self,
@@ -515,39 +531,57 @@ impl ProjectsHandler {
                         serde_json::to_vec(&json!([caller, key])).unwrap()
                     )
                 );
-                store.catalog_create_plan(
-                    &plan_id,
-                    caller,
-                    CatalogTarget::Agent(caller.into()),
-                    &spec.operation,
-                    CatalogSpec {
-                        package: spec.package,
-                        range: spec.range,
-                    },
-                    (self.clock)(),
-                )?;
-                let plan = store.catalog_plan(&plan_id, caller)?;
+                let db = store.clone();
+                let agent = caller.to_owned();
+                let worker_id = plan_id.clone();
+                let clock = self.clock;
+                let plan = catalog_sql::until(deadline, "catalog_prepare", move || {
+                    db.catalog_create_plan(
+                        &worker_id,
+                        &agent,
+                        CatalogTarget::Agent(agent.clone()),
+                        &spec.operation,
+                        CatalogSpec {
+                            package: spec.package,
+                            range: spec.range,
+                        },
+                        clock(),
+                    )?;
+                    db.catalog_plan(&worker_id, &agent)
+                        .map_err(HandlerError::from)
+                })
+                .await?;
                 if plan.state == "pending" {
                     self.catalog_agent.start(store, plan, self.clock);
                 }
                 encode_tool_reply(json!({"plan_id":plan_id,"state":"pending"}))
             }
             "catalog_plan" => {
-                let id = arguments["plan_id"].as_str().expect("validated plan id");
-                let plan = store.catalog_plan(id, caller)?;
-                let mut value = serde_json::to_value(&plan).unwrap();
-                if plan.state == "ready" {
-                    let detail = store.catalog_prepared(id, caller)?;
-                    value["closure"] = json!(detail.packages);
-                    value["moves"] = detail.moves.clone();
-                    value["checks"] = json!(detail.checks);
-                    value["card"] = preview_card(&store, &plan, &detail)?;
-                }
-                encode_tool_reply(value)
+                let id = arguments["plan_id"]
+                    .as_str()
+                    .expect("validated plan id")
+                    .to_owned();
+                let caller = caller.to_owned();
+                catalog_sql::until(deadline, "catalog_plan", move || {
+                    let plan = store.catalog_plan(&id, &caller)?;
+                    let mut value = serde_json::to_value(&plan).unwrap();
+                    if plan.state == "ready" {
+                        let detail = store.catalog_prepared(&id, &caller)?;
+                        value["closure"] = json!(detail.packages);
+                        value["moves"] = detail.moves.clone();
+                        value["checks"] = json!(detail.checks);
+                        value["card"] = preview_card(&store, &plan, &detail)?;
+                    }
+                    encode_tool_reply(value)
+                })
+                .await
             }
-            "catalog_generation" => encode_tool_reply(
-                json!({"generations":store.catalog_agent_generations(caller)?.iter().map(generation_reply).collect::<Vec<_>>()}),
-            ),
+            "catalog_generation" => {
+                let caller = caller.to_owned();
+                catalog_sql::until(deadline, "catalog_generation", move || encode_tool_reply(
+                json!({"generations":store.catalog_agent_generations(&caller)?.iter().map(generation_reply).collect::<Vec<_>>()}),
+            )).await
+            }
             "catalog_install" => {
                 self.install_catalog_plan(
                     &store,
@@ -568,26 +602,67 @@ impl ProjectsHandler {
         generation_id: &str,
         deadline: Instant,
     ) -> Result<(), HandlerError> {
-        let generation = store.catalog_generation(generation_id, caller)?;
-        if !matches!(generation.state.as_str(), "approved" | "installed") {
+        let db = store.clone();
+        let agent = caller.to_owned();
+        let id = generation_id.to_owned();
+        let Some(detail) = catalog_sql::until(deadline, "catalog prefetch read", move || {
+            let generation = db.catalog_generation(&id, &agent)?;
+            if !matches!(generation.state.as_str(), "approved" | "installed") {
+                return Ok(None);
+            }
+            Ok(Some(db.catalog_prepared(&generation.plan_id, &agent)?))
+        })
+        .await?
+        else {
             return Ok(());
-        }
-        let detail = store.catalog_prepared(&generation.plan_id, caller)?;
-        match catalog_consumer::prefetch(
+        };
+        let result = catalog_consumer::prefetch(
             self.catalog_agent.consumers.as_ref(),
             generation_id,
             &detail.packages,
             &detail.checks,
             deadline,
         )
-        .await
-        {
-            Ok(()) => {
-                store.catalog_generation_ready(generation_id, caller)?;
+        .await;
+        let store = store.clone();
+        let caller = caller.to_owned();
+        let generation_id = generation_id.to_owned();
+        catalog_sql::until(deadline, "catalog prefetch result", move || {
+            match result {
+                Ok(()) => {
+                    store.catalog_generation_ready(&generation_id, &caller)?;
+                }
+                Err(e) => store.catalog_prefetch_error(&generation_id, &caller, failure(&e))?,
             }
-            Err(e) => store.catalog_prefetch_error(generation_id, caller, failure(&e))?,
-        }
-        Ok(())
+            Ok(())
+        })
+        .await
+    }
+    async fn refuse_catalog_write(
+        &self,
+        store: &RegistryStore,
+        row: &entorhinal_core::agent::consent::ConsentRequest,
+        target: &Value,
+        authorization: entorhinal_core::agent::consent::Authorization,
+        error: HandlerError,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, HandlerError> {
+        let store = store.clone();
+        let row = row.clone();
+        let target = target.clone();
+        let now = (self.clock)();
+        catalog_sql::until(deadline, "catalog install refusal", move || {
+            crate::tool_provider::writes::refuse_write(
+                &store,
+                &row,
+                "catalog_install",
+                &target,
+                authorization,
+                error,
+                now,
+            )
+        })
+        .await
     }
     async fn install_catalog_plan(
         &self,
@@ -611,7 +686,13 @@ impl ProjectsHandler {
         let arguments = json!({"plan_id":id});
         let digest = cortexkit_role_tool_provider::catalog::composition_digest(&arguments)
             .expect("JSON arguments canonicalize");
-        let saved = store.consent_request(&identity)?;
+        let db = store.clone();
+        let read_identity = identity.clone();
+        let saved = catalog_sql::until(deadline, "catalog install consent read", move || {
+            db.consent_request(&read_identity)
+                .map_err(HandlerError::from)
+        })
+        .await?;
         if let Some(row) = &saved {
             if row.args_digest != digest {
                 return Err(HandlerError::new(
@@ -646,43 +727,59 @@ impl ProjectsHandler {
             state: RequestState::Awaiting,
             outcome: None,
         });
-        let fresh = store.catalog_install_target(id, caller);
+        let db = store.clone();
+        let plan_id = id.to_owned();
+        let agent = caller.to_owned();
+        let fresh = catalog_sql::until(deadline, "catalog install target", move || {
+            db.catalog_install_target(&plan_id, &agent)
+                .map_err(HandlerError::from)
+        })
+        .await;
         let target = match fresh {
             Ok(target) => target,
+            Err(e) if e.code == "catalog_timeout" => return Err(e),
             Err(e) if saved.is_some() => {
-                return self.refuse_agent_write(
-                    store,
-                    &row,
-                    "catalog_install",
-                    &Value::Null,
-                    Authorization::Card {
-                        id: row.elicitation_id.clone().unwrap_or_default(),
-                        answer: "deny".into(),
-                    },
-                    e.into(),
-                )
+                return self
+                    .refuse_catalog_write(
+                        store,
+                        &row,
+                        &Value::Null,
+                        Authorization::Card {
+                            id: row.elicitation_id.clone().unwrap_or_default(),
+                            answer: "deny".into(),
+                        },
+                        e,
+                        deadline,
+                    )
+                    .await
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(e),
         };
         let plan = if saved.is_some() {
-            let plan = store
-                .consent_write_plan(&row.identity)?
-                .ok_or_else(|| HandlerError::new("consent_lost", "missing saved catalog target"))?;
+            let db = store.clone();
+            let identity = row.identity.clone();
+            let plan = catalog_sql::until(deadline, "catalog install saved plan", move || {
+                db.consent_write_plan(&identity).map_err(HandlerError::from)
+            })
+            .await?
+            .ok_or_else(|| HandlerError::new("consent_lost", "missing saved catalog target"))?;
             if plan.tool != "catalog_install"
                 || plan.arguments != arguments
                 || plan.target != target
             {
-                return self.refuse_agent_write(
-                    store,
-                    &row,
-                    "catalog_install",
-                    &target,
-                    Authorization::Card {
-                        id: row.elicitation_id.clone().unwrap_or_default(),
-                        answer: "deny".into(),
-                    },
-                    HandlerError::new("plan_stale", "approved catalog target changed"),
-                );
+                return self
+                    .refuse_catalog_write(
+                        store,
+                        &row,
+                        &target,
+                        Authorization::Card {
+                            id: row.elicitation_id.clone().unwrap_or_default(),
+                            answer: "deny".into(),
+                        },
+                        HandlerError::new("plan_stale", "approved catalog target changed"),
+                        deadline,
+                    )
+                    .await;
             }
             plan
         } else {
@@ -696,13 +793,26 @@ impl ProjectsHandler {
         };
         let detail: PreparedPlan = serde_json::from_value(plan.target["prepared"].clone())
             .map_err(crate::invalid_params)?;
-        let operation = store.catalog_plan(id, caller)?.operation;
+        let db = store.clone();
+        let plan_id = id.to_owned();
+        let agent = caller.to_owned();
+        let (operation, grants, caller_label) =
+            catalog_sql::until(deadline, "catalog install authorization", move || {
+                Ok((
+                    db.catalog_plan(&plan_id, &agent)?.operation,
+                    db.publisher_grants()?,
+                    db.agent_row(&agent)?
+                        .ok_or_else(|| HandlerError::new("gone", "agent disappeared"))?
+                        .name,
+                ))
+            })
+            .await?;
         let op = if operation == "install" {
             entorhinal_core::catalog_grants::Operation::Install
         } else {
             entorhinal_core::catalog_grants::Operation::Upgrade
         };
-        let grants = store.publisher_grants()?;
+
         let covered = saved.is_none()
             && entorhinal_core::catalog_grants::coverage(
                 &detail
@@ -730,10 +840,7 @@ impl ProjectsHandler {
             }
         } else {
             let context = CardContext {
-                caller_label: store
-                    .agent_row(caller)?
-                    .ok_or_else(|| HandlerError::new("gone", "agent disappeared"))?
-                    .name,
+                caller_label,
                 target_kind: "catalog_plan".into(),
                 target_label: id.into(),
                 target_scope: json!({"operation":operation,"target":plan.target}),
@@ -765,17 +872,19 @@ impl ProjectsHandler {
                     ))
                 }
                 ConsentDecision::Refused(code) => {
-                    return self.refuse_agent_write(
-                        store,
-                        &row,
-                        "catalog_install",
-                        &plan.target,
-                        Authorization::Card {
-                            id: row.elicitation_id.clone().unwrap_or_default(),
-                            answer: "deny".into(),
-                        },
-                        HandlerError::new(code, "consent did not authorize installation"),
-                    )
+                    return self
+                        .refuse_catalog_write(
+                            store,
+                            &row,
+                            &plan.target,
+                            Authorization::Card {
+                                id: row.elicitation_id.clone().unwrap_or_default(),
+                                answer: "deny".into(),
+                            },
+                            HandlerError::new(code, "consent did not authorize installation"),
+                            deadline,
+                        )
+                        .await
                 }
                 ConsentDecision::Approved(answer) => Authorization::Card {
                     id: answer.elicitation_id.clone(),
@@ -791,6 +900,8 @@ impl ProjectsHandler {
             granted: None,
             now_ms: (self.clock)(),
         };
+        #[cfg(test)]
+        self.catalog_agent.authorized.notify_one();
         let result = self
             .catalog_install_write_wait(id.into(), commit, deadline)
             .await;
@@ -816,18 +927,64 @@ impl ProjectsHandler {
                     "plan_stale" | "gone" | "invalid_reply" | "consent_lost"
                 ) =>
             {
-                self.refuse_agent_write(
-                    store,
-                    &row,
-                    "catalog_install",
-                    &plan.target,
-                    authorization,
-                    e,
-                )
+                self.refuse_catalog_write(store, &row, &plan.target, authorization, e, deadline)
+                    .await
             }
             Err(e) => Err(e),
         };
         drop(attempt);
         outcome
     }
+}
+
+fn activation_on_store(
+    store: &RegistryStore,
+    method: &str,
+    params: Value,
+    now: i64,
+) -> Result<Vec<u8>, HandlerError> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Read {
+        agent_id: String,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Ack {
+        agent_id: String,
+        generation_id: String,
+    }
+    if method == ACK_ACTIVATION {
+        let args: Ack = serde_json::from_value(params).map_err(crate::invalid_params)?;
+        let generation = store.catalog_activate_generation(&args.generation_id, &args.agent_id, now).map_err(|e| {
+            let mut error = HandlerError::from(e);
+            if error.code == "activation_blocked" {
+                if let Ok(g) = store.catalog_generation(&args.generation_id, &args.agent_id) {
+                    if let Ok(Some(status)) = store.catalog_blocked_pin(&g.closure) {
+                        error.detail = Some(json!({"name":status["name"],"version":status["version"],"reason":status["reason"]}));
+                    }
+                }
+            }
+            error
+        })?;
+        let generation = store.catalog_generation(&generation.generation_id, &args.agent_id)?;
+        return encode_result(json!({"generation":generation_reply(&generation)}));
+    }
+    let args: Read = serde_json::from_value(params).map_err(crate::invalid_params)?;
+    let generations = store.catalog_agent_generations(&args.agent_id)?;
+    let active = generations
+        .iter()
+        .find(|g| matches!(g.state.as_str(), "active" | "degraded"));
+    let ready = generations
+        .iter()
+        .filter(|g| {
+            g.state == "ready"
+                && active.is_none_or(|a| {
+                    (g.created_at_ms, &g.generation_id) > (a.created_at_ms, &a.generation_id)
+                })
+        })
+        .collect::<Vec<_>>();
+    encode_result(
+        json!({"active":active.map(generation_reply),"ready":ready.into_iter().map(generation_reply).collect::<Vec<_>>()}),
+    )
 }

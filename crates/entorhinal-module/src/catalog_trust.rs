@@ -293,14 +293,15 @@ impl CatalogTrust {
         }
         let links = reply["keys"]
             .as_array()
-            .ok_or_else(|| CatalogError::new("invalid_reply", "missing registry keys"))?;
+            .ok_or_else(|| CatalogError::new("invalid_reply", "missing registry keys"))?
+            .clone();
         let expected = self.registry.clone();
         let scope = self.scope.clone();
         // Accepted prefix links survive a later refusal. The refusal is returned
         // after the transaction commits that prefix, never by rolling it back.
-        let (registry, refusal) = self.store()?.catalog_trust_transaction::<_, CatalogError>(
-            &scope,
-            |current, _, _| {
+        let store = self.store()?;
+        let (registry, refusal) = crate::catalog_sql::run(move || {
+            store.catalog_trust_transaction::<_, CatalogError>(&scope, |current, _, _| {
                 identity(&expected, current)?;
                 let mut next = current.clone();
                 let mut pure = statements::RegistryChain {
@@ -384,8 +385,9 @@ impl CatalogTrust {
                         ..Default::default()
                     },
                 ))
-            },
-        )?;
+            })
+        })
+        .await?;
         self.registry = registry;
         if let Some((e, digest)) = refusal {
             if self.refused_links.insert(digest.clone()) {
@@ -512,18 +514,32 @@ impl CatalogTrust {
         };
         let mut refreshed = false;
         let applied = loop {
-            let result = self.store()?.catalog_trust_transaction::<_, CatalogError>(
-                &self.scope,
-                |current, held, _| {
+            let store = self.store()?;
+            let scope = self.scope.clone();
+            let expected = expected.clone();
+            let status_text = status_text.clone();
+            let status_sig = status_sig.to_owned();
+            let pin = pin.clone();
+            let root = root.map(str::to_owned);
+            let result = crate::catalog_sql::run(move || {
+                store.catalog_trust_transaction::<_, CatalogError>(&scope, |current, held, _| {
                     identity(&expected, current)?;
-                    let applied = accept(current, held, &status_text, status_sig, &pin, root)?;
+                    let applied = accept(
+                        current,
+                        held,
+                        &status_text,
+                        &status_sig,
+                        &pin,
+                        root.as_deref(),
+                    )?;
                     let write = TrustWrite {
-                        statuses: vec![row(&applied.held, status_sig, &current.url)],
+                        statuses: vec![row(&applied.held, &status_sig, &current.url)],
                         ..Default::default()
                     };
                     Ok((applied, write))
-                },
-            );
+                })
+            })
+            .await;
             match result {
                 Err(error) if error.code == "key_unknown" && !refreshed => {
                     self.refresh_registry_keys().await?;
@@ -567,31 +583,43 @@ impl CatalogTrust {
             &archive,
             &trust,
         )?;
-        let folder = self.store()?.store_folder().to_path_buf();
+        let store = self.store()?;
+        let folder = store.store_folder().to_path_buf();
+        let scope = self.scope.clone();
+        let root = root.map(str::to_owned);
+        let status_sig = status_sig.to_owned();
         // Recheck this version's current status and selected registry after
         // downloads. A higher status sequence or a replacement registry makes
         // the earlier acceptance stale, so its bytes must not be published.
-        self.store()?.catalog_trust_transaction::<_, CatalogError>(
-            &self.scope,
-            |current, held, _| {
+        crate::catalog_sql::run(move || {
+            store.catalog_trust_transaction::<_, CatalogError>(&scope, |current, held, _| {
                 identity(&expected, current)?;
-                accept(current, held, &status_text, status_sig, &pin, root)?;
+                accept(
+                    current,
+                    held,
+                    &status_text,
+                    &status_sig,
+                    &pin,
+                    root.as_deref(),
+                )?;
                 BlobStore::new(&folder)?.publish(&archive)?;
                 Ok(((), TrustWrite::default()))
-            },
-        )?;
+            })
+        })
+        .await?;
         Ok(verified)
     }
     pub async fn apply_scope_feed(&mut self) -> Result<FeedApply, NetworkError> {
         self.refresh_registry_keys().await?;
-        let etag = self
-            .store()?
-            .catalog_feed_etag(&self.scope)
-            .map_err(store_error)?;
-        let after = self
-            .store()?
-            .catalog_feed_seq(&self.scope)
-            .map_err(store_error)?;
+        let store = self.store()?;
+        let scope = self.scope.clone();
+        let (etag, after) = crate::catalog_sql::run(move || {
+            Ok::<_, CatalogError>((
+                store.catalog_feed_etag(&scope).map_err(store_error)?,
+                store.catalog_feed_seq(&scope).map_err(store_error)?,
+            ))
+        })
+        .await?;
         let mut mode = if after.is_some() {
             status::FeedMode::After
         } else {
@@ -626,13 +654,16 @@ impl CatalogTrust {
                 other => other?,
             };
             if response.not_modified {
-                self.store()?.catalog_trust_transaction::<_, CatalogError>(
-                    &self.scope,
-                    |current, _, _| {
-                        identity(&self.registry, current)?;
+                let store = self.store()?;
+                let scope = self.scope.clone();
+                let expected = self.registry.clone();
+                crate::catalog_sql::run(move || {
+                    store.catalog_trust_transaction::<_, CatalogError>(&scope, |current, _, _| {
+                        identity(&expected, current)?;
                         Ok(((), TrustWrite::default()))
-                    },
-                )?;
+                    })
+                })
+                .await?;
                 return Ok(FeedApply {
                     results: vec![],
                     refusal: None,
@@ -665,112 +696,119 @@ impl CatalogTrust {
                 .collect::<Result<Vec<_>, CatalogError>>()?;
             let expected = self.registry.clone();
             let scope = self.scope.clone();
-            let outcome = self.store()?.catalog_trust_transaction::<_, CatalogError>(
-                &scope,
-                |current, rows, cursor| {
-                    identity(&expected, current)?;
-                    let mut state = status::FeedState {
-                        feed_seq: cursor,
-                        ..Default::default()
-                    };
-                    for r in rows {
-                        let held = restore(r, Some(current), self.cortexkit_root.as_deref())?;
-                        state.held.insert(format!("{}@{}", r.name, r.version), held);
-                    }
-                    let mut pins = std::collections::BTreeMap::new();
-                    for record in &records {
-                        if let Ok(s) =
-                            serde_json::from_str::<status::StatusRecord>(&record.record_text)
-                        {
-                            if scoped(&scope, &s.name, &s.version).is_ok() {
-                                pins.insert(
-                                    format!("{}@{}", s.name, s.version),
-                                    status::Pin {
-                                        name: s.name,
-                                        version: s.version,
-                                        archive_sha256: s.archive_sha256,
-                                    },
-                                );
+            let store = self.store()?;
+            let root = self.cortexkit_root.clone();
+            let outcome = crate::catalog_sql::run(move || {
+                store.catalog_trust_transaction::<_, CatalogError>(
+                    &scope,
+                    |current, rows, cursor| {
+                        identity(&expected, current)?;
+                        let mut state = status::FeedState {
+                            feed_seq: cursor,
+                            ..Default::default()
+                        };
+                        for r in rows {
+                            let held = restore(r, Some(current), root.as_deref())?;
+                            state.held.insert(format!("{}@{}", r.name, r.version), held);
+                        }
+                        let mut pins = std::collections::BTreeMap::new();
+                        for record in &records {
+                            if let Ok(s) =
+                                serde_json::from_str::<status::StatusRecord>(&record.record_text)
+                            {
+                                if scoped(&scope, &s.name, &s.version).is_ok() {
+                                    pins.insert(
+                                        format!("{}@{}", s.name, s.version),
+                                        status::Pin {
+                                            name: s.name,
+                                            version: s.version,
+                                            archive_sha256: s.archive_sha256,
+                                        },
+                                    );
+                                }
                             }
                         }
-                    }
-                    let pure = status::apply_feed(
-                        &state,
-                        mode,
-                        &status::FeedReply::Records {
-                            feed_seq: seq,
-                            records: records.clone(),
-                        },
-                        &chain(current),
-                        &pins,
-                    );
-                    let mut write = TrustWrite::default();
-                    let mut holds = rows.to_vec();
-                    let mut results = Vec::new();
-                    if pure
-                        .refusal
-                        .as_ref()
-                        .is_some_and(|r| r.field.as_deref() == Some("feed_seq"))
-                    {
-                        return Ok((
+                        let pure = status::apply_feed(
+                            &state,
+                            mode,
+                            &status::FeedReply::Records {
+                                feed_seq: seq,
+                                records: records.clone(),
+                            },
+                            &chain(current),
+                            &pins,
+                        );
+                        let mut write = TrustWrite::default();
+                        let mut holds = rows.to_vec();
+                        let mut results = Vec::new();
+                        if pure
+                            .refusal
+                            .as_ref()
+                            .is_some_and(|r| r.field.as_deref() == Some("feed_seq"))
+                        {
+                            return Ok((
+                                FeedApply {
+                                    results,
+                                    refusal: pure.refusal.map(Into::into),
+                                    fetch_full: matches!(
+                                        pure.next_step,
+                                        status::NextStep::FetchFullFeed
+                                    ),
+                                    cursor_advanced: false,
+                                },
+                                write,
+                            ));
+                        }
+                        for (record, (_, result)) in records.iter().zip(pure.records) {
+                            let result = result.map_err(CatalogError::from).and_then(|_| {
+                                let s: status::StatusRecord =
+                                    serde_json::from_str(&record.record_text).map_err(|_| {
+                                        CatalogError::new("status_invalid", "invalid status")
+                                    })?;
+                                let pin = status::Pin {
+                                    name: s.name.clone(),
+                                    version: s.version.clone(),
+                                    archive_sha256: s.archive_sha256.clone(),
+                                };
+                                let applied = accept(
+                                    current,
+                                    &holds,
+                                    &record.record_text,
+                                    &record.signature,
+                                    &pin,
+                                    root.as_deref(),
+                                )?;
+                                let stored = row(&applied.held, &record.signature, &current.url);
+                                holds.retain(|r| {
+                                    r.name != stored.name || r.version != stored.version
+                                });
+                                holds.push(stored.clone());
+                                write.statuses.push(stored);
+                                Ok(applied.result)
+                            });
+                            results.push((record.id.clone(), result));
+                        }
+                        let all_ok = results.iter().all(|(_, r)| r.is_ok());
+                        if all_ok {
+                            write.feed_seq = Some(seq);
+                            write.feed_etag = response.etag.clone();
+                        }
+                        let rollback = results
+                            .iter()
+                            .any(|(_, r)| r.as_ref().is_err_and(|e| e.code == "feed_rollback"));
+                        Ok((
                             FeedApply {
                                 results,
                                 refusal: pure.refusal.map(Into::into),
-                                fetch_full: matches!(
-                                    pure.next_step,
-                                    status::NextStep::FetchFullFeed
-                                ),
-                                cursor_advanced: false,
+                                fetch_full: mode == status::FeedMode::After && rollback,
+                                cursor_advanced: all_ok,
                             },
                             write,
-                        ));
-                    }
-                    for (record, (_, result)) in records.iter().zip(pure.records) {
-                        let result = result.map_err(CatalogError::from).and_then(|_| {
-                            let s: status::StatusRecord = serde_json::from_str(&record.record_text)
-                                .map_err(|_| {
-                                    CatalogError::new("status_invalid", "invalid status")
-                                })?;
-                            let pin = status::Pin {
-                                name: s.name.clone(),
-                                version: s.version.clone(),
-                                archive_sha256: s.archive_sha256.clone(),
-                            };
-                            let applied = accept(
-                                current,
-                                &holds,
-                                &record.record_text,
-                                &record.signature,
-                                &pin,
-                                self.cortexkit_root.as_deref(),
-                            )?;
-                            let stored = row(&applied.held, &record.signature, &current.url);
-                            holds.retain(|r| r.name != stored.name || r.version != stored.version);
-                            holds.push(stored.clone());
-                            write.statuses.push(stored);
-                            Ok(applied.result)
-                        });
-                        results.push((record.id.clone(), result));
-                    }
-                    let all_ok = results.iter().all(|(_, r)| r.is_ok());
-                    if all_ok {
-                        write.feed_seq = Some(seq);
-                        write.feed_etag = response.etag.clone();
-                    }
-                    let rollback = results
-                        .iter()
-                        .any(|(_, r)| r.as_ref().is_err_and(|e| e.code == "feed_rollback"));
-                    Ok((
-                        FeedApply {
-                            results,
-                            refusal: pure.refusal.map(Into::into),
-                            fetch_full: mode == status::FeedMode::After && rollback,
-                            cursor_advanced: all_ok,
-                        },
-                        write,
-                    ))
-                },
-            )?;
+                        ))
+                    },
+                )
+            })
+            .await?;
             if outcome.fetch_full && mode == status::FeedMode::After {
                 mode = status::FeedMode::Full;
                 continue;

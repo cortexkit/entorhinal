@@ -127,27 +127,39 @@ impl Worker {
     fn store(&self) -> Option<RegistryStore> {
         self.store.upgrade()?.lock().unwrap().clone()
     }
-    fn offset(&self) -> Result<u64, &'static str> {
+    async fn offset(&self) -> Result<u64, &'static str> {
         let mut bytes = [0; 8];
         getrandom::getrandom(&mut bytes).map_err(|_| "catalog_poll_failed")?;
-        self.store()
-            .ok_or("store_unavailable")?
-            .catalog_poll_offset(u64::from_le_bytes(bytes))
-            .map_err(|_| "storage_error")
+        let store = self.store().ok_or("store_unavailable")?;
+        crate::catalog_sql::run(move || {
+            store
+                .catalog_poll_offset(u64::from_le_bytes(bytes))
+                .map_err(|e| crate::catalog_blob::CatalogError::new("storage_error", e.to_string()))
+        })
+        .await
+        .map_err(|e| e.code)
     }
     async fn pass(&self) -> Result<(), &'static str> {
-        let scopes = self
-            .store()
-            .ok_or("store_unavailable")?
-            .catalog_pinned_scopes()
-            .map_err(|_| "storage_error")?;
+        let store = self.store().ok_or("store_unavailable")?;
+        let scopes = crate::catalog_sql::run(move || {
+            store
+                .catalog_pinned_scopes()
+                .map_err(|e| crate::catalog_blob::CatalogError::new("storage_error", e.to_string()))
+        })
+        .await
+        .map_err(|e| e.code)?;
         let mut failure = None;
         for scope in scopes {
             self.health.catalog.scopes.fetch_add(1, Ordering::Relaxed);
-            let trust = self
-                .store()
-                .ok_or("store_unavailable")
-                .and_then(|store| (self.sources)(store, &scope).map_err(|e| e.code));
+            let trust = match self.store() {
+                Some(store) => {
+                    let sources = self.sources.clone();
+                    crate::catalog_sql::run(move || sources(store, &scope))
+                        .await
+                        .map_err(|e| e.code)
+                }
+                None => Err("store_unavailable"),
+            };
             let result = match trust {
                 Ok(mut trust) => {
                     trust.use_weak_store(self.store.clone());
@@ -173,7 +185,7 @@ impl Worker {
             }
             let result = match offset {
                 Some(_) => self.pass().await,
-                None => match self.offset() {
+                None => match self.offset().await {
                     Ok(value) => {
                         offset = Some(value);
                         self.pass().await

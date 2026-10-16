@@ -67,6 +67,7 @@ mod catalog_ops;
 mod catalog_poll;
 mod catalog_publish;
 mod catalog_seed;
+mod catalog_sql;
 mod catalog_trust;
 mod catch_up;
 mod claim_codec;
@@ -1379,13 +1380,16 @@ impl ProjectsHandler {
             };
         }
         if request.method == catalog_agent::ACK_ACTIVATION {
-            return match self.execute(request, key) {
+            return match self
+                .catalog_activation_wait(request.method, request.params, key, received)
+                .await
+            {
                 Ok(body) => HandlerOutcome::Response(body),
                 Err(error) => error.into_outcome(),
             };
         }
         if request.method == catalog_ops::READ_BLOB {
-            return match self.catalog_read_blob(request.params, key).await {
+            return match self.catalog_read_blob(request.params, key, received).await {
                 Ok(body) => HandlerOutcome::Response(body),
                 Err(error) => error.into_outcome(),
             };
@@ -1399,7 +1403,7 @@ impl ProjectsHandler {
         } else if request.method == catalog_publish::PUBLISH {
             self.catalog_publish(request.params, key, received).await
         } else if request.method == catalog_seed::SEED {
-            self.catalog_seed(request.params, key).await
+            self.catalog_seed(request.params, key, received).await
         } else if request.method == catalog_ops::PUBLISHER_TRUST {
             self.catalog_publisher_trust(request.params, key, received)
                 .await

@@ -890,20 +890,16 @@ async fn catalog_pending_and_corrupt_bytes_never_raise_card() {
 
 #[tokio::test]
 async fn catalog_commit_revalidates_base_under_writer_lock() {
-    use std::{
-        future::Future,
-        task::{Context, Waker},
-    };
     let f = Fixture::new().await;
     let plan = f.prepare("commit-stale").await;
     f.cingulate
         .script("consent.await", Effect::Answer("approve_always_publisher"));
     let lock = f.tools.handler.writer.lock().await;
     let mut install = Box::pin(f.install(&plan));
-    assert!(install
-        .as_mut()
-        .poll(&mut Context::from_waker(Waker::noop()))
-        .is_pending());
+    tokio::select! {
+        _ = f.tools.handler.catalog_agent.authorized.notified() => {},
+        outcome = &mut install => panic!("install completed before the writer lock was released: {outcome:?}"),
+    }
     assert_eq!(f.cingulate.card_count(), 1);
     let detail = f
         .store()
@@ -932,19 +928,15 @@ async fn catalog_commit_revalidates_base_under_writer_lock() {
 
 #[tokio::test]
 async fn catalog_commit_revalidates_publisher_coverage_under_writer_lock() {
-    use std::{
-        future::Future,
-        task::{Context, Waker},
-    };
     let f = Fixture::new().await;
     f.grant();
     let plan = f.prepare("grant-revoked").await;
     let lock = f.tools.handler.writer.lock().await;
     let mut install = Box::pin(f.install(&plan));
-    assert!(install
-        .as_mut()
-        .poll(&mut Context::from_waker(Waker::noop()))
-        .is_pending());
+    tokio::select! {
+        _ = f.tools.handler.catalog_agent.authorized.notified() => {},
+        outcome = &mut install => panic!("install completed before the writer lock was released: {outcome:?}"),
+    }
     f.store()
         .revoke_publisher_grant("test-grant", 101, &json!("test"))
         .unwrap();
@@ -1383,4 +1375,121 @@ async fn catalog_status_news_views_and_prepare_named_refusal() {
     assert_eq!(refused["state"], "failed");
     assert_eq!(refused["refusal"]["code"], "version_revoked");
     assert_eq!(refused["refusal"]["detail"]["name"], NAME);
+}
+
+#[tokio::test(start_paused = true)]
+async fn catalog_prepare_sql_is_off_runtime_and_bounded() {
+    use crate::catalog_sql::tests::{finish, poll, responsive, started, tracked, HeldSql};
+    let f = finish(Fixture::new()).await;
+    let held = HeldSql::new(f.store()).await;
+    let (request, entered) = tracked(f.tools.call("catalog_prepare", f.spec("held-create")));
+    let mut request = Box::pin(request);
+    started(request.as_mut(), &entered).await;
+    assert!(poll(request.as_mut()).is_pending());
+    responsive(&f.tools.handler).await;
+    tokio::time::advance(std::time::Duration::from_millis(110_001)).await;
+    let answer = poll(request.as_mut());
+    held.finish().await;
+    assert!(
+        matches!(answer, std::task::Poll::Ready(outcome) if error_code(outcome.clone()) == "catalog_timeout")
+    );
+    drop(request);
+    let plan = finish(f.prepare("held-create")).await;
+    assert_eq!(plan["state"], "ready", "{plan}");
+    assert_eq!(plan["closure"][0]["name"], NAME);
+}
+
+#[tokio::test(start_paused = true)]
+async fn catalog_prefetch_sql_is_off_runtime_and_bounded() {
+    use crate::catalog_sql::tests::{finish, poll, responsive, HeldSql};
+    let f = finish(Fixture::new()).await;
+    let plan = finish(f.prepare("held-prefetch")).await;
+    f.grant();
+    f.consumers.consumer.ready.store(false, Ordering::SeqCst);
+    let installed = tool_result(finish(f.install(&plan)).await);
+    let generation = installed["generation_id"].as_str().unwrap();
+    f.consumers.consumer.ready.store(true, Ordering::SeqCst);
+    f.consumers.consumer.calls.lock().unwrap().clear();
+    let held = HeldSql::new(f.store()).await;
+    let mut request = Box::pin(f.tools.handler.prefetch_catalog(
+        &f.consumers.consumer.store,
+        &f.tools.agents[0],
+        generation,
+        Instant::now() + std::time::Duration::from_secs(110),
+    ));
+    loop {
+        tokio::select! {
+            result = &mut request => panic!("prefetch finished while SQL was held: {result:?}"),
+            () = tokio::task::yield_now() => {
+                if f.consumers.consumer.calls.lock().unwrap().iter().any(|(m,_)| m == "catalog_consumer.prefetch") { break; }
+            }
+        }
+    }
+    responsive(&f.tools.handler).await;
+    tokio::time::advance(std::time::Duration::from_millis(110_001)).await;
+    let answer = poll(request.as_mut());
+    held.finish().await;
+    assert!(
+        matches!(answer, std::task::Poll::Ready(Err(error)) if error.code == "catalog_timeout")
+    );
+    drop(request);
+    finish(f.tools.handler.prefetch_catalog(
+        &f.store(),
+        &f.tools.agents[0],
+        generation,
+        Instant::now() + std::time::Duration::from_secs(110),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        f.store()
+            .catalog_generation(generation, &f.tools.agents[0])
+            .unwrap()
+            .state,
+        "ready"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn catalog_activation_sql_is_off_runtime_and_bounded() {
+    use crate::catalog_sql::tests::{finish, poll, responsive, started, tracked, HeldSql};
+    let f = finish(Fixture::new()).await;
+    let plan = finish(f.prepare("held-activation")).await;
+    f.grant();
+    let installed = tool_result(finish(f.install(&plan)).await);
+    let generation = installed["generation_id"].as_str().unwrap();
+    let held = HeldSql::new(f.store()).await;
+    let ack = json!({"agent_id":f.tools.agents[0],"generation_id":generation});
+    let (request, entered) = tracked(f.op(
+        crate::tests::reserved(crate::WRITER_MODULE),
+        ACK_ACTIVATION,
+        ack.clone(),
+    ));
+    let mut request = Box::pin(request);
+    started(request.as_mut(), &entered).await;
+    assert!(poll(request.as_mut()).is_pending());
+    responsive(&f.tools.handler).await;
+    tokio::time::advance(std::time::Duration::from_millis(25_001)).await;
+    let answer = poll(request.as_mut());
+    held.finish().await;
+    assert!(
+        matches!(answer, std::task::Poll::Ready(outcome) if error_code(outcome.clone()) == "catalog_timeout")
+    );
+    drop(request);
+    let active = result(
+        finish(f.op(
+            crate::tests::reserved(crate::WRITER_MODULE),
+            ACK_ACTIVATION,
+            ack,
+        ))
+        .await,
+    );
+    assert_eq!(active["generation"]["state"], "active");
+    assert_eq!(
+        f.store()
+            .catalog_agent_generations(&f.tools.agents[0])
+            .unwrap()
+            .len(),
+        1
+    );
 }

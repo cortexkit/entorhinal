@@ -3353,12 +3353,12 @@ id = "cingulate-detach-settlement"
 guards = "A settled detach is consumed in the same held call rather than returning pending"
 file = "crates/entorhinal-module/src/consent.rs"
 old = '''if let RecordDecision::Settled(decision) =
-            inspect_record(call.store, &current, &record, (call.now_ms)())?
+            inspect_record_wait(call, &current, &record).await?
         {
             return Ok(decision);
         }'''
 new = '''if let RecordDecision::Settled(_decision) =
-            inspect_record(call.store, &current, &record, (call.now_ms)())?
+            inspect_record_wait(call, &current, &record).await?
         {
             // NON-VACUITY BREAK: discard the answer that raced detach.
         }'''
@@ -9101,3 +9101,125 @@ runner = "cargo"
 package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 expect_red = ["tool_provider::tests::catalog_reply_has_top_level_tools"]
+
+# Catalog SQL must yield the runtime and finish replies before their callers time out.
+[[control]]
+id = "catalog-sql-off-runtime"
+guards = "All catalog SQL worker groups keep a single async runtime worker available"
+file = "crates/entorhinal-module/src/catalog_sql.rs"
+old = '''tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if let Some(entered) = entered {'''
+new = '''tokio::spawn(async move { // NON-VACUITY BREAK
+        #[cfg(test)]
+        if let Some(entered) = entered {'''
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_trust::tests::trust_status_sql_does_not_occupy_runtime", "catalog_poll::tests::catalog_poll_clock_sql_does_not_occupy_runtime", "catalog_agent::tests::catalog_prepare_sql_is_off_runtime_and_bounded", "catalog_agent::tests::catalog_prefetch_sql_is_off_runtime_and_bounded", "catalog_agent::tests::catalog_activation_sql_is_off_runtime_and_bounded", "two_machine_acceptance::moves::catalog_moves::catalog_move_sql_does_not_occupy_runtime", "catalog_ops::tests::catalog_registry_sql_is_off_runtime_and_bounded", "catalog_grants::tests::catalog_grant_sql_is_off_runtime_and_bounded", "catalog_seed::tests::catalog_seed_sql_is_off_runtime_and_bounded"]
+
+[[control]]
+id = "catalog-sql-reply-deadline"
+guards = "A blocked catalog SQL worker cannot outlive the served reply deadline"
+file = "crates/entorhinal-module/src/catalog_sql.rs"
+old = 'timeout_at(deadline, run(work))'
+new = 'timeout_at(deadline + std::time::Duration::from_secs(1), run(work)) // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_prepare_sql_is_off_runtime_and_bounded", "catalog_agent::tests::catalog_prefetch_sql_is_off_runtime_and_bounded", "catalog_agent::tests::catalog_activation_sql_is_off_runtime_and_bounded", "catalog_ops::tests::catalog_registry_sql_is_off_runtime_and_bounded", "catalog_grants::tests::catalog_grant_sql_is_off_runtime_and_bounded", "catalog_seed::tests::catalog_seed_sql_is_off_runtime_and_bounded", "catalog_ops::tests::catalog_blob_reply_is_bounded_even_when_blocking_pool_is_full"]
+
+[[control]]
+id = "catalog-tool-110-second-budget"
+guards = "Catalog tools reserve time to answer before the caller times out"
+file = "crates/entorhinal-module/src/tool_provider.rs"
+old = 'std::time::Duration::from_secs(110)'
+new = 'std::time::Duration::from_secs(115) // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_prepare_sql_is_off_runtime_and_bounded"]
+
+[[control]]
+id = "catalog-activation-25-second-budget"
+guards = "Activation acknowledgement answers before the default thirty-second RPC timeout"
+file = "crates/entorhinal-module/src/catalog_agent.rs"
+old = 'received + std::time::Duration::from_secs(25),'
+new = 'received + std::time::Duration::from_secs(30), // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_activation_sql_is_off_runtime_and_bounded"]
+
+[[control]]
+id = "catalog-blob-25-second-budget"
+guards = "Blob reads answer before the default thirty-second RPC timeout"
+file = "crates/entorhinal-module/src/catalog_ops.rs"
+old = 'let deadline = received + std::time::Duration::from_secs(25);'
+new = 'let deadline = received + std::time::Duration::from_secs(30); // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_ops_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_ops::tests::catalog_blob_reply_is_bounded_even_when_blocking_pool_is_full"]
+
+[[control]]
+id = "catalog-seed-110-second-budget"
+guards = "Manual seed answers before the operator CLI timeout"
+file = "crates/entorhinal-module/src/catalog_seed.rs"
+old = 'received + std::time::Duration::from_secs(110),'
+new = 'received + std::time::Duration::from_secs(120), // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_seed_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_seed::tests::catalog_seed_sql_is_off_runtime_and_bounded"]
+
+[[control]]
+id = "catalog-registry-60-second-budget"
+guards = "Registry SQL completion shares the original receipt-relative operator bound"
+file = "crates/entorhinal-module/src/catalog_ops.rs"
+old = 'const CONFIRM_BOUND: std::time::Duration = std::time::Duration::from_secs(60);'
+new = 'const CONFIRM_BOUND: std::time::Duration = std::time::Duration::from_secs(65); // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_ops_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_ops::tests::catalog_registry_sql_is_off_runtime_and_bounded"]
+
+[[control]]
+id = "catalog-grant-60-second-budget"
+guards = "Publisher grant SQL completion shares the original receipt-relative operator bound"
+file = "crates/entorhinal-module/src/catalog_grants.rs"
+old = 'let deadline = received + std::time::Duration::from_secs(60);'
+new = 'let deadline = received + std::time::Duration::from_secs(65); // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/catalog_grants_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_grants::tests::catalog_grant_sql_is_off_runtime_and_bounded"]
+
+[[control]]
+id = "catalog-seed-cli-timeout"
+guards = "The seed CLI caller waits longer than the server seed deadline"
+file = "crates/entorhinal-module/src/cli.rs"
+old = 'timeout: Duration::from_secs(120),'
+new = 'timeout: Duration::from_secs(30), // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/cli.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["cli::catalog_publish_cli_tests::seed_file_is_canonical_and_requires_one_path"]

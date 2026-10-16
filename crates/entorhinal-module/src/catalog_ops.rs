@@ -146,6 +146,7 @@ impl ProjectsHandler {
         received: Instant,
     ) -> Result<Vec<u8>, HandlerError> {
         self.admit(method, key)?;
+        let deadline = received + CONFIRM_BOUND;
         let store = self.with_store(|s| Ok(s.clone()))?;
         enum Write {
             Add(Add),
@@ -189,9 +190,13 @@ impl ProjectsHandler {
             REMOVE => {
                 let mut p: Remove = parse(params)?;
                 p.url = canonical_url(&p.url)?;
-                let registry = store
-                    .catalog_registries()
-                    .map_err(|e| HandlerError::new("store_error", e.to_string()))?
+                let db = store.clone();
+                let registries =
+                    crate::catalog_sql::until(deadline, "registry remove read", move || {
+                        db.catalog_registries().map_err(HandlerError::from)
+                    })
+                    .await?;
+                let registry = registries
                     .into_iter()
                     .find(|r| r.url == p.url)
                     .ok_or_else(|| HandlerError::new("registry_unknown", "unknown registry"))?;
@@ -217,26 +222,28 @@ impl ProjectsHandler {
         if !self.route_admissions().contains_key(&key) {
             return Err(OperatorConfirmError::Declined.into());
         }
-        let deadline = received + CONFIRM_BOUND;
         tokio::select! {
             biased;
             _ = guard.cancelled.wait_for(|closed| *closed) => return Err(OperatorConfirmError::Declined.into()),
             result = timeout_at(deadline,self.operator_confirmer.confirm_operator(&summary,key)) => {
-                result.map_err(|_| HandlerError::from(OperatorConfirmError::Declined))??;
+                result.map_err(|_| crate::catalog_sql::expired("registry confirmation"))??;
             }
         }
         let now = (self.clock)();
         let writer = tokio::select! {
             biased;
             _ = guard.cancelled.wait_for(|closed| *closed) => return Err(OperatorConfirmError::Declined.into()),
-            result = timeout_at(deadline,self.writer.clone().lock_owned()) => result.map_err(|_| HandlerError::from(OperatorConfirmError::Declined))?,
+            result = timeout_at(deadline,self.writer.clone().lock_owned()) => result.map_err(|_| crate::catalog_sql::expired("registry writer admission"))?,
         };
-        if Instant::now() >= deadline || *guard.cancelled.borrow() {
+        if *guard.cancelled.borrow() {
             return Err(OperatorConfirmError::Declined.into());
+        }
+        if Instant::now() >= deadline {
+            return Err(crate::catalog_sql::expired("registry write"));
         }
         #[cfg(test)]
         let commit_hook = self.shared_commit_hook.clone();
-        tokio::task::spawn_blocking(move || {
+        crate::catalog_sql::until(deadline, "registry write", move || {
             // Cancellation of the async caller must not release either guard while SQLite writes.
             let (_writer, _confirmation) = (writer, guard);
             #[cfg(test)]
@@ -261,13 +268,14 @@ impl ProjectsHandler {
             encode_result(json!({"outcome":"ok"}))
         })
         .await
-        .map_err(|e| HandlerError::new("store_error", e.to_string()))?
     }
     pub(super) async fn catalog_read_blob(
         &self,
         params: Value,
         key: RouteKey,
+        received: Instant,
     ) -> Result<Vec<u8>, HandlerError> {
+        let deadline = received + std::time::Duration::from_secs(25);
         let admission = self.admit(READ_BLOB, key)?;
         let Some(Principal::Reserved { module_id }) = admission.principal else {
             return Err(HandlerError::new(
@@ -275,10 +283,9 @@ impl ProjectsHandler {
                 "blob reads require a catalog consumer module",
             ));
         };
-        let catalog = self
-            .participant_discovery
-            .catalog_list()
+        let catalog = timeout_at(deadline, self.participant_discovery.catalog_list())
             .await
+            .map_err(|_| crate::catalog_sql::expired("catalog.read_blob discovery"))?
             .map_err(|_| {
                 HandlerError::new("catalog_consumer_required", "daemon catalog unavailable")
             })?;
@@ -298,11 +305,10 @@ impl ProjectsHandler {
         }
         let p: ReadBlob = parse(params)?;
         let folder = self.with_store(|s| Ok(s.store_folder().to_path_buf()))?;
-        tokio::task::spawn_blocking(move || {
+        crate::catalog_sql::until(deadline, "catalog.read_blob", move || {
             encode_result(BlobStore::new(&folder)?.read_chunk(&p.sha256, p.offset, p.length)?)
         })
         .await
-        .map_err(|e| HandlerError::new("blob_io", e.to_string()))?
     }
 }
 #[cfg(test)]
