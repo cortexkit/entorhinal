@@ -22,8 +22,8 @@ use subc_protocol::{
 };
 
 const REPLY_MAX_MS: u64 = 120_000;
-const ASSISTANT_CAPABILITY_TAG: &str = "entorhinal:agents_create/v1";
-const HEAD_CAPABILITY_TAG: &str = "entorhinal:agents_hire/v1";
+const ASSISTANT_CAPABILITY_TAG: &str = "entorhinal:agents.create/v1";
+const HEAD_CAPABILITY_TAG: &str = "entorhinal:agents.hire/v1";
 const CATALOG_INSTALL_CAPABILITY_TAG: &str = "entorhinal:catalog.install/v1";
 
 #[derive(Clone, Copy, Debug)]

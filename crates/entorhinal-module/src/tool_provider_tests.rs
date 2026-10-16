@@ -630,12 +630,12 @@ async fn provider_discovery_catalog_and_hello_agree_on_exact_tool_table() {
     let catalog_body = response_body(f.call("tool.catalog", json!({})).await);
     let catalog: CatalogAnswer = serde_json::from_slice(&catalog_body).unwrap();
     for (name, tag) in [
-        ("projects_create_workspace", "entorhinal:agents_create/v1"),
-        ("projects_register", "entorhinal:agents_create/v1"),
-        ("agents_create_head", "entorhinal:agents_create/v1"),
-        ("agents_hire", "entorhinal:agents_hire/v1"),
-        ("agents_retire_hire", "entorhinal:agents_hire/v1"),
-        ("agents_list_hires", "entorhinal:agents_hire/v1"),
+        ("projects_create_workspace", "entorhinal:agents.create/v1"),
+        ("projects_register", "entorhinal:agents.create/v1"),
+        ("agents_create_head", "entorhinal:agents.create/v1"),
+        ("agents_hire", "entorhinal:agents.hire/v1"),
+        ("agents_retire_hire", "entorhinal:agents.hire/v1"),
+        ("agents_list_hires", "entorhinal:agents.hire/v1"),
         ("catalog_prepare", "entorhinal:catalog.install/v1"),
         ("catalog_plan", "entorhinal:catalog.install/v1"),
         ("catalog_install", "entorhinal:catalog.install/v1"),
