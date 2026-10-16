@@ -1098,10 +1098,20 @@ fn call_failure(error: subc_client_rs::CallError) -> CallFailure {
         ));
     }
     match error {
-        subc_client_rs::CallError::Module(body) => CallFailure::Refused {
-            code: body.code,
-            message: body.message,
-        },
+        subc_client_rs::CallError::Module(body) => {
+            // A refusal's detail names what failed (for a move, the participant
+            // module and its route or reply). Print it with the message so the
+            // operator doesn't have to dig through logs.
+            let message = match body.detail.as_ref().filter(|d| !d.is_null()) {
+                Some(detail) if body.message.is_empty() => format!("detail: {detail}"),
+                Some(detail) => format!("{}\n  detail: {detail}", body.message),
+                None => body.message,
+            };
+            CallFailure::Refused {
+                code: body.code,
+                message,
+            }
+        }
         subc_client_rs::CallError::OutcomeUnknown(_) => {
             CallFailure::Unknown(format!("call: {error}"))
         }

@@ -4416,6 +4416,32 @@ target = "--bin ck-entorhinal"
 expect_red = ["participant_discovery::tests::disabled_modules_are_ignored_even_when_absent_or_not_ready"]
 
 [[control]]
+id = "discovery-skips-no-wire-processes"
+guards = "A supervised process with no subc wire never blocks a move"
+file = "crates/entorhinal-module/src/participant_discovery.rs"
+old = "subc_control::ModuleProtocol::None => false,"
+new = "subc_control::ModuleProtocol::None => true, // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/participant_discovery.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["participant_discovery::tests::processes_without_the_subc_wire_never_block_but_absent_modules_still_do"]
+
+[[control]]
+id = "discovery-subc-modules-stay-fail-closed"
+guards = "An absent subc module, or one from a daemon without the protocol field, still refuses"
+file = "crates/entorhinal-module/src/participant_discovery.rs"
+old = "subc_control::ModuleProtocol::Subc => true,"
+new = "subc_control::ModuleProtocol::Subc => false, // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/participant_discovery.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["participant_discovery::tests::processes_without_the_subc_wire_never_block_but_absent_modules_still_do"]
+
+[[control]]
 id = "s11-discovery-ready"
 guards = "A participant not ready in the catalogue refuses with its reason and no route open"
 file = "crates/entorhinal-module/src/participant_discovery.rs"
