@@ -1726,10 +1726,22 @@ async fn catalog_status_news_views_and_prepare_named_refusal() {
         degraded["active"]["error"],
         json!({"code":"pinned_revoked","name":NAME,"version":"1.0.0","reason":"registry security notice"})
     );
+    // A revoked current pin is refused from freshly refreshed status, before any
+    // package is listed or verified. Resolution would also end in
+    // `version_revoked`, but only after fetching every version's record.
+    let before = f.registry.calls.lock().unwrap().len();
     let refused = f.prepare("revoked-plan").await;
     assert_eq!(refused["state"], "failed");
     assert_eq!(refused["refusal"]["code"], "version_revoked");
     assert_eq!(refused["refusal"]["detail"]["name"], NAME);
+    let calls = f.registry.calls.lock().unwrap();
+    assert!(
+        !calls[before..]
+            .iter()
+            .any(|path| path.contains("/v1/packages/")),
+        "a revoked current pin must be refused before any package request: {:?}",
+        &calls[before..]
+    );
 }
 
 #[tokio::test(start_paused = true)]
