@@ -304,9 +304,16 @@ impl ProjectsHandler {
             ));
         }
         let p: ReadBlob = parse(params)?;
-        let folder = self.with_store(|s| Ok(s.store_folder().to_path_buf()))?;
+        let store = self.with_store(|s| Ok(s.clone()))?;
         crate::catalog_sql::until(deadline, "catalog.read_blob", move || {
-            encode_result(BlobStore::new(&folder)?.read_chunk(&p.sha256, p.offset, p.length)?)
+            if let Some(status) = store.catalog_blob_tombstone(&p.sha256)? {
+                return Err(HandlerError {
+                    code: "version_tombstoned".into(),
+                    message: "blob is bound only to tombstoned versions".into(),
+                    detail: Some(json!({"name":status["name"],"version":status["version"],"reason":status["reason"]})),
+                });
+            }
+            encode_result(BlobStore::new(store.store_folder())?.read_chunk(&p.sha256, p.offset, p.length)?)
         })
         .await
     }

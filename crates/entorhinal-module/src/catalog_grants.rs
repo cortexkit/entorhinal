@@ -14,6 +14,7 @@ use entorhinal_core::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use tokio::time::{timeout_at, Instant};
 
 #[derive(Clone, PartialEq, Eq)]
@@ -74,7 +75,8 @@ async fn ceiling(
     store: &RegistryStore,
     pins: &[PublisherPin],
     publisher: &str,
-    client: impl Fn(&str) -> Result<RegistryClient, CatalogError>,
+    client: impl Fn(&str) -> Result<RegistryClient, CatalogError> + Send + Sync + 'static,
+    sql: &Arc<crate::move_driver::SqlOperations>,
 ) -> Result<Vec<String>, CatalogError> {
     if pins.is_empty() {
         return Err(CatalogError::new(
@@ -83,7 +85,7 @@ async fn ceiling(
         ));
     }
     let mut tokens = BTreeSet::new();
-    let blobs = BlobStore::new(store.store_folder())?;
+    let client = Arc::new(client);
     for pin in pins {
         let result = async {
             if pin.publisher_fingerprint != publisher || !is_hex(&pin.manifest_sha256, 64) {
@@ -99,19 +101,33 @@ async fn ceiling(
             {
                 return Err(unavailable(pin));
             }
-            let manifest = match blobs.read_verified(&pin.archive_sha256) {
-                Ok(bytes) => archive::read(&bytes)
-                    .ok()
-                    .and_then(|members| members.get("ck.json").map(|bytes| bytes.to_vec()))
-                    .ok_or_else(|| unavailable(pin))?,
-                Err(e) if e.code == "blob_unknown" => client(&format!("@{}", mapped.scope))?
-                    .fetch_manifest(&format!(
-                        "v1/packages/{}/{}/{}/ck.json",
-                        mapped.scope, mapped.name, pin.version
-                    ))
-                    .await
-                    .map_err(|_| unavailable(pin))?,
-                Err(_) => return Err(unavailable(pin)),
+            let folder = store.store_folder().to_path_buf();
+            let held = pin.clone();
+            let guard = sql.begin();
+            let manifest = match crate::catalog_sql::run(move || {
+                let _guard = guard;
+                cached_manifest(&folder, &held)
+            })
+            .await?
+            {
+                Some(bytes) => bytes,
+                None => {
+                    let client = client.clone();
+                    let scope = format!("@{}", mapped.scope);
+                    let guard = sql.begin();
+                    let client = crate::catalog_sql::run(move || {
+                        let _guard = guard;
+                        client(&scope)
+                    })
+                    .await?;
+                    client
+                        .fetch_manifest(&format!(
+                            "v1/packages/{}/{}/{}/ck.json",
+                            mapped.scope, mapped.name, pin.version
+                        ))
+                        .await
+                        .map_err(|_| unavailable(pin))?
+                }
             };
             if manifest.len() > 65_536 || sha256_hex(&manifest) != pin.manifest_sha256 {
                 return Err(unavailable(pin));
@@ -128,6 +144,24 @@ async fn ceiling(
     }
     Ok(tokens.into_iter().collect())
 }
+fn cached_manifest(
+    folder: &std::path::Path,
+    pin: &PublisherPin,
+) -> Result<Option<Vec<u8>>, CatalogError> {
+    // block_in_place panics on a current-thread runtime: tests fail before any
+    // disk I/O if this helper is accidentally called outside the blocking pool.
+    #[cfg(test)]
+    tokio::task::block_in_place(|| {});
+    match BlobStore::new(folder)?.read_verified(&pin.archive_sha256) {
+        Ok(bytes) => archive::read(&bytes)
+            .ok()
+            .and_then(|members| members.get("ck.json").map(|bytes| bytes.to_vec()))
+            .map(Some)
+            .ok_or_else(|| unavailable(pin)),
+        Err(e) if e.code == "blob_unknown" => Ok(None),
+        Err(_) => Err(unavailable(pin)),
+    }
+}
 impl ProjectsHandler {
     pub(super) async fn catalog_publisher_trust(
         &self,
@@ -135,7 +169,7 @@ impl ProjectsHandler {
         key: RouteKey,
         received: Instant,
     ) -> Result<Vec<u8>, HandlerError> {
-        self.catalog_publisher_trust_from(params, key, received, &StoredPins)
+        self.catalog_publisher_trust_from(params, key, received, Arc::new(StoredPins))
             .await
     }
     pub(crate) async fn catalog_publisher_trust_from(
@@ -143,7 +177,7 @@ impl ProjectsHandler {
         params: Value,
         key: RouteKey,
         received: Instant,
-        source: &dyn PinSource,
+        source: Arc<dyn PinSource>,
     ) -> Result<Vec<u8>, HandlerError> {
         self.admit(PUBLISHER_TRUST, key)?;
         let p: TrustRequest = serde_json::from_value(params).map_err(super::invalid_params)?;
@@ -154,19 +188,35 @@ impl ProjectsHandler {
             ));
         }
         let store = self.with_store(|s| Ok(s.clone()))?;
-        let agent = store
-            .agent_row(&p.agent_id)?
-            .ok_or_else(|| HandlerError::new("unknown_agent", "unknown placement agent"))?;
-        if agent.status != "live" {
-            return Err(HandlerError::new("gone", "placement agent is not live"));
-        }
-        let pins = source.pins(&store, &p.agent_id, &p.publisher_fingerprint)?;
         let deadline = received + std::time::Duration::from_secs(60);
+        let db = store.clone();
+        let initial_source = source.clone();
+        let agent_id = p.agent_id.clone();
+        let publisher = p.publisher_fingerprint.clone();
+        let sql_guard = self.catalog_sql.begin();
+        let pins = crate::catalog_sql::until(deadline, "publisher trust pins", move || {
+            let _sql_guard = sql_guard;
+            let agent = db
+                .agent_row(&agent_id)?
+                .ok_or_else(|| HandlerError::new("unknown_agent", "unknown placement agent"))?;
+            if agent.status != "live" {
+                return Err(HandlerError::new("gone", "placement agent is not live"));
+            }
+            initial_source
+                .pins(&db, &agent_id, &publisher)
+                .map_err(HandlerError::from)
+        })
+        .await?;
+        let client_store = store.clone();
         let ceiling = timeout_at(
             deadline,
-            ceiling(&store, &pins, &p.publisher_fingerprint, |scope| {
-                RegistryClient::for_scope(&store, scope, Limits::MODULE)
-            }),
+            ceiling(
+                &store,
+                &pins,
+                &p.publisher_fingerprint,
+                move |scope| RegistryClient::for_scope(&client_store, scope, Limits::MODULE),
+                &self.catalog_sql,
+            ),
         )
         .await
         .map_err(|_| crate::catalog_sql::expired("publisher trust manifests"))??;
@@ -174,6 +224,7 @@ impl ProjectsHandler {
             "Trust publisher {} for install at agent {}",
             p.publisher_fingerprint, p.agent_id
         );
+        let summary = trust_summary(summary, &ceiling);
         if summary.chars().count() > 200 {
             return Err(HandlerError::new(
                 "invalid_params",
@@ -200,17 +251,19 @@ impl ProjectsHandler {
         if Instant::now() >= deadline {
             return Err(crate::catalog_sql::expired("publisher trust write"));
         }
-        let latest = source.pins(&store, &p.agent_id, &p.publisher_fingerprint)?;
-        if latest != pins {
-            return Err(HandlerError::new(
-                "manifest_unavailable",
-                "authenticated pins changed during confirmation",
-            ));
-        }
         let now = (self.clock)();
         let principal = json!(self.admission_for(key).principal);
+        let sql_guard = self.catalog_sql.begin();
         crate::catalog_sql::until(deadline, "publisher trust write", move || {
+            let _sql_guard = sql_guard;
             let (_writer, _confirmation) = (writer, guard);
+            let latest = source.pins(&store, &p.agent_id, &p.publisher_fingerprint)?;
+            if latest != pins {
+                return Err(HandlerError::new(
+                    "manifest_unavailable",
+                    "authenticated pins changed during confirmation",
+                ));
+            }
             let mut random = [0u8; 16];
             getrandom::getrandom(&mut random)
                 .map_err(|e| HandlerError::new("store_error", e.to_string()))?;
@@ -228,6 +281,19 @@ impl ProjectsHandler {
             encode_result(json!({"outcome":"trusted","id":id,"operation":"install"}))
         })
         .await
+    }
+}
+fn trust_summary(identity: String, ceiling: &[String]) -> String {
+    let tokens = if ceiling.is_empty() {
+        "none".into()
+    } else {
+        ceiling.join(", ")
+    };
+    let summary = format!("{identity}; capabilities: {tokens}");
+    if summary.chars().count() <= 200 {
+        summary
+    } else {
+        identity
     }
 }
 #[cfg(test)]
