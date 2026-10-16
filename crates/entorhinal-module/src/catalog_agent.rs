@@ -108,11 +108,23 @@ impl From<entorhinal_core::catalog_resolution::CatalogResolveError> for HandlerE
     fn from(e: entorhinal_core::catalog_resolution::CatalogResolveError) -> Self {
         match e {
             entorhinal_core::catalog_resolution::CatalogResolveError::Store(e) => e.into(),
-            entorhinal_core::catalog_resolution::CatalogResolveError::Refusal(v) => Self {
-                code: v["code"].as_str().unwrap_or("resolution_failed").into(),
-                message: "catalog resolution refused".into(),
-                detail: Some(v),
-            },
+            entorhinal_core::catalog_resolution::CatalogResolveError::Refusal(v) => {
+                let code = v["code"].as_str().unwrap_or("resolution_failed");
+                let kind_slot_taken = code == "kind_slot_taken";
+                Self {
+                    code: code.into(),
+                    message: if kind_slot_taken {
+                        "A profile or persona swap isn't available yet.".into()
+                    } else {
+                        "catalog resolution refused".into()
+                    },
+                    detail: if kind_slot_taken {
+                        v.get("detail").cloned()
+                    } else {
+                        Some(v)
+                    },
+                }
+            }
         }
     }
 }
@@ -214,6 +226,20 @@ fn generation_reply(generation: &entorhinal_core::catalog_agent::CatalogGenerati
     }
     reply
 }
+fn kind_slot_error(
+    conflict: entorhinal_core::catalog_agent::CatalogKindSlotConflict,
+) -> HandlerError {
+    HandlerError {
+        code: "kind_slot_taken".into(),
+        message: "A profile or persona swap isn't available yet.".into(),
+        detail: Some(json!({
+            "kind": conflict.kind,
+            "held": conflict.held,
+            "requested": conflict.requested,
+        })),
+    }
+}
+
 async fn prepare(
     store: &RegistryStore,
     plan: &entorhinal_core::catalog_agent::CatalogPlan,
@@ -379,6 +405,11 @@ async fn prepare(
         }
         error
     })?;
+    if let Some(conflict) =
+        entorhinal_core::catalog_agent::kind_slot_conflict(&resolved.closure, &plan.spec.package)
+    {
+        return Err(kind_slot_error(conflict));
+    }
     let db = store.clone();
     let grants =
         catalog_sql::run(move || db.publisher_grants().map_err(HandlerError::from)).await?;

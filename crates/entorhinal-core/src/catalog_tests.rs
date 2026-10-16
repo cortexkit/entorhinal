@@ -230,4 +230,135 @@ mod catalog_tests {
         assert_eq!(store.catalog_registries().unwrap()[1].keys.len(), 1);
         assert_eq!(store.generation().unwrap(), 0);
     }
+
+    #[test]
+    fn catalog_install_rechecks_kind_slot_after_concurrent_install() {
+        use crate::agent::consent::{
+            Authorization, ConsentCommit, ConsentRequest, RequestIdentity, RequestState,
+        };
+        use crate::catalog_agent::{
+            CatalogSpec, CatalogTarget, PinWriteRequest, PreparedPackage, PreparedPlan,
+        };
+        use entorhinal_catalog::Kind;
+
+        let scratch = TestStore::new("catalog-kind-slot-race");
+        let store = &scratch.store;
+        let agent = crate::catalog_agent::tests::agent(store);
+        let plan_id = "plan:requested-profile";
+        let requested = crate::catalog_agent::tests::pin(
+            "@example/requested-profile",
+            "1.0.0",
+            true,
+        );
+        store
+            .catalog_create_plan(
+                plan_id,
+                &agent,
+                CatalogTarget::Agent(agent.clone()),
+                "install",
+                CatalogSpec {
+                    package: requested.name.clone(),
+                    range: "^1.0.0".into(),
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .catalog_save_prepared(
+                plan_id,
+                &agent,
+                &PreparedPlan {
+                    packages: vec![PreparedPackage {
+                        pin: requested.clone(),
+                        trust: "first_contact".into(),
+                        capabilities: vec![],
+                        has_scripts: false,
+                        root_certified: false,
+                    }],
+                    moves: serde_json::json!({}),
+                    checks: vec![],
+                },
+            )
+            .unwrap();
+        store
+            .catalog_plan_ready(plan_id, &agent, vec![requested.clone()], 2)
+            .unwrap();
+
+        let mut planned_profile = requested;
+        planned_profile.kind = Kind::MemoryProfile;
+        store
+            .db
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "UPDATE catalog_plan SET closure=?1 WHERE plan_id=?2",
+                    rusqlite::params![serde_json::to_string(&vec![planned_profile]).unwrap(), plan_id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let mut held_profile = crate::catalog_agent::tests::pin(
+            "@example/held-profile",
+            "1.0.0",
+            true,
+        );
+        held_profile.kind = Kind::MemoryProfile;
+        store
+            .with_principal("test")
+            .catalog_set_pins(
+                PinWriteRequest {
+                    agent_id: agent.clone(),
+                    pins: vec![held_profile.clone()],
+                    request_key: None,
+                },
+                3,
+            )
+            .unwrap();
+
+        let commit = ConsentCommit {
+            request: ConsentRequest {
+                identity: RequestIdentity {
+                    agent_id: agent.clone(),
+                    tool: "catalog_install".into(),
+                    request_key: plan_id.into(),
+                },
+                args_digest: "digest".into(),
+                scope_ref: "test".into(),
+                scope_epoch: 1,
+                created_at_ms: 3,
+                elicitation_id: None,
+                settlement: None,
+                state: RequestState::Awaiting,
+                outcome: None,
+            },
+            authorization: Authorization::PublisherGrants { ids: vec![] },
+            action: "catalog_install".into(),
+            target: serde_json::json!({}),
+            granted: None,
+            now_ms: 3,
+        };
+        let error = store
+            .with_principal("agent")
+            .with_consent_commit(commit)
+            .catalog_install(plan_id, 3)
+            .unwrap_err();
+        let crate::RegistryError::Domain {
+            code, message, detail, ..
+        } = error
+        else {
+            panic!("expected kind-slot domain refusal")
+        };
+        assert_eq!(code, "kind_slot_taken");
+        assert!(message.contains("swap isn't available yet"));
+        assert_eq!(
+            detail.unwrap(),
+            serde_json::json!({
+                "kind":"memory-profile",
+                "held":"@example/held-profile",
+                "requested":"@example/requested-profile"
+            })
+        );
+        assert_eq!(store.catalog_pins(&agent).unwrap(), vec![held_profile]);
+        assert!(store.catalog_agent_generations(&agent).unwrap().is_empty());
+    }
 }
