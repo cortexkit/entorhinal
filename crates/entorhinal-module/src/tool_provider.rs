@@ -4,7 +4,7 @@
 //! to identify the caller; tool arguments and BindIdentity are caller-supplied
 //! and cannot establish authority for a different agent.
 
-use crate::{encode_result, HandlerError, ProjectsHandler, RouteAdmission, RouteKey};
+use crate::{HandlerError, ProjectsHandler, RouteAdmission, RouteKey};
 use cortexkit_role_tool_provider::{
     call::{check_call, ToolCallRequest},
     catalog::{
@@ -22,6 +22,9 @@ use subc_protocol::{
 };
 
 const REPLY_MAX_MS: u64 = 120_000;
+const ASSISTANT_CAPABILITY_TAG: &str = "entorhinal:agents_create/v1";
+const HEAD_CAPABILITY_TAG: &str = "entorhinal:agents_hire/v1";
+const CATALOG_INSTALL_CAPABILITY_TAG: &str = "entorhinal:catalog.install/v1";
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct AgentTool {
@@ -95,6 +98,21 @@ impl AgentTool {
         .with_reply(Reply::new(REPLY_MAX_MS));
         tool.description = Some(self.description.into());
         tool.modes = Some(vec![CallMode::Classic, CallMode::Codemode]);
+        // Catalog tags control which tools core exposes; route admission still
+        // checks the caller's role from the daemon's scope stamp.
+        let capability = match self.name {
+            "projects_create_workspace" | "projects_register" | "agents_create_head" => {
+                Some(ASSISTANT_CAPABILITY_TAG)
+            }
+            "agents_hire" | "agents_retire_hire" | "agents_list_hires" => Some(HEAD_CAPABILITY_TAG),
+            "catalog_prepare" | "catalog_plan" | "catalog_install" | "catalog_generation" => {
+                Some(CATALOG_INSTALL_CAPABILITY_TAG)
+            }
+            _ => None,
+        };
+        if let Some(capability) = capability {
+            tool = tool.with_capabilities(vec![capability.into()]);
+        }
         tool
     }
 }
@@ -184,6 +202,11 @@ fn catalog(arguments: Map<String, Value>) -> Result<Value, HandlerError> {
     } else {
         Ok(serde_json::to_value(answer).expect("catalog serializes"))
     }
+}
+
+pub(crate) fn encode_tool_reply(value: Value) -> Result<Vec<u8>, HandlerError> {
+    serde_json::to_vec(&value)
+        .map_err(|error| HandlerError::new("encode_failed", error.to_string()))
 }
 
 fn validate_request_key(arguments: &Value) -> Result<(), HandlerError> {
@@ -331,10 +354,10 @@ impl ProjectsHandler {
             .as_object()
             .ok_or_else(|| HandlerError::new("invalid_request", "arguments must be an object"))?;
         if request.name == ops::ROLE_DESCRIBE {
-            return encode_result(role_describe(arguments)?);
+            return encode_tool_reply(role_describe(arguments)?);
         }
         if request.name == ops::TOOL_CATALOG {
-            return encode_result(catalog(arguments.clone())?);
+            return encode_tool_reply(catalog(arguments.clone())?);
         }
         let tool = tool.ok_or_else(|| provider_error(errors::unknown_tool(&request.name)))?;
         let admission = admission.expect("model tools passed caller admission");

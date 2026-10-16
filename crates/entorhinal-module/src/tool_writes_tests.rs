@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     fake_cingulate::{Effect, FakeCingulate},
-    tool_provider::tests::{error_code, result, Fixture},
+    tool_provider::tests::{error_code, module_result as result, tool_result, Fixture},
 };
 use entorhinal_core::{agent::consent::ConsentWrite, AssignWorkspaceRequest};
 use std::sync::Arc;
@@ -107,7 +107,7 @@ async fn permissions_revocation_and_audit_verify_rebuild_acceptance() {
     let (mut f, fake) = fixture(2);
     f.handler.operator_confirmer = Arc::new(Confirm);
     fake.script("consent.await", Effect::Answer("approve_always_project"));
-    let first = result(f.call("agents_hire", hire("first", "First")).await);
+    let first = tool_result(f.call("agents_hire", hire("first", "First")).await);
     let id = first["agent"]["agent_id"].as_str().unwrap();
     let cingulate = crate::tests::reserved("cingulate");
     let listed =
@@ -129,7 +129,7 @@ async fn permissions_revocation_and_audit_verify_rebuild_acceptance() {
         "permissions_operator_required"
     );
     assert_eq!(f.counts(), before);
-    result(f.call("agents_hire", hire("second", "Second")).await);
+    tool_result(f.call("agents_hire", hire("second", "Second")).await);
     assert_eq!(fake.card_count(), 1);
     assert_eq!(
         result(
@@ -160,13 +160,13 @@ async fn permissions_revocation_and_audit_verify_rebuild_acceptance() {
         json!({"grants":[]})
     );
     fake.script("consent.await", Effect::Answer("approve_once"));
-    result(f.call("agents_hire", hire("third", "Third")).await);
+    tool_result(f.call("agents_hire", hire("third", "Third")).await);
     assert_eq!(
         fake.card_count(),
         2,
         "revoked grant cannot cover the next hire"
     );
-    result(
+    tool_result(
         f.call(
             "agents_retire_hire",
             json!({"agent_id":id,"request_key":"retire"}),
@@ -237,7 +237,7 @@ async fn permissions_revocation_and_audit_verify_rebuild_acceptance() {
 async fn hire_card_grant_cap_and_own_retirement_acceptance() {
     let (f, fake) = fixture(2);
     fake.script("consent.await", Effect::Answer("approve_always_project"));
-    let first = result(f.call("agents_hire", hire("first", "Worker")).await);
+    let first = tool_result(f.call("agents_hire", hire("first", "Worker")).await);
     let id = first["agent"]["agent_id"].as_str().unwrap();
     let row = store(&f).agent_row(id).unwrap().unwrap();
     assert_eq!(
@@ -249,7 +249,7 @@ async fn hire_card_grant_cap_and_own_retirement_acceptance() {
     assert_eq!(fake.card_count(), 1);
     assert_eq!(fake.routes().0[0], f.stamp(2));
     let grant = store(&f).consent_grants().unwrap().pop().unwrap();
-    let second = result(f.call("agents_hire", hire("second", "Other")).await);
+    let second = tool_result(f.call("agents_hire", hire("second", "Other")).await);
     assert_ne!(second["agent"]["agent_id"], first["agent"]["agent_id"]);
     assert_eq!(fake.card_count(), 1, "standing grant avoids a second card");
     let audit = store(&f).agent_audit_page(None, None, None).unwrap().rows;
@@ -267,9 +267,9 @@ async fn hire_card_grant_cap_and_own_retirement_acceptance() {
     assert_eq!(error_code(refused), "hire_cap_reached");
     assert_eq!(f.counts(), before);
     assert_eq!(fake.card_count(), 1);
-    let listed = result(f.call("agents_list_hires", json!({})).await);
+    let listed = tool_result(f.call("agents_list_hires", json!({})).await);
     assert_eq!(listed["agents"].as_array().unwrap().len(), 2);
-    let _retired = result(
+    let _retired = tool_result(
         f.call(
             "agents_retire_hire",
             json!({"agent_id":id,"request_key":"retire"}),
@@ -296,7 +296,7 @@ async fn janitor_workspace_register_and_head_each_apply_only_the_named_write() {
     for _ in 0..3 {
         fake.script("consent.await", Effect::Answer("approve_once"));
     }
-    let workspace = result(
+    let workspace = tool_result(
         f.call(
             "projects_create_workspace",
             json!({"workspace_id":"New","name":"New workspace","request_key":"workspace"}),
@@ -305,9 +305,9 @@ async fn janitor_workspace_register_and_head_each_apply_only_the_named_write() {
     );
     assert_eq!(workspace["workspaceId"], "New");
     std::fs::create_dir_all(f.root.join("new-project")).unwrap();
-    let project = result(f.call("projects_register", json!({"workspace_id":"New","name":"New project","dir":f.root.join("new-project"),"request_key":"register"})).await);
+    let project = tool_result(f.call("projects_register", json!({"workspace_id":"New","name":"New project","dir":f.root.join("new-project"),"request_key":"register"})).await);
     let project_id = project["projectId"].as_str().unwrap();
-    let head = result(
+    let head = tool_result(
         f.call(
             "agents_create_head",
             json!({"project_id":project_id,"name":"New head","tag":"head","request_key":"head"}),
@@ -426,9 +426,9 @@ async fn deny_expiry_and_pending_retry_are_terminal_and_apply_once() {
     );
     let row = request(&f, "agents_hire", "pending", 2);
     fake.answer(row.elicitation_id.as_deref().unwrap(), "approve_once");
-    let first = result(f.call("agents_hire", hire("pending", "Worker")).await);
+    let first = tool_result(f.call("agents_hire", hire("pending", "Worker")).await);
     assert_eq!(
-        result(f.call("agents_hire", hire("pending", "Worker")).await),
+        tool_result(f.call("agents_hire", hire("pending", "Worker")).await),
         first
     );
     assert_eq!(store(&f).project_hire_cap("P").unwrap().live_hires, 2);
@@ -450,7 +450,7 @@ async fn deny_expiry_and_pending_retry_are_terminal_and_apply_once() {
 async fn request_conflict_and_crash_after_commit_replay_do_not_remint_revoked_grant() {
     let (mut f, fake) = fixture(2);
     fake.script("consent.await", Effect::Answer("approve_always_project"));
-    let original = result(f.call("agents_hire", hire("key", "Worker")).await);
+    let original = tool_result(f.call("agents_hire", hire("key", "Worker")).await);
     let grant = store(&f).consent_grants().unwrap()[0].id.clone();
     store(&f)
         .consent_transaction(|tx| tx.revoke_grant(&grant, 200))
@@ -466,7 +466,7 @@ async fn request_conflict_and_crash_after_commit_replay_do_not_remint_revoked_gr
     stamp.scope_epoch = 99;
     f.admit(Some(&stamp));
     assert_eq!(
-        result(f.call("agents_hire", hire("key", "Worker")).await),
+        tool_result(f.call("agents_hire", hire("key", "Worker")).await),
         original
     );
     assert_eq!(
@@ -684,9 +684,9 @@ async fn audit_failure_rolls_back_mutation_journal_grant_and_terminal_then_retry
         RequestState::Awaiting
     );
     sql(&f, "DROP TRIGGER fail_audit;");
-    let first = result(f.call("agents_hire", hire("atomic", "Worker")).await);
+    let first = tool_result(f.call("agents_hire", hire("atomic", "Worker")).await);
     assert_eq!(
-        result(f.call("agents_hire", hire("atomic", "Worker")).await),
+        tool_result(f.call("agents_hire", hire("atomic", "Worker")).await),
         first
     );
     assert_eq!(f.counts()[3..], [1, 1]);
@@ -724,7 +724,7 @@ async fn same_key_concurrency_uses_one_card_and_a_single_terminal_commit() {
     let reply = restarted
         .handle_served_request(&serde_json::to_vec(&body).unwrap(), (80, 2))
         .await;
-    result(reply);
+    tool_result(reply);
     assert_eq!(f.counts()[3], 1);
     assert_eq!(fake.card_count(), 1);
 }
@@ -783,7 +783,7 @@ async fn request_namespaces_and_grant_classes_do_not_cross_authorize() {
     let (f, fake) = fixture(0);
     fake.script("consent.await", Effect::Answer("approve_always_workspace"));
     std::fs::create_dir_all(f.root.join("registered")).unwrap();
-    let project = result(f.call("projects_register",json!({"workspace_id":"W","name":"Registered","dir":f.root.join("registered"),"request_key":"same"})).await);
+    let project = tool_result(f.call("projects_register", json!({"workspace_id":"W","name":"Registered","dir":f.root.join("registered"),"request_key":"same"})).await);
     assert_eq!(error_code(f.call("agents_create_head",json!({"project_id":project["projectId"],"name":"Fresh head","tag":"head","request_key":"same"})).await),"consent_pending");
     assert_eq!(
         fake.card_count(),
@@ -825,7 +825,7 @@ async fn default_cap_refuses_the_eleventh_live_hire_even_with_a_grant() {
     let (f, fake) = fixture(2);
     fake.script("consent.await", Effect::Answer("approve_always_project"));
     for index in 0..9 {
-        result(
+        tool_result(
             f.call(
                 "agents_hire",
                 hire(&format!("key{index}"), &format!("Worker{index}")),
@@ -859,7 +859,7 @@ async fn ambiguous_raise_and_epoch_loss_use_the_saved_request_and_plan() {
         .elicitation_id
         .is_none());
     fake.answer("el_1", "approve_once");
-    result(f.call("agents_hire", hire("ambiguous", "Worker")).await);
+    tool_result(f.call("agents_hire", hire("ambiguous", "Worker")).await);
     assert_eq!(fake.card_count(), 1);
     assert_eq!(
         error_code(f.call("agents_hire", hire("epoch", "Later")).await),

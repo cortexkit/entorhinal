@@ -4,7 +4,9 @@
 use crate::catalog_blob::CatalogError;
 use crate::catalog_consumer::{self, ConsumerDiscovery};
 use crate::catalog_trust::CatalogTrust;
-use crate::{encode_result, HandlerError, ProjectsHandler, RouteAdmission};
+use crate::{
+    encode_result, tool_provider::encode_tool_reply, HandlerError, ProjectsHandler, RouteAdmission,
+};
 use entorhinal_catalog::{names, record::VerifiedPackage};
 use entorhinal_core::catalog_agent::{CatalogSpec, CatalogTarget, PreparedPackage, PreparedPlan};
 use entorhinal_core::catalog_resolution::CatalogSubject;
@@ -528,7 +530,7 @@ impl ProjectsHandler {
                 if plan.state == "pending" {
                     self.catalog_agent.start(store, plan, self.clock);
                 }
-                encode_result(json!({"plan_id":plan_id,"state":"pending"}))
+                encode_tool_reply(json!({"plan_id":plan_id,"state":"pending"}))
             }
             "catalog_plan" => {
                 let id = arguments["plan_id"].as_str().expect("validated plan id");
@@ -541,9 +543,9 @@ impl ProjectsHandler {
                     value["checks"] = json!(detail.checks);
                     value["card"] = preview_card(&store, &plan, &detail)?;
                 }
-                encode_result(value)
+                encode_tool_reply(value)
             }
-            "catalog_generation" => encode_result(
+            "catalog_generation" => encode_tool_reply(
                 json!({"generations":store.catalog_agent_generations(caller)?.iter().map(generation_reply).collect::<Vec<_>>()}),
             ),
             "catalog_install" => {

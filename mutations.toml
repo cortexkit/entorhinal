@@ -8949,3 +8949,16 @@ target = "--bin ck-entorhinal"
 expect_red = ["catalog_seed::tests::seed_content_is_idempotent_and_creates_no_pins_or_authority"]
 expect_message = "seeding must not create a pin"
 select = "expected"
+
+
+[[control]]
+id = "tool-provider-catalog-reply-is-bare"
+guards = "tool.catalog replies expose the catalog itself at the top level, including its tools array"
+file = "crates/entorhinal-module/src/tool_provider.rs"
+old = "return encode_tool_reply(catalog(arguments.clone())?);"
+new = '''return encode_tool_reply(json!({"result":catalog(arguments.clone())?})); // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-module/src/tool_provider_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["tool_provider::tests::catalog_reply_has_top_level_tools"]
