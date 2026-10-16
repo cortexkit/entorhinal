@@ -197,32 +197,37 @@ mod catalog_tests {
         assert!(keys[0].valid_from.is_none());
         assert_eq!(keys[1].valid_from.as_deref(), Some("2026-01-01T00:00:00Z"));
         store.db.with_conn_fenced(|tx| tx.execute_batch("INSERT INTO catalog_feed VALUES('@a','https://a.test',99,NULL); INSERT INTO catalog_status VALUES('@a/p','1','https://a.test',99,'t','t',0,'{}','s');")).unwrap();
-        store.catalog_registry_remove("https://a.test").unwrap();
+        assert!(matches!(
+            store.catalog_registry_remove("https://a.test"),
+            Err(crate::catalog::CatalogWriteError::Refused("registry_has_status"))
+        ));
         store
             .read(|conn| {
                 for table in ["catalog_feed", "catalog_status"] {
                     assert_eq!(
                         conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
                             .get::<_, i64>(0))?,
-                        0
+                        1
                     );
                 }
                 Ok(())
             })
             .unwrap();
         store.catalog_registry_remove("https://b.test").unwrap();
-        assert!(store.catalog_registry_for_scope("@a").unwrap().is_none());
+        assert_eq!(store.catalog_registry_for_scope("@a").unwrap().as_deref(), Some("https://a.test"));
+        assert!(store.catalog_registry_for_scope("@b").unwrap().is_none());
+        assert_eq!(store.catalog_registries().unwrap()[0].keys.len(), 2);
         store
             .catalog_registry_add(
-                "https://a.test",
-                &["@a".into()],
+                "https://b.test",
+                &["@b".into()],
                 false,
                 "replacement",
                 "newpk",
                 1,
             )
             .unwrap();
-        assert_eq!(store.catalog_registries().unwrap()[0].keys.len(), 1);
+        assert_eq!(store.catalog_registries().unwrap()[1].keys.len(), 1);
         assert_eq!(store.generation().unwrap(), 0);
     }
 }

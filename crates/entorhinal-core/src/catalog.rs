@@ -132,6 +132,18 @@ impl RegistryStore {
     }
     pub fn catalog_registry_remove(&self, url: &str) -> Result<(), CatalogWriteError> {
         self.catalog_transaction(|tx| {
+            // Removing the signer chain would also erase accepted status history
+            // through cascading deletes, allowing old replies to undo revocations.
+            let has_status: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM catalog_status WHERE registry_url=?1)",
+                    [url],
+                    |r| r.get(0),
+                )
+                .map_err(store_error)?;
+            if has_status {
+                return Err(CatalogWriteError::Refused("registry_has_status"));
+            }
             // Delete the child rows explicitly, so removal is complete even on a
             // connection where foreign-key cascades are off.
             for table in [

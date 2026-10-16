@@ -48,6 +48,19 @@ select = "expected"
 expect_red = ["catalog_agent::tests::catalog_superseded_activation_retry_refuses_without_wire_state"]
 
 [[control]]
+id = "catalog-prepare-blocking-reason"
+guards = "Preparation reports the blocking status reason instead of a generic resolver or unrelated version failure"
+file = "crates/entorhinal-module/src/catalog_agent.rs"
+old = 'return errors.remove(preferred);'
+new = 'return HandlerError::new("resolution_failed", "NON-VACUITY BREAK: lost candidate refusal");'
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_prepare_status_refusals_are_isolated_and_named"]
+
+[[control]]
 id = "catalog-consent-trust-needs-coverage"
 guards = "Consent trust labels require the publisher grant's placement, operation and ceiling"
 file = "crates/entorhinal-module/src/catalog_agent.rs"
@@ -6102,8 +6115,8 @@ only = false
 id = "ento3-held-link"
 guards = "held link remains enforced"
 file = "crates/entorhinal-module/src/catalog_trust.rs"
-old = "statements::apply_registry_key(&mut pure, &text, sig)?;\n                            }"
-new = "// NON-VACUITY BREAK: skip held link validation\n                                }"
+old = "if known.is_some() {\n                            statements::apply_registry_key(&mut pure, &text, sig)?;"
+new = "if known.is_some() {\n                            // NON-VACUITY BREAK: skip held link validation"
 test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
 runner = "cargo"
 package = "entorhinal-module"
@@ -6115,9 +6128,9 @@ only = false
 [[control]]
 id = "ento3-null-anchor"
 guards = "null anchor remains enforced"
-file = "crates/entorhinal-module/src/catalog_trust.rs"
-old = "statements::apply_registry_key(&mut validation, &text, sig)?;"
-new = "// NON-VACUITY BREAK: adopt unchecked anchor"
+file = "crates/entorhinal-catalog/src/statements.rs"
+old = "(k.statement.is_none() && k.public_key == pk)"
+new = "(k.statement.is_none()) /* NON-VACUITY BREAK: ignore bare anchor identity */"
 test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
 runner = "cargo"
 package = "entorhinal-module"
@@ -6278,8 +6291,8 @@ old = '''accept(
                     &pin,
                     root.as_deref(),
                 )?;
-                BlobStore::new(&folder)?.publish(&archive)?;'''
-new = "// NON-VACUITY BREAK: skip final status reapplication\n                BlobStore::new(&folder)?.publish(&archive)?;"
+                let blobs = BlobStore::new(&folder)?;'''
+new = "// NON-VACUITY BREAK: skip final status reapplication\n                let blobs = BlobStore::new(&folder)?;"
 test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
 runner = "cargo"
 package = "entorhinal-module"
@@ -9635,3 +9648,161 @@ package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
 expect_red = ["catalog_seed::tests::stopping_the_catalog_waits_for_a_running_seed_job"]
+
+# Deliberate breaks of registry key, status-history and blob-publication checks.
+[[control]]
+id = "catalog-a1-bare-anchor-metadata"
+guards = "A bare pinned registry identity never persists metadata supplied without its predecessor's authentication"
+file = "crates/entorhinal-module/src/catalog_trust.rs"
+old = '''if known.is_some() {
+                            statements::apply_registry_key(&mut pure, &text, sig)?;
+                        } else {'''
+new = '''if let Some(index) = known {
+                            if next.keys[index].statement.is_none() {
+                                // NON-VACUITY BREAK: authenticate received bytes by declaring them held
+                                pure.keys[index].statement = Some(text.clone());
+                                next.keys[index].statement = Some(text.clone());
+                            }
+                            statements::apply_registry_key(&mut pure, &text, sig)?;
+                        } else {'''
+test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_trust::tests::bare_registry_anchor_never_persists_received_metadata"]
+select = "expected"
+
+[[control]]
+id = "catalog-a2-status-activation"
+guards = "A status cannot be signed before its selected registry key activates"
+file = "crates/entorhinal-catalog/src/status.rs"
+old = '''if chain[index]
+        .valid_from
+        .as_deref()
+        .is_some_and(|at| s.changed_at.as_str() < at)'''
+new = '''if false && chain[index]
+        .valid_from
+        .as_deref()
+        .is_some_and(|at| s.changed_at.as_str() < at) // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-catalog/tests/guards.rs"
+runner = "cargo"
+package = "entorhinal-catalog"
+target = "--test guards"
+expect_red = ["status_signer_activation_bounds_changed_at"]
+select = "expected"
+
+[[control]]
+id = "catalog-a2-restored-status-activation"
+guards = "Restoring a status cannot authenticate a record dated before its registry key activates"
+file = "crates/entorhinal-catalog/src/status.rs"
+old = '''if key
+            .valid_from
+            .as_deref()
+            .is_some_and(|at| record.changed_at.as_str() < at)'''
+new = '''if false && key
+            .valid_from
+            .as_deref()
+            .is_some_and(|at| record.changed_at.as_str() < at) // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-catalog/tests/guards.rs"
+runner = "cargo"
+package = "entorhinal-catalog"
+target = "--test guards"
+expect_red = ["status_signer_activation_bounds_changed_at"]
+select = "expected"
+
+[[control]]
+id = "catalog-a3-bundle-status-precedence"
+guards = "Bundle status only seeds a missing hold and cannot inflate a held registry sequence"
+edits = [
+  { file = "crates/entorhinal-module/src/catalog_seed.rs", old = "if held.is_none() && status::compare(None, &package.status)? == Apply::Applied {", new = "if status::compare(held.as_ref(), &package.status)? == Apply::Applied { // NON-VACUITY BREAK" },
+  { file = "crates/entorhinal-catalog/src/status.rs", old = "if next.bundle_attested {", new = "if false && next.bundle_attested { // NON-VACUITY BREAK" },
+]
+test_file = "crates/entorhinal-module/src/catalog_seed_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_seed::tests::bundle_cannot_replace_held_registry_status_or_pin_its_sequence"]
+select = "expected"
+
+[[control]]
+id = "catalog-a4-online-manifest-publication"
+guards = "Online verification publishes the verified manifest as well as its archive"
+file = "crates/entorhinal-module/src/catalog_trust.rs"
+old = "blobs.publish(&manifest)?;"
+new = "// NON-VACUITY BREAK: leave the verified manifest unpublished"
+test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_trust::tests::online_verification_publishes_manifest_and_archive_together"]
+select = "expected"
+
+[[control]]
+id = "catalog-a5-registry-status-history"
+guards = "Registry removal cannot erase held status or the chain needed to authenticate it"
+file = "crates/entorhinal-core/src/catalog.rs"
+old = "if has_status {"
+new = "if false && has_status { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_trust::tests::registry_removal_preserves_status_history_and_explains_repin"]
+select = "expected"
+
+[[control]]
+id = "catalog-a6-refused-link-feed-fence"
+guards = "A refused registry key link stops status ingestion until the signing epoch is resolved"
+file = "crates/entorhinal-module/src/catalog_trust.rs"
+old = '''// unresolved. Do not accept a feed under a potentially retired key.
+        self.refresh_registry_keys().await?;'''
+new = '''// unresolved. Do not accept a feed under a potentially retired key.
+        let _ = self.refresh_registry_keys().await; // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_trust::tests::refused_key_link_fences_feed_until_chain_repair"]
+select = "expected"
+
+[[control]]
+id = "catalog-blocking-status-before-bytes"
+guards = "A tombstoned or blocking-revoked version refuses before any manifest or archive request"
+file = "crates/entorhinal-module/src/catalog_trust.rs"
+old = "if blocked {"
+new = "if false && blocked { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_trust::tests::blocking_status_refuses_before_any_package_bytes"]
+select = "expected"
+
+[[control]]
+id = "catalog-a3-bundle-comparison"
+guards = "The shared status comparator never advances a held status from a bundle attestation"
+file = "crates/entorhinal-catalog/src/status.rs"
+old = "if next.bundle_attested {"
+new = "if false && next.bundle_attested { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-catalog/src/status.rs"
+runner = "cargo"
+package = "entorhinal-catalog"
+target = "--lib"
+expect_red = ["status::restore_tests::bundle_attestation_cannot_advance_an_existing_hold"]
+select = "expected"
+
+[[control]]
+id = "catalog-a5-removal-wire-message"
+guards = "The registry removal refusal explains rollback protection and directs the operator to repin"
+file = "crates/entorhinal-module/src/catalog_ops.rs"
+old = '''entorhinal_core::catalog::CatalogWriteError::Refused("registry_has_status") => Self::new(
+                "registry_has_status",
+                "removal would discard status history that protects against rollback; use ck catalog registry repin to rotate the registry's key",
+            ),'''
+new = '''// NON-VACUITY BREAK: use the generic code-only refusal instead'''
+test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_trust::tests::registry_removal_preserves_status_history_and_explains_repin"]
+select = "expected"

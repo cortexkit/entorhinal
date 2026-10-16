@@ -343,19 +343,8 @@ impl CatalogTrust {
                         if known.is_none() && anchor.is_some_and(|a| position < a) {
                             return Ok(());
                         }
-                        if let Some(index) = known {
-                            if next.keys[index].statement.is_none() {
-                                let mut validation = pure.clone();
-                                validation.keys[index].statement = Some(text.clone());
-                                statements::apply_registry_key(&mut validation, &text, sig)?;
-                                if link["statement"]["public_key"] != next.keys[index].public_key {
-                                    return Err(Refusal::new(RefusalCode::KeyConflict).into());
-                                }
-                                pure = validation;
-                                next.keys[index].statement = Some(text);
-                            } else {
-                                statements::apply_registry_key(&mut pure, &text, sig)?;
-                            }
+                        if known.is_some() {
+                            statements::apply_registry_key(&mut pure, &text, sig)?;
                         } else {
                             statements::apply_registry_key(&mut pure, &text, sig)?;
                             let statement: statements::RegistryKeyStatement =
@@ -555,6 +544,25 @@ impl CatalogTrust {
                 other => break other?,
             }
         };
+        let accepted_status = applied.held.record();
+        let blocked = accepted_status.state == status::State::Tombstoned
+            || (accepted_status.state == status::State::Revoked
+                && status::revoked_at(
+                    Some(&accepted_status.published_at),
+                    accepted_status.compromise_from.as_deref().unwrap_or(""),
+                ));
+        if blocked {
+            let code = if accepted_status.state == status::State::Tombstoned {
+                "version_tombstoned"
+            } else {
+                "version_revoked"
+            };
+            return Err(CatalogError {
+                code,
+                message: code.into(),
+                detail: Some(json!({"code":code,"name":name,"version":version,"reason":accepted_status.reason})),
+            }.into());
+        }
         let served: record::Record = serde_json::from_value(entry["record"].clone())
             .map_err(|_| CatalogError::new("record_invalid", "invalid record"))?;
         if Some(applied.held.record().publisher_key.clone())
@@ -609,7 +617,9 @@ impl CatalogTrust {
                     &pin,
                     root.as_deref(),
                 )?;
-                BlobStore::new(&folder)?.publish(&archive)?;
+                let blobs = BlobStore::new(&folder)?;
+                blobs.publish(&archive)?;
+                blobs.publish(&manifest)?;
                 Ok(((), TrustWrite::default()))
             })
         })
@@ -617,6 +627,8 @@ impl CatalogTrust {
         Ok(verified)
     }
     pub async fn apply_scope_feed(&mut self) -> Result<FeedApply, NetworkError> {
+        // A refused chain link leaves the registry's current signing epoch
+        // unresolved. Do not accept a feed under a potentially retired key.
         self.refresh_registry_keys().await?;
         let store = self.store()?;
         let scope = self.scope.clone();

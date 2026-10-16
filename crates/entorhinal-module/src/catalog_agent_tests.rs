@@ -524,6 +524,63 @@ async fn catalog_prepare_isolates_failed_versions_and_names_last_refusal() {
 }
 
 #[tokio::test]
+async fn catalog_prepare_status_refusals_are_isolated_and_named() {
+    for state in ["tombstoned", "revoked"] {
+        for healthy in [true, false] {
+            let f = Fixture::new().await;
+            let good = script_free_version(&f.registry, "1.0.0");
+            let mut blocked = script_free_version(&f.registry, "1.1.0");
+            let mut status = blocked["status"]["record"].clone();
+            status["state"] = json!(state);
+            status["reason"] = json!("version excluded by registry");
+            status["compromise_from"] = if state == "revoked" {
+                status["published_at"].clone()
+            } else {
+                Value::Null
+            };
+            blocked["status"] =
+                signed(status, &vectors("statements")["keys"]["registry_status"][0]);
+            let blocked_archive = blocked["record"]["archive_sha256"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let mut invalid = script_free_version(&f.registry, "1.2.0");
+            invalid["signature"] = json!("00".repeat(64));
+            let versions = if healthy {
+                vec![invalid, blocked, good]
+            } else {
+                vec![invalid, blocked]
+            };
+            f.registry.serve(
+                "/v1/packages/example/hello-skill",
+                Reply::bytes(json!({"name":NAME,"versions":versions}).to_string()),
+            );
+            let plan = f.prepare("status-isolation").await;
+            if healthy {
+                assert_eq!(plan["state"], "ready", "{state}: {plan}");
+                assert_eq!(plan["closure"][0]["version"], "1.0.0");
+            } else {
+                assert_eq!(plan["state"], "failed");
+                assert_eq!(plan["refusal"]["code"], format!("version_{state}"));
+                assert_eq!(plan["refusal"]["detail"]["name"], NAME);
+                assert_eq!(plan["refusal"]["detail"]["version"], "1.1.0");
+                assert_eq!(
+                    plan["refusal"]["detail"]["reason"],
+                    "version excluded by registry"
+                );
+            }
+            let calls = f.registry.calls.lock().unwrap();
+            assert!(
+                !calls.iter().any(
+                    |path| path.ends_with("/1.1.0/ck.json") || path.ends_with(&blocked_archive)
+                ),
+                "status-ineligible bytes were requested: {calls:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn catalog_trust_label_requires_placement_operation_and_ceiling() {
     use entorhinal_core::catalog_grants::Operation;
     for missing in ["placement", "operation", "ceiling", "none"] {
