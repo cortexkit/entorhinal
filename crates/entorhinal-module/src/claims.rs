@@ -19,6 +19,10 @@ use tokio::sync::{mpsc, oneshot};
 
 pub(crate) const REFRESH: &str = "agent.refresh_claims";
 pub(crate) const WHERE: &str = "agent.where";
+pub(crate) const WHERE_MANY: &str = "agent.where_many";
+/// Most agent ids `agent.where_many` answers in one call. This is the phone's
+/// contract, independent of engram's own `read_many` batch size.
+const WHERE_MANY_MAX: usize = 64;
 
 #[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
 pub(crate) struct RefreshCounts {
@@ -307,14 +311,56 @@ impl ProjectsHandler {
         if !entorhinal_core::agent::valid_agent_id(&request.agent_id) {
             return Err(HandlerError::new("invalid_request", "invalid agent_id"));
         }
-        let mut value = serde_json::to_value(
-            self.with_agent_store(|store| store.agent_where(&request.agent_id))?,
-        )
-        .map_err(crate::invalid_params)?;
+        encode_result(self.agent_where_value(&request.agent_id)?)
+    }
+
+    pub(super) fn agent_where_many(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Request {
+            #[serde(rename = "agentIds")]
+            agent_ids: Vec<String>,
+        }
+        let request: Request = serde_json::from_value(params)
+            .map_err(|e| HandlerError::new("invalid_request", e.to_string()))?;
+        if request.agent_ids.is_empty() || request.agent_ids.len() > WHERE_MANY_MAX {
+            return Err(HandlerError::new(
+                "invalid_request",
+                format!("agentIds must contain 1 to {WHERE_MANY_MAX} agent ids"),
+            ));
+        }
+        let mut seen = std::collections::HashSet::with_capacity(request.agent_ids.len());
+        for id in &request.agent_ids {
+            if !entorhinal_core::agent::valid_agent_id(id) {
+                return Err(HandlerError::new("invalid_request", "invalid agent id"));
+            }
+            if !seen.insert(id.clone()) {
+                return Err(HandlerError::new("invalid_request", "duplicate agent id"));
+            }
+        }
+
+        let mut agents = Vec::with_capacity(request.agent_ids.len());
+        for id in request.agent_ids {
+            match self.agent_where_value(&id) {
+                Ok(mut agent) => {
+                    agent["agent_id"] = Value::String(id);
+                    agents.push(agent);
+                }
+                Err(error) if error.code == "unknown_agent" => {}
+                Err(error) => return Err(error),
+            }
+        }
+        encode_result(serde_json::json!({"agents":agents}))
+    }
+
+    fn agent_where_value(&self, agent_id: &str) -> Result<Value, HandlerError> {
+        let mut value =
+            serde_json::to_value(self.with_agent_store(|store| store.agent_where(agent_id))?)
+                .map_err(crate::invalid_params)?;
         if let Some(moving) = value.get_mut("moving") {
             crate::move_ops::elapsed(moving, (self.clock)());
         }
-        encode_result(value)
+        Ok(value)
     }
 }
 
@@ -526,6 +572,82 @@ mod tests {
         f.record.batches.lock().unwrap().clear();
         assert_eq!(f.refresh().await["refreshed"], 64);
         assert!(!f.record.batches.lock().unwrap()[0].contains(&format!("claim:{}", agents[2])));
+    }
+
+    #[tokio::test]
+    async fn where_many_preserves_order_omits_unknown_and_matches_single_reply() {
+        let f = Fixture::new(true).await;
+        let first = f.create(1).await;
+        let second = f.create(2).await;
+        let own = f.record.author.clone();
+        f.put(&first, &own, 1);
+        f.put(&second, "02020202020202020202020202020202", 2);
+        f.refresh().await;
+        let calls = f.record.calls.load(Ordering::Relaxed);
+        let expected = f.where_(&first);
+
+        let reply = result(
+            f.call(
+                OTHER,
+                WHERE_MANY,
+                json!({"agentIds":[second,"agent_ffffffffffffffff",first]}),
+            )
+            .await,
+        );
+        let agents = reply["agents"].as_array().unwrap();
+        assert_eq!(
+            agents
+                .iter()
+                .map(|agent| agent["agent_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [second.as_str(), first.as_str()]
+        );
+        assert_eq!(agents[0]["status"], "held_elsewhere");
+        let mut first_without_id = agents[1].clone();
+        first_without_id.as_object_mut().unwrap().remove("agent_id");
+        assert_eq!(first_without_id, expected);
+        assert_eq!(f.record.calls.load(Ordering::Relaxed), calls);
+    }
+
+    #[tokio::test]
+    async fn where_many_refuses_duplicate_ids() {
+        let f = Fixture::new(false).await;
+        assert_eq!(
+            code(
+                f.call(
+                    OTHER,
+                    WHERE_MANY,
+                    json!({"agentIds":["agent_0000000000000001","agent_0000000000000001"]}),
+                )
+                .await
+            ),
+            "invalid_request"
+        );
+    }
+
+    #[tokio::test]
+    async fn where_many_accepts_64_and_refuses_invalid_shapes_and_65() {
+        let f = Fixture::new(false).await;
+        let ids = (0..64)
+            .map(|n| format!("agent_{:016x}", 0x1000 + n))
+            .collect::<Vec<_>>();
+        let accepted = result(f.call(OTHER, WHERE_MANY, json!({"agentIds":ids})).await);
+        assert_eq!(accepted, json!({"agents":[]}));
+
+        let too_many = (0..65)
+            .map(|n| format!("agent_{:016x}", 0x2000 + n))
+            .collect::<Vec<_>>();
+        for params in [
+            json!({"agentIds":[]}),
+            json!({"agentIds":too_many}),
+            json!({"agentIds":["bad-id"]}),
+            json!({"agentIds":["agent_0000000000000001"],"extra":true}),
+        ] {
+            assert_eq!(
+                code(f.call(OTHER, WHERE_MANY, params).await),
+                "invalid_request"
+            );
+        }
     }
     #[tokio::test]
     async fn refresh_integrity_and_all_codec_errors_are_persisted_and_cleared() {
