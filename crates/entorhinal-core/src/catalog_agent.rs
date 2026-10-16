@@ -90,6 +90,58 @@ pub struct CatalogPin {
     pub root: bool,
     pub range: Option<String>,
 }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CatalogKindSlotConflict {
+    pub kind: Kind,
+    pub held: String,
+    pub requested: String,
+}
+/// Find duplicate memory-profile or persona roots in a proposed pin set.
+/// Dependencies do not occupy a root slot, and versions of the same root name
+/// remain one package when a plan is compared with the currently held pins.
+pub fn kind_slot_conflict(pins: &[CatalogPin], requested: &str) -> Option<CatalogKindSlotConflict> {
+    for kind in [Kind::MemoryProfile, Kind::Persona] {
+        let requested_is_root = pins
+            .iter()
+            .any(|pin| pin.root && pin.name == requested && pin.kind == kind);
+        if requested_is_root {
+            if let Some(held) = pins
+                .iter()
+                .filter(|pin| pin.root && pin.kind == kind && pin.name != requested)
+                .map(|pin| pin.name.as_str())
+                .min()
+            {
+                return Some(CatalogKindSlotConflict {
+                    kind,
+                    held: held.into(),
+                    requested: requested.into(),
+                });
+            }
+        }
+
+        let mut roots: Vec<_> = pins
+            .iter()
+            .filter(|pin| pin.root && pin.kind == kind)
+            .map(|pin| pin.name.as_str())
+            .collect();
+        roots.sort_unstable();
+        roots.dedup();
+        if roots.len() > 1 {
+            if let Some(held) = roots.iter().copied().find(|name| *name != requested) {
+                return Some(CatalogKindSlotConflict {
+                    kind,
+                    held: held.into(),
+                    requested: if roots.contains(&requested) {
+                        requested.into()
+                    } else {
+                        roots[1].into()
+                    },
+                });
+            }
+        }
+    }
+    None
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CatalogPinSet {
@@ -910,6 +962,25 @@ impl JournalWriter<'_> {
         })?;
         let caller = &commit.request.identity.agent_id;
         self.mutation(PIN_OP, None, |tx| {
+            // A plan may have been prepared before another install claimed the
+            // same kind slot. Check current pins and the proposed closure before
+            // the ordinary stale-plan refusal so the conflict remains explicit.
+            let candidate = read_plan(tx, plan_id)
+                .map_err(store_error)
+                .map_err(registry_error)?;
+            owner(&candidate.agent_id, caller).map_err(registry_error)?;
+            live(tx, caller).map_err(registry_error)?;
+            if candidate.state == "ready" {
+                let mut proposed = candidate.closure.clone().unwrap_or_default();
+                proposed.extend(read_pins(tx, caller)?);
+                if let Some(conflict) = kind_slot_conflict(&proposed, &candidate.spec.package) {
+                    return Err(RegistryError::Domain {
+                        code: "kind_slot_taken".into(),
+                        message: "A profile or persona swap isn't available yet.".into(),
+                        detail: Some(serde_json::to_value(conflict).unwrap()),
+                    });
+                }
+            }
             let plan = installable(tx, plan_id, caller).map_err(registry_error)?;
             let detail = prepared(tx, plan_id)?;
             let expected =

@@ -35,6 +35,31 @@ select = "expected"
 expect_red = ["catalog_agent::tests::catalog_prepare_isolates_failed_versions_and_names_last_refusal"]
 
 [[control]]
+id = "catalog-prepare-kind-slot"
+guards = "A second memory-profile or persona root is refused before the skill-only kind gate"
+file = "crates/entorhinal-core/src/catalog_resolution.rs"
+old = '''let slot_conflict =
+                        crate::catalog_agent::kind_slot_conflict(&closure, requested);'''
+new = 'let slot_conflict = None::<crate::catalog_agent::CatalogKindSlotConflict>; // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/catalog_resolution.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["catalog_resolution::kind_slot_tests::catalog_prepare_refuses_second_root_before_non_skill_gate"]
+
+[[control]]
+id = "catalog-install-kind-slot-recheck"
+guards = "Install rechecks root kind slots against pins changed after preparation"
+file = "crates/entorhinal-core/src/catalog_agent.rs"
+old = 'if let Some(conflict) = kind_slot_conflict(&proposed, &candidate.spec.package) {'
+new = 'if let Some(conflict) = None::<CatalogKindSlotConflict> { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/catalog_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["tests::catalog_tests::catalog_install_rechecks_kind_slot_after_concurrent_install"]
+
+[[control]]
 id = "catalog-ack-superseded-refuses"
 guards = "Retrying an old activation acknowledgment never exposes the local superseded state"
 file = "crates/entorhinal-module/src/catalog_agent.rs"
@@ -7043,10 +7068,10 @@ expect_red = ["catalog_resolution::tests::held_status_and_capabilities_control_e
 
 [[control]]
 id = "catalog-resolution-kind"
-guards = "Resolver closure members of unsupported kinds are refused before planning"
+guards = "Resolver closure members of unsupported kinds remain refused after the root-slot check"
 file = "crates/entorhinal-core/src/catalog_resolution.rs"
-old = 'if package.manifest.kind != Kind::Skill {'
-new = 'if false && package.manifest.kind != Kind::Skill { // NON-VACUITY BREAK'
+old = 'if let Some(pin) = closure.iter().find(|pin| pin.kind != Kind::Skill) {'
+new = 'if let Some(pin) = None::<&CatalogPin> { // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-core/src/catalog_resolution/tests.rs"
 runner = "cargo"
 package = "entorhinal-core"

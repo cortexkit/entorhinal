@@ -334,6 +334,87 @@ impl Fixture {
     }
 }
 
+fn kind_slot_pin(
+    name: &str,
+    version: &str,
+    kind: entorhinal_catalog::Kind,
+    root: bool,
+) -> entorhinal_core::catalog_agent::CatalogPin {
+    entorhinal_core::catalog_agent::CatalogPin {
+        name: name.into(),
+        version: version.into(),
+        kind,
+        manifest_sha256: "11".repeat(32),
+        archive_sha256: "22".repeat(32),
+        publisher_fingerprint: "33".repeat(32),
+        root,
+        range: root.then(|| "^1.0.0".into()),
+    }
+}
+
+#[test]
+fn catalog_prepare_kind_slot_rejects_second_memory_profile_and_persona_roots() {
+    use entorhinal_catalog::Kind;
+    use entorhinal_core::catalog_agent::kind_slot_conflict;
+
+    for (kind, held, requested) in [
+        (
+            Kind::MemoryProfile,
+            "@example/held-profile",
+            "@example/requested-profile",
+        ),
+        (
+            Kind::Persona,
+            "@example/held-persona",
+            "@example/requested-persona",
+        ),
+    ] {
+        let conflict = kind_slot_conflict(
+            &[
+                kind_slot_pin(held, "1.0.0", kind, true),
+                kind_slot_pin(requested, "1.0.0", kind, true),
+            ],
+            requested,
+        )
+        .unwrap();
+        assert_eq!(conflict.kind, kind);
+        assert_eq!(conflict.held, held);
+        assert_eq!(conflict.requested, requested);
+        let refusal = kind_slot_error(conflict);
+        assert_eq!(refusal.code, "kind_slot_taken");
+        assert!(refusal.message.contains("swap isn't available yet"));
+        assert_eq!(
+            refusal.detail.unwrap(),
+            json!({"kind":kind,"held":held,"requested":requested})
+        );
+    }
+
+    let profile = kind_slot_pin("@example/profile", "1.0.0", Kind::MemoryProfile, true);
+    let persona = kind_slot_pin("@example/persona", "1.0.0", Kind::Persona, true);
+    assert!(kind_slot_conflict(&[profile.clone(), persona], "@example/persona").is_none());
+
+    let same_root_upgrade = kind_slot_pin("@example/profile", "2.0.0", Kind::MemoryProfile, true);
+    assert!(
+        kind_slot_conflict(&[profile.clone(), same_root_upgrade], "@example/profile").is_none()
+    );
+
+    let dependency = kind_slot_pin(
+        "@example/profile-dependency",
+        "1.0.0",
+        Kind::MemoryProfile,
+        false,
+    );
+    assert!(kind_slot_conflict(
+        &[
+            profile,
+            dependency,
+            kind_slot_pin("@example/requested-skill", "1.0.0", Kind::Skill, true),
+        ],
+        "@example/requested-skill"
+    )
+    .is_none());
+}
+
 #[tokio::test]
 async fn catalog_prepare_install_card_pins_ready_ack_active() {
     let f = Fixture::new().await;

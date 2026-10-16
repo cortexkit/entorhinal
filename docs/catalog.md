@@ -650,17 +650,27 @@ package kinds remain separate work.
 ## Multi-root resolver adapter
 
 An agent can have several root packages (packages it installed directly), but
-the resolver takes one root. The roots are combined under one synthetic root
+its roots may contain at most one package of kind `memory-profile` and at most
+one of kind `persona`. Dependencies of those kinds do not occupy a root slot, and
+upgrading the same root package to another version keeps its slot. Preparation
+checks the resolved roots before the current skill-only kind gate, and installation
+rechecks the proposed roots against the live pin set in its transaction. These
+constraints are in place before persona and memory-profile installation is enabled.
+A conflict is refused as `kind_slot_taken` with the kind, held root and requested
+root; a profile or persona swap is not available yet because there is no
+user-facing remove-root operation.
+
+The resolver takes one root. The roots are combined under one synthetic root
 whose requirements are a range per package: roots being installed or upgraded
 keep their requested range, while every other root, and every pinned package it
 reaches through its dependencies, is held at its exact pinned version. The pure
 crate's `synthetic_root_ranges(registry, roots, subject_roots, current_pins)`
-constructs the root requirements from the pinned versions' own dependency graph.
-Core passes root metadata and held-status-overlaid candidates to the pure
-`resolve_roots` entry point; there is no second range builder or conflict mapper. Callers supply locally verified
-record/manifest candidates (including the manifests of current pins); core overlays
-held `catalog_status` eligibility and the caller's local capability tokens. Unheld
-versions are not candidates. No network or content-store I/O runs under the store
+constructs the root requirements from the pinned versions' own dependency graph. Core
+passes root metadata and held-status-overlaid candidates to the pure `resolve_roots`
+entry point; there is no second range builder or conflict mapper. Callers supply
+locally verified record/manifest candidates (including the manifests of current
+pins); core overlays held `catalog_status` eligibility and the caller's local
+capability tokens. Unheld versions are not candidates. No network or content-store I/O runs under the store
 read snapshot.
 
 - Install makes the named spec the subject root. Non-subject roots and their

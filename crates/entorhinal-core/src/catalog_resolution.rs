@@ -172,11 +172,6 @@ impl RegistryStore {
                     let mut closure = Vec::new();
                     for (name, version) in &resolution.picks {
                         let package = by_version[&(name.clone(), version.clone())];
-                        if package.manifest.kind != Kind::Skill {
-                            return Err(CatalogResolveError::Refusal(
-                                json!({"code":"kind_not_yet_supported","package":name}),
-                            ));
-                        }
                         closure.push(CatalogPin {
                             name: name.clone(),
                             version: version.clone(),
@@ -188,6 +183,27 @@ impl RegistryStore {
                             root: roots.contains_key(name),
                             range: roots.get(name).cloned(),
                         });
+                    }
+                    let requested = match &subject {
+                        CatalogSubject::Install(spec) | CatalogSubject::Upgrade(spec) => {
+                            spec.package.as_str()
+                        }
+                        CatalogSubject::UpgradeAll => "",
+                    };
+                    let slot_conflict =
+                        crate::catalog_agent::kind_slot_conflict(&closure, requested);
+                    if let Some(conflict) = slot_conflict {
+                        return Err(CatalogResolveError::Refusal(
+                            json!({"code":"kind_slot_taken","detail":conflict}),
+                        ));
+                    }
+                    // Non-skill packages remain unsupported until their consumers are available.
+                    // Check root slots first so conflicts are rejected as soon as those kinds
+                    // become installable.
+                    if let Some(pin) = closure.iter().find(|pin| pin.kind != Kind::Skill) {
+                        return Err(CatalogResolveError::Refusal(
+                            json!({"code":"kind_not_yet_supported","package":pin.name}),
+                        ));
                     }
                     Ok(CatalogResolution {
                         closure,
@@ -202,3 +218,146 @@ impl RegistryStore {
 }
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod kind_slot_tests {
+    use super::*;
+    use crate::catalog_agent::{CatalogPin, PinWriteRequest};
+    use crate::mutations::tests::Fixture;
+    use entorhinal_catalog::record::{Manifest, Record, Requires};
+    use entorhinal_catalog::status::State;
+
+    fn candidate(name: &str, kind: Kind) -> VerifiedPackage {
+        let name = format!("@example/{name}");
+        VerifiedPackage {
+            record: Record {
+                schema: "ck-record/v1".into(),
+                name: name.clone(),
+                version: "1.0.0".into(),
+                manifest_sha256: "11".repeat(32),
+                archive_sha256: "22".repeat(32),
+                archive_bytes: 0,
+                public_key: "44".repeat(32),
+                log_head: json!({}),
+                flow_version: None,
+            },
+            manifest: Manifest {
+                schema: "ck-package/v1".into(),
+                name,
+                version: "1.0.0".into(),
+                kind,
+                summary: "test".into(),
+                license: "MIT".into(),
+                source: "test".into(),
+                requires: Requires {
+                    capabilities: vec![],
+                    packages: BTreeMap::new(),
+                },
+                files: vec![],
+                body: json!({}),
+            },
+            canonical_record: String::new(),
+        }
+    }
+
+    fn setup(
+        store: &RegistryStore,
+        agent: &str,
+        pins: Vec<CatalogPin>,
+        packages: &[VerifiedPackage],
+    ) {
+        let fingerprint = key_fingerprint(&"44".repeat(32)).unwrap();
+        let mut pins = pins;
+        for pin in &mut pins {
+            pin.publisher_fingerprint = fingerprint.clone();
+        }
+        store
+            .with_principal("test")
+            .catalog_set_pins(
+                PinWriteRequest {
+                    agent_id: agent.into(),
+                    pins,
+                    request_key: None,
+                },
+                2,
+            )
+            .unwrap();
+        store
+            .db
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "INSERT OR IGNORE INTO catalog_registry VALUES('r',0,1,'inc')",
+                    [],
+                )?;
+                for package in packages {
+                    let held = StatusRecord {
+                        schema: "ck-status/v1".into(),
+                        registry_key_id: "key".into(),
+                        name: package.record.name.clone(),
+                        version: package.record.version.clone(),
+                        archive_sha256: package.record.archive_sha256.clone(),
+                        publisher_key: fingerprint.clone(),
+                        sequence: 1,
+                        state: State::Available,
+                        reason: None,
+                        compromise_from: None,
+                        published_at: "2026-01-01T00:00:00Z".into(),
+                        changed_at: "2026-01-01T00:00:00Z".into(),
+                    };
+                    tx.execute(
+                        "INSERT INTO catalog_status VALUES(?1,?2,'r',1,'t','t',0,?3,'signature')",
+                        params![
+                            package.record.name,
+                            package.record.version,
+                            serde_json::to_string(&held).unwrap()
+                        ],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn catalog_prepare_refuses_second_root_before_non_skill_gate() {
+        for kind in [Kind::MemoryProfile, Kind::Persona] {
+            let fixture = Fixture::new("catalog-kind-slot-prepare");
+            let agent = crate::catalog_agent::tests::agent(&fixture.store);
+            let suffix = if kind == Kind::MemoryProfile {
+                "profile"
+            } else {
+                "persona"
+            };
+            let held_name = format!("@example/held-{suffix}");
+            let requested_name = format!("@example/requested-{suffix}");
+            let packages = [
+                candidate(&format!("held-{suffix}"), kind),
+                candidate(&format!("requested-{suffix}"), kind),
+            ];
+            let mut held = crate::catalog_agent::tests::pin(&held_name, "1.0.0", true);
+            held.kind = kind;
+            setup(&fixture.store, &agent, vec![held], &packages);
+
+            let error = fixture
+                .store
+                .catalog_resolve(
+                    &agent,
+                    CatalogSubject::Install(CatalogSpec {
+                        package: requested_name.clone(),
+                        range: "^1.0.0".into(),
+                    }),
+                    &packages,
+                    &[],
+                )
+                .unwrap_err();
+            let CatalogResolveError::Refusal(error) = error else {
+                panic!("expected kind-slot refusal")
+            };
+            assert_eq!(error["code"], "kind_slot_taken");
+            assert_eq!(
+                error["detail"],
+                json!({"kind":kind,"held":held_name,"requested":requested_name})
+            );
+        }
+    }
+}
