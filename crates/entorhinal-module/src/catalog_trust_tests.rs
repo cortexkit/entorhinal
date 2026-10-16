@@ -116,6 +116,202 @@ fn error(e: NetworkError, code: &str, field: Option<&str>) {
     }
 }
 #[tokio::test]
+async fn bare_registry_anchor_never_persists_received_metadata() {
+    let f = Fixture::new(1).await;
+    let mut reply: Value =
+        serde_json::from_slice(&f.fake.replies.lock().unwrap()["/v1/registry/keys"].body).unwrap();
+    reply["keys"][0]["statement"]["valid_from"] = "2020-01-01T00:00:00Z".into();
+    reply["keys"][0]["signature"] = "".into();
+    f.fake
+        .serve("/v1/registry/keys", Reply::bytes(reply.to_string()));
+    let mut trust = f.trust();
+    trust.refresh_registry_keys().await.unwrap();
+    let anchor = &trust.store().unwrap().catalog_registries().unwrap()[0].keys[0];
+    assert!(anchor.statement.is_none());
+    assert!(anchor.valid_from.is_none());
+    drop(trust);
+    f.fake.serve_vectors();
+    let mut trust = f.trust();
+    trust.refresh_registry_keys().await.unwrap();
+    assert_eq!(trust.registry.keys.len(), 2);
+    assert!(trust.registry.keys[0].statement.is_none());
+}
+
+#[tokio::test]
+async fn online_verification_publishes_manifest_and_archive_together() {
+    let f = Fixture::new(0).await;
+    let mut trust = f.trust();
+    let package = package_doc();
+    let record = &package["versions"][0]["record"];
+    let store = trust.store().unwrap();
+    let blobs = BlobStore::new(store.store_folder()).unwrap();
+    for field in ["manifest_sha256", "archive_sha256"] {
+        assert!(blobs
+            .read_verified(record[field].as_str().unwrap())
+            .is_err());
+    }
+    trust.verify_version(NAME, VERSION).await.unwrap();
+    let manifest = blobs
+        .read_verified(record["manifest_sha256"].as_str().unwrap())
+        .unwrap();
+    let archive = blobs
+        .read_verified(record["archive_sha256"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(
+        entorhinal_catalog::archive::read_members(&archive).unwrap()["ck.json"].bytes,
+        manifest
+    );
+}
+
+#[tokio::test]
+async fn refused_key_link_fences_feed_until_chain_repair() {
+    let f = Fixture::new(0).await;
+    let mut trust = f.trust();
+    trust.verify_version(NAME, VERSION).await.unwrap();
+    let mut reply: Value =
+        serde_json::from_slice(&f.fake.replies.lock().unwrap()["/v1/registry/keys"].body).unwrap();
+    reply["keys"][1]["signature"] = "".into();
+    f.fake
+        .serve("/v1/registry/keys", Reply::bytes(reply.to_string()));
+    let mut doc = status_doc()["record"].clone();
+    doc["registry_key_id"] = "test-registry-3".into();
+    doc["sequence"] = 2.into();
+    doc["changed_at"] = "2027-05-01T00:00:00Z".into();
+    doc["state"] = "revoked".into();
+    doc["reason"] = "compromised".into();
+    doc["compromise_from"] = doc["published_at"].clone();
+    let revoked = signed(doc, &vectors("statements")["keys"]["registry_status"][2]);
+    serve_feed(
+        &f.fake,
+        1,
+        vec![revoked.clone()],
+        "/v1/scopes/example/status",
+    );
+    f.fake.calls.lock().unwrap().clear();
+    error(
+        trust.apply_scope_feed().await.unwrap_err(),
+        "signature_invalid",
+        None,
+    );
+    assert!(!f
+        .fake
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|p| p.starts_with("/v1/scopes/example/status")));
+    assert_eq!(
+        trust.store().unwrap().catalog_statuses(URL).unwrap()[0].sequence,
+        1
+    );
+    assert_eq!(
+        trust.store().unwrap().catalog_feed_seq("@example").unwrap(),
+        None
+    );
+    f.fake.serve_vectors();
+    serve_feed(&f.fake, 1, vec![revoked], "/v1/scopes/example/status");
+    assert!(trust.apply_scope_feed().await.unwrap().cursor_advanced);
+    assert_eq!(
+        serde_json::from_str::<Value>(
+            &trust.store().unwrap().catalog_statuses(URL).unwrap()[0].canonical
+        )
+        .unwrap()["state"],
+        "revoked"
+    );
+}
+
+#[tokio::test]
+async fn blocking_status_refuses_before_any_package_bytes() {
+    for (state, compromise_from, expected) in [
+        ("tombstoned", Value::Null, Some("version_tombstoned")),
+        (
+            "revoked",
+            json!("2026-01-01T00:00:00Z"),
+            Some("version_revoked"),
+        ),
+        ("revoked", json!("2028-01-01T00:00:00Z"), None),
+        ("withdrawn", Value::Null, None),
+    ] {
+        let f = Fixture::new(0).await;
+        let mut trust = f.trust();
+        let mut package = package_doc();
+        let mut doc = status_doc()["record"].clone();
+        doc["state"] = state.into();
+        doc["reason"] = "registry reason".into();
+        doc["compromise_from"] = compromise_from;
+        package["versions"][0]["status"] =
+            signed(doc, &vectors("statements")["keys"]["registry_status"][0]);
+        serve_package(&f.fake, &package);
+        let result = trust.verify_version(NAME, VERSION).await;
+        if let Some(code) = expected {
+            let refusal = result.unwrap_err();
+            assert_eq!(refusal.code(), code);
+            assert_eq!(
+                refusal.detail().unwrap(),
+                &json!({"code":code,"name":NAME,"version":VERSION,"reason":"registry reason"})
+            );
+        } else {
+            result.unwrap();
+        }
+        let byte_requests = f
+            .fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|path| path.ends_with("/ck.json") || path.starts_with("/v1/archives/"))
+            .count();
+        assert_eq!(byte_requests, if expected.is_some() { 0 } else { 2 });
+        assert_eq!(
+            trust.store().unwrap().catalog_statuses(URL).unwrap().len(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn registry_removal_preserves_status_history_and_explains_repin() {
+    let f = Fixture::new(0).await;
+    let mut trust = f.trust();
+    let mut doc = status_doc()["record"].clone();
+    doc["sequence"] = 2.into();
+    doc["state"] = "tombstoned".into();
+    doc["reason"] = "removed".into();
+    serve_feed(
+        &f.fake,
+        1,
+        vec![signed(
+            doc,
+            &vectors("statements")["keys"]["registry_status"][0],
+        )],
+        "/v1/scopes/example/status",
+    );
+    trust.apply_scope_feed().await.unwrap();
+    let store = trust.store().unwrap();
+    let before = serde_json::to_value(store.catalog_statuses(URL).unwrap()).unwrap();
+    let keys = store.catalog_registries().unwrap();
+    let wire: crate::HandlerError = store.catalog_registry_remove(URL).unwrap_err().into();
+    assert_eq!(wire.code, "registry_has_status");
+    assert!(wire
+        .message
+        .contains("status history that protects against rollback"));
+    assert!(wire.message.contains("ck catalog registry repin"));
+    assert_eq!(store.catalog_registries().unwrap(), keys);
+    assert_eq!(
+        serde_json::to_value(store.catalog_statuses(URL).unwrap()).unwrap(),
+        before
+    );
+    drop(store);
+    drop(trust);
+    let mut trust = f.trust();
+    error(
+        trust.verify_version(NAME, VERSION).await.unwrap_err(),
+        "feed_rollback",
+        None,
+    );
+}
+
+#[tokio::test]
 async fn chain_walk_validates_held_links_and_persists_cutoffs() {
     let f = Fixture::new(0).await;
     let mut trust = f.trust();
@@ -168,7 +364,7 @@ async fn chain_null_anchor_and_refused_successor() {
         let mut trust = f.trust();
         trust.refresh_registry_keys().await.unwrap();
         assert_eq!(trust.registry.keys.len(), 3 - key);
-        assert!(trust.registry.keys[0].statement.is_some());
+        assert!(trust.registry.keys[0].statement.is_none());
         assert!(trust.registry.keys[0].valid_from.is_none());
     }
     let f = Fixture::new(1).await;
@@ -375,7 +571,7 @@ async fn verify_status_identity_binding_and_separate_blob_publication() {
     );
     error(
         trust.verify_version(NAME, VERSION).await.unwrap_err(),
-        "registry_http_error",
+        "version_tombstoned",
         None,
     );
     assert_eq!(

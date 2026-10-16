@@ -176,7 +176,11 @@ fn tar_header_checksum_is_verified() {
 }
 #[test]
 fn status_key_epoch_cannot_regress() {
-    let chain = chain();
+    // Clear activation times so key time-window checks do not mask epoch rollback.
+    let mut chain = chain();
+    for key in &mut chain {
+        key.valid_from = None;
+    }
     let a = status_record("r3", 2, "2026-05-01T00:00:00Z");
     let held = status::apply_status(None, &a.to_string(), &sig(&a, &key(3)), &chain, &pin())
         .unwrap()
@@ -282,6 +286,31 @@ fn resolver_is_deterministic() {
         );
     }
 }
+#[test]
+fn status_signer_activation_bounds_changed_at() {
+    let keys = chain();
+    for (at, accepted) in [
+        ("2026-06-30T23:59:59Z", false),
+        ("2026-07-01T00:00:00Z", true),
+    ] {
+        let doc = status_record("r3", 1, at);
+        let result =
+            status::apply_status(None, &doc.to_string(), &sig(&doc, &key(3)), &keys, &pin());
+        if accepted {
+            assert_eq!(result.unwrap().result, status::Apply::Applied);
+            status::HeldStatus::restore(&doc.to_string(), &sig(&doc, &key(3)), &keys, 2).unwrap();
+        } else {
+            assert_eq!(result.unwrap_err().code, RefusalCode::KeyNotValid);
+            assert_eq!(
+                status::HeldStatus::restore(&doc.to_string(), &sig(&doc, &key(3)), &keys, 2)
+                    .unwrap_err()
+                    .code,
+                RefusalCode::KeyNotValid
+            );
+        }
+    }
+}
+
 #[test]
 fn status_time_regression_precedes_terminal() {
     let keys = &chain()[..1];

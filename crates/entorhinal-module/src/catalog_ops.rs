@@ -33,6 +33,10 @@ impl From<CatalogError> for HandlerError {
 impl From<entorhinal_core::catalog::CatalogWriteError> for HandlerError {
     fn from(error: entorhinal_core::catalog::CatalogWriteError) -> Self {
         match error {
+            entorhinal_core::catalog::CatalogWriteError::Refused("registry_has_status") => Self::new(
+                "registry_has_status",
+                "removal would discard status history that protects against rollback; use ck catalog registry repin to rotate the registry's key",
+            ),
             entorhinal_core::catalog::CatalogWriteError::Refused(code) => Self::new(code, code),
             entorhinal_core::catalog::CatalogWriteError::Store(error) => {
                 Self::new("store_error", error.to_string())
