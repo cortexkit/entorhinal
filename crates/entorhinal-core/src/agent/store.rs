@@ -900,6 +900,9 @@ impl RegistryStore {
         params: Value,
         now: i64,
     ) -> Result<AgentPrecheck, AgentMutationError> {
+        if op == super::avatars::APPLY_METHOD {
+            return self.precheck_avatar_manifest(params);
+        }
         if op == super::carry::REPAIR_METHOD {
             return self.precheck_repair(params);
         }
@@ -1004,6 +1007,9 @@ impl JournalWriter<'_> {
         op: &str,
         params: Value,
     ) -> Result<Option<Vec<u8>>, AgentMutationError> {
+        if op == super::avatars::APPLY_METHOD {
+            return self.probe_avatar_manifest(params);
+        }
         if op == super::carry::REPAIR_METHOD {
             return self.probe_repair(params);
         }

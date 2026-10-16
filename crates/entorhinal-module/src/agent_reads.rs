@@ -13,6 +13,7 @@ use super::{encode_result, HandlerError, ProjectsHandler, RouteKey, WireRequest}
 
 pub(super) const READ_METHODS: &[&str] = &[
     "agent.preview_repair_workspaces",
+    "agent.preview_avatar_manifest",
     "agent.resolve",
     "agent.resolve_name",
     "agent.list",
@@ -1525,6 +1526,7 @@ mod tests {
             "permissions.list",
             "agent.audit_list",
             "agent.preview_repair_workspaces",
+            "agent.preview_avatar_manifest",
             "resolve",
             "resolve_project_id",
             "resolve_remote",
@@ -1556,6 +1558,7 @@ mod tests {
             "permissions.revoke",
             "agent.set_hire_cap",
             "agent.repair_workspaces",
+            "agent.apply_avatar_manifest",
             "register",
             "assign_workspace",
             "set_workspace_root",

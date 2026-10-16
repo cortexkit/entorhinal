@@ -1,6 +1,7 @@
 //! Agent identity schema and pure validators. Identity does not include runtime
 //! residence, personas, wake policies or authority grants.
 
+mod avatars;
 mod carry;
 mod claims;
 pub mod consent;
@@ -16,6 +17,7 @@ pub mod schema;
 mod store;
 mod validate;
 
+pub use avatars::AvatarManifestPlan;
 pub(crate) use carry::{placement_mismatches, plan_carry};
 pub(crate) use claims::load_claims;
 pub use claims::AgentNameClaim;

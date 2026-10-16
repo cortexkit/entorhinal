@@ -234,7 +234,7 @@ pub fn parse(face: Face, arguments: &[String]) -> Invocation {
             },
             "--json" => json = true,
             "--role" | "--tag" | "--project" | "--workspace" | "--supervisor" | "--request-key"
-            | "--to"
+            | "--to" | "--manifest"
                 if face == Face::Agents =>
             {
                 let Some(value) = rest.next().filter(|value| !value.is_empty()) else {
@@ -251,7 +251,13 @@ pub fn parse(face: Face, arguments: &[String]) -> Invocation {
                 args.push(value.clone());
             }
             "--none" | "--refresh" if face == Face::Agents => args.push(argument.clone()),
-            "--yes" if face == Face::Agents && verb.as_deref() == Some("repair-workspaces") => {
+            "--replace" if face == Face::Agents && verb.as_deref() == Some("avatars") => {
+                args.push(argument.clone())
+            }
+            "--yes"
+                if face == Face::Agents
+                    && matches!(verb.as_deref(), Some("repair-workspaces" | "avatars")) =>
+            {
                 args.push(argument.clone())
             }
             "--project" | "--label"
@@ -389,6 +395,8 @@ usage: ck agents <verb> [args] [--subc <connection file>] [--json]
   list [--project <id>] [--workspace <id>]
   show <agent>               a live digest or a retired/merged identity
   repair-workspaces [--yes]   preview the correction; --yes asks for confirmation
+  avatars --manifest <file> [--replace] [--yes]
+                             preview owner-minted avatars; --yes applies with Touch ID
   where <agent> [--refresh]  cached checkout claim; optionally refresh first
   move <agent> --to <mac>    move an idle agent to another named Mac
   moves                     open moves and the last 32 finished moves
@@ -746,6 +754,7 @@ fn agent_write(method: &str) -> bool {
             | "agent.update_tag"
             | "agent.set_labels"
             | "agent.repair_workspaces"
+            | "agent.apply_avatar_manifest"
             | "agent.move"
             | "agent.move_abort"
             | "agent.set_lid_close_moves"
@@ -757,6 +766,7 @@ fn build_agents(command: &Command) -> Result<(String, Value), String> {
     let mut method = match command.verb.as_str() {
         "hire-cap" => "agent.set_hire_cap",
         "repair-workspaces" => "agent.repair_workspaces",
+        "avatars" => "agent.apply_avatar_manifest",
         "create" => "agent.create",
         "rename" => "agent.rename",
         "retire" => "agent.dispose",
@@ -784,7 +794,8 @@ fn build_agents(command: &Command) -> Result<(String, Value), String> {
             "--role" | "--tag" | "--supervisor" => command.verb == "create",
             "--project" | "--workspace" => matches!(command.verb.as_str(), "create" | "list"),
             "--none" => command.verb == "labels",
-            "--yes" => command.verb == "repair-workspaces",
+            "--yes" => matches!(command.verb.as_str(), "repair-workspaces" | "avatars"),
+            "--manifest" | "--replace" => command.verb == "avatars",
             "--refresh" => command.verb == "where",
             "--to" => command.verb == "move",
             _ => false,
@@ -792,7 +803,7 @@ fn build_agents(command: &Command) -> Result<(String, Value), String> {
         if !allowed {
             return Err(format!("{} does not accept {arg}", command.verb));
         }
-        let value = if matches!(arg.as_str(), "--none" | "--yes" | "--refresh") {
+        let value = if matches!(arg.as_str(), "--none" | "--yes" | "--refresh" | "--replace") {
             String::new()
         } else {
             rest.next()
@@ -805,7 +816,7 @@ fn build_agents(command: &Command) -> Result<(String, Value), String> {
         }
     }
     let count_ok = match command.verb.as_str() {
-        "list" | "moves" | "repair-workspaces" => positional.is_empty(),
+        "list" | "moves" | "repair-workspaces" | "avatars" => positional.is_empty(),
         "rename" | "tag" | "hire-cap" => positional.len() == 2,
         "labels" if flags.contains_key("--none") => positional.len() == 1,
         "labels" => positional.len() >= 2,
@@ -862,6 +873,24 @@ fn build_agents(command: &Command) -> Result<(String, Value), String> {
                 "off" => false,
                 _ => return Err("lid-close-moves requires on or off".into()),
             });
+        }
+        "avatars" => {
+            let path = flags
+                .get("--manifest")
+                .ok_or("avatars requires --manifest <file>")?;
+            let bytes =
+                std::fs::read(path).map_err(|error| format!("read manifest {path}: {error}"))?;
+            // Preserve each manifest entry's agent id, genome, type and version;
+            // the module, not this file reader, validates those fields.
+            params["entries"] = serde_json::from_slice::<Value>(&bytes)
+                .map_err(|error| format!("parse manifest {path}: {error}"))?;
+            params["replace"] = json!(flags.contains_key("--replace"));
+            if !flags.contains_key("--yes") {
+                if flags.contains_key("--request-key") {
+                    return Err("--request-key requires avatars --yes".into());
+                }
+                method = "agent.preview_avatar_manifest";
+            }
         }
         "repair-workspaces" => {
             if !flags.contains_key("--yes") {
@@ -1173,6 +1202,16 @@ fn retry_args(command: &Command, params: &Value) -> Vec<String> {
         args.extend([text(&params["project_id"]), params["cap"].to_string()]);
     } else if command.verb == "repair-workspaces" {
         args.push("--yes".into());
+    } else if command.verb == "avatars" {
+        let path = command
+            .args
+            .windows(2)
+            .find(|pair| pair[0] == "--manifest")
+            .expect("built manifest path");
+        args.extend(["--manifest".into(), path[1].clone(), "--yes".into()]);
+        if params["replace"] == true {
+            args.push("--replace".into());
+        }
     } else if command.verb == "move-abort" {
         args.push(text(&params["cut_id"]));
     } else if command.verb == "lid-close-moves" {
@@ -1219,7 +1258,10 @@ async fn execute_agents(
     method: &str,
     mut params: Value,
 ) -> Result<Value, (u8, String)> {
-    if method == "agent.preview_repair_workspaces" {
+    if matches!(
+        method,
+        "agent.preview_repair_workspaces" | "agent.preview_avatar_manifest"
+    ) {
         let preview = agent_read(caller, method, params)
             .await
             .map_err(CallFailure::display)?;
@@ -1449,6 +1491,7 @@ fn render(command: &Command, value: &Value) {
     }
     match (command.face, command.verb.as_str()) {
         (Face::Agents, "list" | "show") => println!("{}", format_agents(&command.verb, value)),
+        (Face::Agents, "avatars") => println!("{}", format_avatar_manifest(value)),
         (Face::Workspaces, "list") => {
             let workspaces = value["workspaces"].as_array().cloned().unwrap_or_default();
             if workspaces.is_empty() {
@@ -1553,6 +1596,49 @@ fn render(command: &Command, value: &Value) {
             serde_json::to_string_pretty(value).unwrap_or_default()
         ),
     }
+}
+
+fn format_avatar_manifest(value: &Value) -> String {
+    let avatar = |value: &Value| {
+        if value.is_null() {
+            "none".to_owned()
+        } else {
+            format!("{} v{}", text(&value["type"]), text(&value["version"]))
+        }
+    };
+    let mut lines = Vec::new();
+    for written in value["written"].as_array().into_iter().flatten() {
+        lines.push(format!(
+            "{}: written {} -> {}",
+            text(&written["name"]),
+            avatar(&written["from"]),
+            avatar(&written["to"])
+        ));
+    }
+    for remaining in value["remaining"].as_array().into_iter().flatten() {
+        lines.push(format!("{}: remaining", text(&remaining["name"])));
+    }
+    for change in value["changes"].as_array().into_iter().flatten() {
+        lines.push(format!(
+            "{}: {} -> {}",
+            text(&change["name"]),
+            avatar(&change["from"]),
+            avatar(&change["to"])
+        ));
+    }
+    for skipped in value["skipped"].as_array().into_iter().flatten() {
+        lines.push(format!(
+            "{}: skipped (already {})",
+            text(&skipped["name"]),
+            avatar(&skipped["from"])
+        ));
+    }
+    if let Some(applied) = value["applied"].as_u64() {
+        lines.push(format!("{applied} avatar(s) applied"));
+    } else {
+        lines.push("Preview only; use --yes to apply with one Touch ID confirmation.".into());
+    }
+    lines.join("\n")
 }
 
 fn format_rebind(value: &Value) -> String {
@@ -2864,6 +2950,74 @@ mod agent_tests {
                 }
             );
         }
+    }
+
+    #[tokio::test]
+    async fn avatar_manifest_cli_previews_and_only_yes_applies_exact_entries() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../entorhinal-core/src/agent/wild-manifest-sample.json"
+        );
+        let entries: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let preview = json!({"changes":[{"agent_id":"a","name":"Ada","from":{"type":"creature.classic","version":2},"to":{"type":"creature.wild","version":1}},{"agent_id":"b","name":"Grace","from":null,"to":{"type":"creature.wild","version":1}}],"skipped":[{"name":"Linus","from":{"type":"creature.classic","version":2}}]});
+        let script = Script::new(vec![Ok(preview.clone())]);
+        assert_eq!(
+            execute(&script, &["avatars", "--manifest", path])
+                .await
+                .unwrap(),
+            preview
+        );
+        assert_eq!(script.calls()[0].0, "agent.preview_avatar_manifest");
+        assert_eq!(
+            script.calls()[0].1,
+            json!({"entries":entries,"replace":false})
+        );
+        assert_eq!(format_avatar_manifest(&preview), "Ada: creature.classic v2 -> creature.wild v1\nGrace: none -> creature.wild v1\nLinus: skipped (already creature.classic v2)\nPreview only; use --yes to apply with one Touch ID confirmation.");
+        let script = Script::new(vec![Ok(json!({"applied":2,"skipped":[]}))]);
+        execute(
+            &script,
+            &[
+                "avatars",
+                "--manifest",
+                path,
+                "--replace",
+                "--yes",
+                "--request-key",
+                "retry",
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            script.calls(),
+            vec![(
+                "agent.apply_avatar_manifest".into(),
+                json!({"entries":entries,"replace":true,"request_key":"retry","actor":"ck-agents"}),
+                Duration::from_secs(300)
+            )]
+        );
+        let cmd = command(&[
+            "avatars",
+            "--manifest",
+            path,
+            "--replace",
+            "--yes",
+            "--request-key",
+            "retry",
+        ]);
+        let (method, params) = build(&cmd).unwrap();
+        let retry = retry_args(&cmd, &params);
+        let rebuilt = command(&retry.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(build(&rebuilt).unwrap(), (method, params));
+        assert!(build(&command(&["avatars"])).is_err());
+        assert!(build(&command(&[
+            "avatars",
+            "--manifest",
+            path,
+            "--request-key",
+            "no-yes"
+        ]))
+        .is_err());
     }
 
     #[tokio::test]

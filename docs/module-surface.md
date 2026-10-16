@@ -106,6 +106,17 @@ refuses `authority_not_cut_over`, before any prompt. After that:
   `direct_identity_write_not_admitted`; others `write_not_permitted`.
 - `agent.repair_workspaces` is Direct only, after Touch ID
   (`direct_caller_required` otherwise).
+- `agent.apply_avatar_manifest` is also Direct only, with one Touch ID for
+  the batch. An all-skipped seed-only run succeeds without prompting or writing.
+  Request fields are `entries` (the owner's exact per-agent manifest objects),
+  `replace` (default false), `request_key`, and optional `actor`. The read-only
+  `agent.preview_avatar_manifest` takes only `entries` and optional `replace`.
+  All entries validate before approval, and the writer re-plans and checks the
+  approved plan before applying anything. Each change uses its own transaction,
+  standard `agent.set_avatar` shared entry, and `<batch key>:<agent_id>` request
+  key, so replicas need no new identity entry type. Interrupted batches report
+  written and remaining agents; retries replay completed entries and confirm the
+  remaining writes once. Completed batches and all-skipped runs need no prompt.
 - Writes carry a request key. A retry with the same key returns the stored
   reply without prompting again.
 
@@ -123,6 +134,7 @@ refuses `authority_not_cut_over`, before any prompt. After that:
 | `agent.snapshot` | query | Every agent and name claim at one generation, to seed a copy. |
 | `agent.changes` | query | Identity changes after a cursor, optionally waiting up to 25 seconds for the next one. |
 | `agent.preview_repair_workspaces` | query | Preview what `agent.repair_workspaces` would change, including any refusal. |
+| `agent.preview_avatar_manifest` | query | Validate and preview owner-minted avatars by name, including seed-only skips. |
 | `agent.create` | mutate | Create an agent. |
 | `agent.rename` | mutate | Rename an agent. |
 | `agent.update_tag` | mutate | Change an agent's tag. |
@@ -133,6 +145,7 @@ refuses `authority_not_cut_over`, before any prompt. After that:
 | `agent.merge` | mutate | Merge one agent into another and retire the source. |
 | `agent.import` | mutate | Import the executive's agent registry once. |
 | `agent.repair_workspaces` | mutate | Clear stored workspaces on heads and hirees and move their live name claims to their project's workspace. |
+| `agent.apply_avatar_manifest` | mutate | Seed or replace owner-minted avatars with one confirmation and resumable per-agent writes. |
 
 Tests: `agent_principal_matrix_precedes_decode_keys_and_cached_replies_before_and_after_cutover`,
 `every_agent_mutation_is_flow_refused_for_every_principal_before_and_after_cutover`,

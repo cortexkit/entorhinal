@@ -522,6 +522,7 @@ const WRITER_MODULE: &str = "prefrontal-core";
 /// Methods that change the registry or the liveness state derived from it.
 const MUTATING_METHODS: &[&str] = &[
     "agent.repair_workspaces",
+    "agent.apply_avatar_manifest",
     "register",
     "assign_workspace",
     "set_workspace_root",
@@ -610,6 +611,13 @@ fn authorize_write(method: &str, principal: Option<&Principal>) -> Result<(), Ha
             return Err(HandlerError::new(
                 "direct_caller_required",
                 "agent.repair_workspaces requires the operator (ck), with confirmation",
+            ));
+        }
+        if method == "agent.apply_avatar_manifest" && !matches!(principal, Some(Principal::Direct))
+        {
+            return Err(HandlerError::new(
+                "direct_caller_required",
+                "agent.apply_avatar_manifest requires the operator (ck), with confirmation",
             ));
         }
         return match principal {
@@ -1115,7 +1123,10 @@ impl ProjectsHandler {
         if !MUTATING_METHODS.contains(&request.method.as_str()) {
             return self.handle_request_wait(body, key).await;
         }
-        let result = if request.method == "identity_log.enable" {
+        let result = if request.method == "agent.apply_avatar_manifest" {
+            self.apply_avatar_manifest(request.params, key, received)
+                .await
+        } else if request.method == "identity_log.enable" {
             self.enable_log(request.params, key, received).await
         } else if request.method == roles::TAKE {
             self.take_role(request.params, key, received).await
@@ -2113,6 +2124,8 @@ fn declared_provenance() -> Option<ManifestProvenance> {
 fn agent_operation_description(method: &str) -> &'static str {
     match method {
         "agent.preview_repair_workspaces" => "Preview stored agent workspaces and name claims that the operator correction would change, including any refusal.",
+        "agent.preview_avatar_manifest" => "Validate owner-minted avatar manifest entries and preview each agent's avatar change or seed-only skip without writing.",
+        "agent.apply_avatar_manifest" => "Apply an owner-minted avatar manifest with resumable per-agent writes, seed-only unless replace is set. Direct only, with one operator confirmation for the batch.",
         "agent.repair_workspaces" => "Clear stored project-agent workspaces and align live name claims with project placement. Direct only, after cutover, with operator confirmation.",
         "agent.resolve" => "Look up one agent by id, including retired and merged agents.",
         "agent.resolve_name" => "Find an agent by name within a workspace or the global namespace.",
@@ -2353,7 +2366,10 @@ mod tests {
             let executive = authorize_write(method, Some(&reserved(WRITER_MODULE)));
             if *method == "identity_log.enable" {
                 assert_eq!(executive.unwrap_err().code, "write_not_permitted");
-            } else if *method == "agent.repair_workspaces" {
+            } else if matches!(
+                *method,
+                "agent.repair_workspaces" | "agent.apply_avatar_manifest"
+            ) {
                 assert_eq!(executive.unwrap_err().code, "direct_caller_required");
             } else {
                 assert!(executive.is_ok(), "{method} from {WRITER_MODULE}");
@@ -2363,7 +2379,10 @@ mod tests {
                     .expect_err("a write from any other principal must be refused");
                 assert_eq!(
                     error.code,
-                    if *method == "agent.repair_workspaces" {
+                    if matches!(
+                        *method,
+                        "agent.repair_workspaces" | "agent.apply_avatar_manifest"
+                    ) {
                         "direct_caller_required"
                     } else {
                         "write_not_permitted"

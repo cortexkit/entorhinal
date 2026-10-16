@@ -5292,3 +5292,425 @@ package = "entorhinal-core"
 target = "--lib"
 select = "expected"
 expect_red = ["binding::tests::external_worktree_with_retired_token_stays_implicit_after_rebind"]
+
+[[control]]
+id = "avatar-wild-length"
+guards = "A creature.wild genome must be exactly 32,768 hex characters, so classic and wild genomes cannot cross types"
+file = "crates/entorhinal-core/src/agent/validate.rs"
+old = '"creature.wild" => Ok(32_768),'
+new = '"creature.wild" => Ok(2048), // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/agent/validate.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["agent::validate::tests::avatar_lengths_are_per_type"]
+
+# Avatar manifest controls run their exact expect_red tests through Cargo.
+[[control]]
+id = "avatar-manifest-seed-skip"
+guards = "Seed-only never overwrites an existing avatar"
+file = "crates/entorhinal-core/src/agent/avatars.rs"
+old = 'let state = if !request.replace && row.avatar.is_some() {'
+new = 'let state = if false && !request.replace && row.avatar.is_some() { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/agent/avatars.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["agent::avatars::tests::avatar_manifest_seed_only_previews_skips_and_seeds_new_agents"]
+
+[[control]]
+id = "avatar-manifest-replace"
+guards = "Replace writes agents that already have avatars"
+file = "crates/entorhinal-core/src/agent/avatars.rs"
+old = 'let state = if !request.replace && row.avatar.is_some() {'
+new = 'let state = if row.avatar.is_some() { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/agent/avatars.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["agent::avatars::tests::avatar_manifest_replace_accepts_full_genome_with_classic_prefix"]
+
+[[control]]
+id = "avatar-manifest-identical"
+guards = "A fresh replacement refuses full genome equality"
+file = "crates/entorhinal-core/src/agent/avatars.rs"
+old = '.is_some_and(|avatar| avatar.genome == entry.avatar_genome)'
+new = '.is_some_and(|avatar| false && avatar.genome == entry.avatar_genome) // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/agent/avatars.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["agent::avatars::tests::avatar_manifest_identical_replacement_is_refused"]
+
+[[control]]
+id = "avatar-manifest-full-not-prefix"
+guards = "A wild genome with a classic prefix is not an identical genome"
+file = "crates/entorhinal-core/src/agent/avatars.rs"
+old = '.is_some_and(|avatar| avatar.genome == entry.avatar_genome)'
+new = '.is_some_and(|avatar| entry.avatar_genome.starts_with(&avatar.genome)) // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/agent/avatars.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["agent::avatars::tests::avatar_manifest_replace_accepts_full_genome_with_classic_prefix"]
+
+[[control]]
+id = "avatar-manifest-length"
+guards = "Each wild genome validates against its own fixed layout length"
+file = "crates/entorhinal-core/src/agent/avatars.rs"
+old = 'problems.push(format!("{id}: {error}"));'
+new = 'if entry.avatar_type != "creature.wild" { problems.push(format!("{id}: {error}")); } // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/agent/avatars.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["agent::avatars::tests::avatar_manifest_wrong_length_is_refused_atomically"]
+
+[[control]]
+id = "avatar-manifest-type"
+guards = "Unknown avatar layouts are refused before approval"
+file = "crates/entorhinal-core/src/agent/avatars.rs"
+old = 'problems.push(format!("{id}: {error}"));'
+new = 'if entry.avatar_type != "unknown.type" { problems.push(format!("{id}: {error}")); } // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/agent/avatars.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["agent::avatars::tests::avatar_manifest_unknown_type_is_refused"]
+
+[[control]]
+id = "avatar-manifest-unknown-agent"
+guards = "A missing agent refuses the entire manifest rather than dropping its entry"
+file = "crates/entorhinal-core/src/agent/avatars.rs"
+old = '_ => problems.push(format!("{id}: not a live agent")),'
+new = '_ => continue, // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/agent/avatars.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["agent::avatars::tests::avatar_manifest_unknown_and_retired_agents_are_refused_atomically"]
+
+[[control]]
+id = "avatar-manifest-live-agent"
+guards = "Retired agents cannot receive manifest avatars"
+file = "crates/entorhinal-core/src/agent/avatars.rs"
+old = 'Some(row) if row.status == "live" => {'
+new = 'Some(row) if true => { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/agent/avatars.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["agent::avatars::tests::avatar_manifest_unknown_and_retired_agents_are_refused_atomically"]
+
+[[control]]
+id = "avatar-manifest-mixed-types"
+guards = "All entries in one manifest must agree on type"
+file = "crates/entorhinal-core/src/agent/avatars.rs"
+old = 'if types.len() > 1 {'
+new = 'if false && types.len() > 1 { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/agent/avatars.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["agent::avatars::tests::avatar_manifest_mixed_types_are_refused"]
+
+[[control]]
+id = "avatar-manifest-duplicate-ids"
+guards = "Duplicate manifest agent ids refuse before any write"
+file = "crates/entorhinal-core/src/agent/avatars.rs"
+old = 'if !ids.insert(id.clone()) {'
+new = 'if false && !ids.insert(id.clone()) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/agent/avatars.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["agent::avatars::tests::avatar_manifest_duplicate_ids_are_refused"]
+
+[[control]]
+id = "avatar-manifest-empty"
+guards = "An empty manifest is not an all-skipped successful batch"
+file = "crates/entorhinal-core/src/agent/avatars.rs"
+old = 'if request.entries.is_empty() {'
+new = 'if false && request.entries.is_empty() { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/agent/avatars.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["agent::avatars::tests::avatar_manifest_empty_is_refused"]
+
+[[control]]
+id = "avatar-manifest-entry-fields"
+guards = "Owner manifest entries reject unknown fields"
+file = "crates/entorhinal-core/src/agent/avatars.rs"
+old = '''#[serde(deny_unknown_fields)]
+struct ManifestEntry {'''
+new = '''// NON-VACUITY BREAK: allow unknown entry fields
+struct ManifestEntry {'''
+test_file = "crates/entorhinal-core/src/agent/avatars.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["agent::avatars::tests::avatar_manifest_strict_shape_and_aggregated_errors"]
+
+[[control]]
+id = "avatar-manifest-request-fields"
+guards = "The apply request rejects unknown top-level fields"
+file = "crates/entorhinal-core/src/agent/avatars.rs"
+old = '''#[serde(deny_unknown_fields)]
+struct ApplyRequest {'''
+new = '''// NON-VACUITY BREAK: allow unknown request fields
+struct ApplyRequest {'''
+test_file = "crates/entorhinal-core/src/agent/avatars.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["agent::avatars::tests::avatar_manifest_strict_shape_and_aggregated_errors"]
+
+[[control]]
+id = "avatar-manifest-explicit-version"
+guards = "An entry cannot omit the version that interprets its genome"
+file = "crates/entorhinal-core/src/agent/avatars.rs"
+old = '    avatar_version: i64,'
+new = '''    #[serde(default)] // NON-VACUITY BREAK
+    avatar_version: i64,'''
+test_file = "crates/entorhinal-core/src/agent/avatars.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["agent::avatars::tests::avatar_manifest_strict_shape_and_aggregated_errors"]
+
+[[control]]
+id = "avatar-manifest-array"
+guards = "A single entry object cannot stand in for the owner's JSON array"
+file = "crates/entorhinal-core/src/agent/avatars.rs"
+old = '''#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApplyRequest {
+    entries: Vec<ManifestEntry>,'''
+new = '''// NON-VACUITY BREAK: coerce a single object into an array
+fn coerce_manifest<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<ManifestEntry>, D::Error> {
+    let value = Value::deserialize(d)?;
+    serde_json::from_value(if value.is_array() { value } else { json!([value]) }).map_err(serde::de::Error::custom)
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApplyRequest {
+    #[serde(deserialize_with = "coerce_manifest")]
+    entries: Vec<ManifestEntry>,'''
+test_file = "crates/entorhinal-core/src/agent/avatars.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["agent::avatars::tests::avatar_manifest_strict_shape_and_aggregated_errors"]
+
+[[control]]
+id = "avatar-manifest-preflight-overflow"
+guards = "Even a later agent's generation overflow refuses the whole plan before prompting"
+file = "crates/entorhinal-core/src/agent/avatars.rs"
+old = 'if matches!(state, State::Pending) && row.agent_generation == i64::MAX {'
+new = 'if false && matches!(state, State::Pending) && row.agent_generation == i64::MAX { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/agent/avatars.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["agent::avatars::tests::avatar_manifest_generation_overflow_refuses_before_first_write"]
+
+[[control]]
+id = "avatar-manifest-approval-summary"
+guards = "A typed approval must match the full manifest plan"
+file = "crates/entorhinal-core/src/agent/avatars.rs"
+old = 'if !approval.approves(&plan.summary()?) {'
+new = 'if false && !approval.approves(&plan.summary()?) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/agent/avatars.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["agent::avatars::tests::avatar_manifest_approval_binds_full_plan_and_rechecks_under_write_lock"]
+
+[[control]]
+id = "avatar-manifest-writer-revalidation"
+guards = "All unfinished before-images are checked under the writer before even the first write"
+file = "crates/entorhinal-core/src/agent/avatars.rs"
+old = 'if load_row(tx, &expected.entry.agent_id)? != expected.row {'
+new = 'if false && load_row(tx, &expected.entry.agent_id)? != expected.row { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/agent/avatars.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["agent::avatars::tests::avatar_manifest_approval_binds_full_plan_and_rechecks_under_write_lock"]
+
+[[control]]
+id = "avatar-manifest-per-agent-keys"
+guards = "Each agent has its own idempotent key rather than sharing one key across the batch"
+file = "crates/entorhinal-core/src/agent/avatars.rs"
+old = 'format!("{key}:{id}")'
+new = 'format!("{key}") /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::two_machines_receive_every_avatar_manifest_entry"]
+
+[[control]]
+id = "avatar-manifest-completed-retry"
+guards = "Cached entries replay before the identical-genome guard and do not prompt again"
+file = "crates/entorhinal-core/src/agent/avatars.rs"
+old = 'let reply = cached(conn, SET_AVATAR, key.as_deref())?;'
+new = 'let reply: Option<Vec<u8>> = None; // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/agent_ops.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["agent_ops::tests::avatar_manifest_one_prompt_cached_retry_and_zero_change_success"]
+
+[[control]]
+id = "avatar-manifest-resume"
+guards = "Interrupted replacement resumes cached writes without rechecking full-genome equality"
+file = "crates/entorhinal-core/src/agent/avatars.rs"
+old = 'let reply = cached(conn, SET_AVATAR, key.as_deref())?;'
+new = 'let reply: Option<Vec<u8>> = None; // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::two_machines_resume_interrupted_avatar_manifest_without_duplicates"]
+
+[[control]]
+id = "avatar-manifest-cutover"
+guards = "A manifest refuses before takeover without prompting"
+file = "crates/entorhinal-core/src/agent/avatars.rs"
+old = '    require_cutover(conn)?;'
+new = '    let _ = require_cutover(conn); // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/agent_ops.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["agent_ops::tests::avatar_manifest_requires_cutover_before_prompt"]
+
+[[control]]
+id = "avatar-manifest-noop-no-prompt"
+guards = "An all-skipped batch succeeds without another prompt"
+file = "crates/entorhinal-module/src/agent_ops.rs"
+old = 'if pending.is_empty() {'
+new = 'if false && pending.is_empty() { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/agent_ops.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["agent_ops::tests::avatar_manifest_one_prompt_cached_retry_and_zero_change_success"]
+
+[[control]]
+id = "avatar-manifest-declined"
+guards = "The batch capability is created only after successful operator confirmation"
+file = "crates/entorhinal-module/src/agent_ops.rs"
+old = 'result.map_err(|_|HandlerError::from(OperatorConfirmError::Declined))??;'
+new = 'let _ = result; // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/agent_ops.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["agent_ops::tests::avatar_manifest_declined_approval_writes_nothing"]
+
+[[control]]
+id = "avatar-manifest-flow-before-prompt"
+guards = "A flow is refused before batch confirmation, not only by each inner write"
+file = "crates/entorhinal-module/src/agent_ops.rs"
+old = 'super::refuse_flow_write("agent.apply_avatar_manifest", admission.flow_id.as_deref())?;'
+new = '// NON-VACUITY BREAK: omit batch flow precheck'
+test_file = "crates/entorhinal-module/src/agent_ops.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["agent_ops::tests::avatar_manifest_admission_and_all_validation_precede_prompt"]
+
+[[control]]
+id = "avatar-manifest-direct-setter-stays-refused"
+guards = "Batch approval cannot expand the public Direct avatar setter admission"
+file = "crates/entorhinal-module/src/main.rs"
+old = '    if agent_ops::MUTATING_METHODS.contains(&method) {'
+new = '''    if agent_ops::MUTATING_METHODS.contains(&method) {
+        if method == "agent.set_avatar" && matches!(principal, Some(Principal::Direct)) { return Ok(()); } // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-module/src/agent_ops.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["agent_ops::tests::avatar_manifest_one_prompt_cached_retry_and_zero_change_success"]
+
+[[control]]
+id = "avatar-manifest-shared-every-entry"
+guards = "The private shared writer applies the selected agent, not the first entry repeatedly"
+file = "crates/entorhinal-module/src/shared_write.rs"
+old = 'Self::ManifestAvatar(approval, index) => return approval.apply(store, index, now),'
+new = 'Self::ManifestAvatar(approval, _index) => return approval.apply(store, 0, now), // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::two_machines_receive_every_avatar_manifest_entry"]
+
+[[control]]
+id = "avatar-manifest-cli-preview-only"
+guards = "Without --yes the CLI sends only a read-only manifest preview"
+file = "crates/entorhinal-module/src/cli.rs"
+old = 'method = "agent.preview_avatar_manifest";'
+new = 'method = "agent.apply_avatar_manifest"; // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/cli.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["cli::agent_tests::avatar_manifest_cli_previews_and_only_yes_applies_exact_entries"]
+
+[[control]]
+id = "avatar-manifest-direct-only"
+guards = "The batch operation is unavailable to the executive and other modules"
+file = "crates/entorhinal-module/src/main.rs"
+old = 'if method == "agent.apply_avatar_manifest" && !matches!(principal, Some(Principal::Direct))'
+new = 'if false && method == "agent.apply_avatar_manifest" && !matches!(principal, Some(Principal::Direct)) // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/agent_ops.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["agent_ops::tests::avatar_manifest_admission_and_all_validation_precede_prompt"]
+
+[[control]]
+id = "avatar-manifest-summary-bound"
+guards = "The summary builder refuses an oversized future layout name instead of truncating approval text"
+file = "crates/entorhinal-core/src/agent/avatars.rs"
+old = 'if text.chars().count() > OPERATOR_SUMMARY_LIMIT {'
+new = 'if false && text.chars().count() > OPERATOR_SUMMARY_LIMIT { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/agent/avatars.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["agent::avatars::tests::avatar_manifest_summary_refuses_overlong_type_without_truncation"]

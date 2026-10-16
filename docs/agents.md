@@ -1,7 +1,8 @@
 # Agents
 
 How to create, rename, retag, relabel and retire agents, set the hiring cap,
-and correct stored agent workspaces. Agent identity is shared between the
+apply owner-minted avatar manifests, and correct stored agent workspaces.
+Agent identity is shared between the
 operator's Macs when the identity log is enabled ([sharing.md](sharing.md));
 which Mac holds an agent is a separate claim, changed only by a move
 ([moves.md](moves.md)).
@@ -67,6 +68,53 @@ A prompt summary that is too long for the dialog refuses
 
 Verify: `ck agents show Ada-2`. Reverse: run the command again with the old
 value.
+
+## Apply avatar genomes
+
+The avatar owner's `avatar-export --mint-genomes` tool produces a JSON array:
+each entry has exactly `agent_id`, `avatar_genome`, `avatar_type` and
+`avatar_version`. Entorhinal never derives a genome or changes the supplied
+string. A `creature.wild` v1 genome is 16,384 bytes (32,768 hex characters).
+Each entry carries its own avatar type and version; these values are not
+specified once for the whole file.
+
+```sh
+ck agents avatars --manifest avatars.json                 # preview, no writes
+ck agents avatars --manifest avatars.json --yes           # seed agents with no avatar
+ck agents avatars --manifest avatars.json --replace       # preview replacements
+ck agents avatars --manifest avatars.json --replace --yes # replace, one Touch ID
+```
+
+Seed-only is the default: existing avatars are listed as skipped, so the same
+manifest can also give newly created agents their first creature. An all-skipped
+run succeeds without a prompt or a journal entry. `--replace` overwrites every
+listed agent but refuses a genome exactly equal to that agent's current genome.
+Replacement is refused only when the complete new genome matches the current
+one; a wild genome that begins with its classic genome is not an exact match.
+
+The preview lists names, old and new types/versions, and skipped agents. The
+module validates the whole manifest before any prompt, refusing unknown fields,
+non-arrays, empty arrays, duplicate ids, non-live agents, unsupported types,
+wrong genome lengths, and entries that disagree on type. It reports every domain
+problem together, and writes nothing on a refusal. `--yes` requests one Touch ID
+for all changes, with a count/type summary bounded to 200 characters (never
+truncated). The summary also binds the complete plan: identities or avatars
+changing while approval is pending refuse `operator_approval_stale`.
+
+Before the first write, the writer checks the complete approved plan under its
+lock. Each changed agent then gets its own normal `agent.set_avatar` transaction
+and shared append, using the key `<batch key>:<agent_id>`. This avoids an oversized
+shared entry and remains compatible with older replicas. A failure can leave a
+partially written batch: the reply names exactly which agents were written and
+which remain. Retry with the original `--request-key` and unchanged manifest:
+already written entries replay their cached replies, including identical genomes,
+and the remaining entries apply after a new batch confirmation. A completed
+batch replays without another prompt.
+Only the operator can apply manifests; flows and other modules are refused.
+
+Verify the applied manifest by running the preview again; seed-only mode reports
+already-populated avatars as skipped. Reverse:
+apply a saved manifest of the old genomes with `--replace --yes`.
 
 ## Retire
 

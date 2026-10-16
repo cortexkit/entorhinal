@@ -281,6 +281,9 @@ impl RegistryStore {
                     Ok(reply)
                 })?
             }
+            "agent.preview_avatar_manifest" => {
+                self.read_agent(|conn| super::avatars::preview(conn, params))?
+            }
             "agent.preview_repair_workspaces" => {
                 let EmptyRequest {} = decode(params)?;
                 self.read_agent(super::carry::preview_repair)?

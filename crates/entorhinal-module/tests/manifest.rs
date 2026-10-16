@@ -44,6 +44,18 @@ fn manifest_flag_prints_the_manifest_with_the_provided_capability() {
         .collect();
     assert_eq!(rebind.len(), 1);
     assert_eq!(rebind[0]["kind"], "mutate");
+    for (name, kind) in [
+        ("agent.preview_avatar_manifest", "query"),
+        ("agent.apply_avatar_manifest", "mutate"),
+    ] {
+        let matched: Vec<_> = operations.iter().filter(|op| op["name"] == name).collect();
+        assert_eq!(matched.len(), 1, "{name}");
+        assert_eq!(matched[0]["kind"], kind);
+        assert!(matched[0]["description"]
+            .as_str()
+            .unwrap()
+            .contains("manifest"));
+    }
     let mut descriptions = std::collections::BTreeSet::new();
     for operation in operations {
         let description = operation["description"].as_str().unwrap();
