@@ -1,5 +1,8 @@
 //! Machine-local status refresh for scopes referenced by agent pins.
-use crate::{catalog_agent, catalog_trust::CatalogTrust, HealthGauges, ProjectsHandler};
+use crate::{
+    catalog_agent, catalog_trust::CatalogTrust, move_driver::SqlOperations, HealthGauges,
+    ProjectsHandler,
+};
 use entorhinal_core::RegistryStore;
 use std::sync::{
     atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
@@ -122,6 +125,10 @@ struct Worker {
     health: Arc<HealthGauges>,
     clock: fn() -> i64,
     wake: Arc<tokio::sync::Notify>,
+    /// Counts this worker's blocking SQL jobs. Aborting the poll task does not
+    /// stop a job already on the blocking pool, and that job holds a store
+    /// handle, so stopping waits for the count to reach zero.
+    sql: Arc<SqlOperations>,
 }
 impl Worker {
     fn store(&self) -> Option<RegistryStore> {
@@ -131,7 +138,9 @@ impl Worker {
         let mut bytes = [0; 8];
         getrandom::getrandom(&mut bytes).map_err(|_| "catalog_poll_failed")?;
         let store = self.store().ok_or("store_unavailable")?;
+        let guard = self.sql.begin();
         crate::catalog_sql::run(move || {
+            let _guard = guard;
             store
                 .catalog_poll_offset(u64::from_le_bytes(bytes))
                 .map_err(|e| crate::catalog_blob::CatalogError::new("storage_error", e.to_string()))
@@ -141,7 +150,9 @@ impl Worker {
     }
     async fn pass(&self) -> Result<(), &'static str> {
         let store = self.store().ok_or("store_unavailable")?;
+        let guard = self.sql.begin();
         let scopes = crate::catalog_sql::run(move || {
+            let _guard = guard;
             store
                 .catalog_pinned_scopes()
                 .map_err(|e| crate::catalog_blob::CatalogError::new("storage_error", e.to_string()))
@@ -154,9 +165,13 @@ impl Worker {
             let trust = match self.store() {
                 Some(store) => {
                     let sources = self.sources.clone();
-                    crate::catalog_sql::run(move || sources(store, &scope))
-                        .await
-                        .map_err(|e| e.code)
+                    let guard = self.sql.begin();
+                    crate::catalog_sql::run(move || {
+                        let _guard = guard;
+                        sources(store, &scope)
+                    })
+                    .await
+                    .map_err(|e| e.code)
                 }
                 None => Err("store_unavailable"),
             };
@@ -216,6 +231,9 @@ impl ProjectsHandler {
             task.abort();
             let _ = task.await;
         }
+        // Aborting the task leaves its blocking jobs, and the startup seed's,
+        // still running with a store handle; wait until they have all ended.
+        self.catalog_sql.wait().await;
     }
     pub(super) fn start_catalog_poll(&self) {
         let mut task = self.catalog_poll_task.lock().unwrap();
@@ -228,6 +246,7 @@ impl ProjectsHandler {
             health: self.health.clone(),
             clock: self.clock,
             wake: self.catalog_poll_wake.clone(),
+            sql: self.catalog_sql.clone(),
         };
         *task = Some(tokio::spawn(worker.run()));
     }

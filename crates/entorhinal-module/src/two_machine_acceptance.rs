@@ -94,7 +94,12 @@ impl Machine {
         }
         let mut store = RegistryStore::open(descriptor).unwrap();
         store.set_root_records(true);
-        install_store(&handler.store, &handler.health, Ok(store));
+        install_store(
+            &handler.store,
+            &handler.health,
+            &handler.catalog_sql,
+            Ok(store),
+        );
         for (key, principal) in [
             (DIRECT, Principal::Direct),
             (

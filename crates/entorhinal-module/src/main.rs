@@ -588,6 +588,9 @@ struct ProjectsHandler {
     catalog_move_lock: Arc<tokio::sync::Mutex<()>>,
     catalog_poll_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     catalog_poll_wake: Arc<tokio::sync::Notify>,
+    /// Counts the catalog's blocking jobs that hold a store handle: the poll
+    /// worker's SQL and the startup seed. Stopping the catalog waits on it.
+    catalog_sql: Arc<move_driver::SqlOperations>,
     door_client: door_client::DoorClient,
     move_wake: Arc<move_driver::MoveWake>,
     move_driver_task: Mutex<Option<move_driver::MoveDriver>>,
@@ -935,6 +938,7 @@ impl ProjectsHandler {
             catalog_move_lock: Arc::new(tokio::sync::Mutex::new(())),
             catalog_poll_task: Mutex::new(None),
             catalog_poll_wake: Arc::default(),
+            catalog_sql: Arc::default(),
             claim_refresh: Arc::new(claims::RefreshQueue::default()),
             door_client: door_client::DoorClient::production(log_client::SubcConnector::from_args(
                 std::env::args_os().skip(1),
@@ -1188,12 +1192,14 @@ impl ModuleHandler for ProjectsHandler {
                 let move_wake = self.move_wake.clone();
                 let module_started_at = self.module_started_at;
                 let catalog_poll_wake = self.catalog_poll_wake.clone();
+                let catalog_sql = self.catalog_sql.clone();
                 tokio::spawn(async move {
                     let outcome = retry_open_while_lease_held(&descriptor, retry_budget).await;
                     health.store_opening.store(false, Ordering::Relaxed);
                     install_store_with_time(
                         &store,
                         &health,
+                        &catalog_sql,
                         outcome,
                         module_started_at,
                         Instant::now,
@@ -1208,6 +1214,7 @@ impl ModuleHandler for ProjectsHandler {
             outcome => install_store_with_time(
                 &self.store,
                 &self.health,
+                &self.catalog_sql,
                 outcome.map_err(|error| format!("opening projects storage: {error}")),
                 self.module_started_at,
                 Instant::now,
@@ -2551,15 +2558,24 @@ fn management_operation(
 fn install_store(
     store: &Mutex<Option<RegistryStore>>,
     health: &HealthGauges,
+    catalog_sql: &Arc<move_driver::SqlOperations>,
     outcome: Result<RegistryStore, String>,
 ) {
-    install_store_with_time(store, health, outcome, Instant::now(), Instant::now);
+    install_store_with_time(
+        store,
+        health,
+        catalog_sql,
+        outcome,
+        Instant::now(),
+        Instant::now,
+    );
 }
 
 /// Publishes an open outcome into the shared store slot and the health gauges.
 fn install_store_with_time(
     store: &Mutex<Option<RegistryStore>>,
     health: &HealthGauges,
+    catalog_sql: &Arc<move_driver::SqlOperations>,
     outcome: Result<RegistryStore, String>,
     module_started_at: Instant,
     now: impl Fn() -> Instant,
@@ -2594,7 +2610,7 @@ fn install_store_with_time(
             health.store_failed.store(false, Ordering::Relaxed);
             *guard = Some(opened);
             if let Some(opened) = guard.as_ref() {
-                catalog_seed::start(opened.clone());
+                catalog_seed::start(opened.clone(), catalog_sql);
             }
         }
         Err(error) => {
@@ -2730,6 +2746,7 @@ mod tests {
         install_store_with_time(
             &handler.store,
             &handler.health,
+            &handler.catalog_sql,
             Ok(first_store),
             module_started_at,
             || first_ready_at,
@@ -2743,6 +2760,7 @@ mod tests {
         install_store_with_time(
             &handler.store,
             &handler.health,
+            &handler.catalog_sql,
             Ok(second_store),
             module_started_at,
             || later_ready_at,
@@ -2750,6 +2768,8 @@ mod tests {
         let second_report = handler.health().await.metrics.unwrap();
         assert_eq!(second_report["readyAfterMs"], 12_345);
 
+        // Each install starts a startup-seed job holding a store handle.
+        handler.catalog_sql.wait().await;
         drop(handler);
         std::fs::remove_dir_all(first_dir).unwrap();
         std::fs::remove_dir_all(second_dir).unwrap();

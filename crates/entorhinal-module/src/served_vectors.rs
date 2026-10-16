@@ -75,7 +75,12 @@ impl Fixture {
             .with_operator_confirmer(confirmer);
         let mut store = RegistryStore::open(&descriptor).unwrap();
         store.set_root_records(true);
-        install_store(&handler.store, &handler.health, Ok(store));
+        install_store(
+            &handler.store,
+            &handler.health,
+            &handler.catalog_sql,
+            Ok(store),
+        );
         for (route, principal) in [
             (DIRECT, Principal::Direct),
             (CORE, reserved(WRITER_MODULE)),
@@ -183,6 +188,7 @@ impl RoleFixture {
         install_store(
             &handler.store,
             &handler.health,
+            &handler.catalog_sql,
             Ok(RegistryStore::open(&descriptor).unwrap()),
         );
         handler.route_admissions().insert(
@@ -241,6 +247,7 @@ impl RoleFixture {
         install_store(
             &self.handler.store,
             &self.handler.health,
+            &self.handler.catalog_sql,
             Ok(RegistryStore::open(&self.descriptor).unwrap()),
         );
     }
@@ -566,7 +573,12 @@ impl SessionFixture {
         handler.provider_resolver = resolver;
         let mut store = RegistryStore::open(&descriptor).unwrap();
         store.set_root_records(true);
-        install_store(&handler.store, &handler.health, Ok(store));
+        install_store(
+            &handler.store,
+            &handler.health,
+            &handler.catalog_sql,
+            Ok(store),
+        );
         for (route, module_id) in [
             (SESSION_CORE, WRITER_MODULE),
             (SESSION_REGISTRAR, WRITER_MODULE),

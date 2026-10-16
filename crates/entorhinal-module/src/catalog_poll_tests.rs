@@ -94,6 +94,7 @@ impl Fixture {
             health: self.health.clone(),
             clock,
             wake: Arc::default(),
+            sql: Arc::default(),
             sources: Arc::new(move |store, scope| {
                 CatalogTrust::with_client(
                     store,

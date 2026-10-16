@@ -9462,3 +9462,17 @@ package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
 expect_red = ["two_machine_acceptance::consent_workspace_and_hire_replicate_without_local_authority_rows"]
+
+# Stopping the catalog must outlast the blocking jobs that hold a store handle.
+[[control]]
+id = "catalog-stop-waits-for-blocking-jobs"
+guards = "Stopping the catalog waits until its poll and startup-seed blocking jobs have released the store"
+file = "crates/entorhinal-module/src/catalog_poll.rs"
+old = "        self.catalog_sql.wait().await;"
+new = "        // NON-VACUITY BREAK: return before blocking jobs end"
+test_file = "crates/entorhinal-module/src/catalog_seed_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_seed::tests::stopping_the_catalog_waits_for_a_running_seed_job"]

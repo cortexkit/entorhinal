@@ -103,7 +103,12 @@ fn open(descriptor: &StorageDescriptor) -> RehearsalResult<ProjectsHandler> {
     );
     let mut store = RegistryStore::open(descriptor)?;
     store.set_root_records(true);
-    install_store(&handler.store, &handler.health, Ok(store));
+    install_store(
+        &handler.store,
+        &handler.health,
+        &handler.catalog_sql,
+        Ok(store),
+    );
     for (route, principal) in [
         (DIRECT, Principal::Direct),
         (

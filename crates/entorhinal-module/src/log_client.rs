@@ -1021,7 +1021,9 @@ mod tests {
         }
         assert_eq!(connector.calls(), 0);
         assert!(manifest().capabilities.unwrap().requires.is_empty());
-        crate::tests::stop_catch_up(&handler).await;
+        // Every background task opened by the store must stop before its folder
+        // is deleted; Windows refuses to delete a file a task still holds open.
+        crate::tests::stop_store_tasks(&handler).await;
         drop(handler);
         std::fs::remove_dir_all(root).unwrap();
     }

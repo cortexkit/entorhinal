@@ -3,7 +3,9 @@
 use crate::{
     catalog_blob::{BlobStore, CatalogError},
     catalog_trust::CORTEXKIT_ROOT,
-    encode_result, HandlerError, ProjectsHandler, RouteKey,
+    encode_result,
+    move_driver::SqlOperations,
+    HandlerError, ProjectsHandler, RouteKey,
 };
 use entorhinal_catalog::{archive::ARCHIVE_MAX, bundle};
 use entorhinal_core::RegistryStore;
@@ -242,14 +244,22 @@ fn automatic(store: &RegistryStore, seeder: &Seeder) -> Result<Option<Value>, Ca
     result.map(Some)
 }
 
-/// Scheduling performs no file I/O on the startup or health task.
-pub(super) fn start(store: RegistryStore) {
-    schedule(store, Seeder::default());
+/// Scheduling performs no file I/O on the startup or health task. The job is
+/// counted in `sql` because it holds a store handle on the blocking pool until
+/// it ends; the catalog's stop path waits for that count to reach zero.
+pub(super) fn start(store: RegistryStore, sql: &std::sync::Arc<SqlOperations>) {
+    schedule(store, Seeder::default(), sql);
 }
-fn schedule(store: RegistryStore, seeder: Seeder) -> Option<tokio::task::JoinHandle<()>> {
+fn schedule(
+    store: RegistryStore,
+    seeder: Seeder,
+    sql: &std::sync::Arc<SqlOperations>,
+) -> Option<tokio::task::JoinHandle<()>> {
     if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-        Some(
-            runtime.spawn_blocking(move || match automatic(&store, &seeder) {
+        let guard = sql.begin();
+        Some(runtime.spawn_blocking(move || {
+            let _guard = guard;
+            match automatic(&store, &seeder) {
                 Ok(Some(_)) => {
                     tracing::info!(target: "catalog", outcome="seeded", "starter bundle")
                 }
@@ -257,8 +267,8 @@ fn schedule(store: RegistryStore, seeder: Seeder) -> Option<tokio::task::JoinHan
                 Err(error) => {
                     tracing::warn!(target: "catalog", outcome=error.code, "starter bundle")
                 }
-            }),
-        )
+            }
+        }))
     } else {
         None
     }

@@ -455,6 +455,7 @@ mod tests {
             super::super::install_store(
                 &h.store,
                 &h.health,
+                &h.catalog_sql,
                 Ok(RegistryStore::open(&descriptor).unwrap()),
             );
             h.route_admissions().insert(
@@ -970,6 +971,7 @@ mod tests {
         super::super::install_store(
             &f.handler.store,
             &f.handler.health,
+            &f.handler.catalog_sql,
             Ok(RegistryStore::open(&f.descriptor).unwrap()),
         );
         assert_eq!(
@@ -985,6 +987,7 @@ mod tests {
         super::super::install_store(
             &f.handler.store,
             &f.handler.health,
+            &f.handler.catalog_sql,
             Ok(RegistryStore::open(&f.descriptor).unwrap()),
         );
         assert_eq!(f.read()["stale"], true);

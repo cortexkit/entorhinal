@@ -334,7 +334,7 @@ async fn startup_seed_does_not_block_health() {
             .recv_timeout(std::time::Duration::from_secs(10))
             .unwrap();
     }));
-    let task = schedule(store.clone(), seeder).unwrap();
+    let task = schedule(store.clone(), seeder, &handler.catalog_sql).unwrap();
     wait_entered.await.unwrap();
     use subc_client_rs::ModuleHandler;
     let health = tokio::time::timeout(std::time::Duration::from_secs(1), handler.health()).await;
@@ -343,6 +343,42 @@ async fn startup_seed_does_not_block_health() {
     task.await.unwrap();
     handler.store.lock().unwrap().take();
     drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Stopping the catalog must not return while a startup seed job still holds a
+/// store handle on the blocking pool. Otherwise a caller that deletes the store
+/// folder next is refused on Windows, which keeps open files undeletable.
+#[tokio::test(flavor = "current_thread")]
+async fn stopping_the_catalog_waits_for_a_running_seed_job() {
+    use std::future::Future;
+    use std::sync::Arc;
+    use std::task::{Context, Waker};
+    let (root, store, _, _) = fixture("seed-stop-waits");
+    let handler = ProjectsHandler::with_runtime("seed-stop-waits".into(), || 0);
+    let (entered, wait_entered) = tokio::sync::oneshot::channel();
+    let entered = std::sync::Mutex::new(Some(entered));
+    let (release, wait_release) = std::sync::mpsc::channel::<()>();
+    let wait_release = std::sync::Mutex::new(wait_release);
+    let mut seeder = test_seeder();
+    seeder.before_seed = Some(Arc::new(move || {
+        entered.lock().unwrap().take().unwrap().send(()).unwrap();
+        let _ = wait_release.lock().unwrap().recv();
+    }));
+    let task = schedule(store.clone(), seeder, &handler.catalog_sql).unwrap();
+    drop(store);
+    wait_entered.await.unwrap();
+
+    let mut stop = Box::pin(handler.stop_catalog_poll());
+    assert!(
+        stop.as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending(),
+        "stop returned while the seed job still held the store"
+    );
+    release.send(()).unwrap();
+    task.await.unwrap();
+    stop.await;
     fs::remove_dir_all(root).unwrap();
 }
 
