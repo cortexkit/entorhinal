@@ -336,7 +336,9 @@ The opaque stream format is `package-closure/v1`: ASCII
 `ck-package-closure/v1\n`, a big-endian u32 blob count, then ascending unique
 raw SHA-256 digests (32 bytes), each followed by a big-endian u64 byte length and
 the raw blob bytes. There are no pins, permissions or generation IDs in it.
-The source includes each selected manifest and archive digest once. Admissions
+The blobs are the pinned packages' manifests and archives: each frame's digest is
+a pin's `manifest_sha256` or `archive_sha256`, and the source writes each distinct
+digest once. Admissions
 are at most 3,145,692 bytes, and a blob may span admissions. The receiver hashes
 the stream incrementally, checks its sealed cut digest, then verifies every
 frame in bounded staging files before publishing any blob. Bad magic/count,

@@ -7,9 +7,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 
-/// Journal op for a replacement of one agent's whole pin set. It is shared
-/// identity state, but never part of `agent.changes` (core's replica refuses
-/// ops it does not know) or of the project `journal_tail`.
+/// Journal op that replaces one agent's whole pin set. Pins are shared agent
+/// state, but this op is left out of both journal read feeds. `agent.changes`
+/// is the agent-identity change feed that core's identity replica reads, and
+/// that replica refuses ops it does not know. `journal_tail` is the project
+/// history feed, and an agent's pins are not project history.
 pub(crate) const PIN_OP: &str = "catalog.pin";
 
 /// Package identities and privileges authenticated before consumers inspect the
@@ -110,9 +112,11 @@ fn invalid(message: &str) -> rusqlite::Error {
         message.to_owned(),
     )))
 }
-/// Validate shared pins once for local writes, remote apply, replay and verification.
-/// Pins can describe any catalog package kind. Plan preparation separately
-/// refuses packages other than Kind::Skill until their consumers are supported.
+/// Validate shared pins with one set of rules for local writes, remote apply,
+/// replay and verification. Pins can describe any catalog package kind. Plan
+/// preparation (resolving and checking an install or upgrade request) is
+/// stricter: it refuses any package that is not a `Kind::Skill`, because skills
+/// are the only kind with a consumer today.
 pub fn validate_pins(pins: &[CatalogPin]) -> rusqlite::Result<()> {
     let mut seen = BTreeSet::new();
     for pin in pins {
@@ -554,8 +558,11 @@ impl RegistryStore {
                 .collect())
         })
     }
-    /// Save this store's hourly poll phase once. Unlike agent pins, the phase
-    /// never enters the identity journal or replication to other Macs.
+    /// Return this Mac's hourly registry poll phase, a millisecond offset within
+    /// the hour. The first call saves `candidate` modulo one hour; later calls
+    /// return the saved value. The phase is a machine-local value: unlike agent
+    /// pins, it is never recorded in the identity journal or replicated to other
+    /// Macs.
     pub fn catalog_poll_offset(&self, candidate: u64) -> Result<u64, RegistryError> {
         self.catalog_transaction(|tx| {
             tx.execute_batch("CREATE TABLE IF NOT EXISTS catalog_poll_clock(id INTEGER PRIMARY KEY CHECK(id=1), offset_ms INTEGER NOT NULL CHECK(offset_ms>=0 AND offset_ms<3600000))").map_err(store_error)?;
@@ -762,8 +769,10 @@ impl RegistryStore {
     ) -> Result<CatalogGeneration, CatalogWriteError> {
         self.catalog_generation_step(id, caller, "ready", None, 0)
     }
-    /// An aborted move must not leave a generation eligible for activation.
-    /// Shared pins and locally granted publisher permissions are untouched.
+    /// When a cross-Mac agent move is aborted, delete the generation this
+    /// receiving Mac prepared for the moved agent, so it can never be activated.
+    /// Only a generation still approved, installed or ready is deleted. Shared
+    /// pins and locally granted publisher permissions are untouched.
     pub fn catalog_discard_move_generation(
         &self,
         cut: &str,
@@ -815,8 +824,10 @@ impl RegistryStore {
                 };
                 if !allowed { return Err(CatalogWriteError::Refused("invalid_transition")); }
                 if step == "active" {
-                    // Release the unique active slot before taking it. Keep the old
-                    // closure so consumers can finish switching away from its packages.
+                    // An agent may have only one active generation (a unique index
+                    // enforces it), so first mark the current one superseded,
+                    // whether it is active or degraded. Its row and closure are
+                    // kept so consumers can finish switching away from its packages.
                     tx.execute("UPDATE catalog_generation SET state='superseded' WHERE agent_id=?1 AND state IN ('active','degraded')",[&generation.agent_id]).map_err(store_error)?;
                 }
                 tx.execute("UPDATE catalog_generation SET state=?1,error=?2,activated_at_ms=CASE WHEN ?1='active' THEN ?3 ELSE activated_at_ms END WHERE generation_id=?4",params![step,error.map(|e|e.to_string()),now,id]).map_err(store_error)?;

@@ -347,8 +347,15 @@ impl RegistryStore {
 }
 
 impl JournalWriter<'_> {
-    /// One ordinary identity transaction and shared entry. The complete approved
-    /// plan is checked again, ignoring only writes already cached under its keys.
+    /// Apply one pending manifest entry as its own `agent.set_avatar` write. One
+    /// store transaction sets that agent's avatar, bumps its agent generation,
+    /// records the change in the identity journal and, when the shared log is
+    /// enabled, adds the matching shared-log entry. Before writing, it checks the
+    /// whole approved plan again: the operator approval must still match, and
+    /// every entry must still find its agent unchanged and its genome valid.
+    /// The only entries skipped in that check are ones already written, that
+    /// is, whose request key has a cached reply in the journal (found when the
+    /// plan was made, or since).
     pub fn apply_avatar_manifest_entry(
         &self,
         plan: &AvatarManifestPlan,

@@ -602,10 +602,10 @@ mod tests {
         f.handler
             .on_hello_ack(&crate::tests::hello_ack(&f.descriptor))
             .await;
-        // Count only after the pass reports done: it runs its SQL on the blocking
-        // pool, which a single yield doesn't wait for. The paused clock must not
-        // have reached the 30 s timer, which proves this pass came from the store
-        // install itself and not from the periodic refresh.
+        // Count only after the role-refresh pass reports done: it runs its SQL
+        // on the blocking pool, which a single yield doesn't wait for. The paused
+        // clock must not have reached the 30 s periodic role-refresh timer, which
+        // proves this pass came from the store install itself, not the timer.
         f.handler.health.role_refresh_done.notified().await;
         assert!(installed.elapsed() < Duration::from_secs(30));
         assert_eq!(role_batches(), 1);

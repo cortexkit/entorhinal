@@ -241,9 +241,9 @@ mod tests {
         assert_eq!(participants.len(), 1);
         assert_eq!(participants[0].module_id, "alpha");
 
-        // The same absent entry declared as a subc module, or from a daemon
-        // too old to send the field, still refuses: it may be a participant
-        // that is down.
+        // The same absent entry still refuses when it declares protocol "subc",
+        // or has no protocol field at all (a daemon too old to send one): it may
+        // be a participant that is down.
         for protocol in [Some("subc"), None] {
             let mut entry = configured("nats-server", true, "running");
             if let Some(protocol) = protocol {

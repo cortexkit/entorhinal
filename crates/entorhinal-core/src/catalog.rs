@@ -132,7 +132,8 @@ impl RegistryStore {
     }
     pub fn catalog_registry_remove(&self, url: &str) -> Result<(), CatalogWriteError> {
         self.catalog_transaction(|tx| {
-            // Explicit deletion also works on connections with foreign keys disabled.
+            // Delete the child rows explicitly, so removal is complete even on a
+            // connection where foreign-key cascades are off.
             for table in [
                 "catalog_scope_map",
                 "catalog_registry_key",

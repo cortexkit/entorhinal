@@ -59,7 +59,8 @@ Generation fields (shared by the `catalog_generation` agent tool and the
   its requested semver range; transitive pins use `root: false` and `range: null`).
   Generation entries also carry
   `publisher: {fingerprint, scope, first_party}`; the fingerprint duplicates
-  `publisher_fingerprint`, scope is installed (such as `@cortexkit` or `@example`),
+  `publisher_fingerprint`, `scope` is the scope of the installed package (such as
+  `@cortexkit` or `@example`),
   and `first_party` records certification by this Mac's pinned CortexKit root at
   install time. The example closure contains a root-certified CortexKit skill and
   a third-party skill backed by a publisher grant; their flags are true and false.
@@ -87,10 +88,13 @@ clock 700 ms, and handler incarnation `0123456789abcdef`. It verifies the test
 CortexKit publisher certificate against an injected test root, records a publisher
 grant for the third-party skill, then seeds local plans and pins. Status news is
 applied through the store's trust transaction, which also updates generation
-effects; queries and acknowledgements are real handler calls. Separate HTTP tests
-authenticate signed feeds and exercise preparation.
+effects; queries and acknowledgements are real handler calls. These vectors do not
+cover authenticating signed feeds or plan preparation (resolving and checking an
+install request); separate HTTP tests exercise those.
 
-Regenerate from the repository root:
+To regenerate the vectors after an intended change, run these from the repository
+root. The first command rewrites `records.json` from the real handler; the second
+recomputes `SHA256SUMS` over this README and `records.json`:
 
 ```
 ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked catalog_generation_v1_records_match_published_files

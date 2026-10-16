@@ -1,5 +1,9 @@
-//! Entorhinal's machine-local package-closure participant. Pins and permissions
-//! are never imported: only content bound to the receiver's shared pins is read.
+//! Entorhinal's package-closure participant: the agent-move participant that
+//! carries an agent's catalog package files (manifests and archives) to the
+//! receiving Mac. It is machine-local. It never imports pins or publisher
+//! permissions. The receiver already has the agent's shared pins (the exact
+//! package versions and digests recorded for the agent and replicated to every
+//! Mac through the identity log), and it reads only content that matches them.
 mod stream;
 
 use crate::{
@@ -136,7 +140,11 @@ impl CatalogMove {
             .map_err(unavailable)?;
         Ok(())
     }
-    /// Catch up only on a mismatch; a log outage must not block an already matching closure.
+    /// Compare the source's pin digest (`expected`) with this Mac's pin digest
+    /// for the agent. Only on a mismatch, first catch up: read new entries from
+    /// the shared identity log and apply them, so newer pin changes arrive
+    /// locally. Then check again. A log outage therefore cannot block a move
+    /// whose pins already match.
     pub(crate) async fn preflight(
         &self,
         agent: &str,

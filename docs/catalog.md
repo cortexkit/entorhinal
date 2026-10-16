@@ -87,8 +87,10 @@ Upload uses the existing allowlisted registry client, sending `PUT` archive byte
 on the original origin and within the configured base path. Replies are bounded
 and decoded as the contract's known publish fields, never passed through raw. A
 malformed or mismatched success reply is `invalid_reply` with outcome unknown.
-The initial status must bind the archive and publisher fingerprint, and its
-signature is authenticated with the configured registry status-key chain.
+The reply carries the package version's first signed status (sequence 1, state
+`available`). It must match the upload: the same name, version, archive digest and
+publisher fingerprint. Its signature is authenticated with the configured registry
+status-key chain.
 `publish_unavailable` carries Retry-After advice; repeat the identical command to
 resend the durable bytes (there is no internal upload retry or real sleep).
 An existing version with different bytes is reported as `version_exists`.
@@ -100,17 +102,19 @@ remove, then add. Registry URLs must be HTTPS, without credentials, query, or
 fragment; URL parser canonicalization and a trailing-slash normalization identify
 an entry. Removal atomically clears its mappings, key chain, feed and status
 metadata, not its content-addressed blobs or publisher grant history.
-Each registry add receives a hidden random identifier, its incarnation, that
-distinguishes it from a removed entry even when URL, key and confirmation clock
-are identical. In-flight requests carry the old identifier and cannot write to
-the replacement. Repin preserves the identifier; registry list omits it.
+Each time a registry is added, its entry receives a hidden random identifier,
+called the entry's incarnation. The incarnation distinguishes the entry from an
+earlier, removed entry even when URL, key and confirmation clock are identical.
+In-flight requests carry the old identifier and cannot write to the
+replacement. Repin preserves the identifier; registry list omits it.
 
 Writes are Direct-only, refused on flow routes, and require the daemon's operator
 confirmation on the asynchronous serving path. Prompts identify the URL, key id,
 and SHA-256 of the raw public key. Inputs whose complete prompt exceeds 200
 characters are refused, including enough room for a later remove prompt. Repin
 appends a new key; an id or public key already in that registry's chain is
-`key_conflict`. Only the add key has a null `valid_from`. Repin defaults to the
+`key_conflict`. Only the key supplied when the registry is added has a null
+`valid_from`. Repin defaults to the
 module clock at confirmation, truncated to a whole second. Explicit times must
 be real RFC 3339 UTC whole-second `Z` values. Retired keys remain in chain order;
 the pure verifier treats their successor's activation instant as an exclusive
@@ -143,8 +147,9 @@ test-only roots are supplied explicitly, never installed in production trust.
 
 `verify_version` binds the scope and signed name/version to the request before
 accepting status. Held archive digests, publisher fingerprints and publication
-times cannot change. The status commits independently of manifests and blobs:
-an unavailable or tombstoned archive cannot erase an authenticated status.
+times cannot change. The authenticated package status is stored independently of
+package manifests and archive blobs: an unavailable or tombstoned archive cannot
+erase an authenticated status.
 Restoration authenticates held bytes and their signer index and compares every
 denormalized column; later repins do not retroactively invalidate saved status
 records whose signature was accepted before the signer's retirement.
@@ -154,7 +159,9 @@ Feeds use the same binding boundary for held and previously unheld versions,
 without requesting packages. Polls refresh the registry chain. The cursor and
 strong ETag advance only when every record applies or is an authenticated
 duplicate. Partial acceptance keeps good records, but not the new cursor or ETag.
-Expired incremental history and rollback request a full feed; 304 changes nothing.
+An incremental feed request falls back to the full feed when the registry's
+incremental history has expired, or when an incremental record is refused as a
+rollback (`feed_rollback`). An HTTP 304 Not Modified reply changes nothing.
 Status writes reapply against current mapping, chain and holds inside the SQLite
 transaction. Verification rechecks again after downloads before publishing bytes.
 An in-flight request cannot overwrite newer version status or attach old
@@ -179,8 +186,10 @@ The production source cannot yet supply an agent's saved, authenticated package
 closure, so publisher trust deliberately refuses until that source exists;
 an absent authenticated pin set is not a legitimate empty capability ceiling.
 
-Empty ceilings cover token-free packages. Coverage otherwise requires the live
-fingerprint/operation/agent row, capabilities within its ceiling, and no scripts.
+A grant's ceiling is the list of capability tokens it allows. An empty ceiling
+covers packages that need no capability tokens. Coverage otherwise requires an
+unrevoked grant row for the package's publisher fingerprint, the operation and the
+placement agent, capabilities within its ceiling, and no scripts.
 Root-certified CortexKit packages never need publisher grants; their pins cannot
 be used to mint one. A different recovered publisher key inherits no grants.
 Refresh preserves the row id, unions ceilings, replaces time/card reference and
@@ -207,7 +216,8 @@ another tar implementation.
 
 `publish_unavailable`, `status_key_unavailable`, and `status_unavailable` HTTP 503 refusals are typed
 `NetworkError::Retryable` values, carrying the registry refusal kind and parsed
-`Retry-After` advice. Delta-seconds and HTTP-date values are capped at one hour;
+`Retry-After` advice. The parsed `Retry-After` delay, whether given as
+delta-seconds or an HTTP date, is capped at one hour;
 a missing header uses the named `DefaultMissing` policy and an invalid header
 uses `DefaultInvalid`, both defaulting to 60 seconds. Past HTTP dates give zero
 delay. Error response bodies use the JSON reply cap. The client never retries
@@ -241,29 +251,32 @@ EOF and are empty only there. Refusals include `catalog_consumer_required`,
 
 ## Verification boundary
 
-Loopback tests serve unchanged frozen signed vector documents and archives on
+Loopback tests serve unchanged signed test documents and archives on
 contract HTTP paths, plus programmable redirects and barriers. No new private
 signing keys are introduced. Clock-sensitive tests advance Tokio's paused clock;
 loopback socket tests keep that clock fixed while OS I/O completes. The pure
 crate's archive failure corpus is also fetched through the transport.
 
-The clean-account macOS network-prompt observation remains a manual deployment
-check; Linux CI cannot establish it. The dependency inventory below records the
-additional lockfile packages introduced by the transport and base64 encoding.
+Whether macOS shows its network permission prompt for a new user account remains
+a manual deployment check; Linux CI cannot observe it. The dependency inventory
+below records the additional lockfile packages introduced by the transport and
+base64 encoding.
 
 ## Dependency inventory
 
 Trust tests add `ed25519-dalek 2.2.0` as a module dev-dependency only, at the
 already locked version. No package versions or runtime dependencies are added.
-Extra signed HTTP replies use only published TEST-ONLY seeds from
+Extra signed HTTP replies use only published TEST-ONLY signing keys (test keys
+whose private seeds are public) from
 `crates/entorhinal-catalog/tests/vectors/ck-catalog-v1/statements.json`; those
 keys gain no trust merely because tests generated a signature.
 
 New direct module dependencies: `entorhinal-catalog` (workspace path),
 `reqwest 0.12.28` (default features off, `rustls-tls`), `base64 0.22.1`,
 and already-locked `chrono 0.4.45` (default features off, `std` only).
-Existing locked package versions were preserved. Additional resolved lockfile
-packages, including optional and non-Linux target dependencies:
+Existing locked package versions were preserved. Packages newly resolved in the
+lockfile for these transport dependencies, including optional and non-Linux
+target dependencies:
 
 - `atomic-waker 1.1.2`
 - `base64 0.22.1`
@@ -396,7 +409,9 @@ When sharing is enabled, all these writes wait for the identity-log append to be
 confirmed; a refusal rolls them all back. Journal authorization evidence is checked
 on replay, not interpreted as fresh authority on another machine.
 
-Every applied transition records its original result and argument digest locally.
+Every applied plan or generation transition (plan create, ready and failed;
+generation approve, ready, active and degraded) records its original result and
+argument digest locally.
 Repeats return that result, even after a later transition; reuse with different
 arguments is `request_key_conflict`. A partial unique index permits at most one
 active generation per agent. Activation supersedes the previous active (including
@@ -445,8 +460,10 @@ that kind. All declaring consumers of a needed kind must participate. Missing,
 unready or unroutable consumers refuse `consumer_unavailable` with the module named
 (skills require prefrontal-core when no skill consumer is declared).
 
-Alongside each kind capability, a consumer must declare this exact provider role
-in its manifest's `provides` list:
+Alongside each kind capability (the `ck-catalog-consumer-<kind>/v1` declaration
+that claims a package kind), a consumer must declare in its manifest's
+`provides` list this exact `internal_service` provider role for the
+`catalog-consumer` service:
 
 ```json
 {"role":"internal_service","service_id":"catalog-consumer","transport":"bulk","agent_facing":false,"operations":["catalog_consumer.check","catalog_consumer.prefetch"]}
@@ -479,8 +496,11 @@ the daemon's original route refusal code/detail. Missing roles never imply succe
   ready. Otherwise the generation stays approved with a named error; retrying the
   install retries prefetch without another card or pin write.
 
-The composite card uses Cingulate's existing generic-consent facts, sorted by
-module id, with human labels such as `Skills (prefrontal-core)` and exactly the
+The composite consent card is the one approval request the operator sees for an
+install. It combines every participating consumer's card section into a single
+generic-consent request to Cingulate, the module that shows consent prompts to
+the operator: one fact per consumer, sorted by module id,
+with a human label such as `Skills (prefrontal-core)` and exactly the
 consumer's section text. The exact `consent.request` method/params envelope is
 bounded to 1,310,720 bytes at prepare and again before requesting consent. An
 oversized card fails `card_too_large`, naming its consumers; nothing is truncated.
@@ -509,8 +529,8 @@ and token. No new consumer operation or ad hoc spelling conversion is introduced
 ### Core activation operations
 
 `catalog.agent_generation {agent_id}` and
-`catalog.ack_activation {agent_id, generation_id}` admit only
-`reserved:prefrontal-core`, never Direct or a flow-scoped route. The read returns
+`catalog.ack_activation {agent_id, generation_id}` accept calls only from the
+`reserved:prefrontal-core` route, never from Direct or a flow-scoped route. The read returns
 `{active, ready}` with closure digests and `pin_digest`; ready includes only newer
 generations. Acknowledgement is idempotent and refuses a generation that is not
 ready or whose held status blocks activation. Both operations use local state
@@ -579,7 +599,8 @@ pass), `catalogLastError` (null or a named code), `catalogConsecutiveFailures`
 The last error is cleared on success. These gauges do not independently change the
 module's health status and do not include the foreground prepare refresh.
 
-Implementation decisions where the contract leaves details open: one schedule and
+Implementation decisions where the CortexKit catalog contract v1 leaves details
+open: one schedule and
 backoff apply to a whole pass; an empty pinned set is a successful pass; the first
 retry is 2 hours; success realigns to the hourly phase rather than retaining retry
 drift; the first blocked pin in closure order supplies a generation's single error
@@ -602,7 +623,11 @@ package kinds remain separate work.
 
 ## Multi-root resolver adapter
 
-Contract §9.3 defines how multiple roots become one resolver input. The pure
+An agent can have several root packages (packages it installed directly), but
+the resolver takes one root. The roots are combined under one synthetic root
+whose requirements are a range per package: roots being installed or upgraded
+keep their requested range, while every other root, and every pinned package it
+reaches through its dependencies, is held at its exact pinned version. The pure
 crate's `synthetic_root_ranges(registry, roots, subject_roots, current_pins)`
 constructs the root requirements from the pinned versions' own dependency graph.
 Core passes root metadata and held-status-overlaid candidates to the pure

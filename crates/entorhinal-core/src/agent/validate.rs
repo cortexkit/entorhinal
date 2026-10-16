@@ -213,10 +213,8 @@ pub fn decode_github_identity(value: Value) -> Result<Option<GithubIdentity>, Ag
 /// type, refusing unknown types rather than guessing their layout. Each type
 /// reads its own byte layout, so a genome minted for one type must never be
 /// stored under another; the differing lengths refuse that on sight.
-/// `creature.classic` is 1,024 bytes (prefrontal 873870be8,
-/// crates/prefrontal-core-module/src/agent_registry_ops.rs:835-842).
-/// `creature.wild` is 16,384 bytes, per the avatar genome layout that reserves
-/// regions later representations will read.
+/// A `creature.classic` genome is 1,024 bytes. A `creature.wild` genome is
+/// 16,384 bytes, the wild format's fixed genome size.
 fn avatar_layout_hex_chars(avatar_type: &str) -> Result<usize, AgentRegistryError> {
     match avatar_type {
         "creature.classic" => Ok(2048),

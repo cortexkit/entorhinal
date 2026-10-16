@@ -114,7 +114,7 @@ journal:
 | `agent_audit` | The agent tool audit. |
 | `project_hire_cap` | Per-project hire caps. No row means the default of 10. |
 | `catalog_registry`, `catalog_scope_map`, `catalog_registry_key`, `catalog_feed`, `catalog_status`, `catalog_publisher_grant`, `catalog_audit` | Local catalog trust, authenticated status and publisher authority. |
-| `catalog_plan`, `catalog_generation`, `catalog_transition` | Local catalog preparation, activation and idempotent transition receipts; never journaled or exported. |
+| `catalog_plan`, `catalog_generation`, `catalog_transition` | Local catalog preparation, activation and transition receipts (each applied plan or generation transition's argument digest and original result, so a repeat returns the same result); never journaled or exported. |
 
 Tests: `consent_state_is_local_persistent_and_not_rebuilt_or_exported`,
 `remote_cascades_retire_bindings_move_keys_and_clear_workspace_paths`.
@@ -154,7 +154,7 @@ before the module was named entorhinal; changing it would re-run migration 1).
 | 9 | Move checkpoints and the lid-close setting; session bindings may lack a session key. |
 | 10 | Consent state, the audit and hire caps. |
 | 11 | Catalog registry trust, held status, publisher grants and audit. |
-| 12 | Shared catalog pin sets and pins; local plans, generations and transition receipts. |
+| 12 | Shared catalog pin sets and pins; local plans, generations and transition receipts (the recorded result of each applied plan or generation transition). |
 
 Opening a store applies every migration it lacks, once. A store whose recorded
 version is ahead of the binary's highest migration is refused ("registry store

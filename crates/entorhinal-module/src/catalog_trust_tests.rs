@@ -986,8 +986,9 @@ async fn cortexkit_http_uses_only_explicit_root_and_refuses_production_slot() {
         &format!("/v1/archives/{}", entorhinal_catalog::sha256_hex(&archive)),
         Reply::bytes(archive),
     );
-    // The compiled production root must not accept a publishing key that the
-    // TEST-ONLY root certified, and nothing may be downloaded before that check.
+    // The compiled production root must not accept a publishing key certified by
+    // the TEST-ONLY root (the published test key the test vectors are signed
+    // with), and no manifest or archive may be downloaded before that check.
     error(
         trust
             .verify_version("@cortexkit/hello-skill", VERSION)
@@ -1296,10 +1297,13 @@ async fn status_refusal_precedes_package_shape_and_invalid_status_does_not_fetch
         .any(|path| path == "/v1/registry/keys"));
 }
 
-/// The once-per-document decision is asserted on the walker's own record of
-/// logged documents. Counting emitted tracing events instead was flaky in
-/// parallel runs, because tracing caches each callsite's interest globally and
-/// another test thread can register it first without this test's subscriber.
+/// Checks that each refused registry-key document is logged only once, however
+/// often it is refused. The test reads the trust walker's own record of logged
+/// documents (`refused_links`, the SHA-256 digests of documents already
+/// logged) instead of counting emitted tracing events. Counting events was
+/// flaky in parallel runs, because tracing caches each callsite's interest
+/// globally and another test thread can register it first without this test's
+/// subscriber.
 #[tokio::test]
 async fn refused_chain_links_log_once_per_distinct_document() {
     let f = Fixture::new(0).await;

@@ -2923,7 +2923,10 @@ impl ProjectsHandler {
             let now = (self.clock)();
             let worker = tokio::task::spawn_blocking(move || {
                 // On a single-worker test runtime this panics before SQLite if
-                // registration is accidentally moved back onto an async task.
+                // registration is ever moved from this blocking thread back onto
+                // an async task: test builds call `block_in_place`, which panics
+                // when called from an async task on that runtime but not from a
+                // blocking thread.
                 #[cfg(test)]
                 tokio::task::block_in_place(|| {});
                 sessions::register_session_on_store(&store, request.params, role, now)

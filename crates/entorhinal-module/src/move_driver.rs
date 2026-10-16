@@ -168,9 +168,11 @@ pub(crate) struct ReconnectConnector {
     pub(crate) wake: Arc<MoveWake>,
 }
 
-/// Operator and admission hints still use Notify's wake-one or wake-waiters
-/// behavior. Transport replacements reach every move worker independently,
-/// including workers mid-poll: they must poll again after using an old connection.
+/// Wakes move workers. Local wake-ups, sent after an operator action or after a
+/// new move is admitted, use Notify's wake-one or wake-current-waiters behavior.
+/// A transport replacement instead reaches every move worker independently,
+/// including a worker in the middle of a poll: it must poll again after using
+/// an old connection.
 pub(crate) struct MoveWake {
     local: tokio::sync::Notify,
     reconnect: tokio::sync::watch::Sender<u64>,

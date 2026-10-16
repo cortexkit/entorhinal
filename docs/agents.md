@@ -74,7 +74,8 @@ value.
 The avatar owner's `avatar-export --mint-genomes` tool produces a JSON array:
 each entry has exactly `agent_id`, `avatar_genome`, `avatar_type` and
 `avatar_version`. Entorhinal never derives a genome or changes the supplied
-string. A `creature.wild` v1 genome is 16,384 bytes (32,768 hex characters).
+string. `avatar_type` names the avatar type; `creature.wild` is one such type, and
+its v1 genome is 16,384 bytes (32,768 hex characters).
 The type and version belong to each entry, not to the whole file.
 
 ```sh

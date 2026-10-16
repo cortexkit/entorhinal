@@ -1334,11 +1334,14 @@ struct LivenessSession {
 }
 
 impl ProjectsHandler {
-    /// Shared writes use `write_wait`, which handles cached replies, serializes
-    /// database writes, and sends shared changes to the log. Machine-local
-    /// session registration runs on the blocking pool instead. Claim refresh
-    /// has its own async arm and never joins the shared-log writer queue.
-    /// Queries use `handle_request_wait` instead, without joining the write queue.
+    /// Serve one request unless the module is draining. Requests are routed by
+    /// how they touch the store. Ordinary shared writes go through `write_wait`,
+    /// which serves cached replies, serializes database writes, and waits on the
+    /// shared-log writer to send shared changes to the log. Two writes never join
+    /// that writer queue, so a busy or unreachable log cannot hold them up:
+    /// machine-local session registration (which `write_wait` hands to the
+    /// blocking pool) and claim refresh (which has its own async branch). Queries
+    /// go to `handle_request_wait` and never join the write queue either.
     async fn handle_served_request(&self, body: &[u8], key: RouteKey) -> HandlerOutcome {
         let mut draining = self.draining.subscribe();
         tokio::select! {

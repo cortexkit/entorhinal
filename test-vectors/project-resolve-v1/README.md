@@ -8,7 +8,7 @@ Scratch paths are normalized to `/fixture` so the checked-in bytes do not depend
 
 The management surface sends these project operations to module `entorhinal` (`docs/module-surface.md`, **Projects**). The request is the full `{method, params}` envelope, with `method` set to `resolve`, `resolve_project_id`, or `enumerate`. Successful handler replies have a `result` envelope; refusals have `code`, `message`, and `detail`.
 
-`canonicalRoot` is named for its usual input, but accepts **any absolute path**, including paths that are not registered roots or repository roots.
+The `resolve` request parameter `canonicalRoot` is named for its usual input, a project's canonical root path, but accepts **any absolute path**, including paths that are not registered roots or repository roots. The reply also has a `canonicalRoot` field, which holds the canonical form of the queried path.
 
 ## Admission
 
@@ -16,7 +16,7 @@ These reads are open to every principal, including flow-scoped routes. `Projects
 
 ## Versions
 
-The entorhinal module version is **0.1.28**.
+These vectors capture replies from entorhinal module version **0.1.28**.
 
 ## Files and fields
 

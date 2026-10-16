@@ -383,7 +383,11 @@ pub fn bounded_detail(detail: &Value) -> Value {
         detail.get("state").and_then(Value::as_str),
         Some("unknown" | "advanced")
     ) {
-        // The validated reason fits in the summary even when the ref is unusually long.
+        // A diverged participant's reason is copied whole, not trimmed: the
+        // participant protocol already limits it to 256 UTF-8 bytes with no
+        // control characters, so the summary of a diverged detail (module id,
+        // ref, state and reason) still fits within DETAIL_CAP even when the
+        // ref is unusually long.
         for key in ["ref", "state"] {
             if detail.get(key).and_then(Value::as_str).is_some() {
                 summary[key] = summary_string(detail.get(key));

@@ -571,7 +571,9 @@ async fn publish_cross_origin_redirect_never_sent() {
     let location = format!("{}/stolen", second.url);
     let mut f = Fixture::new(FakeVault::new(), Ok(()));
     let first = f.registry(vec![Response::Redirect(location.clone())]).await;
-    // Both origins are allowlisted: the write's stricter origin fence must still refuse.
+    // Both origins are allowlisted, but the write must still refuse this redirect:
+    // a publish may follow a redirect only within the registry's own origin, so
+    // the signed package is never resent to a different server.
     f.handler.catalog_publish.client =
         Some(Arc::new(crate::catalog_network::RegistryClient::loopback(
             &first.url,

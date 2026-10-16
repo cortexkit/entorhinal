@@ -145,7 +145,7 @@ refuses `authority_not_cut_over`, before any prompt. After that:
 | `agent.snapshot` | query | Every agent and name claim at one generation, to seed a copy. |
 | `agent.changes` | query | Identity changes after a cursor, optionally waiting up to 25 seconds for the next one. |
 | `agent.preview_repair_workspaces` | query | Preview what `agent.repair_workspaces` would change, including any refusal. |
-| `agent.preview_avatar_manifest` | query | Validate and preview owner-minted avatars by name, including seed-only skips. |
+| `agent.preview_avatar_manifest` | query | Validate and preview an avatar manifest, whose genomes come from the avatar owner's export tool, listing each agent by name. Without `replace`, agents that already have an avatar are listed as skipped. |
 | `agent.create` | mutate | Create an agent. |
 | `agent.rename` | mutate | Rename an agent. |
 | `agent.update_tag` | mutate | Change an agent's tag. |
@@ -173,9 +173,11 @@ The tools (`projects_create_workspace`, `projects_register`,
 `catalog_generation`) are served through `tool-provider/v1`, with the caller
 taken from the daemon's scope stamp. Their rules are in
 [consent-contract.md](consent-contract.md).
-Catalog tools are available to all live agent roles, self-targeted only; preparation
+Catalog tools are available to all live agent roles, and only for the calling agent:
+`catalog_prepare` must target the caller, and `catalog_plan`, `catalog_install` and
+`catalog_generation` act only on the caller's own plans and generations. Preparation
 is asynchronous, installation reuses the consent coordinator, and generation reads
-omit superseded handoff bookkeeping. See [catalog.md](catalog.md#agent-tools-and-consumer-protocol)
+omit superseded generations, which are local bookkeeping. See [catalog.md](catalog.md#agent-tools-and-consumer-protocol)
 for schemas, consumer kinds, refusals, idempotence and capability-token declarations.
 
 | Operation | Kind | Who | What it does |
@@ -184,7 +186,7 @@ for schemas, consumer kinds, refusals, idempotence and capability-token declarat
 | `permissions.revoke {id}` | mutate | Direct, `reserved:cingulate` | Revoke a grant without prompting. |
 | `agent.audit_list {since_ms?, limit?, cursor?}` | query | Direct, `reserved:callosum` | Page the local audit of agent tool writes. |
 | `agent.set_hire_cap {project_id, cap}` | mutate | Direct, with Touch ID | Set this Mac's hiring limit for a project. |
-| `catalog.agent_generation {agent_id}` | query | `reserved:prefrontal-core` only | Read active/degraded and newer ready package generations and exact pin digests from local state. Optional `pinned_status` lists non-available pins; a degradation error identifies the revoked skill by name, version and reason. |
+| `catalog.agent_generation {agent_id}` | query | `reserved:prefrontal-core` only | Read the agent's active or degraded package generation and any newer ready ones, with exact pin digests, from local state. A generation is one installed set of the agent's pinned packages, where a pin fixes a package's exact version and digests. `ready` generations wait for core to activate them, `active` is the set in use, and `degraded` is an active set that hit an error such as a revoked pin. Optional `pinned_status` lists non-available pins; a degradation error identifies the revoked skill by name, version and reason. |
 | `catalog.ack_activation {agent_id, generation_id}` | mutate | `reserved:prefrontal-core` only | Idempotently activate a ready generation after core renders it. `activation_blocked` names a revoked/tombstoned pin; withdrawn pins remain usable. No network or consumer discovery. |
 
 Refusals: `permissions_operator_required`, `audit_operator_required`,

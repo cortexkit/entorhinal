@@ -1,6 +1,8 @@
 //! Registry replies are composed with the pure verifier; only authenticated
 //! status is durable, and package bytes pass a separate publication boundary.
-#![allow(dead_code)] // Verification is ready for future install and consumer callers.
+// Two items are used only by tests: `verify_version` (production calls
+// `verify_version_with_provenance`) and `FeedApply::cursor_advanced`.
+#![allow(dead_code)]
 use super::catalog_blob::{BlobStore, CatalogError};
 use super::catalog_network::{Limits, NetworkError, RegistryClient};
 use entorhinal_catalog::{jcs, names, record, statements, status, Refusal, RefusalCode};
