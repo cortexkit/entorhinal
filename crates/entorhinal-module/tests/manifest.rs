@@ -25,6 +25,39 @@ fn manifest_flag_prints_the_manifest_with_the_provided_capability() {
     let manifest: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("--manifest prints JSON");
     assert_eq!(manifest["module_id"], "entorhinal");
+    // Placement creates exactly these `ck-<name>` links to this binary and
+    // removes any other link pointing at it, so the list is pinned exactly.
+    // Every name must also be one the binary dispatches on, or a placed link
+    // would start the module instead of a CLI face.
+    assert_eq!(
+        manifest["cli_faces"],
+        serde_json::json!([
+            {"name":"agents","binary":"ck-entorhinal"},
+            {"name":"packages","binary":"ck-entorhinal"},
+            {"name":"projects","binary":"ck-entorhinal"},
+            {"name":"roles","binary":"ck-entorhinal"},
+            {"name":"workspaces","binary":"ck-entorhinal"}
+        ])
+    );
+    // The face is chosen from argv[0], so setting argv[0] exercises the same
+    // dispatch a placed link does, without writing a second copy of the binary.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let binary = ckdev_binary(env!("CARGO_BIN_EXE_ck-entorhinal"));
+        for face in manifest["cli_faces"].as_array().unwrap() {
+            let headline = Command::new(&binary)
+                .arg0(format!("ckdev-{}", face["name"].as_str().unwrap()))
+                .arg("--ck-domain")
+                .output()
+                .unwrap();
+            assert!(
+                headline.status.success(),
+                "{} is declared but the binary doesn't answer to it",
+                face["name"]
+            );
+        }
+    }
     // Pin the exact list: a capability appearing or disappearing changes what
     // the daemon tells consumers this module serves.
     assert_eq!(

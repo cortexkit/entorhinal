@@ -173,7 +173,7 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::from(64)
         }
         cli::Invocation::Command(command) => cli::run(command),
-        cli::Invocation::Manifest => match serde_json::to_string(&manifest()) {
+        cli::Invocation::Manifest => match printed_manifest() {
             Ok(json) => {
                 println!("{json}");
                 std::process::ExitCode::SUCCESS
@@ -2222,6 +2222,25 @@ struct JournalTailParams {
 
 /// The capability identifier entorhinal provides; consumers require it by this name.
 const PROJECT_IDENTITY_CAPABILITY: &str = "project-identity/v1";
+
+/// The operator faces this binary answers to, each reached as `ck <name>`
+/// through a `ck-<name>` link to this binary. Placement reads this list from
+/// the printed manifest and creates or removes the links, so a new face never
+/// depends on someone linking it by hand. It stays out of `ModuleManifest`
+/// because the daemon has no use for it.
+const CLI_FACES: [&str; 5] = ["agents", "packages", "projects", "roles", "workspaces"];
+
+/// `--manifest` output: the module manifest plus the declared CLI faces.
+fn printed_manifest() -> serde_json::Result<String> {
+    let mut printed = serde_json::to_value(manifest())?;
+    printed["cli_faces"] = serde_json::Value::Array(
+        CLI_FACES
+            .iter()
+            .map(|name| serde_json::json!({"name": name, "binary": "ck-entorhinal"}))
+            .collect(),
+    );
+    serde_json::to_string(&printed)
+}
 
 fn manifest() -> ModuleManifest {
     ModuleManifest::builder(MODULE_ID, env!("CARGO_PKG_VERSION"))
