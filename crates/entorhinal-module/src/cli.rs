@@ -1,9 +1,9 @@
 //! Operator surface for the registry: `ck projects <verb>` and
-//! `ck workspaces <verb>`, `ck agents <verb>`, `ck roles <verb>` and `ck catalog <verb>`.
+//! `ck workspaces <verb>`, `ck agents <verb>`, `ck roles <verb>` and `ck packages <verb>`.
 //!
 //! One binary, six names. `ck` runs an unknown domain as `ck-<domain>`, looked
 //! up in CortexKit's bin folder first, then on PATH. `ck-projects`,
-//! `ck-workspaces`, `ck-agents`, `ck-roles` and `ck-catalog` are links to this module binary in that
+//! `ck-workspaces`, `ck-agents`, `ck-roles` and `ck-packages` are links to this module binary in that
 //! folder, and argv[0] selects the face. Operators type `ck projects`, never
 //! `ck-projects`. The module id (entorhinal) is
 //! infrastructure and never part of the operator vocabulary -- a user thinks
@@ -105,7 +105,7 @@ pub enum Face {
     Agents,
     /// `ck-roles`: cached role claims and operator-confirmed takes.
     Roles,
-    /// `ck-catalog`: local registry configuration.
+    /// `ck-packages`: local registry configuration.
     Catalog,
     /// `ck-entorhinal`: the supervised module itself. Serves; its only
     /// operator surface is `--version`/`--help`, which point at the faces.
@@ -127,7 +127,7 @@ pub fn face_from_argv0(argv0: Option<&str>) -> Face {
         "ck-workspaces" | "ckdev-workspaces" => Face::Workspaces,
         "ck-agents" | "ckdev-agents" => Face::Agents,
         "ck-roles" | "ckdev-roles" => Face::Roles,
-        "ck-catalog" | "ckdev-catalog" => Face::Catalog,
+        "ck-packages" | "ckdev-packages" => Face::Catalog,
         _ => Face::Entorhinal,
     }
 }
@@ -334,7 +334,7 @@ fn binary_name(face: Face) -> &'static str {
         Face::Projects => "ck-projects",
         Face::Workspaces => "ck-workspaces",
         Face::Agents => "ck-agents",
-        Face::Catalog => "ck-catalog",
+        Face::Catalog => "ck-packages",
         Face::Roles => "ck-roles",
         Face::Entorhinal => "ck-entorhinal",
     }
@@ -342,7 +342,7 @@ fn binary_name(face: Face) -> &'static str {
 
 pub fn usage(face: Face) -> String {
     match face {
-        Face::Catalog => format!("{}\n  ck catalog publish <package dir> --registry <url> --scope <scope>\n", catalog::usage()),
+        Face::Catalog => format!("{}\n  ck packages publish <package dir> --registry <url> --scope <scope>\n", catalog::usage()),
         Face::Projects => "\
 ck projects — the project registry
 

@@ -152,7 +152,7 @@ placement agent and their subject label is the publisher fingerprint. Coverage
 requires a live matching fingerprint/operation/placement row, required
 capabilities within its ceiling, and no scripts; an empty ceiling is valid for
 token-free packages. Root-certified CortexKit packages do not receive grants.
-The operator's `ck catalog publisher trust` authorizes install only, using
+The operator's `ck packages publisher trust` authorizes install only, using
 authenticated pinned manifests and operator confirmation. Pins are supplied by
 a local trait; until a production pin source exists it refuses
 `manifest_unavailable`, rather than trusting caller-supplied capabilities.

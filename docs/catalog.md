@@ -1,7 +1,9 @@
 # Package catalog storage
 
-`ck-catalog` is another argv0 face of `ck-entorhinal`, like `ck-projects` and
-`ck-agents`. Placement must provide the `ck-catalog` link to expose `ck catalog`.
+`ck-packages` is another argv0 face of `ck-entorhinal`, like `ck-projects` and
+`ck-agents`. Placement must provide the `ck-packages` link to expose `ck packages`.
+The face isn't named `catalog` because `ck catalog` is the daemon's own command,
+which lists the modules registered on the wire.
 The module configures registry trust, verifies packages, walks successor chains,
 ingests status feeds, and holds local publisher grants. The core store also holds
 shared agent pins and local plans/generations. Agent tools prepare verified skill
@@ -13,18 +15,18 @@ remains unavailable until the vault's signing key is provisioned. Non-skill
 installation is not exposed yet.
 
 ```
-ck catalog registry add https://registry.example --scope @example --key-id status-1 --public-key <64-lowercase-hex>
-ck catalog registry add https://fallback.example --default --key-id status-1 --public-key <64-lowercase-hex>
-ck catalog registry repin https://registry.example --key-id status-2 --public-key <64-lowercase-hex> [--valid-from 2026-11-01T00:00:00Z]
-ck catalog registry list [--json]
-ck catalog registry remove https://registry.example
-ck catalog publisher trust <fingerprint> --agent <agent_id>
-ck catalog publish <package dir> --registry <url> --scope <scope>
+ck packages registry add https://registry.example --scope @example --key-id status-1 --public-key <64-lowercase-hex>
+ck packages registry add https://fallback.example --default --key-id status-1 --public-key <64-lowercase-hex>
+ck packages registry repin https://registry.example --key-id status-2 --public-key <64-lowercase-hex> [--valid-from 2026-11-01T00:00:00Z]
+ck packages registry list [--json]
+ck packages registry remove https://registry.example
+ck packages publisher trust <fingerprint> --agent <agent_id>
+ck packages publish <package dir> --registry <url> --scope <scope>
 ```
 
 ## Offline starter bundle
 
-`ck catalog seed <bundle file>` accepts only an operator-opened Direct route,
+`ck packages seed <bundle file>` accepts only an operator-opened Direct route,
 not another module or a flow, and needs no Touch ID: it grants no authority.
 Entorhinal verifies the entire strict `ck-starter-bundle/v1` ustar,
 its root-certified signer, package records and archive bytes before publishing
@@ -139,7 +141,7 @@ Bare operator-pinned anchors retain only their pinned identity; received metadat
 cannot become an authenticated statement without its predecessor's signature.
 Registry removal refuses with `registry_has_status` while any accepted status is
 held, even for an unpinned version: removing its signer chain would discard history
-that protects against rollback. Use `ck catalog registry repin` to rotate the
+that protects against rollback. Use `ck packages registry repin` to rotate the
 registry's key. Registries with no held statuses can still be removed.
 
 Publisher keys from `/v1/scopes/{scope}` are used only for that scope at its

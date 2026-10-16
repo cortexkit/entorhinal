@@ -9941,7 +9941,7 @@ guards = "The registry removal refusal explains rollback protection and directs 
 file = "crates/entorhinal-module/src/catalog_ops.rs"
 old = '''entorhinal_core::catalog::CatalogWriteError::Refused("registry_has_status") => Self::new(
                 "registry_has_status",
-                "removal would discard status history that protects against rollback; use ck catalog registry repin to rotate the registry's key",
+                "removal would discard status history that protects against rollback; use ck packages registry repin to rotate the registry's key",
             ),'''
 new = '''// NON-VACUITY BREAK: use the generic code-only refusal instead'''
 test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"

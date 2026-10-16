@@ -2,7 +2,7 @@ use super::{Command, Value};
 use serde_json::json;
 
 pub(super) fn usage() -> &'static str {
-    "ck catalog — machine-local package registries\n\nusage: ck catalog registry <verb> [--subc <connection file>] [--json]\n\n  add <url> (--scope <@scope>... | --default) --key-id <id> --public-key <64 hex>\n  repin <url> --key-id <id> --public-key <64 hex> [--valid-from <RFC 3339 Z>]\n  remove <url>\n  list\n\nRegistry writes require operator confirmation. Repin retains earlier keys; remove clears mappings and held state.\n\n  seed <bundle file>\n\nSeed verifies offline starter content and initial statuses only: no pins, grants or confirmation.\n\n  publisher trust <fingerprint> --agent <agent_id>\n\nPublisher trust grants install only, using authenticated pins. It refuses manifest_unavailable until the pin source is supplied.\n"
+    "ck packages — machine-local package registries\n\nusage: ck packages registry <verb> [--subc <connection file>] [--json]\n\n  add <url> (--scope <@scope>... | --default) --key-id <id> --public-key <64 hex>\n  repin <url> --key-id <id> --public-key <64 hex> [--valid-from <RFC 3339 Z>]\n  remove <url>\n  list\n\nRegistry writes require operator confirmation. Repin retains earlier keys; remove clears mappings and held state.\n\n  seed <bundle file>\n\nSeed verifies offline starter content and initial statuses only: no pins, grants or confirmation.\n\n  publisher trust <fingerprint> --agent <agent_id>\n\nPublisher trust grants install only, using authenticated pins. It refuses manifest_unavailable until the pin source is supplied.\n"
 }
 pub(super) fn build(command: &Command) -> Result<(String, Value), String> {
     let fail = || usage().to_string();
@@ -90,7 +90,7 @@ mod tests {
     }
     #[test]
     fn catalog_cli_faces_and_wire() {
-        for argv0 in ["/bin/ck-catalog", "CKDEV-CATALOG.EXE"] {
+        for argv0 in ["/bin/ck-packages", "CKDEV-PACKAGES.EXE"] {
             assert_eq!(face_from_argv0(Some(argv0)), Face::Catalog);
         }
         let key = "ab".repeat(32);

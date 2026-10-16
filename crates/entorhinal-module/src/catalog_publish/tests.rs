@@ -695,7 +695,7 @@ fn publish_cli_and_manifest_contract() {
         Invocation::Command(_)
     ));
     assert!(cli::usage(Face::Catalog)
-        .contains("ck catalog publish <package dir> --registry <url> --scope <scope>"));
+        .contains("ck packages publish <package dir> --registry <url> --scope <scope>"));
     let manifest = serde_json::to_value(crate::manifest()).unwrap();
     let ops = manifest["provides"][0]["operations"].as_array().unwrap();
     let op = ops.iter().find(|op| op["name"] == PUBLISH).unwrap();

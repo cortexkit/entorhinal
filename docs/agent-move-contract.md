@@ -314,7 +314,7 @@ trust before staging and repeats its preflight before taking the claim. Missing
 trust aborts with `trust_missing`, listing publisher scopes and key fingerprints;
 it also refuses moves initiated automatically when the source Mac's lid closes,
 rather than parking them until trust changes. Trust keys on the target with
-`ck catalog publisher trust <fingerprint> --agent <agent_id>` and retry.
+`ck packages publisher trust <fingerprint> --agent <agent_id>` and retry.
 These are move abort reasons, not new participant refusal codes.
 
 Publisher grants and source approvals never travel. Non-CortexKit publishers

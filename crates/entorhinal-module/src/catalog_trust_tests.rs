@@ -295,7 +295,7 @@ async fn registry_removal_preserves_status_history_and_explains_repin() {
     assert!(wire
         .message
         .contains("status history that protects against rollback"));
-    assert!(wire.message.contains("ck catalog registry repin"));
+    assert!(wire.message.contains("ck packages registry repin"));
     assert_eq!(store.catalog_registries().unwrap(), keys);
     assert_eq!(
         serde_json::to_value(store.catalog_statuses(URL).unwrap()).unwrap(),
