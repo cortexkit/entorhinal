@@ -9476,3 +9476,17 @@ package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
 expect_red = ["catalog_seed::tests::stopping_the_catalog_waits_for_a_running_seed_job"]
+
+
+[[control]]
+id = "agent-where-many-duplicate-refusal"
+guards = "Batch cached claim reads reject duplicate agent identifiers before reading any rows"
+file = "crates/entorhinal-module/src/claims.rs"
+old = "if !seen.insert(id.clone()) {"
+new = "if seen.insert(id.clone()) && false { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/claims.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["claims::tests::where_many_refuses_duplicate_ids"]

@@ -1618,6 +1618,7 @@ impl ProjectsHandler {
                 "role.take requires the asynchronous served path",
             )),
             claims::WHERE => self.agent_where(request.params),
+            claims::WHERE_MANY => self.agent_where_many(request.params),
             claims::REFRESH => Err(HandlerError::new(
                 "served_path_required",
                 "claim refresh requires the asynchronous served path",
@@ -2405,7 +2406,7 @@ fn manifest() -> ModuleManifest {
                 management_operation(method, ManagementOperationKind::Query, agent_operation_description(method))
             })).chain(std::iter::once(sessions::REGISTER_SESSION).map(|method| {
                 management_operation(method, ManagementOperationKind::Mutate, agent_operation_description(method))
-            })).chain(std::iter::once(claims::WHERE).map(|method| {
+            })).chain([claims::WHERE, claims::WHERE_MANY].into_iter().map(|method| {
                 management_operation(method, ManagementOperationKind::Query, agent_operation_description(method))
             })).chain(std::iter::once(claims::REFRESH).map(|method| {
                 management_operation(method, ManagementOperationKind::Mutate, agent_operation_description(method))
@@ -2531,6 +2532,7 @@ fn agent_operation_description(method: &str) -> &'static str {
         "agent.session_for_ref" => "Resolve a session reference to its registered agent, host session and project root.",
         "agent.session_liveness" => "Answer active, gone or unknown for up to 256 session references, in request order.",
         "agent.where" => "Answer an agent's cached claim, including whether it is known and which device holds it.",
+        "agent.where_many" => "Answer cached claims for up to 64 agents in request order, omitting unknown ids.",
         "agent.refresh_claims" => "Refresh live agents' claim records from engram without waiting for the shared-log writer.",
         "agent.move" => "Admit an idle agent move to a named member, with Direct confirmation, an orchestrator relay or enabled lid-close moves.",
         "agent.move_status" => "Read a local move checkpoint, holds, warnings and diagnostics without calling a participant or engram.",
@@ -2833,7 +2835,7 @@ mod tests {
             .chain(agent_ops::MUTATING_METHODS.iter())
             .chain(sessions::READ_METHODS.iter())
             .chain(std::iter::once(&sessions::REGISTER_SESSION))
-            .chain([&claims::WHERE, &claims::REFRESH])
+            .chain([&claims::WHERE, &claims::WHERE_MANY, &claims::REFRESH])
         {
             let description = agent_operation_description(method);
             assert!(!description.is_empty(), "{method} has no description");
