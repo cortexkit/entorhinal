@@ -2099,8 +2099,8 @@ expect_red = ["cli::agent_tests::repair_workspaces_previews_refusal_and_yes_send
 id = "cli-placement-confirmation-wait"
 guards = "Project registration and workspace assignment keep the 300-second confirmation wait"
 file = "crates/entorhinal-module/src/cli.rs"
-old = "fn placement_call_options(method: &str) -> subc_client_rs::CallOptions {\n    if matches!(method, \"assign_workspace\" | \"register\") {"
-new = "fn placement_call_options(method: &str) -> subc_client_rs::CallOptions {\n    if false /* NON-VACUITY BREAK */ {"
+old = 'if matches!(method, "assign_workspace" | "register") {'
+new = 'if false /* NON-VACUITY BREAK */ {'
 test_file = "crates/entorhinal-module/src/cli.rs"
 runner = "cargo"
 package = "entorhinal-module"
@@ -3411,12 +3411,12 @@ id = "cingulate-feed-record-before-ack"
 guards = "Every awaiting answer is durably captured before cumulative acknowledgement can hide it"
 file = "crates/entorhinal-module/src/consent.rs"
 old = '''tx.record_settlement(
-                    &key,
-                    &binding.args_digest,
-                    &owner.scope_ref,
-                    owner.epoch,
-                    &answer,
-                )?;'''
+                        &key,
+                        &binding.args_digest,
+                        &owner.scope_ref,
+                        owner.epoch,
+                        &answer,
+                    )?;'''
 new = 'let _ = (&key, &binding, &answer); // NON-VACUITY BREAK: cursor only, answers lost'
 test_file = "crates/entorhinal-module/src/consent_tests.rs"
 runner = "cargo"
@@ -5492,7 +5492,7 @@ expect_red = ["catalog_ops::tests::registry_direct_flow_decline_and_sync_guards"
 id = "catalog-declined-prompt"
 guards = "Declining an operator prompt writes no registry, key or removal"
 file = "crates/entorhinal-module/src/catalog_ops.rs"
-old = 'result.map_err(|_| HandlerError::from(OperatorConfirmError::Declined))??;'
+old = 'result.map_err(|_| crate::catalog_sql::expired("registry confirmation"))??;'
 new = 'let _ = result; // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/catalog_ops_tests.rs"
 runner = "cargo"
@@ -6113,7 +6113,15 @@ only = false
 id = "ento3-reapply-before-blob"
 guards = "reapply before blob remains enforced"
 file = "crates/entorhinal-module/src/catalog_trust.rs"
-old = "accept(current, held, &status_text, status_sig, &pin, root)?;\n                BlobStore::new(&folder)?.publish(&archive)?;"
+old = '''accept(
+                    current,
+                    held,
+                    &status_text,
+                    &status_sig,
+                    &pin,
+                    root.as_deref(),
+                )?;
+                BlobStore::new(&folder)?.publish(&archive)?;'''
 new = "// NON-VACUITY BREAK: skip final status reapplication\n                BlobStore::new(&folder)?.publish(&archive)?;"
 test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
 runner = "cargo"
@@ -6237,15 +6245,15 @@ only = false
 
 [[control]]
 id = "ento3-root-slot"
-guards = "root slot remains enforced"
+guards = "The compiled CortexKit root is the production root and never the TEST-ONLY root"
 file = "crates/entorhinal-module/src/catalog_trust.rs"
-old = "pub const CORTEXKIT_ROOT: Option<&str> = None;"
-new = "pub const CORTEXKIT_ROOT: Option<&str> = Some(\"2627e86928debd3e5f5a37687443683a643269ff32567a4cde4a962d9dccd82c\"); // NON-VACUITY BREAK"
+old = 'Some("8af2a8e892d79d2aa52981342f0b451ff5fb54c4e3da42389c12691fcb0a9e25");'
+new = 'Some("2627e86928debd3e5f5a37687443683a643269ff32567a4cde4a962d9dccd82c"); // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
 runner = "cargo"
 package = "entorhinal-module"
 target = "--bin ck-entorhinal"
-expect_red = ["catalog_trust::tests::cortexkit_http_uses_only_explicit_root_and_refuses_production_slot"]
+expect_red = ["catalog_trust::tests::production_root_accepts_only_its_certificates", "catalog_trust::tests::cortexkit_http_uses_only_explicit_root_and_refuses_production_slot"]
 select = "expected"
 only = false
 
@@ -7624,7 +7632,9 @@ expect_red = ["catalog_agent::tests::status_news_revocation_time_and_tombstone"]
 id = "catalog-status-prepare"
 guards = "Preparation names a revoked current pin before attempting to reuse it"
 file = "crates/entorhinal-module/src/catalog_agent.rs"
-old = 'if let Some(status) = store.catalog_blocked_pin(&pins)? {'
+old = '''if let Some(status) =
+        catalog_sql::run(move || db.catalog_blocked_pin(&held).map_err(HandlerError::from)).await?
+    {'''
 new = 'if let Some(status) = None::<Value> { // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
 runner = "cargo"
@@ -8319,8 +8329,8 @@ expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_transf
 id = "catalog-move-abort-generation"
 guards = "An aborted receiver move cannot leave its imported generation ready for activation"
 file = "crates/entorhinal-module/src/catalog_move.rs"
-old = '.catalog_discard_move_generation(id, agent)'
-new = '.catalog_discard_move_generation("other-cut", agent) /* NON-VACUITY BREAK */'
+old = '.catalog_discard_move_generation(&cut, &local_agent)'
+new = '.catalog_discard_move_generation("other-cut", &local_agent) /* NON-VACUITY BREAK */'
 test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/catalog_moves.rs"
 runner = "cargo"
 package = "entorhinal-module"
@@ -9118,7 +9128,7 @@ runner = "cargo"
 package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
-expect_red = ["catalog_trust::tests::trust_status_sql_does_not_occupy_runtime", "catalog_poll::tests::catalog_poll_clock_sql_does_not_occupy_runtime", "catalog_agent::tests::catalog_prepare_sql_is_off_runtime_and_bounded", "catalog_agent::tests::catalog_prefetch_sql_is_off_runtime_and_bounded", "catalog_agent::tests::catalog_activation_sql_is_off_runtime_and_bounded", "two_machine_acceptance::moves::catalog_moves::catalog_move_sql_does_not_occupy_runtime", "catalog_ops::tests::catalog_registry_sql_is_off_runtime_and_bounded", "catalog_grants::tests::catalog_grant_sql_is_off_runtime_and_bounded", "catalog_seed::tests::catalog_seed_sql_is_off_runtime_and_bounded"]
+expect_red = ["catalog_trust::tests::trust_status_sql_does_not_occupy_runtime"]
 
 [[control]]
 id = "catalog-sql-reply-deadline"
@@ -9131,7 +9141,7 @@ runner = "cargo"
 package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
-expect_red = ["catalog_agent::tests::catalog_prepare_sql_is_off_runtime_and_bounded", "catalog_agent::tests::catalog_prefetch_sql_is_off_runtime_and_bounded", "catalog_agent::tests::catalog_activation_sql_is_off_runtime_and_bounded", "catalog_ops::tests::catalog_registry_sql_is_off_runtime_and_bounded", "catalog_grants::tests::catalog_grant_sql_is_off_runtime_and_bounded", "catalog_seed::tests::catalog_seed_sql_is_off_runtime_and_bounded", "catalog_ops::tests::catalog_blob_reply_is_bounded_even_when_blocking_pool_is_full"]
+expect_red = ["catalog_agent::tests::catalog_prefetch_sql_is_off_runtime_and_bounded"]
 
 [[control]]
 id = "catalog-tool-110-second-budget"
@@ -9223,3 +9233,139 @@ package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
 expect_red = ["cli::catalog_publish_cli_tests::seed_file_is_canonical_and_requires_one_path"]
+
+[[control]]
+id = "catalog-poll-sql-off-runtime"
+guards = "Poll clock initialization leaves the async runtime worker available"
+file = "crates/entorhinal-module/src/catalog_sql.rs"
+old = '''tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if let Some(entered) = entered {'''
+new = '''tokio::spawn(async move { // NON-VACUITY BREAK
+        #[cfg(test)]
+        if let Some(entered) = entered {'''
+test_file = "crates/entorhinal-module/src/catalog_poll_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_poll::tests::catalog_poll_clock_sql_does_not_occupy_runtime"]
+
+[[control]]
+id = "catalog-prepare-sql-off-runtime"
+guards = "Catalog preparation leaves the async runtime worker available"
+file = "crates/entorhinal-module/src/catalog_sql.rs"
+old = '''tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if let Some(entered) = entered {'''
+new = '''tokio::spawn(async move { // NON-VACUITY BREAK
+        #[cfg(test)]
+        if let Some(entered) = entered {'''
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_prepare_sql_is_off_runtime_and_bounded"]
+
+[[control]]
+id = "catalog-prefetch-sql-off-runtime"
+guards = "The install and prefetch workflow leaves the async runtime worker available"
+file = "crates/entorhinal-module/src/catalog_sql.rs"
+old = '''tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if let Some(entered) = entered {'''
+new = '''tokio::spawn(async move { // NON-VACUITY BREAK
+        #[cfg(test)]
+        if let Some(entered) = entered {'''
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_prefetch_sql_is_off_runtime_and_bounded"]
+
+[[control]]
+id = "catalog-activation-sql-off-runtime"
+guards = "The install and activation workflow leaves the async runtime worker available"
+file = "crates/entorhinal-module/src/catalog_sql.rs"
+old = '''tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if let Some(entered) = entered {'''
+new = '''tokio::spawn(async move { // NON-VACUITY BREAK
+        #[cfg(test)]
+        if let Some(entered) = entered {'''
+test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_agent::tests::catalog_activation_sql_is_off_runtime_and_bounded"]
+
+[[control]]
+id = "catalog-move-sql-off-runtime"
+guards = "The move workflow leaves the async runtime worker available"
+file = "crates/entorhinal-module/src/catalog_sql.rs"
+old = '''tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if let Some(entered) = entered {'''
+new = '''tokio::spawn(async move { // NON-VACUITY BREAK
+        #[cfg(test)]
+        if let Some(entered) = entered {'''
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/catalog_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_sql_does_not_occupy_runtime"]
+
+[[control]]
+id = "catalog-registry-sql-off-runtime"
+guards = "Confirmed registry SQL leaves the async runtime worker available"
+file = "crates/entorhinal-module/src/catalog_sql.rs"
+old = '''tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if let Some(entered) = entered {'''
+new = '''tokio::spawn(async move { // NON-VACUITY BREAK
+        #[cfg(test)]
+        if let Some(entered) = entered {'''
+test_file = "crates/entorhinal-module/src/catalog_ops_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_ops::tests::catalog_registry_sql_is_off_runtime_and_bounded"]
+
+[[control]]
+id = "catalog-grant-sql-off-runtime"
+guards = "Confirmed publisher grant SQL leaves the async runtime worker available"
+file = "crates/entorhinal-module/src/catalog_sql.rs"
+old = '''tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if let Some(entered) = entered {'''
+new = '''tokio::spawn(async move { // NON-VACUITY BREAK
+        #[cfg(test)]
+        if let Some(entered) = entered {'''
+test_file = "crates/entorhinal-module/src/catalog_grants_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_grants::tests::catalog_grant_sql_is_off_runtime_and_bounded"]
+
+[[control]]
+id = "catalog-seed-sql-off-runtime"
+guards = "Manual seed SQL leaves the async runtime worker available"
+file = "crates/entorhinal-module/src/catalog_sql.rs"
+old = '''tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if let Some(entered) = entered {'''
+new = '''tokio::spawn(async move { // NON-VACUITY BREAK
+        #[cfg(test)]
+        if let Some(entered) = entered {'''
+test_file = "crates/entorhinal-module/src/catalog_seed_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["catalog_seed::tests::catalog_seed_sql_is_off_runtime_and_bounded"]

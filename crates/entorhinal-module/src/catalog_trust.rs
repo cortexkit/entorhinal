@@ -10,9 +10,14 @@ use entorhinal_core::RegistryStore;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-/// Public key of the offline CortexKit root that certifies publishing keys.
-/// None refuses root-based trust until the operator provisions the production key.
-pub const CORTEXKIT_ROOT: Option<&str> = None;
+/// Public key of the offline CortexKit root that certifies publishing keys
+/// (Ed25519, key_id d4c16842f73cac77). Its private half exists only sealed in
+/// the credential vault and the vault's encrypted backups, and it signs
+/// nothing but publishing-key certificates.
+/// Every `@cortexkit` package this build trusts traces back to this key, so
+/// replacing it is a release decision, never a configuration change.
+pub const CORTEXKIT_ROOT: Option<&str> =
+    Some("8af2a8e892d79d2aa52981342f0b451ff5fb54c4e3da42389c12691fcb0a9e25");
 impl From<Refusal> for NetworkError {
     fn from(error: Refusal) -> Self {
         CatalogError::from(error).into()

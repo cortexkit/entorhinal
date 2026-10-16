@@ -30,9 +30,8 @@ Entorhinal verifies the entire strict `ck-starter-bundle/v1` ustar,
 its root-certified signer, package records and archive bytes before publishing
 archives and their embedded `ck.json` through the content-addressed `BlobStore`.
 It creates no pins, grants, generations or journal entries. Repeating the same
-bundle is idempotent. The compiled `CORTEXKIT_ROOT` is empty until the production
-root ceremony; loading then refuses `cortexkit_root_unavailable` without writing
-content or status. TEST-ONLY roots are injected only by tests.
+bundle is idempotent. A bundle must be signed by a publishing key certified by
+the compiled `CORTEXKIT_ROOT`. TEST-ONLY roots are injected only by tests.
 
 The signed bundle document binds each exact record/status member through
 `record_member_sha256`, checked before parsing. Bundle-attested initial statuses
@@ -139,7 +138,7 @@ check both signatures and lineage, ignoring a predecessor's retirement window
 and ignoring revocations whose compromise time is later than the successor's
 activation. Invalid rotations and their descendants are not trusted. Publisher
 windows remain half-open and are checked against the status-attested publication
-time. `CORTEXKIT_ROOT` is an empty compiled slot until the offline root ceremony;
+time. `CORTEXKIT_ROOT` is the compiled public key of the offline CortexKit root;
 test-only roots are supplied explicitly, never installed in production trust.
 
 `verify_version` binds the scope and signed name/version to the request before

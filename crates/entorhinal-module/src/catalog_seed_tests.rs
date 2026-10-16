@@ -40,12 +40,14 @@ fn test_seeder() -> Seeder {
             .into(),
     )
 }
+/// The production seeder trusts only the compiled CortexKit root, so a bundle
+/// signed under the TEST-ONLY root is refused and leaves nothing behind.
 #[test]
-fn seed_root_absent_writes_nothing() {
-    let (root, store, path, _) = fixture("seed-no-root");
+fn production_seeder_refuses_test_only_bundle_and_writes_nothing() {
+    let (root, store, path, _) = fixture("seed-production-root");
     assert_eq!(
         Seeder::default().seed(&store, &path).unwrap_err().code,
-        "cortexkit_root_unavailable"
+        "signature_invalid"
     );
     assert!(!path.parent().unwrap().join("blobs").exists());
     drop(store);
@@ -105,13 +107,15 @@ fn seed_content_is_idempotent_and_creates_no_pins_or_authority() {
 #[test]
 fn automatic_refusal_is_recorded_and_not_retried() {
     let (root, store, path, descriptor) = fixture("seed-refusal");
+    // The production root refuses this TEST-ONLY bundle; that refusal is
+    // recorded once and never retried on later starts.
     assert_eq!(
         automatic(&store, &Seeder::default()).unwrap_err().code,
-        "cortexkit_root_unavailable"
+        "signature_invalid"
     );
     let attempt = path.parent().unwrap().join(ATTEMPT);
     let recorded: Value = serde_json::from_slice(&fs::read(&attempt).unwrap()).unwrap();
-    assert_eq!(recorded["outcome"], "cortexkit_root_unavailable");
+    assert_eq!(recorded["outcome"], "signature_invalid");
     fs::write(&path, b"bad tar").unwrap();
     drop(store);
     let store = RegistryStore::open(&descriptor).unwrap();

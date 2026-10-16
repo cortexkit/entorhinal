@@ -320,10 +320,8 @@ These are move abort reasons, not new participant refusal codes.
 Publisher grants and source approvals never travel. Non-CortexKit publishers
 need a live target-local install grant for that agent. CortexKit keys must be
 certified against the receiver's own built-in root through its configured
-registry's existing key-chain verifier. The built-in CortexKit publishing root,
-`catalog_trust::CORTEXKIT_ROOT`, is currently empty, so these keys refuse
-`trust_missing` until that root is provisioned; the scope
-name alone never grants trust.
+registry's existing key-chain verifier, against the built-in CortexKit root
+`catalog_trust::CORTEXKIT_ROOT`. The scope name alone never grants trust.
 
 Entorhinal exports an immutable snapshot of the pinned content-store blobs on
 its `reserved:entorhinal` session-door stream. Each cut has a new, deterministic

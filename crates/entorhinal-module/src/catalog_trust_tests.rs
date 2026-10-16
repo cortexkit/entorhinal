@@ -737,9 +737,21 @@ async fn cert_vectors_over_http_and_record_key_windows() {
     }
 }
 #[test]
-#[ignore = "root_ceremony_pending: production CORTEXKIT_ROOT is None; activate after offline root ceremony"]
 fn production_root_accepts_only_its_certificates() {
-    let root = CORTEXKIT_ROOT.expect("compiled root must be provisioned by the root ceremony");
+    let root = CORTEXKIT_ROOT.expect("the production root is compiled in");
+    // The certificate the root signed for the first @cortexkit publishing key.
+    let issued = json!({
+        "public_key": "cf865c91b3dc0ae0103d417720c35d64b766427364e94ae811962d55b8120c68",
+        "schema": "ck-key-cert/v1",
+        "scope": "cortexkit",
+        "valid_from": "2026-10-16T00:00:00Z",
+        "valid_until": "2027-10-16T00:00:00Z",
+    });
+    let signature = "7926ed099ff19a2f6a80f573dbfff67dadda7f12b2beb1433d007aee9d842ea182ea2fb5e3c9aad196cc9f078b22529b2f25096bc124ff337bb9ec945fdaae0c";
+    let key = statements::verify_key_cert(&document(&issued).unwrap(), signature, root)
+        .expect("the compiled root verifies the publishing key it certified");
+    assert_eq!(key.public_key, issued["public_key"]);
+    // Certificates signed by the TEST-ONLY root must never verify in production.
     let v = vectors("statements");
     let cert = &v["ck-key-cert/v1"]["cases"][0]["served"];
     assert!(
@@ -974,12 +986,14 @@ async fn cortexkit_http_uses_only_explicit_root_and_refuses_production_slot() {
         &format!("/v1/archives/{}", entorhinal_catalog::sha256_hex(&archive)),
         Reply::bytes(archive),
     );
+    // The compiled production root must not accept a publishing key that the
+    // TEST-ONLY root certified, and nothing may be downloaded before that check.
     error(
         trust
             .verify_version("@cortexkit/hello-skill", VERSION)
             .await
             .unwrap_err(),
-        "key_unknown",
+        "signature_invalid",
         None,
     );
     assert!(!f
