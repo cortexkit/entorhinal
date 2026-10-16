@@ -1218,3 +1218,34 @@ async fn catalog_move_mutex_admission_is_bounded() {
     assert_eq!(error.code, "unavailable");
     assert!(error.message.contains("admission deadline"));
 }
+
+#[tokio::test(start_paused = true)]
+async fn catalog_move_status_refresh_uses_newly_authenticated_registry_keys() {
+    let (mut pair, pin, _, _) = catalog_pair(true, true, false).await;
+    let registry = move_registry(&mut pair.b, &pin).await;
+    registry.serve_vectors();
+    let mut status = vectors("status")["records"][0]["record"].clone();
+    status["archive_sha256"] = json!(pin.archive_sha256);
+    status["registry_key_id"] = json!("test-registry-2");
+    status["changed_at"] = json!("2026-11-01T00:00:00Z");
+    let status = signed(status, &vectors("statements")["keys"]["registry_status"][1]);
+    registry.serve("/v1/scopes/example/status", Reply::bytes(json!({"schema":"ck-status-feed/v1","scope":"example","feed_seq":1,"records":[{"feed_seq":1,"record":status["record"],"signature":status["signature"]}]}).to_string()));
+    let digest = pair.b.store().catalog_pin_digest(AGENT).unwrap();
+    let context = pair.b.machine.handler.catalog_move_context();
+    assert_eq!(
+        drive(context.preflight(AGENT, &digest)).await.unwrap(),
+        vec![pin]
+    );
+    assert_eq!(
+        pair.b
+            .store()
+            .catalog_statuses("https://registry.example.invalid")
+            .unwrap()[0]
+            .signer_index,
+        1
+    );
+    assert_eq!(
+        pair.b.store().catalog_registries().unwrap()[0].keys.len(),
+        3
+    );
+}

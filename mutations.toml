@@ -9778,3 +9778,18 @@ package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 expect_red = ["catalog_trust::tests::registry_removal_preserves_status_history_and_explains_repin"]
 select = "expected"
+
+[[control]]
+id = "catalog-move-refreshed-signer-chain"
+guards = "Move preflight restores status under registry successors authenticated during that same refresh"
+file = "crates/entorhinal-module/src/catalog_move/trust.rs"
+old = 'let rows = store.catalog_statuses(&current.url)?;'
+new = '''let mut current = current;
+                    current.keys.truncate(expected.keys.len()); // NON-VACUITY BREAK
+                    let rows = store.catalog_statuses(&current.url)?;'''
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/catalog_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_status_refresh_uses_newly_authenticated_registry_keys"]

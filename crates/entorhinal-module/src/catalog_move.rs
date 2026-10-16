@@ -347,13 +347,16 @@ impl CatalogMove {
                     .await?;
                     let store = self.store()?;
                     let dir = self.directory(id)?;
-                    private_dir(&dir)?;
-                    let (end_offset, digest) = stream::encode(
-                        &dir.join("payload"),
-                        &BlobStore::new(store.store_folder())?,
-                        &pins,
-                    )
-                    .map_err(|e| HandlerError::new("not_exportable", e.message))?;
+                    let (end_offset, digest) = crate::catalog_sql::run(move || {
+                        private_dir(&dir)?;
+                        stream::encode(
+                            &dir.join("payload"),
+                            &BlobStore::new(store.store_folder())?,
+                            &pins,
+                        )
+                        .map_err(|e| HandlerError::new("not_exportable", e.message))
+                    })
+                    .await?;
                     let state = Checkpoint {
                         agent: agent.into(),
                         pin_digest: expected.into(),
@@ -433,9 +436,19 @@ impl CatalogMove {
                 let stage = dir.join("staging");
                 private_dir(&stage)?;
                 self.download(id, &item, &dir.join("payload")).await?;
-                stream::decode(&dir.join("payload"), &stage, &checked.pins)?;
+                let payload = dir.join("payload");
+                let worker_stage = stage.clone();
+                crate::catalog_sql::run(move || {
+                    stream::decode(&payload, &worker_stage, &checked.pins)
+                })
+                .await?;
                 let checked = self.local_preflight(agent, expected).await?;
-                let packages = staged_packages(&stage, &checked)?;
+                let worker_stage = stage.clone();
+                let (checked, packages) = crate::catalog_sql::run(move || {
+                    let packages = staged_packages(&worker_stage, &checked)?;
+                    Ok::<_, HandlerError>((checked, packages))
+                })
+                .await?;
                 self.coverage(agent, &checked, Some(&packages)).await?;
                 self.install(id, agent, &stage, packages).await?;
                 let state = Checkpoint {

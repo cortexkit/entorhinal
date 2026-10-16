@@ -50,7 +50,7 @@ impl CatalogMove {
                 .iter()
                 .filter(|p| p.name.starts_with(&format!("{scope}/")))
                 .collect();
-            let (rows, keys) = if let Some(registry) = &registry {
+            let (registry, rows, keys) = if let Some(registry) = &registry {
                 let store = self.store()?;
                 let sources = self.sources.clone();
                 let local_scope = scope.clone();
@@ -83,17 +83,26 @@ impl CatalogMove {
                     vec![]
                 };
                 let store = self.store()?;
-                let url = registry.url.clone();
-                let rows = crate::catalog_sql::run(move || {
-                    store.catalog_statuses(&url).map_err(HandlerError::from)
+                let expected = registry.clone();
+                let local_scope = scope.clone();
+                let (registry, rows) = crate::catalog_sql::run(move || {
+                    let mapped = store.catalog_registry_for_scope(&local_scope)?;
+                    let current = store
+                        .catalog_registries()?
+                        .into_iter()
+                        .find(|r| r.url == expected.url && r.incarnation == expected.incarnation)
+                        .filter(|r| mapped.as_ref() == Some(&r.url))
+                        .ok_or_else(|| unavailable("registry changed during move preflight"))?;
+                    let rows = store.catalog_statuses(&current.url)?;
+                    Ok::<_, HandlerError>((current, rows))
                 })
                 .await?;
-                (rows, keys)
+                (Some(registry), rows, keys)
             } else {
                 if scope != "@cortexkit" {
                     return Err(unavailable("pinned scope has no reachable registry"));
                 }
-                (rows, vec![])
+                (None, rows, vec![])
             };
             for pin in scope_pins {
                 let row = rows
