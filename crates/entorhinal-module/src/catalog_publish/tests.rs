@@ -394,6 +394,7 @@ async fn publish_vectors_exact_vault_bytes() {
             REGISTRY,
             "@example",
             &checked,
+            &f.handler.catalog_sql,
         )
         .await
         .unwrap();
@@ -421,6 +422,30 @@ async fn publish_decline_signs_nothing() {
     let _registry = f.registry(vec![Response::Success]).await;
     assert_eq!(f.call().await.unwrap_err().code, "operator_declined");
     f.no_sign();
+}
+
+#[test]
+fn publish_preparation_is_off_runtime_counted_and_bounded() {
+    use crate::catalog_sql::tests::{poll, responsive, HeldSql};
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all().start_paused(true).max_blocking_threads(1).build().unwrap()
+        .block_on(async {
+            let f = Fixture::new(FakeVault::new(), Err(OperatorConfirmError::Declined));
+            let store = f.handler.with_store(|s| Ok(s.clone())).unwrap();
+            let held = HeldSql::new(store).await;
+            let mut request = Box::pin(f.call());
+            assert!(poll(request.as_mut()).is_pending(), "preparation must queue on the blocking pool");
+            responsive(&f.handler).await;
+            let mut drained = Box::pin(f.handler.catalog_sql.wait());
+            assert!(poll(drained.as_mut()).is_pending(), "publish preparation must be counted until the blocking job exits");
+            tokio::time::advance(std::time::Duration::from_millis(60_001)).await;
+            assert!(matches!(poll(request.as_mut()), std::task::Poll::Ready(Err(e)) if e.code == "catalog_timeout"));
+            assert!(poll(drained.as_mut()).is_pending());
+            held.finish().await;
+            drained.await;
+            assert!(f.prompt.calls.lock().unwrap().is_empty());
+            f.no_sign();
+        });
 }
 #[tokio::test]
 async fn publish_direct_only() {

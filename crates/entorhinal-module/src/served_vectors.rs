@@ -1231,6 +1231,29 @@ async fn session_records_match_published_files() {
     assert_eq!(unknown_agent_reply["code"], "unknown_agent");
     where_records.push(unknown_agent);
     published_file("agent-sessions-v1", "where.json", where_records);
+
+    let (where_many, where_many_reply) = fixture
+        .record(
+            SESSION_READER,
+            READER_MODULE,
+            "agent.where_many",
+            json!({"agentIds":[WHERE_ELSEWHERE,"agent_ffffffffffffffff",WHERE_HERE]}),
+        )
+        .await;
+    assert_eq!(
+        where_many_reply["result"]["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|agent| agent["agent_id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [WHERE_ELSEWHERE, WHERE_HERE]
+    );
+    assert_eq!(
+        where_many_reply["result"]["agents"][0]["status"],
+        "held_elsewhere"
+    );
+    published_file("agent-sessions-v1", "where-many.json", vec![where_many]);
 }
 
 #[tokio::test]

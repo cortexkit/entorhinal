@@ -1561,6 +1561,7 @@ mod tests {
             "agent.session_for_ref",
             "agent.session_liveness",
             "agent.where",
+            "agent.where_many",
             "agent.move_status",
             "agent.moves",
             "role.read",

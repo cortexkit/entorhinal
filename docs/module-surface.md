@@ -206,6 +206,7 @@ the cache, so it works offline and never waits on engram.
 | `agent.session_for_ref` | query | any | The agent, host session and project root bound to a reference. |
 | `agent.session_liveness` | query | any | `active`, `gone` or `unknown` for up to 256 references, in order. |
 | `agent.where` | query | any | Which Mac holds an agent, from the cached claim, plus any blocked move's participant and ref explanation. |
+| `agent.where_many` | query | any | Cached claim results for 1–64 agent ids in request order; unknown agents are omitted. |
 | `agent.refresh_claims` | mutate | Direct | Refresh live agents' cached claims from engram. |
 | `role.read` | query | any | Which Mac holds a role, from the cached claim. |
 | `role.take` | mutate | Direct, with Touch ID | Make this Mac the role's holder. |

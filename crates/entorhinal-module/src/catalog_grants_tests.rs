@@ -11,6 +11,7 @@ use entorhinal_core::catalog_grants::{coverage, Coverage, CoveragePackage};
 use std::sync::{Arc, Mutex};
 use subc_protocol::Principal;
 const ROUTE: RouteKey = (181, 1);
+#[derive(Clone)]
 struct Pins(Vec<PublisherPin>);
 impl PinSource for Pins {
     fn pins(&self, _: &RegistryStore, _: &str, _: &str) -> Result<Vec<PublisherPin>, CatalogError> {
@@ -97,8 +98,8 @@ impl Fixture {
             archive_sha256: p["archive_sha256"].as_str().unwrap().into(),
         }])
     }
-    async fn trust(&self, source: &dyn PinSource) -> Result<Value, HandlerError> {
-        let body = self.handler.catalog_publisher_trust_from(json!({"publisher_fingerprint":vectors("record")["keys"]["trusted"]["fingerprint"],"agent_id":self.agent}),ROUTE,Instant::now(),source).await?;
+    async fn trust(&self, source: impl PinSource + 'static) -> Result<Value, HandlerError> {
+        let body = self.handler.catalog_publisher_trust_from(json!({"publisher_fingerprint":vectors("record")["keys"]["trusted"]["fingerprint"],"agent_id":self.agent}),ROUTE,Instant::now(),Arc::new(source)).await?;
         Ok(serde_json::from_slice::<Value>(&body).unwrap()["result"].clone())
     }
 }
@@ -112,25 +113,117 @@ impl Drop for Fixture {
 async fn publisher_trust_authenticates_pins_and_is_install_only() {
     let f = Fixture::new(Ok(()));
     assert_eq!(
-        f.trust(&StoredPins).await.unwrap_err().code,
+        f.trust(StoredPins).await.unwrap_err().code,
         "manifest_unavailable"
     );
     assert_eq!(
-        f.trust(&Pins(vec![])).await.unwrap_err().code,
+        f.trust(Pins(vec![])).await.unwrap_err().code,
         "manifest_unavailable"
     );
     let pins = f.pins();
-    let result = f.trust(&pins).await.unwrap();
+    let result = f.trust(pins.clone()).await.unwrap();
     assert_eq!(result["operation"], "install");
     assert!(f.prompt.calls.lock().unwrap()[0].contains("for install at agent"));
     let grant = f.store().publisher_grants().unwrap().remove(0);
     assert_eq!(grant.operation, Operation::Install);
     let mut corrupt = pins;
     corrupt.0[0].manifest_sha256 = "ab".repeat(32);
-    let e = f.trust(&corrupt).await.unwrap_err();
+    let e = f.trust(corrupt).await.unwrap_err();
     assert_eq!(e.code, "manifest_unavailable");
     assert_eq!(e.detail.unwrap()["name"], "@example/hello-skill");
     assert_eq!(f.store().catalog_audit().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn publisher_confirmation_includes_complete_ceiling_when_it_fits() {
+    let f = Fixture::new(Ok(()));
+    f.trust(f.pins()).await.unwrap();
+    let summary = f.prompt.calls.lock().unwrap()[0].clone();
+    assert!(
+        summary.contains("capabilities: cap/example.read@1"),
+        "{summary}"
+    );
+    assert!(summary.chars().count() <= 200);
+    assert_eq!(
+        trust_summary("publisher and placement".into(), &[]),
+        "publisher and placement; capabilities: none"
+    );
+    let long = vec!["cap/example.long@1".repeat(30)];
+    assert_eq!(
+        trust_summary("publisher and placement".into(), &long),
+        "publisher and placement"
+    );
+    let docs = include_str!("../../../docs/catalog.md");
+    assert!(docs.contains("stored authenticated pins (`StoredPins`)"));
+    assert!(!docs.contains("publisher trust deliberately refuses until that source exists"));
+}
+
+#[tokio::test]
+async fn publisher_pin_and_blob_reads_are_counted_blocking_jobs() {
+    struct OffRuntimePins(Pins, Arc<std::sync::atomic::AtomicUsize>);
+    impl PinSource for OffRuntimePins {
+        fn pins(
+            &self,
+            _: &RegistryStore,
+            _: &str,
+            _: &str,
+        ) -> Result<Vec<PublisherPin>, CatalogError> {
+            tokio::task::block_in_place(|| {});
+            self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.0 .0.clone())
+        }
+    }
+    let f = Fixture::new(Ok(()));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    f.trust(OffRuntimePins(f.pins(), calls.clone()))
+        .await
+        .unwrap();
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    f.handler.catalog_sql.wait().await;
+    assert_eq!(f.store().publisher_grants().unwrap().len(), 1);
+}
+
+#[test]
+fn install_authority_is_derived_from_the_entire_pin_delta() {
+    use entorhinal_core::catalog_agent::CatalogPin;
+    use entorhinal_core::catalog_grants::authorization_operation;
+    let root = CatalogPin {
+        name: "@example/root".into(),
+        version: "1.0.0".into(),
+        kind: entorhinal_catalog::Kind::Skill,
+        manifest_sha256: "aa".repeat(32),
+        archive_sha256: "bb".repeat(32),
+        publisher_fingerprint: "cc".repeat(32),
+        root: true,
+        range: Some("^1.0.0".into()),
+    };
+    let mut dependency = root.clone();
+    dependency.name = "@example/dependency".into();
+    dependency.root = false;
+    dependency.range = None;
+    let before = vec![root.clone(), dependency.clone()];
+    let mut next = before.clone();
+    let mut added = root.clone();
+    added.name = "@example/new-root".into();
+    next.push(added);
+    assert_eq!(
+        authorization_operation("install", &before, &next),
+        Operation::Install
+    );
+    next[1].version = "1.1.0".into();
+    assert_eq!(
+        authorization_operation("install", &before, &next),
+        Operation::Upgrade,
+        "adding a root cannot smuggle a dependency replacement under install authority"
+    );
+    assert_eq!(
+        authorization_operation("install", &before, &[root]),
+        Operation::Upgrade
+    );
+    assert_eq!(
+        authorization_operation("upgrade", &before, &before),
+        Operation::Upgrade
+    );
 }
 #[tokio::test]
 async fn publisher_trust_admission_decline_and_disposed_placement() {
@@ -146,7 +239,7 @@ async fn publisher_trust_admission_decline_and_disposed_placement() {
             .route_admissions()
             .insert(ROUTE, RouteAdmission::from_bind(Some(principal), None));
         assert_eq!(
-            f.trust(&pins).await.unwrap_err().code,
+            f.trust(pins.clone()).await.unwrap_err().code,
             "write_not_permitted"
         );
     }
@@ -158,14 +251,14 @@ async fn publisher_trust_admission_decline_and_disposed_placement() {
         ),
     );
     assert_eq!(
-        f.trust(&pins).await.unwrap_err().code,
+        f.trust(pins.clone()).await.unwrap_err().code,
         "flow_scope_not_admitted"
     );
     f.handler.route_admissions().insert(
         ROUTE,
         RouteAdmission::from_bind(Some(Principal::Direct), None),
     );
-    assert!(f.trust(&pins).await.is_err());
+    assert!(f.trust(pins.clone()).await.is_err());
     assert!(f.store().publisher_grants().unwrap().is_empty());
     f.store()
         .agent_mutation(
@@ -174,7 +267,7 @@ async fn publisher_trust_admission_decline_and_disposed_placement() {
             101,
         )
         .unwrap();
-    assert_eq!(f.trust(&pins).await.unwrap_err().code, "gone");
+    assert_eq!(f.trust(pins.clone()).await.unwrap_err().code, "gone");
 }
 #[tokio::test]
 async fn publisher_manifest_http_digest_strict_identity_and_cap() {
@@ -192,10 +285,11 @@ async fn publisher_manifest_http_digest_strict_identity_and_cap() {
         archive_sha256: p["archive_sha256"].as_str().unwrap().into(),
     };
     let path = "/v1/packages/example/hello-skill/1.0.0/ck.json";
-    let factory = |_: &str| {
+    let url = fake.url.clone();
+    let factory = move |_: &str| {
         Ok(RegistryClient::loopback(
-            &fake.url,
-            std::slice::from_ref(&fake.url),
+            &url,
+            std::slice::from_ref(&url),
             Limits::MODULE,
         ))
     };
@@ -204,7 +298,8 @@ async fn publisher_manifest_http_digest_strict_identity_and_cap() {
         &f.store(),
         std::slice::from_ref(&pin),
         &pin.publisher_fingerprint,
-        &factory,
+        factory.clone(),
+        &f.handler.catalog_sql,
     )
     .await
     .unwrap();
@@ -214,7 +309,8 @@ async fn publisher_manifest_http_digest_strict_identity_and_cap() {
             &f.store(),
             std::slice::from_ref(&pin),
             &pin.publisher_fingerprint,
-            &factory
+            factory.clone(),
+            &f.handler.catalog_sql,
         )
         .await
         .unwrap_err()
@@ -242,7 +338,8 @@ async fn publisher_manifest_http_digest_strict_identity_and_cap() {
                 &f.store(),
                 std::slice::from_ref(&pin),
                 &pin.publisher_fingerprint,
-                &factory
+                factory.clone(),
+                &f.handler.catalog_sql,
             )
             .await
             .unwrap_err()
@@ -481,7 +578,7 @@ async fn publisher_pins_must_stay_authenticated_through_confirmation() {
         calls: std::sync::atomic::AtomicUsize::new(0),
     };
     assert_eq!(
-        f.trust(&moving).await.unwrap_err().code,
+        f.trust(moving).await.unwrap_err().code,
         "manifest_unavailable"
     );
     assert!(f.store().publisher_grants().unwrap().is_empty());
@@ -495,20 +592,24 @@ async fn catalog_grant_sql_is_off_runtime_and_bounded() {
     let f = Fixture::new(Ok(()));
     let pins = f.pins();
     let held = HeldSql::new(f.store()).await;
-    let (request, entered) = tracked(f.trust(&pins));
+    let (request, entered) = tracked(f.trust(pins.clone()));
     let mut request = Box::pin(request);
     started(request.as_mut(), &entered).await;
     assert!(poll(request.as_mut()).is_pending());
     responsive(&f.handler).await;
     tokio::time::advance(std::time::Duration::from_millis(60_001)).await;
     let answer = poll(request.as_mut());
-    assert!(f.handler.writer.try_lock().is_err());
-    assert!(f.handler.confirmation_slot.lock().unwrap().is_some());
+    assert!(f.handler.writer.try_lock().is_ok());
+    assert!(f.handler.confirmation_slot.lock().unwrap().is_none());
     held.finish().await;
     let _writer = finish(f.handler.writer.lock()).await;
     assert!(
         matches!(answer, std::task::Poll::Ready(Err(error)) if error.code == "catalog_timeout")
     );
-    assert_eq!(f.store().publisher_grants().unwrap().len(), 1);
-    assert_eq!(f.prompt.calls.lock().unwrap().len(), 1);
+    // Whether the confirmation prompt ran first depends on how far the pin and
+    // blob reads (on the separate read connection, which the held write does not
+    // block) got in real time before the test clock jumped. Either way the held
+    // write must time out without granting anything, at most one prompt shown.
+    assert!(f.store().publisher_grants().unwrap().is_empty());
+    assert!(f.prompt.calls.lock().unwrap().len() <= 1);
 }

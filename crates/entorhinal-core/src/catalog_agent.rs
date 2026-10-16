@@ -249,6 +249,33 @@ pub(crate) fn replay_pin(tx: &Transaction<'_>, value: Value) -> rusqlite::Result
     entry.restore(tx)
 }
 impl RegistryStore {
+    /// Tombstones forbid serving either object unless another version bound to
+    /// the same digest is still usable. Include prepared closures so consumers
+    /// can read verified bytes before the install commits its pins.
+    pub fn catalog_blob_tombstone(&self, digest: &str) -> Result<Option<Value>, RegistryError> {
+        self.read(|conn| {
+            let statuses = conn.prepare(
+                "WITH bindings(name,version) AS (
+                    SELECT name,version FROM catalog_pin WHERE manifest_sha256=?1 OR archive_sha256=?1
+                    UNION SELECT json_extract(p.value,'$.name'),json_extract(p.value,'$.version')
+                    FROM catalog_plan, json_each(catalog_plan.closure) p
+                    WHERE json_extract(p.value,'$.manifest_sha256')=?1 OR json_extract(p.value,'$.archive_sha256')=?1
+                    UNION SELECT json_extract(p.value,'$.name'),json_extract(p.value,'$.version')
+                    FROM catalog_generation, json_each(catalog_generation.closure) p
+                    WHERE json_extract(p.value,'$.manifest_sha256')=?1 OR json_extract(p.value,'$.archive_sha256')=?1
+                    UNION SELECT name,version FROM catalog_status WHERE json_extract(canonical,'$.archive_sha256')=?1
+                ) SELECT s.canonical FROM bindings b LEFT JOIN catalog_status s ON s.name=b.name AND s.version=b.version"
+            )?.query_map([digest], |r| r.get::<_,Option<String>>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut tombstone = None;
+            for text in statuses {
+                let Some(text) = text else { return Ok(None) };
+                let status: Value = decode(text)?;
+                if status["state"] != "tombstoned" { return Ok(None) }
+                tombstone = Some(status);
+            }
+            Ok(tombstone)
+        })
+    }
     pub fn catalog_pins(&self, agent: &str) -> Result<Vec<CatalogPin>, RegistryError> {
         self.read(|conn| read_pins(conn, agent))
     }
@@ -898,11 +925,11 @@ impl JournalWriter<'_> {
                 .iter()
                 .map(PreparedPackage::coverage)
                 .collect();
-            let operation = if plan.operation == "install" {
-                crate::catalog_grants::Operation::Install
-            } else {
-                crate::catalog_grants::Operation::Upgrade
-            };
+            let operation = crate::catalog_grants::authorization_operation(
+                &plan.operation,
+                &read_pins(tx, caller)?,
+                plan.closure.as_deref().unwrap_or_default(),
+            );
             let always = match &commit.authorization {
                 crate::agent::consent::Authorization::Card { id, answer } => {
                     let saved = crate::agent::consent::load_request(tx, &commit.request.identity)?;
@@ -919,7 +946,7 @@ impl JournalWriter<'_> {
                     match answer.as_str() {
                         "approve_once" => false,
                         "approve_always_publisher"
-                            if plan.operation == "install"
+                            if operation == crate::catalog_grants::Operation::Install
                                 && detail.packages.iter().all(|p| !p.root_certified) =>
                         {
                             true

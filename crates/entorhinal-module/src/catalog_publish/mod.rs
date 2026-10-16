@@ -164,6 +164,7 @@ impl ProjectsHandler {
         received: Instant,
     ) -> Result<Vec<u8>, HandlerError> {
         self.admit(PUBLISH, key)?;
+        let deadline = received + std::time::Duration::from_secs(60);
         let request: Request = serde_json::from_value(params).map_err(crate::invalid_params)?;
         if !Path::new(&request.package_dir).is_absolute() {
             return Err(error(
@@ -171,19 +172,34 @@ impl ProjectsHandler {
                 "package_dir must be an absolute canonical directory",
             ));
         }
-        let canonical =
-            entorhinal_core::RegistryStore::canonical_mutation_root(&request.package_dir)
-                .map_err(|e| error("path_refused", e.to_string()))?;
-        if canonical != request.package_dir {
-            return Err(error("not_canonical", "package_dir must be canonical"));
-        }
-        let archive = pack::pack(Path::new(&canonical))?;
-        let checked = catalog::publish::check(&archive, &request.scope).map_err(refused)?;
+        let store = self.with_store(|s| Ok(s.clone()))?;
+        let package_dir = request.package_dir.clone();
+        let scope = request.scope.clone();
+        let sql_guard = self.catalog_sql.begin();
+        let (canonical, archive, checked, folder, registries) =
+            crate::catalog_sql::until(deadline, "catalog publish preparation", move || {
+                let _sql_guard = sql_guard;
+                let canonical =
+                    entorhinal_core::RegistryStore::canonical_mutation_root(&package_dir)
+                        .map_err(|e| error("path_refused", e.to_string()))?;
+                if canonical != package_dir {
+                    return Err(error("not_canonical", "package_dir must be canonical"));
+                }
+                let archive = pack::pack(Path::new(&canonical))?;
+                let checked = catalog::publish::check(&archive, &scope).map_err(refused)?;
+                let registries = store.catalog_registries()?;
+                Ok((
+                    canonical,
+                    archive,
+                    checked,
+                    store.store_folder().to_path_buf(),
+                    registries,
+                ))
+            })
+            .await?;
         let summary = summary(&checked)?;
         let registry = crate::catalog_network::registry_url(&request.registry)?;
         let registry = registry.as_str().trim_end_matches('/').to_string();
-        let (folder, registries) =
-            self.with_store(|s| Ok((s.store_folder().to_path_buf(), s.catalog_registries()?)))?;
         let allowlist = registries.iter().map(|r| r.url.clone()).collect::<Vec<_>>();
         let client = Arc::new(crate::catalog_network::RegistryClient::new(
             &registry,
@@ -208,7 +224,6 @@ impl ProjectsHandler {
         if !self.route_admissions().contains_key(&key) {
             return Err(OperatorConfirmError::Declined.into());
         }
-        let deadline = received + std::time::Duration::from_secs(60);
         let _serial = tokio::select! {
             biased;
             _ = guard.cancelled.wait_for(|closed| *closed) => return Err(OperatorConfirmError::Declined.into()),
@@ -228,7 +243,7 @@ impl ProjectsHandler {
         let signed = tokio::select! {
             biased;
             _ = guard.cancelled.wait_for(|closed| *closed) => return Err(OperatorConfirmError::Declined.into()),
-            result = timeout_at(deadline, prepare(vault.as_ref(), &folder, &registry, &request.scope, &checked)) => result.map_err(|_| HandlerError::from(OperatorConfirmError::Declined))??,
+            result = timeout_at(deadline, prepare(vault.as_ref(), &folder, &registry, &request.scope, &checked, &self.catalog_sql)) => result.map_err(|_| HandlerError::from(OperatorConfirmError::Declined))??,
         };
         // The authorization guard covers signing and durable storage; upload can be retried.
         let reply = client.publish(&signed, &archive).await.map_err(|e| {
@@ -284,10 +299,18 @@ async fn prepare(
     registry: &str,
     scope: &str,
     checked: &catalog::publish::CheckedArchive,
+    sql: &Arc<crate::move_driver::SqlOperations>,
 ) -> Result<Signed, HandlerError> {
     let public = vault.public_key(CREDENTIAL).await.map_err(vault_error)?;
     let path = storage::path(folder, registry, scope, &checked.archive_sha256);
-    if let Some(signed) = storage::load(&path)? {
+    let held_path = path.clone();
+    let guard = sql.begin();
+    if let Some(signed) = crate::catalog_sql::run(move || {
+        let _guard = guard;
+        storage::load(&held_path)
+    })
+    .await?
+    {
         verify(&signed, checked, &public)?;
         return Ok(signed);
     }
@@ -311,6 +334,12 @@ async fn prepare(
         key_id: signature.key_id,
     };
     verify(&signed, checked, &public)?;
-    storage::save(&path, &signed)?;
+    let saved = signed.clone();
+    let guard = sql.begin();
+    crate::catalog_sql::run(move || {
+        let _guard = guard;
+        storage::save(&path, &saved)
+    })
+    .await?;
     Ok(signed)
 }
