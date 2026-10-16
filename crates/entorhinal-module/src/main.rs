@@ -66,6 +66,7 @@ mod catalog_network;
 mod catalog_ops;
 mod catalog_poll;
 mod catalog_publish;
+mod catalog_seed;
 mod catalog_trust;
 mod catch_up;
 mod claim_codec;
@@ -581,6 +582,7 @@ struct ProjectsHandler {
     participant_discovery: Arc<dyn participant_discovery::ParticipantDiscovery>,
     catalog_agent: catalog_agent::CatalogAgent,
     catalog_publish: catalog_publish::Publisher,
+    catalog_seeder: catalog_seed::Seeder,
     catalog_move_lock: Arc<tokio::sync::Mutex<()>>,
     catalog_poll_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     catalog_poll_wake: Arc<tokio::sync::Notify>,
@@ -665,6 +667,7 @@ const MUTATING_METHODS: &[&str] = &[
     catalog_ops::REMOVE,
     catalog_ops::PUBLISHER_TRUST,
     catalog_publish::PUBLISH,
+    catalog_seed::SEED,
     catalog_agent::ACK_ACTIVATION,
     "remove_root",
     "attach_derived_parent",
@@ -731,6 +734,7 @@ fn authorize_write(method: &str, principal: Option<&Principal>) -> Result<(), Ha
     if method == "identity_log.enable"
         || catalog_ops::WRITES.contains(&method)
         || method == catalog_publish::PUBLISH
+        || method == catalog_seed::SEED
     {
         return match principal {
             Some(Principal::Direct) => Ok(()),
@@ -923,6 +927,7 @@ impl ProjectsHandler {
             )),
             catalog_agent: catalog_agent::CatalogAgent::default(),
             catalog_publish: catalog_publish::Publisher::default(),
+            catalog_seeder: catalog_seed::Seeder::default(),
             catalog_move_lock: Arc::new(tokio::sync::Mutex::new(())),
             catalog_poll_task: Mutex::new(None),
             catalog_poll_wake: Arc::default(),
@@ -1371,6 +1376,8 @@ impl ProjectsHandler {
                 .await
         } else if request.method == catalog_publish::PUBLISH {
             self.catalog_publish(request.params, key, received).await
+        } else if request.method == catalog_seed::SEED {
+            self.catalog_seed(request.params, key).await
         } else if request.method == catalog_ops::PUBLISHER_TRUST {
             self.catalog_publisher_trust(request.params, key, received)
                 .await
@@ -1506,6 +1513,7 @@ impl ProjectsHandler {
             | catalog_ops::REMOVE
             | catalog_ops::PUBLISHER_TRUST
             | catalog_publish::PUBLISH
+            | catalog_seed::SEED
             | catalog_ops::READ_BLOB => Err(HandlerError::new(
                 "served_path_required",
                 "catalog writes and blob reads require the asynchronous served path",
@@ -2189,6 +2197,7 @@ fn manifest() -> ModuleManifest {
                 management_operation(catalog_agent::ACK_ACTIVATION, ManagementOperationKind::Mutate, "Core-only acknowledgement that a ready package generation was rendered at a session boundary."),
                 management_operation(catalog_ops::PUBLISHER_TRUST, ManagementOperationKind::Mutate, "Trust a publisher for installs at one agent within its authenticated pinned capability ceiling (Direct only, operator confirmation)."),
                 management_operation(catalog_publish::PUBLISH, ManagementOperationKind::Mutate, "Pack and check a local package, confirm publication with the operator, sign through the vault and upload durably retryable bytes (Direct only)."),
+                management_operation(catalog_seed::SEED, ManagementOperationKind::Mutate, "Verify an offline starter bundle and seed content and initial status only (Direct only, no confirmation)."),
                 management_operation(
                     "resolve",
                     ManagementOperationKind::Query,
@@ -2552,6 +2561,9 @@ fn install_store_with_time(
             health.store_ready.store(true, Ordering::Relaxed);
             health.store_failed.store(false, Ordering::Relaxed);
             *guard = Some(opened);
+            if let Some(opened) = guard.as_ref() {
+                catalog_seed::start(opened.clone());
+            }
         }
         Err(error) => {
             tracing::error!(target: "store", "{error}");
@@ -2803,6 +2815,7 @@ mod tests {
             if *method == "identity_log.enable"
                 || catalog_ops::WRITES.contains(method)
                 || *method == catalog_publish::PUBLISH
+                || *method == catalog_seed::SEED
             {
                 assert_eq!(executive.unwrap_err().code, "write_not_permitted");
             } else if matches!(

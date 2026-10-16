@@ -1518,6 +1518,7 @@ async fn catalog_generation_v1_records_match_published_files() {
                                 signer_index: 0,
                                 canonical,
                                 signature: "fixture".into(),
+                                starter_proof: None,
                             }],
                             ..Default::default()
                         },

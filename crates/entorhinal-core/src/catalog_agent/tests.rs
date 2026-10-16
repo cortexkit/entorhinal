@@ -669,6 +669,7 @@ fn status_news(
                     signer_index: 0,
                     canonical,
                     signature: "test".into(),
+                    starter_proof: None,
                 }],
                 ..Default::default()
             },

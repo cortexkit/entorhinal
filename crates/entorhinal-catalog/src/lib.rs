@@ -2,6 +2,7 @@
 //! this crate performs no I/O and never installs or executes package content.
 
 pub mod archive;
+pub mod bundle;
 pub mod jcs;
 pub mod names;
 pub mod publish;

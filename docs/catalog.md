@@ -22,6 +22,35 @@ ck catalog publisher trust <fingerprint> --agent <agent_id>
 ck catalog publish <package dir> --registry <url> --scope <scope>
 ```
 
+## Offline starter bundle
+
+`ck catalog seed <bundle file>` accepts only an operator-opened Direct route,
+not another module or a flow, and needs no Touch ID: it grants no authority.
+Entorhinal verifies the entire strict `ck-starter-bundle/v1` ustar,
+its root-certified signer, package records and archive bytes before publishing
+archives and their embedded `ck.json` through the content-addressed `BlobStore`.
+It creates no pins, grants, generations or journal entries. Repeating the same
+bundle is idempotent. The compiled `CORTEXKIT_ROOT` is empty until the production
+root ceremony; loading then refuses `cortexkit_root_unavailable` without writing
+content or status. TEST-ONLY roots are injected only by tests.
+
+The signed bundle document binds each exact record/status member through
+`record_member_sha256`, checked before parsing. Bundle-attested initial statuses
+use the same SQLite compare-and-update boundary as online statuses; a later feed
+still needs a pinned registry status key and refuses lower sequences or equal
+sequences with different bytes as `feed_rollback`. The bundle pins no registry
+key. Migration 11 is amended in place: starter statuses may precede registry
+configuration, and a machine-local metadata proof re-authenticates them after
+restart. Archives and manifests remain outside SQLite.
+
+At startup, `<store folder>/catalog/starter-bundle.tar` is considered only when
+the content store is empty. Loading runs on a background blocking worker, never
+on startup or health. A private machine-local `catalog/starter-bundle.attempt.json`
+records the attempt and its named outcome, including refusals, so a refused or
+interrupted automatic load is not retried at every restart. An explicit seed
+command is still allowed after an automatic refusal. The installer owns placing
+the bundle file; seeding does not create an agent or activate its packages.
+
 ## Publishing
 
 `catalog.publish` accepts the CLI-canonicalized absolute package directory, an

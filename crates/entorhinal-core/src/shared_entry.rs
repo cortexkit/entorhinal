@@ -652,6 +652,7 @@ mod tests {
                     "catalog_registry_key",
                     "catalog_feed",
                     "catalog_status",
+                    "catalog_starter_proof",
                     "catalog_publisher_grant",
                     "catalog_audit",
                     "catalog_plan",

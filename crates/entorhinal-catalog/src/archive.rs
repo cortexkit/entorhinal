@@ -24,6 +24,7 @@ pub enum ArchiveRule {
     TrailingData,
     CkJsonMissing,
     CkJsonNotFirst,
+    MemberUnlisted,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ArchiveError {
@@ -118,6 +119,26 @@ fn text(field: &[u8]) -> String {
         .collect()
 }
 pub fn read(archive: &[u8]) -> Result<BTreeMap<String, &[u8]>, ArchiveError> {
+    let members = read_members(archive)?;
+    if !members.contains_key("ck.json") {
+        return Err(ArchiveError::new(ArchiveRule::CkJsonMissing, None));
+    }
+    Ok(members
+        .into_iter()
+        .map(|(path, member)| (path, member.bytes))
+        .collect())
+}
+
+/// A regular ustar member, retaining its header offset for precise refusals.
+#[derive(Clone, Copy, Debug)]
+pub struct ReadMember<'a> {
+    pub bytes: &'a [u8],
+    pub offset: usize,
+}
+
+/// Read the common strict ustar grammar without requiring a package manifest.
+/// Package archives use `read`; container formats enforce their own member list.
+pub fn read_members(archive: &[u8]) -> Result<BTreeMap<String, ReadMember<'_>>, ArchiveError> {
     if archive.len() > ARCHIVE_MAX {
         return Err(ArchiveError::cap(RefusalCode::ArchiveTooLarge));
     }
@@ -193,16 +214,19 @@ pub fn read(archive: &[u8]) -> Result<BTreeMap<String, &[u8]>, ArchiveError> {
         if path == "ck.json" && size > MANIFEST_MAX {
             return Err(ArchiveError::cap(RefusalCode::ManifestTooLarge));
         }
-        members.insert(path, &archive[at + 512..end]);
+        members.insert(
+            path,
+            ReadMember {
+                bytes: &archive[at + 512..end],
+                offset: at,
+            },
+        );
         at = size
             .checked_add(511)
             .and_then(|n| n.checked_div(512))
             .and_then(|n| n.checked_mul(512))
             .and_then(|n| n.checked_add(at + 512))
             .ok_or_else(|| fail(ArchiveRule::Truncated))?;
-    }
-    if !members.contains_key("ck.json") {
-        return Err(ArchiveError::new(ArchiveRule::CkJsonMissing, None));
     }
     Ok(members)
 }
