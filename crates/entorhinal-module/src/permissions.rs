@@ -1,5 +1,6 @@
 //! Local permission inventory, audit reads and operator-only hire limits.
-//! None of these operations contact Cingulate or join the shared-log writer.
+//! None of these operations contact Cingulate. Revocation gives the shared
+//! writer a short deadline; permission reads never join its queue.
 
 use super::agent_ops::{ConfirmationGuard, OperatorConfirmError};
 use super::shared_write::OPERATOR_BOUND;
@@ -16,6 +17,37 @@ pub(super) const LIST: &str = "permissions.list";
 pub(super) const REVOKE: &str = "permissions.revoke";
 pub(super) const AUDIT: &str = "agent.audit_list";
 pub(super) const SET_CAP: &str = "agent.set_hire_cap";
+const REVOKE_BOUND: std::time::Duration = std::time::Duration::from_secs(4);
+
+fn revoke_unavailable() -> HandlerError {
+    HandlerError::new(
+        "unavailable",
+        "a shared write is in progress; retry permission revocation",
+    )
+}
+
+fn revoke_on_store(
+    store: &RegistryStore,
+    params: Value,
+    now: i64,
+) -> Result<Vec<u8>, HandlerError> {
+    let request: RevokeRequest = parse(params)?;
+    let mut found = false;
+    for grant in store
+        .consent_grants()
+        .map_err(|error| HandlerError::new("storage_error", error.to_string()))?
+    {
+        if grant.id == request.id
+            && live(store, &grant)
+                .map_err(|error| HandlerError::new("storage_error", error.to_string()))?
+        {
+            found = true;
+            break;
+        }
+    }
+    let revoked = found && store.consent_transaction(|tx| tx.revoke_grant(&request.id, now))?;
+    encode_result(json!({"outcome":if revoked { "revoked" } else { "not_found" }}))
+}
 
 pub(super) fn admit(method: &str, principal: Option<&Principal>) -> Result<(), HandlerError> {
     let (module, code, message) = match method {
@@ -157,22 +189,35 @@ impl ProjectsHandler {
     }
 
     pub(super) fn permissions_revoke(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
-        let request: RevokeRequest = parse(params)?;
         let store = self.with_store(|s| Ok(s.clone()))?;
-        let grant = self.with_store(|s| {
-            for grant in s.consent_grants()? {
-                if grant.id == request.id && live(s, &grant)? {
-                    return Ok(Some(grant));
-                }
-            }
-            Ok(None)
-        })?;
-        let revoked = if grant.is_some() {
-            store.consent_transaction(|tx| tx.revoke_grant(&request.id, (self.clock)()))?
-        } else {
-            false
-        };
-        encode_result(json!({"outcome":if revoked { "revoked" } else { "not_found" }}))
+        revoke_on_store(&store, params, (self.clock)())
+    }
+
+    pub(super) async fn permissions_revoke_wait(
+        &self,
+        params: Value,
+        key: RouteKey,
+        received: Instant,
+    ) -> Result<Vec<u8>, HandlerError> {
+        self.admit(REVOKE, key)?;
+        let deadline = received + REVOKE_BOUND;
+        // Refuse before starting SQL when the shared writer is occupied. The
+        // caller has a five-second timeout and does not retry automatically.
+        let writer = timeout_at(deadline, self.writer.clone().lock_owned())
+            .await
+            .map_err(|_| revoke_unavailable())?;
+        let store = self.with_store(|s| Ok(s.clone()))?;
+        let now = (self.clock)();
+        let worker = tokio::task::spawn_blocking(move || {
+            let _writer = writer;
+            #[cfg(test)]
+            tokio::task::block_in_place(|| {});
+            revoke_on_store(&store, params, now)
+        });
+        timeout_at(deadline, worker)
+            .await
+            .map_err(|_| revoke_unavailable())?
+            .map_err(|error| HandlerError::new("storage_error", error.to_string()))?
     }
 
     pub(super) fn agent_audit_list(&self, params: Value) -> Result<Vec<u8>, HandlerError> {

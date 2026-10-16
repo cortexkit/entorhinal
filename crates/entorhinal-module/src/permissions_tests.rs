@@ -293,26 +293,20 @@ async fn provider_revoke_vectors_are_idempotent_local_and_prompt_free() {
     f.grant("grt_03", 1, GrantClass::Hire);
     let before = f.store().agent_changes(0, None).unwrap();
     let journal = f.store().generation().unwrap();
-    // Hold the shared-log writer lock: local permission reads and revokes must
-    // still complete on their first poll, without waiting for that writer.
-    let _writer = f.handler.writer.lock().await;
     for principal in [Principal::Direct, reserved("cingulate")] {
         f.bind(Some(principal.clone()));
-        let read = f.call(LIST, json!({}));
-        let mut read = std::pin::pin!(read);
-        assert!(matches!(
-            read.as_mut().poll(&mut Context::from_waker(Waker::noop())),
-            Poll::Ready(_)
-        ));
+        {
+            // Permission reads remain independent of the shared writer.
+            let _writer = f.handler.writer.lock().await;
+            let read = f.call(LIST, json!({}));
+            let mut read = std::pin::pin!(read);
+            assert!(matches!(
+                read.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Ready(_)
+            ));
+        }
         let v = vector("revoked");
-        let revoke = f.call(REVOKE, v["request"].clone());
-        let mut revoke = std::pin::pin!(revoke);
-        let Poll::Ready(outcome) = revoke
-            .as_mut()
-            .poll(&mut Context::from_waker(Waker::noop()))
-        else {
-            panic!("revoke waited for shared writer")
-        };
+        let outcome = f.call(REVOKE, v["request"].clone()).await;
         let wanted = if principal == Principal::Direct {
             v["reply"].clone()
         } else {
@@ -331,6 +325,85 @@ async fn provider_revoke_vectors_are_idempotent_local_and_prompt_free() {
     );
     assert_eq!(f.store().generation().unwrap(), journal);
     assert!(f.prompt.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn revoke_during_shared_sql_answers_within_four_seconds_without_stalling_reads() {
+    use subc_client_rs::ModuleHandler;
+    async fn finish<F: Future>(future: F) -> F::Output {
+        tokio::pin!(future);
+        loop {
+            tokio::select! {
+                result = &mut future => return result,
+                () = tokio::task::yield_now() => {},
+            }
+        }
+    }
+    assert_eq!(tokio::runtime::Handle::current().metrics().num_workers(), 1);
+    let f = Fixture::new(Err(OperatorConfirmError::Declined));
+    f.grant("grt_03", 1, GrantClass::Hire);
+    let store = f.store();
+    let writer = f.handler.writer.clone().lock_owned().await;
+    let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let sql = tokio::task::spawn_blocking(move || {
+        let _writer = writer;
+        store
+            .apply_entry("test.held", "{}", "test", None, |_| {
+                let _ = ready_tx.send(());
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .unwrap();
+    });
+    while ready_rx.try_recv().is_err() {
+        tokio::task::yield_now().await;
+    }
+    let request = vector("revoked")["request"].clone();
+    let mut revoke = Box::pin(f.call(REVOKE, request.clone()));
+    assert!(revoke
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_pending());
+    let mut health = Box::pin(f.handler.health());
+    assert!(health
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_ready());
+    for method in [LIST, "agent.fleet_identity", "enumerate"] {
+        let mut read = Box::pin(f.call(method, json!({})));
+        assert!(
+            matches!(
+                read.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Ready(HandlerOutcome::Response(_))
+            ),
+            "{method} waited for SQL"
+        );
+    }
+    tokio::time::advance(std::time::Duration::from_millis(4_001)).await;
+    let answer = revoke
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()));
+    // Release before asserting so an intentionally broken deadline cannot leave
+    // a blocking worker alive when the test runtime shuts down.
+    release_tx.send(()).unwrap();
+    while !sql.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    sql.await.unwrap();
+    assert!(
+        matches!(answer, Poll::Ready(HandlerOutcome::Error { ref code, ref message }) if code == "unavailable" && message.contains("shared write is in progress")),
+        "{answer:?}"
+    );
+    drop(revoke);
+    assert_eq!(
+        result(finish(f.call(REVOKE, request.clone())).await)["outcome"],
+        "revoked"
+    );
+    assert_eq!(
+        result(finish(f.call(REVOKE, request)).await)["outcome"],
+        "not_found"
+    );
 }
 
 #[tokio::test]

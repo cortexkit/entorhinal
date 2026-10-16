@@ -3853,7 +3853,7 @@ expect_red = ["permissions::tests::provider_drops_grants_when_holder_or_subject_
 id = "permissions-revoke-persisted"
 guards = "Revocation persists and a repeated revoke returns not_found instead of claiming another change"
 file = "crates/entorhinal-module/src/permissions.rs"
-old = 'store.consent_transaction(|tx| tx.revoke_grant(&request.id, (self.clock)()))?'
+old = 'store.consent_transaction(|tx| tx.revoke_grant(&request.id, now))?'
 new = 'store.consent_transaction(|_| Ok(true))? /* NON-VACUITY BREAK */'
 test_file = "crates/entorhinal-module/src/permissions_tests.rs"
 runner = "cargo"
@@ -3864,10 +3864,11 @@ expect_red = ["permissions::tests::provider_revoke_vectors_are_idempotent_local_
 
 [[control]]
 id = "permissions-revoke-local-writer"
-guards = "Prompt-free local revocation does not queue behind the shared writer"
+guards = "Local revocation uses its four-second deadline rather than the shared-write deadline"
 file = "crates/entorhinal-module/src/main.rs"
 old = '''} else if request.method == permissions::REVOKE {
-            self.execute(request, key)'''
+            self.permissions_revoke_wait(request.params, key, received)
+                .await'''
 new = '''} else if request.method == permissions::REVOKE {
             self.write_wait(request, key, received).await // NON-VACUITY BREAK'''
 test_file = "crates/entorhinal-module/src/permissions_tests.rs"
@@ -3875,7 +3876,7 @@ runner = "cargo"
 package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
-expect_red = ["permissions::tests::provider_revoke_vectors_are_idempotent_local_and_prompt_free"]
+expect_red = ["permissions::tests::revoke_during_shared_sql_answers_within_four_seconds_without_stalling_reads"]
 
 [[control]]
 id = "agent-audit-admission"
@@ -5341,8 +5342,8 @@ expect_red = ["agent::validate::tests::avatar_lengths_are_per_type"]
 id = "avatar-manifest-seed-skip"
 guards = "Seed-only never overwrites an existing avatar"
 file = "crates/entorhinal-core/src/agent/avatars.rs"
-old = 'let state = if !request.replace && row.avatar.is_some() {'
-new = 'let state = if false && !request.replace && row.avatar.is_some() { // NON-VACUITY BREAK'
+old = 'let state = if already_applied || (!request.replace && row.avatar.is_some()) {'
+new = 'let state = if already_applied { // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-core/src/agent/avatars.rs"
 runner = "cargo"
 package = "entorhinal-core"
@@ -5354,7 +5355,7 @@ expect_red = ["agent::avatars::tests::avatar_manifest_seed_only_previews_skips_a
 id = "avatar-manifest-replace"
 guards = "Replace writes agents that already have avatars"
 file = "crates/entorhinal-core/src/agent/avatars.rs"
-old = 'let state = if !request.replace && row.avatar.is_some() {'
+old = 'let state = if already_applied || (!request.replace && row.avatar.is_some()) {'
 new = 'let state = if row.avatar.is_some() { // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-core/src/agent/avatars.rs"
 runner = "cargo"
@@ -5365,7 +5366,7 @@ expect_red = ["agent::avatars::tests::avatar_manifest_replace_accepts_full_genom
 
 [[control]]
 id = "avatar-manifest-identical"
-guards = "A fresh replacement refuses full genome equality"
+guards = "A replacement refuses relabelling an identical genome as a different type or version"
 file = "crates/entorhinal-core/src/agent/avatars.rs"
 old = '.is_some_and(|avatar| avatar.genome == entry.avatar_genome)'
 new = '.is_some_and(|avatar| false && avatar.genome == entry.avatar_genome) // NON-VACUITY BREAK'
@@ -5744,3 +5745,114 @@ package = "entorhinal-core"
 target = "--lib"
 select = "expected"
 expect_red = ["agent::avatars::tests::avatar_manifest_summary_refuses_overlong_type_without_truncation"]
+
+# Slow identity-log appends must not occupy Tokio workers or the drain budget.
+[[control]]
+id = "avatar-incident-session-off-runtime"
+guards = "Session registration waits on the SQLite connection only off Tokio runtime workers"
+file = "crates/entorhinal-module/src/shared_write.rs"
+old = '''            let worker = tokio::task::spawn_blocking(move || {
+                // On a single-worker test runtime this panics before SQLite if'''
+new = '''            let worker = tokio::spawn(async move { // NON-VACUITY BREAK
+                // On a single-worker test runtime this panics before SQLite if'''
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::avatar_batch_keeps_one_runtime_worker_available_and_local_writes_bounded"]
+
+[[control]]
+id = "avatar-incident-session-deadline"
+guards = "A queued local session registration answers within its receipt-relative deadline"
+file = "crates/entorhinal-module/src/shared_write.rs"
+old = 'return timeout_at(received + DEADLINE, worker)'
+new = 'return timeout_at(received + DEADLINE + Duration::from_secs(1), worker) // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::avatar_batch_keeps_one_runtime_worker_available_and_local_writes_bounded"]
+
+[[control]]
+id = "avatar-incident-read-isolation"
+guards = "Cold fleet, avatar, resolve and enumerate reads do not wait on background network catch-up"
+file = "crates/entorhinal-module/src/agent_reads.rs"
+old = '''    ) -> subc_client_rs::HandlerOutcome {
+        let request = match serde_json::from_slice::<WireRequest>(body) {'''
+new = '''    ) -> subc_client_rs::HandlerOutcome {
+        let _writer = self.writer.lock().await; // NON-VACUITY BREAK
+        let request = match serde_json::from_slice::<WireRequest>(body) {'''
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::cold_fleet_and_avatar_reads_do_not_wait_for_background_log_read"]
+
+[[control]]
+id = "avatar-incident-health-isolation"
+guards = "Health never waits on an identity-log append"
+file = "crates/entorhinal-module/src/main.rs"
+old = '    async fn health(&self) -> HealthReport {'
+new = '''    async fn health(&self) -> HealthReport {
+        let _writer = self.writer.lock().await; // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::avatar_batch_keeps_one_runtime_worker_available_and_local_writes_bounded"]
+
+[[control]]
+id = "avatar-incident-drain"
+guards = "A drain notice interrupts an in-flight batch before its append completes"
+file = "crates/entorhinal-module/src/main.rs"
+old = 'self.draining.send_replace(true);'
+new = 'self.draining.send_replace(false); // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::avatar_batch_drain_interrupts_append_without_waiting_for_network_and_resumes"]
+
+[[control]]
+id = "avatar-incident-late-accept-resume"
+guards = "A replayed matching avatar after-image is already applied even without a local request-key response"
+file = "crates/entorhinal-core/src/agent/avatars.rs"
+old = 'let already_applied = row.avatar.as_ref().is_some_and(|avatar| {'
+new = 'let already_applied = false && row.avatar.as_ref().is_some_and(|avatar| { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::avatar_batch_drain_interrupts_append_without_waiting_for_network_and_resumes"]
+
+[[control]]
+id = "permissions-revoke-off-runtime"
+guards = "Local permission revocation runs SQL off the async runtime workers"
+file = "crates/entorhinal-module/src/permissions.rs"
+old = 'let worker = tokio::task::spawn_blocking(move || {'
+new = 'let worker = tokio::spawn(async move { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/permissions_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["permissions::tests::revoke_during_shared_sql_answers_within_four_seconds_without_stalling_reads"]
+
+[[control]]
+id = "permissions-revoke-four-second-bound"
+guards = "A revoke refuses before Cingulate's five-second caller timeout when a shared transaction is open"
+file = "crates/entorhinal-module/src/permissions.rs"
+old = 'const REVOKE_BOUND: std::time::Duration = std::time::Duration::from_secs(4);'
+new = 'const REVOKE_BOUND: std::time::Duration = std::time::Duration::from_secs(6); // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/permissions_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["permissions::tests::revoke_during_shared_sql_answers_within_four_seconds_without_stalling_reads"]
