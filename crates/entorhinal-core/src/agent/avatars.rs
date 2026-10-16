@@ -225,7 +225,17 @@ fn plan(
         }
         match load_row(conn, id)? {
             Some(row) if row.status == "live" => {
+                // A matching after-image may have arrived through log recovery
+                // or another machine, without this machine's request-key cache.
+                // It is already done; only relabelling the same genome is a
+                // mistake, since a new type or version needs its own genome.
+                let already_applied = row.avatar.as_ref().is_some_and(|avatar| {
+                    avatar.genome == entry.avatar_genome
+                        && avatar.avatar_type == entry.avatar_type
+                        && avatar.version == Some(entry.avatar_version)
+                });
                 if request.replace
+                    && !already_applied
                     && row
                         .avatar
                         .as_ref()
@@ -236,7 +246,7 @@ fn plan(
                         row.name
                     ));
                 }
-                let state = if !request.replace && row.avatar.is_some() {
+                let state = if already_applied || (!request.replace && row.avatar.is_some()) {
                     State::Skipped
                 } else {
                     State::Pending
@@ -548,7 +558,25 @@ mod tests {
         apply(&f, request(json!([entry(&id, "b")]), false));
         let mut params = request(json!([entry(&id, "b")]), true);
         params["request_key"] = json!("different-run");
+        params["entries"][0]["avatar_type"] = json!("creature.classic");
+        unchanged_refusal(&f, params.clone(), "identical");
+        params["entries"][0]["avatar_type"] = json!("creature.wild");
+        params["entries"][0]["avatar_version"] = json!(2);
         unchanged_refusal(&f, params, "identical");
+    }
+
+    #[test]
+    fn avatar_manifest_matching_after_image_is_skipped_without_a_request_cache() {
+        let f = fixture(true);
+        let id = create(&f, "Ada", "assistant", None, None);
+        apply(&f, request(json!([entry(&id, "b")]), false));
+        let before = f.store.generation().unwrap();
+        let mut params = request(json!([entry(&id, "b")]), true);
+        params["request_key"] = json!("another-machine");
+        let result = apply(&f, params);
+        assert_eq!(result["applied"], 0);
+        assert_eq!(result["skipped"].as_array().unwrap().len(), 1);
+        assert_eq!(f.store.generation().unwrap(), before);
     }
 
     #[test]

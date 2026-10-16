@@ -18,7 +18,7 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use entorhinal_core::SessionRegistration;
+use entorhinal_core::{RegistryStore, SessionRegistration};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use subc_client_rs::{CallError, ConsumerOptions, SubcConsumer};
@@ -569,25 +569,37 @@ impl ProjectsHandler {
         params: Value,
         role: SessionRole,
     ) -> Result<Vec<u8>, HandlerError> {
-        let request: RegisterSessionRequest = decode(params)?;
-        ref_bounds(&request.ref_kind, &request.session_ref)?;
-        session_key_bounds(&request.harness, &request.session_id)?;
-        bounded("project_root", &request.project_root, PROJECT_ROOT_MAX)?;
-        let binding = self.with_agent_store(|store| {
-            store.register_session(&SessionRegistration {
-                agent_id: &request.agent_id,
-                ref_kind: &request.ref_kind,
-                session_ref: &request.session_ref,
-                harness: &request.harness,
-                session_id: &request.session_id,
-                project_root: &request.project_root,
-                registered_by: role.as_str(),
-                now_ms: (self.clock)(),
-            })
-        })?;
-        encode_result(binding)
+        let store = self.with_store(|s| Ok(s.clone()))?;
+        register_session_on_store(&store, params, role, (self.clock)())
     }
+}
 
+pub(super) fn register_session_on_store(
+    store: &RegistryStore,
+    params: Value,
+    role: SessionRole,
+    now: i64,
+) -> Result<Vec<u8>, HandlerError> {
+    let request: RegisterSessionRequest = decode(params)?;
+    ref_bounds(&request.ref_kind, &request.session_ref)?;
+    session_key_bounds(&request.harness, &request.session_id)?;
+    bounded("project_root", &request.project_root, PROJECT_ROOT_MAX)?;
+    let binding = store
+        .register_session(&SessionRegistration {
+            agent_id: &request.agent_id,
+            ref_kind: &request.ref_kind,
+            session_ref: &request.session_ref,
+            harness: &request.harness,
+            session_id: &request.session_id,
+            project_root: &request.project_root,
+            registered_by: role.as_str(),
+            now_ms: now,
+        })
+        .map_err(HandlerError::from)?;
+    encode_result(binding)
+}
+
+impl ProjectsHandler {
     pub(super) fn for_session(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
         let request: ForSessionRequest = decode(params)?;
         session_key_bounds(&request.harness, &request.session_id)?;

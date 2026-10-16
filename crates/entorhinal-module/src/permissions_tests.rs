@@ -293,26 +293,20 @@ async fn provider_revoke_vectors_are_idempotent_local_and_prompt_free() {
     f.grant("grt_03", 1, GrantClass::Hire);
     let before = f.store().agent_changes(0, None).unwrap();
     let journal = f.store().generation().unwrap();
-    // Hold the shared-log writer lock: local permission reads and revokes must
-    // still complete on their first poll, without waiting for that writer.
-    let _writer = f.handler.writer.lock().await;
     for principal in [Principal::Direct, reserved("cingulate")] {
         f.bind(Some(principal.clone()));
-        let read = f.call(LIST, json!({}));
-        let mut read = std::pin::pin!(read);
-        assert!(matches!(
-            read.as_mut().poll(&mut Context::from_waker(Waker::noop())),
-            Poll::Ready(_)
-        ));
+        {
+            // Permission reads remain independent of the shared writer.
+            let _writer = f.handler.writer.lock().await;
+            let read = f.call(LIST, json!({}));
+            let mut read = std::pin::pin!(read);
+            assert!(matches!(
+                read.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Ready(_)
+            ));
+        }
         let v = vector("revoked");
-        let revoke = f.call(REVOKE, v["request"].clone());
-        let mut revoke = std::pin::pin!(revoke);
-        let Poll::Ready(outcome) = revoke
-            .as_mut()
-            .poll(&mut Context::from_waker(Waker::noop()))
-        else {
-            panic!("revoke waited for shared writer")
-        };
+        let outcome = f.call(REVOKE, v["request"].clone()).await;
         let wanted = if principal == Principal::Direct {
             v["reply"].clone()
         } else {
@@ -330,6 +324,126 @@ async fn provider_revoke_vectors_are_idempotent_local_and_prompt_free() {
         before.entries.len()
     );
     assert_eq!(f.store().generation().unwrap(), journal);
+    assert!(f.prompt.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn revoke_during_shared_sql_answers_within_four_seconds_without_stalling_reads() {
+    use subc_client_rs::ModuleHandler;
+    async fn finish<F: Future>(future: F) -> F::Output {
+        tokio::pin!(future);
+        loop {
+            tokio::select! {
+                result = &mut future => return result,
+                () = tokio::task::yield_now() => {},
+            }
+        }
+    }
+    assert_eq!(tokio::runtime::Handle::current().metrics().num_workers(), 1);
+    let f = Fixture::new(Err(OperatorConfirmError::Declined));
+    f.grant("grt_03", 1, GrantClass::Hire);
+    let store = f.store();
+    let writer = f.handler.writer.clone().lock_owned().await;
+    let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let sql = tokio::task::spawn_blocking(move || {
+        let _writer = writer;
+        store
+            .apply_entry("test.held", "{}", "test", None, |_| {
+                let _ = ready_tx.send(());
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .unwrap();
+    });
+    while ready_rx.try_recv().is_err() {
+        tokio::task::yield_now().await;
+    }
+    let request = vector("revoked")["request"].clone();
+    let mut revoke = Box::pin(f.call(REVOKE, request.clone()));
+    assert!(revoke
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_pending());
+    let mut health = Box::pin(f.handler.health());
+    assert!(health
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_ready());
+    for method in [LIST, "agent.fleet_identity", "enumerate"] {
+        let mut read = Box::pin(f.call(method, json!({})));
+        assert!(
+            matches!(
+                read.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Ready(HandlerOutcome::Response(_))
+            ),
+            "{method} waited for SQL"
+        );
+    }
+    tokio::time::advance(std::time::Duration::from_millis(4_001)).await;
+    let answer = revoke
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()));
+    // Release before asserting so an intentionally broken deadline cannot leave
+    // a blocking worker alive when the test runtime shuts down.
+    release_tx.send(()).unwrap();
+    while !sql.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    sql.await.unwrap();
+    assert!(
+        matches!(answer, Poll::Ready(HandlerOutcome::Error { ref code, ref message }) if code == "unavailable" && message.contains("shared write is in progress")),
+        "{answer:?}"
+    );
+    drop(revoke);
+    assert_eq!(
+        result(finish(f.call(REVOKE, request.clone())).await)["outcome"],
+        "revoked"
+    );
+    assert_eq!(
+        result(finish(f.call(REVOKE, request)).await)["outcome"],
+        "not_found"
+    );
+}
+
+#[tokio::test]
+async fn publisher_revoke_is_off_runtime_persisted_and_audits_the_request_principal() {
+    use entorhinal_core::catalog_grants::{Operation, PublisherGrant};
+    assert_eq!(tokio::runtime::Handle::current().metrics().num_workers(), 1);
+    let f = Fixture::new(Err(OperatorConfirmError::Declined));
+    let store = f.store();
+    let grant = PublisherGrant {
+        id: "pg_revoke".into(),
+        publisher_fingerprint: "ab".repeat(32),
+        operation: Operation::Install,
+        placement_agent_id: f.agents[0].clone(),
+        ceiling: vec![],
+        card_ref: None,
+        granted_at_ms: 99,
+        revoked_at_ms: None,
+    };
+    store
+        .insert_publisher_grant(&grant, &json!({"kind":"direct"}))
+        .unwrap();
+    let principal = reserved("cingulate");
+    f.bind(Some(principal.clone()));
+    for (id, expected) in [
+        ("pg_revoke", "revoked"),
+        ("pg_revoke", "not_found"),
+        ("pg_unknown", "not_found"),
+    ] {
+        assert_eq!(
+            result(f.call(REVOKE, json!({"id":id})).await)["outcome"],
+            expected
+        );
+    }
+    assert_eq!(
+        store.publisher_grants().unwrap()[0].revoked_at_ms,
+        Some(100)
+    );
+    let audit = store.catalog_audit().unwrap();
+    assert_eq!(audit.len(), 2);
+    assert_eq!(audit[1]["detail"]["principal"], json!(principal));
     assert!(f.prompt.calls.lock().unwrap().is_empty());
 }
 
@@ -545,7 +659,6 @@ async fn hire_cap_admission_validation_and_confirmation_guard_every_write() {
     );
     f.bind(Some(Principal::Direct));
     let before = f.store().generation().unwrap();
-    let _writer = f.handler.writer.lock().await;
     for cap in [0, 20, 0] {
         assert_eq!(
             result(f.call(SET_CAP, json!({"project_id":"P","cap":cap})).await),
@@ -592,6 +705,87 @@ async fn hire_cap_admission_validation_and_confirmation_guard_every_write() {
         assert_eq!(f.store().project_hire_cap("P").unwrap().cap, 10);
         assert_eq!(f.prompt.calls.lock().unwrap().len(), 1);
         assert!(f.handler.confirmation_slot.lock().unwrap().is_none());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn hire_cap_sql_runs_off_runtime_and_is_bounded_after_confirmation() {
+    use subc_client_rs::ModuleHandler;
+    struct Delayed;
+    #[async_trait]
+    impl OperatorConfirmer for Delayed {
+        async fn confirm_operator(&self, _: &str, _: RouteKey) -> Result<(), OperatorConfirmError> {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            Ok(())
+        }
+    }
+    assert_eq!(tokio::runtime::Handle::current().metrics().num_workers(), 1);
+    for hold_writer in [true, false] {
+        let mut f = Fixture::new(Ok(()));
+        f.handler.operator_confirmer = Arc::new(Delayed);
+        let store = f.store();
+        let writer = if hold_writer {
+            Some(f.handler.writer.clone().lock_owned().await)
+        } else {
+            None
+        };
+        let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let sql = tokio::task::spawn_blocking(move || {
+            let _writer = writer;
+            store
+                .apply_entry("test.held", "{}", "test", None, |_| {
+                    let _ = ready_tx.send(());
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        });
+        while ready_rx.try_recv().is_err() {
+            tokio::task::yield_now().await;
+        }
+        let mut cap = Box::pin(f.call(SET_CAP, json!({"project_id":"P","cap":0})));
+        assert!(cap
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        assert!(cap
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        let mut health = Box::pin(f.handler.health());
+        assert!(health
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_ready());
+        for method in [LIST, "agent.fleet_identity", "enumerate"] {
+            let mut read = Box::pin(f.call(method, json!({})));
+            assert!(matches!(
+                read.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Ready(HandlerOutcome::Response(_))
+            ));
+        }
+        tokio::time::advance(std::time::Duration::from_millis(4_001)).await;
+        let answer = cap.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+        // Always release the real SQL mutex before checking the deadline, so
+        // a broken bound cannot strand a blocking worker at runtime shutdown.
+        release_tx.send(()).unwrap();
+        sql.await.unwrap();
+        assert!(
+            matches!(answer, Poll::Ready(HandlerOutcome::Error { ref code, .. }) if code == "unavailable"),
+            "{answer:?}"
+        );
+        drop(cap);
+        drop(health);
+        while f.handler.confirmation_slot.lock().unwrap().is_some() {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            f.store().project_hire_cap("P").unwrap().cap,
+            if hold_writer { 10 } else { 0 }
+        );
+        assert!(f.handler.writer.try_lock().is_ok());
     }
 }
 

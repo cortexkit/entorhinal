@@ -1,5 +1,6 @@
 //! Local permission inventory, audit reads and operator-only hire limits.
-//! None of these operations contact Cingulate or join the shared-log writer.
+//! None of these operations contact Cingulate. Revocation gives the shared
+//! writer a short deadline; permission reads never join its queue.
 
 use super::agent_ops::{ConfirmationGuard, OperatorConfirmError};
 use super::shared_write::OPERATOR_BOUND;
@@ -16,6 +17,43 @@ pub(super) const LIST: &str = "permissions.list";
 pub(super) const REVOKE: &str = "permissions.revoke";
 pub(super) const AUDIT: &str = "agent.audit_list";
 pub(super) const SET_CAP: &str = "agent.set_hire_cap";
+const REVOKE_BOUND: std::time::Duration = std::time::Duration::from_secs(4);
+const CAP_WRITE_BOUND: std::time::Duration = std::time::Duration::from_secs(4);
+
+fn revoke_unavailable() -> HandlerError {
+    HandlerError::new(
+        "unavailable",
+        "a shared write is in progress; retry permission revocation",
+    )
+}
+
+fn revoke_on_store(
+    store: &RegistryStore,
+    params: Value,
+    now: i64,
+    principal: Value,
+) -> Result<Vec<u8>, HandlerError> {
+    let request: RevokeRequest = parse(params)?;
+    let mut found = false;
+    for grant in store
+        .consent_grants()
+        .map_err(|error| HandlerError::new("storage_error", error.to_string()))?
+    {
+        if grant.id == request.id
+            && live(store, &grant)
+                .map_err(|error| HandlerError::new("storage_error", error.to_string()))?
+        {
+            found = true;
+            break;
+        }
+    }
+    let revoked = if found {
+        store.consent_transaction(|tx| tx.revoke_grant(&request.id, now))?
+    } else {
+        store.revoke_publisher_grant(&request.id, now, &principal)?
+    };
+    encode_result(json!({"outcome":if revoked { "revoked" } else { "not_found" }}))
+}
 
 pub(super) fn admit(method: &str, principal: Option<&Principal>) -> Result<(), HandlerError> {
     let (module, code, message) = match method {
@@ -176,26 +214,41 @@ impl ProjectsHandler {
         params: Value,
         key: RouteKey,
     ) -> Result<Vec<u8>, HandlerError> {
-        let request: RevokeRequest = parse(params)?;
         let store = self.with_store(|s| Ok(s.clone()))?;
-        let grant = self.with_store(|s| {
-            for grant in s.consent_grants()? {
-                if grant.id == request.id && live(s, &grant)? {
-                    return Ok(Some(grant));
-                }
-            }
-            Ok(None)
-        })?;
-        let revoked = if grant.is_some() {
-            store.consent_transaction(|tx| tx.revoke_grant(&request.id, (self.clock)()))?
-        } else {
-            store.revoke_publisher_grant(
-                &request.id,
-                (self.clock)(),
-                &json!(self.admission_for(key).principal),
-            )?
-        };
-        encode_result(json!({"outcome":if revoked { "revoked" } else { "not_found" }}))
+        revoke_on_store(
+            &store,
+            params,
+            (self.clock)(),
+            json!(self.admission_for(key).principal),
+        )
+    }
+
+    pub(super) async fn permissions_revoke_wait(
+        &self,
+        params: Value,
+        key: RouteKey,
+        received: Instant,
+    ) -> Result<Vec<u8>, HandlerError> {
+        self.admit(REVOKE, key)?;
+        let deadline = received + REVOKE_BOUND;
+        // Refuse before starting SQL when the shared writer is occupied. The
+        // caller has a five-second timeout and does not retry automatically.
+        let writer = timeout_at(deadline, self.writer.clone().lock_owned())
+            .await
+            .map_err(|_| revoke_unavailable())?;
+        let store = self.with_store(|s| Ok(s.clone()))?;
+        let now = (self.clock)();
+        let principal = json!(self.admission_for(key).principal);
+        let worker = tokio::task::spawn_blocking(move || {
+            let _writer = writer;
+            #[cfg(test)]
+            tokio::task::block_in_place(|| {});
+            revoke_on_store(&store, params, now, principal)
+        });
+        timeout_at(deadline, worker)
+            .await
+            .map_err(|_| revoke_unavailable())?
+            .map_err(|error| HandlerError::new("storage_error", error.to_string()))?
     }
 
     pub(super) fn agent_audit_list(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
@@ -246,8 +299,37 @@ impl ProjectsHandler {
         if Instant::now() >= received + OPERATOR_BOUND || *guard.cancelled.borrow() {
             return Err(OperatorConfirmError::Declined.into());
         }
-        self.with_agent_store(|s| s.set_project_hire_cap(&request.project_id, request.cap))?;
-        encode_result(json!({"project_id":request.project_id,"cap":request.cap}))
+        // Confirmation may take minutes; bound the local SQL phase separately,
+        // without extending the receipt-relative operator deadline.
+        let deadline = (Instant::now() + CAP_WRITE_BOUND).min(received + OPERATOR_BOUND);
+        let unavailable = || {
+            HandlerError::new(
+                "unavailable",
+                "a shared write is in progress; retry setting the hire cap",
+            )
+        };
+        let writer = tokio::select! {
+            biased;
+            _ = guard.cancelled.wait_for(|closed| *closed) => return Err(OperatorConfirmError::Declined.into()),
+            result = timeout_at(deadline, self.writer.clone().lock_owned()) => result.map_err(|_| unavailable())?,
+        };
+        if Instant::now() >= deadline || *guard.cancelled.borrow() {
+            return Err(OperatorConfirmError::Declined.into());
+        }
+        let store = self.with_store(|s| Ok(s.clone()))?;
+        let sql = tokio::task::spawn_blocking(move || {
+            // Keep confirmation exclusion until SQL finishes, even if the
+            // caller times out or disconnects while the worker is running.
+            let (_writer, _confirmation) = (writer, guard);
+            #[cfg(test)]
+            tokio::task::block_in_place(|| {});
+            store.set_project_hire_cap(&request.project_id, request.cap)?;
+            encode_result(json!({"project_id":request.project_id,"cap":request.cap}))
+        });
+        timeout_at(deadline, sql)
+            .await
+            .map_err(|_| unavailable())?
+            .map_err(|error| HandlerError::new("storage_error", error.to_string()))?
     }
 }
 

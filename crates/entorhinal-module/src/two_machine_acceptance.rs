@@ -4075,6 +4075,225 @@ struct InterruptAvatarLog {
     remaining: Arc<AtomicUsize>,
 }
 
+// First-poll checks observe async suspension without measuring elapsed time.
+fn first_poll<F: Future>(future: std::pin::Pin<&mut F>) -> std::task::Poll<F::Output> {
+    future.poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+}
+
+async fn avatar_incident_pair() -> (Machine, Machine, Arc<FakeLog>, Value, String) {
+    let log = Arc::new(FakeLog::default());
+    let mut a = Machine::new("avatar-incident-a", log.clone());
+    let b = Machine::new("avatar-incident-b", log.clone());
+    a.handler.operator_confirmer = Arc::new(crate::served_vectors::Approve {
+        summaries: std::sync::Mutex::new(vec![]),
+    });
+    let resolver = sessions::FakeResolver::new();
+    for capability in [sessions::ORCHESTRATOR_CAPABILITY, sessions::HOST_CAPABILITY] {
+        resolver.set(
+            capability,
+            sessions::ProviderResolution::Provider(WRITER_MODULE.into()),
+        );
+    }
+    a.handler.provider_resolver = resolver;
+    a.store()
+        .apply_entry("agent.cutover", "{}", "test", None, |_| Ok(()))
+        .unwrap();
+    let mut entries = Vec::new();
+    for index in 0..32 {
+        let agent = a.call("agent.create", json!({"role":"assistant","name":format!("Avatar {index}"),"tag":"test","request_key":format!("create-{index}")})).await.unwrap();
+        entries.push(json!({"agent_id":agent["agent"]["agent_id"],"avatar_genome":"ab".repeat(16_384),"avatar_type":"creature.wild","avatar_version":1}));
+    }
+    let id = entries[0]["agent_id"].as_str().unwrap().to_owned();
+    a.enable().await;
+    b.enable().await;
+    (
+        a,
+        b,
+        log,
+        json!({"request_key":"avatars","replace":true,"entries":entries}),
+        id,
+    )
+}
+
+fn registration_body(id: &str) -> Vec<u8> {
+    serde_json::to_vec(&json!({"method":sessions::REGISTER_SESSION,"params":{
+        "agent_id":id,"ref_kind":"pi","ref":"avatar-ref","harness":"pi","session_id":"avatar-session","project_root":"/project"
+    }})).unwrap()
+}
+
+#[tokio::test(start_paused = true)]
+async fn avatar_batch_keeps_one_runtime_worker_available_and_local_writes_bounded() {
+    assert_eq!(tokio::runtime::Handle::current().metrics().num_workers(), 1);
+    let (a, b, log, params, id) = avatar_incident_pair().await;
+    a.bytes_on(
+        CORE,
+        sessions::REGISTER_SESSION,
+        serde_json::from_slice::<Value>(&registration_body(&id)).unwrap()["params"].clone(),
+    )
+    .await
+    .unwrap();
+    let head = log.head();
+    let calls = log.calls();
+    for _ in 0..32 {
+        log.on_append(crate::fake_log::Action::Hold);
+    }
+    let batch_body =
+        serde_json::to_vec(&json!({"method":"agent.apply_avatar_manifest","params":params}))
+            .unwrap();
+    let mut batch = Box::pin(a.handler.handle_served_request(&batch_body, DIRECT));
+    for index in 0..32 {
+        drive(async {
+            tokio::select! {
+                biased;
+                () = log.wait_for_calls(calls + (index + 1) * 2) => {},
+                result = &mut batch => panic!("batch finished before append {index}: {result:?}"),
+            }
+        })
+        .await;
+        let frozen = tokio::time::Instant::now();
+        let body = registration_body(&id);
+        let mut registration = Box::pin(a.handler.handle_served_request(&body, CORE));
+        let unrelated_body = serde_json::to_vec(&json!({"method":"register","params":{"projectId":"unrelated","name":"unrelated","roots":[],"requestKey":"unrelated"}})).unwrap();
+        let mut unrelated = Box::pin(a.handler.handle_served_request(&unrelated_body, DIRECT));
+        assert!(first_poll(registration.as_mut()).is_pending());
+        assert!(first_poll(unrelated.as_mut()).is_pending());
+        for (method, params) in [
+            ("resolve", json!({"canonicalRoot":a.dir})),
+            ("enumerate", json!({})),
+            (
+                sessions::SESSION_FOR_REF,
+                json!({"ref_kind":"pi","ref":"avatar-ref"}),
+            ),
+            ("agent.fleet_identity", json!({})),
+            ("agent.avatar_read", json!({"agentIds":[id]})),
+            (
+                "projects.session_liveness",
+                json!({"seq":index+1,"snapshot":true,"sessions":[]}),
+            ),
+        ] {
+            let mut read = Box::pin(a.bytes_on(CORE, method, params));
+            assert!(
+                matches!(first_poll(read.as_mut()), std::task::Poll::Ready(Ok(_))),
+                "{method} waited during append {index}"
+            );
+        }
+        let mut health = Box::pin(a.handler.health());
+        assert!(
+            first_poll(health.as_mut()).is_ready(),
+            "health queued behind append"
+        );
+        if index == 0 {
+            tokio::time::advance(Duration::from_secs(25) + Duration::from_millis(1)).await;
+            assert!(
+                matches!(first_poll(registration.as_mut()), std::task::Poll::Ready(HandlerOutcome::Error { ref code, .. }) if code == "identity_log_contended")
+            );
+            assert!(
+                matches!(first_poll(unrelated.as_mut()), std::task::Poll::Ready(HandlerOutcome::Error { ref code, .. }) if code == "identity_log_contended")
+            );
+        } else {
+            assert_eq!(tokio::time::Instant::now(), frozen);
+        }
+        log.release_next().unwrap();
+    }
+    assert!(matches!(
+        drive(&mut batch).await,
+        HandlerOutcome::Response(_)
+    ));
+    assert_eq!(log.head(), head + 32);
+    b.catch_up().await;
+    assert_eq!(a.shared(), b.shared());
+    assert!(a.store().verify().unwrap().ok);
+    assert!(b.store().verify().unwrap().ok);
+}
+
+#[tokio::test(start_paused = true)]
+async fn avatar_batch_drain_interrupts_append_without_waiting_for_network_and_resumes() {
+    let (mut a, b, log, params, _id) = avatar_incident_pair().await;
+    let head = log.head();
+    let calls = log.calls();
+    log.on_append(crate::fake_log::Action::Hold);
+    let mut batch = Box::pin(a.bytes_on(DIRECT, "agent.apply_avatar_manifest", params.clone()));
+    drive(async {
+        tokio::select! {
+            biased;
+            () = log.wait_for_calls(calls + 2) => {},
+            result = &mut batch => panic!("batch finished before append: {result:?}"),
+        }
+    })
+    .await;
+    let frozen = tokio::time::Instant::now();
+    a.handler
+        .on_draining(
+            subc_client_rs::RouteCloseReason::Restart,
+            std::time::SystemTime::now(),
+        )
+        .await;
+    assert!(
+        matches!(first_poll(batch.as_mut()), std::task::Poll::Ready(Err(ref code)) if code == "module_draining"),
+        "drain must interrupt the batch without advancing the clock"
+    );
+    drop(batch);
+    drop(drive(a.handler.writer.lock()).await);
+    assert_eq!(tokio::time::Instant::now(), frozen);
+    assert_eq!(
+        a.store().identity_log_status().unwrap().pending_write_count,
+        1
+    );
+    assert_eq!(log.head(), head);
+    // A lost append reply can arrive after cancellation. Replay must settle it
+    // from the log, then resume only the remaining manifest entries.
+    log.release_next().unwrap();
+    b.catch_up().await;
+    a.restart(log.clone());
+    a.handler.operator_confirmer = Arc::new(crate::served_vectors::Approve {
+        summaries: std::sync::Mutex::new(vec![]),
+    });
+    a.catch_up().await;
+    let body = serde_json::to_vec(&json!({"method":"agent.apply_avatar_manifest","params":params}))
+        .unwrap();
+    let resumed = drive(a.handler.handle_served_request(&body, DIRECT)).await;
+    let HandlerOutcome::Response(bytes) = resumed else {
+        panic!("{resumed:?}")
+    };
+    let result: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(result["result"]["skipped"].as_array().unwrap().len(), 1);
+    assert_eq!(result["result"]["written"].as_array().unwrap().len(), 31);
+    assert_eq!(log.head(), head + 32);
+    b.catch_up().await;
+    assert_eq!(a.shared(), b.shared());
+    assert!(b.store().verify().unwrap().ok);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cold_fleet_and_avatar_reads_do_not_wait_for_background_log_read() {
+    let (mut a, _b, log, _, id) = avatar_incident_pair().await;
+    a.restart(log.clone());
+    let calls = log.calls();
+    log.on_read(crate::fake_log::Action::Hang);
+    a.handler.start_catch_up();
+    drive(log.wait_for_calls(calls + 1)).await;
+    assert!(a.handler.writer.try_lock().is_err());
+    for method in [
+        "agent.fleet_identity",
+        "agent.avatar_read",
+        "resolve",
+        "enumerate",
+    ] {
+        let params = match method {
+            "agent.avatar_read" => json!({"agentIds":[id]}),
+            "resolve" => json!({"canonicalRoot":a.dir}),
+            _ => json!({"token":"old-incarnation:0"}),
+        };
+        let mut read = Box::pin(a.bytes_on(DIRECT, method, params));
+        assert!(
+            matches!(first_poll(read.as_mut()), std::task::Poll::Ready(Ok(_))),
+            "cold {method} waited for the log"
+        );
+        assert_eq!(log.calls(), calls + 1, "read contacted the shared log");
+    }
+    crate::tests::stop_catch_up(&a.handler).await;
+}
+
 #[async_trait]
 impl LogConnector for InterruptAvatarLog {
     async fn connect(&self) -> Result<Arc<dyn LogTransport>, TransportError> {

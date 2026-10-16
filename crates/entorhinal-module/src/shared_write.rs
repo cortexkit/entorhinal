@@ -2729,16 +2729,38 @@ impl ProjectsHandler {
                 .await;
             return self.execute_with(request, key, Some(&providers));
         }
-        // Session registration writes only machine-local rows, so it never
-        // queues for the shared-log writer. Its providers are obtained here,
-        // after `refuse_flow_write` above, so a flow-scoped route is refused
-        // without asking the daemon anything; the result is handed to
-        // admission without allowing the synchronous seam to use the cache.
+        // Session registration is machine-local, but uses the same SQLite
+        // writer connection as shared writes. Wait for its synchronous mutex
+        // off the runtime. Do not join the shared-log writer queue: background
+        // network reads hold that queue even without an open SQL transaction.
+        // Resolve which modules may register sessions only after rejecting
+        // writes on read-only flow routes, so refused callers do not query the
+        // daemon. Pass those answers to admission; synchronous callers cannot
+        // reuse the serving path's capability cache.
         if request.method == super::sessions::REGISTER_SESSION {
             let providers = self
                 .route_session_providers(&request.method, &admission)
                 .await;
-            return self.execute_with(request, key, Some(&providers));
+            let (_, role) = self.admit_with(&request.method, key, Some(&providers))?;
+            let role = role.ok_or_else(|| sessions::orchestrator_unbound(Some(&providers)))?;
+            let store = self.with_store(|s| Ok(s.clone()))?;
+            let now = (self.clock)();
+            let worker = tokio::task::spawn_blocking(move || {
+                // On a single-worker test runtime this panics before SQLite if
+                // registration is accidentally moved back onto an async task.
+                #[cfg(test)]
+                tokio::task::block_in_place(|| {});
+                sessions::register_session_on_store(&store, request.params, role, now)
+            });
+            return timeout_at(received + DEADLINE, worker)
+                .await
+                .map_err(|_| {
+                    HandlerError::new(
+                        "identity_log_contended",
+                        "session registration deadline expired",
+                    )
+                })?
+                .map_err(|error| HandlerError::new("storage_error", error.to_string()))?;
         }
         let store = self.with_store(|s| Ok(s.clone()))?;
         if request.method == super::member::SET_NAME {

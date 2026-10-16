@@ -577,6 +577,7 @@ struct ProjectsHandler {
     #[allow(dead_code)]
     log_client: log_client::LogClient,
     writer: Arc<tokio::sync::Mutex<()>>,
+    draining: tokio::sync::watch::Sender<bool>,
     catch_up_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     record_client: record_client::RecordClient,
     participant_discovery: Arc<dyn participant_discovery::ParticipantDiscovery>,
@@ -918,6 +919,7 @@ impl ProjectsHandler {
             lease_retry_budget: LEASE_HELD_RETRY_BUDGET,
             log_client: log_client::LogClient::new(connector),
             writer: Arc::new(tokio::sync::Mutex::new(())),
+            draining: tokio::sync::watch::channel(false).0,
             catch_up_task: Mutex::new(None),
             record_client: record_client::RecordClient::new(record_connector),
             participant_discovery: Arc::new(participant_discovery::SubcParticipantDiscovery::new(
@@ -1076,6 +1078,17 @@ impl ProjectsHandler {
 
 #[async_trait]
 impl ModuleHandler for ProjectsHandler {
+    async fn on_draining(
+        &self,
+        _reason: subc_client_rs::RouteCloseReason,
+        _deadline: std::time::SystemTime,
+    ) {
+        // Dropping an in-flight shared-write future closes its settlement
+        // channel. The blocking worker rolls back while preserving the pending
+        // entry for log-read recovery, rather than holding a batch open at stop.
+        self.draining.send_replace(true);
+    }
+
     async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
         let started_us = (self.request_clock)();
         let outcome = if let Some(error) = self.startup_refusal() {
@@ -1319,11 +1332,20 @@ struct LivenessSession {
 
 impl ProjectsHandler {
     /// Shared writes use `write_wait`, which handles cached replies, serializes
-    /// database writes, and sends shared changes to the log. It calls synchronous
-    /// `execute` for local session registration. Claim refresh has its own async
-    /// arm and never joins the shared-log writer queue.
+    /// database writes, and sends shared changes to the log. Machine-local
+    /// session registration runs on the blocking pool instead. Claim refresh
+    /// has its own async arm and never joins the shared-log writer queue.
     /// Queries use `handle_request_wait` instead, without joining the write queue.
     async fn handle_served_request(&self, body: &[u8], key: RouteKey) -> HandlerOutcome {
+        let mut draining = self.draining.subscribe();
+        tokio::select! {
+            biased;
+            _ = draining.wait_for(|stopping| *stopping) => HandlerError::new("module_draining", "module is stopping; retry interrupted work after restart").into_outcome(),
+            outcome = self.handle_active_request(body, key) => outcome,
+        }
+    }
+
+    async fn handle_active_request(&self, body: &[u8], key: RouteKey) -> HandlerOutcome {
         if let Ok(value) = serde_json::from_slice::<Value>(body) {
             if value.get("name").is_some() {
                 return self.handle_tool_request(value, key).await;
@@ -1405,7 +1427,8 @@ impl ProjectsHandler {
         } else if request.method == permissions::SET_CAP {
             self.set_hire_cap(request.params, key, received).await
         } else if request.method == permissions::REVOKE {
-            self.execute(request, key)
+            self.permissions_revoke_wait(request.params, key, received)
+                .await
         } else {
             self.write_wait(request, key, received).await
         };
