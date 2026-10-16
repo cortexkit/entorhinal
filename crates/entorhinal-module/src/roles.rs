@@ -598,12 +598,17 @@ mod tests {
             .put("role:x", 1, claim(1, &f.record.author), &f.record.author);
         crate::tests::stop_store_tasks(&f.handler).await;
         f.handler.store.lock().unwrap().take();
+        let installed = tokio::time::Instant::now();
         f.handler
             .on_hello_ack(&crate::tests::hello_ack(&f.descriptor))
             .await;
-        tokio::task::yield_now().await;
-        assert_eq!(role_batches(), 1);
+        // Count only after the pass reports done: it runs its SQL on the blocking
+        // pool, which a single yield doesn't wait for. The paused clock must not
+        // have reached the 30 s timer, which proves this pass came from the store
+        // install itself and not from the periodic refresh.
         f.handler.health.role_refresh_done.notified().await;
+        assert!(installed.elapsed() < Duration::from_secs(30));
+        assert_eq!(role_batches(), 1);
         assert_eq!(f.read()["known"], true);
         assert_eq!(f.log.calls(), 0);
         f.handler
