@@ -78,23 +78,47 @@ fn identity(expected: &CatalogRegistry, current: &CatalogRegistry) -> Result<(),
     }
     Ok(())
 }
-fn restore(
+pub(super) fn restore(
     row: &CatalogStatus,
-    registry: &CatalogRegistry,
+    registry: Option<&CatalogRegistry>,
+    root: Option<&str>,
 ) -> Result<status::HeldStatus, CatalogError> {
-    let held = status::HeldStatus::restore(
-        &row.canonical,
-        &row.signature,
-        &chain(registry),
-        row.signer_index,
-    )?;
+    let held = if let Some(proof) = &row.starter_proof {
+        if !row.registry_url.is_empty() || row.signer_index != 0 {
+            return Err(CatalogError::new(
+                "status_invalid",
+                "starter status has a registry signer",
+            ));
+        }
+        let root = root.ok_or_else(|| {
+            CatalogError::new(
+                "cortexkit_root_unavailable",
+                "the production CortexKit root has not been provisioned",
+            )
+        })?;
+        let proof: entorhinal_catalog::bundle::Proof = serde_json::from_str(proof)
+            .map_err(|_| CatalogError::new("status_invalid", "invalid starter proof"))?;
+        proof.verify(root)?
+    } else {
+        let registry = registry
+            .filter(|r| r.url == row.registry_url)
+            .ok_or_else(|| {
+                CatalogError::new("status_invalid", "stored status registry is absent")
+            })?;
+        status::HeldStatus::restore(
+            &row.canonical,
+            &row.signature,
+            &chain(registry),
+            row.signer_index,
+        )?
+    };
     let r = held.record();
     if r.name != row.name
         || r.version != row.version
         || r.sequence != row.sequence
         || r.changed_at != row.changed_at
         || r.published_at != row.published_at
-        || row.registry_url != registry.url
+        || held.canonical() != row.canonical
     {
         return Err(CatalogError::new(
             "status_invalid",
@@ -115,6 +139,7 @@ fn row(held: &status::HeldStatus, sig: &str, url: &str) -> CatalogStatus {
         signer_index: held.signer_index(),
         canonical: held.canonical().into(),
         signature: sig.into(),
+        starter_proof: None,
     }
 }
 /// Both ingestion paths enforce the same immutable version binding.
@@ -124,11 +149,12 @@ fn accept(
     text: &str,
     sig: &str,
     pin: &status::Pin,
+    root: Option<&str>,
 ) -> Result<status::AppliedStatus, CatalogError> {
     let held = rows
         .iter()
         .find(|r| r.name == pin.name && r.version == pin.version)
-        .map(|r| restore(r, registry))
+        .map(|r| restore(r, Some(registry), root))
         .transpose()?;
     if held
         .as_ref()
@@ -490,7 +516,7 @@ impl CatalogTrust {
                 &self.scope,
                 |current, held, _| {
                     identity(&expected, current)?;
-                    let applied = accept(current, held, &status_text, status_sig, &pin)?;
+                    let applied = accept(current, held, &status_text, status_sig, &pin, root)?;
                     let write = TrustWrite {
                         statuses: vec![row(&applied.held, status_sig, &current.url)],
                         ..Default::default()
@@ -549,7 +575,7 @@ impl CatalogTrust {
             &self.scope,
             |current, held, _| {
                 identity(&expected, current)?;
-                accept(current, held, &status_text, status_sig, &pin)?;
+                accept(current, held, &status_text, status_sig, &pin, root)?;
                 BlobStore::new(&folder)?.publish(&archive)?;
                 Ok(((), TrustWrite::default()))
             },
@@ -648,7 +674,7 @@ impl CatalogTrust {
                         ..Default::default()
                     };
                     for r in rows {
-                        let held = restore(r, current)?;
+                        let held = restore(r, Some(current), self.cortexkit_root.as_deref())?;
                         state.held.insert(format!("{}@{}", r.name, r.version), held);
                     }
                     let mut pins = std::collections::BTreeMap::new();
@@ -716,6 +742,7 @@ impl CatalogTrust {
                                 &record.record_text,
                                 &record.signature,
                                 &pin,
+                                self.cortexkit_root.as_deref(),
                             )?;
                             let stored = row(&applied.held, &record.signature, &current.url);
                             holds.retain(|r| r.name != stored.name || r.version != stored.version);

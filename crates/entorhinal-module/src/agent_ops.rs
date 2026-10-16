@@ -1347,6 +1347,7 @@ mod tests {
                     let direct_only = crate::catalog_ops::WRITES
                         .iter()
                         .chain(std::iter::once(&crate::catalog_publish::PUBLISH))
+                        .chain(std::iter::once(&crate::catalog_seed::SEED))
                         .any(|candidate| candidate == method);
                     if principal == Some(Principal::Direct)
                         || (!direct_only && principal == Some(reserved(WRITER_MODULE)))

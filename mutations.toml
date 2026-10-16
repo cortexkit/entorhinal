@@ -166,6 +166,7 @@ file = "crates/entorhinal-module/src/main.rs"
 old = '''if method == "identity_log.enable"
         || catalog_ops::WRITES.contains(&method)
         || method == catalog_publish::PUBLISH
+        || method == catalog_seed::SEED
     {'''
 new = "if false /* NON-VACUITY BREAK */ {"
 test_file = "crates/entorhinal-module/src/main.rs"
@@ -5463,6 +5464,7 @@ file = "crates/entorhinal-module/src/main.rs"
 old = '''if method == "identity_log.enable"
         || catalog_ops::WRITES.contains(&method)
         || method == catalog_publish::PUBLISH
+        || method == catalog_seed::SEED
     {'''
 new = 'if method == "identity_log.enable" { // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/catalog_ops_tests.rs"
@@ -6108,7 +6110,7 @@ only = false
 id = "ento3-reapply-before-blob"
 guards = "reapply before blob remains enforced"
 file = "crates/entorhinal-module/src/catalog_trust.rs"
-old = "accept(current, held, &status_text, status_sig, &pin)?;\n                BlobStore::new(&folder)?.publish(&archive)?;"
+old = "accept(current, held, &status_text, status_sig, &pin, root)?;\n                BlobStore::new(&folder)?.publish(&archive)?;"
 new = "// NON-VACUITY BREAK: skip final status reapplication\n                BlobStore::new(&folder)?.publish(&archive)?;"
 test_file = "crates/entorhinal-module/src/catalog_trust_tests.rs"
 runner = "cargo"
@@ -7580,7 +7582,7 @@ expect_red = ["catalog_poll::tests::gated_http_holds_neither_store_nor_handler_l
 id = "catalog-status-effects"
 guards = "Authenticated status ingestion degrades active generations before committing"
 file = "crates/entorhinal-core/src/catalog_trust.rs"
-old = 'crate::catalog_agent::apply_status_effects(tx).map_err(sql)?;'
+old = 'crate::catalog_agent::apply_status_effects(tx)?;'
 new = '// NON-VACUITY BREAK: record status without updating generations'
 test_file = "crates/entorhinal-core/src/catalog_agent/tests.rs"
 runner = "cargo"
@@ -7593,7 +7595,7 @@ expect_red = ["catalog_agent::tests::status_news_withdrawal_revocation_ready_and
 id = "catalog-status-atomic"
 guards = "A crash while applying generation effects rolls status back in the same transaction"
 file = "crates/entorhinal-core/src/catalog_trust.rs"
-old = 'crate::catalog_agent::apply_status_effects(tx).map_err(sql)?;'
+old = 'crate::catalog_agent::apply_status_effects(tx)?;'
 new = '// NON-VACUITY BREAK: skip the transactional effect boundary'
 test_file = "crates/entorhinal-core/src/catalog_agent/tests.rs"
 runner = "cargo"
@@ -8870,3 +8872,80 @@ package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
 expect_red = ["served_vectors::catalog_generation_v1_records_match_published_files"]
+
+# Offline starter bundles authenticate both content and their initial status holds.
+[[control]]
+id = "catalog-starter-signature"
+guards = "A starter bundle with an altered bundle signature is refused"
+file = "crates/entorhinal-catalog/src/bundle.rs"
+old = 'if !crate::verify_signature(&key.public_key, DOMAIN, &canonical(&value)?, signature) {'
+new = 'if false && !crate::verify_signature(&key.public_key, DOMAIN, &canonical(&value)?, signature) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-catalog/tests/reproduction.rs"
+runner = "cargo"
+package = "entorhinal-catalog"
+target = "--test reproduction"
+expect_red = ["starter_bundle_signature"]
+select = "expected"
+
+[[control]]
+id = "catalog-starter-root-certificate"
+guards = "A starter signer certificate must authenticate under the supplied offline root"
+file = "crates/entorhinal-catalog/src/bundle.rs"
+old = '''let key = statements::verify_key_cert(
+        &canonical(&cert["statement"])?,
+        cert["signature"].as_str().unwrap_or(""),
+        root,
+    )?;'''
+new = '''let key = statements::verify_key_cert(
+        &canonical(&cert["statement"])?,
+        cert["signature"].as_str().unwrap_or(""),
+        root,
+    ).or_else(|_| serde_json::from_value(cert["statement"].clone()).map_err(|_| invalid("certificate")))?; // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-catalog/tests/reproduction.rs"
+runner = "cargo"
+package = "entorhinal-catalog"
+target = "--test reproduction"
+expect_red = ["starter_bundle_root_certificate"]
+select = "expected"
+
+[[control]]
+id = "catalog-starter-member-unlisted"
+guards = "A starter bundle refuses every member outside the signed member list"
+file = "crates/entorhinal-catalog/src/bundle.rs"
+old = '.filter(|(path, _)| !expected.contains(path.as_str()))'
+new = '.filter(|(path, _)| false && !expected.contains(path.as_str())) // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-catalog/tests/reproduction.rs"
+runner = "cargo"
+package = "entorhinal-catalog"
+target = "--test reproduction"
+expect_red = ["starter_bundle_unlisted_member"]
+select = "expected"
+
+[[control]]
+id = "catalog-starter-record-member-binding"
+guards = "Initial status bytes must match the record-member hash covered by the bundle signature"
+file = "crates/entorhinal-catalog/src/bundle.rs"
+old = 'if crate::sha256_hex(bytes) != entry.record_member_sha256 {'
+new = 'if false && crate::sha256_hex(bytes) != entry.record_member_sha256 { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-catalog/tests/reproduction.rs"
+runner = "cargo"
+package = "entorhinal-catalog"
+target = "--test reproduction"
+expect_red = ["starter_bundle_record_member_binding"]
+select = "expected"
+
+[[control]]
+id = "catalog-starter-no-pins"
+guards = "Seeding starter content and initial status must never create an agent package pin"
+file = "crates/entorhinal-core/src/catalog_trust.rs"
+old = 'write_statuses(tx, &statuses).map_err(sql)?;'
+new = '''write_statuses(tx, &statuses).map_err(sql)?;
+                tx.execute("INSERT INTO catalog_pin_set SELECT agent_id,'mutation' FROM agent LIMIT 1", []).map_err(sql)?; // NON-VACUITY BREAK
+                tx.execute("INSERT INTO catalog_pin SELECT agent_id,'@cortexkit/starter-persona','1.0.0','persona',printf('%064d',0),printf('%064d',0),printf('%064d',0),1,'*' FROM catalog_pin_set LIMIT 1", []).map_err(sql)?;'''
+test_file = "crates/entorhinal-module/src/catalog_seed_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+expect_red = ["catalog_seed::tests::seed_content_is_idempotent_and_creates_no_pins_or_authority"]
+expect_message = "seeding must not create a pin"
+select = "expected"

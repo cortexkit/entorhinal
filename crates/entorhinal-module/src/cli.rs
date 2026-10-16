@@ -547,6 +547,15 @@ fn build_failure_exit(message: &str) -> u8 {
 
 fn build_at(command: &Command, cwd: &str) -> Result<(String, Value), String> {
     if command.face == Face::Catalog {
+        if command.verb == "seed" {
+            if command.args.len() != 1 {
+                return Err("seed needs <bundle file>".into());
+            }
+            return Ok((
+                super::catalog_seed::SEED.into(),
+                json!({"bundle_file": cli_path(&command.args[0], cwd, true)?}),
+            ));
+        }
         if command.verb == "publish" {
             if command.json || command.args.len() != 5 {
                 return Err("publish needs <package dir> --registry <url> --scope <scope>".into());
@@ -4291,6 +4300,37 @@ mod role_tests {
 #[cfg(test)]
 mod catalog_publish_cli_tests {
     use super::*;
+    #[test]
+    fn seed_file_is_canonical_and_requires_one_path() {
+        let (root, _) = crate::tests::scratch_descriptor("seed-cli");
+        std::fs::write(root.join("starter.tar"), b"fixture").unwrap();
+        let Invocation::Command(command) =
+            parse(Face::Catalog, &["seed".into(), "starter.tar".into()])
+        else {
+            panic!("expected seed command");
+        };
+        let (method, params) = build_at(&command, root.to_str().unwrap()).unwrap();
+        assert_eq!(method, crate::catalog_seed::SEED);
+        assert_eq!(
+            params["bundle_file"],
+            crate::tests::canonical_test_path(root.join("starter.tar"))
+                .to_str()
+                .unwrap()
+        );
+        for args in [
+            vec!["seed".into()],
+            vec!["seed".into(), "a".into(), "b".into()],
+        ] {
+            match parse(Face::Catalog, &args) {
+                Invocation::Command(command) => {
+                    assert!(build_at(&command, root.to_str().unwrap()).is_err())
+                }
+                Invocation::Refuse(_) => {}
+                _ => panic!("expected seed refusal"),
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn publish_path_is_shared_canonical_and_flags_are_closed() {
         let (root, _) = crate::tests::scratch_descriptor("publish-cli");

@@ -1566,6 +1566,7 @@ mod tests {
             "role.read",
         ];
         let expected_mutations = [
+            crate::catalog_seed::SEED,
             "catalog.registry_add",
             "catalog.publish",
             "catalog.publisher_trust",

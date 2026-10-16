@@ -70,6 +70,90 @@ fn base64(s: &str) -> Vec<u8> {
     }
     out
 }
+
+fn starter_case(name: &str) {
+    let vector = load("starter-bundle.json");
+    let case = a(&vector["cases"])
+        .iter()
+        .find(|case| case["name"] == name)
+        .unwrap();
+    let bytes = base64(s(&case["bundle_archive_base64"]));
+    assert_eq!(
+        success(c::bundle::verify(
+            &bytes,
+            s(&vector["keys"]["root"]["public_key_hex"])
+        )),
+        case["expect"],
+        "{name}"
+    );
+}
+#[test]
+fn starter_bundle_signature() {
+    starter_case("bad_bundle_signature");
+}
+#[test]
+fn starter_bundle_root_certificate() {
+    let vector = load("starter-bundle.json");
+    let bytes = base64(s(&vector["valid"]["bundle_archive_base64"]));
+    assert_eq!(
+        success(c::bundle::verify(
+            &bytes,
+            s(&vector["keys"]["registry_status"]["public_key_hex"])
+        )),
+        json!({"ok":false,"code":"signature_invalid"})
+    );
+    starter_case("bundle_key_not_root_certified");
+}
+#[test]
+fn starter_bundle_unlisted_member() {
+    starter_case("extra_unlisted_file");
+}
+#[test]
+fn starter_bundle_record_member_binding() {
+    starter_case("record_member_bytes_changed");
+}
+#[test]
+fn starter_bundle_valid() {
+    let vector = load("starter-bundle.json");
+    let bytes = base64(s(&vector["valid"]["bundle_archive_base64"]));
+    assert_eq!(
+        c::sha256_hex(&bytes),
+        vector["valid"]["bundle_archive_sha256"]
+    );
+    let root = s(&vector["keys"]["root"]["public_key_hex"]);
+    let verified = c::bundle::verify(&bytes, root).unwrap();
+    assert_eq!(verified.packages.len(), 2);
+    for (package, expected) in verified
+        .packages
+        .iter()
+        .zip(a(&vector["valid"]["packages"]))
+    {
+        assert_eq!(
+            serde_json::to_value(&package.package.record).unwrap(),
+            expected["record"]["value"]
+        );
+        assert_eq!(
+            serde_json::to_value(package.status.record()).unwrap(),
+            expected["status"]["value"]
+        );
+        assert_eq!(package.archive, base64(s(&expected["archive_base64"])));
+        assert_eq!(
+            package.proof.verify(root).unwrap().canonical(),
+            package.status.canonical()
+        );
+    }
+}
+#[test]
+fn starter_bundle_other_refusals() {
+    for name in [
+        "archive_sha256_mismatch",
+        "record_missing_status",
+        "non_ustar_entry",
+        "path_escaping_entry",
+    ] {
+        starter_case(name);
+    }
+}
 fn package_members(v: &Value) -> Vec<Member<'_>> {
     a(&v["members"])
         .iter()
@@ -81,7 +165,7 @@ fn reproduce_readme() {
     let readme = fs::read(dir().join("README.md")).unwrap();
     assert_eq!(
         c::sha256_hex(&readme),
-        "77ad44e3973baa0fa61f92316d183d1562e122758de49f3f86fd4a901b408e43"
+        "9db4410b3e97c4406c0ac6884835d4112eaef8086dcab73e9b95b4fadd3568ab"
     );
     let text = String::from_utf8(readme).unwrap();
     let mut checked = 0;
@@ -98,14 +182,14 @@ fn reproduce_readme() {
             checked += 1;
         }
     }
-    assert_eq!(checked, 6);
+    assert_eq!(checked, 7);
 }
 #[test]
 fn reproduce_source() {
     let bytes = fs::read(dir().join("SOURCE.txt")).unwrap();
     assert_eq!(
         c::sha256_hex(&bytes),
-        "1cc258e3a713283bfc7177e1365deedf25692968361fa83c1e0244b65cd5d718"
+        "3269a664109e5ab951ee06e299b8fb8d94180821ab7e4b3bba2252dd33279e51"
     );
     assert!(String::from_utf8(bytes).unwrap().contains("610329529"));
 }

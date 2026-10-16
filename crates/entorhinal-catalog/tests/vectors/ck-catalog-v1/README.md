@@ -29,6 +29,7 @@ prefrontal commit.
 | `status.json` | Signed `ck-status/v1` records for one skill version (published, withdrawn, withdrawal reversed, tombstoned, plus a conflicting second record) and one flow version (published, revoked by key compromise, tombstoned), the client's apply cases (sequence order, `feed_rollback` for a lower sequence or the same sequence with other bytes, terminal states, signature and domain, a publisher-signed record, unknown registry key), the status feed (`feed_seq`, `?after=` replies including `feed_after_unavailable`, and the client's poll outcomes including `feed_rollback` and the full-feed fallback), the compromise-from time rule and the per-kind effect table. |
 | `statements.json` | The signed statements: `ck-registry-key/v1` (the registry status key chain), `ck-key-rotation/v1` (both signatures), `ck-key-cert/v1` (signed by the TEST-ONLY root, with key-window cases) and `ck-status-request/v1` (withdraw and unwithdraw with `after_sequence`), each with valid and negative cases. |
 | `resolver.json` | The semver dialect (range satisfaction, refused ranges and versions, precedence order), the capability token grammar `cap/<area>.<verb>@<major>`, and closure resolution cases with expected picks, pin moves and refusals. |
+| `starter-bundle.json` | A root-certified two-package starter, exact record-member SHA-256 bindings, and eight refusal cases. Copied from the prefrontal repository at f28a3859e; the other vectors retain the earlier revision named in SOURCE.txt. |
 | `generate.ts` | The generator and reference implementations. |
 | `generate.test.ts` | Fails when any committed file differs from what `generate.ts` produces. |
 
@@ -86,4 +87,5 @@ The table below is rewritten by `generate.ts`; the check fails if it is stale.
 | status.json | `6e07ced5fe7178ccd76cca415644f8bf36ef44e532f0155a70345de939d6644b` |
 | statements.json | `89780229b796d1cb4ac25c3c8fe742c3dc19ce0fe6dbe51f336c134b51989d0f` |
 | resolver.json | `be1e2296110dcca2a6c9fbc1df72200485a5ae1779a3b36bf8411f78ef215413` |
+| starter-bundle.json | `3a6e895995e3c5b93d9922791a2ddd8d3272929347db8ae9a5723e599867c325` |
 <!-- sha256:end -->

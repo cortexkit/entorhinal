@@ -17,10 +17,12 @@ CREATE TABLE catalog_feed(scope TEXT PRIMARY KEY,
     registry_url TEXT NOT NULL REFERENCES catalog_registry(url) ON DELETE CASCADE,
     feed_seq INTEGER NOT NULL, etag TEXT);
 CREATE TABLE catalog_status(name TEXT NOT NULL, version TEXT NOT NULL,
-    registry_url TEXT NOT NULL REFERENCES catalog_registry(url) ON DELETE CASCADE,
+    registry_url TEXT REFERENCES catalog_registry(url) ON DELETE CASCADE,
     sequence INTEGER NOT NULL, changed_at TEXT NOT NULL, published_at TEXT NOT NULL,
     signer_index INTEGER NOT NULL, canonical TEXT NOT NULL, signature TEXT NOT NULL,
     PRIMARY KEY(name,version));
+CREATE TABLE catalog_starter_proof(name TEXT NOT NULL, version TEXT NOT NULL, proof TEXT NOT NULL,
+    PRIMARY KEY(name,version), FOREIGN KEY(name,version) REFERENCES catalog_status(name,version) ON DELETE CASCADE);
 CREATE TABLE catalog_publisher_grant(id TEXT PRIMARY KEY, publisher_fingerprint TEXT NOT NULL,
     operation TEXT NOT NULL, placement_agent_id TEXT NOT NULL, ceiling_json TEXT NOT NULL,
     granted_at_ms INTEGER NOT NULL, card_ref TEXT, revoked_at_ms INTEGER,

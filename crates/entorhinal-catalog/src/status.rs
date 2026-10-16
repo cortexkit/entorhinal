@@ -57,8 +57,20 @@ pub struct HeldStatus {
     record: StatusRecord,
     canonical: String,
     signer_index: usize,
+    bundle_attested: bool,
 }
 impl HeldStatus {
+    pub(crate) fn from_bundle(text: &str) -> Result<Self, Refusal> {
+        let (record, canonical) = parse(text)?;
+        // The bundle signature authenticates this initial status without a
+        // registry key. Its placeholder index must not constrain later key epochs.
+        Ok(Self {
+            record,
+            canonical,
+            signer_index: 0,
+            bundle_attested: true,
+        })
+    }
     /// Authenticate a saved status with its original registry signer. A later
     /// successor may retire that signer for new records, but cannot undo a status
     /// already accepted before retirement. Callers compare stored index columns
@@ -81,6 +93,7 @@ impl HeldStatus {
             record,
             canonical,
             signer_index,
+            bundle_attested: false,
         })
     }
     pub fn record(&self) -> &StatusRecord {
@@ -104,7 +117,7 @@ pub struct AppliedStatus {
     pub result: Apply,
     pub held: HeldStatus,
 }
-fn parse(text: &str) -> Result<(StatusRecord, String), Refusal> {
+pub(crate) fn parse(text: &str) -> Result<(StatusRecord, String), Refusal> {
     let invalid = |f| Refusal::field(RefusalCode::StatusInvalid, f);
     let s = shape(
         text,
@@ -196,16 +209,35 @@ pub fn apply_status(
     if s.name != pin.name || s.version != pin.version || s.archive_sha256 != pin.archive_sha256 {
         return Err(Refusal::new(RefusalCode::RecordMismatch));
     }
+    let next = HeldStatus {
+        record: s,
+        canonical,
+        signer_index: index,
+        bundle_attested: false,
+    };
+    let result = compare(held, &next)?;
+    Ok(AppliedStatus {
+        result,
+        held: if result == Apply::Duplicate && held.is_some_and(|h| !h.bundle_attested) {
+            held.cloned().unwrap_or(next)
+        } else {
+            next
+        },
+    })
+}
+
+/// Compare authenticated status records independently of how their trust was
+/// established. Bundle attestations and online registry signatures share this
+/// monotonic boundary; callers still enforce immutable version bindings.
+pub fn compare(held: Option<&HeldStatus>, next: &HeldStatus) -> Result<Apply, Refusal> {
     if let Some(prior) = held {
+        let s = &next.record;
         if s.sequence < prior.record.sequence {
             return Err(Refusal::rollback(RollbackReason::LowerSequence));
         }
         if s.sequence == prior.record.sequence {
-            return if canonical == prior.canonical {
-                Ok(AppliedStatus {
-                    result: Apply::Duplicate,
-                    held: prior.clone(),
-                })
+            return if next.canonical == prior.canonical {
+                Ok(Apply::Duplicate)
             } else {
                 Err(Refusal::rollback(RollbackReason::SameSequenceOtherBytes))
             };
@@ -213,21 +245,17 @@ pub fn apply_status(
         if s.changed_at < prior.record.changed_at {
             return Err(Refusal::rollback(RollbackReason::ChangedAtRegressed));
         }
-        if index < prior.signer_index {
-            return Err(Refusal::rollback(RollbackReason::KeyEpochRegressed));
+        if !next.bundle_attested && !prior.bundle_attested {
+            let index = next.signer_index;
+            if index < prior.signer_index {
+                return Err(Refusal::rollback(RollbackReason::KeyEpochRegressed));
+            }
         }
         if !prior.record.state.permits(s.state) {
             return Err(Refusal::new(RefusalCode::StatusTerminal));
         }
     }
-    Ok(AppliedStatus {
-        result: Apply::Applied,
-        held: HeldStatus {
-            record: s,
-            canonical,
-            signer_index: index,
-        },
-    })
+    Ok(Apply::Applied)
 }
 /// A compromised key blocks unknown publication times as well as times at the
 /// boundary; only an earlier registry-attested publication remains usable.
