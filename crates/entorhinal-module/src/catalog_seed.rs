@@ -129,7 +129,9 @@ fn seed_statuses(
                     }
                 }
             }
-            if status::compare(held.as_ref(), &package.status)? == Apply::Applied {
+            // Bundles initialize status only. An existing hold, especially a
+            // registry-signed revocation, cannot acquire bundle-chosen sequences.
+            if held.is_none() && status::compare(None, &package.status)? == Apply::Applied {
                 writes.push(CatalogStatus {
                     name: next.name.clone(),
                     version: next.version.clone(),

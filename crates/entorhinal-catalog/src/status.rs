@@ -89,6 +89,13 @@ impl HeldStatus {
         if !verify_signature(&key.public_key, "ck-status/v1", &canonical, signature) {
             return Err(Refusal::new(RefusalCode::SignatureInvalid));
         }
+        if key
+            .valid_from
+            .as_deref()
+            .is_some_and(|at| record.changed_at.as_str() < at)
+        {
+            return Err(Refusal::new(RefusalCode::KeyNotValid));
+        }
         Ok(Self {
             record,
             canonical,
@@ -203,6 +210,13 @@ pub fn apply_status(
         .iter()
         .filter_map(|k| k.valid_from.as_deref())
         .min();
+    if chain[index]
+        .valid_from
+        .as_deref()
+        .is_some_and(|at| s.changed_at.as_str() < at)
+    {
+        return Err(Refusal::new(RefusalCode::KeyNotValid));
+    }
     if retirement.is_some_and(|at| s.changed_at.as_str() >= at) {
         return Err(Refusal::new(RefusalCode::KeyNotValid));
     }
@@ -226,9 +240,9 @@ pub fn apply_status(
     })
 }
 
-/// Compare authenticated status records independently of how their trust was
-/// established. Bundle attestations and online registry signatures share this
-/// monotonic boundary; callers still enforce immutable version bindings.
+/// Compare authenticated status records by sequence, timestamp and signer epoch.
+/// Bundles can initialize a missing status but cannot update an existing hold.
+/// Callers still enforce immutable version bindings.
 pub fn compare(held: Option<&HeldStatus>, next: &HeldStatus) -> Result<Apply, Refusal> {
     if let Some(prior) = held {
         let s = &next.record;
@@ -245,7 +259,10 @@ pub fn compare(held: Option<&HeldStatus>, next: &HeldStatus) -> Result<Apply, Re
         if s.changed_at < prior.record.changed_at {
             return Err(Refusal::rollback(RollbackReason::ChangedAtRegressed));
         }
-        if !next.bundle_attested && !prior.bundle_attested {
+        if next.bundle_attested {
+            return Err(Refusal::rollback(RollbackReason::KeyEpochRegressed));
+        }
+        if !prior.bundle_attested {
             let index = next.signer_index;
             if index < prior.signer_index {
                 return Err(Refusal::rollback(RollbackReason::KeyEpochRegressed));
@@ -469,6 +486,47 @@ pub fn select_feed(
 #[cfg(test)]
 mod restore_tests {
     use super::*;
+    #[test]
+    fn bundle_attestation_cannot_advance_an_existing_hold() {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/vectors/ck-catalog-v1/status.json"))
+                .unwrap();
+        let doc = &v["records"][0];
+        let chain = [StatusKey {
+            key_id: "test-registry-1".into(),
+            public_key: v["registry_keys"]["test-registry-1"]["public_key_hex"]
+                .as_str()
+                .unwrap()
+                .into(),
+            valid_from: None,
+        }];
+        let canonical = doc["canonical"].as_str().unwrap();
+        let signature = doc["signature"].as_str().unwrap();
+        let registry = HeldStatus::restore(canonical, signature, &chain, 0).unwrap();
+        let initial_bundle = HeldStatus::from_bundle(canonical).unwrap();
+        let pin = Pin {
+            name: registry.record.name.clone(),
+            version: registry.record.version.clone(),
+            archive_sha256: registry.record.archive_sha256.clone(),
+        };
+        assert!(
+            !apply_status(Some(&initial_bundle), canonical, signature, &chain, &pin)
+                .unwrap()
+                .held
+                .bundle_attested
+        );
+        let mut inflated = doc["record"].clone();
+        inflated["sequence"] = 100.into();
+        let bundle = HeldStatus::from_bundle(&inflated.to_string()).unwrap();
+        assert_eq!(compare(None, &bundle).unwrap(), Apply::Applied);
+        for prior in [&registry, &initial_bundle] {
+            assert_eq!(
+                compare(Some(prior), &bundle).unwrap_err().reason,
+                Some(RollbackReason::KeyEpochRegressed)
+            );
+        }
+    }
+
     #[test]
     fn restore_authenticates_bytes_and_signer_without_new_cutoffs() {
         let v: serde_json::Value =

@@ -245,6 +245,74 @@ fn every_refused_bundle_leaves_content_and_status_empty() {
 }
 
 #[tokio::test]
+async fn bundle_cannot_replace_held_registry_status_or_pin_its_sequence() {
+    use crate::{
+        catalog_network::{Limits, RegistryClient},
+        catalog_trust::CatalogTrust,
+        fake_registry::{FakeRegistry, Reply},
+    };
+    let (root, store, path, descriptor) = fixture("seed-registry-precedence");
+    test_seeder().seed(&store, &path).unwrap();
+    let v = vector();
+    let url = "https://registry.example.invalid";
+    store
+        .catalog_registry_add(
+            url,
+            &["@cortexkit".into()],
+            false,
+            "test-registry-1",
+            v["keys"]["registry_status"]["public_key_hex"]
+                .as_str()
+                .unwrap(),
+            1,
+        )
+        .unwrap();
+    let fake = FakeRegistry::start().await;
+    fake.serve(
+        "/v1/registry/keys",
+        Reply::bytes(json!({"schema":"ck-registry-keys/v1","registry":url,"keys":[]}).to_string()),
+    );
+    let mut trust = CatalogTrust::with_client(
+        store.clone(),
+        "@cortexkit",
+        RegistryClient::loopback(&fake.url, std::slice::from_ref(&fake.url), Limits::MODULE),
+    )
+    .unwrap()
+    .with_test_root(v["keys"]["root"]["public_key_hex"].as_str().unwrap().into());
+    let initial = store.catalog_statuses(url).unwrap()[0].clone();
+    let mut doc: Value = serde_json::from_str(&initial.canonical).unwrap();
+    doc["sequence"] = (initial.sequence + 1).into();
+    let online = signed(doc.clone(), &v["keys"]["registry_status"]);
+    fake.serve("/v1/scopes/cortexkit/status", Reply::bytes(json!({"schema":"ck-status-feed/v1","scope":"cortexkit","feed_seq":1,"records":[{"feed_seq":1,"record":online["record"],"signature":online["signature"]}]}).to_string()));
+    assert!(trust.apply_scope_feed().await.unwrap().cursor_advanced);
+    fs::write(&path, bundle_at_sequence(100)).unwrap();
+    test_seeder().seed(&store, &path).unwrap();
+    let held = store.catalog_statuses(url).unwrap()[0].clone();
+    assert_eq!(held.sequence, initial.sequence + 1);
+    assert!(held.starter_proof.is_none());
+    doc["sequence"] = (initial.sequence + 2).into();
+    doc["state"] = "revoked".into();
+    doc["reason"] = "compromised".into();
+    doc["compromise_from"] = doc["published_at"].clone();
+    let revoked = signed(doc, &v["keys"]["registry_status"]);
+    fake.serve("/v1/scopes/cortexkit/status?after=1", Reply::bytes(json!({"schema":"ck-status-feed/v1","scope":"cortexkit","feed_seq":2,"records":[{"feed_seq":2,"record":revoked["record"],"signature":revoked["signature"]}]}).to_string()));
+    assert!(trust.apply_scope_feed().await.unwrap().cursor_advanced);
+    test_seeder().seed(&store, &path).unwrap();
+    drop(trust);
+    drop(store);
+    let store = RegistryStore::open(&descriptor).unwrap();
+    let held = store.catalog_statuses(url).unwrap()[0].clone();
+    assert_eq!(held.sequence, initial.sequence + 2);
+    assert!(held.starter_proof.is_none());
+    assert_eq!(
+        serde_json::from_str::<Value>(&held.canonical).unwrap()["state"],
+        "revoked"
+    );
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn seeded_statuses_fence_lower_and_conflicting_online_feeds_after_restart() {
     use crate::{
         catalog_network::{Limits, RegistryClient},
