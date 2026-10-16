@@ -588,28 +588,42 @@ async fn publisher_pins_must_stay_authenticated_through_confirmation() {
 
 #[tokio::test(start_paused = true)]
 async fn catalog_grant_sql_is_off_runtime_and_bounded() {
-    use crate::catalog_sql::tests::{finish, poll, responsive, started, tracked, HeldSql};
+    use crate::catalog_sql::tests::{finish, poll, responsive, HeldSql};
     let f = Fixture::new(Ok(()));
     let pins = f.pins();
     let held = HeldSql::new(f.store()).await;
-    let (request, entered) = tracked(f.trust(pins.clone()));
-    let mut request = Box::pin(request);
-    started(request.as_mut(), &entered).await;
-    assert!(poll(request.as_mut()).is_pending());
+    let mut request = Box::pin(f.trust(pins.clone()));
+    // The pin and blob reads use the read connection, which the held write does
+    // not block, and run on the blocking pool in real time. Drive the request
+    // until it has confirmed and taken the shared writer, so the test clock
+    // jumps only once it is waiting on the held write itself.
+    let mut spins = 0;
+    while f.handler.writer.try_lock().is_ok() {
+        assert!(
+            poll(request.as_mut()).is_pending(),
+            "publisher trust finished before reaching the held write"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        spins += 1;
+        assert!(
+            spins < 2_000,
+            "publisher trust never reached the shared writer"
+        );
+    }
+    assert_eq!(f.prompt.calls.lock().unwrap().len(), 1);
     responsive(&f.handler).await;
     tokio::time::advance(std::time::Duration::from_millis(60_001)).await;
     let answer = poll(request.as_mut());
-    assert!(f.handler.writer.try_lock().is_ok());
-    assert!(f.handler.confirmation_slot.lock().unwrap().is_none());
-    held.finish().await;
-    let _writer = finish(f.handler.writer.lock()).await;
     assert!(
         matches!(answer, std::task::Poll::Ready(Err(error)) if error.code == "catalog_timeout")
     );
-    // Whether the confirmation prompt ran first depends on how far the pin and
-    // blob reads (on the separate read connection, which the held write does not
-    // block) got in real time before the test clock jumped. Either way the held
-    // write must time out without granting anything, at most one prompt shown.
-    assert!(f.store().publisher_grants().unwrap().is_empty());
-    assert!(f.prompt.calls.lock().unwrap().len() <= 1);
+    drop(request);
+    // The reply is bounded, but the write is not cancelled: its blocking job
+    // still owns the writer, and commits once the held transaction ends, so a
+    // retry observes the grant rather than prompting again.
+    assert!(f.handler.writer.try_lock().is_err());
+    held.finish().await;
+    let _writer = finish(f.handler.writer.lock()).await;
+    assert_eq!(f.store().publisher_grants().unwrap().len(), 1);
+    assert!(f.handler.confirmation_slot.lock().unwrap().is_none());
 }
