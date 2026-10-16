@@ -135,6 +135,12 @@ statement. An authenticated prefix survives a refused later link; refusal stops
 the walk. Historical links before an operator's anchor cannot extend trust.
 An unknown status signer triggers one chain fetch before verification is retried.
 A replacement lacking the newest held key's signature needs an operator repin.
+Bare operator-pinned anchors retain only their pinned identity; received metadata
+cannot become an authenticated statement without its predecessor's signature.
+Registry removal refuses with `registry_has_status` while any accepted status is
+held, even for an unpinned version: removing its signer chain would discard history
+that protects against rollback. Use `ck catalog registry repin` to rotate the
+registry's key. Registries with no held statuses can still be removed.
 
 Publisher keys from `/v1/scopes/{scope}` are used only for that scope at its
 selected registry; another registry's same-named key id cannot supply trust. Historical rotations
@@ -154,6 +160,15 @@ Restoration authenticates held bytes and their signer index and compares every
 denormalized column; later repins do not retroactively invalidate saved status
 records whose signature was accepted before the signer's retirement.
 Package shape, signature and publisher trust pass before package-byte requests.
+Tombstoned and blocking-revoked versions refuse before manifest or archive
+requests, with `version_tombstoned` or `version_revoked` and the signed reason.
+Withdrawn and non-blocking revoked versions remain fetchable so consumers can
+read manifests for package versions already pinned to an agent. A withdrawn
+version is no longer a new resolution candidate; a non-blocking revocation has a
+compromise time later than the version's authenticated publication time.
+Starter bundles initialize missing holds only; they never replace existing status
+or advance its sequence. Registry updates from a starter hold still obey the
+normal sequence, timestamp and terminal-state rules.
 
 Feeds use the same binding boundary for held and previously unheld versions,
 without requesting packages. Polls refresh the registry chain. The cursor and
@@ -162,8 +177,14 @@ duplicate. Partial acceptance keeps good records, but not the new cursor or ETag
 An incremental feed request falls back to the full feed when the registry's
 incremental history has expired, or when an incremental record is refused as a
 rollback (`feed_rollback`). An HTTP 304 Not Modified reply changes nothing.
+A refused key link stops that scope's poll before the status request: the current
+signing epoch may be unresolved, so an older key cannot be assumed current. The
+accepted prefix and all previously authenticated status remain held for retry
+after chain repair. A refused link alone does not invent a revocation or degrade
+active generations; only authenticated blocking status does so.
 Status writes reapply against current mapping, chain and holds inside the SQLite
-transaction. Verification rechecks again after downloads before publishing bytes.
+transaction. Verification rechecks again after downloads before publishing both
+the verified manifest and archive within that fence.
 An in-flight request cannot overwrite newer version status or attach old
 signatures to a replacement registry's key chain.
 

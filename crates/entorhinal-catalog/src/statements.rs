@@ -208,7 +208,11 @@ pub fn apply_registry_key(
     }
     let bytes = canonical(&s)?;
     if let Some(k) = pin.keys.iter().find(|k| s["key_id"] == k.key_id) {
-        return if k.statement.as_deref() == Some(&bytes) {
+        // A bare pin authenticates only the key identity, not metadata received
+        // with it. Leave it bare: its predecessor may not be held locally.
+        return if k.statement.as_deref() == Some(&bytes)
+            || (k.statement.is_none() && k.public_key == pk)
+        {
             Ok(KeyApply::Duplicate)
         } else {
             Err(Refusal::field(RefusalCode::KeyConflict, "key_id"))

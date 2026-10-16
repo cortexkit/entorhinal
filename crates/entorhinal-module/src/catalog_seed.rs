@@ -129,7 +129,9 @@ fn seed_statuses(
                     }
                 }
             }
-            if status::compare(held.as_ref(), &package.status)? == Apply::Applied {
+            // Bundles initialize status only. An existing hold, especially a
+            // registry-signed revocation, cannot acquire bundle-chosen sequences.
+            if held.is_none() && status::compare(None, &package.status)? == Apply::Applied {
                 writes.push(CatalogStatus {
                     name: next.name.clone(),
                     version: next.version.clone(),
@@ -181,10 +183,16 @@ impl ProjectsHandler {
         }
         let store = self.with_store(|s| Ok(s.clone()))?;
         let seeder = self.catalog_seeder.clone();
+        // Counted like the startup seed: after a reply times out, the job keeps
+        // writing package files and holds a store handle until it ends.
+        let guard = self.catalog_sql.begin();
         let value = crate::catalog_sql::until(
             received + std::time::Duration::from_secs(110),
             "catalog.seed",
-            move || seeder.seed(&store, &path).map_err(HandlerError::from),
+            move || {
+                let _guard = guard;
+                seeder.seed(&store, &path).map_err(HandlerError::from)
+            },
         )
         .await?;
         encode_result(value)
