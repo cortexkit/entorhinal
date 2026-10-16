@@ -1202,6 +1202,38 @@ async fn session_records_match_published_files() {
         "/workspace/session-vectors/opencode"
     );
 
+    // On a Mac that has never turned sharing on, no other Mac can hold an
+    // agent, so an agent with no cached claim is a verified "unclaimed".
+    // Core's head registration accepts exactly this reply.
+    let (sharing_off, sharing_off_reply) = fixture
+        .record(
+            SESSION_READER,
+            READER_MODULE,
+            "agent.where",
+            json!({"agent_id":WHERE_UNCLAIMED}),
+        )
+        .await;
+    assert_eq!(
+        sharing_off_reply["result"],
+        json!({"known":true,"status":"unclaimed","holder":null,"holder_name":null,"epoch":0,"cut_id":null,"read_at_ms":null,"stale":false})
+    );
+    published_file(
+        "agent-sessions-v1",
+        "where-sharing-off.json",
+        vec![sharing_off],
+    );
+    // The remaining location replies describe a Mac with sharing on, where only
+    // verified engram reads count and an unread claim is unknown.
+    fixture
+        .store()
+        .apply_entry("fixture.sharing_on", "{}", "fixture", None, |tx| {
+            tx.execute(
+                "UPDATE identity_log_state SET state='enabled' WHERE id=1",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
     let mut where_records = Vec::new();
     for (agent_id, status, holder_name) in [
         (WHERE_UNCLAIMED, "unclaimed", Value::Null),

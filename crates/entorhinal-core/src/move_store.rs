@@ -1166,6 +1166,8 @@ mod tests {
         f.store.db.with_conn_fenced(|tx| {
             tx.execute("INSERT INTO agent(agent_id,name,tag,role,created_at_ms,updated_at_ms) VALUES('agent_00000001','Ada','test','assistant',1,1)", [])?;
             tx.execute("INSERT INTO member_name(author,display_name) VALUES('peer-author','Studio Mac')", [])?;
+            // Moves happen only with sharing on, where an unread claim is unknown.
+            tx.execute("UPDATE identity_log_state SET state='enabled' WHERE id=1", [])?;
             Ok(())
         }).unwrap();
     }

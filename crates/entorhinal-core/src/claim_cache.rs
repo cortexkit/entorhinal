@@ -276,9 +276,21 @@ impl RegistryStore {
                     return Err(refusal("gone", Some(gone)));
                 }
                 let claim = load_claim(conn, id)?;
-                let known = claim.is_some();
+                // Claims live only in the shared log. While sharing has never
+                // been turned on, no other Mac can hold this agent, so having no
+                // cached claim is a verified "unclaimed", not an unknown. Once
+                // sharing starts, only verified engram reads count.
+                let sharing_off = conn
+                    .query_row(
+                        "SELECT state='disabled' FROM identity_log_state WHERE id=1",
+                        [],
+                        |r| r.get::<_, bool>(0),
+                    )
+                    .optional()?
+                    .unwrap_or(true);
+                let known = claim.is_some() || sharing_off;
                 let read_at_ms = claim.as_ref().map(|c| c.read_at_ms);
-                let claim = claim.unwrap_or_else(|| unclaimed(0, true, false));
+                let claim = claim.unwrap_or_else(|| unclaimed(0, !sharing_off, false));
                 if claim.integrity_failed {
                     return Err(refusal("claim_integrity_failed", None));
                 }
@@ -550,7 +562,21 @@ mod tests {
     #[test]
     fn where_wire_nulls_known_status_integrity_and_restart() {
         let f = Fixture::new();
-        assert_eq!(serde_json::to_string(&f.store.agent_where(ID).unwrap()).unwrap(),"{\"known\":false,\"status\":\"unclaimed\",\"holder\":null,\"holder_name\":null,\"epoch\":0,\"cut_id\":null,\"read_at_ms\":null,\"stale\":true}");
+        // With sharing never turned on, no other Mac can hold the agent, so an
+        // absent claim is a verified "unclaimed". Core's head registration
+        // accepts exactly this shape.
+        assert_eq!(serde_json::to_string(&f.store.agent_where(ID).unwrap()).unwrap(),"{\"known\":true,\"status\":\"unclaimed\",\"holder\":null,\"holder_name\":null,\"epoch\":0,\"cut_id\":null,\"read_at_ms\":null,\"stale\":false}");
+        // In every other sharing state only a verified engram read counts.
+        for state in ["enabling", "joining", "enabled"] {
+            f.store
+                .db
+                .with_conn_fenced(|tx| {
+                    tx.execute("UPDATE identity_log_state SET state=?1 WHERE id=1", [state])?;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(serde_json::to_string(&f.store.agent_where(ID).unwrap()).unwrap(),"{\"known\":false,\"status\":\"unclaimed\",\"holder\":null,\"holder_name\":null,\"epoch\":0,\"cut_id\":null,\"read_at_ms\":null,\"stale\":true}", "{state}");
+        }
         f.observe(present(1, OTHER, false));
         f.store
             .db

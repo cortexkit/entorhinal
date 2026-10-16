@@ -66,11 +66,14 @@ objects deny unknown fields; a field outside the listed schema is an
 - **`session-for-ref.json`**: Pi and OpenCode registrations with
   `project_root`, a migrated legacy row with a null root, and a missing
   reference.
-- **`where.json`**: never-read/unclaimed, locally held, remotely held with a
-  holder name, and unknown agent.
+- **`where.json`**: on a Mac with sharing on: never-read/unclaimed, locally
+  held, remotely held with a holder name, and unknown agent.
 - **`where-many.json`**: a local and remotely held agent, with an unknown ID
   between them to pin request order and omission.
-- **`SHA256SUMS`**: SHA-256 hashes of the five JSON vector files, with names
+- **`where-sharing-off.json`**: on a Mac that has never turned sharing on, an
+  agent with no claim is a verified `unclaimed` (`known: true`), because no
+  other Mac can hold it.
+- **`SHA256SUMS`**: SHA-256 hashes of the six JSON vector files, with names
   relative to this directory.
 
 ## SHA-256 hashes
@@ -82,6 +85,7 @@ objects deny unknown fields; a field outside the listed schema is an
 | `session-for-ref.json` | `f8314b13df331e185f2c4960a314a3e8fac97af5d8e9904150ba024973fbb69a` |
 | `where.json` | `da88d465b4a190dbf14f7224ed8fd4a6cae10a8639fbbc7953b7d8b1f11dce8d` |
 | `where-many.json` | `93cc230f690999df6e7876f0bcabeaf391e5d8c9c7166e16a61d4c9112c153e6` |
+| `where-sharing-off.json` | `0b8fe82664439e2eb38e0816f900c08f7822bdfe29373a77579cfbbd080c6b63` |
 
 ## Reproduce and verify
 
@@ -98,7 +102,7 @@ python3 - <<'PY'
 import hashlib
 from pathlib import Path
 root = Path('test-vectors/agent-sessions-v1')
-names = ['for-session.json', 'register-session.json', 'session-for-ref.json', 'where.json', 'where-many.json']
+names = ['for-session.json', 'register-session.json', 'session-for-ref.json', 'where.json', 'where-many.json', 'where-sharing-off.json']
 root.joinpath('SHA256SUMS').write_text(''.join(
     f'{hashlib.sha256(root.joinpath(name).read_bytes()).hexdigest()}  {name}\n'
     for name in names), encoding='utf-8')

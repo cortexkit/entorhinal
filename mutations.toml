@@ -2440,9 +2440,9 @@ expect_red = ["claim_cache::tests::self_author_conflict_never_overwrites_identit
 
 [[control]]
 id = "claims-where-known"
-guards = "Known reflects presence of a cache row, not assumed knowledge"
+guards = "With sharing on, known reflects presence of a cache row, not assumed knowledge"
 file = "crates/entorhinal-core/src/claim_cache.rs"
-old = "let known = claim.is_some();"
+old = "let known = claim.is_some() || sharing_off;"
 new = "let known = true; // NON-VACUITY BREAK"
 test_file = "crates/entorhinal-core/src/claim_cache.rs"
 runner = "cargo"
@@ -9978,3 +9978,16 @@ package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
 expect_red = ["claims::tests::where_many_refuses_duplicate_ids"]
+
+[[control]]
+id = "where-sharing-off-verified-unclaimed"
+guards = "With sharing never turned on, agent.where answers a claim-less agent as a verified unclaimed, so core's head registration isn't refused"
+file = "crates/entorhinal-core/src/claim_cache.rs"
+old = "let known = claim.is_some() || sharing_off;"
+new = "let known = claim.is_some(); // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/claim_cache.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["claim_cache::tests::where_wire_nulls_known_status_integrity_and_restart"]
