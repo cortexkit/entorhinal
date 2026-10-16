@@ -9,9 +9,10 @@ on:
   workflow_dispatch:
 
 concurrency:
-  # Main and nightly audits must finish even if another push arrives.
+  # Only the newest push matters: deploys don't wait on CI, so an older push's
+  # run is superseded. The nightly and on-demand audits always finish.
   group: ci-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -137,17 +138,20 @@ jobs:
         # ~/.cargo/bin, and a pin change must replace it.
         run: cargo install --locked --force --git https://github.com/cortexkit/commons --rev "$CK_MUTATE_REV" cortexkit-mutate
 
+      # Pushes replay only the rows their own changes touch. The whole catalogue
+      # runs nightly, so a push never waits on it.
       - name: Replay touched rows on every push and PR
         if: github.event_name == 'push' || github.event_name == 'pull_request'
+        env:
+          BEFORE: ${{ github.event.before }}
         run: |
           mkdir -p target/mutations
-          ckdev-mutate run --diff origin/main --narrow --shard ${{ matrix.shard }}/8 --report target/mutations/diff.json
-
-      - name: Replay full catalogue on main
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: |
-          mkdir -p target/mutations
-          ckdev-mutate run --all --narrow --shard ${{ matrix.shard }}/8 --report target/mutations/all.json
+          base=origin/main
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF" = refs/heads/main ] \
+            && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            base="$BEFORE"
+          fi
+          ckdev-mutate run --diff "$base" --narrow --shard ${{ matrix.shard }}/8 --report target/mutations/diff.json
 
       - name: Audit all package targets nightly or on demand
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
