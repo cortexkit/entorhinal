@@ -931,6 +931,10 @@ test_file = "crates/entorhinal-module/src/log_client.rs"
 runner = "cargo"
 package = "entorhinal-module"
 target = "--bin ck-entorhinal"
+# Run only the named test. Under this break a resend loop has no end, so a
+# wider selection includes shared-write tests that retry until the runner's
+# timeout instead of failing.
+select = "expected"
 expect_red = ["log_client::tests::all_refusals_decode_from_error_detail_without_aliases"]
 
 [[control]]

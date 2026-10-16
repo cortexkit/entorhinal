@@ -18,7 +18,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: never
-  CK_MUTATE_REV: 9d6b663dac487bb982c7bfd18a96eee2292164ad
+  CK_MUTATE_REV: 8200b61fe4250989d315ed8064d16754c5032d10
 
 jobs:
   test:
@@ -56,7 +56,9 @@ jobs:
 
       - name: Install pinned mutation runner
         if: steps.mutate-cache.outputs.cache-hit != 'true'
-        run: cargo install --locked --git https://github.com/cortexkit/commons --rev "$CK_MUTATE_REV" cortexkit-mutate
+        # --force: rust-cache can restore an older ckdev-mutate into
+        # ~/.cargo/bin, and a pin change must replace it.
+        run: cargo install --locked --force --git https://github.com/cortexkit/commons --rev "$CK_MUTATE_REV" cortexkit-mutate
 
       - name: Check mutation anchors and exact test names
         run: |
@@ -131,19 +133,21 @@ jobs:
 
       - name: Install pinned mutation runner
         if: steps.mutate-cache.outputs.cache-hit != 'true'
-        run: cargo install --locked --git https://github.com/cortexkit/commons --rev "$CK_MUTATE_REV" cortexkit-mutate
+        # --force: rust-cache can restore an older ckdev-mutate into
+        # ~/.cargo/bin, and a pin change must replace it.
+        run: cargo install --locked --force --git https://github.com/cortexkit/commons --rev "$CK_MUTATE_REV" cortexkit-mutate
 
       - name: Replay touched rows on every push and PR
         if: github.event_name == 'push' || github.event_name == 'pull_request'
         run: |
           mkdir -p target/mutations
-          ckdev-mutate run --diff origin/main --shard ${{ matrix.shard }}/8 --report target/mutations/diff.json
+          ckdev-mutate run --diff origin/main --narrow --shard ${{ matrix.shard }}/8 --report target/mutations/diff.json
 
       - name: Replay full catalogue on main
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
           mkdir -p target/mutations
-          ckdev-mutate run --all --shard ${{ matrix.shard }}/8 --report target/mutations/all.json
+          ckdev-mutate run --all --narrow --shard ${{ matrix.shard }}/8 --report target/mutations/all.json
 
       - name: Audit all package targets nightly or on demand
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
