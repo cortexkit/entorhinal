@@ -456,6 +456,9 @@ async fn catalog_seed_sql_is_off_runtime_and_bounded() {
     .unwrap();
     assert!(serde_json::from_slice::<Value>(&reply).unwrap()["result"].is_object());
     assert_eq!(store.catalog_statuses("").unwrap().len(), 2);
+    // The first seed's reply timed out, but its job may still be publishing
+    // files; deleting the folder under it fails with "directory not empty".
+    handler.stop_catalog_poll().await;
     drop(handler);
     drop(store);
     fs::remove_dir_all(root).unwrap();
