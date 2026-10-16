@@ -24,16 +24,18 @@ request id. Successful replies wrap their value in `result`.
 Cases, in order:
 
 1. `blob_first_chunk`: reads the first seven bytes of a published blob.
-2. `blob_final_chunk`: reads a final chunk whose requested range extends past EOF.
-3. `blob_eof_empty`: reads at EOF and returns empty base64 bytes.
-4. `blob_unknown`: refuses an unknown digest with `blob_unknown`.
-5. `ready`: no active generation (`active: null`), one ready generation.
-6. `ack_success`: the ready generation becomes active, returned in `generation`.
-7. `active_available`: `active` and an empty `ready` list; no `pinned_status`.
-8. `active_withdrawn`: still active, `error: null`; `pinned_status` reports withdrawal.
-9. `degraded_and_ready_blocked`: the active generation became degraded; the newer
-   ready generation also holds the revoked version and cannot be activated.
-10. `ack_blocked`: the ready generation's acknowledgement is refused, with
+2. `blob_middle_chunk`: reads from offset 7 up to where the final chunk starts,
+   so the three captured chunks join into the whole blob.
+3. `blob_final_chunk`: reads a final chunk whose requested range extends past EOF.
+4. `blob_eof_empty`: reads at EOF and returns empty base64 bytes.
+5. `blob_unknown`: refuses an unknown digest with `blob_unknown`.
+6. `ready`: no active generation (`active: null`), one ready generation.
+7. `ack_success`: the ready generation becomes active, returned in `generation`.
+8. `active_available`: `active` and an empty `ready` list; no `pinned_status`.
+9. `active_withdrawn`: still active, `error: null`; `pinned_status` reports withdrawal.
+10. `degraded_and_ready_blocked`: the active generation became degraded; the newer
+    ready generation also holds the revoked version and cannot be activated.
+11. `ack_blocked`: the ready generation's acknowledgement is refused, with
     `code: "activation_blocked"`, `message: "activation_blocked"`, and
     `detail: {name, reason, version}` naming the blocked pin. No `result` is present.
 

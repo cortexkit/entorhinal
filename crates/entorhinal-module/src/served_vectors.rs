@@ -1594,7 +1594,25 @@ async fn catalog_generation_v1_records_match_published_files() {
             .unwrap(),
         b"catalog"
     );
+    // The middle chunk joins the first and final chunks without a gap, so a
+    // consumer can assemble the whole blob from captured replies and check
+    // its digest.
     let final_offset = blob_bytes.len() - 6;
+    let middle_chunk = record_at(
+        &f,
+        &mut records,
+        "blob_middle_chunk",
+        "catalog.read_blob",
+        json!({"sha256":blob_digest,"offset":7,"length":final_offset - 7}),
+        READER,
+    )
+    .await;
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(middle_chunk["result"]["bytes"].as_str().unwrap())
+            .unwrap(),
+        &blob_bytes[7..final_offset]
+    );
     let final_chunk = record_at(
         &f,
         &mut records,
