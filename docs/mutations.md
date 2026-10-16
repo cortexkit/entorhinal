@@ -64,6 +64,65 @@ whether other tests in the same target may fail too. Reports go under
 While a replay runs, do not edit, check out or stash anything in that
 checkout: the break is in the working tree.
 
+## CI replay cost
+
+I measured five representative rows on the Linux build server with
+`ckdev-mutate 0.12.1`. “Cold” is the first replay of an id; “warm” is the
+immediate repeat. The wall time covers the whole `run --only` invocation. The
+runner’s baseline timing separates the clean-source build (including link) from
+test execution; it does not include the mutant’s second build/test in that
+baseline line.
+
+| Row | Wall, cold / warm | Baseline build + link, cold / warm | Baseline tests, cold / warm |
+| --- | ---: | ---: | ---: |
+| `admission-flow-writes` (module) | 110.4 / 136.7 s | 0.32 / 7.77 s | 54.03 / 49.09 s |
+| `move-driver-stop-drains-blocking-sql` (module) | 106.9 / 132.8 s | 6.54 / 5.18 s | 52.15 / 51.77 s |
+| `verify-drift-affects-ok` (core) | 1.9 / 2.9 s | 0.12 / 1.47 s | 0.16 / 0.14 s |
+| `identity-one-live-head-index` (core) | 19.5 / 23.6 s | 1.29 / 1.83 s | 7.04 / 9.77 s |
+| `s1-path-not-unicode-cli` (Cargo/Linux) | 119.1 / 87.4 s | 5.88 / 3.18 s | 47.86 / 41.59 s |
+
+These values are from two-vCPU Linux runs; all five rows reported CAUGHT. There
+are no command-runner rows in the catalogue, so the fifth sample is a
+Linux-scoped Cargo row. The `admission-flow-writes` report executed 687 runnable
+tests in the `ck_entorhinal` target, not only its one expected failure. A
+linker wrapper around the system `cc` measured that large executable’s link at
+0.38–0.40 s. Linking is only a small part of the build, and the test target
+dominates the slow rows.
+
+As a comparison, a temporary expected-only copy of `admission-flow-writes`
+reported CAUGHT with a 5.32 s mutant build and a 0.06 s test; its clean baseline
+build/test was 5.20 / 0.06 s. The default four-vCPU run’s mutant build/test was
+5.86 / 36.07 s. This shows the expected test alone catches this sample row, but
+does not prove the same for every catalogue row.
+
+I tried `CARGO_PROFILE_DEV_DEBUG=0` plus `CARGO_PROFILE_TEST_DEBUG=0`, then
+clang with LLD, separately. For the warm module baseline, default build/test
+was 7.77 / 49.09 s; with no debug info it was 7.83 / 49.57 s, and with LLD it
+was 6.73 / 50.71 s. No-debug did not lower the warmed build, while LLD saved
+about one second in one replay and did not shorten the test. The Linux build
+worker had `ld.lld` but no `mold`; the checked Ubuntu runner image lists Clang
+but not LLD, so LLD would also need installation in CI. On the four-vCPU
+worker, `RUST_TEST_THREADS=8` was inconsistent across repeats: whole-row times
+were 88.1 and 101.6 s versus 93.2 and 80.1 s at the default. None of these
+settings is enabled in CI. The test job already builds all workspace targets
+before the mutation job, and both use `rust-cache`, so dependency cache warmth
+is not the source of the long row time.
+
+At the pinned runner revision, expected-only selection is a row-level setting;
+there is no run-wide option. Currently 411 of the 670 catalogue rows run their
+full selected test target on push replays. Adding `select = "expected"` to the
+catalogue rows would also narrow those rows under `--broad`, and the runner
+refuses that selection on rows with `only = true`; the nightly sweep would no
+longer audit the same breadth. No catalogue or replay behavior is changed here.
+The planned improvement is a run-wide expected-only option in `ckdev-mutate`:
+use it for push/PR and main replays so each row runs its named tests, while
+leaving the nightly `--all --broad` sweep unfiltered.
+
+A full shard was not replayed. The current CI projection remains the measured
+52–80 minutes per shard; the future expected-only projection is roughly 15–20
+minutes for 84 rows if build/link stays near 5–8 s and the selected test remains
+short. That projection is not a full-shard measurement.
+
 ## A row
 
 ```toml
