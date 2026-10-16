@@ -8830,3 +8830,17 @@ package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
 expect_red = ["cli::tests::log_enable_cli_request_enables_through_operator_route"]
+
+
+[[control]]
+id = "catalog-generation-publisher-first-party"
+guards = "Generation replies preserve the first-party root-certification fact recorded at install time"
+file = "crates/entorhinal-module/src/catalog_agent.rs"
+old = '"first_party": fact.first_party,'
+new = '"first_party": false, // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/served_vectors.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["served_vectors::catalog_generation_v1_records_match_published_files"]

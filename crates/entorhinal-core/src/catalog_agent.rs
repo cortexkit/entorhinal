@@ -69,7 +69,8 @@ CREATE TABLE catalog_prepared(plan_id TEXT PRIMARY KEY REFERENCES catalog_plan(p
 CREATE TABLE catalog_generation(generation_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL,
  plan_id TEXT NOT NULL UNIQUE REFERENCES catalog_plan(plan_id),
  state TEXT NOT NULL CHECK(state IN ('installed','approved','ready','active','degraded','superseded')),
- closure TEXT NOT NULL, pin_digest TEXT NOT NULL, created_at_ms INTEGER NOT NULL, activated_at_ms INTEGER, error TEXT);
+ closure TEXT NOT NULL, pin_digest TEXT NOT NULL, created_at_ms INTEGER NOT NULL, activated_at_ms INTEGER, error TEXT,
+ publisher_facts TEXT NOT NULL DEFAULT '[]');
 CREATE UNIQUE INDEX catalog_one_active ON catalog_generation(agent_id) WHERE state='active';
 CREATE TABLE catalog_transition(entity TEXT NOT NULL, id TEXT NOT NULL, transition TEXT NOT NULL,
  args_digest TEXT NOT NULL, result TEXT NOT NULL, PRIMARY KEY(entity,id,transition));
@@ -347,6 +348,17 @@ pub struct CatalogGeneration {
     /// The module serializes only their public notice fields and omits an empty list.
     #[serde(skip)]
     pub pinned_status: Vec<Value>,
+    /// Publisher provenance recorded when this local generation was installed.
+    /// It is intentionally local state and never part of shared pins.
+    #[serde(default)]
+    pub publisher_facts: Vec<CatalogPublisherFact>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogPublisherFact {
+    pub name: String,
+    pub fingerprint: String,
+    pub scope: String,
+    pub first_party: bool,
 }
 fn decode<T: serde::de::DeserializeOwned>(s: String) -> rusqlite::Result<T> {
     serde_json::from_str(&s).map_err(crate::shared_entry::decode_error)
@@ -357,11 +369,39 @@ fn read_plan(conn: &Connection, id: &str) -> rusqlite::Result<CatalogPlan> {
     }))
 }
 fn read_generation(conn: &Connection, id: &str) -> rusqlite::Result<CatalogGeneration> {
-    let mut generation = conn.query_row("SELECT generation_id,agent_id,plan_id,state,closure,pin_digest,created_at_ms,activated_at_ms,error FROM catalog_generation WHERE generation_id=?1",[id],|r| Ok(CatalogGeneration {
-        generation_id:r.get(0)?,agent_id:r.get(1)?,plan_id:r.get(2)?,state:r.get(3)?,closure:decode(r.get(4)?)?,pin_digest:r.get(5)?,created_at_ms:r.get(6)?,activated_at_ms:r.get(7)?,error:r.get::<_,Option<String>>(8)?.map(decode).transpose()?,pinned_status:Vec::new()
+    let mut generation = conn.query_row("SELECT generation_id,agent_id,plan_id,state,closure,pin_digest,created_at_ms,activated_at_ms,error,publisher_facts FROM catalog_generation WHERE generation_id=?1",[id],|r| Ok(CatalogGeneration {
+        generation_id:r.get(0)?,agent_id:r.get(1)?,plan_id:r.get(2)?,state:r.get(3)?,closure:decode(r.get(4)?)?,pin_digest:r.get(5)?,created_at_ms:r.get(6)?,activated_at_ms:r.get(7)?,error:r.get::<_,Option<String>>(8)?.map(decode).transpose()?,pinned_status:Vec::new(),publisher_facts:decode(r.get(9)?)?
     }))?;
     generation.pinned_status = pin_statuses(conn, &generation.closure)?;
     Ok(generation)
+}
+fn publisher_facts(
+    pins: &[CatalogPin],
+    prepared: Option<&PreparedPlan>,
+) -> Vec<CatalogPublisherFact> {
+    pins.iter()
+        .map(|pin| {
+            let scope = pin
+                .name
+                .split_once('/')
+                .map_or("", |(scope, _)| scope)
+                .to_owned();
+            let first_party = scope == "@cortexkit"
+                && prepared.is_some_and(|detail| {
+                    detail.packages.iter().any(|package| {
+                        package.pin.name == pin.name
+                            && package.pin.publisher_fingerprint == pin.publisher_fingerprint
+                            && package.root_certified
+                    })
+                });
+            CatalogPublisherFact {
+                name: pin.name.clone(),
+                fingerprint: pin.publisher_fingerprint.clone(),
+                scope,
+                first_party,
+            }
+        })
+        .collect()
 }
 fn live(conn: &Connection, agent: &str) -> Result<(), CatalogWriteError> {
     let status: Option<String> = crate::agent::load_row(conn, agent)
@@ -698,7 +738,19 @@ impl RegistryStore {
                 }
                 let existing: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM catalog_generation WHERE plan_id=?1)",[plan_id],|r|r.get(0)).map_err(store_error)?;
                 if existing || generation_id.is_empty() { return Err(CatalogWriteError::Refused("request_key_conflict")); }
-                tx.execute("INSERT INTO catalog_generation VALUES(?1,?2,?3,'approved',?4,?5,?6,NULL,NULL)",params![generation_id,plan.agent_id,plan_id,serde_json::to_string(pins).unwrap(),pin_digest(pins).map_err(store_error)?,now]).map_err(store_error)?;
+                let detail = tx
+                    .query_row(
+                        "SELECT detail FROM catalog_prepared WHERE plan_id=?1",
+                        [plan_id],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(store_error)?
+                    .map(decode::<PreparedPlan>)
+                    .transpose()
+                    .map_err(store_error)?;
+                let facts = publisher_facts(pins, detail.as_ref());
+                tx.execute("INSERT INTO catalog_generation(generation_id,agent_id,plan_id,state,closure,pin_digest,created_at_ms,activated_at_ms,error,publisher_facts) VALUES(?1,?2,?3,'approved',?4,?5,?6,NULL,NULL,?7)",params![generation_id,plan.agent_id,plan_id,serde_json::to_string(pins).unwrap(),pin_digest(pins).map_err(store_error)?,now,serde_json::to_string(&facts).unwrap()]).map_err(store_error)?;
                 read_generation(tx,generation_id).map_err(store_error)
             })
         })
@@ -908,15 +960,17 @@ impl JournalWriter<'_> {
                 ));
             }
             let generation_id = format!("generation:{plan_id}");
+            let facts = publisher_facts(&pins, Some(&detail));
             tx.execute(
-                "INSERT INTO catalog_generation VALUES(?1,?2,?3,'approved',?4,?5,?6,NULL,NULL)",
+                "INSERT INTO catalog_generation(generation_id,agent_id,plan_id,state,closure,pin_digest,created_at_ms,activated_at_ms,error,publisher_facts) VALUES(?1,?2,?3,'approved',?4,?5,?6,NULL,NULL,?7)",
                 params![
                     generation_id,
                     caller,
                     plan_id,
                     serde_json::to_string(&pins).unwrap(),
                     pin_digest(&pins)?,
-                    now
+                    now,
+                    serde_json::to_string(&facts).unwrap()
                 ],
             )?;
             if always {

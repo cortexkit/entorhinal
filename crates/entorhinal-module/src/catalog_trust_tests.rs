@@ -989,10 +989,13 @@ async fn cortexkit_http_uses_only_explicit_root_and_refuses_production_slot() {
         .unwrap()
         .iter()
         .any(|p| p.contains("archives") || p.ends_with("ck.json")));
-    trust
-        .verify_version_with_root("@cortexkit/hello-skill", VERSION, Some(root))
+    let (verified, first_party) = trust
+        .with_test_root(root.into())
+        .verify_version_with_provenance("@cortexkit/hello-skill", VERSION)
         .await
         .unwrap();
+    assert!(first_party);
+    assert_eq!(verified.record.name, "@cortexkit/hello-skill");
 }
 #[tokio::test]
 async fn archive_barrier_cannot_publish_after_newer_status() {

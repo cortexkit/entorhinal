@@ -327,9 +327,11 @@ packages, including optional and non-Linux target dependencies:
 
 Migration 12 adds `catalog_pin_set` (one stored `pin_digest` per agent) and
 `catalog_pin` (one row per agent/name). Pins contain name, version, kind, manifest
-and archive SHA-256, publisher fingerprint, `root` and `range`. They contain no
-machine-local generation id. A root has a requested range; a non-root has null
-range. An empty set has the digest of the empty JCS array.
+and archive SHA-256, publisher fingerprint, `root` and `range`. `root` marks a
+package named directly in an install or upgrade request rather than reached only
+as a dependency. Its `range` records the requested semver range; transitive pins use
+`root=false` and `range=null`. Pins contain no machine-local generation id or
+publisher trust fact. An empty set has the digest of the empty JCS array.
 
 The digest is **lowercase SHA-256 of a JCS array sorted by name**. Each object has
 exactly `{name, version, manifest_sha256, archive_sha256,
@@ -349,8 +351,10 @@ Snapshots may retain pins of terminal agents for identity history. Generic
 snapshots and journal replay, but never in `IDENTITY_CHANGE_OPS` or `agent.changes`.
 
 `catalog_plan`, `catalog_generation` and `catalog_transition` are machine-local,
-not journal projections. Plan creation is self-targeted, live-agent-only, and
-accepts install/upgrade for the calling agent, not `hire` (creating another agent)
+not journal projections. `catalog_generation.publisher_facts` records the package
+scope and the install-time first-party certificate result beside each generation;
+this is deliberately not copied with shared pins. Plan creation is self-targeted,
+live-agent-only, and accepts install/upgrade for the calling agent, not `hire` (creating another agent)
 or workspace/project-wide placement targets. A ready closure containing
 any non-skill member becomes failed with `kind_not_yet_supported` and its package
 name. Plans start pending and become ready or failed. Approval of a ready plan
@@ -432,6 +436,15 @@ the daemon's original route refusal code/detail. Missing roles never imply succe
   `{ok:false, refusals:[{package, version, code, message}]}`. A non-string or blank
   section is `consumer_contract_violation`, naming the module. Consumers read bytes
   through `catalog.read_blob` and independently verify them.
+- `catalog.read_blob {sha256, offset, length}` is available only to a daemon-stamped
+  module that declares a catalog-consumer kind capability. It returns
+  `{bytes, offset, total}`, where `bytes` is standard base64; requested `length` is
+  `1..=1,048,576`, and a valid request is clipped at EOF. An empty `bytes` value is
+  returned only when `offset` is exactly the blob length. Refusals include
+  `catalog_consumer_required`, `blob_request_invalid`, `blob_unknown`, `blob_corrupt`
+  and `blob_io` (malformed request fields are `invalid_params`). Fetch `ck.json` by
+  its `manifest_sha256` and the archive by its `archive_sha256`; consumers must
+  verify the returned bytes independently.
 - `catalog_consumer.prefetch {generation_id, packages}` returns `{ready:true}` only
   after durable caching and verification. Every checked consumer must still be
   present with its checked kinds, and every current covering consumer must report
@@ -477,10 +490,16 @@ only: no registry, daemon discovery or consumer request runs on this path. Core
 retains its last active generation when Entorhinal is unavailable at session start.
 
 All three generation surfaces (`catalog_generation`, `catalog.agent_generation`,
-and a successful `catalog.ack_activation`) use one generation serializer. A generation
-optionally includes `pinned_status: [{name, version, state, reason}]`, listing only
-closure versions whose held status is not `available`. The field is **absent**, not
-an empty list, when there is no status news. Pin identities and digests do not change.
+and a successful `catalog.ack_activation`) use one generation serializer. Each
+closure entry adds `publisher: {fingerprint, scope, first_party}` while retaining
+`publisher_fingerprint`. `scope` is the installed package scope (for example,
+`@cortexkit`); `first_party` is the root-certificate result recorded for that local
+generation at install time. Publisher grants never make a package first-party.
+The fact is machine-local: shared pins do not carry it, and a Mac receiving a move
+must certify CortexKit keys against its own root. The generation optionally includes
+`pinned_status: [{name, version, state, reason}]`, listing only closure versions
+whose held status is not `available`. The field is **absent**, not an empty list,
+when there is no status news. Pin identities and digests do not change.
 
 For a **withdrawn** pin, core sees the same `active` (or `ready`) generation, its
 nonblocking `pinned_status` notice, and no new error. Existing pins remain usable;

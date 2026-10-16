@@ -1,8 +1,10 @@
 # Catalog generation v1 served vectors
 
-`records.json` contains six sequential examples produced by the real
-`ProjectsHandler::handle_served_request`, admitted as `reserved:prefrontal-core`
-without a flow scope. `SHA256SUMS` covers this README and `records.json`.
+`records.json` contains ten sequential examples produced by the real
+`ProjectsHandler::handle_served_request`; blob reads use a daemon-stamped caller
+(`phone`) declared as a skill catalog consumer, while generation operations are
+admitted as `reserved:prefrontal-core` without a flow scope. `SHA256SUMS` covers
+this README and `records.json`.
 
 Each record has exactly:
 
@@ -21,15 +23,27 @@ request id. Successful replies wrap their value in `result`.
 
 Cases, in order:
 
-1. `ready`: no active generation (`active: null`), one ready generation.
-2. `ack_success`: the ready generation becomes active, returned in `generation`.
-3. `active_available`: `active` and an empty `ready` list; no `pinned_status`.
-4. `active_withdrawn`: still active, `error: null`; `pinned_status` reports withdrawal.
-5. `degraded_and_ready_blocked`: the active generation became degraded; the newer
+1. `blob_first_chunk`: reads the first seven bytes of a published blob.
+2. `blob_final_chunk`: reads a final chunk whose requested range extends past EOF.
+3. `blob_eof_empty`: reads at EOF and returns empty base64 bytes.
+4. `blob_unknown`: refuses an unknown digest with `blob_unknown`.
+5. `ready`: no active generation (`active: null`), one ready generation.
+6. `ack_success`: the ready generation becomes active, returned in `generation`.
+7. `active_available`: `active` and an empty `ready` list; no `pinned_status`.
+8. `active_withdrawn`: still active, `error: null`; `pinned_status` reports withdrawal.
+9. `degraded_and_ready_blocked`: the active generation became degraded; the newer
    ready generation also holds the revoked version and cannot be activated.
-6. `ack_blocked`: the ready generation's acknowledgement is refused, with
-   `code: "activation_blocked"`, `message: "activation_blocked"`, and
-   `detail: {name, reason, version}` naming the blocked pin. No `result` is present.
+10. `ack_blocked`: the ready generation's acknowledgement is refused, with
+    `code: "activation_blocked"`, `message: "activation_blocked"`, and
+    `detail: {name, reason, version}` naming the blocked pin. No `result` is present.
+
+The blob reply is `{bytes, offset, total}`; `bytes` is standard base64. Requested
+`length` is `1..=1,048,576`, ranges are clipped at EOF, and an empty result is
+permitted only when `offset` equals the total blob length. Read refusals include
+`catalog_consumer_required`, `blob_request_invalid`, `blob_unknown`, `blob_corrupt`
+and `blob_io`; malformed request fields are `invalid_params`. Consumers fetch
+`ck.json` by `manifest_sha256` and the archive by `archive_sha256`, then verify the
+bytes independently.
 
 Generation fields (shared by the `catalog_generation` agent tool and the
 `catalog.agent_generation` / `catalog.ack_activation` operations reserved to core):
@@ -39,8 +53,15 @@ Generation fields (shared by the `catalog_generation` agent tool and the
   three occur here; local `superseded` bookkeeping is never sent);
 - `closure`: exact package pins. Every pin has `name`, `version`, `kind` (`skill`),
   `manifest_sha256`, `archive_sha256`, `publisher_fingerprint`, `root`, and `range`
-  (a root's semver range; non-root pins use null). Identities and hashes are
-  unchanged by status news;
+  (a package named directly in an install/upgrade request has `root: true` and keeps
+  its requested semver range; transitive pins use `root: false` and `range: null`).
+  Generation entries also carry
+  `publisher: {fingerprint, scope, first_party}`; the fingerprint duplicates
+  `publisher_fingerprint`, scope is installed (such as `@cortexkit` or `@example`),
+  and `first_party` records certification by this Mac's pinned CortexKit root at
+  install time. The example closure contains a root-certified CortexKit skill and
+  a third-party skill backed by a publisher grant; their flags are true and false.
+  Identities and hashes are unchanged by status news;
 - `pin_digest`: SHA-256 of the canonical pin set, unchanged by status news;
 - `created_at_ms`: 300 in these fixtures;
 - `activated_at_ms`: null before activation, 700 after acknowledgement;
@@ -60,10 +81,12 @@ module registry generation counter, or additional reason field.
 
 The fixture fixes agent id `agent_0000000000000002`, ids
 `generation:available` / `generation:blocked` and their `plan:`-prefixed plan ids,
-clock 700 ms, and handler incarnation `0123456789abcdef`. It seeds local plans and
-pins, then applies status news through the store's trust transaction, which also
-updates generation effects; the queries and acknowledgements are real handler
-calls. Separate HTTP tests authenticate signed feeds and exercise preparation.
+clock 700 ms, and handler incarnation `0123456789abcdef`. It verifies the test
+CortexKit publisher certificate against an injected test root, records a publisher
+grant for the third-party skill, then seeds local plans and pins. Status news is
+applied through the store's trust transaction, which also updates generation
+effects; queries and acknowledgements are real handler calls. Separate HTTP tests
+authenticate signed feeds and exercise preparation.
 
 Regenerate from the repository root:
 
@@ -77,4 +100,7 @@ without normalizing object order or whitespace. The native mutation control
 `catalog-generation-served-bytes` changes a serialized digest and must fail the
 byte comparison in this test rather than re-generating its expectation from the
 altered implementation. `catalog-generation-served-status` separately removes the
-status overlay to prove that the withdrawal notice is observed.
+status overlay to prove withdrawal is observed. The
+`catalog-generation-publisher-first-party` control flips the stored provenance fact
+in the common generation serializer and must fail the first-party/third-party
+closure assertions.

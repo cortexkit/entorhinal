@@ -164,6 +164,26 @@ impl CatalogAgent {
 mod tests;
 fn generation_reply(generation: &entorhinal_core::catalog_agent::CatalogGeneration) -> Value {
     let mut reply = serde_json::to_value(generation).unwrap();
+    reply
+        .as_object_mut()
+        .expect("generation reply is an object")
+        .remove("publisher_facts");
+    for pin in reply["closure"]
+        .as_array_mut()
+        .expect("generation closure is an array")
+    {
+        let name = pin["name"].as_str().expect("generation pin has a name");
+        let fact = generation
+            .publisher_facts
+            .iter()
+            .find(|fact| fact.name == name)
+            .expect("generation pin has recorded publisher provenance");
+        pin["publisher"] = json!({
+            "fingerprint": fact.fingerprint,
+            "scope": fact.scope,
+            "first_party": fact.first_party,
+        });
+    }
     let statuses = &generation.pinned_status;
     if !statuses.is_empty() {
         reply["pinned_status"] = json!(statuses.iter().map(|s| json!({"name":s["name"],"version":s["version"],"state":s["state"],"reason":s["reason"]})).collect::<Vec<_>>());
@@ -204,6 +224,7 @@ async fn prepare(
     }
     let mut seen = BTreeSet::new();
     let mut candidates = Vec::<VerifiedPackage>::new();
+    let mut first_party = BTreeMap::<(String, String), bool>::new();
     while let Some(name) = queue.pop_front() {
         if !seen.insert(name.clone()) {
             continue;
@@ -230,8 +251,11 @@ async fn prepare(
                     "too many candidate versions",
                 ));
             }
-            let verified = trust.verify_version(&name, &version).await?;
+            let (verified, root_certified) = trust
+                .verify_version_with_provenance(&name, &version)
+                .await?;
             queue.extend(verified.manifest.requires.packages.keys().cloned());
+            first_party.insert((name.clone(), version), root_certified);
             candidates.push(verified);
         }
     }
@@ -274,7 +298,10 @@ async fn prepare(
             .iter()
             .find(|v| v.record.name == pin.name && v.record.version == pin.version)
             .expect("resolver returns only verified candidates");
-        let root_certified = pin.name.starts_with("@cortexkit/");
+        let root_certified = first_party
+            .get(&(pin.name.clone(), pin.version.clone()))
+            .copied()
+            .unwrap_or(false);
         let trusted = root_certified
             || grants.iter().any(|g| {
                 g.publisher_fingerprint == pin.publisher_fingerprint && g.revoked_at_ms.is_none()

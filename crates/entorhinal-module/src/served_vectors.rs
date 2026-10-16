@@ -1364,9 +1364,12 @@ async fn repair_preview_is_open_and_cutover_refusal_precedes_confirmation() {
 
 #[tokio::test]
 async fn catalog_generation_v1_records_match_published_files() {
-    use entorhinal_core::catalog_agent::{CatalogPin, CatalogSpec, CatalogTarget};
+    use entorhinal_core::catalog_agent::{
+        CatalogPin, CatalogSpec, CatalogTarget, PreparedPackage, PreparedPlan,
+    };
+    use entorhinal_core::catalog_grants::{coverage, Coverage, Operation, PublisherGrant};
     use entorhinal_core::catalog_trust::{CatalogStatus, TrustWrite};
-    let f = Fixture::new("catalog-generation-vectors").await;
+    let mut f = Fixture::new("catalog-generation-vectors").await;
     let source = f.snapshot();
     seed_agent(&source, ASSISTANT, "Catalog assistant", None, false, false);
     drop(source);
@@ -1382,6 +1385,79 @@ async fn catalog_generation_v1_records_match_published_files() {
         root: true,
         range: Some("^1.0.0".into()),
     };
+    let trust_vectors = crate::catalog_trust::tests::vectors("statements");
+    let publisher_key = &trust_vectors["keys"]["cortexkit_publish"][0];
+    let test_root = trust_vectors["keys"]["root"]["public_key_hex"]
+        .as_str()
+        .unwrap();
+    let certificate = &trust_vectors["ck-key-cert/v1"]["cases"][0]["served"];
+    let certificate_text = entorhinal_catalog::jcs::to_string(&certificate["statement"]).unwrap();
+    let certified = entorhinal_catalog::statements::verify_key_cert(
+        &certificate_text,
+        certificate["signature"].as_str().unwrap(),
+        test_root,
+    )
+    .unwrap();
+    assert_eq!(certified.public_key, publisher_key["public_key_hex"]);
+    let first_party_pin = CatalogPin {
+        name: "@cortexkit/hello-skill".into(),
+        version: "1.0.0".into(),
+        kind: entorhinal_catalog::Kind::Skill,
+        manifest_sha256: "55".repeat(32),
+        archive_sha256: "66".repeat(32),
+        publisher_fingerprint: publisher_key["fingerprint"].as_str().unwrap().into(),
+        root: true,
+        range: Some("^1.0.0".into()),
+    };
+    let prepared = PreparedPlan {
+        packages: vec![
+            PreparedPackage {
+                pin: first_party_pin.clone(),
+                trust: "trusted".into(),
+                capabilities: vec![],
+                has_scripts: false,
+                root_certified: true,
+            },
+            PreparedPackage {
+                pin: pin.clone(),
+                trust: "trusted".into(),
+                capabilities: vec![],
+                has_scripts: false,
+                root_certified: false,
+            },
+        ],
+        moves: json!({}),
+        checks: vec![],
+    };
+    store
+        .insert_publisher_grant(
+            &PublisherGrant {
+                id: "publisher:catalog-generation-vector".into(),
+                publisher_fingerprint: pin.publisher_fingerprint.clone(),
+                operation: Operation::Install,
+                placement_agent_id: ASSISTANT.into(),
+                ceiling: vec![],
+                card_ref: None,
+                granted_at_ms: 50,
+                revoked_at_ms: None,
+            },
+            &json!("catalog-generation-v1-test"),
+        )
+        .unwrap();
+    assert_eq!(
+        coverage(
+            &prepared
+                .packages
+                .iter()
+                .map(PreparedPackage::coverage)
+                .collect::<Vec<_>>(),
+            &store.publisher_grants().unwrap(),
+            Operation::Install,
+            ASSISTANT,
+            true,
+        ),
+        Coverage::Covered
+    );
     store
         .catalog_registry_add(
             "https://registry.example.invalid",
@@ -1408,7 +1484,15 @@ async fn catalog_generation_v1_records_match_published_files() {
             )
             .unwrap();
         store
-            .catalog_plan_ready(&plan, ASSISTANT, vec![pin.clone()], 200)
+            .catalog_save_prepared(&plan, ASSISTANT, &prepared)
+            .unwrap();
+        store
+            .catalog_plan_ready(
+                &plan,
+                ASSISTANT,
+                vec![first_party_pin.clone(), pin.clone()],
+                200,
+            )
             .unwrap();
         store
             .catalog_approve_plan(&plan, ASSISTANT, id, 300)
@@ -1443,15 +1527,16 @@ async fn catalog_generation_v1_records_match_published_files() {
             .unwrap();
     };
     let mut records = Vec::new();
-    async fn record(
+    async fn record_at(
         f: &Fixture,
         records: &mut Vec<String>,
         case: &str,
         method: &str,
         params: Value,
+        route: RouteKey,
     ) -> Value {
         let request = serde_json::to_vec(&json!({"method":method,"params":params})).unwrap();
-        let outcome = f.handler.handle_served_request(&request, CORE).await;
+        let outcome = f.handler.handle_served_request(&request, route).await;
         let (kind, reply) = match outcome {
             HandlerOutcome::Response(bytes) => ("response", String::from_utf8(bytes).unwrap()),
             other => ("error", refusal(other).to_string()),
@@ -1466,6 +1551,85 @@ async fn catalog_generation_v1_records_match_published_files() {
         ));
         decoded
     }
+    async fn record(
+        f: &Fixture,
+        records: &mut Vec<String>,
+        case: &str,
+        method: &str,
+        params: Value,
+    ) -> Value {
+        record_at(f, records, case, method, params, CORE).await
+    }
+    let blob_folder = f
+        .handler
+        .with_store(|store| Ok(store.store_folder().to_path_buf()))
+        .unwrap();
+    let blob_bytes = b"catalog package bytes";
+    let blob_digest = crate::catalog_blob::BlobStore::new(&blob_folder)
+        .unwrap()
+        .publish(blob_bytes)
+        .unwrap();
+    f.handler.participant_discovery = std::sync::Arc::new(crate::fake_daemon::FakeDaemon::new(
+        crate::fake_daemon::DaemonSnapshot::new(
+            1,
+            vec![],
+            vec![
+                json!({"module_id":READER_MODULE,"ready":true,"roles":[],"control_ops":[],"capabilities":{"provides":[crate::catalog_consumer::SKILL],"requires":[]}}),
+            ],
+        ),
+    ));
+    use base64::Engine;
+    let first_chunk = record_at(
+        &f,
+        &mut records,
+        "blob_first_chunk",
+        "catalog.read_blob",
+        json!({"sha256":blob_digest,"offset":0,"length":7}),
+        READER,
+    )
+    .await;
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(first_chunk["result"]["bytes"].as_str().unwrap())
+            .unwrap(),
+        b"catalog"
+    );
+    let final_offset = blob_bytes.len() - 6;
+    let final_chunk = record_at(
+        &f,
+        &mut records,
+        "blob_final_chunk",
+        "catalog.read_blob",
+        json!({"sha256":blob_digest,"offset":final_offset,"length":10}),
+        READER,
+    )
+    .await;
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(final_chunk["result"]["bytes"].as_str().unwrap())
+            .unwrap(),
+        &blob_bytes[final_offset..]
+    );
+    let eof = record_at(
+        &f,
+        &mut records,
+        "blob_eof_empty",
+        "catalog.read_blob",
+        json!({"sha256":blob_digest,"offset":blob_bytes.len(),"length":1}),
+        READER,
+    )
+    .await;
+    assert_eq!(eof["result"]["bytes"], "");
+    let unknown = record_at(
+        &f,
+        &mut records,
+        "blob_unknown",
+        "catalog.read_blob",
+        json!({"sha256":"ff".repeat(32),"offset":0,"length":1}),
+        READER,
+    )
+    .await;
+    assert_eq!(unknown["code"], "blob_unknown");
     generation("generation:available");
     let ready = record(
         &f,
@@ -1476,6 +1640,19 @@ async fn catalog_generation_v1_records_match_published_files() {
     )
     .await;
     assert_eq!(ready["result"]["ready"][0]["state"], "ready");
+    let closure = ready["result"]["ready"][0]["closure"].as_array().unwrap();
+    assert_eq!(
+        closure[0]["publisher"]["fingerprint"],
+        first_party_pin.publisher_fingerprint
+    );
+    assert_eq!(closure[0]["publisher"]["scope"], "@cortexkit");
+    assert_eq!(closure[0]["publisher"]["first_party"], true);
+    assert_eq!(
+        closure[1]["publisher"]["fingerprint"],
+        pin.publisher_fingerprint
+    );
+    assert_eq!(closure[1]["publisher"]["scope"], "@example");
+    assert_eq!(closure[1]["publisher"]["first_party"], false);
     record(
         &f,
         &mut records,

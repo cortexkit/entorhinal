@@ -179,6 +179,7 @@ pub struct CatalogTrust {
     store: StoreAccess,
     client: RegistryClient,
     scope: String,
+    cortexkit_root: Option<String>,
     registry: CatalogRegistry,
     refused_links: std::collections::BTreeSet<String>,
 }
@@ -219,6 +220,7 @@ impl CatalogTrust {
             store: StoreAccess::Held(store),
             client,
             scope: scope.into(),
+            cortexkit_root: CORTEXKIT_ROOT.map(str::to_owned),
             registry,
             refused_links: Default::default(),
         })
@@ -244,9 +246,15 @@ impl CatalogTrust {
             store: StoreAccess::Held(store),
             client,
             scope: scope.into(),
+            cortexkit_root: CORTEXKIT_ROOT.map(str::to_owned),
             registry,
             refused_links: Default::default(),
         })
+    }
+    #[cfg(test)]
+    pub(crate) fn with_test_root(mut self, root: String) -> Self {
+        self.cortexkit_root = Some(root);
+        self
     }
     pub async fn refresh_registry_keys(&mut self) -> Result<(), NetworkError> {
         let bytes = self.client.fetch_json("v1/registry/keys").await?;
@@ -383,7 +391,18 @@ impl CatalogTrust {
         name: &str,
         version: &str,
     ) -> Result<record::VerifiedPackage, NetworkError> {
-        self.verify_version_with_root(name, version, CORTEXKIT_ROOT)
+        self.verify_version_with_provenance(name, version)
+            .await
+            .map(|(verified, _)| verified)
+    }
+    pub async fn verify_version_with_provenance(
+        &mut self,
+        name: &str,
+        version: &str,
+    ) -> Result<(record::VerifiedPackage, bool), NetworkError> {
+        let root = self.cortexkit_root.clone();
+        let first_party = self.scope == "@cortexkit" && root.is_some();
+        self.verify_version_with_root(name, version, root.as_deref())
             .await
             .map_err(|mut e| {
                 if let NetworkError::Failed(error) = &mut e {
@@ -394,6 +413,7 @@ impl CatalogTrust {
                 }
                 e
             })
+            .map(|verified| (verified, first_party))
     }
     pub async fn versions(&self, name: &str) -> Result<Vec<String>, NetworkError> {
         let mapped = names::map_name(name)
