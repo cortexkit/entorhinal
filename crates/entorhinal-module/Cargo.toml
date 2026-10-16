@@ -28,6 +28,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 subc-client-rs = { workspace = true }
+subc-control = { workspace = true }
 subc-protocol = { workspace = true }
 tokio = { workspace = true }
 getrandom = { workspace = true }

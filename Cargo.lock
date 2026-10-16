@@ -363,6 +363,7 @@ dependencies = [
  "serde",
  "serde_json",
  "subc-client-rs",
+ "subc-control",
  "subc-protocol",
  "subc-transport",
  "tokio",

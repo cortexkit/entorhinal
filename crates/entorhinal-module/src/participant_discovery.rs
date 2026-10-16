@@ -129,10 +129,20 @@ pub(crate) async fn discover_participants(
         .iter()
         .map(|entry| (entry.module_id.as_str(), entry))
         .collect();
+    // A supervised process that speaks no subc wire (`protocol: none`, such as
+    // the message bus) never registers, so it can never be a participant and
+    // must not block every move. Everything else, including an entry from a
+    // daemon too old to report the field (which defaults to `subc`), stays
+    // fail-closed: missing from the catalog means it may be a participant
+    // that is down.
     let enabled: BTreeMap<_, _> = configured
         .modules
         .iter()
         .filter(|entry| entry.enabled)
+        .filter(|entry| match entry.protocol {
+            subc_control::ModuleProtocol::None => false,
+            subc_control::ModuleProtocol::Subc => true,
+        })
         .map(|entry| (entry.module_id.as_str(), entry))
         .collect();
 
@@ -215,6 +225,33 @@ mod tests {
             .expect("must refuse");
         assert_eq!(error.code(), "participant_unavailable");
         error.detail
+    }
+
+    #[tokio::test]
+    async fn processes_without_the_subc_wire_never_block_but_absent_modules_still_do() {
+        // A supervised process with no subc wire (the message bus) is never in
+        // the catalog. It must not block a move.
+        let mut bus = configured("nats-server", true, "running");
+        bus["protocol"] = json!("none");
+        let with_bus = daemon(
+            vec![bus, configured("alpha", true, "running")],
+            vec![participant("alpha")],
+        );
+        let participants = discover_participants(&with_bus).await.unwrap();
+        assert_eq!(participants.len(), 1);
+        assert_eq!(participants[0].module_id, "alpha");
+
+        // The same absent entry declared as a subc module, or from a daemon
+        // too old to send the field, still refuses: it may be a participant
+        // that is down.
+        for protocol in [Some("subc"), None] {
+            let mut entry = configured("nats-server", true, "running");
+            if let Some(protocol) = protocol {
+                entry["protocol"] = json!(protocol);
+            }
+            let absent = daemon(vec![entry], vec![]);
+            assert_eq!(unavailable(&absent).await["module_id"], "nats-server");
+        }
     }
 
     #[test]
