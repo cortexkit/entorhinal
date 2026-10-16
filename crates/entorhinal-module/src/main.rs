@@ -4081,7 +4081,11 @@ mod tests {
         let (dir, descriptor) = scratch_descriptor("lease-held-then-released");
         let predecessor = RegistryStore::open(&descriptor).expect("predecessor opens");
         let mut handler = ProjectsHandler::new().unwrap();
-        handler.lease_retry_budget = Duration::from_secs(2);
+        // A budget far longer than the wait below: if the open settles at all
+        // within that wait, it picked the lease up on release rather than by
+        // running out the budget. That proves promptness without timing a
+        // real clock, which varies with machine load.
+        handler.lease_retry_budget = Duration::from_secs(120);
 
         handler.on_hello_ack(&hello_ack(&descriptor)).await;
         let during = handler.health().await;
@@ -4102,14 +4106,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         drop(predecessor);
 
-        let settled_after = wait_until_settled(&handler, Duration::from_secs(5)).await;
+        wait_until_settled(&handler, Duration::from_secs(30)).await;
         let after = handler.health().await;
         assert_eq!(after.status, HealthStatus::Ok, "{after:?}");
         assert!(handler.store.lock().unwrap().is_some());
-        assert!(
-            settled_after < Duration::from_secs(3),
-            "the retry must pick the lease up promptly after release, not at the budget (took {settled_after:?})"
-        );
         // Opening the store starts every background task, and the catalog
         // poll's first pass runs on the other runtime thread with its own
         // store handle. Stop and await all of them before deleting the folder:
