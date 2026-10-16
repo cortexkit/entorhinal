@@ -528,48 +528,68 @@ impl ProjectsHandler {
         authorization: Authorization,
         error: HandlerError,
     ) -> Result<Vec<u8>, HandlerError> {
-        let outcome =
-            json!({"error":{"code":error.code,"message":error.message,"detail":error.detail}});
-        let saved_outcome = store.consent_transaction(|tx| {
-            let saved = tx.begin_request(row).map_err(|error| {
-                if error.code == "request_key_conflict" {
-                    error
-                } else {
-                    AgentMutationError {
-                        code: "consent_lost".into(),
-                        message: format!(
-                            "stored consent request could not be read or retained: {error}"
-                        ),
-                        detail: None,
-                    }
-                }
-            })?;
-            if saved.state != RequestState::Awaiting {
-                return saved.outcome.ok_or_else(|| AgentMutationError {
-                    code: "consent_lost".into(),
-                    message: "stored terminal consent request has no outcome".into(),
-                    detail: None,
-                });
-            }
-            tx.finish_request(
-                &row.identity,
-                &row.args_digest,
-                RequestState::Refused,
-                &outcome,
-            )?;
-            tx.append_audit(&AuditRow {
-                row_id: 0,
-                time_ms: (self.clock)(),
-                agent_id: row.identity.agent_id.clone(),
-                action: action.into(),
-                target: target.clone(),
-                authorization,
-                outcome: outcome.clone(),
-            })?;
-            Ok(outcome)
-        })?;
-        replay(saved_outcome)
+        refuse_write(
+            store,
+            row,
+            action,
+            target,
+            authorization,
+            error,
+            (self.clock)(),
+        )
     }
+}
+
+pub(crate) fn refuse_write(
+    store: &RegistryStore,
+    row: &ConsentRequest,
+    action: &str,
+    target: &Value,
+    authorization: Authorization,
+    error: HandlerError,
+    now: i64,
+) -> Result<Vec<u8>, HandlerError> {
+    let outcome =
+        json!({"error":{"code":error.code,"message":error.message,"detail":error.detail}});
+    let saved_outcome = store.consent_transaction(|tx| {
+        let saved = tx.begin_request(row).map_err(|error| {
+            if error.code == "request_key_conflict" {
+                error
+            } else {
+                AgentMutationError {
+                    code: "consent_lost".into(),
+                    message: format!(
+                        "stored consent request could not be read or retained: {error}"
+                    ),
+                    detail: None,
+                }
+            }
+        })?;
+        if saved.state != RequestState::Awaiting {
+            return saved.outcome.ok_or_else(|| AgentMutationError {
+                code: "consent_lost".into(),
+                message: "stored terminal consent request has no outcome".into(),
+                detail: None,
+            });
+        }
+        tx.finish_request(
+            &row.identity,
+            &row.args_digest,
+            RequestState::Refused,
+            &outcome,
+        )?;
+        tx.append_audit(&AuditRow {
+            row_id: 0,
+            time_ms: now,
+            agent_id: row.identity.agent_id.clone(),
+            action: action.into(),
+            target: target.clone(),
+            authorization,
+            outcome: outcome.clone(),
+        })?;
+        Ok(outcome)
+    })?;
+    replay(saved_outcome)
 }
 
 #[cfg(test)]

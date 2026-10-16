@@ -161,6 +161,7 @@ impl ProjectsHandler {
         &self,
         params: Value,
         key: RouteKey,
+        received: tokio::time::Instant,
     ) -> Result<Vec<u8>, HandlerError> {
         self.admit(SEED, key)?;
         #[derive(Deserialize)]
@@ -178,9 +179,12 @@ impl ProjectsHandler {
         }
         let store = self.with_store(|s| Ok(s.clone()))?;
         let seeder = self.catalog_seeder.clone();
-        let value = tokio::task::spawn_blocking(move || seeder.seed(&store, &path))
-            .await
-            .map_err(|e| HandlerError::new("store_error", e.to_string()))??;
+        let value = crate::catalog_sql::until(
+            received + std::time::Duration::from_secs(110),
+            "catalog.seed",
+            move || seeder.seed(&store, &path).map_err(HandlerError::from),
+        )
+        .await?;
         encode_result(value)
     }
 }

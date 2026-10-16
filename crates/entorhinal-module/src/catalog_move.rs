@@ -142,7 +142,14 @@ impl CatalogMove {
         agent: &str,
         expected: &str,
     ) -> Result<Vec<CatalogPin>, HandlerError> {
-        let local = self.store()?.catalog_pin_digest(agent)?;
+        let store = self.store()?;
+        let local_agent = agent.to_owned();
+        let local = crate::catalog_sql::run(move || {
+            store
+                .catalog_pin_digest(&local_agent)
+                .map_err(HandlerError::from)
+        })
+        .await?;
         if local != expected {
             self.catch_up.for_move().await?;
         }
@@ -154,7 +161,11 @@ impl CatalogMove {
         expected: &str,
     ) -> Result<Vec<CatalogPin>, HandlerError> {
         let store = self.store()?;
-        let pins = store.catalog_pins(agent)?;
+        let local_agent = agent.to_owned();
+        let (pins, grants) = crate::catalog_sql::run(move || {
+            Ok::<_, HandlerError>((store.catalog_pins(&local_agent)?, store.publisher_grants()?))
+        })
+        .await?;
         let actual = entorhinal_core::catalog_agent::pin_digest(&pins).map_err(unavailable)?;
         if actual != expected {
             return Err(HandlerError {
@@ -163,11 +174,12 @@ impl CatalogMove {
                 detail: Some(json!({"source_pin_digest":expected,"receiver_pin_digest":actual})),
             });
         }
-        let grants = store.publisher_grants()?;
-        drop(store);
+
         let root_keys =
             if pins.iter().any(|p| p.name.starts_with("@cortexkit/")) && self.root.is_some() {
-                match (self.sources)(self.store()?, "@cortexkit") {
+                let store = self.store()?;
+                let sources = self.sources.clone();
+                match crate::catalog_sql::run(move || sources(store, "@cortexkit")).await {
                     Ok(mut trust) => {
                         trust.use_weak_store(self.store.clone());
                         trust
@@ -212,21 +224,26 @@ impl CatalogMove {
         }
         Ok(pins)
     }
-    fn expected(&self, cut: &str, agent: &str) -> Result<String, HandlerError> {
-        let row = self
-            .store()?
-            .agent_move(cut)?
-            .ok_or_else(|| HandlerError::new("invalid_request", "catalog move is not admitted"))?;
-        if row.agent_id != agent {
-            return Err(HandlerError::new(
-                "id_reused",
-                "cut belongs to another agent",
-            ));
-        }
-        row.plan["pin_digest"]
-            .as_str()
-            .map(str::to_owned)
-            .ok_or_else(|| HandlerError::new("invalid_request", "move has no pinned closure"))
+    async fn expected(&self, cut: &str, agent: &str) -> Result<String, HandlerError> {
+        let store = self.store()?;
+        let cut = cut.to_owned();
+        let agent = agent.to_owned();
+        crate::catalog_sql::run(move || {
+            let row = store.agent_move(&cut)?.ok_or_else(|| {
+                HandlerError::new("invalid_request", "catalog move is not admitted")
+            })?;
+            if row.agent_id != agent {
+                return Err(HandlerError::new(
+                    "id_reused",
+                    "cut belongs to another agent",
+                ));
+            }
+            row.plan["pin_digest"]
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| HandlerError::new("invalid_request", "move has no pinned closure"))
+        })
+        .await
     }
     pub(crate) async fn execute(&self, method: &str, params: Value) -> Result<Value, HandlerError> {
         let op = cortexkit_role_agent_data::Op::ALL
@@ -300,7 +317,7 @@ impl CatalogMove {
             }
             return Ok(json!({"step":saved.map_or("none".into(), |s| s.step)}));
         }
-        let expected = self.expected(id, agent)?;
+        let expected = self.expected(id, agent).await?;
         if saved
             .as_ref()
             .is_some_and(|s| s.agent != agent || s.pin_digest != expected)
@@ -323,13 +340,20 @@ impl CatalogMove {
             "agent_data.prepare" => {
                 if saved.is_none() {
                     let store = self.store()?;
-                    let pins = store.catalog_pins(agent)?;
-                    if store.catalog_pin_digest(agent)? != expected {
-                        return Err(HandlerError::new(
-                            "invalid_state",
-                            "source pins changed after admission",
-                        ));
-                    }
+                    let local_agent = agent.to_owned();
+                    let digest = expected.to_owned();
+                    let pins = crate::catalog_sql::run(move || {
+                        let pins = store.catalog_pins(&local_agent)?;
+                        if store.catalog_pin_digest(&local_agent)? != digest {
+                            return Err(HandlerError::new(
+                                "invalid_state",
+                                "source pins changed after admission",
+                            ));
+                        }
+                        Ok(pins)
+                    })
+                    .await?;
+                    let store = self.store()?;
                     let dir = self.directory(id)?;
                     private_dir(&dir)?;
                     let (end_offset, digest) = stream::encode(
@@ -457,9 +481,15 @@ impl CatalogMove {
                         "catalog cut cannot abort",
                     ));
                 }
-                self.store()?
-                    .catalog_discard_move_generation(id, agent)
-                    .map_err(unavailable)?;
+                let store = self.store()?;
+                let cut = id.to_owned();
+                let local_agent = agent.to_owned();
+                crate::catalog_sql::run(move || {
+                    store
+                        .catalog_discard_move_generation(&cut, &local_agent)
+                        .map_err(unavailable)
+                })
+                .await?;
                 let state = saved.get_or_insert_with(|| Checkpoint {
                     agent: agent.into(),
                     pin_digest: expected.into(),
@@ -612,56 +642,71 @@ impl CatalogMove {
             .await
             .map_err(unavailable)?;
         let store = self.store()?;
-        let blobs = BlobStore::new(store.store_folder())?;
-        let pins: Vec<_> = packages.iter().map(|p| p.pin.clone()).collect();
-        for digest in stream::digests(&pins) {
-            let bytes = fs::read(stage.join(&digest)).map_err(unavailable)?;
-            if sha256_hex(&bytes) != digest {
-                return Err(invalid("staged blob hash differs from pin"));
+        let stage = stage.to_path_buf();
+        let worker_plan = plan_id.clone();
+        let worker_generation = generation_id.clone();
+        let agent_id = agent.to_owned();
+        let clock = self.clock;
+        let worker_packages = packages.clone();
+        let worker_checks = checks.clone();
+        crate::catalog_sql::run(move || {
+            let plan_id = worker_plan;
+            let generation_id = worker_generation;
+            let agent = agent_id.as_str();
+            let packages = worker_packages;
+            let checks = worker_checks;
+            let blobs = BlobStore::new(store.store_folder())?;
+            let pins: Vec<_> = packages.iter().map(|p| p.pin.clone()).collect();
+            for digest in stream::digests(&pins) {
+                let bytes = fs::read(stage.join(&digest)).map_err(unavailable)?;
+                if sha256_hex(&bytes) != digest {
+                    return Err(invalid("staged blob hash differs from pin"));
+                }
+                blobs.publish(&bytes)?;
             }
-            blobs.publish(&bytes)?;
-        }
-        let first = pins
-            .first()
-            .ok_or_else(|| invalid("empty catalog closure"))?;
-        store
-            .catalog_create_plan(
-                &plan_id,
-                agent,
-                CatalogTarget::Agent(agent.into()),
-                "install",
-                CatalogSpec {
-                    package: first.name.clone(),
-                    range: format!("={}", first.version),
-                },
-                (self.clock)(),
-            )
-            .map_err(unavailable)?;
-        if store
-            .catalog_plan(&plan_id, agent)
-            .map_err(unavailable)?
-            .state
-            == "pending"
-        {
+            let first = pins
+                .first()
+                .ok_or_else(|| invalid("empty catalog closure"))?;
             store
-                .catalog_save_prepared(
+                .catalog_create_plan(
                     &plan_id,
                     agent,
-                    &PreparedPlan {
-                        packages: packages.clone(),
-                        moves: json!([]),
-                        checks: checks.clone(),
+                    CatalogTarget::Agent(agent.into()),
+                    "install",
+                    CatalogSpec {
+                        package: first.name.clone(),
+                        range: format!("={}", first.version),
                     },
+                    clock(),
                 )
                 .map_err(unavailable)?;
+            if store
+                .catalog_plan(&plan_id, agent)
+                .map_err(unavailable)?
+                .state
+                == "pending"
+            {
+                store
+                    .catalog_save_prepared(
+                        &plan_id,
+                        agent,
+                        &PreparedPlan {
+                            packages: packages.clone(),
+                            moves: json!([]),
+                            checks: checks.clone(),
+                        },
+                    )
+                    .map_err(unavailable)?;
+                store
+                    .catalog_plan_ready(&plan_id, agent, pins, clock())
+                    .map_err(unavailable)?;
+            }
             store
-                .catalog_plan_ready(&plan_id, agent, pins, (self.clock)())
+                .catalog_approve_plan(&plan_id, agent, &generation_id, clock())
                 .map_err(unavailable)?;
-        }
-        store
-            .catalog_approve_plan(&plan_id, agent, &generation_id, (self.clock)())
-            .map_err(unavailable)?;
-        drop(store);
+            Ok::<_, HandlerError>(())
+        })
+        .await?;
         catalog_consumer::prefetch(
             self.consumers.as_ref(),
             &generation_id,
@@ -671,9 +716,14 @@ impl CatalogMove {
         )
         .await
         .map_err(unavailable)?;
-        self.store()?
-            .catalog_generation_ready(&generation_id, agent)
-            .map_err(unavailable)?;
+        let store = self.store()?;
+        let agent = agent.to_owned();
+        crate::catalog_sql::run(move || {
+            store
+                .catalog_generation_ready(&generation_id, &agent)
+                .map_err(unavailable)
+        })
+        .await?;
         Ok(())
     }
 }

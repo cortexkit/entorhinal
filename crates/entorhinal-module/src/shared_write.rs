@@ -1138,8 +1138,19 @@ mod tests {
         let generation = f.store().generation().unwrap();
         tap.fake.on_append(Action::Hold);
         let before_calls = tap.fake.calls();
+        let mut queued = Box::pin(f.call(
+            "agent.rename",
+            json!({"agent_id":id,"name":"Katherine","request_key":"queued-rename"}),
+        ));
         let observe = async {
             tap.fake.wait_for_calls(before_calls + 2).await;
+            assert!(
+                queued
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending(),
+                "a second rename must yield while the shared append holds SQL"
+            );
             assert_eq!(
                 f.pending(),
                 1,
@@ -1176,6 +1187,9 @@ mod tests {
         assert_eq!(f.store().agent_row(id).unwrap().unwrap().name, "Grace");
         assert_eq!(tap.fake.head(), 2);
         assert!(f.store().verify().unwrap().ok);
+        finish(queued.as_mut()).await.unwrap();
+        assert_eq!(f.store().agent_row(id).unwrap().unwrap().name, "Katherine");
+        assert_eq!(tap.fake.head(), 3);
     }
 
     #[tokio::test(start_paused = true)]

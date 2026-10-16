@@ -714,3 +714,26 @@ async fn catalog_move_content_store_errors_use_allowed_retry_refusals() {
         Some(cortexkit_role_agent_data::errors::DriverAction::Retry)
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn catalog_move_sql_does_not_occupy_runtime() {
+    use crate::catalog_sql::tests::{finish, poll, responsive, started, tracked, HeldSql};
+    let (pair, _, _, _) = catalog_pair(true, true, false).await;
+    let cut = pair.published("catalog-held-sql").await;
+    pair.b.pickup().await;
+    let context = pair.b.machine.handler.catalog_move_context();
+    let held = HeldSql::new(pair.b.store()).await;
+    let (import, entered) = tracked(context.execute(
+        "agent_data.import",
+        json!({"refs":[{"ref_kind":"package-closure","ref":AGENT}],"cutId":cut}),
+    ));
+    let mut import = Box::pin(import);
+    started(import.as_mut(), &entered).await;
+    assert!(poll(import.as_mut()).is_pending());
+    responsive(&pair.b.machine.handler).await;
+    held.finish().await;
+    finish(import).await.unwrap();
+    let generations = pair.b.store().catalog_agent_generations(AGENT).unwrap();
+    assert_eq!(generations.len(), 1);
+    assert_eq!(generations[0].state, "ready");
+}

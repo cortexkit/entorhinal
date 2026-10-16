@@ -380,3 +380,47 @@ fn malformed_saved_starter_proof_is_a_refusal_not_a_panic() {
     drop(store);
     fs::remove_dir_all(root).unwrap();
 }
+
+#[tokio::test(start_paused = true)]
+async fn catalog_seed_sql_is_off_runtime_and_bounded() {
+    use crate::catalog_sql::tests::{finish, poll, responsive, started, tracked, HeldSql};
+    let (root, store, path, _) = fixture("seed-held-sql");
+    let mut handler = ProjectsHandler::with_runtime("seed-held-sql".into(), || 0);
+    handler.catalog_seeder = test_seeder();
+    *handler.store.lock().unwrap() = Some(store.clone());
+    let route = (281, 1);
+    handler.route_admissions().insert(
+        route,
+        RouteAdmission::from_bind(Some(Principal::Direct), None),
+    );
+    let held = HeldSql::new(store.clone()).await;
+    let (request, entered) = tracked(handler.catalog_seed(
+        json!({"bundle_file":path}),
+        route,
+        tokio::time::Instant::now(),
+    ));
+    let mut request = Box::pin(request);
+    started(request.as_mut(), &entered).await;
+    assert!(poll(request.as_mut()).is_pending());
+    responsive(&handler).await;
+    tokio::time::advance(std::time::Duration::from_millis(110_001)).await;
+    let answer = poll(request.as_mut());
+    held.finish().await;
+    assert!(
+        matches!(answer, std::task::Poll::Ready(Err(error)) if error.code == "catalog_timeout")
+    );
+    drop(request);
+    // Repeating the same bundle joins the durable, content-addressed result.
+    let reply = finish(handler.catalog_seed(
+        json!({"bundle_file":path}),
+        route,
+        tokio::time::Instant::now(),
+    ))
+    .await
+    .unwrap();
+    assert!(serde_json::from_slice::<Value>(&reply).unwrap()["result"].is_object());
+    assert_eq!(store.catalog_statuses("").unwrap().len(), 2);
+    drop(handler);
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}

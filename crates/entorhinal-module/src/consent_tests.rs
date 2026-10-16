@@ -868,7 +868,15 @@ async fn lease_serializes_same_key_through_commit_but_not_two_tools_with_one_key
     f.fake.script("consent.await", Effect::Hang);
     let future = f.obtain(&a);
     tokio::pin!(future);
-    tokio::select! { biased; _ = &mut future => panic!("wait must remain held"), _ = tokio::task::yield_now() => {} }
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut future => panic!("wait must remain held"),
+            _ = tokio::task::yield_now() => {
+                if f.store().consent_request(&a.identity).unwrap().is_some_and(|r| r.elicitation_id.is_some()) { break; }
+            }
+        }
+    }
     assert_eq!(f.saved(&a).elicitation_id.as_deref(), Some("el_1"));
     assert_eq!(
         f.obtain(&a).await.decision,

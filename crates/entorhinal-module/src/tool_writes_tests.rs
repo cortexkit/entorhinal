@@ -698,12 +698,15 @@ async fn same_key_concurrency_uses_one_card_and_a_single_terminal_commit() {
     let (f, fake) = fixture(2);
     fake.script("consent.await", Effect::Hang);
     let mut first = Box::pin(f.call("agents_hire", hire("concurrent", "Worker")));
-    use std::future::Future;
-    use std::task::{Context, Poll, Waker};
-    assert!(matches!(
-        first.as_mut().poll(&mut Context::from_waker(Waker::noop())),
-        Poll::Pending
-    ));
+    loop {
+        tokio::select! {
+            _ = &mut first => panic!("first call must remain held"),
+            _ = tokio::task::yield_now() => {
+                let identity = entorhinal_core::agent::consent::RequestIdentity { agent_id: f.agents[2].clone(), tool: "agents_hire".into(), request_key: "concurrent".into() };
+                if store(&f).consent_request(&identity).unwrap().is_some_and(|r| r.elicitation_id.is_some()) { break; }
+            }
+        }
+    }
     assert_eq!(
         error_code(f.call("agents_hire", hire("concurrent", "Worker")).await),
         "consent_pending"

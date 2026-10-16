@@ -161,10 +161,15 @@ impl ProjectsHandler {
             return Err(HandlerError::new("gone", "placement agent is not live"));
         }
         let pins = source.pins(&store, &p.agent_id, &p.publisher_fingerprint)?;
-        let ceiling = ceiling(&store, &pins, &p.publisher_fingerprint, |scope| {
-            RegistryClient::for_scope(&store, scope, Limits::MODULE)
-        })
-        .await?;
+        let deadline = received + std::time::Duration::from_secs(60);
+        let ceiling = timeout_at(
+            deadline,
+            ceiling(&store, &pins, &p.publisher_fingerprint, |scope| {
+                RegistryClient::for_scope(&store, scope, Limits::MODULE)
+            }),
+        )
+        .await
+        .map_err(|_| crate::catalog_sql::expired("publisher trust manifests"))??;
         let summary = format!(
             "Trust publisher {} for install at agent {}",
             p.publisher_fingerprint, p.agent_id
@@ -179,19 +184,21 @@ impl ProjectsHandler {
         if !self.route_admissions().contains_key(&key) {
             return Err(OperatorConfirmError::Declined.into());
         }
-        let deadline = received + std::time::Duration::from_secs(60);
         tokio::select! {
             biased;
             _ = guard.cancelled.wait_for(|closed| *closed) => return Err(OperatorConfirmError::Declined.into()),
-            result = timeout_at(deadline,self.operator_confirmer.confirm_operator(&summary,key)) => { result.map_err(|_| HandlerError::from(OperatorConfirmError::Declined))??; }
+            result = timeout_at(deadline,self.operator_confirmer.confirm_operator(&summary,key)) => { result.map_err(|_| crate::catalog_sql::expired("publisher trust confirmation"))??; }
         }
         let writer = tokio::select! {
             biased;
             _ = guard.cancelled.wait_for(|closed| *closed) => return Err(OperatorConfirmError::Declined.into()),
-            result = timeout_at(deadline,self.writer.clone().lock_owned()) => result.map_err(|_| HandlerError::from(OperatorConfirmError::Declined))?,
+            result = timeout_at(deadline,self.writer.clone().lock_owned()) => result.map_err(|_| crate::catalog_sql::expired("publisher trust writer admission"))?,
         };
-        if Instant::now() >= deadline || *guard.cancelled.borrow() {
+        if *guard.cancelled.borrow() {
             return Err(OperatorConfirmError::Declined.into());
+        }
+        if Instant::now() >= deadline {
+            return Err(crate::catalog_sql::expired("publisher trust write"));
         }
         let latest = source.pins(&store, &p.agent_id, &p.publisher_fingerprint)?;
         if latest != pins {
@@ -202,7 +209,7 @@ impl ProjectsHandler {
         }
         let now = (self.clock)();
         let principal = json!(self.admission_for(key).principal);
-        tokio::task::spawn_blocking(move || {
+        crate::catalog_sql::until(deadline, "publisher trust write", move || {
             let (_writer, _confirmation) = (writer, guard);
             let mut random = [0u8; 16];
             getrandom::getrandom(&mut random)
@@ -221,7 +228,6 @@ impl ProjectsHandler {
             encode_result(json!({"outcome":"trusted","id":id,"operation":"install"}))
         })
         .await
-        .map_err(|e| HandlerError::new("store_error", e.to_string()))?
     }
 }
 #[cfg(test)]

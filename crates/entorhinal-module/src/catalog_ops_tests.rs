@@ -376,3 +376,49 @@ async fn repin_retirement_boundary_uses_persisted_whole_second() {
         }
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn catalog_registry_sql_is_off_runtime_and_bounded() {
+    use crate::catalog_sql::tests::{finish, poll, responsive, started, tracked, HeldSql};
+    let f = Fixture::new(Ok(()));
+    let held = HeldSql::new(f.store()).await;
+    let (request, entered) = tracked(f.call(ADD, add()));
+    let mut request = Box::pin(request);
+    started(request.as_mut(), &entered).await;
+    assert!(poll(request.as_mut()).is_pending());
+    responsive(&f.handler).await;
+    tokio::time::advance(std::time::Duration::from_millis(60_001)).await;
+    let answer = poll(request.as_mut());
+    assert!(f.handler.writer.try_lock().is_err());
+    assert!(f.handler.confirmation_slot.lock().unwrap().is_some());
+    held.finish().await;
+    let _writer = finish(f.handler.writer.lock()).await;
+    assert!(
+        matches!(answer, std::task::Poll::Ready(outcome) if code(outcome.clone()) == "catalog_timeout")
+    );
+    assert_eq!(f.prompt.calls.lock().unwrap().len(), 1);
+    assert_eq!(f.store().catalog_registries().unwrap().len(), 1);
+}
+
+#[test]
+fn catalog_blob_reply_is_bounded_even_when_blocking_pool_is_full() {
+    use crate::catalog_sql::tests::{finish, poll, responsive, HeldSql};
+    tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).max_blocking_threads(1).build().unwrap().block_on(async {
+        let mut f = Fixture::new(Ok(()));
+        let bytes = b"catalog blob deadline";
+        let digest = BlobStore::new(&f.root).unwrap().publish(bytes).unwrap();
+        f.bind(Some(reserved("consumer")), false);
+        f.handler.participant_discovery = Arc::new(FakeDaemon::new(DaemonSnapshot::new(1, vec![], vec![json!({"module_id":"consumer","ready":true,"roles":[],"control_ops":[],"capabilities":{"provides":[crate::catalog_consumer::SKILL],"requires":[]}})])));
+        let held = HeldSql::new(f.store()).await;
+        let args = json!({"sha256":digest,"offset":0,"length":1048576});
+        let mut request = Box::pin(f.call(READ_BLOB, args.clone()));
+        assert!(poll(request.as_mut()).is_pending());
+        responsive(&f.handler).await;
+        tokio::time::advance(std::time::Duration::from_millis(25_001)).await;
+        let answer = poll(request.as_mut());
+        held.finish().await;
+        assert!(matches!(answer, std::task::Poll::Ready(outcome) if code(outcome.clone()) == "catalog_timeout"));
+        drop(request);
+        assert_eq!(result(finish(f.call(READ_BLOB, args)).await)["total"], bytes.len());
+    });
+}
