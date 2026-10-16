@@ -164,25 +164,28 @@ impl CatalogAgent {
 mod tests;
 fn generation_reply(generation: &entorhinal_core::catalog_agent::CatalogGeneration) -> Value {
     let mut reply = serde_json::to_value(generation).unwrap();
-    reply
-        .as_object_mut()
-        .expect("generation reply is an object")
-        .remove("publisher_facts");
-    for pin in reply["closure"]
-        .as_array_mut()
-        .expect("generation closure is an array")
-    {
-        let name = pin["name"].as_str().expect("generation pin has a name");
-        let fact = generation
-            .publisher_facts
-            .iter()
-            .find(|fact| fact.name == name)
-            .expect("generation pin has recorded publisher provenance");
-        pin["publisher"] = json!({
-            "fingerprint": fact.fingerprint,
-            "scope": fact.scope,
-            "first_party": fact.first_party,
-        });
+    if let Some(object) = reply.as_object_mut() {
+        object.remove("publisher_facts");
+    }
+    // Attach the publisher facts recorded at install. A pin with no recorded
+    // fact gets no `publisher` object, rather than a guessed one or a panic on
+    // stored data; consumers refuse such a package by name.
+    if let Some(closure) = reply["closure"].as_array_mut() {
+        for pin in closure {
+            let fact = pin["name"].as_str().and_then(|name| {
+                generation
+                    .publisher_facts
+                    .iter()
+                    .find(|fact| fact.name == name)
+            });
+            if let Some(fact) = fact {
+                pin["publisher"] = json!({
+                    "fingerprint": fact.fingerprint,
+                    "scope": fact.scope,
+                    "first_party": fact.first_party,
+                });
+            }
+        }
     }
     let statuses = &generation.pinned_status;
     if !statuses.is_empty() {
