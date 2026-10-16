@@ -26,6 +26,7 @@ pub use fleet::avatar_fingerprint;
 pub(crate) use journal::{change_ops_sql, IDENTITY_CHANGE_OPS, IDENTITY_MARKER_OP};
 pub use journal::{replay_agent_entry, AgentChangeEntry};
 pub use names::*;
+pub(crate) use reads::resolve_in as resolve_agent_in;
 pub(crate) use store::load_row;
 pub use store::{
     valid_agent_id, AgentMutationError, AgentPrecheck, AgentRow, OperatorApproval,

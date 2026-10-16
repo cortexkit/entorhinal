@@ -1,9 +1,9 @@
 //! Applies entries received from the identity log, which engram has already
 //! verified, to this machine's store. An entry that can't be decoded, names an
 //! unknown operation or leaves the store inconsistent is refused and rolled
-//! back, never skipped. Journal replay tolerates some old entry shapes for
-//! compatibility; that tolerance is deliberately not used here, because a
-//! received entry was written by current code and must decode exactly.
+//! back, never skipped. Received entries decode strictly, except that project
+//! after-images from before migration 13 omit the nullable domain column. That
+//! omission means unset on both inbound apply and journal replay.
 
 use rusqlite::{params, Transaction};
 use serde::Deserialize;

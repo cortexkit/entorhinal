@@ -123,6 +123,19 @@ struct AvatarRequest {
 #[serde(deny_unknown_fields)]
 struct EmptyRequest {}
 
+pub(crate) fn resolve_in(
+    conn: &Connection,
+    id: &str,
+    generation: i64,
+) -> Result<Value, AgentMutationError> {
+    let row = load_row(conn, id)?;
+    Ok(json!({"agent_id":id,
+        "status":row.as_ref().map_or("unknown", |row| row.status.as_str()),
+        "merged_into":row.as_ref().and_then(|row| row.merged_into.as_ref()),
+        "gone":row.as_ref().and_then(AgentRow::gone),
+        "generation":generation}))
+}
+
 impl RegistryStore {
     pub(super) fn read_agent<T>(
         &self,
@@ -138,12 +151,11 @@ impl RegistryStore {
             "agent.resolve" => {
                 let request: IdRequest = decode(params)?;
                 self.read_agent(|conn| {
-                    let row = load_row(conn, &request.agent_id)?;
-                    Ok(json!({"agent_id":request.agent_id,
-                        "status":row.as_ref().map_or("unknown", |row| row.status.as_str()),
-                        "merged_into":row.as_ref().and_then(|row| row.merged_into.as_ref()),
-                        "gone":row.as_ref().and_then(AgentRow::gone),
-                        "generation":self.generation_from_connection(conn)?}))
+                    resolve_in(
+                        conn,
+                        &request.agent_id,
+                        self.generation_from_connection(conn)?,
+                    )
                 })?
             }
             "agent.resolve_name" => {

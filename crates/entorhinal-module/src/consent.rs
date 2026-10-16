@@ -135,6 +135,11 @@ pub(super) fn render_card(
         "scope":{"action":row.identity.tool, "target":context.target_scope},
         "dedup_key":key, "requester_ref":key, "binding":Binding::for_request(row),
     });
+    if row.identity.tool == "projects_register" {
+        if let Some(domain) = context.target_scope["domain"].as_str() {
+            card["facts"] = json!([{"label":"Memory domain","value":domain}]);
+        }
+    }
     if row.identity.tool == "catalog_install" {
         let checks: Vec<entorhinal_core::catalog_agent::ConsumerCheck> =
             serde_json::from_value(context.target_scope["target"]["prepared"]["checks"].clone())

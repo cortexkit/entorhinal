@@ -341,27 +341,52 @@ impl JournalWriter<'_> {
         conn: &Connection,
         carries: &[Carry],
     ) -> Result<(), AgentMutationError> {
+        self.admit_carry_and_domain(conn, carries, None)
+    }
+
+    pub(crate) fn admit_carry_and_domain(
+        &self,
+        conn: &Connection,
+        carries: &[Carry],
+        domain: Option<String>,
+    ) -> Result<(), AgentMutationError> {
         let mut carrying = carries
             .iter()
             .filter(|carry| !carry.moves.is_empty())
             .collect::<Vec<_>>();
-        if carrying.is_empty() {
+        if carrying.is_empty() && domain.is_none() {
             return Ok(());
         }
         carrying.sort_by(|a, b| a.project_id.cmp(&b.project_id));
-        require_cutover(conn)?;
+        if !carrying.is_empty() {
+            require_cutover(conn)?;
+        }
         let mut moves = carrying
             .iter()
             .flat_map(|carry| &carry.moves)
             .collect::<Vec<_>>();
         moves.sort_by(|a, b| a.row.agent_id.cmp(&b.row.agent_id));
         check_names(conn, &moves)?;
-        let summary = carry_summary(&carrying)?;
+        let domain_change = domain.is_some();
+        let summary = match (carrying.is_empty(), domain) {
+            (true, Some(domain)) => domain,
+            (false, Some(domain)) => format!("{}; {domain}", carry_summary(&carrying)?),
+            _ => carry_summary(&carrying)?,
+        };
+        if summary.chars().count() > super::OPERATOR_SUMMARY_LIMIT {
+            return Err(AgentMutationError::new(
+                "operator_summary_too_long",
+                "shorten names to fit the combined operator prompt",
+            ));
+        }
         if let Some(probe) = self.probe {
             *probe.borrow_mut() = Some(summary);
             return Ok(());
         }
         match &self.confirmation {
+            PlacementConfirmation::NotRequired if self.principal == "direct" && domain_change => {
+                Err(stale())
+            }
             PlacementConfirmation::NotRequired => Ok(()),
             PlacementConfirmation::Approved(approval) if approval.approves(&summary) => Ok(()),
             PlacementConfirmation::Approved(_) | PlacementConfirmation::NoPrompt => Err(stale()),

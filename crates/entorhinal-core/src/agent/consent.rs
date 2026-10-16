@@ -719,12 +719,21 @@ fn prepare_write(
             let id = super::validate_workspace_id(text("workspace_id")?)
                 .map_err(|e| AgentMutationError::new("invalid_workspace_id", e.to_string()))?;
             let label = workspace(&id)?;
+            let domain = arguments
+                .get("domain")
+                .map(|v| {
+                    v.as_str().ok_or_else(|| {
+                        AgentMutationError::new("invalid_domain", "domain must be a string")
+                    })
+                })
+                .transpose()?;
+            crate::memory::validate_domain(domain)?;
             let dir = crate::mutations::canonical(text("dir")?)?;
             if conn.query_row("SELECT EXISTS(SELECT 1 FROM project WHERE name=?1 UNION ALL SELECT 1 FROM project_root WHERE canonical_root=?2 UNION ALL SELECT 1 FROM derived_root_parent WHERE canonical_parent=?2)", params![text("name")?,dir], |r| r.get::<_,bool>(0))? {
                 return Err(AgentMutationError::new("project_exists", "project name or directory already registered"));
             }
             (
-                json!({"kind":"project","label":text("name")?,"dir":dir,"workspace_id":id,"workspace_label":label}),
+                json!({"kind":"project","label":text("name")?,"dir":dir,"workspace_id":id,"workspace_label":label,"domain":domain}),
                 Some(GrantClass::RegisterProject),
                 Some(id),
             )
@@ -863,7 +872,7 @@ impl JournalWriter<'_> {
         };
         let result = match plan.tool.as_str() {
             "projects_create_workspace" => self.create_workspace_at(crate::CreateWorkspaceRequest { workspace_id:text(&plan.target,"workspace_id")?, name:text(args,"name")? }, now).map_err(Into::into),
-            "projects_register" => self.register_at(crate::RegisterRequest { name:text(args,"name")?, roots:vec![text(&plan.target,"dir")?], workspace_id:plan.scope_id.clone(), ..Default::default() }, now).map_err(Into::into),
+            "projects_register" => self.register_at(crate::RegisterRequest { name:text(args,"name")?, roots:vec![text(&plan.target,"dir")?], workspace_id:plan.scope_id.clone(), domain:args.get("domain").and_then(Value::as_str).map(str::to_owned), ..Default::default() }, now).map_err(Into::into),
             "agents_create_head" => self.agent_mutation_with_id("agent.create", json!({"role":"head","name":args["name"],"tag":args["tag"],"project_id":plan.target["placement"]["project_id"],"request_key":commit.request.identity.request_key}), now, agent_id),
             "agents_hire" => self.agents_hire(&serde_json::from_value(args.clone()).map_err(|e| AgentMutationError::new("invalid_request", e.to_string()))?, now, agent_id),
             "agents_retire_hire" => self.agent_mutation("agent.dispose", json!({"agent_id":args["agent_id"],"request_key":commit.request.identity.request_key}), now),

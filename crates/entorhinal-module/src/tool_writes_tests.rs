@@ -1179,3 +1179,38 @@ fn malformed_terminal_outcomes_are_consent_lost() {
         assert_eq!(replay(outcome).unwrap_err().code, "consent_lost");
     }
 }
+
+#[tokio::test]
+async fn memory_register_domain_is_visible_and_bound_to_tool_consent() {
+    let (f, fake) = fixture(0);
+    fake.script("consent.await", Effect::Answer("approve_once"));
+    std::fs::create_dir_all(f.root.join("domain-project")).unwrap();
+    let args = json!({"workspace_id":"W","name":"Domain project","dir":f.root.join("domain-project"),"domain":"@example/software","request_key":"domain-register"});
+    let reply = tool_result(f.call("projects_register", args.clone()).await);
+    let card = fake
+        .calls()
+        .into_iter()
+        .find(|c| c.method == "consent.request")
+        .unwrap()
+        .params;
+    assert_eq!(
+        card["facts"][0],
+        json!({"label":"Memory domain","value":"@example/software"})
+    );
+    assert_eq!(card["scope"]["target"]["domain"], "@example/software");
+    let context = store(&f)
+        .context_project(f.root.join("domain-project").to_str().unwrap(), "fixed")
+        .unwrap();
+    assert_eq!(context["project_id"], reply["projectId"]);
+    assert_eq!(context["domain"], "@example/software");
+    let mut changed = args;
+    changed["domain"] = json!("@example/other");
+    assert_eq!(
+        error_code(f.call("projects_register", changed).await),
+        "request_key_conflict"
+    );
+    assert_eq!(fake.card_count(), 1);
+    assert!(store(&f).verify().unwrap().ok);
+    store(&f).rebuild().unwrap();
+    assert!(store(&f).verify().unwrap().ok);
+}

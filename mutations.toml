@@ -1864,7 +1864,7 @@ expect_red = ["agent::carry::tests::placement_precheck_orders_cache_refusals_no_
 id = "carry-requires-cutover"
 guards = "A placement that would carry live agents refuses before the agent identity switchover"
 file = "crates/entorhinal-core/src/agent/carry.rs"
-old = "require_cutover(conn)?;\n        let mut moves = carrying"
+old = "if !carrying.is_empty() {\n            require_cutover(conn)?;\n        }\n        let mut moves = carrying"
 new = "// NON-VACUITY BREAK: switchover check omitted\n        let mut moves = carrying"
 test_file = "crates/entorhinal-core/src/agent/carry.rs"
 runner = "cargo"
@@ -2269,7 +2269,10 @@ expect_red = ["cli::agent_tests::repair_workspaces_previews_refusal_and_yes_send
 id = "cli-placement-confirmation-wait"
 guards = "Project registration and workspace assignment keep the 300-second confirmation wait"
 file = "crates/entorhinal-module/src/cli.rs"
-old = 'if matches!(method, "assign_workspace" | "register") {'
+old = '''if matches!(
+        method,
+        "assign_workspace" | "register" | "project.set_domain" | "workspace.set_document"
+    ) {'''
 new = 'if false /* NON-VACUITY BREAK */ {'
 test_file = "crates/entorhinal-module/src/cli.rs"
 runner = "cargo"
@@ -2454,10 +2457,10 @@ expect_red = ["claim_cache::tests::where_wire_nulls_known_status_integrity_and_r
 id = "claims-where-integrity"
 guards = "Agent where refuses marked claims instead of answering a cached holder"
 file = "crates/entorhinal-core/src/claim_cache.rs"
-old = '''                if claim.integrity_failed {
-                    return Err(refusal("claim_integrity_failed", None));'''
-new = '''                if false && claim.integrity_failed { // NON-VACUITY BREAK
-                    return Err(refusal("claim_integrity_failed", None));'''
+old = '''    if claim.integrity_failed {
+        return Err(refusal("claim_integrity_failed", None));'''
+new = '''    if false && claim.integrity_failed { // NON-VACUITY BREAK
+        return Err(refusal("claim_integrity_failed", None));'''
 test_file = "crates/entorhinal-core/src/claim_cache.rs"
 runner = "cargo"
 package = "entorhinal-core"
@@ -9991,3 +9994,240 @@ package = "entorhinal-core"
 target = "--lib"
 select = "expected"
 expect_red = ["claim_cache::tests::where_wire_nulls_known_status_integrity_and_restart"]
+
+[[control]]
+id = "memory-domain-direct-approval"
+guards = "Direct domain changes require approval of the exact summary inside the writer transaction"
+file = "crates/entorhinal-core/src/memory.rs"
+old = 'if self.principal == "direct"'
+new = 'if false /* NON-VACUITY BREAK */ && self.principal == "direct"'
+test_file = "crates/entorhinal-core/src/memory_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["memory::tests::memory_domain_canonical_shared_replay_and_direct_confirmation"]
+
+[[control]]
+id = "memory-register-domain-approval"
+guards = "An unconfirmed Direct register cannot bypass the project-domain confirmation rule"
+file = "crates/entorhinal-core/src/mutations.rs"
+old = 'self.admit_carry_and_domain(tx, &carries, domain_summary)?;'
+new = 'self.admit_carry_and_domain(tx, &carries, None)?; let _ = domain_summary; // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/memory_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["memory::tests::memory_domain_canonical_shared_replay_and_direct_confirmation"]
+
+[[control]]
+id = "memory-document-direct-admission"
+guards = "Workspace document writes refuse every non-Direct principal before decoding"
+file = "crates/entorhinal-module/src/main.rs"
+old = 'if method == "workspace.set_document" && !matches!(principal, Some(Principal::Direct)) {'
+new = 'if false /* NON-VACUITY BREAK */ && method == "workspace.set_document" && !matches!(principal, Some(Principal::Direct)) {'
+test_file = "crates/entorhinal-module/src/memory_context_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["memory_context::tests::memory_documents_refuse_every_non_direct_principal_and_flow_before_decode"]
+
+[[control]]
+id = "memory-direct-touch-id"
+guards = "The served Direct domain and document path must obtain Touch ID, not merely admit Direct"
+file = "crates/entorhinal-module/src/shared_write.rs"
+old = '&& agent_ops::CONFIRMABLE_METHODS.contains(&request.method.as_str());'
+new = '&& !super::memory_context::WRITES.contains(&request.method.as_str()) /* NON-VACUITY BREAK */ && agent_ops::CONFIRMABLE_METHODS.contains(&request.method.as_str());'
+test_file = "crates/entorhinal-module/src/memory_context_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["memory_context::tests::memory_direct_domain_and_document_writes_require_touch_id"]
+
+[[control]]
+id = "memory-document-revision-conflict"
+guards = "A stale expected workspace document revision refuses with the current revision"
+file = "crates/entorhinal-core/src/memory.rs"
+old = 'if req.expected_revision != current {'
+new = 'if false /* NON-VACUITY BREAK */ && req.expected_revision != current {'
+test_file = "crates/entorhinal-core/src/memory_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["memory::tests::memory_document_revisions_hash_conflicts_limits_and_replay"]
+
+[[control]]
+id = "memory-document-text-limits"
+guards = "Workspace charter and document limits count UTF-8 bytes before prompting"
+file = "crates/entorhinal-core/src/memory.rs"
+old = 'if text.len() > limit {'
+new = 'if false /* NON-VACUITY BREAK */ && text.len() > limit {'
+test_file = "crates/entorhinal-core/src/memory_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["memory::tests::memory_document_revisions_hash_conflicts_limits_and_replay"]
+
+[[control]]
+id = "memory-document-control-characters"
+guards = "Accepted workspace documents refuse non-human control characters with UTF-8 byte offsets"
+file = "crates/entorhinal-core/src/memory.rs"
+old = ".find(|(_, c)| c.is_control() && !matches!(c, '\\t' | '\\n' | '\\r'))"
+new = ".find(|(_, c)| false /* NON-VACUITY BREAK */ && c.is_control() && !matches!(c, '\\t' | '\\n' | '\\r'))"
+test_file = "crates/entorhinal-core/src/memory_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["memory::tests::memory_document_revisions_hash_conflicts_limits_and_replay"]
+
+[[control]]
+id = "memory-document-encoded-cap"
+guards = "The actual canonical shared entry is capped before an operator is prompted"
+file = "crates/entorhinal-core/src/memory.rs"
+old = 'if encoded_bytes > SHARED_ENTRY_LIMIT {'
+new = 'if false /* NON-VACUITY BREAK */ && encoded_bytes > SHARED_ENTRY_LIMIT {'
+test_file = "crates/entorhinal-core/src/memory_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["memory::tests::memory_document_revisions_hash_conflicts_limits_and_replay"]
+
+[[control]]
+id = "memory-context-one-transaction"
+guards = "Both context reads retain one WAL snapshot even when a writer commits between their statements"
+file = "crates/entorhinal-core/src/read_connection.rs"
+old = '''let tx = conn.transaction()?;
+        let result = query(&tx)?;
+        tx.commit()?;
+        Ok(result)'''
+new = '''let _ = &mut conn;
+        query(&conn) // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-core/src/memory_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["memory::tests::memory_context_project_is_one_read_transaction", "memory::tests::memory_context_session_is_one_read_transaction"]
+
+[[control]]
+id = "memory-resolve-wire-unchanged"
+guards = "Adding memory policy must not extend resolve's strictly decoded wire shape"
+file = "crates/entorhinal-module/src/main.rs"
+old = '''self.record_query(reply.generation, &self.health.resolve_count);
+        self.encode_read_result(reply)
+    }
+
+    fn resolve_project_id'''
+new = '''self.record_query(reply.generation, &self.health.resolve_count);
+        let mut reply=serde_json::to_value(reply).unwrap(); reply["domain"]=Value::Null; // NON-VACUITY BREAK
+        self.encode_read_result(reply)
+    }
+
+    fn resolve_project_id'''
+test_file = "crates/entorhinal-module/src/served_vectors.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["served_vectors::project_resolve_v1_records_match_published_files"]
+
+[[control]]
+id = "memory-enumerate-wire-unchanged"
+guards = "Adding memory policy must not extend enumerate's strictly decoded wire shape"
+file = "crates/entorhinal-module/src/main.rs"
+old = '''self.record_query(reply.generation, &self.health.enumerate_count);
+        self.encode_read_result(reply)'''
+new = '''self.record_query(reply.generation, &self.health.enumerate_count);
+        let mut reply=serde_json::to_value(reply).unwrap(); reply["document"]=Value::Null; // NON-VACUITY BREAK
+        self.encode_read_result(reply)'''
+test_file = "crates/entorhinal-module/src/served_vectors.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["served_vectors::project_resolve_v1_records_match_published_files"]
+
+[[control]]
+id = "memory-unset-domain-legacy-bytes"
+guards = "Unset domains retain exact pre-13 after-image bytes rather than adding a null key"
+file = "crates/entorhinal-core/src/shared_entry.rs"
+old = 'row.remove("domain");'
+new = 'let _ = &row; // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/shared_entry.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["shared_entry::tests::memory_legacy_project_images_keep_old_bytes_and_strict_other_columns"]
+
+[[control]]
+id = "memory-domain-catalog-grammar"
+guards = "Project domains use canonical catalog package-name validation, not an interpreted or permissive namespace"
+file = "crates/entorhinal-core/src/memory.rs"
+old = 'if value.is_some_and(|value| !names::map_name(value).is_ok_and(|name| name.canonical == value))'
+new = 'if false /* NON-VACUITY BREAK */ && value.is_some_and(|value| !names::map_name(value).is_ok_and(|name| name.canonical == value))'
+test_file = "crates/entorhinal-core/src/memory_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["memory::tests::memory_domain_canonical_shared_replay_and_direct_confirmation"]
+
+[[control]]
+id = "memory-document-digest-framing"
+guards = "The workspace document digest binds both fields with unambiguous length framing"
+file = "crates/entorhinal-core/src/memory.rs"
+old = 'bytes.extend_from_slice(&(text.len() as u64).to_be_bytes());'
+new = 'let _ = text.len(); // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/memory_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["memory::tests::memory_document_revisions_hash_conflicts_limits_and_replay"]
+
+[[control]]
+id = "memory-domain-shared-after-image"
+guards = "Non-null project domains travel in real shared after-images between machines"
+file = "crates/entorhinal-core/src/shared_entry.rs"
+old = 'if *table == "project" && row.get("domain") == Some(&Value::Null) {'
+new = 'if *table == "project" { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::memory_policy_round_trips_between_two_machines_and_rebuilds"]
+
+[[control]]
+id = "memory-document-shared-table"
+guards = "Every accepted workspace document revision travels in the shared identity log"
+file = "crates/entorhinal-core/src/shared_entry.rs"
+old = '    "workspace_document",'
+new = '    // NON-VACUITY BREAK: workspace documents omitted'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::memory_policy_round_trips_between_two_machines_and_rebuilds"]
+
+[[control]]
+id = "memory-empty-document-snapshot-compatible"
+guards = "Snapshots with no accepted document omit the new table so older Macs can still join during rollout"
+file = "crates/entorhinal-core/src/shared_entry.rs"
+old = '.filter(|table| **table != "workspace_document" || !self.0[**table].is_empty())'
+new = '.filter(|_| true) // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/shared_entry.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["shared_entry::tests::memory_legacy_project_images_keep_old_bytes_and_strict_other_columns"]

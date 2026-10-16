@@ -2146,3 +2146,127 @@ async fn role_claims_v1_records_match_published_files() {
 
     published_file("role-claims-v1", "records.json", records);
 }
+
+#[tokio::test]
+async fn memory_context_v1_records_match_published_files() {
+    let fixture = Fixture::new("served-memory-context").await;
+    let root = crate::tests::canonical_test_path(&fixture.dir).join("project");
+    std::fs::create_dir_all(root.join(".git/worktrees/context")).unwrap();
+    let worktree = crate::tests::canonical_test_path(&fixture.dir).join("worktree");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(root.join(".git/worktrees/context/commondir"), "../..\n").unwrap();
+    std::fs::write(
+        worktree.join(".git"),
+        format!(
+            "gitdir: {}\n",
+            root.join(".git/worktrees/context").display()
+        ),
+    )
+    .unwrap();
+    fixture.success(CORE,"register",json!({"projectId":"served-project","name":"Served project","roots":[root],"workspaceId":"served-workspace","domain":"@example/software"})).await;
+    let bare = crate::tests::canonical_test_path(&fixture.dir).join("bare");
+    std::fs::create_dir_all(&bare).unwrap();
+    fixture
+        .success(
+            CORE,
+            "register",
+            json!({"projectId":"agentless","name":"Agentless","roots":[bare]}),
+        )
+        .await;
+    let missing = crate::tests::canonical_test_path(&fixture.dir).join("unregistered");
+    std::fs::create_dir_all(&missing).unwrap();
+    let mut records = Vec::new();
+    let (record, no_doc) = fixture
+        .record("context.project", json!({"folder":root}))
+        .await;
+    assert_eq!(no_doc["result"]["document"], Value::Null);
+    assert_eq!(no_doc["result"]["domain"], "@example/software");
+    records.push(record);
+    for (revision, document) in [(0, "Initial policy\n"), (1, "Accepted policy\n")] {
+        fixture.success(DIRECT,"workspace.set_document",json!({"workspace_id":"served-workspace","expected_revision":revision,"charter":"Build carefully.\n","document":document,"request_key":format!("context-doc-{revision}")})).await;
+    }
+    for folder in [&root, &bare, &missing, &worktree] {
+        let (record, reply) = fixture
+            .record("context.project", json!({"folder":folder}))
+            .await;
+        if folder == &root || folder == &worktree {
+            assert_eq!(reply["result"]["document"]["revision"], 2);
+            assert_eq!(reply["result"]["project_id"], "served-project");
+        }
+        if folder == &missing {
+            assert_eq!(reply["result"]["project_id"], Value::Null);
+            assert_eq!(reply["result"]["via"], "implicit");
+        }
+        records.push(record);
+    }
+    let scratch = crate::tests::canonical_test_path(&fixture.dir)
+        .to_string_lossy()
+        .into_owned();
+    let records = records
+        .into_iter()
+        .map(|r| {
+            r.replace(
+                &json!(scratch).to_string()[1..json!(scratch).to_string().len() - 1],
+                "/fixture",
+            )
+        })
+        .collect();
+    published_file("memory-context-v1", "context-project.json", records);
+    let source = fixture.snapshot();
+    seed_agent(&source, ASSISTANT, "Lin", None, false, false);
+    seed_agent(&source, NO_AVATAR, "Sam", None, false, false);
+    drop(source);
+    assert!(matches!(
+        fixture.import().await,
+        HandlerOutcome::Response(_)
+    ));
+    let store = fixture.handler.with_store(|s| Ok(s.clone())).unwrap();
+    store
+        .with_principal("reserved:prefrontal-core")
+        .catalog_set_pins(
+            entorhinal_core::catalog_agent::PinWriteRequest {
+                agent_id: ASSISTANT.into(),
+                pins: vec![entorhinal_core::catalog_agent::CatalogPin {
+                    name: "@example/memory".into(),
+                    version: "1.0.0".into(),
+                    kind: entorhinal_catalog::Kind::MemoryProfile,
+                    manifest_sha256: "a".repeat(64),
+                    archive_sha256: "b".repeat(64),
+                    publisher_fingerprint: "c".repeat(64),
+                    root: true,
+                    range: Some("^1.0.0".into()),
+                }],
+                request_key: Some("memory-pin".into()),
+            },
+            700,
+        )
+        .unwrap();
+    let mut records = Vec::new();
+    for id in [ASSISTANT, NO_AVATAR] {
+        let (record, reply) = fixture
+            .record("context.session", json!({"agent_id":id}))
+            .await;
+        assert_eq!(
+            reply["result"]["pins"].as_array().unwrap().len(),
+            usize::from(id == ASSISTANT)
+        );
+        records.push(record);
+    }
+    published_file("memory-context-v1", "context-session.json", records);
+    let mut records = Vec::new();
+    for revision in [None, Some(1), Some(99)] {
+        let (record, reply) = fixture
+            .record(
+                "workspace.document",
+                json!({"workspace_id":"served-workspace","revision":revision}),
+            )
+            .await;
+        if revision == Some(99) {
+            assert_eq!(reply["code"], "revision_unknown");
+        } else {
+            assert_eq!(reply["result"]["revision"], revision.unwrap_or(2));
+        }
+        records.push(record);
+    }
+    published_file("memory-context-v1", "workspace-document.json", records);
+}

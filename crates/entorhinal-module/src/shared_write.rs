@@ -2540,6 +2540,8 @@ enum Write {
         Box<entorhinal_core::agent::consent::ConsentCommit>,
     ),
     Register(RegisterRequest),
+    Domain(entorhinal_core::SetProjectDomainRequest),
+    Document(entorhinal_core::SetWorkspaceDocumentRequest),
     Assign(AssignWorkspaceRequest),
     Upgrade(UpgradeImplicitRequest),
     Remove(RemoveRequest),
@@ -2554,6 +2556,12 @@ enum Write {
 impl Write {
     fn decode(method: &str, params: Value) -> Result<Self, HandlerError> {
         Ok(match method {
+            "project.set_domain" => {
+                Self::Domain(serde_json::from_value(params).map_err(invalid_params)?)
+            }
+            "workspace.set_document" => {
+                Self::Document(serde_json::from_value(params).map_err(invalid_params)?)
+            }
             "register" => Self::Register(serde_json::from_value(params).map_err(invalid_params)?),
             "assign_workspace" => {
                 Self::Assign(serde_json::from_value(params).map_err(invalid_params)?)
@@ -2596,6 +2604,8 @@ impl Write {
                 }
                 return Ok(None);
             }
+            Self::Domain(r) => Some(r.request_key.as_str()),
+            Self::Document(r) => Some(r.request_key.as_str()),
             Self::Register(r) => r.request_key.as_deref(),
             Self::Assign(r) => r.request_key.as_deref(),
             Self::Upgrade(r) => r.request_key.as_deref(),
@@ -2641,6 +2651,8 @@ impl Write {
                     .apply_consent_write(&plan, now, (!agent_id.is_empty()).then_some(agent_id))
                     .map_err(Into::into)
             }
+            Self::Domain(r) => writer.set_project_domain_at(r, now),
+            Self::Document(r) => writer.set_workspace_document_at(r, now),
             Self::Register(r) => writer.register_at(r, now),
             Self::Pins(r) => writer.catalog_set_pins(r, now),
             Self::Assign(r) => writer.assign_workspace_at(r, now),
@@ -2738,7 +2750,9 @@ impl From<RegistryError> for HandlerError {
 fn shared_candidate(op: &str) -> bool {
     matches!(
         op,
-        "register"
+        "project.set_domain"
+            | "workspace.set_document"
+            | "register"
             | "assign_workspace"
             | "upgrade_implicit"
             | "remove"

@@ -1531,6 +1531,9 @@ mod tests {
         );
         let operations = surfaces[0]["operations"].as_array().unwrap();
         let expected_queries = [
+            "context.project",
+            "context.session",
+            "workspace.document",
             "catalog.registry_list",
             "catalog.read_blob",
             "catalog.agent_generation",
@@ -1567,6 +1570,8 @@ mod tests {
             "role.read",
         ];
         let expected_mutations = [
+            "project.set_domain",
+            "workspace.set_document",
             crate::catalog_seed::SEED,
             "catalog.registry_add",
             "catalog.publish",

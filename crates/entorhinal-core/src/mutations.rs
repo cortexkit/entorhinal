@@ -23,6 +23,8 @@ pub struct RegisterRequest {
     #[serde(default)]
     pub project_id: Option<String>,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
     #[serde(default)]
     pub workspace_id: Option<String>,
     #[serde(default)]
@@ -629,6 +631,7 @@ impl super::JournalWriter<'_> {
         if self.consent.is_some() {
             req.request_key = None;
         }
+        crate::memory::validate_domain(req.domain.as_deref())?;
         if let Some(id) = req.project_id.as_ref() {
             if reserved(id) {
                 return Err(domain("reserved_project_id_namespace", id));
@@ -694,7 +697,10 @@ impl super::JournalWriter<'_> {
             };
             let mut aliases=Vec::new();
             for root in &req.roots { let old=implicit_project_id(root); if let Some(target)=tx.query_row("SELECT project_id FROM project_alias WHERE old_id=?1",[&old],|r|r.get::<_,String>(0)).optional()? { if target!=project_id { aliases.push(json!({"oldId":old,"owner":target})); } } }
-            let mut changed=existing.is_none();
+            let old_domain: Option<String> = tx.query_row("SELECT domain FROM project WHERE project_id=?1", [&project_id], |r| r.get(0)).optional()?.flatten();
+            let domain_changed = req.domain.is_some() && req.domain != old_domain;
+            let domain_summary = if domain_changed { Some(crate::memory::domain_summary(&req.name,req.domain.as_deref())?) } else { None };
+            let mut changed=existing.is_none() || domain_changed;
             changed |= existing.as_ref().is_some_and(|n| n!=&req.name);
             changed |= req.roots.iter().any(|r| tx.query_row("SELECT 1 FROM project_root WHERE canonical_root=?1",[r],|x|x.get::<_,i64>(0)).optional().unwrap_or(None).is_none());
             changed |= req.derived_root_parents.iter().any(|r| tx.query_row("SELECT 1 FROM derived_root_parent WHERE canonical_parent=?1",[r],|x|x.get::<_,i64>(0)).optional().unwrap_or(None).is_none());
@@ -702,9 +708,10 @@ impl super::JournalWriter<'_> {
             let alias_new= req.roots.iter().any(|r| tx.query_row("SELECT 1 FROM project_alias WHERE old_id=?1",[implicit_project_id(r)],|x|x.get::<_,i64>(0)).optional().unwrap_or(None).is_none()); changed |= alias_new;
             let mut response=json!({"projectId":project_id,"name":req.name,"roots":req.roots,"derivedRootParents":req.derived_root_parents,"warnings":aliases});
             if !changed { return Ok(Action{changed:false,seq:None,value:response,payload}); }
-            self.admit_carry(tx, &carries)?;
+            self.admit_carry_and_domain(tx, &carries, domain_summary)?;
             let seq=append(tx,"register",&payload,&actor,key.as_deref(),now,self.principal)?;
             if existing.is_none() { tx.execute("INSERT INTO project(project_id,name,implicit,seed_identity,created_at,updated_at) VALUES(?1,?2,0,NULL,?3,?3)",params![&project_id,&req.name,now])?; } else { tx.execute("UPDATE project SET name=?1,updated_at=?2 WHERE project_id=?3",params![&req.name,&now,&project_id])?; }
+            if let Some(value) = &req.domain { tx.execute("UPDATE project SET domain=?1 WHERE project_id=?2",[value,&project_id])?; }
             let mut mappings = Vec::new();
             for root in &req.roots {
                 let root_key = chosen.remove(root).flatten();
@@ -1398,6 +1405,7 @@ const DERIVED_TABLES: &[&str] = &[
     "member_name",
     "agent_name_claim",
     "agent",
+    "workspace_document",
     "workspace_member",
     "project_workspace",
     "project_alias",
@@ -1646,6 +1654,19 @@ fn replay(
     now: i64,
     enabled: bool,
 ) -> rusqlite::Result<()> {
+    if op == "workspace.set_document" {
+        let doc = serde_json::from_value(v).map_err(super::shared_entry::decode_error)?;
+        return crate::memory::restore_document(tx, &doc);
+    }
+    if op == "project.set_domain" {
+        let req: crate::SetProjectDomainRequest =
+            serde_json::from_value(v).map_err(super::shared_entry::decode_error)?;
+        tx.execute(
+            "UPDATE project SET domain=?1,updated_at=?2 WHERE project_id=?3",
+            params![req.domain, now, req.project_id],
+        )?;
+        return Ok(());
+    }
     if op == "catalog.pin" {
         return super::catalog_agent::replay_pin(tx, v);
     }
@@ -1725,6 +1746,12 @@ fn replay(
             // placement are restored by the `agent.set_namespace` rows that
             // follow this one, so a bound project is not refused here.
             tx.execute("INSERT INTO project(project_id,name,implicit,seed_identity,created_at,updated_at) VALUES(?1,?2,0,NULL,?3,?3) ON CONFLICT(project_id) DO UPDATE SET name=excluded.name,updated_at=excluded.updated_at",params![id,r.name,now])?;
+            if let Some(value) = &r.domain {
+                tx.execute(
+                    "UPDATE project SET domain=?1 WHERE project_id=?2",
+                    [value, &id],
+                )?;
+            }
             if let Some(w) = &r.workspace_id {
                 tx.execute("INSERT OR IGNORE INTO workspace(workspace_id,name,created_at,updated_at) VALUES(?1,?1,?2,?2)",params![w,now])?;
                 tx.execute("INSERT OR IGNORE INTO project_workspace(project_id,workspace_id) VALUES(?1,?2)",params![id,w])?;
@@ -3468,6 +3495,7 @@ mod audit_fix_tests {
                 request_key: None,
                 actor: None,
                 label: None,
+                domain: None,
             })
             .unwrap();
         let generation_before = store.generation().unwrap();
@@ -3482,6 +3510,7 @@ mod audit_fix_tests {
                 request_key: Some("rk-conflict".into()),
                 actor: None,
                 label: None,
+                domain: None,
             })
             .unwrap_err();
         assert!(matches!(err, RegistryError::Domain { ref code, .. } if code == "root_conflict"));
@@ -3505,6 +3534,7 @@ mod audit_fix_tests {
                 request_key: Some("rk-conflict".into()),
                 actor: None,
                 label: None,
+                domain: None,
             })
             .unwrap();
     }
@@ -3527,6 +3557,7 @@ mod audit_fix_tests {
                 request_key: Some("shared-key".into()),
                 actor: None,
                 label: None,
+                domain: None,
             })
             .unwrap();
         let registered: serde_json::Value = serde_json::from_slice(&blob).unwrap();
@@ -3558,6 +3589,7 @@ mod audit_fix_tests {
                 request_key: Some("shared-key".into()),
                 actor: None,
                 label: None,
+                domain: None,
             })
             .unwrap();
         let replayed: serde_json::Value = serde_json::from_slice(&replay).unwrap();

@@ -30,6 +30,8 @@ use serde_json::{json, Value};
 mod catalog;
 #[path = "retry_quote.rs"]
 mod retry_quote;
+#[path = "workspace_document_cli.rs"]
+mod workspace_document;
 
 #[derive(Debug, PartialEq, Eq)]
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
@@ -303,6 +305,21 @@ pub fn parse(face: Face, arguments: &[String]) -> Invocation {
             {
                 args.push(argument.clone());
             }
+            "--clear" if face == Face::Projects && verb.as_deref() == Some("domain") => {
+                args.push(argument.clone())
+            }
+            "--yes" if face == Face::Workspaces && verb.as_deref() == Some("document") => {
+                args.push(argument.clone())
+            }
+            "--charter-file" | "--document-file" | "--revision"
+                if face == Face::Workspaces && verb.as_deref() == Some("document") =>
+            {
+                let Some(value) = rest.next() else {
+                    return Invocation::Refuse(format!("{argument} needs a value"));
+                };
+                args.push(argument.clone());
+                args.push(value.clone());
+            }
             other if other.starts_with('-') => {
                 return Invocation::Refuse(format!("unknown flag '{other}'\n\n{}", usage(face)));
             }
@@ -351,6 +368,8 @@ usage: ck projects <verb> [args] [--subc <connection file>] [--json]
   list [workspace]        projects, optionally scoped to one workspace
   resolve <dir>           which project owns a directory
   register <name> <dir>   register a project rooted at a directory
+  domain <project-id> <@scope/name> | --clear
+                           set or clear memory domain after Touch ID
   remove <project>        remove a project from the registry
   add-root <project> <dir>
                           add another root to a project (starts unapproved)
@@ -391,6 +410,10 @@ usage: ck workspaces <verb> [args] [--subc <connection file>] [--json]
   set-root <workspace> <directory>
                           record the workspace's root directory
   clear-root <workspace>  remove the recorded root
+  document show <workspace> [--revision N]
+                           read an accepted workspace document
+  document set <workspace> [--charter-file PATH] [--document-file PATH] [--yes]
+                           preview a unified diff; --yes accepts after Touch ID
 
   --subc <path>   daemon connection file; defaults to the usual discovery path
   --json          raw response instead of the rendered form
@@ -546,6 +569,25 @@ fn build_failure_exit(message: &str) -> u8 {
 }
 
 fn build_at(command: &Command, cwd: &str) -> Result<(String, Value), String> {
+    if command.face == Face::Workspaces && command.verb == "document" {
+        return workspace_document::build(command, cwd);
+    }
+    if command.face == Face::Projects && command.verb == "domain" {
+        let [project, value] = command.args.as_slice() else {
+            return Err("domain needs <project-id> <@scope/name> or <project-id> --clear".into());
+        };
+        let domain = if value == "--clear" {
+            Value::Null
+        } else {
+            json!(value)
+        };
+        let mut bytes = [0; 16];
+        getrandom::getrandom(&mut bytes).map_err(|e| e.to_string())?;
+        return Ok((
+            "project.set_domain".into(),
+            json!({"project_id":project,"domain":domain,"request_key":crate::log_client::encode_hex(&bytes)}),
+        ));
+    }
     if command.face == Face::Catalog {
         if command.verb == "seed" {
             if command.args.len() != 1 {
@@ -1463,7 +1505,16 @@ fn call(
             }
         }
         .map_err(|error| (EXIT_TRANSPORT, connect_failure(connection, error)))?;
-        if command.face == Face::Roles {
+        if method == "workspace.document.set" {
+            workspace_document::execute(
+                &ConsumerCaller {
+                    consumer: &consumer,
+                    cwd: cwd.to_owned(),
+                },
+                params,
+            )
+            .await
+        } else if command.face == Face::Roles {
             execute_roles(
                 &ConsumerCaller {
                     consumer: &consumer,
@@ -1489,8 +1540,10 @@ fn call(
             let body = serde_json::to_vec(&json!({"method":method,"params":params}))
                 .map_err(|error| (EXIT_TRANSPORT, format!("serialize request: {error}")))?;
             let options = placement_call_options(method);
-            if matches!(method, "assign_workspace" | "register")
-                || super::catalog_ops::WRITES.contains(&method)
+            if matches!(
+                method,
+                "assign_workspace" | "register" | "project.set_domain" | "workspace.set_document"
+            ) || super::catalog_ops::WRITES.contains(&method)
                 || method == super::catalog_publish::PUBLISH
             {
                 eprintln!("{AGENT_WRITE_NOTICE}");
@@ -1534,7 +1587,10 @@ fn placement_call_options(method: &str) -> subc_client_rs::CallOptions {
             ..subc_client_rs::CallOptions::default()
         };
     }
-    if matches!(method, "assign_workspace" | "register") {
+    if matches!(
+        method,
+        "assign_workspace" | "register" | "project.set_domain" | "workspace.set_document"
+    ) {
         return subc_client_rs::CallOptions {
             timeout: Duration::from_secs(300),
             ..subc_client_rs::CallOptions::default()
@@ -1582,6 +1638,14 @@ fn unwrap_result(envelope: Value) -> Result<Value, (u8, String)> {
 }
 
 fn render(command: &Command, value: &Value) {
+    if command.face == Face::Workspaces && command.verb == "document" && !command.json {
+        if value["preview"] == true {
+            println!("Preview only; pass --yes to accept after Touch ID.");
+        } else {
+            println!("{}", serde_json::to_string_pretty(value).unwrap());
+        }
+        return;
+    }
     if command.json {
         println!(
             "{}",

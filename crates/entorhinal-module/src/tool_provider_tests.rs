@@ -705,6 +705,9 @@ async fn provider_discovery_catalog_and_hello_agree_on_exact_tool_table() {
             .map(|field| ((*field).into(), json!({"type":"string"})))
             .collect();
         let mut required = fields;
+        if index == 1 {
+            properties.insert("domain".into(),json!({"type":"string","description":"Optional canonical memory domain (@scope/name), included in consent."}));
+        }
         if index == 6 {
             properties.insert("spec".into(),json!({"type":"object","properties":{"operation":{"type":"string","enum":["install","upgrade"]},"target":{"type":"object","properties":{"agent_id":{"type":"string"}},"required":["agent_id"],"additionalProperties":false},"package":{"type":"string"},"range":{"type":"string"}},"required":["operation","target","package","range"],"additionalProperties":false}));
         }

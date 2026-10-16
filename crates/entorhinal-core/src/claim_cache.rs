@@ -268,70 +268,71 @@ impl RegistryStore {
     /// A read snapshot joins the cache, identity and display name. Nulls are
     /// retained on the wire so unknown values never masquerade as empty text.
     pub fn agent_where(&self, id: &str) -> Result<AgentWhere, agent::AgentMutationError> {
-        self.read(|conn| {
-            let result = (|| {
-                let row =
-                    agent::load_row(conn, id)?.ok_or_else(|| refusal("unknown_agent", None))?;
-                if let Some(gone) = row.gone() {
-                    return Err(refusal("gone", Some(gone)));
-                }
-                let claim = load_claim(conn, id)?;
-                // Claims live only in the shared log. While sharing has never
-                // been turned on, no other Mac can hold this agent, so having no
-                // cached claim is a verified "unclaimed", not an unknown. Once
-                // sharing starts, only verified engram reads count.
-                let sharing_off = conn
-                    .query_row(
-                        "SELECT state='disabled' FROM identity_log_state WHERE id=1",
-                        [],
-                        |r| r.get::<_, bool>(0),
-                    )
-                    .optional()?
-                    .unwrap_or(true);
-                let known = claim.is_some() || sharing_off;
-                let read_at_ms = claim.as_ref().map(|c| c.read_at_ms);
-                let claim = claim.unwrap_or_else(|| unclaimed(0, !sharing_off, false));
-                if claim.integrity_failed {
-                    return Err(refusal("claim_integrity_failed", None));
-                }
-                let own = self_author(conn)?;
-                let status = if claim.epoch == 0 {
-                    "unclaimed"
-                } else if claim.holder.is_some() && claim.holder == own {
-                    "held_here"
-                } else {
-                    "held_elsewhere"
-                };
-                let (moving, move_errors, move_warnings, move_diagnostics) =
-                    crate::move_store::where_moves(conn, id)?;
-                Ok(AgentWhere {
-                    known,
-                    status,
-                    holder_name: if own.is_some() {
-                        holder_name(conn, claim.holder.as_deref())?
-                    } else {
-                        None
-                    },
-                    holder: claim.holder,
-                    epoch: claim.epoch,
-                    cut_id: claim.cut_id,
-                    read_at_ms,
-                    stale: claim.stale,
-                    moving,
-                    move_errors,
-                    move_warnings,
-                    move_diagnostics,
-                })
-            })();
-            Ok(result)
-        })
-        .map_err(|e| {
-            refusal(
-                "storage_error",
-                Some(serde_json::json!({"message":e.to_string()})),
-            )
-        })?
+        self.read(|conn| Ok(agent_where_in(conn, id)))
+            .map_err(|e| {
+                refusal(
+                    "storage_error",
+                    Some(serde_json::json!({"message":e.to_string()})),
+                )
+            })?
     }
+}
+
+pub(crate) fn agent_where_in(
+    conn: &Connection,
+    id: &str,
+) -> Result<AgentWhere, agent::AgentMutationError> {
+    let row = agent::load_row(conn, id)?.ok_or_else(|| refusal("unknown_agent", None))?;
+    if let Some(gone) = row.gone() {
+        return Err(refusal("gone", Some(gone)));
+    }
+    let claim = load_claim(conn, id)?;
+    // Claims live only in the shared log. While sharing has never
+    // been turned on, no other Mac can hold this agent, so having no
+    // cached claim is a verified "unclaimed", not an unknown. Once
+    // sharing starts, only verified engram reads count.
+    let sharing_off = conn
+        .query_row(
+            "SELECT state='disabled' FROM identity_log_state WHERE id=1",
+            [],
+            |r| r.get::<_, bool>(0),
+        )
+        .optional()?
+        .unwrap_or(true);
+    let known = claim.is_some() || sharing_off;
+    let read_at_ms = claim.as_ref().map(|c| c.read_at_ms);
+    let claim = claim.unwrap_or_else(|| unclaimed(0, !sharing_off, false));
+    if claim.integrity_failed {
+        return Err(refusal("claim_integrity_failed", None));
+    }
+    let own = self_author(conn)?;
+    let status = if claim.epoch == 0 {
+        "unclaimed"
+    } else if claim.holder.is_some() && claim.holder == own {
+        "held_here"
+    } else {
+        "held_elsewhere"
+    };
+    let (moving, move_errors, move_warnings, move_diagnostics) =
+        crate::move_store::where_moves(conn, id)?;
+    Ok(AgentWhere {
+        known,
+        status,
+        holder_name: if own.is_some() {
+            holder_name(conn, claim.holder.as_deref())?
+        } else {
+            None
+        },
+        holder: claim.holder,
+        epoch: claim.epoch,
+        cut_id: claim.cut_id,
+        read_at_ms,
+        stale: claim.stale,
+        moving,
+        move_errors,
+        move_warnings,
+        move_diagnostics,
+    })
 }
 
 #[cfg(test)]

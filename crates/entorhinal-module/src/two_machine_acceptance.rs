@@ -13,6 +13,7 @@ const CORE: RouteKey = (91, 1);
 const SHARED: &[&str] = &[
     "project",
     "workspace",
+    "workspace_document",
     "project_workspace",
     "project_alias",
     "agent",
@@ -4448,6 +4449,83 @@ async fn two_machines_resume_interrupted_avatar_manifest_without_duplicates() {
     );
     assert_eq!(log.head(), head + 2);
     assert_eq!(confirmer.summaries.lock().unwrap().len(), 2);
+    a.clean_rebuild().await;
+    b.clean_rebuild().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn memory_policy_round_trips_between_two_machines_and_rebuilds() {
+    let log = Arc::new(FakeLog::default());
+    let connector: Arc<dyn LogConnector> = log;
+    let mut a = Machine::new("memory-policy-a", connector.clone());
+    let mut b = Machine::new("memory-policy-b", connector);
+    for machine in [&mut a, &mut b] {
+        machine.handler.operator_confirmer = Arc::new(crate::served_vectors::Approve {
+            summaries: Mutex::new(vec![]),
+        });
+    }
+    a.enable_without_agents().await;
+    b.enable_without_agents().await;
+    let root = a.repo("project", &[]);
+    a.call("register",json!({"projectId":"P","name":"Project","workspaceId":"W","roots":[root],"domain":"@example/software"})).await.unwrap();
+    b.catch_up().await;
+    assert_eq!(
+        b.query("SELECT domain FROM project WHERE project_id='P'"),
+        vec![vec![Cell::Text("@example/software".into())]]
+    );
+    a.clean_rebuild().await;
+    b.clean_rebuild().await;
+    for revision in 0..3 {
+        let writer = if revision == 0 { &a } else { &b };
+        writer.call("workspace.set_document",json!({"workspace_id":"W","expected_revision":revision,"charter":if revision==2 {"\t".repeat(4096)}else{"Purpose".into()},"document":if revision==2 {"\"".repeat(65536)}else{format!("Policy {revision}")},"request_key":format!("document-{revision}")})).await.unwrap();
+        a.catch_up().await;
+        b.catch_up().await;
+        assert_eq!(a.rows("workspace_document"), b.rows("workspace_document"));
+        assert_eq!(
+            a.store().workspace_document("W", None).unwrap().revision,
+            revision + 1
+        );
+        a.clean_rebuild().await;
+        b.clean_rebuild().await;
+    }
+    b.call(
+        "project.set_domain",
+        json!({"project_id":"P","domain":"@example/research","request_key":"change-domain"}),
+    )
+    .await
+    .unwrap();
+    a.catch_up().await;
+    assert_eq!(
+        a.query("SELECT domain FROM project WHERE project_id='P'"),
+        vec![vec![Cell::Text("@example/research".into())]]
+    );
+    a.clean_rebuild().await;
+    b.clean_rebuild().await;
+    b.call(
+        "project.set_domain",
+        json!({"project_id":"P","domain":null,"request_key":"clear-domain"}),
+    )
+    .await
+    .unwrap();
+    a.catch_up().await;
+    assert_eq!(a.shared(), b.shared());
+    assert_eq!(
+        a.query("SELECT domain FROM project WHERE project_id='P'"),
+        vec![vec![Cell::Null]]
+    );
+    assert!(b.rows("project_root").is_empty());
+    let context = a.store().context_project(&root, "fixed").unwrap();
+    assert_eq!(
+        context["stamp"]["logPosition"],
+        a.store()
+            .identity_log_status()
+            .unwrap()
+            .last_applied_position
+    );
+    assert_eq!(
+        context["members_digest"],
+        entorhinal_catalog::sha256_hex("P")
+    );
     a.clean_rebuild().await;
     b.clean_rebuild().await;
 }

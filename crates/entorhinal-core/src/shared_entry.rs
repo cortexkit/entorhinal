@@ -17,6 +17,7 @@ pub type SharedRow = BTreeMap<String, Value>;
 pub const PROJECT_SHARED_TABLES: &[&str] = &[
     "workspace",
     "project",
+    "workspace_document",
     "project_workspace",
     "project_alias",
     "project_root_key",
@@ -175,6 +176,12 @@ impl SharedState {
                             Ok((name.clone(), value))
                         })
                         .collect::<rusqlite::Result<SharedRow>>()
+                        .map(|mut row| {
+                            if *table == "project" && row.get("domain") == Some(&Value::Null) {
+                                row.remove("domain");
+                            }
+                            row
+                        })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             tables.insert((*table).into(), rows);
@@ -228,6 +235,9 @@ impl SharedState {
             op: "shared.snapshot".into(),
             tables: PROJECT_SHARED_TABLES
                 .iter()
+                // An empty new table must not force old Macs to upgrade before
+                // any workspace document has actually been accepted.
+                .filter(|table| **table != "workspace_document" || !self.0[**table].is_empty())
                 .map(|table| {
                     (
                         (*table).into(),
@@ -324,11 +334,39 @@ pub(crate) fn record_local_entry(
 }
 
 fn validate_row(row: &SharedRow, expected: &[String], table: &str) -> rusqlite::Result<()> {
-    if row.len() != expected.len() || expected.iter().any(|name| !row.contains_key(name)) {
+    let legacy_domain = table == "project"
+        && expected.iter().any(|name| name == "domain")
+        && !row.contains_key("domain");
+    if row.len() + usize::from(legacy_domain) != expected.len()
+        || expected
+            .iter()
+            .any(|name| !row.contains_key(name) && !(legacy_domain && name == "domain"))
+    {
         return Err(invalid(format!("unknown or missing columns in {table}")));
     }
     for value in row.values() {
         sql_value(value)?;
+    }
+    if table == "project" && row.contains_key("domain") {
+        let value = &row["domain"];
+        if !value.is_null() && !value.is_string() {
+            return Err(invalid("invalid project domain type"));
+        }
+        crate::memory::validate_domain(value.as_str()).map_err(|e| invalid(e.to_string()))?;
+    }
+    if table == "workspace_document" && row.contains_key("charter") {
+        let doc: crate::WorkspaceDocument =
+            serde_json::from_value(serde_json::json!(row)).map_err(decode_error)?;
+        crate::memory::validate_text("charter", &doc.charter, crate::memory::CHARTER_LIMIT)
+            .map_err(|e| invalid(e.to_string()))?;
+        crate::memory::validate_text("document", &doc.document, crate::memory::DOCUMENT_LIMIT)
+            .map_err(|e| invalid(e.to_string()))?;
+        if doc.revision < 1
+            || doc.sha256 != crate::memory::document_sha256(&doc.charter, &doc.document)
+            || doc.accepted_via != "direct"
+        {
+            return Err(invalid("invalid accepted workspace document"));
+        }
     }
     if table == "project_alias"
         && row
@@ -518,7 +556,11 @@ impl ProjectEntry {
                 params_from_iter(
                     names
                         .iter()
-                        .map(|name| sql_value(&row[name]))
+                        .map(|name| {
+                            // Before migration 13, project after-images had no domain.
+                            // Null is omitted on output too, retaining the old bytes.
+                            sql_value(row.get(name).unwrap_or(&Value::Null))
+                        })
                         .collect::<rusqlite::Result<Vec<_>>>()?,
                 ),
             )?;
@@ -689,10 +731,63 @@ mod tests {
     }
 
     #[test]
+    fn memory_legacy_project_images_keep_old_bytes_and_strict_other_columns() {
+        let f = Fixture::new("memory-legacy-image");
+        let value = json!({"op":"project.shared","tables":{"project":{"upsert":[{"project_id":"P","name":"Project","implicit":0,"seed_identity":null,"created_at":1,"updated_at":1}],"delete":[]}}});
+        let old_bytes = canonical_bytes(&value);
+        let remote = crate::remote_apply::RemoteEntry {
+            position: 1,
+            entry_id: "01".repeat(16),
+            author: "02".repeat(16),
+            signer: "test".into(),
+            key_id: "test".into(),
+            envelope_version: 1,
+            kind: "change".into(),
+            entry: old_bytes.clone(),
+        };
+        let before = f.store.read(SharedState::capture).unwrap();
+        f.store.apply_remote_entry(&remote, None).unwrap();
+        assert!(f.store.verify().unwrap().ok);
+        f.store.rebuild().unwrap();
+        assert!(f.store.verify().unwrap().ok);
+        f.store
+            .read(|conn| {
+                let image = SharedState::capture(conn)?;
+                assert_eq!(image.0["project"][0].get("domain"), None);
+                assert!(!image
+                    .snapshot(vec![])
+                    .tables
+                    .contains_key("workspace_document"));
+                let captured = before.project_delta(&image, conn)?;
+                assert_eq!(canonical_bytes(&captured), old_bytes);
+                assert_eq!(captured.tables["project"].upsert, image.0["project"]);
+                for field in ["name", "implicit", "created_at"] {
+                    let mut bad = value.clone();
+                    bad["tables"]["project"]["upsert"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove(field);
+                    assert!(serde_json::from_value::<ProjectEntry>(bad)
+                        .unwrap()
+                        .validate(conn)
+                        .is_err());
+                }
+                let mut bad = value.clone();
+                bad["tables"]["project"]["upsert"][0]["unknown"] = json!(true);
+                assert!(serde_json::from_value::<ProjectEntry>(bad)
+                    .unwrap()
+                    .validate(conn)
+                    .is_err());
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
     fn comparison_records_full_upserts_keys_only_deletes_and_canonical_bytes() {
         let f = Fixture::new("shared-comparison");
         f.store.db.with_conn_fenced(|tx| {
-            tx.execute_batch("INSERT INTO project VALUES('P','old',0,NULL,10,10); INSERT INTO workspace VALUES('W','old',10,10); INSERT INTO project_alias VALUES('old-alias','P',10);")?;
+            tx.execute_batch("INSERT INTO project VALUES('P','old',0,NULL,10,10,NULL); INSERT INTO workspace VALUES('W','old',10,10); INSERT INTO project_alias VALUES('old-alias','P',10);")?;
             let before = SharedState::capture(tx)?;
             tx.execute_batch("UPDATE project SET name='new',updated_at=20; UPDATE workspace SET name='new',updated_at=20; INSERT INTO project_workspace VALUES('P','W'); DELETE FROM project_alias; INSERT INTO project_alias VALUES('explicit','P',20); INSERT INTO project_alias VALUES('pj-implicit1-local','P',20); INSERT INTO workspace_root VALUES('W','/private',20); INSERT INTO project_root_key VALUES('P','remote','owner/repo',20);")?;
             let after = SharedState::capture(tx)?;
