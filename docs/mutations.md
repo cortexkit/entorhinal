@@ -13,12 +13,12 @@ catalogue's header and CI pin the runner version and commit.
 
 ## Install the runner
 
-Use ckdev-mutate 0.12.1 at the commit CI pins (`CK_MUTATE_REV` in
+Use ckdev-mutate 0.12.3 at the commit CI pins (`CK_MUTATE_REV` in
 `.github/workflows/ci.yml`):
 
 ```sh
 cargo install --locked --git https://github.com/cortexkit/commons \
-  --rev 9d6b663dac487bb982c7bfd18a96eee2292164ad cortexkit-mutate
+  --rev 8200b61fe4250989d315ed8064d16754c5032d10 cortexkit-mutate
 ckdev-mutate --version
 ```
 
@@ -78,7 +78,7 @@ test threads did not shorten replays measurably.
 50 to 80 minutes per shard. `select = "expected"` can't simply be added to
 those rows: it also narrows them in the nightly `--broad` sweep, which exists
 to catch breaks that show up in tests other than the named ones. So push and
-main replays are to use a run-wide expected-only option in `ckdev-mutate`,
+main replays run with `--narrow`, which runs each row's named tests only,
 while the nightly sweep stays broad. Rows with `only = true` stay broad in
 every run, because `only` claims every other test stays green.
 ## A row
