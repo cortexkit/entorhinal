@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 use entorhinal_core::{
     claim_cache::{CachedClaim, ClaimObservation},
@@ -9,6 +9,11 @@ use serde_json::{json, Value};
 use subc_client_rs::HandlerOutcome;
 use subc_protocol::Principal;
 
+use crate::{
+    fake_record::{FakeRecord, FakeRecordConnector},
+    log_client::{LogConnector, LogTransport, TransportError},
+    record_client::{RecordClient, CAS},
+};
 use crate::{
     install_store, tests::reserved, ProjectsHandler, RouteAdmission, RouteKey, WRITER_MODULE,
 };
@@ -23,6 +28,11 @@ const ASSISTANT: &str = "agent_0000000000000002";
 const NO_AVATAR: &str = "agent_0000000000000003";
 const RETIRED: &str = "agent_0000000000000004";
 const UNKNOWN: &str = "agent_ffffffffffffffff";
+const ROLE_DIRECT: RouteKey = (904, 1);
+const ROLE_PLEXUS: RouteKey = (905, 1);
+const ROLE: &str = "x";
+const ROLE_SELF_AUTHOR: &str = "01010101010101010101010101010101";
+const ROLE_OTHER_AUTHOR: &str = "02020202020202020202020202020202";
 
 // Use the preserved migrations so the import sees the same columns and defaults
 // as a core snapshot, including the name claims required for live identities.
@@ -146,6 +156,180 @@ impl Drop for Fixture {
         self.handler.store.lock().unwrap().take();
         std::fs::remove_dir_all(&self.dir).unwrap();
     }
+}
+
+struct RoleFixture {
+    dir: PathBuf,
+    descriptor: cortexkit_store_types::StorageDescriptor,
+    handler: ProjectsHandler,
+    record: Arc<FakeRecord>,
+}
+
+impl RoleFixture {
+    async fn new(label: &str, move_on_cas: bool) -> Self {
+        let (dir, descriptor) = crate::tests::scratch_descriptor(label);
+        let record = FakeRecord::new([1; 16]);
+        let confirmer = Arc::new(Approve {
+            summaries: std::sync::Mutex::new(vec![]),
+        });
+        let mut handler = ProjectsHandler::with_runtime(INCARNATION.into(), || 700)
+            .with_operator_confirmer(confirmer);
+        let connector: Arc<dyn LogConnector> = if move_on_cas {
+            Arc::new(MoveRoleCasConnector(record.clone()))
+        } else {
+            Arc::new(FakeRecordConnector(record.clone()))
+        };
+        handler.record_client = RecordClient::new(connector);
+        install_store(
+            &handler.store,
+            &handler.health,
+            Ok(RegistryStore::open(&descriptor).unwrap()),
+        );
+        handler.route_admissions().insert(
+            ROLE_DIRECT,
+            RouteAdmission::from_bind(Some(Principal::Direct), None),
+        );
+        handler.route_admissions().insert(
+            ROLE_PLEXUS,
+            RouteAdmission::from_bind(Some(reserved("plexus")), None),
+        );
+        let fixture = Self {
+            dir,
+            descriptor,
+            handler,
+            record,
+        };
+        fixture.seed_member_names();
+        fixture
+    }
+
+    fn store(&self) -> RegistryStore {
+        self.handler.with_store(|store| Ok(store.clone())).unwrap()
+    }
+
+    fn seed_member_names(&self) {
+        self.store()
+            .apply_entry("fixture.role_member_names", "{}", "fixture", None, |tx| {
+                tx.execute(
+                    "INSERT INTO member_name(author,display_name) VALUES(?1,?2)",
+                    params![ROLE_SELF_AUTHOR, "This Mac"],
+                )?;
+                tx.execute(
+                    "INSERT INTO member_name(author,display_name) VALUES(?1,?2)",
+                    params![ROLE_OTHER_AUTHOR, "Other Mac"],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn enroll(&self) {
+        self.handler
+            .role_read(json!({"role":ROLE}))
+            .expect("enroll role for refresh");
+    }
+
+    async fn refresh(&self) {
+        self.handler.start_role_refresh();
+        self.handler.role_refresh.notify_one();
+        self.handler.health.role_refresh_done.notified().await;
+    }
+
+    async fn restart_store(&self) {
+        crate::tests::stop_store_tasks(&self.handler).await;
+        self.handler.store.lock().unwrap().take();
+        install_store(
+            &self.handler.store,
+            &self.handler.health,
+            Ok(RegistryStore::open(&self.descriptor).unwrap()),
+        );
+    }
+
+    async fn record(
+        &self,
+        records: &mut Vec<String>,
+        case: &str,
+        method: &str,
+        params: Value,
+        route: RouteKey,
+        principal: Value,
+    ) -> Value {
+        let request = serde_json::to_vec(&json!({"method":method,"params":params})).unwrap();
+        let outcome = self.handler.handle_served_request(&request, route).await;
+        let (kind, reply) = match outcome {
+            HandlerOutcome::Response(bytes) => ("response", String::from_utf8(bytes).unwrap()),
+            other => ("error", refusal(other).to_string()),
+        };
+        let decoded = serde_json::from_str(&reply).unwrap();
+        records.push(format!(
+            "  {{\"case\":{},\"request_bytes\":{},\"principal\":{},\"outcome\":{},\"reply_bytes\":{}}}",
+            json!(case),
+            json!(String::from_utf8(request).unwrap()),
+            principal,
+            json!(kind),
+            json!(reply)
+        ));
+        decoded
+    }
+}
+
+impl Drop for RoleFixture {
+    fn drop(&mut self) {
+        self.handler
+            .role_refresh_task
+            .lock()
+            .unwrap()
+            .take()
+            .inspect(|task| task.abort());
+        self.handler
+            .catch_up_task
+            .lock()
+            .unwrap()
+            .take()
+            .inspect(|task| task.abort());
+        self.handler.store.lock().unwrap().take();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[derive(Clone)]
+struct MoveRoleCasConnector(Arc<FakeRecord>);
+
+struct MoveRoleCasTransport(Arc<FakeRecord>);
+
+#[async_trait::async_trait]
+impl LogConnector for MoveRoleCasConnector {
+    async fn connect(&self) -> Result<Arc<dyn LogTransport>, TransportError> {
+        Ok(Arc::new(MoveRoleCasTransport(self.0.clone())))
+    }
+}
+
+#[async_trait::async_trait]
+impl LogTransport for MoveRoleCasTransport {
+    async fn call(&self, method: &str, params: Value) -> Result<Vec<u8>, TransportError> {
+        if method == CAS {
+            let subject = params["subject"].as_str().unwrap();
+            let expected_version = params["expected_version"].as_u64().unwrap();
+            self.0.put(
+                subject,
+                expected_version + 1,
+                role_claim(1, ROLE_OTHER_AUTHOR),
+                ROLE_OTHER_AUTHOR,
+            );
+        }
+        self.0.call(method, params).await
+    }
+}
+
+fn role_claim(epoch: i64, holder: &str) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "v":1,
+        "role":ROLE,
+        "holder":holder,
+        "epoch":epoch,
+        "reason":"cloud"
+    }))
+    .unwrap()
 }
 
 fn refusal(outcome: HandlerOutcome) -> Value {
@@ -1729,4 +1913,169 @@ async fn catalog_generation_v1_records_match_published_files() {
     assert_eq!(refused["code"], "activation_blocked");
     assert_eq!(refused["detail"]["name"], pin.name);
     published_file("catalog-generation-v1", "records.json", records);
+}
+
+#[tokio::test]
+async fn role_claims_v1_records_match_published_files() {
+    let plexus = json!({"kind":"reserved","moduleId":"plexus"});
+    let direct = serde_json::to_value(Principal::Direct).unwrap();
+    let mut records = Vec::new();
+
+    let f = RoleFixture::new("role-claims-never-read", false).await;
+    let unknown = f
+        .record(
+            &mut records,
+            "never_read",
+            "role.read",
+            json!({"role":ROLE}),
+            ROLE_PLEXUS,
+            plexus.clone(),
+        )
+        .await;
+    assert_eq!(unknown["result"]["known"], false);
+
+    let f = RoleFixture::new("role-claims-unheld", false).await;
+    f.enroll();
+    f.refresh().await;
+    let unheld = f
+        .record(
+            &mut records,
+            "read_unheld",
+            "role.read",
+            json!({"role":ROLE}),
+            ROLE_PLEXUS,
+            plexus.clone(),
+        )
+        .await;
+    assert_eq!(unheld["result"]["epoch"], 0);
+    assert_eq!(unheld["result"]["known"], true);
+    assert_eq!(unheld["result"]["stale"], false);
+
+    let f = RoleFixture::new("role-claims-held-here", false).await;
+    f.enroll();
+    f.record.put(
+        "role:x",
+        4,
+        role_claim(4, ROLE_SELF_AUTHOR),
+        ROLE_SELF_AUTHOR,
+    );
+    f.refresh().await;
+    let held_here = f
+        .record(
+            &mut records,
+            "held_here",
+            "role.read",
+            json!({"role":ROLE}),
+            ROLE_PLEXUS,
+            plexus.clone(),
+        )
+        .await;
+    assert!(held_here["result"]["epoch"].as_i64().unwrap() >= 1);
+    assert_eq!(held_here["result"]["holder"], ROLE_SELF_AUTHOR);
+    assert_eq!(held_here["result"]["holder_name"], "This Mac");
+    assert_eq!(held_here["result"]["held_here"], true);
+
+    let f = RoleFixture::new("role-claims-held-elsewhere", false).await;
+    f.enroll();
+    f.record.put(
+        "role:x",
+        5,
+        role_claim(5, ROLE_OTHER_AUTHOR),
+        ROLE_OTHER_AUTHOR,
+    );
+    f.refresh().await;
+    let held_elsewhere = f
+        .record(
+            &mut records,
+            "held_elsewhere",
+            "role.read",
+            json!({"role":ROLE}),
+            ROLE_PLEXUS,
+            plexus.clone(),
+        )
+        .await;
+    assert_eq!(held_elsewhere["result"]["holder"], ROLE_OTHER_AUTHOR);
+    assert_eq!(held_elsewhere["result"]["holder_name"], "Other Mac");
+    assert_eq!(held_elsewhere["result"]["held_here"], false);
+
+    let f = RoleFixture::new("role-claims-stale-after-restart", false).await;
+    f.enroll();
+    f.record.put(
+        "role:x",
+        6,
+        role_claim(6, ROLE_SELF_AUTHOR),
+        ROLE_SELF_AUTHOR,
+    );
+    f.refresh().await;
+    f.restart_store().await;
+    let stale = f
+        .record(
+            &mut records,
+            "stale_after_restart",
+            "role.read",
+            json!({"role":ROLE}),
+            ROLE_PLEXUS,
+            plexus.clone(),
+        )
+        .await;
+    assert_eq!(stale["result"]["known"], true);
+    assert_eq!(stale["result"]["holder"], ROLE_SELF_AUTHOR);
+    assert_eq!(stale["result"]["held_here"], true);
+    assert_eq!(stale["result"]["stale"], true);
+
+    let f = RoleFixture::new("role-claims-integrity-failure", false).await;
+    f.enroll();
+    f.record.error("role:x", Some("decrypt_failed"));
+    f.refresh().await;
+    let integrity = f
+        .record(
+            &mut records,
+            "integrity_failure",
+            "role.read",
+            json!({"role":ROLE}),
+            ROLE_PLEXUS,
+            plexus.clone(),
+        )
+        .await;
+    assert_eq!(integrity["code"], "claim_integrity_failed");
+
+    let f = RoleFixture::new("role-claims-take-epoch-moved", true).await;
+    let moved = f
+        .record(
+            &mut records,
+            "take_epoch_moved",
+            "role.take",
+            json!({
+                "role":ROLE,
+                "expected_epoch":0,
+                "request_id":"11".repeat(16),
+                "reason":"run coordinator"
+            }),
+            ROLE_DIRECT,
+            direct.clone(),
+        )
+        .await;
+    assert_eq!(moved["code"], "epoch_moved");
+    assert_eq!(moved["detail"]["current_epoch"], 1);
+    assert_eq!(moved["detail"]["holder"], ROLE_OTHER_AUTHOR);
+
+    let f = RoleFixture::new("role-claims-take-reserved-plexus", false).await;
+    let denied = f
+        .record(
+            &mut records,
+            "take_reserved_plexus",
+            "role.take",
+            json!({
+                "role":ROLE,
+                "expected_epoch":0,
+                "request_id":"22".repeat(16),
+                "reason":"run coordinator"
+            }),
+            ROLE_PLEXUS,
+            plexus,
+        )
+        .await;
+    assert_eq!(denied["code"], "caller_forbidden");
+
+    published_file("role-claims-v1", "records.json", records);
 }
