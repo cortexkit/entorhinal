@@ -449,7 +449,13 @@ mod tests {
                 writer.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
                 start.wait();
                 for _ in 0..128 {
-                    let tx = writer.transaction().unwrap();
+                    // Take the write lock up front. A deferred transaction reads
+                    // first and then upgrades, and SQLite refuses that upgrade at
+                    // once ("database is locked") instead of waiting out the busy
+                    // timeout when the snapshot side holds the lock.
+                    let tx = writer
+                        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                        .unwrap();
                     let mut row = super::super::store::load_row(&tx,&id).unwrap().unwrap();
                     tx.execute("INSERT INTO registry_journal(op,payload_json,actor,created_at,principal) VALUES('agent.update_tag','{}','test',100,'entorhinal')",[]).unwrap();
                     let seq = tx.last_insert_rowid();
