@@ -162,7 +162,14 @@ pub(crate) fn decode_refusal(code: &str, detail: Option<Value>) -> LogError {
 
 #[derive(Clone, Debug)]
 pub(crate) enum TransportError {
-    Refusal { code: String, detail: Option<Value> },
+    /// `message` is the peer's human-readable reason from the wire error body.
+    /// It is kept for operator logs and move diagnostics only; no decision
+    /// reads it, so callers that build refusals locally may leave it empty.
+    Refusal {
+        code: String,
+        detail: Option<Value>,
+        message: Option<String>,
+    },
     Unavailable,
     NoReply,
 }
@@ -170,7 +177,7 @@ pub(crate) enum TransportError {
 impl From<TransportError> for LogError {
     fn from(error: TransportError) -> Self {
         match error {
-            TransportError::Refusal { code, detail } => decode_refusal(&code, detail),
+            TransportError::Refusal { code, detail, .. } => decode_refusal(&code, detail),
             TransportError::Unavailable => Self::Unavailable,
             TransportError::NoReply => Self::NoReply,
         }
@@ -399,6 +406,7 @@ impl SubcConnector {
                 TransportError::Refusal {
                     code: error.code.into(),
                     detail: Some(json!({"message": error.message})),
+                    message: None,
                 }
             })?;
         let mut slot = self.consumer.lock().await;
@@ -469,12 +477,14 @@ pub(crate) fn service_call_error(error: CallError) -> TransportError {
         return TransportError::Refusal {
             code: body.code.clone(),
             detail: body.detail.clone(),
+            message: Some(body.message.clone()),
         };
     }
     match error {
         CallError::Module(body) => TransportError::Refusal {
             code: body.code,
             detail: body.detail,
+            message: Some(body.message),
         },
         CallError::OutcomeUnknown(_) => TransportError::NoReply,
         _ => TransportError::Unavailable,
@@ -526,6 +536,7 @@ impl LogTransport for SubcTransport {
                 CallError::Module(body) => TransportError::Refusal {
                     code: body.code,
                     detail: body.detail,
+                    message: Some(body.message),
                 },
                 CallError::OutcomeUnknown(_) => TransportError::NoReply,
                 _ => TransportError::Unavailable,
@@ -714,6 +725,7 @@ mod tests {
             *stub.reply.lock().unwrap() = Err(TransportError::Refusal {
                 code: body.code,
                 detail: body.detail,
+                message: Some(body.message),
             });
             assert_eq!(
                 client.append(&request()).await.unwrap_err(),
@@ -1049,5 +1061,23 @@ mod cwd_tests {
             connector.consumer.lock().await.is_none(),
             "no consumer or route may be opened"
         );
+    }
+
+    #[test]
+    fn module_refusal_keeps_the_wire_message_beside_code_and_detail() {
+        let mut body = subc_protocol::ErrorBody::new("invalid_request", "a cut needs items");
+        body.detail = Some(json!({"field":"items"}));
+        match service_call_error(CallError::Module(body)) {
+            TransportError::Refusal {
+                code,
+                detail,
+                message,
+            } => {
+                assert_eq!(code, "invalid_request");
+                assert_eq!(detail, Some(json!({"field":"items"})));
+                assert_eq!(message.as_deref(), Some("a cut needs items"));
+            }
+            other => panic!("a module error is a refusal, got {other:?}"),
+        }
     }
 }

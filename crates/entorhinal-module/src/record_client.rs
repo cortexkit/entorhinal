@@ -76,7 +76,7 @@ impl RecordError {
 impl From<TransportError> for RecordError {
     fn from(error: TransportError) -> Self {
         match error {
-            TransportError::Refusal { code, detail } => Self::refusal(&code, detail),
+            TransportError::Refusal { code, detail, .. } => Self::refusal(&code, detail),
             TransportError::Unavailable => Self::refusal("unavailable", None),
             TransportError::NoReply => Self::NoReply,
         }
@@ -374,6 +374,7 @@ mod tests {
                 return Err(TransportError::Refusal {
                     code: "version_moved".into(),
                     detail: None,
+                    message: None,
                 });
             }
             assert_eq!(method, READ);

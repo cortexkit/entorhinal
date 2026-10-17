@@ -7,7 +7,9 @@ use crate::{
         CutItem, CutRequest as DoorCut, DoorError, HandoffState, SealRequest, SealState,
     },
     log_client::TransportError,
-    move_driver::{backoff, digest_reason, participant_action, Worker, POLL},
+    move_driver::{
+        backoff, digest_reason, participant_action, PeerRefusal, RefusalLog, Worker, POLL,
+    },
     participant_client::{
         AgentRef, ClientError, CutRequest, ParticipantClient, Refs, ReleaseRequest,
     },
@@ -52,6 +54,15 @@ struct Progress {
     contract_violation: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     published_at_ms: Option<i64>,
+    /// The refusal code the door gave for this cut's `cut.seal`, recorded when
+    /// the refusal happened. A refused seal created no cut at the door, so
+    /// cleanup must neither re-send the seal (the door would refuse it again,
+    /// forever) nor abort a cut the door never held. A lost seal reply leaves
+    /// this unset: the door may hold the cut, so cleanup re-seals and aborts.
+    /// Optional and absent by default, so rows written before this field
+    /// existed still decode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    seal_refused: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -99,7 +110,12 @@ struct Failure {
     diagnostic: bool,
     unknown: bool,
     contract_violation: bool,
+    /// Set when the door or a participant answered with a refusal (or a
+    /// terminal seal state), as opposed to a lost reply or a local store or
+    /// record error. Boxed to keep `Result<_, Failure>` small.
+    refusal: Option<Box<PeerRefusal>>,
 }
+
 
 impl Failure {
     fn new(op: &str, code: &str) -> Self {
@@ -111,16 +127,28 @@ impl Failure {
             diagnostic: false,
             unknown: false,
             contract_violation: false,
+            refusal: None,
         }
     }
     fn participant(op: &str, module: &str, error: ClientError) -> Self {
-        let (code, detail, unknown, contract_violation) = match error {
-            ClientError::Refused(r) => (r.code, r.detail.unwrap_or(Value::Null), false, false),
-            ClientError::ContractViolation { code, detail, .. } => {
-                (code, detail.unwrap_or(Value::Null), false, true)
+        let (code, detail, unknown, contract_violation, message) = match error {
+            ClientError::Refused(r) => (
+                r.code,
+                r.detail.unwrap_or(Value::Null),
+                false,
+                false,
+                r.message,
+            ),
+            ClientError::ContractViolation {
+                code,
+                detail,
+                message,
+                ..
+            } => (code, detail.unwrap_or(Value::Null), false, true, message),
+            ClientError::OutcomeUnknown => ("unavailable".into(), Value::Null, true, false, None),
+            ClientError::InvalidReply(detail) => {
+                ("unavailable".into(), json!(detail), true, false, None)
             }
-            ClientError::OutcomeUnknown => ("unavailable".into(), Value::Null, true, false),
-            ClientError::InvalidReply(detail) => ("unavailable".into(), json!(detail), true, false),
         };
         Self {
             code,
@@ -128,6 +156,7 @@ impl Failure {
             op: op.into(),
             module: Some(module.into()),
             diagnostic: false,
+            refusal: (!unknown).then(|| Box::new(PeerRefusal { message })),
             unknown,
             contract_violation,
         }
@@ -135,7 +164,12 @@ impl Failure {
     fn door(op: &str, error: DoorError) -> Self {
         let mut failure = Self::new(op, error.code());
         match error {
-            DoorError::Refused { detail, .. } => failure.detail = detail.unwrap_or(Value::Null),
+            DoorError::Refused {
+                detail, message, ..
+            } => {
+                failure.detail = detail.unwrap_or(Value::Null);
+                failure.refuse(message);
+            }
             DoorError::OutcomeUnknown | DoorError::InvalidReply(_) => {
                 failure.code = "unavailable".into();
                 failure.unknown = true;
@@ -143,11 +177,23 @@ impl Failure {
         }
         failure
     }
+    fn refuse(&mut self, message: Option<String>) {
+        self.refusal = Some(Box::new(PeerRefusal { message }));
+    }
+    fn refused(&self) -> bool {
+        self.refusal.is_some()
+    }
+    fn message(&self) -> Option<&str> {
+        self.refusal.as_ref().and_then(|r| r.message.as_deref())
+    }
     fn detail(&self) -> Value {
         let mut detail = json!({"op":self.op,"code":self.code,"detail":self.detail,
             "contract_violation":self.contract_violation});
         if let Some(module) = &self.module {
             detail["module_id"] = json!(module);
+        }
+        if let Some(message) = self.message() {
+            detail["message"] = json!(message);
         }
         if let Some(reason) = digest_reason(&self.code, Some(&self.detail)) {
             detail["reason"] = json!(reason);
@@ -195,6 +241,7 @@ pub(crate) struct Source {
     resumed: bool,
     last_poll: Option<tokio::time::Instant>,
     abort_held: bool,
+    refusals: RefusalLog,
 }
 
 impl Source {
@@ -206,6 +253,7 @@ impl Source {
             resumed: false,
             last_poll: None,
             abort_held: false,
+            refusals: RefusalLog::default(),
         }
     }
 
@@ -344,6 +392,15 @@ impl Source {
         plan: &mut Plan,
         error: Failure,
     ) -> Result<Option<Duration>, HandlerError> {
+        if error.refused() {
+            self.refusals.note(
+                &self.cut,
+                error.module.as_deref().unwrap_or("engram"),
+                &error.op,
+                &error.code,
+                error.message(),
+            );
+        }
         let busy_retry = !error.contract_violation
             && error.action() == Some(DriverAction::RetryLater)
             && error.op == "agent_data.prepare"
@@ -422,6 +479,12 @@ impl Source {
                 MoveReason::ParticipantRefused
             };
             let reason = String::from(reason);
+            // Only a seal refused before the door ever reported the cut proves
+            // the door holds nothing; once the step is sealed the door
+            // published the cut, whatever a later replay answers.
+            if error.op == "cut.seal" && error.refused() && row.step == Step::Exported {
+                plan.source.seal_refused = Some(error.code.clone());
+            }
             row.abort_requested = Some(json!({"reason":reason,"detail":error.detail()}));
             row.reason = Some(reason);
             row.detail = Some(error.detail());
@@ -444,9 +507,15 @@ impl Source {
             .map_err(|e| {
                 let mut failure = Failure::new("route.open", "unavailable");
                 failure.module = Some(module.into());
-                if let TransportError::Refusal { code, detail } = e {
+                if let TransportError::Refusal {
+                    code,
+                    detail,
+                    message,
+                } = e
+                {
                     failure.code = code;
                     failure.detail = detail.unwrap_or(Value::Null);
+                    failure.refuse(message);
                 }
                 failure
             })?;
@@ -683,6 +752,7 @@ impl Source {
                             },
                         );
                         failure.detail = status.failure.unwrap_or(Value::Null);
+                        failure.refuse(None);
                         Err(failure)
                     }
                 }
@@ -906,11 +976,7 @@ impl Source {
                 Some((record, _)) if record.state == State::Aborted => {
                     self.apply_claim(row, false).await?;
                     if row.seal_sent {
-                        self.worker
-                            .door
-                            .abort(&self.door_cut())
-                            .await
-                            .map_err(|e| Failure::door("cut.abort", e))?;
+                        self.abort_door_cut().await?;
                     }
                     self.abort_participants(row, plan).await?;
                     Self::change_step(row, plan, Step::Aborted);
@@ -928,24 +994,57 @@ impl Source {
             }
         }
         self.abort_participants(row, plan).await?;
-        if row.seal_sent {
-            self.worker
+        // A seal the door refused created no cut there, so a recorded refusal
+        // skips both door calls.
+        if row.seal_sent && plan.source.seal_refused.is_none() {
+            // seal_sent is durable before the send, so it does not prove the door
+            // received the seal. Repeat the identical seal so the door reaches a
+            // known state, then abort that cut.
+            let resealed = self
+                .worker
                 .door
                 .seal(&SealRequest {
                     cut_id: self.cut.clone(),
                     items: plan.source.items.clone(),
                 })
                 .await
-                .map_err(|e| Failure::door("cut.seal", e))?;
-            self.worker
-                .door
-                .abort(&self.door_cut())
-                .await
-                .map_err(|e| Failure::door("cut.abort", e))?;
+                .map_err(|e| Failure::door("cut.seal", e));
+            match resealed {
+                Ok(_) => self.abort_door_cut().await?,
+                // The door replays an identical seal it already accepted, so a
+                // permanent refusal before the cut was ever reported sealed
+                // means it never created this cut and there is nothing to
+                // abort. Record that durably so a restart does not send the
+                // refused seal again.
+                Err(failure)
+                    if failure.refused() && !failure.retryable() && row.step == Step::Exported =>
+                {
+                    self.refusals.note(
+                        &self.cut,
+                        "engram",
+                        &failure.op,
+                        &failure.code,
+                        failure.message(),
+                    );
+                    plan.source.seal_refused = Some(failure.code);
+                    self.save(row, plan, false).await?;
+                }
+                Err(failure) => return Err(failure),
+            }
         }
         Self::change_step(row, plan, Step::Aborted);
         self.save(row, plan, true).await?;
         Ok(Duration::ZERO)
+    }
+
+    async fn abort_door_cut(&self) -> Result<(), Failure> {
+        match self.worker.door.abort(&self.door_cut()).await {
+            Ok(_) => Ok(()),
+            // The door answers not_found for a cut it does not hold, including
+            // one it never accepted. Nothing is left to abort.
+            Err(DoorError::Refused { code, .. }) if code == "not_found" => Ok(()),
+            Err(error) => Err(Failure::door("cut.abort", error)),
+        }
     }
 
     async fn abort_participants(
@@ -2011,6 +2110,7 @@ mod tests {
                 ParticipantEffect::Refuse(Refusal {
                     code: "busy".into(),
                     detail: Some(json!({"refs":["ra"]})),
+                    message: None,
                 }),
             );
         }
@@ -2343,6 +2443,7 @@ mod tests {
             ParticipantEffect::Refuse(Refusal {
                 code: "cut_not_ready".into(),
                 detail: Some(json!({"note":"not allowed for release"})),
+                message: None,
             }),
         );
         f.step(&mut source).await;
@@ -2400,6 +2501,7 @@ mod tests {
                     op: "agent_data.release",
                     code: code.into(),
                     detail: None,
+                    message: None,
                 },
             );
             assert!(!violation.retryable());
@@ -2411,6 +2513,7 @@ mod tests {
             ClientError::Refused(Refusal {
                 code: "unavailable".into(),
                 detail: None,
+                message: None,
             }),
         );
         assert!(unavailable.retryable());
@@ -2578,5 +2681,268 @@ mod tests {
         drop(locked);
         drop(reopened);
         task.abort();
+    }
+
+    /// The door ops this move sent, in order, read from the transport trace.
+    /// The trace records every call before the fake door validates it, so a
+    /// seal the door refuses for its shape still appears here.
+    fn door_ops(f: &Fixture) -> Vec<String> {
+        f.trace
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.op.starts_with("cut."))
+            .map(|event| event.op.clone())
+            .collect()
+    }
+
+    /// Every participant prepares no items, so the cut is empty. The fake door,
+    /// like engram, refuses an empty `cut.seal` with `invalid_request` every
+    /// time it is sent.
+    fn empty_cut(f: &Fixture) {
+        for participant in &f.participants {
+            participant
+                .set_prepare(serde_json::from_value(json!({"items":[],"external":[]})).unwrap());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn source_refused_seal_aborts_without_resealing_or_aborting_the_door() {
+        let f = Fixture::new();
+        empty_cut(&f);
+        let mut source = f.source();
+        f.until(&mut source, Step::Exported).await;
+        f.step(&mut source).await;
+        let row = f.row();
+        assert!(row.abort_requested.is_some());
+        assert_eq!(
+            f.plan().source.seal_refused.as_deref(),
+            Some("invalid_request")
+        );
+        f.until(&mut source, Step::Aborted).await;
+        let row = f.row();
+        assert_eq!(row.reason.as_deref(), Some("door_refused"));
+        assert_eq!(row.detail.as_ref().unwrap()["op"], "cut.seal");
+        assert_eq!(row.detail.as_ref().unwrap()["code"], "invalid_request");
+        // The refused seal is the only door call: cleanup neither repeats it
+        // nor aborts a cut the door never held.
+        assert_eq!(door_ops(&f), ["cut.seal"]);
+        assert!(f.door.cut(CUT).is_none());
+        for participant in &f.participants {
+            assert!(participant.frozen().is_empty());
+            assert!(participant
+                .calls()
+                .iter()
+                .any(|r| matches!(r, Request::Abort(_))));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn source_refused_seal_cleanup_skips_the_door_after_a_mid_cleanup_restart() {
+        let f = Fixture::new();
+        empty_cut(&f);
+        f.participants[1].script(
+            "agent_data.abort",
+            ParticipantEffect::Refuse(Refusal {
+                code: "unavailable".into(),
+                detail: None,
+                message: None,
+            }),
+        );
+        let mut source = f.source();
+        f.until(&mut source, Step::Exported).await;
+        f.step(&mut source).await;
+        assert!(f.row().abort_requested.is_some());
+        // Cleanup aborts participant a, then b refuses, so the cleanup stops
+        // part way with a retry scheduled.
+        f.step(&mut source).await;
+        assert_eq!(f.row().step, Step::Exported);
+        assert_eq!(f.plan().source.aborted, ["a"]);
+        drop(source);
+        let mut restarted = f.source();
+        f.until(&mut restarted, Step::Aborted).await;
+        assert_eq!(f.row().reason.as_deref(), Some("door_refused"));
+        assert_eq!(door_ops(&f), ["cut.seal"]);
+        assert!(f.participants.iter().all(|p| p.frozen().is_empty()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn source_unknown_seal_outcome_cleanup_still_reseals_then_aborts_the_door() {
+        let f = Fixture::new();
+        let mut source = f.source();
+        f.until(&mut source, Step::Exported).await;
+        // The door creates the cut but both replies are lost, so the client
+        // reports an unknown outcome while the door holds a pending cut.
+        for _ in 0..2 {
+            f.door
+                .script("cut.seal", DoorEffect::LoseReply(TransportError::NoReply));
+        }
+        f.step(&mut source).await;
+        assert!(f.row().abort_requested.is_none());
+        assert!(f.door.cut(CUT).is_some_and(|cut| !cut.aborted));
+        let before = door_ops(&f).len();
+        f.abort();
+        f.until(&mut source, Step::Aborted).await;
+        assert_eq!(f.plan().source.seal_refused, None);
+        let cleanup: Vec<_> = door_ops(&f)
+            .split_off(before)
+            .into_iter()
+            .filter(|op| op == "cut.seal" || op == "cut.abort")
+            .collect();
+        assert_eq!(cleanup, ["cut.seal", "cut.abort"]);
+        assert!(f.door.cut(CUT).unwrap().aborted);
+        assert!(f.participants.iter().all(|p| p.frozen().is_empty()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn source_cleanup_reseal_refused_for_a_cut_the_door_never_received_skips_abort() {
+        let f = Fixture::new();
+        let mut source = f.source();
+        f.until(&mut source, Step::Exported).await;
+        // Both sends fail before the door sees them: the outcome is unknown to
+        // the driver, and the door holds no cut.
+        for _ in 0..2 {
+            f.door
+                .script("cut.seal", DoorEffect::FailBefore(TransportError::NoReply));
+        }
+        f.step(&mut source).await;
+        assert!(f.door.cut(CUT).is_none());
+        f.abort();
+        f.door.script(
+            "cut.seal",
+            DoorEffect::RefuseWithMessage("cut_end_mismatch".into(), "the stream moved".into()),
+        );
+        f.until(&mut source, Step::Aborted).await;
+        assert_eq!(
+            f.plan().source.seal_refused.as_deref(),
+            Some("cut_end_mismatch")
+        );
+        assert!(door_ops(&f).iter().all(|op| op != "cut.abort"));
+        assert!(f.door.cut(CUT).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn source_cleanup_treats_a_door_abort_not_found_as_already_gone() {
+        let f = Fixture::new();
+        let mut source = f.source();
+        f.until(&mut source, Step::Exported).await;
+        for _ in 0..2 {
+            f.door
+                .script("cut.seal", DoorEffect::LoseReply(TransportError::NoReply));
+        }
+        f.step(&mut source).await;
+        f.abort();
+        f.door
+            .script("cut.abort", DoorEffect::Refuse("not_found".into()));
+        f.until(&mut source, Step::Aborted).await;
+        assert_eq!(
+            door_ops(&f).iter().filter(|op| *op == "cut.abort").count(),
+            1
+        );
+    }
+
+    /// Collects the fields of each `move` target event as one line.
+    struct MoveLog(Arc<Mutex<Vec<String>>>);
+    impl tracing::Subscriber for MoveLog {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Fields(String);
+            impl tracing::field::Visit for Fields {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push_str(&format!("{}={value:?};", field.name()));
+                }
+            }
+            if event.metadata().target() == "move" {
+                let mut fields = Fields(String::new());
+                event.record(&mut fields);
+                self.0.lock().unwrap().push(fields.0);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn source_refusals_log_once_per_code_and_keep_the_message_in_detail() {
+        let f = Fixture::new();
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let _subscriber = tracing::subscriber::set_default(MoveLog(lines.clone()));
+        let mut source = f.source();
+        f.until(&mut source, Step::Exported).await;
+        for _ in 0..3 {
+            f.door.script(
+                "cut.seal",
+                DoorEffect::RefuseWithMessage("cut_not_ready".into(), "streams settling".into()),
+            );
+        }
+        f.door.script(
+            "cut.seal",
+            DoorEffect::RefuseWithMessage("invalid_request".into(), "engram says no".into()),
+        );
+        f.until(&mut source, Step::Aborted).await;
+        let row = f.row();
+        assert_eq!(row.detail.as_ref().unwrap()["code"], "invalid_request");
+        assert_eq!(row.detail.as_ref().unwrap()["message"], "engram says no");
+        // Three retried refusals and the permanent one reached the driver.
+        assert_eq!(
+            door_ops(&f).iter().filter(|op| *op == "cut.seal").count(),
+            4
+        );
+        let lines = lines.lock().unwrap();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        for (line, code, message) in [
+            (&lines[0], "cut_not_ready", "streams settling"),
+            (&lines[1], "invalid_request", "engram says no"),
+        ] {
+            assert!(line.contains(&format!("cut={CUT:?}")), "{line}");
+            assert!(line.contains("op=\"cut.seal\""), "{line}");
+            assert!(line.contains(&format!("code={code:?}")), "{line}");
+            assert!(line.contains(&format!("message={message:?}")), "{line}");
+            for item in &f.plan().source.items {
+                assert!(!line.contains(&item.session_ref), "{line}");
+            }
+        }
+    }
+
+    #[test]
+    fn participant_refusal_message_is_kept_in_the_stored_detail() {
+        let refused = Failure::participant(
+            "agent_data.prepare",
+            "a",
+            ClientError::Refused(Refusal {
+                code: "busy".into(),
+                detail: None,
+                message: Some("index rebuilding".into()),
+            }),
+        );
+        assert!(refused.refused());
+        assert_eq!(refused.detail()["message"], "index rebuilding");
+        let violation = Failure::participant(
+            "agent_data.release",
+            "a",
+            ClientError::ContractViolation {
+                op: "agent_data.release",
+                code: "busy".into(),
+                detail: None,
+                message: Some("not now".into()),
+            },
+        );
+        assert!(violation.refused());
+        assert_eq!(violation.detail()["message"], "not now");
+        let lost = Failure::participant("agent_data.prepare", "a", ClientError::OutcomeUnknown);
+        assert!(!lost.refused());
+        assert!(lost.detail().get("message").is_none());
     }
 }

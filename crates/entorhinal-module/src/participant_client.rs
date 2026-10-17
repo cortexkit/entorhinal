@@ -39,6 +39,9 @@ use crate::participant_discovery::Participant;
 pub(crate) struct Refusal {
     pub(crate) code: String,
     pub(crate) detail: Option<Value>,
+    /// The participant's human-readable reason from the wire error body, kept
+    /// for operator logs and move diagnostics. No decision reads it.
+    pub(crate) message: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -48,20 +51,31 @@ pub(crate) enum ClientError {
         op: &'static str,
         code: String,
         detail: Option<Value>,
+        message: Option<String>,
     },
     OutcomeUnknown,
     InvalidReply(String),
 }
 
-fn classify_refusal(op: Op, code: String, detail: Option<Value>) -> ClientError {
+fn classify_refusal(
+    op: Op,
+    code: String,
+    detail: Option<Value>,
+    message: Option<String>,
+) -> ClientError {
     let refusal_code = RefusalCode::from_code(&code);
     if allowed_refusals(op).contains(&refusal_code) {
-        ClientError::Refused(Refusal { code, detail })
+        ClientError::Refused(Refusal {
+            code,
+            detail,
+            message,
+        })
     } else {
         ClientError::ContractViolation {
             op: op.method(),
             code,
             detail,
+            message,
         }
     }
 }
@@ -96,7 +110,11 @@ impl ParticipantClient {
                 .call(op.method(), params)
                 .await
                 .map_err(|error| match error {
-                    TransportError::Refusal { code, detail } => classify_refusal(op, code, detail),
+                    TransportError::Refusal {
+                        code,
+                        detail,
+                        message,
+                    } => classify_refusal(op, code, detail, message),
                     TransportError::NoReply | TransportError::Unavailable => {
                         ClientError::OutcomeUnknown
                     }
@@ -797,6 +815,7 @@ mod tests {
             Effect::Refuse(Refusal {
                 code: "unavailable".into(),
                 detail: None,
+                message: None,
             }),
         );
         assert!(matches!(
@@ -983,6 +1002,7 @@ mod refusal_tests {
                 Effect::Refuse(Refusal {
                     code: code.into(),
                     detail: Some(detail.clone()),
+                    message: Some("fixture message".into()),
                 }),
             );
             match client(fake.clone())
@@ -993,6 +1013,7 @@ mod refusal_tests {
                 ClientError::Refused(refusal) => {
                     assert_eq!(refusal.code, code, "{}", request.op().method());
                     assert_eq!(refusal.detail, Some(detail));
+                    assert_eq!(refusal.message.as_deref(), Some("fixture message"));
                 }
                 other => panic!("{} must allow {code}, got {other:?}", request.op().method()),
             }
@@ -1013,6 +1034,7 @@ mod refusal_tests {
                 Effect::Refuse(Refusal {
                     code: code.into(),
                     detail: Some(detail.clone()),
+                    message: None,
                 }),
             );
             match client(fake.clone())
@@ -1024,6 +1046,7 @@ mod refusal_tests {
                     op,
                     code: actual_code,
                     detail: actual_detail,
+                    ..
                 } => {
                     assert_eq!(op, request.op().method());
                     assert_eq!(actual_code, code);
@@ -1050,10 +1073,11 @@ mod refusal_tests {
             Effect::Refuse(Refusal {
                 code: "busy".into(),
                 detail: Some(json!({"step":"prepared"})),
+                message: None,
             }),
         );
         assert!(matches!(client(fake.clone()).prepare(&cut()).await,
-            Err(ClientError::ContractViolation { op: "agent_data.status", code, detail })
+            Err(ClientError::ContractViolation { op: "agent_data.status", code, detail, .. })
             if code == "busy" && detail == Some(json!({"step":"prepared"}))));
         assert_eq!(
             fake.calls()

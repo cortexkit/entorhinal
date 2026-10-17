@@ -568,7 +568,7 @@ impl CatalogMove {
                 .await
             {
                 Ok(reply) if reply["durableOffset"].as_u64() == Some(offset + n as u64) => {}
-                Err(crate::door_client::DoorError::Refused { code, detail })
+                Err(crate::door_client::DoorError::Refused { code, detail, .. })
                     if code == "offset_mismatch"
                         && detail
                             .as_ref()

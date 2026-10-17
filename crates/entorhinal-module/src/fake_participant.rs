@@ -170,7 +170,11 @@ impl FakeParticipant {
             });
         match &effect {
             Some(Effect::Refuse(refusal)) if !recorded => {
-                return Err(refuse(&refusal.code, refusal.detail.clone()))
+                return Err(TransportError::Refusal {
+                    code: refusal.code.clone(),
+                    detail: refusal.detail.clone(),
+                    message: refusal.message.clone(),
+                })
             }
             Some(Effect::FailBefore(error)) => return Err(error.clone()),
             _ => {}
@@ -194,6 +198,7 @@ fn refuse(code: &str, detail: Option<Value>) -> TransportError {
     TransportError::Refusal {
         code: code.to_string(),
         detail,
+        message: None,
     }
 }
 
@@ -500,6 +505,7 @@ mod tests {
             Effect::Refuse(Refusal {
                 code: "busy".into(),
                 detail: None,
+                message: None,
             }),
         );
         assert_eq!(c.prepare(&cut(&["a", "b"])).await.unwrap(), original);
@@ -538,7 +544,9 @@ mod tests {
             let detail = match violating_op {
                 None => refusal(result, "invalid_state").unwrap(),
                 Some(expected_op) => match result.unwrap_err() {
-                    ClientError::ContractViolation { op, code, detail } => {
+                    ClientError::ContractViolation {
+                        op, code, detail, ..
+                    } => {
                         assert_eq!(op, expected_op);
                         assert_eq!(code, "invalid_state");
                         detail.unwrap()
@@ -667,6 +675,7 @@ mod tests {
                 Effect::Refuse(Refusal {
                     code: String::from(*code),
                     detail: Some(json!({"step":"none","note":"scripted refusal"})),
+                    message: None,
                 }),
             );
             let error = fake
@@ -680,6 +689,7 @@ mod tests {
                 TransportError::Refusal {
                     code: actual_code,
                     detail,
+                    ..
                 } => {
                     assert_eq!(actual_code, *code);
                     assert_eq!(detail.unwrap()["note"], "scripted refusal");

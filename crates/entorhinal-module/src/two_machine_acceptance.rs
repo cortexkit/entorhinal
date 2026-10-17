@@ -2069,6 +2069,7 @@ mod moves {
                 Effect::Refuse(Refusal {
                     code: code.into(),
                     detail: None,
+                    message: None,
                 }),
             );
         }
@@ -2260,6 +2261,7 @@ mod moves {
                 .map_err(|e| TransportError::Refusal {
                     code: e.code,
                     detail: e.detail,
+                    message: None,
                 })
         }
     }
@@ -3386,6 +3388,7 @@ mod moves {
             Effect::Refuse(Refusal {
                 code: "incompatible_version".into(),
                 detail: Some(json!({"found":"x".repeat(10_000),"required":"v2"})),
+                message: None,
             }),
         );
         f.b.receiver_until(&cut, MoveStep::Aborted).await;
@@ -3804,6 +3807,7 @@ mod moves {
                     Effect::Refuse(Refusal {
                         code: "incompatible_version".into(),
                         detail: Some(json!({"found":"f".repeat(10_000),"required":"v2"})),
+                        message: None,
                     }),
                 );
                 f.b.receiver_until(&cut, MoveStep::Aborted).await;

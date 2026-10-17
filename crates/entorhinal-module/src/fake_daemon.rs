@@ -84,6 +84,7 @@ impl FakeDaemon {
             return Err(TransportError::Refusal {
                 code: "invalid_target".into(),
                 detail: None,
+                message: None,
             });
         };
         let snapshot = self.snapshot.lock().unwrap();
@@ -95,6 +96,7 @@ impl FakeDaemon {
             .ok_or_else(|| TransportError::Refusal {
                 code: "module_not_found".into(),
                 detail: None,
+                message: None,
             })?;
         if !entry.roles.iter().any(|role| {
             matches!(role,
@@ -104,18 +106,21 @@ impl FakeDaemon {
             return Err(TransportError::Refusal {
                 code: "service_not_provided".into(),
                 detail: Some(json!({"module_id": module_id, "service_id": service_id})),
+                message: None,
             });
         }
         if !entry.ready {
             return Err(TransportError::Refusal {
                 code: "module_warming".into(),
                 detail: serde_json::to_value(&entry.not_ready).ok(),
+                message: None,
             });
         }
         if principal != "reserved:entorhinal" {
             return Err(TransportError::Refusal {
                 code: "forbidden".into(),
                 detail: None,
+                message: None,
             });
         }
         Ok(())
@@ -282,7 +287,7 @@ async fn serve_wire(
             };
             match result {
                 Ok(body) => (FrameType::Response, serde_json::to_vec(&body).unwrap()),
-                Err(TransportError::Refusal { code, detail }) => (
+                Err(TransportError::Refusal { code, detail, .. }) => (
                     FrameType::Error,
                     serde_json::to_vec(
                         &json!({"code": code, "message": "fake route refusal", "detail": detail}),

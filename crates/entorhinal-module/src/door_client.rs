@@ -214,7 +214,13 @@ pub(crate) struct AcceptReply {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum DoorError {
-    Refused { code: String, detail: Option<Value> },
+    /// `message` is engram's human-readable reason, kept for operator logs and
+    /// the move's stored detail. Decisions read only `code` and `detail`.
+    Refused {
+        code: String,
+        detail: Option<Value>,
+        message: Option<String>,
+    },
     OutcomeUnknown,
     InvalidReply(String),
 }
@@ -365,7 +371,15 @@ impl DoorClient {
 
 fn map_transport(error: TransportError) -> DoorError {
     match error {
-        TransportError::Refusal { code, detail } => DoorError::Refused { code, detail },
+        TransportError::Refusal {
+            code,
+            detail,
+            message,
+        } => DoorError::Refused {
+            code,
+            detail,
+            message,
+        },
         TransportError::Unavailable | TransportError::NoReply => DoorError::OutcomeUnknown,
     }
 }
@@ -446,6 +460,7 @@ mod tests {
         TransportError::Refusal {
             code: code.into(),
             detail: None,
+            message: None,
         }
     }
 
@@ -672,13 +687,15 @@ mod tests {
             let stub = Stub::new(vec![Err(TransportError::Refusal {
                 code: code.into(),
                 detail: Some(json!({"stream":"reserved:broca"})),
+                message: Some("the door said no".into()),
             })]);
             let error = stub.client().handoff(&cut()).await.unwrap_err();
             assert_eq!(
                 error,
                 DoorError::Refused {
                     code: code.into(),
-                    detail: Some(json!({"stream":"reserved:broca"}))
+                    detail: Some(json!({"stream":"reserved:broca"})),
+                    message: Some("the door said no".into()),
                 }
             );
             assert_eq!(error.code(), code);

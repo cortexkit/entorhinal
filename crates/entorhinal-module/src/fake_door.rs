@@ -15,6 +15,9 @@ use crate::log_client::{encode_hex, LogConnector, LogTransport, TransportError};
 #[derive(Debug, Clone)]
 pub(crate) enum Effect {
     Refuse(String),
+    /// A refusal whose wire error body carries a human-readable message
+    /// (code, message), as engram's real refusals do.
+    RefuseWithMessage(String, String),
     FailBefore(TransportError),
     LoseReply(TransportError),
     Seal(SealState, Option<Value>),
@@ -204,6 +207,13 @@ impl FakeDoor {
             .and_then(VecDeque::pop_front);
         match &effect {
             Some(Effect::Refuse(code)) => return Err(refuse(code, None)),
+            Some(Effect::RefuseWithMessage(code, message)) => {
+                return Err(TransportError::Refusal {
+                    code: code.clone(),
+                    detail: None,
+                    message: Some(message.clone()),
+                })
+            }
             Some(Effect::FailBefore(error)) => return Err(error.clone()),
             _ => {}
         }
@@ -331,6 +341,7 @@ fn refuse(code: &str, detail: Option<Value>) -> TransportError {
     TransportError::Refusal {
         code: code.into(),
         detail,
+        message: None,
     }
 }
 

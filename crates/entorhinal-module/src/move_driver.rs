@@ -99,6 +99,47 @@ pub(crate) fn digest_reason(code: &str, detail: Option<&serde_json::Value>) -> O
     body.digest_mismatch_detail().ok().flatten()?.reason
 }
 
+/// What a move driver keeps from a refusal the door or a participant sent,
+/// beyond its code and detail. Drivers hold it boxed inside their failure
+/// value so that `Result<_, Failure>` stays small.
+pub(crate) struct PeerRefusal {
+    /// The refusal's human-readable reason from the wire error body.
+    pub(crate) message: Option<String>,
+}
+
+/// Writes one fleet-log line the first time a move's driver sees a given
+/// refusal, so an operator can read why engram or a participant said no.
+/// Retries of the same refusal repeat every backoff interval and would
+/// otherwise flood the log, so a (peer, op, code) triple is logged once per
+/// driver instance; a module restart logs it once more. The line carries only
+/// identifiers and the peer's own message, never a request body or session
+/// content.
+#[derive(Default)]
+pub(crate) struct RefusalLog(HashSet<(String, String, String)>);
+
+impl RefusalLog {
+    pub(crate) fn note(
+        &mut self,
+        cut: &str,
+        peer: &str,
+        op: &str,
+        code: &str,
+        message: Option<&str>,
+    ) {
+        if self.0.insert((peer.into(), op.into(), code.into())) {
+            tracing::warn!(
+                target: "move",
+                cut,
+                peer,
+                op,
+                code,
+                message = message.unwrap_or(""),
+                "move step refused"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn digest_refusal(op: &str) -> crate::participant_client::Refusal {
     let vectors: serde_json::Value = serde_json::from_str(
@@ -115,6 +156,7 @@ pub(crate) fn digest_refusal(op: &str) -> crate::participant_client::Refusal {
     crate::participant_client::Refusal {
         code: body.code.as_str().into(),
         detail: body.detail,
+        message: Some(body.message),
     }
 }
 

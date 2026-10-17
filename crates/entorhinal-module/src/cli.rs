@@ -1908,6 +1908,27 @@ fn format_agent_moves(value: &Value) -> String {
                     lines.push(line);
                 }
             }
+            // A refusal names what refused and the peer's own reason, so an
+            // operator can read why engram or a participant said no.
+            if matches!(
+                row["reason"].as_str(),
+                Some("door_refused" | "participant_refused")
+            ) {
+                let detail = &row["detail"];
+                if detail.is_object() {
+                    let op = text(&detail["op"]);
+                    let code = text(&detail["code"]);
+                    let mut line = match detail["module_id"].as_str() {
+                        Some(module) => format!("  {op} at {module} refused: {code}"),
+                        None => format!("  {op} refused: {code}"),
+                    };
+                    if let Some(message) = detail["message"].as_str() {
+                        line.push_str(" — ");
+                        line.push_str(message);
+                    }
+                    lines.push(line);
+                }
+            }
             if let Some(message) = row["message"].as_str() {
                 lines.push(format!("  {message}"));
             }
@@ -3612,6 +3633,27 @@ mod agent_tests {
         assert!(rendered.contains("participant broca, ref session-1 (unknown)"));
         assert!(!rendered.contains("cut failed"));
         assert!(!rendered.contains("none"));
+    }
+
+    #[test]
+    fn agent_moves_render_a_refusal_with_its_op_code_and_message() {
+        let door = json!({"moves":[{
+            "cut_id":"cut-1","side":"source","step":"aborted",
+            "agent_id":"agent-1","peer_name":"Studio","reason":"door_refused",
+            "detail":{"op":"cut.seal","code":"invalid_request","detail":null,
+                "contract_violation":false,"message":"a cut needs items"}
+        }]});
+        assert!(format_agent_moves(&door)
+            .contains("  cut.seal refused: invalid_request — a cut needs items"));
+        let participant = json!({"moves":[{
+            "cut_id":"cut-1","side":"source","step":"aborted",
+            "agent_id":"agent-1","peer_name":"Studio","reason":"participant_refused",
+            "detail":{"op":"agent_data.prepare","code":"busy","module_id":"broca",
+                "detail":null,"contract_violation":false}
+        }]});
+        let rendered = format_agent_moves(&participant);
+        assert!(rendered.contains("  agent_data.prepare at broca refused: busy"));
+        assert!(!rendered.contains(" — "));
     }
 
     struct Confirm(AtomicUsize);

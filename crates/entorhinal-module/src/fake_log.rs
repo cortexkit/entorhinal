@@ -133,6 +133,7 @@ fn refuse(code: &str, detail: Option<Value>) -> TransportError {
     TransportError::Refusal {
         code: code.into(),
         detail,
+        message: None,
     }
 }
 
@@ -237,7 +238,11 @@ impl LogTransport for FakeLog {
         };
         match action {
             Some(Action::Refuse { code, detail }) => {
-                return Err(TransportError::Refusal { code, detail })
+                return Err(TransportError::Refusal {
+                    code,
+                    detail,
+                    message: None,
+                })
             }
             Some(Action::Hang) => return std::future::pending().await,
             Some(Action::Hold) => {
@@ -503,7 +508,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(error,TransportError::Refusal { code,detail:Some(detail) }
+            matches!(error,TransportError::Refusal { code,detail:Some(detail),.. }
             if code == "too_large" && detail == json!({"field":"entry.data","cap":262144}))
         );
         assert_eq!(fake.head(), 0);

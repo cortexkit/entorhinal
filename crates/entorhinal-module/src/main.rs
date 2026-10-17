@@ -1491,8 +1491,7 @@ impl ProjectsHandler {
 
     fn finish_request(&self, body: &[u8], started_us: u64, outcome: &HandlerOutcome) {
         let elapsed_us = (self.request_clock)().saturating_sub(started_us);
-        let (operation, canonical_root) = request_operation(body);
-        self.health.latency.counters(operation).record(elapsed_us);
+        let request = request_operation(body);
         if matches!(
             outcome,
             HandlerOutcome::Error { code, .. }
@@ -1503,19 +1502,28 @@ impl ProjectsHandler {
                 .store_unavailable
                 .fetch_add(1, Ordering::Relaxed);
         }
+        // A long-poll's time is mostly its intended wait for the next change, up
+        // to 25 s. Timing it would report every idle poll as a slow request and
+        // fill the latency buckets with waits nobody needs to fix.
+        if request.long_poll {
+            return;
+        }
+        let operation = request.operation;
+        self.health.latency.counters(operation).record(elapsed_us);
         if elapsed_us > SLOW_REQUEST_US {
+            let op = request.method.as_deref().unwrap_or(operation.label());
             if matches!(operation, RequestOperation::Resolve) {
                 tracing::warn!(
                     target: "fleet",
-                    op = operation.label(),
+                    op,
                     elapsed_ms = elapsed_us as f64 / 1_000.0,
-                    canonical_root = canonical_root.as_deref().unwrap_or("<missing>"),
+                    canonical_root = request.canonical_root.as_deref().unwrap_or("<missing>"),
                     "slow entorhinal request"
                 );
             } else {
                 tracing::warn!(
                     target: "fleet",
-                    op = operation.label(),
+                    op,
                     elapsed_ms = elapsed_us as f64 / 1_000.0,
                     "slow entorhinal request"
                 );
@@ -2162,9 +2170,14 @@ struct WireRequest {
     params: Value,
 }
 
-fn request_operation(body: &[u8]) -> (RequestOperation, Option<String>) {
+fn request_operation(body: &[u8]) -> RequestSummary {
     let Ok(request) = serde_json::from_slice::<WireRequest>(body) else {
-        return (RequestOperation::Other, None);
+        return RequestSummary {
+            operation: RequestOperation::Other,
+            method: None,
+            canonical_root: None,
+            long_poll: false,
+        };
     };
     let operation = RequestOperation::from_method(&request.method);
     let canonical_root = matches!(operation, RequestOperation::Resolve)
@@ -2177,7 +2190,45 @@ fn request_operation(body: &[u8]) -> (RequestOperation, Option<String>) {
                 .map(str::to_owned)
         })
         .flatten();
-    (operation, canonical_root)
+    // `agent.changes` waits for the next change unless the caller passes
+    // `wait: false`, the same default the feed handler applies.
+    let long_poll = request.method == "agent.changes"
+        && matches!(
+            request.params.get("wait"),
+            None | Some(Value::Null) | Some(Value::Bool(true))
+        );
+    RequestSummary {
+        operation,
+        method: loggable_method(&request.method).map(str::to_owned),
+        canonical_root,
+        long_poll,
+    }
+}
+
+/// What the request path records about one request for the latency counters
+/// and the slow-request warning.
+struct RequestSummary {
+    operation: RequestOperation,
+    /// The method the warning names. Most methods share the `other` latency
+    /// bucket, and a warning that said only `other` could not tell an
+    /// operator which request was slow.
+    method: Option<String>,
+    canonical_root: Option<String>,
+    /// An `agent.changes` call that may hold the request open for up to 25 s
+    /// waiting for the next change.
+    long_poll: bool,
+}
+
+/// The method name as the slow-request warning prints it, or `None` when the
+/// caller sent something other than a short plain identifier, so the fleet log
+/// never echoes arbitrary caller bytes.
+fn loggable_method(method: &str) -> Option<&str> {
+    (!method.is_empty()
+        && method.len() <= 64
+        && method
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')))
+    .then_some(method)
 }
 
 #[derive(Debug, Deserialize)]
@@ -2775,6 +2826,100 @@ mod tests {
         assert_eq!(metrics["latency"]["agent.resolve"]["over500ms"], 1);
         assert_eq!(metrics["latency"]["agent.resolve"]["over3s"], 1);
         assert_eq!(metrics["latency"]["other"]["count"], 1);
+    }
+
+    /// Collects the fields of each warning on the `fleet` target as one line.
+    struct FleetWarnings(Arc<Mutex<Vec<String>>>);
+    impl tracing::Subscriber for FleetWarnings {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Fields(String);
+            impl tracing::field::Visit for Fields {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push_str(&format!("{}={value:?};", field.name()));
+                }
+            }
+            if event.metadata().target() == "fleet"
+                && *event.metadata().level() == tracing::Level::WARN
+            {
+                let mut fields = Fields(String::new());
+                event.record(&mut fields);
+                self.0.lock().unwrap().push(fields.0);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[tokio::test]
+    async fn slow_request_warning_names_the_method_and_skips_change_feed_long_polls() {
+        let mut handler = ProjectsHandler::new().unwrap();
+        // A start and a finish tick for each request below, in order.
+        let ticks = Arc::new(Mutex::new(std::collections::VecDeque::from([
+            0, 25_002_000, 0, 25_002_000, 0, 600_000, 0, 700_000, 0, 800_000,
+        ])));
+        let clock_ticks = Arc::clone(&ticks);
+        handler.request_clock = Arc::new(move || {
+            clock_ticks
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("request clock has a start and finish tick for every request")
+        });
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        let _subscriber = tracing::subscriber::set_default(FleetWarnings(warnings.clone()));
+
+        // Two long-polls: one relying on the default wait, one asking for it.
+        handler.handle_request(
+            br#"{"method":"agent.changes","params":{"incarnation":"i","cursor":0}}"#,
+            (770, 1),
+        );
+        handler.handle_request(
+            br#"{"method":"agent.changes","params":{"incarnation":"i","cursor":0,"wait":true}}"#,
+            (770, 1),
+        );
+        // A change-feed scan that does not wait is an ordinary request.
+        handler.handle_request(
+            br#"{"method":"agent.changes","params":{"incarnation":"i","cursor":0,"wait":false}}"#,
+            (770, 1),
+        );
+        handler.handle_request(br#"{"method":"agent.list","params":{}}"#, (770, 1));
+        handler.handle_request(b"not json", (770, 1));
+
+        let warnings = warnings.lock().unwrap().clone();
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(warnings[0].contains("op=\"agent.changes\""), "{warnings:?}");
+        assert!(warnings[0].contains("elapsed_ms=600.0"), "{warnings:?}");
+        assert!(warnings[1].contains("op=\"agent.list\""), "{warnings:?}");
+        assert!(warnings[2].contains("op=\"other\""), "{warnings:?}");
+        assert!(ticks.lock().unwrap().is_empty());
+        let metrics = handler.health().await.metrics.unwrap();
+        assert_eq!(metrics["latency"]["other"]["count"], 3);
+        assert_eq!(metrics["latency"]["other"]["maxUs"], 800_000);
+    }
+
+    #[test]
+    fn slow_request_log_names_only_plain_method_identifiers() {
+        assert_eq!(loggable_method("agent.list"), Some("agent.list"));
+        assert_eq!(
+            loggable_method("resolve_project_id"),
+            Some("resolve_project_id")
+        );
+        assert_eq!(loggable_method(""), None);
+        assert_eq!(loggable_method("agent list"), None);
+        assert_eq!(loggable_method("agent\nforged=1"), None);
+        assert_eq!(loggable_method(&"a".repeat(65)), None);
     }
 
     #[tokio::test]

@@ -177,6 +177,7 @@ impl ConsumerDiscovery for FakeConsumers {
             return Err(TransportError::Refusal {
                 code: "service_not_provided".into(),
                 detail: Some(json!({"service_id":catalog_consumer::SERVICE})),
+                message: None,
             });
         }
         if module == "zeta" {

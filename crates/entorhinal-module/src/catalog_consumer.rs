@@ -76,7 +76,7 @@ fn route_unavailable(module: &str, error: TransportError) -> HandlerError {
         .detail
         .as_mut()
         .expect("unavailable carries module detail")["route_refusal"] = match error {
-        TransportError::Refusal { code, detail } => json!({"code":code,"detail":detail}),
+        TransportError::Refusal { code, detail, .. } => json!({"code":code,"detail":detail}),
         TransportError::Unavailable => json!({"code":"unavailable"}),
         TransportError::NoReply => json!({"code":"outcome_unknown"}),
     };

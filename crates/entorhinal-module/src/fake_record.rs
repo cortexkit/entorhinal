@@ -322,6 +322,7 @@ fn refuse(code: &str, detail: Option<Value>) -> TransportError {
     TransportError::Refusal {
         code: code.into(),
         detail,
+        message: None,
     }
 }
 fn subject(params: &Value) -> Result<&str, TransportError> {
@@ -333,7 +334,11 @@ fn subject(params: &Value) -> Result<&str, TransportError> {
 }
 fn check_subject(s: &str) -> Result<(), TransportError> {
     validate_subject(s).map_err(|e| match e {
-        RecordError::Refused { code, detail } => TransportError::Refusal { code, detail },
+        RecordError::Refused { code, detail } => TransportError::Refusal {
+            code,
+            detail,
+            message: None,
+        },
         _ => refuse("invalid_request", None),
     })
 }
@@ -416,7 +421,7 @@ impl LogTransport for FakeRecord {
                     bytes += size;
                     entries.push(match reply {
                         Ok(reply) => wire_reply(&reply),
-                        Err(TransportError::Refusal { code, detail }) => {
+                        Err(TransportError::Refusal { code, detail, .. }) => {
                             json!({"error":{"code":code,"detail":detail}})
                         }
                         Err(_) => unreachable!(),

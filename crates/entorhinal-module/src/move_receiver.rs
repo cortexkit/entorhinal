@@ -4,7 +4,9 @@
 use crate::{
     claim_codec::AgentClaim,
     door_client::CutRequest as DoorCut,
-    move_driver::{backoff, digest_reason, participant_action, Worker, POLL},
+    move_driver::{
+        backoff, digest_reason, participant_action, PeerRefusal, RefusalLog, Worker, POLL,
+    },
     participant_client::{AgentRef, ClientError, CutRequest, ParticipantClient, Refs},
     participant_discovery::Participant,
     record_client::{CasRequest, CasSettlement, RecordError, RecordReply},
@@ -270,6 +272,9 @@ struct Failure {
     diagnostic: bool,
     violation: bool,
     action: Option<DriverAction>,
+    /// Set when the door or a participant answered with a refusal, as opposed
+    /// to a lost reply or a local store or record error.
+    refusal: Option<Box<PeerRefusal>>,
 }
 impl Failure {
     fn hold(code: &str, detail: Value) -> Self {
@@ -280,6 +285,7 @@ impl Failure {
             diagnostic: false,
             violation: false,
             action: None,
+            refusal: None,
         }
     }
     fn abort(reason: MoveReason, detail: Value) -> Self {
@@ -289,14 +295,21 @@ impl Failure {
         }
     }
     fn participant(module: &str, op: &str, e: ClientError) -> Self {
-        let (code, detail, violation) = match e {
-            ClientError::Refused(r) => (r.code, r.detail, false),
-            ClientError::ContractViolation { code, detail, .. } => (code, detail, true),
-            ClientError::OutcomeUnknown => ("unavailable".into(), None, false),
+        let (code, detail, violation, refused, message) = match e {
+            ClientError::Refused(r) => (r.code, r.detail, false, true, r.message),
+            ClientError::ContractViolation {
+                code,
+                detail,
+                message,
+                ..
+            } => (code, detail, true, true, message),
+            ClientError::OutcomeUnknown => ("unavailable".into(), None, false, false, None),
             ClientError::InvalidReply(message) => (
                 "invalid_reply".into(),
                 Some(json!({"message":message})),
                 true,
+                false,
+                None,
             ),
         };
         let reason = digest_reason(&code, detail.as_ref());
@@ -304,8 +317,14 @@ impl Failure {
         if let Some(reason) = reason {
             detail["reason"] = json!(reason);
         }
+        if let Some(message) = &message {
+            detail["message"] = json!(message);
+        }
         let mut failure = Self::hold(&code, detail);
         failure.violation = violation;
+        if refused {
+            failure.refusal = Some(Box::new(PeerRefusal { message }));
+        }
         failure.action = participant_action(op, &code);
         if !violation
             && matches!(
@@ -342,6 +361,7 @@ pub(crate) struct Receiver {
     clients: BTreeMap<String, ParticipantClient>,
     liveness: Arc<Mutex<LivenessState>>,
     abort_held: bool,
+    refusals: RefusalLog,
 }
 impl Receiver {
     pub(crate) fn new(worker: Worker, cut: String, liveness: Arc<Mutex<LivenessState>>) -> Self {
@@ -351,6 +371,7 @@ impl Receiver {
             clients: BTreeMap::new(),
             liveness,
             abort_held: false,
+            refusals: RefusalLog::default(),
         }
     }
     /// Resume participant aborts after an operator repairs corrupted undo bytes.
@@ -530,6 +551,15 @@ impl Receiver {
                 },
             )),
             Err(mut f) => {
+                if let Some(refusal) = &f.refusal {
+                    self.refusals.note(
+                        &self.cut,
+                        f.detail["module_id"].as_str().unwrap_or("engram"),
+                        f.detail["op"].as_str().unwrap_or("unknown"),
+                        &f.code,
+                        refusal.message.as_deref(),
+                    );
+                }
                 if !f.violation
                     && f.detail["op"] == "agent_data.abort"
                     && f.action == Some(DriverAction::RetryAfterOperator)
@@ -1400,10 +1430,14 @@ impl Receiver {
 }
 
 fn door_failure(e: crate::door_client::DoorError) -> Failure {
-    Failure::hold(
+    let mut failure = Failure::hold(
         e.code(),
         json!({"op":"cut.takeover","error":format!("{e:?}")}),
-    )
+    );
+    if let crate::door_client::DoorError::Refused { message, .. } = e {
+        failure.refusal = Some(Box::new(PeerRefusal { message }));
+    }
+    failure
 }
 
 /// Accept is a diagnostic task, not a move checkpoint. It can outlive a finished
@@ -1881,6 +1915,7 @@ mod tests {
                 Effect::Refuse(Refusal {
                     code: code.into(),
                     detail: None,
+                    message: None,
                 }),
             );
         }
@@ -3161,6 +3196,7 @@ mod tests {
             Effect::Refuse(Refusal {
                 code: "external_not_present".into(),
                 detail: None,
+                message: None,
             }),
         );
         receiver.tick().await.unwrap();
@@ -3677,5 +3713,38 @@ mod tests {
             f.store().cached_agent_claim(AGENT).unwrap().unwrap().epoch,
             0
         );
+    }
+
+    #[test]
+    fn receiver_refusals_keep_the_wire_message_and_lost_replies_are_not_refusals() {
+        let refused = Failure::participant(
+            "data",
+            "agent_data.import",
+            ClientError::Refused(Refusal {
+                code: "busy".into(),
+                detail: None,
+                message: Some("index rebuilding".into()),
+            }),
+        );
+        assert_eq!(
+            refused.refusal.as_ref().unwrap().message.as_deref(),
+            Some("index rebuilding")
+        );
+        assert_eq!(refused.detail["message"], "index rebuilding");
+        let lost = Failure::participant("data", "agent_data.import", ClientError::OutcomeUnknown);
+        assert!(lost.refusal.is_none());
+        assert!(lost.detail.get("message").is_none());
+        let door = door_failure(crate::door_client::DoorError::Refused {
+            code: "cut_not_published".into(),
+            detail: None,
+            message: Some("not yet".into()),
+        });
+        assert_eq!(
+            door.refusal.as_ref().unwrap().message.as_deref(),
+            Some("not yet")
+        );
+        assert!(door_failure(crate::door_client::DoorError::OutcomeUnknown)
+            .refusal
+            .is_none());
     }
 }

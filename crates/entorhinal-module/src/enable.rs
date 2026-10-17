@@ -847,6 +847,7 @@ mod tests {
                     return Err(TransportError::Refusal {
                         code: log_client::HEAD_MOVED.into(),
                         detail: Some(json!({"head":self.log.head()})),
+                        message: None,
                     });
                 }
             }

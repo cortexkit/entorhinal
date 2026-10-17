@@ -103,7 +103,7 @@ impl ParticipantUnavailable {
 
 fn refusal(error: TransportError) -> Value {
     match error {
-        TransportError::Refusal { code, detail } => json!({"code": code, "detail": detail}),
+        TransportError::Refusal { code, detail, .. } => json!({"code": code, "detail": detail}),
         TransportError::Unavailable => json!({"code": "unavailable"}),
         TransportError::NoReply => json!({"code": "outcome_unknown"}),
     }
