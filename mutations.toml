@@ -261,6 +261,19 @@ target = "--bin ck-entorhinal"
 expect_red = ["move_source::tests::source_digest_mismatch_abort_stuck_frozen_retries_once_on_restart"]
 
 [[control]]
+id = "move-source-refused-seal-skips-door"
+guards = "Cleanup after a permanently refused seal neither re-sends the refused seal nor aborts a cut the door never held, so the move reaches aborted"
+file = "crates/entorhinal-module/src/move_source.rs"
+old = 'if row.seal_sent && plan.source.seal_refused.is_none() {'
+new = 'if row.seal_sent { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/move_source.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["move_source::tests::source_refused_seal_aborts_without_resealing_or_aborting_the_door", "move_source::tests::source_refused_seal_cleanup_skips_the_door_after_a_mid_cleanup_restart"]
+
+[[control]]
 id = "move-digest-import-aborts"
 guards = "An import digest refusal aborts rather than holding for a retry"
 file = "crates/entorhinal-module/src/move_driver.rs"
@@ -7674,8 +7687,8 @@ expect_red = ["tests::every_declared_and_checked_capability_fits_daemon_grammar"
 id = "catalog-agent-consumer-route-refusal"
 guards = "A refused consumer route retains the daemon refusal name and module in plan and generation errors"
 file = "crates/entorhinal-module/src/catalog_consumer.rs"
-old = 'TransportError::Refusal { code, detail } => json!({"code":code,"detail":detail}),'
-new = 'TransportError::Refusal { code: _, detail } => json!({"code":"unavailable","detail":detail}), // NON-VACUITY BREAK'
+old = 'TransportError::Refusal { code, detail, .. } => json!({"code":code,"detail":detail}),'
+new = 'TransportError::Refusal { code: _, detail, .. } => json!({"code":"unavailable","detail":detail}), // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/catalog_agent_tests.rs"
 runner = "cargo"
 package = "entorhinal-module"
