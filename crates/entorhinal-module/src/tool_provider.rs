@@ -67,6 +67,9 @@ impl AgentTool {
             properties.insert((*field).into(), json!({"type":"string"}));
             required.push(*field);
         }
+        if self.name == "projects_register" {
+            properties.insert("domain".into(),json!({"type":"string","description":"Optional canonical memory domain (@scope/name), included in consent."}));
+        }
         if self.name == "catalog_prepare" {
             properties.insert("spec".into(),json!({"type":"object","properties":{"operation":{"type":"string","enum":["install","upgrade"]},"target":{"type":"object","properties":{"agent_id":{"type":"string"}},"required":["agent_id"],"additionalProperties":false},"package":{"type":"string"},"range":{"type":"string"}},"required":["operation","target","package","range"],"additionalProperties":false}));
         }

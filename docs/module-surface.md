@@ -66,8 +66,8 @@ Tests: `writes_are_refused_unless_the_operator_or_the_executive_opened_the_route
 Project mutations are admitted from Direct or the executive; anyone else gets
 `write_not_permitted`. A Direct `register`, `assign_workspace`,
 `upgrade_implicit` or `seed_import` that would carry live heads' and hirees'
-name claims into another workspace first asks for Touch ID; otherwise none of
-these prompt. [projects-and-roots.md](projects-and-roots.md) covers the
+name claims into another workspace first asks for Touch ID. Domain changes
+have the additional confirmation rule below. [projects-and-roots.md](projects-and-roots.md) covers the
 concepts.
 
 | Operation | Kind | What it does |
@@ -102,6 +102,23 @@ Tests: `attach_surface_writes_are_attributed_only_to_direct_and_core`,
 `ownership_write_admission_and_principal_attribution`,
 `rebind_wire_refuses_flow_and_unadmitted_principal_without_binding`,
 `carrying_placement_prompts_exactly_and_cached_reply_is_unchanged`.
+
+## Memory context
+
+[Memory context v1](memory-context.md) defines project domains, versioned accepted
+workspace documents, coherent reads, digest encodings and fleet upgrade order.
+
+| Operation | Kind | Who | What it does |
+|---|---|---|---|
+| `project.set_domain` | mutate | Direct with Touch ID, executive | Set or clear a project's opaque memory domain. |
+| `workspace.set_document` | mutate | Direct with Touch ID only | Accept the next charter/document revision with optimistic concurrency. |
+| `workspace.document` | query | any | Read an accepted revision, latest by default. |
+| `context.project` | query | any | Resolve a folder and read its memory policy, document metadata, membership digest and stamp in one snapshot. |
+| `context.session` | query | any | Read agent resolution, memory/persona pins, catalog generations, whereabouts and stamp in one snapshot. |
+
+Direct `register` also asks for Touch ID when a supplied domain differs from
+the stored value (including a new project's first domain). Omission or the same
+domain needs no domain confirmation. When registration also carries name claims, one combined prompt covers both changes.
 
 ## Agents
 

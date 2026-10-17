@@ -420,6 +420,7 @@ mod tests {
                             "registry_journal" => {
                                 "seq,op,payload_json,actor,request_key,created_at,response_json"
                             }
+                            "project" => "project_id,name,implicit,seed_identity,created_at,updated_at",
                             "project_root" => "canonical_root,project_id,added_at",
                             "workspace" => "workspace_id,name,created_at,updated_at",
                             _ => "*",

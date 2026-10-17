@@ -903,6 +903,11 @@ impl RegistryStore {
         params: Value,
         now: i64,
     ) -> Result<AgentPrecheck, AgentMutationError> {
+        if matches!(op, "project.set_domain" | "workspace.set_document") {
+            return self
+                .precheck_memory_confirmation(op, params, now)
+                .map_err(Into::into);
+        }
         if op == super::avatars::APPLY_METHOD {
             return self.precheck_avatar_manifest(params);
         }

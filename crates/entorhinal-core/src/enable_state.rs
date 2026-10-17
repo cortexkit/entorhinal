@@ -765,13 +765,17 @@ mod tests {
                 "https://github.com/Owner/Repo.git",
             ],
         );
-        a.register(crate::RegisterRequest {
-            project_id: Some("P".into()),
-            name: "Project".into(),
-            roots: vec![RegistryStore::canonical_mutation_root(root.to_str().unwrap()).unwrap()],
-            ..Default::default()
-        })
-        .unwrap();
+        // Populate the historical schema with historical SQL: the current writer
+        // requires columns introduced after migration 6.
+        let root_text = RegistryStore::canonical_mutation_root(root.to_str().unwrap()).unwrap();
+        let payload = serde_json::json!({"projectId":"P","name":"Project","roots":[root_text]});
+        a.db.with_conn_fenced(|tx| {
+            tx.execute("INSERT INTO registry_journal(op,payload_json,actor,created_at,principal) VALUES('register',?1,'fixture',1,'entorhinal')",[payload.to_string()])?;
+            tx.execute("INSERT INTO project(project_id,name,implicit,created_at,updated_at) VALUES('P','Project',0,1,1)",[])?;
+            tx.execute("INSERT INTO project_root(canonical_root,project_id,added_at) VALUES(?1,'P',1)",[&root_text])?;
+            tx.execute("INSERT INTO project_alias(old_id,project_id,created_at) VALUES(?1,'P',1)",[crate::implicit_project_id(&root_text)])?;
+            Ok(())
+        }).unwrap();
         drop(a);
         let a = RegistryStore::open(&a_desc).unwrap();
         a.check_enable_preconditions(0).unwrap();

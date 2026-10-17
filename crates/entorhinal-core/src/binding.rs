@@ -1005,8 +1005,17 @@ impl RegistryStore {
         raw_path: &str,
         binding: Option<&ExecutionBinding>,
     ) -> Result<ResolveReply, RegistryError> {
+        self.read(|conn| Ok(self.resolve_walk_in(conn, raw_path, binding)))?
+    }
+
+    pub(crate) fn resolve_walk_in(
+        &self,
+        conn: &Connection,
+        raw_path: &str,
+        binding: Option<&ExecutionBinding>,
+    ) -> Result<ResolveReply, RegistryError> {
         let (canonical_path, path_exists) = canonical_query_path(Path::new(raw_path))?;
-        self.read(|conn| {
+        let query = || -> rusqlite::Result<ResolveReply> {
             let generation = self.generation_from_connection(conn)?;
             let with_fields = |mut reply: ResolveReply,
                                matched: Option<String>,
@@ -1108,7 +1117,8 @@ impl RegistryStore {
                 root_fields: None,
             };
             with_fields(reply, None, None, Vec::new())
-        })
+        };
+        query().map_err(Into::into)
     }
 }
 

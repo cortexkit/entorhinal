@@ -19,6 +19,8 @@ use std::{
 use subc_client_rs::{ModuleHandle, OperatorConfirmError as SdkConfirmError};
 
 pub(super) const CONFIRMABLE_METHODS: &[&str] = &[
+    "project.set_domain",
+    "workspace.set_document",
     "assign_workspace",
     "register",
     "upgrade_implicit",
@@ -1368,17 +1370,27 @@ mod tests {
                             && !crate::SELF_ADMITTED_METHODS.contains(method)
                     })
                 {
-                    let direct_only = crate::catalog_ops::WRITES
-                        .iter()
-                        .chain(std::iter::once(&crate::catalog_publish::PUBLISH))
-                        .chain(std::iter::once(&crate::catalog_seed::SEED))
-                        .any(|candidate| candidate == method);
+                    let direct_only = *method == "workspace.set_document"
+                        || crate::catalog_ops::WRITES
+                            .iter()
+                            .chain(std::iter::once(&crate::catalog_publish::PUBLISH))
+                            .chain(std::iter::once(&crate::catalog_seed::SEED))
+                            .any(|candidate| candidate == method);
                     if principal == Some(Principal::Direct)
                         || (!direct_only && principal == Some(reserved(WRITER_MODULE)))
                     {
                         assert!(f.handler.admit(method, CALLER).is_ok());
                     } else {
-                        f.refusal(CALLER, method, Value::Null, "write_not_permitted");
+                        f.refusal(
+                            CALLER,
+                            method,
+                            Value::Null,
+                            if *method == "workspace.set_document" {
+                                "direct_caller_required"
+                            } else {
+                                "write_not_permitted"
+                            },
+                        );
                     }
                 }
                 if principal == Some(Principal::Direct)

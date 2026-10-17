@@ -98,6 +98,7 @@ mod fake_daemon;
 mod fake_door;
 mod incarnation;
 mod member;
+mod memory_context;
 mod move_admission;
 mod move_driver;
 mod move_ops;
@@ -653,6 +654,8 @@ const WRITER_MODULE: &str = "prefrontal-core";
 
 /// Methods that change the registry or the liveness state derived from it.
 const MUTATING_METHODS: &[&str] = &[
+    "project.set_domain",
+    "workspace.set_document",
     "agent.repair_workspaces",
     "agent.apply_avatar_manifest",
     "register",
@@ -749,6 +752,12 @@ fn authorize_write(method: &str, principal: Option<&Principal>) -> Result<(), Ha
                 format!("'{method}' is accepted only from the operator (ck); this route was opened by {}", principal_label(other)),
             )),
         };
+    }
+    if method == "workspace.set_document" && !matches!(principal, Some(Principal::Direct)) {
+        return Err(HandlerError::new(
+            "direct_caller_required",
+            "workspace documents require the operator (ck), with confirmation",
+        ));
     }
     if agent_ops::MUTATING_METHODS.contains(&method) {
         if method == "agent.repair_workspaces" && !matches!(principal, Some(Principal::Direct)) {
@@ -1538,6 +1547,12 @@ impl ProjectsHandler {
         let mutating = MUTATING_METHODS.contains(&request.method.as_str());
         let before = mutating.then(|| self.with_store(RegistryStore::generation).ok());
         let result = match request.method.as_str() {
+            method if memory_context::READS.contains(&method) => {
+                self.memory_read(method, request.params)
+            }
+            method if memory_context::WRITES.contains(&method) => {
+                self.memory_write(method, request.params, &principal)
+            }
             "resolve" => self.resolve(request.params),
             "resolve_project_id" => self.resolve_project_id(request.params),
             "resolve_remote" => self.resolve_remote(request.params),
@@ -2247,6 +2262,11 @@ fn manifest() -> ModuleManifest {
     .protocol_ver(PROTOCOL_VERSION)
     .provides(vec![ProviderRole::ManagementSurface {
             operations: vec![
+                management_operation("project.set_domain", ManagementOperationKind::Mutate, "Set or clear a project's opaque memory domain; Direct requires operator confirmation, executive may relay."),
+                management_operation("workspace.set_document", ManagementOperationKind::Mutate, "Accept a versioned workspace charter and document with optimistic revision checking (confirmed Direct only)."),
+                management_operation("workspace.document", ManagementOperationKind::Query, "Read one accepted workspace document revision, latest when omitted."),
+                management_operation("context.project", ManagementOperationKind::Query, "Read resolved project memory policy, workspace document metadata and membership digest in one snapshot."),
+                management_operation("context.session", ManagementOperationKind::Query, "Read agent identity, memory/persona pins, catalog generations and cached whereabouts in one snapshot."),
                 management_operation(catalog_ops::ADD, ManagementOperationKind::Mutate, "Add a machine-local HTTPS registry and pinned key (Direct only, operator confirmation)."),
                 management_operation(catalog_ops::REPIN, ManagementOperationKind::Mutate, "Append a replacement registry key (Direct only, operator confirmation)."),
                 management_operation(catalog_ops::REMOVE, ManagementOperationKind::Mutate, "Remove a registry, mappings and held state (Direct only, operator confirmation)."),
@@ -2893,7 +2913,9 @@ mod tests {
                 assert_eq!(executive.unwrap_err().code, "write_not_permitted");
             } else if matches!(
                 *method,
-                "agent.repair_workspaces" | "agent.apply_avatar_manifest"
+                "agent.repair_workspaces"
+                    | "agent.apply_avatar_manifest"
+                    | "workspace.set_document"
             ) {
                 assert_eq!(executive.unwrap_err().code, "direct_caller_required");
             } else {
@@ -2906,7 +2928,9 @@ mod tests {
                     error.code,
                     if matches!(
                         *method,
-                        "agent.repair_workspaces" | "agent.apply_avatar_manifest"
+                        "agent.repair_workspaces"
+                            | "agent.apply_avatar_manifest"
+                            | "workspace.set_document"
                     ) {
                         "direct_caller_required"
                     } else {

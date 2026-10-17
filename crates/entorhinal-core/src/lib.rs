@@ -27,6 +27,9 @@ pub mod catalog_grants;
 pub mod catalog_resolution;
 pub mod catalog_trust;
 pub mod claim_cache;
+pub mod context;
+mod memory;
+pub use memory::{SetProjectDomainRequest, SetWorkspaceDocumentRequest, WorkspaceDocument};
 pub mod enable_state;
 mod log_schema;
 pub mod move_record;
@@ -203,7 +206,7 @@ CREATE TABLE member_name (
 );
 "#;
 
-const MIGRATIONS: [Migration; 12] = [
+const MIGRATIONS: [Migration; 13] = [
     Migration {
         version: 1,
         statements: V1_SCHEMA,
@@ -251,6 +254,10 @@ const MIGRATIONS: [Migration; 12] = [
     Migration {
         version: 12,
         statements: catalog_agent::V12_CATALOG_AGENT,
+    },
+    Migration {
+        version: 13,
+        statements: memory::V13_MEMORY_CONTEXT,
     },
 ];
 
@@ -413,8 +420,17 @@ impl RegistryStore {
         raw_path: &str,
         binding: Option<&ExecutionBinding>,
     ) -> Result<ResolveReply, RegistryError> {
+        self.read(|conn| Ok(self.resolve_in(conn, raw_path, binding)))?
+    }
+
+    pub(crate) fn resolve_in(
+        &self,
+        conn: &Connection,
+        raw_path: &str,
+        binding: Option<&ExecutionBinding>,
+    ) -> Result<ResolveReply, RegistryError> {
         if self.root_records {
-            return self.resolve_walk(raw_path, binding);
+            return self.resolve_walk_in(conn, raw_path, binding);
         }
         let (canonical_path, path_exists) = canonical_query_path(Path::new(raw_path))?;
         let query_path = PathBuf::from(&canonical_path);
@@ -424,7 +440,7 @@ impl RegistryStore {
             None
         };
 
-        self.read(|conn| {
+        let query = || -> rusqlite::Result<ResolveReply> {
             if let Some(project_id) = conn
                 .query_row(
                     "SELECT project_id FROM project_root WHERE canonical_root = ?1",
@@ -503,7 +519,8 @@ impl RegistryStore {
                 worktree_of: None,
                 root_fields: None,
             })
-        })
+        };
+        query().map_err(Into::into)
     }
 
     /// Resolve a persisted project id through one live alias hop, or report it as
