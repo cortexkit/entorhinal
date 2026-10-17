@@ -726,7 +726,8 @@ impl Receiver {
         // so skip it for the rest of the move. Decide once and persist the set:
         // later steps and restarts must not call a module this Mac never checked.
         // A configured but disabled or warming module is not absent: it may still
-        // keep data on disk, so its fork check below must still run.
+        // keep data on disk, so the move holds below until it is enabled and
+        // its fork check (agent_data.diverged) can run.
         if progress.skipped_absent.is_none() {
             progress.skipped_absent = Some(
                 plan.participants
