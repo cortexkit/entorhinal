@@ -479,6 +479,31 @@ fn memory_context_session_includes_only_memory_persona_pins_and_live_generations
     assert_eq!(reply["pins"].as_array().unwrap().len(), 2);
     assert_eq!(reply["pins"][0]["name"], "@example/memory");
     assert_eq!(reply["pins"][1]["kind"], "persona");
+    // No status record yet reads as null, never a guessed state.
+    assert_eq!(reply["pins"][0]["status"], Value::Null);
+    // A revocation reaches the pin in the same read. A revocation with no
+    // compromise window blocks; a withdrawal is reported but doesn't block.
+    f.store
+        .apply_entry("fixture", "{}", "test", None, |tx| {
+            for (name, state) in [("@example/memory", "revoked"), ("@example/persona", "withdrawn")] {
+                let canonical = json!({"name":name,"version":"1.0.0","state":state,"published_at":"2026-10-01T00:00:00Z"}).to_string();
+                tx.execute(
+                    "INSERT INTO catalog_status(name,version,sequence,changed_at,published_at,signer_index,canonical,signature) VALUES(?1,'1.0.0',2,'2026-10-02T00:00:00Z','2026-10-01T00:00:00Z',0,?2,'')",
+                    params![name, canonical],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    let reply = f.store.context_session(id, "fixed").unwrap();
+    assert_eq!(
+        reply["pins"][0]["status"],
+        json!({"state":"revoked","blocked":true})
+    );
+    assert_eq!(
+        reply["pins"][1]["status"],
+        json!({"state":"withdrawn","blocked":false})
+    );
     let agent: Value = serde_json::from_slice(
         &f.store
             .agent_read("agent.resolve", json!({"agent_id":id}))

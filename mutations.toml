@@ -10298,3 +10298,16 @@ package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
 expect_red = ["roles::tests::role_past_window_settlement_compares_decoded_body_and_author"]
+
+[[control]]
+id = "context-session-pin-status-blocked"
+guards = "context.session reports entorhinal's own blocking judgement on each pinned memory profile or persona, so a revoked version reads as blocked"
+file = "crates/entorhinal-core/src/context.rs"
+old = "\"blocked\": crate::catalog_agent::status_blocks(&status),"
+new = "\"blocked\": false, // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/memory_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["memory::tests::memory_context_session_includes_only_memory_persona_pins_and_live_generations"]

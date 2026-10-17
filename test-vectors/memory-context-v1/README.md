@@ -7,7 +7,8 @@ Only scratch filesystem prefixes in requests are normalized to `/fixture`.
 
 - `context-project.json`: registered domain before a document, with revision 2,
   agentless/unplaced project, unregistered folder, and a Git worktree.
-- `context-session.json`: live agents with and without a memory-profile pin.
+- `context-session.json`: live agents with and without a memory-profile pin, then
+  the same pin after the registry revokes that version (`status` populated).
 - `workspace-document.json`: latest, revision 1, and unknown revision refusal.
 
 All reads use a reserved non-core caller, demonstrating that clients other than

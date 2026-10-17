@@ -2257,6 +2257,24 @@ async fn memory_context_v1_records_match_published_files() {
         );
         records.push(record);
     }
+    // Then the registry revokes that version. The trust sync writes the status
+    // row; here the test writes the same row directly so the sample shows the
+    // populated `status` shape a reader polling for revocations sees.
+    rusqlite::Connection::open(fixture.dir.join("store.db"))
+        .unwrap()
+        .execute(
+            "INSERT INTO catalog_status(name,version,sequence,changed_at,published_at,signer_index,canonical,signature) VALUES('@example/memory','1.0.0',2,'2026-10-02T00:00:00Z','2026-10-01T00:00:00Z',0,?1,'')",
+            [json!({"name":"@example/memory","version":"1.0.0","state":"revoked","published_at":"2026-10-01T00:00:00Z"}).to_string()],
+        )
+        .unwrap();
+    let (record, reply) = fixture
+        .record("context.session", json!({"agent_id":ASSISTANT}))
+        .await;
+    assert_eq!(
+        reply["result"]["pins"][0]["status"],
+        json!({"state":"revoked","blocked":true})
+    );
+    records.push(record);
     published_file("memory-context-v1", "context-session.json", records);
     let mut records = Vec::new();
     for revision in [None, Some(1), Some(99)] {

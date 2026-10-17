@@ -117,10 +117,19 @@ agentless unplaced project. An unregistered folder has no invented project id.
 `agent.resolve` (`agent_id`, `status`, `merged_into`, `gone`, `generation`),
 `catalog_generations` (generation_id and state for active, degraded and ready
 local generations), `pins` (memory-profile/persona only: kind, name, version,
-manifest_sha256, archive_sha256, publisher_fingerprint), `where` (the same cached
-answer as `agent.where`), and `stamp`. Unknown, gone and integrity-failed agents
-refuse just as `agent.where` does. Local superseded/installing generations and
-pins of unrelated manifest kinds are not exposed.
+manifest_sha256, archive_sha256, publisher_fingerprint, status), `where` (the same
+cached answer as `agent.where`), and `stamp`. Unknown, gone and integrity-failed
+agents refuse just as `agent.where` does. Local superseded/installing generations
+and pins of unrelated manifest kinds are not exposed.
+
+Each pin's `status` is the registry status entorhinal holds for that exact
+version, read in the same transaction: `{"state", "blocked"}`, or `null` when no
+status record exists yet. `state` is the signed record's state verbatim
+(`available`, `withdrawn`, `revoked` or `tombstoned`). `blocked` is entorhinal's
+own judgement: a tombstone always blocks, a revocation blocks only versions
+published inside its compromise window, and a withdrawal never blocks. A reader
+polling this reply to catch a mid-session revocation should act on `blocked`
+rather than re-derive it from `state`.
 
 Served fixtures for consumers are in
 [`test-vectors/memory-context-v1/`](../test-vectors/memory-context-v1/).
