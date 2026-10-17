@@ -22,6 +22,7 @@ use std::{
 use tokio::time::{timeout_at, Instant};
 
 pub(crate) const READ: &str = "role.read";
+pub(crate) const FENCE: &str = "role.fence";
 pub(crate) const TAKE: &str = "role.take";
 
 fn record_error(error: RecordError) -> HandlerError {
@@ -89,6 +90,23 @@ impl ProjectsHandler {
         encode_result(
             self.with_store(|s| Ok(s.clone()))?
                 .role_read(&request.role)?,
+        )
+    }
+
+    pub(super) fn role_fence(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Request {
+            role: String,
+        }
+        let request: Request = serde_json::from_value(params)
+            .map_err(|e| HandlerError::new("invalid_request", e.to_string()))?;
+        if !valid_role(&request.role) {
+            return Err(HandlerError::new("invalid_request", "invalid role"));
+        }
+        encode_result(
+            self.with_store(|s| Ok(s.clone()))?
+                .role_fence(&request.role)?,
         )
     }
 
@@ -862,6 +880,29 @@ mod tests {
                 .epoch,
             Some(1)
         );
+        // Here the record version (65) and the body's epoch (1) differ, so the
+        // fence must carry the version engram compares, never the epoch.
+        assert_eq!(
+            result(f.call(DIRECT, FENCE, json!({"role":"x"})).await),
+            json!({"role":"x","subject":"role:x","version":65,"epoch":1,"held_here":true,"holder":f.store().persisted_self_author().unwrap(),"stale":false})
+        );
+        f.close().await;
+    }
+
+    #[tokio::test]
+    async fn role_fence_of_an_unread_role_is_version_zero_and_stale() {
+        let f = Fixture::new();
+        assert_eq!(
+            result(f.call(DIRECT, FENCE, json!({"role":"x"})).await),
+            json!({"role":"x","subject":"role:x","version":0,"epoch":0,"held_here":false,"holder":null,"stale":true})
+        );
+        assert_eq!(f.record.calls.load(Ordering::Relaxed), 0);
+        for bad in [json!({"role":"X"}), json!({"role":"x","extra":true})] {
+            assert_eq!(
+                f.handler.role_fence(bad).unwrap_err().code,
+                "invalid_request"
+            );
+        }
         f.close().await;
     }
 

@@ -1568,6 +1568,7 @@ mod tests {
             "agent.move_status",
             "agent.moves",
             "role.read",
+            "role.fence",
         ];
         let expected_mutations = [
             "project.set_domain",

@@ -10285,3 +10285,16 @@ package = "entorhinal-core"
 target = "--lib"
 select = "expected"
 expect_red = ["shared_entry::tests::memory_legacy_project_images_keep_old_bytes_and_strict_other_columns"]
+
+[[control]]
+id = "role-fence-carries-record-version"
+guards = "The role fence carries the engram record version engram compares, never the body's epoch"
+file = "crates/entorhinal-core/src/role_cache.rs"
+old = "version: version.unwrap_or(0),"
+new = "version: read.epoch, // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/roles.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["roles::tests::role_past_window_settlement_compares_decoded_body_and_author"]

@@ -1628,6 +1628,7 @@ impl ProjectsHandler {
             sessions::SESSION_FOR_REF => self.session_for_ref(request.params),
             sessions::SESSION_LIVENESS => self.agent_session_liveness(request.params),
             roles::READ => self.role_read(request.params),
+            roles::FENCE => self.role_fence(request.params),
             roles::TAKE => Err(HandlerError::new(
                 "served_path_required",
                 "role.take requires the asynchronous served path",
@@ -2451,6 +2452,8 @@ fn manifest() -> ModuleManifest {
                 management_operation(method, ManagementOperationKind::Mutate, agent_operation_description(method))
             })).chain(std::iter::once(roles::READ).map(|method| {
                 management_operation(method, ManagementOperationKind::Query, "Read a cached role claim without waiting for engram.")
+            })).chain(std::iter::once(roles::FENCE).map(|method| {
+                management_operation(method, ManagementOperationKind::Query, "Read the role record's subject and version, the fence engram checks before admitting holder-only work.")
             })).chain(std::iter::once(roles::TAKE).map(|method| {
                 management_operation(method, ManagementOperationKind::Mutate, "Take a role from Direct with operator confirmation and an idempotent request id.")
             })).chain(std::iter::once(move_admission::MOVE).map(|method| {

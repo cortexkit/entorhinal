@@ -21,6 +21,22 @@ pub struct RoleRead {
     pub stale: bool,
 }
 
+/// The fence another module stamps on work only the role's holder may do.
+/// Engram admits such work only while record `subject` is still at `version`.
+/// Only `role.take` writes a role record, so the version moves exactly when
+/// the holder changes; the epoch lives in the record body, which engram never
+/// reads. Callers use `subject` verbatim rather than building it.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct RoleFence {
+    pub role: String,
+    pub subject: String,
+    pub version: i64,
+    pub epoch: i64,
+    pub held_here: bool,
+    pub holder: Option<String>,
+    pub stale: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RoleTakeInput {
@@ -166,6 +182,29 @@ impl RegistryStore {
                 })())
             })
             .map_err(RegistryError::Store)?
+    }
+
+    /// The fence for `role`, from the same cache row as `role_read`. Reading it
+    /// enrolls the role in the refresh set, as `role_read` does.
+    pub fn role_fence(&self, role: &str) -> Result<RoleFence, AgentMutationError> {
+        let read = self.role_read(role)?;
+        let version = self.read(|conn| {
+            conn.query_row(
+                "SELECT version FROM role_cache WHERE role=?1 AND read_at_ms IS NOT NULL",
+                [role],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+        })?;
+        Ok(RoleFence {
+            subject: format!("role:{role}"),
+            version: version.unwrap_or(0),
+            epoch: read.epoch,
+            held_here: read.held_here,
+            holder: read.holder,
+            stale: read.stale,
+            role: read.role,
+        })
     }
 
     /// Snapshot the role set before starting remote reads.
