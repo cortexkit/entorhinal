@@ -2332,6 +2332,68 @@ mod moves {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn receiver_without_a_participant_that_has_no_refs_still_completes_the_move() {
+        let f = Pair::new(&[("broca", "broca-session"), ("pi", "pi-session")]).await;
+        // The agent has no broca sessions on the source, so broca joins the
+        // plan with an empty ref set and prepares nothing...
+        f.a.store()
+            .apply_entry("fixture", "{}", "fixture", None, |tx| {
+                tx.execute_batch("DELETE FROM session_binding WHERE ref_kind='broca-session'")
+            })
+            .unwrap();
+        f.a.discovery.peers["broca"].set_prepare(PrepareReply::new(vec![], vec![]));
+        // ...and broca is not installed on the receiving Mac at all.
+        f.b.discovery
+            .daemon
+            .restart(snapshot(&[("pi", "pi-session")], true, true));
+        let cut = f.published("absent-broca").await;
+        let planned = f.a.record(&cut).await;
+        let broca = planned
+            .participants
+            .iter()
+            .find(|p| p.module_id == "broca")
+            .expect("the source plans every declaring participant");
+        assert!(broca.refs.is_empty());
+        f.b.pickup().await;
+        f.b.receiver_until(&cut, MoveStep::Activated).await;
+        let moves = f.b.machine.call("agent.moves", json!({})).await.unwrap();
+        let row = moves["moves"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["cut_id"] == cut)
+            .unwrap();
+        assert_eq!(row["skipped_participants"], json!(["broca"]));
+        let status =
+            f.b.machine
+                .call("agent.move_status", json!({"cut_id":cut}))
+                .await
+                .unwrap();
+        assert_eq!(status["skipped_participants"], json!(["broca"]));
+        drive(CutAccept::new(f.b.worker(), cut.clone()).tick())
+            .await
+            .unwrap();
+        f.a.source_until(&cut, MoveStep::Released).await;
+        f.b.receiver_until(&cut, MoveStep::Done).await;
+        assert_eq!(f.a.record(&cut).await.state, MoveState::Released);
+        assert!(f.b.discovery.peers["broca"].calls().is_empty());
+        let pi = AgentRef::new("pi-session", "ref-pi-session");
+        assert_eq!(
+            f.b.discovery.peers["pi"].cut(&cut).unwrap().refs,
+            BTreeSet::from([pi])
+        );
+        assert_eq!(f.b.where_().await["status"], "held_here");
+        // The source reports no skip: it called broca as usual.
+        let source =
+            f.a.machine
+                .call("agent.move_status", json!({"cut_id":cut}))
+                .await
+                .unwrap();
+        assert!(source.get("skipped_participants").is_none());
+        f.clean();
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn shared_kind_fans_out_and_move_back_without_host_carries_every_ref() {
         let mut f = Pair::new(&[("alpha", "pi-session"), ("beta", "pi-session")]).await;
         let cut = f.published("out").await;

@@ -1929,6 +1929,14 @@ fn format_agent_moves(value: &Value) -> String {
                     lines.push(line);
                 }
             }
+            if let Some(skipped) = row["skipped_participants"].as_array() {
+                for module in skipped {
+                    lines.push(format!(
+                        "  skipped {}: not installed on this Mac, no data to carry",
+                        text(module)
+                    ));
+                }
+            }
             if let Some(message) = row["message"].as_str() {
                 lines.push(format!("  {message}"));
             }
@@ -3654,6 +3662,21 @@ mod agent_tests {
         let rendered = format_agent_moves(&participant);
         assert!(rendered.contains("  agent_data.prepare at broca refused: busy"));
         assert!(!rendered.contains(" — "));
+    }
+
+    #[test]
+    fn agent_moves_name_each_participant_skipped_as_absent() {
+        let skipped = json!({"moves":[{
+            "cut_id":"cut-1","side":"receiver","step":"activated",
+            "agent_id":"agent-1","peer_name":"Desk","skipped_participants":["broca"]
+        }]});
+        assert!(format_agent_moves(&skipped)
+            .contains("  skipped broca: not installed on this Mac, no data to carry"));
+        let none = json!({"moves":[{
+            "cut_id":"cut-1","side":"receiver","step":"activated",
+            "agent_id":"agent-1","peer_name":"Desk"
+        }]});
+        assert!(!format_agent_moves(&none).contains("skipped"));
     }
 
     struct Confirm(AtomicUsize);

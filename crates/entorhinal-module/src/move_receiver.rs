@@ -258,6 +258,47 @@ struct Progress {
     activation_fork: Option<Value>,
     #[serde(default)]
     takeover_sent: bool,
+    /// Plan participants this Mac leaves out of the whole receiver side of the
+    /// move: each was neither configured nor registered here when the
+    /// preconditions ran, and the source sent no refs for it, so there is no
+    /// data to import, check for forks, activate or undo. `None` means the
+    /// preconditions have not decided yet. Once decided, every later step and
+    /// every restart reads this set instead of asking the daemon again, so a
+    /// module installed mid-move is never called for a cut it never saw.
+    /// Rows written before this field existed decode as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    skipped_absent: Option<Vec<String>>,
+}
+impl Progress {
+    fn skips(&self, module: &str) -> bool {
+        self.skipped_absent
+            .as_ref()
+            .is_some_and(|skipped| skipped.iter().any(|m| m == module))
+    }
+}
+
+/// The plan participants this receiver calls: every one except those
+/// recorded as skipped because they are absent here and carry no refs.
+fn called<'a>(plan: &'a MoveRecord, progress: &Progress) -> Vec<&'a wire::MoveParticipant> {
+    plan.participants
+        .iter()
+        .filter(|p| !progress.skips(&p.module_id))
+        .collect()
+}
+
+/// Participants a receiver row recorded as skipped (absent on that Mac with
+/// nothing to carry), for move status. Empty for source rows and for rows
+/// whose preconditions have not run yet.
+pub(crate) fn skipped_participants(row: &AgentMove) -> Vec<String> {
+    if row.side != MoveSide::Receiver {
+        return Vec::new();
+    }
+    row.plan["_receiver"]["skipped_absent"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m.as_str().map(str::to_owned))
+        .collect()
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct PendingCall {
@@ -634,7 +675,12 @@ impl Receiver {
         }
     }
 
-    async fn preconditions(&mut self, plan: &MoveRecord) -> Result<(), Failure> {
+    async fn preconditions(
+        &mut self,
+        row: &mut AgentMove,
+        plan: &MoveRecord,
+        progress: &mut Progress,
+    ) -> Result<(), Failure> {
         if !self
             .worker
             .sql(RegistryStore::move_authority_cut_over)
@@ -670,7 +716,28 @@ impl Receiver {
                 json!({"op":"catalog.list","error":format!("{e:?}")}),
             )
         })?;
-        for p in &plan.participants {
+        let absent = |module: &str| {
+            !supervisor.modules.iter().any(|m| m.module_id == module)
+                && !catalog.modules.iter().any(|m| m.module_id == module)
+        };
+        // The source plans every module that declares agent data, even one with
+        // no refs for this agent. A module that is not on this Mac at all cannot
+        // hold local data for the agent, and with no refs the source carries none,
+        // so skip it for the rest of the move. Decide once and persist the set:
+        // later steps and restarts must not call a module this Mac never checked.
+        // A configured but disabled or warming module is not absent: it may still
+        // keep data on disk, so its fork check below must still run.
+        if progress.skipped_absent.is_none() {
+            progress.skipped_absent = Some(
+                plan.participants
+                    .iter()
+                    .filter(|p| p.refs.is_empty() && absent(&p.module_id))
+                    .map(|p| p.module_id.clone())
+                    .collect(),
+            );
+            self.save(row, progress).await?;
+        }
+        for p in called(plan, progress) {
             let configured = supervisor
                 .modules
                 .iter()
@@ -900,8 +967,8 @@ impl Receiver {
         match row.step {
             Step::PickedUp => {
                 self.settle_pending(row, plan, progress).await?;
-                self.preconditions(plan).await?;
-                for p in &plan.participants {
+                self.preconditions(row, plan, progress).await?;
+                for p in called(plan, progress) {
                     let client = self.client(&p.module_id).await?;
                     progress.pending = Some(PendingCall {
                         module: p.module_id.clone(),
@@ -936,7 +1003,7 @@ impl Receiver {
                 // session-binding ownership and active local writers before import.
                 self.local_writers(plan).await?;
                 self.catalog_preflight(plan).await?;
-                for p in &plan.participants {
+                for p in called(plan, progress) {
                     let client = self.client(&p.module_id).await?;
                     progress.pending = Some(PendingCall {
                         module: p.module_id.clone(),
@@ -990,7 +1057,7 @@ impl Receiver {
             }
             Step::Activating => {
                 self.settle_pending(row, plan, progress).await?;
-                for p in &plan.participants {
+                for p in called(plan, progress) {
                     let client = self.client(&p.module_id).await?;
                     progress.pending = Some(PendingCall {
                         module: p.module_id.clone(),
@@ -1384,7 +1451,7 @@ impl Receiver {
                 ));
             }
         }
-        for p in &plan.participants {
+        for p in called(plan, progress) {
             if progress.aborted.contains(&p.module_id) {
                 continue;
             }
@@ -2524,6 +2591,214 @@ mod tests {
             assert_eq!(f.claim_cas_count(), 0);
         }
     }
+    fn peer(fake: Arc<FakeParticipant>) -> Arc<Peer> {
+        Arc::new(Peer {
+            fake,
+            write_after_diverged: AtomicBool::new(false),
+            panic_diverged: AtomicBool::new(false),
+            diverged_calls: tokio::sync::Semaphore::new(0),
+            other_activated: tokio::sync::Semaphore::new(0),
+        })
+    }
+    /// Adds a `broca` participant with the given refs to the published plan,
+    /// with its own fake so every call it receives is recorded. The receiver's
+    /// daemon snapshot does not list it, so it starts absent on this Mac.
+    async fn add_broca(f: &Fixture, refs: Value) -> Arc<FakeParticipant> {
+        let broca = Arc::new(FakeParticipant::new(&["session"], vec![]));
+        f.discovery
+            .others
+            .lock()
+            .unwrap()
+            .insert("broca".into(), peer(broca.clone()));
+        let subject = format!("move:{CUT}");
+        let reply = f.worker.records.read(&subject).await.unwrap();
+        let mut record =
+            wire::decode_move_record(&subject, reply.body.as_deref().unwrap()).unwrap();
+        // Participants are encoded sorted by module id, and broca sorts before data.
+        record.participants.insert(
+            0,
+            serde_json::from_value(json!({"module_id":"broca","refs":refs,"external":[]})).unwrap(),
+        );
+        f.put_move(&record, FROM, 1);
+        broca
+    }
+    /// The fixture's daemon snapshot plus a `broca` entry: configured with the
+    /// given enabled flag and, when `registered`, ready in the catalog.
+    fn snapshot_with_broca(enabled: bool, registered: bool) -> DaemonSnapshot {
+        let mut snap = snapshot(true);
+        snap.supervisor.modules.push(
+            serde_json::from_value(
+                json!({"module_id":"broca","state":if enabled {"running"} else {"disabled"},
+                "enabled":enabled,"live":enabled,"health":"ok"}),
+            )
+            .unwrap(),
+        );
+        if registered {
+            let mut entry = snap.catalog.modules[0].clone();
+            entry.module_id = "broca".into();
+            snap.catalog.modules.push(entry);
+        }
+        snap
+    }
+    /// Whether the receiver opened a route to `broca` or sent it any request.
+    fn broca_reached(f: &Fixture, broca: &FakeParticipant) -> bool {
+        let target = crate::participant_discovery::participant_target("broca");
+        !broca.calls().is_empty()
+            || f.discovery.daemon.calls().iter().any(
+                |c| matches!(c, crate::fake_daemon::DaemonCall::Open { target: t, .. } if *t == target),
+            )
+    }
+    fn data_ops(f: &Fixture) -> Vec<&'static str> {
+        f.discovery
+            .participant
+            .fake
+            .calls()
+            .iter()
+            .map(|r| r.op().method())
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receiver_skips_an_absent_participant_with_no_refs_for_the_whole_move() {
+        let f = Fixture::new(false).await;
+        let broca = add_broca(&f, json!([])).await;
+        f.pickup().await;
+        let mut receiver = f.receiver();
+        f.until(&mut receiver, Step::Activated).await;
+        let mut plan = f.plan();
+        plan.state = State::Released;
+        f.put_move(&plan, FROM, 5);
+        receiver.tick().await.unwrap();
+        assert_eq!(f.row().step, Step::Done);
+        let ops = data_ops(&f);
+        for op in [
+            "agent_data.describe",
+            "agent_data.diverged",
+            "agent_data.import",
+            "agent_data.activate",
+        ] {
+            assert!(ops.contains(&op), "data missed {op}: {ops:?}");
+        }
+        assert!(!broca_reached(&f, &broca), "{:?}", broca.calls());
+        assert_eq!(skipped_participants(&f.row()), vec!["broca".to_string()]);
+        assert_eq!(f.store().agent_bound_refs(AGENT).unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receiver_restart_keeps_the_recorded_skip_even_once_the_participant_appears() {
+        let f = Fixture::new(false).await;
+        let broca = add_broca(&f, json!([])).await;
+        f.pickup().await;
+        // Hold the move just after the preconditions decided the skip.
+        f.refuse("agent_data.diverged", "external_not_present");
+        f.receiver().tick().await.unwrap();
+        let row = f.row();
+        assert_eq!(row.step, Step::PickedUp);
+        assert_eq!(row.hold.as_ref().unwrap()["op"], "agent_data.diverged");
+        assert_eq!(skipped_participants(&row), vec!["broca".to_string()]);
+        // broca is now installed and ready here, but the move already recorded
+        // that this Mac never checked it, so the restarted receiver must not call it.
+        f.discovery.daemon.restart(snapshot_with_broca(true, true));
+        let mut restarted = f.receiver();
+        f.until(&mut restarted, Step::Activated).await;
+        assert!(!broca_reached(&f, &broca), "{:?}", broca.calls());
+        assert!(data_ops(&f).contains(&"agent_data.activate"));
+        assert_eq!(skipped_participants(&f.row()), vec!["broca".to_string()]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receiver_absent_participant_with_refs_still_aborts_as_unavailable() {
+        let f = Fixture::new(false).await;
+        let broca = add_broca(&f, json!([{"ref_kind":"session","ref":"r2"}])).await;
+        f.pickup().await;
+        let mut receiver = f.receiver();
+        receiver.tick().await.unwrap();
+        let row = f.row();
+        assert_eq!(row.reason.as_deref(), Some("receiver_precondition"));
+        assert_eq!(
+            row.detail,
+            Some(json!({"code":"participant_unavailable","module_id":"broca","absent":true}))
+        );
+        assert!(skipped_participants(&row).is_empty());
+        f.until(&mut receiver, Step::Aborted).await;
+        assert!(!broca_reached(&f, &broca), "{:?}", broca.calls());
+        assert!(!data_ops(&f).contains(&"agent_data.import"));
+        assert_eq!(f.claim_cas_count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receiver_disabled_participant_with_no_refs_still_holds() {
+        for registered in [false, true] {
+            let f = Fixture::new(false).await;
+            let broca = add_broca(&f, json!([])).await;
+            f.discovery
+                .daemon
+                .restart(snapshot_with_broca(false, registered));
+            f.pickup().await;
+            let mut receiver = f.receiver();
+            for _ in 0..3 {
+                advance_clock();
+                receiver.tick().await.unwrap();
+                let row = f.row();
+                assert_eq!(row.step, Step::PickedUp);
+                assert!(row.abort_requested.is_none());
+                let hold = row.hold.unwrap();
+                assert_eq!(
+                    (&hold["code"], &hold["module_id"]),
+                    (&json!("participant_unavailable"), &json!("broca"))
+                );
+            }
+            assert!(skipped_participants(&f.row()).is_empty());
+            assert!(!data_ops(&f).contains(&"agent_data.diverged"));
+            assert!(!broca_reached(&f, &broca));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receiver_row_without_a_recorded_skip_decodes_and_skips_nothing() {
+        // The progress shape the previous release wrote, with no skip field.
+        let old: Progress = serde_json::from_value(json!({
+            "aborted":[],"touched":["data"],"errors":[],"retry_at_ms":0,"pending":null,
+            "take_failed":false,"contract_violation":null,"activation_fork":null,"takeover_sent":false
+        }))
+        .unwrap();
+        assert!(old.skipped_absent.is_none() && !old.skips("broca"));
+        assert!(serde_json::to_value(&old)
+            .unwrap()
+            .get("skipped_absent")
+            .is_none());
+
+        // A row an older receiver brought to activation with broca installed.
+        let f = Fixture::new(false).await;
+        let broca = add_broca(&f, json!([])).await;
+        f.discovery.daemon.restart(snapshot_with_broca(true, true));
+        f.pickup().await;
+        let mut receiver = f.receiver();
+        f.until(&mut receiver, Step::Activating).await;
+        f.edit(|row| {
+            row.plan["_receiver"]
+                .as_object_mut()
+                .unwrap()
+                .remove("skipped_absent");
+        });
+        assert!(f.row().plan["_receiver"].get("skipped_absent").is_none());
+        // With no recorded set nothing is skipped, and presence is not
+        // re-evaluated either: broca vanishing now holds activation for it.
+        f.discovery.daemon.restart(snapshot(true));
+        let mut restarted = f.receiver();
+        restarted.tick().await.unwrap();
+        let row = f.row();
+        assert_eq!(row.step, Step::Activating);
+        assert_eq!(row.hold.as_ref().unwrap()["module_id"], "broca");
+        assert!(skipped_participants(&row).is_empty());
+        f.discovery.daemon.restart(snapshot_with_broca(true, true));
+        f.until(&mut restarted, Step::Activated).await;
+        assert!(broca
+            .calls()
+            .iter()
+            .any(|r| matches!(r, Request::Activate(_))));
+    }
+
     #[tokio::test]
     async fn receiver_diverged_advanced_and_unknown_abort_before_import() {
         for state in [DivergedState::Advanced, DivergedState::Unknown] {

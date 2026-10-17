@@ -58,20 +58,31 @@ fn unknown_move() -> HandlerError {
 impl ProjectsHandler {
     pub(super) fn move_status(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
         let request: StatusRequest = parse(params)?;
-        let mut row = self
-            .with_store(|s| s.move_status_view(&request.cut_id))?
-            .ok_or_else(unknown_move)?;
-        elapsed(&mut row, (self.clock)());
-        encode_result(row)
+        let (view, row) = self.with_store(|s| {
+            Ok((
+                s.move_status_view(&request.cut_id)?,
+                s.agent_move(&request.cut_id)?,
+            ))
+        })?;
+        let mut view = view.ok_or_else(unknown_move)?;
+        if let Some(row) = &row {
+            show_skipped(&mut view, row);
+        }
+        elapsed(&mut view, (self.clock)());
+        encode_result(view)
     }
 
     pub(super) fn moves(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
         let _: EmptyRequest = parse(params)?;
-        let mut rows = self.with_store(RegistryStore::moves_view)?;
-        for row in &mut rows {
-            elapsed(row, (self.clock)());
+        let (mut views, rows) =
+            self.with_store(|s| Ok((s.moves_view()?, s.list_agent_moves()?)))?;
+        for view in &mut views {
+            if let Some(row) = rows.iter().find(|r| view["cut_id"] == r.cut_id.as_str()) {
+                show_skipped(view, row);
+            }
+            elapsed(view, (self.clock)());
         }
-        encode_result(json!({"moves":rows}))
+        encode_result(json!({"moves":views}))
     }
 
     async fn confirm_move_control(
@@ -199,6 +210,15 @@ impl ProjectsHandler {
             self.with_store(|s| s.set_move_setting(setting))?;
         }
         encode_result(setting)
+    }
+}
+/// The public move view leaves out the private plan, so copy out the one plan
+/// fact an operator needs: which participants this receiver skipped because
+/// they are not installed here and the source sent no data for them.
+fn show_skipped(view: &mut Value, row: &entorhinal_core::move_store::AgentMove) {
+    let skipped = super::move_receiver::skipped_participants(row);
+    if !skipped.is_empty() {
+        view["skipped_participants"] = json!(skipped);
     }
 }
 pub(crate) fn elapsed(value: &mut Value, now: i64) {
