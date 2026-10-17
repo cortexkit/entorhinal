@@ -29,6 +29,7 @@ use std::{
     sync::{atomic::Ordering, Arc, Mutex},
     time::Duration,
 };
+use subc_client_rs::{CatalogList, SupervisorListResponse};
 
 fn error(code: &str) -> HandlerError {
     HandlerError::new(code, code)
@@ -286,6 +287,25 @@ fn called<'a>(plan: &'a MoveRecord, progress: &Progress) -> Vec<&'a wire::MovePa
         .collect()
 }
 
+/// Plan participants this Mac can leave out of the move: the source sent no
+/// refs for them, and this Mac neither configures nor registers them, so they
+/// cannot hold local data for the agent and have nothing staged to undo.
+fn absent_without_refs(
+    plan: &MoveRecord,
+    supervisor: &SupervisorListResponse,
+    catalog: &CatalogList,
+) -> Vec<String> {
+    let absent = |module: &str| {
+        !supervisor.modules.iter().any(|m| m.module_id == module)
+            && !catalog.modules.iter().any(|m| m.module_id == module)
+    };
+    plan.participants
+        .iter()
+        .filter(|p| p.refs.is_empty() && absent(&p.module_id))
+        .map(|p| p.module_id.clone())
+        .collect()
+}
+
 /// Participants a receiver row recorded as skipped (absent on that Mac with
 /// nothing to carry), for move status. Empty for source rows and for rows
 /// whose preconditions have not run yet.
@@ -498,6 +518,21 @@ impl Receiver {
         self.clients.insert(module.into(), client.clone());
         Ok(client)
     }
+    async fn discovery_lists(&self) -> Result<(SupervisorListResponse, CatalogList), Failure> {
+        let supervisor = self.worker.discovery.supervisor_list().await.map_err(|e| {
+            Failure::hold(
+                "unavailable",
+                json!({"op":"supervisor.list","error":format!("{e:?}")}),
+            )
+        })?;
+        let catalog = self.worker.discovery.catalog_list().await.map_err(|e| {
+            Failure::hold(
+                "unavailable",
+                json!({"op":"catalog.list","error":format!("{e:?}")}),
+            )
+        })?;
+        Ok((supervisor, catalog))
+    }
     fn request(&self, p: &wire::MoveParticipant) -> Result<CutRequest, Failure> {
         Ok(CutRequest::new(
             Refs::new(
@@ -704,22 +739,7 @@ impl Receiver {
             ));
         }
         self.catalog_preflight(plan).await?;
-        let supervisor = self.worker.discovery.supervisor_list().await.map_err(|e| {
-            Failure::hold(
-                "unavailable",
-                json!({"op":"supervisor.list","error":format!("{e:?}")}),
-            )
-        })?;
-        let catalog = self.worker.discovery.catalog_list().await.map_err(|e| {
-            Failure::hold(
-                "unavailable",
-                json!({"op":"catalog.list","error":format!("{e:?}")}),
-            )
-        })?;
-        let absent = |module: &str| {
-            !supervisor.modules.iter().any(|m| m.module_id == module)
-                && !catalog.modules.iter().any(|m| m.module_id == module)
-        };
+        let (supervisor, catalog) = self.discovery_lists().await?;
         // The source plans every module that declares agent data, even one with
         // no refs for this agent. A module that is not on this Mac at all cannot
         // hold local data for the agent, and with no refs the source carries none,
@@ -729,13 +749,7 @@ impl Receiver {
         // keep data on disk, so the move holds below until it is enabled and
         // its fork check (agent_data.diverged) can run.
         if progress.skipped_absent.is_none() {
-            progress.skipped_absent = Some(
-                plan.participants
-                    .iter()
-                    .filter(|p| p.refs.is_empty() && absent(&p.module_id))
-                    .map(|p| p.module_id.clone())
-                    .collect(),
-            );
+            progress.skipped_absent = Some(absent_without_refs(plan, &supervisor, &catalog));
             self.save(row, progress).await?;
         }
         for p in called(plan, progress) {
@@ -912,6 +926,13 @@ impl Receiver {
         progress: &mut Progress,
     ) -> Result<(), Failure> {
         if let Some(pending) = progress.pending.clone() {
+            // A skipped participant has no refs, so a call left pending for it
+            // (by a receiver that ran before the skip was decided) changed no
+            // data worth recovering; it is never called again.
+            if progress.skips(&pending.module) {
+                progress.pending = None;
+                return self.save(row, progress).await;
+            }
             let p = plan
                 .participants
                 .iter()
@@ -1411,6 +1432,18 @@ impl Receiver {
         plan: &MoveRecord,
         progress: &mut Progress,
     ) -> Result<(), Failure> {
+        // An abort can arrive before the preconditions decided which absent
+        // participants to skip. Decide here with the same rule, before any
+        // participant call, so cleanup never waits on a module this Mac lacks.
+        // That is safe even if an older receiver already imported: a
+        // participant with no refs staged nothing, so it has nothing to undo.
+        // Persisting the set makes a restart mid-cleanup skip the same modules.
+        let undecided = progress.skipped_absent.is_none();
+        if undecided {
+            let (supervisor, catalog) = self.discovery_lists().await?;
+            progress.skipped_absent = Some(absent_without_refs(plan, &supervisor, &catalog));
+            self.save(row, progress).await?;
+        }
         self.settle_pending(row, plan, progress).await?;
         let request = row
             .abort_requested
@@ -2704,6 +2737,61 @@ mod tests {
         f.until(&mut restarted, Step::Activated).await;
         assert!(!broca_reached(&f, &broca), "{:?}", broca.calls());
         assert!(data_ops(&f).contains(&"agent_data.activate"));
+        assert_eq!(skipped_participants(&f.row()), vec!["broca".to_string()]);
+    }
+
+    /// Publishes the source's abort of the picked-up cut, as the source Mac
+    /// does when it gives up before this receiver ran its preconditions.
+    fn source_aborts(f: &Fixture) {
+        let mut plan = f.plan();
+        plan.state = State::Aborted;
+        plan.reason = Some(MoveReason::Operator);
+        f.put_move(&plan, FROM, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receiver_cleanup_before_preconditions_skips_an_absent_participant_with_no_refs() {
+        let f = Fixture::new(false).await;
+        let broca = add_broca(&f, json!([])).await;
+        f.pickup().await;
+        source_aborts(&f);
+        let mut receiver = f.receiver();
+        f.until(&mut receiver, Step::Aborted).await;
+        assert!(!broca_reached(&f, &broca), "{:?}", broca.calls());
+        let ops = data_ops(&f);
+        assert!(ops.contains(&"agent_data.abort"), "{ops:?}");
+        // The abort came first: the preconditions never ran.
+        assert!(!ops.contains(&"agent_data.describe"), "{ops:?}");
+        assert_eq!(skipped_participants(&f.row()), vec!["broca".to_string()]);
+        assert_eq!(f.claim_cas_count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receiver_restart_mid_cleanup_keeps_skipping_the_absent_participant() {
+        let f = Fixture::new(false).await;
+        let broca = add_broca(&f, json!([])).await;
+        f.pickup().await;
+        source_aborts(&f);
+        // data's abort lands but its reply is lost (twice, past the client's own
+        // retry), so cleanup stops after it recorded the skip and before the
+        // move is aborted.
+        for _ in 0..2 {
+            f.discovery.participant.fake.script(
+                "agent_data.abort",
+                Effect::LoseReply(TransportError::NoReply),
+            );
+        }
+        f.receiver().tick().await.unwrap();
+        let row = f.row();
+        assert_eq!(row.step, Step::PickedUp);
+        assert!(row.abort_requested.is_some());
+        assert_eq!(row.hold.as_ref().unwrap()["op"], "agent_data.abort");
+        assert_eq!(skipped_participants(&row), vec!["broca".to_string()]);
+        // broca is installed now; the restarted cleanup must still skip it.
+        f.discovery.daemon.restart(snapshot_with_broca(true, true));
+        let mut restarted = f.receiver();
+        f.until(&mut restarted, Step::Aborted).await;
+        assert!(!broca_reached(&f, &broca), "{:?}", broca.calls());
         assert_eq!(skipped_participants(&f.row()), vec!["broca".to_string()]);
     }
 

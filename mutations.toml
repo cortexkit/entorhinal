@@ -10350,3 +10350,16 @@ package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
 expect_red = ["move_receiver::tests::receiver_restart_keeps_the_recorded_skip_even_once_the_participant_appears"]
+
+[[control]]
+id = "receiver-cleanup-decides-skip"
+guards = "An abort that reaches the receiver before its preconditions still decides and records the absent no-ref skip before calling any participant, so cleanup never waits on a module this Mac lacks"
+file = "crates/entorhinal-module/src/move_receiver.rs"
+old = "let undecided = progress.skipped_absent.is_none();"
+new = "let undecided = false; // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/move_receiver.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["move_receiver::tests::receiver_cleanup_before_preconditions_skips_an_absent_participant_with_no_refs", "move_receiver::tests::receiver_restart_mid_cleanup_keeps_skipping_the_absent_participant"]
