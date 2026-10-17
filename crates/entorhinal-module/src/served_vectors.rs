@@ -2199,16 +2199,21 @@ async fn memory_context_v1_records_match_published_files() {
         }
         records.push(record);
     }
-    let scratch = crate::tests::canonical_test_path(&fixture.dir)
-        .to_string_lossy()
-        .into_owned();
+    // Map each folder to a fixed path, as the project-resolve samples do, so the
+    // published bytes don't depend on this OS's path separator.
+    let stable = [
+        (root.clone(), "/fixture/project"),
+        (bare.clone(), "/fixture/bare"),
+        (missing.clone(), "/fixture/unregistered"),
+        (worktree.clone(), "/fixture/worktree"),
+    ];
     let records = records
         .into_iter()
-        .map(|r| {
-            r.replace(
-                &json!(scratch).to_string()[1..json!(scratch).to_string().len() - 1],
-                "/fixture",
-            )
+        .map(|mut record| {
+            for (actual, fixed) in &stable {
+                record = record.replace(&json_string_contents(&actual.to_string_lossy()), fixed);
+            }
+            record
         })
         .collect();
     published_file("memory-context-v1", "context-project.json", records);

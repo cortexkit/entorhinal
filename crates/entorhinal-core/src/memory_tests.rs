@@ -35,7 +35,12 @@ impl Fixture {
         .unwrap();
         let f = Self {
             store,
-            root: std::fs::canonicalize(&root).unwrap(),
+            // The registry's own canonical form, not std's: on Windows
+            // `std::fs::canonicalize` returns a verbatim `\\?\` path, which
+            // registration refuses as not canonical.
+            root: std::path::PathBuf::from(
+                RegistryStore::canonical_mutation_root(&root.to_string_lossy()).unwrap(),
+            ),
             _cleanup: crate::scratch_cleanup::ScratchCleanup(root),
         };
         f.store
