@@ -221,7 +221,12 @@ impl RegistryStore {
             Ok(load_document(conn, workspace_id, revision)?.ok_or_else(|| {
                 domain(
                     "revision_unknown",
-                    format!("no accepted revision {revision:?} for {workspace_id}"),
+                    match revision {
+                        Some(revision) => {
+                            format!("workspace {workspace_id} has no accepted revision {revision}")
+                        }
+                        None => format!("workspace {workspace_id} has no accepted document yet"),
+                    },
                 )
             }))
         })?
