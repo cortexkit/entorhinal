@@ -116,7 +116,6 @@ struct Failure {
     refusal: Option<Box<PeerRefusal>>,
 }
 
-
 impl Failure {
     fn new(op: &str, code: &str) -> Self {
         Self {
