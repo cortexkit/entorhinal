@@ -2397,9 +2397,6 @@ fn catalog_consumer_vector_requests(
 
 fn publish_catalog_consumer_vector(name: &str, record: Value) {
     let record = serde_json::to_string_pretty(&record).unwrap();
-    if std::env::var("ENTO_WRITE_SERVED_VECTORS").as_deref() == Ok("1") {
-        print!("VECTOR {name}\n[\n{record}\n]\nEND {name}\n");
-    }
     published_file("catalog-consumer-v1", name, vec![record]);
 }
 
