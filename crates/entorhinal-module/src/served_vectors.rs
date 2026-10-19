@@ -18,6 +18,9 @@ use crate::{
     install_store, tests::reserved, ProjectsHandler, RouteAdmission, RouteKey, WRITER_MODULE,
 };
 
+#[path = "watch_tests.rs"]
+mod watch_tests;
+
 const DIRECT: RouteKey = (901, 1);
 const CORE: RouteKey = (902, 1);
 const READER: RouteKey = (903, 1);
@@ -56,6 +59,7 @@ pub(super) const MIGRATIONS: &[&str] = &[
 struct Fixture {
     dir: PathBuf,
     handler: ProjectsHandler,
+    descriptor: crate::StorageDescriptor,
 }
 
 impl Fixture {
@@ -90,7 +94,11 @@ impl Fixture {
                 .route_admissions()
                 .insert(route, RouteAdmission::from_bind(Some(principal), None));
         }
-        let fixture = Self { dir, handler };
+        let fixture = Self {
+            dir,
+            handler,
+            descriptor,
+        };
         // A rootless project is valid. Its fleet placement has no canonicalRoot,
         // so scratch paths and Windows drive letters never enter the records.
         fixture

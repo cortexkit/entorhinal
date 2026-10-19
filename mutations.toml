@@ -6,6 +6,48 @@
 # audits all package targets, except rows narrowed with select="expected".
 
 [[control]]
+id = "fleet-watch-notice-size"
+guards = "Watch changes above 192 KiB produce one resync, never an oversize or split notice"
+file = "crates/entorhinal-module/src/watches.rs"
+old = 'if body.len() > NOTICE_LIMIT {'
+new = 'if false /* NON-VACUITY BREAK */ && body.len() > NOTICE_LIMIT {'
+test_file = "crates/entorhinal-module/src/watch_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["served_vectors::watch_tests::watch_size_guard_resyncs_instead_of_oversize_or_split"]
+
+[[control]]
+id = "fleet-watch-resume-safety"
+guards = "A placement entry in the complete journal range forces identity resync"
+file = "crates/entorhinal-core/src/agent/fleet.rs"
+old = '''if !IDENTITY_CHANGE_OPS.contains(&op.as_str()) || count > 1000 {
+                        return None;
+                    }'''
+new = '''if count > 1000 { return None; }
+                    if !IDENTITY_CHANGE_OPS.contains(&op.as_str()) { continue; } // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-module/src/watch_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["served_vectors::watch_tests::identity_resume_safety_resyncs_non_agent_ranges_and_bad_tokens"]
+
+[[control]]
+id = "fleet-watch-capacity"
+guards = "The seventeenth watch across both operations is refused before it starts"
+file = "crates/entorhinal-module/src/watches.rs"
+old = 'slots: Semaphore::new(16),'
+new = 'slots: Semaphore::new(17), // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/watch_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["served_vectors::watch_tests::watch_capacity_is_shared_releases_on_cancel_and_sends_nothing_after_cancel"]
+
+[[control]]
 id = "catalog-install-pin-delta-authority"
 guards = "Replacing a held root or dependency requires upgrade authority even when requested as install"
 file = "crates/entorhinal-core/src/catalog_grants.rs"

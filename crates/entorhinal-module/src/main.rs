@@ -132,6 +132,7 @@ mod served_vectors;
 mod sessions;
 mod shared_write;
 mod tool_provider;
+mod watches;
 use shared_write::placement_confirmation;
 #[cfg(test)]
 mod two_machine_acceptance;
@@ -431,6 +432,11 @@ struct HealthGauges {
     move_errors: AtomicU64,
     move_inbox_rejected: AtomicU64,
     move_task_panics: AtomicU64,
+    watches_open: AtomicU64,
+    watch_notices: AtomicU64,
+    watch_resyncs: AtomicU64,
+    #[cfg(test)]
+    watch_waiting: tokio::sync::Notify,
     #[cfg(test)]
     claim_refresh_done: tokio::sync::Notify,
 }
@@ -574,6 +580,7 @@ struct ProjectsHandler {
     commits: Arc<tokio::sync::Notify>,
     feed_waits: tokio::sync::Semaphore,
     feed_clock: Arc<dyn agent_reads::FeedClock>,
+    watches: Arc<watches::Watches>,
     /// Unit tests shorten this policy; production uses the ten-second default.
     lease_retry_budget: Duration,
     #[allow(dead_code)]
@@ -930,6 +937,7 @@ impl ProjectsHandler {
             commits: Arc::new(tokio::sync::Notify::new()),
             feed_waits: tokio::sync::Semaphore::new(8),
             feed_clock: Arc::new(agent_reads::TokioFeedClock),
+            watches: Arc::default(),
             lease_retry_budget: LEASE_HELD_RETRY_BUDGET,
             log_client: log_client::LogClient::new(connector),
             writer: Arc::new(tokio::sync::Mutex::new(())),
@@ -1109,6 +1117,11 @@ impl ModuleHandler for ProjectsHandler {
         let started_us = (self.request_clock)();
         let outcome = if let Some(error) = self.startup_refusal() {
             HandlerError::new("store_unavailable", error).into_outcome()
+        } else if serde_json::from_slice::<WireRequest>(&body)
+            .is_ok_and(|request| watches::is_watch(&request.method))
+        {
+            self.serve_watch(&ctx, &body, route_key(&ctx.route_handle()))
+                .await
         } else {
             self.handle_served_request(&body, route_key(&ctx.route_handle()))
                 .await
@@ -1314,6 +1327,9 @@ impl ModuleHandler for ProjectsHandler {
                 "moveErrors": self.health.move_errors.load(Ordering::Relaxed),
                 "moveInboxRejected": self.health.move_inbox_rejected.load(Ordering::Relaxed),
                 "moveTaskPanics": self.health.move_task_panics.load(Ordering::Relaxed),
+                "watchesOpen": self.health.watches_open.load(Ordering::Relaxed),
+                "watchNoticesSent": self.health.watch_notices.load(Ordering::Relaxed),
+                "watchResyncsSent": self.health.watch_resyncs.load(Ordering::Relaxed),
             })),
         }
     }
@@ -2497,6 +2513,8 @@ fn manifest() -> ModuleManifest {
                 management_operation(method, ManagementOperationKind::Query, agent_operation_description(method))
             })).chain(std::iter::once(sessions::REGISTER_SESSION).map(|method| {
                 management_operation(method, ManagementOperationKind::Mutate, agent_operation_description(method))
+            })).chain([watches::IDENTITY, watches::WHERE].into_iter().map(|method| {
+                management_operation(method, ManagementOperationKind::Query, "Watch process-local fleet changes until cancelled or drained.")
             })).chain([claims::WHERE, claims::WHERE_MANY].into_iter().map(|method| {
                 management_operation(method, ManagementOperationKind::Query, agent_operation_description(method))
             })).chain(std::iter::once(claims::REFRESH).map(|method| {

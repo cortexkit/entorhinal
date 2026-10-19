@@ -1,0 +1,3 @@
+[
+  {"op":"agent.where_watch","request":{},"principal":{"kind":"reserved","moduleId":"callosum"},"frames":[{"type":"StreamData","body":{"cursor":{"incarnation":"0123456789abcdef","seq":0},"kind":"resync"}}]}
+]

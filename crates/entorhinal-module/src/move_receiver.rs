@@ -1416,10 +1416,7 @@ impl Receiver {
         };
         let observations = vec![(row.agent_id.clone(), observation)];
         let now = (self.worker.clock)();
-        let conflicts = self
-            .worker
-            .sql(move |s| s.cache_agent_claims(&observations, now))
-            .await?;
+        let conflicts = self.worker.cache_claims(observations, now).await?;
         self.worker
             .health
             .self_author_conflicts
@@ -1938,6 +1935,7 @@ mod tests {
                 discovery: discovery.clone(),
                 catalog: None,
                 health: Arc::new(crate::HealthGauges::default()),
+                watches: Arc::default(),
                 writer: Arc::new(tokio::sync::Mutex::new(())),
                 clock,
                 wake: Arc::new(crate::move_driver::MoveWake::default()),

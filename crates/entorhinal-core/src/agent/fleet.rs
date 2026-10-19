@@ -1,9 +1,11 @@
 //! The identity half of the fleet view, without runtime residence or activity.
 
-use rusqlite::OptionalExtension;
+use std::collections::BTreeMap;
+
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::{json, Value};
 
-use super::{reads::all_rows, AgentAvatar, AgentMutationError};
+use super::{reads::all_rows, AgentAvatar, AgentMutationError, IDENTITY_CHANGE_OPS};
 use crate::RegistryStore;
 
 /// Fingerprints invalidate avatar caches when the genome changes without a new
@@ -27,51 +29,141 @@ impl RegistryStore {
         token: Option<&str>,
         incarnation: &str,
     ) -> Result<Vec<u8>, AgentMutationError> {
-        let value = self.read_agent(|conn| {
-            let generation = self.generation_from_connection(conn)?;
-            let current = format!("{incarnation}:{generation}");
-            // The last shared identity-log position this machine has applied
-            // (0 while sharing is off). `generation` and `token` count this
-            // machine's own journal, so they can't be compared between
-            // machines; a client merging several machines' replies keeps the
-            // one with the highest `logPosition`, which has seen the most of
-            // the shared history.
-            let log_position: i64 = conn.query_row(
-                "SELECT last_applied_position FROM identity_log_state WHERE id=1",
-                [],
-                |r| r.get(0),
-            )?;
-            let mut reply = json!({"incarnation":incarnation,"generation":generation,"logPosition":log_position,"token":current,"unchanged":token == Some(current.as_str())});
-            if token == Some(current.as_str()) { return Ok(reply); }
-            let mut agents = Vec::new();
-            // One identity row drives each result; roots cannot multiply agents.
-            // Workspace is derived only through project placement, never the
-            // stored agent workspace (workspace heads therefore omit it).
-            // Source: prefrontal 873870be8 crates/prefrontal-core-module/src/fleet_overview.rs:53-83,349-379,418-436.
-            for row in all_rows(conn)?.into_iter().filter(|r| r.status == "live") {
-                let mut agent = json!({"agentId":row.agent_id,"displayName":row.name,"tag":row.tag,"labels":row.labels,"role":row.role});
-                if let Some(avatar) = row.avatar {
-                    let avatar = AgentAvatar { genome:avatar.genome,avatar_type:Some(avatar.avatar_type),version:avatar.version };
-                    let mut value = json!({"fingerprint":avatar_fingerprint(&avatar),"type":avatar.avatar_type});
-                    if let Some(version) = avatar.version { value["version"] = json!(version); }
-                    agent["avatar"] = value;
-                }
-                if let Some(id) = row.project_id {
-                    let name: String = conn.query_row("SELECT name FROM project WHERE project_id=?1", [&id], |r| r.get(0))?;
-                    let mut project = json!({"id":id,"name":name});
-                    let root: Option<String> = conn.query_row("SELECT canonical_root FROM project_root WHERE project_id=?1 ORDER BY canonical_root LIMIT 1", [&id], |r| r.get(0)).optional()?;
-                    if let Some(root) = root { project["canonicalRoot"] = json!(root); }
-                    agent["project"] = project;
-                    let workspace: Option<(String,String)> = conn.query_row("SELECT w.workspace_id,w.name FROM project_workspace pw JOIN workspace w ON w.workspace_id=pw.workspace_id WHERE pw.project_id=?1", [&id], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
-                    if let Some((id,name)) = workspace { agent["workspace"] = json!({"id":id,"name":name}); }
-                }
-                agents.push(agent);
-            }
-            reply["agents"] = Value::Array(agents);
-            Ok(reply)
-        })?;
+        let value = self.read_agent(|conn| self.fleet_value(conn, token, incarnation))?;
         crate::mutations::wire_value(value).map_err(Into::into)
     }
+
+    /// Read the fleet and the complete resume range in the same existing read
+    /// transaction. `None` means the range cannot be reconstructed safely.
+    pub fn agent_fleet_watch_snapshot(
+        &self,
+        incarnation: &str,
+        since: Option<i64>,
+    ) -> Result<FleetWatchSnapshot, AgentMutationError> {
+        self.read_agent(|conn| {
+            let fleet = self.fleet_value(conn, None, incarnation)?;
+            let generation = fleet["generation"].as_i64().expect("fleet generation");
+            let resume = (|| {
+                let since = since?;
+                if since < 0 || since > generation {
+                    return None;
+                }
+                let mut changed = BTreeMap::new();
+                let mut statement = conn.prepare(
+                    "SELECT seq,op,payload_json FROM registry_journal WHERE seq>?1 ORDER BY seq LIMIT 1001",
+                ).ok()?;
+                let entries = statement.query_map([since], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                }).ok()?;
+                let mut expected = since + 1;
+                for (count, entry) in (1..).zip(entries) {
+                    let (seq, op, payload) = entry.ok()?;
+                    if seq != expected {
+                        return None;
+                    }
+                    expected += 1;
+                    // Identity entries name exactly one changed row, including
+                    // import, merge/dispose, namespace repair and avatar manifests
+                    // (journaled as set_namespace and set_avatar). Project ops
+                    // register/upgrade_implicit/seed_import/assign_workspace can
+                    // alter project names, workspace names or placement;
+                    // register/upgrade_implicit/seed_import/add_root/remove_root/
+                    // attach_root and remove with a successor can change the
+                    // first canonical root of a live agent's project. Their
+                    // payloads do not enumerate all affected fleet rows. Reject
+                    // every non-identity op, including future ops, rather than
+                    // mistaking the identity-only change feed for a complete log.
+                    if !IDENTITY_CHANGE_OPS.contains(&op.as_str()) || count > 1000 {
+                        return None;
+                    }
+                    let payload: Value = serde_json::from_str(&payload).ok()?;
+                    let entry = payload.get("entry").unwrap_or(&payload);
+                    let id = entry["agent_id"].as_str()?;
+                    if entry["row"]["agent_id"].as_str()? != id {
+                        return None;
+                    }
+                    changed.insert(id.to_owned(), seq);
+                }
+                if expected != generation + 1 {
+                    return None;
+                }
+                Some(changed)
+            })();
+            Ok(FleetWatchSnapshot { fleet, resume })
+        })
+    }
+
+    fn fleet_value(
+        &self,
+        conn: &Connection,
+        token: Option<&str>,
+        incarnation: &str,
+    ) -> Result<Value, AgentMutationError> {
+        let generation = self.generation_from_connection(conn)?;
+        let current = format!("{incarnation}:{generation}");
+        // The last shared identity-log position this machine has applied
+        // (0 while sharing is off). `generation` and `token` count this
+        // machine's own journal, so they can't be compared between
+        // machines; a client merging several machines' replies keeps the
+        // one with the highest `logPosition`, which has seen the most of
+        // the shared history.
+        let log_position: i64 = conn.query_row(
+            "SELECT last_applied_position FROM identity_log_state WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?;
+        let mut reply = json!({"incarnation":incarnation,"generation":generation,"logPosition":log_position,"token":current,"unchanged":token == Some(current.as_str())});
+        if token == Some(current.as_str()) {
+            return Ok(reply);
+        }
+        let mut agents = Vec::new();
+        // One result per live agent, even when its project has several roots.
+        // The output workspace comes from project_workspace, not the agent's
+        // stored workspace_id. Agents with role workspace_head have no project
+        // and therefore omit the output workspace.
+        // Source: prefrontal 873870be8 crates/prefrontal-core-module/src/fleet_overview.rs:53-83,349-379,418-436.
+        for row in all_rows(conn)?.into_iter().filter(|r| r.status == "live") {
+            let mut agent = json!({"agentId":row.agent_id,"displayName":row.name,"tag":row.tag,"labels":row.labels,"role":row.role});
+            if let Some(avatar) = row.avatar {
+                let avatar = AgentAvatar {
+                    genome: avatar.genome,
+                    avatar_type: Some(avatar.avatar_type),
+                    version: avatar.version,
+                };
+                let mut value =
+                    json!({"fingerprint":avatar_fingerprint(&avatar),"type":avatar.avatar_type});
+                if let Some(version) = avatar.version {
+                    value["version"] = json!(version);
+                }
+                agent["avatar"] = value;
+            }
+            if let Some(id) = row.project_id {
+                let name: String =
+                    conn.query_row("SELECT name FROM project WHERE project_id=?1", [&id], |r| {
+                        r.get(0)
+                    })?;
+                let mut project = json!({"id":id,"name":name});
+                let root: Option<String> = conn.query_row("SELECT canonical_root FROM project_root WHERE project_id=?1 ORDER BY canonical_root LIMIT 1", [&id], |r| r.get(0)).optional()?;
+                if let Some(root) = root {
+                    project["canonicalRoot"] = json!(root);
+                }
+                agent["project"] = project;
+                let workspace: Option<(String,String)> = conn.query_row("SELECT w.workspace_id,w.name FROM project_workspace pw JOIN workspace w ON w.workspace_id=pw.workspace_id WHERE pw.project_id=?1", [&id], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+                if let Some((id, name)) = workspace {
+                    agent["workspace"] = json!({"id":id,"name":name});
+                }
+            }
+            agents.push(agent);
+        }
+        reply["agents"] = Value::Array(agents);
+        Ok(reply)
+    }
+}
+
+/// Fleet rows and a bounded, conservative replay plan from one committed view.
+pub struct FleetWatchSnapshot {
+    pub fleet: Value,
+    pub resume: Option<BTreeMap<String, i64>>,
 }
 
 #[cfg(test)]

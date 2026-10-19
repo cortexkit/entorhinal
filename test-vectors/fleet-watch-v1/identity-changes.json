@@ -1,0 +1,3 @@
+[
+  {"op":"agent.fleet_identity_watch","request":{"token":"0123456789abcdef:4"},"principal":{"kind":"reserved","moduleId":"callosum"},"frames":[{"type":"StreamData","body":{"agents":[{"agentId":"agent_0000000000000001","avatar":{"fingerprint":"b4c04a5d931e65a48e022b8943678d55","type":"creature.classic","version":2},"displayName":"Ada Lovelace","labels":[],"project":{"id":"served-project","name":"Served project"},"role":"head","tag":"","version":5,"workspace":{"id":"served-workspace","name":"served-workspace"}}],"generation":6,"kind":"changes","logPosition":0,"removed":[{"agentId":"agent_0000000000000002","version":6}],"token":"0123456789abcdef:6"}}]}
+]

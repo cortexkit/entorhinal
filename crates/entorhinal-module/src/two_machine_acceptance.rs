@@ -1966,6 +1966,7 @@ mod moves {
                 discovery: h.participant_discovery.clone(),
                 catalog: Some(Arc::new(h.catalog_move_context())),
                 health: h.health.clone(),
+                watches: h.watches.clone(),
                 writer: h.writer.clone(),
                 clock,
                 wake: h.move_wake.clone(),

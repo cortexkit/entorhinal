@@ -24,6 +24,25 @@ pub(crate) const WHERE_MANY: &str = "agent.where_many";
 /// contract, independent of engram's own `read_many` batch size.
 const WHERE_MANY_MAX: usize = 64;
 
+pub(super) fn validate_where_ids(ids: &[String]) -> Result<(), HandlerError> {
+    if ids.is_empty() || ids.len() > WHERE_MANY_MAX {
+        return Err(HandlerError::new(
+            "invalid_request",
+            format!("agentIds must contain 1 to {WHERE_MANY_MAX} agent ids"),
+        ));
+    }
+    let mut seen = std::collections::HashSet::with_capacity(ids.len());
+    for id in ids {
+        if !entorhinal_core::agent::valid_agent_id(id) {
+            return Err(HandlerError::new("invalid_request", "invalid agent id"));
+        }
+        if !seen.insert(id.clone()) {
+            return Err(HandlerError::new("invalid_request", "duplicate agent id"));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
 pub(crate) struct RefreshCounts {
     pub refreshed: usize,
@@ -62,6 +81,7 @@ struct Worker {
     sql_operations: Arc<crate::move_driver::SqlOperations>,
     records: RecordClient,
     health: Arc<HealthGauges>,
+    watches: Arc<crate::watches::Watches>,
     clock: fn() -> i64,
 }
 
@@ -164,10 +184,11 @@ impl Worker {
                 };
                 let now = (self.clock)();
                 let guard = self.sql_operations.begin();
+                let watches = self.watches.clone();
                 let conflicts = tokio::task::spawn_blocking(move || {
                     let _guard = guard;
                     let store = cache;
-                    store.cache_agent_claims(&observations, now)
+                    watches.cache_claims(&store, &observations, now)
                 })
                 .await
                 .map_err(|e| HandlerError::new("storage_error", e.to_string()))??;
@@ -210,6 +231,7 @@ impl ProjectsHandler {
             sql_operations: self.claim_refresh_sql.clone(),
             records: self.record_client.clone(),
             health: self.health.clone(),
+            watches: self.watches.clone(),
             clock: self.clock,
         };
         *task = Some(tokio::spawn(async move {
@@ -323,21 +345,7 @@ impl ProjectsHandler {
         }
         let request: Request = serde_json::from_value(params)
             .map_err(|e| HandlerError::new("invalid_request", e.to_string()))?;
-        if request.agent_ids.is_empty() || request.agent_ids.len() > WHERE_MANY_MAX {
-            return Err(HandlerError::new(
-                "invalid_request",
-                format!("agentIds must contain 1 to {WHERE_MANY_MAX} agent ids"),
-            ));
-        }
-        let mut seen = std::collections::HashSet::with_capacity(request.agent_ids.len());
-        for id in &request.agent_ids {
-            if !entorhinal_core::agent::valid_agent_id(id) {
-                return Err(HandlerError::new("invalid_request", "invalid agent id"));
-            }
-            if !seen.insert(id.clone()) {
-                return Err(HandlerError::new("invalid_request", "duplicate agent id"));
-            }
-        }
+        validate_where_ids(&request.agent_ids)?;
 
         let mut agents = Vec::with_capacity(request.agent_ids.len());
         for id in request.agent_ids {
@@ -722,6 +730,7 @@ mod tests {
             sql_operations: f.handler.claim_refresh_sql.clone(),
             records: RecordClient::new(Arc::new(FakeRecordConnector(other))),
             health: f.handler.health.clone(),
+            watches: f.handler.watches.clone(),
             clock: f.handler.clock,
         };
         assert_eq!(worker.pass().await.unwrap().refreshed, 1);

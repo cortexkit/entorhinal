@@ -1,0 +1,3 @@
+[
+  {"op":"agent.fleet_identity_watch","request":{},"principal":{"kind":"reserved","moduleId":"callosum"},"frames":[{"type":"StreamData","body":{"kind":"resync","token":"0123456789abcdef:4"}}]}
+]

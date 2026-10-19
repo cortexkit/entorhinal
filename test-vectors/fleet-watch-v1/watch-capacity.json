@@ -1,0 +1,3 @@
+[
+  {"op":"agent.where_watch","request":{},"principal":{"kind":"reserved","moduleId":"callosum"},"frames":[{"type":"Error","body":{"code":"watch_capacity","message":"at most 16 watches may be open"}}]}
+]

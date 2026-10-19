@@ -22,7 +22,7 @@ pub(crate) use carry::{placement_mismatches, plan_carry};
 pub(crate) use claims::load_claims;
 pub use claims::AgentNameClaim;
 pub use feed::{AgentChangesReply, AgentSnapshotReply};
-pub use fleet::avatar_fingerprint;
+pub use fleet::{avatar_fingerprint, FleetWatchSnapshot};
 pub(crate) use journal::{change_ops_sql, IDENTITY_CHANGE_OPS, IDENTITY_MARKER_OP};
 pub use journal::{replay_agent_entry, AgentChangeEntry};
 pub use names::*;
