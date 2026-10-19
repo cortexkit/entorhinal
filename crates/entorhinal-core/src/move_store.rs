@@ -534,7 +534,7 @@ impl RegistryStore {
         row: &AgentMove,
         checked_refs: &[MoveRef],
     ) -> Result<AgentMove, AgentMutationError> {
-        let outcome = self.db.with_conn_fenced(|tx| {
+        let outcome = self.with_where_move_changes(|tx| {
             let check = || -> Result<AgentMove, AgentMutationError> {
                 if row.side != MoveSide::Source
                     || row.step != MoveStep::Preparing
@@ -612,7 +612,7 @@ impl RegistryStore {
     /// cut_id already has a checkpoint, return it unchanged so an inbox poll
     /// after a crash cannot insert a second receiver row for the same move.
     pub fn admit_received_move(&self, row: &AgentMove) -> Result<AgentMove, AgentMutationError> {
-        let outcome = self.db.with_conn_fenced(|tx| {
+        let outcome = self.with_where_move_changes(|tx| {
             let check = || -> Result<AgentMove, AgentMutationError> {
                 if row.side != MoveSide::Receiver
                     || !matches!(row.step, MoveStep::PickedUp | MoveStep::Aborted)
@@ -661,18 +661,16 @@ impl RegistryStore {
     /// Insert a checkpoint, refusing duplicate cuts or request keys and a second
     /// non-terminal move for the same agent, on either side.
     pub fn insert_agent_move(&self, row: &AgentMove) -> Result<(), RegistryError> {
-        self.db
-            .with_conn_fenced(|conn| {
-                row.write(conn, true)?;
-                Ok(())
-            })
-            .map_err(RegistryError::Store)
+        self.with_where_move_changes(|conn| {
+            row.write(conn, true)?;
+            Ok(())
+        })
+        .map_err(RegistryError::Store)
     }
 
     /// Replace an existing checkpoint; a missing cut returns false, never inserts.
     pub fn update_agent_move(&self, row: &AgentMove) -> Result<bool, RegistryError> {
-        self.db
-            .with_conn_fenced(|conn| Ok(row.write(conn, false)? != 0))
+        self.with_where_move_changes(|conn| Ok(row.write(conn, false)? != 0))
             .map_err(RegistryError::Store)
     }
 
@@ -684,26 +682,25 @@ impl RegistryStore {
         row: &AgentMove,
         clear_abort: bool,
     ) -> Result<AgentMove, RegistryError> {
-        self.db
-            .with_conn_fenced(|tx| {
-                let current = load_move(tx, &row.cut_id)?;
-                if row.step == MoveStep::Activating
-                    && current.step == MoveStep::Claimed
-                    && current.abort_requested.is_some()
-                {
-                    return Ok(current);
-                }
-                let mut next = row.clone();
-                if clear_abort {
-                    next.abort_requested = None;
-                } else if current.abort_requested.is_some() {
-                    next.abort_requested = current.abort_requested;
-                }
-                next.cut_accept = current.cut_accept;
-                next.write(tx, false)?;
-                Ok(next)
-            })
-            .map_err(RegistryError::Store)
+        self.with_where_move_changes(|tx| {
+            let current = load_move(tx, &row.cut_id)?;
+            if row.step == MoveStep::Activating
+                && current.step == MoveStep::Claimed
+                && current.abort_requested.is_some()
+            {
+                return Ok(current);
+            }
+            let mut next = row.clone();
+            if clear_abort {
+                next.abort_requested = None;
+            } else if current.abort_requested.is_some() {
+                next.abort_requested = current.abort_requested;
+            }
+            next.cut_accept = current.cut_accept;
+            next.write(tx, false)?;
+            Ok(next)
+        })
+        .map_err(RegistryError::Store)
     }
 
     /// Decide an operator abort without a read/write gap. Refusal leaves every
@@ -713,37 +710,35 @@ impl RegistryStore {
         cut_id: &str,
         now_ms: i64,
     ) -> Result<AgentMove, AgentMutationError> {
-        self.db
-            .with_conn_fenced(|tx| {
-                let mut row = load_move(tx, cut_id)?;
-                if row.step == MoveStep::Aborted {
-                    return Ok(Ok(row));
-                }
-                if !row.step.before_boundary(row.side) {
-                    return Ok(Err(crate::session_refusal(
-                        "invalid_state",
-                        "move has crossed the abort boundary",
-                        Some(move_detail(&row)),
-                    )));
-                }
-                if row.abort_stuck() {
-                    let request = row
-                        .abort_requested
-                        .as_mut()
-                        .and_then(Value::as_object_mut)
-                        .ok_or(rusqlite::Error::InvalidQuery)?;
-                    request.insert("retry_pending".into(), Value::Bool(true));
-                } else if row.abort_requested.is_some() {
-                    return Ok(Ok(row));
-                } else {
-                    row.abort_requested =
-                        Some(serde_json::json!({"reason":"operator","detail":null}));
-                }
-                row.updated_at_ms = now_ms;
-                row.write(tx, false)?;
-                Ok(Ok(row))
-            })
-            .map_err(|e| crate::session_refusal("storage_error", e.to_string(), None))?
+        self.with_where_move_changes(|tx| {
+            let mut row = load_move(tx, cut_id)?;
+            if row.step == MoveStep::Aborted {
+                return Ok(Ok(row));
+            }
+            if !row.step.before_boundary(row.side) {
+                return Ok(Err(crate::session_refusal(
+                    "invalid_state",
+                    "move has crossed the abort boundary",
+                    Some(move_detail(&row)),
+                )));
+            }
+            if row.abort_stuck() {
+                let request = row
+                    .abort_requested
+                    .as_mut()
+                    .and_then(Value::as_object_mut)
+                    .ok_or(rusqlite::Error::InvalidQuery)?;
+                request.insert("retry_pending".into(), Value::Bool(true));
+            } else if row.abort_requested.is_some() {
+                return Ok(Ok(row));
+            } else {
+                row.abort_requested = Some(serde_json::json!({"reason":"operator","detail":null}));
+            }
+            row.updated_at_ms = now_ms;
+            row.write(tx, false)?;
+            Ok(Ok(row))
+        })
+        .map_err(|e| crate::session_refusal("storage_error", e.to_string(), None))?
     }
 
     /// Record activation and ref ownership together. Existing bindings for this
@@ -753,7 +748,7 @@ impl RegistryStore {
         row: &AgentMove,
         refs: &[MoveRef],
     ) -> Result<AgentMove, AgentMutationError> {
-        self.db.with_conn_fenced(|tx| {
+        self.with_where_move_changes(|tx| {
             let current = load_move(tx, &row.cut_id)?;
             if current.side != MoveSide::Receiver || current.step != MoveStep::Activating
                 || row.step != MoveStep::Activated || row.activated_at_ms.is_none() {
@@ -787,15 +782,14 @@ impl RegistryStore {
         accept: &Value,
         now_ms: i64,
     ) -> Result<(), RegistryError> {
-        self.db
-            .with_conn_fenced(|tx| {
-                tx.execute(
-                    "UPDATE agent_move SET cut_accept=?2, updated_at_ms=?3 WHERE cut_id=?1",
-                    params![cut_id, accept.to_string(), now_ms],
-                )?;
-                Ok(())
-            })
-            .map_err(RegistryError::Store)
+        self.with_where_move_changes(|tx| {
+            tx.execute(
+                "UPDATE agent_move SET cut_accept=?2, updated_at_ms=?3 WHERE cut_id=?1",
+                params![cut_id, accept.to_string(), now_ms],
+            )?;
+            Ok(())
+        })
+        .map_err(RegistryError::Store)
     }
 
     /// Pending accepts survive terminal move steps and are not limited to the
@@ -829,23 +823,22 @@ impl RegistryStore {
     /// Consume only this move's explicit operator request to retry a stuck abort.
     /// Persisting the flag lets a stopped move driver honor it when it starts again.
     pub fn consume_move_abort_retry(&self, cut_id: &str) -> Result<bool, RegistryError> {
-        self.db
-            .with_conn_fenced(|tx| {
-                let mut row = load_move(tx, cut_id)?;
-                if let Some(request) = row
-                    .abort_requested
-                    .as_mut()
-                    .and_then(Value::as_object_mut)
-                    .filter(|v| v.get("retry_pending") == Some(&Value::Bool(true)))
-                {
-                    request.remove("retry_pending");
-                    row.write(tx, false)?;
-                    Ok(true)
-                } else {
-                    Ok(false)
-                }
-            })
-            .map_err(RegistryError::Store)
+        self.with_where_move_changes(|tx| {
+            let mut row = load_move(tx, cut_id)?;
+            if let Some(request) = row
+                .abort_requested
+                .as_mut()
+                .and_then(Value::as_object_mut)
+                .filter(|v| v.get("retry_pending") == Some(&Value::Bool(true)))
+            {
+                request.remove("retry_pending");
+                row.write(tx, false)?;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        })
+        .map_err(RegistryError::Store)
     }
 
     pub fn move_status_view(&self, cut_id: &str) -> Result<Option<Value>, RegistryError> {

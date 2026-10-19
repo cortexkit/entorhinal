@@ -246,15 +246,14 @@ impl RegistryStore {
         observations: &[(String, ClaimObservation)],
         now: i64,
     ) -> Result<usize, RegistryError> {
-        self.db
-            .with_conn_fenced(|tx| {
-                let mut conflicts = 0;
-                for (id, observation) in observations {
-                    conflicts += usize::from(apply(tx, id, observation, now)?);
-                }
-                Ok(conflicts)
-            })
-            .map_err(RegistryError::Store)
+        self.with_where_changes(|tx| {
+            let mut conflicts = 0;
+            for (id, observation) in observations {
+                conflicts += usize::from(apply(tx, id, observation, now)?);
+            }
+            Ok(conflicts)
+        })
+        .map_err(RegistryError::Store)
     }
 
     pub fn cached_agent_claim(&self, id: &str) -> Result<Option<CachedClaim>, RegistryError> {

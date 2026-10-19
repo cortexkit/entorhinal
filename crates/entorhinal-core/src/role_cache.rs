@@ -225,51 +225,50 @@ impl RegistryStore {
         observations: &[(String, ClaimObservation)],
         now: i64,
     ) -> Result<usize, RegistryError> {
-        self.db
-            .with_conn_fenced(|tx| {
-                let mut conflicts = 0;
-                for (role, observation) in observations {
-                    let old = cached(tx, role)?;
-                    let source: Option<String> = tx
-                        .query_row("SELECT source FROM role_cache WHERE role=?1", [role], |r| {
-                            r.get(0)
-                        })
-                        .optional()?
-                        .flatten();
-                    let replaces = match observation {
-                        ClaimObservation::Present { claim, .. } => {
-                            old.as_ref().is_none_or(|r| claim.version >= r.version)
-                        }
-                        ClaimObservation::Absent { stale, .. } => {
-                            !stale || old.as_ref().is_none_or(|r| r.version == 0)
-                        }
-                        _ => false,
-                    };
-                    match observation {
-                        ClaimObservation::Present { self_author, .. }
-                        | ClaimObservation::Absent { self_author, .. }
-                        | ClaimObservation::CodecFailed { self_author } => {
-                            conflicts +=
-                                usize::from(!claim_cache::learn_self_author(tx, self_author, now)?);
-                        }
-                        _ => {}
+        self.with_where_changes(|tx| {
+            let mut conflicts = 0;
+            for (role, observation) in observations {
+                let old = cached(tx, role)?;
+                let source: Option<String> = tx
+                    .query_row("SELECT source FROM role_cache WHERE role=?1", [role], |r| {
+                        r.get(0)
+                    })
+                    .optional()?
+                    .flatten();
+                let replaces = match observation {
+                    ClaimObservation::Present { claim, .. } => {
+                        old.as_ref().is_none_or(|r| claim.version >= r.version)
                     }
-                    if let Some(row) = claim_cache::decide(old, observation, now) {
-                        write_cache(
-                            tx,
-                            role,
-                            &row,
-                            if replaces {
-                                Some("cloud")
-                            } else {
-                                source.as_deref()
-                            },
-                        )?;
+                    ClaimObservation::Absent { stale, .. } => {
+                        !stale || old.as_ref().is_none_or(|r| r.version == 0)
                     }
+                    _ => false,
+                };
+                match observation {
+                    ClaimObservation::Present { self_author, .. }
+                    | ClaimObservation::Absent { self_author, .. }
+                    | ClaimObservation::CodecFailed { self_author } => {
+                        conflicts +=
+                            usize::from(!claim_cache::learn_self_author(tx, self_author, now)?);
+                    }
+                    _ => {}
                 }
-                Ok(conflicts)
-            })
-            .map_err(RegistryError::Store)
+                if let Some(row) = claim_cache::decide(old, observation, now) {
+                    write_cache(
+                        tx,
+                        role,
+                        &row,
+                        if replaces {
+                            Some("cloud")
+                        } else {
+                            source.as_deref()
+                        },
+                    )?;
+                }
+            }
+            Ok(conflicts)
+        })
+        .map_err(RegistryError::Store)
     }
 
     /// Read role_take_request before asking for operator confirmation or calling
@@ -290,7 +289,7 @@ impl RegistryStore {
         self_author: &str,
         now: i64,
     ) -> Result<RoleTakeAttempt, AgentMutationError> {
-        self.db.with_conn_fenced(|tx| {
+        self.with_where_changes(|tx| {
             match load_attempt(tx, &attempt.input) {
                 Ok(Some(existing)) => return Ok(Ok(existing)),
                 Err(error) => return Ok(Err(error)),

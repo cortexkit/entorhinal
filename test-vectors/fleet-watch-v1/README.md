@@ -36,10 +36,14 @@ over 192 KiB becomes a single small `resync`; notices are never split. Identity
 resume is conservative: every journal entry in the bounded range must be an
 agent identity after-image; project/workspace/root entries force resync because
 they can change joined fleet fields without listing the affected agent ids.
-Whereabouts retains 256 changed claim-cache transactions; a cursor outside that
+Whereabouts retains 256 changed cache transactions or derived-view invalidations; a cursor outside that
 ring (or from another incarnation) forces resync. A transaction increments seq
 once if at least one cached claim changes, including known/stale/read timestamp
-changes; unchanged transactions do not advance it.
+changes; unchanged transactions do not advance it. Member renames, learning the
+Mac's own author identity, sharing-mode changes, agent liveness changes and move
+progress also advance seq with an all-agents resync marker. These fields are
+derived outside the claim cache; the core's post-commit listener invalidates the
+watch history without polling or adding engram calls.
 
 ## Reproduce and verify
 

@@ -41,6 +41,7 @@ pub mod remote_apply;
 pub mod role_cache;
 mod root_keys;
 pub mod shared_entry;
+mod where_notify;
 pub use binding::*;
 pub use mutations::*;
 pub use ownership::{ResolveRemoteReply, ResolveRemoteStatus, SetOwnedRemotesRequest};
@@ -272,6 +273,7 @@ pub struct RegistryStore {
     /// omitted; the shared-token worktree fallback is available in either mode.
     root_records: bool,
     ids: Arc<binding::IdSource>,
+    where_notifications: where_notify::WhereNotifications,
 }
 
 /// The durable local log progress. Reading status never contacts the log or
@@ -389,6 +391,7 @@ impl RegistryStore {
             db: Arc::new(db),
             root_records: false,
             ids: Arc::new(binding::IdSource::Random),
+            where_notifications: where_notify::WhereNotifications::default(),
         })
     }
 
@@ -916,46 +919,45 @@ impl JournalWriter<'_> {
         request_key: Option<&str>,
         apply_projection: impl FnOnce(&Transaction<'_>) -> rusqlite::Result<T>,
     ) -> Result<(i64, T), RegistryError> {
-        self.db
-            .with_conn_fenced(|tx| {
-                // With the log on, compare the shared tables before and after
-                // this write, inside its own transaction, to record what it
-                // changed. Domain writes and this lower-level append both do.
-                let before = if log_schema::log_enabled(tx)? {
-                    Some(shared_entry::SharedState::capture(tx)?)
-                } else {
-                    None
-                };
-                tx.execute(
-                    "INSERT INTO registry_journal
+        self.with_where_changes(|tx| {
+            // With the log on, compare the shared tables before and after
+            // this write, inside its own transaction, to record what it
+            // changed. Domain writes and this lower-level append both do.
+            let before = if log_schema::log_enabled(tx)? {
+                Some(shared_entry::SharedState::capture(tx)?)
+            } else {
+                None
+            };
+            tx.execute(
+                "INSERT INTO registry_journal
                      (op, payload_json, actor, request_key, created_at, principal)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![
-                        op,
-                        payload_json,
-                        actor,
-                        request_key,
-                        now_unix_millis(),
-                        self.principal
-                    ],
+                params![
+                    op,
+                    payload_json,
+                    actor,
+                    request_key,
+                    now_unix_millis(),
+                    self.principal
+                ],
+            )?;
+            let actual_seq = tx.last_insert_rowid();
+            let result = apply_projection(tx)?;
+            if let Some(before) = before {
+                let after = shared_entry::SharedState::capture(tx)?;
+                shared_entry::record_local_entry(
+                    tx,
+                    op,
+                    actual_seq,
+                    payload_json,
+                    &before,
+                    &after,
+                    Vec::new(),
                 )?;
-                let actual_seq = tx.last_insert_rowid();
-                let result = apply_projection(tx)?;
-                if let Some(before) = before {
-                    let after = shared_entry::SharedState::capture(tx)?;
-                    shared_entry::record_local_entry(
-                        tx,
-                        op,
-                        actual_seq,
-                        payload_json,
-                        &before,
-                        &after,
-                        Vec::new(),
-                    )?;
-                }
-                Ok((actual_seq, result))
-            })
-            .map_err(RegistryError::Store)
+            }
+            Ok((actual_seq, result))
+        })
+        .map_err(RegistryError::Store)
     }
 }
 

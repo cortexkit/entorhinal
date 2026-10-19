@@ -490,7 +490,7 @@ impl super::JournalWriter<'_> {
             tx.rollback().map_err(RegistryError::from)?;
             return outcome.map(|_| Vec::new());
         }
-        let out = self.db.with_conn_fenced(|tx| -> rusqlite::Result<Vec<u8>> {
+        let out = self.with_where_changes(|tx| -> rusqlite::Result<Vec<u8>> {
             let fail = |e: E| -> rusqlite::Error {
                 *domain_error.borrow_mut() = Some(e);
                 rusqlite::Error::QueryReturnedNoRows
@@ -1383,15 +1383,14 @@ impl RegistryStore {
     }
 
     pub fn rebuild(&self) -> Result<RebuildReply, RegistryError> {
-        self.db
-            .with_conn_fenced(|tx| {
-                let replay = replay_and_compare(tx)?;
-                Ok(RebuildReply {
-                    generation: self.generation_from_connection(tx)?,
-                    replay,
-                })
+        self.with_where_changes(|tx| {
+            let replay = replay_and_compare(tx)?;
+            Ok(RebuildReply {
+                generation: self.generation_from_connection(tx)?,
+                replay,
             })
-            .map_err(RegistryError::Store)
+        })
+        .map_err(RegistryError::Store)
     }
 }
 

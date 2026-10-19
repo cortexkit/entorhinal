@@ -263,7 +263,7 @@ impl RegistryStore {
         entry: &RemoteEntry,
         self_author: Option<&str>,
     ) -> Result<(), RegistryError> {
-        self.db.with_conn_fenced(|tx| {
+        self.with_where_changes(|tx| {
             let committed: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM registry_journal WHERE entry_id=?1 AND origin='here' AND log_position=?2)", params![entry.entry_id, entry.position], |r| r.get(0))?;
             let position: i64 = tx.query_row("SELECT last_applied_position FROM identity_log_state WHERE id=1", [], |r| r.get(0))?;
             if !committed || entry.position != position { return Err(invalid_entry("own entry is not the committed position")); }
@@ -283,33 +283,32 @@ impl RegistryStore {
             name: name.clone(),
         });
         let error = std::cell::RefCell::new(None);
-        self.db
-            .with_conn_fenced(|tx| {
-                let write = || -> Result<(), RegistryError> {
-                    let seq = append(
-                        tx,
-                        "member.set_name",
-                        &serde_json::from_slice::<Value>(&body).map_err(decode_error)?,
-                        "entorhinal",
-                        None,
-                        crate::now_unix_millis(),
-                        principal,
-                    )?;
-                    name.restore(tx)?;
-                    tx.execute(
-                        "UPDATE registry_journal SET stream='shared',entry=?1 WHERE seq=?2",
-                        params![body, seq],
-                    )?;
-                    crate::pending::finish(tx, Some(seq))?;
-                    Ok(())
-                };
-                write().map_err(|cause| {
-                    let sql_error = invalid_entry(&cause.to_string());
-                    *error.borrow_mut() = Some(cause);
-                    sql_error
-                })
+        self.with_where_changes(|tx| {
+            let write = || -> Result<(), RegistryError> {
+                let seq = append(
+                    tx,
+                    "member.set_name",
+                    &serde_json::from_slice::<Value>(&body).map_err(decode_error)?,
+                    "entorhinal",
+                    None,
+                    crate::now_unix_millis(),
+                    principal,
+                )?;
+                name.restore(tx)?;
+                tx.execute(
+                    "UPDATE registry_journal SET stream='shared',entry=?1 WHERE seq=?2",
+                    params![body, seq],
+                )?;
+                crate::pending::finish(tx, Some(seq))?;
+                Ok(())
+            };
+            write().map_err(|cause| {
+                let sql_error = invalid_entry(&cause.to_string());
+                *error.borrow_mut() = Some(cause);
+                sql_error
             })
-            .map_err(|cause| error.into_inner().unwrap_or(RegistryError::Store(cause)))?;
+        })
+        .map_err(|cause| error.into_inner().unwrap_or(RegistryError::Store(cause)))?;
         // Every registry reply is wrapped in `result`, which the CLI requires;
         // echo the stored (trimmed) name so the operator sees what was saved.
         Ok(serde_json::to_vec(&serde_json::json!({
@@ -402,86 +401,85 @@ impl RegistryStore {
             authorization: None,
         };
         let error = std::cell::RefCell::new(None);
-        self.db
-            .with_conn_fenced(|tx| {
-                let mut install = || -> rusqlite::Result<i64> {
-                    let position: i64 = tx.query_row(
-                        "SELECT last_applied_position FROM identity_log_state WHERE id=1",
-                        [],
+        self.with_where_changes(|tx| {
+            let mut install = || -> rusqlite::Result<i64> {
+                let position: i64 = tx.query_row(
+                    "SELECT last_applied_position FROM identity_log_state WHERE id=1",
+                    [],
+                    |r| r.get(0),
+                )?;
+                if entries
+                    .iter()
+                    .enumerate()
+                    .any(|(i, entry)| entry.position != position + i as i64 + 1)
+                {
+                    return Err(decode_error(serde_json::Error::io(std::io::Error::other(
+                        "snapshot positions are not contiguous",
+                    ))));
+                }
+                // Run the same image validation before inserting any journal row.
+                merged.validate(tx)?;
+                if supersedes {
+                    let had_name: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM member_name WHERE author=?1)", [&entries[0].author], |r| r.get(0))?;
+                    if had_name && merged.member_name.is_none() {
+                        return Err(invalid_entry("supersede invariant: snapshot drops member name"));
+                    }
+                    let before = crate::shared_entry::SharedState::capture(tx)?;
+                    let history = stored_agent_entries(tx)?;
+                    validate_agent_extension(&history, &merged.agents).map_err(|cause| {
+                        decode_error(serde_json::Error::io(std::io::Error::other(format!("supersede invariant: {cause} at position {}", entries.last().unwrap().position))))
+                    })?;
+                    // Deleting every shared row the snapshot lacks is safe
+                    // only because catch-up already re-read log entries
+                    // 1..supersedes_through and refused unless every one has
+                    // this snapshot's author. So these rows can only have
+                    // come from that same machine, never from another.
+                    merged.delete_absent(tx, &before)?;
+                    merged.agents.sort_by(|a, b| (a.row.status == "live", &a.agent_id).cmp(&(b.row.status == "live", &b.agent_id)));
+                    for agent in &mut merged.agents { agent.claims.sort_by_key(|claim| claim.claim_id); }
+                    // Only added or changed agents get an `agent.import`
+                    // journal row. An unchanged agent would otherwise reach
+                    // core again through `agent.changes` for no reason.
+                    merged.agents.retain(|agent| !history.iter().any(|old| old.row == agent.row && old.claims == agent.claims));
+                }
+                let mut seq = 0;
+                for (i, entry) in entries.iter().enumerate() {
+                    let replay_entry = RemoteEntry {
+                        position: entry.position,
+                        entry_id: entry.entry_id.clone(),
+                        author: entry.author.clone(),
+                        signer: entry.signer.clone(),
+                        key_id: entry.key_id.clone(),
+                        envelope_version: entry.envelope_version,
+                        kind: entry.kind.clone(),
+                        entry: canonical_bytes(if i == 0 { &merged } else { &empty }),
+                    };
+                    seq = apply(tx, &replay_entry)?;
+                    let payload: String = tx.query_row(
+                        "SELECT payload_json FROM registry_journal WHERE seq=?1",
+                        [seq],
                         |r| r.get(0),
                     )?;
-                    if entries
-                        .iter()
-                        .enumerate()
-                        .any(|(i, entry)| entry.position != position + i as i64 + 1)
-                    {
-                        return Err(decode_error(serde_json::Error::io(std::io::Error::other(
-                            "snapshot positions are not contiguous",
-                        ))));
-                    }
-                    // Run the same image validation before inserting any journal row.
-                    merged.validate(tx)?;
-                    if supersedes {
-                        let had_name: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM member_name WHERE author=?1)", [&entries[0].author], |r| r.get(0))?;
-                        if had_name && merged.member_name.is_none() {
-                            return Err(invalid_entry("supersede invariant: snapshot drops member name"));
-                        }
-                        let before = crate::shared_entry::SharedState::capture(tx)?;
-                        let history = stored_agent_entries(tx)?;
-                        validate_agent_extension(&history, &merged.agents).map_err(|cause| {
-                            decode_error(serde_json::Error::io(std::io::Error::other(format!("supersede invariant: {cause} at position {}", entries.last().unwrap().position))))
-                        })?;
-                        // Deleting every shared row the snapshot lacks is safe
-                        // only because catch-up already re-read log entries
-                        // 1..supersedes_through and refused unless every one has
-                        // this snapshot's author. So these rows can only have
-                        // come from that same machine, never from another.
-                        merged.delete_absent(tx, &before)?;
-                        merged.agents.sort_by(|a, b| (a.row.status == "live", &a.agent_id).cmp(&(b.row.status == "live", &b.agent_id)));
-                        for agent in &mut merged.agents { agent.claims.sort_by_key(|claim| claim.claim_id); }
-                        // Only added or changed agents get an `agent.import`
-                        // journal row. An unchanged agent would otherwise reach
-                        // core again through `agent.changes` for no reason.
-                        merged.agents.retain(|agent| !history.iter().any(|old| old.row == agent.row && old.claims == agent.claims));
-                    }
-                    let mut seq = 0;
-                    for (i, entry) in entries.iter().enumerate() {
-                        let replay_entry = RemoteEntry {
-                            position: entry.position,
-                            entry_id: entry.entry_id.clone(),
-                            author: entry.author.clone(),
-                            signer: entry.signer.clone(),
-                            key_id: entry.key_id.clone(),
-                            envelope_version: entry.envelope_version,
-                            kind: entry.kind.clone(),
-                            entry: canonical_bytes(if i == 0 { &merged } else { &empty }),
-                        };
-                        seq = apply(tx, &replay_entry)?;
-                        let payload: String = tx.query_row(
-                            "SELECT payload_json FROM registry_journal WHERE seq=?1",
-                            [seq],
-                            |r| r.get(0),
-                        )?;
-                        let mut payload: Value =
-                            serde_json::from_str(&payload).map_err(decode_error)?;
-                        // Keep the original multipart body alongside the merged bytes
-                        // used by replay; no transport dependency is needed to audit it.
-                        payload["snapshot_part"] =
-                            serde_json::from_slice(&entry.entry).map_err(decode_error)?;
-                        tx.execute(
-                            "UPDATE registry_journal SET payload_json=?1 WHERE seq=?2",
-                            params![String::from_utf8(canonical_bytes(&payload)).unwrap(), seq],
-                        )?;
-                    }
-                    learn_identity(tx, self_author)?;
-                    if let Some(head) = join_head {
-                        tx.execute("UPDATE identity_log_state SET state='joining',last_seen_head=?1 WHERE id=1 AND state='disabled'", [head])?;
-                        crate::enable_state::finish_join_at_head(tx, head)?;
-                    }
-                    Ok(seq)
-                };
-                install().inspect_err(|cause| *error.borrow_mut() = Some(cause.to_string()))
-            })
+                    let mut payload: Value =
+                        serde_json::from_str(&payload).map_err(decode_error)?;
+                    // Keep the original multipart body alongside the merged bytes
+                    // used by replay; no transport dependency is needed to audit it.
+                    payload["snapshot_part"] =
+                        serde_json::from_slice(&entry.entry).map_err(decode_error)?;
+                    tx.execute(
+                        "UPDATE registry_journal SET payload_json=?1 WHERE seq=?2",
+                        params![String::from_utf8(canonical_bytes(&payload)).unwrap(), seq],
+                    )?;
+                }
+                learn_identity(tx, self_author)?;
+                if let Some(head) = join_head {
+                    tx.execute("UPDATE identity_log_state SET state='joining',last_seen_head=?1 WHERE id=1 AND state='disabled'", [head])?;
+                    crate::enable_state::finish_join_at_head(tx, head)?;
+                }
+                Ok(seq)
+            };
+            install().inspect_err(|cause| *error.borrow_mut() = Some(cause.to_string()))
+        })
             .map_err(|cause| {
                 domain(
                     "apply_failed",
@@ -499,7 +497,7 @@ impl RegistryStore {
         self_author: Option<&str>,
     ) -> Result<i64, RegistryError> {
         let error = std::cell::RefCell::new(None);
-        let result = self.db.with_conn_fenced(|tx| {
+        let result = self.with_where_changes(|tx| {
             (|| {
                 let seq = apply(tx, entry)?;
                 learn_identity(tx, self_author)?;

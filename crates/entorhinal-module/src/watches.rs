@@ -32,6 +32,7 @@ struct WhereHistory {
 struct WhereBatch {
     seq: u64,
     entries: BTreeMap<String, Value>,
+    all_agents: bool,
 }
 
 pub(crate) struct Watches {
@@ -53,6 +54,22 @@ impl Default for Watches {
 }
 
 impl Watches {
+    fn resync_all(&self) {
+        let mut history = self.history.lock().unwrap();
+        history.seq += 1;
+        let seq = history.seq;
+        history.batches.push_back(WhereBatch {
+            seq,
+            entries: BTreeMap::new(),
+            all_agents: true,
+        });
+        if history.batches.len() > HISTORY_LIMIT {
+            history.batches.pop_front();
+        }
+        drop(history);
+        self.changed.notify_waiters();
+    }
+
     /// Claim refresh, move source and move receiver all use this seam. Serialize observations without
     /// holding the history mutex while SQLite may queue behind another writer.
     /// The refresh and move workers already call this on their blocking pool.
@@ -91,7 +108,11 @@ impl Watches {
                     row["version"] = json!(seq);
                 }
             }
-            history.batches.push_back(WhereBatch { seq, entries });
+            history.batches.push_back(WhereBatch {
+                seq,
+                entries,
+                all_agents: false,
+            });
             if history.batches.len() > HISTORY_LIMIT {
                 history.batches.pop_front();
             }
@@ -199,6 +220,17 @@ impl ProjectsHandler {
             })?;
             self.health.watches_open.fetch_add(1, Ordering::Relaxed);
             let _slot = Slot(&self.health);
+            if whereabouts.is_some() {
+                let watches = std::sync::Arc::downgrade(&self.watches);
+                self.with_agent_store(|store| {
+                    store.set_where_change_listener(std::sync::Arc::new(move || {
+                        if let Some(watches) = watches.upgrade() {
+                            watches.resync_all();
+                        }
+                    }));
+                    Ok(())
+                })?;
+            }
             let mut draining = self.draining.subscribe();
             tokio::select! {
                 biased;
@@ -358,6 +390,7 @@ impl ProjectsHandler {
                         .iter()
                         .filter(|batch| batch.seq > cursor.seq)
                     {
+                        safe &= !batch.all_agents;
                         for (id, row) in &batch.entries {
                             if ids.as_ref().is_none_or(|ids| ids.contains(id)) {
                                 safe &= !row.is_null();

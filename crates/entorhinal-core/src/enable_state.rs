@@ -326,7 +326,7 @@ impl RegistryStore {
         parts: &[EnablePart],
         backfill: &Backfill,
     ) -> Result<(), RegistryError> {
-        self.db.with_conn_fenced(|tx| {
+        self.with_where_changes(|tx| {
             tx.execute("UPDATE identity_log_state SET state='enabling',enable_parts=?1,enable_backfill=?2 WHERE id=1 AND state='disabled'",
                 params![serde_json::to_string(parts).map_err(decode_error)?, serde_json::to_string(backfill).map_err(decode_error)?])?;
             Ok(())
@@ -361,7 +361,7 @@ impl RegistryStore {
     /// base; another entry permanently occupying base + 1 means neither
     /// a retry nor an earlier unanswered send can succeed, so discarding is safe.
     pub fn abandon_enable(&self) -> Result<(), RegistryError> {
-        self.db.with_conn_fenced(|tx| {
+        self.with_where_changes(|tx| {
             tx.execute("UPDATE identity_log_state SET state='disabled',enable_parts=NULL,enable_backfill=NULL WHERE id=1 AND state='enabling'", [])?;
             Ok(())
         }).map_err(RegistryError::Store)
@@ -373,7 +373,7 @@ impl RegistryStore {
         principal: &str,
         self_author: Option<&str>,
     ) -> Result<(), RegistryError> {
-        self.db.with_conn_fenced(|tx| {
+        self.with_where_changes(|tx| {
             crate::remote_apply::learn_identity(tx, self_author)?;
             let (parts, backfill): (String, String) = tx.query_row("SELECT enable_parts,enable_backfill FROM identity_log_state WHERE id=1 AND state='enabling'", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
             let parts: Vec<EnablePart> = serde_json::from_str(&parts).map_err(decode_error)?;
@@ -398,12 +398,11 @@ impl RegistryStore {
     /// append identity_log.enable to the journal and set the state to enabled in
     /// one transaction. Repeating the call after completion adds no journal row.
     pub fn finish_join(&self, head: i64) -> Result<(), RegistryError> {
-        self.db
-            .with_conn_fenced(|tx| {
-                finish_join_at_head(tx, head)?;
-                Ok(())
-            })
-            .map_err(RegistryError::Store)
+        self.with_where_changes(|tx| {
+            finish_join_at_head(tx, head)?;
+            Ok(())
+        })
+        .map_err(RegistryError::Store)
     }
 }
 

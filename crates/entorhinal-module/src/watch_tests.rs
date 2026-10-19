@@ -5,6 +5,9 @@ use async_trait::async_trait;
 use std::{future::Future, pin::Pin, task::Poll, time::Duration};
 use tokio::sync::{mpsc, watch};
 
+#[path = "where_watch_derived_tests.rs"]
+mod derived;
+
 struct Sink {
     sender: mpsc::UnboundedSender<Vec<u8>>,
     cancel: watch::Sender<bool>,
@@ -84,6 +87,9 @@ async fn seeded(label: &str) -> Fixture {
     seed_agent(&source, ASSISTANT, "Grace", None, false, false);
     drop(source);
     assert!(matches!(f.import().await, HandlerOutcome::Response(_)));
+    store(&f)
+        .cache_roles(&[("watch_fixture".into(), absent(false))], 700)
+        .unwrap();
     f
 }
 
@@ -288,6 +294,9 @@ async fn watch_size_guard_resyncs_instead_of_oversize_or_split() {
     sink.cancel.send_replace(true);
     assert!(matches!(watch.await, HandlerOutcome::Streamed));
 
+    store(&f)
+        .cache_roles(&[("watch_fixture".into(), absent(false))], 700)
+        .unwrap();
     let body = request(WHERE, json!({"cursor":{"incarnation":INCARNATION,"seq":0}}));
     let (sink, mut receiver) = Sink::new();
     let watch = f.handler.serve_watch(&sink, &body, READER);

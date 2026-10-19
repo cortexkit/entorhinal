@@ -2513,8 +2513,11 @@ fn manifest() -> ModuleManifest {
                 management_operation(method, ManagementOperationKind::Query, agent_operation_description(method))
             })).chain(std::iter::once(sessions::REGISTER_SESSION).map(|method| {
                 management_operation(method, ManagementOperationKind::Mutate, agent_operation_description(method))
-            })).chain([watches::IDENTITY, watches::WHERE].into_iter().map(|method| {
-                management_operation(method, ManagementOperationKind::Query, "Watch process-local fleet changes until cancelled or drained.")
+            })).chain([
+                (watches::IDENTITY, "Watch process-local fleet identity changes until cancelled or drained."),
+                (watches::WHERE, "Watch process-local agent whereabouts changes until cancelled or drained."),
+            ].into_iter().map(|(method, description)| {
+                management_operation(method, ManagementOperationKind::Query, description)
             })).chain([claims::WHERE, claims::WHERE_MANY].into_iter().map(|method| {
                 management_operation(method, ManagementOperationKind::Query, agent_operation_description(method))
             })).chain(std::iter::once(claims::REFRESH).map(|method| {

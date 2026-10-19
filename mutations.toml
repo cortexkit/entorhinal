@@ -6,6 +6,19 @@
 # audits all package targets, except rows narrowed with select="expected".
 
 [[control]]
+id = "where-watch-member-name-invalidation"
+guards = "A committed local or remote member rename invalidates every whereabouts watch without a claim-cache write"
+file = "crates/entorhinal-core/src/where_notify.rs"
+old = 'if exists(conn, "member_name")? {'
+new = 'if false /* NON-VACUITY BREAK */ && exists(conn, "member_name")? {'
+test_file = "crates/entorhinal-module/src/where_watch_derived_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["served_vectors::watch_tests::derived::where_derived_member_rename_resyncs"]
+
+[[control]]
 id = "fleet-watch-notice-size"
 guards = "Watch changes above 192 KiB produce one resync, never an oversize or split notice"
 file = "crates/entorhinal-module/src/watches.rs"
@@ -3164,8 +3177,8 @@ expect_red = ["role_cache::tests::role_ledger_checks_input_conflicts_and_commits
 id = "roles-refresh-is-cloud"
 guards = "A verified refresh replacing a role observation clears the mark and changes its source to cloud"
 file = "crates/entorhinal-core/src/role_cache.rs"
-old = "                                Some(\"cloud\")"
-new = "                                Some(\"local\") // NON-VACUITY BREAK"
+old = "                            Some(\"cloud\")"
+new = "                            Some(\"local\") // NON-VACUITY BREAK"
 test_file = "crates/entorhinal-core/src/role_cache.rs"
 runner = "cargo"
 package = "entorhinal-core"
