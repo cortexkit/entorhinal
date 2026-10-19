@@ -1,0 +1,57 @@
+[
+{
+  "accepted_reply": {
+    "ready": true
+  },
+  "requests": [
+    {
+      "consumer_module": "fake-flow-consumer",
+      "declared_capability": "ck-catalog-consumer-flow/v1",
+      "method": "catalog_consumer.prefetch",
+      "params": {
+        "generation_id": "generation:catalog-consumer-v1-fake",
+        "packages": [
+          {
+            "archive_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+            "capabilities": [],
+            "has_scripts": false,
+            "kind": "flow",
+            "manifest_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+            "name": "@example/vector-flow",
+            "publisher_fingerprint": "6666666666666666666666666666666666666666666666666666666666666666",
+            "range": "^2.0.0",
+            "root": true,
+            "root_certified": false,
+            "trust": "trusted",
+            "version": "2.0.0"
+          }
+        ]
+      }
+    },
+    {
+      "consumer_module": "fake-skill-consumer",
+      "declared_capability": "ck-catalog-consumer-skill/v1",
+      "method": "catalog_consumer.prefetch",
+      "params": {
+        "generation_id": "generation:catalog-consumer-v1-fake",
+        "packages": [
+          {
+            "archive_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+            "capabilities": [],
+            "has_scripts": false,
+            "kind": "skill",
+            "manifest_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+            "name": "@example/vector-skill",
+            "publisher_fingerprint": "3333333333333333333333333333333333333333333333333333333333333333",
+            "range": "^1.0.0",
+            "root": true,
+            "root_certified": false,
+            "trust": "trusted",
+            "version": "1.0.0"
+          }
+        ]
+      }
+    }
+  ]
+}
+]

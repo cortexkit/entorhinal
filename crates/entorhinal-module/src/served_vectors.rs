@@ -2293,3 +2293,239 @@ async fn memory_context_v1_records_match_published_files() {
     }
     published_file("memory-context-v1", "workspace-document.json", records);
 }
+
+struct CatalogConsumerVectorRoute {
+    capability: &'static str,
+    check_reply: Value,
+    calls: std::sync::Mutex<Vec<(String, Value)>>,
+}
+
+#[async_trait::async_trait]
+impl LogTransport for CatalogConsumerVectorRoute {
+    async fn call(&self, method: &str, params: Value) -> Result<Vec<u8>, TransportError> {
+        self.calls.lock().unwrap().push((method.into(), params));
+        let result = match method {
+            "catalog_consumer.check" => self.check_reply.clone(),
+            "catalog_consumer.prefetch" => json!({"ready":true}),
+            _ => return Err(TransportError::Unavailable),
+        };
+        Ok(serde_json::to_vec(&json!({"result":result})).unwrap())
+    }
+}
+
+struct CatalogConsumerVectorDiscovery {
+    snapshot: crate::fake_daemon::DaemonSnapshot,
+    routes: BTreeMap<String, Arc<CatalogConsumerVectorRoute>>,
+}
+
+#[async_trait::async_trait]
+impl crate::catalog_consumer::ConsumerDiscovery for CatalogConsumerVectorDiscovery {
+    async fn supervisor_list(
+        &self,
+    ) -> Result<subc_client_rs::SupervisorListResponse, TransportError> {
+        Ok(self.snapshot.supervisor.clone())
+    }
+
+    async fn catalog_list(&self) -> Result<subc_client_rs::CatalogList, TransportError> {
+        Ok(self.snapshot.catalog.clone())
+    }
+
+    async fn open(&self, module: &str) -> Result<Arc<dyn LogTransport>, TransportError> {
+        self.routes
+            .get(module)
+            .cloned()
+            .map(|route| route as Arc<dyn LogTransport>)
+            .ok_or(TransportError::Unavailable)
+    }
+}
+
+fn catalog_consumer_vector_discovery(check_reply: Value) -> CatalogConsumerVectorDiscovery {
+    let consumers = [
+        ("fake-flow-consumer", crate::catalog_consumer::FLOW),
+        ("fake-skill-consumer", crate::catalog_consumer::SKILL),
+    ];
+    let routes = consumers
+        .iter()
+        .map(|(module, capability)| {
+            (
+                (*module).to_owned(),
+                Arc::new(CatalogConsumerVectorRoute {
+                    capability,
+                    check_reply: check_reply.clone(),
+                    calls: std::sync::Mutex::new(Vec::new()),
+                }),
+            )
+        })
+        .collect();
+    let snapshot = crate::fake_daemon::DaemonSnapshot::new(
+        1,
+        consumers
+            .iter()
+            .map(|(module, _)| {
+                json!({"module_id":module,"enabled":true,"state":"running","live":true,"health":"ok"})
+            })
+            .collect(),
+        consumers
+            .iter()
+            .map(|(module, capability)| {
+                json!({"module_id":module,"ready":true,"roles":[],"control_ops":[],"capabilities":{"provides":[capability],"requires":[]}})
+            })
+            .collect(),
+    );
+    CatalogConsumerVectorDiscovery { snapshot, routes }
+}
+
+fn catalog_consumer_vector_requests(
+    discovery: &CatalogConsumerVectorDiscovery,
+    method: &str,
+) -> Vec<Value> {
+    let mut requests = Vec::new();
+    for (module, route) in &discovery.routes {
+        for (called_method, params) in route.calls.lock().unwrap().iter() {
+            if called_method == method {
+                requests.push(json!({
+                    "consumer_module":module,
+                    "declared_capability":route.capability,
+                    "method":called_method,
+                    "params":params
+                }));
+            }
+        }
+    }
+    requests
+}
+
+fn publish_catalog_consumer_vector(name: &str, record: Value) {
+    let record = serde_json::to_string_pretty(&record).unwrap();
+    if std::env::var("ENTO_WRITE_SERVED_VECTORS").as_deref() == Ok("1") {
+        print!("VECTOR {name}\n[\n{record}\n]\nEND {name}\n");
+    }
+    published_file("catalog-consumer-v1", name, vec![record]);
+}
+
+#[tokio::test]
+async fn catalog_consumer_v1_requests_match_published_files() {
+    use entorhinal_core::catalog_agent::{CatalogPin, PreparedPackage};
+
+    let packages = vec![
+        PreparedPackage {
+            pin: CatalogPin {
+                name: "@example/vector-skill".into(),
+                version: "1.0.0".into(),
+                kind: entorhinal_catalog::Kind::Skill,
+                manifest_sha256: "11".repeat(32),
+                archive_sha256: "22".repeat(32),
+                publisher_fingerprint: "33".repeat(32),
+                root: true,
+                range: Some("^1.0.0".into()),
+            },
+            trust: "trusted".into(),
+            capabilities: vec![],
+            has_scripts: false,
+            root_certified: false,
+        },
+        PreparedPackage {
+            pin: CatalogPin {
+                name: "@example/vector-flow".into(),
+                version: "2.0.0".into(),
+                kind: entorhinal_catalog::Kind::Flow,
+                manifest_sha256: "44".repeat(32),
+                archive_sha256: "55".repeat(32),
+                publisher_fingerprint: "66".repeat(32),
+                root: true,
+                range: Some("^2.0.0".into()),
+            },
+            trust: "trusted".into(),
+            capabilities: vec![],
+            has_scripts: false,
+            root_certified: false,
+        },
+    ];
+    let accepted_reply = json!({
+        "ok":true,
+        "card_section":"Sample catalog consumer review."
+    });
+    let refusal_reply = json!({
+        "ok":false,
+        "refusals":[{"package":"@example/vector-skill","reason":"sample refusal"}]
+    });
+    let discovery = catalog_consumer_vector_discovery(accepted_reply.clone());
+    let consumers = crate::catalog_consumer::discover(&discovery, &packages)
+        .await
+        .unwrap();
+    let checks =
+        crate::catalog_consumer::check(&consumers, "plan:catalog-consumer-v1-fake", &packages)
+            .await
+            .unwrap();
+    let check_requests = catalog_consumer_vector_requests(&discovery, "catalog_consumer.check");
+
+    // Each route must receive one package, and its kind must match its capability.
+    assert_eq!(check_requests.len(), 2);
+    for request in &check_requests {
+        let expected_kind = match request["declared_capability"].as_str().unwrap() {
+            crate::catalog_consumer::SKILL => "skill",
+            crate::catalog_consumer::FLOW => "flow",
+            other => panic!("unexpected consumer capability {other}"),
+        };
+        let received = request["params"]["packages"].as_array().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0]["kind"], expected_kind);
+    }
+
+    let refusal_discovery = catalog_consumer_vector_discovery(refusal_reply.clone());
+    let refusal_consumers = crate::catalog_consumer::discover(&refusal_discovery, &packages)
+        .await
+        .unwrap();
+    let refusal = crate::catalog_consumer::check(
+        &refusal_consumers,
+        "plan:catalog-consumer-v1-fake",
+        &packages,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refusal.code, "consumer_refused");
+    assert_eq!(
+        refusal.detail.unwrap()["refusals"],
+        refusal_reply["refusals"]
+    );
+
+    let prefetch_reply = json!({"ready":true});
+    crate::catalog_consumer::prefetch(
+        &discovery,
+        "generation:catalog-consumer-v1-fake",
+        &packages,
+        &checks,
+        tokio::time::Instant::now() + std::time::Duration::from_secs(20),
+    )
+    .await
+    .unwrap();
+    let prefetch_requests =
+        catalog_consumer_vector_requests(&discovery, "catalog_consumer.prefetch");
+    assert_eq!(prefetch_requests.len(), 2);
+    for request in &prefetch_requests {
+        let expected_kind = match request["declared_capability"].as_str().unwrap() {
+            crate::catalog_consumer::SKILL => "skill",
+            crate::catalog_consumer::FLOW => "flow",
+            other => panic!("unexpected consumer capability {other}"),
+        };
+        let received = request["params"]["packages"].as_array().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0]["kind"], expected_kind);
+    }
+
+    publish_catalog_consumer_vector(
+        "check.json",
+        json!({
+            "accepted_reply":accepted_reply,
+            "refusal_reply":refusal_reply,
+            "requests":check_requests
+        }),
+    );
+    publish_catalog_consumer_vector(
+        "prefetch.json",
+        json!({
+            "accepted_reply":prefetch_reply,
+            "requests":prefetch_requests
+        }),
+    );
+}
