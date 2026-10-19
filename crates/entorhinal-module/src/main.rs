@@ -36,7 +36,8 @@ use subc_protocol::{
     manifest::{
         build_provenance_from_source, BuildGitShaAbsenceReason, BuildGitShaSource,
         CapabilityDeclarations, Concurrency, GitTreeState, ManagementOperation,
-        ManagementOperationKind, ManifestProvenance, ModuleManifest, ProviderRole,
+        ManagementOperationKind, ManifestProvenance, ModuleManifest, OperationDelivery,
+        ProviderRole,
     },
     scope::ScopeStamp,
     ModuleHelloAckBody, Principal, PROTOCOL_VERSION,
@@ -2570,6 +2571,13 @@ fn manifest() -> ModuleManifest {
         requires: Vec::new(),
         must_never_reach: Vec::new(),
     }))
+    // The two watch queries hold their route open and stream changes until
+    // cancelled or drained. Declaring them as watches lets the daemon and its
+    // clients subscribe to them instead of treating them as one-shot queries.
+    .operation_delivery(BTreeMap::from([
+        (watches::IDENTITY.to_owned(), OperationDelivery::WATCH),
+        (watches::WHERE.to_owned(), OperationDelivery::WATCH),
+    ]))
     .build()
 }
 

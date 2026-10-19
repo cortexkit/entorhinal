@@ -3594,8 +3594,8 @@ expect_red = ["consent::tests::every_card_matches_frozen_cingulate_decoder_and_e
 id = "cingulate-carrier-scope"
 guards = "The real SDK carrier uses the caller's scope epoch on the Cingulate management target"
 file = "crates/entorhinal-module/src/consent_client.rs"
-old = 'scope_epoch: Some(stamp.scope_epoch),'
-new = 'scope_epoch: Some(0), // NON-VACUITY BREAK'
+old = 'Some(stamp.scope_epoch),'
+new = 'Some(0), // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/consent_wire_tests.rs"
 runner = "cargo"
 package = "entorhinal-module"
@@ -10431,3 +10431,16 @@ package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
 expect_red = ["move_receiver::tests::receiver_cleanup_before_preconditions_skips_an_absent_participant_with_no_refs", "move_receiver::tests::receiver_restart_mid_cleanup_keeps_skipping_the_absent_participant"]
+
+[[control]]
+id = "manifest-watch-delivery-declared"
+guards = "Both phone watch queries are declared with watch delivery in the module manifest, and no other operation is"
+file = "crates/entorhinal-module/src/main.rs"
+old = "(watches::WHERE.to_owned(), OperationDelivery::WATCH),"
+new = "// NON-VACUITY BREAK: whereabouts watch delivery dropped"
+test_file = "crates/entorhinal-module/src/agent_reads.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["agent_reads::tests::manifest_pins_exact_authority_surface_capabilities_and_protocol_dependencies"]

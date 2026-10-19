@@ -1651,11 +1651,23 @@ mod tests {
             ])
         );
         assert_eq!(manifest["capabilities"]["requires"], json!([]));
+        // Exactly the two streaming queries are declared as watches; every
+        // other declared operation stays unary.
+        let typed = crate::manifest();
+        let watched = operations
+            .iter()
+            .map(|op| op["name"].as_str().unwrap())
+            .filter(|name| typed.is_watch_operation(name))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            watched,
+            BTreeSet::from(["agent.fleet_identity_watch", "agent.where_watch"])
+        );
         let cargo = include_str!("../../../Cargo.toml");
-        assert!(cargo.contains("subc-protocol = \"0.31.0\""));
-        assert!(cargo.contains("subc-client-rs = \"0.28.4\""));
+        assert!(cargo.contains("subc-protocol = \"0.32.5\""));
+        assert!(cargo.contains("subc-client-rs = \"0.30.1\""));
         let lock = include_str!("../../../Cargo.lock");
-        for (name, version) in [("subc-protocol", "0.31.0"), ("subc-client-rs", "0.28.4")] {
+        for (name, version) in [("subc-protocol", "0.32.5"), ("subc-client-rs", "0.30.1")] {
             assert_eq!(lock.matches(&format!("name = \"{name}\"\n")).count(), 1);
             assert!(lock.contains(&format!("name = \"{name}\"\nversion = \"{version}\"")));
         }

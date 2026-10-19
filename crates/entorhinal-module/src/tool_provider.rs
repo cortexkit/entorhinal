@@ -152,15 +152,14 @@ fn role_describe(arguments: &Map<String, Value>) -> Result<Value, HandlerError> 
             "role.describe takes no arguments",
         ));
     }
-    Ok(serde_json::to_value(RoleDescribe {
-        majors: vec![Major {
+    Ok(serde_json::to_value(RoleDescribe::new(
+        vec![Major {
             version: PROVIDES.into(),
             ops: REQUIRED_OPS.iter().map(|op| (*op).into()).collect(),
             stability: "alpha".into(),
         }],
-        implementation_version: env!("CARGO_PKG_VERSION").into(),
-        capabilities: Vec::new(),
-    })
+        env!("CARGO_PKG_VERSION"),
+    ))
     .expect("role description serializes"))
 }
 

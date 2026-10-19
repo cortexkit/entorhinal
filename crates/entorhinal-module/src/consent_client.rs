@@ -97,11 +97,11 @@ impl ConsentConnector for SubcCingulate {
             NEXT_ROUTE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
         let identity = BindIdentity::new(&cwd, "ck-entorhinal", activity);
-        let selector = ScopeSelector {
-            owner: stamp.owner.clone(),
-            scope_ref: stamp.scope_ref.clone(),
-            scope_epoch: Some(stamp.scope_epoch),
-        };
+        let selector = ScopeSelector::new(
+            stamp.owner.clone(),
+            stamp.scope_ref.clone(),
+            Some(stamp.scope_epoch),
+        );
         let handle = timeout_at(
             deadline,
             consumer.open_route_scoped(

@@ -750,14 +750,14 @@ async fn provider_discovery_catalog_and_hello_agree_on_exact_tool_table() {
         );
     }
     let module_cargo = include_str!("../Cargo.toml");
-    assert!(module_cargo.contains("cortexkit-role-tool-provider = \"=0.7.3\""));
+    assert!(module_cargo.contains("cortexkit-role-tool-provider = \"=0.9.2\""));
     let lock = include_str!("../../../Cargo.lock");
     assert_eq!(
         lock.matches("name = \"cortexkit-role-tool-provider\"\n")
             .count(),
         1
     );
-    assert!(lock.contains("name = \"cortexkit-role-tool-provider\"\nversion = \"0.7.3\""));
+    assert!(lock.contains("name = \"cortexkit-role-tool-provider\"\nversion = \"0.9.2\""));
 }
 
 #[tokio::test]
