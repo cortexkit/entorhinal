@@ -224,9 +224,17 @@ the cache, so it works offline and never waits on engram.
 | `agent.session_liveness` | query | any | `active`, `gone` or `unknown` for up to 256 references, in order. |
 | `agent.where` | query | any | Which Mac holds an agent, from the cached claim, plus any blocked move's participant and ref explanation. |
 | `agent.where_many` | query | any | Cached claim results for 1–64 agent ids in request order; unknown agents are omitted. |
+| `agent.fleet_identity_watch` | watch | any | Stream of changes to `agent.fleet_identity`. Opens with `{token?}` and sends `resync` or `changes` notices; on `resync`, read `agent.fleet_identity` once. |
+| `agent.where_watch` | watch | any | Stream of changes to whereabouts. Opens with `{agentIds?, cursor?}` and sends `resync` or `changes` notices carrying a cursor; on `resync`, read `agent.where_many` once. |
 | `agent.refresh_claims` | mutate | Direct | Refresh live agents' cached claims from engram. |
 | `role.read` | query | any | Which Mac holds a role, from the cached claim. |
 | `role.take` | mutate | Direct, with Touch ID | Make this Mac the role's holder. |
+
+Both watches are declared with watch delivery in the manifest. A notice is
+at most 192 KiB; a larger batch becomes one `resync`. At most 16 watches are
+open at once, and a 17th is refused `watch_capacity` before it streams. A watch
+ends when its caller cancels, its route closes or the module drains. Served
+examples of every notice shape are in `test-vectors/fleet-watch-v1/`.
 
 Role names are 1–64 bytes of lowercase letters, digits and underscores.
 `role.take` carries a request id and the epoch it expects; a retry resends
