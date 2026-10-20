@@ -54,7 +54,7 @@ impl Default for Watches {
 }
 
 impl Watches {
-    fn resync_all(&self) {
+    pub(crate) fn resync_all(&self) {
         let mut history = self.history.lock().unwrap();
         history.seq += 1;
         let seq = history.seq;

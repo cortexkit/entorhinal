@@ -132,7 +132,12 @@ struct Worker {
 }
 impl Worker {
     fn store(&self) -> Option<RegistryStore> {
-        self.store.upgrade()?.lock().unwrap().clone()
+        self.store
+            .upgrade()?
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|s| !s.is_foreign())
     }
     async fn offset(&self) -> Result<u64, &'static str> {
         let mut bytes = [0; 8];
@@ -236,6 +241,9 @@ impl ProjectsHandler {
         self.catalog_sql.wait().await;
     }
     pub(super) fn start_catalog_poll(&self) {
+        if self.health.origin.is_foreign() {
+            return;
+        }
         let mut task = self.catalog_poll_task.lock().unwrap();
         if task.is_some() {
             return;

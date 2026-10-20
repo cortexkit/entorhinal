@@ -132,6 +132,7 @@ mod roles;
 mod served_vectors;
 mod sessions;
 mod shared_write;
+mod store_origin;
 mod tool_provider;
 mod watches;
 use shared_write::placement_confirmation;
@@ -381,6 +382,7 @@ impl RequestLatency {
 
 #[derive(Default)]
 struct HealthGauges {
+    origin: store_origin::Origin,
     catalog: catalog_poll::Gauges,
     store_ready: AtomicBool,
     store_failed: AtomicBool,
@@ -662,6 +664,7 @@ const WRITER_MODULE: &str = "prefrontal-core";
 
 /// Methods that change the registry or the liveness state derived from it.
 const MUTATING_METHODS: &[&str] = &[
+    store_origin::ADOPT,
     "project.set_domain",
     "workspace.set_document",
     "agent.repair_workspaces",
@@ -748,7 +751,8 @@ fn authorize_write(method: &str, principal: Option<&Principal>) -> Result<(), Ha
     if SELF_ADMITTED_METHODS.contains(&method) {
         return Ok(());
     }
-    if method == "identity_log.enable"
+    if method == store_origin::ADOPT
+        || method == "identity_log.enable"
         || catalog_ops::WRITES.contains(&method)
         || method == catalog_publish::PUBLISH
         || method == catalog_seed::SEED
@@ -1024,6 +1028,7 @@ impl ProjectsHandler {
         key: RouteKey,
         providers: Option<&sessions::ResolvedProviders>,
     ) -> Result<(RouteAdmission, Option<sessions::SessionRole>), HandlerError> {
+        self.admit_store_method(method)?;
         let admission = self.admission_for(key);
         permissions::admit(method, admission.principal.as_ref())?;
         refuse_flow_write(method, admission.flow_id.as_deref())?;
@@ -1184,6 +1189,9 @@ impl ModuleHandler for ProjectsHandler {
     }
 
     async fn on_hello_ack(&self, ack: &ModuleHelloAckBody) {
+        self.health
+            .origin
+            .set_daemon(ack.machine_id.as_ref().map(ToString::to_string));
         let descriptor = match descriptor_from_ack(ack) {
             Ok(descriptor) => descriptor,
             Err(error) => {
@@ -1265,7 +1273,8 @@ impl ModuleHandler for ProjectsHandler {
             HealthStatus::Degraded
         } else if failed || !ready {
             HealthStatus::Failing
-        } else if self.health.log_state.load(Ordering::Relaxed) != 0
+        } else if self.health.origin.is_foreign()
+            || self.health.log_state.load(Ordering::Relaxed) != 0
             || self.health.self_author_conflicts.load(Ordering::Relaxed) != 0
             || self.health.move_errors.load(Ordering::Relaxed) != 0
             || self.health.move_inbox_rejected.load(Ordering::Relaxed) != 0
@@ -1284,54 +1293,54 @@ impl ModuleHandler for ProjectsHandler {
         HealthReport {
             status,
             detail,
-            metrics: Some(json!({
-                "storeReady": ready,
-                "catalogLastSuccessMs": catalog["catalogLastSuccessMs"],
-                "catalogLastError": catalog["catalogLastError"],
-                "catalogConsecutiveFailures": catalog["catalogConsecutiveFailures"],
-                "catalogScopesPolled": catalog["catalogScopesPolled"],
-                "generation": self.health.generation.load(Ordering::Relaxed),
-                "resolveCount": self.health.resolve_count.load(Ordering::Relaxed),
-                "enumerateCount": self.health.enumerate_count.load(Ordering::Relaxed),
-                "journalTailCount": self.health.journal_tail_count.load(Ordering::Relaxed),
-                "latency": self.health.latency.report(),
-                "storeUnavailable": self.health.store_unavailable.load(Ordering::Relaxed),
-                // Acquire pairs with the Release store below, so a reader that
-                // sees the flag also sees the elapsed time written before it.
-                "readyAfterMs": self
-                    .health
-                    .ready_recorded
-                    .load(Ordering::Acquire)
-                    .then(|| self.health.ready_after_ms.load(Ordering::Relaxed)),
-                "lastOperationMs": self.health.last_operation_ms.load(Ordering::Relaxed),
-                "livenessBatches": self.health.liveness_batches.load(Ordering::Relaxed),
-                "livenessGaps": self.health.liveness_gaps.load(Ordering::Relaxed),
-                "livenessDroppedOlder": self.health.liveness_dropped_older.load(Ordering::Relaxed),
-                "livenessSessions": self.health.liveness_sessions.load(Ordering::Relaxed),
-                "livenessRefusals": self.health.liveness_refusals.load(Ordering::Relaxed),
-                "identityLogState": enable::status_state(&self.health),
-                "lastAppliedPosition": self.health.log_applied.load(Ordering::Relaxed),
-                "lastSeenHead": self.health.log_head.load(Ordering::Relaxed),
-                "pendingWriteCount": self.health.log_pending.load(Ordering::Relaxed),
-                "lastError": enable::last_error(&self.health),
-                "lastErrorAt": enable::last_error_at(&self.health),
-                "logOwnEntriesAppliedFromLog": self.health.log_own_entries_applied.load(Ordering::Relaxed),
-                "roleRefreshFailed": self.health.role_refresh_failed.load(Ordering::Relaxed),
-                "claimRefreshed": self.health.claim_refreshed.load(Ordering::Relaxed),
-                "claimFailed": self.health.claim_failed.load(Ordering::Relaxed),
-                "claimVersionUnknown": self.health.claim_version_unknown.load(Ordering::Relaxed),
-                "claimSubjectMismatch": self.health.claim_subject_mismatch.load(Ordering::Relaxed),
-                "claimMalformed": self.health.claim_malformed.load(Ordering::Relaxed),
-                "claimError": if self.health.self_author_conflicts.load(Ordering::Relaxed) > 0 { Some("self_author_conflict") } else { None },
-                "selfAuthorConflicts": self.health.self_author_conflicts.load(Ordering::Relaxed),
-                "movesOpen": self.health.moves_open.load(Ordering::Relaxed),
-                "moveErrors": self.health.move_errors.load(Ordering::Relaxed),
-                "moveInboxRejected": self.health.move_inbox_rejected.load(Ordering::Relaxed),
-                "moveTaskPanics": self.health.move_task_panics.load(Ordering::Relaxed),
-                "watchesOpen": self.health.watches_open.load(Ordering::Relaxed),
-                "watchNoticesSent": self.health.watch_notices.load(Ordering::Relaxed),
-                "watchResyncsSent": self.health.watch_resyncs.load(Ordering::Relaxed),
-            })),
+            metrics: Some(self.health.origin.metrics(json!({
+                    "storeReady": ready,
+                    "catalogLastSuccessMs": catalog["catalogLastSuccessMs"],
+                    "catalogLastError": catalog["catalogLastError"],
+                    "catalogConsecutiveFailures": catalog["catalogConsecutiveFailures"],
+                    "catalogScopesPolled": catalog["catalogScopesPolled"],
+                    "generation": self.health.generation.load(Ordering::Relaxed),
+                    "resolveCount": self.health.resolve_count.load(Ordering::Relaxed),
+                    "enumerateCount": self.health.enumerate_count.load(Ordering::Relaxed),
+                    "journalTailCount": self.health.journal_tail_count.load(Ordering::Relaxed),
+                    "latency": self.health.latency.report(),
+                    "storeUnavailable": self.health.store_unavailable.load(Ordering::Relaxed),
+                    // Acquire pairs with the Release store below, so a reader that
+                    // sees the flag also sees the elapsed time written before it.
+                    "readyAfterMs": self
+                        .health
+                        .ready_recorded
+                        .load(Ordering::Acquire)
+                        .then(|| self.health.ready_after_ms.load(Ordering::Relaxed)),
+                    "lastOperationMs": self.health.last_operation_ms.load(Ordering::Relaxed),
+                    "livenessBatches": self.health.liveness_batches.load(Ordering::Relaxed),
+                    "livenessGaps": self.health.liveness_gaps.load(Ordering::Relaxed),
+                    "livenessDroppedOlder": self.health.liveness_dropped_older.load(Ordering::Relaxed),
+                    "livenessSessions": self.health.liveness_sessions.load(Ordering::Relaxed),
+                    "livenessRefusals": self.health.liveness_refusals.load(Ordering::Relaxed),
+                    "identityLogState": enable::status_state(&self.health),
+                    "lastAppliedPosition": self.health.log_applied.load(Ordering::Relaxed),
+                    "lastSeenHead": self.health.log_head.load(Ordering::Relaxed),
+                    "pendingWriteCount": self.health.log_pending.load(Ordering::Relaxed),
+                    "lastError": enable::last_error(&self.health),
+                    "lastErrorAt": enable::last_error_at(&self.health),
+                    "logOwnEntriesAppliedFromLog": self.health.log_own_entries_applied.load(Ordering::Relaxed),
+                    "roleRefreshFailed": self.health.role_refresh_failed.load(Ordering::Relaxed),
+                    "claimRefreshed": self.health.claim_refreshed.load(Ordering::Relaxed),
+                    "claimFailed": self.health.claim_failed.load(Ordering::Relaxed),
+                    "claimVersionUnknown": self.health.claim_version_unknown.load(Ordering::Relaxed),
+                    "claimSubjectMismatch": self.health.claim_subject_mismatch.load(Ordering::Relaxed),
+                    "claimMalformed": self.health.claim_malformed.load(Ordering::Relaxed),
+                    "claimError": if self.health.self_author_conflicts.load(Ordering::Relaxed) > 0 { Some("self_author_conflict") } else { None },
+                    "selfAuthorConflicts": self.health.self_author_conflicts.load(Ordering::Relaxed),
+                    "movesOpen": self.health.moves_open.load(Ordering::Relaxed),
+                    "moveErrors": self.health.move_errors.load(Ordering::Relaxed),
+                    "moveInboxRejected": self.health.move_inbox_rejected.load(Ordering::Relaxed),
+                    "moveTaskPanics": self.health.move_task_panics.load(Ordering::Relaxed),
+                    "watchesOpen": self.health.watches_open.load(Ordering::Relaxed),
+                    "watchNoticesSent": self.health.watch_notices.load(Ordering::Relaxed),
+                    "watchResyncsSent": self.health.watch_resyncs.load(Ordering::Relaxed),
+            }))),
         }
     }
 }
@@ -1376,6 +1385,7 @@ impl ProjectsHandler {
     /// blocking pool) and claim refresh (which has its own async branch). Queries
     /// go to `handle_request_wait` and never join the write queue either.
     async fn handle_served_request(&self, body: &[u8], key: RouteKey) -> HandlerOutcome {
+        self.resume_after_store_adoption();
         let mut draining = self.draining.subscribe();
         tokio::select! {
             biased;
@@ -1395,6 +1405,15 @@ impl ProjectsHandler {
             Ok(request) => request,
             Err(_) => return self.handle_request_unmeasured(body, key),
         };
+        if request.method == store_origin::ADOPT {
+            return match self.adopt_store(request.params, key, received).await {
+                Ok(body) => HandlerOutcome::Response(body),
+                Err(error) => error.into_outcome(),
+            };
+        }
+        if let Err(error) = self.admit_store_method(&request.method) {
+            return error.into_outcome();
+        }
         if cortexkit_role_agent_data::REQUIRED_OPS.contains(&request.method.as_str()) {
             let admission = self.admission_for(key);
             if !matches!(admission.principal, Some(Principal::Reserved { ref module_id }) if module_id == "entorhinal")
@@ -1609,6 +1628,10 @@ impl ProjectsHandler {
             "identity_log.enable" => Err(HandlerError::new(
                 "engram_unavailable",
                 "identity log enabling isn't available in this build yet",
+            )),
+            store_origin::ADOPT => Err(HandlerError::new(
+                "served_path_required",
+                "store adoption requires operator confirmation on the served path",
             )),
             "enumerate" => self.enumerate(request.params),
             "journal_tail" => self.journal_tail(request.params),
@@ -2390,6 +2413,11 @@ fn manifest() -> ModuleManifest {
                     "Enable the shared identity log or join it (operator only).",
                 ),
                 management_operation(
+                    store_origin::ADOPT,
+                    ManagementOperationKind::Mutate,
+                    "Adopt a foreign store after operator confirmation (Direct only).",
+                ),
+                management_operation(
                     member::SET_NAME,
                     ManagementOperationKind::Mutate,
                     "Set this identity-log member's display name (Direct only).",
@@ -2719,14 +2747,21 @@ fn install_store_with_time(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let outcome = outcome.and_then(|opened| {
-        opened
-            .stale_roles()
-            .map_err(|error| format!("staling role cache: {error}"))?;
+        health.origin.check(&opened)?;
+        if !opened.is_foreign() {
+            opened
+                .stale_roles()
+                .map_err(|error| format!("staling role cache: {error}"))?;
+        }
         Ok(opened)
     });
     match outcome {
         Ok(mut opened) => {
-            enable_root_records(&mut opened);
+            if !opened.is_foreign() {
+                enable_root_records(&mut opened);
+            } else if std::env::var(ROOT_RECORDS_ENV).as_deref() == Ok("1") {
+                opened.set_root_records(true);
+            }
             enable::refresh(health, &opened);
             health
                 .generation
@@ -2745,7 +2780,9 @@ fn install_store_with_time(
             health.store_failed.store(false, Ordering::Relaxed);
             *guard = Some(opened);
             if let Some(opened) = guard.as_ref() {
-                catalog_seed::start(opened.clone(), catalog_sql);
+                if !opened.is_foreign() {
+                    catalog_seed::start(opened.clone(), catalog_sql);
+                }
             }
         }
         Err(error) => {
@@ -3177,7 +3214,8 @@ mod tests {
                 assert!(direct.is_ok(), "{method} from direct");
             }
             let executive = authorize_write(method, Some(&reserved(WRITER_MODULE)));
-            if *method == "identity_log.enable"
+            if *method == store_origin::ADOPT
+                || *method == "identity_log.enable"
                 || catalog_ops::WRITES.contains(method)
                 || *method == catalog_publish::PUBLISH
                 || *method == catalog_seed::SEED

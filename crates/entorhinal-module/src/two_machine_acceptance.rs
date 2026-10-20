@@ -4596,3 +4596,62 @@ async fn memory_policy_round_trips_between_two_machines_and_rebuilds() {
     a.clean_rebuild().await;
     b.clean_rebuild().await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn adopt_store_shared_restore_rejoins_with_new_author_and_installs_agents() {
+    let log = FakeLog::default();
+    let a = Machine::new("origin-source", Arc::new(log.with_author([0x11; 16])));
+    let root = a.repo("project", &[("origin", "origin/project")]);
+    a.register("P", &root, Some("W")).await;
+    a.enable_without_agents().await;
+    a.call(
+        "agent.create",
+        json!({"role":"head","name":"Ada","tag":"head","project_id":"P","request_key":"head"}),
+    )
+    .await
+    .unwrap();
+    a.store()
+        .check_store_origin(Some("11111111111111111111111111111111"), 1)
+        .unwrap();
+    let backup = a.dir.join("restore.db");
+    a.conn()
+        .execute("VACUUM INTO ?1", [backup.to_str().unwrap()])
+        .unwrap();
+    let b = Machine::restore(
+        "origin-restored",
+        &backup,
+        Arc::new(log.with_author([0x22; 16])),
+    );
+    let store = b.store();
+    store
+        .check_store_origin(Some("22222222222222222222222222222222"), 2)
+        .unwrap();
+    assert!(store.is_foreign());
+    store
+        .adopt_store("22222222222222222222222222222222", false, 3)
+        .unwrap();
+    assert!(store.enable_registry_is_empty().unwrap());
+    store.rebuild().unwrap();
+    assert!(store.enable_registry_is_empty().unwrap());
+    assert!(store.verify().unwrap().ok);
+    assert!(store
+        .journal_tail(0, 1000)
+        .unwrap()
+        .entries
+        .iter()
+        .all(|e| e.op != "store.adopt"));
+    b.enable().await;
+    assert!(!b.rows("agent").is_empty());
+    assert_eq!(b.shared(), a.shared());
+    b.call("register", json!({"projectId":"B","name":"B","roots":[]}))
+        .await
+        .unwrap();
+    b.call("member.set_name", json!({"display_name":"New Mac"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        b.store().persisted_self_author().unwrap().as_deref(),
+        Some("22222222222222222222222222222222")
+    );
+    b.clean_rebuild().await;
+}

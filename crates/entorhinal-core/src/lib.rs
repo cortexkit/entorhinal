@@ -41,6 +41,7 @@ pub mod remote_apply;
 pub mod role_cache;
 mod root_keys;
 pub mod shared_entry;
+pub mod store_origin;
 mod where_notify;
 pub use binding::*;
 pub use mutations::*;
@@ -207,7 +208,7 @@ CREATE TABLE member_name (
 );
 "#;
 
-const MIGRATIONS: [Migration; 13] = [
+const MIGRATIONS: [Migration; 14] = [
     Migration {
         version: 1,
         statements: V1_SCHEMA,
@@ -260,6 +261,10 @@ const MIGRATIONS: [Migration; 13] = [
         version: 13,
         statements: memory::V13_MEMORY_CONTEXT,
     },
+    Migration {
+        version: 14,
+        statements: store_origin::V14_STORE_ORIGIN,
+    },
 ];
 
 /// A store opened from the descriptor resolved by subc.
@@ -274,6 +279,7 @@ pub struct RegistryStore {
     root_records: bool,
     ids: Arc<binding::IdSource>,
     where_notifications: where_notify::WhereNotifications,
+    foreign: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// The durable local log progress. Reading status never contacts the log or
@@ -392,6 +398,7 @@ impl RegistryStore {
             root_records: false,
             ids: Arc::new(binding::IdSource::Random),
             where_notifications: where_notify::WhereNotifications::default(),
+            foreign: Arc::default(),
         })
     }
 
@@ -708,7 +715,7 @@ impl RegistryStore {
             let mut statement = conn.prepare(&format!(
                 "SELECT seq, op, payload_json, actor, request_key, created_at, principal
                  FROM registry_journal
-                  WHERE seq > ?1 AND op NOT IN ({}, '{}', '{}')
+                  WHERE seq > ?1 AND op NOT IN ({}, '{}', '{}', 'store.adopt')
                  ORDER BY seq
                  LIMIT ?2",
                 agent::change_ops_sql(),
@@ -1485,6 +1492,9 @@ pub(crate) mod scratch_cleanup;
 #[cfg(test)]
 mod tests {
     include!("catalog_tests.rs");
+    mod store_origin_tests {
+        include!("store_origin_tests.rs");
+    }
     use super::*;
     use std::{
         fs,

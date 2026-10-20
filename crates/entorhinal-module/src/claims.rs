@@ -97,7 +97,7 @@ impl Worker {
             let Some(store) = self.store() else {
                 return Ok(RefreshCounts::default());
             };
-            if store.identity_log_status()?.state != "enabled" {
+            if store.is_foreign() || store.identity_log_status()?.state != "enabled" {
                 return Ok(RefreshCounts::default());
             }
             store.live_claim_agents()?
@@ -221,6 +221,9 @@ impl Worker {
 
 impl ProjectsHandler {
     pub(super) fn start_claim_refresh(&self) {
+        if self.health.origin.is_foreign() {
+            return;
+        }
         let mut task = self.claim_refresh_task.lock().unwrap();
         if task.is_some() {
             return;

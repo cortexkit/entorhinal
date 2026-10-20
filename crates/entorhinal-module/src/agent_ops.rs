@@ -1370,7 +1370,8 @@ mod tests {
                             && !crate::SELF_ADMITTED_METHODS.contains(method)
                     })
                 {
-                    let direct_only = *method == "workspace.set_document"
+                    let direct_only = *method == crate::store_origin::ADOPT
+                        || *method == "workspace.set_document"
                         || crate::catalog_ops::WRITES
                             .iter()
                             .chain(std::iter::once(&crate::catalog_publish::PUBLISH))

@@ -267,6 +267,9 @@ impl ProjectsHandler {
     }
 
     pub(super) fn start_role_refresh(&self) {
+        if self.health.origin.is_foreign() {
+            return;
+        }
         let mut task = self.role_refresh_task.lock().unwrap();
         if task.is_some() {
             return;
@@ -292,6 +295,9 @@ impl ProjectsHandler {
                     let Some(cache) = slot.lock().unwrap().clone() else {
                         continue;
                     };
+                    if cache.is_foreign() {
+                        continue;
+                    }
                     match cache.role_subjects() {
                         Ok(roles) => roles,
                         Err(_) => {

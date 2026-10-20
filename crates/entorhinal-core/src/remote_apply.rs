@@ -254,8 +254,10 @@ pub fn validate_agent_extension(
 }
 
 impl RegistryStore {
+    // After adoption from another Mac, inherited journal entries are not writes
+    // committed by this Mac. Rejoining the shared log must apply them again.
     pub fn has_committed_own_entry_at_position(&self) -> Result<bool, RegistryError> {
-        self.read(|conn| conn.query_row("SELECT EXISTS(SELECT 1 FROM registry_journal WHERE origin='here' AND stream='shared' AND entry_id IS NOT NULL AND log_position=(SELECT last_applied_position FROM identity_log_state WHERE id=1))", [], |r| r.get(0)))
+        self.read(|conn| conn.query_row("SELECT EXISTS(SELECT 1 FROM registry_journal WHERE origin='here' AND stream='shared' AND seq > COALESCE((SELECT MAX(seq) FROM registry_journal WHERE op='store.adopt'),0) AND entry_id IS NOT NULL AND log_position=(SELECT last_applied_position FROM identity_log_state WHERE id=1))", [], |r| r.get(0)))
     }
 
     pub fn advance_own_entry(
@@ -264,7 +266,7 @@ impl RegistryStore {
         self_author: Option<&str>,
     ) -> Result<(), RegistryError> {
         self.with_where_changes(|tx| {
-            let committed: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM registry_journal WHERE entry_id=?1 AND origin='here' AND log_position=?2)", params![entry.entry_id, entry.position], |r| r.get(0))?;
+            let committed: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM registry_journal WHERE entry_id=?1 AND origin='here' AND seq > COALESCE((SELECT MAX(seq) FROM registry_journal WHERE op='store.adopt'),0) AND log_position=?2)", params![entry.entry_id, entry.position], |r| r.get(0))?;
             let position: i64 = tx.query_row("SELECT last_applied_position FROM identity_log_state WHERE id=1", [], |r| r.get(0))?;
             if !committed || entry.position != position { return Err(invalid_entry("own entry is not the committed position")); }
             learn_identity(tx, self_author)?;
@@ -596,7 +598,7 @@ fn apply(tx: &Transaction<'_>, entry: &RemoteEntry) -> rusqlite::Result<i64> {
     }
     let own: Option<i64> = tx
         .query_row(
-            "SELECT seq FROM registry_journal WHERE entry_id=?1 AND origin='here'",
+            "SELECT seq FROM registry_journal WHERE entry_id=?1 AND origin='here' AND seq > COALESCE((SELECT MAX(seq) FROM registry_journal WHERE op='store.adopt'),0)",
             [&entry.entry_id],
             |r| r.get(0),
         )
