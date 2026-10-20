@@ -5215,8 +5215,13 @@ mod startup_tests {
                 .cloned()
                 .expect("catalog write failure should be logged with its path")
         };
-        // Unix names reading a directory as a file EISDIR. Windows answers
-        // "Access is denied" instead, so only the path is checked there.
+        // The warning carries the OS error on every platform. Unix names
+        // reading a directory as a file EISDIR; Windows answers "Access is
+        // denied", so the wording is only checked on Unix.
+        assert!(
+            warning.contains("error="),
+            "warning should carry the error: {warning}"
+        );
         #[cfg(unix)]
         assert!(
             warning.contains("Is a directory") || warning.contains("IsADirectory"),
