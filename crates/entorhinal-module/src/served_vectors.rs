@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 use entorhinal_core::{
     claim_cache::{CachedClaim, ClaimObservation},
+    move_store::{AgentMove, MoveSide, MoveStep},
     RegistryStore,
 };
 use rusqlite::{params, Connection};
@@ -550,6 +551,7 @@ const LEGACY_AGENT: &str = "agent_0000000000000104";
 const WHERE_UNCLAIMED: &str = "agent_0000000000000105";
 const WHERE_HERE: &str = "agent_0000000000000106";
 const WHERE_ELSEWHERE: &str = "agent_0000000000000107";
+const WHERE_MOVING: &str = "agent_0000000000000108";
 const SESSION_REF: &str = "0123456789abcdef0123456789abcdef";
 const OPENCODE_REF: &str = "abcdef0123456789abcdef0123456789";
 const SELF_AUTHOR: &str = "1111111111111111";
@@ -1294,6 +1296,146 @@ async fn session_records_match_published_files() {
         "held_elsewhere"
     );
     published_file("agent-sessions-v1", "where-many.json", vec![where_many]);
+}
+
+#[tokio::test]
+async fn moving_agent_where_records_match_published_files() {
+    const CUT_ID: &str = "cut-moving-agent";
+
+    for (side, name) in [
+        (MoveSide::Source, "where-moving-source.json"),
+        (MoveSide::Receiver, "where-moving-receiver.json"),
+    ] {
+        let label = match side {
+            MoveSide::Source => "served-where-moving-source",
+            MoveSide::Receiver => "served-where-moving-receiver",
+        };
+        let fixture = SessionFixture::new(label).await;
+        let source = fixture.snapshot();
+        seed_agent(&source, WHERE_MOVING, "Moving Agent", None, false, false);
+        drop(source);
+
+        let imported = fixture.import().await;
+        let HandlerOutcome::Response(imported) = imported else {
+            panic!(
+                "moving session-vector import refused: {}",
+                refusal(imported)
+            );
+        };
+        assert_eq!(
+            serde_json::from_slice::<Value>(&imported).unwrap()["result"]["agents_imported"],
+            1
+        );
+        fixture.cache_claims();
+        fixture
+            .store()
+            .apply_entry("fixture.sharing_on", "{}", "fixture", None, |tx| {
+                tx.execute(
+                    "UPDATE identity_log_state SET state='enabled' WHERE id=1",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let epoch = if side == MoveSide::Source { 1 } else { 2 };
+        let claim = CachedClaim {
+            holder: Some(SELF_AUTHOR.to_owned()),
+            epoch,
+            cut_id: (side == MoveSide::Receiver).then(|| CUT_ID.to_owned()),
+            version: epoch,
+            read_at_ms: 700,
+            stale: false,
+            integrity_failed: false,
+        };
+        fixture
+            .store()
+            .cache_agent_claims(
+                &[(
+                    WHERE_MOVING.to_owned(),
+                    ClaimObservation::Present {
+                        claim,
+                        self_author: SELF_AUTHOR.to_owned(),
+                    },
+                )],
+                700,
+            )
+            .unwrap();
+
+        let mut row = AgentMove {
+            cut_id: CUT_ID.into(),
+            agent_id: WHERE_MOVING.into(),
+            side,
+            peer: OTHER_AUTHOR.into(),
+            step: if side == MoveSide::Source {
+                MoveStep::Published
+            } else {
+                MoveStep::PickedUp
+            },
+            plan: if side == MoveSide::Source {
+                json!({"_source":{"published_at_ms":650}})
+            } else {
+                json!({"_receiver":{}})
+            },
+            request_body: Some(json!({"agent_id":WHERE_MOVING,"to":"Other Mac"})),
+            record_version: 0,
+            claim_version: Some(epoch),
+            claim_take_body: None,
+            claim_take_version: None,
+            claim_landed_version: None,
+            seal_sent: false,
+            abort_requested: None,
+            hold: None,
+            cut_accept: None,
+            reason: None,
+            detail: None,
+            request_key: None,
+            attempts: 0,
+            activated_at_ms: None,
+            created_at_ms: 600,
+            updated_at_ms: 650,
+        };
+        let store = fixture.store();
+        if side == MoveSide::Source {
+            store.insert_agent_move(&row).unwrap();
+        } else {
+            assert_eq!(store.admit_received_move(&row).unwrap(), row);
+            row.step = MoveStep::Claimed;
+            assert!(store.update_agent_move(&row).unwrap());
+        }
+
+        let (record, answer) = fixture
+            .record(
+                SESSION_READER,
+                READER_MODULE,
+                "agent.where",
+                json!({"agent_id":WHERE_MOVING}),
+            )
+            .await;
+        assert_eq!(answer["result"]["status"], "held_here");
+        assert_eq!(
+            answer["result"]["moving"]["side"],
+            if side == MoveSide::Source {
+                "source"
+            } else {
+                "receiver"
+            }
+        );
+        assert_eq!(
+            answer["result"]["moving"]["step"],
+            if side == MoveSide::Source {
+                "published"
+            } else {
+                "claimed"
+            }
+        );
+        if side == MoveSide::Source {
+            assert_eq!(answer["result"]["moving"]["waiting_ms"], 50);
+        } else {
+            assert!(answer["result"]["moving"]["waiting_ms"].is_null());
+        }
+        published_file("agent-sessions-v1", name, vec![record]);
+    }
 }
 
 #[tokio::test]

@@ -51,6 +51,9 @@ objects deny unknown fields; a field outside the listed schema is an
   an agent never previously read from the claim cache
   (`unclaimed`), `held_here`, `held_elsewhere` with the holder name `Other Mac`,
   and `unknown_agent`.
+- Both moving samples keep top-level `status` at `held_here`; the presence of
+  `moving` for a non-terminal move on this Mac is the signal, and its `side`
+  identifies which end this Mac is.
 - `agent.where_many`: exactly `{agentIds}`, with 1–64 unique valid agent IDs.
   Results preserve request order and omit unknown agents; the sample requests a
   locally held and remotely held agent around an unknown ID.
@@ -73,7 +76,11 @@ objects deny unknown fields; a field outside the listed schema is an
 - **`where-sharing-off.json`**: on a Mac that has never turned sharing on, an
   agent with no claim is a verified `unclaimed` (`known: true`), because no
   other Mac can hold it.
-- **`SHA256SUMS`**: SHA-256 hashes of the six JSON vector files, with names
+- **`where-moving-source.json`**: a locally held agent during the source-side
+  published step, waiting for the receiver to pick up the move.
+- **`where-moving-receiver.json`**: the same locally held agent during the
+  receiver-side claimed step, before activation completes.
+- **`SHA256SUMS`**: SHA-256 hashes of the eight JSON vector files, with names
   relative to this directory.
 
 ## SHA-256 hashes
@@ -85,6 +92,8 @@ objects deny unknown fields; a field outside the listed schema is an
 | `session-for-ref.json` | `f8314b13df331e185f2c4960a314a3e8fac97af5d8e9904150ba024973fbb69a` |
 | `where.json` | `da88d465b4a190dbf14f7224ed8fd4a6cae10a8639fbbc7953b7d8b1f11dce8d` |
 | `where-many.json` | `93cc230f690999df6e7876f0bcabeaf391e5d8c9c7166e16a61d4c9112c153e6` |
+| `where-moving-receiver.json` | `ed04f74915d7f552f2472575a5786beecb2354e42077b29db5200b23e17e2ac0` |
+| `where-moving-source.json` | `3f2dc20b7216d6da8efe89cd9315bab65fbda232faf89191bea27fe84e2da00f` |
 | `where-sharing-off.json` | `0b8fe82664439e2eb38e0816f900c08f7822bdfe29373a77579cfbbd080c6b63` |
 
 ## Reproduce and verify
@@ -102,7 +111,7 @@ python3 - <<'PY'
 import hashlib
 from pathlib import Path
 root = Path('test-vectors/agent-sessions-v1')
-names = ['for-session.json', 'register-session.json', 'session-for-ref.json', 'where.json', 'where-many.json', 'where-sharing-off.json']
+names = ['for-session.json', 'register-session.json', 'session-for-ref.json', 'where.json', 'where-many.json', 'where-moving-receiver.json', 'where-moving-source.json', 'where-sharing-off.json']
 root.joinpath('SHA256SUMS').write_text(''.join(
     f'{hashlib.sha256(root.joinpath(name).read_bytes()).hexdigest()}  {name}\n'
     for name in names), encoding='utf-8')
