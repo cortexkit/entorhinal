@@ -300,6 +300,11 @@ pub fn parse(face: Face, arguments: &[String]) -> Invocation {
             {
                 args.push(argument.clone());
             }
+            "--same-machine"
+                if face == Face::Projects && verb.as_deref() == Some("adopt-store") =>
+            {
+                args.push(argument.clone());
+            }
             "--default" | "--none"
                 if face == Face::Projects && verb.as_deref() == Some("owned-remotes") =>
             {
@@ -388,6 +393,8 @@ usage: ck projects <verb> [args] [--subc <connection file>] [--json]
   unapprove <dir>         withdraw that approval
   trust <dir>             show each root's identity and approval
   verify                  check the store against its journal
+  adopt-store [--same-machine]
+                          adopt a foreign store after Touch ID confirmation
   log status              show local identity log state
   log name <display name> set this member's shared display name
   log enable [--without-agents]
@@ -723,6 +730,23 @@ fn build_at(command: &Command, cwd: &str) -> Result<(String, Value), String> {
                 }
                 .into(),
                 params,
+            )
+        }
+        (Face::Projects, "adopt-store") => {
+            let same_machine = match command
+                .args
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                [] => false,
+                ["--same-machine"] => true,
+                _ => return Err("adopt-store accepts only --same-machine".into()),
+            };
+            (
+                super::store_origin::ADOPT.into(),
+                json!({"same_machine":same_machine}),
             )
         }
         (Face::Projects, "log") => {
@@ -2073,6 +2097,31 @@ mod tests {
             face,
             &args.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
         )
+    }
+
+    #[test]
+    fn adopt_store_cli_accepts_only_its_optional_same_machine_flag() {
+        for (args, same) in [
+            (vec!["adopt-store"], false),
+            (vec!["adopt-store", "--same-machine"], true),
+        ] {
+            let Invocation::Command(command) = parse_as(Face::Projects, &args) else {
+                panic!("adoption command must parse")
+            };
+            assert_eq!(
+                build(&command).unwrap(),
+                ("store.adopt".into(), json!({"same_machine":same}))
+            );
+        }
+        let Invocation::Command(command) = parse_as(Face::Projects, &["adopt-store", "extra"])
+        else {
+            panic!()
+        };
+        assert!(build(&command).is_err());
+        assert!(matches!(
+            parse_as(Face::Agents, &["adopt-store", "--same-machine"]),
+            Invocation::Refuse(_)
+        ));
     }
 
     /// argv[0]'s file stem selects the face; anything unrecognised (including

@@ -165,6 +165,18 @@ impl RegistryStore {
         if !valid_role(role) {
             return Err(refusal("invalid_request"));
         }
+        if self.is_foreign() {
+            return Ok(RoleRead {
+                role: role.into(),
+                known: false,
+                held_here: false,
+                epoch: 0,
+                holder: None,
+                holder_name: None,
+                source: None,
+                stale: true,
+            });
+        }
         let enrolled = self.read(|conn| {
             Ok(conn
                 .query_row("SELECT 1 FROM role_cache WHERE role=?1", [role], |_| Ok(()))

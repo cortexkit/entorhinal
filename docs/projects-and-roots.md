@@ -187,3 +187,27 @@ without writing. A clean store reports `ok: true`. Drift can be repaired with
 the `rebuild` operation, which replays the journal onto the live tables. There
 is no `ck` command for `rebuild`; it is a recovery operation on the module
 surface. See [data-model.md](data-model.md#4-verify-and-rebuild).
+
+## A store restored from another Mac
+
+Entorhinal records the daemon's machine id in its store. If a restored store
+belongs to another Mac, health reports `storeOrigin: "foreign"` and the module
+is degraded. Reads still work, but claims are unknown. Persistent writes are
+refused with `store_from_another_machine`. Background log sync, claims, roles,
+moves and catalog refresh are blocked.
+The session-liveness feed still updates its in-memory mirror.
+
+Run `ck projects adopt-store` and approve the Touch ID prompt to use the store
+here. Local identity, approvals, binding tokens, caches, moves, sessions, consent
+and catalog-local state are cleared. If sharing was off, projects and folder
+paths stay; re-bind and re-approve folders. If sharing was on, the registry is
+reset too: run `ck projects log enable` to rejoin and restore shared identities,
+then `ck projects attach` and re-approve folders. The journal is retained.
+
+After a deliberate `ck machine adopt` on the **same hardware**, use
+`ck projects adopt-store --same-machine` instead. It also requires Touch ID,
+but only records the new machine id: nothing is cleared. Both `adopt-store`
+forms require a foreign store. Older daemons that supply no machine id run
+normally with `storeOrigin: "unchecked"`; entorhinal never invents an id.
+Copying the daemon's machine-id file along with the store cannot be detected
+by this guard.

@@ -424,6 +424,9 @@ impl Worker {
 
 impl ProjectsHandler {
     pub(crate) fn start_move_driver(&self) {
+        if self.health.origin.is_foreign() {
+            return;
+        }
         let mut task = self.move_driver_task.lock().unwrap();
         if task.is_some() {
             return;
@@ -463,6 +466,14 @@ impl ProjectsHandler {
                     signals.handled();
                     if worker.store.upgrade().is_none() {
                         break;
+                    }
+                    if !worker
+                        .store
+                        .upgrade()
+                        .and_then(|slot| slot.lock().unwrap().clone())
+                        .is_some_and(|store| !store.is_foreign())
+                    {
+                        continue;
                     }
                     let _ = poll_inbox(&worker).await;
                     let Ok(rows) = worker.sql(RegistryStore::list_open_agent_moves).await else {

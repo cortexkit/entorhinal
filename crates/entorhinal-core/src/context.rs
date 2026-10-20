@@ -58,7 +58,7 @@ impl RegistryStore {
         id: &str,
         incarnation: &str,
     ) -> Result<Value, RegistryError> {
-        let whereabouts = agent_where_in(conn, id)?;
+        let whereabouts = agent_where_in(conn, id, self.is_foreign())?;
         #[cfg(test)]
         checkpoint();
         let agent = agent::resolve_agent_in(conn, id, self.generation_from_connection(conn)?)?;

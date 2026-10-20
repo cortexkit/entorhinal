@@ -1573,6 +1573,7 @@ mod tests {
             "role.fence",
         ];
         let expected_mutations = [
+            "store.adopt",
             "project.set_domain",
             "workspace.set_document",
             crate::catalog_seed::SEED,

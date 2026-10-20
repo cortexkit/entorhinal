@@ -2893,6 +2893,7 @@ impl ProjectsHandler {
         consent_deadline: Option<Instant>,
     ) -> Result<Vec<u8>, HandlerError> {
         let agent_write = consent.is_some();
+        self.admit_store_method(&request.method)?;
         // Only the served async path can confirm Direct. admit/execute remain
         // unconfirmed, including synchronous tests and non-confirmable methods.
         let admission = self.admission_for(key);

@@ -439,12 +439,13 @@ expect_message = "called `Result::unwrap_err()` on an `Ok` value"
 id = "admission-enable-direct-only"
 guards = "Only an operator's Direct route may enable the identity log"
 file = "crates/entorhinal-module/src/main.rs"
-old = '''if method == "identity_log.enable"
+old = '''if method == store_origin::ADOPT
+        || method == "identity_log.enable"
         || catalog_ops::WRITES.contains(&method)
         || method == catalog_publish::PUBLISH
         || method == catalog_seed::SEED
     {'''
-new = "if false /* NON-VACUITY BREAK */ {"
+new = "if method == store_origin::ADOPT /* NON-VACUITY BREAK */ {"
 test_file = "crates/entorhinal-module/src/main.rs"
 runner = "cargo"
 package = "entorhinal-module"
@@ -5743,12 +5744,13 @@ expect_red = ["tests::catalog_tests::catalog_v10_migration_and_local_rebuild"]
 id = "catalog-direct-admission"
 guards = "Catalog mutations require the Direct operator rather than the executive relay"
 file = "crates/entorhinal-module/src/main.rs"
-old = '''if method == "identity_log.enable"
+old = '''if method == store_origin::ADOPT
+        || method == "identity_log.enable"
         || catalog_ops::WRITES.contains(&method)
         || method == catalog_publish::PUBLISH
         || method == catalog_seed::SEED
     {'''
-new = 'if method == "identity_log.enable" { // NON-VACUITY BREAK'
+new = 'if method == store_origin::ADOPT || method == "identity_log.enable" { // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/catalog_ops_tests.rs"
 runner = "cargo"
 package = "entorhinal-module"
@@ -10457,3 +10459,81 @@ package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
 expect_red = ["agent_reads::tests::manifest_pins_exact_authority_surface_capabilities_and_protocol_dependencies"]
+
+[[control]]
+id = "foreign-store-write-admission"
+guards = "A foreign store refuses every persistent write before decoding or prompting"
+file = "crates/entorhinal-module/src/store_origin.rs"
+old = "if self.health.origin.is_foreign() {"
+new = "if false /* NON-VACUITY BREAK */ && self.health.origin.is_foreign() {"
+test_file = "crates/entorhinal-module/src/store_origin_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["store_origin::tests::foreign_store_refuses_every_write_class_before_decoding_or_confirmation"]
+
+[[control]]
+id = "foreign-store-no-catch-up"
+guards = "A foreign store does not start identity-log catch-up"
+file = "crates/entorhinal-module/src/catch_up.rs"
+old = "if self.health.origin.is_foreign() {"
+new = "if false /* NON-VACUITY BREAK */ && self.health.origin.is_foreign() {"
+test_file = "crates/entorhinal-module/src/store_origin_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["store_origin::tests::foreign_store_starts_no_machine_background_work_and_health_is_lock_free"]
+
+[[control]]
+id = "foreign-store-no-held-here"
+guards = "Foreign whereabouts, batch and watch projections never report held_here"
+file = "crates/entorhinal-core/src/claim_cache.rs"
+old = "let claim = if foreign { None } else { load_claim(conn, id)? };"
+new = "let claim = if false /* NON-VACUITY BREAK */ && foreign { None } else { load_claim(conn, id)? };"
+test_file = "crates/entorhinal-module/src/store_origin_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["store_origin::tests::foreign_store_where_many_watch_and_role_never_hold_here"]
+
+[[control]]
+id = "foreign-store-adopt-clears-author"
+guards = "Full adoption discards the previous Mac's self identity"
+file = "crates/entorhinal-core/src/store_origin.rs"
+old = "    \"self_identity\",\n"
+new = "    // NON-VACUITY BREAK: preserve the old author\n"
+test_file = "crates/entorhinal-core/src/store_origin_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["tests::store_origin_tests::adopt_store_clears_local_state_keeps_shared"]
+
+[[control]]
+id = "foreign-store-adopt-replay-clears-authority"
+guards = "Rebuilding an adopted store cannot resurrect old approvals or bindings"
+file = "crates/entorhinal-core/src/mutations.rs"
+old = "            crate::store_origin::clear_local_projections(\n                tx,\n                request[\"resetShared\"].as_bool().unwrap_or(false),\n            )?;"
+new = "            // NON-VACUITY BREAK: skip the adoption reset during replay"
+test_file = "crates/entorhinal-core/src/store_origin_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["tests::store_origin_tests::adopt_store_rebuild_does_not_resurrect_authority"]
+
+[[control]]
+id = "foreign-store-rejoin-old-author-history"
+guards = "Rejoining applies the old Mac's historical entries instead of treating them as this Mac's committed writes"
+file = "crates/entorhinal-core/src/remote_apply.rs"
+old = "SELECT seq FROM registry_journal WHERE entry_id=?1 AND origin='here' AND seq > COALESCE((SELECT MAX(seq) FROM registry_journal WHERE op='store.adopt'),0)"
+new = "SELECT seq FROM registry_journal WHERE entry_id=?1 AND origin='here' /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::adopt_store_shared_restore_rejoins_with_new_author_and_installs_agents"]

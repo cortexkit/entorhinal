@@ -1398,7 +1398,7 @@ impl RegistryStore {
 // sole list used for snapshots, so verification and repair cover the same tables.
 // Machine-local driver checkpoints and settings (agent_move, move_setting) are
 // deliberately excluded: the identity journal cannot reconstruct them.
-const DERIVED_TABLES: &[&str] = &[
+pub(crate) const DERIVED_TABLES: &[&str] = &[
     "catalog_pin",
     "catalog_pin_set",
     "member_name",
@@ -1478,6 +1478,14 @@ fn delete_and_replay(tx: &Transaction<'_>) -> rusqlite::Result<()> {
         let value: Value = serde_json::from_str(&payload)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         let request = value.get("request").cloned().unwrap_or(value);
+        if op == "store.adopt" {
+            crate::store_origin::clear_local_projections(
+                tx,
+                request["resetShared"].as_bool().unwrap_or(false),
+            )?;
+            enabled = false;
+            continue;
+        }
         if op == "identity_log.enable" {
             enabled = true;
             continue;

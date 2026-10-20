@@ -34,6 +34,9 @@ impl ProjectsHandler {
     }
 
     pub(super) fn start_catch_up(&self) {
+        if self.health.origin.is_foreign() {
+            return;
+        }
         let mut task = self.catch_up_task.lock().unwrap();
         if task.is_none() {
             let worker = self.catch_up_worker();
@@ -119,6 +122,9 @@ impl Worker {
             let store = slot.lock().unwrap().clone();
             drop(slot);
             if let Some(store) = store {
+                if store.is_foreign() {
+                    continue;
+                }
                 // Disabled stores never contact engram. An enabling store has
                 // snapshot parts saved in SQLite with their entry ids and bytes:
                 // retry those appends rather than import the log as if this

@@ -268,6 +268,9 @@ impl ProjectsHandler {
         tool: AgentTool,
         key: RouteKey,
     ) -> Result<(RouteAdmission, AgentRow), HandlerError> {
+        if tool.writes {
+            self.admit_store_write()?;
+        }
         let admission = self.admission_for(key);
         let scope = admission.scope.as_ref().ok_or_else(|| {
             HandlerError::new("caller_forbidden", "an agent scope stamp is required")
