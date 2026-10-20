@@ -553,6 +553,11 @@ async fn adopt_store_uses_real_sdk_confirmation_on_fake_daemon() {
         );
         drop(module);
         crate::tests::stop_store_tasks(&observed).await;
+        // The harness's serve task owns another reference to this handler and
+        // may outlive `drop(module)`, keeping the store's slot (and so its
+        // SQLite files) open. Release the slot explicitly: Windows refuses to
+        // delete a folder whose files are still open.
+        observed.store.lock().unwrap().take();
         drop(observed);
         std::fs::remove_dir_all(dir).unwrap();
     }
