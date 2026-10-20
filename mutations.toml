@@ -10457,3 +10457,16 @@ package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
 expect_red = ["agent_reads::tests::manifest_pins_exact_authority_surface_capabilities_and_protocol_dependencies"]
+
+[[control]]
+id = "engram-startup-catalog-portable-class"
+guards = "A successful startup writes the portable engram backup catalog entry"
+file = "crates/entorhinal-module/src/main.rs"
+old = 'class: "portable",'
+new = 'class: "device-local", // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/main.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["startup_tests::startup_writes_canonical_engram_catalog"]

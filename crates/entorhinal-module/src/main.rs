@@ -26,7 +26,7 @@ use entorhinal_core::{
     AssignWorkspaceRequest, RegisterRequest, RegistryError, RegistryStore, RemoveRequest,
     SeedImportRequest, SetWorkspaceRootRequest, UpgradeImplicitRequest,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use subc_client_rs::{
     BindDecision, HandlerOutcome, HealthReport, HealthStatus, ModuleHandler, RequestCtx,
@@ -2704,6 +2704,17 @@ fn install_store_with_time(
     module_started_at: Instant,
     now: impl Fn() -> Instant,
 ) {
+    let outcome = outcome.inspect(|opened| {
+        let path = opened.store_folder().join("engram-catalog.json");
+        if let Err(error) = write_engram_catalog(&path) {
+            tracing::warn!(
+                target: "store",
+                path = %path.display(),
+                error = %error,
+                "writing engram backup catalog"
+            );
+        }
+    });
     let mut guard = store
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2744,6 +2755,90 @@ fn install_store_with_time(
             *guard = None;
         }
     }
+}
+
+/// Engram's catalog reader validates accepted backup entries, so it owns this schema.
+#[derive(Serialize)]
+struct EngramCatalog {
+    schema_version: u8,
+    module_id: &'static str,
+    entries: Vec<EngramCatalogEntry>,
+}
+
+#[derive(Serialize)]
+struct EngramCatalogEntry {
+    entry_id: &'static str,
+    class: &'static str,
+    mechanism: &'static str,
+    path: &'static str,
+    writer_interaction: &'static str,
+}
+
+fn engram_catalog() -> EngramCatalog {
+    EngramCatalog {
+        schema_version: 1,
+        module_id: "entorhinal",
+        entries: vec![EngramCatalogEntry {
+            entry_id: "entorhinal/store",
+            class: "portable",
+            mechanism: "whole-db",
+            path: "store.db",
+            writer_interaction: "backup-api-live",
+        }],
+    }
+}
+
+fn write_engram_catalog(path: &Path) -> std::io::Result<()> {
+    use std::io::Write;
+
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+    let mut bytes =
+        serde_json::to_vec_pretty(&engram_catalog()).expect("engram catalog serializes");
+    bytes.push(b'\n');
+
+    match std::fs::read(path) {
+        Ok(existing) if existing == bytes => return Ok(()),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let folder = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "engram catalog path has no parent directory",
+        )
+    })?;
+    let (temp, mut file) = loop {
+        let temp = folder.join(format!(
+            ".engram-catalog-{}-{}.tmp",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&temp) {
+            Ok(file) => break (temp, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+
+    let result = (|| {
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temp);
+    }
+    result
 }
 
 /// Environment switch for root records (per-root identity, epoch and approval
@@ -4968,6 +5063,24 @@ mod tests {
 mod startup_tests {
     use super::*;
 
+    const EXPECTED_CATALOG: &str = concat!(
+        "{\n",
+        "  \"schema_version\": 1,\n",
+        "  \"module_id\": \"entorhinal\",\n",
+        "  \"entries\": [\n",
+        "    {\n",
+        "      \"entry_id\": \"entorhinal/store\",\n",
+        "      \"class\": \"",
+        "portable",
+        "\",\n",
+        "      \"mechanism\": \"whole-db\",\n",
+        "      \"path\": \"store.db\",\n",
+        "      \"writer_interaction\": \"backup-api-live\"\n",
+        "    }\n",
+        "  ]\n",
+        "}\n",
+    );
+
     fn ack(storage: Option<Value>) -> ModuleHelloAckBody {
         ModuleHelloAckBody {
             negotiated_ver: 1,
@@ -4990,6 +5103,139 @@ mod startup_tests {
         assert!(descriptor_from_ack(&ack(Some(json!(42))))
             .unwrap_err()
             .starts_with("storage_descriptor_invalid"));
+    }
+
+    #[tokio::test]
+    async fn startup_writes_canonical_engram_catalog() {
+        let (dir, descriptor) = tests::scratch_descriptor("engram-catalog-first-start");
+        let handler = ProjectsHandler::new().unwrap();
+
+        handler.on_hello_ack(&tests::hello_ack(&descriptor)).await;
+
+        let path = dir.join("engram-catalog.json");
+        assert_eq!(std::fs::read(&path).unwrap(), EXPECTED_CATALOG.as_bytes());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        tests::stop_store_tasks(&handler).await;
+        drop(handler);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_keeps_identical_engram_catalog_inode() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (dir, descriptor) = tests::scratch_descriptor("engram-catalog-identical");
+        let first = ProjectsHandler::new().unwrap();
+        first.on_hello_ack(&tests::hello_ack(&descriptor)).await;
+        let path = dir.join("engram-catalog.json");
+        let first_inode = std::fs::metadata(&path).unwrap().ino();
+        tests::stop_store_tasks(&first).await;
+        drop(first);
+
+        let second = ProjectsHandler::new().unwrap();
+        second.on_hello_ack(&tests::hello_ack(&descriptor)).await;
+
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), first_inode);
+        assert_eq!(std::fs::read(&path).unwrap(), EXPECTED_CATALOG.as_bytes());
+        tests::stop_store_tasks(&second).await;
+        drop(second);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_replaces_noncanonical_engram_catalog() {
+        let (dir, descriptor) = tests::scratch_descriptor("engram-catalog-replace");
+        let path = dir.join("engram-catalog.json");
+        std::fs::write(&path, r#"{"schema_version":1,"module_id":"entorhinal"}"#).unwrap();
+        let handler = ProjectsHandler::new().unwrap();
+
+        handler.on_hello_ack(&tests::hello_ack(&descriptor)).await;
+
+        assert_eq!(std::fs::read(&path).unwrap(), EXPECTED_CATALOG.as_bytes());
+        tests::stop_store_tasks(&handler).await;
+        drop(handler);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_catalog_write_warns_and_enumerate_still_serves() {
+        struct Warnings(Arc<Mutex<Vec<String>>>);
+        impl tracing::Subscriber for Warnings {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                struct Fields(String);
+                impl tracing::field::Visit for Fields {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0.push_str(&format!("{}={value:?};", field.name()));
+                    }
+                }
+                if *event.metadata().level() == tracing::Level::WARN {
+                    let mut fields = Fields(String::new());
+                    event.record(&mut fields);
+                    self.0.lock().unwrap().push(fields.0);
+                }
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let (dir, descriptor) = tests::scratch_descriptor("engram-catalog-unwritable");
+        let path = dir.join("engram-catalog.json");
+        std::fs::create_dir(&path).unwrap();
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        let _subscriber = tracing::subscriber::set_default(Warnings(warnings.clone()));
+        let handler = ProjectsHandler::new().unwrap();
+
+        handler.on_hello_ack(&tests::hello_ack(&descriptor)).await;
+
+        let warning = {
+            let warnings = warnings.lock().unwrap();
+            warnings
+                .iter()
+                .find(|warning| warning.contains(&path.to_string_lossy().to_string()))
+                .cloned()
+                .expect("catalog write failure should be logged with its path")
+        };
+        assert!(
+            warning.contains("Is a directory") || warning.contains("IsADirectory"),
+            "warning should name the operating-system error: {warning}"
+        );
+        assert_eq!(handler.health().await.status, HealthStatus::Ok);
+        let response = handler
+            .execute(
+                WireRequest {
+                    method: "enumerate".into(),
+                    params: json!({}),
+                },
+                (0, 0),
+            )
+            .unwrap();
+        let response: Value = serde_json::from_slice(&response).unwrap();
+        assert_eq!(response["result"]["projects"], json!([]));
+
+        tests::stop_store_tasks(&handler).await;
+        drop(handler);
+        drop(_subscriber);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
