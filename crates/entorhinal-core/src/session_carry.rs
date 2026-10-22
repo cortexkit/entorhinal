@@ -63,10 +63,10 @@ impl CarriedBinding {
         (&self.ref_kind, &self.session_ref)
     }
 
-    /// Check what the receiving store needs before it inserts this row: the
-    /// row's own constraints, and a history it can store verbatim. A row that
-    /// passes cannot make the activation transaction fail, so a bad row is
-    /// refused when the stream is imported, before the agent's claim moves.
+    /// Check the row's fields and history against the receiving store's
+    /// constraints, so a malformed row is refused when the stream is
+    /// imported, before the agent's claim moves, rather than failing the
+    /// activation transaction afterwards.
     pub fn check(&self) -> Result<(), String> {
         if self.ref_kind.is_empty() || self.session_ref.is_empty() {
             return Err("binding has an empty ref".into());
@@ -231,10 +231,11 @@ pub(crate) fn install_moved_bindings(
             .get(&(r.ref_kind.as_str(), r.reference.as_str()))
             .copied();
         // A binding this Mac already has keeps its own row and history
-        // untouched. It was opened or moved in here before, and this Mac's
-        // host may have registered or ended it since, so that copy is at
-        // least as current as the source's. This is the same rule as the
-        // `ON CONFLICT DO NOTHING` below that placeholders always used.
+        // untouched; the carried copy is skipped without comparing the two.
+        // That copy was opened or moved in here before, and this Mac's host
+        // may have registered or ended it since, so replacing it could undo
+        // local changes. Placeholders always followed the same rule through
+        // `ON CONFLICT DO NOTHING`.
         let local = tx
             .query_row(
                 "SELECT 1 FROM session_binding WHERE ref_kind=?1 AND ref=?2",

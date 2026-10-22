@@ -607,8 +607,9 @@ struct ProjectsHandler {
     catalog_publish: catalog_publish::Publisher,
     catalog_seeder: catalog_seed::Seeder,
     catalog_move_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Serializes this Mac's session-bindings participant ops, so a request
-    /// left running by a cancelled caller cannot interleave with its retry.
+    /// Serializes this Mac's state-changing session-bindings requests, so a
+    /// request left running by a cancelled caller cannot interleave with its
+    /// retry.
     session_move_lock: Arc<tokio::sync::Mutex<()>>,
     catalog_poll_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     catalog_poll_wake: Arc<tokio::sync::Notify>,

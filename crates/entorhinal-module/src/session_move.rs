@@ -254,8 +254,8 @@ impl SessionMove {
             .unwrap_or_else(|_| Err(unavailable("session bindings request deadline exceeded")))
             .map_err(|mut error| {
                 // A code this op may not answer with would make the driver
-                // treat this Mac's own participant as broken; report it as a
-                // passing failure instead, and the driver retries.
+                // treat this Mac's own participant as broken; answer
+                // `unavailable` instead, which the driver retries.
                 if !cortexkit_role_agent_data::errors::allowed_refusals(op).contains(
                     &cortexkit_role_agent_data::errors::RefusalCode::from_code(&error.code),
                 ) {
@@ -273,8 +273,9 @@ impl SessionMove {
             for r in request.refs.as_slice() {
                 check_ref(r)?;
             }
-            // Session bindings are never in use the way a session is: what a
-            // live session would change is fenced by the move itself.
+            // The bindings are records, not running sessions. Whether each
+            // session is running is checked by the move itself, through
+            // session liveness and the session's own participant.
             return Ok(json!({"refs":request.refs.as_slice().iter()
                 .map(|_| json!({"state":"idle"})).collect::<Vec<_>>()}));
         }
@@ -303,8 +304,9 @@ impl SessionMove {
         if method == "agent_data.status" {
             return Ok(json!({"step":saved.map_or("none".into(), |s| s.step)}));
         }
-        // One request per Mac at a time. A second one, such as a retry
-        // racing a request its caller gave up on, is refused as passing.
+        // One state-changing request per Mac at a time. A second one, such
+        // as a retry racing a request its caller gave up on, is refused
+        // `unavailable`, which the driver retries.
         let _guard = self
             .lock
             .clone()
@@ -405,8 +407,9 @@ impl SessionMove {
             }
             "agent_data.diverged" => {
                 Self::side(row, MoveSide::Receiver)?;
-                // Carried rows never overwrite a binding this Mac already
-                // has, so local data can never be past the cut here.
+                // Always `at_cut`: activation never replaces a binding this
+                // Mac already has, so there is no local copy it could
+                // overwrite.
                 Ok(json!({"refs":[{"state":"at_cut"}]}))
             }
             "agent_data.import" => {

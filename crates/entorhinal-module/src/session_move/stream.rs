@@ -105,8 +105,9 @@ pub(super) fn encode(
     Ok((length, hex(&hash.finalize())))
 }
 
-/// Read one newline-terminated line of at most `cap` bytes, without the
-/// newline. `None` at a clean end of the stream.
+/// Read one newline-terminated line of at most `cap` bytes, the newline
+/// included, and return it without the newline. `None` at a clean end of
+/// the stream.
 fn next_line(reader: &mut impl BufRead, cap: u64) -> Result<Option<Vec<u8>>, HandlerError> {
     let mut line = Vec::new();
     let read = reader.take(cap).read_until(b'\n', &mut line).map_err(io)?;
