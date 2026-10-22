@@ -67,13 +67,24 @@ jobs:
           ckdev-mutate check --strict
 
   native:
-    name: Native (${{ matrix.os }})
+    name: Native (${{ matrix.os }}${{ matrix.shard && format(' {0}/3', matrix.shard) || '' }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        # Windows runs the suite three times slower than macOS, mostly in
+        # per-test filesystem and process costs, so it is split across three
+        # runners by test-name hash; each runs a third of every test binary.
+        include:
+          - os: macos-latest
+            shard: 0
+          - os: windows-latest
+            shard: 1
+          - os: windows-latest
+            shard: 2
+          - os: windows-latest
+            shard: 3
     steps:
       - uses: actions/checkout@v5
 
@@ -114,7 +125,17 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Test
+        if: runner.os != 'Windows'
         run: cargo test --workspace --all-targets --locked --no-fail-fast
+
+      - uses: taiki-e/install-action@nextest
+        if: runner.os == 'Windows'
+
+      # nextest runs each test in its own process, so a test that leans on
+      # state another test left in the same process fails here first.
+      - name: Test (Windows shard)
+        if: runner.os == 'Windows'
+        run: cargo nextest run --workspace --all-targets --locked --no-fail-fast --partition hash:${{ matrix.shard }}/3
 
   mutations:
     name: Mutation proofs (ubuntu, shard ${{ matrix.shard }})

@@ -2111,10 +2111,28 @@ mod tests {
                 }),
             );
         }
+        // Record the delay only from ticks that made a prepare call. A tick
+        // can also finish a bookkeeping step without calling the participant
+        // and return at once; counting that tick as an attempt made this test
+        // fail when it ran alone in a fresh process.
+        let prepares = |f: &Fixture| {
+            f.participants[0]
+                .calls()
+                .iter()
+                .filter(|r| matches!(r, Request::Prepare(_)))
+                .count()
+        };
         let mut delays = vec![];
-        for _ in 0..9 {
+        // Bounded, so a tick that never reaches prepare fails here, not hangs.
+        for _ in 0..30 {
+            if delays.len() == 9 {
+                break;
+            }
+            let before = prepares(&f);
             let delay = source.tick().await.unwrap().unwrap();
-            delays.push(delay.as_secs());
+            if prepares(&f) > before {
+                delays.push(delay.as_secs());
+            }
             tokio::time::advance(backoff(f.row().attempts)).await;
         }
         assert_eq!(delays, vec![1, 2, 4, 8, 16, 30, 30, 30, 0]);
