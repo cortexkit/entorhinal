@@ -2061,6 +2061,7 @@ mod moves {
                 session_id: reference,
                 project_root: "/project",
                 registered_by: "host",
+                runner: None,
                 now_ms: clock(),
             })
         }

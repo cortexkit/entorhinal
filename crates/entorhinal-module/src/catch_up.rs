@@ -70,6 +70,9 @@ impl Drop for ProjectsHandler {
         if let Some(task) = self.claim_refresh_task.get_mut().unwrap().take() {
             task.abort();
         }
+        if let Some(task) = self.session_upkeep_task.get_mut().unwrap().take() {
+            task.abort();
+        }
     }
 }
 

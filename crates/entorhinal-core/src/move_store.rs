@@ -763,6 +763,12 @@ impl RegistryStore {
                     return Ok(Err(crate::session_refusal("ref_bound_elsewhere", "incoming reference has another owner", Some(serde_json::json!({"ref_kind":r.ref_kind,"ref":r.reference})))));
                 }
             }
+            // The move record carries only each reference, so a moved-in row
+            // has no host session, runner or end time here. All three stay
+            // NULL until this Mac's host registers the session, and that
+            // registration records the runner. Retention never prunes a row
+            // whose end time is NULL, so a moved-in reference survives for a
+            // later move back.
             for r in refs {
                 tx.execute("INSERT INTO session_binding(ref_kind,ref,agent_id,harness,session_id,project_root,registered_by,registered_at_ms)
                     VALUES(?1,?2,?3,NULL,NULL,'','move',?4) ON CONFLICT(ref_kind,ref) DO NOTHING",
@@ -1529,6 +1535,7 @@ mod tests {
             session_id: "s",
             project_root: "/project",
             registered_by: "host",
+            runner: None,
             now_ms: 1,
         }
     }
@@ -1544,7 +1551,7 @@ mod tests {
         // Check directly that registering a session for an agent with an open
         // move is refused. Module tests exercise registration of a cut-over agent too.
         f.store.db.with_conn_fenced(|tx| {
-            tx.execute("INSERT INTO session_binding VALUES('session','r','agent-1','host','s','','host',1)", [])?;
+            tx.execute("INSERT INTO session_binding(ref_kind,ref,agent_id,harness,session_id,project_root,registered_by,registered_at_ms) VALUES('session','r','agent-1','host','s','','host',1)", [])?;
             Ok(())
         }).unwrap();
         assert_eq!(
@@ -1700,7 +1707,10 @@ mod tests {
             "schema 8 must define objects to preserve"
         );
         drop(store);
-        let store = RegistryStore::open(&descriptor).unwrap();
+        // Stop at migration 9: later migrations add their own columns and
+        // indexes to session_binding, which this test does not describe.
+        let store =
+            RegistryStore::open_with_migrations(&descriptor, &crate::MIGRATIONS[..9]).unwrap();
         store.db.with_conn_fenced(|conn| {
             assert_eq!(binding_objects(conn)?, before, "migration 9 lost or changed a schema-8 session_binding object");
             let rows = conn.prepare("SELECT ref_kind,ref,agent_id,harness,session_id,project_root,registered_by,registered_at_ms FROM session_binding ORDER BY ref")?

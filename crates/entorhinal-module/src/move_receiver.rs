@@ -3673,6 +3673,7 @@ mod tests {
                 session_id: "new",
                 project_root: "/new",
                 registered_by: "host",
+                runner: None,
                 now_ms: clock(),
             };
             let e = f.store().register_session(&request).unwrap_err();

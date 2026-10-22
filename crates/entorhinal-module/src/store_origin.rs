@@ -78,6 +78,7 @@ impl ProjectsHandler {
         self.start_move_driver();
         self.move_wake.notify_one();
         self.catalog_poll_wake.notify_one();
+        self.start_session_upkeep();
         if let Ok(store) = self.with_store(|s| Ok(s.clone())) {
             catalog_seed::start(store, &self.catalog_sql);
         }

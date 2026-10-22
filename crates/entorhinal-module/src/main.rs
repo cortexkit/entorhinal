@@ -130,6 +130,7 @@ mod permissions;
 mod roles;
 #[cfg(test)]
 mod served_vectors;
+mod session_upkeep;
 mod sessions;
 mod shared_write;
 mod store_origin;
@@ -611,6 +612,12 @@ struct ProjectsHandler {
     role_refresh: Arc<tokio::sync::Notify>,
     role_refresh_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     role_refresh_sql: Arc<move_driver::SqlOperations>,
+    /// The queue of session end stamps from the liveness feed, and the task
+    /// that writes them and prunes long-ended bindings.
+    session_upkeep: Arc<session_upkeep::SessionUpkeep>,
+    session_upkeep_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Counts the upkeep task's blocking jobs that hold a store handle.
+    session_upkeep_sql: Arc<move_driver::SqlOperations>,
     agent_id_draw: fn() -> Result<String, HandlerError>,
     agent_avatar_draw: fn() -> Result<entorhinal_core::agent::StoredAgentAvatar, HandlerError>,
     /// Names the module providing each session capability on first use of a
@@ -705,6 +712,7 @@ const MUTATING_METHODS: &[&str] = &[
     "agent.merge",
     "agent.import",
     "agent.register_session",
+    sessions::END_SESSION,
     "agent.refresh_claims",
     "member.set_name",
     "role.take",
@@ -719,12 +727,14 @@ const MUTATING_METHODS: &[&str] = &[
 /// by its own rule in `admit` instead of by the operator-or-executive gate.
 /// `agent.register_session` is admitted from whichever module the daemon
 /// resolves as the sole provider of a session capability, so a fixed module
-/// name here would refuse a correctly bound provider.
+/// name here would refuse a correctly bound provider. `agent.end_session` is
+/// admitted the same way, from the orchestrator's provider only.
 /// Claim refresh instead has its own Direct-only rule.
 const SELF_ADMITTED_METHODS: &[&str] = &[
     catalog_agent::ACK_ACTIVATION,
     "projects.session_liveness",
     sessions::REGISTER_SESSION,
+    sessions::END_SESSION,
     claims::REFRESH,
     member::SET_NAME,
     roles::TAKE,
@@ -972,6 +982,9 @@ impl ProjectsHandler {
             role_refresh: Arc::new(tokio::sync::Notify::new()),
             role_refresh_task: Mutex::new(None),
             role_refresh_sql: Arc::default(),
+            session_upkeep: Arc::default(),
+            session_upkeep_task: Mutex::new(None),
+            session_upkeep_sql: Arc::default(),
             agent_id_draw: shared_write::draw_agent_id,
             agent_avatar_draw: shared_write::draw_agent_avatar,
             provider_resolver: Arc::new(sessions::SubcProviderResolver::from_args(
@@ -1056,6 +1069,9 @@ impl ProjectsHandler {
         }
         if method == claims::REFRESH {
             self.admit_claim_refresh(key)?;
+        }
+        if method == sessions::END_SESSION {
+            sessions::admit_session_end(providers, admission.principal.as_ref())?;
         }
         let role = if method == sessions::REGISTER_SESSION {
             Some(sessions::admit_session_registration(
@@ -1260,6 +1276,7 @@ impl ModuleHandler for ProjectsHandler {
         self.start_move_driver();
         self.move_wake.notify_one();
         self.move_wake.notify_waiters();
+        self.start_session_upkeep();
     }
 
     async fn health(&self) -> HealthReport {
@@ -1293,7 +1310,7 @@ impl ModuleHandler for ProjectsHandler {
         HealthReport {
             status,
             detail,
-            metrics: Some(self.health.origin.metrics(json!({
+            metrics: Some(self.health.origin.metrics(self.session_upkeep.metrics(json!({
                     "storeReady": ready,
                     "catalogLastSuccessMs": catalog["catalogLastSuccessMs"],
                     "catalogLastError": catalog["catalogLastError"],
@@ -1340,7 +1357,7 @@ impl ModuleHandler for ProjectsHandler {
                     "watchesOpen": self.health.watches_open.load(Ordering::Relaxed),
                     "watchNoticesSent": self.health.watch_notices.load(Ordering::Relaxed),
                     "watchResyncsSent": self.health.watch_resyncs.load(Ordering::Relaxed),
-            }))),
+            })))),
         }
     }
 }
@@ -1371,6 +1388,10 @@ struct LivenessSession {
     last_activity_ms: i64,
     #[serde(default)]
     cause: Option<String>,
+    /// The llm-runner module hosting the session, when the host names one.
+    /// It narrows which binding a `gone` entry may mark ended.
+    #[serde(default)]
+    runner: Option<String>,
     // project_id_hint intentionally ignored for state: the registry re-resolves
     // canonical_root at read time; the hint is a producer fast-path only.
 }
@@ -1672,7 +1693,11 @@ impl ProjectsHandler {
                 Some(role) => self.register_session(request.params, role),
                 None => Err(sessions::orchestrator_unbound(providers)),
             },
+            // Reached only after `admit_with` admitted the orchestrator's
+            // provider, which needs the resolution the served path supplies.
+            sessions::END_SESSION => self.end_session(request.params),
             sessions::FOR_SESSION => self.for_session(request.params),
+            sessions::SESSIONS => self.agent_sessions(request.params),
             sessions::SESSION_FOR_REF => self.session_for_ref(request.params),
             sessions::SESSION_LIVENESS => self.agent_session_liveness(request.params),
             roles::READ => self.role_read(request.params),
@@ -1800,6 +1825,10 @@ impl ProjectsHandler {
         // forever while every later contiguous delta reported clean.
         let snapshot_requested = state.stale;
 
+        // Explicit `gone` reports of applied batches, to be stamped on their
+        // bindings after the mirror lock is released. Absence from a
+        // snapshot, `lapsed` and `unknown` never end a binding.
+        let mut ended = Vec::new();
         if dropped_after.is_none() {
             for session in batch.sessions {
                 let key = SessionKey {
@@ -1807,6 +1836,14 @@ impl ProjectsHandler {
                     session_id: session.session_id,
                 };
                 if session.state == "gone" {
+                    if !key.harness.is_empty() {
+                        ended.push(entorhinal_core::GoneSession {
+                            harness: key.harness.clone(),
+                            session_id: key.session_id.clone(),
+                            runner: session.runner,
+                            ended_at_ms: (self.clock)(),
+                        });
+                    }
                     state.sessions.remove(key.clone());
                     state.gone.insert(key);
                     if state.gone.len() > GONE_SESSIONS_CAP {
@@ -1828,6 +1865,12 @@ impl ProjectsHandler {
         }
         let tracked = state.sessions.len() as u64;
         drop(state);
+        // Queue only: the writer task does the SQL, so a slow or failing
+        // write never delays this batch. A store from another Mac takes no
+        // writes at all.
+        if !self.health.origin.is_foreign() {
+            self.session_upkeep.push(ended);
+        }
 
         if let Some(last) = dropped_after {
             self.health
@@ -2540,7 +2583,7 @@ fn manifest() -> ModuleManifest {
                 management_operation(method, ManagementOperationKind::Mutate, agent_operation_description(method))
             })).chain(sessions::READ_METHODS.iter().map(|method| {
                 management_operation(method, ManagementOperationKind::Query, agent_operation_description(method))
-            })).chain(std::iter::once(sessions::REGISTER_SESSION).map(|method| {
+            })).chain([sessions::REGISTER_SESSION, sessions::END_SESSION].into_iter().map(|method| {
                 management_operation(method, ManagementOperationKind::Mutate, agent_operation_description(method))
             })).chain([
                 (watches::IDENTITY, "Watch process-local fleet identity changes until cancelled or drained."),
@@ -2678,6 +2721,8 @@ fn agent_operation_description(method: &str) -> &'static str {
         "agent.merge" => "Merge one agent into another and retire the source. Accepted only from the executive.",
         "agent.import" => "Import the executive's agent registry once, at cutover. Accepted only from the executive.",
         "agent.register_session" => "Bind an agent's session reference to its host session. Accepted only from the provider of agent-orchestrator/v1 or agent-host/v1.",
+        "agent.end_session" => "Mark a host session's binding ended, idempotently; an unknown session answers found: false. Accepted only from the provider of agent-orchestrator/v1.",
+        "agent.sessions" => "List an agent's session bindings newest first, with runner, end time and liveness, paged by an opaque cursor.",
         "agent.for_session" => "Find the agent and session reference bound to a host session.",
         "agent.session_for_ref" => "Resolve a session reference to its registered agent, host session and project root.",
         "agent.session_liveness" => "Answer active, gone or unknown for up to 256 session references, in request order.",
@@ -3145,6 +3190,7 @@ mod tests {
         handler.stop_claim_refresh().await;
         handler.stop_catalog_poll().await;
         handler.stop_role_refresh().await;
+        handler.stop_session_upkeep().await;
     }
 
     #[tokio::test]
@@ -3182,7 +3228,7 @@ mod tests {
             .iter()
             .chain(agent_ops::MUTATING_METHODS.iter())
             .chain(sessions::READ_METHODS.iter())
-            .chain(std::iter::once(&sessions::REGISTER_SESSION))
+            .chain([&sessions::REGISTER_SESSION, &sessions::END_SESSION])
             .chain([&claims::WHERE, &claims::WHERE_MANY, &claims::REFRESH])
         {
             let description = agent_operation_description(method);
@@ -3263,6 +3309,7 @@ mod tests {
                 "catalog.ack_activation",
                 "projects.session_liveness",
                 "agent.register_session",
+                "agent.end_session",
                 "agent.refresh_claims",
                 "member.set_name",
                 "role.take",

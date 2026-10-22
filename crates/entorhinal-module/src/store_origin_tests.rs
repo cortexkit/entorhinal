@@ -245,6 +245,10 @@ async fn foreign_store_starts_no_machine_background_work_and_health_is_lock_free
     assert!(f.handler.role_refresh_task.lock().unwrap().is_none());
     assert!(f.handler.move_driver_task.lock().unwrap().is_none());
     assert!(f.handler.catalog_poll_task.lock().unwrap().is_none());
+    assert!(
+        f.handler.session_upkeep_task.lock().unwrap().is_none(),
+        "foreign store must not stamp or prune session bindings"
+    );
     assert_eq!(f.log.calls(), 0);
     let held = f.handler.store.lock().unwrap();
     let health = {

@@ -419,6 +419,7 @@ mod tests {
             session_id: "session",
             project_root: "/project",
             registered_by: "host",
+            runner: None,
             now_ms: 10,
         }
     }

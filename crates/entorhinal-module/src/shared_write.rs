@@ -2956,6 +2956,26 @@ impl ProjectsHandler {
                 })?
                 .map_err(|error| HandlerError::new("storage_error", error.to_string()))?;
         }
+        // Ending a session is machine-local like registration and takes the
+        // same path: admission against the orchestrator's provider, then the
+        // SQL on the blocking pool through the store's fenced writer.
+        if request.method == super::sessions::END_SESSION {
+            let providers = self
+                .route_session_providers(&request.method, &admission)
+                .await;
+            self.admit_with(&request.method, key, Some(&providers))?;
+            let store = self.with_store(|s| Ok(s.clone()))?;
+            let now = (self.clock)();
+            let worker = tokio::task::spawn_blocking(move || {
+                sessions::end_session_on_store(&store, request.params, now)
+            });
+            return timeout_at(received + DEADLINE, worker)
+                .await
+                .map_err(|_| {
+                    HandlerError::new("identity_log_contended", "session end deadline expired")
+                })?
+                .map_err(|error| HandlerError::new("storage_error", error.to_string()))?;
+        }
         let store = self.with_store(|s| Ok(s.clone()))?;
         if request.method == super::member::SET_NAME {
             let name = super::member::prepare(&store, request.params.clone())?;

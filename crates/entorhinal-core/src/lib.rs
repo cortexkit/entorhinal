@@ -40,6 +40,7 @@ mod read_connection;
 pub mod remote_apply;
 pub mod role_cache;
 mod root_keys;
+pub mod session_lifecycle;
 pub mod shared_entry;
 pub mod store_origin;
 mod where_notify;
@@ -48,6 +49,9 @@ pub use mutations::*;
 pub use ownership::{ResolveRemoteReply, ResolveRemoteStatus, SetOwnedRemotesRequest};
 pub use root_keys::{
     AttachRootPreview, AttachRootRequest, ResolveRootKeyReply, ResolveRootKeyRequest, RootKey,
+};
+pub use session_lifecycle::{
+    AgentSession, AgentSessionPage, GoneSession, SessionCursor, SessionEnd, SESSION_RETENTION_MS,
 };
 
 // The schema-migration namespace, NOT the module id, and deliberately left as
@@ -208,7 +212,7 @@ CREATE TABLE member_name (
 );
 "#;
 
-const MIGRATIONS: [Migration; 14] = [
+const MIGRATIONS: [Migration; 15] = [
     Migration {
         version: 1,
         statements: V1_SCHEMA,
@@ -264,6 +268,10 @@ const MIGRATIONS: [Migration; 14] = [
     Migration {
         version: 14,
         statements: store_origin::V14_STORE_ORIGIN,
+    },
+    Migration {
+        version: 15,
+        statements: session_lifecycle::V15_SESSION_LIFECYCLE,
     },
 ];
 
@@ -981,6 +989,9 @@ pub struct SessionRegistration<'a> {
     pub project_root: &'a str,
     /// `orchestrator` or `host`.
     pub registered_by: &'a str,
+    /// The llm-runner module hosting the session, when the caller named one.
+    /// Re-registering without one keeps the runner already recorded.
+    pub runner: Option<&'a str>,
     pub now_ms: i64,
 }
 
@@ -1043,7 +1054,9 @@ impl RegistryStore {
     /// another agent) and `session_bound_elsewhere` (the session key already
     /// binds another reference, even one of the same agent).
     /// Registering the same reference again for the same agent moves it to the
-    /// new session key and records the new caller role and time.
+    /// new session key and records the new caller role and time. It also
+    /// clears the binding's end time, and records the runner when one is
+    /// named, keeping the recorded one otherwise.
     pub fn register_session(
         &self,
         request: &SessionRegistration<'_>,
@@ -1131,11 +1144,14 @@ impl RegistryStore {
             }
         }
         tx.execute(
-            "INSERT INTO session_binding(agent_id,ref_kind,ref,harness,session_id,project_root,registered_by,registered_at_ms)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+            // A registration means the session is live, so it clears any end
+            // time an earlier run of the same reference left behind.
+            "INSERT INTO session_binding(agent_id,ref_kind,ref,harness,session_id,project_root,registered_by,registered_at_ms,runner,ended_at_ms)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL)
              ON CONFLICT(ref_kind,ref) DO UPDATE SET harness=excluded.harness,
                  session_id=excluded.session_id, project_root=excluded.project_root,
-                 registered_by=excluded.registered_by, registered_at_ms=excluded.registered_at_ms",
+                 registered_by=excluded.registered_by, registered_at_ms=excluded.registered_at_ms,
+                 runner=COALESCE(excluded.runner, session_binding.runner), ended_at_ms=NULL",
             params![
                 request.agent_id,
                 request.ref_kind,
@@ -1144,7 +1160,8 @@ impl RegistryStore {
                 request.session_id,
                 request.project_root,
                 request.registered_by,
-                request.now_ms
+                request.now_ms,
+                request.runner
             ],
         )?;
         Ok(SessionBinding {
@@ -1603,6 +1620,9 @@ mod tests {
                     "project_root",
                     "registered_by",
                     "registered_at_ms",
+                    // Added by migration 15.
+                    "runner",
+                    "ended_at_ms",
                 ],
             ),
             (

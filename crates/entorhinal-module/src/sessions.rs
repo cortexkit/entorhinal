@@ -1,5 +1,5 @@
-//! Agent sessions: `agent.register_session`, `agent.for_session` and
-//! `agent.session_liveness`.
+//! Agent sessions: `agent.register_session`, `agent.end_session`,
+//! `agent.sessions`, `agent.for_session` and `agent.session_liveness`.
 //!
 //! A session is registered by the module that starts it for an agent. Two
 //! reserved capabilities may do that: `agent-orchestrator/v1`, held by the
@@ -27,11 +27,16 @@ use subc_protocol::Principal;
 use super::{encode_result, HandlerError, ProjectsHandler, SessionKey};
 
 pub(super) const REGISTER_SESSION: &str = "agent.register_session";
+/// Marks a session's binding ended. Only the orchestrator's provider may.
+pub(super) const END_SESSION: &str = "agent.end_session";
 pub(super) const FOR_SESSION: &str = "agent.for_session";
 pub(super) const SESSION_FOR_REF: &str = "agent.session_for_ref";
 pub(super) const SESSION_LIVENESS: &str = "agent.session_liveness";
+/// Lists one agent's session bindings, newest first.
+pub(super) const SESSIONS: &str = "agent.sessions";
 /// The session reads, open to every caller like the other reads.
-pub(super) const READ_METHODS: &[&str] = &[FOR_SESSION, SESSION_FOR_REF, SESSION_LIVENESS];
+pub(super) const READ_METHODS: &[&str] =
+    &[FOR_SESSION, SESSION_FOR_REF, SESSION_LIVENESS, SESSIONS];
 
 /// The module that owns an agent's work and registers the sessions it starts.
 pub(super) const ORCHESTRATOR_CAPABILITY: &str = "agent-orchestrator/v1";
@@ -49,6 +54,10 @@ const HARNESS_MAX: usize = 32;
 const SESSION_ID_MAX: usize = 256;
 const PROJECT_ROOT_MAX: usize = 4096;
 const LIVENESS_REFS_MAX: usize = 256;
+/// A runner is a module id, bounded like the other module ids callers send.
+const RUNNER_MAX: usize = 64;
+const SESSIONS_LIMIT_DEFAULT: usize = 100;
+const SESSIONS_LIMIT_MAX: usize = 500;
 
 /// What the daemon answered when asked which module provides a capability.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -259,6 +268,44 @@ pub(super) fn admit_session_registration(
     ))
 }
 
+/// Admit `agent.end_session`: only the sole provider of
+/// `agent-orchestrator/v1`, matched against the route's daemon-stamped
+/// principal. The host provider registers sessions but does not end them; its
+/// clean ends arrive through the liveness feed instead. Without a resolved
+/// sole orchestrator, refuse `orchestrator_unbound`; any other caller gets
+/// `caller_forbidden`.
+pub(super) fn admit_session_end(
+    providers: Option<&ResolvedProviders>,
+    principal: Option<&Principal>,
+) -> Result<(), HandlerError> {
+    let Some(orchestrator) = providers.and_then(|providers| providers.orchestrator.sole()) else {
+        return Err(HandlerError {
+            code: "orchestrator_unbound".into(),
+            message: match providers {
+                Some(_) => format!(
+                    "no module is the sole provider of {ORCHESTRATOR_CAPABILITY}, so no one may end sessions"
+                ),
+                None => format!(
+                    "'{END_SESSION}' resolves its provider only on the served request path; this request had none"
+                ),
+            },
+            detail: providers.map(|providers| {
+                json!({ORCHESTRATOR_CAPABILITY: providers.orchestrator.outcome()})
+            }),
+        });
+    };
+    if matches!(principal, Some(Principal::Reserved { module_id }) if module_id == orchestrator) {
+        return Ok(());
+    }
+    Err(HandlerError::new(
+        "caller_forbidden",
+        format!(
+            "'{END_SESSION}' is accepted only from the provider of {ORCHESTRATOR_CAPABILITY}; this route was opened by {}",
+            super::principal_label(principal)
+        ),
+    ))
+}
+
 /// Only the sole host claimant may feed liveness. Missing or failed resolution
 /// takes precedence over caller admission, including on the synchronous seam.
 pub(super) fn admit_liveness_feed(
@@ -295,6 +342,25 @@ struct RegisterSessionRequest {
     harness: String,
     session_id: String,
     project_root: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EndSessionRequest {
+    harness: String,
+    session: String,
+    #[serde(default)]
+    runner: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentSessionsRequest {
+    agent_id: String,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    limit: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -369,6 +435,66 @@ fn session_key_bounds(harness: &str, session_id: &str) -> Result<(), HandlerErro
 fn ref_bounds(ref_kind: &str, session_ref: &str) -> Result<(), HandlerError> {
     bounded("ref_kind", ref_kind, REF_KIND_MAX)?;
     bounded("ref", session_ref, REF_MAX)
+}
+
+/// A runner names a module, so beyond its length bound it may hold no
+/// control character.
+fn runner_bounds(runner: &str) -> Result<(), HandlerError> {
+    bounded("runner", runner, RUNNER_MAX)?;
+    if runner.chars().any(char::is_control) {
+        return Err(HandlerError::new(
+            "invalid_request",
+            "runner must not contain control characters",
+        ));
+    }
+    Ok(())
+}
+
+/// Take the optional `runner` out of a registration before the strict decode
+/// of the rest. Registration's field set and its `unknown field` refusal are a
+/// published contract that callers decode byte for byte, and listing `runner`
+/// among the expected fields would change that refusal's text.
+fn take_runner(params: &mut Value) -> Result<Option<String>, HandlerError> {
+    let Some(object) = params.as_object_mut() else {
+        return Ok(None);
+    };
+    match object.remove("runner") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(runner)) => Ok(Some(runner)),
+        Some(_) => Err(HandlerError::new(
+            "invalid_request",
+            "runner must be a string or null",
+        )),
+    }
+}
+
+/// The opaque `agent.sessions` cursor: base64url of the last listed row's
+/// `[registered_at_ms, ref_kind, ref]`.
+fn encode_cursor(cursor: &entorhinal_core::SessionCursor) -> String {
+    use base64::Engine;
+    let bytes = serde_json::to_vec(&json!([
+        cursor.registered_at_ms,
+        cursor.ref_kind,
+        cursor.session_ref
+    ]))
+    .expect("a cursor encodes");
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn decode_cursor(cursor: &str) -> Result<entorhinal_core::SessionCursor, HandlerError> {
+    use base64::Engine;
+    let refused =
+        || HandlerError::new("invalid_request", "cursor was not issued by agent.sessions");
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor)
+        .map_err(|_| refused())?;
+    let (registered_at_ms, ref_kind, session_ref): (i64, String, String) =
+        serde_json::from_slice(&bytes).map_err(|_| refused())?;
+    Ok(entorhinal_core::SessionCursor {
+        registered_at_ms,
+        ref_kind,
+        session_ref,
+    })
 }
 
 impl super::LivenessState {
@@ -503,6 +629,11 @@ impl ProjectsHandler {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let registration = method == REGISTER_SESSION;
+        // Ending a session needs only the orchestrator's provider; the feed
+        // needs only the host's; registration needs both.
+        let ending = method == END_SESSION;
+        let wants_host = !ending;
+        let wants_orchestrator = registration || ending;
         let mut providers = ResolvedProviders {
             host: cached
                 .host
@@ -518,17 +649,19 @@ impl ProjectsHandler {
         }
         self.resolve_needed_providers(
             &mut providers,
-            cached.host.is_none(),
-            registration && cached.orchestrator.is_none(),
+            wants_host && cached.host.is_none(),
+            wants_orchestrator && cached.orchestrator.is_none(),
         )
         .await;
         let transport_failed = |providers: &ResolvedProviders| {
-            matches!(providers.host, ProviderResolution::Transport(_))
-                || (registration
+            (wants_host && matches!(providers.host, ProviderResolution::Transport(_)))
+                || (wants_orchestrator
                     && matches!(providers.orchestrator, ProviderResolution::Transport(_)))
         };
         let would_refuse = if registration {
             admit_session_registration(Some(&providers), admission.principal.as_ref()).is_err()
+        } else if ending {
+            admit_session_end(Some(&providers), admission.principal.as_ref()).is_err()
         } else {
             admit_liveness_feed(Some(&providers), admission.principal.as_ref()).is_err()
         };
@@ -537,8 +670,8 @@ impl ProjectsHandler {
             // cached answers get the one refresh before the final decision.
             self.resolve_needed_providers(
                 &mut providers,
-                cached.host.is_some(),
-                registration && cached.orchestrator.is_some(),
+                wants_host && cached.host.is_some(),
+                wants_orchestrator && cached.orchestrator.is_some(),
             )
             .await;
         }
@@ -553,8 +686,10 @@ impl ProjectsHandler {
             cache.host = None;
             cache.orchestrator = None;
         } else {
-            cache.host = Some(providers.host.clone());
-            if registration {
+            if wants_host {
+                cache.host = Some(providers.host.clone());
+            }
+            if wants_orchestrator {
                 cache.orchestrator = Some(providers.orchestrator.clone());
             }
         }
@@ -580,10 +715,15 @@ pub(super) fn register_session_on_store(
     role: SessionRole,
     now: i64,
 ) -> Result<Vec<u8>, HandlerError> {
+    let mut params = params;
+    let runner = take_runner(&mut params)?;
     let request: RegisterSessionRequest = decode(params)?;
     ref_bounds(&request.ref_kind, &request.session_ref)?;
     session_key_bounds(&request.harness, &request.session_id)?;
     bounded("project_root", &request.project_root, PROJECT_ROOT_MAX)?;
+    if let Some(runner) = &runner {
+        runner_bounds(runner)?;
+    }
     let binding = store
         .register_session(&SessionRegistration {
             agent_id: &request.agent_id,
@@ -593,10 +733,53 @@ pub(super) fn register_session_on_store(
             session_id: &request.session_id,
             project_root: &request.project_root,
             registered_by: role.as_str(),
+            runner: runner.as_deref(),
             now_ms: now,
         })
         .map_err(HandlerError::from)?;
+    // The reply is the binding as before; the runner is not echoed, so the
+    // reply bytes callers decode strictly are the same with or without it.
     encode_result(binding)
+}
+
+impl ProjectsHandler {
+    /// The synchronous seam. Admission has already passed, which only the
+    /// served path can do, so this runs only from that path's tests.
+    pub(super) fn end_session(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
+        let store = self.with_store(|s| Ok(s.clone()))?;
+        end_session_on_store(&store, params, (self.clock)())
+    }
+}
+
+/// End the binding of `{harness, session}` at `now`, the handler's clock. An
+/// unknown session answers `{found: false}` rather than refusing, so a caller
+/// can end sessions it never registered here without checking first.
+pub(super) fn end_session_on_store(
+    store: &RegistryStore,
+    params: Value,
+    now: i64,
+) -> Result<Vec<u8>, HandlerError> {
+    let request: EndSessionRequest = decode(params)?;
+    bounded("harness", &request.harness, HARNESS_MAX)?;
+    bounded("session", &request.session, SESSION_ID_MAX)?;
+    if let Some(runner) = &request.runner {
+        runner_bounds(runner)?;
+    }
+    let ended = store
+        .end_session(
+            &request.harness,
+            &request.session,
+            request.runner.as_deref(),
+            now,
+        )
+        .map_err(HandlerError::from)?;
+    encode_result(match ended {
+        entorhinal_core::SessionEnd::NotFound => json!({"found": false}),
+        entorhinal_core::SessionEnd::Ended { ended_at_ms }
+        | entorhinal_core::SessionEnd::AlreadyEnded { ended_at_ms } => {
+            json!({"found": true, "ended_at_ms": ended_at_ms})
+        }
+    })
 }
 
 impl ProjectsHandler {
@@ -640,6 +823,66 @@ impl ProjectsHandler {
             "harness": binding.harness,
             "session_id": binding.session_id,
             "project_root": binding.project_root,
+        }))
+    }
+
+    /// One page of an agent's sessions with each one's liveness. Liveness
+    /// comes from the in-memory mirror exactly as `agent.session_liveness`
+    /// answers it; a session the mirror cannot vouch for whose binding has an
+    /// end time reads `gone`. A reference moved in from another Mac, with no
+    /// host session here yet, reads `unknown` until it ends.
+    pub(super) fn agent_sessions(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
+        let request: AgentSessionsRequest = decode(params)?;
+        let limit = match request.limit {
+            None => SESSIONS_LIMIT_DEFAULT,
+            Some(limit) if (1..=SESSIONS_LIMIT_MAX as u64).contains(&limit) => limit as usize,
+            Some(_) => {
+                return Err(HandlerError::new(
+                    "invalid_request",
+                    format!("limit must be 1 to {SESSIONS_LIMIT_MAX}"),
+                ))
+            }
+        };
+        let cursor = request.cursor.as_deref().map(decode_cursor).transpose()?;
+        let page = self.with_agent_store(|store| {
+            store.agent_sessions(&request.agent_id, cursor.as_ref(), limit)
+        })?;
+        let state = self
+            .liveness
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let sessions: Vec<Value> = page
+            .sessions
+            .into_iter()
+            .map(|row| {
+                let mirrored = match (&row.harness, &row.session) {
+                    (Some(harness), Some(session)) => {
+                        state.answer(&SessionKey::new(harness, session)).state
+                    }
+                    _ => "unknown",
+                };
+                let liveness = if mirrored == "unknown" && row.ended_at_ms.is_some() {
+                    "gone"
+                } else {
+                    mirrored
+                };
+                json!({
+                    "runner": row.runner,
+                    "session": row.session,
+                    "harness": row.harness,
+                    "ref_kind": row.ref_kind,
+                    "ref": row.session_ref,
+                    "project_root": row.project_root,
+                    "registered_at_ms": row.registered_at_ms,
+                    "ended_at_ms": row.ended_at_ms,
+                    "liveness": liveness,
+                })
+            })
+            .collect();
+        drop(state);
+        self.encode_read_result(json!({
+            "sessions": sessions,
+            "next_cursor": page.next.as_ref().map(encode_cursor),
         }))
     }
 
@@ -737,7 +980,7 @@ impl ProviderResolver for FakeResolver {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::path::PathBuf;
 
     use cortexkit_store_types::StorageDescriptor;
@@ -750,24 +993,29 @@ mod tests {
         RouteAdmission, RouteKey, WRITER_MODULE,
     };
 
-    const NOW: i64 = 700;
-    const EXECUTIVE: RouteKey = (50, 1);
-    const CALLER: RouteKey = (51, 1);
+    pub(crate) const NOW: i64 = 700;
+    pub(crate) const EXECUTIVE: RouteKey = (50, 1);
+    pub(crate) const CALLER: RouteKey = (51, 1);
     const UNKNOWN_AGENT: &str = "agent_0000000000000000";
 
-    struct Fixture {
+    pub(crate) struct Fixture {
         dir: PathBuf,
-        handler: ProjectsHandler,
-        resolver: Arc<FakeResolver>,
+        pub(crate) handler: ProjectsHandler,
+        pub(crate) resolver: Arc<FakeResolver>,
     }
 
     impl Fixture {
         /// A store, with the agent-identity cutover recorded when `cut_over`,
         /// and a resolver naming no provider for either capability.
-        fn new(label: &str, cut_over: bool) -> Self {
+        pub(crate) fn new(label: &str, cut_over: bool) -> Self {
+            Self::with_clock(label, cut_over, || NOW)
+        }
+
+        /// The same fixture with the handler reading `clock` for the time.
+        pub(crate) fn with_clock(label: &str, cut_over: bool, clock: fn() -> i64) -> Self {
             let (dir, descriptor) = scratch_descriptor(label);
             let resolver = FakeResolver::new();
-            let mut handler = ProjectsHandler::with_runtime("0123456789abcdef".into(), || NOW);
+            let mut handler = ProjectsHandler::with_runtime("0123456789abcdef".into(), clock);
             handler.provider_resolver = resolver.clone() as Arc<dyn ProviderResolver>;
             *handler.store.lock().unwrap() = Some(RegistryStore::open(&descriptor).unwrap());
             handler.route_admissions().insert(
@@ -808,7 +1056,7 @@ mod tests {
             );
         }
 
-        fn create(&self, name: &str) -> String {
+        pub(crate) fn create(&self, name: &str) -> String {
             self.sync_ok(
                 EXECUTIVE,
                 "agent.create",
@@ -819,7 +1067,7 @@ mod tests {
                 .into()
         }
 
-        fn bind(&self, route: RouteKey, principal: Option<Principal>, flow: bool) {
+        pub(crate) fn bind(&self, route: RouteKey, principal: Option<Principal>, flow: bool) {
             self.handler.route_admissions().insert(
                 route,
                 RouteAdmission::from_bind(
@@ -829,26 +1077,31 @@ mod tests {
             );
         }
 
-        fn providers(&self, orchestrator: ProviderResolution, host: ProviderResolution) {
+        pub(crate) fn providers(&self, orchestrator: ProviderResolution, host: ProviderResolution) {
             self.resolver.set(ORCHESTRATOR_CAPABILITY, orchestrator);
             self.resolver.set(HOST_CAPABILITY, host);
         }
 
-        fn sync(&self, route: RouteKey, method: &str, params: Value) -> HandlerOutcome {
+        pub(crate) fn sync(&self, route: RouteKey, method: &str, params: Value) -> HandlerOutcome {
             self.handler.handle_request(&body(method, params), route)
         }
 
-        fn sync_ok(&self, route: RouteKey, method: &str, params: Value) -> Value {
+        pub(crate) fn sync_ok(&self, route: RouteKey, method: &str, params: Value) -> Value {
             result(self.sync(route, method, params))
         }
 
-        async fn served(&self, route: RouteKey, method: &str, params: Value) -> HandlerOutcome {
+        pub(crate) async fn served(
+            &self,
+            route: RouteKey,
+            method: &str,
+            params: Value,
+        ) -> HandlerOutcome {
             self.handler
                 .handle_served_request(&body(method, params), route)
                 .await
         }
 
-        async fn register(&self, route: RouteKey, params: Value) -> HandlerOutcome {
+        pub(crate) async fn register(&self, route: RouteKey, params: Value) -> HandlerOutcome {
             self.served(route, REGISTER_SESSION, params).await
         }
 
@@ -872,7 +1125,7 @@ mod tests {
                 .count()
         }
 
-        async fn feed(&self, batch: Value) -> Value {
+        pub(crate) async fn feed(&self, batch: Value) -> Value {
             result(
                 self.served(EXECUTIVE, "projects.session_liveness", batch)
                     .await,
@@ -894,11 +1147,11 @@ mod tests {
         }
     }
 
-    fn body(method: &str, params: Value) -> Vec<u8> {
+    pub(crate) fn body(method: &str, params: Value) -> Vec<u8> {
         serde_json::to_vec(&json!({"method":method,"params":params})).unwrap()
     }
 
-    fn result(outcome: HandlerOutcome) -> Value {
+    pub(crate) fn result(outcome: HandlerOutcome) -> Value {
         match outcome {
             HandlerOutcome::Response(body) => {
                 serde_json::from_slice::<Value>(&body).unwrap()["result"].clone()
@@ -907,7 +1160,7 @@ mod tests {
         }
     }
 
-    fn refusal(outcome: HandlerOutcome) -> (String, Option<Value>) {
+    pub(crate) fn refusal(outcome: HandlerOutcome) -> (String, Option<Value>) {
         match outcome {
             HandlerOutcome::Error { code, .. } => (code, None),
             HandlerOutcome::ErrorWithDetail { code, detail, .. } => (code, Some(detail)),
@@ -915,11 +1168,11 @@ mod tests {
         }
     }
 
-    fn code(outcome: HandlerOutcome) -> String {
+    pub(crate) fn code(outcome: HandlerOutcome) -> String {
         refusal(outcome).0
     }
 
-    fn provider(module_id: &str) -> ProviderResolution {
+    pub(crate) fn provider(module_id: &str) -> ProviderResolution {
         ProviderResolution::Provider(module_id.into())
     }
 
@@ -940,7 +1193,12 @@ mod tests {
         })
     }
 
-    fn registration(agent_id: &str, session_ref: &str, harness: &str, session_id: &str) -> Value {
+    pub(crate) fn registration(
+        agent_id: &str,
+        session_ref: &str,
+        harness: &str,
+        session_id: &str,
+    ) -> Value {
         registration_with_root(agent_id, session_ref, harness, session_id, "/project")
     }
 

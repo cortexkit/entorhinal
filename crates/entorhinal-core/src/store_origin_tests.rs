@@ -73,7 +73,7 @@ fn seed_local(store: &RegistryStore) {
         INSERT INTO role_take_request VALUES('req','leader',0,NULL,0,X'00',1,1);
         INSERT INTO agent_move(cut_id,agent_id,side,peer,step,plan,record_version,seal_sent,attempts,created_at_ms,updated_at_ms) VALUES('cut','agent','source','peer','preparing','{}',1,0,1,1,1);
         UPDATE move_setting SET lid_close_moves=1;
-        INSERT INTO session_binding VALUES('session','ref','agent','harness','session','/repo','host',1);
+        INSERT INTO session_binding VALUES('session','ref','agent','harness','session','/repo','host',1,'broca',NULL);
         INSERT INTO pending_entry VALUES('pending',1);
         INSERT INTO consent_grant VALUES('grant','agent','hire','P',1,'card',NULL);
         INSERT INTO consent_request VALUES('agent','tool','key','digest','scope',1,1,'card','{}','awaiting',NULL);

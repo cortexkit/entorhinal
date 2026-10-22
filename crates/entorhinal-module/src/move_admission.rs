@@ -688,6 +688,7 @@ mod tests {
                     session_id: reference,
                     project_root: "/project",
                     registered_by: "host",
+                    runner: None,
                     now_ms: 700,
                 })
         }
@@ -967,7 +968,7 @@ mod tests {
         f.store()
             .apply_entry("fixture", "{}", "fixture", None, |tx| {
                 tx.execute(
-                    "INSERT INTO session_binding VALUES ('uncovered','r',?1,NULL,NULL,'','move',1)",
+                    "INSERT INTO session_binding(ref_kind,ref,agent_id,harness,session_id,project_root,registered_by,registered_at_ms) VALUES ('uncovered','r',?1,NULL,NULL,'','move',1)",
                     [&id],
                 )?;
                 Ok(())
@@ -1020,7 +1021,7 @@ mod tests {
             let f = Fixture::new(2).await;
             let id = f.create().await;
             if check == 8 {
-                f.store().apply_entry("fixture","{}","fixture",None,|tx| {tx.execute("INSERT INTO session_binding VALUES ('session','r',?1,NULL,NULL,'','move',1)",[&id])?;Ok(())}).unwrap();
+                f.store().apply_entry("fixture","{}","fixture",None,|tx| {tx.execute("INSERT INTO session_binding(ref_kind,ref,agent_id,harness,session_id,project_root,registered_by,registered_at_ms) VALUES ('session','r',?1,NULL,NULL,'','move',1)",[&id])?;Ok(())}).unwrap();
             }
             let store = f.store();
             let record = f.records.record.clone();
