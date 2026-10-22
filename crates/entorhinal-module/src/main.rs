@@ -713,6 +713,7 @@ const MUTATING_METHODS: &[&str] = &[
     "agent.import",
     "agent.register_session",
     sessions::END_SESSION,
+    sessions::SET_SESSION_NETWORK,
     "agent.refresh_claims",
     "member.set_name",
     "role.take",
@@ -727,14 +728,16 @@ const MUTATING_METHODS: &[&str] = &[
 /// by its own rule in `admit` instead of by the operator-or-executive gate.
 /// `agent.register_session` is admitted from whichever module the daemon
 /// resolves as the sole provider of a session capability, so a fixed module
-/// name here would refuse a correctly bound provider. `agent.end_session` is
-/// admitted the same way, from the orchestrator's provider only.
+/// name here would refuse a correctly bound provider. `agent.end_session` and
+/// `agent.set_session_network` are admitted the same way, from the
+/// orchestrator's provider only.
 /// Claim refresh instead has its own Direct-only rule.
 const SELF_ADMITTED_METHODS: &[&str] = &[
     catalog_agent::ACK_ACTIVATION,
     "projects.session_liveness",
     sessions::REGISTER_SESSION,
     sessions::END_SESSION,
+    sessions::SET_SESSION_NETWORK,
     claims::REFRESH,
     member::SET_NAME,
     roles::TAKE,
@@ -1070,8 +1073,8 @@ impl ProjectsHandler {
         if method == claims::REFRESH {
             self.admit_claim_refresh(key)?;
         }
-        if method == sessions::END_SESSION {
-            sessions::admit_session_end(providers, admission.principal.as_ref())?;
+        if method == sessions::END_SESSION || method == sessions::SET_SESSION_NETWORK {
+            sessions::admit_orchestrator_write(method, providers, admission.principal.as_ref())?;
         }
         let role = if method == sessions::REGISTER_SESSION {
             Some(sessions::admit_session_registration(
@@ -1703,6 +1706,7 @@ impl ProjectsHandler {
             // Reached only after `admit_with` admitted the orchestrator's
             // provider, which needs the resolution the served path supplies.
             sessions::END_SESSION => self.end_session(request.params),
+            sessions::SET_SESSION_NETWORK => self.set_session_network(request.params),
             sessions::FOR_SESSION => self.for_session(request.params),
             sessions::SESSIONS => self.agent_sessions(request.params),
             sessions::SESSION_FOR_RUNNER => self.session_for_runner(request.params),
@@ -2591,7 +2595,7 @@ fn manifest() -> ModuleManifest {
                 management_operation(method, ManagementOperationKind::Mutate, agent_operation_description(method))
             })).chain(sessions::READ_METHODS.iter().map(|method| {
                 management_operation(method, ManagementOperationKind::Query, agent_operation_description(method))
-            })).chain([sessions::REGISTER_SESSION, sessions::END_SESSION].into_iter().map(|method| {
+            })).chain([sessions::REGISTER_SESSION, sessions::END_SESSION, sessions::SET_SESSION_NETWORK].into_iter().map(|method| {
                 management_operation(method, ManagementOperationKind::Mutate, agent_operation_description(method))
             })).chain([
                 (watches::IDENTITY, "Watch process-local fleet identity changes until cancelled or drained."),
@@ -2728,10 +2732,11 @@ fn agent_operation_description(method: &str) -> &'static str {
         "agent.dispose" => "Retire an agent; its id stays reserved. Executive or Direct with operator confirmation.",
         "agent.merge" => "Merge one agent into another and retire the source. Accepted only from the executive.",
         "agent.import" => "Import the executive's agent registry once, at cutover. Accepted only from the executive.",
-        "agent.register_session" => "Bind an agent's session reference to its host session. Accepted only from the provider of agent-orchestrator/v1 or agent-host/v1.",
+        "agent.register_session" => "Bind an agent's session reference to its host session, optionally recording whether its agent can reach the network (yes, no or unknown). Accepted only from the provider of agent-orchestrator/v1 or agent-host/v1.",
+        "agent.set_session_network" => "Record whether a host session's agent can reach the network (yes, no or unknown), stamped at commit; the current value again writes nothing. Accepted only from the provider of agent-orchestrator/v1.",
         "agent.end_session" => "Mark a host session's binding ended, idempotently; an unknown session answers found: false. Accepted only from the provider of agent-orchestrator/v1.",
-        "agent.sessions" => "List an agent's session bindings newest first, with runner, end time and liveness, paged by an opaque cursor.",
-        "agent.session_for_runner" => "Resolve a runner and session id to its agent binding, harness and project root. Sessions registered without a runner are not found; look those up with agent.for_session.",
+        "agent.sessions" => "List an agent's session bindings newest first, with runner, end time, liveness and current network access, paged by an opaque cursor.",
+        "agent.session_for_runner" => "Resolve a runner and session id to its agent binding, harness, project root and network access history. Sessions registered without a runner are not found; look those up with agent.for_session.",
         "agent.for_session" => "Find the agent and session reference bound to a host session.",
         "agent.session_for_ref" => "Resolve a session reference to its registered agent, host session and project root.",
         "agent.session_liveness" => "Answer active, gone or unknown for up to 256 session references, in request order.",
@@ -3237,7 +3242,11 @@ mod tests {
             .iter()
             .chain(agent_ops::MUTATING_METHODS.iter())
             .chain(sessions::READ_METHODS.iter())
-            .chain([&sessions::REGISTER_SESSION, &sessions::END_SESSION])
+            .chain([
+                &sessions::REGISTER_SESSION,
+                &sessions::END_SESSION,
+                &sessions::SET_SESSION_NETWORK,
+            ])
             .chain([&claims::WHERE, &claims::WHERE_MANY, &claims::REFRESH])
         {
             let description = agent_operation_description(method);
@@ -3319,6 +3328,7 @@ mod tests {
                 "projects.session_liveness",
                 "agent.register_session",
                 "agent.end_session",
+                "agent.set_session_network",
                 "agent.refresh_claims",
                 "member.set_name",
                 "role.take",

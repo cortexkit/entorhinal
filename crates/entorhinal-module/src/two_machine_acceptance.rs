@@ -2062,6 +2062,7 @@ mod moves {
                 project_root: "/project",
                 registered_by: "host",
                 runner: None,
+                network: None,
                 now_ms: clock(),
             })
         }

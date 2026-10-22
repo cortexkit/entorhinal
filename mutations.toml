@@ -10674,3 +10674,102 @@ runner = "cargo"
 package = "entorhinal-core"
 target = "--lib"
 expect_red = ["session_lifecycle::tests::registration_refuses_a_runner_session_bound_elsewhere"]
+
+[[control]]
+id = "session-network-orchestrator-only"
+guards = "agent.set_session_network admits only the sole agent-orchestrator/v1 provider, never the host, the executive by name, a flow or the synchronous path"
+file = "crates/entorhinal-module/src/main.rs"
+old = "if method == sessions::END_SESSION || method == sessions::SET_SESSION_NETWORK {"
+new = "if method == sessions::END_SESSION /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-module/src/session_network_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["sessions::network_tests::set_session_network_admits_only_the_orchestrator_provider"]
+
+[[control]]
+id = "session-network-repeat-writes-nothing"
+guards = "Setting a session's current network value again writes nothing and returns the current entry"
+file = "crates/entorhinal-core/src/session_network.rs"
+old = "return Ok(NetworkPlan::Unchanged(current.clone()));"
+new = "let _ = current; // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/session_network_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["session_network::tests::set_appends_new_values_and_a_repeat_writes_nothing"]
+
+[[control]]
+id = "session-network-since-strictly-increasing"
+guards = "A network entry's since_ms is raised past the previous entry's when the clock steps back"
+file = "crates/entorhinal-core/src/session_network.rs"
+old = "Some(previous) => now.max(previous.saturating_add(1)),"
+new = "Some(_) => now, // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/session_network_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["session_network::tests::since_ms_stays_strictly_increasing_when_the_clock_steps_back"]
+
+[[control]]
+id = "session-network-history-cap"
+guards = "A binding holding 1,024 network entries refuses another value network_history_full with nothing written"
+file = "crates/entorhinal-core/src/session_network.rs"
+old = "if entries >= NETWORK_HISTORY_MAX {"
+new = "if false /* NON-VACUITY BREAK */ && entries >= NETWORK_HISTORY_MAX {"
+test_file = "crates/entorhinal-core/src/session_network_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["session_network::tests::a_full_history_refuses_network_history_full_and_writes_nothing"]
+
+[[control]]
+id = "session-network-absent-reads-unknown"
+guards = "A binding with no network history reads unknown, never no"
+file = "crates/entorhinal-core/src/session_network.rs"
+old = 'pub const NETWORK_ABSENT: &str = "unknown";'
+new = 'pub const NETWORK_ABSENT: &str = "no"; // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/session_network_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["session_network::tests::an_absent_value_reads_unknown_not_no"]
+
+[[control]]
+id = "session-network-deleted-with-binding"
+guards = "Retention deletes a pruned binding's network history with it"
+file = "crates/entorhinal-core/src/session_network.rs"
+old = "FOREIGN KEY (ref_kind, ref) REFERENCES session_binding(ref_kind, ref) ON DELETE CASCADE"
+new = "CHECK(ref_kind IS NOT NULL) /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-core/src/session_network_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["session_network::tests::history_rows_are_deleted_with_their_binding_on_prune"]
+
+[[control]]
+id = "session-network-end-sample-unchanged"
+guards = "The end-session sample keeps its exact bytes after network access was added"
+file = "test-vectors/agent-sessions-v1/end-session.json"
+old = '"code":"runner_mismatch"'
+new = '"code":"runner_mismatch","NON-VACUITY BREAK":1'
+test_file = "crates/entorhinal-module/src/served_vectors.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["served_vectors::agent_session_samples_keep_their_pinned_bytes_and_checksums", "served_vectors::session_lifecycle_records_match_published_files"]
+
+[[control]]
+id = "session-network-register-runner-sample-unchanged"
+guards = "The runner registration sample keeps its exact bytes after network access was added"
+file = "test-vectors/agent-sessions-v1/register-session-runner.json"
+old = '"registered_by":"orchestrator"'
+new = '"registered_by":"orchestrator","NON-VACUITY BREAK":1'
+test_file = "crates/entorhinal-module/src/served_vectors.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["served_vectors::agent_session_samples_keep_their_pinned_bytes_and_checksums", "served_vectors::session_lifecycle_records_match_published_files"]

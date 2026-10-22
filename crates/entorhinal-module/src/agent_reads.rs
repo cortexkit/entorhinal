@@ -1619,6 +1619,7 @@ mod tests {
             "agent.import",
             "agent.register_session",
             "agent.end_session",
+            "agent.set_session_network",
             "agent.refresh_claims",
             "agent.move",
             "agent.move_abort",

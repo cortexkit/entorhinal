@@ -61,12 +61,30 @@ objects deny unknown fields; a field outside the listed schema is an
 - `agent.end_session`: exactly `{harness, session, runner?}`. Harness is 1–32
   bytes, session 1–256 bytes, runner as above. Accepted only from the sole
   provider of `agent-orchestrator/v1`. The end time is the handler's clock.
+- `agent.register_session` may also carry an optional `network`: `yes`,
+  `no` or `unknown`, whether the session's agent can reach the network. It
+  is taken out before the strict decode like `runner`, `null` reads as
+  absent, any other value is an `invalid_request` naming `network`, and it
+  is never echoed in the reply. A value that differs from the binding's
+  current one is appended to its network history, stamped with the
+  handler's clock when it commits.
+- `agent.set_session_network`: exactly `{harness, session, network}`.
+  Harness is 1–32 bytes, session 1–256 bytes, network as above. Accepted
+  only from the sole provider of `agent-orchestrator/v1`. Replies
+  `{network, since_ms}`: the new entry, or the current one when the value
+  is already current (nothing written). `since_ms` is the handler's clock at
+  commit, raised to the previous entry's time plus one if the clock is not
+  past it. An unknown session is `not_found`; a binding already holding
+  1,024 entries refuses another value `network_history_full`.
 - `agent.sessions`: exactly `{agent_id, cursor?, limit?}`. `limit` is 1–500
   and defaults to 100; `cursor` is the opaque `next_cursor` of the previous
   page. Rows run newest registration first, ties in `(ref_kind, ref)` order.
+  Each row carries `network`, the current value, `unknown` with no history.
 - `agent.session_for_runner`: exactly `{runner, session}`. A session
   registered without a runner is `not_found` here; look it up with
-  `agent.for_session`.
+  `agent.for_session`. The reply carries `network`, the current value
+  (`unknown` with no history), and `network_history`, every
+  `{network, since_ms}` oldest first (empty with no history).
 - `agent.where_many`: exactly `{agentIds}`, with 1–64 unique valid agent IDs.
   Results preserve request order and omit unknown agents; the sample requests a
   locally held and remotely held agent around an unknown ID.
@@ -101,15 +119,23 @@ objects deny unknown fields; a field outside the listed schema is an
   (`found: false`), and `runner_mismatch` for a runner other than the
   recorded one.
 - **`sessions.json`**: one agent's two pages at `limit: 2`: a live Broca worker
-  (`active` from the host's liveness snapshot) and an ended worker (`gone`),
-  then a Pi session registered with `runner: null` (`unknown`), whose page
-  has `next_cursor: null`.
-- **`session-for-runner.json`**: the live worker found by `{runner, session}`,
-  an unknown pair, and a session registered without a runner, both
-  `not_found` with the same shape as `agent.for_session`'s miss.
-- **`SHA256SUMS`**: SHA-256 hashes of the twelve JSON vector files, with names
-  relative to this directory. The first eight lines predate the session
-  lifecycle samples and are pinned by
+  (`active` from the host's liveness snapshot, network `no` after `yes`) and
+  an ended worker (`gone`, network `unknown` with no history), then a Pi
+  session registered with `runner: null` (`unknown`, network `unknown`),
+  whose page has `next_cursor: null`.
+- **`session-for-runner.json`**: the live worker found by `{runner, session}`
+  with its history `yes` at 700 then `no` at 710, the ended worker with no
+  history (`unknown`, `[]`), an unknown pair, and a session registered
+  without a runner, both `not_found` with the same shape as
+  `agent.for_session`'s miss.
+- **`set-session-network.json`**: the live worker's `yes` (a new entry at
+  700), the same `yes` again (nothing written, the same 700), `no` at 710
+  after the clock moved on, `network_history_full` for the ended worker once
+  the handler filled its history with 1,024 alternating entries, and
+  `not_found` for an unknown session.
+- **`SHA256SUMS`**: SHA-256 hashes of the thirteen JSON vector files, with
+  names relative to this directory. The first ten lines, every file but the
+  two session reads and the network sample, are pinned by
   `served_vectors::agent_session_samples_keep_their_pinned_bytes_and_checksums`.
 
 ## SHA-256 hashes
@@ -126,8 +152,9 @@ objects deny unknown fields; a field outside the listed schema is an
 | `where-sharing-off.json` | `0b8fe82664439e2eb38e0816f900c08f7822bdfe29373a77579cfbbd080c6b63` |
 | `end-session.json` | `efd3a0b6c6ac2463ec20e3be9ee26593ad3fd0a4a62c3457ad65f5e876ff6d18` |
 | `register-session-runner.json` | `8ec0505594c6336a924595edf8af73304f1e2bd4d80f197b26b8e18628a4dca3` |
-| `session-for-runner.json` | `b29ec5b317cc3c5f6a512e7414b2873b06c612047c00e7465183a51ea4fa0e1e` |
-| `sessions.json` | `73b1a2d457c1a64390e5b630841c6586791224fa1b67ec6b643f819603de1880` |
+| `session-for-runner.json` | `b62878e6c91d98cc81ff0f993205edd4a88b5eaf49d649bab81feca02696203e` |
+| `sessions.json` | `e9b77127661e0352b508d923c5cd2e718c0b14c63662b8b2cb8e2f8b872f79e1` |
+| `set-session-network.json` | `d6bdd5717154e0c6b5d6675b9f6f03580be9e8cb41c2cf8ae5cd2925ffe831f9` |
 
 ## Reproduce and verify
 
@@ -145,7 +172,7 @@ python3 - <<'PY'
 import hashlib
 from pathlib import Path
 root = Path('test-vectors/agent-sessions-v1')
-names = ['for-session.json', 'register-session.json', 'session-for-ref.json', 'where.json', 'where-many.json', 'where-moving-receiver.json', 'where-moving-source.json', 'where-sharing-off.json', 'end-session.json', 'register-session-runner.json', 'session-for-runner.json', 'sessions.json']
+names = ['for-session.json', 'register-session.json', 'session-for-ref.json', 'where.json', 'where-many.json', 'where-moving-receiver.json', 'where-moving-source.json', 'where-sharing-off.json', 'end-session.json', 'register-session-runner.json', 'session-for-runner.json', 'sessions.json', 'set-session-network.json']
 root.joinpath('SHA256SUMS').write_text(''.join(
     f'{hashlib.sha256(root.joinpath(name).read_bytes()).hexdigest()}  {name}\n'
     for name in names), encoding='utf-8')

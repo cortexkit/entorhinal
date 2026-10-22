@@ -1,5 +1,6 @@
 //! Agent sessions: `agent.register_session`, `agent.end_session`,
-//! `agent.sessions`, `agent.for_session` and `agent.session_liveness`.
+//! `agent.set_session_network`, `agent.sessions`, `agent.for_session` and
+//! `agent.session_liveness`.
 //!
 //! A session is registered by the module that starts it for an agent. Two
 //! reserved capabilities may do that: `agent-orchestrator/v1`, held by the
@@ -29,6 +30,10 @@ use super::{encode_result, HandlerError, ProjectsHandler, SessionKey};
 pub(super) const REGISTER_SESSION: &str = "agent.register_session";
 /// Marks a session's binding ended. Only the orchestrator's provider may.
 pub(super) const END_SESSION: &str = "agent.end_session";
+/// Records whether a session's agent can reach the network. Only the
+/// orchestrator's provider may, because it is the one that knows from the
+/// session's plan.
+pub(super) const SET_SESSION_NETWORK: &str = "agent.set_session_network";
 pub(super) const FOR_SESSION: &str = "agent.for_session";
 pub(super) const SESSION_FOR_REF: &str = "agent.session_for_ref";
 pub(super) const SESSION_LIVENESS: &str = "agent.session_liveness";
@@ -275,13 +280,14 @@ pub(super) fn admit_session_registration(
     ))
 }
 
-/// Admit `agent.end_session`: only the sole provider of
-/// `agent-orchestrator/v1`, matched against the route's daemon-stamped
-/// principal. The host provider registers sessions but does not end them; its
-/// clean ends arrive through the liveness feed instead. Without a resolved
-/// sole orchestrator, refuse `orchestrator_unbound`; any other caller gets
-/// `caller_forbidden`.
-pub(super) fn admit_session_end(
+/// Admit `agent.end_session` or `agent.set_session_network` (`method`):
+/// only the sole provider of `agent-orchestrator/v1`, matched against the
+/// route's daemon-stamped principal. The host provider registers sessions but
+/// does not end them; its clean ends arrive through the liveness feed
+/// instead. Without a resolved sole orchestrator, refuse
+/// `orchestrator_unbound`; any other caller gets `caller_forbidden`.
+pub(super) fn admit_orchestrator_write(
+    method: &str,
     providers: Option<&ResolvedProviders>,
     principal: Option<&Principal>,
 ) -> Result<(), HandlerError> {
@@ -289,11 +295,16 @@ pub(super) fn admit_session_end(
         return Err(HandlerError {
             code: "orchestrator_unbound".into(),
             message: match providers {
-                Some(_) => format!(
+                // The wording predates the network write and is kept for
+                // `agent.end_session`, whose refusal callers may match.
+                Some(_) if method == END_SESSION => format!(
                     "no module is the sole provider of {ORCHESTRATOR_CAPABILITY}, so no one may end sessions"
                 ),
+                Some(_) => format!(
+                    "no module is the sole provider of {ORCHESTRATOR_CAPABILITY}, so no one may call '{method}'"
+                ),
                 None => format!(
-                    "'{END_SESSION}' resolves its provider only on the served request path; this request had none"
+                    "'{method}' resolves its provider only on the served request path; this request had none"
                 ),
             },
             detail: providers.map(|providers| {
@@ -307,7 +318,7 @@ pub(super) fn admit_session_end(
     Err(HandlerError::new(
         "caller_forbidden",
         format!(
-            "'{END_SESSION}' is accepted only from the provider of {ORCHESTRATOR_CAPABILITY}; this route was opened by {}",
+            "'{method}' is accepted only from the provider of {ORCHESTRATOR_CAPABILITY}; this route was opened by {}",
             super::principal_label(principal)
         ),
     ))
@@ -358,6 +369,14 @@ struct EndSessionRequest {
     session: String,
     #[serde(default)]
     runner: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetSessionNetworkRequest {
+    harness: String,
+    session: String,
+    network: String,
 }
 
 #[derive(Deserialize)]
@@ -478,6 +497,32 @@ fn take_runner(params: &mut Value) -> Result<Option<String>, HandlerError> {
         Some(_) => Err(HandlerError::new(
             "invalid_request",
             "runner must be a string or null",
+        )),
+    }
+}
+
+/// Refuse a network value other than `yes`, `no` or `unknown`.
+fn network_bounds(network: &str) -> Result<(), HandlerError> {
+    entorhinal_core::session_network::check_network(network).map_err(HandlerError::from)
+}
+
+/// Take the optional `network` out of a registration before the strict
+/// decode of the rest, for the same reason as `runner`: listing it among the
+/// expected fields would change the published unknown-field refusal. Null
+/// reads as absent, like a null runner.
+fn take_network(params: &mut Value) -> Result<Option<String>, HandlerError> {
+    let Some(object) = params.as_object_mut() else {
+        return Ok(None);
+    };
+    match object.remove("network") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(network)) => {
+            network_bounds(&network)?;
+            Ok(Some(network))
+        }
+        Some(_) => Err(HandlerError::new(
+            "invalid_request",
+            "network must be yes, no or unknown",
         )),
     }
 }
@@ -643,9 +688,10 @@ impl ProjectsHandler {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let registration = method == REGISTER_SESSION;
-        // Ending a session needs only the orchestrator's provider; the feed
-        // needs only the host's; registration needs both.
-        let ending = method == END_SESSION;
+        // Ending a session and recording its network need only the
+        // orchestrator's provider; the feed needs only the host's;
+        // registration needs both.
+        let ending = method == END_SESSION || method == SET_SESSION_NETWORK;
         let wants_host = !ending;
         let wants_orchestrator = registration || ending;
         let mut providers = ResolvedProviders {
@@ -675,7 +721,8 @@ impl ProjectsHandler {
         let would_refuse = if registration {
             admit_session_registration(Some(&providers), admission.principal.as_ref()).is_err()
         } else if ending {
-            admit_session_end(Some(&providers), admission.principal.as_ref()).is_err()
+            admit_orchestrator_write(method, Some(&providers), admission.principal.as_ref())
+                .is_err()
         } else {
             admit_liveness_feed(Some(&providers), admission.principal.as_ref()).is_err()
         };
@@ -719,18 +766,22 @@ impl ProjectsHandler {
         role: SessionRole,
     ) -> Result<Vec<u8>, HandlerError> {
         let store = self.with_store(|s| Ok(s.clone()))?;
-        register_session_on_store(&store, params, role, (self.clock)())
+        register_session_on_store(&store, params, role, (self.clock)(), self.clock)
     }
 }
 
+/// `now` stamps the registration; `clock` is read again when a network
+/// value commits, so a network entry carries its commit time.
 pub(super) fn register_session_on_store(
     store: &RegistryStore,
     params: Value,
     role: SessionRole,
     now: i64,
+    clock: fn() -> i64,
 ) -> Result<Vec<u8>, HandlerError> {
     let mut params = params;
     let runner = take_runner(&mut params)?;
+    let network = take_network(&mut params)?;
     let request: RegisterSessionRequest = decode(params)?;
     ref_bounds(&request.ref_kind, &request.session_ref)?;
     session_key_bounds(&request.harness, &request.session_id)?;
@@ -748,11 +799,15 @@ pub(super) fn register_session_on_store(
             project_root: &request.project_root,
             registered_by: role.as_str(),
             runner: runner.as_deref(),
+            network: network
+                .as_deref()
+                .map(|network| entorhinal_core::NetworkStamp { network, clock }),
             now_ms: now,
         })
         .map_err(HandlerError::from)?;
-    // The reply is the binding as before; the runner is not echoed, so the
-    // reply bytes callers decode strictly are the same with or without it.
+    // The reply is the binding as before; neither the runner nor the network
+    // value is echoed, so the reply bytes callers decode strictly are the
+    // same with or without them.
     encode_result(binding)
 }
 
@@ -794,6 +849,34 @@ pub(super) fn end_session_on_store(
             json!({"found": true, "ended_at_ms": ended_at_ms})
         }
     })
+}
+
+impl ProjectsHandler {
+    /// The synchronous seam, like `end_session`'s: only the served path can
+    /// admit the caller, so this runs only from that path's tests.
+    pub(super) fn set_session_network(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
+        let store = self.with_store(|s| Ok(s.clone()))?;
+        set_session_network_on_store(&store, params, self.clock)
+    }
+}
+
+/// Record the network value of the binding of `{harness, session}`. The
+/// stamp is `clock` read when the entry commits. Replies `{network,
+/// since_ms}`: the new entry, or the current one when the value is already
+/// current and nothing was written.
+pub(super) fn set_session_network_on_store(
+    store: &RegistryStore,
+    params: Value,
+    clock: fn() -> i64,
+) -> Result<Vec<u8>, HandlerError> {
+    let request: SetSessionNetworkRequest = decode(params)?;
+    bounded("harness", &request.harness, HARNESS_MAX)?;
+    bounded("session", &request.session, SESSION_ID_MAX)?;
+    network_bounds(&request.network)?;
+    let change = store
+        .set_session_network(&request.harness, &request.session, &request.network, clock)
+        .map_err(HandlerError::from)?;
+    encode_result(change.entry())
 }
 
 impl ProjectsHandler {
@@ -911,6 +994,7 @@ impl ProjectsHandler {
                     "registered_at_ms": row.registered_at_ms,
                     "ended_at_ms": row.ended_at_ms,
                     "liveness": liveness,
+                    "network": row.network,
                 })
             })
             .collect();
@@ -2813,3 +2897,7 @@ pub(super) mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "session_network_tests.rs"]
+mod network_tests;

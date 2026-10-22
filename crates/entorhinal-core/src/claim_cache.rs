@@ -420,6 +420,7 @@ mod tests {
             project_root: "/project",
             registered_by: "host",
             runner: None,
+            network: None,
             now_ms: 10,
         }
     }

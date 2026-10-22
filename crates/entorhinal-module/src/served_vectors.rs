@@ -1446,11 +1446,13 @@ const ENDED_WORKER_REF: &str = "22222222222222222222222222222222";
 const NO_RUNNER_REF: &str = "33333333333333333333333333333333";
 
 /// Served samples for the session lifecycle: a registration naming its
-/// runner, `agent.end_session` replies, and an agent's two-page session list
-/// with a live worker, an ended worker and a row with no runner.
+/// runner, `agent.end_session` replies, `agent.set_session_network` replies,
+/// and an agent's two-page session list with a live worker whose network
+/// went from `yes` to `no`, an ended worker and a row with no runner, both
+/// with no network history.
 #[tokio::test]
 async fn session_lifecycle_records_match_published_files() {
-    let fixture = SessionFixture::new("served-session-lifecycle").await;
+    let mut fixture = SessionFixture::new("served-session-lifecycle").await;
     let source = fixture.snapshot();
     seed_agent(&source, SESSION_AGENT, "Session Agent", None, false, false);
     drop(source);
@@ -1545,6 +1547,43 @@ async fn session_lifecycle_records_match_published_files() {
     end_records.push(mismatch);
     published_file("agent-sessions-v1", "end-session.json", end_records);
 
+    // The live worker's network: `yes`, the same value again (nothing
+    // written, the first entry's time), then `no` once the clock moved on.
+    let network = |session: &str, network: &str| json!({"harness":"broca","session":session,"network":network});
+    let mut network_records = Vec::new();
+    for (params, expected) in [
+        (
+            network("broca-live", "yes"),
+            json!({"result":{"network":"yes","since_ms":700}}),
+        ),
+        (
+            network("broca-live", "yes"),
+            json!({"result":{"network":"yes","since_ms":700}}),
+        ),
+    ] {
+        let (record, reply) = fixture
+            .record(
+                SESSION_REGISTRAR,
+                WRITER_MODULE,
+                "agent.set_session_network",
+                params,
+            )
+            .await;
+        assert_eq!(reply, expected);
+        network_records.push(record);
+    }
+    fixture.handler.clock = || 710;
+    let (record, reply) = fixture
+        .record(
+            SESSION_REGISTRAR,
+            WRITER_MODULE,
+            "agent.set_session_network",
+            network("broca-live", "no"),
+        )
+        .await;
+    assert_eq!(reply, json!({"result":{"network":"no","since_ms":710}}));
+    network_records.push(record);
+
     // The host reports the live worker active; the others are not mirrored.
     let (_, fed) = fixture
         .record(
@@ -1607,6 +1646,7 @@ async fn session_lifecycle_records_match_published_files() {
     let mut runner_records = Vec::new();
     for (params, found) in [
         (json!({"runner":"broca","session":"broca-live"}), true),
+        (json!({"runner":"broca","session":"broca-ended"}), true),
         (
             json!({"runner":"broca","session":"never-registered"}),
             false,
@@ -1622,7 +1662,6 @@ async fn session_lifecycle_records_match_published_files() {
             )
             .await;
         if found {
-            assert_eq!(reply["result"]["ref"], LIVE_WORKER_REF);
             assert_eq!(reply["result"]["harness"], "broca");
         } else {
             assert_eq!(reply["code"], "not_found");
@@ -1630,17 +1669,63 @@ async fn session_lifecycle_records_match_published_files() {
         }
         runner_records.push(record);
     }
+    assert_eq!(
+        runner_records.len(),
+        4,
+        "live, ended, unknown and runner-less lookups"
+    );
     published_file(
         "agent-sessions-v1",
         "session-for-runner.json",
         runner_records,
     );
+
+    // Fill the ended worker's history to the cap through the handler, after
+    // the reads above so they show it with no history. The next different
+    // value is refused with nothing written.
+    for entry in 0..entorhinal_core::NETWORK_HISTORY_MAX {
+        let (_, reply) = fixture
+            .record(
+                SESSION_REGISTRAR,
+                WRITER_MODULE,
+                "agent.set_session_network",
+                network("broca-ended", if entry % 2 == 0 { "yes" } else { "no" }),
+            )
+            .await;
+        assert!(reply.get("result").is_some(), "{reply}");
+    }
+    let (full, full_reply) = fixture
+        .record(
+            SESSION_REGISTRAR,
+            WRITER_MODULE,
+            "agent.set_session_network",
+            network("broca-ended", "yes"),
+        )
+        .await;
+    assert_eq!(full_reply["code"], "network_history_full");
+    network_records.push(full);
+    let (unknown, unknown_reply) = fixture
+        .record(
+            SESSION_REGISTRAR,
+            WRITER_MODULE,
+            "agent.set_session_network",
+            network("never-registered", "no"),
+        )
+        .await;
+    assert_eq!(unknown_reply["code"], "not_found");
+    network_records.push(unknown);
+    published_file(
+        "agent-sessions-v1",
+        "set-session-network.json",
+        network_records,
+    );
 }
 
-/// The SHA-256 of each agent-sessions sample published before the session
-/// lifecycle was added. Core decodes these replies strictly, so adding the
-/// lifecycle must not change a byte of them.
-const PINNED_SESSION_SAMPLES: [(&str, &str); 8] = [
+/// The SHA-256 of each agent-sessions sample whose bytes must not change.
+/// Core decodes these replies strictly, so later additions (the session
+/// lifecycle, then network access) must not change a byte of them. The last
+/// two were added with the lifecycle and pinned when network access was.
+const PINNED_SESSION_SAMPLES: [(&str, &str); 10] = [
     (
         "for-session.json",
         "dd41914934a9b85b35670a815bef17de84752d8da7d05a1bf8833f3edbd1996b",
@@ -1672,6 +1757,14 @@ const PINNED_SESSION_SAMPLES: [(&str, &str); 8] = [
     (
         "where-sharing-off.json",
         "0b8fe82664439e2eb38e0816f900c08f7822bdfe29373a77579cfbbd080c6b63",
+    ),
+    (
+        "end-session.json",
+        "efd3a0b6c6ac2463ec20e3be9ee26593ad3fd0a4a62c3457ad65f5e876ff6d18",
+    ),
+    (
+        "register-session-runner.json",
+        "8ec0505594c6336a924595edf8af73304f1e2bd4d80f197b26b8e18628a4dca3",
     ),
 ];
 

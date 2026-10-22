@@ -3674,6 +3674,7 @@ mod tests {
                 project_root: "/new",
                 registered_by: "host",
                 runner: None,
+                network: None,
                 now_ms: clock(),
             };
             let e = f.store().register_session(&request).unwrap_err();

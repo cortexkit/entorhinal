@@ -8,7 +8,10 @@
 use rusqlite::{params, OptionalExtension, Transaction};
 use serde::Serialize;
 
-use crate::{agent::AgentMutationError, session_refusal, RegistryError, RegistryStore};
+use crate::{
+    agent::AgentMutationError, session_network::network_history, session_refusal, RegistryError,
+    RegistryStore,
+};
 
 /// Migration 15. `runner` names the module id of the llm-runner hosting the
 /// session (for example `broca`); `ended_at_ms` is when the session was seen
@@ -70,6 +73,8 @@ pub struct AgentSession {
     pub project_root: Option<String>,
     pub registered_at_ms: i64,
     pub ended_at_ms: Option<i64>,
+    /// The network value currently in effect, `unknown` with no history.
+    pub network: String,
 }
 
 /// Where the next page starts: just after this row in list order. Keyset
@@ -93,6 +98,10 @@ pub struct RunnerSessionBinding {
     pub session_ref: String,
     pub project_root: Option<String>,
     pub ended_at_ms: Option<i64>,
+    /// The network value currently in effect, `unknown` with no history.
+    pub network: String,
+    /// Every recorded network value, oldest first; empty with no history.
+    pub network_history: Vec<crate::NetworkEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,10 +267,22 @@ impl RegistryStore {
                         session_ref: row.get(5)?,
                         project_root: row.get(6)?,
                         ended_at_ms: row.get(7)?,
+                        network: crate::NETWORK_ABSENT.to_owned(),
+                        network_history: Vec::new(),
                     })
                 },
             )
-            .optional()
+            .optional()?
+            .map(|mut binding| {
+                // Read in the same snapshot as the binding.
+                binding.network_history =
+                    network_history(conn, &binding.ref_kind, &binding.session_ref)?;
+                if let Some(current) = binding.network_history.last() {
+                    binding.network = current.network.clone();
+                }
+                Ok(binding)
+            })
+            .transpose()
         })
     }
 
@@ -286,7 +307,11 @@ impl RegistryStore {
             }
             let mut statement = conn.prepare(
                 "SELECT runner, session_id, harness, ref_kind, ref, NULLIF(project_root,''),
-                        registered_at_ms, ended_at_ms
+                        registered_at_ms, ended_at_ms,
+                        COALESCE((SELECT network FROM session_network AS history
+                                  WHERE history.ref_kind=session_binding.ref_kind
+                                    AND history.ref=session_binding.ref
+                                  ORDER BY since_ms DESC LIMIT 1), ?6)
                  FROM session_binding
                  WHERE agent_id=?1
                    AND (?2 IS NULL OR registered_at_ms < ?2
@@ -304,6 +329,7 @@ impl RegistryStore {
                         after.map(|cursor| cursor.session_ref.as_str()),
                         // One extra row says whether another page follows.
                         i64::try_from(limit).unwrap_or(i64::MAX).saturating_add(1),
+                        crate::NETWORK_ABSENT,
                     ],
                     |row| {
                         Ok(AgentSession {
@@ -315,6 +341,7 @@ impl RegistryStore {
                             project_root: row.get(5)?,
                             registered_at_ms: row.get(6)?,
                             ended_at_ms: row.get(7)?,
+                            network: row.get(8)?,
                         })
                     },
                 )?

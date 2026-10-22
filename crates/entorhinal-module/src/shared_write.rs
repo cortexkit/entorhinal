@@ -2936,6 +2936,7 @@ impl ProjectsHandler {
             let role = role.ok_or_else(|| sessions::orchestrator_unbound(Some(&providers)))?;
             let store = self.with_store(|s| Ok(s.clone()))?;
             let now = (self.clock)();
+            let clock = self.clock;
             let worker = tokio::task::spawn_blocking(move || {
                 // On a single-worker test runtime this panics before SQLite if
                 // registration is ever moved from this blocking thread back onto
@@ -2944,7 +2945,7 @@ impl ProjectsHandler {
                 // blocking thread.
                 #[cfg(test)]
                 tokio::task::block_in_place(|| {});
-                sessions::register_session_on_store(&store, request.params, role, now)
+                sessions::register_session_on_store(&store, request.params, role, now, clock)
             });
             return timeout_at(received + DEADLINE, worker)
                 .await
@@ -2974,6 +2975,28 @@ impl ProjectsHandler {
                 .await
                 .map_err(|_| {
                     HandlerError::new("identity_log_contended", "session end deadline expired")
+                })?
+                .map_err(|error| HandlerError::new("storage_error", error.to_string()))?;
+        }
+        // Recording a session's network access is machine-local and admitted
+        // like ending one. The handler's clock goes to the blocking thread
+        // and is read inside the store's fenced transaction, so the entry is
+        // stamped when it commits rather than when the request arrived.
+        if request.method == super::sessions::SET_SESSION_NETWORK {
+            let providers = self
+                .route_session_providers(&request.method, &admission)
+                .await;
+            self.admit_with(&request.method, key, Some(&providers))?;
+            let store = self.with_store(|s| Ok(s.clone()))?;
+            let clock = self.clock;
+            let worker = tokio::task::spawn_blocking(move || {
+                sessions::set_session_network_on_store(&store, request.params, clock)
+            });
+            let deadline = received + DEADLINE;
+            return timeout_at(deadline, worker)
+                .await
+                .map_err(|_| {
+                    HandlerError::new("identity_log_contended", "session network deadline expired")
                 })?
                 .map_err(|error| HandlerError::new("storage_error", error.to_string()))?;
         }

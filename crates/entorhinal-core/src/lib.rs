@@ -41,6 +41,7 @@ pub mod remote_apply;
 pub mod role_cache;
 mod root_keys;
 pub mod session_lifecycle;
+pub mod session_network;
 pub mod shared_entry;
 pub mod store_origin;
 mod where_notify;
@@ -53,6 +54,9 @@ pub use root_keys::{
 pub use session_lifecycle::{
     AgentSession, AgentSessionPage, GoneSession, RunnerSessionBinding, SessionCursor, SessionEnd,
     SESSION_RETENTION_MS,
+};
+pub use session_network::{
+    NetworkChange, NetworkEntry, NetworkStamp, NETWORK_ABSENT, NETWORK_HISTORY_MAX,
 };
 
 // The schema-migration namespace, NOT the module id, and deliberately left as
@@ -213,7 +217,7 @@ CREATE TABLE member_name (
 );
 "#;
 
-const MIGRATIONS: [Migration; 15] = [
+const MIGRATIONS: [Migration; 16] = [
     Migration {
         version: 1,
         statements: V1_SCHEMA,
@@ -273,6 +277,10 @@ const MIGRATIONS: [Migration; 15] = [
     Migration {
         version: 15,
         statements: session_lifecycle::V15_SESSION_LIFECYCLE,
+    },
+    Migration {
+        version: 16,
+        statements: session_network::V16_SESSION_NETWORK,
     },
 ];
 
@@ -993,6 +1001,10 @@ pub struct SessionRegistration<'a> {
     /// The llm-runner module hosting the session, when the caller named one.
     /// Re-registering without one keeps the runner already recorded.
     pub runner: Option<&'a str>,
+    /// Whether the session's agent can reach the network, when the caller
+    /// said. It is appended to the binding's network history only when it
+    /// differs from the current value; `None` records nothing.
+    pub network: Option<session_network::NetworkStamp<'a>>,
     pub now_ms: i64,
 }
 
@@ -1059,7 +1071,10 @@ impl RegistryStore {
     /// Registering the same reference again for the same agent moves it to the
     /// new session key and records the new caller role and time. It also
     /// clears the binding's end time, and records the runner when one is
-    /// named, keeping the recorded one otherwise.
+    /// named, keeping the recorded one otherwise. A network value that
+    /// differs from the binding's current one is appended to its history; a
+    /// value other than `yes`, `no` or `unknown` refuses `invalid_request`
+    /// and a full history `network_history_full`, both with nothing written.
     pub fn register_session(
         &self,
         request: &SessionRegistration<'_>,
@@ -1074,8 +1089,8 @@ impl RegistryStore {
     }
 
     // A refusal is returned inside `Ok`, which commits the transaction. That
-    // is safe only because every check runs before the single write at the
-    // end, so a refused registration has written nothing.
+    // is safe only because every check runs before the writes at the end,
+    // so a refused registration has written nothing.
     fn register_session_in(
         tx: &Transaction<'_>,
         request: &SessionRegistration<'_>,
@@ -1179,6 +1194,17 @@ impl RegistryStore {
                 }
             }
         }
+        // The network checks run with the others, before the insert, so a
+        // refused value or a full history leaves the binding untouched.
+        let network_plan = match request.network {
+            Some(stamp) => Some(session_network::plan_network(
+                tx,
+                request.ref_kind,
+                request.session_ref,
+                stamp.network,
+            )?),
+            None => None,
+        };
         tx.execute(
             // A registration means the session is live, so it clears any end
             // time an earlier run of the same reference left behind.
@@ -1200,6 +1226,17 @@ impl RegistryStore {
                 request.runner
             ],
         )?;
+        // After the binding exists, because each history row references it.
+        if let (Some(stamp), Some(plan)) = (request.network, network_plan) {
+            session_network::apply_network_plan(
+                tx,
+                request.ref_kind,
+                request.session_ref,
+                stamp.network,
+                plan,
+                stamp.clock,
+            )?;
+        }
         Ok(SessionBinding {
             agent_id: request.agent_id.into(),
             ref_kind: request.ref_kind.into(),

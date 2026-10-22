@@ -676,6 +676,7 @@ mod tests {
                     "sqlite_sequence",
                     // Machine-local agent session, claim and role state.
                     "session_binding",
+                    "session_network",
                     "claim_cache",
                     "role_cache",
                     "role_take_request",

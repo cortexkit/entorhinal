@@ -218,10 +218,11 @@ the cache, so it works offline and never waits on engram.
 
 | Operation | Kind | Who | What it does |
 |---|---|---|---|
-| `agent.register_session` | mutate | orchestrator or host | Bind an agent's session reference to its host session. Optional `runner` names the llm-runner module hosting it; re-registering without one keeps the recorded runner, and any re-registration clears the end time. A runner and session id already bound to another reference refuse `session_bound_elsewhere`. The reply is unchanged and never echoes `runner`. |
+| `agent.register_session` | mutate | orchestrator or host | Bind an agent's session reference to its host session. Optional `runner` names the llm-runner module hosting it; re-registering without one keeps the recorded runner, and any re-registration clears the end time. A runner and session id already bound to another reference refuse `session_bound_elsewhere`. Optional `network` (`yes`, `no` or `unknown`; `null` is absent, anything else refuses `invalid_request`) is appended to the binding's network history when it differs from the current value, stamped at commit; a full history refuses `network_history_full` and registers nothing. The reply is unchanged and never echoes `runner` or `network`. |
+| `agent.set_session_network {harness, session, network}` | mutate | orchestrator only | Record whether the agent behind a host session's binding can reach the network: `yes`, `no` or `unknown`. Replies `{network, since_ms}`. The current value again writes nothing and replies the current entry's `since_ms`. `since_ms` is the module's clock when the entry commits, raised to one past the previous entry's if the clock is not past it, so each binding's history is strictly increasing. An unknown session refuses `not_found`; a value outside the three `invalid_request`; a binding already holding 1,024 entries `network_history_full`, with nothing written. |
 | `agent.end_session {harness, session, runner?}` | mutate | orchestrator only | Mark the binding of a host session ended at the module's clock. Replies `{found: true, ended_at_ms}`, the first end time again on a repeat (nothing written), or `{found: false}` for an unknown session. A runner different from the recorded one refuses `runner_mismatch`. |
-| `agent.sessions {agent_id, cursor?, limit?}` | query | any | One agent's session bindings, newest registration first, ties by `(ref_kind, ref)`: `{sessions: [{runner, session, harness, ref_kind, ref, project_root, registered_at_ms, ended_at_ms, liveness}], next_cursor}`. `limit` defaults to 100, at most 500; `next_cursor` is opaque and null on the last page. `liveness` is `active`, `gone` or `unknown` as `agent.session_liveness` answers it, and `gone` when the mirror cannot vouch for a session whose binding has ended. A retired agent still lists; an unknown id refuses `unknown_agent`. |
-| `agent.session_for_runner {runner, session}` | query | any | The agent, harness, reference, project root and end time bound to a runner's session id. Sessions registered without a runner are `not_found` here; look those up with `agent.for_session {harness, session_id}`. |
+| `agent.sessions {agent_id, cursor?, limit?}` | query | any | One agent's session bindings, newest registration first, ties by `(ref_kind, ref)`: `{sessions: [{runner, session, harness, ref_kind, ref, project_root, registered_at_ms, ended_at_ms, liveness, network}], next_cursor}`. `limit` defaults to 100, at most 500; `next_cursor` is opaque and null on the last page. `liveness` is `active`, `gone` or `unknown` as `agent.session_liveness` answers it, and `gone` when the mirror cannot vouch for a session whose binding has ended. `network` is the binding's current network value, `unknown` with no history. A retired agent still lists; an unknown id refuses `unknown_agent`. |
+| `agent.session_for_runner {runner, session}` | query | any | The agent, harness, reference, project root and end time bound to a runner's session id, with `network` (the current value, `unknown` with no history) and `network_history: [{network, since_ms}]`, oldest first and empty with no history. Sessions registered without a runner are `not_found` here; look those up with `agent.for_session {harness, session_id}`. |
 | `agent.for_session` | query | any | The agent and reference bound to a host session. |
 | `agent.session_for_ref` | query | any | The agent, host session and project root bound to a reference. |
 | `agent.session_liveness` | query | any | `active`, `gone` or `unknown` for up to 256 references, in order. |
@@ -240,6 +241,21 @@ feed entry's optional `runner` limits that to a binding of the same runner or
 of none. Bindings that ended more than 30 days ago are pruned shortly after
 startup and hourly after that, except every binding of an agent with an open
 move. A binding that never ended is never pruned.
+
+Each binding keeps a history of whether its agent could reach the network,
+written by the orchestrator, which knows it from the session's plan. The
+history is machine-local and never journaled like the binding, and it is
+deleted with the binding, by retention or any other path. Entorhinal stores
+the values without interpreting them, and an absent value reads `unknown`,
+never `no`. Readers find the value in effect at a time from the last entry at
+or before it.
+
+The orchestrator writes in this order. It writes `no` before it removes the
+agent's network, and removes the network only after that write has landed.
+It writes `yes` only after network has been granted. Each entry is stamped
+when it commits, so with this order any lag between the real change and its
+entry errs toward `no`: an entry never says `yes` for a time the agent had no
+network.
 
 Both watches are declared with watch delivery in the manifest. A notice is
 at most 192 KiB; a larger batch becomes one `resync`. At most 16 watches are

@@ -39,6 +39,7 @@ pub(crate) const LOCAL_TABLES: &[&str] = &[
     "role_take_request",
     "agent_move",
     "move_setting",
+    "session_network",
     "session_binding",
     "pending_entry",
     "consent_write_plan",

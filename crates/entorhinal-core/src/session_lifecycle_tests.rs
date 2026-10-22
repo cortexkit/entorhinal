@@ -136,25 +136,27 @@ fn registration<'a>(
         project_root: "/project",
         registered_by: "orchestrator",
         runner,
+        network: None,
         now_ms,
     }
 }
 
-/// A store at the previous end of the chain keeps its bindings across
-/// migration 15, with no runner and no end time, and gains the per-agent
-/// index the session list reads through.
+/// A store just before migration 15 keeps its bindings across it, with no
+/// runner and no end time, and gains the per-agent index the session list
+/// reads through.
 #[test]
 fn migration_15_backfills_null_runner_and_end_and_indexes_agent() {
-    let last = MIGRATIONS.last().unwrap();
-    assert_eq!(
-        last.statements, V15_SESSION_LIFECYCLE,
-        "the session lifecycle migration ends the chain"
-    );
+    // Found by its statements rather than by being last, so later
+    // migrations can follow it in the chain.
+    let lifecycle = MIGRATIONS
+        .iter()
+        .position(|migration| migration.statements == V15_SESSION_LIFECYCLE)
+        .expect("the session lifecycle migration is in the chain");
     let Fixture {
         store,
         descriptor,
         _cleanup,
-    } = Fixture::with_migrations(&MIGRATIONS[..MIGRATIONS.len() - 1]);
+    } = Fixture::with_migrations(&MIGRATIONS[..lifecycle]);
     store
         .db
         .with_conn_fenced(|tx| {
@@ -423,6 +425,7 @@ fn agent_sessions_pages_newest_first_and_cursor_survives_inserts() {
             project_root: Some("/project".into()),
             registered_at_ms: 20,
             ended_at_ms: None,
+            network: "unknown".into(),
         }
     );
     assert_eq!(first.sessions[1].ended_at_ms, Some(25));
@@ -489,6 +492,7 @@ fn hosted<'a>(
         project_root: "/project",
         registered_by: "orchestrator",
         runner,
+        network: None,
         now_ms: 10,
     }
 }
@@ -562,6 +566,8 @@ fn session_binding_for_runner_finds_only_runner_rows() {
             session_ref: "ref-1".into(),
             project_root: Some("/project".into()),
             ended_at_ms: Some(20),
+            network: "unknown".into(),
+            network_history: Vec::new(),
         })
     );
     assert_eq!(
