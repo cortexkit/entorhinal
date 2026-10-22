@@ -53,7 +53,7 @@ fn register_sessions(pair: &Pair) {
                 session_ref: &reference,
                 harness: HARNESS,
                 session_id: session,
-                project_root: "/work/project",
+                project_root: Some("/work/project"),
                 registered_by: "host",
                 runner: Some(RUNNER),
                 network: (session == "history").then_some(NetworkStamp {

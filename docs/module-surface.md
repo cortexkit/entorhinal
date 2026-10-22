@@ -226,7 +226,7 @@ the cache, so it works offline and never waits on engram.
 
 | Operation | Kind | Who | What it does |
 |---|---|---|---|
-| `agent.register_session` | mutate | orchestrator or host | Bind an agent's session reference to its host session. Optional `runner` names the llm-runner module hosting it; re-registering without one keeps the recorded runner, and any re-registration clears the end time. A runner and session id already bound to another reference refuse `session_bound_elsewhere`. Optional `network` (`yes`, `no` or `unknown`; `null` is absent, anything else refuses `invalid_request`) is appended to the binding's network history when it differs from the current value, stamped at commit; a full history refuses `network_history_full` and registers nothing. The reply is unchanged and never echoes `runner` or `network`. |
+| `agent.register_session` | mutate | orchestrator or host | Bind an agent's session reference to its host session. Optional `project_root` is a 1–4096-byte string when sent (not null); omission keeps a stored root, or stores unknown for a new binding. Unknown roots read as null in `agent.session_for_ref`, `agent.sessions` and `agent.session_for_runner`. Optional `runner` names the llm-runner module hosting it; re-registering without one keeps the recorded runner, and any re-registration clears the end time. A runner and session id already bound to another binding refuse `session_bound_elsewhere`. Optional `network` (`yes`, `no` or `unknown`; `null` is absent, anything else refuses `invalid_request`) is appended to the binding's network history when it differs from the current value, stamped at commit; a full history refuses `network_history_full` and registers nothing. The reply never echoes `runner` or `network`. |
 | `agent.set_session_network {harness, session, network}` | mutate | orchestrator only | Record whether the agent behind a host session's binding can reach the network: `yes`, `no` or `unknown`. Replies `{network, since_ms}`. The current value again writes nothing and replies the current entry's `since_ms`. `since_ms` is the module's clock when the entry commits, raised to one past the previous entry's if the clock is not past it, so each binding's history is strictly increasing. An unknown session refuses `not_found`; a value outside the three `invalid_request`; a binding already holding 1,024 entries `network_history_full`, with nothing written. |
 | `agent.end_session {harness, session, runner?}` | mutate | orchestrator only | Mark the binding of a host session ended at the module's clock. Replies `{found: true, ended_at_ms}`, the first end time again on a repeat (nothing written), or `{found: false}` for an unknown session. A runner different from the recorded one refuses `runner_mismatch`. |
 | `agent.sessions {agent_id, cursor?, limit?}` | query | any | One agent's session bindings, newest registration first, ties by `(ref_kind, ref)`: `{sessions: [{runner, session, harness, ref_kind, ref, project_root, registered_at_ms, ended_at_ms, liveness, network}], next_cursor}`. `limit` defaults to 100, at most 500; `next_cursor` is opaque and null on the last page. `liveness` is `active`, `gone` or `unknown` as `agent.session_liveness` answers it, and `gone` when the mirror cannot vouch for a session whose binding has ended. `network` is the binding's current network value, `unknown` with no history. A retired agent still lists; an unknown id refuses `unknown_agent`. |
@@ -241,6 +241,18 @@ the cache, so it works offline and never waits on engram.
 | `agent.refresh_claims` | mutate | Direct | Refresh live agents' cached claims from engram. |
 | `role.read` | query | any | Which Mac holds a role, from the cached claim. |
 | `role.take` | mutate | Direct, with Touch ID | Make this Mac the role's holder. |
+
+Registering a different `ref` for the same `(harness, session_id)`, `agent_id`
+and `ref_kind` re-keys the existing binding in the registration transaction.
+Its network history follows the new key, its `registered_by` stays unchanged,
+and its end time is cleared because registration means the session is live.
+The runner is kept unless one is supplied, and the registration time is updated.
+An occupied destination reference refuses `ref_bound_elsewhere`, even if it
+belongs to the same agent; another agent or reference kind on the host session
+still refuses `session_bound_elsewhere` with the existing binding's detail.
+Open moves and cached claims fence re-keys exactly as other registrations.
+Re-registering the same reference for its agent may still move it to a different
+host session and record the new caller role, as before.
 
 Session bindings are machine-local and never journaled. A binding is marked
 ended by `agent.end_session` or when the host's liveness feed reports the

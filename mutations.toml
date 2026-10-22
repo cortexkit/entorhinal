@@ -2208,9 +2208,9 @@ expect_red = ["sessions::tests::registration_refuses_cutover_agent_ref_and_sessi
 
 [[control]]
 id = "sessions-register-session-bound-elsewhere"
-guards = "A host session key that already binds one reference is refused session_bound_elsewhere for any other, even of the same agent"
+guards = "A host session key bound to one agent refuses session_bound_elsewhere for another agent or reference kind"
 file = "crates/entorhinal-core/src/lib.rs"
-old = "if bound.ref_kind != request.ref_kind || bound.session_ref != request.session_ref {"
+old = "if bound.agent_id != request.agent_id || bound.ref_kind != request.ref_kind {"
 new = "if false { // NON-VACUITY BREAK"
 test_file = "crates/entorhinal-module/src/sessions.rs"
 runner = "cargo"
@@ -10670,13 +10670,91 @@ expect_red = ["served_vectors::agent_session_samples_keep_their_pinned_bytes_and
 id = "session-runner-pair-unique"
 guards = "A registration whose runner and session id are bound to another reference refuses session_bound_elsewhere and writes nothing"
 file = "crates/entorhinal-core/src/lib.rs"
-old = "if ref_kind != request.ref_kind || session_ref != request.session_ref {"
-new = "if false /* NON-VACUITY BREAK */ && (ref_kind != request.ref_kind || session_ref != request.session_ref) {"
+old = "if ref_kind != request.ref_kind || session_ref != previous_ref {"
+new = "if false /* NON-VACUITY BREAK */ && (ref_kind != request.ref_kind || session_ref != previous_ref) {"
 test_file = "crates/entorhinal-core/src/session_lifecycle_tests.rs"
 runner = "cargo"
 package = "entorhinal-core"
 target = "--lib"
 expect_red = ["session_lifecycle::tests::registration_refuses_a_runner_session_bound_elsewhere"]
+
+[[control]]
+id = "session-rekey-same-agent"
+guards = "A new reference for the same agent and host session re-keys the binding in place"
+file = "crates/entorhinal-core/src/lib.rs"
+old = "if bound.agent_id != request.agent_id || bound.ref_kind != request.ref_kind {"
+new = "if bound.agent_id != request.agent_id || bound.ref_kind != request.ref_kind || bound.session_ref != request.session_ref { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/session_lifecycle_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["session_lifecycle::tests::registration_rekey_same_agent_succeeds_and_reopens_in_place"]
+
+[[control]]
+id = "session-rekey-different-agent"
+guards = "A different agent cannot re-key an existing host session binding"
+file = "crates/entorhinal-core/src/lib.rs"
+old = "if bound.agent_id != request.agent_id || bound.ref_kind != request.ref_kind {"
+new = "if bound.ref_kind != request.ref_kind { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/session_lifecycle_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["session_lifecycle::tests::registration_rekey_different_agent_is_refused"]
+
+[[control]]
+id = "session-rekey-history"
+guards = "A re-key preserves every network history entry under the new binding key"
+file = "crates/entorhinal-core/src/lib.rs"
+old = '"UPDATE session_network SET ref=?1 WHERE ref_kind=?2 AND ref=?3",'
+new = '''"DELETE FROM session_network WHERE ref_kind=?2 AND ref=?3 AND ?1 != '' /* NON-VACUITY BREAK */",'''
+test_file = "crates/entorhinal-core/src/session_lifecycle_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["session_lifecycle::tests::registration_rekey_follows_network_history"]
+
+[[control]]
+id = "session-rekey-runner"
+guards = "A re-key without a runner retains the binding's recorded runner"
+file = "crates/entorhinal-core/src/lib.rs"
+old = "runner=COALESCE(excluded.runner, session_binding.runner), ended_at_ms=NULL"
+new = "runner=excluded.runner /* NON-VACUITY BREAK */, ended_at_ms=NULL"
+test_file = "crates/entorhinal-core/src/session_lifecycle_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["session_lifecycle::tests::registration_rekey_keeps_runner"]
+
+[[control]]
+id = "session-rekey-moving"
+guards = "An open move fences a same-agent re-key before it changes the binding"
+file = "crates/entorhinal-core/src/lib.rs"
+old = "move_store::check_moving_registration(tx, request)?;"
+new = "// NON-VACUITY BREAK: skip the moving-registration fence"
+test_file = "crates/entorhinal-core/src/session_lifecycle_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["session_lifecycle::tests::registration_rekey_during_open_move_is_refused"]
+
+[[control]]
+id = "session-rekey-project-root"
+guards = "Omitting project_root on a re-key or re-registration keeps the stored value"
+file = "crates/entorhinal-core/src/lib.rs"
+old = "project_root=COALESCE(?6, session_binding.project_root),"
+new = "project_root=excluded.project_root /* NON-VACUITY BREAK */,"
+test_file = "crates/entorhinal-core/src/session_lifecycle_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["session_lifecycle::tests::registration_rekey_absent_project_root_keeps_stored_value"]
 
 [[control]]
 id = "session-network-orchestrator-only"

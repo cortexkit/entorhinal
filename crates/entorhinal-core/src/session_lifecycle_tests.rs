@@ -133,7 +133,7 @@ fn registration<'a>(
         session_ref: "ref-1",
         harness: "broca",
         session_id,
-        project_root: "/project",
+        project_root: Some("/project"),
         registered_by: "orchestrator",
         runner,
         network: None,
@@ -216,6 +216,326 @@ fn registration_records_runner_keeps_it_when_absent_and_clears_end() {
     assert_eq!(
         f.lifecycle("s2"),
         Some((Some("thalamus-harness".into()), None))
+    );
+}
+
+#[test]
+fn registration_rekey_same_agent_succeeds_and_reopens_in_place() {
+    let f = Fixture::new();
+    f.store
+        .register_session(&registration("s1", None, 10))
+        .unwrap();
+    f.store.end_session("broca", "s1", None, 20).unwrap();
+    let mut request = registration("s1", None, 30);
+    request.session_ref = "ref-new";
+    request.registered_by = "host";
+    let binding = f.store.register_session(&request).unwrap();
+    assert_eq!(binding.session_ref, "ref-new");
+    assert_eq!(binding.registered_by, "orchestrator");
+    assert_eq!(binding.registered_at_ms, 30);
+    assert_eq!(f.lifecycle("s1"), Some((None, None)));
+    assert_eq!(f.count(), 1);
+    assert_eq!(
+        f.store
+            .session_bindings_for_refs(&[("broca-session", "ref-1")])
+            .unwrap(),
+        vec![None]
+    );
+}
+
+#[test]
+fn registration_rekey_different_agent_is_refused() {
+    let f = Fixture::new();
+    f.store
+        .register_session(&registration("s1", None, 10))
+        .unwrap();
+    let mut request = registration("s1", None, 30);
+    request.session_ref = "ref-new";
+    request.agent_id = OTHER;
+    let refusal = f.store.register_session(&request).unwrap_err();
+    assert_eq!(refusal.code, "session_bound_elsewhere");
+    assert_eq!(
+        refusal.detail,
+        Some(serde_json::json!({
+            "ref_kind":"broca-session", "ref":"ref-1", "agent_id":AGENT
+        }))
+    );
+    assert_eq!(
+        f.store
+            .session_binding_for("broca", "s1")
+            .unwrap()
+            .unwrap()
+            .session_ref,
+        "ref-1"
+    );
+    assert_eq!(f.count(), 1);
+}
+
+#[test]
+fn registration_rekey_keeps_runner() {
+    let f = Fixture::new();
+    f.store
+        .register_session(&registration("s1", Some("runner"), 10))
+        .unwrap();
+    let mut request = registration("s1", None, 30);
+    request.session_ref = "ref-new";
+    f.store.register_session(&request).unwrap();
+    assert_eq!(f.lifecycle("s1"), Some((Some("runner".into()), None)));
+    assert_eq!(
+        f.store
+            .session_binding_for_runner("runner", "s1")
+            .unwrap()
+            .unwrap()
+            .session_ref,
+        "ref-new"
+    );
+    request.session_ref = "ref-newer";
+    request.runner = Some("replacement");
+    f.store.register_session(&request).unwrap();
+    assert_eq!(f.lifecycle("s1"), Some((Some("replacement".into()), None)));
+}
+
+#[test]
+fn registration_rekey_follows_network_history() {
+    let f = Fixture::new();
+    let mut request = registration("s1", None, 10);
+    request.network = Some(crate::NetworkStamp {
+        network: "yes",
+        clock: || 10,
+    });
+    f.store.register_session(&request).unwrap();
+    f.store
+        .set_session_network("broca", "s1", "no", || 20)
+        .unwrap();
+    let history = f
+        .store
+        .session_network_history("broca-session", "ref-1")
+        .unwrap();
+    request.session_ref = "ref-new";
+    request.network = Some(crate::NetworkStamp {
+        network: "no",
+        clock: || 30,
+    });
+    f.store.register_session(&request).unwrap();
+    assert_eq!(
+        f.store
+            .session_network_history("broca-session", "ref-new")
+            .unwrap(),
+        history
+    );
+    assert!(f
+        .store
+        .session_network_history("broca-session", "ref-1")
+        .unwrap()
+        .is_empty());
+    request.session_ref = "ref-newer";
+    request.network = Some(crate::NetworkStamp {
+        network: "yes",
+        clock: || 15,
+    });
+    f.store.register_session(&request).unwrap();
+    let moved = f
+        .store
+        .session_network_history("broca-session", "ref-newer")
+        .unwrap();
+    assert_eq!(&moved[..2], history);
+    assert_eq!(
+        moved[2],
+        crate::NetworkEntry {
+            network: "yes".into(),
+            since_ms: 21
+        }
+    );
+}
+
+#[test]
+fn registration_rekey_during_open_move_is_refused() {
+    let f = Fixture::new();
+    f.store
+        .register_session(&registration("s1", None, 10))
+        .unwrap();
+    f.open_move(AGENT, "cut-rekey", "published");
+    let mut request = registration("s1", None, 30);
+    request.session_ref = "ref-new";
+    let refusal = f.store.register_session(&request).unwrap_err();
+    assert_eq!(refusal.code, "agent_moving");
+    assert_eq!(
+        refusal.detail,
+        Some(serde_json::json!({"cut_id":"cut-rekey", "side":"source", "step":"published"}))
+    );
+    assert_eq!(
+        f.store
+            .session_binding_for("broca", "s1")
+            .unwrap()
+            .unwrap()
+            .session_ref,
+        "ref-1"
+    );
+}
+
+#[test]
+fn registration_rekey_absent_project_root_keeps_stored_value() {
+    let f = Fixture::new();
+    f.store
+        .register_session(&registration("s1", None, 10))
+        .unwrap();
+    let mut request = registration("s1", None, 30);
+    request.project_root = None;
+    request.session_ref = "ref-new";
+    assert_eq!(
+        f.store
+            .register_session(&request)
+            .unwrap()
+            .project_root
+            .as_deref(),
+        Some("/project")
+    );
+    assert_eq!(
+        f.store
+            .session_binding_for("broca", "s1")
+            .unwrap()
+            .unwrap()
+            .project_root
+            .as_deref(),
+        Some("/project")
+    );
+    assert_eq!(
+        f.store
+            .register_session(&request)
+            .unwrap()
+            .project_root
+            .as_deref(),
+        Some("/project")
+    );
+    request.project_root = Some("/updated");
+    request.session_ref = "ref-newer";
+    assert_eq!(
+        f.store
+            .register_session(&request)
+            .unwrap()
+            .project_root
+            .as_deref(),
+        Some("/updated")
+    );
+}
+
+#[test]
+fn registration_rekey_refuses_occupied_destination_and_other_ref_kind() {
+    let f = Fixture::new();
+    f.store
+        .register_session(&registration("s1", None, 10))
+        .unwrap();
+    let mut occupied = registration("s2", None, 20);
+    occupied.session_ref = "ref-taken";
+    f.store.register_session(&occupied).unwrap();
+    let mut request = registration("s1", None, 30);
+    request.session_ref = "ref-taken";
+    assert_eq!(
+        f.store.register_session(&request).unwrap_err().code,
+        "ref_bound_elsewhere"
+    );
+    request.session_ref = "ref-new";
+    request.ref_kind = "other-kind";
+    assert_eq!(
+        f.store.register_session(&request).unwrap_err().code,
+        "session_bound_elsewhere"
+    );
+    assert_eq!(
+        f.store
+            .session_binding_for("broca", "s1")
+            .unwrap()
+            .unwrap()
+            .session_ref,
+        "ref-1"
+    );
+    assert_eq!(f.count(), 2);
+}
+
+#[test]
+fn registration_rekey_network_refusal_and_write_failure_leave_old_binding() {
+    let f = Fixture::new();
+    let mut request = registration("s1", None, 10);
+    request.network = Some(crate::NetworkStamp {
+        network: "yes",
+        clock: || 10,
+    });
+    f.store.register_session(&request).unwrap();
+    request.session_ref = "ref-new";
+    request.network = Some(crate::NetworkStamp {
+        network: "invalid",
+        clock: || 20,
+    });
+    assert_eq!(
+        f.store.register_session(&request).unwrap_err().code,
+        "invalid_request"
+    );
+    f.store.db.with_conn_fenced(|tx| {
+        tx.execute_batch("CREATE TRIGGER fail_history_rekey BEFORE UPDATE ON session_network BEGIN SELECT RAISE(ABORT, 'history write failed'); END")
+    }).unwrap();
+    request.network = None;
+    assert_eq!(
+        f.store.register_session(&request).unwrap_err().code,
+        "storage_error"
+    );
+    assert_eq!(
+        f.store
+            .session_binding_for("broca", "s1")
+            .unwrap()
+            .unwrap()
+            .session_ref,
+        "ref-1"
+    );
+    assert_eq!(
+        f.store
+            .session_network_history("broca-session", "ref-1")
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(f.count(), 1);
+}
+
+#[test]
+fn registration_rekey_checks_original_network_history_capacity() {
+    let f = Fixture::new();
+    f.store
+        .register_session(&registration("s1", None, 10))
+        .unwrap();
+    f.store.db.with_conn_fenced(|tx| {
+        for since in 0..crate::NETWORK_HISTORY_MAX {
+            tx.execute("INSERT INTO session_network(ref_kind,ref,network,since_ms) VALUES('broca-session','ref-1','yes',?1)", [since])?;
+        }
+        Ok(())
+    }).unwrap();
+    let mut request = registration("s1", None, 30);
+    request.session_ref = "ref-new";
+    request.network = Some(crate::NetworkStamp {
+        network: "no",
+        clock: || 30,
+    });
+    assert_eq!(
+        f.store.register_session(&request).unwrap_err().code,
+        "network_history_full"
+    );
+    assert_eq!(
+        f.store
+            .session_binding_for("broca", "s1")
+            .unwrap()
+            .unwrap()
+            .session_ref,
+        "ref-1"
+    );
+    request.network = Some(crate::NetworkStamp {
+        network: "yes",
+        clock: || 30,
+    });
+    f.store.register_session(&request).unwrap();
+    assert_eq!(
+        f.store
+            .session_network_history("broca-session", "ref-new")
+            .unwrap()
+            .len(),
+        crate::NETWORK_HISTORY_MAX as usize
     );
 }
 
@@ -489,7 +809,7 @@ fn hosted<'a>(
         session_ref,
         harness,
         session_id,
-        project_root: "/project",
+        project_root: Some("/project"),
         registered_by: "orchestrator",
         runner,
         network: None,

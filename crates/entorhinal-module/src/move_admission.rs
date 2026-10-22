@@ -705,7 +705,7 @@ mod tests {
                     session_ref: reference,
                     harness: "host",
                     session_id: reference,
-                    project_root: "/project",
+                    project_root: Some("/project"),
                     registered_by: "host",
                     runner: None,
                     network: None,

@@ -359,7 +359,15 @@ struct RegisterSessionRequest {
     session_ref: String,
     harness: String,
     session_id: String,
-    project_root: String,
+    #[serde(default, deserialize_with = "present_project_root")]
+    project_root: Option<String>,
+}
+
+// Missing roots are unknown; an explicitly supplied root must still be a string.
+fn present_project_root<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    String::deserialize(deserializer).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -785,7 +793,9 @@ pub(super) fn register_session_on_store(
     let request: RegisterSessionRequest = decode(params)?;
     ref_bounds(&request.ref_kind, &request.session_ref)?;
     session_key_bounds(&request.harness, &request.session_id)?;
-    bounded("project_root", &request.project_root, PROJECT_ROOT_MAX)?;
+    if let Some(root) = &request.project_root {
+        bounded("project_root", root, PROJECT_ROOT_MAX)?;
+    }
     if let Some(runner) = &runner {
         runner_bounds(runner)?;
     }
@@ -796,7 +806,7 @@ pub(super) fn register_session_on_store(
             session_ref: &request.session_ref,
             harness: &request.harness,
             session_id: &request.session_id,
-            project_root: &request.project_root,
+            project_root: request.project_root.as_deref(),
             registered_by: role.as_str(),
             runner: runner.as_deref(),
             network: network
@@ -1572,19 +1582,16 @@ pub(super) mod tests {
             assert_eq!(code, "ref_bound_elsewhere");
             assert_eq!(detail, Some(json!({"agent_id":first})));
         }
-        // The session key already binds another reference, even of the same
-        // agent.
-        for agent in [&first, &second] {
-            let (code, detail) = refusal(
-                f.register(EXECUTIVE, registration(agent, "r2", "pi", "s1"))
-                    .await,
-            );
-            assert_eq!(code, "session_bound_elsewhere");
-            assert_eq!(
-                detail,
-                Some(json!({"ref_kind":"pi","ref":"r1","agent_id":first}))
-            );
-        }
+        // A session cannot be re-keyed by a different agent.
+        let (refusal_code, detail) = refusal(
+            f.register(EXECUTIVE, registration(&second, "r2", "pi", "s1"))
+                .await,
+        );
+        assert_eq!(refusal_code, "session_bound_elsewhere");
+        assert_eq!(
+            detail,
+            Some(json!({"ref_kind":"pi","ref":"r1","agent_id":first}))
+        );
         // Agent checks come before reference checks: an unknown agent asking
         // for a bound reference hears about the agent.
         assert_eq!(
@@ -1698,7 +1705,7 @@ pub(super) mod tests {
         let long = |n: usize| "x".repeat(n);
         let mut bad_registrations = vec![
             json!({"agent_id":agent,"ref_kind":"pi","ref":"r1","harness":"pi"}),
-            json!({"agent_id":agent,"ref_kind":"pi","ref":"r1","harness":"pi","session_id":"s1"}),
+            json!({"agent_id":agent,"ref_kind":"pi","ref":"r1","harness":"pi","session_id":"s1","project_root":null}),
             json!({"agent_id":agent,"ref_kind":"pi","ref":"r1","harness":"pi","session_id":"s1","project_root":"/project","extra":1}),
             json!({"agent_id":agent,"ref_kind":"pi","ref":"r1","harness":"pi","session_id":7,"project_root":"/project"}),
             json!({"agent_id":agent,"ref_kind":"pi","ref":"r1","harness":"pi","session_id":"s1","project_root":7}),
@@ -1815,12 +1822,13 @@ pub(super) mod tests {
     }
 
     /// `agent.for_session` answers the reference a session key binds, for any
-    /// harness string, and `not_found` otherwise; a refused second reference
-    /// does not disturb the first.
+    /// harness string, and `not_found` otherwise; another agent's refused
+    /// registration does not disturb the binding.
     #[tokio::test]
     async fn for_session_returns_the_binding_or_not_found() {
         let f = Fixture::new("for-session", true);
         let agent = f.create("Lookup");
+        let other = f.create("Other Lookup");
         f.providers(provider("prefrontal-core"), ProviderResolution::Unprovided);
         f.bind(CALLER, Some(reserved("anyone")), true);
         assert_eq!(
@@ -1837,7 +1845,7 @@ pub(super) mod tests {
         );
         assert_eq!(
             code(
-                f.register(EXECUTIVE, registration(&agent, "r2", "claude-code", "c1"))
+                f.register(EXECUTIVE, registration(&other, "r2", "claude-code", "c1"))
                     .await
             ),
             "session_bound_elsewhere"

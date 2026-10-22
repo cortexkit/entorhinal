@@ -1299,6 +1299,136 @@ async fn session_records_match_published_files() {
 }
 
 #[tokio::test]
+async fn session_rekey_records_match_published_files() {
+    let fixture = SessionFixture::new("served-session-rekey").await;
+    let source = fixture.snapshot();
+    seed_agent(&source, SESSION_AGENT, "Session Agent", None, false, false);
+    seed_agent(&source, REF_OWNER, "Reference Owner", None, false, false);
+    drop(source);
+    assert!(matches!(
+        fixture.import().await,
+        HandlerOutcome::Response(_)
+    ));
+    let mut records = Vec::new();
+    let initial = json!({
+        "agent_id":SESSION_AGENT, "ref_kind":"pi-session", "ref":SESSION_REF,
+        "harness":"pi", "session_id":"session-rekey",
+        "project_root":"/workspace/session-vectors", "runner":"pi-runner", "network":"yes"
+    });
+    let (record, reply) = fixture
+        .record(
+            SESSION_REGISTRAR,
+            WRITER_MODULE,
+            "agent.register_session",
+            initial.clone(),
+        )
+        .await;
+    assert_eq!(reply["result"]["ref"], SESSION_REF);
+    records.push(record);
+    let mut rekey = initial;
+    rekey["ref"] = json!("runner-session-ref");
+    for field in ["project_root", "runner", "network"] {
+        rekey.as_object_mut().unwrap().remove(field);
+    }
+    let (record, reply) = fixture
+        .record(
+            SESSION_REGISTRAR,
+            WRITER_MODULE,
+            "agent.register_session",
+            rekey.clone(),
+        )
+        .await;
+    assert_eq!(reply["result"]["ref"], "runner-session-ref");
+    assert_eq!(
+        reply["result"]["project_root"],
+        "/workspace/session-vectors"
+    );
+    records.push(record);
+    rekey["agent_id"] = json!(REF_OWNER);
+    rekey["ref"] = json!("another-agent-ref");
+    let (record, reply) = fixture
+        .record(
+            SESSION_REGISTRAR,
+            WRITER_MODULE,
+            "agent.register_session",
+            rekey,
+        )
+        .await;
+    assert_eq!(reply["code"], "session_bound_elsewhere");
+    records.push(record);
+    let rootless = json!({
+        "agent_id":SESSION_AGENT, "ref_kind":"pi-session", "ref":"rootless-ref",
+        "harness":"pi", "session_id":"rootless-session", "runner":"pi-runner"
+    });
+    let (record, reply) = fixture
+        .record(
+            SESSION_REGISTRAR,
+            WRITER_MODULE,
+            "agent.register_session",
+            rootless.clone(),
+        )
+        .await;
+    assert_eq!(reply["result"].get("project_root"), Some(&Value::Null));
+    records.push(record);
+    published_file("agent-sessions-v1", "register-session-rekey.json", records);
+
+    for (method, params) in [
+        (
+            "agent.session_for_ref",
+            json!({"ref_kind":"pi-session", "ref":"rootless-ref"}),
+        ),
+        (
+            "agent.session_for_runner",
+            json!({"runner":"pi-runner", "session":"rootless-session"}),
+        ),
+    ] {
+        let (_, reply) = fixture
+            .record(SESSION_READER, READER_MODULE, method, params)
+            .await;
+        assert!(reply.get("result").is_some(), "{reply}");
+        assert_eq!(reply["result"].get("project_root"), Some(&Value::Null));
+    }
+    let (_, page) = fixture
+        .record(
+            SESSION_READER,
+            READER_MODULE,
+            "agent.sessions",
+            json!({"agent_id":SESSION_AGENT}),
+        )
+        .await;
+    let sessions = page["result"]["sessions"].as_array().unwrap();
+    assert_eq!(
+        sessions
+            .iter()
+            .find(|row| row["ref"] == "rootless-ref")
+            .unwrap()
+            .get("project_root"),
+        Some(&Value::Null)
+    );
+    let known = sessions
+        .iter()
+        .find(|row| row["ref"] == "runner-session-ref")
+        .unwrap();
+    assert_eq!(known["project_root"], "/workspace/session-vectors");
+    assert_eq!(known["runner"], "pi-runner");
+    assert_eq!(known["network"], "yes");
+
+    for invalid in [Value::Null, json!(""), json!(1), json!("x".repeat(4097))] {
+        let mut params = rootless.clone();
+        params["project_root"] = invalid;
+        let (_, reply) = fixture
+            .record(
+                SESSION_REGISTRAR,
+                WRITER_MODULE,
+                "agent.register_session",
+                params,
+            )
+            .await;
+        assert_eq!(reply["code"], "invalid_request");
+    }
+}
+
+#[tokio::test]
 async fn moving_agent_where_records_match_published_files() {
     const CUT_ID: &str = "cut-moving-agent";
 

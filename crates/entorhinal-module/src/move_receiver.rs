@@ -3758,7 +3758,7 @@ mod tests {
                 session_ref: "r",
                 harness: "host",
                 session_id: "new",
-                project_root: "/new",
+                project_root: Some("/new"),
                 registered_by: "host",
                 runner: None,
                 network: None,

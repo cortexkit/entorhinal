@@ -996,7 +996,8 @@ pub struct SessionRegistration<'a> {
     pub session_ref: &'a str,
     pub harness: &'a str,
     pub session_id: &'a str,
-    pub project_root: &'a str,
+    /// Omission keeps a known root; a new binding stores an unknown root.
+    pub project_root: Option<&'a str>,
     /// `orchestrator` or `host`.
     pub registered_by: &'a str,
     /// The llm-runner module hosting the session, when the caller named one.
@@ -1063,10 +1064,12 @@ impl RegistryStore {
     /// the write. Refusals, in order: `authority_not_cut_over` (the journal
     /// holds no agent-identity cutover marker yet, so this store does not own
     /// agent identity), `unknown_agent`, `gone` (the agent is retired or
-    /// merged), `claim_integrity_failed`, `held_elsewhere` (a cached claim at
+    /// merged), `agent_moving` (an open move fences this registration),
+    /// `claim_integrity_failed`, `held_elsewhere` (a cached claim at
     /// epoch 1 or higher belongs to another device), `ref_bound_elsewhere` (the reference already belongs to
-    /// another agent) and `session_bound_elsewhere` (the session key already
-    /// binds another reference, even one of the same agent; also when the
+    /// another agent, or a re-key's destination is already occupied) and
+    /// `session_bound_elsewhere` (the session key already binds another agent
+    /// or reference kind; also when the
     /// runner the binding would carry and the session id already bind
     /// another reference).
     /// Registering the same reference again for the same agent moves it to the
@@ -1076,6 +1079,10 @@ impl RegistryStore {
     /// differs from the binding's current one is appended to its history; a
     /// value other than `yes`, `no` or `unknown` refuses `invalid_request`
     /// and a full history `network_history_full`, both with nothing written.
+    /// A new reference for the same agent, reference kind and host session
+    /// re-keys the existing binding and its network history, preserving its
+    /// caller role. Omitting the project root keeps a recorded root on either
+    /// kind of registration; a new binding without one reads as unknown.
     pub fn register_session(
         &self,
         request: &SessionRegistration<'_>,
@@ -1147,7 +1154,7 @@ impl RegistryStore {
             )
             .optional()?;
         if let Some(bound) = &by_session {
-            if bound.ref_kind != request.ref_kind || bound.session_ref != request.session_ref {
+            if bound.agent_id != request.agent_id || bound.ref_kind != request.ref_kind {
                 return Err(session_refusal(
                     "session_bound_elsewhere",
                     format!(
@@ -1162,15 +1169,28 @@ impl RegistryStore {
                 ));
             }
         }
+        let rekey = by_session
+            .as_ref()
+            .filter(|bound| bound.session_ref != request.session_ref);
+        if rekey.is_some() {
+            if let Some(bound) = &by_ref {
+                return Err(session_refusal(
+                    "ref_bound_elsewhere",
+                    format!("this reference is bound to agent {}", bound.agent_id),
+                    Some(serde_json::json!({"agent_id": bound.agent_id})),
+                ));
+            }
+        }
+        let previous_ref = rekey.map_or(request.session_ref, |bound| bound.session_ref.as_str());
         // A runner owns its session namespace, so one runner and session id
         // name one binding. The runner this registration leaves on the row is
-        // the one it names, or else the one the reference already had.
+        // the one it names, or else the one the binding already had.
         let runner = match request.runner {
             Some(runner) => Some(runner.to_owned()),
             None => tx
                 .query_row(
                     "SELECT runner FROM session_binding WHERE ref_kind=?1 AND ref=?2",
-                    params![request.ref_kind, request.session_ref],
+                    params![request.ref_kind, previous_ref],
                     |row| row.get::<_, Option<String>>(0),
                 )
                 .optional()?
@@ -1180,7 +1200,7 @@ impl RegistryStore {
             if let Some((ref_kind, session_ref, agent_id)) =
                 session_lifecycle::runner_session_owner(tx, runner, request.session_id)?
             {
-                if ref_kind != request.ref_kind || session_ref != request.session_ref {
+                if ref_kind != request.ref_kind || session_ref != previous_ref {
                     return Err(session_refusal(
                         "session_bound_elsewhere",
                         format!(
@@ -1201,53 +1221,74 @@ impl RegistryStore {
             Some(stamp) => Some(session_network::plan_network(
                 tx,
                 request.ref_kind,
-                request.session_ref,
+                previous_ref,
                 stamp.network,
             )?),
             None => None,
         };
-        tx.execute(
+        // The existing foreign key is immediate. Defer it until commit so both
+        // keys can be updated without deleting the binding or its history.
+        // Roll back all writes on error, since refusals are returned as values
+        // to the caller's transaction rather than causing it to roll back.
+        tx.execute_batch("SAVEPOINT session_registration")?;
+        let written = (|| -> Result<SessionBinding, agent::AgentMutationError> {
+            if let Some(bound) = rekey {
+                tx.execute_batch("PRAGMA defer_foreign_keys=ON")?;
+                tx.execute(
+                    "UPDATE session_binding SET ref=?1 WHERE ref_kind=?2 AND ref=?3",
+                    params![request.session_ref, request.ref_kind, bound.session_ref],
+                )?;
+                tx.execute(
+                    "UPDATE session_network SET ref=?1 WHERE ref_kind=?2 AND ref=?3",
+                    params![request.session_ref, request.ref_kind, bound.session_ref],
+                )?;
+            }
+            let registered_by =
+                rekey.map_or(request.registered_by, |bound| bound.registered_by.as_str());
             // A registration means the session is live, so it clears any end
             // time an earlier run of the same reference left behind.
-            "INSERT INTO session_binding(agent_id,ref_kind,ref,harness,session_id,project_root,registered_by,registered_at_ms,runner,ended_at_ms)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL)
+            tx.execute(
+                "INSERT INTO session_binding(agent_id,ref_kind,ref,harness,session_id,project_root,registered_by,registered_at_ms,runner,ended_at_ms)
+             VALUES(?1,?2,?3,?4,?5,COALESCE(?6,''),?7,?8,?9,NULL)
              ON CONFLICT(ref_kind,ref) DO UPDATE SET harness=excluded.harness,
-                 session_id=excluded.session_id, project_root=excluded.project_root,
+                  session_id=excluded.session_id,
+                  project_root=COALESCE(?6, session_binding.project_root),
                  registered_by=excluded.registered_by, registered_at_ms=excluded.registered_at_ms,
                  runner=COALESCE(excluded.runner, session_binding.runner), ended_at_ms=NULL",
-            params![
-                request.agent_id,
-                request.ref_kind,
-                request.session_ref,
-                request.harness,
-                request.session_id,
-                request.project_root,
-                request.registered_by,
-                request.now_ms,
-                request.runner
-            ],
-        )?;
-        // After the binding exists, because each history row references it.
-        if let (Some(stamp), Some(plan)) = (request.network, network_plan) {
-            session_network::apply_network_plan(
-                tx,
-                request.ref_kind,
-                request.session_ref,
-                stamp.network,
-                plan,
-                stamp.clock,
+                params![
+                    request.agent_id,
+                    request.ref_kind,
+                    request.session_ref,
+                    request.harness,
+                    request.session_id,
+                    request.project_root,
+                    registered_by,
+                    request.now_ms,
+                    request.runner
+                ],
             )?;
+            // After the binding exists, because each history row references it.
+            if let (Some(stamp), Some(plan)) = (request.network, network_plan) {
+                session_network::apply_network_plan(
+                    tx,
+                    request.ref_kind,
+                    request.session_ref,
+                    stamp.network,
+                    plan,
+                    stamp.clock,
+                )?;
+            }
+            Ok(tx.query_row(
+                &format!("SELECT {SESSION_BINDING_COLUMNS} FROM session_binding WHERE ref_kind=?1 AND ref=?2"),
+                params![request.ref_kind, request.session_ref],
+                SessionBinding::from_row,
+            )?)
+        })();
+        if written.is_err() {
+            tx.execute_batch("ROLLBACK TO session_registration")?;
         }
-        Ok(SessionBinding {
-            agent_id: request.agent_id.into(),
-            ref_kind: request.ref_kind.into(),
-            session_ref: request.session_ref.into(),
-            harness: Some(request.harness.into()),
-            session_id: Some(request.session_id.into()),
-            project_root: Some(request.project_root.into()),
-            registered_by: request.registered_by.into(),
-            registered_at_ms: request.now_ms,
-        })
+        tx.execute_batch("RELEASE session_registration")?;
+        written
     }
 
     /// The binding a host session key selects, if any. Reads never wait for a

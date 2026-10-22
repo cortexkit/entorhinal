@@ -1,6 +1,6 @@
 # Served agent session and claim reads v1
 
-These records are captured through entorhinal **0.1.26**'s real `ProjectsHandler`
+The original records were captured through entorhinal **0.1.26**'s real `ProjectsHandler`
 request path. Successful replies contain the exact UTF-8 JSON bytes returned by
 the handler, including the `result` envelope; refusals contain the handler's
 `code`, `message`, and `detail` (`null` when no detail was supplied). Each
@@ -22,23 +22,33 @@ incarnation `0123456789abcdef`. The closed `ref_kind` set is `pi-session`,
 own rows. These vectors pair `pi-session` with harness `pi` and
 `opencode-session` with harness `opencode`. `cortexkit-role-llm-runner` is not in
 entorhinal's dependency graph, so `ref` uses a fixed 32-lowercase-hex value
-`0123456789abcdef0123456789abcdef`, not a computed `session_ref`.
+`0123456789abcdef0123456789abcdef`, not a computed `session_ref`. The re-key
+sample uses opaque fixed references for its new keys; entorhinal does not
+compute references from the project root or interpret their contents.
 
 ## Params schemas
 
-All fields listed here are required JSON strings. These operation request
+Fields are required JSON strings unless marked optional. These operation request
 objects deny unknown fields; a field outside the listed schema is an
 `invalid_request`.
 
 - `agent.register_session`: exactly
-  `{agent_id, ref_kind, ref, harness, session_id, project_root}`. The reference
+  `{agent_id, ref_kind, ref, harness, session_id, project_root?}`. The reference
   kind is 1–64 bytes, reference 1–512 bytes, harness 1–32 bytes, session ID
-  1–256 bytes, and project root 1–4096 bytes. The success records register an
+  1–256 bytes, and a supplied project root 1–4096 bytes (not null). Omitting the
+  root keeps a stored root on re-registration or re-key; a new binding without
+  one stores unknown, which reads as null in `agent.session_for_ref`,
+  `agent.sessions` and `agent.session_for_runner`. The success records register an
   unclaimed live agent as `orchestrator`, then register the same reference again
   for that agent. A separate OpenCode registration uses `opencode-session` and
   the `opencode` harness. Refusals cover `ref_bound_elsewhere`, a cached
   `held_elsewhere` claim with the other Mac's name, a `caller_forbidden` request
   from `plexus`, and an unknown field.
+  A different reference for the same agent, reference kind and host session
+  re-keys that binding in place, keeping its caller role, runner unless supplied,
+  and network history, and clearing its end time. A different agent still
+  refuses `session_bound_elsewhere`; an occupied re-key destination refuses
+  `ref_bound_elsewhere`. Open moves and claim checks still apply.
 - `agent.for_session`: exactly `{harness, session_id}`. Harness is 1–32 bytes
   and session ID 1–256 bytes. The file includes a found binding and `not_found`.
 - `agent.session_for_ref`: exactly `{ref_kind, ref}`. Reference kind is 1–64
@@ -114,6 +124,12 @@ objects deny unknown fields; a field outside the listed schema is an
 - **`register-session-runner.json`**: a Broca worker registration naming
   runner `broca`; the reply bytes have the same shape as a registration
   without one.
+- **`register-session-rekey.json`**: captured from the real handler on the
+  unreleased session re-key implementation after 0.1.42, with a separate
+  two-agent fixture and the same fixed clock. Four records show the initial
+  binding, its same-agent re-key without a root or runner, another agent's
+  refused re-key, and a new registration without `project_root` (null in the
+  reply). All older JSON samples remain byte-identical.
 - **`end-session.json`**: ending a worker (`found: true` with the end time),
   the repeat (the same first end time, nothing written), an unknown session
   (`found: false`), and `runner_mismatch` for a runner other than the
@@ -133,7 +149,7 @@ objects deny unknown fields; a field outside the listed schema is an
   after the clock moved on, `network_history_full` for the ended worker once
   the handler filled its history with 1,024 alternating entries, and
   `not_found` for an unknown session.
-- **`SHA256SUMS`**: SHA-256 hashes of the thirteen JSON vector files, with
+- **`SHA256SUMS`**: SHA-256 hashes of the fourteen JSON vector files, with
   names relative to this directory. The first ten lines, every file but the
   two session reads and the network sample, are pinned by
   `served_vectors::agent_session_samples_keep_their_pinned_bytes_and_checksums`.
@@ -155,6 +171,7 @@ objects deny unknown fields; a field outside the listed schema is an
 | `session-for-runner.json` | `b62878e6c91d98cc81ff0f993205edd4a88b5eaf49d649bab81feca02696203e` |
 | `sessions.json` | `e9b77127661e0352b508d923c5cd2e718c0b14c63662b8b2cb8e2f8b872f79e1` |
 | `set-session-network.json` | `d6bdd5717154e0c6b5d6675b9f6f03580be9e8cb41c2cf8ae5cd2925ffe831f9` |
+| `register-session-rekey.json` | `1dcb2af2bcc9f346a9ebac36369f70cb9805e53c0585110d9b675f25f4442b96` |
 
 ## Reproduce and verify
 
@@ -163,6 +180,7 @@ From the repository root, generate the vector files with:
 ```sh
 ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked session_records_match_published_files -- --nocapture
 ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked session_lifecycle_records_match_published_files -- --nocapture
+ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked session_rekey_records_match_published_files -- --nocapture
 ```
 
 Refresh their hashes from the repository root with:
@@ -172,7 +190,7 @@ python3 - <<'PY'
 import hashlib
 from pathlib import Path
 root = Path('test-vectors/agent-sessions-v1')
-names = ['for-session.json', 'register-session.json', 'session-for-ref.json', 'where.json', 'where-many.json', 'where-moving-receiver.json', 'where-moving-source.json', 'where-sharing-off.json', 'end-session.json', 'register-session-runner.json', 'session-for-runner.json', 'sessions.json', 'set-session-network.json']
+names = ['for-session.json', 'register-session.json', 'session-for-ref.json', 'where.json', 'where-many.json', 'where-moving-receiver.json', 'where-moving-source.json', 'where-sharing-off.json', 'end-session.json', 'register-session-runner.json', 'session-for-runner.json', 'sessions.json', 'set-session-network.json', 'register-session-rekey.json']
 root.joinpath('SHA256SUMS').write_text(''.join(
     f'{hashlib.sha256(root.joinpath(name).read_bytes()).hexdigest()}  {name}\n'
     for name in names), encoding='utf-8')
@@ -180,6 +198,5 @@ PY
 ```
 
 Without the write environment variable, the non-ignored
-`served_vectors::session_records_match_published_files` test regenerates every
-JSON file from the real handler and compares the bytes against the published
-files on each run.
+session, lifecycle and re-key vector tests regenerate their JSON from the real
+handler and compare the bytes against the published files on each run.

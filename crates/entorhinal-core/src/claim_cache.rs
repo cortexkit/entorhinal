@@ -417,7 +417,7 @@ mod tests {
             session_ref: "ref",
             harness: "pi",
             session_id: "session",
-            project_root: "/project",
+            project_root: Some("/project"),
             registered_by: "host",
             runner: None,
             network: None,

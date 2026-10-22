@@ -111,7 +111,7 @@ fn registration<'a>(
         session_ref: "ref-1",
         harness: "broca",
         session_id,
-        project_root: "/project",
+        project_root: Some("/project"),
         registered_by: "orchestrator",
         runner: Some("broca"),
         network: network.map(|network| NetworkStamp { network, clock }),
