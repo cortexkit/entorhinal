@@ -33,7 +33,7 @@ pub(super) const RETENTION_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const PENDING_CAP: usize = 8192;
 
 /// Why a stamp or a retention pass did not land. Each kind is logged the
-/// first time it happens and counted every time.
+/// first time it happens; every stamp that fails to land is also counted.
 #[derive(Clone, Copy, Debug)]
 enum Failure {
     QueueFull,

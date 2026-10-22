@@ -59,7 +59,10 @@ fn ended_at(f: &Fixture, agent: &str, session: &str) -> Value {
 
 /// Wait until the upkeep task has finished enough passes for `done` to hold.
 /// Each pass signals once, and a pass may finish work queued before the work
-/// a test waits for, so the condition is rechecked after every signal.
+/// a test waits for, so the condition is rechecked after every signal. A
+/// stamp wait gives up after a bound so a missing stamp fails the test
+/// instead of hanging it; retention waits run on tokio's paused clock, where
+/// such a bound would fire early, and the clock is advanced explicitly.
 async fn until(f: &Fixture, prune: bool, done: impl Fn() -> bool) {
     loop {
         let signal = if prune {
@@ -72,14 +75,21 @@ async fn until(f: &Fixture, prune: bool, done: impl Fn() -> bool) {
         if done() {
             return;
         }
-        signal.await;
+        if prune {
+            signal.await;
+        } else {
+            tokio::time::timeout(Duration::from_secs(30), signal)
+                .await
+                .expect("the upkeep task finished no stamp pass");
+        }
     }
 }
 
 /// Only the sole provider of agent-orchestrator/v1 may end a session. The
 /// host provider may register sessions but not end them, the executive is
 /// not admitted by its name, a flow route is refused before any resolution,
-/// and the synchronous seam has no resolution at all.
+/// and a request through the synchronous `handle_request` path, which
+/// never resolves providers, is refused.
 #[tokio::test]
 async fn end_session_admits_only_the_orchestrator_provider() {
     let f = Fixture::new("end-admission", true);
