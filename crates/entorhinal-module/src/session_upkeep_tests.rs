@@ -424,7 +424,8 @@ async fn moved_in_reference_lists_unknown_until_registered() {
     assert_eq!(
         row,
         json!({"runner":null,"session":null,"harness":null,"ref_kind":"pi","ref":"r1",
-            "project_root":null,"registered_at_ms":5,"ended_at_ms":null,"liveness":"unknown"})
+            "project_root":null,"registered_at_ms":5,"ended_at_ms":null,"liveness":"unknown",
+            "network":"unknown"})
     );
     let mut params = registration(&agent, "r1", "broca", "s1");
     params["runner"] = json!("broca");
@@ -634,6 +635,7 @@ async fn session_for_runner_resolves_runner_rows_for_any_caller() {
             ),
             json!({"agent_id":agent,"runner":"broca","session":"s1","harness":"broca",
                 "ref_kind":"pi","ref":"r1","project_root":"/project","ended_at_ms":null,
+                "network":"unknown","network_history":[],
                 "incarnation":"0123456789abcdef"})
         );
     }
