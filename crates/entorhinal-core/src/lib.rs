@@ -40,6 +40,7 @@ mod read_connection;
 pub mod remote_apply;
 pub mod role_cache;
 mod root_keys;
+pub mod session_carry;
 pub mod session_lifecycle;
 pub mod session_network;
 pub mod shared_entry;

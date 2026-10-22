@@ -13,6 +13,7 @@ use cortexkit_role_agent_data::busy::BusyState;
 use entorhinal_core::{
     move_record::{MoveParticipant, MoveRef},
     move_store::{AgentMove, MoveSide, MoveStep},
+    session_carry::{PACKAGE_CLOSURE_KIND, SESSION_BINDINGS_KIND},
     RegistryStore,
 };
 use serde::Deserialize;
@@ -129,7 +130,16 @@ impl ProjectsHandler {
                 message: "participant unavailable".into(),
                 detail: Some(e.detail),
             })?;
-        if pin_digest.is_none() {
+        // Entorhinal's own participant carries the agent's session bindings,
+        // with their network history, in a stream of its own. Every enabled
+        // entorhinal serves that participant, and discovery refuses the move
+        // when a participant is unready, so outside test fixtures that leave
+        // entorhinal out of discovery every agent with bindings carries them.
+        let carry_bindings =
+            !refs.is_empty() && available.iter().any(|p| p.module_id == "entorhinal");
+        // With no pins and no bindings entorhinal has nothing to send and
+        // stays out of the move, exactly as before bindings were carried.
+        if pin_digest.is_none() && !carry_bindings {
             available.retain(|p| p.module_id != "entorhinal");
         }
         let mut wire_refs: Vec<_> = refs
@@ -137,7 +147,16 @@ impl ProjectsHandler {
             .map(|r| AgentRef::new(r.ref_kind.clone(), r.reference.clone()))
             .collect();
         if pin_digest.is_some() {
-            wire_refs.push(AgentRef::new("package-closure", request.agent_id.clone()));
+            wire_refs.push(AgentRef::new(
+                PACKAGE_CLOSURE_KIND,
+                request.agent_id.clone(),
+            ));
+        }
+        if carry_bindings {
+            wire_refs.push(AgentRef::new(
+                SESSION_BINDINGS_KIND,
+                request.agent_id.clone(),
+            ));
         }
         let plan = participant_client::plan_participants(&available, &wire_refs).await.map_err(|e| {
             let detail = match e {

@@ -15,7 +15,7 @@
 //! its history in the same statement.
 
 use rusqlite::{params, OptionalExtension, Transaction};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{agent::AgentMutationError, session_refusal, RegistryStore};
 
@@ -47,7 +47,8 @@ pub const NETWORK_HISTORY_MAX: i64 = 1024;
 
 /// One entry of a binding's network history: `network` took effect at
 /// `since_ms` and held until the next entry's `since_ms`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkEntry {
     pub network: String,
     pub since_ms: i64,

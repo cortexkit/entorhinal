@@ -880,7 +880,8 @@ mod tests {
                 let value: Value = serde_json::from_slice(&body).unwrap();
                 let description: DescribeReply =
                     serde_json::from_value(value["result"].clone()).unwrap();
-                assert_eq!(description.ref_kinds, vec![KIND]);
+                // The served participant also carries session bindings.
+                assert_eq!(description.ref_kinds, vec![KIND, "session-bindings"]);
             } else {
                 assert!(
                     !matches!(reply, HandlerOutcome::Response(_)),

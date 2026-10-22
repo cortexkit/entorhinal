@@ -12,6 +12,12 @@ commands are in [agent-move-contract.md](agent-move-contract.md).
 - The agent is idle: none of its sessions is running, and every module that
   keeps its data reports it idle.
 - Both Macs run entorhinal and the modules that keep agent data.
+- Both Macs run an entorhinal release that carries session bindings before you
+  move an agent that has any session bindings. A Mac on an older release
+  refuses such a move (`receiver_precondition`, `participant_unavailable`
+  naming `session-bindings`) without writing anything, but cannot finish
+  cancelling it: its move stays open, retrying, until that Mac is upgraded,
+  after which it finishes aborting by itself.
 
 ## Move an agent
 

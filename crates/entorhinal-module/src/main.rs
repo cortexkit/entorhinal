@@ -130,6 +130,7 @@ mod permissions;
 mod roles;
 #[cfg(test)]
 mod served_vectors;
+mod session_move;
 mod session_upkeep;
 mod sessions;
 mod shared_write;
@@ -436,6 +437,14 @@ struct HealthGauges {
     move_errors: AtomicU64,
     move_inbox_rejected: AtomicU64,
     move_task_panics: AtomicU64,
+    /// Session bindings this Mac sent in moves out: every row written to a
+    /// session-bindings stream.
+    session_bindings_carried: AtomicU64,
+    /// Carried bindings this Mac installed as they were on the source.
+    session_bindings_installed: AtomicU64,
+    /// Carried bindings this Mac installed as placeholders, because another
+    /// binding here already held their host or runner session.
+    session_bindings_placeholders: AtomicU64,
     watches_open: AtomicU64,
     watch_notices: AtomicU64,
     watch_resyncs: AtomicU64,
@@ -598,6 +607,9 @@ struct ProjectsHandler {
     catalog_publish: catalog_publish::Publisher,
     catalog_seeder: catalog_seed::Seeder,
     catalog_move_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes this Mac's session-bindings participant ops, so a request
+    /// left running by a cancelled caller cannot interleave with its retry.
+    session_move_lock: Arc<tokio::sync::Mutex<()>>,
     catalog_poll_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     catalog_poll_wake: Arc<tokio::sync::Notify>,
     /// Counts the catalog's blocking jobs that hold a store handle: the poll
@@ -971,6 +983,7 @@ impl ProjectsHandler {
             catalog_publish: catalog_publish::Publisher::default(),
             catalog_seeder: catalog_seed::Seeder::default(),
             catalog_move_lock: Arc::new(tokio::sync::Mutex::new(())),
+            session_move_lock: Arc::new(tokio::sync::Mutex::new(())),
             catalog_poll_task: Mutex::new(None),
             catalog_poll_wake: Arc::default(),
             catalog_sql: Arc::default(),
@@ -1320,7 +1333,7 @@ impl ModuleHandler for ProjectsHandler {
         HealthReport {
             status,
             detail,
-            metrics: Some(self.health.origin.metrics(self.session_upkeep.metrics(json!({
+            metrics: Some(self.health.origin.metrics(self.session_upkeep.metrics(self.session_binding_metrics(json!({
                     "storeReady": ready,
                     "catalogLastSuccessMs": catalog["catalogLastSuccessMs"],
                     "catalogLastError": catalog["catalogLastError"],
@@ -1367,8 +1380,33 @@ impl ModuleHandler for ProjectsHandler {
                     "watchesOpen": self.health.watches_open.load(Ordering::Relaxed),
                     "watchNoticesSent": self.health.watch_notices.load(Ordering::Relaxed),
                     "watchResyncsSent": self.health.watch_resyncs.load(Ordering::Relaxed),
-            })))),
+            }))))),
         }
+    }
+}
+
+impl ProjectsHandler {
+    /// Add the counters of session bindings carried in moves to the health
+    /// metrics: rows this Mac sent, and rows it installed whole or as
+    /// placeholders.
+    fn session_binding_metrics(&self, mut metrics: Value) -> Value {
+        for (key, counter) in [
+            (
+                "sessionBindingsCarried",
+                &self.health.session_bindings_carried,
+            ),
+            (
+                "sessionBindingsInstalled",
+                &self.health.session_bindings_installed,
+            ),
+            (
+                "sessionBindingsPlaceholders",
+                &self.health.session_bindings_placeholders,
+            ),
+        ] {
+            metrics[key] = json!(counter.load(Ordering::Relaxed));
+        }
+        metrics
     }
 }
 
@@ -1457,11 +1495,14 @@ impl ProjectsHandler {
                 )
                 .into_outcome();
             }
-            return match self
-                .catalog_move_context()
-                .execute(&request.method, request.params)
-                .await
-                .and_then(encode_result)
+            return match session_move::execute_participant(
+                &self.catalog_move_context(),
+                &self.session_move_context(),
+                &request.method,
+                request.params,
+            )
+            .await
+            .and_then(encode_result)
             {
                 Ok(body) => HandlerOutcome::Response(body),
                 Err(error) => error.into_outcome(),

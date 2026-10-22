@@ -4552,11 +4552,14 @@ expect_red = ["two_machine_acceptance::moves::takeover_and_accept_diagnostics_do
 [[control]]
 id = "s11-receiver-bindings"
 guards = "Activation installs moved-in bindings with no host and a move back carries them even without a session"
-file = "crates/entorhinal-core/src/move_store.rs"
-old = '''for r in refs {
-                tx.execute("INSERT INTO session_binding'''
-new = '''for r in refs.iter().take(0) { // NON-VACUITY BREAK
-                tx.execute("INSERT INTO session_binding'''
+file = "crates/entorhinal-core/src/session_carry.rs"
+old = '''let Some(row) = row else {
+            insert_placeholder(tx, agent_id, activated_at_ms, r)?;
+            continue;
+        };'''
+new = '''let Some(row) = row else {
+            continue; // NON-VACUITY BREAK
+        };'''
 test_file = "crates/entorhinal-module/src/two_machine_acceptance.rs"
 runner = "cargo"
 package = "entorhinal-module"
@@ -10773,3 +10776,108 @@ package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
 expect_red = ["served_vectors::agent_session_samples_keep_their_pinned_bytes_and_checksums", "served_vectors::session_lifecycle_records_match_published_files"]
+
+[[control]]
+id = "session-carry-export-history"
+guards = "The source's session-bindings export carries each binding's network history"
+file = "crates/entorhinal-core/src/session_carry.rs"
+old = "row.network_history = network_history(conn, &row.ref_kind, &row.session_ref)?;"
+new = "let _ = network_history; // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/session_carry_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["session_carry::tests::export_reads_every_binding_with_its_history_under_the_open_source_move"]
+
+[[control]]
+id = "session-carry-verbatim-since"
+guards = "Carried network history is installed with the source's since_ms, unchanged"
+file = "crates/entorhinal-core/src/session_carry.rs"
+old = "params![row.ref_kind, row.session_ref, entry.network, entry.since_ms],"
+new = "params![row.ref_kind, row.session_ref, entry.network, entry.since_ms + 1], // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/session_carry_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["session_carry::tests::activation_installs_carried_rows_and_history_verbatim"]
+
+[[control]]
+id = "session-carry-keeps-local-binding"
+guards = "A binding the receiver already has keeps its own row and history; the carried copy is skipped"
+file = "crates/entorhinal-core/src/session_carry.rs"
+old = "        if local {"
+new = "        if false && local { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/session_carry_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["session_carry::tests::activation_keeps_an_existing_local_binding_and_its_history"]
+
+[[control]]
+id = "session-carry-collision-placeholder"
+guards = "A carried binding whose host or runner session another local binding holds lands as a placeholder and activation completes"
+file = "crates/entorhinal-core/src/session_carry.rs"
+old = "if collides(tx, row)? {"
+new = "if false && collides(tx, row)? { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/session_carry_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["session_carry::tests::activation_downgrades_a_colliding_row_to_a_placeholder_and_still_activates"]
+
+[[control]]
+id = "session-move-ref-outside-move"
+guards = "A carried binding the move does not name holds the receiver as a contract violation before the claim"
+file = "crates/entorhinal-module/src/session_move.rs"
+old = "if let Some(row) = rows.iter().find(|row| {"
+new = "if let Some(row) = rows.iter().find(|row| { false && // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/binding_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::binding_moves::carried_ref_outside_the_move_holds_as_a_contract_violation_before_the_claim"]
+
+[[control]]
+id = "session-move-unknown-format"
+guards = "Another session-bindings format version is refused incompatible_version at import, before the claim"
+file = "crates/entorhinal-module/src/session_move/stream.rs"
+old = "if let Some(version) = text.strip_prefix(MAGIC_PREFIX) {"
+new = "if let Some(version) = None::<&str>.filter(|_| text.starts_with(MAGIC_PREFIX)) { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/binding_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = [
+    "two_machine_acceptance::moves::binding_moves::unknown_bindings_format_is_refused_before_the_claim",
+    "session_move::stream::tests::session_bindings_stream_refuses_another_format_version",
+]
+
+[[control]]
+id = "session-move-plain-agent"
+guards = "An agent with no bindings and no pins moves without entorhinal and opens no session-bindings stream"
+file = "crates/entorhinal-module/src/move_admission.rs"
+old = "!refs.is_empty() && available.iter().any(|p| p.module_id == \"entorhinal\");"
+new = "available.iter().any(|p| p.module_id == \"entorhinal\"); // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/binding_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::binding_moves::plain_agent_moves_without_entorhinal_or_a_new_stream"]
+
+[[control]]
+id = "receiver-cleanup-skips-undeclared-kind"
+guards = "Receiver cleanup never asks a participant to abort refs whose kind it did not declare"
+file = "crates/entorhinal-module/src/move_receiver.rs"
+old = '''|| (d["code"] == "participant_unavailable"
+                                && d["ref_kind"].is_string()))'''
+new = '''|| (false && d["code"] == "participant_unavailable" // NON-VACUITY BREAK
+                                && d["ref_kind"].is_string()))'''
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/binding_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::binding_moves::older_receiver_refuses_the_bindings_stream_before_writing_anything"]

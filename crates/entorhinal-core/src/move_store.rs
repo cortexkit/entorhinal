@@ -748,38 +748,65 @@ impl RegistryStore {
         row: &AgentMove,
         refs: &[MoveRef],
     ) -> Result<AgentMove, AgentMutationError> {
+        self.activate_agent_move_carrying(row, refs, &[])
+            .map(|(row, _)| row)
+    }
+
+    /// [`Self::activate_agent_move`], installing the bindings the source
+    /// carried in place of the placeholders it would otherwise write, in the
+    /// same transaction as the activation checkpoint.
+    pub fn activate_agent_move_carrying(
+        &self,
+        row: &AgentMove,
+        refs: &[MoveRef],
+        carried: &[crate::session_carry::CarriedBinding],
+    ) -> Result<(AgentMove, crate::session_carry::CarriedInstall), AgentMutationError> {
         self.with_where_move_changes(|tx| {
             let current = load_move(tx, &row.cut_id)?;
-            if current.side != MoveSide::Receiver || current.step != MoveStep::Activating
-                || row.step != MoveStep::Activated || row.activated_at_ms.is_none() {
-                return Ok(Err(crate::session_refusal("invalid_state", "invalid activation checkpoint", Some(move_detail(&current)))));
+            if current.side != MoveSide::Receiver
+                || current.step != MoveStep::Activating
+                || row.step != MoveStep::Activated
+                || row.activated_at_ms.is_none()
+            {
+                return Ok(Err(crate::session_refusal(
+                    "invalid_state",
+                    "invalid activation checkpoint",
+                    Some(move_detail(&current)),
+                )));
             }
             // Check all owners before inserting anything: a refusal must not
             // leave a partial set of moved-in bindings.
             for r in refs {
-                let owner: Option<String> = tx.query_row("SELECT agent_id FROM session_binding WHERE ref_kind=?1 AND ref=?2",
-                    params![r.ref_kind, r.reference], |r| r.get(0)).optional()?;
+                let owner: Option<String> = tx
+                    .query_row(
+                        "SELECT agent_id FROM session_binding WHERE ref_kind=?1 AND ref=?2",
+                        params![r.ref_kind, r.reference],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
                 if owner.is_some_and(|id| id != row.agent_id) {
-                    return Ok(Err(crate::session_refusal("ref_bound_elsewhere", "incoming reference has another owner", Some(serde_json::json!({"ref_kind":r.ref_kind,"ref":r.reference})))));
+                    return Ok(Err(crate::session_refusal(
+                        "ref_bound_elsewhere",
+                        "incoming reference has another owner",
+                        Some(serde_json::json!({"ref_kind":r.ref_kind,"ref":r.reference})),
+                    )));
                 }
             }
-            // The move record carries only each reference, so a moved-in row
-            // has no host session, runner or end time here. All three stay
-            // NULL until this Mac's host registers the session, and that
-            // registration records the runner. Retention never prunes a row
-            // whose end time is NULL, so a moved-in reference survives for a
-            // later move back.
-            for r in refs {
-                tx.execute("INSERT INTO session_binding(ref_kind,ref,agent_id,harness,session_id,project_root,registered_by,registered_at_ms)
-                    VALUES(?1,?2,?3,NULL,NULL,'','move',?4) ON CONFLICT(ref_kind,ref) DO NOTHING",
-                    params![r.ref_kind, r.reference, row.agent_id, row.activated_at_ms])?;
-            }
+            let installed = crate::session_carry::install_moved_bindings(
+                tx,
+                &row.agent_id,
+                row.activated_at_ms,
+                refs,
+                carried,
+            )?;
             let mut next = row.clone();
             next.abort_requested = current.abort_requested;
-            next.cut_accept = Some(serde_json::json!({"state":"pending","attempts":0,"retry_at_ms":0}));
+            next.cut_accept =
+                Some(serde_json::json!({"state":"pending","attempts":0,"retry_at_ms":0}));
             next.write(tx, false)?;
-            Ok(Ok(next))
-        }).map_err(|e| crate::session_refusal("storage_error", e.to_string(), None))?
+            Ok(Ok((next, installed)))
+        })
+        .map_err(|e| crate::session_refusal("storage_error", e.to_string(), None))?
     }
 
     pub fn set_move_cut_accept(
@@ -979,7 +1006,7 @@ fn bound_refs(conn: &rusqlite::Connection, agent_id: &str) -> rusqlite::Result<V
     rows
 }
 
-fn load_move(conn: &rusqlite::Connection, cut_id: &str) -> rusqlite::Result<AgentMove> {
+pub(crate) fn load_move(conn: &rusqlite::Connection, cut_id: &str) -> rusqlite::Result<AgentMove> {
     conn.query_row(
         &format!("SELECT {MOVE_COLUMNS} FROM agent_move WHERE cut_id=?1"),
         [cut_id],

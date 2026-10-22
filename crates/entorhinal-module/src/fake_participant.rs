@@ -128,6 +128,10 @@ impl FakeParticipant {
     pub(crate) fn held(&self) -> BTreeSet<AgentRef> {
         self.state.lock().unwrap().held.clone()
     }
+    /// Hold another ref, as a participant does once its host opens it.
+    pub(crate) fn hold(&self, reference: AgentRef) {
+        self.state.lock().unwrap().held.insert(reference);
+    }
     pub(crate) fn tombstones(&self) -> BTreeMap<AgentRef, String> {
         self.state.lock().unwrap().tombstones.clone()
     }

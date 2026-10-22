@@ -302,9 +302,11 @@ Catalog pins are shared `catalog.pin` identity-log entries; a move does not copy
 them. For a nonempty selection the saved participant plan contains one synthetic
 `package-closure` ref, whose `ref` is the agent ID. Entorhinal handles the package
 blob export and import for this ref. It is not
-a session binding and never enters session liveness. An unpinned agent does not
-include this participant, even if daemon discovery finds entorhinal advertising
-`agent-data/v1`: there are no package bytes for it to carry.
+a session binding and never enters session liveness. An unpinned agent with no
+session bindings does not include this participant, even if daemon discovery
+finds entorhinal advertising `agent-data/v1`: there is nothing for it to carry.
+An unpinned agent with session bindings includes it for its `session-bindings`
+ref only (section 11).
 
 Before divergence checks or import, the receiver compares its own pin digest
 with the plan's digest. On a difference it catches up the identity log once and
@@ -375,3 +377,90 @@ admission; no move mutex or store handle is held across network I/O. Transfers
 are admitted per cut, while status and abort bypass transfer admission. Deadline
 or admission refusals use retryable `unavailable`; an aborted checkpoint cannot
 be overwritten by a late transfer completion.
+
+## 11. Session bindings
+
+A binding row (`session_binding`) and its network history (`session_network`)
+are machine-local, and the move record names each binding only by
+`(ref_kind, ref)`. So entorhinal carries the rows itself. When the agent has at
+least one binding and discovery lists entorhinal, the saved participant plan
+gives entorhinal one more synthetic ref, `session-bindings`, whose `ref` is the
+agent ID, beside `package-closure` when the agent also has pins. Entorhinal's
+`agent_data.describe` lists both ref kinds and both stores
+(`package-closure/v1`, `session-bindings/v1`). A request naming only the
+package closure is answered exactly as before; one naming both is split and
+the two answers joined in ref order. An agent with no bindings and no pins
+moves with the same participants as before and opens no stream of its own.
+
+**Source.** Admission inserts the source checkpoint in the transaction that
+fences new registrations for the agent (section 4). `prepare` then reads every
+binding of the agent, ended ones included, with its whole history, in one
+read snapshot that must still show that open source move and whose bindings
+must equal the plan's binding refs (`invalid_state` otherwise). Setting a
+session's network value or ending a session is not fenced: a change made after
+`prepare` stays on the source and does not travel. The stream is written once
+per cut and saved under `session-moves/<cut_id>/` in the store folder, so a
+repeated `prepare` returns the same item.
+
+**Stream.** Format `session-bindings/v1`, on the `reserved:entorhinal`
+session-door stream, in its own session container
+`sha256("session-bindings:<agent_id>:<cut_id>")[..32]`, so each cut has a new
+one. The bytes are the line `ck-session-bindings/v1`, a JSON header line
+`{"agent_id","count"}`, then one JSON line per binding in strictly ascending
+`(ref_kind, ref)`: `ref_kind`, `ref`, `runner`, `harness`, `session_id`,
+`project_root`, `registered_by`, `registered_at_ms`, `ended_at_ms` and
+`network_history` (`[{network, since_ms}]`, oldest first, exactly as stored).
+Caps: 16,384 bindings, 1 MiB per line, 64 MiB per stream; a source over a cap
+refuses `not_exportable`. Admission and reads go in calls of at most
+1,048,576 raw bytes, like the package closure. About 1,300 bindings with short
+histories encode to about 530 KiB, one call; a binding with the full 1,024-entry
+history is about 47 KiB.
+
+**Receiver.** `import` reads the stream back, hashing it, and refuses
+`digest_mismatch` unless it matches the sealed cut digest, then decodes every
+line strictly (unknown fields, a bad value, unsorted refs, a history out of
+time order or trailing bytes refuse `digest_mismatch`). A first line naming
+another `session-bindings` version refuses `incompatible_version` with
+`{found, required}`, which aborts the move with that reason. After import, and
+before the claim is taken, the driver checks that every carried ref is one of
+the move's binding refs; one that is not holds the move as a
+`contract_violation`. `activate` rechecks the kept bytes' digest
+(`digest_mismatch` holds as a fork).
+
+The rows are installed in the transaction that records `activated`, in place
+of the placeholders written before rows were carried:
+
+- A binding this Mac already has, with the same `(ref_kind, ref)`, keeps its
+  own row and history; the carried copy is skipped.
+- A carried row whose `(harness, session_id)` or `(runner, session_id)` is held
+  by another binding here is installed as a placeholder (no host session,
+  runner or end time, `registered_by` `move`), still with its carried history.
+  The move goes on; the count is logged once and kept in
+  `sessionBindingsPlaceholders`.
+- Any other carried row is installed as it was, and its history verbatim:
+  `since_ms` values are the source Mac's clock, like the times of the content
+  they are compared with.
+- A move ref with no carried row gets a placeholder, as before.
+
+**Older receivers.** A Mac whose entorhinal does not describe
+`session-bindings` refuses the move in its preconditions
+(`receiver_precondition`, detail `participant_unavailable` with that
+`ref_kind`), before any import, claim or binding write. A receiver on this
+release then skips the abort call to such a participant, which was never
+called for the cut. A receiver on an earlier release does not: its own
+entorhinal refuses that abort `invalid_request`, and the receiver resends it
+without backoff, so its move stays open until the Mac is upgraded. After the
+upgrade its entorhinal accepts the abort and the move finishes aborting.
+
+Tests: `moved_bindings_and_network_history_read_the_same_on_both_macs_and_back`,
+`plain_agent_moves_without_entorhinal_or_a_new_stream`,
+`colliding_binding_lands_as_a_placeholder_and_the_move_completes`,
+`unknown_bindings_format_is_refused_before_the_claim`,
+`carried_ref_outside_the_move_holds_as_a_contract_violation_before_the_claim`,
+`older_receiver_refuses_the_bindings_stream_before_writing_anything`,
+`receiver_stuck_aborting_on_an_older_build_finishes_after_upgrading`,
+`export_reads_every_binding_with_its_history_under_the_open_source_move`,
+`activation_installs_carried_rows_and_history_verbatim`,
+`activation_keeps_an_existing_local_binding_and_its_history`,
+`activation_downgrades_a_colliding_row_to_a_placeholder_and_still_activates`,
+`session_bindings_stream_golden_round_trip`.

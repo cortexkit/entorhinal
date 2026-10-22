@@ -10,6 +10,7 @@ use crate::{
     participant_client::{AgentRef, ClientError, CutRequest, ParticipantClient, Refs},
     participant_discovery::Participant,
     record_client::{CasRequest, CasSettlement, RecordError, RecordReply},
+    session_move::StagedError,
     HandlerError, LivenessState, SessionKey,
 };
 use cortexkit_role_agent_data::errors::DriverAction;
@@ -20,6 +21,7 @@ use entorhinal_core::{
         self as wire, InboxRecord, MoveReason, MoveRecord, MoveRecordState as State, PendingMove,
     },
     move_store::{AgentMove, MoveSide, MoveStep as Step},
+    session_carry::{is_binding_ref_kind, CarriedBinding, CarriedInstall, SESSION_BINDINGS_KIND},
     RegistryStore,
 };
 use serde::{Deserialize, Serialize};
@@ -807,6 +809,63 @@ impl Receiver {
         self.local_writers(plan).await
     }
 
+    /// The session bindings the source carried for this move, as this Mac
+    /// imported them; none when the move carries no bindings stream. A
+    /// carried ref the move does not name is the source breaking the
+    /// agent-data contract, and holds the move as a contract violation.
+    async fn carried_bindings(&self, plan: &MoveRecord) -> Result<Vec<CarriedBinding>, Failure> {
+        let carries = plan
+            .participants
+            .iter()
+            .any(|p| p.refs.iter().any(|r| r.ref_kind == SESSION_BINDINGS_KIND));
+        if !carries {
+            return Ok(Vec::new());
+        }
+        let refs: std::collections::BTreeSet<_> = plan
+            .participants
+            .iter()
+            .flat_map(|p| p.refs.clone())
+            .filter(|r| is_binding_ref_kind(&r.ref_kind))
+            .collect();
+        let (cut, agent) = (self.cut.clone(), plan.agent_id.clone());
+        let staged = self
+            .worker
+            .sql(move |s| Ok(crate::session_move::staged_bindings(s, &cut, &agent, &refs)))
+            .await?;
+        match staged {
+            Ok(rows) => Ok(rows),
+            Err(StagedError::OutsideMove(r)) => {
+                let mut failure = Failure::hold(
+                    "contract_violation",
+                    json!({"module_id":"entorhinal","op":"agent_data.import","code":"contract_violation",
+                        "ref_kind":r.ref_kind,"ref":r.reference,
+                        "message":"the source carried a session binding the move does not name"}),
+                );
+                failure.violation = true;
+                Err(failure)
+            }
+            Err(StagedError::Unreadable(error)) => Err(error.into()),
+        }
+    }
+
+    fn count_installed(&self, installed: CarriedInstall) {
+        let health = &self.worker.health;
+        health
+            .session_bindings_installed
+            .fetch_add(installed.installed, Ordering::Relaxed);
+        health
+            .session_bindings_placeholders
+            .fetch_add(installed.placeholders, Ordering::Relaxed);
+        if installed.placeholders > 0 {
+            // Once per move: the activation transaction runs once per cut.
+            tracing::warn!(
+                cut = %self.cut,
+                placeholders = installed.placeholders,
+                "carried session bindings collided with bindings on this Mac and were installed as placeholders"
+            );
+        }
+    }
+
     async fn catalog_preflight(&self, plan: &MoveRecord) -> Result<(), Failure> {
         let Some(expected) = &plan.pin_digest else {
             return Ok(());
@@ -837,7 +896,7 @@ impl Receiver {
             .participants
             .iter()
             .flat_map(|p| p.refs.clone())
-            .filter(|r| r.ref_kind != "package-closure")
+            .filter(|r| is_binding_ref_kind(&r.ref_kind))
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect();
@@ -1040,6 +1099,9 @@ impl Receiver {
                     answer
                         .map_err(|e| Failure::participant(&p.module_id, "agent_data.import", e))?;
                 }
+                // Before the claim moves: every binding the source carried
+                // must be one the move names.
+                self.carried_bindings(plan).await?;
                 Self::step(row, progress, Step::Imported);
                 self.save(row, progress).await?;
             }
@@ -1117,13 +1179,16 @@ impl Receiver {
                     .participants
                     .iter()
                     .flat_map(|p| p.refs.clone())
-                    .filter(|r| r.ref_kind != "package-closure")
+                    .filter(|r| is_binding_ref_kind(&r.ref_kind))
                     .collect::<Vec<_>>();
-                *row = self
+                let carried = self.carried_bindings(plan).await?;
+                let (activated, installed) = self
                     .worker
-                    .sql(move |s| Ok(s.activate_agent_move(&next, &refs)))
+                    .sql(move |s| Ok(s.activate_agent_move_carrying(&next, &refs, &carried)))
                     .await?
                     .map_err(HandlerError::from)?;
+                *row = activated;
+                self.count_installed(installed);
                 *progress = activated_progress;
                 self.worker.gauges().await?;
                 self.worker.wake.notify_one();
@@ -1490,11 +1555,17 @@ impl Receiver {
             // A participant missing before either call has nothing to undo. Save
             // which modules we called so one that disappears afterward must
             // discard its staged data when it returns, before abort can finish.
+            // The same holds for a participant the preconditions refused for
+            // not declaring one of its ref kinds (an older version of it): it
+            // was never called for this cut, and it would refuse an abort
+            // naming a ref kind it does not know, so asking would never end.
             if !progress.touched.contains(&p.module_id)
-                && row
-                    .detail
-                    .as_ref()
-                    .is_some_and(|d| d["absent"] == true && d["module_id"] == p.module_id)
+                && row.detail.as_ref().is_some_and(|d| {
+                    d["module_id"] == p.module_id
+                        && (d["absent"] == true
+                            || (d["code"] == "participant_unavailable"
+                                && d["ref_kind"].is_string()))
+                })
             {
                 continue;
             }

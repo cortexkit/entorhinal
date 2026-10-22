@@ -24,6 +24,14 @@ the first successful store-open time from process start. Requests slower than
 500 ms also emit one fleet warning; a `resolve` warning includes its
 `canonical_root`.
 
+Moves add three counters, each counting since the module started:
+`sessionBindingsCarried` (session bindings this Mac wrote into the
+session-bindings stream of a move out), `sessionBindingsInstalled` (carried
+bindings this Mac installed as they were on the source) and
+`sessionBindingsPlaceholders` (carried bindings it installed as placeholders
+because another binding here already held their host or runner session).
+See [agent-move-contract.md](agent-move-contract.md) section 11.
+
 ## Admission, in general
 
 The daemon stamps each route with a principal when it opens. entorhinal
