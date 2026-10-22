@@ -10881,3 +10881,17 @@ package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
 expect_red = ["two_machine_acceptance::moves::binding_moves::older_receiver_refuses_the_bindings_stream_before_writing_anything"]
+
+[[control]]
+id = "receiver-cleanup-refusal-backoff"
+guards = "A refused receiver cleanup call waits 1 s doubling to 5 minutes, saved across restarts, instead of retrying at once"
+file = "crates/entorhinal-module/src/move_receiver.rs"
+old = '''progress.retry_at_ms = (self.worker.clock)()
+                            .saturating_add(backoff(row.attempts).as_millis() as i64);'''
+new = '''progress.retry_at_ms = 0; // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/abort_backoff.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::abort_backoff::refused_cleanup_backs_off_doubling_to_the_cap_then_aborts"]

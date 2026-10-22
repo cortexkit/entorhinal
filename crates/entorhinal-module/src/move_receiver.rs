@@ -571,6 +571,9 @@ impl Receiver {
             .unwrap_or_default();
         let plan: MoveRecord = serde_json::from_value(plan_value)
             .map_err(|e| HandlerError::new("plan_malformed", e.to_string()))?;
+        // Whether this pass ran abort cleanup, so a refusal from it backs off
+        // instead of being answered with another immediate abort pass.
+        let mut cleaning = false;
         let result: Result<Duration, Failure> = async {
             let (observed, version) = self.read_move(&plan).await?;
             row.record_version = checked_version(version)?;
@@ -611,6 +614,7 @@ impl Receiver {
                     Step::PickedUp | Step::Imported | Step::Staged | Step::Claimed
                 )
             {
+                cleaning = true;
                 self.cleanup(&mut row, &plan, &mut progress).await?;
             } else {
                 self.advance(&mut row, &plan, &mut progress, observed)
@@ -676,7 +680,19 @@ impl Receiver {
                     row.reason = Some(String::from(reason.clone()));
                     row.detail = Some(f.detail.clone());
                     row.abort_requested = Some(json!({"reason":row.reason,"detail":row.detail}));
-                    progress.retry_at_ms = 0;
+                    if cleaning {
+                        // The move is already aborting, so the next pass
+                        // repeats the same cleanup calls. Back off as any
+                        // other retry does (1 s doubling to 5 minutes); the
+                        // attempt count and deadline are saved below, so a
+                        // restart keeps waiting. Reaching a new step resets
+                        // both.
+                        row.attempts += 1;
+                        progress.retry_at_ms = (self.worker.clock)()
+                            .saturating_add(backoff(row.attempts).as_millis() as i64);
+                    } else {
+                        progress.retry_at_ms = 0;
+                    }
                 } else {
                     row.attempts += 1;
                     let delay = backoff(row.attempts);
@@ -703,7 +719,7 @@ impl Receiver {
                 self.save(&mut row, &progress)
                     .await
                     .map_err(|e| HandlerError::new(&e.code, e.detail.to_string()))?;
-                Ok(Some(if f.reason.is_some() {
+                Ok(Some(if f.reason.is_some() && !cleaning {
                     Duration::ZERO
                 } else {
                     backoff(row.attempts).min(POLL)

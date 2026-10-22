@@ -211,6 +211,9 @@ stop and undo its work. Either Mac can ask, within the limits below.
    returns the claim if the receiver took it, aborts the door cut if it was
    sealed, and calls `agent_data.abort` on each participant, which unfreezes
    the agent on the source.
+   When a cleanup call is refused, the next attempt waits 1 second, doubling
+   to 5 minutes; the wait is saved in the checkpoint, so a restart keeps it,
+   and reaching a new step clears it.
 5. **Repeats.** Aborting an `aborted` move, or one whose abort is already in
    progress, returns its status without prompting.
 
@@ -221,7 +224,8 @@ Tests: `abort_boundary_refuses_without_writes_for_both_sides`,
 `source_abort_cleans_every_preboundary_checkpoint_with_and_without_a_record`,
 `moved_claim_aborts_without_take_and_claimed_abort_returns_epoch_two_to_a`,
 `receiver_abort_at_every_irreversible_step_writes_nothing_and_restart_never_cleans_up`,
-`abort_matrix_cleans_every_pre_boundary_checkpoint_across_restarts`.
+`abort_matrix_cleans_every_pre_boundary_checkpoint_across_restarts`,
+`refused_cleanup_backs_off_doubling_to_the_cap_then_aborts`.
 
 ## 7. Holds
 

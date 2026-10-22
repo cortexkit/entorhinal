@@ -2281,6 +2281,7 @@ mod moves {
                 })
         }
     }
+    mod abort_backoff;
     mod binding_moves;
     mod catalog_moves;
 
