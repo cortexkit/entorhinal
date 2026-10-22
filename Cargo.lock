@@ -409,7 +409,7 @@ dependencies = [
 
 [[package]]
 name = "entorhinal-module"
-version = "0.1.41"
+version = "0.1.42"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
