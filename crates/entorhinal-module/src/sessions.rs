@@ -34,9 +34,16 @@ pub(super) const SESSION_FOR_REF: &str = "agent.session_for_ref";
 pub(super) const SESSION_LIVENESS: &str = "agent.session_liveness";
 /// Lists one agent's session bindings, newest first.
 pub(super) const SESSIONS: &str = "agent.sessions";
+/// Resolves a runner's session id to its binding.
+pub(super) const SESSION_FOR_RUNNER: &str = "agent.session_for_runner";
 /// The session reads, open to every caller like the other reads.
-pub(super) const READ_METHODS: &[&str] =
-    &[FOR_SESSION, SESSION_FOR_REF, SESSION_LIVENESS, SESSIONS];
+pub(super) const READ_METHODS: &[&str] = &[
+    FOR_SESSION,
+    SESSION_FOR_REF,
+    SESSION_LIVENESS,
+    SESSIONS,
+    SESSION_FOR_RUNNER,
+];
 
 /// The module that owns an agent's work and registers the sessions it starts.
 pub(super) const ORCHESTRATOR_CAPABILITY: &str = "agent-orchestrator/v1";
@@ -361,6 +368,13 @@ struct AgentSessionsRequest {
     cursor: Option<String>,
     #[serde(default)]
     limit: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionForRunnerRequest {
+    runner: String,
+    session: String,
 }
 
 #[derive(Deserialize)]
@@ -799,6 +813,27 @@ impl ProjectsHandler {
             "ref_kind": binding.ref_kind,
             "ref": binding.session_ref,
         }))
+    }
+
+    /// The binding a runner's session id names, so a caller holding only
+    /// `{runner, session}` learns the harness and project root behind it. A
+    /// binding registered without a runner is `not_found` here; its callers
+    /// look it up by harness and session id with `agent.for_session`.
+    pub(super) fn session_for_runner(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
+        let request: SessionForRunnerRequest = decode(params)?;
+        runner_bounds(&request.runner)?;
+        bounded("session", &request.session, SESSION_ID_MAX)?;
+        let binding = self
+            .with_store(|store| {
+                store.session_binding_for_runner(&request.runner, &request.session)
+            })?
+            .ok_or_else(|| {
+                HandlerError::new(
+                    "not_found",
+                    "no agent session is registered under this runner and session",
+                )
+            })?;
+        self.encode_read_result(binding)
     }
 
     pub(super) fn session_for_ref(&self, params: Value) -> Result<Vec<u8>, HandlerError> {

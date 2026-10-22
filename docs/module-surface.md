@@ -218,7 +218,10 @@ the cache, so it works offline and never waits on engram.
 
 | Operation | Kind | Who | What it does |
 |---|---|---|---|
-| `agent.register_session` | mutate | orchestrator or host | Bind an agent's session reference to its host session. |
+| `agent.register_session` | mutate | orchestrator or host | Bind an agent's session reference to its host session. Optional `runner` names the llm-runner module hosting it; re-registering without one keeps the recorded runner, and any re-registration clears the end time. A runner and session id already bound to another reference refuse `session_bound_elsewhere`. The reply is unchanged and never echoes `runner`. |
+| `agent.end_session {harness, session, runner?}` | mutate | orchestrator only | Mark the binding of a host session ended at the module's clock. Replies `{found: true, ended_at_ms}`, the first end time again on a repeat (nothing written), or `{found: false}` for an unknown session. A runner different from the recorded one refuses `runner_mismatch`. |
+| `agent.sessions {agent_id, cursor?, limit?}` | query | any | One agent's session bindings, newest registration first, ties by `(ref_kind, ref)`: `{sessions: [{runner, session, harness, ref_kind, ref, project_root, registered_at_ms, ended_at_ms, liveness}], next_cursor}`. `limit` defaults to 100, at most 500; `next_cursor` is opaque and null on the last page. `liveness` is `active`, `gone` or `unknown` as `agent.session_liveness` answers it, and `gone` when the mirror cannot vouch for a session whose binding has ended. A retired agent still lists; an unknown id refuses `unknown_agent`. |
+| `agent.session_for_runner {runner, session}` | query | any | The agent, harness, reference, project root and end time bound to a runner's session id. Sessions registered without a runner are `not_found` here; look those up with `agent.for_session {harness, session_id}`. |
 | `agent.for_session` | query | any | The agent and reference bound to a host session. |
 | `agent.session_for_ref` | query | any | The agent, host session and project root bound to a reference. |
 | `agent.session_liveness` | query | any | `active`, `gone` or `unknown` for up to 256 references, in order. |
@@ -229,6 +232,14 @@ the cache, so it works offline and never waits on engram.
 | `agent.refresh_claims` | mutate | Direct | Refresh live agents' cached claims from engram. |
 | `role.read` | query | any | Which Mac holds a role, from the cached claim. |
 | `role.take` | mutate | Direct, with Touch ID | Make this Mac the role's holder. |
+
+Session bindings are machine-local and never journaled. A binding is marked
+ended by `agent.end_session` or when the host's liveness feed reports the
+session `gone` (never from `lapsed`, `unknown` or absence from a snapshot); a
+feed entry's optional `runner` limits that to a binding of the same runner or
+of none. Bindings that ended more than 30 days ago are pruned shortly after
+startup and hourly after that, except every binding of an agent with an open
+move. A binding that never ended is never pruned.
 
 Both watches are declared with watch delivery in the manifest. A notice is
 at most 192 KiB; a larger batch becomes one `resync`. At most 16 watches are

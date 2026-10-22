@@ -2908,8 +2908,8 @@ expect_red = ["sessions::tests::liveness_feed_rebinding_to_thalamus_latches_unti
 id = "feed-route-claimant-cache"
 guards = "Several admitted feed batches on one route resolve the host once, without sharing answers across routes"
 file = "crates/entorhinal-module/src/sessions.rs"
-old = "            cached.host.is_none(),"
-new = "            true, // NON-VACUITY BREAK"
+old = "            wants_host && cached.host.is_none(),"
+new = "            wants_host, // NON-VACUITY BREAK"
 test_file = "crates/entorhinal-module/src/sessions.rs"
 runner = "cargo"
 package = "entorhinal-module"
@@ -3107,8 +3107,8 @@ expect_red = ["sessions::tests::concurrent_feed_first_use_shares_one_resolution"
 id = "sessions-register-caches-orchestrator"
 guards = "Later registrations on a route reuse its orchestrator claimant as well as its host claimant"
 file = "crates/entorhinal-module/src/sessions.rs"
-old = "            registration && cached.orchestrator.is_none(),"
-new = "            registration, // NON-VACUITY BREAK"
+old = "            wants_orchestrator && cached.orchestrator.is_none(),"
+new = "            wants_orchestrator, // NON-VACUITY BREAK"
 test_file = "crates/entorhinal-module/src/sessions.rs"
 runner = "cargo"
 package = "entorhinal-module"
@@ -10550,3 +10550,127 @@ package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
 expect_red = ["two_machine_acceptance::adopt_store_shared_restore_rejoins_with_new_author_and_installs_agents"]
+
+[[control]]
+id = "session-end-orchestrator-only"
+guards = "agent.end_session admits only the sole agent-orchestrator/v1 provider, never the host or the executive by name"
+file = "crates/entorhinal-module/src/sessions.rs"
+old = "if matches!(principal, Some(Principal::Reserved { module_id }) if module_id == orchestrator) {"
+new = "if matches!(principal, Some(Principal::Reserved { .. })) /* NON-VACUITY BREAK */ {"
+test_file = "crates/entorhinal-module/src/session_upkeep_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["session_upkeep::tests::end_session_admits_only_the_orchestrator_provider"]
+
+[[control]]
+id = "session-end-runner-mismatch"
+guards = "Ending a session with a runner other than the recorded one refuses runner_mismatch and writes nothing"
+file = "crates/entorhinal-core/src/session_lifecycle.rs"
+old = "if recorded != named {"
+new = "if false /* NON-VACUITY BREAK */ && recorded != named {"
+test_file = "crates/entorhinal-core/src/session_lifecycle_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["session_lifecycle::tests::end_session_fills_runner_refuses_mismatch_and_repeats_without_writing"]
+
+[[control]]
+id = "session-end-idempotent-repeat"
+guards = "Ending an ended session returns its first end time and writes nothing"
+file = "crates/entorhinal-core/src/session_lifecycle.rs"
+old = "return Ok(SessionEnd::AlreadyEnded { ended_at_ms });"
+new = "let _ = ended_at_ms; // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/session_lifecycle_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["session_lifecycle::tests::end_session_fills_runner_refuses_mismatch_and_repeats_without_writing"]
+
+[[control]]
+id = "session-gone-stamps-binding"
+guards = "A gone entry on the liveness feed stamps the binding's end time through the upkeep queue"
+file = "crates/entorhinal-module/src/main.rs"
+old = "self.session_upkeep.push(ended);"
+new = "drop(ended); // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/session_upkeep_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["session_upkeep::tests::liveness_gone_stamps_the_binding_but_lapsed_and_absence_do_not"]
+
+[[control]]
+id = "session-lapsed-does-not-stamp"
+guards = "Only an explicit gone ends a binding; a lapsed report does not"
+file = "crates/entorhinal-module/src/main.rs"
+old = 'if session.state == "gone" {'
+new = 'if session.state == "gone" || session.state == "lapsed" /* NON-VACUITY BREAK */ {'
+test_file = "crates/entorhinal-module/src/session_upkeep_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["session_upkeep::tests::liveness_gone_stamps_the_binding_but_lapsed_and_absence_do_not"]
+
+[[control]]
+id = "session-retention-open-move"
+guards = "Retention keeps every binding of an agent with an open move"
+file = "crates/entorhinal-core/src/session_lifecycle.rs"
+old = "WHERE step NOT IN ('released','aborted','done','taken_over'))"
+new = "WHERE 0 /* NON-VACUITY BREAK */)"
+test_file = "crates/entorhinal-core/src/session_lifecycle_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["session_lifecycle::tests::retention_keeps_every_binding_of_an_agent_with_an_open_move"]
+
+[[control]]
+id = "session-retention-thirty-day-boundary"
+guards = "A binding that ended exactly thirty days ago is kept; only older ones are pruned"
+file = "crates/entorhinal-core/src/session_lifecycle.rs"
+old = "AND ended_at_ms < ?1"
+new = "AND ended_at_ms <= ?1 /* NON-VACUITY BREAK */"
+test_file = "crates/entorhinal-core/src/session_lifecycle_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["session_lifecycle::tests::retention_prunes_past_thirty_days_and_keeps_the_boundary"]
+
+[[control]]
+id = "session-list-page-order"
+guards = "agent.sessions pages newest registration first"
+file = "crates/entorhinal-core/src/session_lifecycle.rs"
+old = "ORDER BY registered_at_ms DESC, ref_kind, ref"
+new = "ORDER BY registered_at_ms /* NON-VACUITY BREAK */, ref_kind, ref"
+test_file = "crates/entorhinal-core/src/session_lifecycle_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["session_lifecycle::tests::agent_sessions_pages_newest_first_and_cursor_survives_inserts"]
+
+[[control]]
+id = "session-samples-unchanged"
+guards = "The agent-sessions samples published before the session lifecycle keep their exact bytes"
+file = "test-vectors/agent-sessions-v1/register-session.json"
+old = '"message":"held_elsewhere"'
+new = '"message":"held_elsewhere NON-VACUITY BREAK"'
+test_file = "crates/entorhinal-module/src/served_vectors.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["served_vectors::agent_session_samples_keep_their_pinned_bytes_and_checksums", "served_vectors::session_records_match_published_files"]
+
+[[control]]
+id = "session-runner-pair-unique"
+guards = "A registration whose runner and session id are bound to another reference refuses session_bound_elsewhere and writes nothing"
+file = "crates/entorhinal-core/src/lib.rs"
+old = "if ref_kind != request.ref_kind || session_ref != request.session_ref {"
+new = "if false /* NON-VACUITY BREAK */ && (ref_kind != request.ref_kind || session_ref != request.session_ref) {"
+test_file = "crates/entorhinal-core/src/session_lifecycle_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+expect_red = ["session_lifecycle::tests::registration_refuses_a_runner_session_bound_elsewhere"]

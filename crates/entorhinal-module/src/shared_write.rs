@@ -2969,7 +2969,8 @@ impl ProjectsHandler {
             let worker = tokio::task::spawn_blocking(move || {
                 sessions::end_session_on_store(&store, request.params, now)
             });
-            return timeout_at(received + DEADLINE, worker)
+            let deadline = received + DEADLINE;
+            return timeout_at(deadline, worker)
                 .await
                 .map_err(|_| {
                     HandlerError::new("identity_log_contended", "session end deadline expired")

@@ -594,3 +594,79 @@ fn end_session_is_a_self_admitted_mutation_and_sessions_a_query() {
     assert!(!crate::MUTATING_METHODS.contains(&SESSIONS));
     assert!(crate::sessions::READ_METHODS.contains(&SESSIONS));
 }
+
+/// A runner and session id resolve to their binding for any caller; an
+/// unknown pair and a binding registered without a runner answer
+/// `not_found` with no detail, as `agent.for_session` does; and a pair that
+/// another reference already holds refuses a second registration.
+#[tokio::test]
+async fn session_for_runner_resolves_runner_rows_for_any_caller() {
+    let f = Fixture::new("session-for-runner", true);
+    let agent = f.create("Resolved");
+    f.providers(provider(WRITER_MODULE), provider(WRITER_MODULE));
+    let mut hosted = registration(&agent, "r1", "broca", "s1");
+    hosted["runner"] = json!("broca");
+    result(f.register(EXECUTIVE, hosted).await);
+    result(
+        f.register(EXECUTIVE, registration(&agent, "r2", "pi", "s2"))
+            .await,
+    );
+    for principal in [None, Some(Principal::Direct), Some(reserved("thalamus"))] {
+        f.bind(CALLER, principal, true);
+        assert_eq!(
+            result(
+                f.served(
+                    CALLER,
+                    crate::sessions::SESSION_FOR_RUNNER,
+                    json!({"runner":"broca","session":"s1"})
+                )
+                .await
+            ),
+            json!({"agent_id":agent,"runner":"broca","session":"s1","harness":"broca",
+                "ref_kind":"pi","ref":"r1","project_root":"/project","ended_at_ms":null,
+                "incarnation":"0123456789abcdef"})
+        );
+    }
+    let missing = refusal(f.sync(
+        CALLER,
+        crate::sessions::SESSION_FOR_RUNNER,
+        json!({"runner":"broca","session":"nobody"}),
+    ));
+    let for_session_missing = refusal(f.sync(
+        CALLER,
+        crate::sessions::FOR_SESSION,
+        json!({"harness":"broca","session_id":"nobody"}),
+    ));
+    assert_eq!(missing, ("not_found".into(), None));
+    assert_eq!(missing, for_session_missing);
+    for params in [
+        json!({"runner":"pi","session":"s2"}),
+        json!({"runner":"broca","session":"s2"}),
+    ] {
+        assert_eq!(
+            code(f.sync(CALLER, crate::sessions::SESSION_FOR_RUNNER, params)),
+            "not_found"
+        );
+    }
+    for params in [
+        json!({"runner":"","session":"s1"}),
+        json!({"runner":"broca"}),
+        json!({"runner":"broca","session":"s1","harness":"broca"}),
+    ] {
+        assert_eq!(
+            code(f.sync(CALLER, crate::sessions::SESSION_FOR_RUNNER, params.clone())),
+            "invalid_request",
+            "{params}"
+        );
+    }
+
+    let mut taken = registration(&agent, "r3", "other", "s1");
+    taken["runner"] = json!("broca");
+    let (refused, detail) = refusal(f.register(EXECUTIVE, taken).await);
+    assert_eq!(refused, "session_bound_elsewhere");
+    assert_eq!(
+        detail,
+        Some(json!({"ref_kind":"pi","ref":"r1","agent_id":agent}))
+    );
+    assert_eq!(listed(&f, &agent).len(), 2);
+}

@@ -12,13 +12,18 @@ use crate::{agent::AgentMutationError, session_refusal, RegistryError, RegistryS
 
 /// Migration 15. `runner` names the module id of the llm-runner hosting the
 /// session (for example `broca`); `ended_at_ms` is when the session was seen
-/// to end. Rows written before this migration have neither. The index serves
-/// the per-agent list in its page order, newest registration first.
+/// to end. Rows written before this migration have neither. The first index
+/// serves the per-agent list in its page order, newest registration first.
+/// The second makes a runner's session id name one binding: a runner owns its
+/// session namespace, so callers that know only `{runner, session}` can find
+/// the harness and project root behind it. Rows with no runner are outside it.
 pub const V15_SESSION_LIFECYCLE: &str = r#"
 ALTER TABLE session_binding ADD COLUMN runner TEXT NULL;
 ALTER TABLE session_binding ADD COLUMN ended_at_ms INTEGER NULL;
 CREATE INDEX session_binding_agent
     ON session_binding(agent_id, registered_at_ms DESC, ref_kind, ref);
+CREATE UNIQUE INDEX session_binding_runner
+    ON session_binding(runner, session_id) WHERE runner IS NOT NULL;
 "#;
 
 /// How long a binding is kept after its session ended. A binding that never
@@ -76,6 +81,20 @@ pub struct SessionCursor {
     pub session_ref: String,
 }
 
+/// The binding a runner's session id names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RunnerSessionBinding {
+    pub agent_id: String,
+    pub runner: String,
+    pub session: String,
+    pub harness: Option<String>,
+    pub ref_kind: String,
+    #[serde(rename = "ref")]
+    pub session_ref: String,
+    pub project_root: Option<String>,
+    pub ended_at_ms: Option<i64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSessionPage {
     pub sessions: Vec<AgentSession>,
@@ -85,7 +104,9 @@ pub struct AgentSessionPage {
 
 impl RegistryStore {
     /// Mark the binding of a host session ended. A runner named here fills a
-    /// binding that has none; one that differs from the recorded runner is
+    /// binding that has none, unless another binding already holds that
+    /// runner and session id, in which case the end is still recorded and the
+    /// runner left empty; one that differs from the recorded runner is
     /// refused `runner_mismatch` with nothing written. Ending an ended session
     /// returns its first end time and writes nothing, not even a missing
     /// runner.
@@ -138,6 +159,14 @@ impl RegistryStore {
         if let Some(ended_at_ms) = ended_at_ms {
             return Ok(SessionEnd::AlreadyEnded { ended_at_ms });
         }
+        let runner = match runner {
+            Some(named)
+                if recorded.is_none() && runner_session_owner(tx, named, session_id)?.is_some() =>
+            {
+                None
+            }
+            named => named,
+        };
         tx.execute(
             "UPDATE session_binding SET ended_at_ms=?3, runner=COALESCE(runner, ?4)
              WHERE harness=?1 AND session_id=?2",
@@ -203,6 +232,37 @@ impl RegistryStore {
                 return Ok(pruned);
             }
         }
+    }
+
+    /// The binding a runner's session id names. A binding registered without
+    /// a runner is not found here; callers fall back to looking it up by
+    /// harness and session id.
+    pub fn session_binding_for_runner(
+        &self,
+        runner: &str,
+        session: &str,
+    ) -> Result<Option<RunnerSessionBinding>, RegistryError> {
+        self.read(|conn| {
+            conn.query_row(
+                "SELECT agent_id, runner, session_id, harness, ref_kind, ref,
+                        NULLIF(project_root,''), ended_at_ms
+                 FROM session_binding WHERE runner=?1 AND session_id=?2",
+                params![runner, session],
+                |row| {
+                    Ok(RunnerSessionBinding {
+                        agent_id: row.get(0)?,
+                        runner: row.get(1)?,
+                        session: row.get(2)?,
+                        harness: row.get(3)?,
+                        ref_kind: row.get(4)?,
+                        session_ref: row.get(5)?,
+                        project_root: row.get(6)?,
+                        ended_at_ms: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+        })
     }
 
     /// One page of an agent's session bindings, newest registration first,
@@ -272,6 +332,21 @@ impl RegistryStore {
             Ok(Ok(AgentSessionPage { sessions, next }))
         })?
     }
+}
+
+/// The `(ref_kind, ref, agent_id)` of the binding holding this runner and
+/// session id, if any.
+pub(crate) fn runner_session_owner(
+    tx: &Transaction<'_>,
+    runner: &str,
+    session_id: &str,
+) -> rusqlite::Result<Option<(String, String, String)>> {
+    tx.query_row(
+        "SELECT ref_kind, ref, agent_id FROM session_binding WHERE runner=?1 AND session_id=?2",
+        params![runner, session_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .optional()
 }
 
 #[cfg(test)]

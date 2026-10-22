@@ -473,3 +473,131 @@ fn lifecycle_writes_append_no_journal_entry() {
         .unwrap();
     assert_eq!(f.store.generation().unwrap(), before);
 }
+
+fn hosted<'a>(
+    session_ref: &'a str,
+    harness: &'a str,
+    session_id: &'a str,
+    runner: Option<&'a str>,
+) -> SessionRegistration<'a> {
+    SessionRegistration {
+        agent_id: AGENT,
+        ref_kind: "broca-session",
+        session_ref,
+        harness,
+        session_id,
+        project_root: "/project",
+        registered_by: "orchestrator",
+        runner,
+        now_ms: 10,
+    }
+}
+
+/// A runner and session id name one binding. Registering them under another
+/// reference refuses `session_bound_elsewhere` with the same detail as a
+/// taken harness session key, and writes nothing, including when the runner
+/// comes from the reference's earlier registration rather than the request.
+#[test]
+fn registration_refuses_a_runner_session_bound_elsewhere() {
+    let f = Fixture::new();
+    f.store
+        .register_session(&hosted("ref-1", "broca", "s1", Some("broca")))
+        .unwrap();
+    let refusal = f
+        .store
+        .register_session(&hosted("ref-2", "other-harness", "s1", Some("broca")))
+        .unwrap_err();
+    assert_eq!(refusal.code, "session_bound_elsewhere");
+    assert_eq!(
+        refusal.detail,
+        Some(serde_json::json!({"ref_kind":"broca-session","ref":"ref-1","agent_id":AGENT}))
+    );
+    assert_eq!(f.count(), 1, "the refused registration wrote nothing");
+
+    // The reference keeps its runner when re-registered without one, so
+    // moving it onto a session id that runner already uses is refused too.
+    f.store
+        .register_session(&hosted("ref-3", "broca", "s3", Some("broca")))
+        .unwrap();
+    assert_eq!(
+        f.store
+            .register_session(&hosted("ref-3", "other-harness", "s1", None))
+            .unwrap_err()
+            .code,
+        "session_bound_elsewhere"
+    );
+    assert_eq!(f.lifecycle("s3"), Some((Some("broca".into()), None)));
+
+    // Another runner's namespace is separate, and so is a row with no runner.
+    f.store
+        .register_session(&hosted("ref-4", "thalamus", "s1", Some("thalamus-harness")))
+        .unwrap();
+    f.store
+        .register_session(&hosted("ref-5", "pi", "s1", None))
+        .unwrap();
+    // Re-registering the owning reference is not a conflict with itself.
+    f.store
+        .register_session(&hosted("ref-1", "broca", "s1", None))
+        .unwrap();
+}
+
+#[test]
+fn session_binding_for_runner_finds_only_runner_rows() {
+    let f = Fixture::new();
+    f.store
+        .register_session(&hosted("ref-1", "broca", "s1", Some("broca")))
+        .unwrap();
+    f.store
+        .register_session(&hosted("ref-2", "pi", "s2", None))
+        .unwrap();
+    f.store.end_session("broca", "s1", None, 20).unwrap();
+    assert_eq!(
+        f.store.session_binding_for_runner("broca", "s1").unwrap(),
+        Some(crate::RunnerSessionBinding {
+            agent_id: AGENT.into(),
+            runner: "broca".into(),
+            session: "s1".into(),
+            harness: Some("broca".into()),
+            ref_kind: "broca-session".into(),
+            session_ref: "ref-1".into(),
+            project_root: Some("/project".into()),
+            ended_at_ms: Some(20),
+        })
+    );
+    assert_eq!(
+        f.store.session_binding_for_runner("pi", "s2").unwrap(),
+        None
+    );
+    assert_eq!(
+        f.store
+            .session_binding_for_runner("thalamus-harness", "s1")
+            .unwrap(),
+        None
+    );
+}
+
+/// Ending a runner-less binding with a runner whose session id another
+/// binding already holds still records the end but leaves the runner empty.
+#[test]
+fn end_session_leaves_runner_empty_when_another_binding_holds_it() {
+    let f = Fixture::new();
+    f.store
+        .register_session(&hosted("ref-1", "broca", "s1", Some("broca")))
+        .unwrap();
+    f.store
+        .register_session(&hosted("ref-2", "pi", "s1", None))
+        .unwrap();
+    assert_eq!(
+        f.store.end_session("pi", "s1", Some("broca"), 30).unwrap(),
+        SessionEnd::Ended { ended_at_ms: 30 }
+    );
+    let rows: Vec<(Option<String>, Option<i64>)> = f
+        .store
+        .read(|conn| {
+            conn.prepare("SELECT runner, ended_at_ms FROM session_binding ORDER BY ref")?
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect()
+        })
+        .unwrap();
+    assert_eq!(rows, [(Some("broca".into()), None), (None, Some(30))]);
+}

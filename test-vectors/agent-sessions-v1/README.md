@@ -54,6 +54,19 @@ objects deny unknown fields; a field outside the listed schema is an
 - Both moving samples keep top-level `status` at `held_here`; the presence of
   `moving` for a non-terminal move on this Mac is the signal, and its `side`
   identifies which end this Mac is.
+- `agent.register_session` may also carry an optional `runner`: the module ID
+  of the llm-runner hosting the session, 1–64 bytes with no control
+  characters. It is taken out before the strict decode above, so the
+  unknown-field refusal is unchanged, and it is never echoed in the reply.
+- `agent.end_session`: exactly `{harness, session, runner?}`. Harness is 1–32
+  bytes, session 1–256 bytes, runner as above. Accepted only from the sole
+  provider of `agent-orchestrator/v1`. The end time is the handler's clock.
+- `agent.sessions`: exactly `{agent_id, cursor?, limit?}`. `limit` is 1–500
+  and defaults to 100; `cursor` is the opaque `next_cursor` of the previous
+  page. Rows run newest registration first, ties in `(ref_kind, ref)` order.
+- `agent.session_for_runner`: exactly `{runner, session}`. A session
+  registered without a runner is `not_found` here; look it up with
+  `agent.for_session`.
 - `agent.where_many`: exactly `{agentIds}`, with 1–64 unique valid agent IDs.
   Results preserve request order and omit unknown agents; the sample requests a
   locally held and remotely held agent around an unknown ID.
@@ -80,8 +93,24 @@ objects deny unknown fields; a field outside the listed schema is an
   published step, waiting for the receiver to pick up the move.
 - **`where-moving-receiver.json`**: the same locally held agent during the
   receiver-side claimed step, before activation completes.
-- **`SHA256SUMS`**: SHA-256 hashes of the eight JSON vector files, with names
-  relative to this directory.
+- **`register-session-runner.json`**: a Broca worker registration naming
+  runner `broca`; the reply bytes have the same shape as a registration
+  without one.
+- **`end-session.json`**: ending a worker (`found: true` with the end time),
+  the repeat (the same first end time, nothing written), an unknown session
+  (`found: false`), and `runner_mismatch` for a runner other than the
+  recorded one.
+- **`sessions.json`**: one agent's two pages at `limit: 2`: a live Broca worker
+  (`active` from the host's liveness snapshot) and an ended worker (`gone`),
+  then a Pi session registered with `runner: null` (`unknown`), whose page
+  has `next_cursor: null`.
+- **`session-for-runner.json`**: the live worker found by `{runner, session}`,
+  an unknown pair, and a session registered without a runner, both
+  `not_found` with the same shape as `agent.for_session`'s miss.
+- **`SHA256SUMS`**: SHA-256 hashes of the twelve JSON vector files, with names
+  relative to this directory. The first eight lines predate the session
+  lifecycle samples and are pinned by
+  `served_vectors::agent_session_samples_keep_their_pinned_bytes_and_checksums`.
 
 ## SHA-256 hashes
 
@@ -95,6 +124,10 @@ objects deny unknown fields; a field outside the listed schema is an
 | `where-moving-receiver.json` | `ed04f74915d7f552f2472575a5786beecb2354e42077b29db5200b23e17e2ac0` |
 | `where-moving-source.json` | `3f2dc20b7216d6da8efe89cd9315bab65fbda232faf89191bea27fe84e2da00f` |
 | `where-sharing-off.json` | `0b8fe82664439e2eb38e0816f900c08f7822bdfe29373a77579cfbbd080c6b63` |
+| `end-session.json` | `efd3a0b6c6ac2463ec20e3be9ee26593ad3fd0a4a62c3457ad65f5e876ff6d18` |
+| `register-session-runner.json` | `8ec0505594c6336a924595edf8af73304f1e2bd4d80f197b26b8e18628a4dca3` |
+| `session-for-runner.json` | `b29ec5b317cc3c5f6a512e7414b2873b06c612047c00e7465183a51ea4fa0e1e` |
+| `sessions.json` | `73b1a2d457c1a64390e5b630841c6586791224fa1b67ec6b643f819603de1880` |
 
 ## Reproduce and verify
 
@@ -102,6 +135,7 @@ From the repository root, generate the vector files with:
 
 ```sh
 ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked session_records_match_published_files -- --nocapture
+ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked session_lifecycle_records_match_published_files -- --nocapture
 ```
 
 Refresh their hashes from the repository root with:
@@ -111,7 +145,7 @@ python3 - <<'PY'
 import hashlib
 from pathlib import Path
 root = Path('test-vectors/agent-sessions-v1')
-names = ['for-session.json', 'register-session.json', 'session-for-ref.json', 'where.json', 'where-many.json', 'where-moving-receiver.json', 'where-moving-source.json', 'where-sharing-off.json']
+names = ['for-session.json', 'register-session.json', 'session-for-ref.json', 'where.json', 'where-many.json', 'where-moving-receiver.json', 'where-moving-source.json', 'where-sharing-off.json', 'end-session.json', 'register-session-runner.json', 'session-for-runner.json', 'sessions.json']
 root.joinpath('SHA256SUMS').write_text(''.join(
     f'{hashlib.sha256(root.joinpath(name).read_bytes()).hexdigest()}  {name}\n'
     for name in names), encoding='utf-8')

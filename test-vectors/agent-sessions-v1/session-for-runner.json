@@ -1,0 +1,5 @@
+[
+  {"request":{"method":"agent.session_for_runner","params":{"runner":"broca","session":"broca-live"}},"principal":{"kind":"reserved","moduleId":"phone"},"reply":{"result":{"agent_id":"agent_0000000000000101","ended_at_ms":null,"harness":"broca","incarnation":"0123456789abcdef","project_root":"/workspace/session-vectors","ref":"11111111111111111111111111111111","ref_kind":"broca-session","runner":"broca","session":"broca-live"}}},
+  {"request":{"method":"agent.session_for_runner","params":{"runner":"broca","session":"never-registered"}},"principal":{"kind":"reserved","moduleId":"phone"},"reply":{"code":"not_found","detail":null,"message":"no agent session is registered under this runner and session"}},
+  {"request":{"method":"agent.session_for_runner","params":{"runner":"broca","session":"pi-session-001"}},"principal":{"kind":"reserved","moduleId":"phone"},"reply":{"code":"not_found","detail":null,"message":"no agent session is registered under this runner and session"}}
+]

@@ -51,7 +51,8 @@ pub use root_keys::{
     AttachRootPreview, AttachRootRequest, ResolveRootKeyReply, ResolveRootKeyRequest, RootKey,
 };
 pub use session_lifecycle::{
-    AgentSession, AgentSessionPage, GoneSession, SessionCursor, SessionEnd, SESSION_RETENTION_MS,
+    AgentSession, AgentSessionPage, GoneSession, RunnerSessionBinding, SessionCursor, SessionEnd,
+    SESSION_RETENTION_MS,
 };
 
 // The schema-migration namespace, NOT the module id, and deliberately left as
@@ -1052,7 +1053,9 @@ impl RegistryStore {
     /// merged), `claim_integrity_failed`, `held_elsewhere` (a cached claim at
     /// epoch 1 or higher belongs to another device), `ref_bound_elsewhere` (the reference already belongs to
     /// another agent) and `session_bound_elsewhere` (the session key already
-    /// binds another reference, even one of the same agent).
+    /// binds another reference, even one of the same agent; also when the
+    /// runner the binding would carry and the session id already bind
+    /// another reference).
     /// Registering the same reference again for the same agent moves it to the
     /// new session key and records the new caller role and time. It also
     /// clears the binding's end time, and records the runner when one is
@@ -1141,6 +1144,39 @@ impl RegistryStore {
                         "agent_id": bound.agent_id,
                     })),
                 ));
+            }
+        }
+        // A runner owns its session namespace, so one runner and session id
+        // name one binding. The runner this registration leaves on the row is
+        // the one it names, or else the one the reference already had.
+        let runner = match request.runner {
+            Some(runner) => Some(runner.to_owned()),
+            None => tx
+                .query_row(
+                    "SELECT runner FROM session_binding WHERE ref_kind=?1 AND ref=?2",
+                    params![request.ref_kind, request.session_ref],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten(),
+        };
+        if let Some(runner) = &runner {
+            if let Some((ref_kind, session_ref, agent_id)) =
+                session_lifecycle::runner_session_owner(tx, runner, request.session_id)?
+            {
+                if ref_kind != request.ref_kind || session_ref != request.session_ref {
+                    return Err(session_refusal(
+                        "session_bound_elsewhere",
+                        format!(
+                            "this session already binds reference {ref_kind}:{session_ref} of agent {agent_id}"
+                        ),
+                        Some(serde_json::json!({
+                            "ref_kind": ref_kind,
+                            "ref": session_ref,
+                            "agent_id": agent_id,
+                        })),
+                    ));
+                }
             }
         }
         tx.execute(

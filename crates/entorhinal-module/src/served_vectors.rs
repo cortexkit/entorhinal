@@ -1438,6 +1438,276 @@ async fn moving_agent_where_records_match_published_files() {
     }
 }
 
+/// The reference of a live Broca worker session in the lifecycle samples.
+const LIVE_WORKER_REF: &str = "11111111111111111111111111111111";
+/// The reference of an ended Broca worker session in the lifecycle samples.
+const ENDED_WORKER_REF: &str = "22222222222222222222222222222222";
+/// The reference of a Pi session registered without a runner.
+const NO_RUNNER_REF: &str = "33333333333333333333333333333333";
+
+/// Served samples for the session lifecycle: a registration naming its
+/// runner, `agent.end_session` replies, and an agent's two-page session list
+/// with a live worker, an ended worker and a row with no runner.
+#[tokio::test]
+async fn session_lifecycle_records_match_published_files() {
+    let fixture = SessionFixture::new("served-session-lifecycle").await;
+    let source = fixture.snapshot();
+    seed_agent(&source, SESSION_AGENT, "Session Agent", None, false, false);
+    drop(source);
+    let imported = fixture.import().await;
+    let HandlerOutcome::Response(_) = imported else {
+        panic!("lifecycle import refused: {}", refusal(imported));
+    };
+
+    let worker = |session_ref: &str, session_id: &str| {
+        json!({
+            "agent_id":SESSION_AGENT,
+            "ref_kind":"broca-session",
+            "ref":session_ref,
+            "harness":"broca",
+            "session_id":session_id,
+            "project_root":"/workspace/session-vectors",
+            "runner":"broca"
+        })
+    };
+    let (register_record, registered) = fixture
+        .record(
+            SESSION_REGISTRAR,
+            WRITER_MODULE,
+            "agent.register_session",
+            worker(LIVE_WORKER_REF, "broca-live"),
+        )
+        .await;
+    assert_eq!(registered["result"]["registered_by"], "orchestrator");
+    assert!(registered["result"].get("runner").is_none());
+    published_file(
+        "agent-sessions-v1",
+        "register-session-runner.json",
+        vec![register_record],
+    );
+    for params in [
+        worker(ENDED_WORKER_REF, "broca-ended"),
+        json!({
+            "agent_id":SESSION_AGENT,
+            "ref_kind":"pi-session",
+            "ref":NO_RUNNER_REF,
+            "harness":"pi",
+            "session_id":"pi-session-001",
+            "project_root":"/workspace/session-vectors"
+        }),
+    ] {
+        let (_, reply) = fixture
+            .record(
+                SESSION_REGISTRAR,
+                WRITER_MODULE,
+                "agent.register_session",
+                params,
+            )
+            .await;
+        assert!(reply.get("result").is_some(), "{reply}");
+    }
+
+    let mut end_records = Vec::new();
+    for (params, expected) in [
+        (
+            json!({"harness":"broca","session":"broca-ended","runner":"broca"}),
+            json!({"result":{"found":true,"ended_at_ms":700}}),
+        ),
+        (
+            json!({"harness":"broca","session":"broca-ended","runner":"broca"}),
+            json!({"result":{"found":true,"ended_at_ms":700}}),
+        ),
+        (
+            json!({"harness":"broca","session":"never-registered"}),
+            json!({"result":{"found":false}}),
+        ),
+    ] {
+        let (record, reply) = fixture
+            .record(
+                SESSION_REGISTRAR,
+                WRITER_MODULE,
+                "agent.end_session",
+                params,
+            )
+            .await;
+        assert_eq!(reply, expected);
+        end_records.push(record);
+    }
+    let (mismatch, mismatch_reply) = fixture
+        .record(
+            SESSION_REGISTRAR,
+            WRITER_MODULE,
+            "agent.end_session",
+            json!({"harness":"broca","session":"broca-live","runner":"thalamus-harness"}),
+        )
+        .await;
+    assert_eq!(mismatch_reply["code"], "runner_mismatch");
+    end_records.push(mismatch);
+    published_file("agent-sessions-v1", "end-session.json", end_records);
+
+    // The host reports the live worker active; the others are not mirrored.
+    let (_, fed) = fixture
+        .record(
+            SESSION_CORE,
+            WRITER_MODULE,
+            "projects.session_liveness",
+            json!({"seq":1,"snapshot":true,"sessions":[
+                {"harness":"broca","sessionId":"broca-live","canonicalRoot":"/workspace/session-vectors","state":"active","runner":"broca"}]}),
+        )
+        .await;
+    assert_eq!(fed["result"]["accepted"], true);
+    let (first_page, first) = fixture
+        .record(
+            SESSION_READER,
+            READER_MODULE,
+            "agent.sessions",
+            json!({"agent_id":SESSION_AGENT,"limit":2}),
+        )
+        .await;
+    let liveness = |page: &Value| {
+        page["result"]["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| (row["ref"].clone(), row["liveness"].clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        liveness(&first),
+        [
+            (json!(LIVE_WORKER_REF), json!("active")),
+            (json!(ENDED_WORKER_REF), json!("gone"))
+        ]
+    );
+    let cursor = first["result"]["next_cursor"].clone();
+    assert!(cursor.is_string());
+    let (second_page, second) = fixture
+        .record(
+            SESSION_READER,
+            READER_MODULE,
+            "agent.sessions",
+            json!({"agent_id":SESSION_AGENT,"cursor":cursor,"limit":2}),
+        )
+        .await;
+    assert_eq!(
+        liveness(&second),
+        [(json!(NO_RUNNER_REF), json!("unknown"))]
+    );
+    assert!(second["result"]["sessions"][0]["runner"].is_null());
+    assert!(second["result"]["next_cursor"].is_null());
+    published_file(
+        "agent-sessions-v1",
+        "sessions.json",
+        vec![first_page, second_page],
+    );
+
+    // A runner's session id resolves to its binding; an unknown pair, and a
+    // session registered without a runner, are `not_found` like
+    // `agent.for_session`'s miss.
+    let mut runner_records = Vec::new();
+    for (params, found) in [
+        (json!({"runner":"broca","session":"broca-live"}), true),
+        (
+            json!({"runner":"broca","session":"never-registered"}),
+            false,
+        ),
+        (json!({"runner":"broca","session":"pi-session-001"}), false),
+    ] {
+        let (record, reply) = fixture
+            .record(
+                SESSION_READER,
+                READER_MODULE,
+                "agent.session_for_runner",
+                params,
+            )
+            .await;
+        if found {
+            assert_eq!(reply["result"]["ref"], LIVE_WORKER_REF);
+            assert_eq!(reply["result"]["harness"], "broca");
+        } else {
+            assert_eq!(reply["code"], "not_found");
+            assert!(reply["detail"].is_null());
+        }
+        runner_records.push(record);
+    }
+    published_file(
+        "agent-sessions-v1",
+        "session-for-runner.json",
+        runner_records,
+    );
+}
+
+/// The SHA-256 of each agent-sessions sample published before the session
+/// lifecycle was added. Core decodes these replies strictly, so adding the
+/// lifecycle must not change a byte of them.
+const PINNED_SESSION_SAMPLES: [(&str, &str); 8] = [
+    (
+        "for-session.json",
+        "dd41914934a9b85b35670a815bef17de84752d8da7d05a1bf8833f3edbd1996b",
+    ),
+    (
+        "register-session.json",
+        "20015ad11322866712bf4e43666ba3356c87700b3905884b8deed67fb3d1edbb",
+    ),
+    (
+        "session-for-ref.json",
+        "f8314b13df331e185f2c4960a314a3e8fac97af5d8e9904150ba024973fbb69a",
+    ),
+    (
+        "where.json",
+        "da88d465b4a190dbf14f7224ed8fd4a6cae10a8639fbbc7953b7d8b1f11dce8d",
+    ),
+    (
+        "where-many.json",
+        "93cc230f690999df6e7876f0bcabeaf391e5d8c9c7166e16a61d4c9112c153e6",
+    ),
+    (
+        "where-moving-receiver.json",
+        "ed04f74915d7f552f2472575a5786beecb2354e42077b29db5200b23e17e2ac0",
+    ),
+    (
+        "where-moving-source.json",
+        "3f2dc20b7216d6da8efe89cd9315bab65fbda232faf89191bea27fe84e2da00f",
+    ),
+    (
+        "where-sharing-off.json",
+        "0b8fe82664439e2eb38e0816f900c08f7822bdfe29373a77579cfbbd080c6b63",
+    ),
+];
+
+/// The earlier samples keep their pinned bytes, and `SHA256SUMS` names every
+/// JSON sample in the directory with its current hash.
+#[test]
+fn agent_session_samples_keep_their_pinned_bytes_and_checksums() {
+    use sha2::{Digest, Sha256};
+    let directory =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-vectors/agent-sessions-v1");
+    let hash = |name: &str| {
+        format!(
+            "{:x}",
+            Sha256::digest(std::fs::read(directory.join(name)).unwrap())
+        )
+    };
+    for (name, pinned) in PINNED_SESSION_SAMPLES {
+        assert_eq!(hash(name), pinned, "{name} changed");
+    }
+    let sums = std::fs::read_to_string(directory.join("SHA256SUMS")).unwrap();
+    let mut listed = Vec::new();
+    for line in sums.lines() {
+        let (sum, name) = line.split_once("  ").expect("a SHA256SUMS line");
+        assert_eq!(hash(name), sum, "SHA256SUMS is stale for {name}");
+        listed.push(name.to_owned());
+    }
+    let mut samples: Vec<String> = std::fs::read_dir(&directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".json"))
+        .collect();
+    samples.sort();
+    listed.sort();
+    assert_eq!(listed, samples, "SHA256SUMS lists every sample");
+}
+
 #[tokio::test]
 async fn avatar_read_matches_core_contract_v1_0() {
     let core: Value = serde_json::from_str(include_str!(
