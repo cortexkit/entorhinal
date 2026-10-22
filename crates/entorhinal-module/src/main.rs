@@ -1242,7 +1242,6 @@ impl ModuleHandler for ProjectsHandler {
                 let catalog_sql = self.catalog_sql.clone();
                 tokio::spawn(async move {
                     let outcome = retry_open_while_lease_held(&descriptor, retry_budget).await;
-                    health.store_opening.store(false, Ordering::Relaxed);
                     install_store_with_time(
                         &store,
                         &health,
@@ -1251,6 +1250,11 @@ impl ModuleHandler for ProjectsHandler {
                         module_started_at,
                         Instant::now,
                     );
+                    // Clear "opening" only after the outcome is installed. Clearing
+                    // it first left a window where health read neither opening nor
+                    // ready and reported the store as failing, which the daemon
+                    // counts against the module.
+                    health.store_opening.store(false, Ordering::Release);
                     claim_refresh.signal();
                     role_refresh.notify_one();
                     move_wake.notify_one();
@@ -1283,9 +1287,12 @@ impl ModuleHandler for ProjectsHandler {
         // Health is deliberately insulated from the store mutex and database. The
         // daemon's health path must remain responsive even when a domain request is
         // blocked or the store has failed; only cached atomic gauges are read here.
+        // Read "opening" first, with Acquire: the retry task clears it with
+        // Release only after installing the store, so once it reads false, the
+        // ready and failed flags below already show the installed outcome.
+        let opening = self.health.store_opening.load(Ordering::Acquire);
         let ready = self.health.store_ready.load(Ordering::Relaxed);
         let failed = self.health.store_failed.load(Ordering::Relaxed);
-        let opening = self.health.store_opening.load(Ordering::Relaxed);
         let status = if opening {
             HealthStatus::Degraded
         } else if failed || !ready {
@@ -4486,7 +4493,7 @@ mod tests {
 
     async fn wait_until_settled(handler: &ProjectsHandler, budget: Duration) -> Duration {
         let started = Instant::now();
-        while handler.health.store_opening.load(Ordering::Relaxed) {
+        while handler.health.store_opening.load(Ordering::Acquire) {
             assert!(
                 started.elapsed() < budget,
                 "open did not settle within {budget:?}"
