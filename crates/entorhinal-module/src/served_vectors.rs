@@ -1810,6 +1810,65 @@ async fn session_lifecycle_records_match_published_files() {
         runner_records,
     );
 
+    let mut open_records = Vec::new();
+    let mut cursor = Value::Null;
+    loop {
+        let mut request = json!({"agent_id":SESSION_AGENT,"open":true,"limit":1});
+        if !cursor.is_null() {
+            request["cursor"] = cursor;
+        }
+        let (record, reply) = fixture
+            .record(SESSION_READER, READER_MODULE, "agent.sessions", request)
+            .await;
+        assert!(reply["result"]["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["ended_at_ms"].is_null()));
+        cursor = reply["result"]["next_cursor"].clone();
+        open_records.push(record);
+        if cursor.is_null() {
+            break;
+        }
+    }
+    published_file("agent-sessions-v1", "sessions-open.json", open_records);
+
+    fixture
+        .handler
+        .with_store(|store| {
+            store.apply_entry("fixture.remote_finished", "{}", "fixture", None, |tx| {
+                tx.execute(
+                    "UPDATE session_binding SET held_on='source-mac' WHERE ref=?1",
+                    [ENDED_WORKER_REF],
+                )?;
+                Ok(())
+            })
+        })
+        .unwrap();
+    let (listed, reply) = fixture
+        .record(
+            SESSION_READER,
+            READER_MODULE,
+            "agent.sessions",
+            json!({"agent_id":SESSION_AGENT}),
+        )
+        .await;
+    assert_eq!(reply["result"]["sessions"][1]["heldOn"], "source-mac");
+    let (refused, reply) = fixture
+        .record(
+            SESSION_REGISTRAR,
+            WRITER_MODULE,
+            "agent.register_session",
+            worker(ENDED_WORKER_REF, "broca-ended"),
+        )
+        .await;
+    assert_eq!(reply["code"], "session_on_other_machine");
+    published_file(
+        "agent-sessions-v1",
+        "sessions-held-on.json",
+        vec![listed, refused],
+    );
+
     // Fill the ended worker's history to the cap through the handler, after
     // the reads above so they show it with no history. The next different
     // value is refused with nothing written.

@@ -2,7 +2,7 @@
 //! self-describing.
 //!
 //! ```text
-//! ck-session-bindings/v1\n
+//! ck-session-bindings/v1\n (or v2 for finished metadata with a data holder)
 //! {"agent_id":"…","count":N}\n
 //! N lines, one CarriedBinding as JSON each, in strictly ascending (ref_kind, ref)
 //! ```
@@ -26,10 +26,10 @@ use std::{
 };
 
 pub(super) const MAGIC: &[u8] = b"ck-session-bindings/v1\n";
+pub(super) const FINISHED_MAGIC: &[u8] = b"ck-session-bindings/v2\n";
 const MAGIC_PREFIX: &str = "ck-session-bindings/";
-/// The most bindings one stream may carry. The shared move record already
-/// limits a move to the refs that fit in its 64 KiB body (a few hundred
-/// bindings), so this only bounds a stream that is corrupt or hostile.
+/// The most bindings one stream may carry, including finished metadata
+/// that no longer occupies space in the shared move record.
 pub(super) const ROW_CAP: u64 = 16_384;
 /// The longest encoded binding. A binding holding the full 1,024-entry
 /// network history encodes to about 45 KiB, so this leaves room for long
@@ -126,7 +126,8 @@ fn next_line(reader: &mut impl BufRead, cap: u64) -> Result<Option<Vec<u8>>, Han
 pub(super) fn decode(path: &Path, agent: &str) -> Result<Vec<CarriedBinding>, HandlerError> {
     let mut reader = BufReader::new(File::open(path).map_err(io)?);
     let first = next_line(&mut reader, 64)?.unwrap_or_default();
-    if first != MAGIC[..MAGIC.len() - 1] {
+    let finished = first == FINISHED_MAGIC[..FINISHED_MAGIC.len() - 1];
+    if first != MAGIC[..MAGIC.len() - 1] && !finished {
         let text = String::from_utf8_lossy(&first);
         if let Some(version) = text.strip_prefix(MAGIC_PREFIX) {
             let found = format!("session-bindings/{version}");
@@ -156,6 +157,11 @@ pub(super) fn decode(path: &Path, agent: &str) -> Result<Vec<CarriedBinding>, Ha
         let row: CarriedBinding = serde_json::from_slice(&line)
             .map_err(|e| invalid(format!("bad session binding: {e}")))?;
         row.check().map_err(invalid)?;
+        if !finished && row.held_on.is_some() {
+            return Err(invalid(
+                "remote finished bindings require session-bindings/v2",
+            ));
+        }
         if rows.last().is_some_and(|last| last.key() >= row.key()) {
             return Err(invalid(
                 "session bindings are not in strictly ascending ref order",
@@ -188,6 +194,7 @@ mod tests {
             registered_by: "host".into(),
             registered_at_ms: 40,
             ended_at_ms: Some(90),
+            held_on: None,
             network_history: history
                 .into_iter()
                 .map(|(network, since_ms)| NetworkEntry {
@@ -240,14 +247,14 @@ mod tests {
     #[test]
     fn session_bindings_stream_refuses_another_format_version() {
         let mut bytes = golden();
-        bytes[21] = b'2';
+        bytes[21] = b'3';
         let dir = scratch("session-bindings-version");
         std::fs::write(dir.join("payload"), bytes).unwrap();
         let error = decode(&dir.join("payload"), AGENT).unwrap_err();
         assert_eq!(error.code, "incompatible_version");
         assert_eq!(
             error.detail,
-            Some(json!({"found":"session-bindings/v2","required":"session-bindings/v1"}))
+            Some(json!({"found":"session-bindings/v3","required":"session-bindings/v1"}))
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -332,4 +339,23 @@ mod tests {
         assert_eq!(decode(&dir.join("payload"), AGENT).unwrap().len(), 1300);
         std::fs::remove_dir_all(dir).unwrap();
     }
+}
+
+#[cfg(test)]
+#[test]
+fn finished_v2_round_trips_and_cannot_masquerade_as_v1() {
+    let (dir, _) = crate::tests::scratch_descriptor("finished-v2");
+    std::fs::create_dir_all(&dir).unwrap();
+    let row: CarriedBinding = serde_json::from_value(serde_json::json!({
+        "ref_kind":"broca-session","ref":"finished","runner":null,"harness":null,
+        "session_id":null,"project_root":"","registered_by":"move","registered_at_ms":1,
+        "ended_at_ms":2,"network_history":[],"held_on":"machine-a"
+    }))
+    .unwrap();
+    let path = dir.join("payload");
+    encode(&path, FINISHED_MAGIC, "agent", std::slice::from_ref(&row)).unwrap();
+    assert_eq!(decode(&path, "agent").unwrap(), vec![row.clone()]);
+    encode(&path, MAGIC, "agent", &[row]).unwrap();
+    assert_eq!(decode(&path, "agent").unwrap_err().code, "digest_mismatch");
+    std::fs::remove_dir_all(dir).unwrap();
 }

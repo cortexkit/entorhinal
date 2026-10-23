@@ -53,9 +53,12 @@ use std::{
 use tokio::time::Duration;
 
 const KIND: &str = SESSION_BINDINGS_KIND;
-/// The stream format, as `prepare` reports it and as the stream's first
-/// line names it.
+/// The legacy format keeps its exact bytes when no remote metadata is carried.
 pub(crate) const FORMAT: &str = "session-bindings/v1";
+const FINISHED_FORMAT: &str = "session-bindings/v2";
+fn legacy_format() -> String {
+    FORMAT.into()
+}
 /// Entorhinal's reserved engram stream, shared with the package closure;
 /// each cut item still has its own session ref.
 const STREAM: &str = "reserved:entorhinal";
@@ -82,6 +85,8 @@ struct Checkpoint {
     agent: String,
     step: String,
     item: CutItem,
+    #[serde(default = "legacy_format")]
+    format: String,
 }
 
 /// Test-only changes to what a source writes, standing in for a source Mac
@@ -377,7 +382,7 @@ impl SessionMove {
                 Ok(json!({"items":[{"ref_kind":KIND,"ref":agent,
                     "sessionRef":state.item.session_ref,"stream":STREAM,
                     "endOffset":state.item.end_offset,"digest":state.item.digest,
-                    "format":FORMAT,"frozen":true}],"external":[]}))
+                    "format":state.format,"frozen":true}],"external":[]}))
             }
             "agent_data.export" => {
                 Self::side(row, MoveSide::Source)?;
@@ -446,6 +451,7 @@ impl SessionMove {
                     agent: agent.into(),
                     step: "imported".into(),
                     item,
+                    format: FORMAT.into(),
                 };
                 self.save(id, &state)?;
                 Ok(json!({"items":[{"sessionRef":state.item.session_ref,
@@ -475,6 +481,7 @@ impl SessionMove {
                 let state = Checkpoint {
                     agent: agent.into(),
                     step: "aborted".into(),
+                    format: FORMAT.into(),
                     item: saved.map(|s| s.item).unwrap_or_else(|| CutItem {
                         session_ref: session_ref(agent, id),
                         stream: STREAM.into(),
@@ -500,13 +507,22 @@ impl SessionMove {
         let (cut, owner) = (id.to_owned(), agent.to_owned());
         #[cfg(test)]
         let fault = self.fault;
-        let (end_offset, digest, count) = crate::catalog_sql::run(move || {
+        let (end_offset, digest, count, format) = crate::catalog_sql::run(move || {
             #[allow(unused_mut)]
             let mut rows = store
                 .export_session_bindings(&cut, &owner)
                 .map_err(HandlerError::from)?;
             #[allow(unused_mut)]
-            let mut magic = stream::MAGIC;
+            let mut magic = if rows.iter().any(|b| b.held_on.is_some()) {
+                stream::FINISHED_MAGIC
+            } else {
+                stream::MAGIC
+            };
+            let format = if magic == stream::FINISHED_MAGIC {
+                FINISHED_FORMAT
+            } else {
+                FORMAT
+            };
             #[cfg(test)]
             {
                 if let Some(extra) = fault.extra {
@@ -518,12 +534,13 @@ impl SessionMove {
             }
             private_dir(&dir)?;
             let (length, digest) = stream::encode(&dir.join("payload"), magic, &owner, &rows)?;
-            Ok::<_, HandlerError>((length, digest, rows.len() as u64))
+            Ok::<_, HandlerError>((length, digest, rows.len() as u64, format))
         })
         .await?;
         let state = Checkpoint {
             agent: agent.into(),
             step: "prepared".into(),
+            format: format.into(),
             item: CutItem {
                 session_ref: session_ref(agent, id),
                 stream: STREAM.into(),
@@ -756,8 +773,8 @@ pub(crate) enum StagedError {
 }
 
 /// The bindings this Mac imported for receiver move `cut` of `agent`,
-/// rechecked against the import's digest, each of whose refs must be one of
-/// the move's `binding_refs`. Runs on a blocking thread.
+/// rechecked against the import's digest. Each row must name a frozen ref
+/// or finished metadata with a data holder. Runs on a blocking thread.
 pub(crate) fn staged_bindings(
     store: &RegistryStore,
     cut: &str,
@@ -782,7 +799,7 @@ pub(crate) fn staged_bindings(
         !binding_refs.contains(&MoveRef {
             ref_kind: row.ref_kind.clone(),
             reference: row.session_ref.clone(),
-        })
+        }) && !(row.ended_at_ms.is_some() && row.held_on.is_some())
     }) {
         return Err(StagedError::OutsideMove(MoveRef {
             ref_kind: row.ref_kind.clone(),

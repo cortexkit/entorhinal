@@ -10936,8 +10936,9 @@ expect_red = [
 id = "session-move-plain-agent"
 guards = "An agent with no bindings and no pins moves without entorhinal and opens no session-bindings stream"
 file = "crates/entorhinal-module/src/move_admission.rs"
-old = "!refs.is_empty() && available.iter().any(|p| p.module_id == \"entorhinal\");"
-new = "available.iter().any(|p| p.module_id == \"entorhinal\"); // NON-VACUITY BREAK"
+old = '''let carry_bindings = self.with_store(|s| s.agent_has_bindings(&request.agent_id))?
+            && available.iter().any(|p| p.module_id == "entorhinal");'''
+new = '''let carry_bindings = available.iter().any(|p| p.module_id == "entorhinal"); // NON-VACUITY BREAK'''
 test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/binding_moves.rs"
 runner = "cargo"
 package = "entorhinal-module"
@@ -10986,3 +10987,237 @@ package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
 expect_red = ["tests::slow_request_warning_names_the_method_and_skips_change_feed_long_polls"]
+
+[[control]]
+id = "session-location-live-cut"
+guards = "Only live-at-admission bindings reach participant calls; finished metadata never consumes participant refs"
+file = "crates/entorhinal-core/src/move_store.rs"
+old = 'WHERE agent_id=?1 AND ended_at_ms IS NULL ORDER BY ref_kind,ref'
+new = 'WHERE agent_id=?1 ORDER BY ref_kind,ref /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/binding_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::binding_moves::moved_bindings_and_network_history_read_the_same_on_both_macs_and_back"]
+
+[[control]]
+id = "session-location-frozen-cut"
+guards = "Ending a binding after admission cannot remove it from the frozen participant ref set"
+file = "crates/entorhinal-core/src/session_carry.rs"
+old = 'if !planned.is_subset(&read)'
+new = 'if rows.iter().any(|b| b.ended_at_ms.is_some() && b.held_on.is_none()) || !planned.is_subset(&read) /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/binding_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::binding_moves::session_ending_after_admission_stays_in_every_participant_ref_set"]
+
+[[control]]
+id = "session-location-source-origin"
+guards = "Finished metadata records the source store-origin machine ID rather than a claim author or receiver"
+file = "crates/entorhinal-core/src/session_carry.rs"
+old = 'binding.held_on = Some(origin.clone());'
+new = 'binding.held_on = Some(format!("wrong-{origin}")); // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/session_carry_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["session_carry::tests::export_reads_every_binding_with_its_history_under_the_open_source_move"]
+
+[[control]]
+id = "session-location-original-holder"
+guards = "A second metadata move preserves the original data holder"
+file = "crates/entorhinal-core/src/session_carry.rs"
+old = '}) && binding.held_on.is_none()'
+new = '}) && true /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-core/src/session_carry_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["session_carry::tests::finished_metadata_keeps_original_holder_across_three_macs_and_clears_at_home"]
+
+[[control]]
+id = "session-location-clear-home"
+guards = "Returning finished metadata to its data-holding machine clears held_on"
+file = "crates/entorhinal-core/src/session_carry.rs"
+old = '.filter(|holder| Some(*holder) != origin.as_deref()),'
+new = '.filter(|holder| { let _ = (holder, &origin); true }), // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/session_carry_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["session_carry::tests::finished_metadata_keeps_original_holder_across_three_macs_and_clears_at_home"]
+
+[[control]]
+id = "session-location-install-metadata"
+guards = "Activation installs finished rows outside the participant ref set, not live placeholders"
+file = "crates/entorhinal-core/src/session_carry.rs"
+old = 'for r in refs.iter().chain(metadata_refs.iter()) {'
+new = 'for r in refs.iter().chain(metadata_refs.iter().take(0)) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/session_carry_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["session_carry::tests::finished_metadata_keeps_original_holder_across_three_macs_and_clears_at_home"]
+
+[[control]]
+id = "session-location-finished-collision"
+guards = "Finished collisions are counted and skipped without placeholders or changes to the local owner and history"
+file = "crates/entorhinal-core/src/session_carry.rs"
+old = 'if row.held_on.is_some() {'
+new = 'if false && row.held_on.is_some() { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-core/src/session_carry_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["session_carry::tests::finished_collision_skips_metadata_and_keeps_local_binding_and_history_identical"]
+
+[[control]]
+id = "session-location-refuse-revival"
+guards = "Registration and rekey refuse remote finished bindings without any binding or history write"
+file = "crates/entorhinal-core/src/lib.rs"
+old = 'if let Some(machine_id) = remote {'
+new = 'if let Some(machine_id) = remote.filter(|_| false) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/binding_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::binding_moves::held_elsewhere_registration_and_rekey_refuse_without_writes"]
+
+[[control]]
+id = "session-location-live-cap"
+guards = "257 live bindings refuse at admission with counts before recording anything; 4000 finished bindings plus four live refs still move"
+file = "crates/entorhinal-module/src/move_admission.rs"
+old = 'if refs.len() > 256 {'
+new = 'if refs.len() > 257 { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/binding_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::binding_moves::live_ref_cap_refuses_257_before_recording_but_thousands_finished_move"]
+
+[[control]]
+id = "session-location-retention"
+guards = "Held-elsewhere finished metadata follows the ordinary 30-day pruning rule"
+file = "crates/entorhinal-core/src/session_lifecycle.rs"
+old = 'WHERE ended_at_ms IS NOT NULL AND ended_at_ms < ?1'
+new = 'WHERE held_on IS NULL AND ended_at_ms IS NOT NULL AND ended_at_ms < ?1 /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-core/src/session_carry_tests.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["session_carry::tests::finished_metadata_keeps_original_holder_across_three_macs_and_clears_at_home"]
+
+[[control]]
+id = "session-location-open-filter"
+guards = "Open-only paging drops ended rows rather than filtering on mirror liveness"
+file = "crates/entorhinal-core/src/session_lifecycle.rs"
+old = 'let open_clause = if open {'
+new = 'let open_clause = if false && open { /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/session_upkeep_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["session_upkeep::tests::agent_sessions_pages_and_maps_liveness"]
+
+[[control]]
+id = "session-location-cursor-filter"
+guards = "A cursor is only valid with the filter that issued it; omitted and false preserve legacy bytes"
+file = "crates/entorhinal-module/src/sessions.rs"
+old = 'if tagged.is_some() != request.open {'
+new = 'if false && (tagged.is_some() != request.open) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/session_upkeep_tests.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["session_upkeep::tests::agent_sessions_pages_and_maps_liveness"]
+
+[[control]]
+id = "session-location-held-read"
+guards = "Session lists identify the machine holding finished data"
+file = "crates/entorhinal-module/src/sessions.rs"
+old = 'if let Some(holder) = row.held_on {'
+new = 'if let Some(holder) = row.held_on.filter(|_| false) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/binding_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::binding_moves::moved_bindings_and_network_history_read_the_same_on_both_macs_and_back"]
+
+[[control]]
+id = "session-location-finished-only"
+guards = "An agent with finished bindings but no live refs still carries its metadata stream"
+file = "crates/entorhinal-module/src/move_admission.rs"
+old = 'let carry_bindings = self.with_store(|s| s.agent_has_bindings(&request.agent_id))?'
+new = 'let carry_bindings = !refs.is_empty() /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/binding_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::binding_moves::finished_only_agent_moves_metadata_without_participant_placeholders"]
+
+[[control]]
+id = "session-location-no-null-wire"
+guards = "Absent held_on keeps legacy session stream bytes unchanged"
+file = "crates/entorhinal-core/src/session_carry.rs"
+old = '#[serde(default, skip_serializing_if = "Option::is_none")]'
+new = '#[serde(default)] // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/session_move/stream.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["session_move::stream::tests::session_bindings_stream_golden_round_trip"]
+
+[[control]]
+id = "session-location-runner-read"
+guards = "Runner lookup identifies the machine holding finished data"
+file = "crates/entorhinal-core/src/session_lifecycle.rs"
+old = 'held_on: row.get(8)?,'
+new = 'held_on: None, // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/binding_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::binding_moves::moved_bindings_and_network_history_read_the_same_on_both_macs_and_back"]
+
+[[control]]
+id = "session-location-ref-read"
+guards = "Reference lookup identifies the machine holding finished data"
+file = "crates/entorhinal-module/src/sessions.rs"
+old = 'if let Some(holder) = binding.held_on {'
+new = 'if let Some(holder) = binding.held_on.filter(|_| false) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/binding_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::binding_moves::moved_bindings_and_network_history_read_the_same_on_both_macs_and_back"]
+
+[[control]]
+id = "session-location-rekey-lookup"
+guards = "A new reference under a remote finished binding's existing host key cannot bypass the revival fence"
+file = "crates/entorhinal-core/src/lib.rs"
+old = 'OR (harness=?3 AND session_id=?4)) LIMIT 1'
+new = 'OR (0 AND harness=?3 AND session_id=?4)) LIMIT 1 /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/binding_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::binding_moves::held_elsewhere_registration_and_rekey_refuse_without_writes"]

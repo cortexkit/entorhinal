@@ -385,8 +385,14 @@ be overwritten by a late transfer completion.
 ## 11. Session bindings
 
 A binding row (`session_binding`) and its network history (`session_network`)
-are machine-local, and the move record names each binding only by
-`(ref_kind, ref)`. So entorhinal carries the rows itself. When the agent has at
+are machine-local. Only bindings with `ended_at_ms IS NULL` at admission
+enter the participant ref set as `(ref_kind, ref)`. That set is fixed for the
+whole move: ending a session afterwards does not remove its ref. Finished
+bindings never enter participant prepare, export, import, activate, release
+or abort calls; only their metadata travels in entorhinal's own stream.
+Admission refuses more than 256 live refs as `live_ref_cap`, with detail
+`{live_refs, cap: 256}`, before recording a move or contacting participants.
+When the agent has at
 least one binding and discovery lists entorhinal, the saved participant plan
 gives entorhinal one more synthetic ref, `session-bindings`, whose `ref` is the
 agent ID, beside `package-closure` when the agent also has pins. Entorhinal's
@@ -400,13 +406,18 @@ moves with the same participants as before and opens no stream of its own.
 fences new registrations for the agent (section 4). `prepare` then reads every
 binding of the agent, ended ones included, with its whole history, in one
 read snapshot that must still show that open source move and whose bindings
-must equal the plan's binding refs (`invalid_state` otherwise). Setting a
+must contain every frozen binding ref and no additional live binding
+(`invalid_state` otherwise). Finished rows outside that set are marked with
+`held_on`: their existing holder, or the source's machine ID recorded by the
+store-origin guard, never the source's claim author. An unknown store origin
+refuses export rather than guessing a location. Setting a
 session's network value or ending a session is not fenced: a change made after
 `prepare` stays on the source and does not travel. The stream is written once
 per cut and saved under `session-moves/<cut_id>/` in the store folder, so a
 repeated `prepare` returns the same item.
 
-**Stream.** Format `session-bindings/v1`, on the `reserved:entorhinal`
+**Stream.** Format `session-bindings/v1` when all data travels as refs, or
+`session-bindings/v2` when finished metadata names a data holder, on the `reserved:entorhinal`
 session-door stream, in its own session container
 `sha256("session-bindings:<agent_id>:<cut_id>")[..32]`, so each cut has a new
 one. The bytes are the line `ck-session-bindings/v1`, a JSON header line
@@ -414,6 +425,12 @@ one. The bytes are the line `ck-session-bindings/v1`, a JSON header line
 `(ref_kind, ref)`: `ref_kind`, `ref`, `runner`, `harness`, `session_id`,
 `project_root`, `registered_by`, `registered_at_ms`, `ended_at_ms` and
 `network_history` (`[{network, since_ms}]`, oldest first, exactly as stored).
+Version 2 uses first line `ck-session-bindings/v2` and adds optional `held_on`
+to finished metadata rows; only ended rows may name a nonempty holder.
+Older readers reject its version as `incompatible_version` before taking the
+claim, rather than silently installing reopenable metadata. New readers also
+accept v1. Without finished metadata, all package and session stream bytes
+remain identical; absent `held_on` is omitted, not serialized as null.
 Caps: 16,384 bindings, 1 MiB per line, 64 MiB per stream; a source over a cap
 refuses `not_exportable`. Admission and reads go in calls of at most
 1,048,576 raw bytes, like the package closure. About 1,300 bindings with short
@@ -426,8 +443,9 @@ line strictly (unknown fields, a bad value, unsorted refs, a history out of
 time order or trailing bytes refuse `digest_mismatch`). A first line naming
 another `session-bindings` version refuses `incompatible_version` with
 `{found, required}`, which aborts the move with that reason. After import, and
-before the claim is taken, the driver checks that every carried ref is one of
-the move's binding refs; one that is not holds the move as a
+before the claim is taken, the driver checks that every carried row is either
+one of the move's frozen binding refs or finished metadata with `held_on`;
+one that is neither holds the move as a
 `contract_violation`. `activate` rechecks the kept bytes' digest
 (`digest_mismatch` holds as a fork).
 
@@ -436,15 +454,33 @@ of the placeholders written before rows were carried:
 
 - A binding this Mac already has, with the same `(ref_kind, ref)`, keeps its
   own row and history; the carried copy is skipped.
-- A carried row whose `(harness, session_id)` or `(runner, session_id)` is held
+- A live-at-admission carried row whose `(harness, session_id)` or `(runner, session_id)` is held
   by another binding here is installed as a placeholder (no host session,
   runner or end time, `registered_by` `move`), still with its carried history.
   The move goes on; the count is logged once and kept in
   `sessionBindingsPlaceholders`.
+- A finished metadata row with a colliding host or runner key is skipped,
+  never replaced by a placeholder. Its local owner and history stay untouched.
+  The activation result counts and names each skip and its local owner; the
+  receiver logs that collision list once per move.
 - Any other carried row is installed as it was, and its history verbatim:
   `since_ms` values are the source Mac's clock, like the times of the content
   they are compared with.
 - A move ref with no carried row gets a placeholder, as before.
+
+The receiver stores a finished row's incoming `held_on`, clearing it to null
+when it equals the receiver's store-origin machine ID. A→B→C therefore keeps
+the original holder A; returning to A clears the marker. Locally registered
+rows always start with null. The existing 30-day pruning rule also deletes
+held-elsewhere metadata and its network-history rows, never participant data
+and never by calling a participant.
+
+A moved agent's finished sessions are listed on the new Mac, marked as held
+on the source Mac (or the earlier Mac that still holds their data), and cannot
+be opened on the new Mac until a backfill. `agent.sessions`,
+`agent.session_for_runner` and `agent.session_for_ref` include `heldOn` only
+when non-null. `agent.register_session`, including re-keying, refuses these
+rows as `session_on_other_machine`, with detail `{machine_id}`, without writes.
 
 **Older receivers.** A Mac whose entorhinal does not describe
 `session-bindings` refuses the move in its preconditions

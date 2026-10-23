@@ -746,6 +746,7 @@ fn agent_sessions_pages_newest_first_and_cursor_survives_inserts() {
             registered_at_ms: 20,
             ended_at_ms: None,
             network: "unknown".into(),
+            held_on: None,
         }
     );
     assert_eq!(first.sessions[1].ended_at_ms, Some(25));
@@ -888,6 +889,7 @@ fn session_binding_for_runner_finds_only_runner_rows() {
             ended_at_ms: Some(20),
             network: "unknown".into(),
             network_history: Vec::new(),
+            held_on: None,
         })
     );
     assert_eq!(
@@ -926,4 +928,28 @@ fn end_session_leaves_runner_empty_when_another_binding_holds_it() {
         })
         .unwrap();
     assert_eq!(rows, [(Some("broca".into()), None), (None, Some(30))]);
+}
+
+#[test]
+fn migration_17_preserves_local_rows_and_indexes_open_only_pages() {
+    let f = Fixture::with_migrations(&MIGRATIONS[..16]);
+    f.bind(AGENT, "live", 20, Some("broca"), None);
+    f.bind(AGENT, "ended", 30, Some("broca"), Some(40));
+    drop(f.store);
+    let store = RegistryStore::open(&f.descriptor).unwrap();
+    let page = store.agent_sessions(AGENT, None, 100).unwrap();
+    assert_eq!(page.sessions.len(), 2);
+    assert!(page.sessions.iter().all(|row| row.held_on.is_none()));
+    let open = store
+        .agent_sessions_filtered(AGENT, None, 100, true)
+        .unwrap();
+    assert_eq!(open.sessions.len(), 1);
+    assert_eq!(open.sessions[0].session_ref, "live");
+    let plan = store.read(|conn| {
+        let mut stmt = conn.prepare("EXPLAIN QUERY PLAN SELECT ref FROM session_binding WHERE agent_id=?1 AND ended_at_ms IS NULL ORDER BY registered_at_ms DESC,ref_kind,ref LIMIT 100")?;
+        let rows = stmt.query_map([AGENT], |r| r.get::<_,String>(3))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.join("\n"))
+    }).unwrap();
+    assert!(plan.contains("session_binding_open_agent"), "{plan}");
+    assert!(!plan.contains("TEMP B-TREE"), "{plan}");
 }

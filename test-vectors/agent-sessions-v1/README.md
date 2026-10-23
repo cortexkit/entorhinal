@@ -86,7 +86,10 @@ objects deny unknown fields; a field outside the listed schema is an
   commit, raised to the previous entry's time plus one if the clock is not
   past it. An unknown session is `not_found`; a binding already holding
   1,024 entries refuses another value `network_history_full`.
-- `agent.sessions`: exactly `{agent_id, cursor?, limit?}`. `limit` is 1–500
+- `agent.sessions`: exactly `{agent_id, cursor?, limit?, open?}`. Optional boolean
+  `open: true` selects only bindings with no end time; omitted or false preserves
+  the full list and existing bytes. Cursors are filter-specific: cross-filter
+  use refuses `invalid_request`. `limit` is 1–500
   and defaults to 100; `cursor` is the opaque `next_cursor` of the previous
   page. Rows run newest registration first, ties in `(ref_kind, ref)` order.
   Each row carries `network`, the current value, `unknown` with no history.
@@ -99,7 +102,19 @@ objects deny unknown fields; a field outside the listed schema is an
   Results preserve request order and omit unknown agents; the sample requests a
   locally held and remotely held agent around an unknown ID.
 
+Moved finished sessions retain metadata on the receiving Mac while their data
+stays on the source (or its recorded earlier holder). The three session reads
+include `heldOn` only for such remote data. Registration, including re-keying,
+refuses `session_on_other_machine` with `{machine_id}` and writes nothing until
+a backfill makes the data local.
+
 ## Files
+
+- **`sessions-open.json`**: two open-only pages skip the ended worker and show
+  the filter-specific cursor.
+- **`sessions-held-on.json`**: lists a finished worker with `heldOn`, followed by
+  a served `session_on_other_machine` registration refusal. All older JSON
+  samples remain byte-identical.
 
 - **`register-session.json`**: orchestrator registration success, same-reference
   re-registration, a distinct OpenCode session registration, `ref_bound_elsewhere`,

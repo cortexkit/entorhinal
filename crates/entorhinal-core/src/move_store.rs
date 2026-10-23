@@ -520,10 +520,20 @@ impl RegistryStore {
         }
     }
 
-    /// Read the agent's bound (ref_kind, ref) pairs in stable order. Participants
+    /// Read the agent's live bound (ref_kind, ref) pairs in stable order. Participants
     /// move data by these pairs, not by the source Mac's host-session identifiers.
     pub fn agent_bound_refs(&self, agent_id: &str) -> Result<Vec<MoveRef>, RegistryError> {
         self.read(|conn| bound_refs(conn, agent_id))
+    }
+
+    pub fn agent_has_bindings(&self, agent_id: &str) -> Result<bool, RegistryError> {
+        self.read(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM session_binding WHERE agent_id=?1)",
+                [agent_id],
+                |r| r.get(0),
+            )
+        })
     }
 
     /// Commit a fully checked source move. The key lookup and the registration
@@ -570,6 +580,13 @@ impl RegistryStore {
                         "agent_busy",
                         "a session started during the check",
                         None,
+                    ));
+                }
+                if checked_refs.len() > 256 {
+                    return Err(crate::session_refusal(
+                        "live_ref_cap",
+                        "too many live session references",
+                        Some(serde_json::json!({"live_refs":checked_refs.len(),"cap":256})),
                     ));
                 }
                 let pins = crate::catalog_agent::read_pins(tx, &row.agent_id)?;
@@ -993,7 +1010,7 @@ impl RegistryStore {
 
 fn bound_refs(conn: &rusqlite::Connection, agent_id: &str) -> rusqlite::Result<Vec<MoveRef>> {
     let mut stmt = conn.prepare(
-        "SELECT ref_kind,ref FROM session_binding WHERE agent_id=?1 ORDER BY ref_kind,ref",
+        "SELECT ref_kind,ref FROM session_binding WHERE agent_id=?1 AND ended_at_ms IS NULL ORDER BY ref_kind,ref",
     )?;
     let rows = stmt
         .query_map([agent_id], |r| {
@@ -1763,6 +1780,9 @@ mod tests {
             assert!(conn.execute("INSERT INTO session_binding VALUES ('session','bad','a1',NULL,NULL,'','other',66)", []).is_err());
             Ok(())
         }).unwrap();
+        drop(store);
+        // Current readers need the additive columns from later migrations.
+        let store = RegistryStore::open(&descriptor).unwrap();
         let legacy = store.session_binding_for("host-a", "s1").unwrap().unwrap();
         assert_eq!(
             legacy.project_root, None,

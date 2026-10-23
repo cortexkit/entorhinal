@@ -218,7 +218,7 @@ CREATE TABLE member_name (
 );
 "#;
 
-const MIGRATIONS: [Migration; 16] = [
+const MIGRATIONS: [Migration; 17] = [
     Migration {
         version: 1,
         statements: V1_SCHEMA,
@@ -282,6 +282,10 @@ const MIGRATIONS: [Migration; 16] = [
     Migration {
         version: 16,
         statements: session_network::V16_SESSION_NETWORK,
+    },
+    Migration {
+        version: 17,
+        statements: session_lifecycle::V17_SESSION_LOCATION,
     },
 ];
 
@@ -1022,6 +1026,8 @@ pub struct SessionBinding {
     pub project_root: Option<String>,
     pub registered_by: String,
     pub registered_at_ms: i64,
+    #[serde(rename = "heldOn", skip_serializing_if = "Option::is_none")]
+    pub held_on: Option<String>,
 }
 
 impl SessionBinding {
@@ -1035,12 +1041,13 @@ impl SessionBinding {
             project_root: row.get(5)?,
             registered_by: row.get(6)?,
             registered_at_ms: row.get(7)?,
+            held_on: row.get(8)?,
         })
     }
 }
 
 const SESSION_BINDING_COLUMNS: &str =
-    "agent_id,ref_kind,ref,harness,session_id,NULLIF(project_root,''),registered_by,registered_at_ms";
+    "agent_id,ref_kind,ref,harness,session_id,NULLIF(project_root,''),registered_by,registered_at_ms,held_on";
 
 fn session_refusal(
     code: &str,
@@ -1127,6 +1134,28 @@ impl RegistryStore {
         })?;
         if let Some(gone) = row.gone() {
             return Err(session_refusal("gone", "agent is gone", Some(gone)));
+        }
+        // Remote metadata is never an invitation to revive a conversation,
+        // even if the agent's claim or move state has changed since import.
+        let remote: Option<String> = tx
+            .query_row(
+                "SELECT held_on FROM session_binding WHERE held_on IS NOT NULL AND
+             ((ref_kind=?1 AND ref=?2) OR (harness=?3 AND session_id=?4)) LIMIT 1",
+                params![
+                    request.ref_kind,
+                    request.session_ref,
+                    request.harness,
+                    request.session_id
+                ],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(machine_id) = remote {
+            return Err(session_refusal(
+                "session_on_other_machine",
+                "session data is held on another machine",
+                Some(serde_json::json!({"machine_id": machine_id})),
+            ));
         }
         move_store::check_moving_registration(tx, request)?;
         claim_cache::check_registration_claim(tx, request.agent_id)?;
@@ -1738,6 +1767,7 @@ mod tests {
                     // Added by migration 15.
                     "runner",
                     "ended_at_ms",
+                    "held_on",
                 ],
             ),
             (

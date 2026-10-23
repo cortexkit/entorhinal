@@ -156,6 +156,12 @@ before the module was named entorhinal; changing it would re-run migration 1).
 | 11 | Catalog registry trust, held status, publisher grants and audit. |
 | 12 | Shared catalog pin sets and pins; local plans, generations and transition receipts (the recorded result of each applied plan or generation transition). |
 
+Migration 17 adds nullable `session_binding.held_on TEXT` (null for existing
+and locally created rows) and a partial index ordered by
+`(agent_id, registered_at_ms DESC, ref_kind, ref)` where `ended_at_ms IS NULL`.
+It records the machine retaining a moved finished session's data and supports
+open-only session paging without scanning the finished backlog.
+
 Opening a store applies every migration it lacks, once. A store whose recorded
 version is ahead of the binary's highest migration is refused ("registry store
 is at schema version N, ahead of this binary's highest migration M"), because

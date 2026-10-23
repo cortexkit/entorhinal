@@ -827,8 +827,8 @@ impl Receiver {
 
     /// The session bindings the source carried for this move, as this Mac
     /// imported them; none when the move carries no bindings stream. A
-    /// carried ref the move does not name is the source breaking the
-    /// agent-data contract, and holds the move as a contract violation.
+    /// live carried ref the move does not name breaks the agent-data
+    /// contract and holds the move; finished metadata need not name a ref.
     async fn carried_bindings(&self, plan: &MoveRecord) -> Result<Vec<CarriedBinding>, Failure> {
         let carries = plan
             .participants
@@ -865,6 +865,12 @@ impl Receiver {
     }
 
     fn count_installed(&self, installed: CarriedInstall) {
+        if !installed.skipped_finished.is_empty() {
+            tracing::warn!(cut = %self.cut,
+                skipped = installed.skipped_finished.len(),
+                collisions = ?installed.skipped_finished,
+                "finished session metadata skipped because local bindings own its host keys");
+        }
         let health = &self.worker.health;
         health
             .session_bindings_installed

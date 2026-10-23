@@ -114,6 +114,13 @@ impl ProjectsHandler {
             return Err(error);
         }
         let refs = self.with_store(|s| s.agent_bound_refs(&request.agent_id))?;
+        if refs.len() > 256 {
+            return Err(HandlerError {
+                code: "live_ref_cap".into(),
+                message: "too many live session references".into(),
+                detail: Some(json!({"live_refs":refs.len(),"cap":256})),
+            });
+        }
         let pins = self.with_store(|s| s.catalog_pins(&request.agent_id))?;
         let pin_digest = if pins.is_empty() {
             None
@@ -135,8 +142,8 @@ impl ProjectsHandler {
         // entorhinal serves that participant, and discovery refuses the move
         // when a participant is unready, so outside test fixtures that leave
         // entorhinal out of discovery every agent with bindings carries them.
-        let carry_bindings =
-            !refs.is_empty() && available.iter().any(|p| p.module_id == "entorhinal");
+        let carry_bindings = self.with_store(|s| s.agent_has_bindings(&request.agent_id))?
+            && available.iter().any(|p| p.module_id == "entorhinal");
         // With no pins and no bindings entorhinal has nothing to send and
         // stays out of the move, exactly as before bindings were carried.
         if pin_digest.is_none() && !carry_bindings {

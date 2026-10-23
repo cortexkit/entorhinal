@@ -1,7 +1,7 @@
 //! Carrying an agent's session bindings, with their network history, from
 //! the source Mac of a move to the receiving Mac.
 //!
-//! The shared move record names each binding only by `(ref_kind, ref)`, so
+//! The shared move record names live bindings only by `(ref_kind, ref)`, so
 //! without more data the receiver could only insert placeholder rows: no host
 //! session, no runner, no history. Entorhinal therefore sends the full rows in
 //! its own agent-data stream (ref kind [`SESSION_BINDINGS_KIND`], one ref per
@@ -56,6 +56,9 @@ pub struct CarriedBinding {
     pub registered_at_ms: i64,
     pub ended_at_ms: Option<i64>,
     pub network_history: Vec<NetworkEntry>,
+    /// Only metadata travels for a finished session outside the frozen ref set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_on: Option<String>,
 }
 
 impl CarriedBinding {
@@ -83,6 +86,11 @@ impl CarriedBinding {
         if self.harness.is_some() != self.session_id.is_some() {
             return Err("harness and session id must both be present or both absent".into());
         }
+        if self.held_on.as_ref().is_some_and(|id| id.is_empty())
+            || (self.held_on.is_some() && self.ended_at_ms.is_none())
+        {
+            return Err("only finished bindings may name a nonempty data holder".into());
+        }
         if self.network_history.len() > NETWORK_HISTORY_MAX as usize {
             return Err("network history exceeds its cap".into());
         }
@@ -103,7 +111,7 @@ impl CarriedBinding {
 }
 
 /// What installing carried bindings at activation did, for health counters.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CarriedInstall {
     /// Carried rows written as they were on the source.
     pub installed: u64,
@@ -112,6 +120,9 @@ pub struct CarriedInstall {
     pub placeholders: u64,
     /// Carried rows skipped because this Mac already had the binding.
     pub kept: u64,
+    /// Finished metadata skipped because a local binding owns its host or
+    /// runner session key: (incoming ref, local binding ref).
+    pub skipped_finished: Vec<(MoveRef, MoveRef)>,
 }
 
 /// The session-binding refs of a stored move plan, sorted and without
@@ -131,7 +142,7 @@ pub fn plan_binding_refs(plan: &Value) -> BTreeSet<MoveRef> {
 fn carried_rows(conn: &Connection, agent_id: &str) -> rusqlite::Result<Vec<CarriedBinding>> {
     let mut statement = conn.prepare(
         "SELECT ref_kind, ref, runner, harness, session_id, project_root, registered_by,
-                registered_at_ms, ended_at_ms
+                registered_at_ms, ended_at_ms, held_on
          FROM session_binding WHERE agent_id=?1 ORDER BY ref_kind, ref",
     )?;
     let mut rows = statement
@@ -147,6 +158,7 @@ fn carried_rows(conn: &Connection, agent_id: &str) -> rusqlite::Result<Vec<Carri
                 registered_at_ms: row.get(7)?,
                 ended_at_ms: row.get(8)?,
                 network_history: Vec::new(),
+                held_on: row.get(9)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -160,7 +172,7 @@ impl RegistryStore {
     /// Every binding of the agent moving out under `cut_id`, with its network
     /// history, read in one snapshot. The snapshot also shows the open source
     /// move, which since admission has refused every new registration for
-    /// the agent, and its plan, whose binding refs must equal the rows read:
+    /// the agent, and its plan, whose binding refs must still be present:
     /// a mismatch is refused `invalid_state` rather than carrying a set the
     /// receiver was never told about.
     pub fn export_session_bindings(
@@ -187,7 +199,8 @@ impl RegistryStore {
                     None,
                 )));
             };
-            let rows = carried_rows(conn, agent_id)?;
+            let mut rows = carried_rows(conn, agent_id)?;
+            let planned = plan_binding_refs(&row.plan);
             let read: BTreeSet<MoveRef> = rows
                 .iter()
                 .map(|b| MoveRef {
@@ -195,12 +208,39 @@ impl RegistryStore {
                     reference: b.session_ref.clone(),
                 })
                 .collect();
-            if read != plan_binding_refs(&row.plan) {
+            if !planned.is_subset(&read)
+                || rows.iter().any(|b| {
+                    b.ended_at_ms.is_none()
+                        && !planned.contains(&MoveRef {
+                            ref_kind: b.ref_kind.clone(),
+                            reference: b.session_ref.clone(),
+                        })
+                })
+            {
                 return Ok(Err(session_refusal(
                     "invalid_state",
                     "the agent's bindings differ from the admitted move",
                     None,
                 )));
+            }
+            let origin: Option<String> = conn
+                .query_row("SELECT machine_id FROM store_origin", [], |r| r.get(0))
+                .optional()?;
+            for binding in &mut rows {
+                if !planned.contains(&MoveRef {
+                    ref_kind: binding.ref_kind.clone(),
+                    reference: binding.session_ref.clone(),
+                }) && binding.held_on.is_none()
+                {
+                    let Some(origin) = &origin else {
+                        return Ok(Err(session_refusal(
+                            "invalid_state",
+                            "store origin is unknown",
+                            None,
+                        )));
+                    };
+                    binding.held_on = Some(origin.clone());
+                }
             }
             Ok(Ok(rows))
         })
@@ -210,8 +250,9 @@ impl RegistryStore {
 
 /// Write the moved-in bindings inside the activation transaction. `refs` are
 /// the move's binding refs; `carried` are the rows the source sent, already
-/// checked when the stream was imported. A ref with no carried row gets a
-/// placeholder, as a move that carries nothing always did.
+/// checked when the stream was imported. Finished metadata outside `refs`
+/// is installed too, but never creates a placeholder. A live ref with no
+/// carried row gets a placeholder, as a move that carries nothing always did.
 pub(crate) fn install_moved_bindings(
     tx: &Transaction<'_>,
     agent_id: &str,
@@ -223,7 +264,18 @@ pub(crate) fn install_moved_bindings(
         carried.iter().map(|b| (b.key(), b)).collect();
     let mut outcome = CarriedInstall::default();
     let mut seen = BTreeSet::new();
-    for r in refs {
+    let metadata_refs: Vec<MoveRef> = carried
+        .values()
+        .filter(|b| b.held_on.is_some())
+        .map(|b| MoveRef {
+            ref_kind: b.ref_kind.clone(),
+            reference: b.session_ref.clone(),
+        })
+        .collect();
+    let origin: Option<String> = tx
+        .query_row("SELECT machine_id FROM store_origin", [], |r| r.get(0))
+        .optional()?;
+    for r in refs.iter().chain(metadata_refs.iter()) {
         if !seen.insert((r.ref_kind.as_str(), r.reference.as_str())) {
             continue;
         }
@@ -255,6 +307,25 @@ pub(crate) fn install_moved_bindings(
             continue;
         };
         if collides(tx, row)? {
+            // A local host key wins too. Remote finished metadata must never
+            // turn into a live placeholder that a later move would export.
+            if row.held_on.is_some() {
+                outcome.kept += 1;
+                let local = tx.query_row(
+                    "SELECT ref_kind,ref FROM session_binding
+                     WHERE (harness=?1 AND session_id=?2) OR (runner=?3 AND session_id=?2)
+                     ORDER BY ref_kind,ref LIMIT 1",
+                    params![row.harness, row.session_id, row.runner],
+                    |r| {
+                        Ok(MoveRef {
+                            ref_kind: r.get(0)?,
+                            reference: r.get(1)?,
+                        })
+                    },
+                )?;
+                outcome.skipped_finished.push((r.clone(), local));
+                continue;
+            }
             // The unique indexes allow one binding per host session and one
             // per runner session. Another binding here already holds this
             // one's, so it lands as a placeholder, as it would have before
@@ -265,8 +336,8 @@ pub(crate) fn install_moved_bindings(
         } else {
             tx.execute(
                 "INSERT INTO session_binding(ref_kind,ref,agent_id,harness,session_id,project_root,
-                     registered_by,registered_at_ms,runner,ended_at_ms)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                     registered_by,registered_at_ms,runner,ended_at_ms,held_on)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                 params![
                     row.ref_kind,
                     row.session_ref,
@@ -277,7 +348,10 @@ pub(crate) fn install_moved_bindings(
                     row.registered_by,
                     row.registered_at_ms,
                     row.runner,
-                    row.ended_at_ms
+                    row.ended_at_ms,
+                    row.held_on
+                        .as_deref()
+                        .filter(|holder| Some(*holder) != origin.as_deref()),
                 ],
             )?;
             outcome.installed += 1;

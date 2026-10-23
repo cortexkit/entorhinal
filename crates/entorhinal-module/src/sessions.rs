@@ -392,6 +392,8 @@ struct SetSessionNetworkRequest {
 struct AgentSessionsRequest {
     agent_id: String,
     #[serde(default)]
+    open: bool,
+    #[serde(default)]
     cursor: Option<String>,
     #[serde(default)]
     limit: Option<u64>,
@@ -944,14 +946,18 @@ impl ProjectsHandler {
                     "no agent session is registered under this reference",
                 )
             })?;
-        self.encode_read_result(json!({
+        let mut reply = json!({
             "agent_id": binding.agent_id,
             "ref_kind": binding.ref_kind,
             "ref": binding.session_ref,
             "harness": binding.harness,
             "session_id": binding.session_id,
             "project_root": binding.project_root,
-        }))
+        });
+        if let Some(holder) = binding.held_on {
+            reply["heldOn"] = json!(holder);
+        }
+        self.encode_read_result(reply)
     }
 
     /// One page of an agent's sessions with each one's liveness. Liveness
@@ -971,9 +977,25 @@ impl ProjectsHandler {
                 ))
             }
         };
-        let cursor = request.cursor.as_deref().map(decode_cursor).transpose()?;
+        // Legacy cursors keep their bytes and mean the unfiltered list. An
+        // open-only cursor carries a distinct tag so it cannot skip rows in
+        // the other list when reused with a different filter.
+        let cursor = request
+            .cursor
+            .as_deref()
+            .map(|cursor| {
+                let tagged = cursor.strip_prefix("open:");
+                if tagged.is_some() != request.open {
+                    return Err(HandlerError::new(
+                        "invalid_request",
+                        "cursor filter does not match open",
+                    ));
+                }
+                decode_cursor(tagged.unwrap_or(cursor))
+            })
+            .transpose()?;
         let page = self.with_agent_store(|store| {
-            store.agent_sessions(&request.agent_id, cursor.as_ref(), limit)
+            store.agent_sessions_filtered(&request.agent_id, cursor.as_ref(), limit, request.open)
         })?;
         let state = self
             .liveness
@@ -994,7 +1016,7 @@ impl ProjectsHandler {
                 } else {
                     mirrored
                 };
-                json!({
+                let mut reply = json!({
                     "runner": row.runner,
                     "session": row.session,
                     "harness": row.harness,
@@ -1005,13 +1027,20 @@ impl ProjectsHandler {
                     "ended_at_ms": row.ended_at_ms,
                     "liveness": liveness,
                     "network": row.network,
-                })
+                });
+                if let Some(holder) = row.held_on {
+                    reply["heldOn"] = json!(holder);
+                }
+                reply
             })
             .collect();
         drop(state);
         self.encode_read_result(json!({
             "sessions": sessions,
-            "next_cursor": page.next.as_ref().map(encode_cursor),
+            "next_cursor": page.next.as_ref().map(|cursor| {
+                let encoded = encode_cursor(cursor);
+                if request.open { format!("open:{encoded}") } else { encoded }
+            }),
         }))
     }
 

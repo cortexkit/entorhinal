@@ -30,6 +30,7 @@ impl Fixture {
             },
         };
         let store = RegistryStore::open_with_migrations(&descriptor, &crate::MIGRATIONS).unwrap();
+        store.check_store_origin(Some("source-machine"), 1).unwrap();
         Self {
             store,
             _cleanup: crate::scratch_cleanup::ScratchCleanup(root),
@@ -94,6 +95,7 @@ fn binding(session: &str, runner: Option<&str>, history: Vec<NetworkEntry>) -> C
         registered_at_ms: 40,
         ended_at_ms: None,
         network_history: history,
+        held_on: None,
     }
 }
 
@@ -148,7 +150,7 @@ fn export_reads_every_binding_with_its_history_under_the_open_source_move() {
     for b in [&live, &ended] {
         f.bind(AGENT, b);
     }
-    let refs = vec![move_ref(&live), move_ref(&ended)];
+    let refs = vec![move_ref(&live)];
     // Without an open source move nothing freezes the agent, so nothing is read.
     assert_eq!(
         f.store
@@ -166,13 +168,14 @@ fn export_reads_every_binding_with_its_history_under_the_open_source_move() {
         ))
         .unwrap();
     let exported = f.store.export_session_bindings("cut", AGENT).unwrap();
+    ended.held_on = Some("source-machine".into());
     assert_eq!(exported, vec![live.clone(), ended.clone()]);
     assert_eq!(
         exported[0].network_history,
         vec![entry("yes", 100), entry("no", 250)]
     );
     // A plan naming a different set than the rows is refused, not carried.
-    let other = agent_move("cut-2", MoveSide::Source, MoveStep::Preparing, &refs[..1]);
+    let other = agent_move("cut-2", MoveSide::Source, MoveStep::Preparing, &[]);
     f.store
         .db
         .with_conn_fenced(|tx| tx.execute("DELETE FROM agent_move", []))
@@ -218,7 +221,8 @@ fn activation_installs_carried_rows_and_history_verbatim() {
         CarriedInstall {
             installed: 2,
             placeholders: 0,
-            kept: 0
+            kept: 0,
+            skipped_finished: Vec::new(),
         }
     );
     let placeholder = CarriedBinding {
@@ -279,7 +283,8 @@ fn activation_downgrades_a_colliding_row_to_a_placeholder_and_still_activates() 
         CarriedInstall {
             installed: 0,
             placeholders: 2,
-            kept: 0
+            kept: 0,
+            skipped_finished: Vec::new(),
         }
     );
     let rows = f.rows();
@@ -322,4 +327,105 @@ fn carried_rows_are_checked_against_the_receiving_schema() {
     for case in cases {
         assert!(case.check().is_err(), "{case:?}");
     }
+}
+
+#[test]
+fn finished_metadata_keeps_original_holder_across_three_macs_and_clears_at_home() {
+    fn hop(source: &Fixture, receiver: &Fixture, cut: &str) {
+        source
+            .store
+            .insert_agent_move(&agent_move(cut, MoveSide::Source, MoveStep::Preparing, &[]))
+            .unwrap();
+        let rows = source.store.export_session_bindings(cut, AGENT).unwrap();
+        receiver
+            .store
+            .insert_agent_move(&agent_move(
+                cut,
+                MoveSide::Receiver,
+                MoveStep::Activating,
+                &[],
+            ))
+            .unwrap();
+        let mut activated = agent_move(cut, MoveSide::Receiver, MoveStep::Activated, &[]);
+        activated.activated_at_ms = Some(5000);
+        let (_, outcome) = receiver
+            .store
+            .activate_agent_move_carrying(&activated, &[], &rows)
+            .unwrap();
+        assert_eq!(outcome.installed, 1);
+        assert_eq!(outcome.placeholders, 0);
+        for f in [source, receiver] {
+            f.store
+                .db
+                .with_conn_fenced(|tx| tx.execute("DELETE FROM agent_move", []))
+                .unwrap();
+        }
+    }
+    let a = Fixture::new();
+    let b = Fixture::new();
+    let c = Fixture::new();
+    for (f, id) in [(&a, "a"), (&b, "b"), (&c, "c")] {
+        f.store
+            .db
+            .with_conn_fenced(|tx| tx.execute("UPDATE store_origin SET machine_id=?1", [id]))
+            .unwrap();
+    }
+    let mut finished = binding(
+        "ended",
+        Some("broca"),
+        vec![entry("yes", 1), entry("no", 2)],
+    );
+    finished.ended_at_ms = Some(90);
+    a.bind(AGENT, &finished);
+    hop(&a, &b, "ab");
+    assert_eq!(b.rows()[0].held_on.as_deref(), Some("a"));
+    hop(&b, &c, "bc");
+    assert_eq!(c.rows()[0].held_on.as_deref(), Some("a"));
+    // Retention removes metadata, not the data still held on the original Mac.
+    assert_eq!(
+        a.store
+            .prune_ended_sessions(91 + crate::SESSION_RETENTION_MS)
+            .unwrap(),
+        1
+    );
+    hop(&c, &a, "ca");
+    assert_eq!(a.rows(), vec![finished]);
+    assert_eq!(
+        c.store
+            .prune_ended_sessions(91 + crate::SESSION_RETENTION_MS)
+            .unwrap(),
+        1
+    );
+    assert!(c.rows().is_empty());
+}
+
+#[test]
+fn finished_collision_skips_metadata_and_keeps_local_binding_and_history_identical() {
+    let f = Fixture::new();
+    let local = binding("s1", Some("broca"), vec![entry("no", 10)]);
+    f.bind(AGENT, &local);
+    let before = serde_json::to_vec(&f.rows()).unwrap();
+    let mut remote = local.clone();
+    remote.session_ref = "remote-finished".into();
+    remote.ended_at_ms = Some(20);
+    remote.held_on = Some("other-machine".into());
+    remote.network_history = vec![entry("yes", 5)];
+    let next = activating(&f, &[]);
+    let (_, outcome) = f
+        .store
+        .activate_agent_move_carrying(&next, &[], &[remote.clone()])
+        .unwrap();
+    assert_eq!(
+        outcome.skipped_finished,
+        vec![(move_ref(&remote), move_ref(&local))]
+    );
+    assert_eq!(outcome.kept, 1);
+    assert_eq!(outcome.placeholders, 0);
+    assert_eq!(outcome.installed, 0);
+    assert_eq!(serde_json::to_vec(&f.rows()).unwrap(), before);
+    assert!(f
+        .store
+        .session_bindings_for_refs(&[("broca-session", "remote-finished")])
+        .unwrap()[0]
+        .is_none());
 }

@@ -79,6 +79,14 @@ fn register_sessions(pair: &Pair) {
 
 async fn bindings_pair(fault: SourceFault) -> Pair {
     let pair = Pair::new(&[("broca", KIND)]).await;
+    pair.a
+        .store()
+        .check_store_origin(Some("machine-a"), clock())
+        .unwrap();
+    pair.b
+        .store()
+        .check_store_origin(Some("machine-b"), clock())
+        .unwrap();
     carry_bindings(&pair.a, fault);
     carry_bindings(&pair.b, SourceFault::default());
     register_sessions(&pair);
@@ -149,7 +157,36 @@ async fn moved_bindings_and_network_history_read_the_same_on_both_macs_and_back(
         Some(vec![("session-bindings".into(), AGENT.into())])
     );
     pair.finish(&cut).await;
-    assert_eq!(session_reads(&pair.b).await, before);
+    for mac in [&pair.a, &pair.b] {
+        for request in mac.discovery.peers["broca"].calls() {
+            if let Some(refs) = request.refs() {
+                assert_eq!(refs.as_slice().len(), 4);
+                assert!(refs.as_slice().iter().all(|r| r.r#ref != "ref-ended"));
+            }
+        }
+    }
+    let mut remote = before.clone();
+    for row in remote.0["sessions"].as_array_mut().unwrap() {
+        if row["ref"] == "ref-ended" {
+            row["heldOn"] = json!("machine-a");
+        }
+    }
+    remote.1[2]["heldOn"] = json!("machine-a");
+    assert_eq!(session_reads(&pair.b).await, remote);
+    assert_eq!(
+        pair.b
+            .machine
+            .call(
+                "agent.session_for_ref",
+                json!({"ref_kind":KIND,"ref":"ref-ended"})
+            )
+            .await
+            .unwrap()["heldOn"],
+        "machine-a"
+    );
+    for participant in pair.a.record(&cut).await.participants {
+        assert!(participant.refs.iter().all(|r| r.reference != "ref-ended"));
+    }
     // The fixture's placeholder binding travels too, so the receiver holds
     // all five of the source's rows, every one installed as it was.
     let health = &pair.b.machine.handler.health;
@@ -204,7 +241,7 @@ async fn moved_bindings_and_network_history_read_the_same_on_both_macs_and_back(
     pair.b.source_until(&back, MoveStep::Released).await;
     pair.a.receiver_until(&back, MoveStep::Done).await;
     assert_eq!(session_reads(&pair.a).await, before);
-    assert_eq!(session_reads(&pair.b).await, before);
+    assert_eq!(session_reads(&pair.b).await, remote);
     // Ended bindings are kept for the retention window like any other.
     assert_eq!(
         pair.b
@@ -251,7 +288,8 @@ async fn colliding_binding_lands_as_a_placeholder_and_the_move_completes() {
             Ok(())
         })
         .unwrap();
-    let before = session_reads(&pair.a).await;
+    let mut before = session_reads(&pair.a).await;
+    before.1[2]["heldOn"] = json!("machine-a");
     let cut = pair.published("collide").await;
     pair.finish(&cut).await;
     assert_eq!(pair.b.row(&cut).step, MoveStep::Done);
@@ -279,7 +317,7 @@ async fn colliding_binding_lands_as_a_placeholder_and_the_move_completes() {
 #[tokio::test(start_paused = true)]
 async fn unknown_bindings_format_is_refused_before_the_claim() {
     let pair = bindings_pair(SourceFault {
-        magic: Some(b"ck-session-bindings/v2\n"),
+        magic: Some(b"ck-session-bindings/v3\n"),
         extra: None,
     })
     .await;
@@ -303,6 +341,7 @@ fn stranger() -> entorhinal_core::session_carry::CarriedBinding {
         registered_by: "move".into(),
         registered_at_ms: 1,
         ended_at_ms: None,
+        held_on: None,
         network_history: vec![],
     }
 }
@@ -379,4 +418,203 @@ async fn receiver_stuck_aborting_on_an_older_build_finishes_after_upgrading() {
     assert_eq!(pair.a.record(&cut).await.state, MoveState::Aborted);
     assert!(!claim_taken(&pair.b), "receiver took the claim");
     assert!(pair.b.store().agent_bound_refs(AGENT).unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn held_elsewhere_registration_and_rekey_refuse_without_writes() {
+    let pair = bindings_pair(SourceFault::default()).await;
+    let cut = pair.published("held-register").await;
+    pair.finish(&cut).await;
+    let before = (
+        pair.b.machine.rows("session_binding"),
+        pair.b.machine.rows("session_network"),
+    );
+    for (reference, session) in [("ref-ended", "different"), ("new-ref", "ended")] {
+        let error = pair
+            .b
+            .store()
+            .register_session(&SessionRegistration {
+                agent_id: AGENT,
+                ref_kind: KIND,
+                session_ref: reference,
+                harness: HARNESS,
+                session_id: session,
+                project_root: Some("/different"),
+                registered_by: "host",
+                runner: Some(RUNNER),
+                network: Some(NetworkStamp {
+                    network: "yes",
+                    clock,
+                }),
+                now_ms: clock(),
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "session_on_other_machine");
+        assert_eq!(error.detail, Some(json!({"machine_id":"machine-a"})));
+        assert_eq!(
+            (
+                pair.b.machine.rows("session_binding"),
+                pair.b.machine.rows("session_network")
+            ),
+            before
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn session_ending_after_admission_stays_in_every_participant_ref_set() {
+    let pair = bindings_pair(SourceFault::default()).await;
+    let cut = pair.a.admit_to(B, "ends-during-move").await.unwrap();
+    pair.a
+        .store()
+        .end_session(HARNESS, "live-1", Some(RUNNER), clock())
+        .unwrap();
+    pair.a
+        .door
+        .script("cut.seal", DoorEffect::Seal(SealState::Published, None));
+    pair.a.source_until(&cut, MoveStep::Published).await;
+    let record = pair.a.record(&cut).await;
+    assert!(record
+        .participants
+        .iter()
+        .filter(|p| p.module_id == "broca")
+        .all(|p| p.refs.iter().any(|r| r.reference == "ref-live-1")));
+    pair.finish(&cut).await;
+    let row = pair
+        .b
+        .store()
+        .session_binding_for_runner(RUNNER, "live-1")
+        .unwrap()
+        .unwrap();
+    assert!(row.ended_at_ms.is_some());
+    assert_eq!(row.held_on, None);
+    for mac in [&pair.a, &pair.b] {
+        for request in mac.discovery.peers["broca"].calls() {
+            if let Some(refs) = request.refs() {
+                assert_eq!(refs.as_slice().len(), 4);
+                assert!(refs.as_slice().iter().any(|r| r.r#ref == "ref-live-1"));
+                assert!(refs.as_slice().iter().all(|r| r.r#ref != "ref-ended"));
+            }
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn live_ref_cap_refuses_257_before_recording_but_thousands_finished_move() {
+    let pair = bindings_pair(SourceFault::default()).await;
+    pair.a.store().apply_entry("fixture.many_sessions", "{}", "fixture", None, |tx| {
+        for i in 0..253 {
+            tx.execute("INSERT INTO session_binding(ref_kind,ref,agent_id,project_root,registered_by,registered_at_ms) VALUES(?1,?2,?3,'','move',1)", rusqlite::params![KIND,format!("bulk-{i:04}"),AGENT])?;
+        }
+        Ok(())
+    }).unwrap();
+    // The fixture has four live refs, including its initial placeholder.
+    let before = pair.a.machine.rows("agent_move");
+    let error = drive(pair.a.machine.handler.admit_move(
+        json!({"agent_id":AGENT,"to":B,"request_key":"too-many-live"}),
+        CORE,
+        tokio::time::Instant::now(),
+    ))
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, "live_ref_cap");
+    assert_eq!(error.detail, Some(json!({"live_refs":257,"cap":256})));
+    assert_eq!(pair.a.machine.rows("agent_move"), before);
+    pair.a.store().apply_entry("fixture.finish_sessions", "{}", "fixture", None, |tx| {
+        tx.execute("UPDATE session_binding SET ended_at_ms=10 WHERE ref LIKE 'bulk-%'", [])?;
+        for i in 253..4000 {
+            tx.execute("INSERT INTO session_binding(ref_kind,ref,agent_id,project_root,registered_by,registered_at_ms,ended_at_ms) VALUES(?1,?2,?3,'','move',1,10)", rusqlite::params![KIND,format!("bulk-{i:04}"),AGENT])?;
+        }
+        Ok(())
+    }).unwrap();
+    let cut = pair.published("many-finished").await;
+    let record = pair.a.record(&cut).await;
+    let refs = &record
+        .participants
+        .iter()
+        .find(|p| p.module_id == "broca")
+        .unwrap()
+        .refs;
+    assert_eq!(refs.len(), 4);
+    assert!(refs
+        .iter()
+        .all(|r| !r.reference.starts_with("bulk-") && r.reference != "ref-ended"));
+    pair.finish(&cut).await;
+    assert_eq!(pair.b.machine.rows("session_binding").len(), 4005);
+    assert_eq!(
+        pair.b
+            .store()
+            .session_bindings_for_refs(&[(KIND, "bulk-3999")])
+            .unwrap()[0]
+            .as_ref()
+            .unwrap()
+            .held_on
+            .as_deref(),
+        Some("machine-a")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn abort_never_sends_finished_binding_refs_to_participants() {
+    let pair = bindings_pair(SourceFault::default()).await;
+    let cut = pair.a.admit_to(B, "abort-finished").await.unwrap();
+    pair.a.source_until(&cut, MoveStep::Exported).await;
+    pair.a.abort(&cut);
+    pair.a.source_until(&cut, MoveStep::Aborted).await;
+    let calls = pair.a.discovery.peers["broca"].calls();
+    assert!(calls.iter().any(|r| r.op().method() == "agent_data.abort"));
+    for request in calls {
+        if let Some(refs) = request.refs() {
+            assert_eq!(refs.as_slice().len(), 4);
+            assert!(refs.as_slice().iter().all(|r| r.r#ref != "ref-ended"));
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn finished_only_agent_moves_metadata_without_participant_placeholders() {
+    let pair = bindings_pair(SourceFault::default()).await;
+    pair.a
+        .store()
+        .apply_entry("fixture.finish_all", "{}", "fixture", None, |tx| {
+            tx.execute(
+                "UPDATE session_binding SET ended_at_ms=COALESCE(ended_at_ms,?1) WHERE agent_id=?2",
+                rusqlite::params![clock(), AGENT],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let cut = pair.published("only-finished").await;
+    let record = pair.a.record(&cut).await;
+    assert_eq!(
+        entorhinal_refs(&record),
+        Some(vec![("session-bindings".into(), AGENT.into())])
+    );
+    assert!(record
+        .participants
+        .iter()
+        .filter(|p| p.module_id != "entorhinal")
+        .all(|p| p.refs.is_empty()));
+    pair.finish(&cut).await;
+    let page = pair.b.store().agent_sessions(AGENT, None, 100).unwrap();
+    assert_eq!(page.sessions.len(), 5);
+    assert!(page
+        .sessions
+        .iter()
+        .all(|r| r.ended_at_ms.is_some() && r.held_on.as_deref() == Some("machine-a")));
+    assert_eq!(
+        pair.b
+            .machine
+            .handler
+            .health
+            .session_bindings_placeholders
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    for mac in [&pair.a, &pair.b] {
+        assert!(mac.discovery.peers["broca"]
+            .calls()
+            .iter()
+            .all(|r| r.refs().is_none_or(|refs| refs.as_slice().is_empty())));
+    }
 }

@@ -351,6 +351,36 @@ async fn agent_sessions_pages_and_maps_liveness() {
         }
     }
     // Every registration has the same time, so ties order by reference.
+    let unfiltered = sessions(&f, json!({"agent_id":agent,"limit":1}));
+    assert_eq!(
+        unfiltered,
+        sessions(&f, json!({"agent_id":agent,"limit":1,"open":false}))
+    );
+    let first_open = sessions(&f, json!({"agent_id":agent,"limit":1,"open":true}));
+    let mut open_seen = Vec::new();
+    let mut page = first_open.clone();
+    loop {
+        for row in page["sessions"].as_array().unwrap() {
+            assert!(row["ended_at_ms"].is_null());
+            open_seen.push(row["ref"].as_str().unwrap().to_owned());
+        }
+        if page["next_cursor"].is_null() {
+            break;
+        }
+        page = sessions(
+            &f,
+            json!({"agent_id":agent,"limit":1,"open":true,"cursor":page["next_cursor"]}),
+        );
+    }
+    assert_eq!(open_seen, ["r-active", "r-gone", "r-idle", "r-lapsed"]);
+    for params in [
+        json!({"agent_id":agent,"open":true,"cursor":unfiltered["next_cursor"]}),
+        json!({"agent_id":agent,"cursor":first_open["next_cursor"]}),
+        json!({"agent_id":agent,"open":false,"cursor":first_open["next_cursor"]}),
+        json!({"agent_id":agent,"open":"true"}),
+    ] {
+        assert_eq!(code(f.sync(CALLER, SESSIONS, params)), "invalid_request");
+    }
     assert_eq!(
         seen,
         [

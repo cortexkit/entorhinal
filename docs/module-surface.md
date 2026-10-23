@@ -229,7 +229,7 @@ the cache, so it works offline and never waits on engram.
 | `agent.register_session` | mutate | orchestrator or host | Bind an agent's session reference to its host session. Optional `project_root` is a 1–4096-byte string when sent (not null); omission keeps a stored root, or stores unknown for a new binding. Unknown roots read as null in `agent.session_for_ref`, `agent.sessions` and `agent.session_for_runner`. Optional `runner` names the llm-runner module hosting it; re-registering without one keeps the recorded runner, and any re-registration clears the end time. A runner and session id already bound to another binding refuse `session_bound_elsewhere`. Optional `network` (`yes`, `no` or `unknown`; `null` is absent, anything else refuses `invalid_request`) is appended to the binding's network history when it differs from the current value, stamped at commit; a full history refuses `network_history_full` and registers nothing. The reply never echoes `runner` or `network`. |
 | `agent.set_session_network {harness, session, network}` | mutate | orchestrator only | Record whether the agent behind a host session's binding can reach the network: `yes`, `no` or `unknown`. Replies `{network, since_ms}`. The current value again writes nothing and replies the current entry's `since_ms`. `since_ms` is the module's clock when the entry commits, raised to one past the previous entry's if the clock is not past it, so each binding's history is strictly increasing. An unknown session refuses `not_found`; a value outside the three `invalid_request`; a binding already holding 1,024 entries `network_history_full`, with nothing written. |
 | `agent.end_session {harness, session, runner?}` | mutate | orchestrator only | Mark the binding of a host session ended at the module's clock. Replies `{found: true, ended_at_ms}`, the first end time again on a repeat (nothing written), or `{found: false}` for an unknown session. A runner different from the recorded one refuses `runner_mismatch`. |
-| `agent.sessions {agent_id, cursor?, limit?}` | query | any | One agent's session bindings, newest registration first, ties by `(ref_kind, ref)`: `{sessions: [{runner, session, harness, ref_kind, ref, project_root, registered_at_ms, ended_at_ms, liveness, network}], next_cursor}`. `limit` defaults to 100, at most 500; `next_cursor` is opaque and null on the last page. `liveness` is `active`, `gone` or `unknown` as `agent.session_liveness` answers it, and `gone` when the mirror cannot vouch for a session whose binding has ended. `network` is the binding's current network value, `unknown` with no history. A retired agent still lists; an unknown id refuses `unknown_agent`. |
+| `agent.sessions {agent_id, cursor?, limit?, open?}` | query | any | One agent's session bindings, newest registration first, ties by `(ref_kind, ref)`: `{sessions: [{runner, session, harness, ref_kind, ref, project_root, registered_at_ms, ended_at_ms, liveness, network}], next_cursor}`. `limit` defaults to 100, at most 500; `next_cursor` is opaque and null on the last page. `liveness` is `active`, `gone` or `unknown` as `agent.session_liveness` answers it, and `gone` when the mirror cannot vouch for a session whose binding has ended. `network` is the binding's current network value, `unknown` with no history. A retired agent still lists; an unknown id refuses `unknown_agent`. |
 | `agent.session_for_runner {runner, session}` | query | any | The agent, harness, reference, project root and end time bound to a runner's session id, with `network` (the current value, `unknown` with no history) and `network_history: [{network, since_ms}]`, oldest first and empty with no history. Sessions registered without a runner are `not_found` here; look those up with `agent.for_session {harness, session_id}`. |
 | `agent.for_session` | query | any | The agent and reference bound to a host session. |
 | `agent.session_for_ref` | query | any | The agent, host session and project root bound to a reference. |
@@ -254,13 +254,36 @@ Open moves and cached claims fence re-keys exactly as other registrations.
 Re-registering the same reference for its agent may still move it to a different
 host session and record the new caller role, as before.
 
+`agent.sessions` accepts optional boolean `open`. True selects only bindings whose
+`ended_at_ms` is null, not a liveness-state filter; omitted or false lists every
+binding with unchanged reply and cursor bytes. Ordering and keyset pagination
+are unchanged. Open-only cursors carry an `open:` tag; using a cursor with the
+other filter refuses `invalid_request`. Migration 17 adds a partial ordered
+index for open-only paging, avoiding scans of an agent's finished backlog.
+
+A moved agent's finished sessions are listed on the new Mac, marked as held on
+the source Mac (or an earlier data-holding Mac), and cannot be opened there
+until a backfill. The nullable `session_binding.held_on` column records that
+machine's store-origin ID, not its claim author. `agent.sessions`,
+`agent.session_for_runner` and `agent.session_for_ref` include `heldOn` only
+when non-null; local rows and returning data use null and omit the key.
+Registration and same-agent re-keying refuse held-elsewhere rows as
+`session_on_other_machine`, detail `{machine_id}`, with nothing written.
+Moves carry only live-at-admission sessions as participant refs, fixed even if
+they end during the move; finished rows travel only as metadata and network
+history. More than 256 live refs refuses `live_ref_cap` with `{live_refs, cap}`
+before recording anything. See [session binding moves](agent-move-contract.md#11-session-bindings)
+for stream versions, installation and collision behavior.
+
 Session bindings are machine-local and never journaled. A binding is marked
 ended by `agent.end_session` or when the host's liveness feed reports the
 session `gone` (never from `lapsed`, `unknown` or absence from a snapshot); a
 feed entry's optional `runner` limits that to a binding of the same runner or
 of none. Bindings that ended more than 30 days ago are pruned shortly after
 startup and hourly after that, except every binding of an agent with an open
-move. A binding that never ended is never pruned.
+move. A binding that never ended is never pruned. Held-elsewhere ended rows
+follow the same 30-day rule; pruning removes only metadata and history, never
+calls a participant, and never deletes the data still held on another Mac.
 
 Each binding keeps a history of whether its agent could reach the network,
 written by the orchestrator, which knows it from the session's plan. The

@@ -29,6 +29,15 @@ CREATE UNIQUE INDEX session_binding_runner
     ON session_binding(runner, session_id) WHERE runner IS NOT NULL;
 "#;
 
+/// Remote finished sessions retain metadata without pretending their data
+/// moved. The partial index lets open-only paging skip the ended backlog.
+pub const V17_SESSION_LOCATION: &str = r#"
+ALTER TABLE session_binding ADD COLUMN held_on TEXT NULL;
+CREATE INDEX session_binding_open_agent
+    ON session_binding(agent_id, registered_at_ms DESC, ref_kind, ref)
+    WHERE ended_at_ms IS NULL;
+"#;
+
 /// How long a binding is kept after its session ended. A binding that never
 /// ended is never pruned, however old it is.
 pub const SESSION_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
@@ -75,6 +84,8 @@ pub struct AgentSession {
     pub ended_at_ms: Option<i64>,
     /// The network value currently in effect, `unknown` with no history.
     pub network: String,
+    #[serde(rename = "heldOn", skip_serializing_if = "Option::is_none")]
+    pub held_on: Option<String>,
 }
 
 /// Where the next page starts: just after this row in list order. Keyset
@@ -102,6 +113,8 @@ pub struct RunnerSessionBinding {
     pub network: String,
     /// Every recorded network value, oldest first; empty with no history.
     pub network_history: Vec<crate::NetworkEntry>,
+    #[serde(rename = "heldOn", skip_serializing_if = "Option::is_none")]
+    pub held_on: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,7 +267,7 @@ impl RegistryStore {
         self.read(|conn| {
             conn.query_row(
                 "SELECT agent_id, runner, session_id, harness, ref_kind, ref,
-                        NULLIF(project_root,''), ended_at_ms
+                        NULLIF(project_root,''), ended_at_ms, held_on
                  FROM session_binding WHERE runner=?1 AND session_id=?2",
                 params![runner, session],
                 |row| {
@@ -269,6 +282,7 @@ impl RegistryStore {
                         ended_at_ms: row.get(7)?,
                         network: crate::NETWORK_ABSENT.to_owned(),
                         network_history: Vec::new(),
+                        held_on: row.get(8)?,
                     })
                 },
             )
@@ -297,6 +311,17 @@ impl RegistryStore {
         after: Option<&SessionCursor>,
         limit: usize,
     ) -> Result<AgentSessionPage, AgentMutationError> {
+        self.agent_sessions_filtered(agent_id, after, limit, false)
+    }
+
+    /// The same keyset page, optionally limited to bindings not yet ended.
+    pub fn agent_sessions_filtered(
+        &self,
+        agent_id: &str,
+        after: Option<&SessionCursor>,
+        limit: usize,
+        open: bool,
+    ) -> Result<AgentSessionPage, AgentMutationError> {
         self.read(|conn| {
             if crate::agent::load_row(conn, agent_id)?.is_none() {
                 return Ok(Err(session_refusal(
@@ -305,21 +330,23 @@ impl RegistryStore {
                     None,
                 )));
             }
-            let mut statement = conn.prepare(
+            let open_clause = if open { "AND ended_at_ms IS NULL" } else { "" };
+            let mut statement = conn.prepare(&format!(
                 "SELECT runner, session_id, harness, ref_kind, ref, NULLIF(project_root,''),
                         registered_at_ms, ended_at_ms,
                         COALESCE((SELECT network FROM session_network AS history
                                   WHERE history.ref_kind=session_binding.ref_kind
                                     AND history.ref=session_binding.ref
-                                  ORDER BY since_ms DESC LIMIT 1), ?6)
+                                  ORDER BY since_ms DESC LIMIT 1), ?6), held_on
                  FROM session_binding
-                 WHERE agent_id=?1
+                  WHERE agent_id=?1
+                    {open_clause}
                    AND (?2 IS NULL OR registered_at_ms < ?2
                         OR (registered_at_ms = ?2
                             AND (ref_kind > ?3 OR (ref_kind = ?3 AND ref > ?4))))
                  ORDER BY registered_at_ms DESC, ref_kind, ref
                  LIMIT ?5",
-            )?;
+            ))?;
             let mut sessions = statement
                 .query_map(
                     params![
@@ -342,6 +369,7 @@ impl RegistryStore {
                             registered_at_ms: row.get(6)?,
                             ended_at_ms: row.get(7)?,
                             network: row.get(8)?,
+                            held_on: row.get(9)?,
                         })
                     },
                 )?
