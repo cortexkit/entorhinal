@@ -2328,12 +2328,16 @@ fn request_operation(body: &[u8]) -> RequestSummary {
         })
         .flatten();
     // `agent.changes` waits for the next change unless the caller passes
-    // `wait: false`, the same default the feed handler applies.
-    let long_poll = request.method == "agent.changes"
+    // `wait: false`, the same default the feed handler applies. A watch stays
+    // open for as long as its subscriber keeps it, often hours, so its time is
+    // never a slow request either.
+    let long_poll = (request.method == "agent.changes"
         && matches!(
             request.params.get("wait"),
             None | Some(Value::Null) | Some(Value::Bool(true))
-        );
+        ))
+        || request.method == watches::IDENTITY
+        || request.method == watches::WHERE;
     RequestSummary {
         operation,
         method: loggable_method(&request.method).map(str::to_owned),
@@ -2351,8 +2355,9 @@ struct RequestSummary {
     /// operator which request was slow.
     method: Option<String>,
     canonical_root: Option<String>,
-    /// An `agent.changes` call that may hold the request open for up to 25 s
-    /// waiting for the next change.
+    /// A request whose time is mostly an intended wait: an `agent.changes`
+    /// call holding open for up to 25 s, or a watch held open by its
+    /// subscriber.
     long_poll: bool,
 }
 
@@ -3129,7 +3134,18 @@ mod tests {
         let mut handler = ProjectsHandler::new().unwrap();
         // A start and a finish tick for each request below, in order.
         let ticks = Arc::new(Mutex::new(std::collections::VecDeque::from([
-            0, 25_002_000, 0, 25_002_000, 0, 600_000, 0, 700_000, 0, 800_000,
+            0,
+            25_002_000,
+            0,
+            25_002_000,
+            0,
+            256_000_000,
+            0,
+            600_000,
+            0,
+            700_000,
+            0,
+            800_000,
         ])));
         let clock_ticks = Arc::clone(&ticks);
         handler.request_clock = Arc::new(move || {
@@ -3151,6 +3167,8 @@ mod tests {
             br#"{"method":"agent.changes","params":{"incarnation":"i","cursor":0,"wait":true}}"#,
             (770, 1),
         );
+        // A watch is held open by its subscriber; its duration is no latency.
+        handler.handle_request(br#"{"method":"agent.where_watch","params":{}}"#, (770, 1));
         // A change-feed scan that does not wait is an ordinary request.
         handler.handle_request(
             br#"{"method":"agent.changes","params":{"incarnation":"i","cursor":0,"wait":false}}"#,

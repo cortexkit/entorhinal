@@ -10973,3 +10973,16 @@ package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
 expect_red = ["two_machine_acceptance::moves::abort_backoff::refused_cleanup_backs_off_doubling_to_the_cap_then_aborts"]
+
+[[control]]
+id = "slow-request-log-skips-watches"
+guards = "A watch held open by its subscriber is never reported as a slow request"
+file = "crates/entorhinal-module/src/main.rs"
+old = "        || request.method == watches::WHERE;"
+new = "        || false; // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-module/src/main.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["tests::slow_request_warning_names_the_method_and_skips_change_feed_long_polls"]
