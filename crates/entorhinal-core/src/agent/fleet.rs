@@ -118,9 +118,12 @@ impl RegistryStore {
         }
         let mut agents = Vec::new();
         // One result per live agent, even when its project has several roots.
-        // The output workspace comes from project_workspace, not the agent's
-        // stored workspace_id. Agents with role workspace_head have no project
-        // and therefore omit the output workspace.
+        // Heads and hirees store no workspace: theirs is wherever their project
+        // is placed, so it comes from project_workspace, and is absent while the
+        // project is unplaced. A workspace head has no project and belongs to
+        // the workspace it stores, so that one is reported for it instead;
+        // readers then have one field to answer "which workspace is this agent
+        // in" for every role.
         // Source: prefrontal 873870be8 crates/prefrontal-core-module/src/fleet_overview.rs:53-83,349-379,418-436.
         for row in all_rows(conn)?.into_iter().filter(|r| r.status == "live") {
             let mut agent = json!({"agentId":row.agent_id,"displayName":row.name,"tag":row.tag,"labels":row.labels,"role":row.role});
@@ -150,6 +153,17 @@ impl RegistryStore {
                 agent["project"] = project;
                 let workspace: Option<(String,String)> = conn.query_row("SELECT w.workspace_id,w.name FROM project_workspace pw JOIN workspace w ON w.workspace_id=pw.workspace_id WHERE pw.project_id=?1", [&id], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
                 if let Some((id, name)) = workspace {
+                    agent["workspace"] = json!({"id":id,"name":name});
+                }
+            } else if let Some(id) = row.workspace_id.as_deref() {
+                let name: Option<String> = conn
+                    .query_row(
+                        "SELECT name FROM workspace WHERE workspace_id=?1",
+                        [id],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let Some(name) = name {
                     agent["workspace"] = json!({"id":id,"name":name});
                 }
             }
@@ -261,7 +275,7 @@ mod tests {
             fleet(&f, None),
             json!({"incarnation":INCARNATION,"generation":generation,"logPosition":0,"token":format!("{INCARNATION}:{generation}"),"unchanged":false,"agents":[
             {"agentId":head,"displayName":"Head","tag":"tag","labels":[],"role":"head","project":{"id":"P","name":"Project","canonicalRoot":a_root},"workspace":{"id":"W2","name":"W2"},"avatar":{"fingerprint":"b4c04a5d931e65a48e022b8943678d55","type":"creature.classic","version":2}},
-            {"agentId":w,"displayName":"Workspace","tag":"tag","labels":[],"role":"workspace_head"},
+            {"agentId":w,"displayName":"Workspace","tag":"tag","labels":[],"role":"workspace_head","workspace":{"id":"W1","name":"W1"}},
             {"agentId":assistant,"displayName":"Assistant","tag":"tag","labels":[],"role":"assistant"}]})
         );
         assert_eq!(

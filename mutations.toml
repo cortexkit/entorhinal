@@ -11221,3 +11221,16 @@ package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
 expect_red = ["two_machine_acceptance::moves::binding_moves::held_elsewhere_registration_and_rekey_refuse_without_writes"]
+
+[[control]]
+id = "fleet-workspace-head-reports-its-workspace"
+guards = "A workspace head, which has no project, reports the workspace it stores in agent.fleet_identity"
+file = "crates/entorhinal-core/src/agent/fleet.rs"
+old = "            } else if let Some(id) = row.workspace_id.as_deref() {"
+new = "            } else if let Some(id) = None::<&str> { // NON-VACUITY BREAK"
+test_file = "crates/entorhinal-core/src/agent/fleet.rs"
+runner = "cargo"
+package = "entorhinal-core"
+target = "--lib"
+select = "expected"
+expect_red = ["agent::fleet::tests::fleet_pins_one_row_first_root_placement_only_workspace_and_omitted_optionals"]
