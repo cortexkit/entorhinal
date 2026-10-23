@@ -26,6 +26,13 @@ entorhinal's dependency graph, so `ref` uses a fixed 32-lowercase-hex value
 sample uses opaque fixed references for its new keys; entorhinal does not
 compute references from the project root or interpret their contents.
 
+Releases after 0.1.44 renamed the fixture's display names from `This Mac` and
+`Other Mac` to `This machine` and `Other machine`, the source machine id in
+`sessions-held-on.json` from `source-mac` to `source-machine`, and the waiting
+message in `where-moving-source.json` to "waiting for the target machine to
+pick up the move". Codes, keys and every other byte are unchanged, but the six
+affected files have new hashes, so consumers that pin them must re-pin.
+
 ## Params schemas
 
 Fields are required JSON strings unless marked optional. These operation request
@@ -174,12 +181,12 @@ a backfill makes the data local.
 | File | SHA-256 |
 | --- | --- |
 | `for-session.json` | `dd41914934a9b85b35670a815bef17de84752d8da7d05a1bf8833f3edbd1996b` |
-| `register-session.json` | `20015ad11322866712bf4e43666ba3356c87700b3905884b8deed67fb3d1edbb` |
+| `register-session.json` | `756975d9e0697109b0f7a70c0a08dfa18b2fc5222915e1051870948b1836d6a0` |
 | `session-for-ref.json` | `f8314b13df331e185f2c4960a314a3e8fac97af5d8e9904150ba024973fbb69a` |
-| `where.json` | `da88d465b4a190dbf14f7224ed8fd4a6cae10a8639fbbc7953b7d8b1f11dce8d` |
-| `where-many.json` | `93cc230f690999df6e7876f0bcabeaf391e5d8c9c7166e16a61d4c9112c153e6` |
-| `where-moving-receiver.json` | `ed04f74915d7f552f2472575a5786beecb2354e42077b29db5200b23e17e2ac0` |
-| `where-moving-source.json` | `3f2dc20b7216d6da8efe89cd9315bab65fbda232faf89191bea27fe84e2da00f` |
+| `where.json` | `faacea127dcaaa7181329562e4de553851aebf700358b3267864e894166b911e` |
+| `where-many.json` | `422b8592c531c3c22e161b7a926f3ac61df6155fca2a9660bb159b1a0054d565` |
+| `where-moving-receiver.json` | `cd7a4e475915787cf1a1680a05ad4421b3da19fe90a0a106c3b878b71064b9a6` |
+| `where-moving-source.json` | `87e6cf886a685406c0f7b51c9e372f2ac781a138372ea19ea926a0095df75bb1` |
 | `where-sharing-off.json` | `0b8fe82664439e2eb38e0816f900c08f7822bdfe29373a77579cfbbd080c6b63` |
 | `end-session.json` | `efd3a0b6c6ac2463ec20e3be9ee26593ad3fd0a4a62c3457ad65f5e876ff6d18` |
 | `register-session-runner.json` | `8ec0505594c6336a924595edf8af73304f1e2bd4d80f197b26b8e18628a4dca3` |

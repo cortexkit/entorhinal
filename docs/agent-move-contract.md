@@ -492,7 +492,7 @@ entorhinal refuses that abort `invalid_request`, and the receiver resends it
 without backoff, so its move stays open until the machine is upgraded. After the
 upgrade its entorhinal accepts the abort and the move finishes aborting.
 
-Tests: `moved_bindings_and_network_history_read_the_same_on_both_macs_and_back`,
+Tests: `moved_bindings_and_network_history_read_the_same_on_both_machines_and_back`,
 `plain_agent_moves_without_entorhinal_or_a_new_stream`,
 `colliding_binding_lands_as_a_placeholder_and_the_move_completes`,
 `unknown_bindings_format_is_refused_before_the_claim`,

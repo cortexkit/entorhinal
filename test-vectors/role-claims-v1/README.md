@@ -42,6 +42,10 @@ body, including its `result` envelope; successful object key order and whitespac
 are not normalized before comparison. The role cache's local `source` field is
 present where a claim is known; it is not a remote read timestamp.
 
+Releases after 0.1.44 renamed the member names from `This Mac` and `Other Mac`
+to `This machine` and `Other machine`; codes and keys are unchanged, but
+`records.json` has a new hash, so consumers that pin it must re-pin.
+
 `SHA256SUMS` covers this README and `records.json`.
 
 Regenerate the vectors from the repository root:

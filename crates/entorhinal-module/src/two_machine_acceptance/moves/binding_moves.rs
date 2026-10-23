@@ -145,7 +145,7 @@ fn claim_taken(node: &MoveMachine) -> bool {
 }
 
 #[tokio::test(start_paused = true)]
-async fn moved_bindings_and_network_history_read_the_same_on_both_macs_and_back() {
+async fn moved_bindings_and_network_history_read_the_same_on_both_machines_and_back() {
     let pair = bindings_pair(SourceFault::default()).await;
     let before = session_reads(&pair.a).await;
     let history = &before.1[3]["network_history"];

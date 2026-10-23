@@ -1921,7 +1921,7 @@ const PINNED_SESSION_SAMPLES: [(&str, &str); 10] = [
     ),
     (
         "register-session.json",
-        "20015ad11322866712bf4e43666ba3356c87700b3905884b8deed67fb3d1edbb",
+        "756975d9e0697109b0f7a70c0a08dfa18b2fc5222915e1051870948b1836d6a0",
     ),
     (
         "session-for-ref.json",
@@ -1929,19 +1929,19 @@ const PINNED_SESSION_SAMPLES: [(&str, &str); 10] = [
     ),
     (
         "where.json",
-        "da88d465b4a190dbf14f7224ed8fd4a6cae10a8639fbbc7953b7d8b1f11dce8d",
+        "faacea127dcaaa7181329562e4de553851aebf700358b3267864e894166b911e",
     ),
     (
         "where-many.json",
-        "93cc230f690999df6e7876f0bcabeaf391e5d8c9c7166e16a61d4c9112c153e6",
+        "422b8592c531c3c22e161b7a926f3ac61df6155fca2a9660bb159b1a0054d565",
     ),
     (
         "where-moving-receiver.json",
-        "ed04f74915d7f552f2472575a5786beecb2354e42077b29db5200b23e17e2ac0",
+        "cd7a4e475915787cf1a1680a05ad4421b3da19fe90a0a106c3b878b71064b9a6",
     ),
     (
         "where-moving-source.json",
-        "3f2dc20b7216d6da8efe89cd9315bab65fbda232faf89191bea27fe84e2da00f",
+        "87e6cf886a685406c0f7b51c9e372f2ac781a138372ea19ea926a0095df75bb1",
     ),
     (
         "where-sharing-off.json",

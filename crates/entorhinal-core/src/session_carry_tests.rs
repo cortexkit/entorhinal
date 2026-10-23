@@ -330,7 +330,7 @@ fn carried_rows_are_checked_against_the_receiving_schema() {
 }
 
 #[test]
-fn finished_metadata_keeps_original_holder_across_three_macs_and_clears_at_home() {
+fn finished_metadata_keeps_original_holder_across_three_machines_and_clears_at_home() {
     fn hop(source: &Fixture, receiver: &Fixture, cut: &str) {
         source
             .store

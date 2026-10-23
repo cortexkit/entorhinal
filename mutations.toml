@@ -10999,7 +10999,7 @@ runner = "cargo"
 package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
-expect_red = ["two_machine_acceptance::moves::binding_moves::moved_bindings_and_network_history_read_the_same_on_both_macs_and_back"]
+expect_red = ["two_machine_acceptance::moves::binding_moves::moved_bindings_and_network_history_read_the_same_on_both_machines_and_back"]
 
 [[control]]
 id = "session-location-frozen-cut"
@@ -11038,7 +11038,7 @@ runner = "cargo"
 package = "entorhinal-core"
 target = "--lib"
 select = "expected"
-expect_red = ["session_carry::tests::finished_metadata_keeps_original_holder_across_three_macs_and_clears_at_home"]
+expect_red = ["session_carry::tests::finished_metadata_keeps_original_holder_across_three_machines_and_clears_at_home"]
 
 [[control]]
 id = "session-location-clear-home"
@@ -11051,7 +11051,7 @@ runner = "cargo"
 package = "entorhinal-core"
 target = "--lib"
 select = "expected"
-expect_red = ["session_carry::tests::finished_metadata_keeps_original_holder_across_three_macs_and_clears_at_home"]
+expect_red = ["session_carry::tests::finished_metadata_keeps_original_holder_across_three_machines_and_clears_at_home"]
 
 [[control]]
 id = "session-location-install-metadata"
@@ -11064,7 +11064,7 @@ runner = "cargo"
 package = "entorhinal-core"
 target = "--lib"
 select = "expected"
-expect_red = ["session_carry::tests::finished_metadata_keeps_original_holder_across_three_macs_and_clears_at_home"]
+expect_red = ["session_carry::tests::finished_metadata_keeps_original_holder_across_three_machines_and_clears_at_home"]
 
 [[control]]
 id = "session-location-finished-collision"
@@ -11116,7 +11116,7 @@ runner = "cargo"
 package = "entorhinal-core"
 target = "--lib"
 select = "expected"
-expect_red = ["session_carry::tests::finished_metadata_keeps_original_holder_across_three_macs_and_clears_at_home"]
+expect_red = ["session_carry::tests::finished_metadata_keeps_original_holder_across_three_machines_and_clears_at_home"]
 
 [[control]]
 id = "session-location-open-filter"
@@ -11155,7 +11155,7 @@ runner = "cargo"
 package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
-expect_red = ["two_machine_acceptance::moves::binding_moves::moved_bindings_and_network_history_read_the_same_on_both_macs_and_back"]
+expect_red = ["two_machine_acceptance::moves::binding_moves::moved_bindings_and_network_history_read_the_same_on_both_machines_and_back"]
 
 [[control]]
 id = "session-location-finished-only"
@@ -11194,7 +11194,7 @@ runner = "cargo"
 package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
-expect_red = ["two_machine_acceptance::moves::binding_moves::moved_bindings_and_network_history_read_the_same_on_both_macs_and_back"]
+expect_red = ["two_machine_acceptance::moves::binding_moves::moved_bindings_and_network_history_read_the_same_on_both_machines_and_back"]
 
 [[control]]
 id = "session-location-ref-read"
@@ -11207,7 +11207,7 @@ runner = "cargo"
 package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
-expect_red = ["two_machine_acceptance::moves::binding_moves::moved_bindings_and_network_history_read_the_same_on_both_macs_and_back"]
+expect_red = ["two_machine_acceptance::moves::binding_moves::moved_bindings_and_network_history_read_the_same_on_both_machines_and_back"]
 
 [[control]]
 id = "session-location-rekey-lookup"
