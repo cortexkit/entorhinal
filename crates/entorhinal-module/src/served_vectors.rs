@@ -227,11 +227,11 @@ impl RoleFixture {
             .apply_entry("fixture.role_member_names", "{}", "fixture", None, |tx| {
                 tx.execute(
                     "INSERT INTO member_name(author,display_name) VALUES(?1,?2)",
-                    params![ROLE_SELF_AUTHOR, "This Mac"],
+                    params![ROLE_SELF_AUTHOR, "This machine"],
                 )?;
                 tx.execute(
                     "INSERT INTO member_name(author,display_name) VALUES(?1,?2)",
-                    params![ROLE_OTHER_AUTHOR, "Other Mac"],
+                    params![ROLE_OTHER_AUTHOR, "Other machine"],
                 )?;
                 Ok(())
             })
@@ -660,11 +660,11 @@ impl SessionFixture {
             .apply_entry("fixture.member_names", "{}", "fixture", None, |tx| {
                 tx.execute(
                     "INSERT INTO member_name(author,display_name) VALUES(?1,?2)",
-                    params![SELF_AUTHOR, "This Mac"],
+                    params![SELF_AUTHOR, "This machine"],
                 )?;
                 tx.execute(
                     "INSERT INTO member_name(author,display_name) VALUES(?1,?2)",
-                    params![OTHER_AUTHOR, "Other Mac"],
+                    params![OTHER_AUTHOR, "Other machine"],
                 )?;
                 Ok(())
             })
@@ -1212,7 +1212,7 @@ async fn session_records_match_published_files() {
         "/workspace/session-vectors/opencode"
     );
 
-    // On a Mac that has never turned sharing on, no other Mac can hold an
+    // On a machine that has never turned sharing on, no other machine can hold an
     // agent, so an agent with no cached claim is a verified "unclaimed".
     // Core's head registration accepts exactly this reply.
     let (sharing_off, sharing_off_reply) = fixture
@@ -1232,7 +1232,7 @@ async fn session_records_match_published_files() {
         "where-sharing-off.json",
         vec![sharing_off],
     );
-    // The remaining location replies describe a Mac with sharing on, where only
+    // The remaining location replies describe a machine with sharing on, where only
     // verified engram reads count and an unread claim is unknown.
     fixture
         .store()
@@ -1247,8 +1247,8 @@ async fn session_records_match_published_files() {
     let mut where_records = Vec::new();
     for (agent_id, status, holder_name) in [
         (WHERE_UNCLAIMED, "unclaimed", Value::Null),
-        (WHERE_HERE, "held_here", json!("This Mac")),
-        (WHERE_ELSEWHERE, "held_elsewhere", json!("Other Mac")),
+        (WHERE_HERE, "held_here", json!("This machine")),
+        (WHERE_ELSEWHERE, "held_elsewhere", json!("Other machine")),
     ] {
         let (record, answer) = fixture
             .record(
@@ -1507,7 +1507,7 @@ async fn moving_agent_where_records_match_published_files() {
             } else {
                 json!({"_receiver":{}})
             },
-            request_body: Some(json!({"agent_id":WHERE_MOVING,"to":"Other Mac"})),
+            request_body: Some(json!({"agent_id":WHERE_MOVING,"to":"Other machine"})),
             record_version: 0,
             claim_version: Some(epoch),
             claim_take_body: None,
@@ -1838,7 +1838,7 @@ async fn session_lifecycle_records_match_published_files() {
         .with_store(|store| {
             store.apply_entry("fixture.remote_finished", "{}", "fixture", None, |tx| {
                 tx.execute(
-                    "UPDATE session_binding SET held_on='source-mac' WHERE ref=?1",
+                    "UPDATE session_binding SET held_on='source-machine' WHERE ref=?1",
                     [ENDED_WORKER_REF],
                 )?;
                 Ok(())
@@ -1853,7 +1853,7 @@ async fn session_lifecycle_records_match_published_files() {
             json!({"agent_id":SESSION_AGENT}),
         )
         .await;
-    assert_eq!(reply["result"]["sessions"][1]["heldOn"], "source-mac");
+    assert_eq!(reply["result"]["sessions"][1]["heldOn"], "source-machine");
     let (refused, reply) = fixture
         .record(
             SESSION_REGISTRAR,
@@ -2741,7 +2741,7 @@ async fn role_claims_v1_records_match_published_files() {
         .await;
     assert!(held_here["result"]["epoch"].as_i64().unwrap() >= 1);
     assert_eq!(held_here["result"]["holder"], ROLE_SELF_AUTHOR);
-    assert_eq!(held_here["result"]["holder_name"], "This Mac");
+    assert_eq!(held_here["result"]["holder_name"], "This machine");
     assert_eq!(held_here["result"]["held_here"], true);
 
     let f = RoleFixture::new("role-claims-held-elsewhere", false).await;
@@ -2764,7 +2764,7 @@ async fn role_claims_v1_records_match_published_files() {
         )
         .await;
     assert_eq!(held_elsewhere["result"]["holder"], ROLE_OTHER_AUTHOR);
-    assert_eq!(held_elsewhere["result"]["holder_name"], "Other Mac");
+    assert_eq!(held_elsewhere["result"]["holder_name"], "Other machine");
     assert_eq!(held_elsewhere["result"]["held_here"], false);
 
     let f = RoleFixture::new("role-claims-stale-after-restart", false).await;

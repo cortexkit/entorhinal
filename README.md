@@ -5,8 +5,8 @@ entorhinal is the project and agent registry for
 a durable id (`pj-…`) and answers which project a directory belongs to, so
 modules that keep per-project state agree on what a project is, even when a
 directory moves or has several names. It also holds agent identity (names,
-roles, placement), records which of the operator's Macs holds an agent or a
-role, moves idle agents between Macs, and keeps the consent state behind the
+roles, placement), records which of the operator's machines holds an agent or a
+role, moves idle agents between machines, and keeps the consent state behind the
 tools agents use to create workspaces, projects and hires. It runs as a module
 supervised by the subc daemon and provides the `project-identity/v1` and
 `agent-identity/v1` capabilities; modules that cannot work without them declare
@@ -63,7 +63,9 @@ ck roles    read | take
 `ck projects`, `ck workspaces`, `ck agents` or `ck roles` on its own prints the
 full usage. `--json` prints the raw response. Agent identity writes, hire caps,
 role takes and moves from `ck` land only after the operator approves the exact
-change at a Touch ID prompt the daemon shows.
+change at a presence prompt the daemon shows (Touch ID on macOS, Windows Hello
+on Windows). Linux has no presence provider, so there these writes refuse
+`operator_presence_unavailable`.
 
 ## Documentation
 
@@ -76,7 +78,7 @@ Start with [docs/architecture.md](docs/architecture.md).
   [consent](docs/consent-contract.md),
   [session liveness](docs/session-liveness-contract.md).
 - Operator guides: [projects and roots](docs/projects-and-roots.md),
-  [agents](docs/agents.md), [sharing between Macs](docs/sharing.md),
+  [agents](docs/agents.md), [sharing between machines](docs/sharing.md),
   [moving agents](docs/moves.md), [mutation proofs](docs/mutations.md).
 - [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
 

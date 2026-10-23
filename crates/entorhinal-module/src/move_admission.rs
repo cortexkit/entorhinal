@@ -101,7 +101,10 @@ impl ProjectsHandler {
         let (mut claim_version, own) = self.move_claim(&request.agent_id).await?;
         let (peer, peer_name) = self.with_agent_store(|s| s.resolve_move_member(&request.to))?;
         if peer == own {
-            return Err(HandlerError::new("invalid_request", "target is this Mac"));
+            return Err(HandlerError::new(
+                "invalid_request",
+                "target is this machine",
+            ));
         }
         if let Err(error) = self.move_open_check(&request.agent_id) {
             if error.code == "move_in_progress" {
@@ -663,7 +666,7 @@ mod tests {
                 .set_member_name(
                     entorhinal_core::shared_entry::MemberName {
                         author: TARGET.into(),
-                        display_name: "Studio Mac".into(),
+                        display_name: "Studio".into(),
                     },
                     "fixture",
                 )
@@ -695,7 +698,7 @@ mod tests {
             self.call(
                 key,
                 MOVE,
-                json!({"agent_id":id,"to":"Studio Mac","request_key":"move"}),
+                json!({"agent_id":id,"to":"Studio","request_key":"move"}),
             )
             .await
         }
@@ -776,7 +779,7 @@ mod tests {
         );
         assert_eq!(
             *f.prompt.summaries.lock().unwrap(),
-            vec![format!("move agent \"ENTO\" (\"{id}\") to \"Studio Mac\"")]
+            vec![format!("move agent \"ENTO\" (\"{id}\") to \"Studio\"")]
         );
         *f.prompt.outcome.lock().unwrap() = Ok(());
         let generation = f.store().generation().unwrap();
@@ -974,7 +977,7 @@ mod tests {
             .set_member_name(
                 entorhinal_core::shared_entry::MemberName {
                     author: "03030303030303030303030303030303".into(),
-                    display_name: "Studio Mac".into(),
+                    display_name: "Studio".into(),
                 },
                 "fixture",
             )
@@ -984,7 +987,7 @@ mod tests {
             .set_member_name(
                 entorhinal_core::shared_entry::MemberName {
                     author: "03030303030303030303030303030303".into(),
-                    display_name: "Other Mac".into(),
+                    display_name: "Other machine".into(),
                 },
                 "fixture",
             )
@@ -1023,7 +1026,7 @@ mod tests {
                 f.call(
                     ORCH,
                     MOVE,
-                    json!({"agent_id":id,"to":"Studio Mac","request_key":"other"})
+                    json!({"agent_id":id,"to":"Studio","request_key":"other"})
                 )
                 .await
             ),
@@ -1126,7 +1129,7 @@ mod tests {
         let handler = f.handler.clone();
         let request = body(
             MOVE,
-            json!({"agent_id":id,"to":"Studio Mac","request_key":"move"}),
+            json!({"agent_id":id,"to":"Studio","request_key":"move"}),
         );
         let task = tokio::spawn(async move { handler.handle_served_request(&request, ORCH).await });
         f.gate_entered(1).await;
@@ -1152,7 +1155,7 @@ mod tests {
         f.discovery.gate.store(true, Ordering::Relaxed);
         let request = body(
             MOVE,
-            json!({"agent_id":id,"to":"Studio Mac","request_key":"move"}),
+            json!({"agent_id":id,"to":"Studio","request_key":"move"}),
         );
         let handler = f.handler.clone();
         let request_for_task = request.clone();
@@ -1213,7 +1216,7 @@ mod tests {
             .set_member_name(
                 entorhinal_core::shared_entry::MemberName {
                     author: TARGET.into(),
-                    display_name: "Renamed Mac".into(),
+                    display_name: "Renamed".into(),
                 },
                 "fixture",
             )
@@ -1226,7 +1229,7 @@ mod tests {
                 f.call(
                     ORCH,
                     MOVE,
-                    json!({"agent_id":id,"to":"Renamed Mac","request_key":"move"})
+                    json!({"agent_id":id,"to":"Renamed","request_key":"move"})
                 )
                 .await
             ),
@@ -1240,7 +1243,7 @@ mod tests {
             .set_member_name(
                 entorhinal_core::shared_entry::MemberName {
                     author: TARGET.into(),
-                    display_name: "Renamed Mac".into(),
+                    display_name: "Renamed".into(),
                 },
                 "fixture",
             )

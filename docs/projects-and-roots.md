@@ -1,7 +1,7 @@
 # Projects and roots
 
 How to register projects, approve their checkouts, attach a checkout on a
-second Mac, repair a replaced checkout and choose which git remotes a root
+second machine, repair a replaced checkout and choose which git remotes a root
 owns. Every command here talks to the running module through the subc daemon.
 The admission rules are in [module-surface.md](module-surface.md).
 
@@ -13,7 +13,7 @@ The admission rules are in [module-surface.md](module-surface.md).
   still resolves, to an id derived from its path (`pj-implicit1-…`). It is
   marked `NOT REGISTERED` and authorizes nothing.
 - **Root.** A registered folder of a project. A project can have several.
-  Root paths are local to each Mac.
+  Root paths are local to each machine.
 - **Binding.** Which checkout a root currently is. On binding, entorhinal
   writes a random token to `cortexkit-root-incarnation` in the checkout's git
   common directory and records it with a fresh registration epoch. A root's
@@ -109,12 +109,12 @@ binding it changes nothing. On an `unverifiable` root it refuses
 
 Verify: `ck projects trust` shows `bound` and `approved`.
 
-## Attach a checkout on another Mac
+## Attach a checkout on another machine
 
 With the shared identity log enabled ([sharing.md](sharing.md)), projects
-registered on one Mac appear on the others, without folders. Each root has a
+registered on one machine appear on the others, without folders. Each root has a
 machine-neutral **root key**: `owner/repo` from its owned GitHub remote, or a
-label. To give a shared project a folder on this Mac:
+label. To give a shared project a folder on this machine:
 
 ```sh
 ck projects attach ~/src/my-app                     # preview: matched project and key
@@ -169,7 +169,7 @@ ck workspaces clear-root <workspace-id>
 
 `assign` moves the project if it is already in another workspace. If the
 project has a live head or hirees, their name claims move with it; from `ck`
-that change needs Touch ID, and it is refused if a moving name is taken in the
+that change needs operator confirmation, and it is refused if a moving name is taken in the
 target workspace. A workspace root is only what the operator sets; when none is
 set, none is reported.
 
@@ -188,16 +188,16 @@ the `rebuild` operation, which replays the journal onto the live tables. There
 is no `ck` command for `rebuild`; it is a recovery operation on the module
 surface. See [data-model.md](data-model.md#4-verify-and-rebuild).
 
-## A store restored from another Mac
+## A store restored from another machine
 
 Entorhinal records the daemon's machine id in its store. If a restored store
-belongs to another Mac, health reports `storeOrigin: "foreign"` and the module
+belongs to another machine, health reports `storeOrigin: "foreign"` and the module
 is degraded. Reads still work, but claims are unknown. Persistent writes are
 refused with `store_from_another_machine`. Background log sync, claims, roles,
 moves and catalog refresh are blocked.
 The session-liveness feed still updates its in-memory mirror.
 
-Run `ck projects adopt-store` and approve the Touch ID prompt to use the store
+Run `ck projects adopt-store` and approve the presence prompt to use the store
 here. Local identity, approvals, binding tokens, caches, moves, sessions, consent
 and catalog-local state are cleared. If sharing was off, projects and folder
 paths stay; re-bind and re-approve folders. If sharing was on, the registry is
@@ -205,7 +205,7 @@ reset too: run `ck projects log enable` to rejoin and restore shared identities,
 then `ck projects attach` and re-approve folders. The journal is retained.
 
 After a deliberate `ck machine adopt` on the **same hardware**, use
-`ck projects adopt-store --same-machine` instead. It also requires Touch ID,
+`ck projects adopt-store --same-machine` instead. It also requires operator confirmation,
 but only records the new machine id: nothing is cleared. Both `adopt-store`
 forms require a foreign store. Older daemons that supply no machine id run
 normally with `storeOrigin: "unchecked"`; entorhinal never invents an id.

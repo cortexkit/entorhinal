@@ -1089,8 +1089,8 @@ impl Source {
                         failure
                     })?;
             // A shared abort record says the move was cancelled. For a claimed
-            // agent, only a claim held here permits this Mac to resume writes;
-            // keep participant data read-only while another Mac holds it.
+            // agent, only a claim held here permits this machine to resume writes;
+            // keep participant data read-only while another machine holds it.
             if !require_present
                 && claim.epoch >= 1
                 && claim.holder.as_deref() != Some(&reply.self_author)

@@ -490,17 +490,17 @@ mod tests {
         assert_eq!(c.prepare(&cut(&["b", "a"])).await.unwrap(), original);
         refusal(c.prepare(&cut(&["a"])).await, "id_reused");
         c.export(&cut(&["b", "a"])).await.unwrap();
-        let release = release_request(&cut(&["a", "b"]), "mac-b");
+        let release = release_request(&cut(&["a", "b"]), "machine-b");
         assert!(c.release(&release).await.unwrap().enforced);
         fake.set_enforced(false);
         assert!(
-            c.release(&release_request(&cut(&["b", "a"]), "mac-b"))
+            c.release(&release_request(&cut(&["b", "a"]), "machine-b"))
                 .await
                 .unwrap()
                 .enforced
         );
         refusal(
-            c.release(&release_request(&cut(&["a", "b"]), "mac-c"))
+            c.release(&release_request(&cut(&["a", "b"]), "machine-c"))
                 .await,
             "id_reused",
         );
@@ -520,7 +520,7 @@ mod tests {
         );
         assert_eq!(
             fake.tombstones().values().cloned().collect::<Vec<_>>(),
-            ["mac-b", "mac-b"]
+            ["machine-b", "machine-b"]
         );
     }
 
@@ -591,7 +591,7 @@ mod tests {
         refusal(a.export(&request).await, "cut_unknown");
         refusal(a.activate(&request).await, "cut_unknown");
         refusal(
-            a.release(&release_request(&request, "mac-b")).await,
+            a.release(&release_request(&request, "machine-b")).await,
             "cut_unknown",
         );
         refusal(b.prepare(&request).await, "unknown_ref");
@@ -610,7 +610,7 @@ mod tests {
         );
         refusal(a.import(&request).await, "invalid_state");
         refusal(
-            a.release(&release_request(&request, "mac-b")).await,
+            a.release(&release_request(&request, "machine-b")).await,
             "invalid_state",
         );
         a.export(&request).await.unwrap();
@@ -626,7 +626,7 @@ mod tests {
             "activated"
         );
         assert_eq!(source.cut(CUT).unwrap().step, Step::Exported);
-        a.release(&release_request(&request, "mac-b"))
+        a.release(&release_request(&request, "machine-b"))
             .await
             .unwrap();
         assert_eq!(
@@ -635,7 +635,7 @@ mod tests {
         );
         assert!(source.frozen().is_empty());
         assert!(receiver.tombstones().is_empty());
-        assert_eq!(source.tombstones()[&reference("a")], "mac-b");
+        assert_eq!(source.tombstones()[&reference("a")], "machine-b");
         assert_eq!(receiver.cut(CUT).unwrap().step, Step::Activated);
     }
 

@@ -1,5 +1,5 @@
 //! Carrying an agent's session bindings, with their network history, from
-//! the source Mac of a move to the receiving Mac.
+//! the source machine of a move to the receiving machine.
 //!
 //! The shared move record names live bindings only by `(ref_kind, ref)`, so
 //! without more data the receiver could only insert placeholder rows: no host
@@ -39,7 +39,7 @@ pub fn is_binding_ref_kind(ref_kind: &str) -> bool {
     ref_kind != PACKAGE_CLOSURE_KIND && ref_kind != SESSION_BINDINGS_KIND
 }
 
-/// One binding as carried between Macs: every column of its
+/// One binding as carried between machines: every column of its
 /// `session_binding` row except the agent id (the move names the agent), and
 /// its whole network history, oldest first, with the source's `since_ms`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,9 +116,9 @@ pub struct CarriedInstall {
     /// Carried rows written as they were on the source.
     pub installed: u64,
     /// Carried rows written as placeholders because their host session or
-    /// runner session already names another binding on this Mac.
+    /// runner session already names another binding on this machine.
     pub placeholders: u64,
-    /// Carried rows skipped because this Mac already had the binding.
+    /// Carried rows skipped because this machine already had the binding.
     pub kept: u64,
     /// Finished metadata skipped because a local binding owns its host or
     /// runner session key: (incoming ref, local binding ref).
@@ -282,9 +282,9 @@ pub(crate) fn install_moved_bindings(
         let row = carried
             .get(&(r.ref_kind.as_str(), r.reference.as_str()))
             .copied();
-        // A binding this Mac already has keeps its own row and history
+        // A binding this machine already has keeps its own row and history
         // untouched; the carried copy is skipped without comparing the two.
-        // That copy was opened or moved in here before, and this Mac's host
+        // That copy was opened or moved in here before, and this machine's host
         // may have registered or ended it since, so replacing it could undo
         // local changes. Placeholders always followed the same rule through
         // `ON CONFLICT DO NOTHING`.
@@ -356,7 +356,7 @@ pub(crate) fn install_moved_bindings(
             )?;
             outcome.installed += 1;
         }
-        // Verbatim, including `since_ms` from the source Mac's clock: the
+        // Verbatim, including `since_ms` from the source machine's clock: the
         // display rows these values are compared with were stamped by that
         // same clock.
         for entry in &row.network_history {
@@ -376,7 +376,7 @@ fn insert_placeholder(
     r: &MoveRef,
 ) -> rusqlite::Result<()> {
     // A placeholder has no host session, runner or end time. All three stay
-    // NULL until this Mac's host registers the session, and that
+    // NULL until this machine's host registers the session, and that
     // registration records the runner. Retention never prunes a row whose
     // end time is NULL, so a moved-in reference survives for a later move
     // back.
@@ -388,7 +388,7 @@ fn insert_placeholder(
     Ok(())
 }
 
-/// Whether another binding on this Mac already holds the carried row's host
+/// Whether another binding on this machine already holds the carried row's host
 /// session or runner session.
 fn collides(tx: &Transaction<'_>, row: &CarriedBinding) -> rusqlite::Result<bool> {
     if let (Some(harness), Some(session_id)) = (&row.harness, &row.session_id) {

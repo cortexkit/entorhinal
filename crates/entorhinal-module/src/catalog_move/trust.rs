@@ -1,4 +1,4 @@
-//! Check the receiving Mac's permissions and refresh registry status for every
+//! Check the receiving machine's permissions and refresh registry status for every
 //! package pinned to the moving agent.
 use super::*;
 use entorhinal_core::catalog_grants::{coverage, Coverage, CoveragePackage, Operation};
@@ -11,7 +11,7 @@ pub(super) struct Preflight {
 fn refused(pin: &CatalogPin, reason: &str) -> HandlerError {
     HandlerError {
         code: "trust_missing".into(),
-        message: "the target Mac cannot authorize the moved closure".into(),
+        message: "the target machine cannot authorize the moved closure".into(),
         detail: Some(json!({"publishers":[{
             "publisher":pin.name.split('/').next().unwrap(),
             "publisher_fingerprint":pin.publisher_fingerprint,

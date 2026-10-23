@@ -11,25 +11,28 @@ const HARNESS: &str = "broca";
 /// network history is `yes` then `no`.
 const SESSIONS: [&str; 4] = ["live-1", "live-2", "ended", "history"];
 
-/// Route this Mac's entorhinal participant through the production
+/// Route this machine's entorhinal participant through the production
 /// dispatcher, which serves the package closure and the session bindings,
 /// and list it in discovery beside the fake Broca participant.
-fn carry_bindings(mac: &Mac, fault: SourceFault) {
-    mac.discovery.daemon.restart(snapshot(
+fn carry_bindings(node: &MoveMachine, fault: SourceFault) {
+    node.discovery.daemon.restart(snapshot(
         &[("broca", KIND), ("entorhinal", "session-bindings")],
         true,
         true,
     ));
-    *mac.discovery.catalog.lock().unwrap() =
-        Some(Arc::new(mac.machine.handler.catalog_move_context()));
-    *mac.discovery.bindings.lock().unwrap() = Some(Arc::new(
-        mac.machine.handler.session_move_context().with_fault(fault),
+    *node.discovery.catalog.lock().unwrap() =
+        Some(Arc::new(node.machine.handler.catalog_move_context()));
+    *node.discovery.bindings.lock().unwrap() = Some(Arc::new(
+        node.machine
+            .handler
+            .session_move_context()
+            .with_fault(fault),
     ));
 }
 
 /// Tell the liveness mirror these sessions are gone, so a move may take them.
-fn sessions_gone(mac: &Mac) {
-    let mut state = mac.machine.handler.liveness.lock().unwrap();
+fn sessions_gone(node: &MoveMachine) {
+    let mut state = node.machine.handler.liveness.lock().unwrap();
     state.stale = false;
     for session in SESSIONS {
         state.gone.insert(crate::SessionKey::new(HARNESS, session));
@@ -95,9 +98,9 @@ async fn bindings_pair(fault: SourceFault) -> Pair {
     pair
 }
 
-/// What the apps and Thalamus read for the agent on one Mac.
-async fn session_reads(mac: &Mac) -> (Value, Vec<Value>) {
-    let sessions = mac
+/// What the apps and Thalamus read for the agent on one machine.
+async fn session_reads(node: &MoveMachine) -> (Value, Vec<Value>) {
+    let sessions = node
         .machine
         .call("agent.sessions", json!({"agent_id":AGENT}))
         .await
@@ -107,7 +110,7 @@ async fn session_reads(mac: &Mac) -> (Value, Vec<Value>) {
     let mut by_runner = Vec::new();
     for session in SESSIONS {
         by_runner.push(
-            mac.machine
+            node.machine
                 .call(
                     "agent.session_for_runner",
                     json!({"runner":RUNNER,"session":session}),
@@ -132,8 +135,8 @@ fn entorhinal_refs(record: &MoveRecord) -> Option<Vec<(String, String)>> {
         })
 }
 
-fn claim_taken(mac: &Mac) -> bool {
-    mac.records
+fn claim_taken(node: &MoveMachine) -> bool {
+    node.records
         .calls
         .lock()
         .unwrap()
@@ -157,8 +160,8 @@ async fn moved_bindings_and_network_history_read_the_same_on_both_macs_and_back(
         Some(vec![("session-bindings".into(), AGENT.into())])
     );
     pair.finish(&cut).await;
-    for mac in [&pair.a, &pair.b] {
-        for request in mac.discovery.peers["broca"].calls() {
+    for node in [&pair.a, &pair.b] {
+        for request in node.discovery.peers["broca"].calls() {
             if let Some(refs) = request.refs() {
                 assert_eq!(refs.as_slice().len(), 4);
                 assert!(refs.as_slice().iter().all(|r| r.r#ref != "ref-ended"));
@@ -210,15 +213,15 @@ async fn moved_bindings_and_network_history_read_the_same_on_both_macs_and_back(
         pair.a.machine.rows("session_network")
     );
 
-    // Back to the first Mac in a new cut and stream. Its own rows are kept
+    // Back to the first machine in a new cut and stream. Its own rows are kept
     // as they are, so every read is still the same.
     pair.b
         .door
         .script("cut.seal", DoorEffect::Seal(SealState::Published, None));
     let back = pair.b.admit_to(A, "bindings-back").await.unwrap();
     pair.b.source_until(&back, MoveStep::Published).await;
-    let item = |cut: &str, mac: &Mac| -> Vec<String> {
-        mac.door
+    let item = |cut: &str, node: &MoveMachine| -> Vec<String> {
+        node.door
             .session_calls()
             .into_iter()
             .filter(|(m, p)| m == "session.admit" && p["sessionRef"].is_string())
@@ -258,9 +261,9 @@ async fn moved_bindings_and_network_history_read_the_same_on_both_macs_and_back(
 #[tokio::test(start_paused = true)]
 async fn plain_agent_moves_without_entorhinal_or_a_new_stream() {
     let pair = Pair::new(&[]).await;
-    for mac in [&pair.a, &pair.b] {
-        carry_bindings(mac, SourceFault::default());
-        mac.discovery
+    for node in [&pair.a, &pair.b] {
+        carry_bindings(node, SourceFault::default());
+        node.discovery
             .daemon
             .restart(snapshot(&[("entorhinal", "session-bindings")], true, true));
     }
@@ -368,7 +371,7 @@ async fn carried_ref_outside_the_move_holds_as_a_contract_violation_before_the_c
     assert!(pair.b.store().agent_bound_refs(AGENT).unwrap().is_empty());
 }
 
-/// A receiving Mac whose entorhinal predates carried bindings describes only
+/// A receiving machine whose entorhinal predates carried bindings describes only
 /// the package closure. It refuses the move in its preconditions, before
 /// any import or claim, and writes no binding.
 #[tokio::test(start_paused = true)]
@@ -488,8 +491,8 @@ async fn session_ending_after_admission_stays_in_every_participant_ref_set() {
         .unwrap();
     assert!(row.ended_at_ms.is_some());
     assert_eq!(row.held_on, None);
-    for mac in [&pair.a, &pair.b] {
-        for request in mac.discovery.peers["broca"].calls() {
+    for node in [&pair.a, &pair.b] {
+        for request in node.discovery.peers["broca"].calls() {
             if let Some(refs) = request.refs() {
                 assert_eq!(refs.as_slice().len(), 4);
                 assert!(refs.as_slice().iter().any(|r| r.r#ref == "ref-live-1"));
@@ -611,8 +614,8 @@ async fn finished_only_agent_moves_metadata_without_participant_placeholders() {
             .load(std::sync::atomic::Ordering::Relaxed),
         0
     );
-    for mac in [&pair.a, &pair.b] {
-        assert!(mac.discovery.peers["broca"]
+    for node in [&pair.a, &pair.b] {
+        assert!(node.discovery.peers["broca"]
             .calls()
             .iter()
             .all(|r| r.refs().is_none_or(|refs| refs.as_slice().is_empty())));

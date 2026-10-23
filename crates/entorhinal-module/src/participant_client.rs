@@ -584,7 +584,7 @@ mod tests {
                 ("agent_data.abort", CUT_JSON, "{}"),
                 (
                     "agent_data.release",
-                    r#"{"refs":[{"ref_kind":"session","ref":"s1"}],"cutId":"0123456789abcdef0123456789abcdef","holder":"mac-b"}"#,
+                    r#"{"refs":[{"ref_kind":"session","ref":"s1"}],"cutId":"0123456789abcdef0123456789abcdef","holder":"machine-b"}"#,
                     r#"{"enforced":false}"#,
                 ),
             ])),
@@ -624,7 +624,7 @@ mod tests {
         assert_eq!(client.activate(&cut).await.unwrap(), Empty::new());
         assert_eq!(client.abort(&cut).await.unwrap(), Empty::new());
         let release = round_trip::<ReleaseRequest>(
-            r#"{"refs":[{"ref_kind":"session","ref":"s1"}],"cutId":"0123456789abcdef0123456789abcdef","holder":"mac-b"}"#,
+            r#"{"refs":[{"ref_kind":"session","ref":"s1"}],"cutId":"0123456789abcdef0123456789abcdef","holder":"machine-b"}"#,
         );
         assert!(!client.release(&release).await.unwrap().enforced);
         assert!(fixtures.fixtures.lock().unwrap().is_empty());
@@ -639,7 +639,7 @@ mod tests {
             r#"{"op":"agent_data.import","refs":[],"cutId":"0123456789abcdef0123456789abcdef"}"#,
             r#"{"op":"agent_data.activate","refs":[],"cutId":"0123456789abcdef0123456789abcdef"}"#,
             r#"{"op":"agent_data.abort","refs":[],"cutId":"0123456789abcdef0123456789abcdef"}"#,
-            r#"{"op":"agent_data.release","refs":[],"cutId":"0123456789abcdef0123456789abcdef","holder":"mac-b"}"#,
+            r#"{"op":"agent_data.release","refs":[],"cutId":"0123456789abcdef0123456789abcdef","holder":"machine-b"}"#,
         ] {
             let mut value: Value = serde_json::from_str(literal).unwrap();
             let method = value
@@ -862,7 +862,9 @@ mod tests {
         }
         a.prepare(&cut()).await.unwrap();
         a.export(&cut()).await.unwrap();
-        a.release(&release_request(cut(), "mac-b")).await.unwrap();
+        a.release(&release_request(cut(), "machine-b"))
+            .await
+            .unwrap();
         b.import(&cut()).await.unwrap();
         b.activate(&cut()).await.unwrap();
         let abort = cut_with_refs(cut().refs.into_vec(), "ffffffffffffffffffffffffffffffff");
@@ -984,7 +986,7 @@ mod refusal_tests {
             (Request::Activate(cut()), "external_not_present"),
             (Request::Abort(cut()), "invalid_state"),
             (
-                Request::Release(release_request(cut(), "mac-b")),
+                Request::Release(release_request(cut(), "machine-b")),
                 "unknown_ref",
             ),
             (Request::Diverged(cut()), "cut_not_ready"),
@@ -1024,7 +1026,10 @@ mod refusal_tests {
     #[tokio::test]
     async fn disallowed_and_unknown_refusal_codes_are_contract_violations() {
         for (request, code) in [
-            (Request::Release(release_request(cut(), "mac-b")), "busy"),
+            (
+                Request::Release(release_request(cut(), "machine-b")),
+                "busy",
+            ),
             (Request::Prepare(cut()), "frobnicated"),
         ] {
             let fake = Arc::new(FakeParticipant::new(&["session"], cut().refs.into_vec()));

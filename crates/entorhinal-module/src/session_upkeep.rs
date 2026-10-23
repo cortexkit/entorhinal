@@ -10,7 +10,7 @@
 //! Like claim refresh, the task holds the handler's store slot weakly and
 //! takes a store handle only for one blocking job, so dropping the handler or
 //! taking its store out closes the database. It never runs on a store from
-//! another Mac, which the central write gate keeps read-only.
+//! another machine, which the central write gate keeps read-only.
 
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -171,7 +171,7 @@ impl Worker {
                 Some(store) if store.is_foreign() => self.upkeep.fail(
                     Failure::ForeignStore,
                     count,
-                    "the store belongs to another Mac",
+                    "the store belongs to another machine",
                 ),
                 Some(store) => {
                     let guard = self.sql.begin();
@@ -228,7 +228,7 @@ impl Worker {
 }
 
 impl ProjectsHandler {
-    /// Start the upkeep task once. A store from another Mac gets none; store
+    /// Start the upkeep task once. A store from another machine gets none; store
     /// adoption starts it.
     pub(super) fn start_session_upkeep(&self) {
         if self.health.origin.is_foreign() {

@@ -437,12 +437,12 @@ struct HealthGauges {
     move_errors: AtomicU64,
     move_inbox_rejected: AtomicU64,
     move_task_panics: AtomicU64,
-    /// Session bindings this Mac sent in moves out: every row written to a
+    /// Session bindings this machine sent in moves out: every row written to a
     /// session-bindings stream.
     session_bindings_carried: AtomicU64,
-    /// Carried bindings this Mac installed as they were on the source.
+    /// Carried bindings this machine installed as they were on the source.
     session_bindings_installed: AtomicU64,
-    /// Carried bindings this Mac installed as placeholders, because another
+    /// Carried bindings this machine installed as placeholders, because another
     /// binding here already held their host or runner session.
     session_bindings_placeholders: AtomicU64,
     watches_open: AtomicU64,
@@ -607,7 +607,7 @@ struct ProjectsHandler {
     catalog_publish: catalog_publish::Publisher,
     catalog_seeder: catalog_seed::Seeder,
     catalog_move_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Serializes this Mac's state-changing session-bindings requests, so a
+    /// Serializes this machine's state-changing session-bindings requests, so a
     /// request left running by a cancelled caller cannot interleave with its
     /// retry.
     session_move_lock: Arc<tokio::sync::Mutex<()>>,
@@ -1038,7 +1038,7 @@ impl ProjectsHandler {
     /// process, including an agent's shell, reaches entorhinal as `Direct`.
     /// The one way a `Direct` caller writes agent identity is `write_wait`,
     /// which, for five methods only, asks the operator to approve the exact
-    /// write at a Touch ID prompt first. Nothing else skips this refusal.
+    /// write at a presence prompt first. Nothing else skips this refusal.
     /// Enabling the identity log is reserved to an unscoped operator route.
     /// `agent.register_session` is admitted only from the module the daemon
     /// names as the sole provider of a session capability. Only the asynchronous
@@ -1388,7 +1388,7 @@ impl ModuleHandler for ProjectsHandler {
 
 impl ProjectsHandler {
     /// Add the counters of session bindings carried in moves to the health
-    /// metrics: rows this Mac sent, and rows it installed whole or as
+    /// metrics: rows this machine sent, and rows it installed whole or as
     /// placeholders.
     fn session_binding_metrics(&self, mut metrics: Value) -> Value {
         for (key, counter) in [
@@ -1920,7 +1920,7 @@ impl ProjectsHandler {
         let tracked = state.sessions.len() as u64;
         drop(state);
         // Queue only: the writer task does the SQL, so a slow or failing
-        // write never delays this batch. A store from another Mac takes no
+        // write never delays this batch. A store from another machine takes no
         // writes at all.
         if !self.health.origin.is_foreign() {
             self.session_upkeep.push(ended);
@@ -2794,7 +2794,7 @@ fn agent_operation_description(method: &str) -> &'static str {
         "agent.move_status" => "Read a local move checkpoint, holds, warnings and diagnostics without calling a participant or engram.",
         "agent.moves" => "Read open local moves followed by the last 32 finished moves, including warnings and diagnostics.",
         "agent.move_abort" => "Request move cleanup before the irreversible boundary; Direct confirms, or the orchestrator relays. Only Direct can retry a stuck abort.",
-        "agent.set_lid_close_moves" => "Enable or disable engram's lid-close moves on this Mac, from Direct with operator confirmation.",
+        "agent.set_lid_close_moves" => "Enable or disable engram's lid-close moves on this machine, from Direct with operator confirmation.",
         "member.set_name" => "Set this identity-log member's display name (Direct only).",
         _ => "",
     }

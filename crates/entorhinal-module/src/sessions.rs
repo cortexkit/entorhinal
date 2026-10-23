@@ -963,7 +963,7 @@ impl ProjectsHandler {
     /// One page of an agent's sessions with each one's liveness. Liveness
     /// comes from the in-memory mirror exactly as `agent.session_liveness`
     /// answers it; a session the mirror cannot vouch for whose binding has an
-    /// end time reads `gone`. A reference moved in from another Mac, with no
+    /// end time reads `gone`. A reference moved in from another machine, with no
     /// host session here yet, reads `unknown` until it ends.
     pub(super) fn agent_sessions(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
         let request: AgentSessionsRequest = decode(params)?;

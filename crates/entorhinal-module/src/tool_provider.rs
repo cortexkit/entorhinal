@@ -324,7 +324,7 @@ impl ProjectsHandler {
             if claim.epoch >= 1 && (claim.holder.is_none() || claim.holder != own) {
                 return Err(HandlerError::new(
                     "held_elsewhere",
-                    "the stamped agent is held by another Mac",
+                    "the stamped agent is held by another machine",
                 ));
             }
         }

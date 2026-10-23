@@ -25,8 +25,8 @@ sends `{"method":op,"params":request}` in one ordinary SUBC Request.
 - `SHA256SUMS`: hashes of the six JSON files, relative to this directory.
 
 The incarnation is fixed to `0123456789abcdef`. Identity tokens/generations and
-whereabouts seqs are local to one process on one Mac; do not compare them between
-Macs. Identity notices also carry the last applied shared `logPosition`. On
+whereabouts seqs are local to one process on one machine; do not compare them between
+machines. Identity notices also carry the last applied shared `logPosition`. On
 `resync`, read `agent.fleet_identity` or `agent.where_many` and open a watch from
 the new resume point. There is no full snapshot in a watch notice. A normal end,
 including route cancellation or module draining, is `StreamEnd`, never Response.
@@ -40,7 +40,7 @@ Whereabouts retains 256 changed cache transactions or derived-view invalidations
 ring (or from another incarnation) forces resync. A transaction increments seq
 once if at least one cached claim changes, including known/stale/read timestamp
 changes; unchanged transactions do not advance it. Member renames, learning the
-Mac's own author identity, sharing-mode changes, agent liveness changes and move
+machine's own author identity, sharing-mode changes, agent liveness changes and move
 progress also advance seq with an all-agents resync marker. These fields are
 derived outside the claim cache; the core's post-commit listener invalidates the
 watch history without polling or adding engram calls.

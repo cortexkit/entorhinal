@@ -13,7 +13,7 @@ caller principal with whichever module the catalog lists for either role; it
 does not compare against a fixed module name. Since one module provides both
 roles here, it is admitted as the orchestrator. Read calls use the reserved
 `phone` route, and the refusal vector uses `plexus`, which provides neither
-role. Claim records and Mac display names are fixed in the scratch registry; no
+role. Claim records and machine display names are fixed in the scratch registry; no
 network or machine-local state is used.
 
 The fixture imports seven live agents with fixed IDs, uses clock `700` and
@@ -42,7 +42,7 @@ objects deny unknown fields; a field outside the listed schema is an
   unclaimed live agent as `orchestrator`, then register the same reference again
   for that agent. A separate OpenCode registration uses `opencode-session` and
   the `opencode` harness. Refusals cover `ref_bound_elsewhere`, a cached
-  `held_elsewhere` claim with the other Mac's name, a `caller_forbidden` request
+  `held_elsewhere` claim with the other machine's name, a `caller_forbidden` request
   from `plexus`, and an unknown field.
   A different reference for the same agent, reference kind and host session
   re-keys that binding in place, keeping its caller role, runner unless supplied,
@@ -59,11 +59,11 @@ objects deny unknown fields; a field outside the listed schema is an
 - `agent.where`: exactly `{agent_id}`, where the string has entorhinal's form
   `agent_` followed by 8 or 16 lowercase hexadecimal digits. The file includes
   an agent never previously read from the claim cache
-  (`unclaimed`), `held_here`, `held_elsewhere` with the holder name `Other Mac`,
+  (`unclaimed`), `held_here`, `held_elsewhere` with the holder name `Other machine`,
   and `unknown_agent`.
 - Both moving samples keep top-level `status` at `held_here`; the presence of
-  `moving` for a non-terminal move on this Mac is the signal, and its `side`
-  identifies which end this Mac is.
+  `moving` for a non-terminal move on this machine is the signal, and its `side`
+  identifies which end this machine is.
 - `agent.register_session` may also carry an optional `runner`: the module ID
   of the llm-runner hosting the session, 1–64 bytes with no control
   characters. It is taken out before the strict decode above, so the
@@ -102,7 +102,7 @@ objects deny unknown fields; a field outside the listed schema is an
   Results preserve request order and omit unknown agents; the sample requests a
   locally held and remotely held agent around an unknown ID.
 
-Moved finished sessions retain metadata on the receiving Mac while their data
+Moved finished sessions retain metadata on the receiving machine while their data
 stays on the source (or its recorded earlier holder). The three session reads
 include `heldOn` only for such remote data. Registration, including re-keying,
 refuses `session_on_other_machine` with `{machine_id}` and writes nothing until
@@ -125,13 +125,13 @@ a backfill makes the data local.
 - **`session-for-ref.json`**: Pi and OpenCode registrations with
   `project_root`, a migrated legacy row with a null root, and a missing
   reference.
-- **`where.json`**: on a Mac with sharing on: never-read/unclaimed, locally
+- **`where.json`**: on a machine with sharing on: never-read/unclaimed, locally
   held, remotely held with a holder name, and unknown agent.
 - **`where-many.json`**: a local and remotely held agent, with an unknown ID
   between them to pin request order and omission.
-- **`where-sharing-off.json`**: on a Mac that has never turned sharing on, an
+- **`where-sharing-off.json`**: on a machine that has never turned sharing on, an
   agent with no claim is a verified `unclaimed` (`known: true`), because no
-  other Mac can hold it.
+  other machine can hold it.
 - **`where-moving-source.json`**: a locally held agent during the source-side
   published step, waiting for the receiver to pick up the move.
 - **`where-moving-receiver.json`**: the same locally held agent during the

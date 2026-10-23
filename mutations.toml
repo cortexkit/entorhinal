@@ -4337,7 +4337,7 @@ expect_red = ["two_machine_acceptance::moves::version_three_epoch_zero_uses_reco
 
 [[control]]
 id = "s11-not-holder"
-guards = "A refreshed claim held by another Mac refuses admission before any move write"
+guards = "A refreshed claim held by another machine refuses admission before any move write"
 file = "crates/entorhinal-module/src/move_admission.rs"
 old = "if cached.epoch >= 1 && cached.holder.as_ref() != Some(&own) {"
 new = "if false && cached.epoch >= 1 && cached.holder.as_ref() != Some(&own) { // NON-VACUITY BREAK"
@@ -5440,7 +5440,7 @@ only = false
 
 [[control]]
 id = "agent-tool-claim-holder-admission"
-guards = "A moved agent's cached claim prevents old-Mac tools using retained standing grants"
+guards = "A moved agent's cached claim prevents old-machine tools using retained standing grants"
 file = "crates/entorhinal-module/src/tool_provider.rs"
 old = 'if claim.epoch >= 1 && (claim.holder.is_none() || claim.holder != own) {'
 new = 'if false && claim.epoch >= 1 && (claim.holder.is_none() || claim.holder != own) { // NON-VACUITY BREAK'
@@ -5454,7 +5454,7 @@ only = false
 
 [[control]]
 id = "move-receiver-source-holder-before-cas"
-guards = "A claimed agent held by a third Mac is refused at the pinned version before CAS"
+guards = "A claimed agent held by a third machine is refused at the pinned version before CAS"
 file = "crates/entorhinal-module/src/move_receiver.rs"
 old = 'if claim.epoch >= 1 && claim.holder.as_deref() != Some(&plan.from) {'
 new = 'if false && claim.epoch >= 1 && claim.holder.as_deref() != Some(&plan.from) { // NON-VACUITY BREAK'
@@ -6767,7 +6767,7 @@ only = false
 
 [[control]]
 id = "ento3-grants-local-only"
-guards = "Publisher grants and audit writes never enter the identity journal exported to another Mac"
+guards = "Publisher grants and audit writes never enter the identity journal exported to another machine"
 file = "crates/entorhinal-core/src/catalog_grants.rs"
 old = 'audit(tx, kind, &row, principal, row.granted_at_ms)?;'
 new = '''audit(tx, kind, &row, principal, row.granted_at_ms)?;
@@ -9158,7 +9158,7 @@ expect_red = ["agent::avatars::tests::avatar_manifest_summary_refuses_overlong_t
 
 [[control]]
 id = "member-name-reply-envelope"
-guards = "Naming a Mac replies inside the result envelope the CLI unwraps, so a saved name never prints a transport error"
+guards = "Naming a machine replies inside the result envelope the CLI unwraps, so a saved name never prints a transport error"
 file = "crates/entorhinal-core/src/remote_apply.rs"
 old = '"result": {"display_name": name.display_name}'
 new = '"ok": true, "display_name": name.display_name // NON-VACUITY BREAK'
@@ -9736,7 +9736,7 @@ expect_red = ["shared_write::tests::head_moved_uses_new_entry_id_but_agent_id_dr
 
 [[control]]
 id = "create-avatar-direct-writer"
-guards = "A Touch ID approved Direct create supplies the pre-drawn avatar to the same writer"
+guards = "An operator-approved Direct create supplies the pre-drawn avatar to the same writer"
 file = "crates/entorhinal-module/src/shared_write.rs"
 old = '.with_create_avatar(avatar)'
 new = '.with_create_avatar(None) // NON-VACUITY BREAK'
@@ -9749,7 +9749,7 @@ expect_red = ["shared_write::tests::confirmation::served::confirmed_direct_creat
 
 [[control]]
 id = "create-avatar-consent-tools"
-guards = "Consent-approved hire and head creation both draw a default avatar that the second Mac receives"
+guards = "Consent-approved hire and head creation both draw a default avatar that the second machine receives"
 file = "crates/entorhinal-module/src/shared_write.rs"
 old = '|| matches!(&prepared, Some(Write::Consent(plan,_)) if matches!(plan.tool.as_str(), "agents_hire" | "agents_create_head"));'
 new = '|| false; // NON-VACUITY BREAK'
@@ -9830,7 +9830,7 @@ expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_regist
 
 [[control]]
 id = "catalog-move-starter-root-fallback"
-guards = "A receiving Mac can authenticate starter-bundle pins without a mapped registry or a publisher grant"
+guards = "A receiving machine can authenticate starter-bundle pins without a mapped registry or a publisher grant"
 file = "crates/entorhinal-module/src/catalog_move/trust.rs"
 old = 'if scope != "@cortexkit" {'
 new = 'if true { // NON-VACUITY BREAK'
@@ -10189,7 +10189,7 @@ expect_red = ["memory_context::tests::memory_documents_refuse_every_non_direct_p
 
 [[control]]
 id = "memory-direct-touch-id"
-guards = "The served Direct domain and document path must obtain Touch ID, not merely admit Direct"
+guards = "The served Direct domain and document path must obtain operator confirmation, not merely admit Direct"
 file = "crates/entorhinal-module/src/shared_write.rs"
 old = '&& agent_ops::CONFIRMABLE_METHODS.contains(&request.method.as_str());'
 new = '&& !super::memory_context::WRITES.contains(&request.method.as_str()) /* NON-VACUITY BREAK */ && agent_ops::CONFIRMABLE_METHODS.contains(&request.method.as_str());'
@@ -10374,7 +10374,7 @@ expect_red = ["two_machine_acceptance::memory_policy_round_trips_between_two_mac
 
 [[control]]
 id = "memory-empty-document-snapshot-compatible"
-guards = "Snapshots with no accepted document omit the new table so older Macs can still join during rollout"
+guards = "Snapshots with no accepted document omit the new table so older machines can still join during rollout"
 file = "crates/entorhinal-core/src/shared_entry.rs"
 old = '.filter(|table| **table != "workspace_document" || !self.0[**table].is_empty())'
 new = '.filter(|_| true) // NON-VACUITY BREAK'
@@ -10413,7 +10413,7 @@ expect_red = ["memory::tests::memory_context_session_includes_only_memory_person
 
 [[control]]
 id = "receiver-skip-needs-empty-refs"
-guards = "A participant absent on the receiving Mac is skipped only when the source carries no refs for it; one with refs still aborts participant_unavailable"
+guards = "A participant absent on the receiving machine is skipped only when the source carries no refs for it; one with refs still aborts participant_unavailable"
 file = "crates/entorhinal-module/src/move_receiver.rs"
 old = ".filter(|p| p.refs.is_empty() && absent(&p.module_id))"
 new = ".filter(|p| absent(&p.module_id)) // NON-VACUITY BREAK"
@@ -10439,7 +10439,7 @@ expect_red = ["move_receiver::tests::receiver_restart_keeps_the_recorded_skip_ev
 
 [[control]]
 id = "receiver-cleanup-decides-skip"
-guards = "An abort that reaches the receiver before its preconditions still decides and records the absent no-ref skip before calling any participant, so cleanup never waits on a module this Mac lacks"
+guards = "An abort that reaches the receiver before its preconditions still decides and records the absent no-ref skip before calling any participant, so cleanup never waits on a module this machine lacks"
 file = "crates/entorhinal-module/src/move_receiver.rs"
 old = "let undecided = progress.skipped_absent.is_none();"
 new = "let undecided = false; // NON-VACUITY BREAK"
@@ -10517,7 +10517,7 @@ expect_red = ["store_origin::tests::foreign_store_where_many_watch_and_role_neve
 
 [[control]]
 id = "foreign-store-adopt-clears-author"
-guards = "Full adoption discards the previous Mac's self identity"
+guards = "Full adoption discards the previous machine's self identity"
 file = "crates/entorhinal-core/src/store_origin.rs"
 old = "    \"self_identity\",\n"
 new = "    // NON-VACUITY BREAK: preserve the old author\n"
@@ -10543,7 +10543,7 @@ expect_red = ["tests::store_origin_tests::adopt_store_rebuild_does_not_resurrect
 
 [[control]]
 id = "foreign-store-rejoin-old-author-history"
-guards = "Rejoining applies the old Mac's historical entries instead of treating them as this Mac's committed writes"
+guards = "Rejoining applies the old machine's historical entries instead of treating them as this machine's committed writes"
 file = "crates/entorhinal-core/src/remote_apply.rs"
 old = "SELECT seq FROM registry_journal WHERE entry_id=?1 AND origin='here' AND seq > COALESCE((SELECT MAX(seq) FROM registry_journal WHERE op='store.adopt'),0)"
 new = "SELECT seq FROM registry_journal WHERE entry_id=?1 AND origin='here' /* NON-VACUITY BREAK */"

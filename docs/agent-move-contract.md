@@ -1,8 +1,8 @@
 # Agent move contract
 
-A move hands an idle agent, with its sessions and their data, from the Mac
-that holds it (the **source**) to another of the operator's Macs (the
-**receiver**). Both Macs run entorhinal; each drives its own half. They
+A move hands an idle agent, with its sessions and their data, from the machine
+that holds it (the **source**) to another of the operator's machines (the
+**receiver**). Both machines run entorhinal; each drives its own half. They
 coordinate through records that engram stores, and every module that keeps
 agent data takes part through the `agent-data/v1` participant contract.
 [moves.md](moves.md) is the operator guide.
@@ -20,15 +20,15 @@ its transition rules) and `move_store.rs` (the local checkpoint).
 | Term | Meaning |
 |---|---|
 | cut | One move, named by its `cut_id` (16 random bytes in lowercase hex). |
-| move record | The shared record both Macs read and write by compare-and-swap. Its states are listed in section 2. |
-| inbox | A per-Mac record the source appends to so the receiver finds the move. |
-| checkpoint | The local `agent_move` row on each Mac: side, step, the saved plan, and any hold. |
+| move record | The shared record both machines read and write by compare-and-swap. Its states are listed in section 2. |
+| inbox | A per-machine record the source appends to so the receiver finds the move. |
+| checkpoint | The local `agent_move` row on each machine: side, step, the saved plan, and any hold. |
 | step | The local progress of one side (section 3). |
-| claim | engram's record of which Mac holds an agent, with an epoch. The receiver takes it during the move. |
+| claim | engram's record of which machine holds an agent, with an epoch. The receiver takes it during the move. |
 | participant | A module that provides `agent-data/v1` and declares the session reference kinds it holds data for. |
 | boundary | The point after which a side can no longer abort: the receiver starting activation. |
 | hold | A durable note on the checkpoint that stops the driver from retrying until something changes. |
-| fork | Both Macs changed the agent; the receiver holds instead of choosing a side. |
+| fork | Both machines changed the agent; the receiver holds instead of choosing a side. |
 
 ## 2. The move record
 
@@ -47,22 +47,22 @@ write each (`check_transition` and the author check in `move_record.rs`):
 | `staged` | `aborted` | receiver |
 | `claimed` | `aborted` | receiver |
 
-Every other row is refused. "Source" means the record's `from` Mac and
-"receiver" its `to` Mac, as authored in engram; a record written by the wrong
-Mac is not acted on. A record or inbox body that is malformed, has an unknown
+Every other row is refused. "Source" means the record's `from` machine and
+"receiver" its `to` machine, as authored in engram; a record written by the wrong
+machine is not acted on. A record or inbox body that is malformed, has an unknown
 version or state, or exceeds its size bound is refused by name.
 
 For an agent with catalog package pins, the immutable plan also includes
 `pin_digest`, the digest reported by `catalog.agent_generation`. The source
 captures it at admission and checks that the selection did not change before
 committing the checkpoint. An empty pin set omits the field entirely, retaining
-the original record bytes for older Macs. Updated entorhinal decoders accept
+the original record bytes for older machines. Updated entorhinal decoders accept
 records both with and without `pin_digest`.
-Moving an agent with catalog pins requires **both Macs to support catalog
+Moving an agent with catalog pins requires **both machines to support catalog
 moves**. Older record decoders reject fields they do not recognize, including
 `pin_digest`, so they do not pick up a pinned-package move. The source remains
 at `published`, with status `waiting_for_target`,
-the message "waiting for the target Mac to pick up the move", `waiting_since_ms`
+the message "waiting for the target machine to pick up the move", `waiting_since_ms`
 and elapsed `waiting_ms` in move status and `agent.where`. It never interprets
 an absent inbox entry as evidence of rejection. The operator can abort this wait
 with the existing move-abort command, upgrade the target, and retry.
@@ -95,7 +95,7 @@ Steps are closed. Source: `preparing` → `exported` → `sealed` → `published
 | receiver | `activating` | `agent_data.activate` on each participant, then write `activated`. |
 | receiver | `activated` | Finish when the record reads `released` (`done`) or the door reports takeover (`taken_over`). |
 
-Each Mac allows at most one open move per agent, whichever side it is on, and
+Each machine allows at most one open move per agent, whichever side it is on, and
 at most four open moves in total. A receiver's inbox holds at most 64 entries.
 
 Tests: `restarted_source_and_receiver_resume_at_every_recorded_step`,
@@ -112,9 +112,9 @@ scoped route is refused first (`flow_scope_not_admitted`).
 
 | Caller | Rule |
 |---|---|
-| `Direct` (`ck agents move`) | The operator approves the exact move at a Touch ID prompt. After approval the claim, the open-move slot and idleness are checked again. |
+| `Direct` (`ck agents move`) | The operator approves the exact move at a presence prompt. After approval the claim, the open-move slot and idleness are checked again. |
 | The sole provider of `agent-orchestrator/v1` | Accepted without a local prompt. That module relays moves the operator confirmed on the phone; entorhinal checks only that the caller is the resolved provider. |
-| `reserved:engram` | Accepted only while this Mac's lid-close setting is on (`caller_forbidden` otherwise). |
+| `reserved:engram` | Accepted only while this machine's lid-close setting is on (`caller_forbidden` otherwise). |
 
 Anyone else gets `caller_forbidden`. Then, in order, and with nothing written
 on refusal:
@@ -126,10 +126,10 @@ on refusal:
 2. `authority_not_cut_over`; `identity_log_disabled` (moves need the shared
    identity log).
 3. `unknown_agent`; `gone`.
-4. The agent's claim must be current, intact and held by this Mac
+4. The agent's claim must be current, intact and held by this machine
    (`claim_stale`, `claim_integrity_failed`, `not_holder`).
-5. `to` must name exactly one other Mac by its display name in the identity log
-   (`unknown_member`; `invalid_request` when the target is this Mac).
+5. `to` must name exactly one other machine by its display name in the identity log
+   (`unknown_member`; `invalid_request` when the target is this machine).
 6. `move_in_progress` when the agent already has an open move; `move_cap` at
    four open moves.
 7. Participant discovery: every required participant must be available, and
@@ -194,11 +194,11 @@ Tests: `restarted_source_and_receiver_resume_at_every_recorded_step`,
 
 ## 6. Aborting
 
-`agent.move_abort {cut_id, request_key}` asks this Mac's side of the move to
-stop and undo its work. Either Mac can ask, within the limits below.
+`agent.move_abort {cut_id, request_key}` asks this machine's side of the move to
+stop and undo its work. Either machine can ask, within the limits below.
 
-1. **Who.** `Direct` with a Touch ID prompt, or the orchestrator without one.
-   Others get `caller_forbidden`. `unknown_move` when this Mac has no such cut.
+1. **Who.** `Direct` with a presence prompt, or the orchestrator without one.
+   Others get `caller_forbidden`. `unknown_move` when this machine has no such cut.
 2. **Until when.** Only before the side's boundary: source steps up to
    `published`, receiver steps up to `claimed`. Later steps refuse
    `invalid_state` and write nothing. An abort request and the receiver's
@@ -240,13 +240,13 @@ malformed reason remains a participant contract violation.
 
 | Status | When | What clears it |
 |---|---|---|
-| `abort_stuck` | A participant refused `agent_data.abort` with an operator-retry action. The source agent stays frozen. | An operator retry (`ck agents move-abort <cut_id>` again, `Direct` only, with Touch ID), which retries once; or one fresh attempt after the driver restarts. A second refusal holds again. |
+| `abort_stuck` | A participant refused `agent_data.abort` with an operator-retry action. The source agent stays frozen. | An operator retry (`ck agents move-abort <cut_id>` again, `Direct` only, with operator confirmation), which retries once; or one fresh attempt after the driver restarts. A second refusal holds again. |
 | `held_as_fork` | At the receiver, a participant refused activation terminally, or broke its contract during activation. The receiver stays at `activating` and keeps the claim. | Operator repair. entorhinal does not retry and does not return the claim. |
 | `contract_violation` | A participant replied outside its contract at another step. | Operator repair. |
 
 A receiver also holds, rather than aborts, when it cannot prove the claim it
 must take: the source is not the holder at the pinned version, or the claim
-names the wrong Mac or epoch.
+names the wrong machine or epoch.
 
 Tests: `source_digest_mismatch_abort_stuck_frozen_retries_once_on_restart`,
 `receiver_digest_mismatch_abort_stuck_retries_once_on_restart`,
@@ -273,9 +273,9 @@ Not guaranteed:
 
 - That a participant enforces the freeze on the source. A participant that
   cannot block writes reports it, and the move carries a
-  `release_not_enforced` warning: anything written on the old Mac after that
+  `release_not_enforced` warning: anything written on the old machine after that
   point becomes a fork.
-- That a move finishes while engram, the other Mac or a participant is
+- That a move finishes while engram, the other machine or a participant is
   unreachable. Transient failures are retried with a backoff that grows to
   five minutes; refusals that cannot be retried before the activation boundary
   abort the move.
@@ -293,8 +293,8 @@ next to its `module_id`, `ref` and state, and is also included in `agent.where`
 while the move is open or in its move diagnostics after completion.
 
 `agent.set_lid_close_moves {enabled, request_key}` is `Direct` only
-(`caller_forbidden` otherwise) and asks for Touch ID when the value changes.
-It defaults to off and is local to the Mac.
+(`caller_forbidden` otherwise) and asks for operator confirmation when the value changes.
+It defaults to off and is local to the machine.
 
 Tests: `moves_view_orders_open_first_and_limits_finished_to_latest_32`,
 `served_move_controls_admit_confirm_and_bypass_shared_writer`,
@@ -318,7 +318,7 @@ compares again. A persistent difference aborts with `pin_digest_mismatch`, namin
 `source_pin_digest` and `receiver_pin_digest`. The receiver checks local publisher
 trust before staging and repeats its preflight before taking the claim. Missing
 trust aborts with `trust_missing`, listing publisher scopes and key fingerprints;
-it also refuses moves initiated automatically when the source Mac's lid closes,
+it also refuses moves initiated automatically when the source machine's lid closes,
 rather than parking them until trust changes. Trust keys on the target with
 `ck packages publisher trust <fingerprint> --agent <agent_id>` and retry.
 These are move abort reasons, not new participant refusal codes.
@@ -452,7 +452,7 @@ one that is neither holds the move as a
 The rows are installed in the transaction that records `activated`, in place
 of the placeholders written before rows were carried:
 
-- A binding this Mac already has, with the same `(ref_kind, ref)`, keeps its
+- A binding this machine already has, with the same `(ref_kind, ref)`, keeps its
   own row and history; the carried copy is skipped.
 - A live-at-admission carried row whose `(harness, session_id)` or `(runner, session_id)` is held
   by another binding here is installed as a placeholder (no host session,
@@ -464,7 +464,7 @@ of the placeholders written before rows were carried:
   The activation result counts and names each skip and its local owner; the
   receiver logs that collision list once per move.
 - Any other carried row is installed as it was, and its history verbatim:
-  `since_ms` values are the source Mac's clock, like the times of the content
+  `since_ms` values are the source machine's clock, like the times of the content
   they are compared with.
 - A move ref with no carried row gets a placeholder, as before.
 
@@ -475,21 +475,21 @@ rows always start with null. The existing 30-day pruning rule also deletes
 held-elsewhere metadata and its network-history rows, never participant data
 and never by calling a participant.
 
-A moved agent's finished sessions are listed on the new Mac, marked as held
-on the source Mac (or the earlier Mac that still holds their data), and cannot
-be opened on the new Mac until a backfill. `agent.sessions`,
+A moved agent's finished sessions are listed on the new machine, marked as held
+on the source machine (or the earlier machine that still holds their data), and cannot
+be opened on the new machine until a backfill. `agent.sessions`,
 `agent.session_for_runner` and `agent.session_for_ref` include `heldOn` only
 when non-null. `agent.register_session`, including re-keying, refuses these
 rows as `session_on_other_machine`, with detail `{machine_id}`, without writes.
 
-**Older receivers.** A Mac whose entorhinal does not describe
+**Older receivers.** A machine whose entorhinal does not describe
 `session-bindings` refuses the move in its preconditions
 (`receiver_precondition`, detail `participant_unavailable` with that
 `ref_kind`), before any import, claim or binding write. A receiver on this
 release then skips the abort call to such a participant, which was never
 called for the cut. A receiver on an earlier release does not: its own
 entorhinal refuses that abort `invalid_request`, and the receiver resends it
-without backoff, so its move stays open until the Mac is upgraded. After the
+without backoff, so its move stays open until the machine is upgraded. After the
 upgrade its entorhinal accepts the abort and the move finishes aborting.
 
 Tests: `moved_bindings_and_network_history_read_the_same_on_both_macs_and_back`,

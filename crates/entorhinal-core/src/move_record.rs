@@ -163,7 +163,7 @@ pub struct MoveRecord {
     pub claim_version: u64,
     pub participants: Vec<MoveParticipant>,
     /// Catalog package pins are shared version-and-digest selections. Omit this
-    /// field when that set is empty: older Macs reject unknown record fields.
+    /// field when that set is empty: older machines reject unknown record fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pin_digest: Option<String>,
     pub reason: Option<MoveReason>,
@@ -579,16 +579,16 @@ mod tests {
 
     const CUT: &str = "0123456789abcdef0123456789abcdef";
     const SUBJECT: &str = "move:0123456789abcdef0123456789abcdef";
-    const MOVE_FIXTURE: &str = r#"{"v":1,"cut_id":"0123456789abcdef0123456789abcdef","agent_id":"agent-a","from":"mac-a","to":"mac-b","state":"published","claim_version":3,"participants":[{"module_id":"alpha","refs":[{"ref_kind":"pi-session","ref":"session-a"}],"external":[{"ref_kind":"pi-session","ref":"session-a","note":"Copy the transcript","check":{"digest":"abc","row":7}}]},{"module_id":"beta","refs":[{"ref_kind":"pi-session","ref":"session-a"}],"external":[]}],"reason":null,"detail":null}"#;
-    const INBOX_FIXTURE: &str = r#"{"v":1,"pending":[{"cut_id":"0123456789abcdef0123456789abcdef","from":"mac-a","agent_id":"agent-a"}]}"#;
+    const MOVE_FIXTURE: &str = r#"{"v":1,"cut_id":"0123456789abcdef0123456789abcdef","agent_id":"agent-a","from":"machine-a","to":"machine-b","state":"published","claim_version":3,"participants":[{"module_id":"alpha","refs":[{"ref_kind":"pi-session","ref":"session-a"}],"external":[{"ref_kind":"pi-session","ref":"session-a","note":"Copy the transcript","check":{"digest":"abc","row":7}}]},{"module_id":"beta","refs":[{"ref_kind":"pi-session","ref":"session-a"}],"external":[]}],"reason":null,"detail":null}"#;
+    const INBOX_FIXTURE: &str = r#"{"v":1,"pending":[{"cut_id":"0123456789abcdef0123456789abcdef","from":"machine-a","agent_id":"agent-a"}]}"#;
 
     fn record() -> MoveRecord {
         MoveRecord {
             v: 1,
             cut_id: CUT.into(),
             agent_id: "agent-a".into(),
-            from: "mac-a".into(),
-            to: "mac-b".into(),
+            from: "machine-a".into(),
+            to: "machine-b".into(),
             state: MoveRecordState::Published,
             claim_version: 3,
             pin_digest: None,
@@ -683,7 +683,7 @@ mod tests {
     fn entry(cut_id: &str) -> PendingMove {
         PendingMove {
             cut_id: cut_id.into(),
-            from: "mac-a".into(),
+            from: "machine-a".into(),
             agent_id: "agent-a".into(),
         }
     }
@@ -714,7 +714,7 @@ mod tests {
 
     #[test]
     fn move_codec_accepts_literal_incompatible_version_abort() {
-        let literal = r#"{"v":1,"cut_id":"0123456789abcdef0123456789abcdef","agent_id":"agent-a","from":"mac-a","to":"mac-b","state":"aborted","claim_version":0,"participants":[],"reason":"incompatible_version","detail":{"code":"incompatible_version","module_id":"adapter","note":"Upgrade this Mac"}}"#;
+        let literal = r#"{"v":1,"cut_id":"0123456789abcdef0123456789abcdef","agent_id":"agent-a","from":"machine-a","to":"machine-b","state":"aborted","claim_version":0,"participants":[],"reason":"incompatible_version","detail":{"code":"incompatible_version","module_id":"adapter","note":"Upgrade this machine"}}"#;
         let subject = "move:0123456789abcdef0123456789abcdef";
         let body = decode_move_record(subject, literal.as_bytes()).unwrap();
         assert_eq!(body.reason, Some(MoveReason::IncompatibleVersion));
@@ -726,7 +726,7 @@ mod tests {
 
     #[test]
     fn move_codec_preserves_unknown_abort_reason_opaquely() {
-        let literal = r#"{"v":1,"cut_id":"0123456789abcdef0123456789abcdef","agent_id":"agent-a","from":"mac-a","to":"mac-b","state":"aborted","claim_version":0,"participants":[],"reason":"some_future_reason","detail":null}"#;
+        let literal = r#"{"v":1,"cut_id":"0123456789abcdef0123456789abcdef","agent_id":"agent-a","from":"machine-a","to":"machine-b","state":"aborted","claim_version":0,"participants":[],"reason":"some_future_reason","detail":null}"#;
         let subject = "move:0123456789abcdef0123456789abcdef";
         let body = decode_move_record(subject, literal.as_bytes()).unwrap();
         assert_eq!(
@@ -777,7 +777,7 @@ mod tests {
         value.cut_id = "f".repeat(32);
         refuses(&value, CodecError::CutIdMismatch);
         assert_eq!(
-            decode_move_record("inbox:mac-a", MOVE_FIXTURE.as_bytes()),
+            decode_move_record("inbox:machine-a", MOVE_FIXTURE.as_bytes()),
             Err(CodecError::CutIdMismatch)
         );
         assert_eq!(CodecError::CutIdMismatch.code(), "cut_id_mismatch");
@@ -1183,9 +1183,9 @@ mod tests {
             value.state = state;
             assert_eq!(required_writer(state), writer);
             for (author, accepted) in [
-                ("mac-a", writer != Receiver),
-                ("mac-b", writer != Source),
-                ("third-mac", false),
+                ("machine-a", writer != Receiver),
+                ("machine-b", writer != Source),
+                ("third-machine", false),
             ] {
                 assert_eq!(
                     check_record_author(&value, author),

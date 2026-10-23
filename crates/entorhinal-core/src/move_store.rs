@@ -180,7 +180,7 @@ impl AgentMove {
             notices.insert("status".into(), "waiting_for_target".into());
             notices.insert(
                 "message".into(),
-                "waiting for the target Mac to pick up the move".into(),
+                "waiting for the target machine to pick up the move".into(),
             );
             notices.insert(
                 "waiting_since_ms".into(),
@@ -205,7 +205,7 @@ impl AgentMove {
         }
         let warnings: Vec<_> = self.plan["_source"]["enforced"].as_object().into_iter().flatten()
             .filter(|(_, enforced)| **enforced == false)
-            .map(|(module, _)| serde_json::json!({"module_id":module,"code":"release_not_enforced","message":format!("The old Mac cannot block writes for {module}; anything typed there becomes a fork")}))
+            .map(|(module, _)| serde_json::json!({"module_id":module,"code":"release_not_enforced","message":format!("The old machine cannot block writes for {module}; anything typed there becomes a fork")}))
             .collect();
         if !warnings.is_empty() {
             notices.insert("warnings".into(), Value::Array(warnings));
@@ -221,7 +221,7 @@ impl AgentMove {
             if let Some(detail) = self.hold.as_ref().filter(|_| self.abort_stuck()) {
                 let module = detail["module_id"].as_str().unwrap_or("the participant");
                 let message = if self.side == MoveSide::Source {
-                    format!("abort stuck, agent frozen on this Mac until {module} is repaired")
+                    format!("abort stuck, agent frozen on this machine until {module} is repaired")
                 } else {
                     format!("abort stuck, cleanup cannot finish until {module} is repaired")
                 };
@@ -521,7 +521,7 @@ impl RegistryStore {
     }
 
     /// Read the agent's live bound (ref_kind, ref) pairs in stable order. Participants
-    /// move data by these pairs, not by the source Mac's host-session identifiers.
+    /// move data by these pairs, not by the source machine's host-session identifiers.
     pub fn agent_bound_refs(&self, agent_id: &str) -> Result<Vec<MoveRef>, RegistryError> {
         self.read(|conn| bound_refs(conn, agent_id))
     }
@@ -1208,7 +1208,7 @@ mod tests {
     fn view_agent(f: &Fixture) {
         f.store.db.with_conn_fenced(|tx| {
             tx.execute("INSERT INTO agent(agent_id,name,tag,role,created_at_ms,updated_at_ms) VALUES('agent_00000001','Ada','test','assistant',1,1)", [])?;
-            tx.execute("INSERT INTO member_name(author,display_name) VALUES('peer-author','Studio Mac')", [])?;
+            tx.execute("INSERT INTO member_name(author,display_name) VALUES('peer-author','Studio')", [])?;
             // Moves happen only with sharing on, where an unread claim is unknown.
             tx.execute("UPDATE identity_log_state SET state='enabled' WHERE id=1", [])?;
             Ok(())
@@ -1223,11 +1223,11 @@ mod tests {
         f.store.insert_agent_move(&row).unwrap();
         assert_eq!(
             serde_json::to_string(&f.store.agent_where("agent_00000001").unwrap()).unwrap(),
-            r#"{"known":false,"status":"unclaimed","holder":null,"holder_name":null,"epoch":0,"cut_id":null,"read_at_ms":null,"stale":true,"moving":{"cut_id":"cut","hold":{"code":"external_not_present","note":"外部","ref":"r"},"peer":"peer-author","peer_name":"Studio Mac","side":"receiver","step":"picked_up"}}"#
+            r#"{"known":false,"status":"unclaimed","holder":null,"holder_name":null,"epoch":0,"cut_id":null,"read_at_ms":null,"stale":true,"moving":{"cut_id":"cut","hold":{"code":"external_not_present","note":"外部","ref":"r"},"peer":"peer-author","peer_name":"Studio","side":"receiver","step":"picked_up"}}"#
         );
         assert_eq!(
             serde_json::to_string(&json!({"moves":f.store.moves_view().unwrap()})).unwrap(),
-            r#"{"moves":[{"abort_requested":null,"activated_at_ms":99,"agent_id":"agent_00000001","attempts":7,"created_at_ms":1,"cut_accept":null,"cut_id":"cut","detail":null,"hold":{"code":"external_not_present","note":"外部","ref":"r"},"peer":"peer-author","peer_name":"Studio Mac","reason":null,"record_version":3,"request_key":"key-cut","seal_sent":true,"side":"receiver","step":"picked_up","updated_at_ms":2}]}"#
+            r#"{"moves":[{"abort_requested":null,"activated_at_ms":99,"agent_id":"agent_00000001","attempts":7,"created_at_ms":1,"cut_accept":null,"cut_id":"cut","detail":null,"hold":{"code":"external_not_present","note":"外部","ref":"r"},"peer":"peer-author","peer_name":"Studio","reason":null,"record_version":3,"request_key":"key-cut","seal_sent":true,"side":"receiver","step":"picked_up","updated_at_ms":2}]}"#
         );
         let mut row = row;
         row.step = MoveStep::Done;
@@ -1236,7 +1236,7 @@ mod tests {
         f.store.update_agent_move(&row).unwrap();
         assert_eq!(
             serde_json::to_string(&f.store.move_status_view("cut").unwrap().unwrap()).unwrap(),
-            r#"{"abort_requested":null,"activated_at_ms":99,"agent_id":"agent_00000001","attempts":7,"created_at_ms":1,"cut_accept":{"code":"cut_not_published","state":"refused"},"cut_id":"cut","detail":null,"hold":null,"peer":"peer-author","peer_name":"Studio Mac","reason":null,"record_version":3,"request_key":"key-cut","seal_sent":true,"side":"receiver","step":"done","updated_at_ms":2}"#
+            r#"{"abort_requested":null,"activated_at_ms":99,"agent_id":"agent_00000001","attempts":7,"created_at_ms":1,"cut_accept":{"code":"cut_not_published","state":"refused"},"cut_id":"cut","detail":null,"hold":null,"peer":"peer-author","peer_name":"Studio","reason":null,"record_version":3,"request_key":"key-cut","seal_sent":true,"side":"receiver","step":"done","updated_at_ms":2}"#
         );
         assert_eq!(
             serde_json::to_string(&f.store.agent_where("agent_00000001").unwrap()).unwrap(),
@@ -1295,7 +1295,7 @@ mod tests {
         assert_eq!(status["warnings"][0]["module_id"], "data");
         assert_eq!(
             status["warnings"][0]["message"],
-            "The old Mac cannot block writes for data; anything typed there becomes a fork"
+            "The old machine cannot block writes for data; anything typed there becomes a fork"
         );
         let where_ = serde_json::to_value(f.store.agent_where("agent_00000001").unwrap()).unwrap();
         assert!(where_.get("moveErrors").is_none());
@@ -1328,7 +1328,7 @@ mod tests {
         assert_eq!(status["status"], "abort_stuck");
         assert_eq!(
             status["message"],
-            "abort stuck, agent frozen on this Mac until data is repaired"
+            "abort stuck, agent frozen on this machine until data is repaired"
         );
         assert_eq!(
             serde_json::to_value(f.store.agent_where("agent_00000001").unwrap()).unwrap()["moving"]

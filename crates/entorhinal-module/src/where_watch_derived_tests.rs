@@ -150,7 +150,7 @@ async fn where_derived_self_author_learning_resyncs() {
         store
             .cache_agent_claims(&[(HEAD.into(), held(OWN))], 700)
             .unwrap();
-        name(&store, OWN, "This Mac");
+        name(&store, OWN, "This machine");
         store
             .apply_entry("fixture", "{}", "test", None, |tx| {
                 tx.execute("DELETE FROM self_identity", [])
@@ -208,7 +208,7 @@ async fn where_derived_self_author_learning_resyncs() {
         assert_eq!(store.cached_agent_claim(HEAD).unwrap(), before);
         let after = store.agent_where(HEAD).unwrap();
         assert_eq!(after.status, "held_here");
-        assert_eq!(after.holder_name.as_deref(), Some("This Mac"));
+        assert_eq!(after.holder_name.as_deref(), Some("This machine"));
         store
             .cache_roles(&[("watch_fixture".into(), absent(false))], 702)
             .unwrap();

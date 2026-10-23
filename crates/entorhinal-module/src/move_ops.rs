@@ -200,7 +200,7 @@ impl ProjectsHandler {
             let _guard = self
                 .confirm_move_control(
                     &format!(
-                        "turn lid-close moves {} on this Mac",
+                        "turn lid-close moves {} on this machine",
                         if request.enabled { "on" } else { "off" }
                     ),
                     key,
@@ -402,7 +402,7 @@ mod tests {
             f.prompt.summaries.lock().unwrap().as_slice(),
             &[
                 "abort move \"direct\" for agent \"direct\"",
-                "turn lid-close moves on on this Mac"
+                "turn lid-close moves on on this machine"
             ]
         );
         assert!(f.store().move_setting().unwrap().lid_close_moves);

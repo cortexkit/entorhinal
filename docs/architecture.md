@@ -2,7 +2,7 @@
 
 entorhinal is the registry the other CortexKit modules ask "which project is
 this directory?" and "who is this agent?". It runs as one supervised process
-per Mac, under the subc daemon, with one SQLite store. This document names the
+per machine, under the subc daemon, with one SQLite store. This document names the
 parts, follows the data through them, and lists the rules that most often
 surprise a reader of the code.
 
@@ -14,8 +14,8 @@ surprise a reader of the code.
 | Module | `crates/entorhinal-module/src/main.rs` | The `ck-entorhinal` process. The subc client library handles the connection to the daemon; this crate supplies the manifest, route admission, dispatch and health. |
 | CLI faces | `crates/entorhinal-module/src/cli.rs` | The same binary run as `ck-projects`, `ck-workspaces`, `ck-agents` or `ck-roles` is a command-line client. With no arguments, or only `--subc <file>`, it is the module. |
 | Shared-log writer | `shared_write.rs` | Runs shared writes one at a time and sends them to engram's identity log. |
-| Catch-up | `catch_up.rs`, `enable.rs` | Reads the identity log and applies other Macs' entries; enables and joins the log. |
-| Claim and role refresh | `claims.rs`, `roles.rs` | Background tasks that cache which Mac holds each agent and role. |
+| Catch-up | `catch_up.rs`, `enable.rs` | Reads the identity log and applies other machines' entries; enables and joins the log. |
+| Claim and role refresh | `claims.rs`, `roles.rs` | Background tasks that cache which machine holds each agent and role. |
 | Move driver | `move_driver.rs`, `move_source.rs`, `move_receiver.rs` | Background tasks that drive open agent moves. |
 | Agent tools and consent | `tool_provider.rs`, `tool_writes.rs`, `consent.rs`, `permissions.rs` | Tools agents call, consent cards through Cingulate, grants, the audit. |
 | Sessions | `sessions.rs` | Session bindings and the in-memory session liveness mirror. |
@@ -56,7 +56,7 @@ writer catches up, records a pending entry, prepares the transaction, sends
 the entry to engram and commits only when engram confirms the append at the
 expected position. See [identity-log-contract.md](identity-log-contract.md).
 
-**A confirmed write.** For an operator write that needs Touch ID, the module
+**A confirmed write.** For an operator write that needs operator confirmation, the module
 checks the write against a read snapshot first, asks the daemon to show the
 prompt, and only then joins the write path, which checks everything again.
 
@@ -66,14 +66,14 @@ through Cingulate, then re-checked and committed with its audit row. See
 [consent-contract.md](consent-contract.md).
 
 **A move.** Admission writes a local checkpoint; the move driver then talks to
-participants, engram's records and session door, and the other Mac's
+participants, engram's records and session door, and the other machine's
 entorhinal through those records. See
 [agent-move-contract.md](agent-move-contract.md).
 
 ## Rules that bite
 
 1. **Reads never block.** Reads use their own WAL connection and never wait
-   for the writer lock, engram, a participant or a Touch ID prompt. Health is
+   for the writer lock, engram, a participant or a presence prompt. Health is
    computed from counters only, so the daemon's health check stays prompt even
    when a write is stuck.
 2. **The journal is the truth for derived tables.** Anything `rebuild` would
@@ -82,12 +82,12 @@ entorhinal through those records. See
    outside the journal. See [data-model.md](data-model.md).
 3. **Paths and authority never travel.** Only the tables listed in
    `shared_entry.rs` go to the identity log. Root paths, approvals, grants and
-   caps stay on their Mac, and nothing received from another Mac authorizes a
+   caps stay on their machine, and nothing received from another machine authorizes a
    write here.
 4. **Flows cannot write.** A route opened under a flow's scope refuses every
    mutation, whoever opened it.
 5. **`Direct` is not the operator.** Every local process connects as
-   `Direct`. Agent identity writes from `Direct` therefore need a Touch ID
+   `Direct`. Agent identity writes from `Direct` therefore need a presence
    prompt; without one they refuse. See
    [module-surface.md](module-surface.md).
 6. **A newer store is refused.** A binary refuses a store whose schema is
@@ -96,7 +96,7 @@ entorhinal through those records. See
    `lastErrorAt` or a workspace root are left out when unknown. A reader must
    not treat a missing value as 0 or as "none".
 8. **Identity is not residence.** Agent identity (name, role, placement) is
-   shared; which Mac holds an agent is a claim in engram, cached locally and
+   shared; which machine holds an agent is a claim in engram, cached locally and
    changed only by a move.
 9. **Approval belongs to one checkout.** Approval is keyed by a binding's
    registration epoch, so a replaced checkout at the same path is never
@@ -108,7 +108,7 @@ entorhinal through those records. See
 ## Health
 
 The module reports `Ok`, `Degraded` (the store is waiting for a predecessor's
-lease, the identity log is stalled or unavailable, this Mac's author identity
+lease, the identity log is stalled or unavailable, this machine's author identity
 conflicts, or a move reported errors, rejected inbox entries or a task panic)
 or `Failing` (the store is not open). Its metrics include the generation,
 query counters, liveness counters, identity-log state and progress, claim

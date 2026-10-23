@@ -7,13 +7,13 @@ below rather than extending the strict project-identity replies.
 
 ## Fleet upgrade ordering
 
-Upgrade **every Mac before setting a project domain or accepting a workspace
+Upgrade **every machine before setting a project domain or accepting a workspace
 document**. Database migration 13 adds `project.domain` and `workspace_document`.
 Pre-13 project after-images omit `domain`; upgraded readers treat only that
 missing column as null. Upgraded writers also omit a null domain, preserving the
-pre-13 project after-image bytes. Thus Macs on the previous build can keep
+pre-13 project after-image bytes. Thus machines on the previous build can keep
 applying ordinary unset-domain project changes during rollout. A non-null
-domain or a workspace document requires the new build on all Macs. Every other
+domain or a workspace document requires the new build on all machines. Every other
 missing or unknown shared column is still refused. Old shared history continues
 to apply, join, replay, rebuild and verify without rewriting log bytes.
 
@@ -27,7 +27,7 @@ Omission preserves an existing project's domain. Null means unset in storage.
 
 `project.set_domain {project_id, domain, request_key}` sets a domain or clears it
 with an explicit null. It is admitted from `reserved:prefrontal-core`, or Direct
-after Touch ID; all flow-scoped writes refuse. A domain changes the default
+after operator confirmation; all flow-scoped writes refuse. A domain changes the default
 memory behavior of every agent in its project, so a local shell cannot silently
 change it. Direct registration also prompts
 when its supplied domain would change (including a new project's domain), but
@@ -44,7 +44,7 @@ ck projects domain <project-id> --clear
 ## Accepted workspace documents
 
 `workspace.set_document {workspace_id, expected_revision, charter, document,
-request_key}` is **Direct only, after Touch ID**, including when core or an
+request_key}` is **Direct only, after operator confirmation**, including when core or an
 agent tries to call it. The text is operator-authored policy for every member
 project, not an agent-writable draft. The first write expects revision 0; each accepted write
 inserts an immutable new revision. A stale expectation refuses
@@ -84,7 +84,7 @@ ck workspaces document show W --revision 1
 
 Without `--yes`, set prints a unified diff and changes nothing. With `--yes`,
 it shows the diff, asks the operator to approve acceptance through the daemon's
-Touch ID prompt, and submits against the revision it just read.
+presence prompt, and submits against the revision it just read.
 Either file may be omitted to keep its accepted part (empty on the first write).
 Concurrent acceptance refuses rather than overwriting another revision.
 `workspace.document {workspace_id, revision?}` returns the full accepted record,
@@ -107,7 +107,7 @@ root-record mode and worktree discovery. Its reply contains:
 - `members_digest`: SHA-256 of workspace member project ids sorted in binary
   order and joined by LF, with no trailing LF (hash of empty bytes for no members);
   this uses shared `project_workspace`, not machine-local `workspace_member`;
-- `stamp`: `{incarnation, generation, logPosition}`. Generation is this Mac's
+- `stamp`: `{incarnation, generation, logPosition}`. Generation is this machine's
   journal sequence, logPosition its applied shared-log position (0 when disabled).
 
 Without a workspace, document and members_digest are null, including an

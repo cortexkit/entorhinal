@@ -27,7 +27,7 @@ ck packages publish <package dir> --registry <url> --scope <scope>
 ## Offline starter bundle
 
 `ck packages seed <bundle file>` accepts only an operator-opened Direct route,
-not another module or a flow, and needs no Touch ID: it grants no authority.
+not another module or a flow, and needs no operator confirmation: it grants no authority.
 Entorhinal verifies the entire strict `ck-starter-bundle/v1` ustar,
 its root-certified signer, package records and archive bytes before publishing
 archives and their embedded `ck.json` through the content-addressed `BlobStore`.
@@ -64,7 +64,7 @@ flow identity are checked before the operator prompt or any vault call. Checks
 requiring registry state (scope grants, version reservations and quotas) remain
 the registry's responsibility.
 
-The Touch ID prompt names the package, version, kind and complete archive SHA-256.
+The presence prompt names the package, version, kind and complete archive SHA-256.
 A summary over 200 characters is refused, never truncated. Approval gates signing,
 not just upload. The published `cortexkit-claustrum-client` opens the vault route
 as `reserved:entorhinal` with the supervised launch identity. It reads public key
@@ -207,7 +207,7 @@ Their SHA-256 and strict manifest name/version must match the pin. Any failure
 returns `manifest_unavailable` with the package identity, without writing a grant.
 Production uses the agent's stored authenticated pins (`StoredPins`), filtered
 by publisher fingerprint. An absent authenticated pin set refuses rather than
-minting an empty capability ceiling. The Touch ID summary includes the complete
+minting an empty capability ceiling. The presence prompt's summary includes the complete
 granted capability ceiling (or `none`) when the identity and tokens fit within
 200 characters. Otherwise it retains the full publisher and placement identity:
 an unbounded token list cannot fit without truncating the authorization facts.
@@ -569,7 +569,7 @@ closure entry adds `publisher: {fingerprint, scope, first_party}` while retainin
 `publisher_fingerprint`. `scope` is the installed package scope (for example,
 `@cortexkit`); `first_party` is the root-certificate result recorded for that local
 generation at install time. Publisher grants never make a package first-party.
-The fact is machine-local: shared pins do not carry it, and a Mac receiving a move
+The fact is machine-local: shared pins do not carry it, and a machine receiving a move
 must certify CortexKit keys against its own root. The generation optionally includes
 `pinned_status: [{name, version, state, reason}]`, listing only closure versions
 whose held status is not `available`. The field is **absent**, not an empty list,
@@ -633,7 +633,7 @@ drift; the first blocked pin in closure order supplies a generation's single err
 while `pinned_status` lists all status news; an already degraded generation updates
 its blocking reason on subsequent status news. The local scheduling table is
 created lazily for stores predating polling. The offset belongs to this local store
-and is never replicated to other Macs through the shared identity journal.
+and is never replicated to other machines through the shared identity journal.
 
 ### Integration decisions
 

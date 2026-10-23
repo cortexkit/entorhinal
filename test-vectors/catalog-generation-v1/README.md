@@ -61,7 +61,7 @@ Generation fields (shared by the `catalog_generation` agent tool and the
   `publisher: {fingerprint, scope, first_party}`; the fingerprint duplicates
   `publisher_fingerprint`, `scope` is the scope of the installed package (such as
   `@cortexkit` or `@example`),
-  and `first_party` records certification by this Mac's pinned CortexKit root at
+  and `first_party` records certification by this machine's pinned CortexKit root at
   install time. The example closure contains a root-certified CortexKit skill and
   a third-party skill backed by a publisher grant; their flags are true and false.
   Identities and hashes are unchanged by status news;

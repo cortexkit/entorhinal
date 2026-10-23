@@ -192,7 +192,7 @@ pub fn validate_pins(pins: &[CatalogPin]) -> rusqlite::Result<()> {
 /// Lowercase SHA-256 of a JCS array sorted by name. Each object has exactly
 /// name, version, manifest_sha256, archive_sha256, publisher_fingerprint, root
 /// (boolean), and range (string for roots, null otherwise). Agent id, kind and
-/// machine-local generation ids are excluded so source and destination Macs can
+/// machine-local generation ids are excluded so source and destination machines can
 /// compare the same package/root identities when an agent moves between them.
 pub fn pin_digest(pins: &[CatalogPin]) -> rusqlite::Result<String> {
     validate_pins(pins)?;
@@ -637,11 +637,11 @@ impl RegistryStore {
                 .collect())
         })
     }
-    /// Return this Mac's hourly registry poll phase, a millisecond offset within
+    /// Return this machine's hourly registry poll phase, a millisecond offset within
     /// the hour. The first call saves `candidate` modulo one hour; later calls
     /// return the saved value. The phase is a machine-local value: unlike agent
     /// pins, it is never recorded in the identity journal or replicated to other
-    /// Macs.
+    /// machines.
     pub fn catalog_poll_offset(&self, candidate: u64) -> Result<u64, RegistryError> {
         self.catalog_transaction(|tx| {
             tx.execute_batch("CREATE TABLE IF NOT EXISTS catalog_poll_clock(id INTEGER PRIMARY KEY CHECK(id=1), offset_ms INTEGER NOT NULL CHECK(offset_ms>=0 AND offset_ms<3600000))").map_err(store_error)?;
@@ -801,9 +801,9 @@ impl RegistryStore {
             })
         })
     }
-    /// Approval creates execution state only on this Mac. Shared pins must use
+    /// Approval creates execution state only on this machine. Shared pins must use
     /// JournalWriter::catalog_set_pins and the module's log-append coordinator,
-    /// so other Macs receive the same pin set; this local transaction cannot do that.
+    /// so other machines receive the same pin set; this local transaction cannot do that.
     pub fn catalog_approve_plan(
         &self,
         plan_id: &str,
@@ -848,8 +848,8 @@ impl RegistryStore {
     ) -> Result<CatalogGeneration, CatalogWriteError> {
         self.catalog_generation_step(id, caller, "ready", None, 0)
     }
-    /// When a cross-Mac agent move is aborted, delete the generation this
-    /// receiving Mac prepared for the moved agent, so it can never be activated.
+    /// When a cross-machine agent move is aborted, delete the generation this
+    /// receiving machine prepared for the moved agent, so it can never be activated.
     /// Only a generation still approved, installed or ready is deleted. Shared
     /// pins and locally granted publisher permissions are untouched.
     pub fn catalog_discard_move_generation(

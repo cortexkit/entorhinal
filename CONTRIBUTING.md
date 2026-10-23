@@ -105,7 +105,7 @@ talks to the subc daemon or another module belongs in `entorhinal-module`.
 | `crates/entorhinal-module/src/main.rs` | The module: manifest, route admission, request dispatch, health. |
 | `crates/entorhinal-module/src/cli.rs` | The `ck projects`, `ck workspaces`, `ck agents` and `ck roles` commands. |
 | `crates/entorhinal-module/src/shared_write.rs`, `catch_up.rs`, `enable.rs`, `log_client.rs`, `member.rs` | Writing to, reading from and joining the shared identity log. |
-| `crates/entorhinal-module/src/move_*.rs`, `participant_*.rs`, `door_client.rs`, `record_client.rs` | Moving agents between Macs. |
+| `crates/entorhinal-module/src/move_*.rs`, `participant_*.rs`, `door_client.rs`, `record_client.rs` | Moving agents between machines. |
 | `crates/entorhinal-module/src/tool_*.rs`, `consent*.rs`, `permissions.rs` | Agent tools, consent cards, grants and the audit. |
 | `crates/entorhinal-module/src/sessions.rs`, `claims.rs`, `roles.rs` | Sessions, session liveness, claims and roles. |
 | `crates/entorhinal-module/src/fake_*.rs` | In-process stand-ins for other modules, compiled only for tests. |

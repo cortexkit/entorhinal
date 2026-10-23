@@ -39,8 +39,8 @@ tool argument never names the caller. On every call, including retries:
    Otherwise `caller_forbidden`.
 2. The stamped agent must exist (`unknown_agent`), be live (`gone`), and have
    the tool's role (`role_forbidden`).
-3. If this Mac's cached claim for the agent failed verification,
-   `claim_integrity_failed`; if it names another Mac at epoch 1 or higher,
+3. If this machine's cached claim for the agent failed verification,
+   `claim_integrity_failed`; if it names another machine at epoch 1 or higher,
    `held_elsewhere`. A standing grant does not override either.
 4. A write tool requires `request_key`: 1–128 bytes, each printable ASCII
    (`0x20`–`0x7e`); otherwise `invalid_request_key`. This is checked before
@@ -136,9 +136,9 @@ A grant is held by one agent and has a class and a scope. Classes are closed:
 3. Revocation takes effect for the next request; it does not undo a write
    already made.
 4. Grants are machine-local. They are never written to the identity log and
-   never authorize anything on another Mac.
+   never authorize anything on another machine.
 
-`permissions.list {agent_id?}` lists live grants on this Mac, labelled with
+`permissions.list {agent_id?}` lists live grants on this machine, labelled with
 workspace or project names. `permissions.revoke {id}` revokes a grant without
 prompting and returns `revoked`, or `not_found` for an unknown or already
 ended grant. Both admit only `Direct` and `reserved:cingulate`; everyone else,
@@ -193,7 +193,7 @@ retry applies the write once.
 A tool write that changes shared state goes through the shared-log writer like
 any other ([identity-log-contract.md](identity-log-contract.md)). Its entry
 carries the authorization (card id and answer, grant id, or `own_hire`), so
-`verify` and `rebuild` on any Mac need no live card or grant.
+`verify` and `rebuild` on any machine need no live card or grant.
 
 Tests: `commit_rechecks_caller_role_liveness_cap_grant_and_own_hire`,
 `assistant_role_and_grant_scope_are_rechecked_inside_commit`,
@@ -223,16 +223,16 @@ Tests: `audit_pages_visit_tied_timestamps_once_and_since_is_inclusive`,
 
 ## 8. The hire cap
 
-1. Each project has a hire cap on each Mac. With no cap set, it is 10.
+1. Each project has a hire cap on each machine. With no cap set, it is 10.
 2. The count is every live `hiree` in the project, however it was created.
 3. Only `agents_hire` is gated: at or above the cap it refuses
    `hire_cap_reached`, with or without a grant. Operator creation, the
-   executive's relay, imports and identities received from other Macs are not
+   executive's relay, imports and identities received from other machines are not
    gated.
 4. A cap of 0 stops agent hiring. Lowering the cap below the current count
    retires nobody.
 5. `agent.set_hire_cap {project_id, cap}` is `Direct` only
-   (`direct_caller_required` otherwise) and always asks for Touch ID. A
+   (`direct_caller_required` otherwise) and always asks for operator confirmation. A
    negative cap refuses `invalid_request`; an unknown project refuses
    `not_found`. Caps are machine-local.
 

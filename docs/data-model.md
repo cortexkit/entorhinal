@@ -1,9 +1,9 @@
 # Data model
 
-entorhinal keeps everything in one SQLite database per Mac: the registry
+entorhinal keeps everything in one SQLite database per machine: the registry
 journal, the tables derived from it, and machine-local operational state. This
 document lists the tables, says which are shared through the identity log and
-which stay on the Mac, and describes the journal and migrations.
+which stay on the machine, and describes the journal and migrations.
 
 Code: `crates/entorhinal-core/src/lib.rs` (opening, migrations 1, 2, 5 and 8),
 `binding.rs` (3), `agent/schema.rs` (4), `ownership.rs` (6), `log_schema.rs`
@@ -82,7 +82,7 @@ journal:
 | `project_root_key` | Machine-neutral root keys (`remote` as `owner/repo`, or `label`) per project. |
 | `agent` | Agent identity: name, tag, labels, role, placement, avatar, GitHub identity, supervisor, and retirement or merge. |
 | `agent_name_claim` | Active and released name claims, one active claim per agent and per name in a namespace. |
-| `member_name` | Display names of the Macs in the identity log, keyed by author. |
+| `member_name` | Display names of the machines in the identity log, keyed by author. |
 | `catalog_pin_set`, `catalog_pin` | An agent's shared package pins, root ranges and canonical pin digest. `catalog.pin` is never an identity-feed op. |
 
 **Local and derived.** Rebuilt from the journal, never shared:
@@ -108,7 +108,7 @@ journal:
 | `session_binding` | Session reference to host session bindings. |
 | `claim_cache`, `role_cache` | Cached agent and role claims from engram. A null holder means the record was absent. |
 | `role_take_request` | Each approved role take, so a retry resends the same bytes. |
-| `self_identity` | This Mac's own author pseudonym, once learned. |
+| `self_identity` | This machine's own author pseudonym, once learned. |
 | `agent_move`, `move_setting` | Move checkpoints and the lid-close setting. |
 | `consent_grant`, `consent_request`, `consent_write_plan`, `consent_feed_cursor` | Consent state. |
 | `agent_audit` | The agent tool audit. |

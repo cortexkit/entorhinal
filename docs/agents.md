@@ -3,8 +3,8 @@
 How to create, rename, retag, relabel and retire agents, set the hiring cap,
 apply owner-minted avatar manifests, and correct stored agent workspaces.
 Agent identity is shared between the
-operator's Macs when the identity log is enabled ([sharing.md](sharing.md));
-which Mac holds an agent is a separate claim, changed only by a move
+operator's machines when the identity log is enabled ([sharing.md](sharing.md));
+which machine holds an agent is a separate claim, changed only by a move
 ([moves.md](moves.md)).
 
 ## Before you start
@@ -12,7 +12,7 @@ which Mac holds an agent is a separate claim, changed only by a move
 - Agent identity must have been imported from the executive. Until then every
   write refuses `authority_not_cut_over` before any prompt.
 - Every write from `ck agents` lands only after you approve the exact change
-  at a Touch ID prompt the daemon shows. The command prints
+  at a presence prompt the daemon shows. The command prints
   `a confirmation prompt may appear; approve it to continue` and waits up to
   five minutes. A write that would fail anyway is refused before the prompt.
 - `<agent>` is an agent id (`agent_` followed by 8 or 16 hex digits) or a live
@@ -82,7 +82,7 @@ The type and version belong to each entry, not to the whole file.
 ck agents avatars --manifest avatars.json                 # preview, no writes
 ck agents avatars --manifest avatars.json --yes           # seed agents with no avatar
 ck agents avatars --manifest avatars.json --replace       # preview replacements
-ck agents avatars --manifest avatars.json --replace --yes # replace, one Touch ID
+ck agents avatars --manifest avatars.json --replace --yes # replace, one operator confirmation
 ```
 
 Seed-only is the default: existing avatars are listed as skipped, so the same
@@ -95,7 +95,7 @@ The preview lists names, old and new types/versions, and skipped agents. The
 module validates the whole manifest before any prompt, refusing unknown fields,
 non-arrays, empty arrays, duplicate ids, non-live agents, unsupported types,
 wrong genome lengths, and entries that disagree on type. It reports every domain
-problem together, and writes nothing on a refusal. `--yes` requests one Touch ID
+problem together, and writes nothing on a refusal. `--yes` requests one operator confirmation
 for all changes, with a count/type summary bounded to 200 characters (never
 truncated). The summary also binds the complete plan: identities or avatars
 changing while approval is pending refuse `operator_approval_stale`.
@@ -142,7 +142,7 @@ ck agents hire-cap <project-id> 4
 - With no cap set, the cap is 10.
 - The count includes every live hiree, however it was created; only hires an
   agent requests are refused at the cap. Lowering the cap retires nobody.
-- Caps are local to this Mac and always need Touch ID.
+- Caps are local to this machine and always need operator confirmation.
 
 Verify: the command prints the project and the new cap.
 
@@ -156,7 +156,7 @@ older registry may hold stored workspaces or claims in the wrong place.
 
 ```sh
 ck agents repair-workspaces          # preview: what would change, or why it is refused
-ck agents repair-workspaces --yes    # send the correction, with Touch ID
+ck agents repair-workspaces --yes    # send the correction, with operator confirmation
 ```
 
 The preview never writes. If it reports a refusal (for example two agents
@@ -175,5 +175,5 @@ ck agents where Ada-2              # from the local claim cache
 ck agents where Ada-2 --refresh    # refresh claims from engram first
 ```
 
-The answer says whether the claim is known and which Mac holds it. Reads never
+The answer says whether the claim is known and which machine holds it. Reads never
 wait for engram unless you pass `--refresh`.

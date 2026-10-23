@@ -25,9 +25,9 @@ the first successful store-open time from process start. Requests slower than
 `canonical_root`.
 
 Moves add three counters, each counting since the module started:
-`sessionBindingsCarried` (session bindings this Mac wrote into the
+`sessionBindingsCarried` (session bindings this machine wrote into the
 session-bindings stream of a move out), `sessionBindingsInstalled` (carried
-bindings this Mac installed as they were on the source) and
+bindings this machine installed as they were on the source) and
 `sessionBindingsPlaceholders` (carried bindings it installed as placeholders
 because another binding here already held their host or runner session).
 See [agent-move-contract.md](agent-move-contract.md) section 11.
@@ -45,12 +45,14 @@ applies these checks, in order, before decoding a request
    principal never passes a write rule.
 
 Every query is open to every caller, including flow-scoped and unverified
-routes. A mutation that needs the operator's confirmation shows a Touch ID
-prompt through the daemon, naming the exact change. One prompt is open at a
-time (a second request refuses `operator_confirmation_busy`); it is withdrawn
-when the caller's route closes; the request gives up after 270 seconds. A
-decline or timeout refuses `operator_declined`; a daemon or Mac that cannot
-show the prompt refuses `operator_presence_unavailable`.
+routes. A mutation that needs the operator's confirmation shows a presence
+prompt through the daemon (Touch ID on macOS, Windows Hello on Windows), naming
+the exact change. One prompt is open at a time (a second request refuses
+`operator_confirmation_busy`); it is withdrawn when the caller's route closes;
+the request gives up after 270 seconds. A decline or timeout refuses
+`operator_declined`; a daemon or machine that cannot show the prompt refuses
+`operator_presence_unavailable`. Linux has no presence provider, so on Linux
+every such mutation refuses that way.
 
 Principals in the tables:
 
@@ -74,7 +76,7 @@ Tests: `writes_are_refused_unless_the_operator_or_the_executive_opened_the_route
 Project mutations are admitted from Direct or the executive; anyone else gets
 `write_not_permitted`. A Direct `register`, `assign_workspace`,
 `upgrade_implicit` or `seed_import` that would carry live heads' and hirees'
-name claims into another workspace first asks for Touch ID. Domain changes
+name claims into another workspace first asks for operator confirmation. Domain changes
 have the additional confirmation rule below. [projects-and-roots.md](projects-and-roots.md) covers the
 concepts.
 
@@ -118,13 +120,13 @@ workspace documents, coherent reads, digest encodings and fleet upgrade order.
 
 | Operation | Kind | Who | What it does |
 |---|---|---|---|
-| `project.set_domain` | mutate | Direct with Touch ID, executive | Set or clear a project's opaque memory domain. |
-| `workspace.set_document` | mutate | Direct with Touch ID only | Accept the next charter/document revision with optimistic concurrency. |
+| `project.set_domain` | mutate | Direct with operator confirmation, executive | Set or clear a project's opaque memory domain. |
+| `workspace.set_document` | mutate | Direct with operator confirmation only | Accept the next charter/document revision with optimistic concurrency. |
 | `workspace.document` | query | any | Read an accepted revision, latest by default. |
 | `context.project` | query | any | Resolve a folder and read its memory policy, document metadata, membership digest and stamp in one snapshot. |
 | `context.session` | query | any | Read agent resolution, memory/persona pins, catalog generations, whereabouts and stamp in one snapshot. |
 
-Direct `register` also asks for Touch ID when a supplied domain differs from
+Direct `register` also asks for operator confirmation when a supplied domain differs from
 the stored value (including a new project's first domain). Omission or the same
 domain needs no domain confirmation. When registration also carries name claims, one combined prompt covers both changes.
 
@@ -140,9 +142,9 @@ refuses `authority_not_cut_over`, before any prompt. After that:
 - `agent.set_avatar`, `agent.set_github_identity`, `agent.merge` and
   `agent.import` are admitted from the executive only. Direct gets
   `direct_identity_write_not_admitted`; others `write_not_permitted`.
-- `agent.repair_workspaces` is Direct only, after Touch ID
+- `agent.repair_workspaces` is Direct only, after operator confirmation
   (`direct_caller_required` otherwise).
-- `agent.apply_avatar_manifest` is also Direct only, with one Touch ID for
+- `agent.apply_avatar_manifest` is also Direct only, with one operator confirmation for
   the batch. An all-skipped seed-only run succeeds without prompting or writing.
   Request fields are `entries` (the owner's exact per-agent manifest objects),
   `replace` (default false), `request_key`, and optional `actor`. The read-only
@@ -207,10 +209,10 @@ for schemas, consumer kinds, refusals, idempotence and capability-token declarat
 
 | Operation | Kind | Who | What it does |
 |---|---|---|---|
-| `permissions.list {agent_id?}` | query | Direct, `reserved:cingulate` | List live grants on this Mac. |
+| `permissions.list {agent_id?}` | query | Direct, `reserved:cingulate` | List live grants on this machine. |
 | `permissions.revoke {id}` | mutate | Direct, `reserved:cingulate` | Revoke a grant without prompting. |
 | `agent.audit_list {since_ms?, limit?, cursor?}` | query | Direct, `reserved:callosum` | Page the local audit of agent tool writes. |
-| `agent.set_hire_cap {project_id, cap}` | mutate | Direct, with Touch ID | Set this Mac's hiring limit for a project. |
+| `agent.set_hire_cap {project_id, cap}` | mutate | Direct, with operator confirmation | Set this machine's hiring limit for a project. |
 | `catalog.agent_generation {agent_id}` | query | `reserved:prefrontal-core` only | Read the agent's active or degraded package generation and any newer ready ones, with exact pin digests, from local state. A generation is one installed set of the agent's pinned packages, where a pin fixes a package's exact version and digests. `ready` generations wait for core to activate them, `active` is the set in use, and `degraded` is an active set that hit an error such as a revoked pin. Optional `pinned_status` lists non-available pins; a degradation error identifies the revoked skill by name, version and reason. |
 | `catalog.ack_activation {agent_id, generation_id}` | mutate | `reserved:prefrontal-core` only | Idempotently activate a ready generation after core renders it. `activation_blocked` names a revoked/tombstoned pin; withdrawn pins remain usable. No network or consumer discovery. |
 
@@ -220,7 +222,7 @@ are not open to every caller.
 
 ## Sessions, claims and roles
 
-Claims say which of the operator's Macs holds an agent or a role. They are
+Claims say which of the operator's machines holds an agent or a role. They are
 records in engram that entorhinal caches locally; every read here answers from
 the cache, so it works offline and never waits on engram.
 
@@ -234,13 +236,13 @@ the cache, so it works offline and never waits on engram.
 | `agent.for_session` | query | any | The agent and reference bound to a host session. |
 | `agent.session_for_ref` | query | any | The agent, host session and project root bound to a reference. |
 | `agent.session_liveness` | query | any | `active`, `gone` or `unknown` for up to 256 references, in order. |
-| `agent.where` | query | any | Which Mac holds an agent, from the cached claim, plus any blocked move's participant and ref explanation. |
+| `agent.where` | query | any | Which machine holds an agent, from the cached claim, plus any blocked move's participant and ref explanation. |
 | `agent.where_many` | query | any | Cached claim results for 1–64 agent ids in request order; unknown agents are omitted. |
 | `agent.fleet_identity_watch` | watch | any | Stream of changes to `agent.fleet_identity`. Opens with `{token?}` and sends `resync` or `changes` notices; on `resync`, read `agent.fleet_identity` once. |
 | `agent.where_watch` | watch | any | Stream of changes to whereabouts. Opens with `{agentIds?, cursor?}` and sends `resync` or `changes` notices carrying a cursor; on `resync`, read `agent.where_many` once. |
 | `agent.refresh_claims` | mutate | Direct | Refresh live agents' cached claims from engram. |
-| `role.read` | query | any | Which Mac holds a role, from the cached claim. |
-| `role.take` | mutate | Direct, with Touch ID | Make this Mac the role's holder. |
+| `role.read` | query | any | Which machine holds a role, from the cached claim. |
+| `role.take` | mutate | Direct, with operator confirmation | Make this machine the role's holder. |
 
 Registering a different `ref` for the same `(harness, session_id)`, `agent_id`
 and `ref_kind` re-keys the existing binding in the registration transaction.
@@ -261,8 +263,8 @@ are unchanged. Open-only cursors carry an `open:` tag; using a cursor with the
 other filter refuses `invalid_request`. Migration 17 adds a partial ordered
 index for open-only paging, avoiding scans of an agent's finished backlog.
 
-A moved agent's finished sessions are listed on the new Mac, marked as held on
-the source Mac (or an earlier data-holding Mac), and cannot be opened there
+A moved agent's finished sessions are listed on the new machine, marked as held on
+the source machine (or an earlier data-holding machine), and cannot be opened there
 until a backfill. The nullable `session_binding.held_on` column records that
 machine's store-origin ID, not its claim author. `agent.sessions`,
 `agent.session_for_runner` and `agent.session_for_ref` include `heldOn` only
@@ -283,7 +285,7 @@ of none. Bindings that ended more than 30 days ago are pruned shortly after
 startup and hourly after that, except every binding of an agent with an open
 move. A binding that never ended is never pruned. Held-elsewhere ended rows
 follow the same 30-day rule; pruning removes only metadata and history, never
-calls a participant, and never deletes the data still held on another Mac.
+calls a participant, and never deletes the data still held on another machine.
 
 Each binding keeps a history of whether its agent could reach the network,
 written by the orchestrator, which knows it from the session's plan. The
@@ -315,18 +317,18 @@ Tests: `refresh_admission_empty_disabled_and_sync_seam_are_closed`,
 `role_take_is_confirmed_direct_only_and_ledger_precedes_prompts`,
 `role_lost_reply_retries_exact_attempt_without_another_prompt`.
 
-## Moving agents between Macs
+## Moving agents between machines
 
 Rules are in [agent-move-contract.md](agent-move-contract.md); the guide is
 [moves.md](moves.md).
 
 | Operation | Kind | Who | What it does |
 |---|---|---|---|
-| `agent.move {agent_id, to, request_key}` | mutate | Direct with Touch ID; orchestrator; `reserved:engram` while lid-close moves are on | Start moving an idle agent to a named Mac. |
+| `agent.move {agent_id, to, request_key}` | mutate | Direct with operator confirmation; orchestrator; `reserved:engram` while lid-close moves are on | Start moving an idle agent to a named machine. |
 | `agent.move_status {cut_id}` | query | any | One move's local checkpoint, including any optional participant explanation for a diverged block. |
 | `agent.moves` | query | any | Open moves, then the 32 most recently finished, including optional participant explanations for diverged blocks. |
-| `agent.move_abort {cut_id, request_key}` | mutate | Direct with Touch ID; orchestrator | Cancel a move before its boundary. Only Direct can retry a stuck abort. |
-| `agent.set_lid_close_moves {enabled, request_key}` | mutate | Direct with Touch ID | Allow or deny engram's lid-close moves on this Mac. |
+| `agent.move_abort {cut_id, request_key}` | mutate | Direct with operator confirmation; orchestrator | Cancel a move before its boundary. Only Direct can retry a stuck abort. |
+| `agent.set_lid_close_moves {enabled, request_key}` | mutate | Direct with operator confirmation | Allow or deny engram's lid-close moves on this machine. |
 
 ## Shared identity log
 
@@ -337,7 +339,7 @@ is [sharing.md](sharing.md).
 |---|---|---|---|
 | `identity_log.status` | query | any | Local log state, progress and pending writes, without contacting engram. |
 | `identity_log.enable {without_agents?}` | mutate | Direct | Enable the shared log, or join it. |
-| `member.set_name {display_name}` | mutate | Direct | Name this Mac in the shared log. |
+| `member.set_name {display_name}` | mutate | Direct | Name this machine in the shared log. |
 
 Other callers get `write_not_permitted` (`identity_log.enable`) or
 `caller_forbidden` (`member.set_name`).

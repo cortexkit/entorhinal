@@ -386,7 +386,7 @@ async fn agent_tools_refuse_cached_claims_held_elsewhere_even_with_standing_gran
                 error_code(
                     f.call(
                         "agents_hire",
-                        json!({"request_key":"old-Mac","name":"Hire","tag":"worker","labels":[]})
+                        json!({"request_key":"old-machine","name":"Hire","tag":"worker","labels":[]})
                     )
                     .await
                 ),

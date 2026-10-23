@@ -1,5 +1,5 @@
-//! Publisher grants authorize only this Mac. Neither grants nor their audit rows
-//! enter the identity journal that other Macs replay.
+//! Publisher grants authorize only this machine. Neither grants nor their audit rows
+//! enter the identity journal that other machines replay.
 use crate::catalog::{store_error, CatalogWriteError};
 use crate::{RegistryError, RegistryStore};
 use rusqlite::params;

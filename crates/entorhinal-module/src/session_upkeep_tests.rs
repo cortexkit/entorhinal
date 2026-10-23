@@ -430,8 +430,8 @@ async fn agent_sessions_pages_and_maps_liveness() {
     );
 }
 
-/// A reference moved in from another Mac lists with no runner, no session
-/// and `unknown` liveness until this Mac's host registers it, which fills
+/// A reference moved in from another machine lists with no runner, no session
+/// and `unknown` liveness until this machine's host registers it, which fills
 /// all three. A retired agent still lists its rows.
 #[tokio::test]
 async fn moved_in_reference_lists_unknown_until_registered() {

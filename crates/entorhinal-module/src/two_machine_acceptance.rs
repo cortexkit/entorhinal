@@ -1848,7 +1848,7 @@ mod moves {
         catalog: Mutex<Option<Arc<crate::catalog_move::CatalogMove>>>,
         /// Set to route entorhinal's participant through the production
         /// dispatcher that also carries session bindings; unset, entorhinal
-        /// answers only for the package closure, as an older Mac does.
+        /// answers only for the package closure, as an older machine does.
         bindings: Mutex<Option<Arc<crate::session_move::SessionMove>>>,
     }
     #[async_trait]
@@ -1942,14 +1942,14 @@ mod moves {
         }
     }
 
-    struct Mac {
+    struct MoveMachine {
         machine: Machine,
         log: Arc<dyn LogConnector>,
         records: Arc<Records>,
         discovery: Arc<Discovery>,
         door: FakeDoor,
     }
-    impl Mac {
+    impl MoveMachine {
         fn configure(&mut self) {
             self.machine.handler.clock = clock;
             self.machine.handler.participant_discovery = self.discovery.clone();
@@ -2130,8 +2130,8 @@ mod moves {
     }
 
     struct Pair {
-        a: Mac,
-        b: Mac,
+        a: MoveMachine,
+        b: MoveMachine,
         modules: Vec<(String, String)>,
     }
     impl Pair {
@@ -2145,7 +2145,7 @@ mod moves {
             let mut b_record = record.restart();
             Arc::get_mut(&mut b_record).unwrap().author = B.into();
             let door = FakeDoor::new([1; 16]);
-            let mut macs = Vec::new();
+            let mut nodes = Vec::new();
             for (index, author, fake) in [(1, A, record), (2, B, b_record)] {
                 let log: Arc<dyn LogConnector> = Arc::new(log.with_author([index; 16]));
                 let records = Arc::new(Records {
@@ -2171,22 +2171,22 @@ mod moves {
                     peer.set_prepare(serde_json::from_value(json!({"items":[{"ref_kind":kind,"ref":format!("ref-{kind}"),"sessionRef":session_ref,"stream":item.stream,"endOffset":42,"digest":item.digest,"format":"v1","frozen":true}],"external":[]})).unwrap());
                     (module.to_string(), peer)
                 }).collect() });
-                let mut mac = Mac {
+                let mut node = MoveMachine {
                     machine,
                     log,
                     records,
                     discovery,
                     door: door.for_author([index; 16]),
                 };
-                mac.configure();
+                node.configure();
                 // Both stores begin with the same assistant identity and an
                 // identity-log authority marker. Bindings and move checkpoints
                 // remain local. Setup precedes generation snapshots so later
                 // assertions detect any identity-journal append by the move.
-                mac.store().apply_entry("agent.cutover", "{}", "fixture", None, |tx| tx.execute_batch(
+                node.store().apply_entry("agent.cutover", "{}", "fixture", None, |tx| tx.execute_batch(
                     "INSERT INTO agent(agent_id,name,tag,role,created_at_ms,updated_at_ms) VALUES('agent_0123456789abcdef','ENTO','E','assistant',1,1); UPDATE identity_log_state SET state='enabled';"
                 )).unwrap();
-                mac.store()
+                node.store()
                     .cache_agent_claims(
                         &[(
                             AGENT.into(),
@@ -2198,8 +2198,8 @@ mod moves {
                         clock(),
                     )
                     .unwrap();
-                for (member, name) in [(A, "Desk Mac"), (B, "Studio Mac")] {
-                    mac.store()
+                for (member, name) in [(A, "Desk"), (B, "Studio")] {
+                    node.store()
                         .set_member_name(
                             entorhinal_core::shared_entry::MemberName {
                                 author: member.into(),
@@ -2215,13 +2215,13 @@ mod moves {
                         .map(|(_, kind)| *kind)
                         .collect::<BTreeSet<_>>()
                     {
-                        mac.store().apply_entry("fixture", "{}", "fixture", None, |tx| { tx.execute("INSERT INTO session_binding(ref_kind,ref,agent_id,harness,session_id,project_root,registered_by,registered_at_ms) VALUES(?1,?2,?3,NULL,NULL,'','move',1)", (kind, format!("ref-{kind}"), AGENT))?; Ok(()) }).unwrap();
+                        node.store().apply_entry("fixture", "{}", "fixture", None, |tx| { tx.execute("INSERT INTO session_binding(ref_kind,ref,agent_id,harness,session_id,project_root,registered_by,registered_at_ms) VALUES(?1,?2,?3,NULL,NULL,'','move',1)", (kind, format!("ref-{kind}"), AGENT))?; Ok(()) }).unwrap();
                     }
                 }
-                macs.push(mac);
+                nodes.push(node);
             }
-            let b = macs.pop().unwrap();
-            let a = macs.pop().unwrap();
+            let b = nodes.pop().unwrap();
+            let a = nodes.pop().unwrap();
             Self {
                 a,
                 b,
@@ -2249,8 +2249,8 @@ mod moves {
             self.b.receiver_until(cut, MoveStep::Done).await;
         }
         fn clean(&self) {
-            for mac in [&self.a, &self.b] {
-                for peer in mac.discovery.peers.values() {
+            for node in [&self.a, &self.b] {
+                for peer in node.discovery.peers.values() {
                     assert!(peer.frozen().is_empty());
                     assert!(peer.staged().is_empty());
                 }
@@ -2360,7 +2360,7 @@ mod moves {
             })
             .unwrap();
         f.a.discovery.peers["broca"].set_prepare(PrepareReply::new(vec![], vec![]));
-        // ...and broca is not installed on the receiving Mac at all.
+        // ...and broca is not installed on the receiving machine at all.
         f.b.discovery
             .daemon
             .restart(snapshot(&[("pi", "pi-session")], true, true));
@@ -2420,7 +2420,7 @@ mod moves {
         assert_eq!(record.participants.len(), 2);
         assert_eq!(record.participants[0].refs, record.participants[1].refs);
         for module in ["alpha", "beta"] {
-            for (mac, ops) in [
+            for (node, ops) in [
                 (
                     &f.a,
                     vec![
@@ -2440,7 +2440,7 @@ mod moves {
             ] {
                 for op in ops {
                     assert!(
-                        mac.discovery.peers[module]
+                        node.discovery.peers[module]
                             .calls()
                             .iter()
                             .any(|r| r.op().method() == op),
@@ -2497,14 +2497,14 @@ mod moves {
     }
 
     fn put_claim(
-        mac: &Mac,
+        node: &MoveMachine,
         version: u64,
         holder: Option<&str>,
         epoch: i64,
         cut: Option<&str>,
         author: &str,
     ) {
-        mac.records.fake.put(&format!("claim:{AGENT}"),version,serde_json::to_vec(&json!({"v":1,"agent_id":AGENT,"holder":holder,"epoch":epoch,"cut_id":cut,"reason":null})).unwrap(),author);
+        node.records.fake.put(&format!("claim:{AGENT}"),version,serde_json::to_vec(&json!({"v":1,"agent_id":AGENT,"holder":holder,"epoch":epoch,"cut_id":cut,"reason":null})).unwrap(),author);
     }
     #[tokio::test(start_paused = true)]
     async fn version_three_epoch_zero_uses_record_version_not_cache_version() {
@@ -2555,12 +2555,12 @@ mod moves {
                         .set_member_name(
                             entorhinal_core::shared_entry::MemberName {
                                 author: "03030303030303030303030303030303".into(),
-                                display_name: "Studio Mac".into(),
+                                display_name: "Studio".into(),
                             },
                             "fixture",
                         )
                         .unwrap();
-                    "Studio Mac"
+                    "Studio"
                 }
             };
             let admission = f.a.machine.handler.admit_move(
@@ -2749,10 +2749,10 @@ mod moves {
         f.b.restart().await;
         elapse(300_000);
         f.finish(&cut).await;
-        for mac in [&f.a, &f.b] {
-            let before = mac.row(&cut);
+        for node in [&f.a, &f.b] {
+            let before = node.row(&cut);
             assert_eq!(
-                mac.machine
+                node.machine
                     .bytes_on(
                         CORE,
                         "agent.move_abort",
@@ -2762,8 +2762,8 @@ mod moves {
                     .unwrap_err(),
                 "invalid_state"
             );
-            assert_eq!(mac.row(&cut), before);
-            assert!(!mac
+            assert_eq!(node.row(&cut), before);
+            assert!(!node
                 .discovery
                 .peers
                 .values()
@@ -3522,7 +3522,7 @@ mod moves {
                     .set_member_name(
                         entorhinal_core::shared_entry::MemberName {
                             author: B.into(),
-                            display_name: "Renamed Mac".into(),
+                            display_name: "Renamed".into(),
                         },
                         "fixture",
                     )
@@ -3596,23 +3596,23 @@ mod moves {
                     f.b.receiver_until(&cut, step).await;
                 }
             }
-            let mac = if matches!(step, MoveStep::Releasing | MoveStep::Released) {
+            let node = if matches!(step, MoveStep::Releasing | MoveStep::Released) {
                 &f.a
             } else {
                 &f.b
             };
-            assert_eq!(mac.row(&cut).step, step);
-            let before = mac.row(&cut);
+            assert_eq!(node.row(&cut).step, step);
+            let before = node.row(&cut);
             assert_eq!(
-                mac.store()
+                node.store()
                     .request_agent_move_abort(&cut, clock())
                     .unwrap_err()
                     .code,
                 "invalid_state"
             );
-            assert_eq!(mac.row(&cut), before);
+            assert_eq!(node.row(&cut), before);
             assert_eq!(
-                mac.machine
+                node.machine
                     .bytes_on(
                         CORE,
                         "agent.move_abort",
@@ -3622,7 +3622,7 @@ mod moves {
                     .unwrap_err(),
                 "invalid_state"
             );
-            assert_eq!(mac.row(&cut), before);
+            assert_eq!(node.row(&cut), before);
             f.a.records.fake.error(&format!("claim:{AGENT}"), None);
             f.a.restart().await;
             f.b.restart().await;
@@ -3634,8 +3634,8 @@ mod moves {
             if f.b.row(&cut).step != MoveStep::TakenOver {
                 f.b.receiver_until(&cut, MoveStep::Done).await;
             }
-            for mac in [&f.a, &f.b] {
-                assert!(!mac.discovery.peers["pi"]
+            for node in [&f.a, &f.b] {
+                assert!(!node.discovery.peers["pi"]
                     .calls()
                     .iter()
                     .any(|r| matches!(r, Request::Abort(_))));
@@ -3677,7 +3677,7 @@ mod moves {
                 }
                 // Without proof of our own claim take, returning ownership
                 // could overwrite another writer. Publishing abort while the
-                // receiver still owns the claim could let both Macs resume writes.
+                // receiver still owns the claim could let both machines resume writes.
                 assert_eq!(f.b.row(&cut).step, MoveStep::Staged);
                 assert_eq!(f.b.record(&cut).await.state, MoveState::Staged);
                 assert!(f.b.row(&cut).hold.is_some());
@@ -3792,23 +3792,23 @@ mod moves {
             if op == "record.cas" {
                 f.a.records.fake.drop_reply.store(true, Ordering::Relaxed);
             } else {
-                let mac = if ["agent_data.import", "agent_data.activate"].contains(&op) {
+                let node = if ["agent_data.import", "agent_data.activate"].contains(&op) {
                     &f.b
                 } else {
                     &f.a
                 };
-                mac.discovery.peers["pi"].script(op, Effect::LoseReply(TransportError::NoReply));
+                node.discovery.peers["pi"].script(op, Effect::LoseReply(TransportError::NoReply));
             }
             let cut = f.published(op).await;
             f.finish(&cut).await;
             assert_eq!(f.b.claim().await.version, 1);
             if op != "record.cas" {
-                let mac = if ["agent_data.import", "agent_data.activate"].contains(&op) {
+                let node = if ["agent_data.import", "agent_data.activate"].contains(&op) {
                     &f.b
                 } else {
                     &f.a
                 };
-                assert!(mac.discovery.peers["pi"]
+                assert!(node.discovery.peers["pi"]
                     .calls()
                     .iter()
                     .any(|r| matches!(r, Request::Status(_))));
@@ -3821,17 +3821,17 @@ mod moves {
     async fn concurrent_sources_append_one_inbox_without_overwriting_each_other() {
         let f = Pair::with_receiver_refs(&[("pi", "pi-session")], true).await;
         let target = "03030303030303030303030303030303";
-        for mac in [&f.a, &f.b] {
-            mac.store()
+        for node in [&f.a, &f.b] {
+            node.store()
                 .set_member_name(
                     entorhinal_core::shared_entry::MemberName {
                         author: target.into(),
-                        display_name: "Third Mac".into(),
+                        display_name: "Third".into(),
                     },
                     "fixture",
                 )
                 .unwrap();
-            mac.door
+            node.door
                 .script("cut.seal", DoorEffect::Seal(SealState::Published, None));
         }
         let a = f.a.admit_to(target, "append-a").await.unwrap();
@@ -4664,7 +4664,7 @@ async fn adopt_store_shared_restore_rejoins_with_new_author_and_installs_agents(
     b.call("register", json!({"projectId":"B","name":"B","roots":[]}))
         .await
         .unwrap();
-    b.call("member.set_name", json!({"display_name":"New Mac"}))
+    b.call("member.set_name", json!({"display_name":"New machine"}))
         .await
         .unwrap();
     assert_eq!(

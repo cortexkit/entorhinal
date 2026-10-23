@@ -260,7 +260,7 @@ fn activation_keeps_an_existing_local_binding_and_its_history() {
 fn activation_downgrades_a_colliding_row_to_a_placeholder_and_still_activates() {
     let f = Fixture::new();
     // Another agent's bindings already hold host session s1 and runner
-    // session s2 on this Mac.
+    // session s2 on this machine.
     let mut holder = binding("s1", None, vec![]);
     holder.session_ref = "other-1".into();
     f.bind("agent_other", &holder);
@@ -381,7 +381,7 @@ fn finished_metadata_keeps_original_holder_across_three_macs_and_clears_at_home(
     assert_eq!(b.rows()[0].held_on.as_deref(), Some("a"));
     hop(&b, &c, "bc");
     assert_eq!(c.rows()[0].held_on.as_deref(), Some("a"));
-    // Retention removes metadata, not the data still held on the original Mac.
+    // Retention removes metadata, not the data still held on the original machine.
     assert_eq!(
         a.store
             .prune_ended_sessions(91 + crate::SESSION_RETENTION_MS)

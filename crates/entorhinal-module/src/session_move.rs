@@ -1,6 +1,6 @@
 //! Entorhinal's session-bindings participant: the agent-move participant that
 //! carries every session binding of the moving agent, ended ones included,
-//! with its whole network history, to the receiving Mac.
+//! with its whole network history, to the receiving machine.
 //!
 //! The shared move record names each binding only by `(ref_kind, ref)`. On
 //! its own that lets the receiver insert placeholders with no host session,
@@ -89,7 +89,7 @@ struct Checkpoint {
     format: String,
 }
 
-/// Test-only changes to what a source writes, standing in for a source Mac
+/// Test-only changes to what a source writes, standing in for a source machine
 /// that runs another version or misbehaves.
 #[cfg(test)]
 #[derive(Clone, Copy, Default)]
@@ -259,7 +259,7 @@ impl SessionMove {
             .unwrap_or_else(|_| Err(unavailable("session bindings request deadline exceeded")))
             .map_err(|mut error| {
                 // A code this op may not answer with would make the driver
-                // treat this Mac's own participant as broken; answer
+                // treat this machine's own participant as broken; answer
                 // `unavailable` instead, which the driver retries.
                 if !cortexkit_role_agent_data::errors::allowed_refusals(op).contains(
                     &cortexkit_role_agent_data::errors::RefusalCode::from_code(&error.code),
@@ -309,7 +309,7 @@ impl SessionMove {
         if method == "agent_data.status" {
             return Ok(json!({"step":saved.map_or("none".into(), |s| s.step)}));
         }
-        // One state-changing request per Mac at a time. A second one, such
+        // One state-changing request per machine at a time. A second one, such
         // as a retry racing a request its caller gave up on, is refused
         // `unavailable`, which the driver retries.
         let _guard = self
@@ -413,7 +413,7 @@ impl SessionMove {
             "agent_data.diverged" => {
                 Self::side(row, MoveSide::Receiver)?;
                 // Always `at_cut`: activation never replaces a binding this
-                // Mac already has, so there is no local copy it could
+                // machine already has, so there is no local copy it could
                 // overwrite.
                 Ok(json!({"refs":[{"state":"at_cut"}]}))
             }
@@ -772,7 +772,7 @@ pub(crate) enum StagedError {
     Unreadable(HandlerError),
 }
 
-/// The bindings this Mac imported for receiver move `cut` of `agent`,
+/// The bindings this machine imported for receiver move `cut` of `agent`,
 /// rechecked against the import's digest. Each row must name a frozen ref
 /// or finished metadata with a data holder. Runs on a blocking thread.
 pub(crate) fn staged_bindings(

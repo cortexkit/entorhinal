@@ -133,7 +133,7 @@ pub(super) fn decode(path: &Path, agent: &str) -> Result<Vec<CarriedBinding>, Ha
             let found = format!("session-bindings/{version}");
             return Err(HandlerError {
                 code: "incompatible_version".into(),
-                message: format!("this Mac reads {}, not {found}", super::FORMAT),
+                message: format!("this machine reads {}, not {found}", super::FORMAT),
                 detail: Some(json!({"found":found,"required":super::FORMAT})),
             });
         }
@@ -316,7 +316,7 @@ mod tests {
         error.message
     }
 
-    /// The largest agent seen on a working Mac had about 1,300 Broca
+    /// The largest agent seen on a working machine had about 1,300 Broca
     /// bindings. With realistic ids, paths and a short network history each,
     /// that stream is well inside one session-door call.
     #[test]

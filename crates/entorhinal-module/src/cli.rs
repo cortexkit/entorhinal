@@ -103,7 +103,7 @@ pub enum Face {
     Workspaces,
     /// `ck-agents`: reads agents, and creates, renames, retires, retags and
     /// relabels them; each write lands only after the operator approves it at
-    /// a Touch ID prompt.
+    /// a presence prompt.
     Agents,
     /// `ck-roles`: cached role claims and operator-confirmed takes.
     Roles,
@@ -374,7 +374,7 @@ usage: ck projects <verb> [args] [--subc <connection file>] [--json]
   resolve <dir>           which project owns a directory
   register <name> <dir>   register a project rooted at a directory
   domain <project-id> <@scope/name> | --clear
-                           set or clear memory domain after Touch ID
+                           set or clear memory domain after operator confirmation
   remove <project>        remove a project from the registry
   add-root <project> <dir>
                           add another root to a project (starts unapproved)
@@ -394,7 +394,7 @@ usage: ck projects <verb> [args] [--subc <connection file>] [--json]
   trust <dir>             show each root's identity and approval
   verify                  check the store against its journal
   adopt-store [--same-machine]
-                          adopt a foreign store after Touch ID confirmation
+                          adopt a foreign store after operator confirmation
   log status              show local identity log state
   log name <display name> set this member's shared display name
   log enable [--without-agents]
@@ -420,7 +420,7 @@ usage: ck workspaces <verb> [args] [--subc <connection file>] [--json]
   document show <workspace> [--revision N]
                            read an accepted workspace document
   document set <workspace> [--charter-file PATH] [--document-file PATH] [--yes]
-                           preview a unified diff; --yes accepts after Touch ID
+                           preview a unified diff; --yes accepts after operator confirmation
 
   --subc <path>   daemon connection file; defaults to the usual discovery path
   --json          raw response instead of the rendered form
@@ -439,14 +439,15 @@ usage: ck agents <verb> [args] [--subc <connection file>] [--json]
   tag <agent> <text>
   labels <agent> <label>...   replace the whole label set
   labels <agent> --none      clear the label set
-  hire-cap <project> <n>     set this Mac's hiring cap (project id; Touch ID required)
+  hire-cap <project> <n>     set this machine's hiring cap (project id; operator confirmation required)
   list [--project <id>] [--workspace <id>]
   show <agent>               a live digest or a retired/merged identity
   repair-workspaces [--yes]   preview the correction; --yes asks for confirmation
   avatars --manifest <file> [--replace] [--yes]
-                             preview owner-minted avatars; --yes applies with Touch ID
+                             preview owner-minted avatars; --yes applies with operator confirmation
   where <agent> [--refresh]  cached checkout claim; optionally refresh first
-  move <agent> --to <mac>    move an idle agent to another named Mac
+  move <agent> --to <machine>
+                             move an idle agent to another named machine
   moves                     open moves and the last 32 finished moves
   move-abort <cut_id>        request cleanup before the irreversible boundary
   lid-close-moves on|off     allow or deny engram's lid-close moves
@@ -1664,7 +1665,7 @@ fn unwrap_result(envelope: Value) -> Result<Value, (u8, String)> {
 fn render(command: &Command, value: &Value) {
     if command.face == Face::Workspaces && command.verb == "document" && !command.json {
         if value["preview"] == true {
-            println!("Preview only; pass --yes to accept after Touch ID.");
+            println!("Preview only; pass --yes to accept after operator confirmation.");
         } else {
             println!("{}", serde_json::to_string_pretty(value).unwrap());
         }
@@ -1828,7 +1829,7 @@ fn format_avatar_manifest(value: &Value) -> String {
     if let Some(applied) = value["applied"].as_u64() {
         lines.push(format!("{applied} avatar(s) applied"));
     } else {
-        lines.push("Preview only; use --yes to apply with one Touch ID confirmation.".into());
+        lines.push("Preview only; use --yes to apply with one operator confirmation.".into());
     }
     lines.join("\n")
 }
@@ -1956,7 +1957,7 @@ fn format_agent_moves(value: &Value) -> String {
             if let Some(skipped) = row["skipped_participants"].as_array() {
                 for module in skipped {
                     lines.push(format!(
-                        "  skipped {}: not installed on this Mac, no data to carry",
+                        "  skipped {}: not installed on this machine, no data to carry",
                         text(module)
                     ));
                 }
@@ -3200,9 +3201,9 @@ mod agent_tests {
     fn move_verbs_build_wire_shapes_and_retries() {
         for (args, method, expected) in [
             (
-                vec!["move", ID, "--to", "Studio Mac"],
+                vec!["move", ID, "--to", "Studio"],
                 "agent.move",
-                json!({"agent_id":ID,"to":"Studio Mac"}),
+                json!({"agent_id":ID,"to":"Studio"}),
             ),
             (
                 vec!["move-abort", "cut-1"],
@@ -3241,12 +3242,12 @@ mod agent_tests {
         );
         for args in [
             vec!["move", ID],
-            vec!["move", ID, "--to", "Mac", "--to", "Mac"],
+            vec!["move", ID, "--to", "machine", "--to", "machine"],
             vec!["moves", ID],
             vec!["moves", "--request-key", "k"],
             vec!["move-abort"],
             vec!["lid-close-moves", "yes"],
-            vec!["retire", ID, "--to", "Mac"],
+            vec!["retire", ID, "--to", "machine"],
         ] {
             assert!(build(&command(&args)).is_err(), "{args:?}");
         }
@@ -3298,14 +3299,14 @@ mod agent_tests {
             Ok(json!({"agent_id":ID})),
             Ok(json!({"cut_id":"cut-1","step":"preparing"})),
         ]);
-        execute(&script, &["move", "Ada", "--to", "Studio Mac"])
+        execute(&script, &["move", "Ada", "--to", "Studio"])
             .await
             .unwrap();
         let calls = script.calls();
         assert_eq!(calls[0].0, "agent.resolve_name");
         assert_eq!(calls[1].0, "agent.move");
         assert_eq!(calls[1].1["agent_id"], ID);
-        assert_eq!(calls[1].1["to"], "Studio Mac");
+        assert_eq!(calls[1].1["to"], "Studio");
         assert_eq!(calls[1].2, Duration::from_secs(300));
         for (args, method) in [
             (vec!["moves"], "agent.moves"),
@@ -3348,7 +3349,7 @@ mod agent_tests {
             script.calls()[0].1,
             json!({"entries":entries,"replace":false})
         );
-        assert_eq!(format_avatar_manifest(&preview), "Ada: creature.classic v2 -> creature.wild v1\nGrace: none -> creature.wild v1\nLinus: skipped (already creature.classic v2)\nPreview only; use --yes to apply with one Touch ID confirmation.");
+        assert_eq!(format_avatar_manifest(&preview), "Ada: creature.classic v2 -> creature.wild v1\nGrace: none -> creature.wild v1\nLinus: skipped (already creature.classic v2)\nPreview only; use --yes to apply with one operator confirmation.");
         let script = Script::new(vec![Ok(json!({"applied":2,"skipped":[]}))]);
         execute(
             &script,
@@ -3720,7 +3721,7 @@ mod agent_tests {
             "agent_id":"agent-1","peer_name":"Desk","skipped_participants":["broca"]
         }]});
         assert!(format_agent_moves(&skipped)
-            .contains("  skipped broca: not installed on this Mac, no data to carry"));
+            .contains("  skipped broca: not installed on this machine, no data to carry"));
         let none = json!({"moves":[{
             "cut_id":"cut-1","side":"receiver","step":"activated",
             "agent_id":"agent-1","peer_name":"Desk"

@@ -1,5 +1,5 @@
 //! Store provenance is machine-local. Adoption that clears state records that
-//! reset in the journal, so replay cannot resurrect the previous Mac's approvals.
+//! reset in the journal, so replay cannot resurrect the previous machine's approvals.
 use crate::{RegistryError, RegistryStore};
 use rusqlite::{params, OptionalExtension, Transaction};
 use std::sync::atomic::Ordering;

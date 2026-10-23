@@ -288,7 +288,7 @@ pub(crate) fn agent_where_in(
     }
     let claim = if foreign { None } else { load_claim(conn, id)? };
     // Claims live only in the shared log. While sharing has never
-    // been turned on, no other Mac can hold this agent, so having no
+    // been turned on, no other machine can hold this agent, so having no
     // cached claim is a verified "unclaimed", not an unknown. Once
     // sharing starts, only verified engram reads count.
     let sharing_off = !foreign
@@ -566,7 +566,7 @@ mod tests {
     #[test]
     fn where_wire_nulls_known_status_integrity_and_restart() {
         let f = Fixture::new();
-        // With sharing never turned on, no other Mac can hold the agent, so an
+        // With sharing never turned on, no other machine can hold the agent, so an
         // absent claim is a verified "unclaimed". Core's head registration
         // accepts exactly this shape.
         assert_eq!(serde_json::to_string(&f.store.agent_where(ID).unwrap()).unwrap(),"{\"known\":true,\"status\":\"unclaimed\",\"holder\":null,\"holder_name\":null,\"epoch\":0,\"cut_id\":null,\"read_at_ms\":null,\"stale\":false}");

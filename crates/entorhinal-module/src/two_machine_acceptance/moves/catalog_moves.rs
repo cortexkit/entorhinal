@@ -102,16 +102,16 @@ fn serve_move_status_at(
         );
     }
 }
-async fn move_registry(mac: &mut Mac, pin: &CatalogPin) -> Arc<FakeRegistry> {
+async fn move_registry(node: &mut MoveMachine, pin: &CatalogPin) -> Arc<FakeRegistry> {
     let registry = Arc::new(FakeRegistry::start().await);
     let scope = pin.name.split('/').next().unwrap().to_owned();
-    if mac
+    if node
         .store()
         .catalog_registry_for_scope(&scope)
         .unwrap()
         .is_none()
     {
-        mac.store()
+        node.store()
             .catalog_registry_add(
                 "https://registry.example.invalid",
                 &[scope],
@@ -127,7 +127,7 @@ async fn move_registry(mac: &mut Mac, pin: &CatalogPin) -> Arc<FakeRegistry> {
     registry.serve("/v1/registry/keys", Reply::bytes(json!({"schema":"ck-registry-keys/v1","registry":"https://registry.example.invalid","keys":[]}).to_string()));
     serve_move_status(&registry, pin, "available", 1);
     let held = registry.clone();
-    mac.machine.handler.catalog_agent.sources = Arc::new(move |store, scope| {
+    node.machine.handler.catalog_agent.sources = Arc::new(move |store, scope| {
         CatalogTrust::with_client(
             store,
             scope,
@@ -202,8 +202,8 @@ fn package(large: bool) -> (CatalogPin, Vec<u8>) {
         archive,
     )
 }
-fn grant(mac: &Mac, pin: &CatalogPin, id: &str) {
-    mac.store()
+fn grant(node: &MoveMachine, pin: &CatalogPin, id: &str) {
+    node.store()
         .insert_publisher_grant(
             &entorhinal_core::catalog_grants::PublisherGrant {
                 id: id.into(),
@@ -219,8 +219,8 @@ fn grant(mac: &Mac, pin: &CatalogPin, id: &str) {
         )
         .unwrap();
 }
-async fn pins(mac: &Mac, pins: Vec<CatalogPin>, key: &str) {
-    drive(mac.machine.handler.catalog_pins_write_wait(
+async fn pins(node: &MoveMachine, pins: Vec<CatalogPin>, key: &str) {
+    drive(node.machine.handler.catalog_pins_write_wait(
         PinWriteRequest {
             agent_id: AGENT.into(),
             pins,
@@ -241,18 +241,18 @@ async fn catalog_pair(
     let (pin, archive) = package(large);
     move_registry(&mut pair.a, &pin).await;
     move_registry(&mut pair.b, &pin).await;
-    for mac in [&mut pair.a, &mut pair.b] {
+    for node in [&mut pair.a, &mut pair.b] {
         let consumer = Arc::new(Consumer {
-            folder: mac.store().store_folder().to_path_buf(),
+            folder: node.store().store_folder().to_path_buf(),
             calls: Mutex::new(vec![]),
             refuse_check: Mutex::new(false),
         });
-        mac.machine.handler.catalog_agent.consumers = Arc::new(Consumers(consumer));
-        mac.discovery
+        node.machine.handler.catalog_agent.consumers = Arc::new(Consumers(consumer));
+        node.discovery
             .daemon
             .restart(snapshot(&[("entorhinal", "package-closure")], true, true));
-        *mac.discovery.catalog.lock().unwrap() =
-            Some(Arc::new(mac.machine.handler.catalog_move_context()));
+        *node.discovery.catalog.lock().unwrap() =
+            Some(Arc::new(node.machine.handler.catalog_move_context()));
     }
     pins(&pair.a, vec![pin.clone()], "pins-1").await;
     if catch_up {
@@ -276,9 +276,10 @@ async fn catalog_pair(
         Some(Arc::new(pair.b.machine.handler.catalog_move_context()));
     (pair, pin, archive, consumer)
 }
-fn no_claim_take(mac: &Mac) {
+fn no_claim_take(node: &MoveMachine) {
     assert!(
-        !mac.records
+        !node
+            .records
             .calls
             .lock()
             .unwrap()
@@ -538,7 +539,7 @@ async fn catalog_move_legacy_target_wait_is_visible_and_operator_can_abort() {
     assert_eq!(status["status"], "waiting_for_target");
     assert_eq!(
         status["message"],
-        "waiting for the target Mac to pick up the move"
+        "waiting for the target machine to pick up the move"
     );
     assert_eq!(status["waiting_ms"], 12_345);
     let where_ = pair.a.where_().await;
@@ -553,7 +554,7 @@ async fn catalog_move_back_uses_a_new_session_container() {
     let (pair, _, _, _) = catalog_pair(true, true, false).await;
     let first = pair.published("catalog-outbound").await;
     pair.finish(&first).await;
-    let second = pair.b.admit_to("Desk Mac", "catalog-return").await.unwrap();
+    let second = pair.b.admit_to("Desk", "catalog-return").await.unwrap();
     pair.b
         .door
         .script("cut.seal", DoorEffect::Seal(SealState::Published, None));
@@ -712,11 +713,7 @@ async fn catalog_move_lost_admit_reply_and_fresh_context_reuse_immutable_bytes()
 #[tokio::test(start_paused = true)]
 async fn catalog_move_lease_errors_remain_retryable_participant_refusals() {
     let (pair, _, _, _) = catalog_pair(true, true, false).await;
-    let cut = pair
-        .a
-        .admit_to("Studio Mac", "catalog-lease")
-        .await
-        .unwrap();
+    let cut = pair.a.admit_to("Studio", "catalog-lease").await.unwrap();
     let context = pair.a.machine.handler.catalog_move_context();
     let request = json!({"refs":[{"ref_kind":"package-closure","ref":AGENT}],"cutId":cut});
     for code in [
@@ -799,11 +796,7 @@ async fn catalog_move_none_status_and_aborted_cut_cannot_import() {
 #[tokio::test(start_paused = true)]
 async fn catalog_move_content_store_errors_use_allowed_retry_refusals() {
     let (pair, _, _, _) = catalog_pair(true, true, false).await;
-    let cut = pair
-        .a
-        .admit_to("Studio Mac", "catalog-blob-io")
-        .await
-        .unwrap();
+    let cut = pair.a.admit_to("Studio", "catalog-blob-io").await.unwrap();
     let root = pair.a.store().store_folder().join("catalog/blobs");
     std::fs::remove_dir_all(&root).unwrap();
     std::fs::write(root, b"not a directory").unwrap();
@@ -1045,15 +1038,15 @@ async fn catalog_move_starter_proof_authorizes_offline_root_and_carries_certific
         root: true,
         range: Some("*".into()),
     };
-    for mac in [&pair.a, &pair.b] {
-        mac.store()
+    for node in [&pair.a, &pair.b] {
+        node.store()
             .catalog_registry_remove("https://registry.example.invalid")
             .unwrap();
-        let blobs = BlobStore::new(mac.store().store_folder()).unwrap();
+        let blobs = BlobStore::new(node.store().store_folder()).unwrap();
         blobs.publish(package.archive).unwrap();
         // Retain the bundle's signed metadata so the receiver can reverify its
         // initial package status against its own root without a registry.
-        mac.store()
+        node.store()
             .catalog_seed_transaction::<_, crate::catalog_blob::CatalogError>(|_, _| {
                 Ok((
                     (),

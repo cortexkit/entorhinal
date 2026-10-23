@@ -1,8 +1,8 @@
 //! A receiver whose cleanup call is refused waits before asking again.
 use super::*;
 
-fn abort_calls(mac: &Mac) -> usize {
-    mac.discovery.peers["pi"]
+fn abort_calls(node: &MoveMachine) -> usize {
+    node.discovery.peers["pi"]
         .calls()
         .iter()
         .filter(|r| r.op().method() == "agent_data.abort")

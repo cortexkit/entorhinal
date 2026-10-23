@@ -70,7 +70,7 @@ pub struct GoneSession {
 
 /// One row of the per-agent session list. `session` is the stored host
 /// session id; it and `harness` are null for a reference that moved in from
-/// another Mac and has not been opened here yet.
+/// another machine and has not been opened here yet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AgentSession {
     pub runner: Option<String>,
@@ -228,7 +228,7 @@ impl RegistryStore {
     /// before `now_ms`. A binding ended exactly at the boundary is kept. Every
     /// binding of an agent with an open move is kept, because the move still
     /// reads the agent's references; so is every binding that never ended,
-    /// including references moved in from another Mac and not yet reopened,
+    /// including references moved in from another machine and not yet reopened,
     /// which a later move back still needs. Returns how many were deleted.
     pub fn prune_ended_sessions(&self, now_ms: i64) -> Result<usize, RegistryError> {
         let cutoff = now_ms.saturating_sub(SESSION_RETENTION_MS);

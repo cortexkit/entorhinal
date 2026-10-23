@@ -1510,7 +1510,7 @@ function currentKeyCheck(keys: ScopeKey[], publicKey: string): StatementResult |
 // the newest key the client already holds for that registry. The client's
 // key set starts from the key pinned with the allowlist entry and
 // grows only along this chain; old keys are kept for records already held.
-// Only that first key needs the user's Touch ID approval; chain successors
+// Only that first key needs the operator's approval; chain successors
 // are pinned without it.
 export interface RegistryPin {
   registry: string

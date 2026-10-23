@@ -53,10 +53,10 @@ The answer vocabulary of `agent.session_liveness` is closed: `active`, `gone`,
    writes the row: `authority_not_cut_over` (agent identity has not been
    imported yet), `unknown_agent`, `gone` (retired or merged), `agent_moving`
    (an open move fences the agent, or reserves this reference for an agent
-   arriving from another Mac; see
+   arriving from another machine; see
    [agent-move-contract.md](agent-move-contract.md)),
    `claim_integrity_failed`, `held_elsewhere` (a cached
-   claim at epoch 1 or higher names another Mac), `ref_bound_elsewhere` (the
+   claim at epoch 1 or higher names another machine), `ref_bound_elsewhere` (the
    reference belongs to another agent) and `session_bound_elsewhere` (the
    session key already binds another reference). A refused registration
    writes nothing.

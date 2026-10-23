@@ -89,7 +89,7 @@ impl ProjectsHandler {
         if self.health.origin.is_foreign() {
             return Err(HandlerError {
                 code: "store_from_another_machine".into(),
-                message: "store belongs to another Mac; use ck projects adopt-store".into(),
+                message: "store belongs to another machine; use ck projects adopt-store".into(),
                 detail: Some(
                     json!({"storeMachineId":self.health.origin.store_id(),"daemonMachineId":self.health.origin.daemon_id()}),
                 ),

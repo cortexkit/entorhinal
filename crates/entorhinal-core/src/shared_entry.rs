@@ -235,7 +235,7 @@ impl SharedState {
             op: "shared.snapshot".into(),
             tables: PROJECT_SHARED_TABLES
                 .iter()
-                // An empty new table must not force old Macs to upgrade before
+                // An empty new table must not force old machines to upgrade before
                 // any workspace document has actually been accepted.
                 .filter(|table| **table != "workspace_document" || !self.0[**table].is_empty())
                 .map(|table| {
@@ -682,9 +682,9 @@ mod tests {
                     "role_take_request",
                     "self_identity",
                     "store_origin",
-                    // These machine-local consent and agent tables are never sent to other Macs:
+                    // These machine-local consent and agent tables are never sent to other machines:
                     // consent_grant, consent_request, consent_write_plan, consent_feed_cursor,
-                    // agent_audit and project_hire_cap. They describe this Mac's permissions and retries.
+                    // agent_audit and project_hire_cap. They describe this machine's permissions and retries.
                     "consent_grant",
                     "consent_request",
                     "consent_write_plan",

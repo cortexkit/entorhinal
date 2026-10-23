@@ -261,7 +261,7 @@ struct Progress {
     activation_fork: Option<Value>,
     #[serde(default)]
     takeover_sent: bool,
-    /// Plan participants this Mac leaves out of the whole receiver side of the
+    /// Plan participants this machine leaves out of the whole receiver side of the
     /// move: each was neither configured nor registered here when the
     /// preconditions ran, and the source sent no refs for it, so there is no
     /// data to import, check for forks, activate or undo. `None` means the
@@ -289,8 +289,8 @@ fn called<'a>(plan: &'a MoveRecord, progress: &Progress) -> Vec<&'a wire::MovePa
         .collect()
 }
 
-/// Plan participants this Mac can leave out of the move: the source sent no
-/// refs for them, and this Mac neither configures nor registers them, so they
+/// Plan participants this machine can leave out of the move: the source sent no
+/// refs for them, and this machine neither configures nor registers them, so they
 /// cannot hold local data for the agent and have nothing staged to undo.
 fn absent_without_refs(
     plan: &MoveRecord,
@@ -308,7 +308,7 @@ fn absent_without_refs(
         .collect()
 }
 
-/// Participants a receiver row recorded as skipped (absent on that Mac with
+/// Participants a receiver row recorded as skipped (absent on that machine with
 /// nothing to carry), for move status. Empty for source rows and for rows
 /// whose preconditions have not run yet.
 pub(crate) fn skipped_participants(row: &AgentMove) -> Vec<String> {
@@ -401,7 +401,7 @@ impl Failure {
                 _ => MoveReason::ParticipantRefused,
             });
             if code == "incompatible_version" {
-                failure.detail["note"] = json!("Upgrade this Mac to import the cut's format");
+                failure.detail["note"] = json!("Upgrade this machine to import the cut's format");
             }
         }
         failure
@@ -759,10 +759,10 @@ impl Receiver {
         self.catalog_preflight(plan).await?;
         let (supervisor, catalog) = self.discovery_lists().await?;
         // The source plans every module that declares agent data, even one with
-        // no refs for this agent. A module that is not on this Mac at all cannot
+        // no refs for this agent. A module that is not on this machine at all cannot
         // hold local data for the agent, and with no refs the source carries none,
         // so skip it for the rest of the move. Decide once and persist the set:
-        // later steps and restarts must not call a module this Mac never checked.
+        // later steps and restarts must not call a module this machine never checked.
         // A configured but disabled or warming module is not absent: it may still
         // keep data on disk, so the move holds below until it is enabled and
         // its fork check (agent_data.diverged) can run.
@@ -825,7 +825,7 @@ impl Receiver {
         self.local_writers(plan).await
     }
 
-    /// The session bindings the source carried for this move, as this Mac
+    /// The session bindings the source carried for this move, as this machine
     /// imported them; none when the move carries no bindings stream. A
     /// live carried ref the move does not name breaks the agent-data
     /// contract and holds the move; finished metadata need not name a ref.
@@ -883,7 +883,7 @@ impl Receiver {
             tracing::warn!(
                 cut = %self.cut,
                 placeholders = installed.placeholders,
-                "carried session bindings collided with bindings on this Mac and were installed as placeholders"
+                "carried session bindings collided with bindings on this machine and were installed as placeholders"
             );
         }
     }
@@ -892,7 +892,7 @@ impl Receiver {
         let Some(expected) = &plan.pin_digest else {
             return Ok(());
         };
-        let catalog = self.worker.catalog.as_ref().ok_or_else(|| Failure::abort(MoveReason::IncompatibleVersion, json!({"code":"incompatible_version","module_id":"entorhinal","note":"Both Macs need catalog move support"})))?;
+        let catalog = self.worker.catalog.as_ref().ok_or_else(|| Failure::abort(MoveReason::IncompatibleVersion, json!({"code":"incompatible_version","module_id":"entorhinal","note":"Both machines need catalog move support"})))?;
         catalog
             .preflight(&plan.agent_id, expected)
             .await
@@ -1093,7 +1093,7 @@ impl Receiver {
                         matches!(r.state, DivergedState::Advanced | DivergedState::Unknown)
                     }) {
                         // Preserve the participant's validated reason in the checkpoint and shared abort detail
-                        // so either Mac can show it beside the participant and ref.
+                        // so either machine can show it beside the participant and ref.
                         let mut detail = json!({"module_id":p.module_id,"ref":reference.reference,"state":r.state});
                         if let Some(reason) = &r.reason {
                             detail["reason"] = json!(reason);
@@ -1101,7 +1101,7 @@ impl Receiver {
                         return Err(Failure::abort(MoveReason::Diverged, detail));
                     }
                 }
-                // Diverged asks each participant whether this Mac has data past
+                // Diverged asks each participant whether this machine has data past
                 // the cut. A host can write while that call is in flight, so recheck
                 // session-binding ownership and active local writers before import.
                 self.local_writers(plan).await?;
@@ -1518,7 +1518,7 @@ impl Receiver {
     ) -> Result<(), Failure> {
         // An abort can arrive before the preconditions decided which absent
         // participants to skip. Decide here with the same rule, before any
-        // participant call, so cleanup never waits on a module this Mac lacks.
+        // participant call, so cleanup never waits on a module this machine lacks.
         // That is safe even if an older receiver already imported: a
         // participant with no refs staged nothing, so it has nothing to undo.
         // Persisting the set makes a restart mid-cleanup skip the same modules.
@@ -2727,7 +2727,7 @@ mod tests {
     }
     /// Adds a `broca` participant with the given refs to the published plan,
     /// with its own fake so every call it receives is recorded. The receiver's
-    /// daemon snapshot does not list it, so it starts absent on this Mac.
+    /// daemon snapshot does not list it, so it starts absent on this machine.
     async fn add_broca(f: &Fixture, refs: Value) -> Arc<FakeParticipant> {
         let broca = Arc::new(FakeParticipant::new(&["session"], vec![]));
         f.discovery
@@ -2822,7 +2822,7 @@ mod tests {
         assert_eq!(row.hold.as_ref().unwrap()["op"], "agent_data.diverged");
         assert_eq!(skipped_participants(&row), vec!["broca".to_string()]);
         // broca is now installed and ready here, but the move already recorded
-        // that this Mac never checked it, so the restarted receiver must not call it.
+        // that this machine never checked it, so the restarted receiver must not call it.
         f.discovery.daemon.restart(snapshot_with_broca(true, true));
         let mut restarted = f.receiver();
         f.until(&mut restarted, Step::Activated).await;
@@ -2831,7 +2831,7 @@ mod tests {
         assert_eq!(skipped_participants(&f.row()), vec!["broca".to_string()]);
     }
 
-    /// Publishes the source's abort of the picked-up cut, as the source Mac
+    /// Publishes the source's abort of the picked-up cut, as the source machine
     /// does when it gives up before this receiver ran its preconditions.
     fn source_aborts(f: &Fixture) {
         let mut plan = f.plan();

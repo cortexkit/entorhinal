@@ -11,7 +11,7 @@
 //! written to `registry_journal` or sent to the identity log, so `verify` and
 //! journal replay never see it. Rows are keyed to their binding by
 //! `(ref_kind, ref)` with a cascading foreign key, so every path that deletes
-//! a binding (retention, clearing a store restored from another Mac) deletes
+//! a binding (retention, clearing a store restored from another machine) deletes
 //! its history in the same statement.
 
 use rusqlite::{params, OptionalExtension, Transaction};

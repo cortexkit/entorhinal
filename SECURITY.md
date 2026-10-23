@@ -15,7 +15,7 @@ instead. A failing test against the serving path (`ProjectsHandler` in
 ## Threat model
 
 entorhinal is a local module. It runs as the operator's own OS user, under the
-subc daemon, on each of the operator's Macs. This section says what it trusts,
+subc daemon, on each of the operator's machines. This section says what it trusts,
 what it refuses, where its state lives and what it does not defend against.
 [docs/module-surface.md](docs/module-surface.md) has the admission rule for
 every operation.
@@ -48,8 +48,10 @@ every operation.
 - **Unconfirmed `Direct` agent writes.** Every local process, including an
   agent's own shell, reaches entorhinal as `Direct`. So a `Direct` caller can
   change agent identity only for the methods in `agent_ops::CONFIRMABLE_METHODS`,
-  and only after the operator approves the exact change at a Touch ID prompt
-  the daemon shows. Any other `Direct` agent identity write is refused with
+  and only after the operator approves the exact change at a presence prompt
+  the daemon shows (Touch ID on macOS, Windows Hello on Windows). Linux has no
+  presence provider, so on Linux these writes refuse
+  `operator_presence_unavailable`. Any other `Direct` agent identity write is refused with
   `direct_identity_write_not_admitted` (`authorize_write` in `main.rs`). Hire
   caps, role takes, operator moves, move aborts and the lid-close setting use
   the same prompt. Tests: `writes_are_refused_unless_the_operator_or_the_executive_opened_the_route`,
@@ -72,7 +74,7 @@ every operation.
   See [docs/identity-log-contract.md](docs/identity-log-contract.md).
 - **Shared authority.** Consent grants, consent requests, the audit, hire caps,
   move checkpoints, session bindings and cached claims are machine-local. They
-  are never written to the identity log, so another Mac's state never
+  are never written to the identity log, so another machine's state never
   authorizes a write here (`consent_state_is_local_persistent_and_not_rebuilt_or_exported`).
 
 ### Where state lives
@@ -96,7 +98,7 @@ every operation.
 ### What it does not defend against
 
 - **A compromised daemon.** The daemon mints the principals and scope stamps
-  entorhinal trusts and shows the Touch ID prompts. A daemon that lies about
+  entorhinal trusts and shows the presence prompts. A daemon that lies about
   either can make entorhinal accept any write.
 - **The same OS user with direct disk access.** Any process running as the
   operator's user can open the store file and change it, or rewrite a

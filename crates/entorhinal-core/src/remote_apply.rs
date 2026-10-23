@@ -254,8 +254,8 @@ pub fn validate_agent_extension(
 }
 
 impl RegistryStore {
-    // After adoption from another Mac, inherited journal entries are not writes
-    // committed by this Mac. Rejoining the shared log must apply them again.
+    // After adoption from another machine, inherited journal entries are not writes
+    // committed by this machine. Rejoining the shared log must apply them again.
     pub fn has_committed_own_entry_at_position(&self) -> Result<bool, RegistryError> {
         self.read(|conn| conn.query_row("SELECT EXISTS(SELECT 1 FROM registry_journal WHERE origin='here' AND stream='shared' AND seq > COALESCE((SELECT MAX(seq) FROM registry_journal WHERE op='store.adopt'),0) AND entry_id IS NOT NULL AND log_position=(SELECT last_applied_position FROM identity_log_state WHERE id=1))", [], |r| r.get(0)))
     }
