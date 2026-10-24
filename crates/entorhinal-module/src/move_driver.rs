@@ -393,6 +393,12 @@ impl Worker {
             rows.iter().filter(|r| !r.step.is_terminal()).count() as u64,
             Ordering::Relaxed,
         );
+        self.health.cut_releases_pending.store(
+            rows.iter()
+                .filter(|row| row.plan["_cut_release"]["state"] == "pending")
+                .count() as u64,
+            Ordering::Relaxed,
+        );
         let errors = rows
             .iter()
             .map(|r| {
@@ -450,6 +456,10 @@ impl ProjectsHandler {
         let mut signals = self.move_wake.subscribe();
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let driver = tokio::spawn(async move {
+            // Dropping the task set also cancels cleanup if the driver unwinds,
+            // so restarting the driver cannot leave an older releaser running.
+            let mut releaser = tokio::task::JoinSet::new();
+            releaser.spawn(crate::cut_release::run(worker.clone()));
             let mut interval = tokio::time::interval(POLL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut owners = TaskOwners::default();
@@ -523,6 +533,7 @@ impl ProjectsHandler {
                 _ = poll => {},
             }
             tasks.shutdown().await;
+            releaser.shutdown().await;
         });
         *task = Some(MoveDriver {
             stop,

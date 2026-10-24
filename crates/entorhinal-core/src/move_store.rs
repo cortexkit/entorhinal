@@ -306,6 +306,14 @@ fn public_move(conn: &rusqlite::Connection, row: &AgentMove) -> rusqlite::Result
     if let Value::Object(notices) = row.notices() {
         object.extend(notices);
     }
+    if let Some(release) = row.plan.get("_cut_release") {
+        let mut release = release.clone();
+        if let Some(object) = release.as_object_mut() {
+            object.remove("attempts");
+            object.remove("retry_at_ms");
+        }
+        object.insert("cut_release".into(), release);
+    }
     Ok(value)
 }
 
@@ -714,6 +722,18 @@ impl RegistryStore {
                 next.abort_requested = current.abort_requested;
             }
             next.cut_accept = current.cut_accept;
+            // Release runs independently after the move boundary. A stale move
+            // checkpoint must not erase its retry deadline or completed outcome.
+            if let Some(release) = current.plan.get("_cut_release") {
+                next.plan["_cut_release"] = release.clone();
+            } else if next.side == MoveSide::Source
+                && next.step == MoveStep::Aborted
+                && next.seal_sent
+                && next.plan["_source"]["seal_refused"].is_null()
+            {
+                next.plan["_cut_release"] =
+                    serde_json::json!({"state":"pending","attempts":0,"retry_at_ms":0});
+            }
             next.write(tx, false)?;
             Ok(next)
         })
@@ -820,6 +840,8 @@ impl RegistryStore {
             next.abort_requested = current.abort_requested;
             next.cut_accept =
                 Some(serde_json::json!({"state":"pending","attempts":0,"retry_at_ms":0}));
+            next.plan["_cut_release"] =
+                serde_json::json!({"state":"pending","attempts":0,"retry_at_ms":0});
             next.write(tx, false)?;
             Ok(Ok((next, installed)))
         })
@@ -837,6 +859,18 @@ impl RegistryStore {
                 "UPDATE agent_move SET cut_accept=?2, updated_at_ms=?3 WHERE cut_id=?1",
                 params![cut_id, accept.to_string(), now_ms],
             )?;
+            Ok(())
+        })
+        .map_err(RegistryError::Store)
+    }
+
+    /// Update only the machine-local release checkpoint, leaving the move and
+    /// its identity journal untouched even while another task advances the move.
+    pub fn set_move_cut_release(&self, cut_id: &str, release: &Value) -> Result<(), RegistryError> {
+        self.with_where_move_changes(|tx| {
+            let mut row = load_move(tx, cut_id)?;
+            row.plan["_cut_release"] = release.clone();
+            row.write(tx, false)?;
             Ok(())
         })
         .map_err(RegistryError::Store)

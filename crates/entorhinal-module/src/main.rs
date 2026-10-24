@@ -87,6 +87,7 @@ mod current_directory;
 mod cut_barrier_rehearsal;
 // Agent moves open engram's session-door route lazily so reads and startup
 // continue to work while engram is unavailable.
+mod cut_release;
 #[allow(dead_code)]
 mod door_client;
 mod enable;
@@ -437,6 +438,9 @@ struct HealthGauges {
     move_errors: AtomicU64,
     move_inbox_rejected: AtomicU64,
     move_task_panics: AtomicU64,
+    cut_releases_pending: AtomicU64,
+    cut_releases_released: AtomicU64,
+    cut_releases_stopped: AtomicU64,
     /// Session bindings this machine sent in moves out: every row written to a
     /// session-bindings stream.
     session_bindings_carried: AtomicU64,
@@ -452,6 +456,15 @@ struct HealthGauges {
     watch_waiting: tokio::sync::Notify,
     #[cfg(test)]
     claim_refresh_done: tokio::sync::Notify,
+}
+
+impl HealthGauges {
+    fn cut_release_metrics(&self, mut metrics: Value) -> Value {
+        metrics["cutReleasesPending"] = json!(self.cut_releases_pending.load(Ordering::Relaxed));
+        metrics["cutReleasesReleased"] = json!(self.cut_releases_released.load(Ordering::Relaxed));
+        metrics["cutReleasesStopped"] = json!(self.cut_releases_stopped.load(Ordering::Relaxed));
+        metrics
+    }
 }
 
 /// Volatile liveness state fed by `projects.session_liveness` batches. Never
@@ -1334,7 +1347,7 @@ impl ModuleHandler for ProjectsHandler {
         HealthReport {
             status,
             detail,
-            metrics: Some(self.health.origin.metrics(self.session_upkeep.metrics(self.session_binding_metrics(json!({
+            metrics: Some(self.health.cut_release_metrics(self.health.origin.metrics(self.session_upkeep.metrics(self.session_binding_metrics(json!({
                     "storeReady": ready,
                     "catalogLastSuccessMs": catalog["catalogLastSuccessMs"],
                     "catalogLastError": catalog["catalogLastError"],
@@ -1381,7 +1394,7 @@ impl ModuleHandler for ProjectsHandler {
                     "watchesOpen": self.health.watches_open.load(Ordering::Relaxed),
                     "watchNoticesSent": self.health.watch_notices.load(Ordering::Relaxed),
                     "watchResyncsSent": self.health.watch_resyncs.load(Ordering::Relaxed),
-            }))))),
+            })))))),
         }
     }
 }

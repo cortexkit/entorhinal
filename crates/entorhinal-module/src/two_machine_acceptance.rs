@@ -2284,6 +2284,7 @@ mod moves {
     mod abort_backoff;
     mod binding_moves;
     mod catalog_moves;
+    mod cut_releases;
 
     #[tokio::test(start_paused = true)]
     async fn full_move_three_participants_preserves_refs_claim_and_local_journals() {

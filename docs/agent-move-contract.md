@@ -180,7 +180,30 @@ Tests: `preconditions_refuse_in_order_with_named_codes`,
    mismatch aborts the move.
 6. **Task failure.** A move task that panics records a hold with code
    `move_task_failed` and is driven again after a backoff that doubles from one
-   second up to five minutes.
+    second up to five minutes.
+7. **Cut reservations.** The receiver records a pending `cut.release {cutId}`
+   in the same local transaction as `activated`. The source records one when
+   it finishes `aborted` after sending `cut.abort`; an abort before any cut was
+   sealed has nothing to release. This metadata lives only in the move row's
+   `plan._cut_release`, never in the shared move record or identity journal.
+   An independent task sends the request over engram's `session-door` as
+   `reserved:entorhinal`, without holding a store handle or write lock across
+   the call. It starts and stops with the move driver, including store shutdown.
+   Neither a pending nor a stopped release holds a move open or prevents another
+   move. A lost reply resends the same idempotent request.
+   `published` and `aborted` outcomes finish cleanup, including when
+   `reservationDropped` is false (another commit still lists the cut).
+   `invalid_request`, `caller_forbidden` and `cut_release_unknown` stop cleanup
+   with that code and one log entry. `unavailable` and `lease_not_active` retry
+   from one second, doubling to five minutes. `plane_version_unsupported` is
+   expected until trimming is enabled and retries at most every six hours,
+   without an error log. Attempts and deadlines survive restart; a crash during
+   an unanswered call conservatively keeps its six-hour deadline.
+   `agent.move_status` and `agent.moves` include `cut_release` only when it
+   exists: `pending`, `released` with `outcome` and `reservationDropped`, or
+   `stopped` with `code`. Health reads atomic `cutReleasesPending`,
+   `cutReleasesReleased` and `cutReleasesStopped`; the latter two count
+   completions in the current process.
 
 Tests: `restarted_source_and_receiver_resume_at_every_recorded_step`,
 `source_retryable_refusals_cap_backoff_and_unknown_codes_abort_by_name`,

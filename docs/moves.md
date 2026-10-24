@@ -60,6 +60,16 @@ under the same `cut_id`. A move is finished on the source at `released` (or
 `agent.move_status {cut_id}` returns one move; there is no separate `ck`
 command for it.
 
+After activation, the receiving machine releases engram's sealed-cut storage
+reservation in the background. After cancellation, the machine that aborted
+the cut releases it instead. This cleanup never delays completion or your next
+move. The API replies include `cut_release` when cleanup exists: `pending`,
+`released` (with `reservationDropped`), or `stopped` (with its refusal code).
+`reservationDropped: false` is a successful release: another commit on the
+machine still lists the cut. Until engram enables trimming, cleanup may remain
+pending and retries every six hours. Ordinary temporary failures retry with
+backoff, and restarting entorhinal preserves pending cleanup.
+
 Verify the result: `ck agents where <agent> --refresh` names the target machine.
 
 Things a move can report:

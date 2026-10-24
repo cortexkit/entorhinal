@@ -1,7 +1,7 @@
 //! Entorhinal's cut operations on engram's `session-door` internal service.
 //!
-//! Calls seven move operations: seal, status, abort, handoff, read, takeover and
-//! accept. Replies include progress and failure detail for the move driver.
+//! Calls move operations including release of a finished cut's reservation.
+//! Replies include progress and failure detail for the move driver.
 //!
 //! The move driver owns call ordering and retries refusals. This client settles
 //! lost transport replies with status before repeating the identical request.
@@ -17,7 +17,7 @@ use subc_protocol::RouteTarget;
 use crate::log_client::{encode_hex, LogConnector, LogTransport, SubcConnector, TransportError};
 
 pub(crate) const SERVICE_ID: &str = "session-door";
-pub(crate) const OPS: [&str; 7] = [
+pub(crate) const OPS: [&str; 8] = [
     "cut.seal",
     "cut.status",
     "cut.read",
@@ -25,6 +25,7 @@ pub(crate) const OPS: [&str; 7] = [
     "cut.takeover",
     "cut.abort",
     "cut.accept",
+    "cut.release",
 ];
 pub(crate) const ITEM_CAP: usize = 1024;
 
@@ -91,6 +92,8 @@ pub(crate) enum Request {
     Abort(CutRequest),
     #[serde(rename = "cut.accept")]
     Accept(CutRequest),
+    #[serde(rename = "cut.release")]
+    Release(CutRequest),
 }
 
 impl Request {
@@ -103,6 +106,7 @@ impl Request {
             Self::Takeover(_) => OPS[4],
             Self::Abort(_) => OPS[5],
             Self::Accept(_) => OPS[6],
+            Self::Release(_) => OPS[7],
         }
     }
 
@@ -114,7 +118,8 @@ impl Request {
             | Self::Handoff(request)
             | Self::Takeover(request)
             | Self::Abort(request)
-            | Self::Accept(request) => &request.cut_id,
+            | Self::Accept(request)
+            | Self::Release(request) => &request.cut_id,
         }
     }
 }
@@ -204,6 +209,20 @@ pub(crate) struct TakeoverReply {
 pub(crate) struct AbortReply {
     pub(crate) handoff: HandoffState,
     pub(crate) state: SealState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ReleaseOutcome {
+    Published,
+    Aborted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct ReleaseReply {
+    pub(crate) outcome: ReleaseOutcome,
+    pub(crate) reservation_dropped: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -367,6 +386,11 @@ impl DoorClient {
     pub(crate) async fn accept(&self, cut: &CutRequest) -> Result<AcceptReply, DoorError> {
         self.call(Request::Accept(cut.clone())).await
     }
+    pub(crate) async fn release(&self, cut: &CutRequest) -> Result<ReleaseReply, DoorError> {
+        // Release is idempotent and status cannot recover its stored outcome.
+        // Leave retries to the durable releaser instead of probing cut.status.
+        self.once(&Request::Release(cut.clone())).await
+    }
 }
 
 fn map_transport(error: TransportError) -> DoorError {
@@ -490,8 +514,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn seven_ops_match_literal_handler_wire_fixtures() {
+    #[tokio::test(start_paused = true)]
+    async fn move_ops_match_literal_handler_wire_fixtures() {
         // Literal handler replies pin the wire independently of the in-tree fake,
         // so a matching serialization mistake in both implementations cannot pass.
         let stub = Stub::new(vec![
@@ -508,6 +532,7 @@ mod tests {
             reply(r#"{"result":{"takeover":"in_progress","sessionRef":null,"code":null}}"#),
             reply(r#"{"result":{"handoff":"aborted","state":"published"}}"#),
             reply(r#"{"result":{"lifted":["11111111111111111111111111111111"]}}"#),
+            reply(r#"{"result":{"outcome":"published","reservationDropped":false}}"#),
         ]);
         let client = stub.client();
         let sealed = client.seal(&seal()).await.unwrap();
@@ -535,6 +560,13 @@ mod tests {
             }
         );
         assert_eq!(client.accept(&cut()).await.unwrap().lifted, vec![REF]);
+        assert_eq!(
+            client.release(&cut()).await.unwrap(),
+            ReleaseReply {
+                outcome: ReleaseOutcome::Published,
+                reservation_dropped: false,
+            }
+        );
         let calls = stub.calls.lock().unwrap();
         assert_eq!(
             calls.iter().map(|call| call.0.as_str()).collect::<Vec<_>>(),

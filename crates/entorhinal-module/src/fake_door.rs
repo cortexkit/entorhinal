@@ -23,6 +23,7 @@ pub(crate) enum Effect {
     Seal(SealState, Option<Value>),
     Handoff(HandoffReply),
     Takeover(TakeoverProgress),
+    Release(bool),
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +52,7 @@ struct State {
     handed_off: BTreeMap<(String, String), String>,
     scripts: BTreeMap<(String, String), VecDeque<Effect>>,
     calls: Vec<DoorCall>,
+    releases: BTreeMap<(String, String), ReleaseReply>,
 }
 
 #[derive(Clone)]
@@ -104,6 +106,9 @@ impl FakeDoor {
 
     pub(crate) fn calls(&self) -> Vec<DoorCall> {
         self.state.lock().unwrap().calls.clone()
+    }
+    pub(crate) fn release_count(&self) -> usize {
+        self.state.lock().unwrap().releases.len()
     }
     pub(crate) fn session_calls(&self) -> Vec<(String, Value)> {
         self.state.lock().unwrap().session_calls.clone()
@@ -185,16 +190,17 @@ impl FakeDoor {
             }
             return Ok(serde_json::to_vec(&json!({"result":reply})).unwrap());
         }
+        let invalid_detail = (method == "cut.release").then(|| json!({"field":"cutId"}));
         let mut object = params
             .as_object()
             .cloned()
-            .ok_or_else(|| refuse("invalid_request", None))?;
+            .ok_or_else(|| refuse("invalid_request", invalid_detail.clone()))?;
         if object.contains_key("op") {
-            return Err(refuse("invalid_request", None));
+            return Err(refuse("invalid_request", invalid_detail.clone()));
         }
         object.insert("op".into(), Value::String(method.into()));
         let request: Request = serde_json::from_value(Value::Object(object))
-            .map_err(|_| refuse("invalid_request", None))?;
+            .map_err(|_| refuse("invalid_request", invalid_detail.clone()))?;
         validate(&request)?;
         let mut state = self.state.lock().unwrap();
         state.calls.push(DoorCall {
@@ -206,11 +212,21 @@ impl FakeDoor {
             .get_mut(&(self.author.clone(), method.into()))
             .and_then(VecDeque::pop_front);
         match &effect {
-            Some(Effect::Refuse(code)) => return Err(refuse(code, None)),
+            Some(Effect::Refuse(code)) => {
+                let code = release_code(method, code);
+                return Err(refuse(
+                    code,
+                    (code == "invalid_request")
+                        .then_some(invalid_detail)
+                        .flatten(),
+                ));
+            }
             Some(Effect::RefuseWithMessage(code, message)) => {
                 return Err(TransportError::Refusal {
-                    code: code.clone(),
-                    detail: None,
+                    code: release_code(method, code).into(),
+                    detail: (code == "invalid_request")
+                        .then_some(invalid_detail)
+                        .flatten(),
                     message: Some(message.clone()),
                 })
             }
@@ -352,9 +368,30 @@ fn valid_hex(value: &str, bytes: usize) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+fn release_code<'a>(method: &str, code: &'a str) -> &'a str {
+    if method == "cut.release"
+        && !matches!(
+            code,
+            "invalid_request"
+                | "caller_forbidden"
+                | "cut_release_unknown"
+                | "unavailable"
+                | "lease_not_active"
+                | "plane_version_unsupported"
+        )
+    {
+        "unavailable"
+    } else {
+        code
+    }
+}
+
 fn validate(request: &Request) -> Result<(), TransportError> {
     if !valid_cut_id(request.cut_id()) {
-        return Err(refuse("invalid_request", None));
+        return Err(refuse(
+            "invalid_request",
+            matches!(request, Request::Release(_)).then(|| json!({"field":"cutId"})),
+        ));
     }
     if let Request::Seal(seal) = request {
         // Stream labels identify modules, refs are 16-byte hex and digests are
@@ -466,6 +503,29 @@ fn execute(
     effect: Option<&Effect>,
 ) -> Result<Value, TransportError> {
     let cut_id = request.cut_id();
+    if let Request::Release(_) = request {
+        let key = (author.to_owned(), cut_id.to_owned());
+        if let Some(reply) = state.releases.get(&key) {
+            return Ok(json!(reply));
+        }
+        let cut = state
+            .cuts
+            .get(cut_id)
+            .ok_or_else(|| refuse("cut_release_unknown", None))?;
+        let outcome = if cut.aborted && cut.author == author {
+            ReleaseOutcome::Aborted
+        } else if cut.state == SealState::Published {
+            ReleaseOutcome::Published
+        } else {
+            return Err(refuse("cut_release_unknown", None));
+        };
+        let reply = ReleaseReply {
+            outcome,
+            reservation_dropped: !matches!(effect, Some(Effect::Release(false))),
+        };
+        state.releases.insert(key, reply.clone());
+        return Ok(json!(reply));
+    }
     if let Request::Seal(seal) = request {
         if let Some(cut) = state.cuts.get(cut_id) {
             // A matching seal replay reports its current state even if a stream
@@ -657,7 +717,7 @@ fn execute(
                 .collect();
             Ok(json!(AcceptReply { lifted }))
         }
-        Request::Seal(_) => unreachable!(),
+        Request::Seal(_) | Request::Release(_) => unreachable!(),
     }
 }
 
@@ -1196,5 +1256,70 @@ mod tests {
             .iter()
             .all(|call| call.author == "01010101010101010101010101010101"));
         assert_eq!(source.cut(ID).unwrap().state, SealState::Aborted);
+    }
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn cut_release_admits_only_entorhinal_and_enforces_closed_refusals() {
+        let door = FakeDoor::new([1; 16]);
+        let request = CutRequest {
+            cut_id: "11".repeat(16),
+        };
+        assert!(
+            matches!(door.handle("direct", "cut.release", json!(request)),
+            Err(TransportError::Refusal { code, .. }) if code == "caller_forbidden")
+        );
+        for params in [
+            json!({}),
+            json!({"cutId":"bad"}),
+            json!({"cutId":request.cut_id,"extra":true}),
+        ] {
+            assert!(
+                matches!(door.handle("reserved:entorhinal", "cut.release", params),
+                Err(TransportError::Refusal { code, detail:Some(detail), .. })
+                if code == "invalid_request" && detail["field"] == "cutId")
+            );
+        }
+        assert!(matches!(door.client().release(&request).await,
+            Err(DoorError::Refused { code, .. }) if code == "cut_release_unknown"));
+        for code in [
+            "unavailable",
+            "lease_not_active",
+            "plane_version_unsupported",
+            "future_code",
+        ] {
+            door.script("cut.release", Effect::Refuse(code.into()));
+            let expected = if code == "future_code" {
+                "unavailable"
+            } else {
+                code
+            };
+            assert!(matches!(door.client().release(&request).await,
+                Err(DoorError::Refused { code, .. }) if code == expected));
+        }
+        let item = CutItem {
+            session_ref: "22".repeat(16),
+            stream: "reserved:pi".into(),
+            end_offset: 42,
+            digest: "33".repeat(32),
+        };
+        door.set_stream(item.clone());
+        door.script("cut.seal", Effect::Seal(SealState::Published, None));
+        door.client()
+            .seal(&SealRequest {
+                cut_id: request.cut_id.clone(),
+                items: vec![item],
+            })
+            .await
+            .unwrap();
+        let receiver = door.for_author([2; 16]);
+        let first = receiver.client().release(&request).await.unwrap();
+        assert_eq!(first.outcome, ReleaseOutcome::Published);
+        assert_eq!(receiver.client().release(&request).await.unwrap(), first);
+        assert_eq!(door.release_count(), 1);
     }
 }

@@ -11250,3 +11250,81 @@ package = "entorhinal-core"
 target = "--lib"
 select = "expected"
 expect_red = ["agent::fleet::tests::fleet_pins_one_row_first_root_placement_only_workspace_and_omitted_optionals"]
+
+[[control]]
+id = "cut-release-exactly-once"
+guards = "Completed cut reservations are not released again by the receiver"
+file = "crates/entorhinal-module/src/cut_release.rs"
+old = 'if release["state"] != "pending"'
+new = 'if release["state"] != "pending" && release["state"] != "released" /* NON-VACUITY BREAK */'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/cut_releases.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::cut_releases::published_receiver_releases_once_and_status_is_optional"]
+only = false
+
+[[control]]
+id = "cut-release-crash-durability"
+guards = "Activation commits its pending release before a crash can lose it"
+file = "crates/entorhinal-core/src/move_store.rs"
+old = '''            next.cut_accept =
+                Some(serde_json::json!({"state":"pending","attempts":0,"retry_at_ms":0}));
+            next.plan["_cut_release"] =
+                serde_json::json!({"state":"pending","attempts":0,"retry_at_ms":0});'''
+new = '''            next.cut_accept =
+                Some(serde_json::json!({"state":"pending","attempts":0,"retry_at_ms":0}));
+            // NON-VACUITY BREAK: omit the durable release checkpoint.'''
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/cut_releases.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::cut_releases::activation_release_survives_crash_and_stale_checkpoints"]
+only = false
+
+[[control]]
+id = "cut-release-stop-vs-retry"
+guards = "Every stop refusal is terminal rather than silently retried"
+file = "crates/entorhinal-module/src/cut_release.rs"
+old = '''                if matches!(
+                    code.as_str(),'''
+new = '''                if false /* NON-VACUITY BREAK */ && matches!(
+                    code.as_str(),'''
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/cut_releases.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::cut_releases::release_stop_codes_are_terminal"]
+only = false
+
+[[control]]
+id = "cut-release-plane-slow-retry"
+guards = "Unsupported trimming planes wait six hours before retrying even after restart"
+file = "crates/entorhinal-module/src/cut_release.rs"
+old = 'const SLOW_RETRY: Duration = Duration::from_secs(6 * 60 * 60);'
+new = 'const SLOW_RETRY: Duration = Duration::from_secs(60); // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/cut_releases.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::cut_releases::release_unsupported_plane_waits_six_hours_across_restart"]
+only = false
+
+[[control]]
+id = "cut-release-no-move-blocking"
+guards = "A pending cut release cannot prevent admission of the next move"
+file = "crates/entorhinal-core/src/move_store.rs"
+old = 'if row.plan["pin_digest"].as_str() != digest.as_deref() {'
+new = '''if row.plan["pin_digest"].as_str() != digest.as_deref()
+                    || tx.query_row("SELECT EXISTS(SELECT 1 FROM agent_move WHERE json_extract(plan, '$._cut_release.state') = 'pending')", [], |r| r.get::<_, bool>(0))? { // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/cut_releases.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::cut_releases::held_release_does_not_hold_move_or_next_move"]
+only = false

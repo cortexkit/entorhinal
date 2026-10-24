@@ -561,6 +561,10 @@ impl Receiver {
             return Ok(None);
         }
         let mut plan_value = row.plan.clone();
+        // Release metadata is local bookkeeping, never part of the shared plan.
+        if let Some(plan) = plan_value.as_object_mut() {
+            plan.remove("_cut_release");
+        }
         let progress_value = plan_value
             .as_object_mut()
             .and_then(|v| v.remove("_receiver"));
@@ -2065,6 +2069,7 @@ mod tests {
         fn plan(&self) -> MoveRecord {
             let mut v = self.row().plan;
             v.as_object_mut().unwrap().remove("_receiver");
+            v.as_object_mut().unwrap().remove("_cut_release");
             serde_json::from_value(v).unwrap()
         }
         fn put_move(&self, record: &MoveRecord, author: &str, version: u64) {
