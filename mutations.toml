@@ -9895,11 +9895,27 @@ select = "expected"
 expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_stalled_network_does_not_block_status_or_abort_and_has_deadline"]
 
 [[control]]
+id = "catalog-move-abort-during-network"
+guards = "Abort can write an aborted checkpoint while import is still awaiting registry I/O"
+file = "crates/entorhinal-module/src/catalog_move.rs"
+old = '''"agent_data.import" => {
+                let checked = self.local_preflight(agent, expected).await?;'''
+new = '''"agent_data.import" => {
+                let _network_guard = self.lock.lock().await; // NON-VACUITY BREAK
+                let checked = self.local_preflight(agent, expected).await?;'''
+test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/catalog_moves.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["two_machine_acceptance::moves::catalog_moves::catalog_move_stalled_network_does_not_block_status_or_abort_and_has_deadline"]
+
+[[control]]
 id = "catalog-move-request-deadline"
 guards = "The total participant deadline bounds even a still-pending registry request"
 file = "crates/entorhinal-module/src/catalog_move.rs"
 old = 'tokio::time::timeout(self.request_timeout, self.execute_inner(method, params))'
-new = 'tokio::time::timeout(Duration::from_secs(300), self.execute_inner(method, params)) // NON-VACUITY BREAK'
+new = 'tokio::time::timeout(self.request_timeout + Duration::from_secs(300), self.execute_inner(method, params)) // NON-VACUITY BREAK'
 test_file = "crates/entorhinal-module/src/two_machine_acceptance/moves/catalog_moves.rs"
 runner = "cargo"
 package = "entorhinal-module"

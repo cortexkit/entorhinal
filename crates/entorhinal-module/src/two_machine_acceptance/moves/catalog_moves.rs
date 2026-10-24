@@ -103,6 +103,13 @@ fn serve_move_status_at(
     }
 }
 async fn move_registry(node: &mut MoveMachine, pin: &CatalogPin) -> Arc<FakeRegistry> {
+    move_registry_with_limits(node, pin, Limits::MODULE).await
+}
+async fn move_registry_with_limits(
+    node: &mut MoveMachine,
+    pin: &CatalogPin,
+    limits: Limits,
+) -> Arc<FakeRegistry> {
     let registry = Arc::new(FakeRegistry::start().await);
     let scope = pin.name.split('/').next().unwrap().to_owned();
     if node
@@ -131,7 +138,7 @@ async fn move_registry(node: &mut MoveMachine, pin: &CatalogPin) -> Arc<FakeRegi
         CatalogTrust::with_client(
             store,
             scope,
-            RegistryClient::loopback(&held.url, std::slice::from_ref(&held.url), Limits::MODULE),
+            RegistryClient::loopback(&held.url, std::slice::from_ref(&held.url), limits),
         )
     });
     registry
@@ -1137,8 +1144,19 @@ async fn catalog_move_root_certificate_must_cover_publication_time() {
 
 #[tokio::test(start_paused = true)]
 async fn catalog_move_stalled_network_does_not_block_status_or_abort_and_has_deadline() {
+    let request_deadline = std::time::Duration::from_secs(3600);
     let (mut pair, pin, _, _) = catalog_pair(true, true, false).await;
-    let registry = move_registry(&mut pair.b, &pin).await;
+    // Long participant and registry deadlines keep import stalled while status
+    // and abort run; the 60-second timeouts only guard against a hung test.
+    let registry = move_registry_with_limits(
+        &mut pair.b,
+        &pin,
+        Limits {
+            json_timeout: request_deadline * 2,
+            ..Limits::MODULE
+        },
+    )
+    .await;
     let cut = pair.published("stalled-import").await;
     pair.b.pickup().await;
     tokio::time::resume();
@@ -1157,18 +1175,33 @@ async fn catalog_move_stalled_network_does_not_block_status_or_abort_and_has_dea
         .machine
         .handler
         .catalog_move_context()
-        .with_test_timeout(std::time::Duration::from_millis(500));
+        .with_test_timeout(request_deadline);
     let request = json!({"refs":[{"ref_kind":"package-closure","ref":AGENT}],"cutId":cut});
     let import = context.execute("agent_data.import", request.clone());
     tokio::pin!(import);
-    tokio::select! { result = &mut import => panic!("import did not stall: {result:?}"), _ = entered.notified() => {} }
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        tokio::select! { result = &mut import => panic!("import did not stall: {result:?}"), _ = entered.notified() => {} }
+    })
+    .await
+    .expect("import never reached the stalled registry");
     for op in ["agent_data.status", "agent_data.abort"] {
         let reply = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(60),
             context.execute(op, request.clone()),
         )
-        .await;
-        assert!(reply.unwrap().is_ok(), "{op} queued behind network I/O");
+        .await
+        .expect("participant operation hung behind stalled network I/O");
+        assert!(
+            reply.is_ok(),
+            "{op} failed during stalled import: {reply:?}"
+        );
+        // Poll the import first: a successful operation is only independent of
+        // network I/O if the import has not already completed on its own.
+        tokio::select! {
+            biased;
+            result = &mut import => panic!("import completed before {op} returned: {result:?}"),
+            _ = std::future::ready(()) => {}
+        }
     }
     assert_eq!(
         context
@@ -1177,7 +1210,15 @@ async fn catalog_move_stalled_network_does_not_block_status_or_abort_and_has_dea
             .unwrap()["step"],
         "aborted"
     );
-    let error = import.await.unwrap_err();
+    // Keep the stub blocked and trip only the participant deadline. Advancing
+    // virtual time also makes a missing deadline fail without a real-clock wait.
+    tokio::time::pause();
+    tokio::time::advance(request_deadline).await;
+    let error = tokio::select! {
+        biased;
+        result = &mut import => result.unwrap_err(),
+        _ = std::future::ready(()) => panic!("import still pending after its request deadline")
+    };
     assert_eq!(error.code, "unavailable");
     assert!(error.message.contains("request deadline"));
     assert!(pair
