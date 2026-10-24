@@ -179,7 +179,7 @@ fn reproduce_readme() {
     let readme = fs::read(dir().join("README.md")).unwrap();
     assert_eq!(
         c::sha256_hex(&readme),
-        "132414d99c639927ece46fe5b204c84c9a0d2cb150bdce38e7899d13baeefef5"
+        "ca51d5776923aa34276b94b85211b8c32ff312fe928c0a9accf495ba0e4f475d"
     );
     let text = String::from_utf8(readme).unwrap();
     let mut checked = 0;
@@ -203,22 +203,24 @@ fn reproduce_source() {
     let bytes = fs::read(dir().join("SOURCE.txt")).unwrap();
     assert_eq!(
         c::sha256_hex(&bytes),
-        "a67e6a0539bacee290d536b5d52dd72f5e40ba012b3fc8fc3a72fe8dab6fac1d"
+        "39c38011de092051e655436e34f366ad866ee21e5f3bf331271eeeb22392cf74"
     );
-    assert!(String::from_utf8(bytes).unwrap().contains("610329529"));
+    assert!(String::from_utf8(bytes)
+        .unwrap()
+        .contains("42205d52b7d58018437132e50aa001995f207947"));
 }
 #[test]
 fn reproduce_generator() {
     assert_eq!(
         c::sha256_hex(fs::read(dir().join("generate.ts")).unwrap()),
-        "0b796b2f48289e6b3842eafead93579e19bc82e8dc62e76d61644c017154c652"
+        "f5aebbd7a714a26b975412f274370dcba7d434d99a554df83714d225ad937c45"
     );
 }
 #[test]
 fn reproduce_generator_test() {
     assert_eq!(
         c::sha256_hex(fs::read(dir().join("generate.test.ts")).unwrap()),
-        "78ebd3a78d4a37eae8f7c28a8a337b9d8c71c36e656e6ed3f7c4495c5e0d3d9f"
+        "bda06a92a44f10b9924b90a309291352c4f956e097e9c1e15e4a92f99b96d12b"
     );
 }
 #[test]

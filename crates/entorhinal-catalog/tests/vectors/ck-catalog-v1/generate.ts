@@ -222,6 +222,7 @@ export const DOMAIN_REGISTRY_KEY = "ck-registry-key/v1"
 export const DOMAIN_KEY_ROTATION = "ck-key-rotation/v1"
 export const DOMAIN_KEY_CERT = "ck-key-cert/v1"
 export const DOMAIN_STATUS_REQUEST = "ck-status-request/v1"
+export const DOMAIN_STARTER_BUNDLE = "ck-starter-bundle/v1"
 
 export function signingInput(domain: string, canonical: string): Buffer {
   return Buffer.concat([Buffer.from(domain, "ascii"), Buffer.from([0]), Buffer.from(canonical, "utf8")])
@@ -619,7 +620,7 @@ function textField(header: Buffer, start: number, length: number): string {
 // The strict reader every party runs before trusting an archive. It walks
 // the archive once, header by header, and refuses at the first rule that
 // fails, so every implementation reports the same rule at the same offset.
-export function readArchive(archive: Buffer): ArchiveResult {
+export function readArchive(archive: Buffer, requiredMember: string | null = "ck.json"): ArchiveResult {
   const fail = (rule: ArchiveRule, extra: { offset?: number; member?: string; typeflag?: string } = {}): ArchiveResult => ({ ok: false, code: "archive_invalid", rule, ...extra })
   const members = new Map<string, Buffer>()
   const byLowerCase = new Map<string, string>()
@@ -654,7 +655,7 @@ export function readArchive(archive: Buffer): ArchiveResult {
     members.set(path, archive.subarray(at + 512, at + 512 + size))
     at += 512 + Math.ceil(size / 512) * 512
   }
-  if (!members.has("ck.json")) return fail("ck_json_missing")
+  if (requiredMember !== null && !members.has(requiredMember)) return fail("ck_json_missing")
   return { ok: true, members }
 }
 
@@ -1510,7 +1511,7 @@ function currentKeyCheck(keys: ScopeKey[], publicKey: string): StatementResult |
 // the newest key the client already holds for that registry. The client's
 // key set starts from the key pinned with the allowlist entry and
 // grows only along this chain; old keys are kept for records already held.
-// Only that first key needs the user's Touch ID approval; chain successors
+// Only that first key needs the user's approval on their device; chain successors
 // are pinned without it.
 export interface RegistryPin {
   registry: string
@@ -2053,6 +2054,438 @@ function archiveVectors() {
       expect: c.expect,
     })),
     path_cases: pathOut,
+  }
+}
+
+// ───────────────────────────── starter bundle ─────────────────────────────
+
+function starterBundleVectors() {
+  const created = "2026-11-01T00:00:00Z"
+  const persona = makePackage(
+    "starter-persona",
+    {
+      schema: "ck-package/v1",
+      name: "@cortexkit/starter-persona",
+      version: "1.0.0",
+      kind: "persona",
+      summary: "A minimal first-party starter persona",
+      license: "MIT",
+      source: "https://example.invalid/starter-persona",
+      requires: { capabilities: [], packages: {} },
+      body: {
+        prompt: "PERSONA.md",
+        implements: [],
+        delegates_to: {},
+        capabilities: { required: [], optional: [] },
+        skills: [],
+        flows: [],
+      },
+    },
+    [{ path: "PERSONA.md", content: "# Starter persona\n\nA minimal test-vector persona.\n" }],
+  )
+  const skill = makePackage(
+    "starter-skill",
+    {
+      schema: "ck-package/v1",
+      name: "@cortexkit/starter-skill",
+      version: "1.0.0",
+      kind: "skill",
+      summary: "A minimal first-party starter skill",
+      license: "MIT",
+      source: "https://example.invalid/starter-skill",
+      requires: { capabilities: [], packages: {} },
+      body: { entry: "SKILL.md", audience: "user", scripts: [] },
+    },
+    [{ path: "SKILL.md", content: "# Starter skill\n\nA minimal test-vector skill.\n" }],
+  )
+  const publisher = TEST_CORTEXKIT_KEY_1
+  const root = TEST_ROOT_KEY
+  const registry = TEST_REGISTRY_KEY_1
+  const packages = [persona, skill]
+  const certificate = {
+    schema: DOMAIN_KEY_CERT,
+    scope: "cortexkit",
+    public_key: publisher.publicKeyHex,
+    valid_from: "2026-10-01T00:00:00Z",
+    valid_until: "2027-04-01T00:00:00Z",
+  }
+  const certificateSignature = signCanonical(certificate, root, DOMAIN_KEY_CERT)
+  const signedCertificate = { statement: certificate, signature: certificateSignature.signature }
+  const certificateText = jcs(signedCertificate)
+
+  const packageVectors = packages.map((pkg) => {
+    const record = recordFor(pkg, publisher)
+    const recordSigned = signCanonical(record, publisher, DOMAIN_RECORD)
+    const status = {
+      ...statusRecord(pkg, { sequence: 1, state: "available", reason: null, published_at: created, changed_at: created }),
+      publisher_key: publisher.fingerprint,
+    }
+    const statusSigned = signCanonical(status, registry, DOMAIN_STATUS)
+    const recordEnvelope = { record, signature: recordSigned.signature }
+    const statusEnvelope = { record: status, signature: statusSigned.signature }
+    const recordFile = { record: recordEnvelope, status: statusEnvelope }
+    const packageName = pkg.manifest.name!.toString().split("/")[1]
+    const recordPath = `records/cortexkit/${packageName}/${pkg.manifest.version}.json`
+    const archivePath = `archives/${sha256Hex(pkg.archive)}.tar`
+    return {
+      pkg,
+      recordPath,
+      archivePath,
+      record,
+      recordCanonical: recordSigned.canonical,
+      recordSignature: recordSigned.signature,
+      recordSigningInputHex: signingInput(DOMAIN_RECORD, recordSigned.canonical).toString("hex"),
+      status,
+      statusCanonical: statusSigned.canonical,
+      statusSignature: statusSigned.signature,
+      statusSigningInputHex: signingInput(DOMAIN_STATUS, statusSigned.canonical).toString("hex"),
+      recordFile,
+      recordFileText: jcs(recordFile),
+    }
+  })
+
+  const bundleDocument = {
+    schema: DOMAIN_STARTER_BUNDLE,
+    created,
+    records: packageVectors.map((v) => ({
+      name: v.pkg.manifest.name,
+      version: v.pkg.manifest.version,
+      archive_sha256: sha256Hex(v.pkg.archive),
+      record_member_sha256: sha256Hex(v.recordFileText),
+      record: v.recordPath,
+      archive: v.archivePath,
+    })),
+  }
+  const bundleCanonical = jcs(bundleDocument)
+  const bundleSigningInput = signingInput(DOMAIN_STARTER_BUNDLE, bundleCanonical)
+  const bundleSignature = signHex(publisher, bundleSigningInput)
+  const entries: TarEntry[] = [
+    tarEntry("bundle.json", bundleCanonical),
+    tarEntry("bundle.cert.json", certificateText),
+    ...packageVectors.map((v) => tarEntry(v.recordPath, v.recordFileText)),
+    ...packageVectors.map((v) => tarEntry(v.archivePath, v.pkg.archive)),
+    tarEntry("bundle.sig", bundleSignature),
+  ]
+  const archiveFor = (items: TarEntry[]) => writeTar(items)
+  const validArchive = archiveFor(entries)
+  const packageByName = new Map(packageVectors.map((v) => [v.pkg.manifest.name as string, v.pkg]))
+  const registryKeys = { [TEST_REGISTRY_KEY_ID]: registry.publicKeyHex }
+
+  type BundleArchiveRule = ArchiveRule | "member_unlisted"
+  type BundleResult = { ok: true } | { ok: false; code?: string; field?: string; rule?: BundleArchiveRule; offset?: number; member?: string; typeflag?: string }
+  const refused = (code: string, extra: { field?: string; rule?: BundleArchiveRule; offset?: number; member?: string; typeflag?: string } = {}): BundleResult => ({ ok: false, code, ...extra })
+  const offsetOfMember = (bytes: Buffer, target: string): number | null => {
+    let at = 0
+    while (at + 512 <= bytes.length) {
+      const header = bytes.subarray(at, at + 512)
+      if (header.every((byte) => byte === 0)) return null
+      const size = octalField(header.subarray(124, 136))
+      if (size === null) return null
+      const name = textField(header, 0, 100)
+      const prefix = textField(header, 345, 155)
+      if ((prefix ? `${prefix}/${name}` : name) === target) return at
+      at += 512 + Math.ceil(size / 512) * 512
+    }
+    return null
+  }
+  const verifyBundle = (bytes: Buffer): BundleResult => {
+    const read = readArchive(bytes, null)
+    if (!read.ok) return read
+    const members = read.members
+    if (!members.has("bundle.json")) return { ok: false }
+    let parsed: unknown
+    try {
+      parsed = parseStrictJson(members.get("bundle.json")!.toString("utf8"))
+    } catch {
+      return { ok: false }
+    }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return { ok: false }
+    const bundle = parsed as { schema?: unknown; created?: unknown; records?: unknown }
+    if (bundle.schema !== DOMAIN_STARTER_BUNDLE || typeof bundle.created !== "string" || !Array.isArray(bundle.records)) return { ok: false }
+
+    const certBytes = members.get("bundle.cert.json")
+    if (!certBytes) return refused("key_unknown")
+    let certEnvelope: unknown
+    try {
+      certEnvelope = parseStrictJson(certBytes.toString("utf8"))
+    } catch {
+      return { ok: false }
+    }
+    if (typeof certEnvelope !== "object" || certEnvelope === null || Array.isArray(certEnvelope)) return { ok: false }
+    const cert = certEnvelope as { statement?: Record<string, unknown>; signature?: string }
+    if (!cert.statement || typeof cert.signature !== "string") return { ok: false }
+    const certResult = verifyKeyCert(jcs(cert.statement), cert.signature, root.publicKeyHex)
+    if (!certResult.ok) return refused(certResult.code, "field" in certResult ? { field: certResult.field } : {})
+    if (!windowCovers(cert.statement as { valid_from: string; valid_until: string | null }, bundle.created)) return refused("key_not_valid")
+
+    const signature = members.get("bundle.sig")?.toString("ascii")
+    if (!signature || !verifyHex(cert.statement.public_key as string, signingInput(DOMAIN_STARTER_BUNDLE, jcs(bundle)), signature)) {
+      return refused("signature_invalid")
+    }
+
+    const expectedMembers = new Set(["bundle.json", "bundle.cert.json", "bundle.sig"])
+    for (const item of bundle.records) {
+      if (typeof item !== "object" || item === null || Array.isArray(item)) return { ok: false }
+      const row = item as { name?: unknown; version?: unknown; archive_sha256?: unknown; record_member_sha256?: unknown; record?: unknown; archive?: unknown }
+      if (typeof row.name !== "string" || typeof row.version !== "string" || typeof row.archive_sha256 !== "string" || typeof row.record_member_sha256 !== "string" || typeof row.record !== "string" || typeof row.archive !== "string") return { ok: false }
+      expectedMembers.add(row.record)
+      expectedMembers.add(row.archive)
+      const nameParts = row.name.slice(1).split("/")
+      const expectedRecordPath = `records/${nameParts[0]}/${nameParts[1]}/${row.version}.json`
+      if (row.record !== expectedRecordPath) return { ok: false }
+      const recordBytes = members.get(row.record)
+      if (!recordBytes) return refused("record_invalid", { field: "record" })
+      if (sha256Hex(recordBytes) !== row.record_member_sha256) {
+        return refused("record_mismatch", { field: "record_member_sha256", member: row.record })
+      }
+      const componentArchive = members.get(row.archive)
+      if (!componentArchive || sha256Hex(componentArchive) !== row.archive_sha256 || row.archive !== `archives/${row.archive_sha256}.tar`) {
+        return refused("record_mismatch", { field: "archive_sha256" })
+      }
+      const sourcePackage = packageByName.get(row.name)
+      if (!sourcePackage || sourcePackage.manifest.version !== row.version) return { ok: false }
+      const recordText = recordBytes.toString("utf8")
+      let recordFile: unknown
+      try {
+        recordFile = parseStrictJson(recordText)
+      } catch {
+        return refused("record_invalid", { field: "json" })
+      }
+      if (typeof recordFile !== "object" || recordFile === null || Array.isArray(recordFile)) return refused("record_invalid", { field: "json" })
+      const document = recordFile as { record?: { record?: Record<string, unknown>; signature?: string }; status?: { record?: Record<string, unknown>; signature?: string } }
+      if (!document.record?.record || typeof document.record.signature !== "string") return refused("record_invalid", { field: "record" })
+      if (!document.status?.record || typeof document.status.signature !== "string") return refused("status_invalid", { field: "status" })
+
+      const recordResult = verifyRecord(
+        jcs(document.record.record),
+        document.record.signature,
+        { ...sourcePackage, archive: componentArchive },
+        [keyFingerprint(cert.statement.public_key as string)],
+      )
+      if (!recordResult.ok) return refused(recordResult.code, "field" in recordResult ? { field: recordResult.field } : {})
+      const statusResult = applyStatus(
+        null,
+        jcs(document.status.record),
+        document.status.signature,
+        registryKeys,
+        { name: row.name, version: row.version, archive_sha256: row.archive_sha256 },
+      )
+      if (!statusResult.ok) return refused(statusResult.code, "field" in statusResult ? { field: statusResult.field } : {})
+      if (document.status.record.publisher_key !== keyFingerprint(document.record.record.public_key as string)) return refused("record_mismatch", { field: "publisher_key" })
+    }
+    for (const path of members.keys()) {
+      if (expectedMembers.has(path)) continue
+      const offset = offsetOfMember(bytes, path)
+      if (offset === null) return { ok: false }
+      return refused("archive_invalid", { rule: "member_unlisted", offset, member: path })
+    }
+    return { ok: true }
+  }
+
+  type BundleCase = { name: string; note: string; archive: Buffer; expect: BundleResult }
+  const replaceEntry = (path: string, data: string | Buffer, extra: Partial<HeaderSpec> = {}) =>
+    entries.map((entry) => (entry.header.path === path ? tarEntry(path, data, extra) : entry))
+  const corruptComponentArchive = Buffer.from(packageVectors[0].pkg.archive)
+  corruptComponentArchive[512 + 1] ^= 0x01
+  const firstRecord = packageVectors[0]
+  const changedStatusRecord = {
+    ...firstRecord.recordFile,
+    status: {
+      ...firstRecord.recordFile.status,
+      record: {
+        ...firstRecord.recordFile.status.record,
+        sequence: firstRecord.recordFile.status.record.sequence + 1,
+      },
+    },
+  }
+  const missingStatus = { ...firstRecord.recordFile } as Record<string, unknown>
+  delete missingStatus.status
+  const missingStatusText = jcs(missingStatus)
+  const missingStatusBundle = {
+    ...bundleDocument,
+    records: bundleDocument.records.map((row) => row.record === firstRecord.recordPath
+      ? { ...row, record_member_sha256: sha256Hex(missingStatusText) }
+      : row),
+  }
+  const missingStatusBundleCanonical = jcs(missingStatusBundle)
+  const missingStatusBundleSignature = signHex(publisher, signingInput(DOMAIN_STARTER_BUNDLE, missingStatusBundleCanonical))
+  const missingStatusEntries = entries.map((entry) => {
+    if (entry.header.path === firstRecord.recordPath) return tarEntry(firstRecord.recordPath, missingStatusText)
+    if (entry.header.path === "bundle.json") return tarEntry("bundle.json", missingStatusBundleCanonical)
+    if (entry.header.path === "bundle.sig") return tarEntry("bundle.sig", missingStatusBundleSignature)
+    return entry
+  })
+  const unrootedCert = {
+    schema: DOMAIN_KEY_CERT,
+    scope: "cortexkit",
+    public_key: TEST_CORTEXKIT_KEY_2.publicKeyHex,
+    valid_from: "2026-10-01T00:00:00Z",
+    valid_until: null,
+  }
+  const unrootedCertSignature = signCanonical(unrootedCert, publisher, DOMAIN_KEY_CERT).signature
+  const unrootedBundleSignature = signHex(TEST_CORTEXKIT_KEY_2, bundleSigningInput)
+  const firstHeader = entries[0]
+  const pathEscapeEntry = tarEntry("../outside.txt", "outside\n")
+  const cases: BundleCase[] = [
+    {
+      name: "bad_bundle_signature",
+      note: "the first signature byte is flipped; bundle.json and the root-certified signer are unchanged",
+      archive: archiveFor(replaceEntry("bundle.sig", flipFirstBit(bundleSignature))),
+      expect: refused("signature_invalid"),
+    },
+    {
+      name: "bundle_key_not_root_certified",
+      note: "the bundle signer is publisher key 2, but its certificate was signed by publish key 1 instead of the root",
+      archive: archiveFor(replaceEntry("bundle.cert.json", jcs({ statement: unrootedCert, signature: unrootedCertSignature })).map((entry) => (entry.header.path === "bundle.sig" ? tarEntry("bundle.sig", unrootedBundleSignature) : entry))),
+      expect: refused("signature_invalid"),
+    },
+    {
+      name: "archive_sha256_mismatch",
+      note: "one byte of the first component archive changes while bundle.json retains its original digest",
+      archive: archiveFor(replaceEntry(firstRecord.archivePath, corruptComponentArchive)),
+      expect: refused("record_mismatch", { field: "archive_sha256" }),
+    },
+    {
+      name: "record_member_bytes_changed",
+      note: "the first record member's status sequence changes while bundle.json and bundle.sig remain unchanged",
+      archive: archiveFor(replaceEntry(firstRecord.recordPath, jcs(changedStatusRecord))),
+      expect: refused("record_mismatch", { field: "record_member_sha256", member: firstRecord.recordPath }),
+    },
+    {
+      name: "record_missing_status",
+      note: "the first signed record file omits its latest status envelope",
+      archive: archiveFor(missingStatusEntries),
+      expect: refused("status_invalid", { field: "status" }),
+    },
+    {
+      name: "non_ustar_entry",
+      note: "bundle.json has a non-POSIX ustar magic while its header checksum remains valid",
+      archive: archiveFor(replaceEntry("bundle.json", firstHeader.data, { magic: "ustar " })),
+      expect: refused("archive_invalid", { rule: "magic", offset: 0 }),
+    },
+    {
+      name: "path_escaping_entry",
+      note: "a regular-file member uses a parent-directory path",
+      archive: archiveFor([...entries, pathEscapeEntry]),
+      expect: refused("archive_invalid", { rule: "path_invalid", offset: validArchive.length - 1024, member: "../outside.txt" }),
+    },
+    {
+      name: "extra_unlisted_file",
+      note: "a regular file is added without a reference from bundle.json",
+      archive: archiveFor([...entries, tarEntry("unlisted.txt", "not listed\n")]),
+      expect: { ok: false, code: "archive_invalid", rule: "member_unlisted", offset: validArchive.length - 1024, member: "unlisted.txt" },
+    },
+  ]
+  for (const c of cases) expectSame(`starter bundle case ${c.name}`, verifyBundle(c.archive), c.expect)
+  expectSame("starter bundle valid", verifyBundle(validArchive), { ok: true })
+
+  const validRead = readArchive(validArchive, null)
+  if (!validRead.ok || !validRead.members.has("bundle.json")) throw new Error("starter bundle: valid archive refused")
+
+  const invalidPersonaManifest = {
+    ...persona.manifest,
+    body: { ...(persona.manifest.body as Record<string, unknown>), memory_scope: "project" },
+  }
+  const personaBodyFields = new Set([
+    "prompt",
+    "extends",
+    "implements",
+    "delegates_to",
+    "capabilities",
+    "routing",
+    "activation",
+    "skills",
+    "flows",
+    "memory_profile",
+  ])
+  const validateClosedPersonaBody = (body: unknown) => {
+    if (typeof body !== "object" || body === null || Array.isArray(body)) return refused("manifest_invalid")
+    return Object.keys(body).some((field) => !personaBodyFields.has(field)) ? refused("manifest_invalid") : { ok: true as const }
+  }
+  expectSame("valid starter persona body", validateClosedPersonaBody(persona.manifest.body), { ok: true })
+  const invalidPersonaManifestResult = validateClosedPersonaBody(invalidPersonaManifest.body)
+  expectSame("persona body carrying removed memory_scope", invalidPersonaManifestResult, refused("manifest_invalid"))
+  const invalidPersonaManifestText = `${JSON.stringify(invalidPersonaManifest, null, 2)}\n`
+
+  return {
+    schema: "ck-catalog-v1/starter-bundle",
+    domain: DOMAIN_STARTER_BUNDLE,
+    format: {
+      bundle_json: "JCS {schema, created, records: [{name, version, archive_sha256, record_member_sha256, record, archive}]} where record_member_sha256 hashes the exact record member bytes and record/archive are member paths",
+      record_member: "JCS {record: {record, signature}, status: {record, signature}}",
+      certificate_member: "bundle.cert.json is JCS {statement, signature} for ck-key-cert/v1, signed by the TEST-ONLY root",
+      signature_member: "bundle.sig is 128 lowercase hexadecimal ASCII bytes",
+      archive: "one strict ustar archive; component archives remain their own raw strict ustar bytes",
+    },
+    signing: {
+      algorithm: "Ed25519 (RFC 8032, pure, deterministic)",
+      signing_input: "ASCII(ck-starter-bundle/v1) || 0x00 || UTF-8(JCS(bundle.json))",
+      signing_input_hex: bundleSigningInput.toString("hex"),
+      canonical_bundle_json: bundleCanonical,
+      signature: bundleSignature,
+    },
+    keys: {
+      WARNING: "TEST-ONLY keys derived from published fixed seed text; never trust them outside these vectors.",
+      root: keyOut(root),
+      publish: keyOut(publisher),
+      registry_status: keyOut(registry),
+    },
+    valid: {
+      created,
+      bundle_json: bundleDocument,
+      bundle_json_jcs: bundleCanonical,
+      bundle_signature: bundleSignature,
+      bundle_signing_input_hex: bundleSigningInput.toString("hex"),
+      bundle_archive_base64: validArchive.toString("base64"),
+      bundle_archive_sha256: sha256Hex(validArchive),
+      bundle_archive_bytes: validArchive.length,
+      members: [...validRead.members].map(([path, bytes]) => ({ path, sha256: sha256Hex(bytes), bytes: bytes.length })),
+      certificate: {
+        statement: certificate,
+        canonical: certificateSignature.canonical,
+        signing_input_hex: signingInput(DOMAIN_KEY_CERT, certificateSignature.canonical).toString("hex"),
+        signature: certificateSignature.signature,
+      },
+      packages: packageVectors.map((v) => ({
+        name: v.pkg.manifest.name,
+        version: v.pkg.manifest.version,
+        kind: v.pkg.manifest.kind,
+        record_path: v.recordPath,
+        record_file: v.recordFile,
+        archive_path: v.archivePath,
+        archive_base64: v.pkg.archive.toString("base64"),
+        archive_sha256: sha256Hex(v.pkg.archive),
+        archive_bytes: v.pkg.archive.length,
+        record: {
+          value: v.record,
+          canonical: v.recordCanonical,
+          signing_input_hex: v.recordSigningInputHex,
+          signature: v.recordSignature,
+        },
+        status: {
+          value: v.status,
+          canonical: v.statusCanonical,
+          signing_input_hex: v.statusSigningInputHex,
+          signature: v.statusSignature,
+        },
+      })),
+    },
+    cases: cases.map((c) => ({
+      name: c.name,
+      note: c.note,
+      bundle_archive_base64: c.archive.toString("base64"),
+      bundle_archive_sha256: sha256Hex(c.archive),
+      bundle_archive_bytes: c.archive.length,
+      expect: c.expect,
+    })),
+    persona_manifest_cases: [
+      {
+        name: "persona_body_memory_scope",
+        note: "Persona bodies are closed, so memory authorization is not declared by the package.",
+        manifest_text: invalidPersonaManifestText,
+        expect: invalidPersonaManifestResult,
+      },
+    ],
   }
 }
 
@@ -2871,7 +3304,7 @@ function resolverVectors() {
 
 // ───────────────────────────── files ─────────────────────────────
 
-export const JSON_FILES = ["names.json", "record.json", "archive.json", "status.json", "statements.json", "resolver.json"] as const
+export const JSON_FILES = ["names.json", "record.json", "archive.json", "status.json", "statements.json", "resolver.json", "starter-bundle.json"] as const
 const README = "README.md"
 const SUMS_BEGIN = "<!-- sha256:begin (generated by generate.ts) -->"
 const SUMS_END = "<!-- sha256:end -->"
@@ -2890,6 +3323,7 @@ export function generateFiles(readmeText: string): Record<string, string> {
     "status.json": asJson(statusVectors()),
     "statements.json": asJson(statementsVectors()),
     "resolver.json": asJson(resolverVectors()),
+    "starter-bundle.json": asJson(starterBundleVectors()),
   }
   const begin = readmeText.indexOf(SUMS_BEGIN)
   const end = readmeText.indexOf(SUMS_END)

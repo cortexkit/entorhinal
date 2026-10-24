@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { readFileSync } from "node:fs"
 import { join } from "node:path"
-import { driftedFiles, JSON_FILES, parseRange, parseStrictJson, parseVersion, resolve, satisfies, SKILL_PACKAGE, TEST_KEY_1, VECTOR_DIR, verifyRecord } from "./generate"
+import { driftedFiles, DOMAIN_STARTER_BUNDLE, JSON_FILES, jcs, parseRange, parseStrictJson, parseVersion, resolve, satisfies, sha256Hex, signingInput, SKILL_PACKAGE, TEST_KEY_1, VECTOR_DIR, verifyRecord } from "./generate"
 
 const committed = (name: string) => readFileSync(join(VECTOR_DIR, name), "utf8")
 
@@ -62,6 +62,58 @@ describe("ck-catalog-v1 test vectors", () => {
     const staleSum = (file: string) => (file === "README.md" ? committed(file).replace(/(\| names\.json \| `)[0-9a-f]/, "$1x") : committed(file))
     expect(staleSum("README.md")).not.toBe(committed("README.md"))
     expect(driftedFiles(staleSum)).toEqual(["README.md"])
+  })
+})
+
+describe("ck-catalog-v1 starter bundle vector", () => {
+  test("includes deterministic package archives and JCS signing input", () => {
+    const vector = JSON.parse(committed("starter-bundle.json")) as {
+      domain: string
+      valid: {
+        bundle_json: { records: { record: string; record_member_sha256: string }[] }
+        bundle_json_jcs: string
+        bundle_signing_input_hex: string
+        bundle_archive_base64: string
+        bundle_archive_sha256: string
+        packages: { kind: string; record_path: string; record_file: unknown; archive_base64: string; archive_sha256: string; record: { canonical: string; signing_input_hex: string }; status: { canonical: string; signing_input_hex: string } }[]
+      }
+      cases: { name: string; bundle_archive_base64: string; bundle_archive_sha256: string; expect: { ok: boolean; code?: string; field?: string; rule?: string; member?: string; offset?: number } }[]
+      persona_manifest_cases: { name: string; manifest_text: string; expect: { ok: boolean; code?: string } }[]
+    }
+    expect(vector.domain).toBe(DOMAIN_STARTER_BUNDLE)
+    expect(jcs(JSON.parse(vector.valid.bundle_json_jcs))).toBe(vector.valid.bundle_json_jcs)
+    expect(signingInput(DOMAIN_STARTER_BUNDLE, vector.valid.bundle_json_jcs).toString("hex")).toBe(vector.valid.bundle_signing_input_hex)
+    expect(sha256Hex(Buffer.from(vector.valid.bundle_archive_base64, "base64"))).toBe(vector.valid.bundle_archive_sha256)
+    expect(vector.valid.packages.map((pkg) => pkg.kind)).toEqual(["persona", "skill"])
+    expect(vector.persona_manifest_cases).toHaveLength(1)
+    const personaManifestCase = vector.persona_manifest_cases[0]
+    expect(personaManifestCase.name).toBe("persona_body_memory_scope")
+    expect(JSON.parse(personaManifestCase.manifest_text).body.memory_scope).toBe("project")
+    expect(personaManifestCase.expect).toEqual({ ok: false, code: "manifest_invalid" })
+    const recordRows = new Map(vector.valid.bundle_json.records.map((row) => [row.record, row]))
+    for (const pkg of vector.valid.packages) {
+      expect(sha256Hex(Buffer.from(pkg.archive_base64, "base64"))).toBe(pkg.archive_sha256)
+      expect(recordRows.get(pkg.record_path)?.record_member_sha256).toBe(sha256Hex(jcs(pkg.record_file)))
+      expect(pkg.record.signing_input_hex).toBe(signingInput("ck-record/v1", pkg.record.canonical).toString("hex"))
+      expect(pkg.status.signing_input_hex).toBe(signingInput("ck-status/v1", pkg.status.canonical).toString("hex"))
+    }
+    const cases = new Map(vector.cases.map((entry) => [entry.name, entry]))
+    expect(cases.get("bad_bundle_signature")?.expect).toEqual({ ok: false, code: "signature_invalid" })
+    expect(cases.get("bundle_key_not_root_certified")?.expect).toEqual({ ok: false, code: "signature_invalid" })
+    expect(cases.get("archive_sha256_mismatch")?.expect).toEqual({ ok: false, code: "record_mismatch", field: "archive_sha256" })
+    expect(cases.get("record_member_bytes_changed")?.expect).toEqual({
+      ok: false,
+      code: "record_mismatch",
+      field: "record_member_sha256",
+      member: "records/cortexkit/starter-persona/1.0.0.json",
+    })
+    expect(cases.get("record_missing_status")?.expect).toEqual({ ok: false, code: "status_invalid", field: "status" })
+    expect(cases.get("non_ustar_entry")?.expect).toEqual({ ok: false, code: "archive_invalid", rule: "magic", offset: 0 })
+    expect(cases.get("path_escaping_entry")?.expect).toMatchObject({ ok: false, code: "archive_invalid", rule: "path_invalid", member: "../outside.txt" })
+    expect(cases.get("path_escaping_entry")?.expect.offset).toEqual(expect.any(Number))
+    expect(cases.get("extra_unlisted_file")?.expect).toMatchObject({ ok: false, code: "archive_invalid", rule: "member_unlisted", member: "unlisted.txt" })
+    expect(cases.get("extra_unlisted_file")?.expect.offset).toEqual(expect.any(Number))
+    for (const entry of vector.cases) expect(sha256Hex(Buffer.from(entry.bundle_archive_base64, "base64"))).toBe(entry.bundle_archive_sha256)
   })
 })
 

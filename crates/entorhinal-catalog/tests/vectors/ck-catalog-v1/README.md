@@ -3,7 +3,8 @@
 These vectors freeze the byte-level parts of the CK catalog contract v1: the
 package-name to Basal-id mapping and scope claims, the signed `ck-record/v1`,
 the strict ustar archive reader, the signed `ck-status/v1` and the status
-feed, the signed key and status statements, and the resolver. The CK registry
+feed, the signed key and status statements, the resolver, and the signed
+`ck-starter-bundle/v1`. The CK registry
 (TypeScript, in cortexkit-cloud) and Entorhinal (Rust) MUST both reproduce
 these bytes and outcomes exactly, and each pins this directory at a named
 prefrontal commit.
@@ -29,7 +30,7 @@ prefrontal commit.
 | `status.json` | Signed `ck-status/v1` records for one skill version (published, withdrawn, withdrawal reversed, tombstoned, plus a conflicting second record) and one flow version (published, revoked by key compromise, tombstoned), the client's apply cases (sequence order, `feed_rollback` for a lower sequence or the same sequence with other bytes, terminal states, signature and domain, a publisher-signed record, unknown registry key), the status feed (`feed_seq`, `?after=` replies including `feed_after_unavailable`, and the client's poll outcomes including `feed_rollback` and the full-feed fallback), the compromise-from time rule and the per-kind effect table. |
 | `statements.json` | The signed statements: `ck-registry-key/v1` (the registry status key chain), `ck-key-rotation/v1` (both signatures), `ck-key-cert/v1` (signed by the TEST-ONLY root, with key-window cases) and `ck-status-request/v1` (withdraw and unwithdraw with `after_sequence`), each with valid and negative cases. |
 | `resolver.json` | The semver dialect (range satisfaction, refused ranges and versions, precedence order), the capability token grammar `cap/<area>.<verb>@<major>`, and closure resolution cases with expected picks, pin moves and refusals. |
-| `starter-bundle.json` | A root-certified two-package starter, exact record-member SHA-256 bindings, eight refusal cases, and a standalone persona-manifest case (a body declaring `memory_scope` is refused as `manifest_invalid`). Copied from the prefrontal repository at ff0608080; the other vectors retain the earlier revision named in SOURCE.txt. |
+| `starter-bundle.json` | A strict bundle ustar containing a persona and skill, with a root-certified `@cortexkit` signer, signed record and status envelopes, expected hashes and signing input. `bundle.json` binds each exact record-member byte sequence with `record_member_sha256`; changed record bytes are refused as `record_mismatch`. The bundle certificate member is `bundle.cert.json`; unlisted members are refused as `archive_invalid` with rule `member_unlisted`. Also includes a standalone invalid persona-manifest case: a body with `memory_scope` is refused as `manifest_invalid`. |
 | `generate.ts` | The generator and reference implementations. |
 | `generate.test.ts` | Fails when any committed file differs from what `generate.ts` produces. |
 

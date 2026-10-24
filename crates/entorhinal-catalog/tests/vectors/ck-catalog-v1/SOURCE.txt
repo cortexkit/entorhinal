@@ -1,2 +1,1 @@
-Copy of prefrontal test-vectors/ck-catalog-v1 at 610329529, byte-identical except this file.
-starter-bundle.json is copied byte-identically from prefrontal ff0608080 (sha256 d8ad7a8e1036d642a56ad2fd84db08d6a229b4106fbb5bf27e4675578af39108). README.md adds its description and checksum. The earlier generator and other vectors remain pinned to 610329529; regenerate starter-bundle.json only with the generator at ff0608080.
+Copy of prefrontal test-vectors/ck-catalog-v1 at 42205d52b7d58018437132e50aa001995f207947, byte-identical except this file. Regenerate the vectors only with that commit's generate.ts.
