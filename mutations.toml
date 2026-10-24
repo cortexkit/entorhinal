@@ -11328,3 +11328,16 @@ target = "--bin ck-entorhinal"
 select = "expected"
 expect_red = ["two_machine_acceptance::moves::cut_releases::held_release_does_not_hold_move_or_next_move"]
 only = false
+
+[[control]]
+id = "session-for-ref-runner"
+guards = "agent.session_for_ref names the binding's recorded runner so callers can rebuild the session reference"
+file = "crates/entorhinal-module/src/sessions.rs"
+old = 'if let Some(runner) = binding.runner {'
+new = 'if let Some(runner) = binding.runner.filter(|_| false) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/sessions.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["sessions::tests::session_for_ref_names_the_recorded_runner_and_omits_an_unrecorded_one"]

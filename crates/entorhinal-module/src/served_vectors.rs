@@ -554,6 +554,9 @@ const WHERE_ELSEWHERE: &str = "agent_0000000000000107";
 const WHERE_MOVING: &str = "agent_0000000000000108";
 const SESSION_REF: &str = "0123456789abcdef0123456789abcdef";
 const OPENCODE_REF: &str = "abcdef0123456789abcdef0123456789";
+/// The reference of the Broca session whose `agent.session_for_ref` reply
+/// names its runner.
+const RUNNER_REF: &str = "44444444444444444444444444444444";
 const SELF_AUTHOR: &str = "1111111111111111";
 const OTHER_AUTHOR: &str = "2222222222222222";
 const PLEXUS_MODULE: &str = "plexus";
@@ -1189,6 +1192,42 @@ async fn session_records_match_published_files() {
         )
         .await;
     assert!(legacy_reply["result"]["project_root"].is_null());
+    // A binding whose runner was recorded, so the sample pins the reply that
+    // names it; the replies above have no runner and so carry no `runner`
+    // key. This registration is not a published record, which keeps
+    // register-session.json unchanged.
+    let (_, runner_registered) = fixture
+        .record(
+            SESSION_REGISTRAR,
+            WRITER_MODULE,
+            "agent.register_session",
+            json!({
+                "agent_id":SESSION_AGENT,
+                "ref_kind":"broca-session",
+                "ref":RUNNER_REF,
+                "harness":"broca",
+                "session_id":"broca-session-001",
+                "project_root":"/workspace/session-vectors/broca",
+                "runner":"broca"
+            }),
+        )
+        .await;
+    assert!(
+        runner_registered.get("result").is_some(),
+        "{runner_registered}"
+    );
+    let (runner_ref, runner_reply) = fixture
+        .record(
+            SESSION_READER,
+            READER_MODULE,
+            "agent.session_for_ref",
+            json!({"ref_kind":"broca-session","ref":RUNNER_REF}),
+        )
+        .await;
+    assert_eq!(runner_reply["result"]["runner"], "broca");
+    for reply in [&found_ref, &opencode_ref_reply, &legacy_reply] {
+        assert!(reply["result"].get("runner").is_none(), "{reply}");
+    }
     let (for_ref_missing, missing_ref) = fixture
         .record(
             SESSION_READER,
@@ -1201,7 +1240,13 @@ async fn session_records_match_published_files() {
     published_file(
         "agent-sessions-v1",
         "session-for-ref.json",
-        vec![for_ref_found, opencode_for_ref, legacy_ref, for_ref_missing],
+        vec![
+            for_ref_found,
+            opencode_for_ref,
+            legacy_ref,
+            runner_ref,
+            for_ref_missing,
+        ],
     );
     assert_eq!(
         found_ref["result"]["project_root"],
@@ -1914,6 +1959,9 @@ async fn session_lifecycle_records_match_published_files() {
 /// Core decodes these replies strictly, so later additions (the session
 /// lifecycle, then network access) must not change a byte of them. The last
 /// two were added with the lifecycle and pinned when network access was.
+/// `session-for-ref.json` was re-pinned when `agent.session_for_ref` began
+/// naming a recorded runner: it gained a record with a runner, and its
+/// existing records kept their bytes.
 const PINNED_SESSION_SAMPLES: [(&str, &str); 10] = [
     (
         "for-session.json",
@@ -1925,7 +1973,7 @@ const PINNED_SESSION_SAMPLES: [(&str, &str); 10] = [
     ),
     (
         "session-for-ref.json",
-        "f8314b13df331e185f2c4960a314a3e8fac97af5d8e9904150ba024973fbb69a",
+        "3e9e99950c167a2b2c5b3315fca35d353f50bc29e8ad93afe616c15e7cb703f6",
     ),
     (
         "where.json",

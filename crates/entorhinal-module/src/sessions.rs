@@ -957,6 +957,13 @@ impl ProjectsHandler {
         if let Some(holder) = binding.held_on {
             reply["heldOn"] = json!(holder);
         }
+        // The runner is part of the session reference callers compute from
+        // `{runner, harness, session}`, so they need it to rebuild that
+        // reference. A binding with no recorded runner omits the key rather
+        // than sending null, as `heldOn` does.
+        if let Some(runner) = binding.runner {
+            reply["runner"] = json!(runner);
+        }
         self.encode_read_result(reply)
     }
 
@@ -1988,6 +1995,67 @@ pub(super) mod tests {
                 "harness":"pi",
                 "session_id":"s3",
                 "project_root":" /new-root/ ",
+                "incarnation":"0123456789abcdef",
+            })
+        );
+    }
+
+    /// The reply names the runner recorded for the binding and omits the key
+    /// when none was recorded, rather than sending null. Re-registering
+    /// without a runner keeps the recorded one, so the read still names it.
+    #[tokio::test]
+    async fn session_for_ref_names_the_recorded_runner_and_omits_an_unrecorded_one() {
+        let f = Fixture::new("session-for-ref-runner", true);
+        let agent = f.create("RunnerLookup");
+        f.providers(provider("prefrontal-core"), ProviderResolution::Unprovided);
+        let mut hosted = registration(&agent, "hosted", "broca", "s1");
+        hosted["runner"] = json!("broca");
+        result(f.register(EXECUTIVE, hosted).await);
+        result(
+            f.register(EXECUTIVE, registration(&agent, "plain", "pi", "s2"))
+                .await,
+        );
+        let hosted_params = json!({"ref_kind":"pi","ref":"hosted"});
+        let mut expected = json!({
+            "agent_id":agent,
+            "ref_kind":"pi",
+            "ref":"hosted",
+            "harness":"broca",
+            "session_id":"s1",
+            "project_root":"/project",
+            "runner":"broca",
+            "incarnation":"0123456789abcdef",
+        });
+        assert_eq!(
+            f.sync_ok(CALLER, SESSION_FOR_REF, hosted_params.clone()),
+            expected
+        );
+
+        result(
+            f.register(EXECUTIVE, registration(&agent, "hosted", "broca", "s3"))
+                .await,
+        );
+        expected["session_id"] = json!("s3");
+        assert_eq!(
+            f.sync_ok(CALLER, SESSION_FOR_REF, hosted_params),
+            expected,
+            "re-registering without a runner keeps the recorded one"
+        );
+
+        let plain = f.sync_ok(
+            CALLER,
+            SESSION_FOR_REF,
+            json!({"ref_kind":"pi","ref":"plain"}),
+        );
+        assert_eq!(
+            plain,
+            json!({
+                "agent_id":agent,
+                "ref_kind":"pi",
+                "ref":"plain",
+                "harness":"pi",
+                "session_id":"s2",
+                "project_root":"/project",
                 "incarnation":"0123456789abcdef",
             })
         );

@@ -1028,6 +1028,13 @@ pub struct SessionBinding {
     pub registered_at_ms: i64,
     #[serde(rename = "heldOn", skip_serializing_if = "Option::is_none")]
     pub held_on: Option<String>,
+    /// The llm-runner module hosting the session, when one was recorded.
+    /// It is never serialized with the binding: `agent.register_session`
+    /// replies with the binding itself, and callers decode that reply
+    /// strictly, so it must keep its bytes. A read that reports the runner
+    /// adds it to its reply explicitly.
+    #[serde(skip)]
+    pub runner: Option<String>,
 }
 
 impl SessionBinding {
@@ -1042,12 +1049,13 @@ impl SessionBinding {
             registered_by: row.get(6)?,
             registered_at_ms: row.get(7)?,
             held_on: row.get(8)?,
+            runner: row.get(9)?,
         })
     }
 }
 
 const SESSION_BINDING_COLUMNS: &str =
-    "agent_id,ref_kind,ref,harness,session_id,NULLIF(project_root,''),registered_by,registered_at_ms,held_on";
+    "agent_id,ref_kind,ref,harness,session_id,NULLIF(project_root,''),registered_by,registered_at_ms,held_on,runner";
 
 fn session_refusal(
     code: &str,

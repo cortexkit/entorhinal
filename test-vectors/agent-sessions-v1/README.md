@@ -62,7 +62,11 @@ objects deny unknown fields; a field outside the listed schema is an
   bytes and reference 1–512 bytes. The file includes a binding with its current
   `project_root`, a migrated legacy row represented by schema 9's empty-root
   backfill for a binding predating `project_root` (whose reply has
-  `project_root: null`), and `not_found`.
+  `project_root: null`), and `not_found`. The reply carries `runner`, the
+  module ID of the llm-runner hosting the session, only when the binding has
+  one recorded; a binding without one omits the key rather than sending
+  `null`. Re-registering without a runner keeps the recorded one, so the
+  reply still names it.
 - `agent.where`: exactly `{agent_id}`, where the string has entorhinal's form
   `agent_` followed by 8 or 16 lowercase hexadecimal digits. The file includes
   an agent never previously read from the claim cache
@@ -130,8 +134,11 @@ a backfill makes the data local.
 - **`for-session.json`**: Pi and OpenCode lookups of registered sessions and a
   missing harness/session key.
 - **`session-for-ref.json`**: Pi and OpenCode registrations with
-  `project_root`, a migrated legacy row with a null root, and a missing
-  reference.
+  `project_root` and no runner (no `runner` key), a migrated legacy row with a
+  null root, a Broca session registered with runner `broca` (whose reply
+  carries `runner: "broca"`), and a missing reference. Releases after 0.1.46
+  added the Broca record; the other four records are byte-identical to
+  before, but the file has a new hash, so consumers that pin it must re-pin.
 - **`where.json`**: on a machine with sharing on: never-read/unclaimed, locally
   held, remotely held with a holder name, and unknown agent.
 - **`where-many.json`**: a local and remotely held agent, with an unknown ID
@@ -182,7 +189,7 @@ a backfill makes the data local.
 | --- | --- |
 | `for-session.json` | `dd41914934a9b85b35670a815bef17de84752d8da7d05a1bf8833f3edbd1996b` |
 | `register-session.json` | `756975d9e0697109b0f7a70c0a08dfa18b2fc5222915e1051870948b1836d6a0` |
-| `session-for-ref.json` | `f8314b13df331e185f2c4960a314a3e8fac97af5d8e9904150ba024973fbb69a` |
+| `session-for-ref.json` | `3e9e99950c167a2b2c5b3315fca35d353f50bc29e8ad93afe616c15e7cb703f6` |
 | `where.json` | `faacea127dcaaa7181329562e4de553851aebf700358b3267864e894166b911e` |
 | `where-many.json` | `422b8592c531c3c22e161b7a926f3ac61df6155fca2a9660bb159b1a0054d565` |
 | `where-moving-receiver.json` | `cd7a4e475915787cf1a1680a05ad4421b3da19fe90a0a106c3b878b71064b9a6` |
