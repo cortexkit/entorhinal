@@ -12,8 +12,14 @@ use crate::HandlerError;
 
 const SLOW_RETRY: Duration = Duration::from_secs(6 * 60 * 60);
 
+/// How often the releaser looks for due releases. A release is never urgent,
+/// since the move it follows has already finished, so a coarse cadence avoids a
+/// store read every second on a machine that is almost always idle. Retry
+/// deadlines finer than this are honoured at the next scan.
+const SCAN_INTERVAL: Duration = Duration::from_secs(15);
+
 pub(crate) async fn run(worker: Worker) {
-    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    let mut interval = tokio::time::interval(SCAN_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
