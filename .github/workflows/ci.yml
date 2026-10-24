@@ -141,7 +141,11 @@ jobs:
     name: Mutation proofs (ubuntu, shard ${{ matrix.shard }})
     needs: test
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # A push replays only its touched rows, a few minutes per shard. The nightly
+    # audit replays every row against its whole test binary, about 1.5-2.5 h per
+    # shard with today's catalogue, and a 120-minute cap cancelled it before it
+    # finished. It gets GitHub's hosted-runner maximum headroom instead.
+    timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 330 || 30 }}
     strategy:
       fail-fast: false
       matrix:
