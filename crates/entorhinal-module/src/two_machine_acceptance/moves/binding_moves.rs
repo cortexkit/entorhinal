@@ -98,6 +98,26 @@ async fn bindings_pair(fault: SourceFault) -> Pair {
     pair
 }
 
+#[tokio::test(start_paused = true)]
+async fn entorhinal_participant_does_not_declare_agent_refs() {
+    let pair = bindings_pair(SourceFault::default()).await;
+    let participant = pair
+        .a
+        .discovery
+        .open_participant("entorhinal")
+        .await
+        .unwrap();
+    let bytes = participant
+        .call("agent_data.describe", json!({}))
+        .await
+        .unwrap();
+    let reply: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        reply["result"]["ref_kinds"],
+        json!(["package-closure", "session-bindings"])
+    );
+}
+
 /// What the apps and Thalamus read for the agent on one machine.
 async fn session_reads(node: &MoveMachine) -> (Value, Vec<Value>) {
     let sessions = node

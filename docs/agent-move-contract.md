@@ -413,8 +413,17 @@ enter the participant ref set as `(ref_kind, ref)`. That set is fixed for the
 whole move: ending a session afterwards does not remove its ref. Finished
 bindings never enter participant prepare, export, import, activate, release
 or abort calls; only their metadata travels in entorhinal's own stream.
-Admission refuses more than 256 live refs as `live_ref_cap`, with detail
+Admission refuses more than 256 live session refs as `live_ref_cap`, with detail
 `{live_refs, cap: 256}`, before recording a move or contacting participants.
+Admission-generated refs, including the agent ref described below, do not count toward
+this session limit.
+The agent-data wire contract also limits each participant's routed ref set to
+256 refs. Admission checks the largest routed set after describe and before
+busy or state-changing participant calls. Exceeding it refuses `live_ref_cap`
+with `{live_refs, cap: 256, module_id, participant_refs}`. Thus a participant
+declaring both `agent` and a session kind can carry at most 255 session refs
+alongside the agent ref; separate agent-only and session-only participants can
+carry the agent ref and all 256 live session refs.
 When the agent has at
 least one binding and discovery lists entorhinal, the saved participant plan
 gives entorhinal one more synthetic ref, `session-bindings`, whose `ref` is the
@@ -424,6 +433,18 @@ agent ID, beside `package-closure` when the agent also has pins. Entorhinal's
 package closure is answered exactly as before; one naming both is split and
 the two answers joined in ref order. An agent with no bindings and no pins
 moves with the same participants as before and opens no stream of its own.
+
+Admission describes each available participant once. If at least one declares
+`agent` in `ref_kinds`, the move also includes exactly one
+`{"ref_kind":"agent","ref":"<agent_id>"}` for the moving agent. Normal
+routing sends it to every participant declaring that kind, alongside any
+session refs that participant declares. No declarer means no agent ref: the
+ref sets, saved plan, move record and wire requests remain unchanged.
+Entorhinal's own participant does not declare `agent`; it continues to carry
+only package closures and session bindings. The agent ref is frozen with the
+other refs for every step, including a move back. It obeys the same receiver
+set-matching and absent-participant rules: a missing participant holding agent
+data cannot be skipped, so the receiver stops the move.
 
 **Source.** Admission inserts the source checkpoint in the transaction that
 fences new registrations for the agent (section 4). `prepare` then reads every

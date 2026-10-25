@@ -12,6 +12,17 @@ commands are in [agent-move-contract.md](agent-move-contract.md).
 - The agent is idle: none of its sessions is running, and every module that
   keeps its data reports it idle.
 - Both machines run entorhinal and the modules that keep agent data.
+- Modules can keep data for the whole agent, not just its sessions. When an
+  available module declares the `agent` ref kind, the move sends the agent ID
+  to every module declaring that kind, together with any session refs it
+  handles. Those modules must also be present on the receiver; otherwise the
+  move stops rather than leaving agent data behind. A move back carries the
+  agent ref again. With no declarer, move plans and requests are unchanged.
+  The 256 live-ref limit counts only session refs, not the agent ref.
+  Each module's routed set is also limited to 256 refs by the wire contract:
+  a module handling both kinds can take 255 session refs plus the agent ref.
+  A larger set refuses `live_ref_cap`, naming the module and its ref count,
+  before busy checks or data transfer.
 - Both machines run an entorhinal release that carries session bindings before you
   move an agent that has any session bindings. A machine on an older release
   refuses such a move (`receiver_precondition`, `participant_unavailable`

@@ -31,12 +31,12 @@ pub const SESSION_BINDINGS_KIND: &str = "session-bindings";
 /// The ref kind of entorhinal's catalog package closure.
 pub const PACKAGE_CLOSURE_KIND: &str = "package-closure";
 
-/// Whether a move ref names a session binding. Entorhinal adds two refs of
-/// its own to a move (the package closure and the carried bindings), each
-/// naming the agent rather than a session. Neither may ever become a
-/// `session_binding` row or be looked up as one.
+/// Whether a move ref names a session binding. The reserved `agent`,
+/// `package-closure` and `session-bindings` kinds name whole-agent or
+/// entorhinal-owned data, not a host session. They must never become
+/// `session_binding` rows or be looked up as sessions.
 pub fn is_binding_ref_kind(ref_kind: &str) -> bool {
-    ref_kind != PACKAGE_CLOSURE_KIND && ref_kind != SESSION_BINDINGS_KIND
+    ref_kind != "agent" && ref_kind != PACKAGE_CLOSURE_KIND && ref_kind != SESSION_BINDINGS_KIND
 }
 
 /// One binding as carried between machines: every column of its
@@ -418,6 +418,17 @@ fn collides(tx: &Transaction<'_>, row: &CarriedBinding) -> rusqlite::Result<bool
         }
     }
     Ok(false)
+}
+
+#[cfg(test)]
+mod ref_kind_tests {
+    #[test]
+    fn reserved_whole_agent_refs_are_never_session_bindings() {
+        for kind in ["agent", "package-closure", "session-bindings"] {
+            assert!(!super::is_binding_ref_kind(kind), "{kind}");
+        }
+        assert!(super::is_binding_ref_kind("broca-session"));
+    }
 }
 
 #[cfg(test)]

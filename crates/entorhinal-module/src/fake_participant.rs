@@ -40,6 +40,7 @@ struct State {
     tombstones: BTreeMap<AgentRef, String>,
     scripts: BTreeMap<String, VecDeque<Effect>>,
     calls: Vec<Request>,
+    wire_calls: Vec<(String, Value)>,
 }
 
 pub(crate) struct FakeParticipant {
@@ -69,6 +70,7 @@ impl FakeParticipant {
                 tombstones: BTreeMap::new(),
                 scripts: BTreeMap::new(),
                 calls: vec![],
+                wire_calls: vec![],
             }),
         }
     }
@@ -115,6 +117,9 @@ impl FakeParticipant {
     }
     pub(crate) fn calls(&self) -> Vec<Request> {
         self.state.lock().unwrap().calls.clone()
+    }
+    pub(crate) fn wire_calls(&self) -> Vec<(String, Value)> {
+        self.state.lock().unwrap().wire_calls.clone()
     }
     pub(crate) fn cut(&self, cut_id: &str) -> Option<CutState> {
         self.state.lock().unwrap().cuts.get(cut_id).cloned()
@@ -165,6 +170,7 @@ impl FakeParticipant {
             .map_err(|error| refuse(error.code.as_str(), error.detail))?;
         let mut state = self.state.lock().unwrap();
         state.calls.push(request.clone());
+        state.wire_calls.push((method.into(), params));
         let effect = state.scripts.get_mut(method).and_then(VecDeque::pop_front);
         let recorded = request.op().changes_state()
             && request_cut(&request).is_some_and(|cut| {

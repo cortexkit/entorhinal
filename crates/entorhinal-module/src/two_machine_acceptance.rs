@@ -2282,6 +2282,7 @@ mod moves {
         }
     }
     mod abort_backoff;
+    mod agent_refs;
     mod binding_moves;
     mod catalog_moves;
     mod cut_releases;

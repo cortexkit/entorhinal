@@ -117,6 +117,8 @@ impl ProjectsHandler {
             return Err(error);
         }
         let refs = self.with_store(|s| s.agent_bound_refs(&request.agent_id))?;
+        // Only live session refs count toward the cap; synthetic refs, including
+        // the agent ref, do not consume a session slot.
         if refs.len() > 256 {
             return Err(HandlerError {
                 code: "live_ref_cap".into(),
@@ -168,13 +170,46 @@ impl ProjectsHandler {
                 request.agent_id.clone(),
             ));
         }
-        let plan = participant_client::plan_participants(&available, &wire_refs).await.map_err(|e| {
+        let plan_error = |e| {
             let detail = match e {
                 participant_client::PlanError::RefKindUnavailable(kind) => json!({"ref_kind":kind}),
-                participant_client::PlanError::Participant { module_id, error } => json!({"module_id":module_id,"op":"agent_data.describe","error":format!("{error:?}")}),
+                participant_client::PlanError::Participant { module_id, error } => {
+                    json!({"module_id":module_id,"op":"agent_data.describe","error":format!("{error:?}")})
+                }
             };
-            HandlerError { code:"participant_unavailable".into(), message:"participant cannot cover move refs".into(), detail:Some(detail) }
-        })?;
+            HandlerError {
+                code: "participant_unavailable".into(),
+                message: "participant cannot cover move refs".into(),
+                detail: Some(detail),
+            }
+        };
+        let described = participant_client::describe_participants(&available)
+            .await
+            .map_err(plan_error)?;
+        // Agent-wide data has no session binding. Add its ref only when a
+        // participant can carry it, so older participant sets stay unchanged.
+        let carries_agent = described
+            .iter()
+            .any(|p| p.description.ref_kinds.iter().any(|kind| kind == "agent"));
+        if carries_agent {
+            wire_refs.push(AgentRef::new("agent", request.agent_id.clone()));
+        }
+        let plan =
+            participant_client::plan_participants(described, &wire_refs).map_err(plan_error)?;
+        // The wire contract caps each participant's fixed ref set separately.
+        // Check after routing but before busy or any state-changing call, so
+        // an oversized set is not misreported as a busy participant.
+        if let Some(participant) = plan.iter().max_by_key(|p| p.refs.len()) {
+            if participant.refs.len() > 256 {
+                return Err(HandlerError {
+                    code: "live_ref_cap".into(),
+                    message: "too many participant references".into(),
+                    detail: Some(
+                        json!({"live_refs":refs.len(),"cap":256,"module_id":participant.client.module_id,"participant_refs":participant.refs.len()}),
+                    ),
+                });
+            }
+        }
         self.move_idle(&refs, &plan).await?;
         let mut confirmation = None;
         if direct {

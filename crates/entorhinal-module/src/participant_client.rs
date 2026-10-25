@@ -252,6 +252,11 @@ pub(crate) struct PlannedParticipant {
     pub(crate) description: DescribeReply,
 }
 
+pub(crate) struct DescribedParticipant {
+    pub(crate) client: ParticipantClient,
+    pub(crate) description: DescribeReply,
+}
+
 #[derive(Debug)]
 pub(crate) enum PlanError {
     Participant {
@@ -261,16 +266,13 @@ pub(crate) enum PlanError {
     RefKindUnavailable(String),
 }
 
-/// Describe only the available participants supplied by discovery, and retain every
-/// declaring participant, not just the first owner of a kind. Empty ref sets are valid.
-pub(crate) async fn plan_participants(
+/// Describe each available participant once so admission can choose refs from
+/// their declared kinds before routing those refs.
+pub(crate) async fn describe_participants(
     available: &[Participant],
-    refs: &[AgentRef],
-) -> Result<Vec<PlannedParticipant>, PlanError> {
-    let refs: BTreeSet<_> = refs.iter().cloned().collect();
+) -> Result<Vec<DescribedParticipant>, PlanError> {
     let available: BTreeMap<_, _> = available.iter().map(|p| (&p.module_id, p)).collect();
-    let mut covered = BTreeSet::new();
-    let mut plan = Vec::new();
+    let mut described = Vec::new();
     for participant in available.values() {
         let client = ParticipantClient::new(participant);
         let description = client
@@ -280,6 +282,28 @@ pub(crate) async fn plan_participants(
                 module_id: participant.module_id.clone(),
                 error,
             })?;
+        described.push(DescribedParticipant {
+            client,
+            description,
+        });
+    }
+    Ok(described)
+}
+
+/// Retain every declaring participant, not just the first owner of a kind.
+/// Empty ref sets are valid; routing uses the descriptions frozen at admission.
+pub(crate) fn plan_participants(
+    described: Vec<DescribedParticipant>,
+    refs: &[AgentRef],
+) -> Result<Vec<PlannedParticipant>, PlanError> {
+    let refs: BTreeSet<_> = refs.iter().cloned().collect();
+    let mut covered = BTreeSet::new();
+    let mut plan = Vec::new();
+    for DescribedParticipant {
+        client,
+        description,
+    } in described
+    {
         let routed: Vec<_> = refs
             .iter()
             .filter(|r| description.ref_kinds.contains(&r.ref_kind))
@@ -909,9 +933,8 @@ mod tests {
                 transport: a.clone(),
             },
         ];
-        let plan = plan_participants(&available, &[shared.clone(), other.clone()])
-            .await
-            .unwrap();
+        let described = describe_participants(&available).await.unwrap();
+        let plan = plan_participants(described, &[shared.clone(), other.clone()]).unwrap();
         assert_eq!(
             plan.iter()
                 .map(|p| p.client.module_id.as_str())
@@ -944,8 +967,9 @@ mod tests {
         }
         assert!(unavailable.calls().is_empty());
         let missing = AgentRef::new("unsupported", "x");
+        let described = describe_participants(&available).await.unwrap();
         assert!(
-            matches!(plan_participants(&available, &[missing]).await, Err(PlanError::RefKindUnavailable(kind)) if kind == "unsupported")
+            matches!(plan_participants(described, &[missing]), Err(PlanError::RefKindUnavailable(kind)) if kind == "unsupported")
         );
     }
 }
