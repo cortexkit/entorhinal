@@ -2282,7 +2282,7 @@ mod tests {
             /// This wrapper gives it the fixture's scratch descriptor and
             /// forwards every hook `ProjectsHandler` implements, unchanged.
             struct Scratch {
-                handler: ProjectsHandler,
+                handler: Arc<ProjectsHandler>,
                 descriptor: StorageDescriptor,
             }
             #[async_trait]
@@ -2310,10 +2310,14 @@ mod tests {
 
             /// Serve a fresh handler over the fixture's store, which already
             /// holds the `agent.cutover` marker, and bind one `Direct` route.
+            /// Also returns a clone of the served handler: its background
+            /// tasks keep the store files open, so a test must stop them
+            /// (`finish`) before the fixture deletes its folder, or Windows
+            /// refuses the deletion.
             async fn start(
                 f: &mut Fixture,
                 answers: impl IntoIterator<Item = OperatorAnswer>,
-            ) -> (ModuleHarness, RouteHandle) {
+            ) -> (ModuleHarness, RouteHandle, Arc<ProjectsHandler>) {
                 // Disabled keeps the write local, so no log stand-in is needed.
                 state(f, "disabled");
                 // Release the fixture's store and its lease. The served
@@ -2330,7 +2334,8 @@ mod tests {
                 // handler's route admissions and receives the live module
                 // handle before any request is served.
                 let confirmer = Arc::new(DaemonConfirmer::new(handler.route_admissions.clone()));
-                let handler = handler.with_operator_confirmer(confirmer.clone());
+                let handler = Arc::new(handler.with_operator_confirmer(confirmer.clone()));
+                let served = handler.clone();
                 let descriptor = f.descriptor.clone();
                 let mut module = ModuleHarness::start(
                     move |handle| {
@@ -2359,7 +2364,14 @@ mod tests {
                         .with_principal(Principal::Direct),
                     )
                     .await;
-                (module, route)
+                (module, route, served)
+            }
+
+            /// Shut the harness down and stop the served handler's background
+            /// tasks, so no task still holds the store when the fixture drops.
+            async fn finish(module: &mut ModuleHarness, served: &ProjectsHandler) {
+                module.shutdown().await;
+                crate::tests::stop_store_tasks(served).await;
             }
 
             async fn create(module: &mut ModuleHarness, route: RouteHandle) -> Frame {
@@ -2411,7 +2423,7 @@ mod tests {
             #[tokio::test]
             async fn confirmed_direct_create_commits_with_the_exact_summary_and_route() {
                 let mut f = Fixture::new("served-confirmed", Arc::new(FailConnector::default()));
-                let (mut module, route) = start(&mut f, [OperatorAnswer::Confirmed]).await;
+                let (mut module, route, served) = start(&mut f, [OperatorAnswer::Confirmed]).await;
                 let generation = f.store().generation().unwrap();
                 let reply = create(&mut module, route).await;
                 assert_eq!(
@@ -2422,7 +2434,7 @@ mod tests {
                 );
                 let agent = id(&reply.body);
                 one_confirm(&module);
-                module.shutdown().await;
+                finish(&mut module, &served).await;
                 assert!(
                     cancels(&module).is_empty(),
                     "a confirmed prompt is not withdrawn"
@@ -2474,7 +2486,7 @@ mod tests {
                 ] {
                     let label = format!("{answer:?}");
                     let mut f = Fixture::new("served-refused", Arc::new(FailConnector::default()));
-                    let (mut module, route) = start(&mut f, [answer]).await;
+                    let (mut module, route, served) = start(&mut f, [answer]).await;
                     let before = image(&f);
                     let body = error(&create(&mut module, route).await);
                     assert_eq!(
@@ -2483,7 +2495,7 @@ mod tests {
                         "{label}"
                     );
                     one_confirm(&module);
-                    module.shutdown().await;
+                    finish(&mut module, &served).await;
                     assert!(
                         cancels(&module).is_empty(),
                         "{label}: a refused prompt is not withdrawn"
@@ -2499,7 +2511,7 @@ mod tests {
             #[tokio::test(start_paused = true)]
             async fn unanswered_prompt_is_withdrawn_at_the_operator_bound() {
                 let mut f = Fixture::new("served-unanswered", Arc::new(FailConnector::default()));
-                let (mut module, route) = start(&mut f, [OperatorAnswer::NoAnswer]).await;
+                let (mut module, route, served) = start(&mut f, [OperatorAnswer::NoAnswer]).await;
                 let before = image(&f);
                 let sent = Instant::now();
                 let body = json!({"method":"agent.create","params":new_request("served")});
@@ -2522,7 +2534,7 @@ mod tests {
                     waited >= OPERATOR_BOUND && waited < Duration::from_secs(290),
                     "{waited:?}"
                 );
-                module.shutdown().await;
+                finish(&mut module, &served).await;
                 assert_eq!(cancels(&module), [(0, 0, confirm, 0)]);
                 assert_eq!(image(&f), before);
                 assert!(rows(&f).is_empty());
