@@ -11523,3 +11523,16 @@ package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
 expect_red = ["served_vectors::project_resolve_v1_records_roundtrip_through_project_identity"]
+
+[[control]]
+id = "agent-identity-resolve-reply-shape"
+guards = "agent.resolve replies keep the members the shared agent-identity type requires"
+file = "crates/entorhinal-core/src/agent/reads.rs"
+old = '''        "merged_into":row.as_ref().and_then(|row| row.merged_into.as_ref()),'''
+new = '''        "mergedInto":row.as_ref().and_then(|row| row.merged_into.as_ref()), // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-module/src/served_vectors.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["served_vectors::agent_identity_requests_enforce_structure_not_semantics"]

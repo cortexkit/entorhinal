@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
+use cortexkit_agent_identity as aid;
 use cortexkit_project_identity as pid;
 use entorhinal_core::{
     claim_cache::{CachedClaim, ClaimObservation},
@@ -412,6 +413,13 @@ fn assert_avatar_reply(actual: &Value, expected: &Value) {
 }
 
 fn published_file(directory: &str, name: &str, records: Vec<String>) {
+    if agent_identity_vector(directory, name) {
+        let records: Vec<Value> = records
+            .iter()
+            .map(|record| serde_json::from_str(record).unwrap())
+            .collect();
+        assert_agent_identity_records(&format!("served {directory}/{name}"), &records);
+    }
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../test-vectors")
         .join(directory)
@@ -427,6 +435,335 @@ fn published_file(directory: &str, name: &str, records: Vec<String>) {
             published, served,
             "{name} differs from the real handler reply"
         );
+    }
+}
+
+fn agent_identity_vector(directory: &str, name: &str) -> bool {
+    matches!(
+        (directory, name),
+        (
+            "memory-context-v1",
+            "context-project.json" | "context-session.json" | "context-session-populated.json"
+        ) | (
+            "agent-sessions-v1",
+            "where.json"
+                | "where-many.json"
+                | "where-sharing-off.json"
+                | "where-moving-source.json"
+                | "where-moving-receiver.json"
+        ) | (
+            "agent-identity-reads-v1",
+            "agent-resolve.json" | "agent-resolve-merged.json"
+        )
+    )
+}
+
+fn agent_identity_params_are_structurally_valid(op: &str, params: &Value) -> bool {
+    let Some(params) = params.as_object() else {
+        return false;
+    };
+    if params.len() != 1 {
+        return false;
+    }
+    match op {
+        "context.project" => params.get("folder").is_some_and(Value::is_string),
+        "context.session" | "agent.resolve" | "agent.where" => {
+            params.get("agent_id").is_some_and(Value::is_string)
+        }
+        "agent.where_many" => params
+            .get("agentIds")
+            .and_then(Value::as_array)
+            .is_some_and(|ids| ids.iter().all(Value::is_string)),
+        _ => panic!("unexpected identity operation {op}"),
+    }
+}
+
+fn check_agent_identity_record<P: DeserializeOwned, R: DeserializeOwned + Serialize>(
+    label: &str,
+    record: &Value,
+    errors: &mut Vec<String>,
+) {
+    let request = if let Some(op) = record.get("op") {
+        json!({"method": op, "params": record["request"]})
+    } else {
+        record["request"].clone()
+    };
+    // Typed decoding checks wire structure; ID syntax and batch admission stay in the handler.
+    let structurally_valid = agent_identity_params_are_structurally_valid(
+        request["method"].as_str().unwrap(),
+        &request["params"],
+    );
+    let decoded = serde_json::from_value::<aid::Request<P>>(request.clone());
+    if decoded.is_ok() != structurally_valid {
+        errors.push(format!(
+            "{label}: request decoding disagrees with structural validity {structurally_valid}: {request}; error: {:?}",
+            decoded.err()
+        ));
+    }
+    let reply = &record["reply"];
+    match serde_json::from_value::<aid::Outcome<R>>(reply.clone()) {
+        Ok(decoded) => {
+            let encoded = serde_json::to_value(decoded).unwrap();
+            if *reply != encoded {
+                errors.push(format!(
+                    "{label}: reply members changed: {reply} -> {encoded}"
+                ));
+            }
+        }
+        Err(error) => errors.push(format!("{label}: reply decode failed: {error}; {reply}")),
+    }
+}
+
+fn assert_agent_identity_records(label: &str, records: &[Value]) {
+    assert!(!records.is_empty(), "{label}: no records");
+    let mut errors = Vec::new();
+    for (index, record) in records.iter().enumerate() {
+        let label = format!("{label}[{index}]");
+        let op = record.get("op").unwrap_or(&record["request"]["method"]);
+        match op.as_str().unwrap() {
+            "context.project" => check_agent_identity_record::<
+                aid::ContextProjectParams,
+                aid::ContextProjectReply,
+            >(&label, record, &mut errors),
+            "context.session" => check_agent_identity_record::<
+                aid::ContextSessionParams,
+                aid::ContextSessionReply,
+            >(&label, record, &mut errors),
+            "agent.resolve" => check_agent_identity_record::<
+                aid::AgentResolveParams,
+                aid::AgentResolveReply,
+            >(&label, record, &mut errors),
+            "agent.where" => check_agent_identity_record::<
+                aid::AgentWhereParams,
+                aid::AgentWhereReply,
+            >(&label, record, &mut errors),
+            "agent.where_many" => check_agent_identity_record::<
+                aid::AgentWhereManyParams,
+                aid::AgentWhereManyReply,
+            >(&label, record, &mut errors),
+            op => errors.push(format!("{label}: unexpected operation {op}")),
+        }
+    }
+    assert!(!records.is_empty(), "{label}: no records");
+    assert!(errors.is_empty(), "{}", errors.join("\n"));
+}
+
+#[test]
+fn agent_identity_published_records_roundtrip_exactly() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-vectors");
+    let mut records = Vec::new();
+    for (directory, name) in [
+        ("memory-context-v1", "context-project.json"),
+        ("memory-context-v1", "context-session.json"),
+        ("memory-context-v1", "context-session-populated.json"),
+        ("agent-sessions-v1", "where.json"),
+        ("agent-sessions-v1", "where-many.json"),
+        ("agent-sessions-v1", "where-sharing-off.json"),
+        ("agent-sessions-v1", "where-moving-source.json"),
+        ("agent-sessions-v1", "where-moving-receiver.json"),
+        ("agent-identity-reads-v1", "agent-resolve.json"),
+        ("agent-identity-reads-v1", "agent-resolve-merged.json"),
+    ] {
+        let path = root.join(directory).join(name);
+        let batch: Vec<Value> = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            !batch.is_empty(),
+            "published {directory}/{name}: no records"
+        );
+        records.extend(batch);
+    }
+    assert_agent_identity_records("published identity vectors", &records);
+}
+
+#[tokio::test]
+async fn agent_identity_pin_status_projection_roundtrips() {
+    let fixture = Fixture::new("agent-identity-pin-projection").await;
+    let source = fixture.snapshot();
+    seed_agent(&source, ASSISTANT, "Lin", None, false, false);
+    drop(source);
+    assert!(matches!(
+        fixture.import().await,
+        HandlerOutcome::Response(_)
+    ));
+    let store = fixture.handler.with_store(|s| Ok(s.clone())).unwrap();
+    store
+        .with_principal("reserved:prefrontal-core")
+        .catalog_set_pins(
+            entorhinal_core::catalog_agent::PinWriteRequest {
+                agent_id: ASSISTANT.into(),
+                pins: vec![entorhinal_core::catalog_agent::CatalogPin {
+                    name: "@example/memory".into(),
+                    version: "1.0.0".into(),
+                    kind: entorhinal_catalog::Kind::MemoryProfile,
+                    manifest_sha256: "a".repeat(64),
+                    archive_sha256: "b".repeat(64),
+                    publisher_fingerprint: "c".repeat(64),
+                    root: true,
+                    range: Some("^1.0.0".into()),
+                }],
+                request_key: Some("pin-projection".into()),
+            },
+            700,
+        )
+        .unwrap();
+    let conn = Connection::open(fixture.dir.join("store.db")).unwrap();
+    let mut records = Vec::new();
+    for state in [
+        json!("available"),
+        json!("withdrawn"),
+        json!("tombstoned"),
+        json!("revoked"),
+        json!("future-state"),
+        Value::Null,
+        json!(false),
+        json!(7),
+        json!([1, "two"]),
+        json!({"future": [true, null]}),
+    ] {
+        conn.execute("INSERT OR REPLACE INTO catalog_status(name,version,sequence,changed_at,published_at,signer_index,canonical,signature) VALUES('@example/memory','1.0.0',2,'2026-10-02T00:00:00Z','2026-10-01T00:00:00Z',0,?1,'')", [json!({"state":state,"published_at":"2026-10-01T00:00:00Z"}).to_string()]).unwrap();
+        let (record, reply) = fixture
+            .record("context.session", json!({"agent_id":ASSISTANT}))
+            .await;
+        assert_eq!(reply["result"]["pins"][0]["status"]["state"], state);
+        let typed: aid::Outcome<aid::ContextSessionReply> =
+            serde_json::from_value(reply.clone()).unwrap();
+        let aid::Outcome::Success(success) = typed else {
+            panic!("pin projection was refused")
+        };
+        let typed_state = &success.result.pins[0].status.as_ref().unwrap().state;
+        if !state.is_string() {
+            assert!(matches!(typed_state, aid::PinStatusState::Json(value) if value == &state));
+        }
+        records.push(serde_json::from_str(&record).unwrap());
+    }
+    conn.execute("UPDATE catalog_status SET canonical='{}'", [])
+        .unwrap();
+    let (record, reply) = fixture
+        .record("context.session", json!({"agent_id":ASSISTANT}))
+        .await;
+    assert_eq!(
+        reply["result"]["pins"][0]["status"],
+        json!({"state":null,"blocked":false})
+    );
+    records.push(serde_json::from_str(&record).unwrap());
+    conn.execute("UPDATE catalog_status SET canonical='not-json'", [])
+        .unwrap();
+    let (record, reply) = fixture
+        .record("context.session", json!({"agent_id":ASSISTANT}))
+        .await;
+    assert_eq!(reply["code"], "store_corrupt");
+    records.push(serde_json::from_str(&record).unwrap());
+    assert_agent_identity_records("served pin status projections", &records);
+}
+
+#[tokio::test]
+async fn agent_identity_requests_enforce_structure_not_semantics() {
+    let fixture = Fixture::new("agent-identity-request-validation").await;
+    let mut records = Vec::new();
+    for (op, field, value, code) in [
+        (
+            "context.project",
+            "folder",
+            json!("/unused"),
+            "invalid_params",
+        ),
+        (
+            "context.session",
+            "agent_id",
+            json!(ASSISTANT),
+            "invalid_params",
+        ),
+        (
+            "agent.resolve",
+            "agent_id",
+            json!(ASSISTANT),
+            "invalid_request",
+        ),
+        (
+            "agent.where",
+            "agent_id",
+            json!(ASSISTANT),
+            "invalid_request",
+        ),
+        (
+            "agent.where_many",
+            "agentIds",
+            json!([ASSISTANT]),
+            "invalid_request",
+        ),
+    ] {
+        let mut invalid_params = vec![
+            json!({}),
+            json!({field:null}),
+            json!({field:42}),
+            json!({field:value,"extra":true}),
+            Value::Null,
+            json!(false),
+            json!(42),
+            json!("params"),
+            json!([]),
+            json!({field:false}),
+            json!({field:{}}),
+        ];
+        if op == "agent.where_many" {
+            invalid_params.extend([
+                json!({field:"not-an-array"}),
+                json!({field:[null]}),
+                json!({field:[42]}),
+                json!({field:[false]}),
+                json!({field:[{}]}),
+                json!({field:[[]]}),
+            ]);
+        } else {
+            invalid_params.push(json!({field:[]}));
+        }
+        for params in invalid_params {
+            assert!(!agent_identity_params_are_structurally_valid(op, &params));
+            let (record, reply) = fixture.record(op, params).await;
+            assert_eq!(reply["code"], code);
+            records.push(serde_json::from_str(&record).unwrap());
+        }
+        let params = json!({field:value});
+        assert!(agent_identity_params_are_structurally_valid(op, &params));
+        let (record, _) = fixture.record(op, params).await;
+        records.push(serde_json::from_str(&record).unwrap());
+    }
+    for params in [
+        json!({"agentIds":[]}),
+        json!({"agentIds":[ASSISTANT, ASSISTANT]}),
+        json!({"agentIds":(1..=65).map(|id| format!("agent_{id:016x}")).collect::<Vec<_>>()}),
+        json!({"agentIds":["invalid"]}),
+    ] {
+        assert!(agent_identity_params_are_structurally_valid(
+            "agent.where_many",
+            &params
+        ));
+        let (record, reply) = fixture.record("agent.where_many", params).await;
+        assert_eq!(reply["code"], "invalid_request");
+        records.push(serde_json::from_str(&record).unwrap());
+    }
+    let (record, reply) = fixture
+        .record("agent.where", json!({"agent_id":"invalid"}))
+        .await;
+    assert_eq!(reply["code"], "invalid_request");
+    records.push(serde_json::from_str(&record).unwrap());
+    assert_agent_identity_records("served request contract probes", &records);
+}
+
+#[test]
+fn agent_identity_refusal_codes_have_named_variants() {
+    for (wire, expected) in [
+        ("unknown_agent", pid::RefusalCode::UnknownAgent),
+        ("gone", pid::RefusalCode::Gone),
+        (
+            "claim_integrity_failed",
+            pid::RefusalCode::ClaimIntegrityFailed,
+        ),
+        ("store_corrupt", pid::RefusalCode::StoreCorrupt),
+    ] {
+        let decoded: aid::RefusalCode = serde_json::from_value(json!(wire)).unwrap();
+        assert_eq!(decoded, expected);
+        assert_eq!(serde_json::to_value(decoded).unwrap(), json!(wire));
     }
 }
 
