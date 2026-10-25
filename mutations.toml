@@ -463,6 +463,10 @@ test_file = "crates/entorhinal-module/src/main.rs"
 runner = "cargo"
 package = "entorhinal-module"
 target = "--bin ck-entorhinal"
+# Run only the named test. Under this break every query is treated as a write,
+# so in a whole-binary run tests that poll a read until a state appears wait
+# until the runner's timeout instead of failing.
+select = "expected"
 expect_red = ["tests::queries_are_answered_for_every_principal"]
 expect_message = "resolve"
 
