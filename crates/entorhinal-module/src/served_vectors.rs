@@ -1011,12 +1011,16 @@ async fn project_resolve_v1_records_match_published_files() {
     ] {
         std::fs::create_dir_all(path.join(".git")).unwrap();
         std::fs::write(path.join(".git/config"), "[core]\n\tbare = false\n").unwrap();
+        // Register the canonical form: on macOS the temp folder sits under
+        // /var, a link to /private/var, and registration refuses a path that
+        // isn't canonical.
+        let canonical = crate::tests::canonical_test_path(path);
         let (_, reply) = identities
             .record(
                 SESSION_CORE,
                 WRITER_MODULE,
                 "register",
-                json!({"projectId":project_id,"name":name,"roots":[path]}),
+                json!({"projectId":project_id,"name":name,"roots":[canonical]}),
             )
             .await;
         assert!(
