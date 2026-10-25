@@ -6,6 +6,21 @@
 # audits all package targets, except rows narrowed with select="expected".
 
 [[control]]
+id = "served-project-resolve-remote-wire-bytes"
+guards = "Remote lookup replies retain the generation served by the store in the published byte samples"
+file = "crates/entorhinal-module/src/main.rs"
+old = 'let reply = self.with_store(|store| store.resolve_remote(&params.owner, &params.repo))?;'
+new = '''let mut reply = self.with_store(|store| store.resolve_remote(&params.owner, &params.repo))?;
+        reply.generation = -1; // NON-VACUITY BREAK'''
+test_file = "crates/entorhinal-module/src/served_vectors.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["served_vectors::project_resolve_remote_v1_records_match_published_file"]
+expect_message = "resolve-remote.json differs from the real handler reply"
+
+[[control]]
 id = "served-project-resolve-remotes-error"
 guards = "Resolve root records preserve remotesError when a registered root's git config cannot be read"
 file = "crates/entorhinal-module/src/main.rs"
