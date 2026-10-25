@@ -1291,6 +1291,124 @@ async fn project_resolve_v1_records() -> [(&'static str, Vec<String>); 4] {
 }
 
 #[tokio::test]
+async fn project_resolve_remote_v1_records_match_published_file() {
+    let fixture = SessionFixture::new("served-project-resolve-remote-v1").await;
+    let fixed_token = "0123456789abcdef".repeat(4);
+    let mut paths = Vec::new();
+    for (folder, project_id, name, repo) in [
+        ("widgets-checkout", "pj-widgets", "Widgets", "widgets"),
+        ("shared-one", "pj-shared-one", "Shared One", "shared"),
+        ("shared-two", "pj-shared-two", "Shared Two", "shared-two"),
+        (
+            "unreadable-config-checkout",
+            "pj-unreadable",
+            "Unreadable Config",
+            "hidden",
+        ),
+    ] {
+        let root = fixture.dir.join(folder);
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(
+            root.join(".git/config"),
+            format!("[remote \"origin\"]\n\turl = https://github.com/example-org/{repo}.git\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".git/cortexkit-root-incarnation"),
+            format!("{fixed_token}\n"),
+        )
+        .unwrap();
+        // Registration requires canonical paths, including macOS's /private/var
+        // spelling when the temporary directory is reached through /var.
+        let root = crate::tests::canonical_test_path(root)
+            .to_string_lossy()
+            .into_owned();
+        let (_, reply) = fixture
+            .record(
+                SESSION_CORE,
+                WRITER_MODULE,
+                "register",
+                json!({"projectId":project_id,"name":name,"roots":[root]}),
+            )
+            .await;
+        assert!(
+            reply.get("result").is_some(),
+            "fixture project registration failed: {reply}"
+        );
+        // Map complete paths, not just the scratch prefix: Windows separators
+        // inside a path must also become the fixed forward-slash spelling.
+        paths.push((root, format!("/fixture/{folder}")));
+    }
+    // Registration refuses an already owned repository. Git config can change
+    // afterwards, so two legitimately registered projects can become ambiguous.
+    std::fs::write(
+        PathBuf::from(&paths[2].0).join(".git/config"),
+        "[remote \"origin\"]\n\turl = https://github.com/example-org/shared.git\n",
+    )
+    .unwrap();
+    let scratch_root = crate::tests::canonical_test_path(&fixture.dir)
+        .to_string_lossy()
+        .into_owned();
+    let mut records = Vec::new();
+    for (owner, repo) in [
+        ("example-org", "widgets"),
+        ("example-org", "missing"),
+        ("example-org", "shared"),
+        ("EXAMPLE-ORG", "WiDgEtS"),
+        ("example-org", "hidden"),
+    ] {
+        let (record, reply) = fixture
+            .record(
+                SESSION_READER,
+                READER_MODULE,
+                "resolve_remote",
+                json!({"owner":owner,"repo":repo}),
+            )
+            .await;
+        records.push(normalize_project_record(
+            record,
+            &scratch_root,
+            &paths,
+            &[],
+            &reply,
+        ));
+    }
+    // Invalid UTF-8 reliably fails config reads even for privileged runners;
+    // permission bits do not. The previously found repository must disappear
+    // without preventing another readable root from matching.
+    std::fs::write(PathBuf::from(&paths[3].0).join(".git/config"), [0xff]).unwrap();
+    for repo in ["hidden", "widgets"] {
+        let (record, reply) = fixture
+            .record(
+                SESSION_READER,
+                READER_MODULE,
+                "resolve_remote",
+                json!({"owner":"example-org","repo":repo}),
+            )
+            .await;
+        records.push(normalize_project_record(
+            record,
+            &scratch_root,
+            &paths,
+            &[],
+            &reply,
+        ));
+    }
+    let (record, reply) = fixture
+        .record(SESSION_READER, READER_MODULE, "resolve_remote", json!({}))
+        .await;
+    assert_eq!(reply["code"], "invalid_params");
+    records.push(normalize_project_record(
+        record,
+        &scratch_root,
+        &paths,
+        &[],
+        &reply,
+    ));
+    published_file("project-resolve-v1", "resolve-remote.json", records);
+}
+
+#[tokio::test]
 async fn session_records_match_published_files() {
     let fixture = SessionFixture::new("served-sessions").await;
     let source = fixture.snapshot();
