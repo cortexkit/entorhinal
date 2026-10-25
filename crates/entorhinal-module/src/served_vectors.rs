@@ -1,11 +1,13 @@
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
+use cortexkit_project_identity as pid;
 use entorhinal_core::{
     claim_cache::{CachedClaim, ClaimObservation},
     move_store::{AgentMove, MoveSide, MoveStep},
     RegistryStore,
 };
 use rusqlite::{params, Connection};
+use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};
 use subc_client_rs::HandlerOutcome;
 use subc_protocol::Principal;
@@ -758,6 +760,104 @@ fn normalize_project_record(
 
 #[tokio::test]
 async fn project_resolve_v1_records_match_published_files() {
+    for (name, records) in project_resolve_v1_records().await {
+        published_file("project-resolve-v1", name, records);
+    }
+}
+
+#[tokio::test]
+async fn project_resolve_v1_records_roundtrip_through_project_identity() {
+    fn changed_members(before: &Value, after: &Value, path: &str, changes: &mut Vec<String>) {
+        match (before, after) {
+            (Value::Object(left), Value::Object(right)) => {
+                for (key, value) in left {
+                    let next = format!("{path}/{key}");
+                    match right.get(key) {
+                        Some(other) => changed_members(value, other, &next, changes),
+                        None => changes.push(format!("{next}: lost {value}")),
+                    }
+                }
+                for (key, value) in right {
+                    if !left.contains_key(key) {
+                        changes.push(format!("{path}/{key}: added {value}"));
+                    }
+                }
+            }
+            (Value::Array(left), Value::Array(right)) if left.len() == right.len() => {
+                for (index, (value, other)) in left.iter().zip(right).enumerate() {
+                    changed_members(value, other, &format!("{path}/{index}"), changes);
+                }
+            }
+            _ if before != after => changes.push(format!("{path}: {before} -> {after}")),
+            _ => {}
+        }
+    }
+
+    fn check_record<P: DeserializeOwned, R: DeserializeOwned + Serialize>(
+        label: &str,
+        record: &Value,
+    ) {
+        let request = serde_json::from_value::<pid::Request<P>>(record["request"].clone());
+        // Requests refused as invalid_params must fail typed decoding; all other
+        // published and freshly served requests must remain decodable.
+        if record["reply"]["code"] == "invalid_params" {
+            assert!(request.is_err(), "{label}: invalid_params request decoded");
+        } else {
+            request.unwrap_or_else(|error| panic!("{label}: request decode failed: {error}"));
+        }
+
+        let reply = &record["reply"];
+        let decoded: pid::Outcome<R> = serde_json::from_value(reply.clone())
+            .unwrap_or_else(|error| panic!("{label}: reply decode failed: {error}; reply={reply}"));
+        let encoded = serde_json::to_value(decoded)
+            .unwrap_or_else(|error| panic!("{label}: reply encode failed: {error}"));
+        let mut changes = Vec::new();
+        changed_members(reply, &encoded, "", &mut changes);
+        // Value equality preserves member presence, including null versus absent,
+        // without depending on object key order or platform-specific JSON bytes.
+        assert_eq!(
+            reply,
+            &encoded,
+            "{label}: project-identity round trip changed members:\n{}",
+            changes.join("\n")
+        );
+    }
+
+    // Check both committed examples and freshly served replies: otherwise a
+    // handler change could escape the typed check until the examples are updated.
+    for (name, served) in project_resolve_v1_records().await {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-vectors/project-resolve-v1")
+            .join(name);
+        let published: Vec<Value> =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let served: Vec<Value> = served
+            .iter()
+            .map(|record| serde_json::from_str(record).unwrap())
+            .collect();
+        for (source, records) in [("published", published), ("served", served)] {
+            assert!(!records.is_empty(), "{source} {name}: no records");
+            for (index, record) in records.iter().enumerate() {
+                let label = format!("{source} {name}[{index}]");
+                match record["request"]["method"].as_str().unwrap() {
+                    "resolve" => {
+                        check_record::<pid::ResolveParams, pid::ResolveReply>(&label, record)
+                    }
+                    "resolve_project_id" => check_record::<
+                        pid::ResolveProjectIdParams,
+                        pid::ResolveProjectIdReply,
+                    >(&label, record),
+                    "enumerate" => {
+                        check_record::<pid::EnumerateParams, pid::EnumerateReply>(&label, record)
+                    }
+                    method => panic!("{label}: unexpected method {method}"),
+                }
+            }
+        }
+    }
+}
+
+async fn project_resolve_v1_records() -> [(&'static str, Vec<String>); 4] {
     let fixture = SessionFixture::new("served-project-resolve-v1").await;
     fixture
         .handler
@@ -928,7 +1028,6 @@ async fn project_resolve_v1_records_match_published_files() {
         &implicit_ids,
         &malformed_reply,
     ));
-    published_file("project-resolve-v1", "resolve.json", resolve_records);
 
     let mut project_id_records = Vec::new();
     for project_id in ["pj-resolve-root", alias_id.as_str(), "pj-no-such-project"] {
@@ -948,11 +1047,6 @@ async fn project_resolve_v1_records_match_published_files() {
             &reply,
         ));
     }
-    published_file(
-        "project-resolve-v1",
-        "resolve-project-id.json",
-        project_id_records,
-    );
 
     let enumeration = SessionFixture::new("served-project-enumerate-v1").await;
     for (project_id, name) in [
@@ -988,7 +1082,7 @@ async fn project_resolve_v1_records_match_published_files() {
     let (record, _) = enumeration
         .record(SESSION_READER, READER_MODULE, "enumerate", json!({}))
         .await;
-    published_file("project-resolve-v1", "enumerate.json", vec![record]);
+    let enumerate_records = vec![record];
 
     // Keep the additional lifecycle writes separate so the original records'
     // generations and published bytes remain unchanged.
@@ -1188,11 +1282,12 @@ async fn project_resolve_v1_records_match_published_files() {
         &mut identity_records,
     )
     .await;
-    published_file(
-        "project-resolve-v1",
-        "resolve-root-records.json",
-        identity_records,
-    );
+    [
+        ("resolve.json", resolve_records),
+        ("resolve-project-id.json", project_id_records),
+        ("enumerate.json", enumerate_records),
+        ("resolve-root-records.json", identity_records),
+    ]
 }
 
 #[tokio::test]
