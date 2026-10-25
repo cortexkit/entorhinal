@@ -1059,10 +1059,22 @@ async fn project_resolve_v1_records_match_published_files() {
         .unwrap()
         .set_root_records(true);
 
+    // Every path a reply can name maps to its fixed spelling explicitly. Only
+    // replacing the scratch root would leave the platform's separator inside
+    // the rest of the path, so Windows would publish `/fixture\remotes-checkout`.
+    let mut stable_paths = vec![
+        (root.clone(), "/fixture/remotes-checkout".to_string()),
+        (
+            unreadable.clone(),
+            "/fixture/unreadable-config-checkout".to_string(),
+        ),
+    ];
+
     async fn record_root_state(
         fixture: &SessionFixture,
         path: &str,
         identity: &str,
+        stable_paths: &[(String, String)],
         records: &mut Vec<String>,
     ) -> Value {
         let (record, reply) = fixture
@@ -1080,7 +1092,7 @@ async fn project_resolve_v1_records_match_published_files() {
         records.push(normalize_project_record(
             record,
             &scratch_root,
-            &[],
+            stable_paths,
             &[],
             &reply,
         ));
@@ -1088,13 +1100,34 @@ async fn project_resolve_v1_records_match_published_files() {
     }
 
     let mut identity_records = Vec::new();
-    record_root_state(&identities, &root, "unbound", &mut identity_records).await;
-    record_root_state(&identities, &unreadable, "unbound", &mut identity_records).await;
+    record_root_state(
+        &identities,
+        &root,
+        "unbound",
+        &stable_paths,
+        &mut identity_records,
+    )
+    .await;
+    record_root_state(
+        &identities,
+        &unreadable,
+        "unbound",
+        &stable_paths,
+        &mut identity_records,
+    )
+    .await;
 
     let store = identities.store();
     store.bind_root(&root, "project-resolve-v1").unwrap();
     store.approve_root(&root, "project-resolve-v1").unwrap();
-    let bound = record_root_state(&identities, &root, "bound", &mut identity_records).await;
+    let bound = record_root_state(
+        &identities,
+        &root,
+        "bound",
+        &stable_paths,
+        &mut identity_records,
+    )
+    .await;
     let epoch = bound["result"]["rootRecords"][0]["registrationEpoch"]
         .as_str()
         .unwrap();
@@ -1126,16 +1159,35 @@ async fn project_resolve_v1_records_match_published_files() {
     let worktree = crate::tests::canonical_test_path(worktree)
         .to_string_lossy()
         .into_owned();
+    stable_paths.push((container.clone(), "/fixture/attached-worktrees".to_string()));
+    stable_paths.push((
+        worktree.clone(),
+        "/fixture/attached-worktrees/retired-worktree".to_string(),
+    ));
     std::fs::write(
         PathBuf::from(&root).join(".git/cortexkit-root-incarnation"),
         format!("{}\n", "e".repeat(64)),
     )
     .unwrap();
-    record_root_state(&identities, &root, "replaced", &mut identity_records).await;
+    record_root_state(
+        &identities,
+        &root,
+        "replaced",
+        &stable_paths,
+        &mut identity_records,
+    )
+    .await;
     // Rebinding retires the epoch retained by the attached container. Resolve
     // reaches the retired worktree record through the containment path.
     store.bind_root(&root, "project-resolve-v1").unwrap();
-    record_root_state(&identities, &worktree, "retired", &mut identity_records).await;
+    record_root_state(
+        &identities,
+        &worktree,
+        "retired",
+        &stable_paths,
+        &mut identity_records,
+    )
+    .await;
     published_file(
         "project-resolve-v1",
         "resolve-root-records.json",
