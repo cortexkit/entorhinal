@@ -36,6 +36,18 @@ detail was supplied).
   runs supervisor and placement validation. Despite those populated identities,
   `agent.resolve` does not emit names, roles, tags, labels, avatars, placement, or
   `supervisor_agent_id`; the head and hiree have the same result shape.
+- **`agent-resolve-merged.json`**: two direct `agent.resolve` records after a merge,
+  in order:
+  - merged assistant Luma (`agent_0000000000000601`), with `status: "merged"`,
+    `merged_into: "agent_0000000000000602"`, and
+    `gone: {"at":700,"reason":"merged","into_agent_id":"agent_0000000000000602"}`;
+  - surviving assistant Sora (`agent_0000000000000602`), with `status: "live"`,
+    `merged_into: null`, and `gone: null`.
+  Both agents are created with invented names and fixed ids through the store's
+  real `agent.create` mutation, then merged through its real `agent.merge`
+  mutation, all as `reserved:prefrontal-core`. Reads go through the handler as
+  `Reserved(phone)`. No terminal state is seeded with SQL. The separate file
+  leaves the previously published `agent-resolve.json` bytes and checksum intact.
 - **`fleet-identity.json`**: a full `{}` read, the unchanged read using its
   returned token, and an unknown-field `invalid_request` refusal. The fixture
   has a head with a versioned avatar, an assistant with an unversioned avatar,
@@ -50,7 +62,7 @@ detail was supplied).
   present avatar, and a duplicate of the first id. Unknown/unset avatars are
   omitted, while retired avatars and duplicates are retained in request order.
   The last three records refuse zero ids, 65 ids, and an empty-string id.
-- **`SHA256SUMS`**: SHA-256 hashes of the three JSON files, with filenames relative
+- **`SHA256SUMS`**: SHA-256 hashes of the four JSON files, with filenames relative
   to this directory.
 
 ## Reproduce and verify
@@ -63,7 +75,14 @@ ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked served
 
 On PowerShell, set `$env:ENTO_WRITE_SERVED_VECTORS = '1'` before the same cargo
 command, and remove that environment variable afterwards. Generation rewrites
-the three JSON files in this directory. Refresh their hashes from the repository
+the four JSON files in this directory. To regenerate only the merged sample
+without rewriting previously published files, use:
+
+```sh
+ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked served_vectors::agent_resolve_merged_records_match_published_file -- --exact --nocapture
+```
+
+Refresh their hashes from the repository
 root with:
 
 ```sh
@@ -71,7 +90,7 @@ python3 - <<'PY'
 import hashlib
 from pathlib import Path
 root = Path('test-vectors/agent-identity-reads-v1')
-names = ['agent-resolve.json', 'avatar-read.json', 'fleet-identity.json']
+names = ['agent-resolve.json', 'agent-resolve-merged.json', 'avatar-read.json', 'fleet-identity.json']
 root.joinpath('SHA256SUMS').write_text(''.join(
     f'{hashlib.sha256(root.joinpath(name).read_bytes()).hexdigest()}  {name}\n'
     for name in names), encoding='utf-8')
@@ -79,8 +98,9 @@ PY
 ```
 
 Without the write environment variable, the non-ignored
-`served_vectors::served_records_match_published_files` and
-`served_vectors::agent_resolve_records_match_published_file` tests byte-compare
+`served_vectors::served_records_match_published_files`,
+`served_vectors::agent_resolve_records_match_published_file`, and
+`served_vectors::agent_resolve_merged_records_match_published_file` tests byte-compare
 the captured records with these files on every CI run, including Linux, macOS,
 and Windows. The fixed clock is `700` and the process incarnation is
 `0123456789abcdef`. The project is
@@ -90,12 +110,14 @@ platform path or temporary-directory name enters the fixture or the captured
 replies. In particular, `agent.resolve` emits no filesystem paths, so its
 records need no path substitutions.
 
-The direct resolve generator can also be checked independently with both test
+The direct resolve generators can also be checked independently with both test
 runners (leave `ENTO_WRITE_SERVED_VECTORS` unset):
 
 ```sh
 cargo test --workspace --all-targets --locked served_vectors::agent_resolve_records_match_published_file -- --exact
 cargo nextest run --workspace --all-targets --locked -E 'test(served_vectors::agent_resolve_records_match_published_file)'
+cargo test --workspace --all-targets --locked served_vectors::agent_resolve_merged_records_match_published_file -- --exact
+cargo nextest run --workspace --all-targets --locked -E 'test(served_vectors::agent_resolve_merged_records_match_published_file)'
 ```
 
 Fleet avatar fingerprints are the first 32 hexadecimal characters of BLAKE3

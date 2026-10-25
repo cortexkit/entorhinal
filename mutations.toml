@@ -6,6 +6,29 @@
 # audits all package targets, except rows narrowed with select="expected".
 
 [[control]]
+id = "served-agent-resolve-merged-wire-bytes"
+guards = "Published merged agent.resolve replies retain the successor id"
+file = "crates/entorhinal-module/src/agent_reads.rs"
+old = '''        result.insert(
+            "incarnation".into(),
+            Value::String(self.incarnation.clone()),
+        );'''
+new = '''        result.insert(
+            "incarnation".into(),
+            Value::String(self.incarnation.clone()),
+        );
+        if result.get("status").and_then(Value::as_str) == Some("merged") {
+            result.insert("merged_into".into(), Value::Null); // NON-VACUITY BREAK
+        }'''
+test_file = "crates/entorhinal-module/src/served_vectors.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--all-targets", "--locked", "{test}", "--", "--exact"]
+list_command = ["python3", "-c", "import json, subprocess, sys; r = subprocess.run(['cargo', 'test', '--workspace', '--all-targets', '--locked', sys.argv[1], '--', '--exact', '--list'], check=True, capture_output=True, text=True); print(json.dumps([line.removesuffix(': test') for line in r.stdout.splitlines() if line.endswith(': test')]))", "{test}"]
+test_count_pattern = '''running {count} test
+test served_vectors::agent_resolve_merged_records_match_published_file'''
+expect_red = ["served_vectors::agent_resolve_merged_records_match_published_file"]
+
+[[control]]
 id = "served-agent-resolve-wire-bytes"
 guards = "Published agent.resolve replies retain the serving process incarnation"
 file = "crates/entorhinal-module/src/agent_reads.rs"

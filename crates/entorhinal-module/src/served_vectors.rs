@@ -626,6 +626,76 @@ async fn agent_resolve_records_match_published_file() {
     published_file("agent-identity-reads-v1", "agent-resolve.json", records);
 }
 
+#[tokio::test]
+async fn agent_resolve_merged_records_match_published_file() {
+    const MERGED: &str = "agent_0000000000000601";
+    const SURVIVOR: &str = "agent_0000000000000602";
+    let fixture = Fixture::new("served-agent-resolve-merged").await;
+    drop(fixture.snapshot());
+    let imported = fixture.import().await;
+    let HandlerOutcome::Response(bytes) = imported else {
+        panic!(
+            "merged resolve fixture import refused: {}",
+            refusal(imported)
+        );
+    };
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).unwrap()["result"]["agents_imported"],
+        0
+    );
+    {
+        let mut store = fixture.handler.store.lock().unwrap();
+        let writer = store
+            .as_mut()
+            .unwrap()
+            .with_principal("reserved:prefrontal-core");
+        // Fixed ids keep the records reproducible while real mutations enforce
+        // name claims and write the merge's terminal state and journal entries.
+        for (id, name) in [(MERGED, "Luma"), (SURVIVOR, "Sora")] {
+            writer
+                .agent_mutation_with_id(
+                    "agent.create",
+                    json!({"role":"assistant","name":name,"tag":"Research assistant","request_key":format!("resolve-merged-create-{name}")}),
+                    700,
+                    Some(id),
+                )
+                .unwrap();
+        }
+        writer
+            .agent_mutation(
+                "agent.merge",
+                json!({"agent_id":MERGED,"into_agent_id":SURVIVOR,"request_key":"resolve-merged-merge"}),
+                700,
+            )
+            .unwrap();
+    }
+
+    let mut records = Vec::new();
+    for (id, status, merged_into, gone) in [
+        (
+            MERGED,
+            "merged",
+            json!(SURVIVOR),
+            json!({"at":700,"reason":"merged","into_agent_id":SURVIVOR}),
+        ),
+        (SURVIVOR, "live", Value::Null, Value::Null),
+    ] {
+        let (record, reply) = fixture
+            .record("agent.resolve", json!({"agent_id":id}))
+            .await;
+        assert_eq!(reply["result"]["agent_id"], id);
+        assert_eq!(reply["result"]["status"], status);
+        assert_eq!(reply["result"]["merged_into"], merged_into);
+        assert_eq!(reply["result"]["gone"], gone);
+        records.push(record);
+    }
+    published_file(
+        "agent-identity-reads-v1",
+        "agent-resolve-merged.json",
+        records,
+    );
+}
+
 const SESSION_AGENT: &str = "agent_0000000000000101";
 const REF_OWNER: &str = "agent_0000000000000102";
 const CLAIMED_AGENT: &str = "agent_0000000000000103";
