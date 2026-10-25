@@ -989,6 +989,154 @@ async fn project_resolve_v1_records_match_published_files() {
         .record(SESSION_READER, READER_MODULE, "enumerate", json!({}))
         .await;
     published_file("project-resolve-v1", "enumerate.json", vec![record]);
+
+    // Keep the additional lifecycle writes separate so the original records'
+    // generations and published bytes remain unchanged.
+    let identities = SessionFixture::new("served-project-root-identities-v1").await;
+    // The handler normally binds roots after registration. Disable that step
+    // until the unbound examples have been registered.
+    identities
+        .handler
+        .store
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .set_root_records(false);
+    let root = identities.dir.join("remotes-checkout");
+    let unreadable = identities.dir.join("unreadable-config-checkout");
+    for (path, project_id, name) in [
+        (&root, "pj-remotes-root", "Remotes Root"),
+        (&unreadable, "pj-unreadable-root", "Unreadable Config Root"),
+    ] {
+        std::fs::create_dir_all(path.join(".git")).unwrap();
+        std::fs::write(path.join(".git/config"), "[core]\n\tbare = false\n").unwrap();
+        let (_, reply) = identities
+            .record(
+                SESSION_CORE,
+                WRITER_MODULE,
+                "register",
+                json!({"projectId":project_id,"name":name,"roots":[path]}),
+            )
+            .await;
+        assert!(
+            reply.get("result").is_some(),
+            "fixture project registration failed: {reply}"
+        );
+    }
+    let root = crate::tests::canonical_test_path(root)
+        .to_string_lossy()
+        .into_owned();
+    let unreadable = crate::tests::canonical_test_path(unreadable)
+        .to_string_lossy()
+        .into_owned();
+    std::fs::write(
+        PathBuf::from(&root).join(".git/config"),
+        concat!(
+            "[remote \"origin\"]\n\turl = https://github.com/example-org/widgets.git\n",
+            "[remote \"upstream\"]\n\turl = git@github.com:example-upstream/widgets.git\n",
+        ),
+    )
+    .unwrap();
+    // Invalid UTF-8 makes reading the config fail even when tests run as root;
+    // permission bits would not reliably produce an unreadable config.
+    std::fs::write(PathBuf::from(&unreadable).join(".git/config"), [0xff]).unwrap();
+    std::fs::write(
+        PathBuf::from(&root).join(".git/cortexkit-root-incarnation"),
+        format!("{fixed_token}\n"),
+    )
+    .unwrap();
+    identities
+        .handler
+        .store
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .set_root_records(true);
+
+    async fn record_root_state(
+        fixture: &SessionFixture,
+        path: &str,
+        identity: &str,
+        records: &mut Vec<String>,
+    ) -> Value {
+        let (record, reply) = fixture
+            .record(
+                SESSION_READER,
+                READER_MODULE,
+                "resolve",
+                json!({"canonicalRoot":path}),
+            )
+            .await;
+        assert_eq!(reply["result"]["rootRecords"][0]["identity"], identity);
+        let scratch_root = crate::tests::canonical_test_path(&fixture.dir)
+            .to_string_lossy()
+            .into_owned();
+        records.push(normalize_project_record(
+            record,
+            &scratch_root,
+            &[],
+            &[],
+            &reply,
+        ));
+        reply
+    }
+
+    let mut identity_records = Vec::new();
+    record_root_state(&identities, &root, "unbound", &mut identity_records).await;
+    record_root_state(&identities, &unreadable, "unbound", &mut identity_records).await;
+
+    let store = identities.store();
+    store.bind_root(&root, "project-resolve-v1").unwrap();
+    store.approve_root(&root, "project-resolve-v1").unwrap();
+    let bound = record_root_state(&identities, &root, "bound", &mut identity_records).await;
+    let epoch = bound["result"]["rootRecords"][0]["registrationEpoch"]
+        .as_str()
+        .unwrap();
+    let container = identities.dir.join("attached-worktrees");
+    std::fs::create_dir_all(&container).unwrap();
+    let container = crate::tests::canonical_test_path(container)
+        .to_string_lossy()
+        .into_owned();
+    store
+        .attach_derived_parent(entorhinal_core::AttachDerivedParentRequest {
+            project_id: "pj-remotes-root".into(),
+            root: root.clone(),
+            incarnation: fixed_token,
+            registration_epoch: epoch.into(),
+            container: container.clone(),
+            ..Default::default()
+        })
+        .unwrap();
+    let worktree = PathBuf::from(&container).join("retired-worktree");
+    let admin = PathBuf::from(&root).join(".git/worktrees/retired-worktree");
+    std::fs::create_dir_all(&admin).unwrap();
+    std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(
+        worktree.join(".git"),
+        format!("gitdir: {}\n", admin.display()),
+    )
+    .unwrap();
+    let worktree = crate::tests::canonical_test_path(worktree)
+        .to_string_lossy()
+        .into_owned();
+    std::fs::write(
+        PathBuf::from(&root).join(".git/cortexkit-root-incarnation"),
+        format!("{}\n", "e".repeat(64)),
+    )
+    .unwrap();
+    record_root_state(&identities, &root, "replaced", &mut identity_records).await;
+    // Rebinding retires the epoch retained by the attached container. Resolve
+    // reaches the retired worktree record through the containment path.
+    store.bind_root(&root, "project-resolve-v1").unwrap();
+    record_root_state(&identities, &worktree, "retired", &mut identity_records).await;
+    published_file(
+        "project-resolve-v1",
+        "resolve-root-records.json",
+        identity_records,
+    );
 }
 
 #[tokio::test]
