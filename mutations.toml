@@ -1349,6 +1349,10 @@ test_file = "crates/entorhinal-module/src/shared_write.rs"
 runner = "cargo"
 package = "entorhinal-module"
 target = "--bin ck-entorhinal"
+# Run only the named test. Under this break the slot is never released, so in
+# a whole-binary run every later test that asks for a confirmation waits on it
+# until the runner's timeout instead of failing.
+select = "expected"
 expect_red = ["shared_write::tests::confirmation::busy_slot_survives_approval_and_releases_on_finish_drop_and_deadline"]
 
 [[control]]
