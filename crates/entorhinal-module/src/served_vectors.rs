@@ -546,6 +546,86 @@ async fn served_records_match_published_files() {
     published_file("agent-identity-reads-v1", "avatar-read.json", records);
 }
 
+#[tokio::test]
+async fn agent_resolve_records_match_published_file() {
+    const HIREE: &str = "agent_0000000000000005";
+    let fixture = Fixture::new("served-agent-resolve").await;
+    let source = fixture.snapshot();
+    seed_agent(
+        &source,
+        HEAD,
+        "Mira",
+        Some(&json!({"genome":"d".repeat(2048),"type":"creature.classic","version":3})),
+        false,
+        true,
+    );
+    seed_agent(&source, RETIRED, "Ivo", None, true, false);
+    drop(source);
+    let imported = fixture.import().await;
+    let HandlerOutcome::Response(bytes) = imported else {
+        panic!("resolve fixture import refused: {}", refusal(imported));
+    };
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).unwrap()["result"]["agents_imported"],
+        2
+    );
+    fixture
+        .success(
+            CORE,
+            "agent.update_tag",
+            json!({"agent_id":HEAD,"tag":"Research lead","request_key":"resolve-head-tag"}),
+        )
+        .await;
+    fixture
+        .success(
+            CORE,
+            "agent.set_labels",
+            json!({"agent_id":HEAD,"labels":["research","planning"],"request_key":"resolve-head-labels"}),
+        )
+        .await;
+    // The ordinary create mutation accepts a fixed id for fixture setup without
+    // bypassing its placement, supervisor, name-claim, or journal validation.
+    fixture
+        .handler
+        .store
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .with_principal("reserved:prefrontal-core")
+        .agent_mutation_with_id(
+            "agent.create",
+            json!({"role":"hiree","name":"Neri","tag":"Research helper","project_id":"served-project","supervisor_agent_id":HEAD,"request_key":"resolve-hiree"}),
+            700,
+            Some(HIREE),
+        )
+        .unwrap();
+
+    let mut records = Vec::new();
+    for (id, status) in [
+        (HEAD, "live"),
+        (HIREE, "live"),
+        (RETIRED, "retired"),
+        (UNKNOWN, "unknown"),
+    ] {
+        let (record, reply) = fixture
+            .record("agent.resolve", json!({"agent_id":id}))
+            .await;
+        assert_eq!(reply["result"]["status"], status);
+        records.push(record);
+    }
+    for request in [
+        json!({}),
+        json!({"agent_id":42}),
+        json!({"agent_id":HEAD,"unknown":true}),
+    ] {
+        let (record, reply) = fixture.record("agent.resolve", request).await;
+        assert_eq!(reply["code"], "invalid_request");
+        records.push(record);
+    }
+    published_file("agent-identity-reads-v1", "agent-resolve.json", records);
+}
+
 const SESSION_AGENT: &str = "agent_0000000000000101";
 const REF_OWNER: &str = "agent_0000000000000102";
 const CLAIMED_AGENT: &str = "agent_0000000000000103";
