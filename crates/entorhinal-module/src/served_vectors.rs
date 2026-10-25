@@ -3461,6 +3461,186 @@ async fn memory_context_v1_records_match_published_files() {
     published_file("memory-context-v1", "workspace-document.json", records);
 }
 
+#[tokio::test]
+async fn memory_context_v1_populated_records_match_published_file() {
+    use entorhinal_core::{
+        catalog_agent::{CatalogPin, CatalogSpec, CatalogTarget},
+        remote_apply::{RemoteEntry, ENVELOPE_VERSION},
+    };
+    const LOCAL_AUTHOR: &str = "11111111111111111111111111111111";
+    const REMOTE_AUTHOR: &str = "22222222222222222222222222222222";
+
+    let fixture = Fixture::new("served-memory-context-populated").await;
+    let root = crate::tests::canonical_test_path(&fixture.dir).join("project");
+    std::fs::create_dir_all(&root).unwrap();
+    fixture
+        .success(
+            CORE,
+            "register",
+            json!({"projectId":"served-project","name":"Served project","roots":[root],"workspaceId":"served-workspace"}),
+        )
+        .await;
+    let source = fixture.snapshot();
+    seed_agent(&source, ASSISTANT, "Mira", None, false, false);
+    seed_agent(&source, RETIRED, "Oren", None, true, false);
+    drop(source);
+    assert!(matches!(
+        fixture.import().await,
+        HandlerOutcome::Response(_)
+    ));
+    let store = fixture.handler.with_store(|s| Ok(s.clone())).unwrap();
+
+    let skill = CatalogPin {
+        name: "@example/context-skill".into(),
+        version: "1.0.0".into(),
+        kind: entorhinal_catalog::Kind::Skill,
+        manifest_sha256: "a".repeat(64),
+        archive_sha256: "b".repeat(64),
+        publisher_fingerprint: "c".repeat(64),
+        root: true,
+        range: Some("^1.0.0".into()),
+    };
+    for (plan, generation) in [
+        ("plan:context-active", "generation:context-active"),
+        ("plan:context-ready", "generation:context-ready"),
+    ] {
+        store
+            .catalog_create_plan(
+                plan,
+                ASSISTANT,
+                CatalogTarget::Agent(ASSISTANT.into()),
+                "install",
+                CatalogSpec {
+                    package: skill.name.clone(),
+                    range: "^1.0.0".into(),
+                },
+                700,
+            )
+            .unwrap();
+        store
+            .catalog_plan_ready(plan, ASSISTANT, vec![skill.clone()], 700)
+            .unwrap();
+        store
+            .catalog_approve_plan(plan, ASSISTANT, generation, 700)
+            .unwrap();
+        store
+            .catalog_generation_ready(generation, ASSISTANT)
+            .unwrap();
+    }
+    store
+        .catalog_activate_generation("generation:context-active", ASSISTANT, 700)
+        .unwrap();
+
+    store
+        .apply_remote_entry(
+            &RemoteEntry {
+                position: store.identity_log_status().unwrap().last_applied_position + 1,
+                entry_id: "context-member-name".into(),
+                author: REMOTE_AUTHOR.into(),
+                signer: "fixture".into(),
+                key_id: "fixture".into(),
+                envelope_version: ENVELOPE_VERSION,
+                kind: "change".into(),
+                entry: serde_json::to_vec(&json!({
+                    "op":"member.set_name","author":REMOTE_AUTHOR,"display_name":"Juniper laptop"
+                }))
+                .unwrap(),
+            },
+            Some(LOCAL_AUTHOR),
+        )
+        .unwrap();
+    const CUT_ID: &str = "cut-context-remote";
+    store
+        .cache_agent_claims(
+            &[(
+                ASSISTANT.into(),
+                ClaimObservation::Present {
+                    claim: CachedClaim {
+                        holder: Some(REMOTE_AUTHOR.into()),
+                        epoch: 2,
+                        cut_id: Some(CUT_ID.into()),
+                        version: 2,
+                        read_at_ms: 700,
+                        stale: false,
+                        integrity_failed: false,
+                    },
+                    self_author: LOCAL_AUTHOR.into(),
+                },
+            )],
+            700,
+        )
+        .unwrap();
+    store
+        .insert_agent_move(&AgentMove {
+            cut_id: CUT_ID.into(),
+            agent_id: ASSISTANT.into(),
+            side: MoveSide::Source,
+            peer: REMOTE_AUTHOR.into(),
+            step: MoveStep::Releasing,
+            plan: json!({"_source":{}}),
+            request_body: Some(json!({"agent_id":ASSISTANT,"to":"Juniper laptop"})),
+            record_version: 0,
+            claim_version: Some(2),
+            claim_take_body: None,
+            claim_take_version: None,
+            claim_landed_version: None,
+            seal_sent: false,
+            abort_requested: None,
+            hold: None,
+            cut_accept: None,
+            reason: None,
+            detail: None,
+            request_key: None,
+            attempts: 0,
+            activated_at_ms: None,
+            created_at_ms: 600,
+            updated_at_ms: 650,
+        })
+        .unwrap();
+
+    let (record, reply) = fixture
+        .record("context.session", json!({"agent_id":ASSISTANT}))
+        .await;
+    assert_eq!(
+        reply["result"]["catalog_generations"],
+        json!([
+            {"generation_id":"generation:context-active","state":"active"},
+            {"generation_id":"generation:context-ready","state":"ready"}
+        ]),
+        "session includes active and ready generations"
+    );
+    assert_eq!(reply["result"]["where"]["status"], "held_elsewhere");
+    assert_eq!(reply["result"]["where"]["holder"], REMOTE_AUTHOR);
+    assert_eq!(reply["result"]["where"]["holder_name"], "Juniper laptop");
+    assert_eq!(reply["result"]["where"]["cut_id"], CUT_ID);
+    assert_eq!(reply["result"]["where"]["read_at_ms"], 700);
+    assert_eq!(reply["result"]["where"]["moving"]["step"], "releasing");
+    let mut records = vec![record];
+
+    // Session reads check whereabouts before resolving identity, so a retired
+    // agent produces a gone refusal, never a successful agent.gone object.
+    let (record, reply) = fixture
+        .record("context.session", json!({"agent_id":RETIRED}))
+        .await;
+    assert_eq!(reply["code"], "gone");
+    assert_eq!(reply["detail"], json!({"reason":"deleted","at":10}));
+    records.push(record);
+    let records = records
+        .into_iter()
+        .map(|record| {
+            record.replace(
+                &json_string_contents(&root.to_string_lossy()),
+                "/fixture/project",
+            )
+        })
+        .collect();
+    published_file(
+        "memory-context-v1",
+        "context-session-populated.json",
+        records,
+    );
+}
+
 struct CatalogConsumerVectorRoute {
     capability: &'static str,
     check_reply: Value,

@@ -6,6 +6,21 @@
 # audits all package targets, except rows narrowed with select="expected".
 
 [[control]]
+id = "served-context-session-populated-generations"
+guards = "Published populated session replies retain both active and ready catalog generation summaries"
+file = "crates/entorhinal-core/src/context.rs"
+old = "WHERE agent_id=?1 AND state IN ('active','degraded','ready') ORDER BY created_at_ms,generation_id"
+new = "WHERE agent_id=?1 AND state IN ('active','degraded') /* NON-VACUITY BREAK */ ORDER BY created_at_ms,generation_id"
+test_file = "crates/entorhinal-module/src/served_vectors.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--all-targets", "--locked", "{test}", "--", "--exact"]
+list_command = ["python3", "-c", "import json, subprocess, sys; r = subprocess.run(['cargo', 'test', '--workspace', '--all-targets', '--locked', sys.argv[1], '--', '--exact', '--list'], check=True, capture_output=True, text=True); print(json.dumps([line.removesuffix(': test') for line in r.stdout.splitlines() if line.endswith(': test')]))", "{test}"]
+test_count_pattern = '''running {count} test
+test served_vectors::memory_context_v1_populated_records_match_published_file'''
+expect_red = ["served_vectors::memory_context_v1_populated_records_match_published_file"]
+expect_message = "session includes active and ready generations"
+
+[[control]]
 id = "served-project-resolve-remote-wire-bytes"
 guards = "Remote lookup replies retain the generation served by the store in the published byte samples"
 file = "crates/entorhinal-module/src/main.rs"
