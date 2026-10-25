@@ -11448,3 +11448,20 @@ package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
 expect_red = ["two_machine_acceptance::moves::agent_refs::combined_declarer_refuses_257_routed_refs_before_busy_or_recording"]
+
+[[control]]
+id = "project-identity-resolve-remote-found-shape"
+guards = "A found resolve_remote reply carries the projectId member the shared project-identity type requires"
+file = "crates/entorhinal-core/src/ownership.rs"
+old = '''        #[serde(rename = "projectId")]
+        project_id: String,
+        root: String,'''
+new = '''        #[serde(rename = "project")] // NON-VACUITY BREAK
+        project_id: String,
+        root: String,'''
+test_file = "crates/entorhinal-module/src/served_vectors.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+expect_red = ["served_vectors::project_resolve_v1_records_roundtrip_through_project_identity"]

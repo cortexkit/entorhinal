@@ -825,7 +825,12 @@ async fn project_resolve_v1_records_roundtrip_through_project_identity() {
 
     // Check both committed examples and freshly served replies: otherwise a
     // handler change could escape the typed check until the examples are updated.
-    for (name, served) in project_resolve_v1_records().await {
+    let mut files = project_resolve_v1_records().await.to_vec();
+    files.push((
+        "resolve-remote.json",
+        project_resolve_remote_v1_records().await,
+    ));
+    for (name, served) in files {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../test-vectors/project-resolve-v1")
             .join(name);
@@ -846,6 +851,10 @@ async fn project_resolve_v1_records_roundtrip_through_project_identity() {
                     "resolve_project_id" => check_record::<
                         pid::ResolveProjectIdParams,
                         pid::ResolveProjectIdReply,
+                    >(&label, record),
+                    "resolve_remote" => check_record::<
+                        pid::ResolveRemoteParams,
+                        pid::ResolveRemoteReply,
                     >(&label, record),
                     "enumerate" => {
                         check_record::<pid::EnumerateParams, pid::EnumerateReply>(&label, record)
@@ -1292,6 +1301,14 @@ async fn project_resolve_v1_records() -> [(&'static str, Vec<String>); 4] {
 
 #[tokio::test]
 async fn project_resolve_remote_v1_records_match_published_file() {
+    published_file(
+        "project-resolve-v1",
+        "resolve-remote.json",
+        project_resolve_remote_v1_records().await,
+    );
+}
+
+async fn project_resolve_remote_v1_records() -> Vec<String> {
     let fixture = SessionFixture::new("served-project-resolve-remote-v1").await;
     let fixed_token = "0123456789abcdef".repeat(4);
     let mut paths = Vec::new();
@@ -1405,7 +1422,7 @@ async fn project_resolve_remote_v1_records_match_published_file() {
         &[],
         &reply,
     ));
-    published_file("project-resolve-v1", "resolve-remote.json", records);
+    records
 }
 
 #[tokio::test]
