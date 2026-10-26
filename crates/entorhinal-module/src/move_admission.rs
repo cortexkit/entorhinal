@@ -706,6 +706,15 @@ mod tests {
                     "fixture",
                 )
                 .unwrap();
+            if stage >= 2 {
+                // Enabling sharing queues a claim refresh of its own. Whether that
+                // pass reads before or after a test's first agent exists depends
+                // on blocking-pool scheduling, so on a slow machine it can add a
+                // read the test never made. Finish it here and forget its engram
+                // calls, so tests that count calls see only their own move's.
+                f.handler.wait_claim_refresh().await.unwrap();
+                f.records.calls.lock().unwrap().clear();
+            }
             f
         }
         fn store(&self) -> RegistryStore {
@@ -1115,15 +1124,14 @@ mod tests {
                     _ => "agent_busy",
                 }
             );
+            let calls = f.records.calls.lock().unwrap().clone();
             assert_eq!(
-                f.records
-                    .calls
-                    .lock()
-                    .unwrap()
+                calls
                     .iter()
                     .filter(|(m, _)| m == "record.read_many")
                     .count(),
-                2
+                2,
+                "check {check}: {calls:?}"
             );
         }
     }
