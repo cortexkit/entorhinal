@@ -79,7 +79,7 @@ Start with [docs/architecture.md](docs/architecture.md).
   [session liveness](docs/session-liveness-contract.md).
 - Operator guides: [projects and roots](docs/projects-and-roots.md),
   [agents](docs/agents.md), [sharing between machines](docs/sharing.md),
-  [moving agents](docs/moves.md), [mutation proofs](docs/mutations.md).
+  [moving agents](docs/moves.md).
 - [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
 
 ## License

@@ -15,7 +15,6 @@ scripts/check-cortexkit-layout.sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --all-targets --locked
-ckdev-mutate check --strict
 ```
 
 - `scripts/check-cortexkit-layout.sh` confirms that nothing under
@@ -30,14 +29,6 @@ ckdev-mutate check --strict
   Linux, macOS and Windows; the macOS and Windows jobs use `--no-fail-fast`.
   Some tests only run on one platform (for example the Windows ACL tests in
   `crates/entorhinal-module/tests/windows_owner_only.rs`).
-- `ckdev-mutate check --strict` validates the mutation catalogue in
-  `mutations.toml`: every anchor must still match the source and every named
-  test in an active row must exist. Active command rows must supply a
-  `list_command`. Rows restricted to another host by `platforms`, or marked
-  `unreachable` or `desk_only` with a reason automation cannot replay them,
-  are exempt from test-name verification.
-  See [docs/mutations.md](docs/mutations.md) for installing the runner and
-  for what the catalogue is.
 
 Always build, check and test with `--workspace`. Building one crate on its own
 compiles a second variant of shared dependencies, because workspace feature
@@ -46,11 +37,6 @@ unification no longer applies. To run a subset of tests, filter by name:
 ```sh
 cargo test --workspace --all-targets --locked shared_write::tests::
 ```
-
-After the main test job, CI also replays mutation rows: rows your change
-touches on every push and pull request, the full catalogue on `main`, and a
-broader audit of every package target nightly. A replay that finds a break no
-test catches fails the job.
 
 ### What not to run
 
@@ -62,6 +48,9 @@ test catches fails the job.
 
 ## Tests
 
+- A bug fix comes with a test that fails without the fix. Show that once, by
+  running the new test against the unfixed code; there is no separate
+  catalogue of proofs to keep.
 - Tests assert order and outcome, never elapsed time. Where a test needs a
   deadline, size it only to stop a hang on a clean CI runner.
 - A test that sends a request goes through the serving path the daemon uses
@@ -110,7 +99,6 @@ talks to the subc daemon or another module belongs in `entorhinal-module`.
 | `crates/entorhinal-module/src/sessions.rs`, `claims.rs`, `roles.rs` | Sessions, session liveness, claims and roles. |
 | `crates/entorhinal-module/src/fake_*.rs` | In-process stand-ins for other modules, compiled only for tests. |
 | `crates/*/tests/` | Integration tests that need their own binary or golden files. |
-| `mutations.toml` | Mutation proofs; see [docs/mutations.md](docs/mutations.md). |
 
 Every CortexKit dependency comes from crates.io. Do not add a `path`
 dependency on a sibling checkout: `crates/entorhinal-core/tests/dependency_sources.rs`

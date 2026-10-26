@@ -49,6 +49,4 @@ backwards), and its own tests cover those rules.
 ## Verification
 
 From the workspace root, run the gates listed in `CONTRIBUTING.md` (format,
-clippy and the workspace tests). The catalog's deliberate-break controls are the
-`catalog-*` rows in the root `mutations.toml`; replay one with
-`ckdev-mutate run --only <id>`.
+clippy and the workspace tests).

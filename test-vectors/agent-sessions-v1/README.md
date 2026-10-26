@@ -296,10 +296,4 @@ with both Cargo's test runner and nextest:
 ```sh
 cargo test --workspace --all-targets --locked served_vectors::session_lookup_cases_match_published_file -- --exact
 cargo nextest run --workspace --all-targets --locked -E 'test(served_vectors::session_lookup_cases_match_published_file)'
-ckdev-mutate check --strict
-ckdev-mutate run --only served-session-lookup-runner
 ```
-
-The `served-session-lookup-runner` control in root `mutations.toml` removes the
-recorded runner from `agent.session_for_ref`; the lookup-case generator test must
-fail its explicit expected-field assertion.
