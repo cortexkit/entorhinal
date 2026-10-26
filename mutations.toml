@@ -6,6 +6,21 @@
 # audits all package targets, except rows narrowed with select="expected".
 
 [[control]]
+id = "served-session-lookup-runner"
+guards = "The lookup case samples retain the recorded runner on a reference lookup"
+file = "crates/entorhinal-module/src/sessions.rs"
+old = 'if let Some(runner) = binding.runner {'
+new = 'if let Some(runner) = binding.runner.filter(|_| false) { // NON-VACUITY BREAK'
+test_file = "crates/entorhinal-module/src/served_vectors.rs"
+runner = "command"
+command = ["cargo", "test", "--workspace", "--all-targets", "--locked", "{test}", "--", "--exact"]
+list_command = ["python3", "-c", "import json, subprocess, sys; r = subprocess.run(['cargo', 'test', '--workspace', '--all-targets', '--locked', sys.argv[1], '--', '--exact', '--list'], check=True, capture_output=True, text=True); print(json.dumps([line.removesuffix(': test') for line in r.stdout.splitlines() if line.endswith(': test')]))", "{test}"]
+test_count_pattern = '''running {count} test
+test served_vectors::session_lookup_cases_match_published_file'''
+expect_red = ["served_vectors::session_lookup_cases_match_published_file"]
+expect_message = "ref lookup fields"
+
+[[control]]
 id = "served-agent-resolve-merged-wire-bytes"
 guards = "Published merged agent.resolve replies retain the successor id"
 file = "crates/entorhinal-module/src/agent_reads.rs"

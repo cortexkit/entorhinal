@@ -2264,6 +2264,390 @@ async fn session_records_match_published_files() {
     published_file("agent-sessions-v1", "where-many.json", vec![where_many]);
 }
 
+/// Lookup edge cases use real registrations, including a new binding whose
+/// omitted project root is unknown rather than a synthetic migrated row.
+/// Fleet records retain an issued token across an identity edit to distinguish
+/// an unchanged reply from a stale-token full reply.
+#[tokio::test]
+async fn session_lookup_cases_match_published_file() {
+    use entorhinal_core::{move_record::MoveRef, session_carry::SESSION_BINDINGS_KIND};
+
+    const AGENT: &str = "agent_0000000000000201";
+    const FULL_REF: &str = "55555555555555555555555555555555";
+    const NULL_REF: &str = "66666666666666666666666666666666";
+    const BARE_REF: &str = "77777777777777777777777777777777";
+    const SESSION_DIRECT: RouteKey = (908, 1);
+    let fixture = SessionFixture::new("served-session-lookups").await;
+    let mut receiver = SessionFixture::new("served-session-lookups-receiver").await;
+    receiver.handler.operator_confirmer = Arc::new(Approve {
+        summaries: std::sync::Mutex::new(vec![]),
+    });
+    let root = fixture.dir.join("lookup-project");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    // Canonicalize before registration so macOS's /var symlink cannot make
+    // the handler return a different spelling than the path mapped below.
+    let root = crate::tests::canonical_test_path(&root)
+        .to_string_lossy()
+        .into_owned();
+    for (machine, machine_id) in [
+        (&fixture, "lookup-source-machine"),
+        (&receiver, "lookup-receiver-machine"),
+    ] {
+        machine
+            .store()
+            .check_store_origin(Some(machine_id), 700)
+            .unwrap();
+        machine.handler.route_admissions().insert(
+            SESSION_DIRECT,
+            RouteAdmission::from_bind(Some(Principal::Direct), None),
+        );
+        let request = serde_json::to_vec(&json!({"method":"register","params":{
+            "projectId":"served-project","name":"Lookup project","roots":[root],
+            "workspaceId":"served-workspace"
+        }}))
+        .unwrap();
+        let registered = machine
+            .handler
+            .handle_served_request(&request, SESSION_DIRECT)
+            .await;
+        if !matches!(registered, HandlerOutcome::Response(_)) {
+            panic!(
+                "lookup project registration refused: {}",
+                refusal(registered)
+            );
+        }
+        let source = machine.snapshot();
+        seed_agent(
+            &source,
+            AGENT,
+            "Lookup Explorer",
+            Some(&json!({"genome":"d".repeat(2048),"type":"creature.classic","version":2})),
+            false,
+            true,
+        );
+        drop(source);
+        let imported = machine.import().await;
+        assert!(matches!(imported, HandlerOutcome::Response(_)));
+    }
+
+    for params in [
+        json!({"agent_id":AGENT,"ref_kind":"broca-session","ref":FULL_REF,
+            "harness":"broca","session_id":"lookup-ended","runner":"lookup-runner",
+            "project_root":root,"network":"yes"}),
+        json!({"agent_id":AGENT,"ref_kind":"broca-session","ref":NULL_REF,
+            "harness":"broca","session_id":"lookup-rootless","runner":"lookup-runner"}),
+        json!({"agent_id":AGENT,"ref_kind":"pi-session","ref":BARE_REF,
+            "harness":"pi","session_id":"lookup-runnerless"}),
+    ] {
+        let (_, reply) = fixture
+            .record(
+                SESSION_REGISTRAR,
+                WRITER_MODULE,
+                "agent.register_session",
+                params,
+            )
+            .await;
+        assert_eq!(reply["result"]["registered_by"], "orchestrator", "{reply}");
+    }
+    let (_, ended) = fixture
+        .record(
+            SESSION_REGISTRAR,
+            WRITER_MODULE,
+            "agent.end_session",
+            json!({"harness":"broca","session":"lookup-ended","runner":"lookup-runner"}),
+        )
+        .await;
+    assert_eq!(ended, json!({"result":{"found":true,"ended_at_ms":700}}));
+
+    // Finished sessions outside the moved ref set retain their source data
+    // holder. Export and activation install that metadata without SQL edits.
+    let refs = vec![
+        MoveRef {
+            ref_kind: "broca-session".into(),
+            reference: NULL_REF.into(),
+        },
+        MoveRef {
+            ref_kind: "pi-session".into(),
+            reference: BARE_REF.into(),
+        },
+    ];
+    let mut moving = AgentMove {
+        cut_id: "cut-session-lookups".into(),
+        agent_id: AGENT.into(),
+        side: MoveSide::Source,
+        peer: "lookup-peer".into(),
+        step: MoveStep::Preparing,
+        plan: json!({"participants":[
+            {"module_id":"lookup-runner","refs":refs,"external":[]},
+            {"module_id":"entorhinal","refs":[{"ref_kind":SESSION_BINDINGS_KIND,"ref":AGENT}],"external":[]}
+        ]}),
+        request_body: None,
+        record_version: 1,
+        claim_version: None,
+        claim_take_body: None,
+        claim_take_version: None,
+        claim_landed_version: None,
+        seal_sent: false,
+        abort_requested: None,
+        hold: None,
+        cut_accept: None,
+        reason: None,
+        detail: None,
+        request_key: None,
+        attempts: 0,
+        activated_at_ms: None,
+        created_at_ms: 700,
+        updated_at_ms: 700,
+    };
+    fixture.store().insert_agent_move(&moving).unwrap();
+    let carried = fixture
+        .store()
+        .export_session_bindings(&moving.cut_id, AGENT)
+        .unwrap();
+    let holder = carried
+        .iter()
+        .find(|row| row.session_ref == FULL_REF)
+        .unwrap()
+        .held_on
+        .as_ref()
+        .unwrap();
+    assert_eq!(holder, "lookup-source-machine");
+    moving.side = MoveSide::Receiver;
+    moving.step = MoveStep::Activating;
+    receiver.store().insert_agent_move(&moving).unwrap();
+    moving.step = MoveStep::Activated;
+    moving.activated_at_ms = Some(700);
+    let (_, installed) = receiver
+        .store()
+        .activate_agent_move_carrying(&moving, &refs, &carried)
+        .unwrap();
+    assert_eq!(installed.installed, 3);
+    assert_eq!(installed.placeholders, 0);
+
+    let mut records = Vec::new();
+    for (method, cases) in [
+        (
+            "agent.session_for_ref",
+            vec![
+                (json!({"ref_kind":"broca-session","ref":FULL_REF}), None),
+                (json!({"ref_kind":"pi-session","ref":BARE_REF}), None),
+                (
+                    json!({"ref_kind":"broca-session","ref":"lookup-missing"}),
+                    Some("not_found"),
+                ),
+                (json!({"ref_kind":"broca-session"}), Some("invalid_request")),
+                (
+                    json!({"ref_kind":"broca-session","ref":7}),
+                    Some("invalid_request"),
+                ),
+                (
+                    json!({"ref_kind":"broca-session","ref":FULL_REF,"unexpected":true}),
+                    Some("invalid_request"),
+                ),
+            ],
+        ),
+        (
+            "agent.session_for_runner",
+            vec![
+                (
+                    json!({"runner":"lookup-runner","session":"lookup-ended"}),
+                    None,
+                ),
+                (
+                    json!({"runner":"lookup-runner","session":"lookup-rootless"}),
+                    None,
+                ),
+                (
+                    json!({"runner":"lookup-runner","session":"lookup-missing"}),
+                    Some("not_found"),
+                ),
+                (json!({"runner":"lookup-runner"}), Some("invalid_request")),
+                (
+                    json!({"runner":"lookup-runner","session":7}),
+                    Some("invalid_request"),
+                ),
+                (
+                    json!({"runner":"lookup-runner","session":"lookup-ended","session_id":"lookup-ended"}),
+                    Some("invalid_request"),
+                ),
+                (
+                    json!({"runner":"lookup-runner","session":"lookup-runnerless"}),
+                    Some("not_found"),
+                ),
+            ],
+        ),
+    ] {
+        for (index, (params, refusal_code)) in cases.into_iter().enumerate() {
+            let (record, reply) = receiver
+                .record(SESSION_READER, READER_MODULE, method, params)
+                .await;
+            if let Some(code) = refusal_code {
+                assert_eq!(reply["code"], code, "{reply}");
+                assert!(reply["detail"].is_null(), "{reply}");
+            } else if method == "agent.session_for_ref" {
+                let expected = if index == 0 {
+                    json!({"agent_id":AGENT,"ref_kind":"broca-session","ref":FULL_REF,
+                        "harness":"broca","session_id":"lookup-ended","project_root":root,
+                        "runner":"lookup-runner","incarnation":INCARNATION,"heldOn":holder})
+                } else {
+                    json!({"agent_id":AGENT,"ref_kind":"pi-session","ref":BARE_REF,
+                        "harness":"pi","session_id":"lookup-runnerless","project_root":null,
+                        "incarnation":INCARNATION})
+                };
+                assert_eq!(reply["result"], expected, "ref lookup fields");
+            } else {
+                let expected = if index == 0 {
+                    json!({"agent_id":AGENT,"harness":"broca","session":"lookup-ended",
+                        "ref_kind":"broca-session","ref":FULL_REF,"runner":"lookup-runner",
+                        "project_root":root,"ended_at_ms":700,"network":"yes",
+                        "network_history":[{"network":"yes","since_ms":700}],"incarnation":INCARNATION,
+                        "heldOn":holder})
+                } else {
+                    json!({"agent_id":AGENT,"harness":"broca","session":"lookup-rootless",
+                        "ref_kind":"broca-session","ref":NULL_REF,"runner":"lookup-runner",
+                        "project_root":null,"ended_at_ms":null,"network":"unknown","network_history":[],
+                        "incarnation":INCARNATION})
+                };
+                assert_eq!(reply["result"], expected, "runner lookup fields");
+            }
+            // Map the entire JSON-escaped path explicitly; replacing only a
+            // scratch prefix would leave Windows separators in the suffix.
+            records.push(record.replace(
+                &json_string_contents(&root),
+                "/fixture/session-lookups/populated",
+            ));
+        }
+    }
+    assert_eq!(records.len(), 13);
+
+    async fn fleet_edit(fixture: &SessionFixture, method: &str, params: Value) {
+        let request = serde_json::to_vec(&json!({"method":method,"params":params})).unwrap();
+        let outcome = fixture
+            .handler
+            .handle_served_request(&request, SESSION_DIRECT)
+            .await;
+        if !matches!(outcome, HandlerOutcome::Response(_)) {
+            panic!("fleet setup refused: {}", refusal(outcome));
+        }
+    }
+    fleet_edit(
+        &receiver,
+        "agent.update_tag",
+        json!({
+            "agent_id":AGENT,"tag":"lookup","request_key":"lookup-fleet-tag"
+        }),
+    )
+    .await;
+    fleet_edit(
+        &receiver,
+        "agent.set_labels",
+        json!({
+            "agent_id":AGENT,"labels":["lookup"],"request_key":"lookup-fleet-labels"
+        }),
+    )
+    .await;
+    let (record, full) = receiver
+        .record(
+            SESSION_READER,
+            READER_MODULE,
+            "agent.fleet_identity",
+            json!({}),
+        )
+        .await;
+    assert_eq!(full["result"]["unchanged"], false);
+    assert_eq!(full["result"]["agents"].as_array().unwrap().len(), 1);
+    assert_eq!(full["result"]["agents"][0]["agentId"], AGENT);
+    assert_eq!(full["result"]["agents"][0]["tag"], "lookup");
+    assert_eq!(full["result"]["agents"][0]["labels"], json!(["lookup"]));
+    assert_eq!(
+        full["result"]["agents"][0]["avatar"]["type"],
+        "creature.classic"
+    );
+    assert_eq!(full["result"]["agents"][0]["avatar"]["version"], 2);
+    assert_eq!(
+        full["result"]["agents"][0]["project"],
+        json!({
+            "id":"served-project","name":"Lookup project","canonicalRoot":root
+        })
+    );
+    assert_eq!(
+        full["result"]["agents"][0]["workspace"],
+        json!({
+            "id":"served-workspace","name":"served-workspace"
+        })
+    );
+    assert_eq!(full["result"]["logPosition"], 0);
+    assert_eq!(full["result"]["incarnation"], INCARNATION);
+    let token = full["result"]["token"].as_str().unwrap();
+    let generation = full["result"]["generation"].as_i64().unwrap();
+    assert!(generation > 0);
+    records.push(record.replace(
+        &json_string_contents(&root),
+        "/fixture/session-lookups/populated",
+    ));
+    let (record, unchanged) = receiver
+        .record(
+            SESSION_READER,
+            READER_MODULE,
+            "agent.fleet_identity",
+            json!({"token":token}),
+        )
+        .await;
+    assert_eq!(
+        unchanged["result"],
+        json!({"generation":generation,
+        "incarnation":INCARNATION,"logPosition":0,"token":token,"unchanged":true})
+    );
+    records.push(record);
+
+    // Invalidate a token that the handler actually issued, rather than
+    // constructing a string that only resembles an older token.
+    fleet_edit(
+        &receiver,
+        "agent.update_tag",
+        json!({
+            "agent_id":AGENT,"tag":"lookup-next","request_key":"lookup-fleet-tag-next"
+        }),
+    )
+    .await;
+    let mut refreshed = None;
+    for (params, refusal_code) in [
+        (json!({"token":token}), None),
+        (json!({"unexpected":true}), Some("invalid_request")),
+        (json!({"token":7}), None),
+        (json!({"token":"not-a-token"}), None),
+    ] {
+        let (record, reply) = receiver
+            .record(
+                SESSION_READER,
+                READER_MODULE,
+                "agent.fleet_identity",
+                params,
+            )
+            .await;
+        if let Some(code) = refusal_code {
+            assert_eq!(reply["code"], code, "{reply}");
+            assert!(reply["detail"].is_null());
+        } else {
+            assert_eq!(reply["result"]["unchanged"], false);
+            assert_eq!(reply["result"]["generation"], generation + 1);
+            assert_eq!(reply["result"]["agents"][0]["tag"], "lookup-next");
+            assert_ne!(reply["result"]["token"], token);
+            if let Some(expected) = &refreshed {
+                assert_eq!(&reply, expected, "bad tokens return the full fleet");
+            } else {
+                refreshed = Some(reply.clone());
+            }
+        }
+        records.push(record.replace(
+            &json_string_contents(&root),
+            "/fixture/session-lookups/populated",
+        ));
+    }
+    assert_eq!(records.len(), 19);
+    published_file("agent-sessions-v1", "session-lookup-cases.json", records);
+}
+
 #[tokio::test]
 async fn session_rekey_records_match_published_files() {
     let fixture = SessionFixture::new("served-session-rekey").await;

@@ -16,8 +16,9 @@ roles here, it is admitted as the orchestrator. Read calls use the reserved
 role. Claim records and machine display names are fixed in the scratch registry; no
 network or machine-local state is used.
 
-The fixture imports seven live agents with fixed IDs, uses clock `700` and
-incarnation `0123456789abcdef`. The closed `ref_kind` set is `pi-session`,
+The original fixture imports seven live agents with fixed IDs, uses clock `700`
+and incarnation `0123456789abcdef`. Reference kinds and harnesses are open
+strings, not closed enums; familiar kinds include `pi-session`,
 `opencode-session`, `claude-code-session`, `broca-session`, and `agent` for core's
 own rows. These vectors pair `pi-session` with harness `pi` and
 `opencode-session` with harness `opencode`. `cortexkit-role-llm-runner` is not in
@@ -178,9 +179,66 @@ a backfill makes the data local.
   after the clock moved on, `network_history_full` for the ended worker once
   the handler filled its history with 1,024 alternating entries, and
   `not_found` for an unknown session.
-- **`SHA256SUMS`**: SHA-256 hashes of the fourteen JSON vector files, with
-  names relative to this directory. The first ten lines, every file but the
-  two session reads and the network sample, are pinned by
+- **`session-lookup-cases.json`**: nineteen additional session and fleet lookup
+  records from real orchestrator registrations, without changing any older JSON
+  file. The fixture imports invented head agent `agent_0000000000000201`
+  (`Lookup Explorer`) with a versioned avatar, registers a rooted project through
+  a Direct route, and uses the
+  same fixed clock/incarnation, and registers three sessions. The populated
+  session is ended through `agent.end_session`; production move export and
+  receiver activation carry its metadata with `heldOn: "lookup-source-machine"`.
+  No session rows are created or altered with raw SQL. The source and receiver
+  origins are initialized through `check_store_origin` with fixed invented IDs.
+  The project root is a canonical scratch directory at registration (including
+  macOS's `/private/var` spelling); its entire JSON-escaped path is explicitly
+  mapped to `/fixture/session-lookups/populated`, so Windows cannot leave a
+  backslash in a suffix.
+
+  | Record | Operation | Case / reply |
+  | --- | --- | --- |
+  | 1 | `agent.session_for_ref` | Found, all fields populated: runner, project root and `heldOn`. |
+  | 2 | `agent.session_for_ref` | Found, root omitted at registration → `project_root: null`; no recorded runner → key omitted, not null. |
+  | 3 | `agent.session_for_ref` | Unknown reference → `not_found`. |
+  | 4 | `agent.session_for_ref` | Missing `ref` → `invalid_request`. |
+  | 5 | `agent.session_for_ref` | Numeric `ref` → `invalid_request`. |
+  | 6 | `agent.session_for_ref` | Extra `unexpected` member → `invalid_request`. |
+  | 7 | `agent.session_for_runner` | Found, all fields populated: runner, root, end time, current `yes`, nonempty history and `heldOn`. |
+  | 8 | `agent.session_for_runner` | Found, `project_root` and `ended_at_ms` null, current `unknown`, empty history; runner remains required. |
+  | 9 | `agent.session_for_runner` | Unknown pair → `not_found`. |
+  | 10 | `agent.session_for_runner` | Missing `session` → `invalid_request`. |
+  | 11 | `agent.session_for_runner` | Numeric `session` → `invalid_request`. |
+  | 12 | `agent.session_for_runner` | Extra `session_id` → `invalid_request`, proving it is not an alias for `session`. |
+  | 13 | `agent.session_for_runner` | Existing session registered without a runner → `not_found`. |
+  | 14 | `agent.fleet_identity` | Full `{}` reply: versioned avatar fingerprint, nonempty tag/labels, rooted project/workspace placement, and `logPosition: 0`. |
+  | 15 | `agent.fleet_identity` | Current issued token → `unchanged: true`, no `agents` member. |
+  | 16 | `agent.fleet_identity` | Previously issued token after real `agent.update_tag` → full reply with new token/generation, not a stale-token refusal. |
+  | 17 | `agent.fleet_identity` | Extra `unexpected` member → `invalid_request`. |
+  | 18 | `agent.fleet_identity` | Numeric `token` → full reply, **not** `invalid_request`; non-string tokens are cache misses. |
+  | 19 | `agent.fleet_identity` | Bad opaque string token → full reply, not a bad-token refusal. |
+
+  The session replies are **not the same row type**: the ref read has nullable
+  `session_id` and optional/omitted `runner`; the runner read has required
+  `session`, required `runner`, and adds `ended_at_ms`, `network` and
+  `network_history`. Both include `incarnation`. `heldOn` is omitted unless
+  finished data is remote. No reply field remains without a populated example
+  for either op. Null harness/session-ID placeholder cases are not produced by
+  registration, which requires both strings
+  (`crates/entorhinal-module/src/sessions.rs:361-364`). Placeholders created by
+  move activation have null harness/session ID and no runner
+  (`crates/entorhinal-core/src/session_carry.rs:372-389`), so they cannot be
+  found by runner/session. Neither lookup ever returns `runner: null`.
+  Fleet identity accepts `{}` or `{token: <any JSON value>}` and denies extra
+  members. Only an exact current string token returns the unchanged shape;
+  stale, bad, null and non-string tokens all return the full shape. Sharing is
+  off in this fixture, so `logPosition` honestly remains `0`, distinct from the
+  local journal `generation`. The existing
+  `test-vectors/agent-identity-reads-v1/fleet-identity.json` stays unchanged.
+  It already covers absent/unversioned avatars and rootless placement; the new
+  records add a populated `project.canonicalRoot`, tag and labels. No fleet
+  field lacks a populated example after these additions. Nonzero log position,
+  wild avatars, workspace-head/hiree roles and an empty fleet remain unsampled.
+- **`SHA256SUMS`**: SHA-256 hashes of the seventeen JSON vector files, with
+  names relative to this directory. The first ten lines are pinned by
   `served_vectors::agent_session_samples_keep_their_pinned_bytes_and_checksums`.
 
 ## SHA-256 hashes
@@ -201,6 +259,9 @@ a backfill makes the data local.
 | `sessions.json` | `e9b77127661e0352b508d923c5cd2e718c0b14c63662b8b2cb8e2f8b872f79e1` |
 | `set-session-network.json` | `d6bdd5717154e0c6b5d6675b9f6f03580be9e8cb41c2cf8ae5cd2925ffe831f9` |
 | `register-session-rekey.json` | `1dcb2af2bcc9f346a9ebac36369f70cb9805e53c0585110d9b675f25f4442b96` |
+| `sessions-held-on.json` | `ce3ab0bb16f03a0f7aa605805234c80b42e3f92b2d0e384dd15ac8a7e2af9caa` |
+| `sessions-open.json` | `01d785e934526b457d9f958ac94d8a0829526729e0f418e114ea8faab3a86af7` |
+| `session-lookup-cases.json` | `5e2a306b6a05bd4ab1c922c0c57541d16e3fb33c2c403a797fe5a34edb774107` |
 
 ## Reproduce and verify
 
@@ -210,6 +271,7 @@ From the repository root, generate the vector files with:
 ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked session_records_match_published_files -- --nocapture
 ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked session_lifecycle_records_match_published_files -- --nocapture
 ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked session_rekey_records_match_published_files -- --nocapture
+ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked served_vectors::session_lookup_cases_match_published_file -- --exact --nocapture
 ```
 
 Refresh their hashes from the repository root with:
@@ -219,13 +281,25 @@ python3 - <<'PY'
 import hashlib
 from pathlib import Path
 root = Path('test-vectors/agent-sessions-v1')
-names = ['for-session.json', 'register-session.json', 'session-for-ref.json', 'where.json', 'where-many.json', 'where-moving-receiver.json', 'where-moving-source.json', 'where-sharing-off.json', 'end-session.json', 'register-session-runner.json', 'session-for-runner.json', 'sessions.json', 'set-session-network.json', 'register-session-rekey.json']
+names = ['for-session.json', 'register-session.json', 'session-for-ref.json', 'where.json', 'where-many.json', 'where-moving-receiver.json', 'where-moving-source.json', 'where-sharing-off.json', 'end-session.json', 'register-session-runner.json', 'session-for-runner.json', 'sessions.json', 'set-session-network.json', 'register-session-rekey.json', 'sessions-held-on.json', 'sessions-open.json', 'session-lookup-cases.json']
 root.joinpath('SHA256SUMS').write_text(''.join(
     f'{hashlib.sha256(root.joinpath(name).read_bytes()).hexdigest()}  {name}\n'
     for name in names), encoding='utf-8')
 PY
 ```
 
-Without the write environment variable, the non-ignored
-session, lifecycle and re-key vector tests regenerate their JSON from the real
-handler and compare the bytes against the published files on each run.
+Without `ENTO_WRITE_SERVED_VECTORS=1`, the non-ignored session, lifecycle,
+re-key and lookup-case tests regenerate their JSON from the real handler and
+compare the bytes against the published files on each run. Verify the new file
+with both Cargo's test runner and nextest:
+
+```sh
+cargo test --workspace --all-targets --locked served_vectors::session_lookup_cases_match_published_file -- --exact
+cargo nextest run --workspace --all-targets --locked -E 'test(served_vectors::session_lookup_cases_match_published_file)'
+ckdev-mutate check --strict
+ckdev-mutate run --only served-session-lookup-runner
+```
+
+The `served-session-lookup-runner` control in root `mutations.toml` removes the
+recorded runner from `agent.session_for_ref`; the lookup-case generator test must
+fail its explicit expected-field assertion.
