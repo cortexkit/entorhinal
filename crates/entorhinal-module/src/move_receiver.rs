@@ -7,7 +7,7 @@ use crate::{
     move_driver::{
         backoff, digest_reason, participant_action, PeerRefusal, RefusalLog, Worker, POLL,
     },
-    participant_client::{AgentRef, ClientError, CutRequest, ParticipantClient, Refs},
+    participant_client::{AgentRef, ClientError, CutRequest, ImportReply, ParticipantClient, Refs},
     participant_discovery::Participant,
     record_client::{CasRequest, CasSettlement, RecordError, RecordReply},
     session_move::StagedError,
@@ -271,13 +271,74 @@ struct Progress {
     /// Rows written before this field existed decode as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     skipped_absent: Option<Vec<String>>,
+    /// Entries each participant reported dropping while it imported this cut,
+    /// keyed by participant, then by the staged stream's `sessionRef`, then by
+    /// the participant's own reason, with the count it gave. Each participant's
+    /// latest import reply replaces its whole entry, so a resent import after
+    /// a lost reply or a restart never counts the same drops twice. Absent
+    /// when no participant reported drops, so rows without losses keep the
+    /// bytes they had before this field existed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    dropped: BTreeMap<String, ImportDrops>,
 }
+/// One participant's reported drops: `sessionRef` to reason to count.
+type ImportDrops = BTreeMap<String, BTreeMap<String, u64>>;
 impl Progress {
     fn skips(&self, module: &str) -> bool {
         self.skipped_absent
             .as_ref()
             .is_some_and(|skipped| skipped.iter().any(|m| m == module))
     }
+    /// Keep what one participant's import reply says it dropped, replacing
+    /// anything an earlier reply from the same participant recorded.
+    fn record_drops(&mut self, module: &str, reply: &ImportReply) {
+        let drops: ImportDrops = reply
+            .items
+            .iter()
+            .filter_map(|item| {
+                item.dropped
+                    .clone()
+                    .map(|dropped| (item.session_ref.clone(), dropped))
+            })
+            .collect();
+        if drops.is_empty() {
+            self.dropped.remove(module);
+        } else {
+            self.dropped.insert(module.to_owned(), drops);
+        }
+    }
+}
+
+/// What participants dropped while importing this move's data on this
+/// machine, one `{participant, session_ref, reason, count}` entry per reason,
+/// with reasons and counts exactly as the participants reported them. Empty
+/// for source rows, for moves nothing was dropped from, and for aborted moves,
+/// whose staged imports were discarded and never became the agent's data.
+pub(crate) fn import_losses(row: &AgentMove) -> Vec<Value> {
+    if row.side != MoveSide::Receiver || row.step == Step::Aborted {
+        return Vec::new();
+    }
+    let Some(dropped) = row.plan["_receiver"]
+        .get("dropped")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<BTreeMap<String, ImportDrops>>(value).ok())
+    else {
+        return Vec::new();
+    };
+    let mut losses = Vec::new();
+    for (participant, streams) in dropped {
+        for (session_ref, reasons) in streams {
+            for (reason, count) in reasons {
+                losses.push(json!({
+                    "participant": participant,
+                    "session_ref": session_ref,
+                    "reason": reason,
+                    "count": count,
+                }));
+            }
+        }
+    }
+    losses
 }
 
 /// The plan participants this receiver calls: every one except those
@@ -1033,10 +1094,11 @@ impl Receiver {
             // import may still be changing the data that abort needs to discard.
             match pending.op.as_str() {
                 "agent_data.import" => {
-                    client
+                    let reply = client
                         .import(&self.request(p)?)
                         .await
                         .map_err(|e| Failure::participant(&p.module_id, &pending.op, e))?;
+                    progress.record_drops(&p.module_id, &reply);
                 }
                 "agent_data.diverged" => {
                     client
@@ -1118,6 +1180,11 @@ impl Receiver {
                     });
                     self.save(row, progress).await?;
                     let answer = client.import(&self.request(p)?).await;
+                    // Saved with the cleared pending call below, so the drops a
+                    // reply reports are durable before the move goes on.
+                    if let Ok(reply) = &answer {
+                        progress.record_drops(&p.module_id, reply);
+                    }
                     if !matches!(answer, Err(ClientError::OutcomeUnknown)) {
                         progress.pending = None;
                         self.save(row, progress).await?;
@@ -3124,6 +3191,88 @@ mod tests {
         assert_eq!(f.row().step, Step::PickedUp);
         assert_eq!(f.worker.health.move_errors.load(Ordering::Relaxed), 2);
         assert_eq!(f.claim_cas_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn receiver_import_reply_with_a_broken_drop_map_stops_as_a_contract_violation() {
+        let f = Fixture::new(false).await;
+        f.pickup().await;
+        let broken = json!({"items":[{"sessionRef":"c6ea741d409f833ee60be91d9176e493",
+            "endOffset":0,"digest":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "dropped":{"root_missing":0}}]});
+        f.discovery
+            .participant
+            .fake
+            .script("agent_data.import", Effect::Reply(broken));
+        let mut receiver = f.receiver();
+        receiver.tick().await.unwrap();
+        let violation = f.row().plan["_receiver"]["contract_violation"].clone();
+        assert_eq!(violation["op"], "agent_data.import");
+        assert_eq!(violation["code"], "invalid_reply");
+        assert!(violation["detail"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("dropped count must be positive"));
+        assert!(f.row().plan["_receiver"].get("dropped").is_none());
+        assert!(import_losses(&f.row()).is_empty());
+        // Like an unknown refusal code, the violation parks the step for the
+        // operator: no further participant call, even after a restart.
+        let count = f.discovery.participant.fake.calls().len();
+        advance_clock();
+        f.receiver().tick().await.unwrap();
+        assert_eq!(count, f.discovery.participant.fake.calls().len());
+        assert_eq!(f.row().step, Step::PickedUp);
+        assert_eq!(f.claim_cas_count(), 0);
+    }
+
+    #[test]
+    fn a_later_import_reply_replaces_a_participants_recorded_drops() {
+        let item = |reasons: &[(&str, u64)]| {
+            let item = cortexkit_role_agent_data::import::ImportedItem::new(
+                "c6ea741d409f833ee60be91d9176e493",
+                1,
+                "d",
+            );
+            if reasons.is_empty() {
+                item
+            } else {
+                item.with_dropped(
+                    reasons
+                        .iter()
+                        .map(|(reason, count)| ((*reason).to_owned(), *count))
+                        .collect(),
+                )
+                .unwrap()
+            }
+        };
+        let mut progress = Progress::default();
+        let first = ImportReply::new(vec![item(&[("root_missing", 12)])]);
+        progress.record_drops("aft", &first);
+        progress.record_drops("other", &first);
+        progress.record_drops("aft", &first);
+        assert_eq!(
+            serde_json::to_value(&progress.dropped).unwrap(),
+            json!({
+                "aft":{"c6ea741d409f833ee60be91d9176e493":{"root_missing":12}},
+                "other":{"c6ea741d409f833ee60be91d9176e493":{"root_missing":12}}
+            })
+        );
+        progress.record_drops(
+            "aft",
+            &ImportReply::new(vec![item(&[("content_mismatch", 3)])]),
+        );
+        assert_eq!(
+            serde_json::to_value(&progress.dropped["aft"]).unwrap(),
+            json!({"c6ea741d409f833ee60be91d9176e493":{"content_mismatch":3}})
+        );
+        progress.record_drops("aft", &ImportReply::new(vec![item(&[])]));
+        progress.record_drops("other", &ImportReply::new(vec![]));
+        assert!(progress.dropped.is_empty());
+        // With nothing dropped the checkpoint carries no `dropped` key at all.
+        assert!(serde_json::to_value(&progress)
+            .unwrap()
+            .get("dropped")
+            .is_none());
     }
 
     #[tokio::test]

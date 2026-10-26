@@ -315,13 +315,37 @@ not shown. A participant's optional `diverged` explanation appears in `detail`
 next to its `module_id`, `ref` and state, and is also included in `agent.where`
 while the move is open or in its move diagnostics after completion.
 
+On the receiver, an `agent_data.import` reply item may carry `dropped`, a map
+from participant-defined reasons to counts of entries the participant dropped
+while importing (agent-data 0.2.4). The receiver keeps each participant's
+drops in its machine-local checkpoint, in the same saved plan as the rest of
+its progress, before it moves on. A later reply from the same participant for
+the cut, such as the one recovered after a lost reply or a restart, replaces
+that participant's drops instead of adding to them. While any are recorded,
+and the move has not aborted, `agent.move_status` and `agent.moves` include
+`losses`: one `{participant, session_ref, reason, count}` entry per reason,
+sorted by participant, then `session_ref` (the item's `sessionRef`), then
+reason. Reasons and counts are shown as given; entorhinal never branches on a
+reason. A move whose replies report no drops has no `losses` key, and its
+replies are unchanged. Losses are not written to the shared move record, so
+only the receiving machine shows them. A `dropped` map that breaks the
+contract's rules (empty, more than 16 reasons, a reason outside
+`[a-z][a-z0-9_]{0,63}`, or a count outside 1 to 2^53 - 1) is an invalid reply:
+the receiver records a `contract_violation` naming the broken rule and stops
+the step, as it does for an out-of-contract refusal code.
+
 `agent.set_lid_close_moves {enabled, request_key}` is `Direct` only
 (`caller_forbidden` otherwise) and asks for operator confirmation when the value changes.
 It defaults to off and is local to the machine.
 
 Tests: `moves_view_orders_open_first_and_limits_finished_to_latest_32`,
 `served_move_controls_admit_confirm_and_bypass_shared_writer`,
-`move_controls_presence_failure_and_aborted_noop_preserve_state`.
+`move_controls_presence_failure_and_aborted_noop_preserve_state`,
+`import_drops_show_as_completed_with_losses_and_survive_a_restart`,
+`a_move_without_drops_keeps_its_status_replies_unchanged`,
+`a_later_import_reply_replaces_a_participants_recorded_drops`,
+`receiver_import_reply_with_a_broken_drop_map_stops_as_a_contract_violation`,
+`import_drop_vectors_decode_and_reject_broken_maps_naming_the_rule`.
 
 ## 10. Catalog package closures
 

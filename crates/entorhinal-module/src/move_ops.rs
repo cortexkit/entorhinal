@@ -67,6 +67,7 @@ impl ProjectsHandler {
         let mut view = view.ok_or_else(unknown_move)?;
         if let Some(row) = &row {
             show_skipped(&mut view, row);
+            show_losses(&mut view, row);
         }
         elapsed(&mut view, (self.clock)());
         encode_result(view)
@@ -79,6 +80,7 @@ impl ProjectsHandler {
         for view in &mut views {
             if let Some(row) = rows.iter().find(|r| view["cut_id"] == r.cut_id.as_str()) {
                 show_skipped(view, row);
+                show_losses(view, row);
             }
             elapsed(view, (self.clock)());
         }
@@ -219,6 +221,15 @@ fn show_skipped(view: &mut Value, row: &entorhinal_core::move_store::AgentMove) 
     let skipped = super::move_receiver::skipped_participants(row);
     if !skipped.is_empty() {
         view["skipped_participants"] = json!(skipped);
+    }
+}
+/// Copy out, from the private plan, what participants reported dropping while
+/// importing on this machine. A move with any losses must not read as a clean
+/// success; without losses the view gains no key at all.
+fn show_losses(view: &mut Value, row: &entorhinal_core::move_store::AgentMove) {
+    let losses = super::move_receiver::import_losses(row);
+    if !losses.is_empty() {
+        view["losses"] = json!(losses);
     }
 }
 pub(crate) fn elapsed(value: &mut Value, now: i64) {

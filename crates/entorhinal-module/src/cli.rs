@@ -1962,6 +1962,31 @@ fn format_agent_moves(value: &Value) -> String {
                     ));
                 }
             }
+            // Drops reported on import mean the move must never read as a
+            // clean success. Reasons are the participants' own words, shown as
+            // given.
+            if let Some(losses) = row["losses"].as_array().filter(|l| !l.is_empty()) {
+                lines.push(
+                    if matches!(
+                        row["step"].as_str(),
+                        Some("activated" | "done" | "taken_over")
+                    ) {
+                        "  completed with losses:"
+                    } else {
+                        "  import reported losses (move not finished yet):"
+                    }
+                    .into(),
+                );
+                for loss in losses {
+                    lines.push(format!(
+                        "    {}: {} {} (stream {})",
+                        text(&loss["participant"]),
+                        text(&loss["reason"]),
+                        loss["count"],
+                        text(&loss["session_ref"])
+                    ));
+                }
+            }
             if let Some(message) = row["message"].as_str() {
                 lines.push(format!("  {message}"));
             }
@@ -3727,6 +3752,37 @@ mod agent_tests {
             "agent_id":"agent-1","peer_name":"Desk"
         }]});
         assert!(!format_agent_moves(&none).contains("skipped"));
+    }
+
+    #[test]
+    fn agent_moves_show_import_losses_as_completed_with_losses() {
+        let losses = json!([
+            {"participant":"aft","session_ref":"c6ea741d409f833ee60be91d9176e493","reason":"content_mismatch","count":3},
+            {"participant":"aft","session_ref":"c6ea741d409f833ee60be91d9176e493","reason":"root_missing","count":12}
+        ]);
+        let done = json!({"moves":[{
+            "cut_id":"cut-1","side":"receiver","step":"done",
+            "agent_id":"agent-1","peer_name":"Desk","losses":losses
+        }]});
+        assert_eq!(
+            format_agent_moves(&done),
+            "move cut-1  receiver done  agent agent-1  peer Desk\n  completed with losses:\n    aft: content_mismatch 3 (stream c6ea741d409f833ee60be91d9176e493)\n    aft: root_missing 12 (stream c6ea741d409f833ee60be91d9176e493)"
+        );
+        let staged = json!({"moves":[{
+            "cut_id":"cut-1","side":"receiver","step":"staged",
+            "agent_id":"agent-1","peer_name":"Desk","losses":losses
+        }]});
+        let rendered = format_agent_moves(&staged);
+        assert!(rendered.contains("  import reported losses (move not finished yet):"));
+        assert!(!rendered.contains("completed"));
+        let clean = json!({"moves":[{
+            "cut_id":"cut-1","side":"receiver","step":"done",
+            "agent_id":"agent-1","peer_name":"Desk"
+        }]});
+        assert_eq!(
+            format_agent_moves(&clean),
+            "move cut-1  receiver done  agent agent-1  peer Desk"
+        );
     }
 
     struct Confirm(AtomicUsize);
