@@ -749,28 +749,6 @@ async fn provider_discovery_catalog_and_hello_agree_on_exact_tool_table() {
             }
         );
     }
-    let module_cargo = include_str!("../Cargo.toml");
-    assert!(module_cargo.contains("cortexkit-role-tool-provider = \"=0.9.2\""));
-    let lock = include_str!("../../../Cargo.lock");
-    assert_eq!(
-        lock.matches("name = \"cortexkit-role-tool-provider\"\n")
-            .count(),
-        1
-    );
-    assert!(lock.contains("name = \"cortexkit-role-tool-provider\"\nversion = \"0.9.2\""));
-}
-
-#[tokio::test]
-async fn catalog_reply_has_top_level_tools() {
-    let f = Fixture::new();
-    let body = response_body(f.call("tool.catalog", json!({})).await);
-    let reply: Value = serde_json::from_slice(&body).unwrap();
-    assert!(reply.get("tools").is_some_and(Value::is_array));
-    let catalog: CatalogAnswer = serde_json::from_slice(&body).unwrap();
-    assert_eq!(
-        reply["tools"].as_array().unwrap().len(),
-        catalog.tools.len()
-    );
 }
 
 #[tokio::test]

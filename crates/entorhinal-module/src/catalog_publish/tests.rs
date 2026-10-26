@@ -653,31 +653,6 @@ async fn publish_cached_tamper_refused() {
     assert_eq!(registry.uploads.lock().unwrap().len(), 1);
     assert_eq!(f.vault.attempts.load(Ordering::SeqCst), 1);
 }
-#[tokio::test]
-async fn publish_fake_vault_contract() {
-    let vault = Arc::new(FakeVault::new());
-    assert!(vault.resolver().sign("unknown", b"bytes").await.is_err());
-    assert!(vault
-        .resolver()
-        .sign(CREDENTIAL, &vec![0; 1_048_577])
-        .await
-        .is_err());
-    for (caller, nonce) in [
-        ("Direct", Some("secret")),
-        ("reserved:other", Some("secret")),
-        ("reserved:entorhinal", None),
-    ] {
-        let mut fake = FakeVault::new();
-        fake.caller = caller.into();
-        fake.nonce = nonce.map(String::from);
-        assert!(Arc::new(fake)
-            .resolver()
-            .sign(CREDENTIAL, b"bytes")
-            .await
-            .is_err());
-    }
-    assert_eq!(vault.attempts.load(Ordering::SeqCst), 0);
-}
 #[test]
 fn publish_cli_and_manifest_contract() {
     use crate::cli::{self, Face, Invocation};

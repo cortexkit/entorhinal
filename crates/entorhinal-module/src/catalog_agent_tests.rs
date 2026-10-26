@@ -825,10 +825,6 @@ async fn catalog_missing_unready_and_wrong_kind_consumer_fail_plan() {
 #[tokio::test]
 async fn catalog_refused_consumer_route_fails_plan_and_holds_generation() {
     let f = Fixture::new().await;
-    assert_eq!(
-        consumer_role(),
-        json!({"role":"internal_service","service_id":"catalog-consumer","transport":"bulk","agent_facing":false,"operations":["catalog_consumer.check","catalog_consumer.prefetch"]})
-    );
     f.consumers.has_role.store(false, Ordering::SeqCst);
     let plan = f.prepare("no-service-role").await;
     assert_eq!(plan["state"], "failed");

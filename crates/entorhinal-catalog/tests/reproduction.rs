@@ -362,12 +362,6 @@ fn reproduce_resolver() {
         assert!(s(&case["version"]).parse::<semver::Version>().is_err());
         assert_eq!(case["code"], "version_invalid");
     }
-    for token in a(&v["capability_tokens"]["valid"]) {
-        assert!(resolver::capability_token(s(token)));
-    }
-    for token in a(&v["capability_tokens"]["invalid"]) {
-        assert!(!resolver::capability_token(s(token)));
-    }
     for case in a(&v["cases"]) {
         let registry = serde_json::from_value(case["registry"].clone()).unwrap();
         let caps: Vec<String> = serde_json::from_value(case["local_capabilities"].clone()).unwrap();

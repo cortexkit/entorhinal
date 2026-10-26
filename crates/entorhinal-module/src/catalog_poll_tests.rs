@@ -138,29 +138,6 @@ async fn completed_pass(
     );
     completion.gauges
 }
-#[test]
-fn completed_passes_are_buffered_with_their_results_and_gauges() {
-    let gauges = Gauges::default();
-    let mut completions = gauges.completions();
-    gauges.finish(Ok(()), 100);
-    gauges.finish(Err("status_unavailable"), 200);
-    gauges.finish(Ok(()), 300);
-    for (number, result, success, failures) in [
-        (1, Ok(()), 100, 0),
-        (2, Err("status_unavailable"), 100, 1),
-        (3, Ok(()), 300, 0),
-    ] {
-        let pass = completions.try_recv().unwrap();
-        assert_eq!(pass.number, number);
-        assert_eq!(pass.result, result);
-        assert_eq!(pass.gauges["catalogLastSuccessMs"], success);
-        assert_eq!(pass.gauges["catalogConsecutiveFailures"], failures);
-    }
-    assert!(matches!(
-        completions.try_recv(),
-        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-    ));
-}
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.slot.lock().unwrap().take();

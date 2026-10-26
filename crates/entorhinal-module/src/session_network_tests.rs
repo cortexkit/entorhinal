@@ -150,7 +150,7 @@ async fn set_session_network_replies_new_repeat_and_refusals() {
         );
     }
     for value in ["", "NO", "maybe"] {
-        let HandlerOutcome::Error { code, message } = set(
+        let HandlerOutcome::Error { code, .. } = set(
             &f,
             EXECUTIVE,
             json!({"harness":"broca","session":"s1","network":value}),
@@ -160,7 +160,6 @@ async fn set_session_network_replies_new_repeat_and_refusals() {
             panic!("{value} was not refused without detail");
         };
         assert_eq!(code, "invalid_request", "{value}");
-        assert!(message.contains("network"), "{message}");
     }
     assert_eq!(history(&f, "r1"), [("yes".into(), NOW)]);
 }

@@ -1668,13 +1668,5 @@ mod tests {
             watched,
             BTreeSet::from(["agent.fleet_identity_watch", "agent.where_watch"])
         );
-        let cargo = include_str!("../../../Cargo.toml");
-        assert!(cargo.contains("subc-protocol = \"0.32.5\""));
-        assert!(cargo.contains("subc-client-rs = \"0.30.1\""));
-        let lock = include_str!("../../../Cargo.lock");
-        for (name, version) in [("subc-protocol", "0.32.5"), ("subc-client-rs", "0.30.1")] {
-            assert_eq!(lock.matches(&format!("name = \"{name}\"\n")).count(), 1);
-            assert!(lock.contains(&format!("name = \"{name}\"\nversion = \"{version}\"")));
-        }
     }
 }

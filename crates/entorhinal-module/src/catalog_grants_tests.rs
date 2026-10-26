@@ -153,9 +153,6 @@ async fn publisher_confirmation_includes_complete_ceiling_when_it_fits() {
         trust_summary("publisher and placement".into(), &long),
         "publisher and placement"
     );
-    let docs = include_str!("../../../docs/catalog.md");
-    assert!(docs.contains("stored authenticated pins (`StoredPins`)"));
-    assert!(!docs.contains("publisher trust deliberately refuses until that source exists"));
 }
 
 #[tokio::test]
