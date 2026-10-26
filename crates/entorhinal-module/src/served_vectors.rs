@@ -451,9 +451,12 @@ fn agent_identity_vector(directory: &str, name: &str) -> bool {
                 | "where-sharing-off.json"
                 | "where-moving-source.json"
                 | "where-moving-receiver.json"
+                | "session-for-ref.json"
+                | "session-for-runner.json"
+                | "session-lookup-cases.json"
         ) | (
             "agent-identity-reads-v1",
-            "agent-resolve.json" | "agent-resolve-merged.json"
+            "agent-resolve.json" | "agent-resolve-merged.json" | "fleet-identity.json"
         )
     )
 }
@@ -462,6 +465,20 @@ fn agent_identity_params_are_structurally_valid(op: &str, params: &Value) -> boo
     let Some(params) = params.as_object() else {
         return false;
     };
+    match op {
+        "agent.session_for_ref" => {
+            return params.len() == 2
+                && params.get("ref_kind").is_some_and(Value::is_string)
+                && params.get("ref").is_some_and(Value::is_string);
+        }
+        "agent.session_for_runner" => {
+            return params.len() == 2
+                && params.get("runner").is_some_and(Value::is_string)
+                && params.get("session").is_some_and(Value::is_string);
+        }
+        "agent.fleet_identity" => return params.keys().all(|key| key == "token"),
+        _ => {}
+    }
     if params.len() != 1 {
         return false;
     }
@@ -488,7 +505,7 @@ fn check_agent_identity_record<P: DeserializeOwned, R: DeserializeOwned + Serial
     } else {
         record["request"].clone()
     };
-    // Typed decoding checks wire structure; ID syntax and batch admission stay in the handler.
+    // Typed decoding checks wire structure; string bounds and admission stay in the handler.
     let structurally_valid = agent_identity_params_are_structurally_valid(
         request["method"].as_str().unwrap(),
         &request["params"],
@@ -503,6 +520,32 @@ fn check_agent_identity_record<P: DeserializeOwned, R: DeserializeOwned + Serial
     let reply = &record["reply"];
     match serde_json::from_value::<aid::Outcome<R>>(reply.clone()) {
         Ok(decoded) => {
+            if reply["code"] == "not_found" {
+                assert!(
+                    matches!(
+                        &decoded,
+                        aid::Outcome::Refusal(refusal) if refusal.code == aid::RefusalCode::NotFound
+                    ),
+                    "{label}: not_found must have a named variant"
+                );
+            }
+            if request["method"] == "agent.fleet_identity"
+                && matches!(&decoded, aid::Outcome::Success(_))
+            {
+                let result = &reply["result"];
+                if result["unchanged"] == true {
+                    assert!(
+                        result.get("agents").is_none(),
+                        "{label}: unchanged fleet has agents"
+                    );
+                } else {
+                    assert_eq!(result["unchanged"], false, "{label}");
+                    assert!(
+                        result["agents"].is_array(),
+                        "{label}: full fleet lacks agents"
+                    );
+                }
+            }
             let encoded = serde_json::to_value(decoded).unwrap();
             if *reply != encoded {
                 errors.push(format!(
@@ -541,6 +584,18 @@ fn assert_agent_identity_records(label: &str, records: &[Value]) {
                 aid::AgentWhereManyParams,
                 aid::AgentWhereManyReply,
             >(&label, record, &mut errors),
+            "agent.session_for_ref" => check_agent_identity_record::<
+                aid::AgentSessionForRefParams,
+                aid::AgentSessionForRefReply,
+            >(&label, record, &mut errors),
+            "agent.session_for_runner" => check_agent_identity_record::<
+                aid::AgentSessionForRunnerParams,
+                aid::AgentSessionForRunnerReply,
+            >(&label, record, &mut errors),
+            "agent.fleet_identity" => check_agent_identity_record::<
+                aid::AgentFleetIdentityParams,
+                aid::AgentFleetIdentityReply,
+            >(&label, record, &mut errors),
             op => errors.push(format!("{label}: unexpected operation {op}")),
         }
     }
@@ -561,8 +616,12 @@ fn agent_identity_published_records_roundtrip_exactly() {
         ("agent-sessions-v1", "where-sharing-off.json"),
         ("agent-sessions-v1", "where-moving-source.json"),
         ("agent-sessions-v1", "where-moving-receiver.json"),
+        ("agent-sessions-v1", "session-for-ref.json"),
+        ("agent-sessions-v1", "session-for-runner.json"),
+        ("agent-sessions-v1", "session-lookup-cases.json"),
         ("agent-identity-reads-v1", "agent-resolve.json"),
         ("agent-identity-reads-v1", "agent-resolve-merged.json"),
+        ("agent-identity-reads-v1", "fleet-identity.json"),
     ] {
         let path = root.join(directory).join(name);
         let batch: Vec<Value> = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -750,9 +809,100 @@ async fn agent_identity_requests_enforce_structure_not_semantics() {
     assert_agent_identity_records("served request contract probes", &records);
 }
 
+#[tokio::test]
+async fn agent_identity_session_lookup_requests_enforce_structure_not_semantics() {
+    let fixture = Fixture::new("agent-identity-session-lookup-validation").await;
+    let mut records = Vec::new();
+    for (op, params) in [
+        (
+            "agent.session_for_ref",
+            json!({"ref_kind":"open-kind","ref":"unregistered"}),
+        ),
+        (
+            "agent.session_for_runner",
+            json!({"runner":"open-runner","session":"unregistered"}),
+        ),
+    ] {
+        let mut invalid_params = Vec::new();
+        let mut extra = params.clone();
+        extra["unexpected"] = json!(true);
+        invalid_params.push(extra);
+        for key in params.as_object().unwrap().keys() {
+            let mut missing = params.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            invalid_params.push(missing);
+            for wrong_type in [Value::Null, json!(7), json!(false), json!([]), json!({})] {
+                let mut wrong = params.clone();
+                wrong[key] = wrong_type;
+                invalid_params.push(wrong);
+            }
+        }
+        for params in invalid_params {
+            assert!(!agent_identity_params_are_structurally_valid(op, &params));
+            let (record, reply) = fixture.record(op, params).await;
+            assert_eq!(reply["code"], "invalid_request");
+            records.push(serde_json::from_str(&record).unwrap());
+        }
+        let (record, reply) = fixture.record(op, params.clone()).await;
+        assert_eq!(reply["code"], "not_found");
+        records.push(serde_json::from_str(&record).unwrap());
+        for key in params.as_object().unwrap().keys() {
+            for value in [String::new(), "x".repeat(513), "\u{0001}".into()] {
+                let mut semantic_probe = params.clone();
+                semantic_probe[key] = json!(value);
+                assert!(agent_identity_params_are_structurally_valid(
+                    op,
+                    &semantic_probe
+                ));
+                let (record, _) = fixture.record(op, semantic_probe).await;
+                records.push(serde_json::from_str(&record).unwrap());
+            }
+        }
+    }
+    for params in [
+        json!({}),
+        json!({"token":null}),
+        json!({"token":7}),
+        json!({"token":false}),
+        json!({"token":[]}),
+        json!({"token":{"future":true}}),
+        json!({"token":"not-a-token"}),
+        json!({"token":""}),
+    ] {
+        assert!(agent_identity_params_are_structurally_valid(
+            "agent.fleet_identity",
+            &params
+        ));
+        let (record, reply) = fixture.record("agent.fleet_identity", params).await;
+        assert_eq!(reply["result"]["unchanged"], false);
+        assert!(reply["result"]["agents"].is_array());
+        records.push(serde_json::from_str(&record).unwrap());
+    }
+    for params in [
+        json!({"unexpected":true}),
+        json!({"token":7,"unexpected":true}),
+    ] {
+        assert!(!agent_identity_params_are_structurally_valid(
+            "agent.fleet_identity",
+            &params
+        ));
+        let (record, reply) = fixture.record("agent.fleet_identity", params).await;
+        assert_eq!(reply["code"], "invalid_request");
+        records.push(serde_json::from_str(&record).unwrap());
+    }
+    assert_agent_identity_records("served session lookup request probes", &records);
+}
+
 #[test]
 fn agent_identity_refusal_codes_have_named_variants() {
     for (wire, expected) in [
+        ("not_found", pid::RefusalCode::NotFound),
+        ("invalid_request", pid::RefusalCode::InvalidRequest),
+        ("store_unavailable", pid::RefusalCode::StoreUnavailable),
+        ("module_draining", pid::RefusalCode::ModuleDraining),
+        ("storage_unavailable", pid::RefusalCode::StorageUnavailable),
+        ("storage_error", pid::RefusalCode::StorageError),
+        ("encode_failed", pid::RefusalCode::EncodeFailed),
         ("unknown_agent", pid::RefusalCode::UnknownAgent),
         ("gone", pid::RefusalCode::Gone),
         (

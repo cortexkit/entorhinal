@@ -11554,3 +11554,23 @@ package = "entorhinal-module"
 target = "--bin ck-entorhinal"
 select = "expected"
 expect_red = ["served_vectors::agent_identity_requests_enforce_structure_not_semantics"]
+
+[[control]]
+id = "agent-identity-session-for-runner-row-shape"
+guards = "agent.session_for_runner replies keep the `session` member the shared agent-identity row type requires"
+file = "crates/entorhinal-core/src/session_lifecycle.rs"
+old = '''    pub runner: String,
+    pub session: String,
+    pub harness: Option<String>,'''
+new = '''    pub runner: String,
+    #[serde(rename = "session_id")] // NON-VACUITY BREAK
+    pub session: String,
+    pub harness: Option<String>,'''
+test_file = "crates/entorhinal-module/src/served_vectors.rs"
+runner = "cargo"
+package = "entorhinal-module"
+target = "--bin ck-entorhinal"
+select = "expected"
+# The fresh replies are typed in the generator's own test; the published-records
+# test reads only the committed file, which a handler change does not alter.
+expect_red = ["served_vectors::session_lookup_cases_match_published_file"]
