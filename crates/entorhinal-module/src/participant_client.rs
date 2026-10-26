@@ -574,6 +574,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn import_drop_vectors_decode_and_reject_broken_maps_naming_the_rule() {
+        use cortexkit_role_agent_data::vectors;
+
+        let vectors: Value = serde_json::from_str(
+            vectors::file("import-drops.json").expect("published import drop vectors"),
+        )
+        .unwrap();
+        let cut = cut();
+        let params = serde_json::to_value(&cut).unwrap();
+        let client_for = |result| {
+            ParticipantClient::new(&Participant {
+                module_id: "vector-fixture".into(),
+                transport: Arc::new(VectorTransport {
+                    method: cortexkit_role_agent_data::ops::IMPORT.into(),
+                    params: params.clone(),
+                    result,
+                }),
+            })
+        };
+
+        let valid = vectors["valid"].as_array().unwrap();
+        assert!(!valid.is_empty());
+        for vector in valid {
+            let reply = client_for(vector["reply"].clone())
+                .import(&cut)
+                .await
+                .unwrap_or_else(|error| panic!("{}: {error:?}", vector["name"]));
+            assert_eq!(
+                serde_json::to_value(&reply).unwrap(),
+                vector["reply"],
+                "{}",
+                vector["name"]
+            );
+            assert!(reply.items[0].dropped.is_some(), "{}", vector["name"]);
+        }
+
+        let refused = vectors["refused"].as_array().unwrap();
+        assert_eq!(refused.len(), 14);
+        for vector in refused {
+            match client_for(vector["reply"].clone()).import(&cut).await {
+                // The receiver handles an invalid reply as a participant
+                // contract violation and stops the step.
+                Err(ClientError::InvalidReply(message)) => assert!(
+                    message.contains(vector["rule"].as_str().unwrap()),
+                    "{}: {message}",
+                    vector["name"]
+                ),
+                other => panic!("{} must be refused, got {other:?}", vector["name"]),
+            }
+        }
+
+        // `null` decodes as no drops, and an item without drops keeps its bytes.
+        let item =
+            json!({"sessionRef":"c6ea741d409f833ee60be91d9176e493","endOffset":1,"digest":"d"});
+        let mut with_null = item.clone();
+        with_null["dropped"] = Value::Null;
+        let reply = client_for(json!({"items":[with_null]}))
+            .import(&cut)
+            .await
+            .unwrap();
+        assert_eq!(reply.items[0].dropped, None);
+        assert_eq!(
+            serde_json::to_value(&reply).unwrap(),
+            json!({"items":[item]})
+        );
+    }
+
+    #[tokio::test]
     async fn all_ten_ops_round_trip_literal_contract_fixtures() {
         let fixtures = Arc::new(FixtureTransport {
             fixtures: Mutex::new(VecDeque::from([

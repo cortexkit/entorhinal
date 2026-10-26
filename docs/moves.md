@@ -99,6 +99,20 @@ Things a move can report:
   changed it. The move waits for you; entorhinal does not pick a side.
 - `contract_violation`: a module replied outside the agent-data contract and
   needs repair.
+- **Completed with losses**: a receiving participant reported that it dropped
+  some entries while importing (for example, undo history kinds it cannot
+  carry). The move still activates, but it is not a clean success:
+  `ck agents moves` prints `completed with losses:` (or `import reported
+  losses (move not finished yet):` before activation) and one line per
+  participant, stream and reason with its count, exactly as the participant
+  reported them. `agent.move_status` and `agent.moves` carry the same entries in
+  `losses`, a list of `{participant, session_ref, reason, count}`. `session_ref`
+  names the staged stream the participant imported: for a harness session it is
+  the same value as the session's ref, so it can be looked up; for other kinds
+  it is the participant's own stream handle. Losses are recorded on the
+  machine that ran the import and survive restarts; the source machine does
+  not see them. A move with no drops has no `losses` key, and an aborted
+  move shows none because nothing it staged was kept.
 
 ## Cancel a move
 

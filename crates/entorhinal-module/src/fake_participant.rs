@@ -16,6 +16,9 @@ pub(crate) enum Effect {
     Refuse(Refusal),
     FailBefore(TransportError),
     LoseReply(TransportError),
+    /// Do the op, then answer with this raw result instead of the typed
+    /// reply, so a test can send a reply the contract forbids.
+    Reply(Value),
 }
 
 #[derive(Debug, Clone)]
@@ -190,8 +193,14 @@ impl FakeParticipant {
             _ => {}
         }
         let reply = execute(&mut state, request)?;
-        if let Some(Effect::LoseReply(error)) = effect {
-            return Err(error);
+        match effect {
+            Some(Effect::LoseReply(error)) => return Err(error),
+            Some(Effect::Reply(raw)) => {
+                return Ok(
+                    serde_json::to_vec(&json!({"result": raw})).expect("fake reply serializes")
+                )
+            }
+            _ => {}
         }
         Ok(serde_json::to_vec(&json!({"result": reply})).expect("fake reply serializes"))
     }
