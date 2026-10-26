@@ -396,18 +396,44 @@ async fn startup_seed_does_not_block_health() {
     let mut seeder = test_seeder();
     seeder.before_seed = Some(Arc::new(move || {
         entered.lock().unwrap().take().unwrap().send(()).unwrap();
+        // Park until health has answered. The bound only keeps a regression
+        // from hanging the suite; it is longer than the health guard below, so
+        // a health read that waited for the seed can't pass by outlasting it.
         wait_release
             .lock()
             .unwrap()
-            .recv_timeout(std::time::Duration::from_secs(10))
+            .recv_timeout(std::time::Duration::from_secs(60))
             .unwrap();
     }));
     let task = schedule(store.clone(), seeder, &handler.catalog_sql).unwrap();
     wait_entered.await.unwrap();
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
     use subc_client_rs::ModuleHandler;
-    let health = tokio::time::timeout(std::time::Duration::from_secs(1), handler.health()).await;
-    release.send(()).unwrap();
-    assert!(health.is_ok(), "background bundle load blocked health");
+    // Health's first poll must be ready while the seed job is parked. It runs
+    // on its own thread so that a health read blocking on the seed fails the
+    // guard below instead of deadlocking this runtime's only thread; the seed
+    // cannot finish before `release`, so receiving the report first is the
+    // proof and the bound only turns that regression into a failure.
+    let runtime = tokio::runtime::Handle::current();
+    let (report_tx, report_rx) = std::sync::mpsc::channel();
+    let health = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let _context = runtime.enter();
+            let first_poll = std::pin::pin!(handler.health())
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()));
+            let _ = report_tx.send(matches!(first_poll, Poll::Ready(_)));
+        });
+        let health = report_rx.recv_timeout(std::time::Duration::from_secs(30));
+        release.send(()).unwrap();
+        health
+    });
+    assert_eq!(
+        health,
+        Ok(true),
+        "background bundle load blocked health or health was not ready on its first poll"
+    );
     task.await.unwrap();
     handler.store.lock().unwrap().take();
     drop(store);

@@ -4333,15 +4333,14 @@ mod launch_path_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn non_unicode_canonical_paths_and_cwd_are_refused() {
+    fn non_unicode_canonical_paths_are_refused() {
         use std::os::unix::ffi::OsStringExt;
         let (dir, _) = crate::tests::scratch_descriptor("cli-non-unicode");
         let invalid = dir.join(std::ffi::OsString::from_vec(vec![0xff]));
-        if let Err(error) = std::fs::create_dir(&invalid) {
-            eprintln!("non_unicode_canonical_paths_and_cwd_are_refused skipped: {error}");
-            std::fs::remove_dir_all(dir).unwrap();
-            return;
-        }
+        // Linux filesystems store names as raw bytes, so this only fails when
+        // the setup itself is broken; that must fail the test, not skip it.
+        std::fs::create_dir(&invalid)
+            .unwrap_or_else(|error| panic!("creating a non-UTF-8 directory failed: {error}"));
         let alias = dir.join("alias");
         std::os::unix::fs::symlink(&invalid, &alias).unwrap();
         let raw = alias.to_str().unwrap();
@@ -4356,6 +4355,15 @@ mod launch_path_tests {
                 .unwrap_err()
                 .contains("path_not_unicode")
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // The working directory is injected, so no non-UTF-8 name is created on
+    // disk and this case runs on every Unix, not only Linux.
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_cwd_is_refused() {
+        use std::os::unix::ffi::OsStringExt;
         fn invalid_cwd() -> std::io::Result<PathBuf> {
             Ok(PathBuf::from(std::ffi::OsString::from_vec(vec![
                 b'/', 0xff,
@@ -4373,7 +4381,6 @@ mod launch_path_tests {
         assert!(String::from_utf8(stderr)
             .unwrap()
             .contains("path_not_unicode"));
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(windows)]

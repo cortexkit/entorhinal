@@ -757,12 +757,28 @@ fn missing_unreadable_and_non_sqlite_paths_refuse_without_writes() {
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&f.source_path, fs::Permissions::from_mode(0o000)).unwrap();
-        let result = f.import("unreadable");
+        // Mode 0o000 does not stop a privileged user (root, or a process with
+        // CAP_DAC_OVERRIDE), so the file is only unreadable if opening it fails
+        // here. Otherwise the refusal cannot be observed and the case reports
+        // itself as skipped instead of failing correct code.
+        let unreadable = fs::File::open(&f.source_path).is_err();
+        let result = unreadable.then(|| f.import("unreadable"));
         fs::set_permissions(&f.source_path, fs::Permissions::from_mode(0o600)).unwrap();
-        let error = result.unwrap_err();
-        assert_eq!(error.code, "invalid_request");
-        assert!(error.message.contains(f.source_path.to_str().unwrap()));
-        f.empty(0);
+        if let Some(result) = result {
+            let error = result.unwrap_err();
+            assert_eq!(error.code, "invalid_request");
+            assert!(error.message.contains(f.source_path.to_str().unwrap()));
+            f.empty(0);
+        } else {
+            // libtest captures `eprintln!` for passing tests; a direct write
+            // keeps the skipped case visible in the suite output.
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr(),
+                "SKIPPED missing_unreadable_and_non_sqlite_paths_refuse_without_writes \
+                 (unreadable file case): file modes cannot deny reads to this user"
+            );
+        }
     }
     #[cfg(windows)]
     {

@@ -584,15 +584,15 @@ mod tests {
                         tx.execute_batch("UPDATE project SET name='uncommitted'; UPDATE agent SET terminal_reason='retired',terminal_at_ms=900; DELETE FROM project_root;")?;
                         parked_tx.send(()).unwrap();
                         // Park until the reads are done. The bound only keeps a
-                        // regression from hanging the suite, and it's far longer
-                        // than any reply wait, so a blocked read can't slip
+                        // regression from hanging the suite; it is longer than the
+                        // whole read guard below, so a blocked read can't slip
                         // through by outlasting the park.
-                        let _ = release_rx.recv_timeout(Duration::from_secs(10));
+                        let _ = release_rx.recv_timeout(Duration::from_secs(60));
                         tx.execute_batch("SELECT * FROM missing_rollback_sentinel")
                     })
                 }).unwrap_err();
             });
-            parked_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            parked_rx.recv_timeout(Duration::from_secs(30)).unwrap();
             scope.spawn(move || {
                 for (method, params) in requests {
                     let start = Instant::now();
@@ -607,13 +607,15 @@ mod tests {
             });
             // Every reply must arrive while the writer is still parked: a read
             // queued behind the writer can't finish until `release_tx` below,
-            // so receiving them all first proves no read waited for it. The
-            // per-reply wait is far under the writer's park, so a loaded
-            // test machine slows a reply without making it look blocked.
+            // so receiving them all first proves no read waited for it. One
+            // deadline bounds the whole batch only so that regression fails
+            // instead of hanging; it is generous enough that a loaded machine
+            // slows the replies without making them look blocked.
+            let deadline = Instant::now() + Duration::from_secs(30);
             let mut received = Vec::new();
             let mut all_before_release = true;
             for _ in &expected {
-                match reply_rx.recv_timeout(Duration::from_millis(1_500)) {
+                match reply_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                     Ok(reply) => received.push(reply),
                     Err(_) => {
                         all_before_release = false;
@@ -648,7 +650,12 @@ mod tests {
 
     #[tokio::test]
     async fn health_reads_only_atomics_while_writer_and_store_slot_are_parked() {
-        use std::{sync::mpsc, thread, time::Instant};
+        use std::{
+            future::Future,
+            sync::mpsc,
+            task::{Context, Poll, Waker},
+            thread,
+        };
         use subc_client_rs::ModuleHandler;
 
         let f = Fixture::new(true);
@@ -656,7 +663,8 @@ mod tests {
         let generation = f.head();
         let (parked_tx, parked_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let elapsed = thread::scope(|scope| {
+        let (health_tx, health_rx) = mpsc::channel();
+        thread::scope(|scope| {
             let handler = &f.handler;
             let writer = scope.spawn(move || {
                 handler
@@ -667,33 +675,44 @@ mod tests {
                             // installation slot; health must use atomics only.
                             let _slot = handler.store.lock().unwrap();
                             parked_tx.send(()).unwrap();
-                            let _ = release_rx.recv_timeout(Duration::from_secs(2));
+                            // Park until health has answered. The bound only
+                            // keeps a regression from hanging the suite; it is
+                            // longer than the health guard below, so a blocked
+                            // health read can't slip through by outlasting it.
+                            let _ = release_rx.recv_timeout(Duration::from_secs(60));
                             tx.execute_batch("SELECT * FROM missing_rollback_sentinel")
                         })
                     })
                     .unwrap_err();
             });
-            parked_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-            let start = Instant::now();
-            // Health has no awaits, store reads or locks. Poll it synchronously
-            // while the writer is known to be inside its uncommitted transaction.
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .build()
-                .unwrap();
-            let health = scope
-                .spawn(move || runtime.block_on(handler.health()))
-                .join()
-                .unwrap();
-            assert_eq!(health.metrics.unwrap()["generation"], generation);
-            let elapsed = start.elapsed();
+            parked_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+            // Health has no awaits, store reads or locks, so its first poll must
+            // be ready while the writer is known to be inside its uncommitted
+            // transaction and holding the store slot. The poll runs on its own
+            // thread so that a health read that blocks on the slot fails the
+            // guard below instead of deadlocking this one.
+            let runtime = tokio::runtime::Handle::current();
+            scope.spawn(move || {
+                let _context = runtime.enter();
+                let first_poll = std::pin::pin!(handler.health())
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()));
+                let _ = health_tx.send(match first_poll {
+                    Poll::Ready(report) => Some(report),
+                    Poll::Pending => None,
+                });
+            });
+            // The writer cannot release before `release_tx` below, so receiving
+            // the report first proves health never waited for storage. The
+            // bound only turns that regression into a failure, not a hang.
+            let health = health_rx.recv_timeout(Duration::from_secs(30));
             let _ = release_tx.send(());
             writer.join().unwrap();
-            elapsed
+            let health = health
+                .expect("health waited for the parked writer or store slot")
+                .expect("health must answer on its first poll");
+            assert_eq!(health.metrics.unwrap()["generation"], generation);
         });
-        assert!(
-            elapsed < Duration::from_millis(100),
-            "health waited {elapsed:?} for storage"
-        );
     }
 
     #[tokio::test]

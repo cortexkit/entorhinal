@@ -4666,13 +4666,25 @@ mod tests {
         };
         let handler = ProjectsHandler::new().unwrap();
 
-        let started = Instant::now();
-        handler.on_hello_ack(&hello_ack(&descriptor)).await;
+        // Failing at once means no inline retry: every retry waits on a Tokio
+        // timer before reopening, so the HELLO_ACK handler must be finished on
+        // its first poll. This replaces a wall-clock budget, which a loaded
+        // machine could exceed without any retry happening.
+        {
+            use std::future::Future;
+            use std::task::{Context, Waker};
+            assert!(
+                std::pin::pin!(handler.on_hello_ack(&hello_ack(&descriptor)))
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_ready(),
+                "a non-lease error must fail without waiting to retry"
+            );
+        }
         assert!(
             !handler.health.store_opening.load(Ordering::Relaxed),
             "a non-lease error must not start the retry task"
         );
-        assert!(started.elapsed() < Duration::from_secs(1));
         let after = handler.health().await;
         assert_eq!(after.status, HealthStatus::Failing, "{after:?}");
         let _ = std::fs::remove_dir_all(dir);

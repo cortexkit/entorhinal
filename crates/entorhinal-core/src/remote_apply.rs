@@ -2120,11 +2120,15 @@ mod tests {
                 Err::<(), _>(rusqlite::Error::QueryReturnedNoRows)
             })
         });
-        received.recv_timeout(Duration::from_secs(5)).unwrap();
+        received.recv_timeout(Duration::from_secs(30)).unwrap();
         let reader = f.store.clone();
         let (done, result) = mpsc::channel();
         let verify = thread::spawn(move || done.send(reader.verify()).unwrap());
-        let observed = result.recv_timeout(Duration::from_millis(100));
+        // The writer stays parked until `release` below, so a verify that
+        // waited for the writer lock could not reply before then. Collecting the
+        // result first is the proof; the bound only turns that regression into
+        // a failure instead of a hang, and is far longer than any honest verify.
+        let observed = result.recv_timeout(Duration::from_secs(30));
         release.send(()).unwrap();
         assert!(handle.join().unwrap().is_err());
         verify.join().unwrap();

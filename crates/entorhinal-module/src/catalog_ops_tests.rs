@@ -289,13 +289,18 @@ async fn read_blob_requires_daemon_consumer_capability() {
         assert_eq!(reply["total"], bytes.len());
     }
     assert_eq!(f.store().generation().unwrap(), 0);
-    for name in ["store.db", "store.db-wal"] {
-        if let Ok(database) = std::fs::read(f.root.join(name)) {
-            assert!(
-                !database.windows(bytes.len()).any(|window| window == bytes),
-                "package bytes in {name}"
-            );
-        }
+    // The main database must be readable, or this check would pass without
+    // looking. The WAL may legitimately not exist; any other read error fails.
+    for (name, required) in [("store.db", true), ("store.db-wal", false)] {
+        let database = match std::fs::read(f.root.join(name)) {
+            Ok(database) => database,
+            Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => panic!("reading {name} failed: {error}"),
+        };
+        assert!(
+            !database.windows(bytes.len()).any(|window| window == bytes),
+            "package bytes in {name}"
+        );
     }
 }
 

@@ -2033,13 +2033,11 @@ mod tests {
         let root = repo(&f, "alpha", Some("https://github.com/owner/symlink.git"));
         let common = Path::new(&root).with_file_name("common");
         fs::rename(Path::new(&root).join(".git"), &common).unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&common, Path::new(&root).join(".git")).unwrap();
-        #[cfg(windows)]
-        if let Err(error) =
-            std::os::windows::fs::symlink_dir(&common, Path::new(&root).join(".git"))
-        {
-            eprintln!("symlinked_git_directory_reads_remotes_and_binds: skipped: {error}");
+        if !crate::mutations::path_identity_tests::symlink_dir(
+            &common,
+            &Path::new(&root).join(".git"),
+            "symlinked_git_directory_reads_remotes_and_binds",
+        ) {
             return;
         }
         assert_eq!(git_common_dir(Path::new(&root)).unwrap(), common);

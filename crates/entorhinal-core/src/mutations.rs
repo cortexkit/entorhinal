@@ -4472,7 +4472,7 @@ mod project_replay_tests {
 }
 
 #[cfg(test)]
-mod path_identity_tests {
+pub(crate) mod path_identity_tests {
     use super::tests::{result, Fixture};
     use super::*;
     use std::fs;
@@ -4598,19 +4598,32 @@ mod path_identity_tests {
         assert_eq!(reason(&f, other.to_str().unwrap(), homes), "missing");
     }
 
-    fn symlink_dir(target: &Path, link: &Path, test: &str) -> bool {
+    /// Reports a skipped test on the real stderr. libtest captures `eprintln!`
+    /// for passing tests, so a skip printed that way would read as a plain pass
+    /// that asserted nothing; a direct write shows in the suite output.
+    pub(crate) fn report_skip(test: &str, reason: &str) {
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "SKIPPED {test}: {reason}");
+    }
+
+    /// Creates a directory symlink, or returns false when this Windows account
+    /// lacks the symlink privilege (developer mode off and not elevated), after
+    /// reporting the skip. Any other failure fails the test, so a broken setup
+    /// never passes as an unsupported environment.
+    pub(crate) fn symlink_dir(target: &Path, link: &Path, test: &str) -> bool {
         #[cfg(unix)]
         let outcome = std::os::unix::fs::symlink(target, link);
         #[cfg(windows)]
         let outcome = std::os::windows::fs::symlink_dir(target, link);
         if let Err(error) = outcome {
-            #[cfg(unix)]
-            panic!("{test}: symlink failed: {error}");
-            #[cfg(windows)]
-            {
-                eprintln!("SKIP {test}: cannot create directory symlink: {error}");
+            // ERROR_PRIVILEGE_NOT_HELD: creating symlinks needs developer mode
+            // or an elevated account on Windows.
+            const PRIVILEGE_NOT_HELD: i32 = 1314;
+            if cfg!(windows) && error.raw_os_error() == Some(PRIVILEGE_NOT_HELD) {
+                report_skip(test, &format!("cannot create directory symlinks: {error}"));
                 return false;
             }
+            panic!("{test}: symlink failed: {error}");
         }
         true
     }
@@ -4633,14 +4646,28 @@ mod path_identity_tests {
         assert_eq!(reason(&f, alias, homes(&home)), "home_scoped");
     }
 
+    // Needs a case-insensitive filesystem. Linux volumes are case-sensitive by
+    // default, so the test is ignored there; macOS and Windows default to
+    // case-insensitive volumes and run it.
+    #[cfg_attr(
+        target_os = "linux",
+        ignore = "needs a case-insensitive filesystem; Linux volumes are case-sensitive"
+    )]
     #[test]
     fn home_guard_reduces_case_aliases_when_supported() {
         let f = Fixture::new("home-case");
         let home = f.dir("A");
         let alias = f.root.join("a");
-        if let Err(error) = fs::read_dir(&alias) {
-            eprintln!("SKIP home_guard_reduces_case_aliases_when_supported: filesystem is case-sensitive ({error})");
-            return;
+        match fs::read_dir(&alias) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                report_skip(
+                    "home_guard_reduces_case_aliases_when_supported",
+                    "this volume is case-sensitive",
+                );
+                return;
+            }
+            Err(error) => panic!("reading the case alias failed: {error}"),
         }
         assert!(check(alias.to_str().unwrap(), homes(&home)));
         assert_eq!(
@@ -4694,26 +4721,24 @@ mod path_identity_tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn unicode_symlink(f: &Fixture, test: &str) -> Option<String> {
+    fn unicode_symlink(f: &Fixture, test: &str) -> String {
         use std::os::unix::ffi::OsStringExt;
         let bad = f.root.join(std::ffi::OsString::from_vec(vec![0xff]));
-        if let Err(error) = fs::create_dir(&bad) {
-            eprintln!("SKIP {test}: filesystem refuses byte 0xff: {error}");
-            return None;
-        }
+        // Linux filesystems store names as raw bytes, so this only fails when
+        // the setup itself is broken; that must fail the test, not skip it.
+        fs::create_dir(&bad).unwrap_or_else(|error| {
+            panic!("{test}: creating a non-UTF-8 directory failed: {error}")
+        });
         let link = f.root.join("unicode-link");
         std::os::unix::fs::symlink(&bad, &link).unwrap();
-        Some(link.to_str().unwrap().to_owned())
+        link.to_str().unwrap().to_owned()
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn unreducible_home_refuses_before_any_journal_write() {
         let f = Fixture::new("home-unicode");
-        let Some(home) = unicode_symlink(&f, "unreducible_home_refuses_before_any_journal_write")
-        else {
-            return;
-        };
+        let home = unicode_symlink(&f, "unreducible_home_refuses_before_any_journal_write");
         let root = f.dir("candidate");
         assert_eq!(f.store.generation().unwrap(), 0);
         let req = request(&[f.root.to_str().unwrap()], true);
@@ -4739,9 +4764,7 @@ mod path_identity_tests {
     #[test]
     fn canonical_rejects_non_unicode_canonical_form() {
         let f = Fixture::new("canonical-unicode");
-        let Some(root) = unicode_symlink(&f, "canonical_rejects_non_unicode_canonical_form") else {
-            return;
-        };
+        let root = unicode_symlink(&f, "canonical_rejects_non_unicode_canonical_form");
         for error in [
             canonical(&root).unwrap_err(),
             RegistryStore::canonical_mutation_root(&root).unwrap_err(),

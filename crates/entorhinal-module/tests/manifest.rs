@@ -41,13 +41,21 @@ fn manifest_flag_prints_the_manifest_with_the_provided_capability() {
     );
     // The face is chosen from argv[0], so setting argv[0] exercises the same
     // dispatch a placed link does, without writing a second copy of the binary.
+    // tests/ck_domain.rs already runs the agents, projects and workspaces faces
+    // with stricter output checks, so only the other declared faces, including
+    // any added later, are probed here.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
+        const CHECKED_IN_CK_DOMAIN_TESTS: [&str; 3] = ["agents", "projects", "workspaces"];
         let binary = ckdev_binary(env!("CARGO_BIN_EXE_ck-entorhinal"));
         for face in manifest["cli_faces"].as_array().unwrap() {
+            let name = face["name"].as_str().unwrap();
+            if CHECKED_IN_CK_DOMAIN_TESTS.contains(&name) {
+                continue;
+            }
             let headline = Command::new(&binary)
-                .arg0(format!("ckdev-{}", face["name"].as_str().unwrap()))
+                .arg0(format!("ckdev-{name}"))
                 .arg("--ck-domain")
                 .output()
                 .unwrap();

@@ -2196,11 +2196,11 @@ mod path_identity_tests {
         let f = Fixture::new("query-symlink");
         let prefix = f.dir("real");
         let alias = f.root.join("alias");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&prefix, &alias).unwrap();
-        #[cfg(windows)]
-        if let Err(error) = std::os::windows::fs::symlink_dir(&prefix, &alias) {
-            eprintln!("SKIP missing_query_tail_canonicalizes_its_existing_symlink_prefix: {error}");
+        if !crate::mutations::path_identity_tests::symlink_dir(
+            Path::new(&prefix),
+            &alias,
+            "missing_query_tail_canonicalizes_its_existing_symlink_prefix",
+        ) {
             return;
         }
         let path = alias.join("MiSsInG").join("TaIl");
