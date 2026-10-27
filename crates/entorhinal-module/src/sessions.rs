@@ -41,6 +41,7 @@ pub(super) const SESSION_LIVENESS: &str = "agent.session_liveness";
 pub(super) const SESSIONS: &str = "agent.sessions";
 /// Resolves a runner's session id to its binding.
 pub(super) const SESSION_FOR_RUNNER: &str = "agent.session_for_runner";
+pub(super) const SESSION_FOR_HARNESS: &str = "agent.session_for_harness";
 /// The session reads, open to every caller like the other reads.
 pub(super) const READ_METHODS: &[&str] = &[
     FOR_SESSION,
@@ -48,6 +49,7 @@ pub(super) const READ_METHODS: &[&str] = &[
     SESSION_LIVENESS,
     SESSIONS,
     SESSION_FOR_RUNNER,
+    SESSION_FOR_HARNESS,
 ];
 
 /// The module that owns an agent's work and registers the sessions it starts.
@@ -403,6 +405,13 @@ struct AgentSessionsRequest {
 #[serde(deny_unknown_fields)]
 struct SessionForRunnerRequest {
     runner: String,
+    session: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SessionForHarnessRequest {
+    harness: String,
     session: String,
 }
 
@@ -913,7 +922,7 @@ impl ProjectsHandler {
     /// The binding a runner's session id names, so a caller holding only
     /// `{runner, session}` learns the harness and project root behind it. A
     /// binding registered without a runner is `not_found` here; its callers
-    /// look it up by harness and session id with `agent.for_session`.
+    /// look it up by harness and session id with `agent.session_for_harness`.
     pub(super) fn session_for_runner(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
         let request: SessionForRunnerRequest = decode(params)?;
         runner_bounds(&request.runner)?;
@@ -926,6 +935,23 @@ impl ProjectsHandler {
                 HandlerError::new(
                     "not_found",
                     "no agent session is registered under this runner and session",
+                )
+            })?;
+        self.encode_read_result(binding)
+    }
+
+    pub(super) fn session_for_harness(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
+        let request: SessionForHarnessRequest = decode(params)?;
+        bounded("harness", &request.harness, HARNESS_MAX)?;
+        bounded("session", &request.session, SESSION_ID_MAX)?;
+        let binding = self
+            .with_store(|store| {
+                store.session_binding_for_harness(&request.harness, &request.session)
+            })?
+            .ok_or_else(|| {
+                HandlerError::new(
+                    "not_found",
+                    "no agent session is registered under this harness and session",
                 )
             })?;
         self.encode_read_result(binding)

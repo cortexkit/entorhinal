@@ -880,7 +880,7 @@ fn session_binding_for_runner_finds_only_runner_rows() {
         f.store.session_binding_for_runner("broca", "s1").unwrap(),
         Some(crate::RunnerSessionBinding {
             agent_id: AGENT.into(),
-            runner: "broca".into(),
+            runner: Some("broca".into()),
             session: "s1".into(),
             harness: Some("broca".into()),
             ref_kind: "broca-session".into(),
@@ -902,6 +902,40 @@ fn session_binding_for_runner_finds_only_runner_rows() {
             .unwrap(),
         None
     );
+}
+
+#[test]
+fn session_binding_for_harness_includes_runnerless_rows() {
+    let f = Fixture::new();
+    f.store
+        .register_session(&hosted("ref-1", "pi", "s1", Some("broca")))
+        .unwrap();
+    f.store
+        .register_session(&hosted("ref-2", "opencode", "s2", None))
+        .unwrap();
+    f.store.end_session("pi", "s1", None, 20).unwrap();
+    assert_eq!(
+        f.store.session_binding_for_harness("pi", "s1").unwrap(),
+        f.store.session_binding_for_runner("broca", "s1").unwrap()
+    );
+    let runnerless = f
+        .store
+        .session_binding_for_harness("opencode", "s2")
+        .unwrap()
+        .unwrap();
+    assert_eq!(runnerless.runner, None);
+    assert_eq!(runnerless.session_ref, "ref-2");
+    assert_eq!(runnerless.project_root.as_deref(), Some("/project"));
+    assert_eq!(runnerless.network, "unknown");
+    assert!(runnerless.network_history.is_empty());
+    for (harness, session) in [("pi", "s2"), ("broca", "s1"), ("opencode", "missing")] {
+        assert_eq!(
+            f.store
+                .session_binding_for_harness(harness, session)
+                .unwrap(),
+            None
+        );
+    }
 }
 
 /// Ending a runner-less binding with a runner whose session id another

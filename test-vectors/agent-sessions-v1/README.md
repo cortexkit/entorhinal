@@ -308,3 +308,47 @@ with both Cargo's test runner and nextest:
 cargo test --workspace --all-targets --locked served_vectors::session_lookup_cases_match_published_file -- --exact
 cargo nextest run --workspace --all-targets --locked -E 'test(served_vectors::session_lookup_cases_match_published_file)'
 ```
+
+## Harness session lookup
+
+`agent.session_for_harness` accepts exactly `{harness, session}`: a 1–32-byte
+harness and a 1–256-byte session id. Unknown fields, missing or wrongly typed
+fields, and out-of-bounds strings refuse `invalid_request`. An unknown pair
+refuses `not_found`. Reads are open to every principal and do not require a
+recorded runner.
+
+**`session-for-harness.json`** contains five real-handler records, in order:
+
+1. A runner-bearing Pi session, with current network `no` and history `yes`
+   at 700 then `no` at 701. Its reply is identical to the runner lookup reply.
+2. An OpenCode session with ID `head`, registered without a runner: the reply
+   includes `runner: null`.
+3. An ended session whose data is held on `source-machine`, with `heldOn`
+   and `ended_at_ms: 710`.
+4. An unknown session (`not_found`).
+5. An extra `session_id` field (`invalid_request`).
+
+The reply has exactly the `agent.session_for_runner` shape: `agent_id`, `runner`,
+`session`, `harness`, `ref_kind`, `ref`, `project_root`, `ended_at_ms`, `network`,
+`network_history`, `incarnation`, and optional `heldOn`. Every project path in
+this file is normalized to `/fixture/project`, including JSON escaping of native
+paths, so the published bytes do not depend on the operating system.
+
+Runner-bearing replies round-trip through
+`cortexkit-agent-identity::AgentSessionForRunnerReply`. Version 0.1.1 of that
+crate requires a runner and cannot decode the null-runner success record; the
+test asserts that record's exact shape instead. The crate needs a nullable-runner
+reply type for this operation. No dependency is changed.
+
+Generate only the new file, leaving the earlier samples untouched:
+
+```sh
+ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked served_vectors::session_for_harness_records_match_published_file -- --exact --nocapture
+```
+
+Run the same command without `ENTO_WRITE_SERVED_VECTORS=1` to compare the
+handler's bytes against the published file. Its checksum is appended to
+`SHA256SUMS`; when using the refresh script above, append
+`'session-for-harness.json'` to `names` so the new entry is retained.
+
+SHA-256: `32ec4b73a8571b8d534b76c4858d4d0190063c8343fe5aea5f2630e50a2c9544`.

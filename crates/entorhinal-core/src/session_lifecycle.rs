@@ -97,11 +97,12 @@ pub struct SessionCursor {
     pub session_ref: String,
 }
 
-/// The binding a runner's session id names.
+/// A session binding found by either a runner-and-session pair or a
+/// harness-and-session pair.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RunnerSessionBinding {
     pub agent_id: String,
-    pub runner: String,
+    pub runner: Option<String>,
     pub session: String,
     pub harness: Option<String>,
     pub ref_kind: String,
@@ -264,12 +265,33 @@ impl RegistryStore {
         runner: &str,
         session: &str,
     ) -> Result<Option<RunnerSessionBinding>, RegistryError> {
+        self.session_binding_for_key("runner", runner, session)
+    }
+
+    /// The binding a harness's session id names, including bindings registered
+    /// before a runner was recorded.
+    pub fn session_binding_for_harness(
+        &self,
+        harness: &str,
+        session: &str,
+    ) -> Result<Option<RunnerSessionBinding>, RegistryError> {
+        self.session_binding_for_key("harness", harness, session)
+    }
+
+    fn session_binding_for_key(
+        &self,
+        key_column: &str,
+        key: &str,
+        session: &str,
+    ) -> Result<Option<RunnerSessionBinding>, RegistryError> {
         self.read(|conn| {
             conn.query_row(
-                "SELECT agent_id, runner, session_id, harness, ref_kind, ref,
+                &format!(
+                    "SELECT agent_id, runner, session_id, harness, ref_kind, ref,
                         NULLIF(project_root,''), ended_at_ms, held_on
-                 FROM session_binding WHERE runner=?1 AND session_id=?2",
-                params![runner, session],
+                 FROM session_binding WHERE {key_column}=?1 AND session_id=?2"
+                ),
+                params![key, session],
                 |row| {
                     Ok(RunnerSessionBinding {
                         agent_id: row.get(0)?,

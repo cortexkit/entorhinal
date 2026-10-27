@@ -453,6 +453,7 @@ fn agent_identity_vector(directory: &str, name: &str) -> bool {
                 | "where-moving-receiver.json"
                 | "session-for-ref.json"
                 | "session-for-runner.json"
+                | "session-for-harness.json"
                 | "session-lookup-cases.json"
         ) | (
             "agent-identity-reads-v1",
@@ -474,6 +475,11 @@ fn agent_identity_params_are_structurally_valid(op: &str, params: &Value) -> boo
         "agent.session_for_runner" => {
             return params.len() == 2
                 && params.get("runner").is_some_and(Value::is_string)
+                && params.get("session").is_some_and(Value::is_string);
+        }
+        "agent.session_for_harness" => {
+            return params.len() == 2
+                && params.get("harness").is_some_and(Value::is_string)
                 && params.get("session").is_some_and(Value::is_string);
         }
         "agent.fleet_identity" => return params.keys().all(|key| key == "token"),
@@ -592,6 +598,34 @@ fn assert_agent_identity_records(label: &str, records: &[Value]) {
                 aid::AgentSessionForRunnerParams,
                 aid::AgentSessionForRunnerReply,
             >(&label, record, &mut errors),
+            "agent.session_for_harness" => {
+                if record.pointer("/reply/result/runner") == Some(&Value::Null) {
+                    // cortexkit-agent-identity 0.1.1 requires a runner in its
+                    // runner-lookup reply type. Until the crate provides a
+                    // nullable-runner type for harness lookups, pin the full
+                    // runnerless sample explicitly instead of coercing null.
+                    check_agent_identity_record::<crate::sessions::SessionForHarnessRequest, Value>(
+                        &label,
+                        record,
+                        &mut errors,
+                    );
+                    assert_eq!(
+                        record["reply"],
+                        json!({"result":{
+                            "agent_id":SESSION_AGENT,"runner":null,"session":"head","harness":"opencode",
+                            "ref_kind":"pi-session","ref":NO_RUNNER_REF,"project_root":"/fixture/project",
+                            "ended_at_ms":null,"network":"unknown","network_history":[],
+                            "incarnation":"0123456789abcdef"
+                        }}),
+                        "{label}"
+                    );
+                } else {
+                    check_agent_identity_record::<
+                        crate::sessions::SessionForHarnessRequest,
+                        aid::AgentSessionForRunnerReply,
+                    >(&label, record, &mut errors);
+                }
+            }
             "agent.fleet_identity" => check_agent_identity_record::<
                 aid::AgentFleetIdentityParams,
                 aid::AgentFleetIdentityReply,
@@ -618,6 +652,7 @@ fn agent_identity_published_records_roundtrip_exactly() {
         ("agent-sessions-v1", "where-moving-receiver.json"),
         ("agent-sessions-v1", "session-for-ref.json"),
         ("agent-sessions-v1", "session-for-runner.json"),
+        ("agent-sessions-v1", "session-for-harness.json"),
         ("agent-sessions-v1", "session-lookup-cases.json"),
         ("agent-identity-reads-v1", "agent-resolve.json"),
         ("agent-identity-reads-v1", "agent-resolve-merged.json"),
@@ -3527,6 +3562,121 @@ async fn session_lifecycle_records_match_published_files() {
         "set-session-network.json",
         network_records,
     );
+}
+
+#[tokio::test]
+async fn session_for_harness_records_match_published_file() {
+    let fixture = SessionFixture::new("served-session-for-harness").await;
+    let source = fixture.snapshot();
+    seed_agent(&source, SESSION_AGENT, "Session Agent", None, false, false);
+    drop(source);
+    assert!(matches!(
+        fixture.import().await,
+        HandlerOutcome::Response(_)
+    ));
+    let root = fixture.dir.join("project").to_string_lossy().into_owned();
+    for (session_ref, harness, session, runner) in [
+        (LIVE_WORKER_REF, "pi", "worker", Some("broca")),
+        (NO_RUNNER_REF, "opencode", "head", None),
+        (ENDED_WORKER_REF, "pi", "remote-ended", Some("broca")),
+    ] {
+        let (_, reply) = fixture
+            .record(
+                SESSION_REGISTRAR,
+                WRITER_MODULE,
+                "agent.register_session",
+                json!({"agent_id":SESSION_AGENT,"ref_kind":"pi-session","ref":session_ref,
+                    "harness":harness,"session_id":session,"runner":runner,"project_root":root}),
+            )
+            .await;
+        assert!(reply.get("result").is_some(), "{reply}");
+    }
+    for network in ["yes", "no"] {
+        let (_, reply) = fixture
+            .record(
+                SESSION_REGISTRAR,
+                WRITER_MODULE,
+                "agent.set_session_network",
+                json!({"harness":"pi","session":"worker","network":network}),
+            )
+            .await;
+        assert!(reply.get("result").is_some(), "{reply}");
+    }
+    fixture
+        .store()
+        .end_session("pi", "remote-ended", None, 710)
+        .unwrap();
+    fixture
+        .store()
+        .apply_entry("fixture.remote_finished", "{}", "fixture", None, |tx| {
+            tx.execute(
+                "UPDATE session_binding SET held_on='source-machine' WHERE ref=?1",
+                [ENDED_WORKER_REF],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let mut records = Vec::new();
+    for (params, expected_code) in [
+        (json!({"harness":"pi","session":"worker"}), None),
+        (json!({"harness":"opencode","session":"head"}), None),
+        (json!({"harness":"pi","session":"remote-ended"}), None),
+        (
+            json!({"harness":"pi","session":"missing"}),
+            Some("not_found"),
+        ),
+        (
+            json!({"harness":"pi","session":"worker","session_id":"worker"}),
+            Some("invalid_request"),
+        ),
+    ] {
+        let (record, reply) = fixture
+            .record(
+                SESSION_READER,
+                READER_MODULE,
+                "agent.session_for_harness",
+                params.clone(),
+            )
+            .await;
+        if let Some(code) = expected_code {
+            assert_eq!(reply["code"], code);
+            assert!(reply["detail"].is_null());
+        } else {
+            assert_eq!(reply["result"]["project_root"], root);
+            match params["session"].as_str().unwrap() {
+                "worker" => {
+                    assert_eq!(reply["result"]["runner"], "broca");
+                    assert_eq!(reply["result"]["network"], "no");
+                    assert_eq!(
+                        reply["result"]["network_history"].as_array().unwrap().len(),
+                        2
+                    );
+                    let (_, runner_reply) = fixture
+                        .record(
+                            SESSION_READER,
+                            READER_MODULE,
+                            "agent.session_for_runner",
+                            json!({"runner":"broca","session":"worker"}),
+                        )
+                        .await;
+                    assert_eq!(reply, runner_reply);
+                }
+                "head" => assert!(reply["result"]["runner"].is_null()),
+                "remote-ended" => {
+                    assert_eq!(reply["result"]["heldOn"], "source-machine");
+                    assert_eq!(reply["result"]["ended_at_ms"], 710);
+                }
+                _ => unreachable!(),
+            }
+        }
+        // Escape the native path before replacing it so Windows separators
+        // and Unix paths produce the same published JSON bytes.
+        records.push(record.replace(
+            &json_string_contents(&root),
+            &json_string_contents("/fixture/project"),
+        ));
+    }
+    published_file("agent-sessions-v1", "session-for-harness.json", records);
 }
 
 /// The SHA-256 of each agent-sessions sample whose bytes must not change.
