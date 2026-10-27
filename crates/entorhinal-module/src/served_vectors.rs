@@ -2799,6 +2799,125 @@ async fn session_lookup_cases_match_published_file() {
 }
 
 #[tokio::test]
+async fn sessions_head_runners_match_published_file() {
+    const AGENT: &str = "agent_0000000000000301";
+    const CORE_REF: &str = "11111111111111111111111111111111";
+    const THALAMUS_REF: &str = "22222222222222222222222222222222";
+    const REKEYED_REF: &str = "33333333333333333333333333333333";
+    const RUNNER: &str = "thalamus-harness";
+    const FIXED_ROOT: &str = "/fixture/head-project";
+
+    let fixture = SessionFixture::new("served-head-runners").await;
+    let root = fixture.dir.join("head-project");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    let root = crate::tests::canonical_test_path(&root)
+        .to_string_lossy()
+        .into_owned();
+    let (_, project) = fixture
+        .record(
+            SESSION_CORE,
+            WRITER_MODULE,
+            "register",
+            json!({
+                "projectId":"served-project", "name":"Orchard", "roots":[root],
+                "workspaceId":"served-workspace"
+            }),
+        )
+        .await;
+    assert!(project.get("result").is_some(), "{project}");
+    let source = fixture.snapshot();
+    seed_agent(&source, AGENT, "Orchard Head", None, false, true);
+    drop(source);
+    assert!(matches!(
+        fixture.import().await,
+        HandlerOutcome::Response(_)
+    ));
+
+    let core = json!({
+        "agent_id":AGENT, "ref_kind":"opencode-session", "ref":CORE_REF,
+        "harness":"opencode", "session_id":"head-core-plugin", "project_root":root
+    });
+    let thalamus = json!({
+        "agent_id":AGENT, "ref_kind":"opencode-session", "ref":THALAMUS_REF,
+        "harness":"opencode", "session_id":"head-thalamus", "project_root":root,
+        "runner":RUNNER
+    });
+    let mut records = Vec::new();
+    for params in [core.clone(), thalamus] {
+        let (record, reply) = fixture
+            .record(
+                SESSION_REGISTRAR,
+                WRITER_MODULE,
+                "agent.register_session",
+                params,
+            )
+            .await;
+        assert_eq!(reply["result"]["registered_by"], "orchestrator", "{reply}");
+        records.push(record);
+    }
+
+    for (reference, runner) in [(CORE_REF, None), (REKEYED_REF, Some(RUNNER))] {
+        if let Some(runner) = runner {
+            let mut rekey = core.clone();
+            rekey["ref"] = json!(reference);
+            rekey["runner"] = json!(runner);
+            let (record, reply) = fixture
+                .record(
+                    SESSION_REGISTRAR,
+                    WRITER_MODULE,
+                    "agent.register_session",
+                    rekey,
+                )
+                .await;
+            assert_eq!(reply["result"]["ref"], REKEYED_REF, "{reply}");
+            assert_eq!(reply["result"]["registered_by"], "orchestrator");
+            records.push(record);
+        }
+
+        let (record, reply) = fixture
+            .record(
+                SESSION_READER,
+                READER_MODULE,
+                "agent.sessions",
+                json!({"agent_id":AGENT}),
+            )
+            .await;
+        assert_eq!(reply["result"]["incarnation"], INCARNATION);
+        assert_eq!(reply["result"].get("next_cursor"), Some(&Value::Null));
+        let sessions = reply["result"]["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 2, "re-keying must not add a session row");
+        for (session, expected_ref, expected_runner) in [
+            ("head-core-plugin", reference, runner),
+            ("head-thalamus", THALAMUS_REF, Some(RUNNER)),
+        ] {
+            let row = sessions
+                .iter()
+                .find(|row| row["session"] == session)
+                .unwrap();
+            assert_eq!(row["harness"], "opencode");
+            assert_eq!(row["ref_kind"], "opencode-session");
+            assert_eq!(row["ref"], expected_ref);
+            assert_eq!(row.get("runner"), Some(&json!(expected_runner)));
+            assert_eq!(row["project_root"], root);
+        }
+        records.push(record);
+    }
+
+    // Replace the entire JSON-escaped root in requests and replies so Windows
+    // separators and canonical path prefixes cannot leak into the sample.
+    let records = records
+        .into_iter()
+        .map(|record| {
+            record.replace(
+                &json_string_contents(&root),
+                &json_string_contents(FIXED_ROOT),
+            )
+        })
+        .collect();
+    published_file("agent-sessions-v1", "sessions-head-runners.json", records);
+}
+
+#[tokio::test]
 async fn session_rekey_records_match_published_files() {
     let fixture = SessionFixture::new("served-session-rekey").await;
     let source = fixture.snapshot();

@@ -237,7 +237,16 @@ a backfill makes the data local.
   records add a populated `project.canonicalRoot`, tag and labels. No fleet
   field lacks a populated example after these additions. Nonzero log position,
   wild avatars, workspace-head/hiree roles and an empty fleet remain unsampled.
-- **`SHA256SUMS`**: SHA-256 hashes of the seventeen JSON vector files, with
+- **`sessions-head-runners.json`**: One project head has two OpenCode sessions,
+  registered through `agent.register_session` as `prefrontal-core`. The phone's
+  first `agent.sessions` read shows the core-plugin session with `runner: null`
+  and the hosted session with `runner: "thalamus-harness"`. Re-registering the
+  plugin session with the same harness/session ID, a new ref and that runner
+  replaces its runner and re-keys its ref in place; the second read still has
+  exactly two rows. All five records use clock `700` and incarnation
+  `0123456789abcdef`; the complete canonical scratch root is mapped explicitly
+  to `/fixture/head-project`, including in registration requests.
+- **`SHA256SUMS`**: SHA-256 hashes of the eighteen JSON vector files, with
   names relative to this directory. The first ten lines are pinned by
   `served_vectors::agent_session_samples_keep_their_pinned_bytes_and_checksums`.
 
@@ -262,6 +271,7 @@ a backfill makes the data local.
 | `sessions-held-on.json` | `ce3ab0bb16f03a0f7aa605805234c80b42e3f92b2d0e384dd15ac8a7e2af9caa` |
 | `sessions-open.json` | `01d785e934526b457d9f958ac94d8a0829526729e0f418e114ea8faab3a86af7` |
 | `session-lookup-cases.json` | `5e2a306b6a05bd4ab1c922c0c57541d16e3fb33c2c403a797fe5a34edb774107` |
+| `sessions-head-runners.json` | `7fc7eb2e343958034adbf283d6304e201cb43fd64d89f4f42a96ce06765d2a1b` |
 
 ## Reproduce and verify
 
@@ -272,6 +282,7 @@ ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked sessio
 ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked session_lifecycle_records_match_published_files -- --nocapture
 ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked session_rekey_records_match_published_files -- --nocapture
 ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked served_vectors::session_lookup_cases_match_published_file -- --exact --nocapture
+ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked served_vectors::sessions_head_runners_match_published_file -- --exact --nocapture
 ```
 
 Refresh their hashes from the repository root with:
@@ -281,7 +292,7 @@ python3 - <<'PY'
 import hashlib
 from pathlib import Path
 root = Path('test-vectors/agent-sessions-v1')
-names = ['for-session.json', 'register-session.json', 'session-for-ref.json', 'where.json', 'where-many.json', 'where-moving-receiver.json', 'where-moving-source.json', 'where-sharing-off.json', 'end-session.json', 'register-session-runner.json', 'session-for-runner.json', 'sessions.json', 'set-session-network.json', 'register-session-rekey.json', 'sessions-held-on.json', 'sessions-open.json', 'session-lookup-cases.json']
+names = ['for-session.json', 'register-session.json', 'session-for-ref.json', 'where.json', 'where-many.json', 'where-moving-receiver.json', 'where-moving-source.json', 'where-sharing-off.json', 'end-session.json', 'register-session-runner.json', 'session-for-runner.json', 'sessions.json', 'set-session-network.json', 'register-session-rekey.json', 'sessions-held-on.json', 'sessions-open.json', 'session-lookup-cases.json', 'sessions-head-runners.json']
 root.joinpath('SHA256SUMS').write_text(''.join(
     f'{hashlib.sha256(root.joinpath(name).read_bytes()).hexdigest()}  {name}\n'
     for name in names), encoding='utf-8')
