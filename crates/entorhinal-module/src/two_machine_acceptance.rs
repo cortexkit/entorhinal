@@ -620,6 +620,66 @@ async fn s3_names_replicate_to_where_and_survive_supersede_for_late_joiner() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn agent_created_on_another_machine_has_its_claim_read_after_catch_up() {
+    use crate::{
+        fake_record::{FakeRecord, FakeRecordConnector},
+        record_client::RecordClient,
+    };
+    let root = FakeLog::default();
+    let a = Machine::new_with_record(
+        "remote-claim-a",
+        Arc::new(root.with_author([0x11; 16])),
+        RecordClient::new(Arc::new(FakeRecordConnector(FakeRecord::new([0x11; 16])))),
+    );
+    // B's record stand-in has no claim for the new agent, which reads as
+    // absent: a known, unclaimed agent once B's refresh has read it.
+    let b = Machine::new_with_record(
+        "remote-claim-b",
+        Arc::new(root.with_author([0x22; 16])),
+        RecordClient::new(Arc::new(FakeRecordConnector(FakeRecord::new([0x22; 16])))),
+    );
+    a.enable_without_agents().await;
+    b.enable_without_agents().await;
+    let created = a
+        .call(
+            "agent.create",
+            json!({"request_key":"remote-claim","name":"Ada","tag":"test","role":"assistant"}),
+        )
+        .await
+        .unwrap();
+    let agent = created["agent"]["agent_id"].as_str().unwrap();
+    // Wait out the refresh B's enable asked for, so the only pass that can
+    // finish after this point is one the catch-up below asks for.
+    b.bytes_on(DIRECT, "agent.refresh_claims", json!({}))
+        .await
+        .unwrap();
+    let refreshed = b.handler.health.claim_refresh_done.notified();
+    tokio::pin!(refreshed);
+    refreshed.as_mut().enable();
+    b.catch_up().await;
+    // The pass reads SQLite on a blocking thread, which a paused clock doesn't
+    // wait for, so keep this task runnable and bound the wait in real time.
+    let started = std::time::Instant::now();
+    loop {
+        tokio::select! {
+            biased;
+            () = &mut refreshed => break,
+            () = tokio::task::yield_now() => {}
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "applying a remote agent.create must schedule a claim refresh"
+        );
+    }
+    let where_reply = b
+        .call("agent.where", json!({"agent_id":agent}))
+        .await
+        .unwrap();
+    assert_eq!(where_reply["known"], true);
+    assert_eq!(where_reply["status"], "unclaimed");
+}
+
+#[tokio::test(start_paused = true)]
 async fn s3_joiner_first_own_write_learns_author_before_name() {
     let root = FakeLog::default();
     let a = Machine::new("first-own-a", Arc::new(root.with_author([0x11; 16])));

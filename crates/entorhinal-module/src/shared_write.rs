@@ -3150,6 +3150,7 @@ impl ProjectsHandler {
         };
         if state != "enabled" || !candidate {
             if agent_write {
+                let before = store.generation().map_err(storage_error)?;
                 let body = prepared.unwrap().run(
                     &store,
                     &principal,
@@ -3159,6 +3160,10 @@ impl ProjectsHandler {
                     None,
                 )?;
                 self.commits.notify_waiters();
+                if creating && store.generation().map_err(storage_error)? != before {
+                    drop(writer);
+                    self.refresh_claims_for_new_agent();
+                }
                 return self.record_mutation(Ok(body));
             }
             if approval.is_some() || creating {
@@ -3173,7 +3178,8 @@ impl ProjectsHandler {
                 )?;
                 // Confirmed local commits wake the identity feed just like
                 // execute does; a cached reply must not wake idle readers.
-                if store.generation().map_err(storage_error)? != before {
+                let committed = store.generation().map_err(storage_error)? != before;
+                if committed {
                     self.commits.notify_waiters();
                 }
                 if request.method == "register" && store.root_records_enabled() {
@@ -3183,6 +3189,10 @@ impl ProjectsHandler {
                     {
                         tracing::warn!(target:"binding", "binding after confirmed register failed: {error}");
                     }
+                }
+                if creating && committed {
+                    drop(writer);
+                    self.refresh_claims_for_new_agent();
                 }
                 return self.record_mutation(if request.method.starts_with("agent.") {
                     self.attach_incarnation(body)
@@ -3330,6 +3340,12 @@ impl ProjectsHandler {
                 body = self.attach_incarnation(body)?;
             }
             self.commits.notify_waiters();
+            // Head-moved retries `continue` above, so only the attempt that
+            // committed reaches here and asks for one refresh.
+            if creating {
+                drop(writer);
+                self.refresh_claims_for_new_agent();
+            }
             return self.record_mutation(Ok(body));
         }
         unreachable!()

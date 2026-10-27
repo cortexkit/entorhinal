@@ -1675,6 +1675,7 @@ impl ProjectsHandler {
         // head also catches secondary bind_root commits and partial successes;
         // cached retries and volatile liveness updates don't wake idle readers.
         let mutating = MUTATING_METHODS.contains(&request.method.as_str());
+        let creates_agent = matches!(request.method.as_str(), "agent.create" | "agent.import");
         let before = mutating.then(|| self.with_store(RegistryStore::generation).ok());
         let result = match request.method.as_str() {
             method if memory_context::READS.contains(&method) => {
@@ -1802,6 +1803,11 @@ impl ProjectsHandler {
         };
         if mutating && before.flatten() != self.with_store(RegistryStore::generation).ok() {
             self.commits.notify_waiters();
+            // A request-key replay leaves the generation unchanged, so only a
+            // create or import that committed a new agent asks for a refresh.
+            if creates_agent {
+                self.refresh_claims_for_new_agent();
+            }
         }
         result
     }

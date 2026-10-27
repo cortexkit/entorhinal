@@ -277,6 +277,14 @@ impl ProjectsHandler {
         self.claim_refresh_sql.wait().await;
     }
 
+    /// Ask for a claim refresh after a new agent became live in the store, so
+    /// `agent.where` learns the agent's claim without an operator refresh.
+    /// This only enqueues a request for the refresh task: the write that
+    /// created the agent must not wait for engram before replying.
+    pub(super) fn refresh_claims_for_new_agent(&self) {
+        self.claim_refresh.signal();
+    }
+
     pub(super) fn admit_claim_refresh(&self, key: RouteKey) -> Result<(), HandlerError> {
         let admission = self.admission_for(key);
         super::refuse_flow_write(REFRESH, admission.flow_id.as_deref())?;
@@ -476,7 +484,15 @@ mod tests {
                 .handle_served_request(&body(method, params), key)
                 .await
         }
+        /// Create an agent through the served handler, then wait out the claim
+        /// refresh the create asks for, so a test's later record calls and
+        /// batches come only from the steps it takes itself.
         async fn create(&self, n: usize) -> String {
+            let id = self.create_only(n).await;
+            self.handler.wait_claim_refresh().await.unwrap();
+            id
+        }
+        async fn create_only(&self, n: usize) -> String {
             result(self.call(HOST,"agent.create",json!({"name":format!("Agent {n}"),"role":"assistant","tag":"test","request_key":format!("create-{n}")})).await)["agent"]["agent_id"].as_str().unwrap().into()
         }
         fn put(&self, id: &str, holder: &str, epoch: i64) {
@@ -535,6 +551,23 @@ mod tests {
         assert_eq!(f.record.calls.load(Ordering::Relaxed), 0);
     }
     #[tokio::test]
+    async fn created_agent_claim_is_read_without_a_manual_refresh() {
+        let f = Fixture::new(true).await;
+        // Fixture::new waited for its own refresh, so the only pass that can
+        // finish after this point is one the create asks for.
+        let refreshed = f.handler.health.claim_refresh_done.notified();
+        tokio::pin!(refreshed);
+        refreshed.as_mut().enable();
+        let id = f.create_only(1).await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), refreshed)
+            .await
+            .expect("creating an agent must schedule a claim refresh");
+        let answer = f.where_(&id);
+        assert_eq!(answer["known"], true);
+        assert_eq!(answer["status"], "unclaimed");
+    }
+
+    #[tokio::test]
     async fn refresh_batches_live_agents_at_64_and_where_never_calls_record() {
         let f = Fixture::new(true).await;
         let mut agents = Vec::new();
@@ -544,7 +577,10 @@ mod tests {
         let own = f.record.author.clone();
         f.put(&agents[0], &own, 1);
         f.put(&agents[1], "02020202020202020202020202020202", 3);
-        assert_eq!(f.where_(&agents[0])["known"], false);
+        f.record.batches.lock().unwrap().clear();
+        // The creates' refreshes cached every claim as absent. `agent.where`
+        // answers from that cache, not from the claims just written.
+        assert_eq!(f.where_(&agents[0])["status"], "unclaimed");
         assert_eq!(f.refresh().await, json!({"refreshed":65,"failed":0}));
         assert_eq!(
             f.record
@@ -788,11 +824,12 @@ mod tests {
     async fn refresh_received_during_inflight_waits_for_next_pass_without_duplication() {
         let f = Fixture::new(true).await;
         let id = f.create(1).await;
+        let base = f.record.calls.load(Ordering::Relaxed);
         f.record.hung.store(true, Ordering::Relaxed);
         let handler = f.handler.clone();
         let first =
             tokio::spawn(async move { handler.refresh_agent_claims(json!({}), DIRECT).await });
-        f.record.wait_for_calls(1).await;
+        f.record.wait_for_calls(base + 1).await;
         let handler = f.handler.clone();
         let (sent, received) = oneshot::channel();
         let second = tokio::spawn(async move {
@@ -809,17 +846,18 @@ mod tests {
             serde_json::from_slice::<Value>(&reply).unwrap()["result"],
             json!({"refreshed":1,"failed":0})
         );
-        assert_eq!(f.record.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(f.record.calls.load(Ordering::Relaxed), base + 2);
         assert_eq!(f.where_(&id)["known"], true);
     }
     #[tokio::test(start_paused = true)]
     async fn hung_catchup_and_record_do_not_block_registration_or_cached_reads() {
         let f = Fixture::new(true).await;
         let id = f.create(1).await;
+        let base = f.record.calls.load(Ordering::Relaxed);
         f.record.hung.store(true, Ordering::Relaxed);
         let h = f.handler.clone();
         let refresh = tokio::spawn(async move { h.refresh_agent_claims(json!({}), DIRECT).await });
-        f.record.wait_for_calls(1).await;
+        f.record.wait_for_calls(base + 1).await;
         let calls = f.log.calls();
         f.log.on_read(Action::Hang);
         f.handler.start_catch_up();

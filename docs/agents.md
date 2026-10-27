@@ -177,3 +177,9 @@ ck agents where Ada-2 --refresh    # refresh claims from engram first
 
 The answer says whether the claim is known and which machine holds it. Reads never
 wait for engram unless you pass `--refresh`.
+
+With sharing on, a new agent's claim is read right after the agent is created,
+whether it was created on this machine or arrived from another machine through
+the shared log. The read runs in the background, so the create itself never
+waits for engram; `known` turns true once that read finishes, usually
+reporting the agent as unclaimed.
