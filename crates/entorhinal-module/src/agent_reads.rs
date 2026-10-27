@@ -1585,6 +1585,7 @@ mod tests {
             "agent.session_liveness",
             "agent.sessions",
             "agent.session_for_runner",
+            "agent.session_for_harness",
             "agent.where",
             "agent.where_many",
             "agent.where_watch",

@@ -712,3 +712,91 @@ async fn session_for_runner_resolves_runner_rows_for_any_caller() {
     );
     assert_eq!(listed(&f, &agent).len(), 2);
 }
+
+#[tokio::test]
+async fn session_for_harness_resolves_all_rows_for_any_caller() {
+    use crate::sessions::{SESSION_FOR_HARNESS, SESSION_FOR_RUNNER};
+
+    let f = Fixture::new("session-for-harness", true);
+    let agent = f.create("Harness resolved");
+    f.providers(provider(WRITER_MODULE), provider(WRITER_MODULE));
+    let mut hosted = registration(&agent, "r1", "pi", "s1");
+    hosted["runner"] = json!("broca");
+    hosted["network"] = json!("no");
+    result(f.register(EXECUTIVE, hosted).await);
+    result(
+        f.register(EXECUTIVE, registration(&agent, "r2", "opencode", "s2"))
+            .await,
+    );
+    store(&f).end_session("pi", "s1", None, NOW).unwrap();
+    let calls = f.resolver.calls();
+    for principal in [None, Some(Principal::Direct), Some(reserved("thalamus"))] {
+        f.bind(CALLER, principal, true);
+        let harness = f
+            .served(
+                CALLER,
+                SESSION_FOR_HARNESS,
+                json!({"harness":"pi","session":"s1"}),
+            )
+            .await;
+        let runner = f
+            .served(
+                CALLER,
+                SESSION_FOR_RUNNER,
+                json!({"runner":"broca","session":"s1"}),
+            )
+            .await;
+        match (&harness, &runner) {
+            (HandlerOutcome::Response(a), HandlerOutcome::Response(b)) => assert_eq!(a, b),
+            other => panic!("expected byte-identical success replies, got {other:?}"),
+        }
+        let reply = result(harness);
+        assert_eq!(reply["network"], "no");
+        assert_eq!(reply["network_history"].as_array().unwrap().len(), 1);
+        assert_eq!(reply["ended_at_ms"], NOW);
+        assert_eq!(
+            result(
+                f.served(
+                    CALLER,
+                    SESSION_FOR_HARNESS,
+                    json!({"harness":"opencode","session":"s2"})
+                )
+                .await
+            ),
+            json!({"agent_id":agent,"runner":null,"session":"s2","harness":"opencode",
+                "ref_kind":"pi","ref":"r2","project_root":"/project","ended_at_ms":null,
+                "network":"unknown","network_history":[],"incarnation":"0123456789abcdef"})
+        );
+    }
+    assert_eq!(f.resolver.calls(), calls, "reads resolve no providers");
+    assert!(crate::sessions::READ_METHODS.contains(&SESSION_FOR_HARNESS));
+    assert!(!crate::MUTATING_METHODS.contains(&SESSION_FOR_HARNESS));
+    assert!(!crate::SELF_ADMITTED_METHODS.contains(&SESSION_FOR_HARNESS));
+    for params in [
+        json!({"harness":"opencode","session":"missing"}),
+        json!({"harness":"broca","session":"s1"}),
+    ] {
+        assert_eq!(
+            refusal(f.sync(CALLER, SESSION_FOR_HARNESS, params)),
+            ("not_found".into(), None)
+        );
+    }
+    for params in [
+        json!({"session":"s1"}),
+        json!({"harness":"pi"}),
+        json!({"harness":null,"session":"s1"}),
+        json!({"harness":"pi","session":7}),
+        json!({"harness":"","session":"s1"}),
+        json!({"harness":"pi","session":""}),
+        json!({"harness":"x".repeat(33),"session":"s1"}),
+        json!({"harness":"pi","session":"x".repeat(257)}),
+        json!({"harness":"pi","session":"s1","session_id":"s1"}),
+        json!({"harness":"pi","session":"s1","runner":"broca"}),
+    ] {
+        assert_eq!(
+            code(f.sync(CALLER, SESSION_FOR_HARNESS, params.clone())),
+            "invalid_request",
+            "{params}"
+        );
+    }
+}
