@@ -40,7 +40,7 @@ tokio = { workspace = true }
 getrandom = { workspace = true }
 
 [dev-dependencies]
-cortexkit-agent-identity = "0.1.1"
+cortexkit-agent-identity = "0.1.2"
 cortexkit-project-identity = "0.1.4"
 ed25519-dalek = "2.2.0"
 cortexkit-test-support = "0.1.0"

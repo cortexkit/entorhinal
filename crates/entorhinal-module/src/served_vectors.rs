@@ -598,34 +598,10 @@ fn assert_agent_identity_records(label: &str, records: &[Value]) {
                 aid::AgentSessionForRunnerParams,
                 aid::AgentSessionForRunnerReply,
             >(&label, record, &mut errors),
-            "agent.session_for_harness" => {
-                if record.pointer("/reply/result/runner") == Some(&Value::Null) {
-                    // cortexkit-agent-identity 0.1.1 requires a runner in its
-                    // runner-lookup reply type. Until the crate provides a
-                    // nullable-runner type for harness lookups, pin the full
-                    // runnerless sample explicitly instead of coercing null.
-                    check_agent_identity_record::<crate::sessions::SessionForHarnessRequest, Value>(
-                        &label,
-                        record,
-                        &mut errors,
-                    );
-                    assert_eq!(
-                        record["reply"],
-                        json!({"result":{
-                            "agent_id":SESSION_AGENT,"runner":null,"session":"head","harness":"opencode",
-                            "ref_kind":"pi-session","ref":NO_RUNNER_REF,"project_root":"/fixture/project",
-                            "ended_at_ms":null,"network":"unknown","network_history":[],
-                            "incarnation":"0123456789abcdef"
-                        }}),
-                        "{label}"
-                    );
-                } else {
-                    check_agent_identity_record::<
-                        crate::sessions::SessionForHarnessRequest,
-                        aid::AgentSessionForRunnerReply,
-                    >(&label, record, &mut errors);
-                }
-            }
+            "agent.session_for_harness" => check_agent_identity_record::<
+                aid::AgentSessionForHarnessParams,
+                aid::AgentSessionForHarnessReply,
+            >(&label, record, &mut errors),
             "agent.fleet_identity" => check_agent_identity_record::<
                 aid::AgentFleetIdentityParams,
                 aid::AgentFleetIdentityReply,
