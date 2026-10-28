@@ -1,0 +1,10 @@
+# Git-ignored folders engram backs up, one path per line, relative to this root.
+# Internal design notes, audits and maintainer scripts.
+.cortexkit/internal-docs/
+.cortexkit/scripts/
+# Worker briefs, spec drafts, reviewed specs, reports and consult outputs.
+.cortexkit/prefrontal/drafts/
+.cortexkit/prefrontal/prompts/
+.cortexkit/prefrontal/specs/
+.cortexkit/prefrontal/reports/
+.cortexkit/prefrontal/task-outputs/
