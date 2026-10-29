@@ -49,8 +49,12 @@ pub(crate) fn valid_cut_id(id: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+// Engram's replies may gain members, so the reply types (and `CutItem`, which
+// `cut.read` returns) ignore members they don't know. A strict reply type turned
+// one extra member into a decode failure that the client could only report as
+// an unknown outcome, so a published move retried `cut.seal` forever. Request
+// types stay strict: entorhinal writes them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct CutItem {
     #[serde(rename = "sessionRef")]
     pub(crate) session_ref: String,
@@ -157,7 +161,6 @@ pub(crate) enum TakeoverState {
 pub(crate) type SealReply = StatusReply;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct StatusReply {
     pub(crate) state: SealState,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -169,14 +172,12 @@ pub(crate) struct StatusReply {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct ReadReply {
     pub(crate) items: Vec<CutItem>,
     pub(crate) author: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct HandoffReply {
     pub(crate) state: HandoffState,
     #[serde(rename = "sessionRef", skip_serializing_if = "Option::is_none")]
@@ -186,7 +187,6 @@ pub(crate) struct HandoffReply {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct TakeoverProgress {
     pub(crate) state: TakeoverState,
     #[serde(rename = "sessionRef", skip_serializing_if = "Option::is_none")]
@@ -196,7 +196,6 @@ pub(crate) struct TakeoverProgress {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct TakeoverReply {
     pub(crate) takeover: TakeoverState,
     #[serde(rename = "sessionRef")]
@@ -205,7 +204,6 @@ pub(crate) struct TakeoverReply {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct AbortReply {
     pub(crate) handoff: HandoffState,
     pub(crate) state: SealState,
@@ -219,14 +217,13 @@ pub(crate) enum ReleaseOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ReleaseReply {
     pub(crate) outcome: ReleaseOutcome,
     pub(crate) reservation_dropped: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct AcceptReply {
     pub(crate) lifted: Vec<String>,
 }
@@ -582,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn status_progress_objects_and_terminal_states_are_strict() {
+    fn status_states_are_strict_and_extra_members_are_ignored() {
         for state in ["pending", "published", "failed", "aborted"] {
             let _: StatusReply = serde_json::from_value(json!({"state":state})).unwrap();
         }
@@ -606,11 +603,18 @@ mod tests {
         for invalid in [
             json!({"state":"other"}),
             json!({"state":"published","handoff":"released"}),
-            json!({"state":"published","extra":true}),
-            json!({"state":"published","handoff":{"state":"released","extra":true}}),
         ] {
             assert!(serde_json::from_value::<StatusReply>(invalid).is_err());
         }
+        // Members engram adds later are ignored, at the top level and inside
+        // progress objects; only the known members drive decisions.
+        let tolerant: StatusReply = serde_json::from_value(json!({
+            "state":"published","publish_sent":true,"fenced":true,
+            "handoff":{"state":"released","extra":true}
+        }))
+        .unwrap();
+        assert_eq!(tolerant.state, SealState::Published);
+        assert_eq!(tolerant.handoff.unwrap().state, HandoffState::Released);
         assert!(
             serde_json::from_value::<SealRequest>(json!({"cutId":ID,"items":[],"extra":true}))
                 .is_err()
@@ -641,6 +645,25 @@ mod tests {
             assert_eq!(calls[0].0, request.op());
             assert_eq!(calls[1], ("cut.status".into(), json!({"cutId":ID})));
         }
+    }
+
+    #[tokio::test]
+    async fn lost_seal_reply_resolves_when_status_carries_extra_members() {
+        // The first seal reply is lost, so the client probes cut.status before
+        // resealing. A status reply with members this client doesn't know must
+        // still resolve the cut, or the move retries cut.seal forever.
+        let stub = Stub::new(vec![
+            Err(TransportError::NoReply),
+            reply(r#"{"result":{"state":"published","publish_sent":true,"items":[]}}"#),
+            reply(r#"{"result":{"state":"published","author":"d1d4c9b7"}}"#),
+        ]);
+        let sealed = stub.client().seal(&seal()).await.unwrap();
+        assert_eq!(sealed.state, SealState::Published);
+        let calls = stub.calls.lock().unwrap();
+        assert_eq!(
+            calls.iter().map(|call| call.0.as_str()).collect::<Vec<_>>(),
+            ["cut.seal", "cut.status", "cut.seal"]
+        );
     }
 
     #[tokio::test]
