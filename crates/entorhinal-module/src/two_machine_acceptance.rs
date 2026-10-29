@@ -2342,6 +2342,7 @@ mod moves {
         }
     }
     mod abort_backoff;
+    mod agent_data_request_vectors;
     mod agent_refs;
     mod binding_moves;
     mod catalog_moves;

@@ -53,6 +53,8 @@ pub(crate) enum DaemonCall {
 pub(crate) struct FakeDaemon {
     snapshot: Arc<Mutex<DaemonSnapshot>>,
     calls: Arc<Mutex<Vec<DaemonCall>>>,
+    participant: Option<Arc<crate::fake_participant::FakeParticipant>>,
+    request_bytes: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 impl FakeDaemon {
@@ -60,7 +62,21 @@ impl FakeDaemon {
         Self {
             snapshot: Arc::new(Mutex::new(snapshot)),
             calls: Arc::new(Mutex::new(Vec::new())),
+            participant: None,
+            request_bytes: Arc::default(),
         }
+    }
+
+    pub(crate) fn with_participant(
+        mut self,
+        participant: Arc<crate::fake_participant::FakeParticipant>,
+    ) -> Self {
+        self.participant = Some(participant);
+        self
+    }
+
+    pub(crate) fn request_bytes(&self) -> Vec<Vec<u8>> {
+        self.request_bytes.lock().unwrap().clone()
     }
 
     pub(crate) fn restart(&self, snapshot: DaemonSnapshot) {
@@ -298,8 +314,35 @@ async fn serve_wire(
             }
         } else {
             let (target, principal) = routes.get(&frame.header.channel).unwrap().clone();
-            let body = serde_json::from_slice(&frame.body).unwrap();
-            (FrameType::Response, daemon.request(target, principal, body))
+            // Record the received body before parsing so vectors pin the real
+            // consumer serializer, including whitespace and object-key order.
+            daemon
+                .request_bytes
+                .lock()
+                .unwrap()
+                .push(frame.body.clone());
+            let body: Value = serde_json::from_slice(&frame.body).unwrap();
+            let reply = daemon.request(target, principal.clone(), body.clone());
+            match &daemon.participant {
+                Some(participant) => match participant.handle(
+                    &principal,
+                    body["method"].as_str().unwrap(),
+                    body["params"].clone(),
+                ) {
+                    Ok(reply) => (FrameType::Response, reply),
+                    Err(TransportError::Refusal {
+                        code,
+                        detail,
+                        message,
+                    }) => (
+                        FrameType::Error,
+                        serde_json::to_vec(&json!({"code":code,"detail":detail,"message":message}))
+                            .unwrap(),
+                    ),
+                    Err(error) => panic!("unexpected participant error: {error:?}"),
+                },
+                None => (FrameType::Response, reply),
+            }
         };
         let reply = Frame::build_with_version(
             frame.header.ver,

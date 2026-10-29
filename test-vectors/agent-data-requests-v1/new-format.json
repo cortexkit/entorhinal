@@ -1,0 +1,18 @@
+[
+  {"request":{"method":"agent.register_session","params":{"agent_id":"agent_0123456789abcdef","harness":"opencode","project_root":"/workspace/agent-data-example","ref":"386b5b14bf78c68c559f922d7800b165","ref_kind":"opencode-session","runner":"thalamus-harness","session_id":"session-example-001"}},"principal":{"kind":"reserved","moduleId":"prefrontal-core"},"reply":{"result":{"agent_id":"agent_0123456789abcdef","harness":"opencode","project_root":"/workspace/agent-data-example","ref":"386b5b14bf78c68c559f922d7800b165","ref_kind":"opencode-session","registered_at_ms":1000,"registered_by":"orchestrator","session_id":"session-example-001"}}},
+  {"request":{"method":"agent.session_for_ref","params":{"ref":"386b5b14bf78c68c559f922d7800b165","ref_kind":"opencode-session"}},"principal":{"kind":"reserved","moduleId":"prefrontal-core"},"reply":{"result":{"agent_id":"agent_0123456789abcdef","harness":"opencode","incarnation":"0123456789abcdef","project_root":"/workspace/agent-data-example","ref":"386b5b14bf78c68c559f922d7800b165","ref_kind":"opencode-session","runner":"thalamus-harness","session_id":"session-example-001"}}},
+  {"side":"source","request":{"method":"agent_data.describe","params":{}}},
+  {"side":"source","request":{"method":"agent_data.busy","params":{"refs":[{"ref":"386b5b14bf78c68c559f922d7800b165","ref_kind":"opencode-session"}]}}},
+  {"side":"source","request":{"method":"agent_data.prepare","params":{"cutId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","refs":[{"ref":"386b5b14bf78c68c559f922d7800b165","ref_kind":"opencode-session"}]}}},
+  {"side":"source","request":{"method":"agent_data.export","params":{"cutId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","refs":[{"ref":"386b5b14bf78c68c559f922d7800b165","ref_kind":"opencode-session"}]}}},
+  {"side":"source","request":{"method":"agent_data.release","params":{"cutId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","holder":"02020202020202020202020202020202","refs":[{"ref":"386b5b14bf78c68c559f922d7800b165","ref_kind":"opencode-session"}]}}},
+  {"side":"receiver","request":{"method":"agent_data.describe","params":{}}},
+  {"side":"receiver","request":{"method":"agent_data.diverged","params":{"cutId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","refs":[{"ref":"386b5b14bf78c68c559f922d7800b165","ref_kind":"opencode-session"}]}}},
+  {"side":"receiver","request":{"method":"agent_data.import","params":{"cutId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","refs":[{"ref":"386b5b14bf78c68c559f922d7800b165","ref_kind":"opencode-session"}]}}},
+  {"side":"receiver","request":{"method":"agent_data.activate","params":{"cutId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","refs":[{"ref":"386b5b14bf78c68c559f922d7800b165","ref_kind":"opencode-session"}]}}},
+  {"side":"source-abort","request":{"method":"agent_data.describe","params":{}}},
+  {"side":"source-abort","request":{"method":"agent_data.busy","params":{"refs":[{"ref":"386b5b14bf78c68c559f922d7800b165","ref_kind":"opencode-session"}]}}},
+  {"side":"source-abort","request":{"method":"agent_data.prepare","params":{"cutId":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","refs":[{"ref":"386b5b14bf78c68c559f922d7800b165","ref_kind":"opencode-session"}]}}},
+  {"side":"source-abort","request":{"method":"agent_data.export","params":{"cutId":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","refs":[{"ref":"386b5b14bf78c68c559f922d7800b165","ref_kind":"opencode-session"}]}}},
+  {"side":"source-abort","request":{"method":"agent_data.abort","params":{"cutId":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","refs":[{"ref":"386b5b14bf78c68c559f922d7800b165","ref_kind":"opencode-session"}]}}}
+]

@@ -232,6 +232,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cortexkit-rich-ui-syntax"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98509395f8f7afce4127b6c6e1f1eaf11ee20fba57a86c27a21da67e10a3bc45"
+dependencies = [
+ "pulldown-cmark",
+]
+
+[[package]]
 name = "cortexkit-role-agent-data"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -239,6 +248,19 @@ checksum = "67120d0281f07d005086abfc348d88ae455f2abe03d10cbe5700d36be57d3072"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "cortexkit-role-llm-runner"
+version = "0.7.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "818411d37268fef3c4c5fba3b62b9bd0fee4d4cc5f93d037003b144193580a9a"
+dependencies = [
+ "cortexkit-rich-ui-syntax",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -440,6 +462,7 @@ dependencies = [
  "cortexkit-log",
  "cortexkit-project-identity",
  "cortexkit-role-agent-data",
+ "cortexkit-role-llm-runner",
  "cortexkit-role-tool-provider",
  "cortexkit-store-types",
  "cortexkit-test-support",
@@ -1151,6 +1174,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "pulldown-cmark"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "278e9268c93b9e498a2da46c34d90ba93a3255eb99009646398f34bc73ab36eb"
+dependencies = [
+ "bitflags",
+ "memchr",
+ "unicase",
 ]
 
 [[package]]
@@ -1941,6 +1975,12 @@ name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
+
+[[package]]
+name = "unicase"
+version = "2.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "357cc3acc6a036009fd6c973ed009037c732d60d0b4f6c673e9041497482a28f"
 
 [[package]]
 name = "unicode-ident"
