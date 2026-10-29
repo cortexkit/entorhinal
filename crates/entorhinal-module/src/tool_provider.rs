@@ -358,11 +358,7 @@ impl ProjectsHandler {
         };
         let request: ToolCallRequest = serde_json::from_value(value)
             .map_err(|error| HandlerError::new("invalid_request", error.to_string()))?;
-        let pin = check_call(&request).map_err(|error| HandlerError {
-            code: error.code,
-            message: error.message,
-            detail: error.detail,
-        })?;
+        let pin = check_call(&request).map_err(provider_error)?;
         let arguments = request
             .arguments
             .as_object()
@@ -373,25 +369,11 @@ impl ProjectsHandler {
         if request.name == ops::TOOL_CATALOG {
             return encode_tool_reply(catalog(arguments.clone())?);
         }
-        let tool = tool.ok_or_else(|| {
-            let error = errors::unknown_tool(&request.name);
-            HandlerError {
-                code: error.code,
-                message: error.message,
-                detail: error.detail,
-            }
-        })?;
+        let tool = tool.ok_or_else(|| provider_error(errors::unknown_tool(&request.name)))?;
         let admission = admission.expect("model tools passed caller admission");
         let definition = tool.catalog();
-        // The pinned tool-provider role uses an older protocol crate. Translate
-        // the route's call mode at the boundary without changing its meaning.
-        let mode = match admission.call_mode.as_ref() {
-            None | Some(subc_client_rs::CallMode::Classic) => CallMode::Classic,
-            Some(subc_client_rs::CallMode::Codemode) => CallMode::Codemode,
-            Some(subc_client_rs::CallMode::Flow) => CallMode::Flow,
-            Some(subc_client_rs::CallMode::Unknown(mode)) => CallMode::Unknown(mode.clone()),
-        };
-        if !cortexkit_role_tool_provider::catalog::serves_call_mode(&definition, &mode) {
+        let mode = admission.call_mode.as_ref().unwrap_or(&CallMode::Classic);
+        if !cortexkit_role_tool_provider::catalog::serves_call_mode(&definition, mode) {
             return Err(HandlerError::new(
                 errors::CALL_MODE_UNSUPPORTED,
                 "this tool does not serve the route's call mode",
@@ -428,6 +410,14 @@ impl ProjectsHandler {
             Ok(body) => HandlerOutcome::Response(body),
             Err(error) => error.into_outcome(),
         }
+    }
+}
+
+fn provider_error(error: subc_protocol::ErrorBody) -> HandlerError {
+    HandlerError {
+        code: error.code,
+        message: error.message,
+        detail: error.detail,
     }
 }
 

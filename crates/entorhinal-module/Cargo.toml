@@ -20,13 +20,13 @@ test = false
 [dependencies]
 entorhinal-core = { path = "../entorhinal-core" }
 base64 = "0.22"
-cortexkit-claustrum-client = "0.5.0"
+cortexkit-claustrum-client = "0.7.3"
 sha2 = "0.10.9"
 entorhinal-catalog = { path = "../entorhinal-catalog" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 cortexkit-role-agent-data = "0.2.4"
-cortexkit-role-tool-provider = "=0.9.2"
+cortexkit-role-tool-provider = "=0.13.2"
 cortexkit-store-types = { workspace = true }
 cortexkit-log = { workspace = true }
 tracing = { workspace = true }

@@ -21,7 +21,9 @@ mod storage;
 mod tests;
 
 pub const PUBLISH: &str = "catalog.publish";
-const CREDENTIAL: &str = "signing:cortexkit-publish:1";
+// This vault record id is used to read the public key and sign; scoped read/sign
+// grants authorize those operations.
+const CREDENTIAL_ID: &str = "signing:cortexkit-publish:1";
 
 #[derive(Default)]
 pub(crate) struct Publisher {
@@ -135,7 +137,7 @@ fn verify(
     public: &cortexkit_claustrum_client::CredentialPublicKey,
 ) -> Result<(), HandlerError> {
     let expected = canonical_record(&checked.record(&public.public_key_hex))?;
-    if public.algorithm != "ed25519"
+    if public.algorithm != cortexkit_claustrum_client::PublicKeyAlgorithm::Ed25519
         || !catalog::is_hex(&public.public_key_hex, 64)
         || !catalog::is_hex(&public.key_id, 16)
         || signed.key_id != public.key_id
@@ -301,7 +303,7 @@ async fn prepare(
     checked: &catalog::publish::CheckedArchive,
     sql: &Arc<crate::move_driver::SqlOperations>,
 ) -> Result<Signed, HandlerError> {
-    let public = vault.public_key(CREDENTIAL).await.map_err(vault_error)?;
+    let public = vault.public_key(CREDENTIAL_ID).await.map_err(vault_error)?;
     let path = storage::path(folder, registry, scope, &checked.archive_sha256);
     let held_path = path.clone();
     let guard = sql.begin();
@@ -314,7 +316,7 @@ async fn prepare(
         verify(&signed, checked, &public)?;
         return Ok(signed);
     }
-    if public.algorithm != "ed25519"
+    if public.algorithm != cortexkit_claustrum_client::PublicKeyAlgorithm::Ed25519
         || !catalog::is_hex(&public.public_key_hex, 64)
         || !catalog::is_hex(&public.key_id, 16)
     {
@@ -326,7 +328,10 @@ async fn prepare(
     let record = checked.record(&public.public_key_hex);
     let canonical = canonical_record(&record)?;
     let input = catalog::signing_input("ck-record/v1", &canonical);
-    let signature = vault.sign(CREDENTIAL, &input).await.map_err(vault_error)?;
+    let signature = vault
+        .sign(CREDENTIAL_ID, &input)
+        .await
+        .map_err(vault_error)?;
     let signed = Signed {
         record,
         canonical,

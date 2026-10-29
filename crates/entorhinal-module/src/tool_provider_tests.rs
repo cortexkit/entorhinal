@@ -7,7 +7,7 @@ use crate::{
 use entorhinal_core::{RegisterRequest, RegistryStore};
 use std::path::PathBuf;
 use std::sync::Arc;
-use subc_client_rs::{CallMode, ModuleHandler, RouteBindRequest, RouteHandle};
+use subc_client_rs::{ModuleHandler, RouteBindRequest, RouteHandle};
 use subc_protocol::{scope::ScopeStamp, BindIdentity, RouteTarget};
 
 const ROUTE: RouteKey = (80, 2);
@@ -619,6 +619,28 @@ async fn schema_pins_and_call_modes_are_checked_after_agent_admission() {
 }
 
 #[tokio::test]
+async fn shared_call_validation_rejects_malformed_unadvertised_inputs() {
+    let f = Fixture::new();
+    f.admit(Some(&f.stamp(2)));
+    for body in [
+        json!({"name":"user_command.invoke", "arguments":{}}),
+        json!({"name":"agents_list_hires", "arguments":arguments("agents_list_hires"), "output_refs":false}),
+        json!({"name":"agents_list_hires", "arguments":arguments("agents_list_hires"), "output_refs":{"ref":"x".repeat(4097)}}),
+    ] {
+        let before = f.counts();
+        assert_eq!(
+            error_code(
+                f.handler
+                    .handle_served_request(&serde_json::to_vec(&body).unwrap(), ROUTE)
+                    .await
+            ),
+            "invalid_request"
+        );
+        assert_eq!(f.counts(), before);
+    }
+}
+
+#[tokio::test]
 async fn provider_discovery_catalog_and_hello_agree_on_exact_tool_table() {
     let f = Fixture::new();
     let role_body = response_body(f.call("role.describe", json!({})).await);
@@ -729,10 +751,7 @@ async fn provider_discovery_catalog_and_hello_agree_on_exact_tool_table() {
         assert_eq!(tool.reply.as_ref().unwrap().max_ms, 120_000);
         assert_eq!(
             tool.modes,
-            Some(vec![
-                cortexkit_role_tool_provider::CallMode::Classic,
-                cortexkit_role_tool_provider::CallMode::Codemode,
-            ])
+            Some(vec![CallMode::Classic, CallMode::Codemode])
         );
         assert_eq!(
             tool.result_format, None,

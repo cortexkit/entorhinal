@@ -59,7 +59,7 @@ impl FakeVault {
         }
     }
     fn admit(&self, id: &str) -> Result<(), CredentialResolverError> {
-        if self.caller != "reserved:entorhinal" || self.nonce.is_none() || id != CREDENTIAL {
+        if self.caller != "reserved:entorhinal" || self.nonce.is_none() || id != CREDENTIAL_ID {
             return Err(CredentialResolverError::new(
                 CredentialErrorClass::CredentialAbsent,
                 "not_found",
