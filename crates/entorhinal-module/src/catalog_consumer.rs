@@ -1,5 +1,7 @@
 //! Each consumer capability declares one package kind; none is a wildcard.
-use crate::log_client::{service_call_error, LogTransport, SubcConnector, TransportError};
+use crate::log_client::{
+    service_call_error, warn_call_error, LogTransport, SubcConnector, TransportError,
+};
 use crate::{HandlerError, WRITER_MODULE};
 use async_trait::async_trait;
 use entorhinal_catalog::Kind;
@@ -41,7 +43,10 @@ impl ConsumerDiscovery for SubcConsumers {
             .await?
             .supervisor_list()
             .await
-            .map_err(service_call_error)
+            .map_err(|error| {
+                warn_call_error("subc", "control", "supervisor.list", &error);
+                service_call_error(error)
+            })
     }
     async fn catalog_list(&self) -> Result<CatalogList, TransportError> {
         self.0
@@ -49,7 +54,10 @@ impl ConsumerDiscovery for SubcConsumers {
             .await?
             .catalog_list()
             .await
-            .map_err(service_call_error)
+            .map_err(|error| {
+                warn_call_error("subc", "control", "catalog.list", &error);
+                service_call_error(error)
+            })
     }
     async fn open(&self, module: &str) -> Result<Arc<dyn LogTransport>, TransportError> {
         self.0

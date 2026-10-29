@@ -445,7 +445,10 @@ impl SubcConnector {
             .consumer
             .open_route(target.clone(), identity.clone(), CallOptions::default())
             .await
-            .map_err(service_call_error)?;
+            .map_err(|error| {
+                warn_route_call_error(&target, "route.open", &error);
+                service_call_error(error)
+            })?;
         Ok(Arc::new(ServiceTransport {
             consumer: transport.consumer.clone(),
             target,
@@ -470,6 +473,37 @@ struct ServiceTransport {
     consumer: Arc<SubcConsumer>,
     target: RouteTarget,
     identity: BindIdentity,
+}
+
+pub(crate) fn warn_call_error(module: &str, service: &str, method: &str, error: &CallError) {
+    // The SDK wraps route-open refusals in NotSent, but they are answers, not
+    // transport failures. Leave their logging to the refusal handlers.
+    if error.route_open_refusal().is_some() {
+        return;
+    }
+    let variant = match error {
+        CallError::Module(_) => return,
+        CallError::NotSent(_) => "NotSent",
+        CallError::OutcomeUnknown(_) => "OutcomeUnknown",
+        CallError::SubscriptionBackpressure(_) => "SubscriptionBackpressure",
+        CallError::StaleRouteHandle(_) => "StaleRouteHandle",
+        CallError::CapabilityUnprovided { .. } => "CapabilityUnprovided",
+        CallError::CapabilityAmbiguous { .. } => "CapabilityAmbiguous",
+        CallError::InvalidCapabilityIdentifier { .. } => "InvalidCapabilityIdentifier",
+    };
+    tracing::warn!(module, service, method, variant, error = %error, "outbound subc call failed");
+}
+
+fn warn_route_call_error(target: &RouteTarget, method: &str, error: &CallError) {
+    let (module, service) = match target {
+        RouteTarget::InternalService {
+            module_id,
+            service_id,
+        } => (module_id.as_str(), service_id.as_str()),
+        RouteTarget::ManagementSurface { module_id } => (module_id.as_str(), "management_surface"),
+        RouteTarget::ToolProvider { module_id } => (module_id.as_str(), "tool_provider"),
+    };
+    warn_call_error(module, service, method, error);
 }
 
 pub(crate) fn service_call_error(error: CallError) -> TransportError {
@@ -504,7 +538,10 @@ impl LogTransport for ServiceTransport {
                 CallOptions::default(),
             )
             .await
-            .map_err(service_call_error)
+            .map_err(|error| {
+                warn_route_call_error(&self.target, method, &error);
+                service_call_error(error)
+            })
     }
 }
 
@@ -532,17 +569,24 @@ impl LogTransport for SubcTransport {
                 CallOptions::default(),
             )
             .await
-            .map_err(|error| match error {
-                CallError::Module(body) => TransportError::Refusal {
-                    code: body.code,
-                    detail: body.detail,
-                    message: Some(body.message),
-                },
-                CallError::OutcomeUnknown(_) => TransportError::NoReply,
-                _ => TransportError::Unavailable,
+            .map_err(|error| {
+                warn_route_call_error(&engram_target(), method, &error);
+                match error {
+                    CallError::Module(body) => TransportError::Refusal {
+                        code: body.code,
+                        detail: body.detail,
+                        message: Some(body.message),
+                    },
+                    CallError::OutcomeUnknown(_) => TransportError::NoReply,
+                    _ => TransportError::Unavailable,
+                }
             })
     }
 }
+
+#[cfg(test)]
+#[path = "outbound_call_tests.rs"]
+mod outbound_call_tests;
 
 #[cfg(test)]
 mod tests {

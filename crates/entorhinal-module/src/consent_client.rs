@@ -118,7 +118,15 @@ impl ConsentConnector for SubcCingulate {
         )
         .await
         .map_err(|_| ConsentError::Ambiguous)?
-        .map_err(call_error)?;
+        .map_err(|error| {
+            crate::log_client::warn_call_error(
+                "cingulate",
+                "management_surface",
+                "route.open",
+                &error,
+            );
+            call_error(error)
+        })?;
         Ok(Box::new(SubcConsentRoute {
             consumer,
             handle,
@@ -153,7 +161,15 @@ impl ConsentRoute for SubcConsentRoute {
                 },
             )
             .await
-            .map_err(call_error)?;
+            .map_err(|error| {
+                crate::log_client::warn_call_error(
+                    "cingulate",
+                    "management_surface",
+                    method,
+                    &error,
+                );
+                call_error(error)
+            })?;
         serde_json::from_slice::<Value>(&reply)
             .ok()
             .and_then(|envelope| envelope.get("result").cloned())
@@ -161,10 +177,18 @@ impl ConsentRoute for SubcConsentRoute {
     }
 
     async fn close(&self) {
-        let _ = self
+        if let Err(error) = self
             .consumer
             .close_handle(&self.handle, CloseRouteOptions::default())
-            .await;
+            .await
+        {
+            crate::log_client::warn_call_error(
+                "cingulate",
+                "management_surface",
+                "route.close",
+                &error,
+            );
+        }
         self.closed
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
@@ -180,9 +204,17 @@ impl Drop for SubcConsentRoute {
             let consumer = self.consumer.clone();
             let handle = self.handle;
             runtime.spawn(async move {
-                let _ = consumer
+                if let Err(error) = consumer
                     .close_handle(&handle, CloseRouteOptions::default())
-                    .await;
+                    .await
+                {
+                    crate::log_client::warn_call_error(
+                        "cingulate",
+                        "management_surface",
+                        "route.close",
+                        &error,
+                    );
+                }
             });
         }
     }

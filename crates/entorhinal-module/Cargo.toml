@@ -40,6 +40,7 @@ tokio = { workspace = true }
 getrandom = { workspace = true }
 
 [dev-dependencies]
+tracing-subscriber = "0.3"
 cortexkit-agent-identity = "0.1.2"
 cortexkit-project-identity = "0.1.4"
 ed25519-dalek = "2.2.0"

@@ -1241,7 +1241,15 @@ impl CliCaller for ConsumerCaller<'_> {
                 options,
             )
             .await
-            .map_err(call_failure)?;
+            .map_err(|error| {
+                crate::log_client::warn_call_error(
+                    super::MODULE_ID,
+                    "management_surface",
+                    method,
+                    &error,
+                );
+                call_failure(error)
+            })?;
         let envelope = serde_json::from_slice(&bytes)
             .map_err(|error| CallFailure::Transport(format!("decode response: {error}")))?;
         unwrap_result(envelope).map_err(|(_, message)| CallFailure::Transport(message))
@@ -1588,15 +1596,23 @@ fn call(
                     options,
                 )
                 .await
-                .map_err(|error| match error {
-                    // A module refusal is the registry answering, and its code is
-                    // the answer: `not_found` and a store failure need different
-                    // reactions from the operator, so the code is surfaced verbatim
-                    // rather than folded into a transport message.
-                    subc_client_rs::CallError::Module(body) => {
-                        (EXIT_REFUSED, format!("{}: {}", body.code, body.message))
+                .map_err(|error| {
+                    crate::log_client::warn_call_error(
+                        super::MODULE_ID,
+                        "management_surface",
+                        method,
+                        &error,
+                    );
+                    match error {
+                        // A module refusal is the registry answering, and its code is
+                        // the answer: `not_found` and a store failure need different
+                        // reactions from the operator, so the code is surfaced verbatim
+                        // rather than folded into a transport message.
+                        subc_client_rs::CallError::Module(body) => {
+                            (EXIT_REFUSED, format!("{}: {}", body.code, body.message))
+                        }
+                        other => (EXIT_TRANSPORT, format!("call: {other}")),
                     }
-                    other => (EXIT_TRANSPORT, format!("call: {other}")),
                 })?;
             let envelope = serde_json::from_slice(&bytes)
                 .map_err(|error| (EXIT_TRANSPORT, format!("decode response: {error}")))?;

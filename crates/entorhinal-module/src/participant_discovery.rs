@@ -13,7 +13,9 @@ use serde_json::{json, Value};
 use subc_client_rs::{CatalogList, SupervisorListResponse};
 use subc_protocol::{manifest::ProviderRole, RouteTarget};
 
-use super::log_client::{service_call_error, LogTransport, SubcConnector, TransportError};
+use super::log_client::{
+    service_call_error, warn_call_error, LogTransport, SubcConnector, TransportError,
+};
 
 pub(crate) fn provider_role() -> ProviderRole {
     serde_json::from_value(json!({
@@ -63,7 +65,10 @@ impl ParticipantDiscovery for SubcParticipantDiscovery {
             .await?
             .supervisor_list()
             .await
-            .map_err(service_call_error)
+            .map_err(|error| {
+                warn_call_error("subc", "control", "supervisor.list", &error);
+                service_call_error(error)
+            })
     }
 
     async fn catalog_list(&self) -> Result<CatalogList, TransportError> {
@@ -72,7 +77,10 @@ impl ParticipantDiscovery for SubcParticipantDiscovery {
             .await?
             .catalog_list()
             .await
-            .map_err(service_call_error)
+            .map_err(|error| {
+                warn_call_error("subc", "control", "catalog.list", &error);
+                service_call_error(error)
+            })
     }
 
     async fn open_participant(

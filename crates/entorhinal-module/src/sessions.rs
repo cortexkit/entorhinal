@@ -154,7 +154,11 @@ impl ProviderResolver for SubcProviderResolver {
             Ok(consumer) => consumer,
             Err(error) => return ProviderResolution::Transport(error),
         };
-        match consumer.resolve_provider(capability).await {
+        let result = consumer.resolve_provider(capability).await;
+        if let Err(error) = &result {
+            crate::log_client::warn_call_error("subc", "control", "catalog.list", error);
+        }
+        match result {
             Ok(module_id) => ProviderResolution::Provider(module_id),
             Err(CallError::CapabilityUnprovided { .. }) => ProviderResolution::Unprovided,
             Err(CallError::CapabilityAmbiguous { claimants, .. }) => {
