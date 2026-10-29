@@ -62,7 +62,8 @@ pub(crate) async fn remove_inbox(
     own: &str,
     cut: &str,
 ) -> Result<(), HandlerError> {
-    loop {
+    const MAX_ATTEMPTS: i64 = 8;
+    for attempt in 1..=MAX_ATTEMPTS {
         let (reply, body) = inbox(worker, own).await?;
         let next = wire::remove_inbox(&body, cut).map_err(|e| error(e.code()))?;
         if next == body {
@@ -80,10 +81,19 @@ pub(crate) async fn remove_inbox(
         };
         match worker.records.cas(&request).await {
             Ok(_) => return Ok(()),
-            Err(e) if e.code() == "version_moved" || matches!(e, RecordError::NoReply) => {}
+            Err(e) if e.code() == "version_moved" || matches!(e, RecordError::NoReply) => {
+                if attempt < MAX_ATTEMPTS {
+                    tokio::time::sleep(backoff(attempt)).await;
+                }
+            }
             Err(e) => return Err(record_error(e)),
         }
     }
+    // Persistent conflicts or lost replies must yield to a later inbox poll.
+    Err(HandlerError::new(
+        "unavailable",
+        "inbox removal retry limit reached",
+    ))
 }
 
 fn pickup_row(record: &MoveRecord, entry: &PendingMove, version: i64, now: i64) -> AgentMove {
@@ -1888,6 +1898,7 @@ mod tests {
     struct Records {
         fake: Arc<FakeRecord>,
         calls: Mutex<Vec<(String, Value)>>,
+        inbox_cas_errors: Mutex<std::collections::VecDeque<TransportError>>,
         slot: std::sync::Weak<Mutex<Option<RegistryStore>>>,
         crash: Mutex<Option<(wire::ClaimWrite, bool)>>,
         hit: tokio::sync::Semaphore,
@@ -1910,6 +1921,11 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((method.into(), params.clone()));
+            if method == "record.cas" && params["subject"] == format!("inbox:{TO}") {
+                if let Some(error) = self.inbox_cas_errors.lock().unwrap().pop_front() {
+                    return Err(error);
+                }
+            }
             let is_claim = method == "record.cas" && params["subject"] == format!("claim:{AGENT}");
             if method == "record.read"
                 && params["subject"] == format!("claim:{AGENT}")
@@ -2048,6 +2064,7 @@ mod tests {
             let records = Arc::new(Records {
                 fake,
                 calls: Mutex::new(vec![]),
+                inbox_cas_errors: Mutex::new(Default::default()),
                 slot: Arc::downgrade(&slot),
                 crash: Mutex::new(None),
                 hit: tokio::sync::Semaphore::new(0),
@@ -2197,6 +2214,15 @@ mod tests {
                 .unwrap()
                 .iter()
                 .filter(|(op, p)| op == "record.cas" && p["subject"] == format!("claim:{AGENT}"))
+                .count()
+        }
+        fn inbox_call_count(&self, method: &str) -> usize {
+            self.records
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(op, p)| op == method && p["subject"] == format!("inbox:{TO}"))
                 .count()
         }
     }
@@ -2361,6 +2387,106 @@ mod tests {
                 "{case}"
             );
         }
+    }
+
+    fn version_moved() -> TransportError {
+        TransportError::Refusal {
+            code: "version_moved".into(),
+            detail: None,
+            message: None,
+        }
+    }
+
+    async fn assert_remove_waiting(
+        removal: std::pin::Pin<&mut impl std::future::Future<Output = Result<(), HandlerError>>>,
+    ) {
+        tokio::select! {
+            biased;
+            result = removal => panic!("inbox removal must wait between attempts, got {result:?}"),
+            () = std::future::ready(()) => {}
+        }
+    }
+
+    async fn check_remove_inbox_retry_cap(failure: TransportError, calls_per_attempt: usize) {
+        let f = Fixture::new(false).await;
+        *f.records.inbox_cas_errors.lock().unwrap() =
+            std::iter::repeat_n(failure, 16 * calls_per_attempt).collect();
+        let removal = remove_inbox(&f.worker, TO, CUT);
+        tokio::pin!(removal);
+        for (index, seconds) in [1, 2, 4, 8, 16, 32, 64].into_iter().enumerate() {
+            assert_remove_waiting(removal.as_mut()).await;
+            assert_eq!(
+                f.inbox_call_count("record.cas"),
+                (index + 1) * calls_per_attempt
+            );
+            assert_eq!(f.inbox_call_count("record.read"), index + 1);
+            tokio::time::advance(Duration::from_secs(seconds) - Duration::from_millis(1)).await;
+            assert_remove_waiting(removal.as_mut()).await;
+            assert_eq!(
+                f.inbox_call_count("record.cas"),
+                (index + 1) * calls_per_attempt
+            );
+            tokio::time::advance(Duration::from_millis(1)).await;
+        }
+        assert_eq!(removal.await.unwrap_err().code, "unavailable");
+        assert_eq!(f.inbox_call_count("record.cas"), 8 * calls_per_attempt);
+        assert_eq!(f.inbox_call_count("record.read"), 8);
+        assert_eq!(inbox(&f.worker, TO).await.unwrap().1.pending[0].cut_id, CUT);
+        f.records.inbox_cas_errors.lock().unwrap().clear();
+        remove_inbox(&f.worker, TO, CUT).await.unwrap();
+        assert!(inbox(&f.worker, TO).await.unwrap().1.pending.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remove_inbox_version_moved_backs_off_and_stops_after_eight_attempts() {
+        check_remove_inbox_retry_cap(version_moved(), 1).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remove_inbox_no_reply_backs_off_and_stops_after_eight_attempts() {
+        // RecordClient retries the identical CAS once before returning NoReply.
+        check_remove_inbox_retry_cap(TransportError::NoReply, 2).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remove_inbox_later_cas_removes_only_its_entry_from_the_reread_inbox() {
+        let f = Fixture::new(false).await;
+        *f.records.inbox_cas_errors.lock().unwrap() = [
+            version_moved(),
+            TransportError::NoReply,
+            TransportError::NoReply,
+        ]
+        .into();
+        let removal = remove_inbox(&f.worker, TO, CUT);
+        tokio::pin!(removal);
+        assert_remove_waiting(removal.as_mut()).await;
+        assert_eq!(f.inbox_call_count("record.cas"), 1);
+        let mut body = inbox(&f.worker, TO).await.unwrap().1;
+        let other = PendingMove {
+            cut_id: "abcdef0123456789abcdef0123456789".into(),
+            from: FROM.into(),
+            agent_id: AGENT.into(),
+        };
+        body.pending.push(other.clone());
+        f.records.fake.put(
+            &format!("inbox:{TO}"),
+            2,
+            wire::encode_inbox_record(&body).unwrap(),
+            FROM,
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_remove_waiting(removal.as_mut()).await;
+        assert_eq!(f.inbox_call_count("record.cas"), 3);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        removal.await.unwrap();
+        assert_eq!(inbox(&f.worker, TO).await.unwrap().1.pending, vec![other]);
+        let calls = f.records.calls.lock().unwrap();
+        let versions: Vec<_> = calls
+            .iter()
+            .filter(|(op, p)| op == "record.cas" && p["subject"] == format!("inbox:{TO}"))
+            .map(|(_, p)| p["expected_version"].as_u64().unwrap())
+            .collect();
+        assert_eq!(versions, [1, 2, 2, 2]);
     }
 
     #[tokio::test(start_paused = true)]

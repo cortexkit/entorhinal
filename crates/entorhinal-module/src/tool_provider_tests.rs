@@ -7,7 +7,7 @@ use crate::{
 use entorhinal_core::{RegisterRequest, RegistryStore};
 use std::path::PathBuf;
 use std::sync::Arc;
-use subc_client_rs::{ModuleHandler, RouteBindRequest, RouteHandle};
+use subc_client_rs::{CallMode, ModuleHandler, RouteBindRequest, RouteHandle};
 use subc_protocol::{scope::ScopeStamp, BindIdentity, RouteTarget};
 
 const ROUTE: RouteKey = (80, 2);
@@ -729,7 +729,10 @@ async fn provider_discovery_catalog_and_hello_agree_on_exact_tool_table() {
         assert_eq!(tool.reply.as_ref().unwrap().max_ms, 120_000);
         assert_eq!(
             tool.modes,
-            Some(vec![CallMode::Classic, CallMode::Codemode])
+            Some(vec![
+                cortexkit_role_tool_provider::CallMode::Classic,
+                cortexkit_role_tool_provider::CallMode::Codemode,
+            ])
         );
         assert_eq!(
             tool.result_format, None,
