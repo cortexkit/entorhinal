@@ -1,0 +1,24 @@
+{
+  "op": "user.set",
+  "principal": {
+    "kind": "reserved",
+    "moduleId": "prefrontal-core"
+  },
+  "reply": {
+    "outcome": "error",
+    "refusal": {
+      "code": "invalid_request",
+      "detail": null,
+      "message": "scope is required only for expertise"
+    }
+  },
+  "request": {
+    "field": "name",
+    "request_key": "global-scope",
+    "scope": {
+      "id": "example-studio",
+      "kind": "workspace"
+    },
+    "value": "Mira"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "op": "user.set",
+  "principal": {
+    "kind": "reserved",
+    "moduleId": "prefrontal-core"
+  },
+  "reply": {
+    "outcome": "error",
+    "refusal": {
+      "code": "request_key_reused",
+      "detail": null,
+      "message": "request_key_reused: request key has a different body"
+    }
+  },
+  "request": {
+    "field": "name",
+    "request_key": "set-name.json",
+    "value": "Other Example"
+  }
+}

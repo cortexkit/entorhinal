@@ -1,0 +1,20 @@
+{
+  "op": "user.set",
+  "principal": {
+    "kind": "reserved",
+    "moduleId": "prefrontal-core"
+  },
+  "reply": {
+    "outcome": "error",
+    "refusal": {
+      "code": "invalid_value",
+      "detail": null,
+      "message": "computer_savviness must be 1, 2 or 3"
+    }
+  },
+  "request": {
+    "field": "computer_savviness",
+    "request_key": "bad-value",
+    "value": 4
+  }
+}

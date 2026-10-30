@@ -1,0 +1,12 @@
+{
+  "op": "user.get",
+  "principal": {
+    "kind": "reserved",
+    "moduleId": "prefrontal-core"
+  },
+  "reply": {
+    "outcome": "response",
+    "reply_bytes": "{\"result\":{\"expertise\":[],\"token\":\"u1:a0dffa9f9e8f2a9b4077cbf3d6aa5e3e40cc041303771adf321cdb3b3bb934bf\",\"unchanged\":false,\"user\":{}}}"
+  },
+  "request": {}
+}

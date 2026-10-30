@@ -1,0 +1,16 @@
+{
+  "op": "user.set",
+  "principal": {
+    "kind": "reserved",
+    "moduleId": "prefrontal-core"
+  },
+  "reply": {
+    "outcome": "response",
+    "reply_bytes": "{\"result\":{\"expertise\":[],\"token\":\"u1:17647db9f3214e2dadf7209e229ba58f5f603c122c45acacaa8421607134494f\",\"unchanged\":false,\"user\":{\"address_as\":\"Mira\",\"name\":\"Mira Example\",\"pronouns\":\"they/them\"}}}"
+  },
+  "request": {
+    "field": "pronouns",
+    "request_key": "set-pronouns.json",
+    "value": "they/them"
+  }
+}

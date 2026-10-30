@@ -34,6 +34,7 @@ Entry kinds are closed: `change` and `snapshot`. Entry operations are closed:
 |---|---|---|
 | `change` | `project.shared` | Row upserts and deletes for the shared project tables, plus any agents a placement change carried. |
 | `change` | `member.set_name` | One machine's display name. |
+| `change` | `user.set` | One validated user-profile field change, with its principal and optional actor audit label. |
 | `change` | `agent.create`, `agent.rename`, `agent.update_tag`, `agent.set_labels`, `agent.set_avatar`, `agent.set_github_identity`, `agent.dispose`, `agent.merge`, `agent.set_namespace` | The complete after-image of one agent and its name claims. |
 | `snapshot` | `shared.snapshot` | One part of a complete copy of the shared state. |
 
@@ -51,6 +52,7 @@ Only these tables travel (`PROJECT_SHARED_TABLES`, `AGENT_SHARED_TABLES` and
   `project_root_key`;
 - `agent`, `agent_name_claim`;
 - `member_name`.
+- `user_profile`, `user_expertise` (personal data, excluded from both public journal feeds).
 
 Aliases of implicit (path-derived) project ids are not shared. Everything else
 is machine-local: root paths, bindings, approvals, owned-remote overrides,
@@ -66,7 +68,7 @@ Test: `consent_workspace_and_hire_replicate_without_local_authority_rows`.
 
 These methods produce a shared entry when the log is enabled: `register`,
 `assign_workspace`, `upgrade_implicit`, `remove`, `seed_import`, `add_root`,
-`attach_root`, `member.set_name`, every agent identity write except
+`attach_root`, `member.set_name`, `user.set`, every agent identity write except
 `agent.import`, and agent tool writes. Other writes stay local.
 
 1. **One writer.** Shared writes run one at a time under the module's writer

@@ -13,6 +13,11 @@ supervised by the subc daemon and provides the `project-identity/v1` and
 them `required`, and the daemon holds those modules unroutable until
 entorhinal has registered.
 
+The fleet's optional user profile also lives here. `user.get` reads it and
+`user.set` changes one field through the shared identity log; Direct writes
+require operator confirmation. These are module operations, not CLI commands.
+See [module surface](docs/module-surface.md#user-profile) for their contracts.
+
 | Crate | Role |
 |---|---|
 | `crates/entorhinal-core` | The store and every domain rule: projects, roots, agents, the registry journal, shared-log entries, move checkpoints and consent state. Knows nothing about subc. |

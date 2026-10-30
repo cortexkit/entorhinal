@@ -1,0 +1,16 @@
+{
+  "op": "user.set",
+  "principal": {
+    "kind": "reserved",
+    "moduleId": "prefrontal-core"
+  },
+  "reply": {
+    "outcome": "response",
+    "reply_bytes": "{\"result\":{\"expertise\":[{\"scope\":{\"id\":\"example-studio\",\"kind\":\"workspace\"},\"text\":\"Comfortable with design and research\"},{\"scope\":{\"id\":\"pj-example-one\",\"kind\":\"project\"},\"text\":\"Learning Rust and SQLite\"}],\"token\":\"u1:48adda61a17fbde6619c6003a02fa1d0a87e8803970d97eff1d0f21e178f03de\",\"unchanged\":false,\"user\":{\"address_as\":\"Mira\",\"computer_savviness\":3,\"pronouns\":\"they/them\",\"verbosity\":\"concise\"}}}"
+  },
+  "request": {
+    "field": "name",
+    "request_key": "clear-name",
+    "value": null
+  }
+}

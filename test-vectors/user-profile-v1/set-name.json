@@ -1,0 +1,16 @@
+{
+  "op": "user.set",
+  "principal": {
+    "kind": "reserved",
+    "moduleId": "prefrontal-core"
+  },
+  "reply": {
+    "outcome": "response",
+    "reply_bytes": "{\"result\":{\"expertise\":[],\"token\":\"u1:ed4d0ef688cff852f41bd2399f7416446152d458c68e86bc646eda1d6ec945c6\",\"unchanged\":false,\"user\":{\"name\":\"Mira Example\"}}}"
+  },
+  "request": {
+    "field": "name",
+    "request_key": "set-name.json",
+    "value": "Mira Example"
+  }
+}

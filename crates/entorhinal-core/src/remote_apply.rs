@@ -47,6 +47,7 @@ enum Decoded {
     Agent(Box<AgentChangeEntry>),
     Member(crate::shared_entry::MemberName),
     Pins(crate::catalog_agent::CatalogPinSet),
+    User(crate::user_profile::UserEntry),
 }
 
 #[derive(Deserialize)]
@@ -581,6 +582,12 @@ fn apply(tx: &Transaction<'_>, entry: &RemoteEntry) -> rusqlite::Result<i64> {
             pins.validate(tx, true)?;
             Decoded::Pins(pins)
         }
+        ("change", "user.set") => {
+            let user: crate::user_profile::UserEntry =
+                serde_json::from_value(value).map_err(decode_error)?;
+            user.validate(tx).map_err(crate::user_profile::sql_error)?;
+            Decoded::User(user)
+        }
         ("change", op) if AGENT_OPS.contains(&op) => {
             let agent: AgentChangeEntry = serde_json::from_value(value).map_err(decode_error)?;
             check_agent_entry(tx, &agent)?;
@@ -610,6 +617,21 @@ fn apply(tx: &Transaction<'_>, entry: &RemoteEntry) -> rusqlite::Result<i64> {
         // the same snapshot. Validate those references against the final state.
         tx.execute_batch("PRAGMA defer_foreign_keys=ON;")?;
         match decoded {
+            Decoded::User(user) => {
+                let payload = json!({"entry":user});
+                let seq = append(
+                    tx,
+                    "user.set",
+                    &payload,
+                    user.actor.as_deref().unwrap_or("log"),
+                    None,
+                    0,
+                    &user.principal,
+                )?;
+                user.restore(tx)?;
+                tag(tx, seq, entry, &payload)?;
+                seq
+            }
             Decoded::Pins(pins) => {
                 let payload = json!({"entry":pins});
                 let seq = append(tx, "catalog.pin", &payload, "log", None, 0, "entorhinal")?;

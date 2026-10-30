@@ -1,0 +1,16 @@
+{
+  "op": "user.set",
+  "principal": {
+    "kind": "reserved",
+    "moduleId": "prefrontal-core"
+  },
+  "reply": {
+    "outcome": "response",
+    "reply_bytes": "{\"result\":{\"expertise\":[],\"token\":\"u1:70d37f7e659a4155ee259e10def7caa02502df40aff601352050493de8f64d59\",\"unchanged\":false,\"user\":{\"address_as\":\"Mira\",\"name\":\"Mira Example\"}}}"
+  },
+  "request": {
+    "field": "address_as",
+    "request_key": "set-address-as.json",
+    "value": "Mira"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "op": "user.set",
+  "principal": {
+    "kind": "reserved",
+    "moduleId": "prefrontal-core"
+  },
+  "reply": {
+    "outcome": "response",
+    "reply_bytes": "{\"result\":{\"expertise\":[],\"token\":\"u1:07354fac6fbebda879109eecf566fce20dedd5f301d86a180dd6006ff67aa74f\",\"unchanged\":false,\"user\":{\"address_as\":\"Mira\",\"computer_savviness\":3,\"name\":\"Mira Example\",\"pronouns\":\"they/them\",\"verbosity\":\"concise\"}}}"
+  },
+  "request": {
+    "field": "verbosity",
+    "request_key": "set-verbosity.json",
+    "value": "concise"
+  }
+}

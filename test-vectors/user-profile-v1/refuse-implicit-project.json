@@ -1,0 +1,24 @@
+{
+  "op": "user.set",
+  "principal": {
+    "kind": "reserved",
+    "moduleId": "prefrontal-core"
+  },
+  "reply": {
+    "outcome": "error",
+    "refusal": {
+      "code": "unknown_scope",
+      "detail": null,
+      "message": "unknown_scope: scope must name an existing workspace or registered project"
+    }
+  },
+  "request": {
+    "field": "expertise",
+    "request_key": "implicit",
+    "scope": {
+      "id": "pj-implicit-123",
+      "kind": "project"
+    },
+    "value": "Skill"
+  }
+}

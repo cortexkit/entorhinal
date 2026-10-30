@@ -1550,6 +1550,7 @@ mod tests {
         );
         let operations = surfaces[0]["operations"].as_array().unwrap();
         let expected_queries = [
+            "user.get",
             "context.project",
             "context.session",
             "workspace.document",
@@ -1595,6 +1596,7 @@ mod tests {
             "role.fence",
         ];
         let expected_mutations = [
+            "user.set",
             "store.adopt",
             "project.set_domain",
             "workspace.set_document",

@@ -1,0 +1,20 @@
+{
+  "op": "user.set",
+  "principal": {
+    "kind": "reserved",
+    "moduleId": "prefrontal-core"
+  },
+  "reply": {
+    "outcome": "response",
+    "reply_bytes": "{\"result\":{\"expertise\":[{\"scope\":{\"id\":\"example-studio\",\"kind\":\"workspace\"},\"text\":\"Comfortable with design and research\"},{\"scope\":{\"id\":\"pj-example-one\",\"kind\":\"project\"},\"text\":\"Learning Rust and SQLite\"}],\"token\":\"u1:9c894839f8075dfe0f5248201e0fc8e58cd0a2838b38c4f1e7786b0afb849fd1\",\"unchanged\":false,\"user\":{\"address_as\":\"Mira\",\"computer_savviness\":3,\"name\":\"Mira Example\",\"pronouns\":\"they/them\",\"verbosity\":\"concise\"}}}"
+  },
+  "request": {
+    "field": "expertise",
+    "request_key": "set-project-expertise.json",
+    "scope": {
+      "id": "pj-example-one",
+      "kind": "project"
+    },
+    "value": "Learning Rust and SQLite"
+  }
+}

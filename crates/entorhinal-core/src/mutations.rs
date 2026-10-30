@@ -583,10 +583,12 @@ impl super::JournalWriter<'_> {
             };
             let mut value = action.value;
             if let Value::Object(ref mut map) = value {
-                map.insert("generation".to_string(), json!(generation));
-                // Agent replies keep core's reply keys, which have no `noop`.
-                if !op.starts_with("agent.") {
-                    map.insert("noop".to_string(), json!(!action.changed));
+                if op != crate::user_profile::SET_OP {
+                    map.insert("generation".to_string(), json!(generation));
+                    // Agent replies keep core's reply keys, which have no `noop`.
+                    if !op.starts_with("agent.") {
+                        map.insert("noop".to_string(), json!(!action.changed));
+                    }
                 }
             }
             if let Some(commit) = &self.consent {
@@ -1399,6 +1401,8 @@ impl RegistryStore {
 // Machine-local driver checkpoints and settings (agent_move, move_setting) are
 // deliberately excluded: the identity journal cannot reconstruct them.
 pub(crate) const DERIVED_TABLES: &[&str] = &[
+    "user_expertise",
+    "user_profile",
     "catalog_pin",
     "catalog_pin_set",
     "member_name",
@@ -1513,6 +1517,8 @@ fn delete_and_replay(tx: &Transaction<'_>) -> rusqlite::Result<()> {
                 super::shared_entry::replay_member_name(tx, image)?;
             } else if op == "catalog.pin" {
                 super::catalog_agent::replay_pin(tx, image)?;
+            } else if op == crate::user_profile::SET_OP {
+                super::user_profile::replay_user(tx, image)?;
             } else if op.starts_with("agent.") && image["op"] != "project.shared" {
                 super::agent::replay_agent_entry(tx, &op, &image)?;
             } else {
@@ -1676,6 +1682,9 @@ fn replay(
     }
     if op == "catalog.pin" {
         return super::catalog_agent::replay_pin(tx, v);
+    }
+    if op == crate::user_profile::SET_OP {
+        return super::user_profile::replay_user(tx, v);
     }
     if super::agent::replay_agent_entry(tx, op, &v)? {
         return Ok(());

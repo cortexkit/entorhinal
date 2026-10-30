@@ -52,6 +52,7 @@ pub(crate) const LOCAL_TABLES: &[&str] = &[
     "catalog_prepared",
     "catalog_plan",
     "catalog_transition",
+    "user_request",
     "catalog_starter_proof",
     "catalog_status",
     "catalog_feed",

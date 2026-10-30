@@ -38,15 +38,15 @@ The daemon stamps each route with a principal when it opens. entorhinal
 applies these checks, in order, before decoding a request
 (`ProjectsHandler::admit_with` and `authorize_write` in `main.rs`):
 
-1. Operation-specific rules for the permission operations.
+1. Operation-specific rules for the permission and user-profile operations.
 2. **Flow scope.** Any mutation on a route opened under a flow's scope refuses
    `flow_scope_not_admitted`, whoever opened it.
 3. **Write rule.** By group, as the tables below say. A route with no recorded
    principal never passes a write rule.
 
-Every query is open to every caller, including flow-scoped and unverified
-routes. A mutation that needs the operator's confirmation shows a presence
-prompt through the daemon (Touch ID on macOS, Windows Hello on Windows), naming
+Except for the permission and user-profile queries, queries are open to every caller,
+including flow-scoped and unverified routes. A mutation that needs operator
+confirmation shows a prompt through the daemon, naming
 the exact change. One prompt is open at a time (a second request refuses
 `operator_confirmation_busy`); it is withdrawn when the caller's route closes;
 the request gives up after 270 seconds. A decline or timeout refuses
@@ -112,6 +112,58 @@ Tests: `attach_surface_writes_are_attributed_only_to_direct_and_core`,
 `ownership_write_admission_and_principal_attribution`,
 `rebind_wire_refuses_flow_and_unadmitted_principal_without_binding`,
 `carrying_placement_prompts_exactly_and_cached_reply_is_unchanged`.
+
+## User profile
+
+| Operation | Kind | Who | What it does |
+|---|---|---|---|
+| `user.get` | query | Direct, `reserved:prefrontal-core`, `reserved:callosum` | Read the fleet profile, all scoped expertise, and optionally a project's effective expertise. |
+| `user.set` | mutate | Core and callosum without a prompt; Direct with operator confirmation | Set or clear one field, idempotently by request key. |
+
+Both operations refuse flows and all other principals with `caller_forbidden`;
+request fields cannot grant access. Callosum excludes `user.set` from its simulator
+profile's own allowed-operation list; entorhinal does not distinguish that profile
+from a phone profile.
+There is no profile CLI command.
+
+`user.get` accepts `{}`, `{"project_id":"pj-…"}`, `{"token":"…"}`, or both
+keys. Its result contains `token`, `unchanged:false`, `user`, and `expertise`.
+Unset global fields are omitted, never null. Expertise is ordered by scope
+(workspaces first, then projects) and id. With `project_id`, an applicable line
+also appears as `effective_expertise:{"text":"…","from":{"kind":"…","id":"…"}}`:
+the project's own line overrides its placed workspace's. Unknown or implicit
+project ids refuse `unknown_project`. A matching token returns only `token` and
+`unchanged:true`. Tokens are opaque state digests; a project-context token also
+covers effective expertise, so placement changes cannot yield a stale cache hit.
+
+`user.set` accepts `field`, required `value` (null clears), required
+`request_key` (1–128 printable ASCII), optional `actor` (audit label, never in
+replies), and `scope:{"kind":"workspace|project","id":"…"}` only for expertise.
+Fields are `name` (1–64 characters), `address_as` (1–64), `pronouns` (1–32),
+`computer_savviness` (integer 1–3), `verbosity` (`concise|balanced|verbose`),
+and `expertise` (1–300). Actor is 1–128 characters. Text is trimmed and must be
+nonempty; controls, newlines, tabs, Unicode line separators, bidi overrides and
+isolates are refused. Limits count Unicode characters, not bytes.
+
+Scopes must exist; implicit project ids refuse `unknown_scope`. Scope removal
+cascades to expertise in the same transaction on either machine. A successful
+set returns the same shape as an unscoped get. Repeating a request key with the
+same body returns the original reply; another body refuses `request_key_reused`.
+A no-op leaves the token unchanged. Bad shapes, unknown fields or global-field
+scopes refuse `invalid_request`; bad values refuse `invalid_value`.
+
+Direct writes validate before prompting, hold no store/writer lock during
+confirmation, then revalidate and apply. The summary names the field, exact
+scope and new value or `clear`; summaries over 200 characters refuse
+`operator_summary_too_long`, never truncate. The normal confirmation busy,
+declined and presence-unavailable refusals apply. Longer values can be relayed
+through core or callosum.
+
+The two shared tables travel through the identity log as `user.set` entries and
+join snapshots; sharing off keeps writes local. They participate in verify and
+rebuild but never appear in `agent.changes` or project `journal_tail`. The log
+retains earlier values after clearing, and its hosted entries are encrypted.
+Published handler-generated samples: [user-profile-v1](../test-vectors/user-profile-v1/README.md).
 
 ## Memory context
 

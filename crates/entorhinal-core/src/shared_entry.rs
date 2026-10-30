@@ -23,6 +23,8 @@ pub const PROJECT_SHARED_TABLES: &[&str] = &[
     "project_root_key",
     "catalog_pin_set",
     "catalog_pin",
+    "user_profile",
+    "user_expertise",
 ];
 pub const AGENT_SHARED_TABLES: &[&str] = &["agent", "agent_name_claim"];
 pub const MEMBER_SHARED_TABLES: &[&str] = &["member_name"];
@@ -235,9 +237,14 @@ impl SharedState {
             op: "shared.snapshot".into(),
             tables: PROJECT_SHARED_TABLES
                 .iter()
-                // An empty new table must not force old machines to upgrade before
-                // any workspace document has actually been accepted.
-                .filter(|table| **table != "workspace_document" || !self.0[**table].is_empty())
+                // Omit optional empty tables to preserve snapshots for fleets
+                // that have not written workspace documents or a user profile.
+                .filter(|table| {
+                    !matches!(
+                        **table,
+                        "workspace_document" | "user_profile" | "user_expertise"
+                    ) || !self.0[**table].is_empty()
+                })
                 .map(|table| {
                     (
                         (*table).into(),
@@ -318,7 +325,9 @@ pub(crate) fn record_local_entry(
             entry.agents = agents;
             attribution(&mut entry)?;
             canonical_bytes(&entry)
-        } else if op.starts_with("agent.") || matches!(op, "member.set_name" | "catalog.pin") {
+        } else if op.starts_with("agent.")
+            || matches!(op, "member.set_name" | "catalog.pin" | "user.set")
+        {
             canonical_bytes(payload.get("entry").unwrap_or(&payload))
         } else {
             let mut entry = before.project_delta(after, tx)?;
@@ -431,6 +440,25 @@ impl ProjectEntry {
             return Err(invalid("unsupported project entry op"));
         }
         for (table, changes) in &self.tables {
+            if self.op == "project.shared" && table.starts_with("user_") {
+                if table != "user_expertise" || !changes.upsert.is_empty() {
+                    return Err(invalid("profile changes require user.set"));
+                }
+                for row in &changes.delete {
+                    let (parent, key) = match row.get("scope_kind").and_then(Value::as_str) {
+                        Some("project") => ("project", "project_id"),
+                        Some("workspace") => ("workspace", "workspace_id"),
+                        _ => return Err(invalid("invalid expertise deletion scope")),
+                    };
+                    if !self
+                        .tables
+                        .get(parent)
+                        .is_some_and(|c| c.delete.iter().any(|p| p.get(key) == row.get("scope_id")))
+                    {
+                        return Err(invalid("expertise deletion requires scope removal"));
+                    }
+                }
+            }
             if self.op == "project.shared"
                 && matches!(table.as_str(), "catalog_pin" | "catalog_pin_set")
             {
@@ -515,6 +543,7 @@ impl ProjectEntry {
             )?;
         }
         crate::catalog_agent::validate_pin_projection(tx)?;
+        crate::user_profile::validate_projection(tx)?;
         // Which workspace a project belongs to is shared; `workspace_member` is
         // this machine's own index of it, so rebuild its local rows from the
         // shared placement. Rows of other kinds, written by older versions,
@@ -703,6 +732,7 @@ mod tests {
                     "catalog_prepared",
                     "catalog_generation",
                     "catalog_transition",
+                    "user_request",
                 ];
                 let schema = conn
                     .prepare("SELECT name FROM sqlite_schema WHERE type='table'")?

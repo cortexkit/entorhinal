@@ -1364,9 +1364,11 @@ mod tests {
                     .iter()
                     // Operator-only log changes have their own confirmation tests.
                     // Self-admitted methods have their own rule, covered in sessions.rs.
+                    // User-profile writes have narrower admission and dedicated tests.
                     .filter(|method| {
                         !MUTATING_METHODS.contains(method)
                             && **method != "identity_log.enable"
+                            && **method != crate::user_profile::SET
                             && !crate::SELF_ADMITTED_METHODS.contains(method)
                     })
                 {

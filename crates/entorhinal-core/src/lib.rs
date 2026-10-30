@@ -45,6 +45,7 @@ pub mod session_lifecycle;
 pub mod session_network;
 pub mod shared_entry;
 pub mod store_origin;
+pub mod user_profile;
 mod where_notify;
 pub use binding::*;
 pub use mutations::*;
@@ -218,7 +219,7 @@ CREATE TABLE member_name (
 );
 "#;
 
-const MIGRATIONS: [Migration; 17] = [
+const MIGRATIONS: [Migration; 18] = [
     Migration {
         version: 1,
         statements: V1_SCHEMA,
@@ -286,6 +287,10 @@ const MIGRATIONS: [Migration; 17] = [
     Migration {
         version: 17,
         statements: session_lifecycle::V17_SESSION_LOCATION,
+    },
+    Migration {
+        version: 18,
+        statements: user_profile::V18_USER_PROFILE,
     },
 ];
 
@@ -737,7 +742,7 @@ impl RegistryStore {
             let mut statement = conn.prepare(&format!(
                 "SELECT seq, op, payload_json, actor, request_key, created_at, principal
                  FROM registry_journal
-                  WHERE seq > ?1 AND op NOT IN ({}, '{}', '{}', 'store.adopt')
+                  WHERE seq > ?1 AND op NOT IN ({}, '{}', '{}', 'user.set', 'store.adopt')
                  ORDER BY seq
                  LIMIT ?2",
                 agent::change_ops_sql(),
@@ -750,7 +755,7 @@ impl RegistryStore {
                     Ok(JournalEntry {
                         seq: row.get(0)?,
                         op: row.get(1)?,
-                        payload_json: row.get(2)?,
+                        payload_json: user_profile::public_journal_payload(row.get(2)?),
                         actor: row.get(3)?,
                         request_key: row.get(4)?,
                         created_at: row.get(5)?,

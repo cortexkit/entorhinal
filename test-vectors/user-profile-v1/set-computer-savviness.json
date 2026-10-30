@@ -1,0 +1,16 @@
+{
+  "op": "user.set",
+  "principal": {
+    "kind": "reserved",
+    "moduleId": "prefrontal-core"
+  },
+  "reply": {
+    "outcome": "response",
+    "reply_bytes": "{\"result\":{\"expertise\":[],\"token\":\"u1:7d9e7c93a1b4e97fbc2b89d0eab96833eed2a87e758d9f20a6add3c9592525a9\",\"unchanged\":false,\"user\":{\"address_as\":\"Mira\",\"computer_savviness\":3,\"name\":\"Mira Example\",\"pronouns\":\"they/them\"}}}"
+  },
+  "request": {
+    "field": "computer_savviness",
+    "request_key": "set-computer-savviness.json",
+    "value": 3
+  }
+}

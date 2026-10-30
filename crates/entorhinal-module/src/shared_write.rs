@@ -591,6 +591,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn user_profile_shared_writer_retries_and_persists_original_reply_without_noop_append() {
+        let tap = Tap::new(0);
+        tap.fake.on_append(Action::DropReply);
+        let mut f = Fixture::new("user-profile-shared", connector(&tap));
+        let request =
+            json!({"field":"name","value":"Mira","actor":"Mira via core","request_key":"name"});
+        let reply = f.call("user.set", request.clone()).await.unwrap();
+        let sends = tap.sends();
+        assert_eq!(sends.len(), 2);
+        assert_eq!(sends[0], sends[1]);
+        let user: Value = serde_json::from_slice(
+            &log_client::decode_hex(sends[0]["entry"]["data"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(user["op"], "user.set");
+        assert_eq!(user["value"], "Mira");
+        assert_eq!(user["actor"], "Mira via core");
+        assert_eq!(user["principal"], "reserved:prefrontal-core");
+        assert_eq!(tap.fake.head(), 1);
+        assert_eq!(f.pending(), 0);
+        f.restart(connector(&tap));
+        assert_eq!(f.call("user.set", request).await.unwrap(), reply);
+        assert_eq!(
+            f.call(
+                "user.set",
+                json!({"field":"name","value":"Mira","request_key":"noop"})
+            )
+            .await
+            .unwrap(),
+            reply
+        );
+        assert_eq!(tap.sends().len(), 2);
+        assert_eq!(tap.fake.head(), 1);
+        assert!(f.store().verify().unwrap().ok);
+    }
+
+    #[tokio::test]
     async fn head_moved_uses_new_entry_id_but_agent_id_drawn_once_before_attempts() {
         static AVATAR_DRAWS: AtomicUsize = AtomicUsize::new(0);
         fn counting_avatar() -> Result<entorhinal_core::agent::StoredAgentAvatar, HandlerError> {
@@ -2563,11 +2600,13 @@ enum Write {
     Agent(String, Value),
     Member(entorhinal_core::shared_entry::MemberName),
     Pins(entorhinal_core::catalog_agent::PinWriteRequest),
+    User(entorhinal_core::user_profile::UserSetRequest),
 }
 
 impl Write {
     fn decode(method: &str, params: Value) -> Result<Self, HandlerError> {
         Ok(match method {
+            super::user_profile::SET => Self::User(super::user_profile::decode_set(params)?),
             "project.set_domain" => {
                 Self::Domain(serde_json::from_value(params).map_err(invalid_params)?)
             }
@@ -2598,6 +2637,7 @@ impl Write {
         principal: &str,
     ) -> Result<Option<Vec<u8>>, HandlerError> {
         let key = match self {
+            Self::User(req) => return store.probe_user_set(req).map_err(Into::into),
             Self::ManifestAvatar(approval, index) => return approval.probe(store, *index),
             Self::Consent(_, commit) | Self::CatalogInstall(_, commit) => {
                 let row = store.consent_request(&commit.request.identity)?;
@@ -2650,6 +2690,7 @@ impl Write {
             .with_create_avatar(avatar)
             .with_confirmation(placement_confirmation(principal, approval));
         match self {
+            Self::User(req) => writer.user_set(req, now, approval),
             Self::ManifestAvatar(approval, index) => return approval.apply(store, index, now),
             Self::CatalogInstall(id, commit) => {
                 return writer
@@ -2763,6 +2804,7 @@ fn shared_candidate(op: &str) -> bool {
     matches!(
         op,
         "project.set_domain"
+            | "user.set"
             | "workspace.set_document"
             | "register"
             | "assign_workspace"
@@ -2911,7 +2953,11 @@ impl ProjectsHandler {
         let admission = self.admission_for(key);
         let direct = !agent_write
             && matches!(admission.principal, Some(Principal::Direct))
-            && agent_ops::CONFIRMABLE_METHODS.contains(&request.method.as_str());
+            && (agent_ops::CONFIRMABLE_METHODS.contains(&request.method.as_str())
+                || request.method == super::user_profile::SET);
+        if request.method == super::user_profile::SET {
+            super::user_profile::admit(admission.principal.as_ref(), admission.flow_id.as_deref())?;
+        }
         refuse_flow_write(&request.method, admission.flow_id.as_deref())?;
         if request.method == super::member::SET_NAME {
             super::member::admit(admission.principal.as_ref())?;
@@ -3037,11 +3083,16 @@ impl ProjectsHandler {
         let mut approval = None;
         let mut budget_start = received;
         if direct {
-            let summary = match store.precheck_agent_confirmation(
-                &request.method,
-                request.params.clone(),
-                (self.clock)(),
-            )? {
+            let precheck = if let Some(Write::User(req)) = &prepared {
+                store.precheck_user_confirmation(req)?
+            } else {
+                store.precheck_agent_confirmation(
+                    &request.method,
+                    request.params.clone(),
+                    (self.clock)(),
+                )?
+            };
+            let summary = match precheck {
                 AgentPrecheck::Cached(body) => {
                     return if request.method.starts_with("agent.") {
                         self.attach_incarnation(body)

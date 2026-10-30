@@ -106,6 +106,7 @@ mod move_driver;
 mod move_ops;
 mod move_receiver;
 mod move_source;
+mod user_profile;
 // The client for engram's identity log. Only writes to shared state and
 // catch-up call it, and it opens its route on first use, so startup and every
 // read work with engram absent. It has no callers until the shared write path
@@ -697,6 +698,7 @@ const WRITER_MODULE: &str = "prefrontal-core";
 
 /// Methods that change the registry or the liveness state derived from it.
 const MUTATING_METHODS: &[&str] = &[
+    user_profile::SET,
     store_origin::ADOPT,
     "project.set_domain",
     "workspace.set_document",
@@ -787,6 +789,17 @@ const SELF_ADMITTED_METHODS: &[&str] = &[
 /// the store file itself. A route with no recorded principal is refused rather
 /// than assumed to be the operator.
 fn authorize_write(method: &str, principal: Option<&Principal>) -> Result<(), HandlerError> {
+    if method == user_profile::SET {
+        user_profile::admit(principal, None)?;
+        return if matches!(principal, Some(Principal::Direct)) {
+            Err(HandlerError::new(
+                "operator_presence_unavailable",
+                "Direct user.set requires the served operator confirmation path",
+            ))
+        } else {
+            Ok(())
+        };
+    }
     if SELF_ADMITTED_METHODS.contains(&method) {
         return Ok(());
     }
@@ -1073,6 +1086,9 @@ impl ProjectsHandler {
     ) -> Result<(RouteAdmission, Option<sessions::SessionRole>), HandlerError> {
         self.admit_store_method(method)?;
         let admission = self.admission_for(key);
+        if matches!(method, user_profile::GET | user_profile::SET) {
+            user_profile::admit(admission.principal.as_ref(), admission.flow_id.as_deref())?;
+        }
         permissions::admit(method, admission.principal.as_ref())?;
         refuse_flow_write(method, admission.flow_id.as_deref())?;
         authorize_write(method, admission.principal.as_ref())?;
@@ -1678,6 +1694,14 @@ impl ProjectsHandler {
         let creates_agent = matches!(request.method.as_str(), "agent.create" | "agent.import");
         let before = mutating.then(|| self.with_store(RegistryStore::generation).ok());
         let result = match request.method.as_str() {
+            user_profile::GET => self.user_get(request.params),
+            user_profile::SET => {
+                let req = user_profile::decode_set(request.params)?;
+                self.with_store(|s| {
+                    s.with_principal(&principal)
+                        .user_set(req, (self.clock)(), None)
+                })
+            }
             method if memory_context::READS.contains(&method) => {
                 self.memory_read(method, request.params)
             }
@@ -2509,6 +2533,10 @@ fn manifest() -> ModuleManifest {
                     ManagementOperationKind::Query,
                     "Look up a project by its durable project id and return its registration record.",
                 ),
+                management_operation(user_profile::GET, ManagementOperationKind::Query,
+                    "Read the shared user profile, scoped expertise and an opaque change token (profile renderers or Direct only)."),
+                management_operation(user_profile::SET, ManagementOperationKind::Mutate,
+                    "Set or clear one shared user profile field (core or callosum; Direct requires operator confirmation)."),
                 management_operation(
                     "resolve_remote",
                     ManagementOperationKind::Query,
@@ -3349,7 +3377,9 @@ mod tests {
             .filter(|method| !SELF_ADMITTED_METHODS.contains(method))
         {
             let direct = authorize_write(method, Some(&Principal::Direct));
-            if agent_ops::MUTATING_METHODS.contains(method) {
+            if *method == user_profile::SET {
+                assert_eq!(direct.unwrap_err().code, "operator_presence_unavailable");
+            } else if agent_ops::MUTATING_METHODS.contains(method) {
                 assert_eq!(
                     direct.unwrap_err().code,
                     "direct_identity_write_not_admitted",
@@ -3381,7 +3411,9 @@ mod tests {
                     .expect_err("a write from any other principal must be refused");
                 assert_eq!(
                     error.code,
-                    if matches!(
+                    if *method == user_profile::SET {
+                        "caller_forbidden"
+                    } else if matches!(
                         *method,
                         "agent.repair_workspaces"
                             | "agent.apply_avatar_manifest"

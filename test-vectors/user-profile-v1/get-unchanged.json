@@ -1,0 +1,15 @@
+{
+  "op": "user.get",
+  "principal": {
+    "kind": "reserved",
+    "moduleId": "prefrontal-core"
+  },
+  "reply": {
+    "outcome": "response",
+    "reply_bytes": "{\"result\":{\"token\":\"u1:b4094acde24170503278f0cb3eafdcda16d5146369be73c7bd912895e0d7c682\",\"unchanged\":true}}"
+  },
+  "request": {
+    "project_id": "pj-example-two",
+    "token": "u1:b4094acde24170503278f0cb3eafdcda16d5146369be73c7bd912895e0d7c682"
+  }
+}

@@ -84,6 +84,7 @@ journal:
 | `agent_name_claim` | Active and released name claims, one active claim per agent and per name in a namespace. |
 | `member_name` | Display names of the machines in the identity log, keyed by author. |
 | `catalog_pin_set`, `catalog_pin` | An agent's shared package pins, root ranges and canonical pin digest. `catalog.pin` is never an identity-feed op. |
+| `user_profile`, `user_expertise` | The optional fleet-wide user fields and workspace/project expertise. Changes use `user.set`, never the agent or project history feeds. Scope deletion cascades to expertise in the same transaction. |
 
 **Local and derived.** Rebuilt from the journal, never shared:
 
@@ -108,6 +109,7 @@ journal:
 | `session_binding` | Session reference to host session bindings. |
 | `claim_cache`, `role_cache` | Cached agent and role claims from engram. A null holder means the record was absent. |
 | `role_take_request` | Each approved role take, so a retry resends the same bytes. |
+| `user_request` | Original user.set bodies and replies, including no-ops; request-key reuse is checked locally and receipts survive rebuild. |
 | `self_identity` | This machine's own author pseudonym, once learned. |
 | `agent_move`, `move_setting` | Move checkpoints and the lid-close setting. |
 | `consent_grant`, `consent_request`, `consent_write_plan`, `consent_feed_cursor` | Consent state. |
@@ -155,6 +157,7 @@ before the module was named entorhinal; changing it would re-run migration 1).
 | 10 | Consent state, the audit and hire caps. |
 | 11 | Catalog registry trust, held status, publisher grants and audit. |
 | 12 | Shared catalog pin sets and pins; local plans, generations and transition receipts (the recorded result of each applied plan or generation transition). |
+| 18 | Shared user profile and scoped expertise, scope-deletion triggers, and local user request receipts. |
 
 Migration 17 adds nullable `session_binding.held_on TEXT` (null for existing
 and locally created rows) and a partial index ordered by
