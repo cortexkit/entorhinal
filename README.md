@@ -17,6 +17,8 @@ The fleet's optional user profile also lives here. `user.get` reads it and
 `user.set` changes one field through the shared identity log; Direct writes
 require operator confirmation. These are module operations, not CLI commands.
 See [module surface](docs/module-surface.md#user-profile) for their contracts.
+A `user.get` token is meaningful only for the same request context it came
+from: the same `project_id`, or no `project_id` for an unscoped read.
 
 | Crate | Role |
 |---|---|

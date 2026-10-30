@@ -40,7 +40,8 @@ UPDATE_USER_PROFILE_VECTORS=1 cargo test --workspace --all-targets --locked user
 
 Tokens are opaque state digests, not journal positions. A token from a
 project-context read includes effective expertise as well as the whole profile;
-consumers should retry with the same `project_id`. Direct confirmation and
+the token is meaningful only for that same request context (the same
+`project_id`, or none for an unscoped read). Direct confirmation and
 other admission refusals are covered by handler tests, not these relay samples.
 Callosum excludes writes from its simulator profile in that profile's own
 allowed-operation list, rather than in entorhinal admission.

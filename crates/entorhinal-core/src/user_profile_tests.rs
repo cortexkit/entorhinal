@@ -135,6 +135,24 @@ fn user_profile_tokens_scopes_idempotency_and_rebuild() {
     f.set(json!({"field":"expertise","scope":{"kind":"project","id":"pj-one"},"value":"Project practice","request_key":"project"}));
     let all=f.set(json!({"field":"expertise","scope":{"kind":"workspace","id":"studio"},"value":"Workspace practice","request_key":"workspace"}));
     assert_eq!(all["expertise"][0]["scope"]["kind"], "workspace");
+    let scoped = f
+        .store
+        .user_get(UserGetRequest {
+            project_id: Some("pj-one".into()),
+            token: all["token"].as_str().map(str::to_owned),
+        })
+        .unwrap();
+    assert_eq!(scoped["unchanged"], false);
+    assert_eq!(scoped["user"], all["user"]);
+    assert_eq!(scoped["effective_expertise"]["text"], "Project practice");
+    let unscoped = f
+        .store
+        .user_get(UserGetRequest {
+            project_id: None,
+            token: scoped["token"].as_str().map(str::to_owned),
+        })
+        .unwrap();
+    assert_eq!(unscoped, all);
     for (project, kind, text) in [
         ("pj-one", "project", "Project practice"),
         ("pj-two", "workspace", "Workspace practice"),

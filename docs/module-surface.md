@@ -135,6 +135,8 @@ the project's own line overrides its placed workspace's. Unknown or implicit
 project ids refuse `unknown_project`. A matching token returns only `token` and
 `unchanged:true`. Tokens are opaque state digests; a project-context token also
 covers effective expertise, so placement changes cannot yield a stale cache hit.
+A token is meaningful only for the same request context it came from: reuse it
+with the same `project_id`, or with none if the original read was unscoped.
 
 `user.set` accepts `field`, required `value` (null clears), required
 `request_key` (1–128 printable ASCII), optional `actor` (audit label, never in
