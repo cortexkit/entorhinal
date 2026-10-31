@@ -1142,6 +1142,16 @@ pub struct RemoveRootRequest {
     pub actor: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MoveRootToNewProjectRequest {
+    pub from_project_id: String,
+    pub root: String,
+    pub name: String,
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
 /// Attach a worker container to a root's current approved binding, before any
 /// worktree is created in it. It can never add or replace a root.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1366,6 +1376,14 @@ impl RegistryStore {
         self.with_principal("entorhinal").remove_root(request)
     }
 
+    pub fn move_root_to_new_project(
+        &self,
+        request: MoveRootToNewProjectRequest,
+    ) -> Result<Vec<u8>, RegistryError> {
+        self.with_principal("entorhinal")
+            .move_root_to_new_project(request)
+    }
+
     pub fn attach_derived_parent(
         &self,
         request: AttachDerivedParentRequest,
@@ -1386,6 +1404,87 @@ impl RegistryStore {
 }
 
 impl super::JournalWriter<'_> {
+    pub fn move_root_to_new_project(
+        &self,
+        request: MoveRootToNewProjectRequest,
+    ) -> Result<Vec<u8>, RegistryError> {
+        self.move_root_to_new_project_at(request, super::now_unix_millis())
+    }
+
+    /// Transfer a checkout and its recorded identity together, so no shared
+    /// writer can claim the key between removal and registration.
+    pub fn move_root_to_new_project_at(
+        &self,
+        mut request: MoveRootToNewProjectRequest,
+        now: i64,
+    ) -> Result<Vec<u8>, RegistryError> {
+        request.root = canonical_query_path(Path::new(&request.root))?.0;
+        let actor = request.actor.clone().unwrap_or_else(|| "module".into());
+        self.mutation("move_root_to_new_project", None, |tx| {
+            let owner = tx.query_row(
+                "SELECT project_id FROM project_root WHERE canonical_root=?1",
+                [&request.root], |r| r.get::<_, String>(0),
+            ).optional()?;
+            match owner {
+                Some(owner) if owner == request.from_project_id => {}
+                Some(owner) => return Err(domain("root_conflict", format!("{} is a root of {owner}", request.root))),
+                None => return Err(domain("not_found", format!("{} is not a registered root", request.root))),
+            }
+            let count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM project_root WHERE project_id=?1",
+                [&request.from_project_id], |r| r.get(0),
+            )?;
+            if count <= 1 {
+                return Err(domain("last_root", format!("{} is the only root of {}; rename the project instead", request.root, request.from_project_id)));
+            }
+            let root_key = crate::root_keys::mapped_key(tx, &request.root)?;
+            if let Some(key) = &root_key {
+                if let Some(other) = tx.query_row(
+                    "SELECT canonical_root FROM project_root WHERE project_id=?1 AND root_key_kind=?2 AND root_key=?3 AND canonical_root<>?4 ORDER BY canonical_root LIMIT 1",
+                    [&request.from_project_id, &key.kind, &key.root_key, &request.root], |r| r.get::<_, String>(0),
+                ).optional()? {
+                    return Err(domain("root_key_in_use", format!("{} is also carried by {other}", key.root_key)));
+                }
+            }
+            let registration = crate::RegisterRequest {
+                name: request.name.clone(),
+                roots: vec![request.root.clone()],
+                actor: request.actor.clone(),
+                ..Default::default()
+            };
+            let project_id = super::mutations::mint("register1", &registration.name, &registration.roots);
+            if tx.query_row("SELECT 1 FROM project WHERE project_id=?1 UNION ALL SELECT 1 FROM project_alias WHERE old_id=?1", [&project_id], |r| r.get::<_, i64>(0)).optional()?.is_some() {
+                return Err(domain("project_id_occupied", &project_id));
+            }
+            let remove = RemoveRootRequest {
+                project_id: request.from_project_id.clone(),
+                root: request.root.clone(),
+                actor: request.actor.clone(),
+            };
+            let payload = serde_json::to_value(&remove).map_err(|e| domain("encode_failed", e.to_string()))?;
+            let seq = super::mutations::append(tx, "remove_root", &payload, &actor, None, now, self.principal)?;
+            apply_remove_root(tx, &remove, seq)?;
+            if let Some(key) = &root_key {
+                let release = crate::root_keys::ReleaseRootKey {
+                    project_id: request.from_project_id.clone(),
+                    kind: key.kind.clone(),
+                    root_key: key.root_key.clone(),
+                };
+                let value = serde_json::to_value(&release).map_err(|e| domain("encode_failed", e.to_string()))?;
+                super::mutations::append(tx, "root_key.release", &value, &actor, None, now, self.principal)?;
+                crate::root_keys::release(tx, &release)?;
+            }
+            let keys = std::collections::BTreeMap::from([(request.root.clone(), root_key.clone())]);
+            let registered = self.register_in(tx, &registration, now, Some(&keys))?;
+            Ok(Action {
+                changed: true,
+                seq: registered.seq,
+                value: json!({"fromProjectId":request.from_project_id,"projectId":project_id,"name":request.name,"root":request.root,"rootKey":root_key}),
+                payload: registered.payload,
+            })
+        })
+    }
+
     /// Add a root to an existing project. Refused when the root belongs to
     /// another project, nests inside or around any registered root, sits in or
     /// around a worker container, or names a GitHub repository another project

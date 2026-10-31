@@ -18,6 +18,28 @@ pub struct RootKey {
     pub root_key: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct ReleaseRootKey {
+    pub project_id: String,
+    pub kind: String,
+    pub root_key: String,
+}
+
+pub(crate) fn clear_unowned_mappings(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    tx.execute("UPDATE project_root SET root_key=NULL,root_key_kind=NULL WHERE root_key IS NOT NULL AND NOT EXISTS(SELECT 1 FROM project_root_key k WHERE k.project_id=project_root.project_id AND k.kind=project_root.root_key_kind AND k.root_key=project_root.root_key)", [])?;
+    Ok(())
+}
+
+pub(crate) fn release(tx: &Transaction<'_>, key: &ReleaseRootKey) -> rusqlite::Result<()> {
+    tx.execute(
+        "DELETE FROM project_root_key WHERE project_id=?1 AND kind=?2 AND root_key=?3",
+        [&key.project_id, &key.kind, &key.root_key],
+    )?;
+    // Other machines keep their checkout registration when shared identity no
+    // longer owns its key, just as when a superseding snapshot drops a key.
+    clear_unowned_mappings(tx)
+}
+
 /// Select only effective owned remotes. Secondary remotes intentionally do not
 /// reserve another key: every root has at most one machine-neutral name.
 pub(crate) fn choose(remotes: &[GitRemote], label: Option<&str>) -> Option<RootKey> {
@@ -478,6 +500,197 @@ mod tests {
             })
             .unwrap()
             .roots
+    }
+
+    fn move_request(root: &str) -> crate::MoveRootToNewProjectRequest {
+        crate::MoveRootToNewProjectRequest {
+            from_project_id: "P".into(),
+            root: root.into(),
+            name: "Separated".into(),
+            actor: Some("operator".into()),
+        }
+    }
+
+    #[test]
+    fn move_root_to_new_project_transfers_key_resets_authority_and_rebuilds_identically() {
+        let mut f = Fixture::new("move-root");
+        f.store.set_root_records(true);
+        enable(&f);
+        let kept = repo(&f, "kept", "move/kept");
+        let root = repo(&f, "moved", "move/separated");
+        register(&f, "P", kept.clone());
+        f.store
+            .add_root(AddRootRequest {
+                project_id: "P".into(),
+                root: root.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+        f.store
+            .assign_workspace(crate::AssignWorkspaceRequest {
+                project_id: "P".into(),
+                workspace_id: "W".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        f.store.bind_root(&root, "test").unwrap();
+        f.store.approve_root(&root, "test").unwrap();
+        let head = f.store.generation().unwrap();
+        let changes_before = f.store.agent_changes(head, Some(100)).unwrap();
+        let moved = result(
+            &f.store
+                .move_root_to_new_project(move_request(&root))
+                .unwrap(),
+        );
+        let id = moved["projectId"].as_str().unwrap();
+        assert_eq!(
+            id,
+            crate::mutations::mint("register1", "Separated", std::slice::from_ref(&root))
+        );
+        assert_eq!(moved["fromProjectId"], "P");
+        assert_eq!(moved["name"], "Separated");
+        assert_eq!(moved["root"], root);
+        assert_eq!(
+            moved["rootKey"],
+            json!({"kind":"remote","rootKey":"move/separated"})
+        );
+        assert_eq!(moved["generation"], head + 4);
+        assert_eq!(f.store.resolve(&kept).unwrap().project_id, "P");
+        assert_eq!(f.store.root_count("P").unwrap(), 1);
+        let resolved = f.store.resolve(&root).unwrap();
+        assert_eq!(resolved.project_id, id);
+        assert!(resolved.workspace_id.is_none());
+        let record = &resolved.root_fields.unwrap().root_records[0];
+        assert_eq!(record.approval.state, "unapproved");
+        assert!(record.registration_epoch.is_none());
+        assert!(lookup(&f, "P", "remote", "move/separated").is_empty());
+        assert_eq!(
+            lookup(&f, id, "remote", "move/separated"),
+            vec![root.clone()]
+        );
+        f.store.read(|conn| {
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM project_root_key WHERE project_id='P' AND root_key='move/separated'", [], |r| r.get::<_, i64>(0))?, 0);
+            Ok(())
+        }).unwrap();
+        let journal = f.store.journal_tail(head, 100).unwrap();
+        assert_eq!(
+            journal
+                .entries
+                .iter()
+                .map(|e| e.op.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "remove_root",
+                "root_key.release",
+                "register",
+                "root_key.assign"
+            ]
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&journal.entries[1].payload_json).unwrap(),
+            json!({"project_id":"P","kind":"remote","root_key":"move/separated"})
+        );
+        assert!(!crate::agent::IDENTITY_CHANGE_OPS.contains(&"root_key.release"));
+        let changes_after = f.store.agent_changes(head, Some(100)).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&changes_before.entries).unwrap(),
+            serde_json::to_vec(&changes_after.entries).unwrap()
+        );
+        assert_eq!(changes_before.cursor, head);
+        assert_eq!(changes_after.cursor, head + 4);
+        assert_eq!(changes_after.generation, head + 4);
+        assert!(f.store.verify().unwrap().ok);
+        let before = cells(&f);
+        assert!(f.store.rebuild().unwrap().replay.ok);
+        assert_eq!(before, cells(&f));
+    }
+
+    #[test]
+    fn move_root_to_new_project_refusals_write_no_cells_or_generation() {
+        for enabled in [false, true] {
+            let f = Fixture::new("move-refusals");
+            if enabled {
+                enable(&f);
+            }
+            let root = repo(&f, "only", "move/same");
+            let foreign = repo(&f, "foreign", "move/foreign");
+            let missing = f.dir("unregistered");
+            register(&f, "P", root.clone());
+            register(&f, "Q", foreign.clone());
+            for (path, expected) in [
+                (&root, "last_root"),
+                (&missing, "not_found"),
+                (&foreign, "root_conflict"),
+            ] {
+                let before = cells(&f);
+                let generation = f.store.generation().unwrap();
+                code(
+                    f.store
+                        .move_root_to_new_project(move_request(path))
+                        .unwrap_err(),
+                    expected,
+                );
+                assert_eq!(before, cells(&f));
+                assert_eq!(generation, f.store.generation().unwrap());
+            }
+            if enabled {
+                let clone = repo(&f, "clone", "move/same");
+                f.store
+                    .add_root(AddRootRequest {
+                        project_id: "P".into(),
+                        root: clone.clone(),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                let before = cells(&f);
+                let generation = f.store.generation().unwrap();
+                let error = f
+                    .store
+                    .move_root_to_new_project(move_request(&root))
+                    .unwrap_err();
+                assert!(error.to_string().contains(&clone));
+                code(error, "root_key_in_use");
+                assert_eq!(before, cells(&f));
+                assert_eq!(generation, f.store.generation().unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn move_root_to_new_project_preserves_labels_and_unkeyed_roots() {
+        for enabled in [false, true] {
+            let f = Fixture::new("move-labels");
+            if enabled {
+                enable(&f);
+            }
+            register(&f, "P", f.dir("kept"));
+            let root = f.dir("moved");
+            f.store
+                .add_root(AddRootRequest {
+                    project_id: "P".into(),
+                    root: root.clone(),
+                    label: Some("operator-key".into()),
+                    ..Default::default()
+                })
+                .unwrap();
+            let moved = result(
+                &f.store
+                    .move_root_to_new_project(move_request(&root))
+                    .unwrap(),
+            );
+            if enabled {
+                assert_eq!(
+                    moved["rootKey"],
+                    json!({"kind":"label","rootKey":"operator-key"})
+                );
+            } else {
+                assert!(moved["rootKey"].is_null());
+            }
+            assert!(f.store.verify().unwrap().ok);
+            let before = cells(&f);
+            assert!(f.store.rebuild().unwrap().replay.ok);
+            assert_eq!(before, cells(&f));
+        }
     }
 
     #[test]

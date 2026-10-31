@@ -290,6 +290,18 @@ pub fn parse(face: Face, arguments: &[String]) -> Invocation {
                 args.push(argument.clone());
                 args.push(value.clone());
             }
+            "--to-new-project"
+                if face == Face::Projects && verb.as_deref() == Some("move-root") =>
+            {
+                let Some(value) = rest
+                    .next()
+                    .filter(|value| !value.starts_with('-') && !value.is_empty())
+                else {
+                    return Invocation::Refuse(format!("{argument} needs a value"));
+                };
+                args.push(argument.clone());
+                args.push(value.clone());
+            }
             "--yes" if face == Face::Projects && verb.as_deref() == Some("attach") => {
                 args.push(argument.clone());
             }
@@ -382,6 +394,8 @@ usage: ck projects <verb> [args] [--subc <connection file>] [--json]
                           preview the matched project/key; --yes attaches unapproved
   remove-root <project> <dir>
                           remove one root from a project
+  move-root <dir> --to-new-project <name>
+                          move a checkout and its key into a new project
   rebind <dir>            rebind a replaced checkout (approval still needed)
   owned-remotes <root> <name>...
                           own exactly these remote names
@@ -464,7 +478,7 @@ ck-entorhinal — the registry module (supervised by the subc daemon)
 This binary is the module itself; it is not an operator command. The operator
 surface is:
 
-  ck projects      list, register, resolve, remove, add-root, remove-root,
+   ck projects      list, register, resolve, remove, add-root, remove-root, move-root,
                    attach, owned-remotes, approve, unapprove, trust, verify, log
   ck workspaces    list, assign, set-root, clear-root
    ck agents        create, rename, retire, tag, labels, list, show
@@ -833,6 +847,19 @@ fn build_at(command: &Command, cwd: &str) -> Result<(String, Value), String> {
                 "actor": actor,
             }),
         ),
+        (Face::Projects, "move-root") => {
+            let args = command.args.iter().map(String::as_str).collect::<Vec<_>>();
+            let [root, "--to-new-project", name] = args.as_slice() else {
+                return Err("move-root needs <dir> --to-new-project <name>".into());
+            };
+            if root.starts_with('-') || name.is_empty() || name.starts_with('-') {
+                return Err("move-root needs <dir> --to-new-project <name>".into());
+            }
+            (
+                "move_root_to_new_project".into(),
+                json!({"root":query(root)?,"name":name,"actor":actor}),
+            )
+        }
         (Face::Projects, "approve") => (
             "approve_project".to_string(),
             json!({ "canonicalRoot": query(&need(0, "a directory")?)?, "actor": actor }),
@@ -1273,6 +1300,40 @@ async fn agent_read(
     Ok(value)
 }
 
+async fn execute_move_root(
+    caller: &impl CliCaller,
+    mut params: Value,
+    json_output: bool,
+) -> Result<Value, (u8, String)> {
+    let old = caller
+        .call(
+            "resolve",
+            json!({"canonicalRoot":params["root"]}),
+            subc_client_rs::CallOptions::default(),
+        )
+        .await
+        .map_err(CallFailure::display)?;
+    if old["via"] == "implicit" || old["projectId"].as_str().is_none() {
+        return Err((
+            EXIT_REFUSED,
+            "not_found: directory is not a registered project root".into(),
+        ));
+    }
+    params["fromProjectId"] = old["projectId"].clone();
+    let mut moved = caller
+        .call(
+            "move_root_to_new_project",
+            params,
+            placement_call_options("move_root_to_new_project"),
+        )
+        .await
+        .map_err(CallFailure::display)?;
+    if !json_output {
+        moved["fromProjectName"] = old["projectName"].clone();
+    }
+    Ok(moved)
+}
+
 /// Heads and hirees store no workspace of their own: theirs is wherever their
 /// project is placed. `show` looks that up for any live agent with no stored
 /// workspace, whether it was named by id or by name, so it reports the
@@ -1568,6 +1629,16 @@ fn call(
                 params,
             )
             .await
+        } else if method == "move_root_to_new_project" {
+            execute_move_root(
+                &ConsumerCaller {
+                    consumer: &consumer,
+                    cwd: cwd.to_owned(),
+                },
+                params,
+                command.json,
+            )
+            .await
         } else {
             // Keep the established project/workspace transport messages unchanged.
             let body = serde_json::to_vec(&json!({"method":method,"params":params}))
@@ -1630,7 +1701,11 @@ fn placement_call_options(method: &str) -> subc_client_rs::CallOptions {
     }
     if matches!(
         method,
-        "assign_workspace" | "register" | "project.set_domain" | "workspace.set_document"
+        "assign_workspace"
+            | "register"
+            | "project.set_domain"
+            | "workspace.set_document"
+            | "move_root_to_new_project"
     ) {
         return subc_client_rs::CallOptions {
             timeout: Duration::from_secs(300),
@@ -1695,6 +1770,7 @@ fn render(command: &Command, value: &Value) {
         return;
     }
     match (command.face, command.verb.as_str()) {
+        (Face::Projects, "move-root") => println!("{}", format_move_root(value)),
         (Face::Agents, "list" | "show") => println!("{}", format_agents(&command.verb, value)),
         (Face::Agents, "moves") => println!("{}", format_agent_moves(value)),
         (Face::Agents, "avatars") => println!("{}", format_avatar_manifest(value)),
@@ -1805,6 +1881,20 @@ fn render(command: &Command, value: &Value) {
             serde_json::to_string_pretty(value).unwrap_or_default()
         ),
     }
+}
+
+fn format_move_root(value: &Value) -> String {
+    let key = if value["rootKey"].is_null() {
+        "none".into()
+    } else {
+        format!(
+            "{}:{}",
+            text(&value["rootKey"]["kind"]),
+            text(&value["rootKey"]["rootKey"])
+        )
+    };
+    format!("Moved root {} with key {key} from {} ({}) to new project {} ({}).\nThe new root needs `ck projects approve` and a workspace (`ck workspaces assign`) before a head can be created.",
+        text(&value["root"]), text(&value["fromProjectName"]), text(&value["fromProjectId"]), text(&value["name"]), text(&value["projectId"]))
 }
 
 fn format_avatar_manifest(value: &Value) -> String {
@@ -3335,6 +3425,43 @@ mod agent_tests {
     }
 
     #[tokio::test]
+    async fn move_root_cli_resolves_source_and_reports_key_and_required_setup() {
+        let script = Script::new(vec![
+            Ok(json!({"projectId":"old","projectName":"Original","via":"root"})),
+            Ok(
+                json!({"fromProjectId":"old","projectId":"new","name":"Separated","root":"/checkout","rootKey":{"kind":"remote","rootKey":"owner/repo"}}),
+            ),
+        ]);
+        let moved = execute_move_root(
+            &script,
+            json!({"root":"/checkout","name":"Separated","actor":"ck-projects"}),
+            false,
+        )
+        .await
+        .unwrap();
+        let calls = script.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "resolve");
+        assert_eq!(calls[0].1, json!({"canonicalRoot":"/checkout"}));
+        assert_eq!(calls[1].0, "move_root_to_new_project");
+        assert_eq!(
+            calls[1].1,
+            json!({"fromProjectId":"old","root":"/checkout","name":"Separated","actor":"ck-projects"})
+        );
+        assert_eq!(calls[1].2, Duration::from_secs(300));
+        assert_eq!(format_move_root(&moved), "Moved root /checkout with key remote:owner/repo from Original (old) to new project Separated (new).\nThe new root needs `ck projects approve` and a workspace (`ck workspaces assign`) before a head can be created.");
+        let script = Script::new(vec![Ok(json!({"projectId":"implicit","via":"implicit"}))]);
+        assert_eq!(
+            execute_move_root(&script, json!({"root":"/checkout"}), false)
+                .await
+                .unwrap_err()
+                .0,
+            EXIT_REFUSED
+        );
+        assert_eq!(script.calls().len(), 1);
+    }
+
+    #[tokio::test]
     async fn move_cli_resolves_only_agent_targets_and_uses_write_timeout() {
         let script = Script::new(vec![
             Ok(json!({"agent_id":ID})),
@@ -4321,6 +4448,49 @@ mod launch_path_tests {
             Face::Entorhinal
         );
         assert_eq!(face_from_argv0(Some("ck-projects.other")), Face::Entorhinal);
+    }
+
+    #[test]
+    fn move_root_cli_requires_explicit_destination_and_checks_cwd() {
+        let (dir, _) = crate::tests::scratch_descriptor("move-cli-path");
+        let cwd = dir.to_str().unwrap();
+        let args = ["move-root", "missing", "--to-new-project", "Separated"].map(str::to_string);
+        let Invocation::Command(cmd) = parse(Face::Projects, &args) else {
+            panic!("move-root must parse as an operator command");
+        };
+        let (method, params) = build_at(&cmd, cwd).unwrap();
+        assert_eq!(method, "move_root_to_new_project");
+        assert_eq!(
+            params["root"],
+            entorhinal_core::RegistryStore::canonical_query_path(&dir.join("missing"))
+                .unwrap()
+                .0
+        );
+        assert_eq!(params["name"], "Separated");
+        assert!(params["fromProjectId"].is_null());
+        for args in [
+            vec![],
+            vec!["."],
+            vec![".", "--to-new-project"],
+            vec![".", "--to-new-project", "Name", "extra"],
+            vec![".", "--unknown", "Name"],
+        ] {
+            assert!(build_at(&command(Face::Projects, "move-root", &args), cwd).is_err());
+        }
+        let mut stderr = Vec::new();
+        assert_eq!(
+            run_with_directory(
+                cmd,
+                || Err(std::io::Error::other("injected cwd failure")),
+                &mut stderr
+            ),
+            ExitCode::from(EXIT_REFUSED)
+        );
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "cwd_unreadable: injected cwd failure\n"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

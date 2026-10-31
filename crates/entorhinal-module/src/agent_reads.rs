@@ -1625,6 +1625,7 @@ mod tests {
             "attach_root",
             "identity_log.enable",
             "remove_root",
+            "move_root_to_new_project",
             "attach_derived_parent",
             "approve_root",
             "unapprove_root",

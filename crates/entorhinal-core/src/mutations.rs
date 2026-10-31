@@ -654,78 +654,354 @@ impl super::JournalWriter<'_> {
         req.derived_root_parents.sort();
         req.derived_root_parents.dedup();
         let key = req.request_key.clone();
+        self.mutation("register", key.clone().as_deref(), move |tx| {
+            self.register_in(tx, &req, now, None)
+        })
+    }
+
+    /// Share registration's checks and journal shape with compound writes. A
+    /// moved root keeps its recorded key rather than consulting changed remotes.
+    pub(crate) fn register_in(
+        &self,
+        tx: &Transaction<'_>,
+        req: &RegisterRequest,
+        now: i64,
+        root_keys: Option<&BTreeMap<String, Option<crate::RootKey>>>,
+    ) -> Result<Action, RegistryError> {
+        let key = req.request_key.clone();
         let actor = req.actor.clone().unwrap_or_else(|| "module".into());
         let payload =
-            serde_json::to_value(&req).map_err(|e| domain("encode_failed", e.to_string()))?;
-        self.mutation("register", key.clone().as_deref(), move |tx| {
-            let mut owners = BTreeSet::new();
-            for root in &req.roots { if let Some(owner) = tx.query_row("SELECT project_id FROM project_root WHERE canonical_root=?1",[root],|r|r.get::<_,String>(0)).optional()? { owners.insert(owner); } }
-            for parent in &req.derived_root_parents { if let Some(owner) = tx.query_row("SELECT project_id FROM derived_root_parent WHERE canonical_parent=?1",[parent],|r|r.get::<_,String>(0)).optional()? { owners.insert(owner); } }
-            let project_id = match req.project_id.clone() { Some(id) => id, None => if owners.len()==1 { owners.iter().next().unwrap().clone() } else if owners.len()>1 { return Err(domain("project_conflict", format!("conflicting owners: {}", owners.into_iter().collect::<Vec<_>>().join(",")))) } else { mint("register1", &req.name, &req.roots) } };
-            let existing = tx.query_row("SELECT name FROM project WHERE project_id=?1",[&project_id],|r|r.get::<_,String>(0)).optional()?;
-            if req.project_id.is_none() && owners.is_empty() && existing.is_some() && super::log_schema::log_enabled(tx)? {
-                return Err(domain("project_id_occupied", format!("{project_id}; use attach_root or an explicit project_id")));
+            serde_json::to_value(req).map_err(|e| domain("encode_failed", e.to_string()))?;
+        let mut owners = BTreeSet::new();
+        for root in &req.roots {
+            if let Some(owner) = tx
+                .query_row(
+                    "SELECT project_id FROM project_root WHERE canonical_root=?1",
+                    [root],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                owners.insert(owner);
             }
-            if req.project_id.is_some() && existing.is_none() && tx.query_row("SELECT project_id FROM project_alias WHERE old_id=?1",[&project_id],|r|r.get::<_,String>(0)).optional()?.is_some() { return Err(domain("project_id_occupied", &project_id)); }
-            let mut chosen = BTreeMap::new();
-            for root in &req.roots {
-                if let Some(owner)=tx.query_row("SELECT project_id FROM project_root WHERE canonical_root=?1",[root],|r|r.get::<_,String>(0)).optional()? { if owner!=project_id { return Err(domain("root_conflict",format!("root {root} is owned by {owner}"))); } }
-                if let Some(owner)=tx.query_row("SELECT project_id FROM derived_root_parent WHERE canonical_parent=?1",[root],|r|r.get::<_,String>(0)).optional()? { if owner!=project_id { return Err(domain("root_conflict",format!("root {root} is claimed by {owner}"))); } }
-                chosen.insert(root.clone(), super::root_keys::incoming(tx, &project_id, root, req.label.as_deref())?);
-                let (remotes, _) = super::ownership::root_remotes(tx, root)?;
-                if let Some((repository, owner)) = super::binding::repository_owner(tx, &project_id, &remotes)? {
-                    return Err(domain("repository_owned", format!("{repository} belongs to {owner}")));
+        }
+        for parent in &req.derived_root_parents {
+            if let Some(owner) = tx
+                .query_row(
+                    "SELECT project_id FROM derived_root_parent WHERE canonical_parent=?1",
+                    [parent],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                owners.insert(owner);
+            }
+        }
+        let project_id = match req.project_id.clone() {
+            Some(id) => id,
+            None => {
+                if owners.len() == 1 {
+                    owners.iter().next().unwrap().clone()
+                } else if owners.len() > 1 {
+                    return Err(domain(
+                        "project_conflict",
+                        format!(
+                            "conflicting owners: {}",
+                            owners.into_iter().collect::<Vec<_>>().join(",")
+                        ),
+                    ));
+                } else {
+                    mint("register1", &req.name, &req.roots)
                 }
             }
-            for parent in &req.derived_root_parents {
-                let mut stmt=tx.prepare("SELECT project_id,canonical_root FROM project_root WHERE project_id<>?1")?;
-                let rows=stmt.query_map([&project_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?;
-                for row in rows { let (owner,root)=row?; if super::path_prefix_or_equal(Path::new(parent),Path::new(&root)) { return Err(domain("derived_parent_contains_foreign_root",format!("parent {parent} conflicts with owner {owner}"))); } }
-            }
-            for root in &req.roots {
-                let mut stmt=tx.prepare("SELECT project_id,canonical_parent FROM derived_root_parent WHERE project_id<>?1")?;
-                let rows=stmt.query_map([&project_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?;
-                for row in rows { let (owner,parent)=row?; if super::path_prefix_or_equal(Path::new(&parent),Path::new(root)) { return Err(domain("root_under_foreign_derived_parent",format!("root {root} is under {parent}, owned by {owner}"))); } }
-            }
-            if let Some(w) = &req.workspace_id { if let Some(old)=tx.query_row("SELECT workspace_id FROM project_workspace WHERE project_id=?1",[&project_id],|r|r.get::<_,String>(0)).optional()? { if old!=*w { return Err(domain("workspace_conflict",format!("project {project_id} belongs to workspace {old}"))); } } }
-            // Placing an unplaced project carries its live heads' and hirees'
-            // name claims into the workspace. A placed project either stays
-            // where it is or was refused just above.
-            let carries = match &req.workspace_id {
-                Some(w) if tx.query_row("SELECT 1 FROM project_workspace WHERE project_id=?1",[&project_id],|r|r.get::<_,i64>(0)).optional()?.is_none() => {
-                    vec![super::agent::plan_carry(tx, &project_id, w)?]
+        };
+        let existing = tx
+            .query_row(
+                "SELECT name FROM project WHERE project_id=?1",
+                [&project_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        if req.project_id.is_none()
+            && owners.is_empty()
+            && existing.is_some()
+            && super::log_schema::log_enabled(tx)?
+        {
+            return Err(domain(
+                "project_id_occupied",
+                format!("{project_id}; use attach_root or an explicit project_id"),
+            ));
+        }
+        if req.project_id.is_some()
+            && existing.is_none()
+            && tx
+                .query_row(
+                    "SELECT project_id FROM project_alias WHERE old_id=?1",
+                    [&project_id],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+                .is_some()
+        {
+            return Err(domain("project_id_occupied", &project_id));
+        }
+        let mut chosen = BTreeMap::new();
+        for root in &req.roots {
+            if let Some(owner) = tx
+                .query_row(
+                    "SELECT project_id FROM project_root WHERE canonical_root=?1",
+                    [root],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                if owner != project_id {
+                    return Err(domain(
+                        "root_conflict",
+                        format!("root {root} is owned by {owner}"),
+                    ));
                 }
-                _ => Vec::new(),
-            };
-            let mut aliases=Vec::new();
-            for root in &req.roots { let old=implicit_project_id(root); if let Some(target)=tx.query_row("SELECT project_id FROM project_alias WHERE old_id=?1",[&old],|r|r.get::<_,String>(0)).optional()? { if target!=project_id { aliases.push(json!({"oldId":old,"owner":target})); } } }
-            let old_domain: Option<String> = tx.query_row("SELECT domain FROM project WHERE project_id=?1", [&project_id], |r| r.get(0)).optional()?.flatten();
-            let domain_changed = req.domain.is_some() && req.domain != old_domain;
-            let domain_summary = if domain_changed { Some(crate::memory::domain_summary(&req.name,req.domain.as_deref())?) } else { None };
-            let mut changed=existing.is_none() || domain_changed;
-            changed |= existing.as_ref().is_some_and(|n| n!=&req.name);
-            changed |= req.roots.iter().any(|r| tx.query_row("SELECT 1 FROM project_root WHERE canonical_root=?1",[r],|x|x.get::<_,i64>(0)).optional().unwrap_or(None).is_none());
-            changed |= req.derived_root_parents.iter().any(|r| tx.query_row("SELECT 1 FROM derived_root_parent WHERE canonical_parent=?1",[r],|x|x.get::<_,i64>(0)).optional().unwrap_or(None).is_none());
-            if let Some(w)=&req.workspace_id { changed |= tx.query_row("SELECT 1 FROM project_workspace WHERE project_id=?1",[&project_id],|x|x.get::<_,i64>(0)).optional()?.is_none(); let _=w; }
-            let alias_new= req.roots.iter().any(|r| tx.query_row("SELECT 1 FROM project_alias WHERE old_id=?1",[implicit_project_id(r)],|x|x.get::<_,i64>(0)).optional().unwrap_or(None).is_none()); changed |= alias_new;
-            let mut response=json!({"projectId":project_id,"name":req.name,"roots":req.roots,"derivedRootParents":req.derived_root_parents,"warnings":aliases});
-            if !changed { return Ok(Action{changed:false,seq:None,value:response,payload}); }
-            self.admit_carry_and_domain(tx, &carries, domain_summary)?;
-            let seq=append(tx,"register",&payload,&actor,key.as_deref(),now,self.principal)?;
-            if existing.is_none() { tx.execute("INSERT INTO project(project_id,name,implicit,seed_identity,created_at,updated_at) VALUES(?1,?2,0,NULL,?3,?3)",params![&project_id,&req.name,now])?; } else { tx.execute("UPDATE project SET name=?1,updated_at=?2 WHERE project_id=?3",params![&req.name,&now,&project_id])?; }
-            if let Some(value) = &req.domain { tx.execute("UPDATE project SET domain=?1 WHERE project_id=?2",[value,&project_id])?; }
-            let mut mappings = Vec::new();
-            for root in &req.roots {
-                let root_key = chosen.remove(root).flatten();
-                tx.execute("INSERT OR IGNORE INTO project_root(canonical_root,project_id,added_at) VALUES(?1,?2,?3)",params![root,&project_id,now])?;
-                super::root_keys::assign(tx, &project_id, root, root_key, now, &mut mappings)?;
-                let old=implicit_project_id(root); let _=tx.execute("INSERT OR IGNORE INTO project_alias(old_id,project_id,created_at) VALUES(?1,?2,?3)",params![old,&project_id,now])?;
             }
-            super::root_keys::journal_assignments(tx, mappings, &actor, now, self.principal)?;
-            for parent in &req.derived_root_parents { tx.execute("INSERT OR IGNORE INTO derived_root_parent(canonical_parent,project_id) VALUES(?1,?2)",[parent,&project_id])?; }
-            if let Some(w)=&req.workspace_id { tx.execute("INSERT OR IGNORE INTO workspace(workspace_id,name,created_at,updated_at) VALUES(?1,?1,?2,?2)",params![w,now])?; tx.execute("INSERT OR IGNORE INTO project_workspace(project_id,workspace_id) VALUES(?1,?2)",[&project_id,w])?; tx.execute("INSERT OR IGNORE INTO workspace_member(workspace_id,ref_kind,device_fingerprint,project_id) VALUES(?1,'local','',?2)",[w,&project_id])?; }
-            self.apply_carry(tx, &carries, &actor, now)?;
-            response["implicitAliasCollisions"]=json!(aliases); Ok(Action{changed:true,seq:Some(seq),value:response,payload:json!({"request":payload,"implicitAliasCollisions":aliases})})
+            if let Some(owner) = tx
+                .query_row(
+                    "SELECT project_id FROM derived_root_parent WHERE canonical_parent=?1",
+                    [root],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                if owner != project_id {
+                    return Err(domain(
+                        "root_conflict",
+                        format!("root {root} is claimed by {owner}"),
+                    ));
+                }
+            }
+            chosen.insert(
+                root.clone(),
+                match root_keys.and_then(|keys| keys.get(root)) {
+                    Some(key) => key.clone(),
+                    None => {
+                        super::root_keys::incoming(tx, &project_id, root, req.label.as_deref())?
+                    }
+                },
+            );
+            let (remotes, _) = super::ownership::root_remotes(tx, root)?;
+            if let Some((repository, owner)) =
+                super::binding::repository_owner(tx, &project_id, &remotes)?
+            {
+                return Err(domain(
+                    "repository_owned",
+                    format!("{repository} belongs to {owner}"),
+                ));
+            }
+        }
+        for parent in &req.derived_root_parents {
+            let mut stmt = tx.prepare(
+                "SELECT project_id,canonical_root FROM project_root WHERE project_id<>?1",
+            )?;
+            let rows = stmt.query_map([&project_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (owner, root) = row?;
+                if super::path_prefix_or_equal(Path::new(parent), Path::new(&root)) {
+                    return Err(domain(
+                        "derived_parent_contains_foreign_root",
+                        format!("parent {parent} conflicts with owner {owner}"),
+                    ));
+                }
+            }
+        }
+        for root in &req.roots {
+            let mut stmt = tx.prepare(
+                "SELECT project_id,canonical_parent FROM derived_root_parent WHERE project_id<>?1",
+            )?;
+            let rows = stmt.query_map([&project_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (owner, parent) = row?;
+                if super::path_prefix_or_equal(Path::new(&parent), Path::new(root)) {
+                    return Err(domain(
+                        "root_under_foreign_derived_parent",
+                        format!("root {root} is under {parent}, owned by {owner}"),
+                    ));
+                }
+            }
+        }
+        if let Some(w) = &req.workspace_id {
+            if let Some(old) = tx
+                .query_row(
+                    "SELECT workspace_id FROM project_workspace WHERE project_id=?1",
+                    [&project_id],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                if old != *w {
+                    return Err(domain(
+                        "workspace_conflict",
+                        format!("project {project_id} belongs to workspace {old}"),
+                    ));
+                }
+            }
+        }
+        // Placing an unplaced project carries its live heads' and hirees'
+        // name claims into the workspace. A placed project either stays
+        // where it is or was refused just above.
+        let carries = match &req.workspace_id {
+            Some(w)
+                if tx
+                    .query_row(
+                        "SELECT 1 FROM project_workspace WHERE project_id=?1",
+                        [&project_id],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .optional()?
+                    .is_none() =>
+            {
+                vec![super::agent::plan_carry(tx, &project_id, w)?]
+            }
+            _ => Vec::new(),
+        };
+        let mut aliases = Vec::new();
+        for root in &req.roots {
+            let old = implicit_project_id(root);
+            if let Some(target) = tx
+                .query_row(
+                    "SELECT project_id FROM project_alias WHERE old_id=?1",
+                    [&old],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                if target != project_id {
+                    aliases.push(json!({"oldId":old,"owner":target}));
+                }
+            }
+        }
+        let old_domain: Option<String> = tx
+            .query_row(
+                "SELECT domain FROM project WHERE project_id=?1",
+                [&project_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        let domain_changed = req.domain.is_some() && req.domain != old_domain;
+        let domain_summary = if domain_changed {
+            Some(crate::memory::domain_summary(
+                &req.name,
+                req.domain.as_deref(),
+            )?)
+        } else {
+            None
+        };
+        let mut changed = existing.is_none() || domain_changed;
+        changed |= existing.as_ref().is_some_and(|n| n != &req.name);
+        changed |= req.roots.iter().any(|r| {
+            tx.query_row(
+                "SELECT 1 FROM project_root WHERE canonical_root=?1",
+                [r],
+                |x| x.get::<_, i64>(0),
+            )
+            .optional()
+            .unwrap_or(None)
+            .is_none()
+        });
+        changed |= req.derived_root_parents.iter().any(|r| {
+            tx.query_row(
+                "SELECT 1 FROM derived_root_parent WHERE canonical_parent=?1",
+                [r],
+                |x| x.get::<_, i64>(0),
+            )
+            .optional()
+            .unwrap_or(None)
+            .is_none()
+        });
+        if let Some(w) = &req.workspace_id {
+            changed |= tx
+                .query_row(
+                    "SELECT 1 FROM project_workspace WHERE project_id=?1",
+                    [&project_id],
+                    |x| x.get::<_, i64>(0),
+                )
+                .optional()?
+                .is_none();
+            let _ = w;
+        }
+        let alias_new = req.roots.iter().any(|r| {
+            tx.query_row(
+                "SELECT 1 FROM project_alias WHERE old_id=?1",
+                [implicit_project_id(r)],
+                |x| x.get::<_, i64>(0),
+            )
+            .optional()
+            .unwrap_or(None)
+            .is_none()
+        });
+        changed |= alias_new;
+        let mut response = json!({"projectId":project_id,"name":req.name,"roots":req.roots,"derivedRootParents":req.derived_root_parents,"warnings":aliases});
+        if !changed {
+            return Ok(Action {
+                changed: false,
+                seq: None,
+                value: response,
+                payload,
+            });
+        }
+        self.admit_carry_and_domain(tx, &carries, domain_summary)?;
+        let seq = append(
+            tx,
+            "register",
+            &payload,
+            &actor,
+            key.as_deref(),
+            now,
+            self.principal,
+        )?;
+        if existing.is_none() {
+            tx.execute("INSERT INTO project(project_id,name,implicit,seed_identity,created_at,updated_at) VALUES(?1,?2,0,NULL,?3,?3)",params![&project_id,&req.name,now])?;
+        } else {
+            tx.execute(
+                "UPDATE project SET name=?1,updated_at=?2 WHERE project_id=?3",
+                params![&req.name, &now, &project_id],
+            )?;
+        }
+        if let Some(value) = &req.domain {
+            tx.execute(
+                "UPDATE project SET domain=?1 WHERE project_id=?2",
+                [value, &project_id],
+            )?;
+        }
+        let mut mappings = Vec::new();
+        for root in &req.roots {
+            let root_key = chosen.remove(root).flatten();
+            tx.execute("INSERT OR IGNORE INTO project_root(canonical_root,project_id,added_at) VALUES(?1,?2,?3)",params![root,&project_id,now])?;
+            super::root_keys::assign(tx, &project_id, root, root_key, now, &mut mappings)?;
+            let old = implicit_project_id(root);
+            let _=tx.execute("INSERT OR IGNORE INTO project_alias(old_id,project_id,created_at) VALUES(?1,?2,?3)",params![old,&project_id,now])?;
+        }
+        super::root_keys::journal_assignments(tx, mappings, &actor, now, self.principal)?;
+        for parent in &req.derived_root_parents {
+            tx.execute("INSERT OR IGNORE INTO derived_root_parent(canonical_parent,project_id) VALUES(?1,?2)",[parent,&project_id])?;
+        }
+        if let Some(w) = &req.workspace_id {
+            tx.execute("INSERT OR IGNORE INTO workspace(workspace_id,name,created_at,updated_at) VALUES(?1,?1,?2,?2)",params![w,now])?;
+            tx.execute(
+                "INSERT OR IGNORE INTO project_workspace(project_id,workspace_id) VALUES(?1,?2)",
+                [&project_id, w],
+            )?;
+            tx.execute("INSERT OR IGNORE INTO workspace_member(workspace_id,ref_kind,device_fingerprint,project_id) VALUES(?1,'local','',?2)",[w,&project_id])?;
+        }
+        self.apply_carry(tx, &carries, &actor, now)?;
+        response["implicitAliasCollisions"] = json!(aliases);
+        Ok(Action {
+            changed: true,
+            seq: Some(seq),
+            value: response,
+            payload: json!({"request":payload,"implicitAliasCollisions":aliases}),
         })
     }
 
@@ -1083,7 +1359,7 @@ fn move_root_keys(tx: &Transaction<'_>, id: &str, successor: Option<&str>) -> ru
     Ok(())
 }
 
-fn mint(domain: &str, name: &str, roots: &[String]) -> String {
+pub(crate) fn mint(domain: &str, name: &str, roots: &[String]) -> String {
     let mut h = blake3::Hasher::new();
     h.update(domain.as_bytes());
     h.update(b":");
@@ -1707,6 +1983,10 @@ fn replay(
     match op {
         "attach_root" => super::root_keys::replay_attach(tx, seq, &v, now)?,
         "root_key.assign" | "root_key.backfill" => super::shared_entry::replay_root_keys(tx, v)?,
+        "root_key.release" => {
+            let release = serde_json::from_value(v).map_err(super::shared_entry::decode_error)?;
+            super::root_keys::release(tx, &release)?;
+        }
         "workspace_root.backfill" => super::log_schema::replay_workspace_root_backfill(tx, v)?,
         "register" => {
             let r: RegisterRequest = serde_json::from_value(v)

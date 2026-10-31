@@ -2597,6 +2597,7 @@ enum Write {
     Seed(SeedImportRequest),
     Add(entorhinal_core::AddRootRequest),
     Attach(entorhinal_core::AttachRootRequest),
+    MoveRoot(entorhinal_core::MoveRootToNewProjectRequest),
     Agent(String, Value),
     Member(entorhinal_core::shared_entry::MemberName),
     Pins(entorhinal_core::catalog_agent::PinWriteRequest),
@@ -2624,6 +2625,9 @@ impl Write {
             "seed_import" => Self::Seed(serde_json::from_value(params).map_err(invalid_params)?),
             "add_root" => Self::Add(serde_json::from_value(params).map_err(invalid_params)?),
             "attach_root" => Self::Attach(serde_json::from_value(params).map_err(invalid_params)?),
+            "move_root_to_new_project" => {
+                Self::MoveRoot(serde_json::from_value(params).map_err(invalid_params)?)
+            }
             super::member::SET_NAME => {
                 Self::Member(serde_json::from_value(params).map_err(invalid_params)?)
             }
@@ -2664,6 +2668,7 @@ impl Write {
             Self::Remove(r) => r.request_key.as_deref(),
             Self::Seed(r) => r.request_key.as_deref(),
             Self::Add(_) => None,
+            Self::MoveRoot(_) => None,
             Self::Attach(r) => r.request_key.as_deref(),
             Self::Member(_) => None,
             Self::Pins(r) => r.request_key.as_deref(),
@@ -2714,6 +2719,7 @@ impl Write {
             Self::Seed(r) => writer.seed_import_at(r, now),
             Self::Add(r) => writer.add_root_at(r, now),
             Self::Attach(r) => writer.attach_root_at(r, now),
+            Self::MoveRoot(r) => writer.move_root_to_new_project_at(r, now),
             Self::Member(name) => {
                 return store.set_member_name(name, principal).map_err(Into::into)
             }
@@ -2813,6 +2819,7 @@ fn shared_candidate(op: &str) -> bool {
             | "seed_import"
             | "add_root"
             | "attach_root"
+            | "move_root_to_new_project"
             | "member.set_name"
     ) || (agent_ops::MUTATING_METHODS.contains(&op) && op != "agent.import")
 }
@@ -3377,8 +3384,10 @@ impl ProjectsHandler {
             if store.persisted_self_author()?.is_none() {
                 let _ = self.catch_up(&store, deadline).await;
             }
-            if matches!(request.method.as_str(), "register" | "add_root")
-                && store.root_records_enabled()
+            if matches!(
+                request.method.as_str(),
+                "register" | "add_root" | "move_root_to_new_project"
+            ) && store.root_records_enabled()
             {
                 if let Err(error) = store
                     .with_principal(&principal_label(admission.principal.as_ref()))

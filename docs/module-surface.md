@@ -101,12 +101,34 @@ concepts.
 | `attach_root` | mutate | Attach a local checkout to an existing project's root key; it starts unapproved. |
 | `rebind_root` | mutate | Rebind a replaced or unbound checkout, keeping its project id; approval is still required. |
 | `remove_root` | mutate | Remove one root, retiring its binding and worker containers. |
+| `move_root_to_new_project` | mutate | Operator only, without a presence prompt: move a checkout and its recorded repository key into a newly registered project, in one shared write. |
 | `attach_derived_parent` | mutate | Attach a worker container to a root's current approved binding. |
 | `approve_root`, `unapprove_root` | mutate | Approve or withdraw approval of one root's current binding. |
 | `approve_project`, `unapprove_project` | mutate | The same for every root of the project a path belongs to; approval refuses unless every root is identified. |
 | `seed_import` | mutate | Bulk-import registrations from a seed file (recovery). |
 | `rebuild` | mutate | Rebuild the derived tables by replaying the journal (recovery). |
 | `projects.session_liveness` | mutate | The session liveness feed. Host only; never journaled. See [session-liveness-contract.md](session-liveness-contract.md). |
+
+`move_root_to_new_project` takes `{fromProjectId, root, name, actor?}` and
+returns `{fromProjectId, projectId, name, root, rootKey, generation}` (plus the
+usual `noop: false`). The new project has no workspace and the root is not
+approved. Use `ck projects approve <dir>` and
+`ck workspaces assign <project-id> <workspace-id>` before creating the project's
+head agent (its lead agent).
+The source must retain at least one local root; rename a single-root project
+instead. A root outside the source project is refused, and `root_key_in_use`
+names another local root if it still carries the same key. Refusals leave the
+whole write unapplied. Roots without a recorded key remain unkeyed (`rootKey:
+null`).
+
+The journal reuses `remove_root`, `register` and `root_key.assign`. The key
+transfer adds `root_key.release` with payload
+`{project_id, kind, root_key}`. Like `root_key.assign`, it is visible in
+`journal_tail`, never in the agent identity feed. Sharing sends one project
+delta, not separate remove/register requests. A receiving machine keeps any
+checkout registered under the old project but clears its released key; it
+does not move that machine's folders to the new project. Ordinary `remove_root`
+still retains the project's repository keys.
 
 Tests: `attach_surface_writes_are_attributed_only_to_direct_and_core`,
 `ownership_write_admission_and_principal_attribution`,

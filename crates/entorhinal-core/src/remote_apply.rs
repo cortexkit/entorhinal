@@ -680,6 +680,9 @@ fn apply(tx: &Transaction<'_>, entry: &RemoteEntry) -> rusqlite::Result<i64> {
                     apply_carried(tx, &project, entry)?
                 } else {
                     let seq = append(tx, &project.op, &json!({}), "log", None, 0, "entorhinal")?;
+                    // Root-key releases arrive in this shared delta. Applying
+                    // it also clears obsolete local key mappings, without
+                    // removing the receiving machine's checkout registrations.
                     project.apply(tx, seq)?;
                     tag(
                         tx,

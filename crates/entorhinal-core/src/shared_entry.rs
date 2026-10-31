@@ -557,7 +557,7 @@ impl ProjectEntry {
         {
             // Successor moves and key upserts have finished. A moved key keeps
             // its mapping, while a removed key leaves the local root unkeyed.
-            tx.execute("UPDATE project_root SET root_key=NULL,root_key_kind=NULL WHERE root_key IS NOT NULL AND NOT EXISTS(SELECT 1 FROM project_root_key k WHERE k.project_id=project_root.project_id AND k.kind=project_root.root_key_kind AND k.root_key=project_root.root_key)", [])?;
+            crate::root_keys::clear_unowned_mappings(tx)?;
         }
         Ok(())
     }

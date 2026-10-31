@@ -350,6 +350,100 @@ async fn pair(label: &str, log: Arc<dyn LogConnector>) -> (Machine, Machine) {
 }
 
 #[tokio::test(start_paused = true)]
+async fn move_root_to_new_project_is_one_shared_write_and_keeps_remote_checkout_unkeyed() {
+    let log = Arc::new(FakeLog::default());
+    let (a, b) = pair("move-root", log.clone()).await;
+    let kept = a.repo("kept", &[("origin", "move/kept")]);
+    let moved = a.repo("moved", &[("origin", "move/separated")]);
+    a.register("P", &kept, Some("W")).await;
+    a.call("add_root", json!({"projectId":"P","root":moved}))
+        .await
+        .unwrap();
+    a.call("approve_root", json!({"root":moved})).await.unwrap();
+    b.catch_up().await;
+    let clone = b.repo("clone", &[("origin", "move/separated")]);
+    b.call("attach_root", json!({"path":clone})).await.unwrap();
+    b.approve(&clone).await;
+    let local_binding = b.rows("root_binding");
+    let local_approval = b.rows("root_approval");
+    let head = log.head();
+    let cursor = a.store().generation().unwrap();
+    let feed_params = json!({"incarnation":"acceptance","cursor":cursor,"wait":false});
+    let before_feed = a.call("agent.changes", feed_params.clone()).await.unwrap();
+    let request = json!({"fromProjectId":"P","root":moved,"name":"Separated"});
+    assert_eq!(
+        a.bytes_on(CORE, "move_root_to_new_project", request.clone())
+            .await
+            .unwrap_err(),
+        "write_not_permitted"
+    );
+    let flow = (99, 1);
+    a.handler.route_admissions().insert(
+        flow,
+        RouteAdmission::from_bind(
+            Some(Principal::Direct),
+            Some(&crate::tests::flow_stamp(Some("flow"))),
+        ),
+    );
+    assert_eq!(
+        a.bytes_on(flow, "move_root_to_new_project", request.clone())
+            .await
+            .unwrap_err(),
+        "flow_scope_not_admitted"
+    );
+    assert_eq!(log.head(), head);
+    let result = a.call("move_root_to_new_project", request).await.unwrap();
+    let project = result["projectId"].as_str().unwrap();
+    assert_eq!(result["generation"], cursor + 4);
+    assert_eq!(log.head(), head + 1);
+    let after_feed = a.call("agent.changes", feed_params).await.unwrap();
+    assert_eq!(
+        serde_json::to_vec(&before_feed["entries"]).unwrap(),
+        serde_json::to_vec(&after_feed["entries"]).unwrap()
+    );
+    assert_eq!(before_feed["cursor"], cursor);
+    assert_eq!(after_feed["cursor"], a.store().generation().unwrap());
+    assert_eq!(after_feed["generation"], after_feed["cursor"]);
+    assert_eq!(after_feed["cursor"], cursor + 5);
+    b.catch_up().await;
+    assert_eq!(a.shared(), b.shared());
+    for machine in [&a, &b] {
+        assert_eq!(machine.query("SELECT project_id,kind,root_key FROM project_root_key WHERE root_key='move/separated'"), vec![vec![Cell::Text(project.into()), Cell::Text("remote".into()), Cell::Text("move/separated".into())]]);
+        let resolved = machine
+            .call("resolve_project_id", json!({"projectId":project}))
+            .await
+            .unwrap();
+        assert!(resolved["workspaceId"].is_null());
+        assert_eq!(machine.call("verify", json!({})).await.unwrap()["ok"], true);
+        machine.clean_rebuild().await;
+    }
+    assert_eq!(a.store().resolve(&moved).unwrap().project_id, project);
+    assert_eq!(a.store().resolve(&kept).unwrap().project_id, "P");
+    let record = a
+        .store()
+        .trust(&moved)
+        .unwrap()
+        .root_fields
+        .unwrap()
+        .root_records
+        .remove(0);
+    assert_eq!(record.approval.state, "unapproved");
+    assert_eq!(record.identity, "bound");
+    assert_eq!(
+        b.query("SELECT canonical_root,project_id,root_key_kind,root_key FROM project_root"),
+        vec![vec![
+            Cell::Text(clone.clone()),
+            Cell::Text("P".into()),
+            Cell::Null,
+            Cell::Null
+        ]]
+    );
+    assert_eq!(b.rows("root_binding"), local_binding);
+    assert_eq!(b.rows("root_approval"), local_approval);
+    assert_eq!(b.store().resolve(&clone).unwrap().project_id, "P");
+}
+
+#[tokio::test(start_paused = true)]
 async fn disabled_workload_keeps_local_journal_and_never_connects() {
     let fail = Arc::new(FailConnector::default());
     let m = Machine::new("disabled-acceptance", fail.clone());

@@ -59,6 +59,7 @@ runs it under the names `ck-projects`, `ck-workspaces`, `ck-agents` and
 
 ```
 ck projects list | resolve | register | remove | add-root | attach | remove-root
+            move-root <dir> --to-new-project <name>
             rebind | owned-remotes | approve | unapprove | trust | verify
             log status | log name | log enable
 ck workspaces list | assign | set-root | clear-root
@@ -73,6 +74,16 @@ role takes and moves from `ck` land only after the operator approves the exact
 change at a presence prompt the daemon shows (Touch ID on macOS, Windows Hello
 on Windows). Linux has no presence provider, so there these writes refuse
 `operator_presence_unavailable`.
+
+`ck projects move-root <dir> --to-new-project <name>` separates one checkout
+and its repository key from a multi-root project into a new project. The source
+must keep another root, and no other local root may carry the transferred key.
+The move is atomic and shared when identity sharing is enabled; ordinary
+`remove-root` does not release a repository key. The new root needs
+`ck projects approve <dir>` and the project needs
+`ck workspaces assign <project-id> <workspace-id>` before creating the project's
+head agent (its lead agent).
+This operator command does not ask for a presence prompt.
 
 ## Documentation
 

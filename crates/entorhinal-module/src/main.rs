@@ -725,6 +725,7 @@ const MUTATING_METHODS: &[&str] = &[
     catalog_seed::SEED,
     catalog_agent::ACK_ACTIVATION,
     "remove_root",
+    "move_root_to_new_project",
     "attach_derived_parent",
     "approve_root",
     "unapprove_root",
@@ -804,6 +805,7 @@ fn authorize_write(method: &str, principal: Option<&Principal>) -> Result<(), Ha
         return Ok(());
     }
     if method == store_origin::ADOPT
+        || method == "move_root_to_new_project"
         || method == "identity_log.enable"
         || catalog_ops::WRITES.contains(&method)
         || method == catalog_publish::PUBLISH
@@ -1764,6 +1766,25 @@ impl ProjectsHandler {
             "rebind_root" => self.rebind_root(request.params, &principal),
             "attach_root" => self.attach_root(request.params, &principal),
             "remove_root" => self.remove_root(request.params, &principal),
+            "move_root_to_new_project" => {
+                let req = serde_json::from_value::<entorhinal_core::MoveRootToNewProjectRequest>(
+                    request.params,
+                )
+                .map_err(invalid_params)?;
+                let reply =
+                    self.record_mutation(self.with_store(|s| {
+                        s.with_principal(&principal).move_root_to_new_project(req)
+                    }))?;
+                self.with_store(|store| {
+                    if store.root_records_enabled() {
+                        if let Err(error) = store.with_principal(&principal).bind_unbound_roots("entorhinal") {
+                            tracing::warn!(target:"binding", "binding after root move failed: {error}");
+                        }
+                    }
+                    Ok(())
+                })?;
+                Ok(reply)
+            }
             "attach_derived_parent" => self.attach_derived_parent(request.params, &principal),
             "approve_root" => self.set_root_approval(request.params, true, &principal),
             "unapprove_root" => self.set_root_approval(request.params, false, &principal),
@@ -2646,6 +2667,11 @@ fn manifest() -> ModuleManifest {
                     "remove_root",
                     ManagementOperationKind::Mutate,
                     "Remove one root from a project, retiring its binding and worker containers.",
+                ),
+                management_operation(
+                    "move_root_to_new_project",
+                    ManagementOperationKind::Mutate,
+                    "Move one checkout and its repository key into a new unapproved, unplaced project.",
                 ),
                 management_operation(
                     "attach_derived_parent",
