@@ -2396,7 +2396,7 @@ mod tests {
                             RouteTarget::ToolProvider {
                                 module_id: MODULE_ID.into(),
                             },
-                            BindIdentity::new("/tmp/project", "test", "ck-agents"),
+                            BindIdentity::new("test", "ck-agents"),
                         )
                         .with_principal(Principal::Direct),
                     )

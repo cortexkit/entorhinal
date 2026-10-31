@@ -401,14 +401,13 @@ pub(crate) fn subc_connection_file(
 
 impl SubcConnector {
     async fn transport(&self) -> Result<Arc<SubcTransport>, TransportError> {
-        let cwd =
-            super::current_directory::read_current_directory(self.read_cwd).map_err(|error| {
-                TransportError::Refusal {
-                    code: error.code.into(),
-                    detail: Some(json!({"message": error.message})),
-                    message: None,
-                }
-            })?;
+        super::current_directory::read_current_directory(self.read_cwd).map_err(|error| {
+            TransportError::Refusal {
+                code: error.code.into(),
+                detail: Some(json!({"message": error.message})),
+                message: None,
+            }
+        })?;
         let mut slot = self.consumer.lock().await;
         if let Some(transport) = slot.as_ref() {
             return Ok(transport.clone());
@@ -420,7 +419,6 @@ impl SubcConnector {
         .map_err(|_| TransportError::Unavailable)?;
         let transport = Arc::new(SubcTransport {
             consumer: Arc::new(consumer),
-            cwd,
         });
         *slot = Some(transport.clone());
         Ok(transport)
@@ -436,7 +434,7 @@ impl SubcConnector {
         activity: &'static str,
     ) -> Result<Arc<dyn LogTransport>, TransportError> {
         let transport = self.transport().await?;
-        let identity = BindIdentity::new(&transport.cwd, "ck-entorhinal", activity);
+        let identity = BindIdentity::new("ck-entorhinal", activity);
         // With the default CallOptions the SDK fills the omitted consumer identity
         // from SUBC_MODULE_ID and the supervisor's cached launch secret. The daemon
         // therefore authenticates reserved:entorhinal, the principal participants
@@ -466,7 +464,6 @@ impl LogConnector for SubcConnector {
 
 struct SubcTransport {
     consumer: Arc<SubcConsumer>,
-    cwd: String,
 }
 
 struct ServiceTransport {
@@ -484,6 +481,7 @@ pub(crate) fn warn_call_error(module: &str, service: &str, method: &str, error: 
     let variant = match error {
         CallError::Module(_) => return,
         CallError::NotSent(_) => "NotSent",
+        CallError::DaemonTooOld { .. } => "DaemonTooOld",
         CallError::OutcomeUnknown(_) => "OutcomeUnknown",
         CallError::SubscriptionBackpressure(_) => "SubscriptionBackpressure",
         CallError::StaleRouteHandle(_) => "StaleRouteHandle",
@@ -564,7 +562,7 @@ impl LogTransport for SubcTransport {
         self.consumer
             .call(
                 engram_target(),
-                BindIdentity::new(&self.cwd, "ck-entorhinal", "identity-log"),
+                BindIdentity::new("ck-entorhinal", "identity-log"),
                 body,
                 CallOptions::default(),
             )

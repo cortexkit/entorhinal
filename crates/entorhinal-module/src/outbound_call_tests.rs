@@ -94,6 +94,12 @@ fn transport_warning_carries_target_method_variant_and_display_text() {
 fn other_non_module_variants_are_named_without_discarding_the_error() {
     let cases = [
         (
+            CallError::DaemonTooOld {
+                daemon_ver: "0.38.0".into(),
+            },
+            "DaemonTooOld",
+        ),
+        (
             CallError::SubscriptionBackpressure("receiver full".into()),
             "SubscriptionBackpressure",
         ),

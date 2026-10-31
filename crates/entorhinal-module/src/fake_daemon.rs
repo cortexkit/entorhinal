@@ -215,7 +215,8 @@ impl WireDaemon {
             key: generate_key().unwrap(),
             daemon_id: generate_daemon_id().unwrap(),
             pid: std::process::id(),
-            daemon_ver: "participant-test-double".into(),
+            // The SDK only sends project-free binds to compatible daemon versions.
+            daemon_ver: "0.39.0".into(),
         };
         write_atomic(connection_file, &info).unwrap();
         let task = tokio::spawn(async move {
@@ -273,6 +274,10 @@ async fn serve_wire(
                     )
                 }
                 "route.open" => {
+                    let identity = request["identity"].as_object().unwrap();
+                    assert_eq!(identity["harness"], "ck-entorhinal");
+                    assert!(!identity.contains_key("project_root"));
+                    assert!(!identity.contains_key("project_id"));
                     let target: RouteTarget =
                         serde_json::from_value(request["target"].clone()).unwrap();
                     // The fake authenticates the launch identity just as the daemon

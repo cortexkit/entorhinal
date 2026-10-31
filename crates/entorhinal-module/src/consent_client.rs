@@ -88,7 +88,7 @@ impl ConsentConnector for SubcCingulate {
             .await
             .map_err(|_| ConsentError::Ambiguous)?
             .map_err(|_| ConsentError::Refused("consent_unavailable".into()))?;
-        let cwd = crate::current_directory::read_current_directory(std::env::current_dir)
+        crate::current_directory::read_current_directory(std::env::current_dir)
             .map_err(|_| ConsentError::Refused("consent_unavailable".into()))?;
         // The SDK caches routes by identity. A unique activity prevents one held
         // call's close from tearing down another call under the same owner.
@@ -96,7 +96,7 @@ impl ConsentConnector for SubcCingulate {
             "agent consent {}",
             NEXT_ROUTE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
-        let identity = BindIdentity::new(&cwd, "ck-entorhinal", activity);
+        let identity = BindIdentity::new("ck-entorhinal", activity);
         let selector = ScopeSelector::new(
             stamp.owner.clone(),
             stamp.scope_ref.clone(),

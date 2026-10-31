@@ -529,13 +529,7 @@ fn run_with_directory(
         }
     };
 
-    match call(
-        command.connection.as_deref(),
-        &command,
-        &method,
-        params,
-        &cwd,
-    ) {
+    match call(command.connection.as_deref(), &command, &method, params) {
         Ok(mut value) => {
             // Attach and approval replies carry the project's id but not its
             // name. For text output, look the name up afterwards with the same
@@ -551,7 +545,6 @@ fn run_with_directory(
                     &command,
                     "enumerate",
                     json!({}),
-                    &cwd,
                 ) {
                     if let Some(name) = project_name_from_list(&projects, &value["projectId"]) {
                         value["projectName"] = Value::String(name);
@@ -1236,7 +1229,6 @@ trait CliCaller: Sync {
 
 struct ConsumerCaller<'a> {
     consumer: &'a subc_client_rs::SubcConsumer,
-    cwd: String,
 }
 
 fn connect_failure(connection: Option<&Path>, error: impl std::fmt::Display) -> String {
@@ -1262,8 +1254,7 @@ impl CliCaller for ConsumerCaller<'_> {
                 subc_protocol::RouteTarget::ManagementSurface {
                     module_id: super::MODULE_ID.into(),
                 },
-                // No project is invented for an operator calling from an arbitrary directory.
-                subc_protocol::BindIdentity::new(&self.cwd, "ck-entorhinal", "operator"),
+                subc_protocol::BindIdentity::new("ck-entorhinal", "operator"),
                 body,
                 options,
             )
@@ -1575,7 +1566,6 @@ fn call(
     command: &Command,
     method: &str,
     params: Value,
-    cwd: &str,
 ) -> Result<Value, (u8, String)> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
@@ -1603,7 +1593,6 @@ fn call(
             workspace_document::execute(
                 &ConsumerCaller {
                     consumer: &consumer,
-                    cwd: cwd.to_owned(),
                 },
                 params,
             )
@@ -1612,7 +1601,6 @@ fn call(
             execute_roles(
                 &ConsumerCaller {
                     consumer: &consumer,
-                    cwd: cwd.to_owned(),
                 },
                 method,
                 params,
@@ -1622,7 +1610,6 @@ fn call(
             execute_agents(
                 &ConsumerCaller {
                     consumer: &consumer,
-                    cwd: cwd.to_owned(),
                 },
                 command,
                 method,
@@ -1633,7 +1620,6 @@ fn call(
             execute_move_root(
                 &ConsumerCaller {
                     consumer: &consumer,
-                    cwd: cwd.to_owned(),
                 },
                 params,
                 command.json,
@@ -1657,12 +1643,7 @@ fn call(
                     subc_protocol::RouteTarget::ManagementSurface {
                         module_id: super::MODULE_ID.into(),
                     },
-                    // `project_id` is deliberately left unset: this is the operator
-                    // CLI, which has no registered project to resolve and must not
-                    // invent one. Absent means "key on the triple", which is the
-                    // honest answer for a caller that binds from whatever directory
-                    // the operator happened to be standing in.
-                    subc_protocol::BindIdentity::new(cwd, "ck-entorhinal", "operator"),
+                    subc_protocol::BindIdentity::new("ck-entorhinal", "operator"),
                     body,
                     options,
                 )
@@ -4291,7 +4272,8 @@ mod cli_transport_tests {
                 key: generate_key().unwrap(),
                 daemon_id: generate_daemon_id().unwrap(),
                 pid: std::process::id(),
-                daemon_ver: "cli-test".into(),
+                // The SDK only sends project-free binds to compatible daemon versions.
+                daemon_ver: "0.39.0".into(),
             };
             let path = root.join("connection.json");
             write_atomic(&path, &info).unwrap();
@@ -4314,6 +4296,11 @@ mod cli_transport_tests {
                         if request["op"] != "route.open" {
                             continue;
                         }
+                        let identity = request["identity"].as_object().unwrap();
+                        assert_eq!(identity["harness"], "ck-entorhinal");
+                        assert_eq!(identity["session"], "operator");
+                        assert!(!identity.contains_key("project_root"));
+                        assert!(!identity.contains_key("project_id"));
                         (
                             FrameType::Response,
                             serde_json::to_vec(
@@ -4350,7 +4337,6 @@ mod cli_transport_tests {
                 CliCaller::call(
                     &ConsumerCaller {
                         consumer: &consumer,
-                        cwd: "/tmp/project".into(),
                     },
                     "agent.dispose",
                     json!({"agent_id":"agent_01234567","request_key":"key"}),

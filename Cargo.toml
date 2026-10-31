@@ -5,10 +5,10 @@ members = ["crates/entorhinal-core", "crates/entorhinal-module", "crates/entorhi
 [workspace.dependencies]
 # Every CortexKit dependency comes from crates.io, so a fresh clone builds with
 # no sibling checkouts beside it.
-subc-client-rs = "0.32.18"
-subc-control = "0.33.4"
-subc-protocol = "0.33.5"
-subc-transport = "0.14.1"
+subc-client-rs = "0.33.0"
+subc-control = "0.34.0"
+subc-protocol = "0.34.1"
+subc-transport = "0.15.0"
 subc-jsonc = "0.1.1"
 
 cortexkit-paths = "0.1.1"

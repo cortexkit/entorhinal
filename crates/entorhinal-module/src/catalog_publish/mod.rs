@@ -178,7 +178,7 @@ impl ProjectsHandler {
         let package_dir = request.package_dir.clone();
         let scope = request.scope.clone();
         let sql_guard = self.catalog_sql.begin();
-        let (canonical, archive, checked, folder, registries) =
+        let (archive, checked, folder, registries) =
             crate::catalog_sql::until(deadline, "catalog publish preparation", move || {
                 let _sql_guard = sql_guard;
                 let canonical =
@@ -191,7 +191,6 @@ impl ProjectsHandler {
                 let checked = catalog::publish::check(&archive, &scope).map_err(refused)?;
                 let registries = store.catalog_registries()?;
                 Ok((
-                    canonical,
                     archive,
                     checked,
                     store.store_folder().to_path_buf(),
@@ -241,7 +240,7 @@ impl ProjectsHandler {
         if *guard.cancelled.borrow() || Instant::now() >= deadline {
             return Err(OperatorConfirmError::Declined.into());
         }
-        let vault = self.catalog_publish.resolver(Path::new(&canonical))?;
+        let vault = self.catalog_publish.resolver()?;
         let signed = tokio::select! {
             biased;
             _ = guard.cancelled.wait_for(|closed| *closed) => return Err(OperatorConfirmError::Declined.into()),
@@ -281,7 +280,7 @@ impl ProjectsHandler {
     }
 }
 impl Publisher {
-    fn resolver(&self, root: &Path) -> Result<Arc<dyn CredentialResolver>, HandlerError> {
+    fn resolver(&self) -> Result<Arc<dyn CredentialResolver>, HandlerError> {
         #[cfg(test)]
         if let Some(vault) = &self.vault {
             return Ok(vault.clone());
@@ -290,7 +289,6 @@ impl Publisher {
             .ok_or_else(|| error("not_found", "supervised vault connection unavailable"))?;
         Ok(Arc::new(ClaustrumCredentialResolver::new(
             connection,
-            root.to_path_buf(),
             crate::MODULE_ID,
         )))
     }

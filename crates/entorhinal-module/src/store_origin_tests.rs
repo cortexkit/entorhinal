@@ -519,7 +519,7 @@ async fn adopt_store_uses_real_sdk_confirmation_on_fake_daemon() {
                     RouteTarget::ManagementSurface {
                         module_id: MODULE_ID.into(),
                     },
-                    BindIdentity::new("/scratch", "test", "ck-projects"),
+                    BindIdentity::new("test", "ck-projects"),
                 )
                 .with_principal(Principal::Direct),
             )

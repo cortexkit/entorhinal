@@ -713,7 +713,7 @@ impl Served {
                     RouteTarget::ManagementSurface {
                         module_id: crate::MODULE_ID.into(),
                     },
-                    BindIdentity::new("/tmp/watch", "test", "phone"),
+                    BindIdentity::new("test", "phone"),
                 )
                 .with_principal(reserved("callosum")),
             )

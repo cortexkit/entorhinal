@@ -5,7 +5,7 @@
 //! `intent / Module operations` pins `record.read`, `record.read_many` and
 //! `record.cas` on engram's `agent-sync` internal service. The shared SUBC
 //! connector binds with daemon-verified `reserved:entorhinal`, no flow/session
-//! scope, via `BindIdentity(cwd, ck-entorhinal, identity-log)` and default call
+//! scope, via `BindIdentity(ck-entorhinal, identity-log)` and default call
 //! options. Replies use the existing `{result: ...}` envelope and lowercase hex.
 //! `constraints / Subjects, Body, Closed refusal set` pins 256-byte subjects,
 //! 64 KiB bodies and the refusal set below. `intent / record.read_many` pins

@@ -39,7 +39,7 @@ use subc_protocol::{
         ManagementOperationKind, ManifestProvenance, ModuleManifest, OperationDelivery,
         ProviderRole,
     },
-    scope::ScopeStamp,
+    scope::{ScopeStamp, BIND_NO_PROJECT_CAPABILITY},
     ModuleHelloAckBody, Principal, PROTOCOL_VERSION,
 };
 
@@ -2763,6 +2763,8 @@ fn manifest() -> ModuleManifest {
     // surface require a new capability version.
     .capabilities(Some(CapabilityDeclarations {
         provides: vec![PROJECT_IDENTITY_CAPABILITY.to_owned(), "agent-identity/v1".to_owned(),
+            // Route admission trusts the daemon's session metadata, not a caller-supplied project.
+            BIND_NO_PROJECT_CAPABILITY.to_owned(),
             permissions::CAPABILITY.to_owned(),
             cortexkit_role_tool_provider::PROVIDES.to_owned(),
             cortexkit_role_agent_data::PROVIDES.to_owned(),
@@ -3351,7 +3353,7 @@ mod tests {
             subc_protocol::RouteTarget::ToolProvider {
                 module_id: MODULE_ID.into(),
             },
-            subc_protocol::BindIdentity::new(PathBuf::from("/tmp/project"), "test", "bind"),
+            subc_protocol::BindIdentity::new("test", "bind"),
         )
         .with_principal(Principal::Direct);
         handler.on_bind(&request).await;
@@ -5219,6 +5221,7 @@ mod tests {
             serde_json::json!([
                 "project-identity/v1",
                 "agent-identity/v1",
+                "bind-no-project/v1",
                 "permissions/v1",
                 "tool-provider/v1",
                 "agent-data/v1",
@@ -5266,6 +5269,7 @@ mod tests {
             .chain(value["capabilities"]["requires"].as_array().unwrap())
             .map(|v| v.as_str().unwrap())
             .collect();
+        assert!(declared.contains(&BIND_NO_PROJECT_CAPABILITY));
         let checked = [
             sessions::ORCHESTRATOR_CAPABILITY,
             sessions::HOST_CAPABILITY,
@@ -5573,7 +5577,7 @@ mod startup_tests {
                     subc_protocol::RouteTarget::ManagementSurface {
                         module_id: MODULE_ID.into(),
                     },
-                    subc_protocol::BindIdentity::new("/scratch/project", "test", "operator"),
+                    subc_protocol::BindIdentity::new("test", "operator"),
                 )
                 .with_principal(Principal::Direct),
             )

@@ -463,7 +463,7 @@ async fn bind_captures_scope_epoch_and_mode_and_route_gone_drops_authority() {
         RouteTarget::ToolProvider {
             module_id: MODULE_ID.into(),
         },
-        BindIdentity::new(f.root.clone(), "project", "session"),
+        BindIdentity::new("project", "session"),
     )
     .with_principal(reserved("prefrontal"))
     .with_scope(stamp.clone())

@@ -222,7 +222,6 @@ async fn real_daemon_supervises_projects_and_routes_resolve() {
             "op": "route.open",
             "target": RouteTarget::ManagementSurface { module_id: MODULE_ID.to_string() },
             "identity": BindIdentity::new(
-                project_root.clone(),
                 "projects-real-e2e".to_string(),
                 "session-1".to_string(),
             )

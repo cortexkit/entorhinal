@@ -1672,6 +1672,7 @@ mod tests {
             json!([
                 "project-identity/v1",
                 "agent-identity/v1",
+                "bind-no-project/v1",
                 "permissions/v1",
                 "tool-provider/v1",
                 "agent-data/v1",

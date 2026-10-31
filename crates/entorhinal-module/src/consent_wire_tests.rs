@@ -22,7 +22,8 @@ async fn production_client_opens_scoped_cingulate_target_sends_envelope_and_clos
         key: generate_key().unwrap(),
         daemon_id: generate_daemon_id().unwrap(),
         pid: std::process::id(),
-        daemon_ver: "cingulate-test-double".into(),
+        // The SDK only sends project-free binds to compatible daemon versions.
+        daemon_ver: "0.39.0".into(),
     };
     write_atomic(&path, &info).unwrap();
     let stamp: ScopeStamp = serde_json::from_value(json!({"owner":{"kind":"reserved", "module_id":"prefrontal"}, "ref":"head:alf", "scope_epoch":7, "kind":"head", "attributes":{"agent_id":"agent-a"}, "owner_authorized":true})).unwrap();
@@ -60,6 +61,10 @@ async fn production_client_opens_scoped_cingulate_target_sends_envelope_and_clos
                             json!({"op":"server.describe", "protocol_ver":subc_protocol::PROTOCOL_VERSION, "subc_ops":[], "capabilities":[], "connected_clients":1})
                         }
                         "route.open" => {
+                            let identity = body["identity"].as_object().unwrap();
+                            assert_eq!(identity["harness"], "ck-entorhinal");
+                            assert!(!identity.contains_key("project_root"));
+                            assert!(!identity.contains_key("project_id"));
                             assert_eq!(
                                 body["target"],
                                 json!({"kind":"management_surface", "module_id":"cingulate"})

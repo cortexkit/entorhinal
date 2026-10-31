@@ -2430,7 +2430,7 @@ pub(super) mod tests {
             subc_protocol::RouteTarget::ToolProvider {
                 module_id: "entorhinal".into(),
             },
-            subc_protocol::BindIdentity::new(f.dir.clone(), "test", "bind"),
+            subc_protocol::BindIdentity::new("test", "bind"),
         )
         .with_principal(reserved("thalamus-harness"));
         f.handler.on_bind(&request).await;

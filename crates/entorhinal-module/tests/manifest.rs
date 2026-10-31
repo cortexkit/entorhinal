@@ -73,6 +73,7 @@ fn manifest_flag_prints_the_manifest_with_the_provided_capability() {
         serde_json::json!([
             "project-identity/v1",
             "agent-identity/v1",
+            "bind-no-project/v1",
             "permissions/v1",
             "tool-provider/v1",
             "agent-data/v1",
