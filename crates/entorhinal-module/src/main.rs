@@ -3416,6 +3416,7 @@ mod tests {
             }
             let executive = authorize_write(method, Some(&reserved(WRITER_MODULE)));
             if *method == store_origin::ADOPT
+                || *method == "move_root_to_new_project"
                 || *method == "identity_log.enable"
                 || catalog_ops::WRITES.contains(method)
                 || *method == catalog_publish::PUBLISH
