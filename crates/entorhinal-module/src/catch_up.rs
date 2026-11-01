@@ -148,6 +148,7 @@ impl Worker {
     }
 
     async fn background(self) {
+        let mut outage = OutageLog::default();
         let mut ticks = tokio::time::interval(INTERVAL);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -194,9 +195,18 @@ impl Worker {
                         self.run(&store, deadline).await
                     };
                     super::enable::refresh(&self.health, &store);
-                    if let Err(error) = result {
-                        super::enable::record_error(&self.health, &error);
-                        tracing::warn!(target: "identity_log", "catch-up: {}: {}", error.code, error.message);
+                    match result {
+                        Err(error) => {
+                            super::enable::record_error(&self.health, &error);
+                            if let Some(line) = outage.failed(&error.code, &error.message) {
+                                tracing::warn!(target: "identity_log", "{line}");
+                            }
+                        }
+                        Ok(()) => {
+                            if let Some(line) = outage.succeeded() {
+                                tracing::info!(target: "identity_log", "{line}");
+                            }
+                        }
                     }
                 }
             }
@@ -479,6 +489,54 @@ impl Worker {
                 .fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
+    }
+}
+
+/// Turns the background catch-up's per-attempt results into log lines for an
+/// operator. The loop retries every 30 s, so logging each failure buried one
+/// outage under hundreds of identical warnings (381 during an engram outage of
+/// about three hours). This reports the first failure, any change of failure
+/// code, and the recovery with how many attempts failed. The health counters
+/// still record every attempt.
+#[derive(Default)]
+struct OutageLog {
+    /// The failure code of the outage in progress and how many attempts it
+    /// has failed so far; `None` while catch-up is working.
+    current: Option<(String, u64)>,
+}
+
+impl OutageLog {
+    /// A line to log for this failed attempt, or `None` when it only repeats
+    /// the outage already reported.
+    fn failed(&mut self, code: &str, message: &str) -> Option<String> {
+        match &mut self.current {
+            Some((current, attempts)) if current == code => {
+                *attempts += 1;
+                None
+            }
+            Some((current, attempts)) => {
+                let line = format!(
+                    "catch-up: {code}: {message} (was {current} for {attempts} attempts; repeats are not logged)"
+                );
+                self.current = Some((code.to_owned(), 1));
+                Some(line)
+            }
+            None => {
+                self.current = Some((code.to_owned(), 1));
+                Some(format!(
+                    "catch-up: {code}: {message} (retrying every {} s; repeats are not logged)",
+                    INTERVAL.as_secs()
+                ))
+            }
+        }
+    }
+
+    /// A line to log when catch-up works again after an outage, or `None`
+    /// when no outage was in progress.
+    fn succeeded(&mut self) -> Option<String> {
+        self.current.take().map(|(code, attempts)| {
+            format!("catch-up recovered after {attempts} failed attempts ({code})")
+        })
     }
 }
 
@@ -1809,5 +1867,41 @@ mod tests {
             assert_eq!(audit(&f.store()).len(), 1);
             assert!(f.store().verify().unwrap().ok);
         }
+    }
+
+    #[test]
+    fn outage_log_reports_an_outage_once_and_its_recovery() {
+        let mut log = OutageLog::default();
+        assert_eq!(log.succeeded(), None, "no outage, nothing to report");
+
+        let first = log
+            .failed("engram_unavailable", "deadline expired")
+            .unwrap();
+        assert!(first.starts_with("catch-up: engram_unavailable: deadline expired"));
+        for _ in 0..300 {
+            assert_eq!(log.failed("engram_unavailable", "deadline expired"), None);
+        }
+
+        let changed = log
+            .failed("engram_key_unavailable", "engram key unavailable")
+            .unwrap();
+        assert!(
+            changed.contains("was engram_unavailable for 301 attempts"),
+            "{changed}"
+        );
+        assert_eq!(
+            log.failed("engram_key_unavailable", "engram key unavailable"),
+            None
+        );
+
+        assert_eq!(
+            log.succeeded().as_deref(),
+            Some("catch-up recovered after 2 failed attempts (engram_key_unavailable)")
+        );
+        assert_eq!(log.succeeded(), None, "recovery is reported once");
+        assert!(
+            log.failed("engram_unavailable", "again").is_some(),
+            "a new outage is reported"
+        );
     }
 }
