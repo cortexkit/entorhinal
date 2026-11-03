@@ -206,7 +206,11 @@ pub(crate) fn error_code(outcome: HandlerOutcome) -> String {
 pub(crate) fn response_body(outcome: HandlerOutcome) -> Vec<u8> {
     match outcome {
         HandlerOutcome::Response(body) => body,
-        _ => panic!("expected provider response"),
+        HandlerOutcome::Error { code, message, .. }
+        | HandlerOutcome::ErrorWithDetail { code, message, .. } => {
+            panic!("expected provider response, got {code}: {message}")
+        }
+        HandlerOutcome::Streamed => panic!("expected provider response, got stream"),
     }
 }
 
@@ -216,6 +220,49 @@ pub(crate) fn tool_result(outcome: HandlerOutcome) -> Value {
 
 pub(crate) fn module_result(outcome: HandlerOutcome) -> Value {
     serde_json::from_slice::<Value>(&response_body(outcome)).unwrap()["result"].clone()
+}
+
+#[test]
+fn tool_result_limits_exact_legacy_boundary() {
+    let at_limit = json!("é".repeat(MAX_MODEL_VISIBLE_BYTES / 2));
+    assert_eq!(
+        legacy_model_visible_bytes(&at_limit),
+        MAX_MODEL_VISIBLE_BYTES
+    );
+    let encoded = encode_tool_reply(at_limit.clone()).unwrap();
+    assert_eq!(serde_json::from_slice::<Value>(&encoded).unwrap(), at_limit);
+    assert_eq!(
+        encode_tool_reply(json!("é".repeat(MAX_MODEL_VISIBLE_BYTES / 2 + 1)))
+            .unwrap_err()
+            .code,
+        "tool_result_too_large"
+    );
+    // Legacy objects count JSON escaping, not just the lengths of their strings.
+    assert_eq!(
+        encode_tool_reply(json!({"text":"\u{0000}".repeat(MAX_MODEL_VISIBLE_BYTES / 6)}))
+            .unwrap_err()
+            .code,
+        "tool_result_too_large"
+    );
+}
+
+#[tokio::test]
+async fn tool_result_limits_refusal_messages() {
+    let f = Fixture::new();
+    f.admit(Some(&f.stamp(2)));
+    let outcome = f
+        .call(
+            "agents_list_hires",
+            json!({"x".repeat(MAX_MODEL_VISIBLE_BYTES):""}),
+        )
+        .await;
+    match outcome {
+        HandlerOutcome::Error { code, message, .. } => {
+            assert_eq!(code, "tool_result_too_large");
+            assert!(message.len() <= MAX_MODEL_VISIBLE_BYTES);
+        }
+        _ => panic!("expected bounded refusal"),
+    }
 }
 
 #[tokio::test]
@@ -738,6 +785,9 @@ async fn provider_discovery_catalog_and_hello_agree_on_exact_tool_table() {
                 "labels".into(),
                 json!({"type":"array", "items":{"type":"string"}}),
             );
+        }
+        if index == 5 {
+            properties.insert("next".into(), json!({"type":"string", "description":"Opaque continuation from the previous page; omit on the first page."}));
         }
         if index < 5 || index == 6 {
             required.push("request_key");

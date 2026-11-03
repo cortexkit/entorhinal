@@ -234,6 +234,114 @@ async fn permissions_revocation_and_audit_verify_rebuild_acceptance() {
 }
 
 #[tokio::test]
+async fn tool_result_limits_creation_replies() {
+    use cortexkit_role_tool_provider::result::{
+        legacy_model_visible_bytes, MAX_MODEL_VISIBLE_BYTES,
+    };
+    let (f, fake) = fixture(0);
+    for _ in 0..4 {
+        fake.script("consent.await", Effect::Answer("approve_once"));
+    }
+    let workspace_id = "w".repeat(512);
+    let workspace = tool_result(f.call("projects_create_workspace", json!({"workspace_id":workspace_id,"name":"w".repeat(20_000),"request_key":"size-workspace"})).await);
+    let dir = f.root.join("large-project");
+    std::fs::create_dir_all(&dir).unwrap();
+    let project = tool_result(f.call("projects_register", json!({"workspace_id":workspace_id,"name":"p".repeat(20_000),"dir":dir,"request_key":"size-project"})).await);
+    let head = tool_result(f.call("agents_create_head", json!({"project_id":project["projectId"],"name":"🦊".repeat(24),"tag":"t".repeat(256),"request_key":"size-head"})).await);
+    for (name, reply) in [
+        ("projects_create_workspace", workspace),
+        ("projects_register", project),
+        ("agents_create_head", head),
+    ] {
+        let bytes = legacy_model_visible_bytes(&reply);
+        println!("{name}: {bytes} model-visible bytes");
+        assert!(bytes <= MAX_MODEL_VISIBLE_BYTES, "{name}: {bytes}");
+    }
+    let oversized = json!({"workspace_id":"oversized","name":"w".repeat(70_000),"request_key":"oversized-workspace"});
+    assert_eq!(
+        error_code(f.call("projects_create_workspace", oversized.clone()).await),
+        "tool_result_too_large"
+    );
+    let counts = f.counts();
+    assert_eq!(
+        error_code(f.call("projects_create_workspace", oversized).await),
+        "tool_result_too_large"
+    );
+    assert_eq!(
+        f.counts(),
+        counts,
+        "an oversized write reply remains replayable without repeating the mutation"
+    );
+}
+
+#[tokio::test]
+async fn tool_result_limits_hire_pages_reach_end() {
+    use cortexkit_role_tool_provider::result::{
+        legacy_model_visible_bytes, MAX_MODEL_VISIBLE_BYTES,
+    };
+    let (f, fake) = fixture(2);
+    store(&f).set_project_hire_cap("P", 121).unwrap();
+    fake.script("consent.await", Effect::Answer("approve_always_project"));
+    let labels = (0..16)
+        .map(|i| {
+            format!(
+                "{}{}",
+                "🦊".repeat(31),
+                char::from_u32(0x1f400 + i).unwrap()
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut expected = Vec::new();
+    let mut largest_hire = 0;
+    for i in 0..120 {
+        let reply = tool_result(f.call("agents_hire", json!({"request_key":format!("large-{i}"),"name":format!("{i:03}{}", "🦊".repeat(21)),"tag":"t".repeat(256),"labels":labels})).await);
+        let bytes = legacy_model_visible_bytes(&reply);
+        assert!(bytes <= MAX_MODEL_VISIBLE_BYTES);
+        largest_hire = largest_hire.max(bytes);
+        expected.push(reply["agent"]["agent_id"].as_str().unwrap().to_owned());
+    }
+    println!("agents_hire: {largest_hire} model-visible bytes");
+    let mut arguments = json!({});
+    let mut seen = Vec::new();
+    let mut pages = 0;
+    loop {
+        let page = tool_result(f.call("agents_list_hires", arguments).await);
+        let bytes = legacy_model_visible_bytes(&page);
+        println!("agents_list_hires page: {bytes} model-visible bytes");
+        assert!(bytes <= MAX_MODEL_VISIBLE_BYTES);
+        let agents = page["agents"].as_array().unwrap();
+        assert!(!agents.is_empty());
+        assert!(agents.len() <= 50);
+        seen.extend(
+            agents
+                .iter()
+                .map(|a| a["agent_id"].as_str().unwrap().to_owned()),
+        );
+        pages += 1;
+        assert!(pages < 120, "pagination must advance");
+        let Some(next) = page.get("next") else {
+            break;
+        };
+        assert!(next.is_string());
+        arguments = json!({"next":next});
+    }
+    assert!(pages > 1);
+    expected.sort();
+    seen.sort();
+    assert_eq!(seen, expected, "every hire appears exactly once");
+    let retired = tool_result(
+        f.call(
+            "agents_retire_hire",
+            json!({"agent_id":expected[0],"request_key":"retire-large"}),
+        )
+        .await,
+    );
+    let bytes = legacy_model_visible_bytes(&retired);
+    println!("agents_retire_hire: {bytes} model-visible bytes");
+    assert!(bytes <= MAX_MODEL_VISIBLE_BYTES);
+}
+
+#[tokio::test]
 async fn hire_card_grant_cap_and_own_retirement_acceptance() {
     let (f, fake) = fixture(2);
     fake.script("consent.await", Effect::Answer("approve_always_project"));

@@ -11,7 +11,9 @@ use cortexkit_role_tool_provider::{
         composition_digest, schema_digest, CatalogAnswer, CatalogRequest, CatalogTool, Reply,
     },
     describe::{Major, RoleDescribe},
-    errors, ops, CallMode, PROVIDES, REQUIRED_OPS,
+    errors, ops,
+    result::{legacy_model_visible_bytes, MAX_MODEL_VISIBLE_BYTES},
+    CallMode, PROVIDES, REQUIRED_OPS,
 };
 use entorhinal_core::agent::AgentRow;
 use serde_json::{json, Map, Value};
@@ -78,6 +80,9 @@ impl AgentTool {
                 "labels".into(),
                 json!({"type":"array", "items":{"type":"string"}}),
             );
+        }
+        if self.name == "agents_list_hires" {
+            properties.insert("next".into(), json!({"type":"string", "description":"Opaque continuation from the previous page; omit on the first page."}));
         }
         if self.writes && self.name != "catalog_install" {
             // Some regex engines let `$` precede a final newline. The negative
@@ -207,8 +212,18 @@ fn catalog(arguments: Map<String, Value>) -> Result<Value, HandlerError> {
 }
 
 pub(crate) fn encode_tool_reply(value: Value) -> Result<Vec<u8>, HandlerError> {
+    if legacy_model_visible_bytes(&value) > MAX_MODEL_VISIBLE_BYTES {
+        return Err(tool_result_too_large());
+    }
     serde_json::to_vec(&value)
         .map_err(|error| HandlerError::new("encode_failed", error.to_string()))
+}
+
+fn tool_result_too_large() -> HandlerError {
+    HandlerError::new(
+        "tool_result_too_large",
+        "The complete reply exceeds 65,536 model-visible bytes. Narrow names, labels or paths; for catalog reads, prepare a smaller package dependency set (fewer packages, checks and moves). No partial reply is returned. A write may already have completed; reuse its request_key or plan_id, not a new one.",
+    )
 }
 
 fn validate_request_key(arguments: &Value) -> Result<(), HandlerError> {
@@ -408,7 +423,14 @@ impl ProjectsHandler {
     pub(super) async fn handle_tool_request(&self, value: Value, key: RouteKey) -> HandlerOutcome {
         match self.execute_tool_request(value, key).await {
             Ok(body) => HandlerOutcome::Response(body),
-            Err(error) => error.into_outcome(),
+            Err(error) => {
+                // Refusals can echo unbounded input or downstream diagnostics too.
+                if error.message.len() > MAX_MODEL_VISIBLE_BYTES {
+                    tool_result_too_large().into_outcome()
+                } else {
+                    error.into_outcome()
+                }
+            }
         }
     }
 }

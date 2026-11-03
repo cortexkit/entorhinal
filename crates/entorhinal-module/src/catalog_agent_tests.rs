@@ -417,6 +417,87 @@ fn catalog_prepare_kind_slot_rejects_second_memory_profile_and_persona_roots() {
 }
 
 #[tokio::test]
+async fn tool_result_limits_catalog_replies() {
+    use cortexkit_role_tool_provider::result::{
+        legacy_model_visible_bytes, MAX_MODEL_VISIBLE_BYTES,
+    };
+    let f = Fixture::new().await;
+    *f.consumers.consumer.check_reply.lock().unwrap() =
+        json!({"ok":true,"card_section":"x".repeat(20_807)});
+    let prepared = tool_result(f.tools.call("catalog_prepare", f.spec("size")).await);
+    f.tools.handler.catalog_agent.finished.notified().await;
+    let plan = tool_result(
+        f.tools
+            .call("catalog_plan", json!({"plan_id":prepared["plan_id"]}))
+            .await,
+    );
+    assert_eq!(plan["state"], "ready");
+    f.grant();
+    let installed = tool_result(f.install(&plan).await);
+    let generations = tool_result(f.tools.call("catalog_generation", json!({})).await);
+    assert_eq!(generations["generations"].as_array().unwrap().len(), 1);
+    let mut generation = f
+        .store()
+        .catalog_agent_generations(&f.tools.agents[0])
+        .unwrap()
+        .remove(0);
+    let pin = generation.closure[0].clone();
+    let mut last_fitting = 0;
+    for i in 1..300 {
+        let mut extra = pin.clone();
+        extra.name = format!("@example/package-{i}");
+        generation.closure.push(extra);
+        let reply = json!({"generations":[generation_reply(&generation)]});
+        let bytes = legacy_model_visible_bytes(&reply);
+        match encode_tool_reply(reply) {
+            Ok(_) => {
+                assert!(bytes <= MAX_MODEL_VISIBLE_BYTES);
+                last_fitting = bytes;
+            }
+            Err(error) => {
+                assert_eq!(error.code, "tool_result_too_large");
+                assert!(bytes > MAX_MODEL_VISIBLE_BYTES);
+                break;
+            }
+        }
+    }
+    assert!(
+        last_fitting > 65_000,
+        "exercise the last fitting package set"
+    );
+    assert!(
+        legacy_model_visible_bytes(&json!({"generations":[generation_reply(&generation)]}))
+            > MAX_MODEL_VISIBLE_BYTES
+    );
+    println!(
+        "catalog_generation largest fitting fixture closure: {last_fitting} model-visible bytes"
+    );
+    for (name, reply) in [
+        ("catalog_prepare", prepared),
+        ("catalog_plan", plan),
+        ("catalog_install", installed),
+        ("catalog_generation", generations),
+    ] {
+        let bytes = legacy_model_visible_bytes(&reply);
+        println!("{name}: {bytes} model-visible bytes");
+        assert!(bytes <= MAX_MODEL_VISIBLE_BYTES, "{name}: {bytes}");
+    }
+    // Consumer sections can fit the consent card while exceeding a tool reply.
+    *f.consumers.consumer.check_reply.lock().unwrap() =
+        json!({"ok":true,"card_section":"x".repeat(70_000)});
+    let prepared = tool_result(f.tools.call("catalog_prepare", f.spec("oversized")).await);
+    f.tools.handler.catalog_agent.finished.notified().await;
+    assert_eq!(
+        error_code(
+            f.tools
+                .call("catalog_plan", json!({"plan_id":prepared["plan_id"]}))
+                .await
+        ),
+        "tool_result_too_large"
+    );
+}
+
+#[tokio::test]
 async fn catalog_prepare_install_card_pins_ready_ack_active() {
     let f = Fixture::new().await;
     let plan = f.prepare("first").await;

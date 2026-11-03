@@ -283,6 +283,26 @@ is asynchronous, installation reuses the consent coordinator, and generation rea
 omit superseded generations, which are local bookkeeping. See [catalog.md](catalog.md#agent-tools-and-consumer-protocol)
 for schemas, consumer kinds, refusals, idempotence and capability-token declarations.
 
+All agent tool replies use legacy JSON and are checked against the tool-provider
+limit of 65,536 model-visible bytes before sending. Oversized replies refuse with
+`tool_result_too_large`; they are never silently shortened. Refusals' messages obey
+the same limit. A write may already have completed when its reply is refused:
+reuse the same `request_key` (or `plan_id` for `catalog_install`) rather than
+starting a new write.
+
+`agents_list_hires {next?}` returns `{agents, next?}`: at most 50 of the caller's
+live hires per page, fewer when needed to fit the byte limit. Pass the opaque
+`next` string unchanged to get the following page; its absence marks the end.
+Pagination follows agent id order and is not a snapshot: hires created or retired
+between calls can change later pages. A single record that cannot fit refuses
+`tool_result_too_large` instead of returning an empty, non-advancing page.
+
+Catalog plans and generations are complete, internally related records (package
+closures, checks, moves and consent previews). They are not split across pages.
+If `catalog_plan` or `catalog_generation` refuses `tool_result_too_large`, prepare
+a smaller package dependency set with fewer packages, checks or moves. Large
+individual records on other tools require narrower names, labels or paths.
+
 | Operation | Kind | Who | What it does |
 |---|---|---|---|
 | `permissions.list {agent_id?}` | query | Direct, `reserved:cingulate` | List live grants on this machine. |

@@ -141,16 +141,34 @@ impl ProjectsHandler {
         let store = self.with_store(|s| Ok(s.clone()))?;
         if !tool.writes {
             let mut hires = Vec::new();
-            let mut cursor: Option<String> = None;
+            let mut cursor = arguments
+                .get("next")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             loop {
                 let body = store.agent_read(
                     "agent.list",
-                    json!({"role":"hiree","limit":200,"cursor":cursor}),
+                    json!({"role":"hiree","limit":1,"cursor":cursor}),
                 )?;
                 let page = core_result(&body)?;
                 let agents = page["agents"].as_array().ok_or_else(|| {
                     HandlerError::new("invalid_reply", "core agent.list reply has no agents array")
                 })?;
+                let next = match page.get("next_cursor") {
+                    None => None,
+                    Some(value) => Some(
+                        value
+                            .as_str()
+                            .filter(|cursor| !cursor.is_empty())
+                            .ok_or_else(|| {
+                                HandlerError::new(
+                                    "invalid_reply",
+                                    "core agent.list next_cursor must be a nonempty string",
+                                )
+                            })?
+                            .to_owned(),
+                    ),
+                };
                 for agent in agents {
                     let id = agent["agent_id"]
                         .as_str()
@@ -166,25 +184,28 @@ impl ProjectsHandler {
                         row.status == "live" && row.supervisor_agent_id.as_deref() == Some(caller)
                     }) {
                         hires.push(agent.clone());
+                        let mut reply = json!({"agents":hires});
+                        if let Some(next) = &next {
+                            reply["next"] = json!(next);
+                        }
+                        if cortexkit_role_tool_provider::result::legacy_model_visible_bytes(&reply)
+                            > cortexkit_role_tool_provider::result::MAX_MODEL_VISIBLE_BYTES
+                        {
+                            hires.pop();
+                            if hires.is_empty() {
+                                return encode_tool_reply(reply);
+                            }
+                            // Resume before the row that did not fit, never after it.
+                            return encode_tool_reply(json!({"agents":hires,"next":cursor}));
+                        }
                     }
                 }
-                cursor = match page.get("next_cursor") {
-                    None => None,
-                    Some(value) => Some(
-                        value
-                            .as_str()
-                            .filter(|cursor| !cursor.is_empty())
-                            .ok_or_else(|| {
-                                HandlerError::new(
-                                    "invalid_reply",
-                                    "core agent.list next_cursor must be a nonempty string",
-                                )
-                            })?
-                            .to_owned(),
-                    ),
-                };
+                cursor = next;
                 if cursor.is_none() {
                     break;
+                }
+                if hires.len() == 50 {
+                    return encode_tool_reply(json!({"agents":hires,"next":cursor}));
                 }
             }
             return encode_tool_reply(json!({"agents":hires}));

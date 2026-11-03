@@ -26,7 +26,7 @@ entorhinal-catalog = { path = "../entorhinal-catalog" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 cortexkit-role-agent-data = "0.2.4"
-cortexkit-role-tool-provider = "=0.14.0"
+cortexkit-role-tool-provider = "=0.15.0"
 cortexkit-store-types = { workspace = true }
 cortexkit-log = { workspace = true }
 tracing = { workspace = true }
