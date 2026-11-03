@@ -277,15 +277,39 @@ impl RegistryStore {
     }
 }
 
-pub(crate) fn agent_where_in(
+pub(crate) struct ClaimView {
+    pub known: bool,
+    pub claim: CachedClaim,
+    pub own: Option<String>,
+    pub read_at_ms: Option<i64>,
+}
+
+impl ClaimView {
+    pub fn status(&self) -> &'static str {
+        if self.claim.epoch == 0 {
+            "unclaimed"
+        } else if self.claim.holder.is_some() && self.claim.holder == self.own {
+            "held_here"
+        } else {
+            "held_elsewhere"
+        }
+    }
+
+    pub fn holder_name(&self, conn: &Connection) -> rusqlite::Result<Option<String>> {
+        if self.own.is_some() {
+            holder_name(conn, self.claim.holder.as_deref())
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// `agent.where` and `agent.session_residence` share the sharing fallback and holder comparison.
+pub(crate) fn load_claim_view(
     conn: &Connection,
     id: &str,
     foreign: bool,
-) -> Result<AgentWhere, agent::AgentMutationError> {
-    let row = agent::load_row(conn, id)?.ok_or_else(|| refusal("unknown_agent", None))?;
-    if let Some(gone) = row.gone() {
-        return Err(refusal("gone", Some(gone)));
-    }
+) -> rusqlite::Result<ClaimView> {
     let claim = if foreign { None } else { load_claim(conn, id)? };
     // Claims live only in the shared log. While sharing has never
     // been turned on, no other machine can hold this agent, so having no
@@ -303,31 +327,40 @@ pub(crate) fn agent_where_in(
     let known = claim.is_some() || sharing_off;
     let read_at_ms = claim.as_ref().map(|c| c.read_at_ms);
     let claim = claim.unwrap_or_else(|| unclaimed(0, !sharing_off, false));
-    if claim.integrity_failed {
+    Ok(ClaimView {
+        known,
+        claim,
+        own: self_author(conn)?,
+        read_at_ms,
+    })
+}
+
+pub(crate) fn agent_where_in(
+    conn: &Connection,
+    id: &str,
+    foreign: bool,
+) -> Result<AgentWhere, agent::AgentMutationError> {
+    let row = agent::load_row(conn, id)?.ok_or_else(|| refusal("unknown_agent", None))?;
+    if let Some(gone) = row.gone() {
+        return Err(refusal("gone", Some(gone)));
+    }
+    let view = load_claim_view(conn, id, foreign)?;
+    if view.claim.integrity_failed {
         return Err(refusal("claim_integrity_failed", None));
     }
-    let own = self_author(conn)?;
-    let status = if claim.epoch == 0 {
-        "unclaimed"
-    } else if claim.holder.is_some() && claim.holder == own {
-        "held_here"
-    } else {
-        "held_elsewhere"
-    };
+    let status = view.status();
+    let holder_name = view.holder_name(conn)?;
+    let claim = view.claim;
     let (moving, move_errors, move_warnings, move_diagnostics) =
         crate::move_store::where_moves(conn, id)?;
     Ok(AgentWhere {
-        known,
+        known: view.known,
         status,
-        holder_name: if own.is_some() {
-            holder_name(conn, claim.holder.as_deref())?
-        } else {
-            None
-        },
+        holder_name,
         holder: claim.holder,
         epoch: claim.epoch,
         cut_id: claim.cut_id,
-        read_at_ms,
+        read_at_ms: view.read_at_ms,
         stale: claim.stale,
         moving,
         move_errors,

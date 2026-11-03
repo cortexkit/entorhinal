@@ -1,0 +1,3 @@
+[
+  {"request":{"method":"agent.session_residence","params":{"runner":"broca","session":"missing"}},"principal":{"kind":"reserved","moduleId":"phone"},"reply":{"result":{"state":"not_registered"}}}
+]

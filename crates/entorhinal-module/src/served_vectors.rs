@@ -25,6 +25,9 @@ use crate::{
 #[path = "watch_tests.rs"]
 mod watch_tests;
 
+#[path = "served_vectors/session_residence_tests.rs"]
+mod session_residence_tests;
+
 const DIRECT: RouteKey = (901, 1);
 const CORE: RouteKey = (902, 1);
 const READER: RouteKey = (903, 1);

@@ -43,6 +43,7 @@ mod root_keys;
 pub mod session_carry;
 pub mod session_lifecycle;
 pub mod session_network;
+pub mod session_residence;
 pub mod shared_entry;
 pub mod store_origin;
 pub mod user_profile;

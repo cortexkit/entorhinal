@@ -41,6 +41,7 @@ pub(super) const SESSION_LIVENESS: &str = "agent.session_liveness";
 pub(super) const SESSIONS: &str = "agent.sessions";
 /// Resolves a runner's session id to its binding.
 pub(super) const SESSION_FOR_RUNNER: &str = "agent.session_for_runner";
+pub(super) const SESSION_RESIDENCE: &str = "agent.session_residence";
 pub(super) const SESSION_FOR_HARNESS: &str = "agent.session_for_harness";
 /// The session reads, open to every caller like the other reads.
 pub(super) const READ_METHODS: &[&str] = &[
@@ -49,6 +50,7 @@ pub(super) const READ_METHODS: &[&str] = &[
     SESSION_LIVENESS,
     SESSIONS,
     SESSION_FOR_RUNNER,
+    SESSION_RESIDENCE,
     SESSION_FOR_HARNESS,
 ];
 
@@ -921,6 +923,15 @@ impl ProjectsHandler {
             "ref_kind": binding.ref_kind,
             "ref": binding.session_ref,
         }))
+    }
+
+    pub(super) fn session_residence(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
+        let request: SessionForRunnerRequest = decode(params)?;
+        runner_bounds(&request.runner)?;
+        bounded("session", &request.session, SESSION_ID_MAX)?;
+        encode_result(
+            self.with_store(|store| store.session_residence(&request.runner, &request.session))?,
+        )
     }
 
     /// The binding a runner's session id names, so a caller holding only

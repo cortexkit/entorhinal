@@ -309,6 +309,7 @@ the cache, so it works offline and never waits on engram.
 | `agent.end_session {harness, session, runner?}` | mutate | orchestrator only | Mark the binding of a host session ended at the module's clock. Replies `{found: true, ended_at_ms}`, the first end time again on a repeat (nothing written), or `{found: false}` for an unknown session. A runner different from the recorded one refuses `runner_mismatch`. |
 | `agent.sessions {agent_id, cursor?, limit?, open?}` | query | any | One agent's session bindings, newest registration first, ties by `(ref_kind, ref)`: `{sessions: [{runner, session, harness, ref_kind, ref, project_root, registered_at_ms, ended_at_ms, liveness, network}], next_cursor}`. `limit` defaults to 100, at most 500; `next_cursor` is opaque and null on the last page. `liveness` is `active`, `gone` or `unknown` as `agent.session_liveness` answers it, and `gone` when the mirror cannot vouch for a session whose binding has ended. `network` is the binding's current network value, `unknown` with no history. A retired agent still lists; an unknown id refuses `unknown_agent`. |
 | `agent.session_for_runner {runner, session}` | query | any | The agent, harness, reference, project root and end time bound to a runner's session id, with `network` (the current value, `unknown` with no history) and `network_history: [{network, since_ms}]`, oldest first and empty with no history. Sessions registered without a runner are `not_found` here; look those up with `agent.session_for_harness {harness, session}`. |
+| `agent.session_residence {runner, session}` | query | any | Whether this machine holds a session's agent, from one local read snapshot of its binding, open move, cached claim and self identity. Replies `{state, agent_id?, held_on?, holder?, holder_name?, epoch?, cut_id?, read_at_ms?}` with absent fields omitted, never null. Unknown fields, an empty or over-64-byte runner, control characters in the runner, or an empty or over-256-byte session refuse `invalid_request`. |
 | `agent.session_for_harness {harness, session}` | query | any | Resolve a host session regardless of its runner, with exactly the same reply as `agent.session_for_runner`: `agent_id`, `runner` (null when unrecorded), `session`, `harness`, `ref_kind`, `ref`, `project_root`, `ended_at_ms`, `network`, `network_history` and `incarnation`, plus `heldOn` when data is on another machine. Requires a 1–32-byte harness and 1–256-byte session; unknown fields or malformed requests refuse `invalid_request`, and unknown sessions refuse `not_found`. |
 | `agent.for_session` | query | any | The agent and reference bound to a host session. |
 | `agent.session_for_ref` | query | any | The agent, host session and project root bound to a reference, with `runner` (the bare module id of the llm-runner hosting the session) only when the binding has one recorded; a binding without one omits the key rather than sending `null`. Re-registering without a runner keeps the recorded one, so the reply still names it. |
@@ -320,6 +321,33 @@ the cache, so it works offline and never waits on engram.
 | `agent.refresh_claims` | mutate | Direct | Refresh live agents' cached claims from engram. |
 | `role.read` | query | any | Which machine holds a role, from the cached claim. |
 | `role.take` | mutate | Direct, with operator confirmation | Make this machine the role's holder. |
+
+`agent.session_residence` is intended for restoring a session from backup before
+making it writable. Its precedence is:
+
+1. No `(runner, session)` binding: only `{state: "not_registered"}` (no move evidence).
+2. The binding has `held_on`: `elsewhere`, with `agent_id` and `held_on` exactly as
+   stored. This is a store-origin machine ID, not an engram author. No name is
+   given because there is no trustworthy join to the author-keyed `member_name`
+   table. `holder`, `holder_name` and claim fields are omitted in this branch.
+3. The agent has a local open move, using the same definition as `agent.where`:
+   `moving`, with `agent_id`. Wait before restoring writability.
+4. An unread claim with sharing on or joining, a stale or integrity-failed claim,
+   or an epoch at least 1 without this machine's author identity: `unknown`.
+5. A usable claim at epoch at least 1: `here` when held by this machine's author,
+   otherwise `elsewhere`.
+6. Epoch 0 with no holder: `unclaimed`. An absent claim also means verified
+   `unclaimed` at epoch 0 while sharing has never been enabled, just as in `agent.where`.
+
+From the claim checks onward the reply includes `agent_id` and the available
+claim fields. With no cache row and sharing on, no claim fields are invented.
+Only `here`, or `unclaimed` at epoch 0, permits making the restored session
+writable; `elsewhere` and `unknown` require read-only access. Residence is stricter
+than `agent.where`: the latter retains its existing status even for stale claims,
+refuses integrity-failed claims, and reports a positive-epoch claim without self
+identity as `held_elsewhere`. Neither read contacts engram; the periodic 30-second
+claim refresh supplies the local cache. Served examples are in
+[`agent-session-residence-v1`](../test-vectors/agent-session-residence-v1/README.md).
 
 Registering a different `ref` for the same `(harness, session_id)`, `agent_id`
 and `ref_kind` re-keys the existing binding in the registration transaction.

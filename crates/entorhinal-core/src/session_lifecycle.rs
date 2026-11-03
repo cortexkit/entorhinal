@@ -5,7 +5,7 @@
 //! is written to `registry_journal` or sent to the identity log, so `verify`
 //! and journal replay never see it.
 
-use rusqlite::{params, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Serialize;
 
 use crate::{
@@ -284,42 +284,7 @@ impl RegistryStore {
         key: &str,
         session: &str,
     ) -> Result<Option<RunnerSessionBinding>, RegistryError> {
-        self.read(|conn| {
-            conn.query_row(
-                &format!(
-                    "SELECT agent_id, runner, session_id, harness, ref_kind, ref,
-                        NULLIF(project_root,''), ended_at_ms, held_on
-                 FROM session_binding WHERE {key_column}=?1 AND session_id=?2"
-                ),
-                params![key, session],
-                |row| {
-                    Ok(RunnerSessionBinding {
-                        agent_id: row.get(0)?,
-                        runner: row.get(1)?,
-                        session: row.get(2)?,
-                        harness: row.get(3)?,
-                        ref_kind: row.get(4)?,
-                        session_ref: row.get(5)?,
-                        project_root: row.get(6)?,
-                        ended_at_ms: row.get(7)?,
-                        network: crate::NETWORK_ABSENT.to_owned(),
-                        network_history: Vec::new(),
-                        held_on: row.get(8)?,
-                    })
-                },
-            )
-            .optional()?
-            .map(|mut binding| {
-                // Read in the same snapshot as the binding.
-                binding.network_history =
-                    network_history(conn, &binding.ref_kind, &binding.session_ref)?;
-                if let Some(current) = binding.network_history.last() {
-                    binding.network = current.network.clone();
-                }
-                Ok(binding)
-            })
-            .transpose()
-        })
+        self.read(|conn| session_binding_for_key_in(conn, key_column, key, session))
     }
 
     /// One page of an agent's session bindings, newest registration first,
@@ -429,3 +394,44 @@ pub(crate) fn runner_session_owner(
 #[cfg(test)]
 #[path = "session_lifecycle_tests.rs"]
 mod tests;
+
+pub(crate) fn session_binding_for_key_in(
+    conn: &Connection,
+    key_column: &str,
+    key: &str,
+    session: &str,
+) -> rusqlite::Result<Option<RunnerSessionBinding>> {
+    conn.query_row(
+        &format!(
+            "SELECT agent_id, runner, session_id, harness, ref_kind, ref,
+                NULLIF(project_root,''), ended_at_ms, held_on
+         FROM session_binding WHERE {key_column}=?1 AND session_id=?2"
+        ),
+        params![key, session],
+        |row| {
+            Ok(RunnerSessionBinding {
+                agent_id: row.get(0)?,
+                runner: row.get(1)?,
+                session: row.get(2)?,
+                harness: row.get(3)?,
+                ref_kind: row.get(4)?,
+                session_ref: row.get(5)?,
+                project_root: row.get(6)?,
+                ended_at_ms: row.get(7)?,
+                network: crate::NETWORK_ABSENT.to_owned(),
+                network_history: Vec::new(),
+                held_on: row.get(8)?,
+            })
+        },
+    )
+    .optional()?
+    .map(|mut binding| {
+        // Read in the same snapshot as the binding.
+        binding.network_history = network_history(conn, &binding.ref_kind, &binding.session_ref)?;
+        if let Some(current) = binding.network_history.last() {
+            binding.network = current.network.clone();
+        }
+        Ok(binding)
+    })
+    .transpose()
+}

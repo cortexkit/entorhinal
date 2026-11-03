@@ -1,0 +1,3 @@
+[
+  {"request":{"method":"agent.session_residence","params":{"runner":"broca","session":"restore"}},"principal":{"kind":"reserved","moduleId":"phone"},"reply":{"result":{"agent_id":"agent_0000000000000201","state":"unknown"}}}
+]
