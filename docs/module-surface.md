@@ -286,9 +286,25 @@ for schemas, consumer kinds, refusals, idempotence and capability-token declarat
 All agent tool replies use legacy JSON and are checked against the tool-provider
 limit of 65,536 model-visible bytes before sending. Oversized replies refuse with
 `tool_result_too_large`; they are never silently shortened. Refusals' messages obey
-the same limit. A write may already have completed when its reply is refused:
-reuse the same `request_key` (or `plan_id` for `catalog_install`) rather than
-starting a new write.
+the same limit. Write inputs are bounded before consent and revalidated before
+commit, so their complete success replies fit with room to spare. The encoder
+also checks writes as a safety net and logs a warning naming the tool if that
+bound is ever violated.
+
+For tool writes, workspace and project names are at most 1,024 UTF-8 bytes
+(workspace names are measured after trimming). A registered root is at most
+4,096 bytes, matching the session `project_root` limit. Workspace/project ids
+retain their existing 512-byte identity limit; agent names retain their existing
+24-scalar normalization rules, tags 256 bytes, and hire labels at most 16 strings
+of 32 scalars each. A root's existing implicit-alias owner id must also fit 512
+bytes, because registration echoes that id in collision warnings; choose a root
+without that collision if it does not fit. These additional tool-only size
+checks refuse `invalid_request` before a consent card or mutation. Existing
+identity validation codes still apply. `catalog_install` accepts a `plan_id` of
+1–128 printable ASCII bytes, the same limit as its consent request key.
+Existing records and management reads are not shortened or rewritten.
+A cached outcome stored before these caps could in principle still exceed the
+limit on replay; the safety guard and tool-naming warning also cover that path.
 
 `agents_list_hires {next?}` returns `{agents, next?}`: at most 50 of the caller's
 live hires per page, fewer when needed to fit the byte limit. Pass the opaque
@@ -300,8 +316,7 @@ between calls can change later pages. A single record that cannot fit refuses
 Catalog plans and generations are complete, internally related records (package
 closures, checks, moves and consent previews). They are not split across pages.
 If `catalog_plan` or `catalog_generation` refuses `tool_result_too_large`, prepare
-a smaller package dependency set with fewer packages, checks or moves. Large
-individual records on other tools require narrower names, labels or paths.
+a smaller package dependency set with fewer packages, checks or moves.
 
 | Operation | Kind | Who | What it does |
 |---|---|---|---|

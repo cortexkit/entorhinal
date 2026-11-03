@@ -222,7 +222,7 @@ pub(crate) fn encode_tool_reply(value: Value) -> Result<Vec<u8>, HandlerError> {
 fn tool_result_too_large() -> HandlerError {
     HandlerError::new(
         "tool_result_too_large",
-        "The complete reply exceeds 65,536 model-visible bytes. Narrow names, labels or paths; for catalog reads, prepare a smaller package dependency set (fewer packages, checks and moves). No partial reply is returned. A write may already have completed; reuse its request_key or plan_id, not a new one.",
+        "The complete reply exceeds 65,536 model-visible bytes. For catalog reads, prepare a smaller package dependency set (fewer packages, checks and moves). No partial reply is returned.",
     )
 }
 
@@ -411,6 +411,18 @@ impl ProjectsHandler {
         if !tool.writes || tool.name.starts_with("catalog_") {
             validate_arguments(tool, arguments)?;
         }
+        if tool.name == "catalog_install" {
+            let id = arguments["plan_id"].as_str().expect("validated plan id");
+            if id.len() > entorhinal_core::agent::limits::MAX_CATALOG_PLAN_ID_BYTES
+                || id.is_empty()
+                || !id.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+            {
+                return Err(HandlerError::new(
+                    "invalid_request_key",
+                    "plan_id must be 1–128 printable ASCII bytes",
+                ));
+            }
+        }
         if tool.name.starts_with("catalog_") {
             return self
                 .execute_catalog_tool(tool.name, arguments.clone(), admission, deadline)
@@ -421,9 +433,18 @@ impl ProjectsHandler {
     }
 
     pub(super) async fn handle_tool_request(&self, value: Value, key: RouteKey) -> HandlerOutcome {
+        let write_tool = TOOLS
+            .iter()
+            .find(|tool| tool.writes && value["name"].as_str() == Some(tool.name))
+            .map(|tool| tool.name);
         match self.execute_tool_request(value, key).await {
             Ok(body) => HandlerOutcome::Response(body),
             Err(error) => {
+                if error.code == "tool_result_too_large" {
+                    if let Some(tool) = write_tool {
+                        tracing::warn!(tool, "write tool exceeded its model-visible reply bound; input validation must prevent this");
+                    }
+                }
                 // Refusals can echo unbounded input or downstream diagnostics too.
                 if error.message.len() > MAX_MODEL_VISIBLE_BYTES {
                     tool_result_too_large().into_outcome()

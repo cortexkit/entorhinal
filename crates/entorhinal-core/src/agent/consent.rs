@@ -697,6 +697,11 @@ fn prepare_write(
     };
     let (target, grant_class, scope_id) = match tool {
         "projects_create_workspace" => {
+            tool_field_bytes(
+                text("name")?.trim(),
+                super::limits::MAX_WORKSPACE_NAME_BYTES,
+                "workspace name",
+            )?;
             let id = super::validate_workspace_id(text("workspace_id")?)
                 .map_err(|e| AgentMutationError::new("invalid_workspace_id", e.to_string()))?;
             if conn.query_row(
@@ -716,6 +721,16 @@ fn prepare_write(
             )
         }
         "projects_register" => {
+            tool_field_bytes(
+                text("name")?,
+                super::limits::MAX_PROJECT_NAME_BYTES,
+                "project name",
+            )?;
+            tool_field_bytes(
+                text("dir")?,
+                super::limits::MAX_PROJECT_ROOT_BYTES,
+                "project root",
+            )?;
             let id = super::validate_workspace_id(text("workspace_id")?)
                 .map_err(|e| AgentMutationError::new("invalid_workspace_id", e.to_string()))?;
             let label = workspace(&id)?;
@@ -729,6 +744,22 @@ fn prepare_write(
                 .transpose()?;
             crate::memory::validate_domain(domain)?;
             let dir = crate::mutations::canonical(text("dir")?)?;
+            // Registration echoes an existing alias owner twice. Check stored
+            // data too, both before consent and when the writer revalidates it.
+            let alias_owner: Option<String> = conn
+                .query_row(
+                    "SELECT project_id FROM project_alias WHERE old_id=?1",
+                    [crate::implicit_project_id(&dir)],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(owner) = alias_owner {
+                tool_field_bytes(
+                    &owner,
+                    super::limits::MAX_ALIAS_OWNER_BYTES,
+                    "implicit alias owner project id",
+                )?;
+            }
             if conn.query_row("SELECT EXISTS(SELECT 1 FROM project WHERE name=?1 UNION ALL SELECT 1 FROM project_root WHERE canonical_root=?2 UNION ALL SELECT 1 FROM derived_root_parent WHERE canonical_parent=?2)", params![text("name")?,dir], |r| r.get::<_,bool>(0))? {
                 return Err(AgentMutationError::new("project_exists", "project name or directory already registered"));
             }
@@ -756,6 +787,14 @@ fn prepare_write(
             let id = caller.project_id.as_deref().ok_or_else(|| {
                 AgentMutationError::new("invalid_role_shape", "head requires a project")
             })?;
+            let normalized = super::validate_project_id(id)
+                .map_err(|e| AgentMutationError::new("invalid_project_id", e.to_string()))?;
+            if normalized != id {
+                return Err(AgentMutationError::new(
+                    "invalid_project_id",
+                    "head project id must already be normalized",
+                ));
+            }
             check_hire_cap(conn, id)?;
             (
                 json!({"kind":"agent","label":text("name")?,"placement":project(id)?}),
@@ -791,6 +830,16 @@ fn prepare_write(
         grant_class,
         scope_id,
     })
+}
+
+fn tool_field_bytes(value: &str, maximum: usize, field: &str) -> Result<(), AgentMutationError> {
+    if value.len() > maximum {
+        return Err(AgentMutationError::new(
+            "invalid_request",
+            format!("{field} exceeds {maximum} UTF-8 bytes for a tool write"),
+        ));
+    }
+    Ok(())
 }
 
 impl RegistryStore {

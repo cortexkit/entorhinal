@@ -417,6 +417,43 @@ fn catalog_prepare_kind_slot_rejects_second_memory_profile_and_persona_roots() {
 }
 
 #[tokio::test]
+async fn tool_result_limits_catalog_prepare_maximum_reply() {
+    use cortexkit_role_tool_provider::result::{
+        legacy_model_visible_bytes, MAX_MODEL_VISIBLE_BYTES,
+    };
+    let f = Fixture::new().await;
+    let spec = f.spec(&"k".repeat(128));
+    let reply = tool_result(f.tools.call("catalog_prepare", spec).await);
+    f.tools.handler.catalog_agent.finished.notified().await;
+    assert_eq!(reply["plan_id"].as_str().unwrap().len(), 69);
+    assert_eq!(reply["state"], "pending");
+    let bytes = legacy_model_visible_bytes(&reply);
+    println!("catalog_prepare maximum reply: {bytes} model-visible bytes");
+    assert!(bytes <= MAX_MODEL_VISIBLE_BYTES - 16_384);
+}
+
+#[tokio::test]
+async fn tool_result_limits_catalog_install_maximum_reply() {
+    use cortexkit_role_tool_provider::result::{
+        legacy_model_visible_bytes, MAX_MODEL_VISIBLE_BYTES,
+    };
+    let f = Fixture::new().await;
+    let plan = f.prepare("maximum-install").await;
+    f.grant();
+    let mut reply = tool_result(f.install(&plan).await);
+    // Older stored plans can use the full consent-key limit, unlike generated ids.
+    reply["generation_id"] = json!(format!(
+        "generation:{}",
+        "\\".repeat(entorhinal_core::agent::limits::MAX_CATALOG_PLAN_ID_BYTES)
+    ));
+    reply["generation"] = json!(u64::MAX);
+    let bytes = legacy_model_visible_bytes(&reply);
+    println!("catalog_install maximum reply: {bytes} model-visible bytes");
+    assert!(bytes <= MAX_MODEL_VISIBLE_BYTES - 16_384);
+    encode_tool_reply(reply).unwrap();
+}
+
+#[tokio::test]
 async fn tool_result_limits_catalog_replies() {
     use cortexkit_role_tool_provider::result::{
         legacy_model_visible_bytes, MAX_MODEL_VISIBLE_BYTES,

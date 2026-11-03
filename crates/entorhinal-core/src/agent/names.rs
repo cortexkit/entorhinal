@@ -1,13 +1,12 @@
 use icu_casemap::CaseMapper;
 use icu_normalizer::ComposingNormalizer;
 
-use super::{AgentRegistryError, InvalidNameReason};
+use super::{limits::MAX_NAME_SCALARS, AgentRegistryError, InvalidNameReason};
 
 // Version 1 pins the name normalization pipeline, and its length limit applies
 // to both the display name and the folded lookup name in Unicode scalars.
 // Source: prefrontal 873870be8, crates/prefrontal-core-store/src/agent_registry.rs:25-29.
 pub const NAME_NORMALIZATION_VERSION: i64 = 1;
-const MAX_NAME_SCALARS: usize = 24;
 
 /// Keep the user's display spelling separately from the case-folded lookup key,
 /// alongside the version that identifies how the two names were normalized.

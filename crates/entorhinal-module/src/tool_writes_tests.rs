@@ -233,45 +233,267 @@ async fn permissions_revocation_and_audit_verify_rebuild_acceptance() {
         .is_some());
 }
 
-#[tokio::test]
-async fn tool_result_limits_creation_replies() {
+fn assert_write_reply_margin(name: &str, mut reply: Value) {
     use cortexkit_role_tool_provider::result::{
         legacy_model_visible_bytes, MAX_MODEL_VISIBLE_BYTES,
     };
+    fn widen_numbers(value: &mut Value) {
+        match value {
+            Value::Number(_) => *value = json!(u64::MAX),
+            Value::Array(values) => values.iter_mut().for_each(widen_numbers),
+            Value::Object(values) => values.values_mut().for_each(widen_numbers),
+            _ => {}
+        }
+    }
+    // Twenty decimal characters cover every timestamp and sequence representation.
+    widen_numbers(&mut reply);
+    let bytes = legacy_model_visible_bytes(&reply);
+    println!("{name} maximum reply: {bytes} model-visible bytes");
+    assert!(bytes <= MAX_MODEL_VISIBLE_BYTES - 16_384, "{name}: {bytes}");
+    crate::tool_provider::encode_tool_reply(reply).unwrap();
+}
+
+#[tokio::test]
+async fn tool_result_limits_workspace_maximum_reply() {
+    use entorhinal_core::agent::limits::*;
     let (f, fake) = fixture(0);
-    for _ in 0..4 {
-        fake.script("consent.await", Effect::Answer("approve_once"));
-    }
-    let workspace_id = "w".repeat(512);
-    let workspace = tool_result(f.call("projects_create_workspace", json!({"workspace_id":workspace_id,"name":"w".repeat(20_000),"request_key":"size-workspace"})).await);
-    let dir = f.root.join("large-project");
+    fake.script("consent.await", Effect::Answer("approve_once"));
+    let reply = tool_result(f.call("projects_create_workspace", json!({"workspace_id":"\0".repeat(MAX_SCOPE_BYTES),"name":"\0".repeat(MAX_WORKSPACE_NAME_BYTES),"request_key":"maximum-workspace"})).await);
+    assert_write_reply_margin("projects_create_workspace", reply);
+}
+
+fn alias_fixture(f: &Fixture, dir: &std::path::Path, owner_bytes: usize) {
+    let owner = "\0".repeat(owner_bytes);
+    store(f)
+        .register(entorhinal_core::RegisterRequest {
+            project_id: Some(owner.clone()),
+            name: "Alias owner".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let old = entorhinal_core::implicit_project_id(dir.to_str().unwrap());
+    rusqlite::Connection::open(f.root.join("store.db"))
+        .unwrap()
+        .execute(
+            "INSERT INTO project_alias(old_id,project_id) VALUES(?1,?2)",
+            rusqlite::params![old, owner],
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn tool_result_limits_register_maximum_reply() {
+    use entorhinal_core::agent::limits::*;
+    let (f, fake) = fixture(0);
+    let dir = f.root.join("maximum-project");
     std::fs::create_dir_all(&dir).unwrap();
-    let project = tool_result(f.call("projects_register", json!({"workspace_id":workspace_id,"name":"p".repeat(20_000),"dir":dir,"request_key":"size-project"})).await);
-    let head = tool_result(f.call("agents_create_head", json!({"project_id":project["projectId"],"name":"🦊".repeat(24),"tag":"t".repeat(256),"request_key":"size-head"})).await);
-    for (name, reply) in [
-        ("projects_create_workspace", workspace),
-        ("projects_register", project),
-        ("agents_create_head", head),
+    alias_fixture(&f, &dir, MAX_ALIAS_OWNER_BYTES);
+    fake.script("consent.await", Effect::Answer("approve_once"));
+    let mut reply = tool_result(f.call("projects_register", json!({"workspace_id":"W","name":"\0".repeat(MAX_PROJECT_NAME_BYTES),"dir":dir,"request_key":"maximum-project"})).await);
+    assert_eq!(reply["warnings"].as_array().unwrap().len(), 1);
+    assert_eq!(reply["implicitAliasCollisions"], reply["warnings"]);
+    assert_eq!(reply["roots"].as_array().unwrap().len(), 1);
+    assert_eq!(reply["derivedRootParents"], json!([]));
+    assert_eq!(reply["projectId"].as_str().unwrap().len(), 19);
+    // Build the maximum escaped path independently of filesystem path limits.
+    reply["roots"] = json!([format!(
+        "/{}",
+        "\u{0001}".repeat(MAX_PROJECT_ROOT_BYTES - 1)
+    )]);
+    assert_write_reply_margin("projects_register", reply);
+}
+
+fn maximum_project(f: &Fixture) -> String {
+    use entorhinal_core::agent::limits::MAX_SCOPE_BYTES;
+    let id = "\0".repeat(MAX_SCOPE_BYTES);
+    store(f)
+        .register(entorhinal_core::RegisterRequest {
+            project_id: Some(id.clone()),
+            name: "Maximum identity project".into(),
+            workspace_id: Some("W".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    id
+}
+
+#[tokio::test]
+async fn tool_result_limits_head_maximum_reply() {
+    use entorhinal_core::agent::limits::*;
+    let (f, fake) = fixture(0);
+    let project = maximum_project(&f);
+    fake.script("consent.await", Effect::Answer("approve_once"));
+    let reply = tool_result(f.call("agents_create_head", json!({"project_id":project,"name":"🦊".repeat(MAX_NAME_SCALARS),"tag":"\0".repeat(MAX_TAG_BYTES),"request_key":"maximum-head"})).await);
+    assert!(reply["agent"].get("avatar").is_none());
+    assert_eq!(reply["agent"]["labels"], json!([]));
+    assert_eq!(reply["agent"]["workspace_id"], Value::Null);
+    assert_write_reply_margin("agents_create_head", reply);
+}
+
+#[tokio::test]
+async fn tool_result_limits_hire_maximum_reply() {
+    use entorhinal_core::agent::limits::*;
+    let (mut f, fake) = fixture(2);
+    let project = maximum_project(&f);
+    let body = store(&f).agent_mutation("agent.create", json!({"role":"head","project_id":project,"name":"Maximum head","tag":"head","request_key":"maximum-head"}), 100).unwrap();
+    f.agents[2] = serde_json::from_slice::<Value>(&body).unwrap()["result"]["agent"]["agent_id"]
+        .as_str()
+        .unwrap()
+        .into();
+    f.admit(Some(&f.stamp(2)));
+    let labels = [0, 1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 16, 17, 18, 19, 20]
+        .into_iter()
+        .map(|code| {
+            format!(
+                "{}{}",
+                "\0".repeat(MAX_AGENT_LABEL_SCALARS - 1),
+                char::from_u32(code).unwrap()
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(labels.len(), MAX_AGENT_LABELS);
+    fake.script("consent.await", Effect::Answer("approve_once"));
+    let reply = tool_result(f.call("agents_hire", json!({"name":"🦊".repeat(MAX_NAME_SCALARS),"tag":"\0".repeat(MAX_TAG_BYTES),"labels":labels,"request_key":"maximum-hire"})).await);
+    assert!(reply["agent"].get("avatar").is_none());
+    assert_eq!(reply["agent"]["workspace_id"], Value::Null);
+    assert_write_reply_margin("agents_hire", reply);
+}
+
+#[tokio::test]
+async fn tool_result_limits_retire_maximum_reply() {
+    let (f, fake) = fixture(2);
+    fake.script("consent.await", Effect::Answer("approve_once"));
+    let hired = tool_result(
+        f.call("agents_hire", hire("maximum-retire-hire", "Retire me"))
+            .await,
+    );
+    let id = hired["agent"]["agent_id"].as_str().unwrap();
+    assert_eq!(id.len(), 22);
+    let reply = tool_result(
+        f.call(
+            "agents_retire_hire",
+            json!({"agent_id":id,"request_key":"maximum-retire"}),
+        )
+        .await,
+    );
+    assert_write_reply_margin("agents_retire_hire", reply);
+}
+
+#[tokio::test]
+async fn tool_result_limits_inputs_refuse_before_consent_and_writes() {
+    use entorhinal_core::agent::limits::*;
+    for (role, tool, arguments, code) in [
+        (
+            0,
+            "projects_create_workspace",
+            json!({"workspace_id":"oversized","name":"x".repeat(MAX_WORKSPACE_NAME_BYTES + 1),"request_key":"large"}),
+            "invalid_request",
+        ),
+        (
+            0,
+            "projects_create_workspace",
+            json!({"workspace_id":"x".repeat(MAX_SCOPE_BYTES + 1),"name":"Workspace","request_key":"large"}),
+            "invalid_workspace_id",
+        ),
+        (
+            0,
+            "projects_register",
+            json!({"workspace_id":"W","name":"x".repeat(MAX_PROJECT_NAME_BYTES + 1),"dir":"unused","request_key":"large"}),
+            "invalid_request",
+        ),
+        (
+            0,
+            "projects_register",
+            json!({"workspace_id":"W","name":"Project","dir":"x".repeat(MAX_PROJECT_ROOT_BYTES + 1),"request_key":"large"}),
+            "invalid_request",
+        ),
+        (
+            0,
+            "agents_create_head",
+            json!({"project_id":"x".repeat(MAX_SCOPE_BYTES + 1),"name":"Head","tag":"head","request_key":"large"}),
+            "invalid_project_id",
+        ),
+        (
+            0,
+            "agents_create_head",
+            json!({"project_id":"P","name":"x".repeat(MAX_NAME_SCALARS + 1),"tag":"head","request_key":"large"}),
+            "invalid_name",
+        ),
+        (
+            2,
+            "agents_hire",
+            json!({"name":"Hire","tag":"x".repeat(MAX_TAG_BYTES + 1),"request_key":"large"}),
+            "invalid_tag",
+        ),
+        (
+            2,
+            "agents_hire",
+            json!({"name":"Hire","tag":"hire","labels":vec!["x";MAX_AGENT_LABELS + 1],"request_key":"large"}),
+            "invalid_labels",
+        ),
+        (
+            2,
+            "agents_hire",
+            json!({"name":"Hire","tag":"hire","labels":["x".repeat(MAX_AGENT_LABEL_SCALARS + 1)],"request_key":"large"}),
+            "invalid_labels",
+        ),
+        (
+            2,
+            "catalog_install",
+            json!({"plan_id":"x".repeat(MAX_CATALOG_PLAN_ID_BYTES + 1)}),
+            "invalid_request_key",
+        ),
     ] {
-        let bytes = legacy_model_visible_bytes(&reply);
-        println!("{name}: {bytes} model-visible bytes");
-        assert!(bytes <= MAX_MODEL_VISIBLE_BYTES, "{name}: {bytes}");
+        let (f, fake) = fixture(role);
+        let before = f.counts();
+        assert_eq!(error_code(f.call(tool, arguments).await), code, "{tool}");
+        assert_eq!(fake.card_count(), 0, "{tool}");
+        assert_eq!(f.counts(), before, "{tool}");
     }
-    let oversized = json!({"workspace_id":"oversized","name":"w".repeat(70_000),"request_key":"oversized-workspace"});
+    let (f, fake) = fixture(0);
+    let dir = f.root.join("long-alias-owner");
+    std::fs::create_dir_all(&dir).unwrap();
+    alias_fixture(&f, &dir, MAX_ALIAS_OWNER_BYTES + 1);
+    let before = f.counts();
     assert_eq!(
-        error_code(f.call("projects_create_workspace", oversized.clone()).await),
-        "tool_result_too_large"
+        error_code(
+            f.call(
+                "projects_register",
+                json!({"workspace_id":"W","name":"Project","dir":dir,"request_key":"long-owner"})
+            )
+            .await
+        ),
+        "invalid_request"
     );
-    let counts = f.counts();
+    assert_eq!(fake.card_count(), 0);
+    assert_eq!(f.counts(), before);
+    let (f, fake) = fixture(2);
+    let project_id = "p".repeat(MAX_SCOPE_BYTES + 1);
+    store(&f)
+        .register(entorhinal_core::RegisterRequest {
+            project_id: Some(project_id.clone()),
+            name: "Oversized inherited id".into(),
+            workspace_id: Some("W".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    rusqlite::Connection::open(f.root.join("store.db"))
+        .unwrap()
+        .execute(
+            "UPDATE agent SET project_id=?1 WHERE agent_id=?2",
+            rusqlite::params![project_id, f.agents[2]],
+        )
+        .unwrap();
+    let before = f.counts();
     assert_eq!(
-        error_code(f.call("projects_create_workspace", oversized).await),
-        "tool_result_too_large"
+        error_code(
+            f.call("agents_hire", hire("long-inherited-id", "Hire"))
+                .await
+        ),
+        "invalid_project_id"
     );
-    assert_eq!(
-        f.counts(),
-        counts,
-        "an oversized write reply remains replayable without repeating the mutation"
-    );
+    assert_eq!(fake.card_count(), 0);
+    assert_eq!(f.counts(), before);
 }
 
 #[tokio::test]

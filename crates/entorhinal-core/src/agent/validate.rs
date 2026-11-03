@@ -4,15 +4,11 @@ use icu_casemap::CaseMapper;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{names::trim_unicode_15_1, AgentRegistryError, InvalidAgentLabelReason};
-
-// Identity fields have separate bounds: tag/scope ids use bytes, labels use
-// Unicode scalars, and a label list has its own count limit.
-// Source: prefrontal 873870be8, crates/prefrontal-core-store/src/agent_registry.rs:30-33.
-const MAX_TAG_BYTES: usize = 256;
-const MAX_AGENT_LABELS: usize = 16;
-const MAX_AGENT_LABEL_SCALARS: usize = 32;
-const MAX_SCOPE_BYTES: usize = 512;
+use super::{
+    limits::{MAX_AGENT_LABELS, MAX_AGENT_LABEL_SCALARS, MAX_SCOPE_BYTES, MAX_TAG_BYTES},
+    names::trim_unicode_15_1,
+    AgentRegistryError, InvalidAgentLabelReason,
+};
 
 /// Represent a GitHub App or user-token identity using credential references,
 /// never the credentials themselves; reject fields outside the tagged variant.

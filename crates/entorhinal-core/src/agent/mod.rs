@@ -11,6 +11,7 @@ mod feed;
 mod fleet;
 pub mod import;
 mod journal;
+pub mod limits;
 mod names;
 mod reads;
 pub mod schema;
