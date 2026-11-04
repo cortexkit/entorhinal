@@ -866,6 +866,67 @@ fn registration_refuses_a_runner_session_bound_elsewhere() {
         .unwrap();
 }
 
+/// A host session that moves to a new host kind on the same runner keeps its
+/// id (an OpenCode 1 session reopened under OpenCode 2). The same agent's
+/// registration under the new reference kind and harness takes the binding
+/// over in place, keeping its network history and caller role, and leaves no
+/// row under the old kind. Another agent is still refused.
+#[test]
+fn registration_moves_a_runner_session_to_a_new_host_kind() {
+    let f = Fixture::new();
+    let mut old = hosted("ses_1", "opencode", "ses_1", Some("thalamus-harness"));
+    old.ref_kind = "opencode-session";
+    old.network = Some(crate::NetworkStamp {
+        network: "yes",
+        clock: || 10,
+    });
+    f.store.register_session(&old).unwrap();
+    f.store
+        .set_session_network("opencode", "ses_1", "no", || 20)
+        .unwrap();
+    let history = f
+        .store
+        .session_network_history("opencode-session", "ses_1")
+        .unwrap();
+    assert_eq!(history.len(), 2);
+
+    let mut stranger = hosted("ses_1", "opencode2", "ses_1", Some("thalamus-harness"));
+    stranger.ref_kind = "opencode2-session";
+    stranger.agent_id = OTHER;
+    assert_eq!(
+        f.store.register_session(&stranger).unwrap_err().code,
+        "session_bound_elsewhere"
+    );
+
+    let mut new = hosted("ses_1", "opencode2", "ses_1", Some("thalamus-harness"));
+    new.ref_kind = "opencode2-session";
+    new.registered_by = "host";
+    new.now_ms = 30;
+    let bound = f.store.register_session(&new).unwrap();
+    assert_eq!(bound.ref_kind, "opencode2-session");
+    assert_eq!(bound.harness.as_deref(), Some("opencode2"));
+    assert_eq!(bound.registered_by, "orchestrator", "caller role is kept");
+    assert_eq!(f.count(), 1, "the binding moved; no second row");
+    assert_eq!(
+        f.store
+            .session_network_history("opencode2-session", "ses_1")
+            .unwrap(),
+        history
+    );
+    assert!(f
+        .store
+        .session_binding_for("opencode", "ses_1")
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        f.store
+            .session_binding_for("opencode2", "ses_1")
+            .unwrap()
+            .map(|b| b.agent_id),
+        Some(AGENT.to_owned())
+    );
+}
+
 #[test]
 fn session_binding_for_runner_finds_only_runner_rows() {
     let f = Fixture::new();

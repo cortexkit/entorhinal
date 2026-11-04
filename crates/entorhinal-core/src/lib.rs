@@ -1102,7 +1102,9 @@ impl RegistryStore {
     /// and a full history `network_history_full`, both with nothing written.
     /// A new reference for the same agent, reference kind and host session
     /// re-keys the existing binding and its network history, preserving its
-    /// caller role. Omitting the project root keeps a recorded root on either
+    /// caller role. So does a registration naming the binding's own runner
+    /// and session id under a new reference kind and harness for the same
+    /// agent: the session moved to a new host kind and kept its id. Omitting the project root keeps a recorded root on either
     /// kind of registration; a new binding without one reads as unknown.
     pub fn register_session(
         &self,
@@ -1224,10 +1226,46 @@ impl RegistryStore {
                 ));
             }
         }
-        let previous_ref = rekey.map_or(request.session_ref, |bound| bound.session_ref.as_str());
         // A runner owns its session namespace, so one runner and session id
-        // name one binding. The runner this registration leaves on the row is
-        // the one it names, or else the one the binding already had.
+        // name one binding. When a host session moves to a new host kind on
+        // the same runner and keeps its id (an OpenCode 1 session reopened
+        // under OpenCode 2), the same agent's registration under the new kind
+        // and harness takes that binding over in place, with its network
+        // history, rather than leaving the session bound under a kind no
+        // reader looks up any more.
+        let host_change = match (request.runner, &by_session, &by_ref) {
+            (Some(runner), None, None) => {
+                match session_lifecycle::runner_session_owner(tx, runner, request.session_id)? {
+                    Some((kind, session_ref, agent_id))
+                        if agent_id == request.agent_id && kind != request.ref_kind =>
+                    {
+                        // Never revive a session whose data another machine holds.
+                        let held_on: Option<String> = tx.query_row(
+                            "SELECT held_on FROM session_binding WHERE ref_kind=?1 AND ref=?2",
+                            params![kind, session_ref],
+                            |r| r.get(0),
+                        )?;
+                        if let Some(machine_id) = held_on {
+                            return Err(session_refusal(
+                                "session_on_other_machine",
+                                "session data is held on another machine",
+                                Some(serde_json::json!({"machine_id": machine_id})),
+                            ));
+                        }
+                        Some((kind, session_ref))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let (previous_kind, previous_ref) = match (&host_change, rekey) {
+            (Some((kind, session_ref)), _) => (kind.as_str(), session_ref.as_str()),
+            (None, Some(bound)) => (request.ref_kind, bound.session_ref.as_str()),
+            (None, None) => (request.ref_kind, request.session_ref),
+        };
+        // The runner this registration leaves on the row is the one it names,
+        // or else the one the binding already had.
         let runner = match request.runner {
             Some(runner) => Some(runner.to_owned()),
             None => tx
@@ -1243,7 +1281,7 @@ impl RegistryStore {
             if let Some((ref_kind, session_ref, agent_id)) =
                 session_lifecycle::runner_session_owner(tx, runner, request.session_id)?
             {
-                if ref_kind != request.ref_kind || session_ref != previous_ref {
+                if ref_kind != previous_kind || session_ref != previous_ref {
                     return Err(session_refusal(
                         "session_bound_elsewhere",
                         format!(
@@ -1263,7 +1301,7 @@ impl RegistryStore {
         let network_plan = match request.network {
             Some(stamp) => Some(session_network::plan_network(
                 tx,
-                request.ref_kind,
+                previous_kind,
                 previous_ref,
                 stamp.network,
             )?),
@@ -1275,6 +1313,17 @@ impl RegistryStore {
         // to the caller's transaction rather than causing it to roll back.
         tx.execute_batch("SAVEPOINT session_registration")?;
         let written = (|| -> Result<SessionBinding, agent::AgentMutationError> {
+            if let Some((kind, session_ref)) = &host_change {
+                tx.execute_batch("PRAGMA defer_foreign_keys=ON")?;
+                tx.execute(
+                    "UPDATE session_binding SET ref_kind=?1, ref=?2, harness=?3 WHERE ref_kind=?4 AND ref=?5",
+                    params![request.ref_kind, request.session_ref, request.harness, kind, session_ref],
+                )?;
+                tx.execute(
+                    "UPDATE session_network SET ref_kind=?1, ref=?2 WHERE ref_kind=?3 AND ref=?4",
+                    params![request.ref_kind, request.session_ref, kind, session_ref],
+                )?;
+            }
             if let Some(bound) = rekey {
                 tx.execute_batch("PRAGMA defer_foreign_keys=ON")?;
                 tx.execute(
@@ -1286,8 +1335,19 @@ impl RegistryStore {
                     params![request.session_ref, request.ref_kind, bound.session_ref],
                 )?;
             }
-            let registered_by =
-                rekey.map_or(request.registered_by, |bound| bound.registered_by.as_str());
+            let carried_by: Option<String> = match &host_change {
+                Some(_) => tx
+                    .query_row(
+                        "SELECT registered_by FROM session_binding WHERE ref_kind=?1 AND ref=?2",
+                        params![request.ref_kind, request.session_ref],
+                        |row| row.get(0),
+                    )
+                    .optional()?,
+                None => None,
+            };
+            let registered_by = carried_by.as_deref().unwrap_or_else(|| {
+                rekey.map_or(request.registered_by, |bound| bound.registered_by.as_str())
+            });
             // A registration means the session is live, so it clears any end
             // time an earlier run of the same reference left behind.
             tx.execute(
