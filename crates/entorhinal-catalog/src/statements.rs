@@ -270,6 +270,11 @@ pub struct NextStatus {
     pub sequence: u64,
     pub state: State,
 }
+/// Apply a publisher's withdraw or unwithdraw request at `request_time`, the
+/// registry's clock when the request arrived. The signing key must be
+/// unrevoked and its window must cover `request_time`. Outside `@cortexkit`,
+/// only a key with no `valid_until` has status authority; a root-certified
+/// `@cortexkit` key with a finite certificate holds it within that window.
 pub fn apply_status_request(
     path: &RequestPath,
     text: &str,
@@ -277,6 +282,7 @@ pub fn apply_status_request(
     sig: &str,
     held: &VersionStatus,
     keys: &[ScopeKey],
+    request_time: &str,
 ) -> Result<NextStatus, Refusal> {
     let s = shape(
         text,
@@ -328,7 +334,17 @@ pub fn apply_status_request(
     if !verify_signature(pk, "ck-status-request/v1", &canonical(&s)?, sig) {
         return Err(Refusal::new(RefusalCode::SignatureInvalid));
     }
-    current(keys, pk)?;
+    let key = keys
+        .iter()
+        .find(|k| k.public_key == pk)
+        .ok_or_else(|| Refusal::new(RefusalCode::KeyUnknown))?;
+    if key.revocation.is_some() {
+        return Err(Refusal::new(RefusalCode::KeyRevoked));
+    }
+    let cortexkit = path.name.starts_with("@cortexkit/");
+    if !key.covers(request_time) || (!cortexkit && key.valid_until.is_some()) {
+        return Err(Refusal::new(RefusalCode::KeyNotValid));
+    }
     if s["archive_sha256"] != held.archive_sha256 {
         return Err(Refusal::field(
             RefusalCode::RecordMismatch,

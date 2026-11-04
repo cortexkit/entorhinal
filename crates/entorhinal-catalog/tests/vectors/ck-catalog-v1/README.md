@@ -67,6 +67,10 @@ bun test-vectors/ck-catalog-v1/generate.ts --check  # exit 1 on drift
   one with its reference verifier, reader, applier or resolver and stops if
   the two disagree, so a file cannot record a mistake of the reference code
   without someone also writing that mistake down by hand.
+- **Status-request time** is registry-assigned, not part of the signed statement.
+  Cases use `default_request_time` unless they carry a `request_time` override.
+  The finite-certificate status cases use the root-certified key from `bounded_cert`
+  in `statements.json`, a certificate with a finite validity period.
 
 The check runs in the repository's TypeScript test gate: `bun test` from the
 repository root picks up `generate.test.ts`. To run it alone:
@@ -86,7 +90,7 @@ The table below is rewritten by `generate.ts`; the check fails if it is stale.
 | record.json | `279ba8405e45141ccf2edaaee2c615b0405061dc0e564b7d11f1d6d9e82b2c2f` |
 | archive.json | `e5ac9b06742cc3dd6fae5aac1d707c51d603350348d02a66beecb024305a1191` |
 | status.json | `6e07ced5fe7178ccd76cca415644f8bf36ef44e532f0155a70345de939d6644b` |
-| statements.json | `89780229b796d1cb4ac25c3c8fe742c3dc19ce0fe6dbe51f336c134b51989d0f` |
+| statements.json | `378800f2f608175e8d4d96cf8c1f82d2451ac3887d63e6d211b33f921ce2d4b6` |
 | resolver.json | `be1e2296110dcca2a6c9fbc1df72200485a5ae1779a3b36bf8411f78ef215413` |
 | starter-bundle.json | `d8ad7a8e1036d642a56ad2fd84db08d6a229b4106fbb5bf27e4675578af39108` |
 <!-- sha256:end -->

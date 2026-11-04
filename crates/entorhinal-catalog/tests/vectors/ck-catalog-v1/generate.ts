@@ -1579,7 +1579,7 @@ export function windowCovers(window: { valid_from: string; valid_until: string |
 }
 
 // ck-status-request/v1: a publisher's withdraw or unwithdraw, signed by a
-// current key of the package's scope. after_sequence must equal the
+// key authorized at the registry's request time. after_sequence must equal the
 // version's current status sequence: the registry applies it as one
 // compare-and-set, so a replayed or stale request changes nothing.
 export interface VersionStatus {
@@ -1593,6 +1593,7 @@ export function applyStatusRequest(
   request: { statement_text: string; public_key: string; signature: string },
   current: VersionStatus,
   keys: ScopeKey[],
+  requestTime: string,
 ): StatementResult {
   const p = parseStatement(request.statement_text, DOMAIN_STATUS_REQUEST, ["schema", "action", "name", "version", "archive_sha256", "reason", "after_sequence"])
   if (!p.ok) return p
@@ -1607,8 +1608,11 @@ export function applyStatusRequest(
   if (!Number.isSafeInteger(s.after_sequence) || (s.after_sequence as number) < 1) return invalid("after_sequence")
   for (const field of ["action", "name", "version"] as const) if (s[field] !== path[field]) return { ok: false, code: "record_mismatch", field }
   if (!verifyHex(request.public_key, signingInput(DOMAIN_STATUS_REQUEST, jcs(s)), request.signature)) return { ok: false, code: "signature_invalid" }
-  const keyCheck = currentKeyCheck(keys, request.public_key)
-  if (keyCheck) return keyCheck
+  const key = keys.find((k) => k.public_key === request.public_key)
+  if (!key) return { ok: false, code: "key_unknown" }
+  if (key.revocation) return { ok: false, code: "key_revoked" }
+  const scope = path.name.split("/")[0].slice(1)
+  if (!windowCovers(key, requestTime) || (scope !== "cortexkit" && key.valid_until !== null)) return { ok: false, code: "key_not_valid" }
   if (s.archive_sha256 !== current.archive_sha256) return { ok: false, code: "record_mismatch", field: "archive_sha256" }
   if (s.after_sequence !== current.sequence) return { ok: false, code: "status_sequence_conflict" }
   if (s.action === "withdraw" ? current.state !== "available" : current.state !== "withdrawn") return { ok: false, code: "action_not_allowed" }
@@ -1761,6 +1765,10 @@ function statementsVectors() {
     after_sequence: 1,
   }
   const unwithdraw = { ...withdraw, action: "unwithdraw", reason: null, after_sequence: 2 }
+  const defaultRequestTime = "2026-11-01T00:00:00Z"
+  const certifiedWithdraw = { ...withdraw, name: "@cortexkit/hello-skill" }
+  const certifiedUnwithdraw = { ...unwithdraw, name: "@cortexkit/hello-skill" }
+  const certifiedKey = current(C1, { valid_from: cert1.valid_from, valid_until: cert1.valid_until })
   const at = (sequence: number, state: State): VersionStatus => ({ archive_sha256: skillArchive, sequence, state })
   type ReqCase = {
     name: string
@@ -1769,6 +1777,7 @@ function statementsVectors() {
     request: { statement: Record<string, unknown>; public_key: string; signature: string }
     current: VersionStatus
     scope_keys: ScopeKey[]
+    request_time?: string
     expect: StatementResult
   }
   const rq = (
@@ -1777,17 +1786,18 @@ function statementsVectors() {
     statement: Record<string, unknown>,
     currentStatus: VersionStatus,
     expect: StatementResult,
-    o: { pathAction?: string; key?: TestKey; keys?: ScopeKey[]; domain?: string; flip?: boolean } = {},
+    o: { pathAction?: string; pathName?: string; key?: TestKey; keys?: ScopeKey[]; domain?: string; flip?: boolean; requestTime?: string } = {},
   ): ReqCase => {
     const key = o.key ?? K1
     const sigHex = signedStatement(statement, key, o.domain ?? DOMAIN_STATUS_REQUEST).signature
     return {
       name,
       note,
-      path: { action: o.pathAction ?? (statement.action as string), name: "@example/hello-skill", version: "1.0.0" },
+      path: { action: o.pathAction ?? (statement.action as string), name: o.pathName ?? "@example/hello-skill", version: "1.0.0" },
       request: { statement, public_key: key.publicKeyHex, signature: o.flip ? flipFirstBit(sigHex) : sigHex },
       current: currentStatus,
       scope_keys: o.keys ?? [current(K1)],
+      ...(o.requestTime === undefined ? {} : { request_time: o.requestTime }),
       expect,
     }
   }
@@ -1814,9 +1824,27 @@ function statementsVectors() {
       keys: [current(K1, { valid_until: "2026-06-01T00:00:00Z" }), current(K3, { valid_from: "2026-06-01T00:00:00Z" })],
     }),
     rq("other_archive", "", { ...withdraw, archive_sha256: sha256Hex(FLOW_PACKAGE.archive) }, at(1, "available"), { ok: false, code: "record_mismatch", field: "archive_sha256" }),
+    rq("finite_cert_withdraw_inside_window", "the root-certified key may withdraw at valid_from", certifiedWithdraw, at(1, "available"), { ok: true, result: "applied", next: { sequence: 2, state: "withdrawn" } }, {
+      key: C1, keys: [certifiedKey], pathName: certifiedWithdraw.name, requestTime: cert1.valid_from,
+    }),
+    rq("finite_cert_unwithdraw_inside_window", "the root-certified key may unwithdraw just before valid_until", certifiedUnwithdraw, at(2, "withdrawn"), { ok: true, result: "applied", next: { sequence: 3, state: "available" } }, {
+      key: C1, keys: [certifiedKey], pathName: certifiedUnwithdraw.name, requestTime: "2027-03-31T23:59:59Z",
+    }),
+    rq("finite_cert_withdraw_at_valid_until", "valid_until is exclusive", certifiedWithdraw, at(1, "available"), { ok: false, code: "key_not_valid" }, {
+      key: C1, keys: [certifiedKey], pathName: certifiedWithdraw.name, requestTime: cert1.valid_until,
+    }),
+    rq("finite_cert_unwithdraw_at_valid_until", "valid_until is exclusive", certifiedUnwithdraw, at(2, "withdrawn"), { ok: false, code: "key_not_valid" }, {
+      key: C1, keys: [certifiedKey], pathName: certifiedUnwithdraw.name, requestTime: cert1.valid_until,
+    }),
+    rq("finite_cert_withdraw_before_valid_from", "the certificate is not yet valid", certifiedWithdraw, at(1, "available"), { ok: false, code: "key_not_valid" }, {
+      key: C1, keys: [certifiedKey], pathName: certifiedWithdraw.name, requestTime: "2026-09-30T23:59:59Z",
+    }),
+    rq("finite_cert_unwithdraw_before_valid_from", "the certificate is not yet valid", certifiedUnwithdraw, at(2, "withdrawn"), { ok: false, code: "key_not_valid" }, {
+      key: C1, keys: [certifiedKey], pathName: certifiedUnwithdraw.name, requestTime: "2026-09-30T23:59:59Z",
+    }),
   ]
   for (const k of requestCases) {
-    const got = applyStatusRequest(k.path, { statement_text: jcs(k.request.statement), public_key: k.request.public_key, signature: k.request.signature }, k.current, k.scope_keys)
+    const got = applyStatusRequest(k.path, { statement_text: jcs(k.request.statement), public_key: k.request.public_key, signature: k.request.signature }, k.current, k.scope_keys, k.request_time ?? defaultRequestTime)
     expectSame(`status request case ${k.name}`, got, k.expect)
   }
 
@@ -1868,7 +1896,7 @@ function statementsVectors() {
         "statement_invalid",
         "record_mismatch (action, name, version against the path)",
         "signature_invalid",
-        "key_unknown / key_revoked / key_not_valid (a current key of the scope)",
+        "key_unknown / key_revoked / key_not_valid (a current key of the scope or an in-window root-certified @cortexkit key)",
         "record_mismatch (archive_sha256)",
         "status_sequence_conflict (after_sequence must equal the current sequence)",
         "action_not_allowed (withdraw only from available, unwithdraw only from withdrawn)",
@@ -1878,6 +1906,7 @@ function statementsVectors() {
         { ...statementOut(unwithdraw, DOMAIN_STATUS_REQUEST), public_key: K1.publicKeyHex, signature: signedStatement(unwithdraw, K1, DOMAIN_STATUS_REQUEST).signature },
       ],
       cases: requestCases,
+      default_request_time: defaultRequestTime,
     },
   }
 }

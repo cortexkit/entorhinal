@@ -179,7 +179,7 @@ fn reproduce_readme() {
     let readme = fs::read(dir().join("README.md")).unwrap();
     assert_eq!(
         c::sha256_hex(&readme),
-        "ca51d5776923aa34276b94b85211b8c32ff312fe928c0a9accf495ba0e4f475d"
+        "5414127cdcc6791f12cc10244ea22b59bb69b7343fc93119e09c2076c77201eb"
     );
     let text = String::from_utf8(readme).unwrap();
     let mut checked = 0;
@@ -203,17 +203,17 @@ fn reproduce_source() {
     let bytes = fs::read(dir().join("SOURCE.txt")).unwrap();
     assert_eq!(
         c::sha256_hex(&bytes),
-        "39c38011de092051e655436e34f366ad866ee21e5f3bf331271eeeb22392cf74"
+        "251c7f5cb7ecfd636a8dbf9d5d28dda5d0cc6fcd265907a1da556509d5f98c2a"
     );
     assert!(String::from_utf8(bytes)
         .unwrap()
-        .contains("42205d52b7d58018437132e50aa001995f207947"));
+        .contains("e6635c6ae451f02618b945a3dbc244ed4c9c9f86"));
 }
 #[test]
 fn reproduce_generator() {
     assert_eq!(
         c::sha256_hex(fs::read(dir().join("generate.ts")).unwrap()),
-        "f5aebbd7a714a26b975412f274370dcba7d434d99a554df83714d225ad937c45"
+        "1353aedd963fbdd7aed3883ad80916419227a66c1fc6b1b3259fcc3beef5aff9"
     );
 }
 #[test]
@@ -522,8 +522,10 @@ fn reproduce_statements() {
     for doc in a(&r["valid"]) {
         signed(doc, "statement", &publishers[0], "signature");
     }
+    let default_time = s(&r["default_request_time"]);
     for case in a(&r["cases"]) {
         let req = &case["request"];
+        let request_time = case["request_time"].as_str().unwrap_or(default_time);
         let got = statements::apply_status_request(
             &serde_json::from_value(case["path"].clone()).unwrap(),
             &req["statement"].to_string(),
@@ -531,6 +533,7 @@ fn reproduce_statements() {
             s(&req["signature"]),
             &serde_json::from_value(case["current"].clone()).unwrap(),
             &serde_json::from_value::<Vec<_>>(case["scope_keys"].clone()).unwrap(),
+            request_time,
         )
         .map(|next| json!({"result":"applied","next":next}));
         assert_eq!(outcome(got), case["expect"], "{}", case["name"]);

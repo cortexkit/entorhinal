@@ -1085,7 +1085,7 @@
       "statement_invalid",
       "record_mismatch (action, name, version against the path)",
       "signature_invalid",
-      "key_unknown / key_revoked / key_not_valid (a current key of the scope)",
+      "key_unknown / key_revoked / key_not_valid (a current key of the scope or an in-window root-certified @cortexkit key)",
       "record_mismatch (archive_sha256)",
       "status_sequence_conflict (after_sequence must equal the current sequence)",
       "action_not_allowed (withdraw only from available, unwithdraw only from withdrawn)"
@@ -1848,7 +1848,256 @@
           "code": "record_mismatch",
           "field": "archive_sha256"
         }
+      },
+      {
+        "name": "finite_cert_withdraw_inside_window",
+        "note": "the root-certified key may withdraw at valid_from",
+        "path": {
+          "action": "withdraw",
+          "name": "@cortexkit/hello-skill",
+          "version": "1.0.0"
+        },
+        "request": {
+          "statement": {
+            "schema": "ck-status-request/v1",
+            "action": "withdraw",
+            "name": "@cortexkit/hello-skill",
+            "version": "1.0.0",
+            "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+            "reason": "The script prints the wrong greeting",
+            "after_sequence": 1
+          },
+          "public_key": "27543dcc1ba216946c1ea38d2d2adc2d47a5024c0bd4abd053fe6ea477a66dd4",
+          "signature": "872bf71ad2d29fed06143936f352be970f9b8cf7d5ae182be37625bf4a88332d2349fdc33b288b794a1e0e3f93a9e1e99d434bd897c0ed0143a623b7559be007"
+        },
+        "current": {
+          "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+          "sequence": 1,
+          "state": "available"
+        },
+        "scope_keys": [
+          {
+            "public_key": "27543dcc1ba216946c1ea38d2d2adc2d47a5024c0bd4abd053fe6ea477a66dd4",
+            "valid_from": "2026-10-01T00:00:00Z",
+            "valid_until": "2027-04-01T00:00:00Z",
+            "revocation": null
+          }
+        ],
+        "request_time": "2026-10-01T00:00:00Z",
+        "expect": {
+          "ok": true,
+          "result": "applied",
+          "next": {
+            "sequence": 2,
+            "state": "withdrawn"
+          }
+        }
+      },
+      {
+        "name": "finite_cert_unwithdraw_inside_window",
+        "note": "the root-certified key may unwithdraw just before valid_until",
+        "path": {
+          "action": "unwithdraw",
+          "name": "@cortexkit/hello-skill",
+          "version": "1.0.0"
+        },
+        "request": {
+          "statement": {
+            "schema": "ck-status-request/v1",
+            "action": "unwithdraw",
+            "name": "@cortexkit/hello-skill",
+            "version": "1.0.0",
+            "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+            "reason": null,
+            "after_sequence": 2
+          },
+          "public_key": "27543dcc1ba216946c1ea38d2d2adc2d47a5024c0bd4abd053fe6ea477a66dd4",
+          "signature": "5b0febf182439472e97b7a2997fb05316df46c2432d81e89198545fdc60ce8d4dd3ce173c489dc7b52de48a48fcf3aeafcb60912a868092d0ae7bee38deaad0a"
+        },
+        "current": {
+          "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+          "sequence": 2,
+          "state": "withdrawn"
+        },
+        "scope_keys": [
+          {
+            "public_key": "27543dcc1ba216946c1ea38d2d2adc2d47a5024c0bd4abd053fe6ea477a66dd4",
+            "valid_from": "2026-10-01T00:00:00Z",
+            "valid_until": "2027-04-01T00:00:00Z",
+            "revocation": null
+          }
+        ],
+        "request_time": "2027-03-31T23:59:59Z",
+        "expect": {
+          "ok": true,
+          "result": "applied",
+          "next": {
+            "sequence": 3,
+            "state": "available"
+          }
+        }
+      },
+      {
+        "name": "finite_cert_withdraw_at_valid_until",
+        "note": "valid_until is exclusive",
+        "path": {
+          "action": "withdraw",
+          "name": "@cortexkit/hello-skill",
+          "version": "1.0.0"
+        },
+        "request": {
+          "statement": {
+            "schema": "ck-status-request/v1",
+            "action": "withdraw",
+            "name": "@cortexkit/hello-skill",
+            "version": "1.0.0",
+            "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+            "reason": "The script prints the wrong greeting",
+            "after_sequence": 1
+          },
+          "public_key": "27543dcc1ba216946c1ea38d2d2adc2d47a5024c0bd4abd053fe6ea477a66dd4",
+          "signature": "872bf71ad2d29fed06143936f352be970f9b8cf7d5ae182be37625bf4a88332d2349fdc33b288b794a1e0e3f93a9e1e99d434bd897c0ed0143a623b7559be007"
+        },
+        "current": {
+          "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+          "sequence": 1,
+          "state": "available"
+        },
+        "scope_keys": [
+          {
+            "public_key": "27543dcc1ba216946c1ea38d2d2adc2d47a5024c0bd4abd053fe6ea477a66dd4",
+            "valid_from": "2026-10-01T00:00:00Z",
+            "valid_until": "2027-04-01T00:00:00Z",
+            "revocation": null
+          }
+        ],
+        "request_time": "2027-04-01T00:00:00Z",
+        "expect": {
+          "ok": false,
+          "code": "key_not_valid"
+        }
+      },
+      {
+        "name": "finite_cert_unwithdraw_at_valid_until",
+        "note": "valid_until is exclusive",
+        "path": {
+          "action": "unwithdraw",
+          "name": "@cortexkit/hello-skill",
+          "version": "1.0.0"
+        },
+        "request": {
+          "statement": {
+            "schema": "ck-status-request/v1",
+            "action": "unwithdraw",
+            "name": "@cortexkit/hello-skill",
+            "version": "1.0.0",
+            "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+            "reason": null,
+            "after_sequence": 2
+          },
+          "public_key": "27543dcc1ba216946c1ea38d2d2adc2d47a5024c0bd4abd053fe6ea477a66dd4",
+          "signature": "5b0febf182439472e97b7a2997fb05316df46c2432d81e89198545fdc60ce8d4dd3ce173c489dc7b52de48a48fcf3aeafcb60912a868092d0ae7bee38deaad0a"
+        },
+        "current": {
+          "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+          "sequence": 2,
+          "state": "withdrawn"
+        },
+        "scope_keys": [
+          {
+            "public_key": "27543dcc1ba216946c1ea38d2d2adc2d47a5024c0bd4abd053fe6ea477a66dd4",
+            "valid_from": "2026-10-01T00:00:00Z",
+            "valid_until": "2027-04-01T00:00:00Z",
+            "revocation": null
+          }
+        ],
+        "request_time": "2027-04-01T00:00:00Z",
+        "expect": {
+          "ok": false,
+          "code": "key_not_valid"
+        }
+      },
+      {
+        "name": "finite_cert_withdraw_before_valid_from",
+        "note": "the certificate is not yet valid",
+        "path": {
+          "action": "withdraw",
+          "name": "@cortexkit/hello-skill",
+          "version": "1.0.0"
+        },
+        "request": {
+          "statement": {
+            "schema": "ck-status-request/v1",
+            "action": "withdraw",
+            "name": "@cortexkit/hello-skill",
+            "version": "1.0.0",
+            "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+            "reason": "The script prints the wrong greeting",
+            "after_sequence": 1
+          },
+          "public_key": "27543dcc1ba216946c1ea38d2d2adc2d47a5024c0bd4abd053fe6ea477a66dd4",
+          "signature": "872bf71ad2d29fed06143936f352be970f9b8cf7d5ae182be37625bf4a88332d2349fdc33b288b794a1e0e3f93a9e1e99d434bd897c0ed0143a623b7559be007"
+        },
+        "current": {
+          "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+          "sequence": 1,
+          "state": "available"
+        },
+        "scope_keys": [
+          {
+            "public_key": "27543dcc1ba216946c1ea38d2d2adc2d47a5024c0bd4abd053fe6ea477a66dd4",
+            "valid_from": "2026-10-01T00:00:00Z",
+            "valid_until": "2027-04-01T00:00:00Z",
+            "revocation": null
+          }
+        ],
+        "request_time": "2026-09-30T23:59:59Z",
+        "expect": {
+          "ok": false,
+          "code": "key_not_valid"
+        }
+      },
+      {
+        "name": "finite_cert_unwithdraw_before_valid_from",
+        "note": "the certificate is not yet valid",
+        "path": {
+          "action": "unwithdraw",
+          "name": "@cortexkit/hello-skill",
+          "version": "1.0.0"
+        },
+        "request": {
+          "statement": {
+            "schema": "ck-status-request/v1",
+            "action": "unwithdraw",
+            "name": "@cortexkit/hello-skill",
+            "version": "1.0.0",
+            "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+            "reason": null,
+            "after_sequence": 2
+          },
+          "public_key": "27543dcc1ba216946c1ea38d2d2adc2d47a5024c0bd4abd053fe6ea477a66dd4",
+          "signature": "5b0febf182439472e97b7a2997fb05316df46c2432d81e89198545fdc60ce8d4dd3ce173c489dc7b52de48a48fcf3aeafcb60912a868092d0ae7bee38deaad0a"
+        },
+        "current": {
+          "archive_sha256": "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398",
+          "sequence": 2,
+          "state": "withdrawn"
+        },
+        "scope_keys": [
+          {
+            "public_key": "27543dcc1ba216946c1ea38d2d2adc2d47a5024c0bd4abd053fe6ea477a66dd4",
+            "valid_from": "2026-10-01T00:00:00Z",
+            "valid_until": "2027-04-01T00:00:00Z",
+            "revocation": null
+          }
+        ],
+        "request_time": "2026-09-30T23:59:59Z",
+        "expect": {
+          "ok": false,
+          "code": "key_not_valid"
+        }
       }
-    ]
+    ],
+    "default_request_time": "2026-11-01T00:00:00Z"
   }
 }

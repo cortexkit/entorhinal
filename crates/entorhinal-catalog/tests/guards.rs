@@ -637,9 +637,17 @@ fn statement_and_status_shape_refusals_are_typed() {
             state: status::State::Available,
         };
         assert_eq!(
-            c::statements::apply_status_request(&path, text, "", "", &current, &[])
-                .unwrap_err()
-                .code,
+            c::statements::apply_status_request(
+                &path,
+                text,
+                "",
+                "",
+                &current,
+                &[],
+                "2026-11-01T00:00:00Z"
+            )
+            .unwrap_err()
+            .code,
             RefusalCode::StatementInvalid
         );
     }
