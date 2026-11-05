@@ -37,6 +37,13 @@ pub enum ClaimObservation {
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct NodeSelf {
+    pub author: Option<String>,
+    pub display_name: Option<String>,
+    pub sharing: String,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct AgentWhere {
     pub known: bool,
     pub status: &'static str,
@@ -262,6 +269,25 @@ impl RegistryStore {
 
     pub fn persisted_self_author(&self) -> Result<Option<String>, RegistryError> {
         self.read(self_author)
+    }
+
+    /// Read this machine's identity and name from the same snapshot, using
+    /// the member-name lookup that supplies `agent.where`'s holder name.
+    pub fn node_self(&self) -> Result<NodeSelf, RegistryError> {
+        self.read(|conn| {
+            let author = self_author(conn)?;
+            let display_name = holder_name(conn, author.as_deref())?;
+            let sharing = conn.query_row(
+                "SELECT state FROM identity_log_state WHERE id=1",
+                [],
+                |row| row.get(0),
+            )?;
+            Ok(NodeSelf {
+                author,
+                display_name,
+                sharing,
+            })
+        })
     }
 
     /// A read snapshot joins the cache, identity and display name. Nulls are

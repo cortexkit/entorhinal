@@ -2077,6 +2077,67 @@ async fn project_resolve_remote_v1_records() -> Vec<String> {
 }
 
 #[tokio::test]
+async fn node_self_records_match_published_file() {
+    let fixture = SessionFixture::new("served-node-self").await;
+    let (disabled, reply) = fixture
+        .record(SESSION_READER, READER_MODULE, "node.self", json!({}))
+        .await;
+    assert_eq!(
+        reply,
+        json!({"result":{"author":null,"display_name":null,"sharing":"disabled"}})
+    );
+    fixture
+        .store()
+        .apply_entry("fixture.node", "{}", "fixture", None, |tx| {
+            tx.execute(
+                "UPDATE identity_log_state SET state='enabled' WHERE id=1",
+                [],
+            )?;
+            tx.execute(
+                "INSERT INTO self_identity(id,self_author,learned_at_ms) VALUES(1,?1,700)",
+                [SELF_AUTHOR],
+            )?;
+            tx.execute(
+                "INSERT INTO member_name(author,display_name) VALUES(?1,?2),(?3,?4)",
+                params![
+                    OTHER_AUTHOR,
+                    "Other machine",
+                    SELF_AUTHOR,
+                    "Workshop machine"
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let (named, reply) = fixture
+        .record(SESSION_READER, READER_MODULE, "node.self", json!({}))
+        .await;
+    assert_eq!(
+        reply,
+        json!({"result":{"author":SELF_AUTHOR,"display_name":"Workshop machine","sharing":"enabled"}})
+    );
+    fixture
+        .store()
+        .apply_entry("fixture.unnamed", "{}", "fixture", None, |tx| {
+            tx.execute("DELETE FROM member_name WHERE author=?1", [SELF_AUTHOR])?;
+            Ok(())
+        })
+        .unwrap();
+    let (unnamed, reply) = fixture
+        .record(SESSION_READER, READER_MODULE, "node.self", json!({}))
+        .await;
+    assert_eq!(
+        reply,
+        json!({"result":{"author":SELF_AUTHOR,"display_name":null,"sharing":"enabled"}})
+    );
+    published_file(
+        "agent-sessions-v1",
+        "node-self.json",
+        vec![disabled, named, unnamed],
+    );
+}
+
+#[tokio::test]
 async fn session_records_match_published_files() {
     let fixture = SessionFixture::new("served-sessions").await;
     let source = fixture.snapshot();

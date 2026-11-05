@@ -351,11 +351,20 @@ the cache, so it works offline and never waits on engram.
 | `agent.session_liveness` | query | any | `active`, `gone` or `unknown` for up to 256 references, in order. |
 | `agent.where` | query | any | Which machine holds an agent, from the cached claim, plus any blocked move's participant and ref explanation. |
 | `agent.where_many` | query | any | Cached claim results for 1–64 agent ids in request order; unknown agents are omitted. |
+| `node.self {}` | query | any | This machine's identity-log identity: `{author: string or null, display_name: string or null, sharing: "disabled" or "enabling" or "joining" or "enabled"}` inside the usual `{result: ...}` envelope. Unknown params refuse `invalid_request`. |
 | `agent.fleet_identity_watch` | watch | any | Stream of changes to `agent.fleet_identity`. Opens with `{token?}` and sends `resync` or `changes` notices; on `resync`, read `agent.fleet_identity` once. |
 | `agent.where_watch` | watch | any | Stream of changes to whereabouts. Opens with `{agentIds?, cursor?}` and sends `resync` or `changes` notices carrying a cursor; on `resync`, read `agent.where_many` once. |
 | `agent.refresh_claims` | mutate | Direct | Refresh live agents' cached claims from engram. |
 | `role.read` | query | any | Which machine holds a role, from the cached claim. |
 | `role.take` | mutate | Direct, with operator confirmation | Make this machine the role's holder. |
+
+`node.self` reads one local read-only snapshot without contacting engram or
+writing a journal entry. `author` is the opaque identity-log author compared with
+`agent.where` and `agent.where_many`'s `holder`, or null until this machine has
+learned its author. `display_name` is this author's own member name, as set by
+`ck projects log name` (`member.set_name`): the same value another machine sees
+as `holder_name`, or null when unset or when there is no author. `sharing` is the
+state reported by `identity_log.status`.
 
 `agent.session_residence` is intended for restoring a session from backup before
 making it writable. Its precedence is:

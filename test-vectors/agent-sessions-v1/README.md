@@ -144,6 +144,11 @@ a backfill makes the data local.
   held, remotely held with a holder name, and unknown agent.
 - **`where-many.json`**: a local and remotely held agent, with an unknown ID
   between them to pin request order and omission.
+- **`node-self.json`**: this machine's identity-log author, own member name and
+  sharing state: sharing disabled (null author and name), enabled with the name
+  `Workshop machine`, and enabled with no name. The enabled cases include a
+  differently named member so another machine's name cannot stand in for this
+  machine's own record.
 - **`where-sharing-off.json`**: on a machine that has never turned sharing on, an
   agent with no claim is a verified `unclaimed` (`known: true`), because no
   other machine can hold it.
@@ -246,7 +251,7 @@ a backfill makes the data local.
   exactly two rows. All five records use clock `700` and incarnation
   `0123456789abcdef`; the complete canonical scratch root is mapped explicitly
   to `/fixture/head-project`, including in registration requests.
-- **`SHA256SUMS`**: SHA-256 hashes of the eighteen JSON vector files, with
+- **`SHA256SUMS`**: SHA-256 hashes of the twenty JSON vector files, with
   names relative to this directory. The first ten lines are pinned by
   `served_vectors::agent_session_samples_keep_their_pinned_bytes_and_checksums`.
 
@@ -272,6 +277,7 @@ a backfill makes the data local.
 | `sessions-open.json` | `01d785e934526b457d9f958ac94d8a0829526729e0f418e114ea8faab3a86af7` |
 | `session-lookup-cases.json` | `5e2a306b6a05bd4ab1c922c0c57541d16e3fb33c2c403a797fe5a34edb774107` |
 | `sessions-head-runners.json` | `7fc7eb2e343958034adbf283d6304e201cb43fd64d89f4f42a96ce06765d2a1b` |
+| `node-self.json` | `bda136c8fd751a28a70d452f8cf4b48bf1700774fc5eeffde8abe39d96b38e08` |
 
 ## Reproduce and verify
 
@@ -283,6 +289,7 @@ ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked sessio
 ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked session_rekey_records_match_published_files -- --nocapture
 ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked served_vectors::session_lookup_cases_match_published_file -- --exact --nocapture
 ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked served_vectors::sessions_head_runners_match_published_file -- --exact --nocapture
+ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked served_vectors::node_self_records_match_published_file -- --exact --nocapture
 ```
 
 Refresh their hashes from the repository root with:
@@ -292,7 +299,7 @@ python3 - <<'PY'
 import hashlib
 from pathlib import Path
 root = Path('test-vectors/agent-sessions-v1')
-names = ['for-session.json', 'register-session.json', 'session-for-ref.json', 'where.json', 'where-many.json', 'where-moving-receiver.json', 'where-moving-source.json', 'where-sharing-off.json', 'end-session.json', 'register-session-runner.json', 'session-for-runner.json', 'sessions.json', 'set-session-network.json', 'register-session-rekey.json', 'sessions-held-on.json', 'sessions-open.json', 'session-lookup-cases.json', 'sessions-head-runners.json']
+names = ['for-session.json', 'register-session.json', 'session-for-ref.json', 'where.json', 'where-many.json', 'where-moving-receiver.json', 'where-moving-source.json', 'where-sharing-off.json', 'end-session.json', 'register-session-runner.json', 'session-for-runner.json', 'sessions.json', 'set-session-network.json', 'register-session-rekey.json', 'sessions-held-on.json', 'sessions-open.json', 'session-lookup-cases.json', 'sessions-head-runners.json', 'session-for-harness.json', 'node-self.json']
 root.joinpath('SHA256SUMS').write_text(''.join(
     f'{hashlib.sha256(root.joinpath(name).read_bytes()).hexdigest()}  {name}\n'
     for name in names), encoding='utf-8')
@@ -300,12 +307,13 @@ PY
 ```
 
 Without `ENTO_WRITE_SERVED_VECTORS=1`, the non-ignored session, lifecycle,
-re-key and lookup-case tests regenerate their JSON from the real handler and
+re-key, lookup-case and node-self tests regenerate their JSON from the real handler and
 compare the bytes against the published files on each run. Verify the new file
 with both Cargo's test runner and nextest:
 
 ```sh
 cargo test --workspace --all-targets --locked served_vectors::session_lookup_cases_match_published_file -- --exact
+cargo test --workspace --all-targets --locked served_vectors::node_self_records_match_published_file -- --exact
 cargo nextest run --workspace --all-targets --locked -E 'test(served_vectors::session_lookup_cases_match_published_file)'
 ```
 

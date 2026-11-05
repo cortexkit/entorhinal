@@ -2868,6 +2868,7 @@ fn agent_operation_description(method: &str) -> &'static str {
         "agent.session_liveness" => "Answer active, gone or unknown for up to 256 session references, in request order.",
         "agent.where" => "Answer an agent's cached claim, including whether it is known and which device holds it.",
         "agent.where_many" => "Answer cached claims for up to 64 agents in request order, omitting unknown ids.",
+        "node.self" => "Read this machine's identity-log author, member name and sharing state.",
         "agent.refresh_claims" => "Refresh live agents' claim records from engram without waiting for the shared-log writer.",
         "agent.move" => "Admit an idle agent move to a named member, with Direct confirmation, an orchestrator relay or enabled lid-close moves.",
         "agent.move_status" => "Read a local move checkpoint, holds, warnings and diagnostics without calling a participant or engram.",

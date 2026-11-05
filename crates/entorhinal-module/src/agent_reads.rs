@@ -12,6 +12,7 @@ use serde_json::Value;
 use super::{encode_result, HandlerError, ProjectsHandler, RouteKey, WireRequest};
 
 pub(super) const READ_METHODS: &[&str] = &[
+    "node.self",
     "agent.preview_repair_workspaces",
     "agent.preview_avatar_manifest",
     "agent.resolve",
@@ -137,6 +138,10 @@ impl ProjectsHandler {
 
     pub(super) fn agent_read(&self, method: &str, params: Value) -> Result<Vec<u8>, HandlerError> {
         match method {
+            "node.self" => {
+                let _: EmptyRequest = decode(params)?;
+                encode_result(self.with_store(RegistryStore::node_self)?)
+            }
             "agent.snapshot" => {
                 let _: EmptyRequest = decode(params)?;
                 self.encode_read_result(self.with_agent_store(RegistryStore::agent_snapshot)?)
@@ -223,6 +228,7 @@ mod tests {
     };
 
     use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
+    use entorhinal_core::claim_cache::{CachedClaim, ClaimObservation};
     use serde_json::json;
     use subc_client_rs::HandlerOutcome;
     use subc_protocol::{ErrorBody, Principal};
@@ -476,6 +482,99 @@ mod tests {
         params
     }
 
+    #[test]
+    fn node_self_sharing_off_has_no_author_or_name_and_does_not_write() {
+        let f = Fixture::new(false);
+        f.sql("INSERT INTO member_name(author,display_name) VALUES('1111111111111111','Other machine');");
+        let before = f.ok("journal_tail", json!({"afterSeq":0}));
+        assert_eq!(
+            f.ok("node.self", json!({})),
+            json!({"author":null,"display_name":null,"sharing":"disabled"})
+        );
+        assert_eq!(f.ok("journal_tail", json!({"afterSeq":0})), before);
+    }
+
+    #[test]
+    fn node_self_sharing_on_uses_own_member_name_and_matches_where() {
+        let f = Fixture::new(true);
+        let agent = f.create("Node reader");
+        f.sql("UPDATE identity_log_state SET state='enabled' WHERE id=1;
+            INSERT INTO member_name(author,display_name) VALUES('1111111111111111','Other machine');
+            INSERT INTO member_name(author,display_name) VALUES('2222222222222222','Workshop machine');");
+        f.handler
+            .with_store(|store| {
+                store.cache_agent_claims(
+                    &[(
+                        agent.clone(),
+                        ClaimObservation::Present {
+                            claim: CachedClaim {
+                                holder: Some("2222222222222222".into()),
+                                epoch: 1,
+                                cut_id: None,
+                                version: 1,
+                                read_at_ms: 700,
+                                stale: false,
+                                integrity_failed: false,
+                            },
+                            self_author: "2222222222222222".into(),
+                        },
+                    )],
+                    700,
+                )
+            })
+            .unwrap();
+        let reply = f.ok("node.self", json!({}));
+        assert_eq!(
+            reply,
+            json!({"author":"2222222222222222","display_name":"Workshop machine","sharing":"enabled"})
+        );
+        let location = f.ok("agent.where", json!({"agent_id":agent}));
+        assert_eq!(location["status"], "held_here");
+        assert_eq!(reply["author"], location["holder"]);
+        assert_eq!(reply["display_name"], location["holder_name"]);
+    }
+
+    #[test]
+    fn node_self_sharing_on_without_own_name_ignores_other_member_name() {
+        let f = Fixture::new(false);
+        f.sql("UPDATE identity_log_state SET state='enabled' WHERE id=1;
+            INSERT INTO self_identity(id,self_author,learned_at_ms) VALUES(1,'2222222222222222',700);
+            INSERT INTO member_name(author,display_name) VALUES('1111111111111111','Other machine');");
+        assert_eq!(
+            f.ok("node.self", json!({})),
+            json!({"author":"2222222222222222","display_name":null,"sharing":"enabled"})
+        );
+    }
+
+    #[test]
+    fn node_self_reports_bootstrap_states_without_an_author() {
+        let f = Fixture::new(false);
+        for state in ["enabling", "joining", "enabled"] {
+            f.sql(&format!(
+                "UPDATE identity_log_state SET state='{state}' WHERE id=1"
+            ));
+            assert_eq!(
+                f.ok("node.self", json!({})),
+                json!({"author":null,"display_name":null,"sharing":state})
+            );
+        }
+    }
+
+    #[test]
+    fn node_self_refuses_unknown_params_and_unavailable_storage() {
+        let f = Fixture::new(false);
+        for params in [json!({"unknown":true}), Value::Null, json!("invalid")] {
+            f.fail("node.self", params, "invalid_request");
+        }
+        let unavailable = ProjectsHandler::with_runtime(INCARNATION.into(), || 700);
+        assert_eq!(
+            wire_error(unavailable.handle_request(&body("node.self", json!({})), READER)).code,
+            "storage_unavailable"
+        );
+        f.sql("DROP TABLE member_name");
+        f.fail("node.self", json!({}), "storage_error");
+    }
+
     #[tokio::test]
     async fn all_reads_are_open_to_every_principal_before_and_after_cutover() {
         for activated in [false, true] {
@@ -505,6 +604,12 @@ mod tests {
                             "agent.github_identity" => {
                                 assert_eq!(wire_error(outcome).code, "unknown_agent")
                             }
+                            "node.self" => {
+                                assert_eq!(
+                                    success(outcome),
+                                    json!({"author":null,"display_name":null,"sharing":"disabled"})
+                                );
+                            }
                             _ => {
                                 let result = success(outcome);
                                 assert_eq!(result["incarnation"], INCARNATION, "{method}");
@@ -527,6 +632,7 @@ mod tests {
 
     fn read_requests(cursor: i64, root: &std::path::Path) -> Vec<(&'static str, Value)> {
         vec![
+            ("node.self", json!({})),
             ("agent.resolve", json!({"agent_id":UNKNOWN})),
             ("agent.resolve_name", json!({"name":"Missing"})),
             ("agent.list", json!({})),
@@ -721,7 +827,7 @@ mod tests {
         let unavailable = ProjectsHandler::with_runtime(INCARNATION.into(), || 700);
         for (method, params) in read_requests(0, &f.root)
             .into_iter()
-            .filter(|(method, _)| method.starts_with("agent."))
+            .filter(|(method, _)| method.starts_with("agent.") || *method == "node.self")
         {
             assert_eq!(
                 wire_error(request(&unavailable, method, params.clone()).await).code,
@@ -1590,6 +1696,7 @@ mod tests {
             "agent.session_for_harness",
             "agent.where",
             "agent.where_many",
+            "node.self",
             "agent.where_watch",
             "agent.move_status",
             "agent.moves",
