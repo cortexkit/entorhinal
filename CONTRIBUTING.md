@@ -2,7 +2,7 @@
 
 This file says what a change must pass, how to commit it, and where code
 goes. For what the module does and how its parts fit together, start with
-[docs/architecture.md](docs/architecture.md).
+[ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## The gate
 
@@ -78,27 +78,11 @@ cargo test --workspace --all-targets --locked shared_write::tests::
 
 ## Where code goes
 
-The workspace has two crates. The rule that separates them: anything that can
-be decided from the store alone belongs in `entorhinal-core`; anything that
-talks to the subc daemon or another module belongs in `entorhinal-module`.
-
-| Path | What goes there |
-|---|---|
-| `crates/entorhinal-core/src/lib.rs` | `RegistryStore`: opening the store, the migration chain, resolve and the other project reads. |
-| `crates/entorhinal-core/src/mutations.rs` | Project and workspace writes, the registry journal, `verify` and `rebuild`. |
-| `crates/entorhinal-core/src/binding.rs`, `root_keys.rs`, `ownership.rs` | Root bindings and approval, machine-neutral root keys, owned remotes. |
-| `crates/entorhinal-core/src/agent/` | Agent identity: schema, validation, names, reads, the change feed, workspace carry, and machine-local consent state. |
-| `crates/entorhinal-core/src/shared_entry.rs`, `remote_apply.rs`, `log_schema.rs`, `enable_state.rs`, `pending.rs` | Shared identity-log entries, applying remote entries, and the local log state. |
-| `crates/entorhinal-core/src/move_record.rs`, `move_store.rs` | Move record codecs and the machine-local move checkpoint. |
-| `crates/entorhinal-core/src/claim_cache.rs`, `role_cache.rs` | Cached agent and role claims. |
-| `crates/entorhinal-module/src/main.rs` | The module: manifest, route admission, request dispatch, health. |
-| `crates/entorhinal-module/src/cli.rs` | The `ck projects`, `ck workspaces`, `ck agents` and `ck roles` commands. |
-| `crates/entorhinal-module/src/shared_write.rs`, `catch_up.rs`, `enable.rs`, `log_client.rs`, `member.rs` | Writing to, reading from and joining the shared identity log. |
-| `crates/entorhinal-module/src/move_*.rs`, `participant_*.rs`, `door_client.rs`, `record_client.rs` | Moving agents between machines. |
-| `crates/entorhinal-module/src/tool_*.rs`, `consent*.rs`, `permissions.rs` | Agent tools, consent cards, grants and the audit. |
-| `crates/entorhinal-module/src/sessions.rs`, `claims.rs`, `roles.rs` | Sessions, session liveness, claims and roles. |
-| `crates/entorhinal-module/src/fake_*.rs` | In-process stand-ins for other modules, compiled only for tests. |
-| `crates/*/tests/` | Integration tests that need their own binary or golden files. |
+[STRUCTURE.md](STRUCTURE.md) maps every file and says where new code goes.
+The rule that separates the crates: anything that can be decided from the
+store alone belongs in `entorhinal-core`; anything that talks to the subc
+daemon, another module or the network belongs in `entorhinal-module`; pure
+package-catalog checks belong in `entorhinal-catalog`.
 
 Every CortexKit dependency comes from crates.io. Do not add a `path`
 dependency on a sibling checkout: `crates/entorhinal-core/tests/dependency_sources.rs`

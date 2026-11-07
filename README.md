@@ -54,8 +54,8 @@ connecting to anything. Everything else needs a running subc daemon.
 ## Commands
 
 The binary `ck-entorhinal` is the module. People use it through `ck`, which
-runs it under the names `ck-projects`, `ck-workspaces`, `ck-agents` and
-`ck-roles`:
+runs it under the names `ck-projects`, `ck-workspaces`, `ck-agents`,
+`ck-roles` and `ck-packages`:
 
 ```
 ck projects list | resolve | register | remove | add-root | attach | remove-root
@@ -66,10 +66,12 @@ ck workspaces list | assign | set-root | clear-root
 ck agents   create | rename | retire | tag | labels | hire-cap | list | show
             avatars | repair-workspaces | where | move | moves | move-abort | lid-close-moves
 ck roles    read | take
+ck packages registry add | repin | remove | list
+            seed | publisher trust | publish
 ```
 
-`ck projects`, `ck workspaces`, `ck agents` or `ck roles` on its own prints the
-full usage. `--json` prints the raw response. Agent identity writes, hire caps,
+`ck projects`, `ck workspaces`, `ck agents`, `ck roles` or `ck packages` on its
+own prints the full usage. `--json` prints the raw response. Agent identity writes, hire caps,
 role takes and moves from `ck` land only after the operator approves the exact
 change at a presence prompt the daemon shows (Touch ID on macOS, Windows Hello
 on Windows). Linux has no presence provider, so there these writes refuse
@@ -87,10 +89,11 @@ This operator command does not ask for a presence prompt.
 
 ## Documentation
 
-Start with [docs/architecture.md](docs/architecture.md).
+Start with [ARCHITECTURE.md](ARCHITECTURE.md); [STRUCTURE.md](STRUCTURE.md)
+maps the code.
 
-- Architecture: [architecture](docs/architecture.md),
-  [data model](docs/data-model.md), [module surface](docs/module-surface.md).
+- Reference: [data model](docs/data-model.md),
+  [module surface](docs/module-surface.md).
 - Contracts: [identity log](docs/identity-log-contract.md),
   [agent moves](docs/agent-move-contract.md),
   [consent](docs/consent-contract.md),

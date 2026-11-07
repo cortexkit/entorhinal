@@ -1,6 +1,4 @@
 //! Generic record contract: reviewed engram record spec ct_00000000-0000-40f0.
-//! Engram serving commit: not yet shipped; the release must pin its serving
-//! `engram-module/src/agent_sync.rs` commit before enabling this client.
 //!
 //! `intent / Module operations` pins `record.read`, `record.read_many` and
 //! `record.cas` on engram's `agent-sync` internal service. The shared SUBC
