@@ -44,9 +44,16 @@ Migration 19 adds a machine-local scope opt-out table so removal and the opt-out
 commit atomically. It is not journaled, rebuilt or shared; adopting a foreign store
 as a different machine clears it along with registry mappings, keys and publisher
 grants. Startup skips foreign stores. If the built-in row cannot be added, startup
-still serves reads,
-logs a warning and retries at the next start. An existing entry for the same URL
-under other scopes is preserved rather than silently changing its authority.
+still serves reads, logs a warning and retries at the next start. An existing
+entry for the same URL under other scopes is preserved rather than silently
+changing its authority.
+
+A fresh machine receiving a move with `@cortexkit` packages uses the built-in
+registry's online feed and key verification path, so it must reach
+`catalog.cortexkit.io`; a network failure holds the move for retry rather than
+using a starter bundle's stored proof of initial package status. The offline
+starter-proof path is reached only after the operator removes the built-in
+registry and no other registry maps that scope.
 
 ## Offline starter bundle
 

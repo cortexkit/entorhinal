@@ -723,6 +723,7 @@ mod tests {
                     "catalog_registry",
                     "catalog_scope_map",
                     "catalog_registry_key",
+                    "catalog_registry_opt_out",
                     "catalog_feed",
                     "catalog_status",
                     "catalog_starter_proof",

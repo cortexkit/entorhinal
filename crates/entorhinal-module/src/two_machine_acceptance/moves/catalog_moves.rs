@@ -105,6 +105,14 @@ fn serve_move_status_at(
 async fn move_registry(node: &mut MoveMachine, pin: &CatalogPin) -> Arc<FakeRegistry> {
     move_registry_with_limits(node, pin, Limits::MODULE).await
 }
+async fn remove_builtin_registry(node: &MoveMachine) {
+    // These fixtures choose their own trust anchor, or no registry at all.
+    // Drain startup writes before removal so the opt-out cannot race bootstrap.
+    node.machine.handler.catalog_sql.wait().await;
+    node.store()
+        .catalog_registry_remove(crate::catalog_trust::CORTEXKIT_REGISTRY.url)
+        .unwrap();
+}
 async fn move_registry_with_limits(
     node: &mut MoveMachine,
     pin: &CatalogPin,
@@ -587,6 +595,7 @@ async fn catalog_move_back_uses_a_new_session_container() {
 #[tokio::test(start_paused = true)]
 async fn catalog_move_root_trust_uses_receiver_root_not_source_grants() {
     let (mut pair, mut pin, _, _) = catalog_pair(false, true, false).await;
+    remove_builtin_registry(&pair.b).await;
 
     let vectors = vectors("statements");
     let cert = &vectors["ck-key-cert/v1"]["cases"][0]["served"];
@@ -1046,6 +1055,7 @@ async fn catalog_move_starter_proof_authorizes_offline_root_and_carries_certific
         range: Some("*".into()),
     };
     for node in [&pair.a, &pair.b] {
+        remove_builtin_registry(node).await;
         node.store()
             .catalog_registry_remove("https://registry.example.invalid")
             .unwrap();
@@ -1113,6 +1123,7 @@ async fn catalog_move_root_certificate_must_cover_publication_time() {
     .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     for at in [before.as_str(), statement["valid_until"].as_str().unwrap()] {
         let (mut pair, mut pin, _, _) = catalog_pair(false, true, false).await;
+        remove_builtin_registry(&pair.b).await;
         pair.b
             .store()
             .catalog_registry_remove("https://registry.example.invalid")
@@ -1279,7 +1290,15 @@ async fn catalog_move_status_refresh_uses_newly_authenticated_registry_keys() {
         1
     );
     assert_eq!(
-        pair.b.store().catalog_registries().unwrap()[0].keys.len(),
+        pair.b
+            .store()
+            .catalog_registries()
+            .unwrap()
+            .iter()
+            .find(|registry| registry.url == "https://registry.example.invalid")
+            .unwrap()
+            .keys
+            .len(),
         3
     );
 }
