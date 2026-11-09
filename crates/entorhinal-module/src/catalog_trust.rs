@@ -20,6 +20,23 @@ use serde_json::{json, Value};
 /// replacing it is a release decision, never a configuration change.
 pub const CORTEXKIT_ROOT: Option<&str> =
     Some("8af2a8e892d79d2aa52981342f0b451ff5fb54c4e3da42389c12691fcb0a9e25");
+
+pub struct BuiltinRegistry {
+    pub url: &'static str,
+    pub scope: &'static str,
+    pub key_id: &'static str,
+    pub public_key: &'static str,
+}
+
+/// Compiled in so first-party packages work without operator setup, just as
+/// publishing certificates use the compiled root. Authority is least-scoped:
+/// only `@cortexkit`, never the default registry or another package scope.
+pub const CORTEXKIT_REGISTRY: BuiltinRegistry = BuiltinRegistry {
+    url: "https://catalog.cortexkit.io",
+    scope: "@cortexkit",
+    key_id: "genesis",
+    public_key: "57e7fcba3ee643f26196fc3f36174515e2aa01e4e0b00bda0e8f42d62cba36a4",
+};
 impl From<Refusal> for NetworkError {
     fn from(error: Refusal) -> Self {
         CatalogError::from(error).into()

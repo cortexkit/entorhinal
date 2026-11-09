@@ -24,6 +24,30 @@ ck packages publisher trust <fingerprint> --agent <agent_id>
 ck packages publish <package dir> --registry <url> --scope <scope>
 ```
 
+The CortexKit registry at `https://catalog.cortexkit.io` is built in: startup
+adds it with the compiled `genesis` status key for **`@cortexkit` only**, never
+as a default or as authority for another scope. It uses the same allowlist,
+redirect policy, key-chain and status verification as an operator-added registry.
+An existing `@cortexkit` mapping is left untouched, including operator repins.
+
+To opt out, run `ck packages registry remove https://catalog.cortexkit.io`.
+Removal is remembered on this machine across restarts. As with any registry,
+removal refuses with `registry_has_status` while accepted status history is held;
+use `ck packages registry repin` to rotate its key instead. To restore the built-in
+mapping after removal, explicitly add it again:
+
+```
+ck packages registry add https://catalog.cortexkit.io --scope @cortexkit --key-id genesis --public-key 57e7fcba3ee643f26196fc3f36174515e2aa01e4e0b00bda0e8f42d62cba36a4
+```
+
+Migration 19 adds a machine-local scope opt-out table so removal and the opt-out
+commit atomically. It is not journaled, rebuilt or shared; adopting a foreign store
+as a different machine clears it along with registry mappings, keys and publisher
+grants. Startup skips foreign stores. If the built-in row cannot be added, startup
+still serves reads,
+logs a warning and retries at the next start. An existing entry for the same URL
+under other scopes is preserved rather than silently changing its authority.
+
 ## Offline starter bundle
 
 `ck packages seed <bundle file>` accepts only an operator-opened Direct route,

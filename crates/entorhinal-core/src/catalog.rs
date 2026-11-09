@@ -31,6 +31,12 @@ CREATE TABLE catalog_audit(id INTEGER PRIMARY KEY, at_ms INTEGER NOT NULL, kind 
     grant_id TEXT, detail_json TEXT NOT NULL);
 "#;
 
+// Removal and its opt-out must commit together, so a crash cannot restore trust
+// that the operator removed. These scope choices are machine-local and are not
+// shared with other machines.
+pub(crate) const V19_CATALOG_REGISTRY_OPT_OUT: &str =
+    "CREATE TABLE catalog_registry_opt_out(scope TEXT PRIMARY KEY);";
+
 #[derive(Debug)]
 pub enum CatalogWriteError {
     Refused(&'static str),
@@ -89,29 +95,46 @@ impl RegistryStore {
         now: i64,
     ) -> Result<(), CatalogWriteError> {
         self.catalog_transaction(|tx| {
-            let exists = |sql: &str, value: &str| -> Result<bool, CatalogWriteError> {
-                tx.query_row(sql, [value], |r| r.get(0)).map_err(store_error)
-            };
-            if exists("SELECT EXISTS(SELECT 1 FROM catalog_registry WHERE url=?1)", url)? {
-                return Err(CatalogWriteError::Refused("registry_already_added"));
-            }
-            if is_default && exists("SELECT EXISTS(SELECT 1 FROM catalog_registry WHERE is_default=1 AND ?1 IS NOT NULL)", url)? {
-                return Err(CatalogWriteError::Refused("default_already_set"));
-            }
+            add_registry(tx, url, scopes, is_default, key_id, public_key, now)?;
             for scope in scopes {
-                if exists("SELECT EXISTS(SELECT 1 FROM catalog_scope_map WHERE scope=?1)", scope)? {
-                    return Err(CatalogWriteError::Refused("scope_already_mapped"));
-                }
+                tx.execute(
+                    "DELETE FROM catalog_registry_opt_out WHERE scope=?1",
+                    [scope],
+                )
+                .map_err(store_error)?;
             }
-            let mut random = [0u8; 16];
-            getrandom::getrandom(&mut random).map_err(|_| CatalogWriteError::Refused("store_error"))?;
-            let incarnation = random.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-            tx.execute("INSERT INTO catalog_registry VALUES(?1,?2,?3,?4)", params![url,now,is_default,incarnation]).map_err(store_error)?;
-            for scope in scopes {
-                tx.execute("INSERT INTO catalog_scope_map VALUES(?1,?2)", params![scope,url]).map_err(store_error)?;
-            }
-            tx.execute("INSERT INTO catalog_registry_key VALUES(?1,0,?2,?3,NULL,NULL)", params![url,key_id,public_key]).map_err(store_error)?;
             Ok(())
+        })
+    }
+
+    /// Materialize a compiled registry only where the operator has neither
+    /// configured that scope nor removed its mapping. A default is not a scope
+    /// choice: the built-in must remain an explicit, least-authority mapping.
+    pub fn catalog_registry_bootstrap(
+        &self,
+        url: &str,
+        scope: &str,
+        key_id: &str,
+        public_key: &str,
+        now: i64,
+    ) -> Result<bool, CatalogWriteError> {
+        if self.is_foreign() {
+            return Ok(false);
+        }
+        self.catalog_transaction(|tx| {
+            let skip: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM catalog_scope_map WHERE scope=?1)
+                    OR EXISTS(SELECT 1 FROM catalog_registry_opt_out WHERE scope=?1)",
+                    [scope],
+                    |r| r.get(0),
+                )
+                .map_err(store_error)?;
+            if skip {
+                return Ok(false);
+            }
+            add_registry(tx, url, &[scope.to_owned()], false, key_id, public_key, now)?;
+            Ok(true)
         })
     }
     pub fn catalog_registry_repin(
@@ -144,6 +167,12 @@ impl RegistryStore {
             if has_status {
                 return Err(CatalogWriteError::Refused("registry_has_status"));
             }
+            tx.execute(
+                "INSERT OR IGNORE INTO catalog_registry_opt_out(scope)
+                    SELECT scope FROM catalog_scope_map WHERE registry_url=?1",
+                [url],
+            )
+            .map_err(store_error)?;
             // Delete the child rows explicitly, so removal is complete even on a
             // connection where foreign-key cascades are off.
             for table in [
@@ -171,6 +200,66 @@ impl RegistryStore {
     pub fn catalog_registry_for_scope(&self, scope: &str) -> Result<Option<String>, RegistryError> {
         self.read(|conn| registry_for_scope(conn, scope))
     }
+}
+fn add_registry(
+    tx: &rusqlite::Transaction<'_>,
+    url: &str,
+    scopes: &[String],
+    is_default: bool,
+    key_id: &str,
+    public_key: &str,
+    now: i64,
+) -> Result<(), CatalogWriteError> {
+    let exists = |sql: &str, value: &str| -> Result<bool, CatalogWriteError> {
+        tx.query_row(sql, [value], |r| r.get(0))
+            .map_err(store_error)
+    };
+    if exists(
+        "SELECT EXISTS(SELECT 1 FROM catalog_registry WHERE url=?1)",
+        url,
+    )? {
+        return Err(CatalogWriteError::Refused("registry_already_added"));
+    }
+    if is_default
+        && exists(
+            "SELECT EXISTS(SELECT 1 FROM catalog_registry WHERE is_default=1 AND ?1 IS NOT NULL)",
+            url,
+        )?
+    {
+        return Err(CatalogWriteError::Refused("default_already_set"));
+    }
+    for scope in scopes {
+        if exists(
+            "SELECT EXISTS(SELECT 1 FROM catalog_scope_map WHERE scope=?1)",
+            scope,
+        )? {
+            return Err(CatalogWriteError::Refused("scope_already_mapped"));
+        }
+    }
+    let mut random = [0u8; 16];
+    getrandom::getrandom(&mut random).map_err(|_| CatalogWriteError::Refused("store_error"))?;
+    let incarnation = random
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    tx.execute(
+        "INSERT INTO catalog_registry VALUES(?1,?2,?3,?4)",
+        params![url, now, is_default, incarnation],
+    )
+    .map_err(store_error)?;
+    for scope in scopes {
+        tx.execute(
+            "INSERT INTO catalog_scope_map VALUES(?1,?2)",
+            params![scope, url],
+        )
+        .map_err(store_error)?;
+    }
+    tx.execute(
+        "INSERT INTO catalog_registry_key VALUES(?1,0,?2,?3,NULL,NULL)",
+        params![url, key_id, public_key],
+    )
+    .map_err(store_error)?;
+    Ok(())
 }
 pub(crate) fn read_registries(
     conn: &rusqlite::Connection,

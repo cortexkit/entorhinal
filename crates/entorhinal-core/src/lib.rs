@@ -221,7 +221,7 @@ CREATE TABLE member_name (
 );
 "#;
 
-const MIGRATIONS: [Migration; 18] = [
+const MIGRATIONS: [Migration; 19] = [
     Migration {
         version: 1,
         statements: V1_SCHEMA,
@@ -293,6 +293,10 @@ const MIGRATIONS: [Migration; 18] = [
     Migration {
         version: 18,
         statements: user_profile::V18_USER_PROFILE,
+    },
+    Migration {
+        version: 19,
+        statements: catalog::V19_CATALOG_REGISTRY_OPT_OUT,
     },
 ];
 

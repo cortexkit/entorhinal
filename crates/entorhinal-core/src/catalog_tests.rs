@@ -1,6 +1,38 @@
 mod catalog_tests {
     use super::*;
     #[test]
+    fn builtin_registry_migration_and_atomic_local_opt_out() {
+        let scratch = TestStore::new("builtin-registry-migration");
+        let descriptor = legacy_descriptor(&scratch, "prior.db");
+        let prior = MIGRATIONS.iter()
+            .position(|migration| migration.statements == crate::catalog::V19_CATALOG_REGISTRY_OPT_OUT)
+            .unwrap();
+        assert_eq!(MIGRATIONS[prior].version, MIGRATIONS[prior - 1].version + 1);
+        let old = RegistryStore::open_with_migrations(&descriptor, &MIGRATIONS[..prior]).unwrap();
+        assert_eq!(old.read(|c| c.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name='catalog_registry_opt_out'", [], |r| r.get::<_, i64>(0))).unwrap(), 0);
+        drop(old);
+        let store = RegistryStore::open(&descriptor).unwrap();
+        let url = "https://builtin.test";
+        let scope = "@builtin";
+        assert!(store.catalog_registry_bootstrap(url, scope, "k", "pk", 1).unwrap());
+        assert!(!store.catalog_registry_bootstrap(url, scope, "k", "pk", 2).unwrap());
+        let before = store.catalog_registries().unwrap();
+        store.db.with_conn_fenced(|tx| tx.execute_batch("CREATE TRIGGER refuse_opt_out BEFORE INSERT ON catalog_registry_opt_out BEGIN SELECT RAISE(ABORT,'test opt-out refusal'); END;")).unwrap();
+        assert!(store.catalog_registry_remove(url).is_err());
+        assert_eq!(store.catalog_registries().unwrap(), before);
+        store.db.with_conn_fenced(|tx| tx.execute_batch("DROP TRIGGER refuse_opt_out;")).unwrap();
+        store.catalog_registry_remove(url).unwrap();
+        store.rebuild().unwrap();
+        assert!(!store.catalog_registry_bootstrap(url, scope, "k", "pk", 3).unwrap());
+        assert_eq!(store.generation().unwrap(), 0);
+        assert!(store.catalog_audit().unwrap().is_empty());
+        store.check_store_origin(Some("old"), 1).unwrap();
+        store.check_store_origin(Some("new"), 2).unwrap();
+        assert!(!store.catalog_registry_bootstrap(url, scope, "k", "pk", 4).unwrap());
+        store.adopt_store("new", false, 5).unwrap();
+        assert!(store.catalog_registry_bootstrap(url, scope, "k", "pk", 6).unwrap());
+    }
+    #[test]
     fn publisher_authority_never_enters_identity_journal_or_shared_snapshot() {
         use crate::catalog_grants::{Operation, PublisherGrant};
         let scratch = TestStore::new("publisher-local-only");

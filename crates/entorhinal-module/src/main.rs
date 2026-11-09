@@ -60,6 +60,7 @@ mod agent_ops;
 mod agent_reads;
 mod catalog_agent;
 mod catalog_blob;
+mod catalog_builtin;
 mod catalog_consumer;
 mod catalog_grants;
 mod catalog_move;
@@ -2980,6 +2981,7 @@ fn install_store_with_time(
             *guard = Some(opened);
             if let Some(opened) = guard.as_ref() {
                 if !opened.is_foreign() {
+                    catalog_builtin::start(opened.clone(), catalog_sql);
                     catalog_seed::start(opened.clone(), catalog_sql);
                 }
             }

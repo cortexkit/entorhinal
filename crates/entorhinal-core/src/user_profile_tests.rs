@@ -407,7 +407,10 @@ fn user_profile_migration_and_local_workspace_cascade() {
             path: f._cleanup.0.join("prior/store.db").to_string_lossy().into(),
         },
     };
-    let prior = crate::MIGRATIONS.len() - 1;
+    let prior = crate::MIGRATIONS
+        .iter()
+        .position(|migration| migration.statements == crate::user_profile::V18_USER_PROFILE)
+        .unwrap();
     assert_eq!(
         crate::MIGRATIONS[prior].version,
         crate::MIGRATIONS[prior - 1].version + 1

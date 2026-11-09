@@ -59,6 +59,7 @@ pub(crate) const LOCAL_TABLES: &[&str] = &[
     "catalog_scope_map",
     "catalog_registry_key",
     "catalog_registry",
+    "catalog_registry_opt_out",
     "catalog_publisher_grant",
     "catalog_audit",
 ];

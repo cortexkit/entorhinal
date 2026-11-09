@@ -77,6 +77,18 @@ change at a presence prompt the daemon shows (Touch ID on macOS, Windows Hello
 on Windows). Linux has no presence provider, so there these writes refuse
 `operator_presence_unavailable`.
 
+`ck packages` includes the built-in `https://catalog.cortexkit.io` registry,
+scoped only to `@cortexkit` (not the default registry). Existing operator mappings
+and repins are preserved. Remove it with
+`ck packages registry remove https://catalog.cortexkit.io`; the machine remembers
+the opt-out across restarts. Removal still refuses while status history is held;
+use `ck packages registry repin` to rotate a key without discarding that history.
+Restore a removed mapping with:
+
+```
+ck packages registry add https://catalog.cortexkit.io --scope @cortexkit --key-id genesis --public-key 57e7fcba3ee643f26196fc3f36174515e2aa01e4e0b00bda0e8f42d62cba36a4
+```
+
 `ck projects move-root <dir> --to-new-project <name>` separates one checkout
 and its repository key from a multi-root project into a new project. The source
 must keep another root, and no other local root may carry the transferred key.

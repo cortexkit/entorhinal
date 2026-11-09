@@ -80,6 +80,7 @@ impl ProjectsHandler {
         self.catalog_poll_wake.notify_one();
         self.start_session_upkeep();
         if let Ok(store) = self.with_store(|s| Ok(s.clone())) {
+            crate::catalog_builtin::start(store.clone(), &self.catalog_sql);
             catalog_seed::start(store, &self.catalog_sql);
         }
     }
