@@ -1729,6 +1729,7 @@ mod tests {
             "rebuild",
             "projects.session_liveness",
             "add_root",
+            "refresh_root_key",
             "rebind_root",
             "attach_root",
             "identity_log.enable",
