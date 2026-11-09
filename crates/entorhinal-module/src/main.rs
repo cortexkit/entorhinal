@@ -714,6 +714,7 @@ const MUTATING_METHODS: &[&str] = &[
     "rebuild",
     "projects.session_liveness",
     "add_root",
+    "refresh_root_key",
     "rebind_root",
     "attach_root",
     "identity_log.enable",
@@ -1763,6 +1764,7 @@ impl ProjectsHandler {
                     .expect("liveness admission requires a principal"),
             ),
             "add_root" => self.add_root(request.params, &principal),
+            "refresh_root_key" => self.refresh_root_key(request.params, &principal),
             "rebind_root" => self.rebind_root(request.params, &principal),
             "attach_root" => self.attach_root(request.params, &principal),
             "remove_root" => self.remove_root(request.params, &principal),
@@ -2212,6 +2214,12 @@ impl ProjectsHandler {
         })?;
         Ok(reply)
     }
+
+    fn refresh_root_key(&self, params: Value, principal: &str) -> Result<Vec<u8>, HandlerError> {
+        let req = serde_json::from_value::<entorhinal_core::RefreshRootKeyRequest>(params)
+            .map_err(invalid_params)?;
+        self.record_mutation(self.with_store(|s| s.with_principal(principal).refresh_root_key(req)))
+    }
     fn rebind_root(&self, params: Value, principal: &str) -> Result<Vec<u8>, HandlerError> {
         let params = serde_json::from_value::<RebindRootParams>(params).map_err(invalid_params)?;
         self.record_mutation(self.with_store(|store| {
@@ -2653,6 +2661,11 @@ fn manifest() -> ModuleManifest {
                     "add_root",
                     ManagementOperationKind::Mutate,
                     "Add a root to a registered project; it starts unapproved.",
+                ),
+                management_operation(
+                    "refresh_root_key",
+                    ManagementOperationKind::Mutate,
+                    "Fill a registered root's missing repository key, preserving its binding and approval.",
                 ),
                 management_operation(
                     "rebind_root",
@@ -3603,6 +3616,7 @@ mod tests {
         let handler = ProjectsHandler::new().unwrap();
         let flow_route: RouteKey = (7, 1);
         let head_route: RouteKey = (8, 1);
+        let direct_route: RouteKey = (8, 2);
         handler.route_admissions().insert(
             flow_route,
             RouteAdmission::from_bind(
@@ -3614,11 +3628,24 @@ mod tests {
             head_route,
             RouteAdmission::from_bind(Some(reserved(WRITER_MODULE)), Some(&flow_stamp(None))),
         );
+        handler.route_admissions().insert(
+            direct_route,
+            RouteAdmission::from_bind(Some(Principal::Direct), None),
+        );
 
         let error = handler
             .admit("register", flow_route)
             .expect_err("a flow route must not write");
         assert_eq!(error.code, "flow_scope_not_admitted");
+        assert_eq!(
+            handler
+                .admit("refresh_root_key", flow_route)
+                .unwrap_err()
+                .code,
+            "flow_scope_not_admitted"
+        );
+        assert!(handler.admit("refresh_root_key", direct_route).is_ok());
+        assert!(handler.admit("refresh_root_key", head_route).is_ok());
         assert!(
             handler.admit("enumerate", flow_route).is_ok(),
             "reads stay open"
@@ -5234,6 +5261,7 @@ mod tests {
         assert_eq!(value["capabilities"]["requires"], json!([]));
         for (name, kind) in [
             ("attach_root", "mutate"),
+            ("refresh_root_key", "mutate"),
             ("rebind_root", "mutate"),
             ("identity_log.enable", "mutate"),
             ("resolve_root_key", "query"),

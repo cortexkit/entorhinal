@@ -98,6 +98,7 @@ concepts.
 | `upgrade_implicit` | mutate | Promote an implicit project to a registered one, keeping its id. |
 | `remove` | mutate | Remove a project registration; its id stops resolving. |
 | `add_root` | mutate | Add a root to a registered project; it starts unapproved. |
+| `refresh_root_key` | mutate | Fill a registered root's missing repository key from its current owned remotes, preserving its binding and approval. |
 | `attach_root` | mutate | Attach a local checkout to an existing project's root key; it starts unapproved. |
 | `rebind_root` | mutate | Rebind a replaced or unbound checkout, keeping its project id; approval is still required. |
 | `remove_root` | mutate | Remove one root, retiring its binding and worker containers. |
@@ -108,6 +109,12 @@ concepts.
 | `seed_import` | mutate | Bulk-import registrations from a seed file (recovery). |
 | `rebuild` | mutate | Rebuild the derived tables by replaying the journal (recovery). |
 | `projects.session_liveness` | mutate | The session liveness feed. Host only; never journaled. See [session-liveness-contract.md](session-liveness-contract.md). |
+
+`refresh_root_key` takes `{root}` and returns `{projectId, name, root, rootKey,
+generation, noop}`. It fills only a missing key; repeating the same refresh is a
+no-op. It requires the identity log to be enabled and refuses `identity_log_disabled`,
+`remotes_unreadable`, `root_key_unavailable`, `root_key_exists`, or
+`root_key_present` rather than replacing an existing different key.
 
 `move_root_to_new_project` takes `{fromProjectId, root, name, actor?}` and
 returns `{fromProjectId, projectId, name, root, rootKey, generation}` (plus the

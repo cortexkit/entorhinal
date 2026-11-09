@@ -158,6 +158,21 @@ under a folder macOS protects needs Files & Folders access for entorhinal (see
 Verify: `ck projects trust ~/src/my-app --json` lists each remote and whether
 it is owned.
 
+## Fill a missing repository key
+
+If a root was registered before its GitHub remote existed, fill its missing
+machine-neutral key after adding the remote:
+
+```sh
+ck projects refresh-key ~/src/my-app
+```
+
+The command uses the root's current owned remotes, just as adding a root does.
+It preserves the checkout binding and operator approval, so there is no need to
+remove and add the root again. An identical key is a no-op; an existing different
+key cannot be replaced. The command refuses if the root owns no GitHub remote
+or another project already holds the key.
+
 ## Workspaces
 
 ```sh

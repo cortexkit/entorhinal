@@ -1,11 +1,13 @@
-//! Stable machine-neutral root names. A key is chosen only when a root is
-//! inserted; the journal, not today's checkout configuration, owns its mapping.
+//! Stable machine-neutral root names. A key is chosen when a root is inserted
+//! or explicitly filled; the journal, not today's checkout configuration, owns it.
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::path::Path;
 
 use crate::{
+    canonical_query_path,
     mutations::{append, canonical, domain, Action},
     shared_entry::RootKeyMapping,
     GitRemote, JournalWriter, RegistryError, RegistryStore,
@@ -87,7 +89,16 @@ pub(crate) fn incoming(
     if error.is_some() {
         return Ok(None);
     }
-    let key = choose(&remotes, label);
+    checked_key(conn, project, &remotes, label)
+}
+
+fn checked_key(
+    conn: &Connection,
+    project: &str,
+    remotes: &[GitRemote],
+    label: Option<&str>,
+) -> Result<Option<RootKey>, RegistryError> {
+    let key = choose(remotes, label);
     if let Some(key) = &key {
         if key.kind == "remote" {
             if let Some(owner) = conn.query_row(
@@ -99,6 +110,26 @@ pub(crate) fn incoming(
         }
     }
     Ok(key)
+}
+
+fn refresh_key(conn: &Connection, project: &str, root: &str) -> Result<RootKey, RegistryError> {
+    if !crate::log_schema::log_enabled(conn)? {
+        return Err(domain(
+            "identity_log_disabled",
+            "root keys require an enabled identity log",
+        ));
+    }
+    // Unlike insertion, an explicit refresh must derive a key for a registered root.
+    let (remotes, error) = crate::ownership::root_remotes(conn, root)?;
+    if let Some(error) = error {
+        return Err(domain("remotes_unreadable", error));
+    }
+    checked_key(conn, project, &remotes, None)?.ok_or_else(|| {
+        domain(
+            "root_key_unavailable",
+            format!("{root} owns no GitHub remote"),
+        )
+    })
 }
 
 pub(crate) fn assign(
@@ -133,9 +164,9 @@ pub(crate) fn journal_assignments(
     actor: &str,
     now: i64,
     principal: &str,
-) -> Result<(), RegistryError> {
+) -> Result<Option<i64>, RegistryError> {
     if !mappings.is_empty() {
-        append(
+        return Ok(Some(append(
             tx,
             "root_key.assign",
             &json!({"mappings": mappings}),
@@ -143,9 +174,9 @@ pub(crate) fn journal_assignments(
             None,
             now,
             principal,
-        )?;
+        )?));
     }
-    Ok(())
+    Ok(None)
 }
 
 pub(crate) fn mapped_key(conn: &Connection, root: &str) -> rusqlite::Result<Option<RootKey>> {
@@ -193,6 +224,12 @@ pub struct AttachRootRequest {
     pub actor: Option<String>,
     #[serde(default)]
     pub request_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RefreshRootKeyRequest {
+    pub root: String,
 }
 
 /// A read-only match, not a reservation: attachment checks again in its write
@@ -311,9 +348,49 @@ impl RegistryStore {
     pub fn attach_root(&self, req: AttachRootRequest) -> Result<Vec<u8>, RegistryError> {
         self.with_principal("entorhinal").attach_root(req)
     }
+
+    pub fn refresh_root_key(&self, req: RefreshRootKeyRequest) -> Result<Vec<u8>, RegistryError> {
+        self.with_principal("entorhinal").refresh_root_key(req)
+    }
 }
 
 impl JournalWriter<'_> {
+    pub fn refresh_root_key(&self, req: RefreshRootKeyRequest) -> Result<Vec<u8>, RegistryError> {
+        self.refresh_root_key_at(req, crate::now_unix_millis())
+    }
+
+    pub fn refresh_root_key_at(
+        &self,
+        mut req: RefreshRootKeyRequest,
+        now: i64,
+    ) -> Result<Vec<u8>, RegistryError> {
+        req.root = canonical_query_path(Path::new(&req.root))?.0;
+        self.mutation("refresh_root_key", None, |tx| {
+            let (project, name) = tx
+                .query_row(
+                    "SELECT r.project_id,p.name FROM project_root r JOIN project p ON p.project_id=r.project_id WHERE r.canonical_root=?1",
+                    [&req.root],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?
+                .ok_or_else(|| domain("not_found", format!("{} is not a registered root", req.root)))?;
+            let key = refresh_key(tx, &project, &req.root)?;
+            let value = json!({"projectId":project,"name":name,"root":req.root,"rootKey":key});
+            if let Some(existing) = mapped_key(tx, &req.root)? {
+                if existing != key {
+                    return Err(domain("root_key_present", format!("{} already has root key {}", req.root, existing.root_key)));
+                }
+                return Ok(Action { changed: false, seq: None, value, payload: json!({}) });
+            }
+            // Fill identity in place: replacing the checkout binding would discard approval.
+            let mut mappings = Vec::new();
+            assign(tx, &project, &req.root, Some(key), now, &mut mappings)?;
+            let payload = json!({"mappings":mappings});
+            let seq = journal_assignments(tx, mappings, "module", now, self.principal)?;
+            Ok(Action { changed: true, seq, value, payload })
+        })
+    }
+
     pub fn attach_root(&self, req: AttachRootRequest) -> Result<Vec<u8>, RegistryError> {
         self.attach_root_at(req, crate::now_unix_millis())
     }
@@ -973,6 +1050,200 @@ mod tests {
     #[test]
     fn add_root_assigns_and_refuses_shared_remote_conflicts() {
         root_inserter("add_root");
+    }
+
+    #[test]
+    fn refresh_root_key_fills_in_place_preserving_approval_and_replays() {
+        let mut f = Fixture::new("refresh-root-key");
+        f.store.set_root_records(true);
+        enable(&f);
+        register(&f, "P", f.dir("original"));
+        let root = f.dir("checkout");
+        git(&root, &["init", "--quiet"]);
+        f.store
+            .add_root(AddRootRequest {
+                project_id: "P".into(),
+                root: root.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+        f.store.bind_unbound_roots("test").unwrap();
+        f.store.approve_root(&root, "test").unwrap();
+        let before = cells(&f);
+        let record = f
+            .store
+            .trust(&root)
+            .unwrap()
+            .root_fields
+            .unwrap()
+            .root_records
+            .remove(0);
+        assert!(record.root_key.is_none());
+        assert!(record.registration_epoch.is_some());
+        assert_eq!(record.approval.state, "approved");
+        assert_eq!(before["root_approval"].len(), 1);
+        let token = fs::read(Path::new(&root).join(".git/cortexkit-root-incarnation")).unwrap();
+        let generation = f.store.generation().unwrap();
+
+        git(
+            &root,
+            &["remote", "add", "origin", "git@github.com:o/r.git"],
+        );
+        let reply = result(
+            &f.store
+                .refresh_root_key(RefreshRootKeyRequest {
+                    root: format!("{root}/."),
+                })
+                .unwrap(),
+        );
+        assert_eq!(reply["noop"], false);
+        assert_eq!(reply["projectId"], "P");
+        assert_eq!(reply["rootKey"], json!({"kind":"remote","rootKey":"o/r"}));
+        assert_eq!(lookup(&f, "P", "remote", "o/r"), vec![root.clone()]);
+        assert_eq!(f.store.generation().unwrap(), generation + 1);
+        assert_eq!(
+            assignment_rows(&f),
+            vec![json!({"mappings":[{
+                "canonical_root":root,"kind":"remote","root_key":"o/r"
+            }]})]
+        );
+        let after = cells(&f);
+        for table in [
+            "root_binding",
+            "root_approval",
+            "retired_binding",
+            "derived_root_parent",
+        ] {
+            assert_eq!(before[table], after[table], "{table} must survive refresh");
+        }
+        let refreshed = f
+            .store
+            .trust(&root)
+            .unwrap()
+            .root_fields
+            .unwrap()
+            .root_records
+            .remove(0);
+        assert_eq!(record.registration_epoch, refreshed.registration_epoch);
+        assert_eq!(refreshed.approval.state, "approved");
+        assert_eq!(
+            token,
+            fs::read(Path::new(&root).join(".git/cortexkit-root-incarnation")).unwrap()
+        );
+
+        let reply = result(
+            &f.store
+                .refresh_root_key(RefreshRootKeyRequest { root: root.clone() })
+                .unwrap(),
+        );
+        assert_eq!(reply["noop"], true);
+        assert_eq!(reply["projectId"], "P");
+        assert_eq!(reply["rootKey"]["rootKey"], "o/r");
+        assert_eq!(after, cells(&f));
+        assert!(f.store.verify().unwrap().ok);
+        assert!(f.store.rebuild().unwrap().replay.ok);
+        assert_eq!(after, cells(&f));
+    }
+
+    #[test]
+    fn refresh_root_key_refusals_leave_every_cell_unchanged() {
+        let f = Fixture::new("refresh-refusals");
+        let root = f.dir("root");
+        git(&root, &["init", "--quiet"]);
+        register(&f, "P", root.clone());
+        let refuse = |root: &str, expected: &str| {
+            let before = cells(&f);
+            code(
+                f.store
+                    .refresh_root_key(RefreshRootKeyRequest { root: root.into() })
+                    .unwrap_err(),
+                expected,
+            );
+            assert_eq!(before, cells(&f));
+        };
+        refuse(&root, "identity_log_disabled");
+        enable(&f);
+        refuse(&f.dir("unregistered"), "not_found");
+        refuse(&root, "root_key_unavailable");
+        git(
+            &root,
+            &["remote", "add", "origin", "https://example.com/o/r.git"],
+        );
+        refuse(&root, "root_key_unavailable");
+        register(&f, "owner", repo(&f, "owner", "taken/key"));
+        git(
+            &root,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "git@github.com:taken/key.git",
+            ],
+        );
+        refuse(&root, "root_key_exists");
+        let config = Path::new(&root).join(".git/config");
+        fs::remove_file(&config).unwrap();
+        fs::create_dir(&config).unwrap();
+        refuse(&root, "remotes_unreadable");
+
+        let keyed = repo(&f, "keyed", "original/key");
+        register(&f, "keyed", keyed.clone());
+        git(
+            &keyed,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "git@github.com:changed/key.git",
+            ],
+        );
+        refuse(&keyed, "root_key_present");
+        assert!(serde_json::from_value::<RefreshRootKeyRequest>(json!({
+            "root":root,"requestKey":"unsupported"
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn refresh_root_key_refactor_keeps_add_root_remote_assignment_policy() {
+        for enabled in [false, true] {
+            let f = Fixture::new("refresh-add-root-policy");
+            if enabled {
+                enable(&f);
+            }
+            register(&f, "P", f.dir("original"));
+            let root = repo(&f, "added", "o/r");
+            let add = || {
+                f.store
+                    .add_root(AddRootRequest {
+                        project_id: "P".into(),
+                        root: root.clone(),
+                        ..Default::default()
+                    })
+                    .unwrap()
+            };
+            assert_eq!(result(&add())["noop"], false);
+            let key = f.store.read(|conn| mapped_key(conn, &root)).unwrap();
+            assert_eq!(
+                key,
+                enabled.then(|| RootKey {
+                    kind: "remote".into(),
+                    root_key: "o/r".into()
+                })
+            );
+            git(
+                &root,
+                &[
+                    "remote",
+                    "set-url",
+                    "origin",
+                    "git@github.com:changed/key.git",
+                ],
+            );
+            let before = cells(&f);
+            assert_eq!(result(&add())["noop"], true);
+            assert_eq!(before, cells(&f));
+        }
     }
     #[test]
     fn upgrade_implicit_assigns_and_refuses_shared_remote_conflicts() {

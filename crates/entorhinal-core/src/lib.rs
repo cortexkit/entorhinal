@@ -52,7 +52,8 @@ pub use binding::*;
 pub use mutations::*;
 pub use ownership::{ResolveRemoteReply, ResolveRemoteStatus, SetOwnedRemotesRequest};
 pub use root_keys::{
-    AttachRootPreview, AttachRootRequest, ResolveRootKeyReply, ResolveRootKeyRequest, RootKey,
+    AttachRootPreview, AttachRootRequest, RefreshRootKeyRequest, ResolveRootKeyReply,
+    ResolveRootKeyRequest, RootKey,
 };
 pub use session_lifecycle::{
     AgentSession, AgentSessionPage, GoneSession, RunnerSessionBinding, SessionCursor, SessionEnd,

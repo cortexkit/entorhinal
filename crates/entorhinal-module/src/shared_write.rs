@@ -1300,6 +1300,107 @@ mod tests {
         assert_eq!(f.pending(), 0);
         assert!(f.store().verify().unwrap().ok);
     }
+
+    #[tokio::test]
+    async fn refresh_root_key_uses_shared_writer_and_retries_without_rebinding() {
+        let tap = Tap::new(0);
+        let f = Fixture::new("write-refresh-key", connector(&tap));
+        f.handler
+            .store
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .set_root_records(true);
+        f.call("register", register("P", "base")).await.unwrap();
+        let root = f.dir.join("root");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/config"), "[core]\n\tbare = false\n").unwrap();
+        let root = crate::tests::canonical_test_path(root)
+            .to_string_lossy()
+            .into_owned();
+        f.call("add_root", json!({"projectId":"P","root":root}))
+            .await
+            .unwrap();
+        f.store().approve_root(&root, "test").unwrap();
+        let before = f
+            .store()
+            .trust(&root)
+            .unwrap()
+            .root_fields
+            .unwrap()
+            .root_records
+            .remove(0);
+        std::fs::write(
+            PathBuf::from(&root).join(".git/config"),
+            "[core]\n\tbare = false\n[remote \"origin\"]\n\turl = git@github.com:o/r.git\n",
+        )
+        .unwrap();
+        let sends_before = tap.sends().len();
+        let generation = f.store().generation().unwrap();
+        tap.races.store(1, Ordering::SeqCst);
+        let reply: Value = serde_json::from_slice(
+            &f.call("refresh_root_key", json!({"root":root}))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reply["result"]["rootKey"]["rootKey"], "o/r");
+        assert_eq!(reply["result"]["noop"], false);
+        let sends = tap.sends();
+        assert_eq!(sends.len(), sends_before + 2);
+        let entries: Vec<Value> = sends[sends_before..]
+            .iter()
+            .map(|send| {
+                serde_json::from_slice(
+                    &log_client::decode_hex(send["entry"]["data"].as_str().unwrap()).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
+        assert_eq!(entries[0], entries[1]);
+        assert_eq!(
+            entries[0]["tables"]["project_root_key"]["upsert"][0]["root_key"],
+            "o/r"
+        );
+        assert_eq!(
+            entries[0]["tables"]["project_root_key"]["upsert"][0]["created_at"],
+            700
+        );
+        for table in ["project_root", "root_binding", "root_approval"] {
+            assert!(entries[0]["tables"].get(table).is_none());
+        }
+        let rows = f.store().journal_tail(generation, 100).unwrap().entries;
+        assert!(rows.iter().all(|row| row.op != "bind_root"));
+        let assignments: Vec<_> = rows
+            .into_iter()
+            .filter(|row| row.op == "root_key.assign")
+            .map(|row| (row.op, row.created_at))
+            .collect();
+        assert_eq!(assignments, vec![("root_key.assign".into(), 700)]);
+        let after = f
+            .store()
+            .trust(&root)
+            .unwrap()
+            .root_fields
+            .unwrap()
+            .root_records
+            .remove(0);
+        assert_eq!(before.registration_epoch, after.registration_epoch);
+        assert_eq!(after.approval.state, "approved");
+        let image = f.image();
+        let reply: Value = serde_json::from_slice(
+            &f.call("refresh_root_key", json!({"root":root}))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reply["result"]["noop"], true);
+        assert_eq!(image, f.image());
+        assert_eq!(tap.sends().len(), sends.len());
+        assert_eq!(f.pending(), 0);
+        assert!(f.store().verify().unwrap().ok);
+    }
     mod confirmation {
         use super::*;
         use crate::agent_ops::{OperatorConfirmError, OperatorConfirmer};
@@ -2596,6 +2697,7 @@ enum Write {
     Remove(RemoveRequest),
     Seed(SeedImportRequest),
     Add(entorhinal_core::AddRootRequest),
+    RefreshKey(entorhinal_core::RefreshRootKeyRequest),
     Attach(entorhinal_core::AttachRootRequest),
     MoveRoot(entorhinal_core::MoveRootToNewProjectRequest),
     Agent(String, Value),
@@ -2624,6 +2726,9 @@ impl Write {
             "remove" => Self::Remove(serde_json::from_value(params).map_err(invalid_params)?),
             "seed_import" => Self::Seed(serde_json::from_value(params).map_err(invalid_params)?),
             "add_root" => Self::Add(serde_json::from_value(params).map_err(invalid_params)?),
+            "refresh_root_key" => {
+                Self::RefreshKey(serde_json::from_value(params).map_err(invalid_params)?)
+            }
             "attach_root" => Self::Attach(serde_json::from_value(params).map_err(invalid_params)?),
             "move_root_to_new_project" => {
                 Self::MoveRoot(serde_json::from_value(params).map_err(invalid_params)?)
@@ -2668,6 +2773,7 @@ impl Write {
             Self::Remove(r) => r.request_key.as_deref(),
             Self::Seed(r) => r.request_key.as_deref(),
             Self::Add(_) => None,
+            Self::RefreshKey(_) => None,
             Self::MoveRoot(_) => None,
             Self::Attach(r) => r.request_key.as_deref(),
             Self::Member(_) => None,
@@ -2718,6 +2824,7 @@ impl Write {
             Self::Remove(r) => writer.remove_at(r, now),
             Self::Seed(r) => writer.seed_import_at(r, now),
             Self::Add(r) => writer.add_root_at(r, now),
+            Self::RefreshKey(r) => writer.refresh_root_key_at(r, now),
             Self::Attach(r) => writer.attach_root_at(r, now),
             Self::MoveRoot(r) => writer.move_root_to_new_project_at(r, now),
             Self::Member(name) => {
@@ -2818,6 +2925,7 @@ fn shared_candidate(op: &str) -> bool {
             | "remove"
             | "seed_import"
             | "add_root"
+            | "refresh_root_key"
             | "attach_root"
             | "move_root_to_new_project"
             | "member.set_name"

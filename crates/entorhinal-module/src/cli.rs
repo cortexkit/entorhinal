@@ -390,6 +390,7 @@ usage: ck projects <verb> [args] [--subc <connection file>] [--json]
   remove <project>        remove a project from the registry
   add-root <project> <dir>
                           add another root to a project (starts unapproved)
+  refresh-key <dir>        fill a missing repository key, preserving approval
   attach <path> [--project ID] [--label L] [--yes]
                           preview the matched project/key; --yes attaches unapproved
   remove-root <project> <dir>
@@ -479,7 +480,7 @@ This binary is the module itself; it is not an operator command. The operator
 surface is:
 
    ck projects      list, register, resolve, remove, add-root, remove-root, move-root,
-                   attach, owned-remotes, approve, unapprove, trust, verify, log
+                   refresh-key, attach, owned-remotes, approve, unapprove, trust, verify, log
   ck workspaces    list, assign, set-root, clear-root
    ck agents        create, rename, retire, tag, labels, list, show
    ck roles         read, take
@@ -827,6 +828,10 @@ fn build_at(command: &Command, cwd: &str) -> Result<(String, Value), String> {
                 "root": mutation(&need(1, "a directory")?)?,
                 "actor": actor,
             }),
+        ),
+        (Face::Projects, "refresh-key") => (
+            "refresh_root_key".to_string(),
+            json!({"root": mutation(&need(0, "a directory")?)?}),
         ),
         (Face::Projects, "rebind") => (
             "rebind_root".to_string(),
@@ -1751,6 +1756,7 @@ fn render(command: &Command, value: &Value) {
         return;
     }
     match (command.face, command.verb.as_str()) {
+        (Face::Projects, "refresh-key") => println!("{}", format_refresh_key(value)),
         (Face::Projects, "move-root") => println!("{}", format_move_root(value)),
         (Face::Agents, "list" | "show") => println!("{}", format_agents(&command.verb, value)),
         (Face::Agents, "moves") => println!("{}", format_agent_moves(value)),
@@ -1862,6 +1868,18 @@ fn render(command: &Command, value: &Value) {
             serde_json::to_string_pretty(value).unwrap_or_default()
         ),
     }
+}
+
+fn format_refresh_key(value: &Value) -> String {
+    if value["noop"] == true {
+        return "Nothing changed.".into();
+    }
+    format!(
+        "{} ({}): repository key {}",
+        text(&value["name"]),
+        text(&value["projectId"]),
+        text(&value["rootKey"]["rootKey"]),
+    )
 }
 
 fn format_move_root(value: &Value) -> String {
@@ -2610,6 +2628,33 @@ mod tests {
             format_owned_remotes(&json!({"root":"/repo","remotes":[]})),
             "/repo: owned remotes: none"
         );
+    }
+
+    #[test]
+    fn refresh_root_key_cli_maps_path_and_names_project_and_key_or_noop() {
+        let (dir, _) = crate::tests::scratch_descriptor("refresh-key-cli");
+        let root = dir.to_str().unwrap();
+        let command = match parse_as(Face::Projects, &["refresh-key", root]) {
+            Invocation::Command(command) => command,
+            _ => panic!("refresh-key must parse as a command"),
+        };
+        let (method, params) = build(&command).unwrap();
+        assert_eq!(method, "refresh_root_key");
+        assert_eq!(
+            params,
+            json!({"root":entorhinal_core::RegistryStore::canonical_mutation_root(root).unwrap()})
+        );
+        assert_eq!(
+            format_refresh_key(
+                &json!({"projectId":"P","name":"Project","rootKey":{"kind":"remote","rootKey":"o/r"},"noop":false})
+            ),
+            "Project (P): repository key o/r"
+        );
+        assert_eq!(
+            format_refresh_key(&json!({"noop":true})),
+            "Nothing changed."
+        );
+        assert!(usage(Face::Projects).contains("refresh-key <dir>"));
     }
 
     #[test]
@@ -4506,6 +4551,7 @@ mod launch_path_tests {
         for (face, verb, args, field) in [
             (Face::Projects, "register", vec!["name", root], "roots"),
             (Face::Projects, "add-root", vec!["p1", root], "root"),
+            (Face::Projects, "refresh-key", vec![root], "root"),
             (Face::Projects, "attach", vec![root, "--yes"], "path"),
             (Face::Workspaces, "set-root", vec!["w1", root], "root"),
         ] {
