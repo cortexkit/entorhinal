@@ -3360,6 +3360,10 @@ mod tests {
         handler.stop_catalog_poll().await;
         handler.stop_role_refresh().await;
         handler.stop_session_upkeep().await;
+        // Every store install starts blocking catalog jobs (the built-in registry
+        // and the starter seed) that hold a store handle; Windows cannot delete a
+        // scratch folder while one is still open.
+        handler.catalog_sql.wait().await;
     }
 
     #[tokio::test]

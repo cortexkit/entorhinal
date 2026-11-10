@@ -1256,6 +1256,10 @@ impl SessionFixture {
                 RouteAdmission::from_bind(Some(reserved(module_id)), None),
             );
         }
+        // The store install starts the built-in registry job on the blocking
+        // pool. Let it finish so no handle is open when `Drop` deletes the
+        // scratch folder, which Windows refuses while a file is in use.
+        handler.catalog_sql.wait().await;
         Self { dir, handler }
     }
 
