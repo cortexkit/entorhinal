@@ -90,7 +90,19 @@ pub(crate) fn participant_action(op: &str, code: &str) -> Option<DriverAction> {
     Op::ALL
         .into_iter()
         .find(|candidate| candidate.method() == op)
-        .map(|op| driver_action_for(op, &RefusalCode::from_code(code)))
+        .and_then(
+            |op| match driver_action_for(op, &RefusalCode::from_code(code)) {
+                action @ (DriverAction::Abort
+                | DriverAction::RetryWithinStep
+                | DriverAction::RetryLater
+                | DriverAction::RetryAfterOperator
+                | DriverAction::Retry
+                | DriverAction::TerminalForStep) => Some(action),
+                // A newer action may cross a safety boundary; None makes callers
+                // hold durably instead of guessing whether to abort or retry.
+                _ => None,
+            },
+        )
 }
 
 pub(crate) fn digest_reason(code: &str, detail: Option<&serde_json::Value>) -> Option<String> {

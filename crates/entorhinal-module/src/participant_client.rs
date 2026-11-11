@@ -1123,6 +1123,11 @@ mod refusal_tests {
                 "busy",
             ),
             (Request::Prepare(cut()), "frobnicated"),
+            (Request::Abort(cut()), "participant_failed"),
+            (
+                Request::Release(release_request(cut(), "machine-b")),
+                "participant_failed",
+            ),
         ] {
             let fake = Arc::new(FakeParticipant::new(&["session"], cut().refs.into_vec()));
             let detail = json!({"note":"contract violation","nested":{"future":true}});

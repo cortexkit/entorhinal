@@ -460,7 +460,8 @@ impl Failure {
             failure.refusal = Some(Box::new(PeerRefusal { message }));
         }
         failure.action = participant_action(op, &code);
-        if !violation
+        failure.violation |= failure.action.is_none();
+        if !failure.violation
             && matches!(
                 failure.action,
                 Some(DriverAction::Abort | DriverAction::TerminalForStep)
@@ -3413,6 +3414,86 @@ mod tests {
         f.until(&mut receiver, Step::Aborted).await;
         assert_eq!(f.claim_cas_count(), 0);
         assert!(f.discovery.participant.fake.staged().is_empty());
+    }
+    #[tokio::test]
+    async fn receiver_missing_driver_action_is_a_contract_hold_not_an_abort() {
+        let failure = Failure::participant(
+            "data",
+            "agent_data.future",
+            ClientError::Refused(crate::participant_client::Refusal {
+                code: "participant_failed".into(),
+                detail: None,
+                message: None,
+            }),
+        );
+        assert!(failure.action.is_none());
+        assert!(failure.violation);
+        assert!(failure.reason.is_none());
+    }
+    #[tokio::test]
+    async fn receiver_participant_failed_import_aborts_with_participant_named() {
+        let f = Fixture::new(false).await;
+        f.pickup().await;
+        f.refuse("agent_data.import", "participant_failed");
+        let mut receiver = f.receiver();
+        receiver.tick().await.unwrap();
+        assert_eq!(f.row().reason.as_deref(), Some("participant_refused"));
+        let detail = f.row().detail.unwrap();
+        assert_eq!(detail["code"], "participant_failed");
+        assert_eq!(detail["module_id"], "data");
+        assert_eq!(detail["op"], "agent_data.import");
+        f.until(&mut receiver, Step::Aborted).await;
+        assert_eq!(f.claim_cas_count(), 0);
+        assert!(f.discovery.participant.fake.staged().is_empty());
+        let reply = f.worker.records.read(&format!("move:{CUT}")).await.unwrap();
+        let record =
+            wire::decode_move_record(&format!("move:{CUT}"), reply.body.as_deref().unwrap())
+                .unwrap();
+        assert_eq!(record.state, State::Aborted);
+        assert_eq!(record.detail.unwrap(), detail);
+    }
+    #[tokio::test]
+    async fn receiver_participant_failed_activate_holds_fork_across_restart() {
+        for detail in [
+            Some(json!({"reason":"participant storage is corrupt"})),
+            None,
+        ] {
+            let f = Fixture::new(false).await;
+            f.pickup().await;
+            let mut receiver = f.receiver();
+            f.until(&mut receiver, Step::Activating).await;
+            f.discovery.participant.fake.script(
+                "agent_data.activate",
+                Effect::Refuse(crate::participant_client::Refusal {
+                    code: "participant_failed".into(),
+                    detail: detail.clone(),
+                    message: None,
+                }),
+            );
+            receiver.tick().await.unwrap();
+            let row = f.row();
+            assert_eq!(row.step, Step::Activating);
+            assert!(row.abort_requested.is_none());
+            assert!(row.plan["_receiver"]["contract_violation"].is_null());
+            assert!(row.plan["_receiver"]["activation_fork"].is_object());
+            let held = row.detail.unwrap();
+            assert_eq!(held["module_id"], "data");
+            assert_eq!(held["op"], "agent_data.activate");
+            assert_eq!(held["code"], "participant_failed");
+            assert_eq!(held["detail"], detail.unwrap_or(Value::Null));
+            let calls = f.discovery.participant.fake.calls().len();
+            for _ in 0..3 {
+                advance_clock();
+                receiver.tick().await.unwrap();
+            }
+            let mut restarted = f.receiver();
+            restarted.tick().await.unwrap();
+            assert_eq!(calls, f.discovery.participant.fake.calls().len());
+            assert_eq!(f.row().step, Step::Activating);
+            assert!(f.row().abort_requested.is_none());
+            assert_eq!(f.claim().await.version, 1);
+            assert_eq!(f.claim_cas_count(), 1);
+        }
     }
 
     #[tokio::test]

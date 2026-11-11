@@ -422,15 +422,16 @@ impl Source {
                 .map_err(|f| HandlerError::new(&f.code, f.detail.to_string()))?;
             return Ok(Some(POLL));
         }
-        if error.contract_violation {
+        let unknown_action = error.module.is_some() && error.action().is_none();
+        if error.contract_violation || unknown_action {
             let detail = error.detail();
             if !plan.source.errors.contains(&detail) {
                 plan.source.errors.push(detail.clone());
             }
-            if cleanup || row.step == Step::Releasing {
-                // Release cannot be rolled back, and cleanup cannot finish by
-                // trusting a participant that broke its contract. Stop calls
-                // durably rather than turning the violation into another retry.
+            if unknown_action || cleanup || row.step == Step::Releasing {
+                // Unknown actions cannot be executed safely. Release cannot be
+                // rolled back, and cleanup cannot trust a broken contract.
+                // Stop calls durably rather than retrying in either case.
                 plan.source.contract_violation = Some(detail.clone());
                 row.detail = Some(detail.clone());
                 row.hold = Some(detail);
@@ -2097,6 +2098,73 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn source_missing_driver_action_holds_without_abort_or_retry_after_restart() {
+        let f = Fixture::new();
+        let mut source = f.source();
+        let mut row = f.row();
+        let mut plan: Plan = serde_json::from_value(row.plan.clone()).unwrap();
+        // An unknown op produces the same missing-action signal as a future
+        // DriverAction variant, which cannot be constructed outside its crate.
+        let error = Failure::participant(
+            "agent_data.future",
+            "b",
+            ClientError::Refused(Refusal {
+                code: "participant_failed".into(),
+                detail: None,
+                message: None,
+            }),
+        );
+        assert!(error.action().is_none());
+        source.failed(&mut row, &mut plan, error).await.unwrap();
+        let held = f.row();
+        assert_eq!(held.step, row.step);
+        assert!(held.abort_requested.is_none());
+        assert_eq!(held.attempts, 0);
+        assert!(held.plan["_source"]["contract_violation"].is_object());
+        assert_eq!(held.hold.unwrap()["module_id"], "b");
+        let counts: Vec<_> = f.participants.iter().map(|p| p.calls().len()).collect();
+        f.step(&mut source).await;
+        let mut restarted = f.source();
+        f.step(&mut restarted).await;
+        assert_eq!(f.row().step, held.step);
+        assert!(f.row().abort_requested.is_none());
+        assert_eq!(f.row().attempts, 0);
+        assert_eq!(
+            f.participants
+                .iter()
+                .map(|p| p.calls().len())
+                .collect::<Vec<_>>(),
+            counts
+        );
+    }
+    #[tokio::test(start_paused = true)]
+    async fn source_participant_failed_prepare_and_export_abort_with_participant_named() {
+        for op in ["agent_data.prepare", "agent_data.export"] {
+            let f = Fixture::new();
+            let mut source = f.source();
+            f.participants[1].script(
+                op,
+                ParticipantEffect::Refuse(Refusal {
+                    code: "participant_failed".into(),
+                    detail: Some(json!({"reason":"participant storage is corrupt"})),
+                    message: None,
+                }),
+            );
+            f.until(&mut source, Step::Aborted).await;
+            let row = f.row();
+            assert_eq!(row.reason.as_deref(), Some("participant_refused"));
+            let detail = row.detail.unwrap();
+            assert_eq!(detail["module_id"], "b");
+            assert_eq!(detail["op"], op);
+            assert_eq!(detail["code"], "participant_failed");
+            assert_eq!(detail["detail"]["reason"], "participant storage is corrupt");
+            assert!(row.plan["_source"]["contract_violation"].is_null());
+            let reply = f.worker.records.read(&format!("move:{CUT}")).await.unwrap();
+            assert!(reply.body.is_none());
+            assert!(f.door.calls().is_empty());
+        }
+    }
     #[tokio::test(start_paused = true)]
     async fn source_prepare_busy_retries_eight_times_with_paused_exponential_backoff() {
         let f = Fixture::new();
