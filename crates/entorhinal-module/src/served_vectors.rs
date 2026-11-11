@@ -1197,6 +1197,224 @@ async fn agent_resolve_merged_records_match_published_file() {
     );
 }
 
+#[tokio::test]
+async fn github_identity_records_match_published_file() {
+    const MERGED: &str = "agent_0000000000000601";
+    const SURVIVOR: &str = "agent_0000000000000602";
+    const READER_MODULE: &str = "claustrum";
+    let fixture = Fixture::new("served-github-identity").await;
+    fixture.handler.route_admissions().insert(
+        READER,
+        RouteAdmission::from_bind(Some(reserved(READER_MODULE)), None),
+    );
+    let source = fixture.snapshot();
+    for (id, name, head) in [
+        (HEAD, "Mira", true),
+        (ASSISTANT, "Neri", false),
+        (NO_AVATAR, "Tavi", false),
+        (RETIRED, "Ivo", false),
+        (MERGED, "Luma", false),
+        (SURVIVOR, "Sora", false),
+    ] {
+        seed_agent(&source, id, name, None, false, head);
+    }
+    drop(source);
+    let imported = fixture.import().await;
+    let HandlerOutcome::Response(bytes) = imported else {
+        panic!(
+            "GitHub identity fixture import refused: {}",
+            refusal(imported)
+        );
+    };
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).unwrap()["result"]["agents_imported"],
+        6
+    );
+    for (id, identity) in [
+        (
+            HEAD,
+            json!({"kind":"app","app_id":314159,"app_slug":"fern-bot","installation_id":271828,"client_id":"Iv23syntheticFernBot","credential_ref":"github_app:fern-bot","coauthor_line":"Co-authored-by: fern-bot[bot] <314159+fern-bot[bot]@users.noreply.github.com>"}),
+        ),
+        (
+            ASSISTANT,
+            json!({"kind":"app","app_id":314159,"app_slug":"fern-bot","credential_ref":"github_app:fern-bot","coauthor_line":"Co-authored-by: fern-bot[bot] <314159+fern-bot[bot]@users.noreply.github.com>"}),
+        ),
+        (
+            NO_AVATAR,
+            json!({"kind":"user_token","login":"fern-gardener","credential_ref":"github_user:fern-gardener","coauthor_line":null}),
+        ),
+    ] {
+        fixture
+            .success(
+                CORE,
+                "agent.set_github_identity",
+                json!({"agent_id":id,"github_identity":identity,"request_key":format!("github-identity-{id}")}),
+            )
+            .await;
+    }
+    fixture
+        .success(
+            CORE,
+            "agent.dispose",
+            json!({"agent_id":RETIRED,"request_key":"github-identity-retire"}),
+        )
+        .await;
+    fixture
+        .success(
+            CORE,
+            "agent.merge",
+            json!({"agent_id":MERGED,"into_agent_id":SURVIVOR,"request_key":"github-identity-merge"}),
+        )
+        .await;
+
+    let mut records = Vec::new();
+    for id in [
+        HEAD, ASSISTANT, NO_AVATAR, SURVIVOR, UNKNOWN, RETIRED, MERGED,
+    ] {
+        let op = "agent.github_identity";
+        let request = json!({"agent_id":id});
+        let reply = match fixture.outcome(READER, op, request.clone()).await {
+            HandlerOutcome::Response(bytes) => String::from_utf8(bytes).unwrap(),
+            outcome => serde_json::to_string(&refusal(outcome)).unwrap(),
+        };
+        // Keep the handler's success bytes, including its result envelope, so
+        // whitespace and key-order changes also invalidate the published file.
+        records.push(format!(
+            "  {{\"op\":{},\"request\":{},\"principal\":{},\"reply\":{reply}}}",
+            json!(op),
+            request,
+            json!({"kind":"reserved","moduleId":READER_MODULE}),
+        ));
+    }
+    published_file("agent-github-identity-v1", "github-identity.json", records);
+}
+
+#[test]
+fn github_identity_published_records_decode() {
+    #[derive(Debug, PartialEq, serde::Deserialize, Serialize)]
+    #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+    enum GithubIdentity {
+        App {
+            app_id: i64,
+            app_slug: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            installation_id: Option<i64>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            client_id: Option<String>,
+            credential_ref: String,
+            coauthor_line: String,
+        },
+        UserToken {
+            login: String,
+            credential_ref: String,
+            coauthor_line: Option<String>,
+        },
+    }
+
+    #[derive(Debug, serde::Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct GithubIdentityResult {
+        github_identity: Option<GithubIdentity>,
+        agent_generation: i64,
+        generation: i64,
+        incarnation: String,
+        #[serde(rename = "projectId", default, skip_serializing_if = "Option::is_none")]
+        project_id: Option<String>,
+    }
+
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../test-vectors/agent-github-identity-v1/github-identity.json");
+    let records: Vec<Value> = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(records.len(), 7);
+    for record in &records {
+        assert_eq!(record["op"], "agent.github_identity");
+        assert_eq!(
+            record["principal"],
+            json!({"kind":"reserved","moduleId":"claustrum"})
+        );
+    }
+    for (index, record) in records[..4].iter().enumerate() {
+        let result = &record["reply"]["result"];
+        let decoded: GithubIdentityResult = serde_json::from_value(result.clone()).unwrap();
+        assert_eq!(decoded.incarnation, INCARNATION);
+        assert!(decoded.agent_generation > 0);
+        assert!(decoded.generation >= decoded.agent_generation);
+        assert_eq!(
+            decoded.project_id.as_deref(),
+            (index == 0).then_some("served-project")
+        );
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), *result);
+        match (index, decoded.github_identity) {
+            (
+                0 | 1,
+                Some(GithubIdentity::App {
+                    app_id,
+                    app_slug,
+                    installation_id,
+                    client_id,
+                    credential_ref,
+                    coauthor_line,
+                }),
+            ) => {
+                assert_eq!(app_id, 314159);
+                assert_eq!(app_slug, "fern-bot");
+                assert_eq!(installation_id, (index == 0).then_some(271828));
+                assert_eq!(
+                    client_id.as_deref(),
+                    (index == 0).then_some("Iv23syntheticFernBot")
+                );
+                assert_eq!(credential_ref, "github_app:fern-bot");
+                assert_eq!(
+                    coauthor_line,
+                    "Co-authored-by: fern-bot[bot] <314159+fern-bot[bot]@users.noreply.github.com>"
+                );
+            }
+            (
+                2,
+                Some(GithubIdentity::UserToken {
+                    login,
+                    credential_ref,
+                    coauthor_line,
+                }),
+            ) => {
+                assert_eq!(login, "fern-gardener");
+                assert_eq!(credential_ref, "github_user:fern-gardener");
+                assert_eq!(coauthor_line, None);
+            }
+            (3, None) => (),
+            other => panic!("unexpected identity record: {other:?}"),
+        }
+    }
+    let common_app = &records[1]["reply"]["result"]["github_identity"];
+    assert!(common_app.get("installation_id").is_none());
+    assert!(common_app.get("client_id").is_none());
+    assert_eq!(
+        records[2]["reply"]["result"]["github_identity"].get("coauthor_line"),
+        Some(&Value::Null)
+    );
+    assert_eq!(
+        records[3]["reply"]["result"].get("github_identity"),
+        Some(&Value::Null)
+    );
+    assert_eq!(records[4]["request"]["agent_id"], UNKNOWN);
+    assert_eq!(
+        records[4]["reply"],
+        json!({"code":"unknown_agent","message":format!("unknown agent {UNKNOWN}"),"detail":null})
+    );
+    for (index, detail) in [
+        (5, json!({"reason":"deleted","at":700})),
+        (
+            6,
+            json!({"reason":"merged","at":700,"into_agent_id":"agent_0000000000000602"}),
+        ),
+    ] {
+        assert_eq!(
+            records[index]["reply"],
+            json!({"code":"gone","message":"agent is gone","detail":detail})
+        );
+    }
+}
+
 const SESSION_AGENT: &str = "agent_0000000000000101";
 const REF_OWNER: &str = "agent_0000000000000102";
 const CLAIMED_AGENT: &str = "agent_0000000000000103";
