@@ -169,9 +169,24 @@ pub(crate) struct SqlOperations {
 }
 
 impl SqlOperations {
-    pub(crate) fn begin(self: &Arc<Self>) -> SqlGuard {
+    fn begin(self: &Arc<Self>) -> SqlGuard {
         self.count.fetch_add(1, Ordering::AcqRel);
         SqlGuard(self.clone())
+    }
+
+    pub(crate) fn tracked<F, R>(self: &Arc<Self>, operation: F) -> impl FnOnce() -> R
+    where
+        F: FnOnce() -> R,
+    {
+        // Count queued work too: aborting its async caller cannot stop a blocking job.
+        let guard = self.begin();
+        move || {
+            // Calling FnOnce consumes its captures, including store handles, before
+            // the guard signals idle. A body-local guard would drop too early.
+            let result = operation();
+            drop(guard);
+            result
+        }
     }
 
     pub(crate) async fn wait(&self) {
@@ -340,17 +355,13 @@ impl Worker {
         operation: impl FnOnce(&RegistryStore) -> Result<T, RegistryError> + Send + 'static,
     ) -> Result<T, HandlerError> {
         let slot = self.store.clone();
-        // Count queued work too: aborting its async caller cannot stop a blocking closure.
-        let guard = self.sql_operations.begin();
-        tokio::task::spawn_blocking(move || {
-            // The store is dropped before this guard, including when the operation panics.
-            let _guard = guard;
+        tokio::task::spawn_blocking(self.sql_operations.tracked(move || {
             let store = slot
                 .upgrade()
                 .and_then(|slot| slot.lock().unwrap().clone())
                 .ok_or_else(|| HandlerError::new("storage_unavailable", "move store is gone"))?;
             operation(&store).map_err(HandlerError::from)
-        })
+        }))
         .await
         .map_err(|e| HandlerError::new("storage_error", e.to_string()))?
     }
@@ -700,6 +711,51 @@ pub(crate) mod reconnect_test {
 mod tests {
     use super::*;
     use std::{future::Future, task::Poll};
+
+    #[tokio::test]
+    async fn sql_wait_returns_after_blocking_captures_drop() {
+        #[derive(Debug, PartialEq)]
+        enum Event {
+            CaptureDropped { sql_active: bool },
+            WaitReturned,
+        }
+
+        struct Capture {
+            sql: Arc<SqlOperations>,
+            events: Arc<Mutex<Vec<Event>>>,
+        }
+
+        impl Drop for Capture {
+            fn drop(&mut self) {
+                self.events.lock().unwrap().push(Event::CaptureDropped {
+                    sql_active: self.sql.count.load(Ordering::Acquire) == 1,
+                });
+            }
+        }
+
+        let sql = Arc::new(SqlOperations::default());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let capture = Capture {
+            sql: sql.clone(),
+            events: events.clone(),
+        };
+        let job = tokio::task::spawn_blocking(sql.tracked(move || {
+            std::hint::black_box(&capture);
+        }));
+
+        sql.wait().await;
+        events.lock().unwrap().push(Event::WaitReturned);
+        job.await.unwrap();
+        // Recording the count at Drop also detects early idle if the blocking
+        // thread finishes before the waiter is scheduled.
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                Event::CaptureDropped { sql_active: true },
+                Event::WaitReturned,
+            ]
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn reconnect_generations_broadcast_and_coalesce_independently() {

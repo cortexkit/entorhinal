@@ -177,10 +177,10 @@ impl ProjectsHandler {
         let store = self.with_store(|s| Ok(s.clone()))?;
         let package_dir = request.package_dir.clone();
         let scope = request.scope.clone();
-        let sql_guard = self.catalog_sql.begin();
-        let (archive, checked, folder, registries) =
-            crate::catalog_sql::until(deadline, "catalog publish preparation", move || {
-                let _sql_guard = sql_guard;
+        let (archive, checked, folder, registries) = crate::catalog_sql::until(
+            deadline,
+            "catalog publish preparation",
+            self.catalog_sql.tracked(move || {
                 let canonical =
                     entorhinal_core::RegistryStore::canonical_mutation_root(&package_dir)
                         .map_err(|e| error("path_refused", e.to_string()))?;
@@ -196,8 +196,9 @@ impl ProjectsHandler {
                     store.store_folder().to_path_buf(),
                     registries,
                 ))
-            })
-            .await?;
+            }),
+        )
+        .await?;
         let summary = summary(&checked)?;
         let registry = crate::catalog_network::registry_url(&request.registry)?;
         let registry = registry.as_str().trim_end_matches('/').to_string();
@@ -304,12 +305,8 @@ async fn prepare(
     let public = vault.public_key(CREDENTIAL_ID).await.map_err(vault_error)?;
     let path = storage::path(folder, registry, scope, &checked.archive_sha256);
     let held_path = path.clone();
-    let guard = sql.begin();
-    if let Some(signed) = crate::catalog_sql::run(move || {
-        let _guard = guard;
-        storage::load(&held_path)
-    })
-    .await?
+    if let Some(signed) =
+        crate::catalog_sql::run(sql.tracked(move || storage::load(&held_path))).await?
     {
         verify(&signed, checked, &public)?;
         return Ok(signed);
@@ -338,11 +335,6 @@ async fn prepare(
     };
     verify(&signed, checked, &public)?;
     let saved = signed.clone();
-    let guard = sql.begin();
-    crate::catalog_sql::run(move || {
-        let _guard = guard;
-        storage::save(&path, &saved)
-    })
-    .await?;
+    crate::catalog_sql::run(sql.tracked(move || storage::save(&path, &saved))).await?;
     Ok(signed)
 }

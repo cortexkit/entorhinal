@@ -103,32 +103,25 @@ async fn ceiling(
             }
             let folder = store.store_folder().to_path_buf();
             let held = pin.clone();
-            let guard = sql.begin();
-            let manifest = match crate::catalog_sql::run(move || {
-                let _guard = guard;
-                cached_manifest(&folder, &held)
-            })
-            .await?
-            {
-                Some(bytes) => bytes,
-                None => {
-                    let client = client.clone();
-                    let scope = format!("@{}", mapped.scope);
-                    let guard = sql.begin();
-                    let client = crate::catalog_sql::run(move || {
-                        let _guard = guard;
-                        client(&scope)
-                    })
-                    .await?;
-                    client
-                        .fetch_manifest(&format!(
-                            "v1/packages/{}/{}/{}/ck.json",
-                            mapped.scope, mapped.name, pin.version
-                        ))
-                        .await
-                        .map_err(|_| unavailable(pin))?
-                }
-            };
+            let manifest =
+                match crate::catalog_sql::run(sql.tracked(move || cached_manifest(&folder, &held)))
+                    .await?
+                {
+                    Some(bytes) => bytes,
+                    None => {
+                        let client = client.clone();
+                        let scope = format!("@{}", mapped.scope);
+                        let client =
+                            crate::catalog_sql::run(sql.tracked(move || client(&scope))).await?;
+                        client
+                            .fetch_manifest(&format!(
+                                "v1/packages/{}/{}/{}/ck.json",
+                                mapped.scope, mapped.name, pin.version
+                            ))
+                            .await
+                            .map_err(|_| unavailable(pin))?
+                    }
+                };
             if manifest.len() > 65_536 || sha256_hex(&manifest) != pin.manifest_sha256 {
                 return Err(unavailable(pin));
             }
@@ -193,19 +186,21 @@ impl ProjectsHandler {
         let initial_source = source.clone();
         let agent_id = p.agent_id.clone();
         let publisher = p.publisher_fingerprint.clone();
-        let sql_guard = self.catalog_sql.begin();
-        let pins = crate::catalog_sql::until(deadline, "publisher trust pins", move || {
-            let _sql_guard = sql_guard;
-            let agent = db
-                .agent_row(&agent_id)?
-                .ok_or_else(|| HandlerError::new("unknown_agent", "unknown placement agent"))?;
-            if agent.status != "live" {
-                return Err(HandlerError::new("gone", "placement agent is not live"));
-            }
-            initial_source
-                .pins(&db, &agent_id, &publisher)
-                .map_err(HandlerError::from)
-        })
+        let pins = crate::catalog_sql::until(
+            deadline,
+            "publisher trust pins",
+            self.catalog_sql.tracked(move || {
+                let agent = db
+                    .agent_row(&agent_id)?
+                    .ok_or_else(|| HandlerError::new("unknown_agent", "unknown placement agent"))?;
+                if agent.status != "live" {
+                    return Err(HandlerError::new("gone", "placement agent is not live"));
+                }
+                initial_source
+                    .pins(&db, &agent_id, &publisher)
+                    .map_err(HandlerError::from)
+            }),
+        )
         .await?;
         let client_store = store.clone();
         let ceiling = timeout_at(
@@ -253,33 +248,35 @@ impl ProjectsHandler {
         }
         let now = (self.clock)();
         let principal = json!(self.admission_for(key).principal);
-        let sql_guard = self.catalog_sql.begin();
-        crate::catalog_sql::until(deadline, "publisher trust write", move || {
-            let _sql_guard = sql_guard;
-            let (_writer, _confirmation) = (writer, guard);
-            let latest = source.pins(&store, &p.agent_id, &p.publisher_fingerprint)?;
-            if latest != pins {
-                return Err(HandlerError::new(
-                    "manifest_unavailable",
-                    "authenticated pins changed during confirmation",
-                ));
-            }
-            let mut random = [0u8; 16];
-            getrandom::getrandom(&mut random)
-                .map_err(|e| HandlerError::new("store_error", e.to_string()))?;
-            let grant = PublisherGrant {
-                id: format!("pg_{}", entorhinal_catalog::hex(&random)),
-                publisher_fingerprint: p.publisher_fingerprint,
-                operation: Operation::Install,
-                placement_agent_id: p.agent_id,
-                ceiling,
-                card_ref: None,
-                granted_at_ms: now,
-                revoked_at_ms: None,
-            };
-            let id = store.insert_publisher_grant(&grant, &principal)?;
-            encode_result(json!({"outcome":"trusted","id":id,"operation":"install"}))
-        })
+        crate::catalog_sql::until(
+            deadline,
+            "publisher trust write",
+            self.catalog_sql.tracked(move || {
+                let (_writer, _confirmation) = (writer, guard);
+                let latest = source.pins(&store, &p.agent_id, &p.publisher_fingerprint)?;
+                if latest != pins {
+                    return Err(HandlerError::new(
+                        "manifest_unavailable",
+                        "authenticated pins changed during confirmation",
+                    ));
+                }
+                let mut random = [0u8; 16];
+                getrandom::getrandom(&mut random)
+                    .map_err(|e| HandlerError::new("store_error", e.to_string()))?;
+                let grant = PublisherGrant {
+                    id: format!("pg_{}", entorhinal_catalog::hex(&random)),
+                    publisher_fingerprint: p.publisher_fingerprint,
+                    operation: Operation::Install,
+                    placement_agent_id: p.agent_id,
+                    ceiling,
+                    card_ref: None,
+                    granted_at_ms: now,
+                    revoked_at_ms: None,
+                };
+                let id = store.insert_publisher_grant(&grant, &principal)?;
+                encode_result(json!({"outcome":"trusted","id":id,"operation":"install"}))
+            }),
+        )
         .await
     }
 }

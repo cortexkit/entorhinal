@@ -185,14 +185,11 @@ impl ProjectsHandler {
         let seeder = self.catalog_seeder.clone();
         // Counted like the startup seed: after a reply times out, the job keeps
         // writing package files and holds a store handle until it ends.
-        let guard = self.catalog_sql.begin();
         let value = crate::catalog_sql::until(
             received + std::time::Duration::from_secs(110),
             "catalog.seed",
-            move || {
-                let _guard = guard;
-                seeder.seed(&store, &path).map_err(HandlerError::from)
-            },
+            self.catalog_sql
+                .tracked(move || seeder.seed(&store, &path).map_err(HandlerError::from)),
         )
         .await?;
         encode_result(value)
@@ -264,10 +261,8 @@ fn schedule(
     sql: &std::sync::Arc<SqlOperations>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-        let guard = sql.begin();
-        Some(runtime.spawn_blocking(move || {
-            let _guard = guard;
-            match automatic(&store, &seeder) {
+        Some(
+            runtime.spawn_blocking(sql.tracked(move || match automatic(&store, &seeder) {
                 Ok(Some(_)) => {
                     tracing::info!(target: "catalog", outcome="seeded", "starter bundle")
                 }
@@ -275,8 +270,8 @@ fn schedule(
                 Err(error) => {
                     tracing::warn!(target: "catalog", outcome=error.code, "starter bundle")
                 }
-            }
-        }))
+            })),
+        )
     } else {
         None
     }

@@ -13,9 +13,7 @@ pub(super) fn start(
         return None;
     }
     let runtime = tokio::runtime::Handle::try_current().ok()?;
-    let guard = sql.begin();
-    Some(runtime.spawn_blocking(move || {
-        let _guard = guard;
+    Some(runtime.spawn_blocking(sql.tracked(move || {
         let registry = CORTEXKIT_REGISTRY;
         if let Err(error) = store.catalog_registry_bootstrap(
             registry.url,
@@ -40,7 +38,7 @@ pub(super) fn start(
                 "built-in registry unavailable; preserving operator configuration and retrying at next startup"
             );
         }
-    }))
+    })))
 }
 
 #[cfg(test)]

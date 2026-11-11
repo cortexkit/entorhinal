@@ -143,25 +143,21 @@ impl Worker {
         let mut bytes = [0; 8];
         getrandom::getrandom(&mut bytes).map_err(|_| "catalog_poll_failed")?;
         let store = self.store().ok_or("store_unavailable")?;
-        let guard = self.sql.begin();
-        crate::catalog_sql::run(move || {
-            let _guard = guard;
+        crate::catalog_sql::run(self.sql.tracked(move || {
             store
                 .catalog_poll_offset(u64::from_le_bytes(bytes))
                 .map_err(|e| crate::catalog_blob::CatalogError::new("storage_error", e.to_string()))
-        })
+        }))
         .await
         .map_err(|e| e.code)
     }
     async fn pass(&self) -> Result<(), &'static str> {
         let store = self.store().ok_or("store_unavailable")?;
-        let guard = self.sql.begin();
-        let scopes = crate::catalog_sql::run(move || {
-            let _guard = guard;
+        let scopes = crate::catalog_sql::run(self.sql.tracked(move || {
             store
                 .catalog_pinned_scopes()
                 .map_err(|e| crate::catalog_blob::CatalogError::new("storage_error", e.to_string()))
-        })
+        }))
         .await
         .map_err(|e| e.code)?;
         let mut failure = None;
@@ -170,13 +166,9 @@ impl Worker {
             let trust = match self.store() {
                 Some(store) => {
                     let sources = self.sources.clone();
-                    let guard = self.sql.begin();
-                    crate::catalog_sql::run(move || {
-                        let _guard = guard;
-                        sources(store, &scope)
-                    })
-                    .await
-                    .map_err(|e| e.code)
+                    crate::catalog_sql::run(self.sql.tracked(move || sources(store, &scope)))
+                        .await
+                        .map_err(|e| e.code)
                 }
                 None => Err("store_unavailable"),
             };

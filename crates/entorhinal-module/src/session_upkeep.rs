@@ -174,11 +174,9 @@ impl Worker {
                     "the store belongs to another machine",
                 ),
                 Some(store) => {
-                    let guard = self.sql.begin();
-                    let written = tokio::task::spawn_blocking(move || {
-                        let _guard = guard;
-                        store.stamp_gone_sessions(&stamps)
-                    })
+                    let written = tokio::task::spawn_blocking(
+                        self.sql.tracked(move || store.stamp_gone_sessions(&stamps)),
+                    )
                     .await;
                     match written {
                         Ok(Ok(stamped)) => {
@@ -206,11 +204,9 @@ impl Worker {
     async fn prune(&self) {
         if let Some(store) = self.store().filter(|store| !store.is_foreign()) {
             let now = (self.clock)();
-            let guard = self.sql.begin();
-            let pruned = tokio::task::spawn_blocking(move || {
-                let _guard = guard;
-                store.prune_ended_sessions(now)
-            })
+            let pruned = tokio::task::spawn_blocking(
+                self.sql.tracked(move || store.prune_ended_sessions(now)),
+            )
             .await;
             match pruned {
                 Ok(Ok(pruned)) => {

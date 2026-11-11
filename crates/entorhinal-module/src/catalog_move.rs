@@ -502,11 +502,13 @@ impl CatalogMove {
                 });
                 state.step = "aborted".into();
                 self.save(id, state)?;
-                let store = self.store()?;
+                let held_store = self.store()?;
                 let cut = id.to_owned();
                 let local_agent = agent.to_owned();
                 crate::catalog_sql::run(move || {
-                    let _guard = guard;
+                    // Drop the store before releasing admission, including on errors.
+                    let _admission = guard;
+                    let store = held_store;
                     store
                         .catalog_discard_move_generation(&cut, &local_agent)
                         .map_err(unavailable)
@@ -693,11 +695,12 @@ impl CatalogMove {
         self.local_preflight(agent, &digest).await?;
         let guard = self.admit().await?;
         self.not_aborted(cut)?;
-        let store = self.store()?;
+        let held_store = self.store()?;
         crate::catalog_sql::run(move || {
             // The blocking write may outlive a cancelled request. Keep admission
-            // until the write finishes so abort cannot race a late approval.
-            let _guard = guard;
+            // until the write and its store handle end so abort cannot race a late approval.
+            let _admission = guard;
+            let store = held_store;
             let plan_id = worker_plan;
             let generation_id = worker_generation;
             let agent = agent_id.as_str();
@@ -759,10 +762,12 @@ impl CatalogMove {
         self.local_preflight(agent, &digest).await?;
         let guard = self.admit().await?;
         self.not_aborted(cut)?;
-        let store = self.store()?;
+        let held_store = self.store()?;
         let agent = agent.to_owned();
         crate::catalog_sql::run(move || {
-            let _guard = guard;
+            // Drop the store before releasing admission, including on errors.
+            let _admission = guard;
+            let store = held_store;
             store
                 .catalog_generation_ready(&generation_id, &agent)
                 .map_err(unavailable)

@@ -379,12 +379,10 @@ impl ProjectsHandler {
                             return;
                         };
                         let now = clock();
-                        let guard = sql_operations.begin();
-                        match tokio::task::spawn_blocking(move || {
-                            let _guard = guard;
+                        match tokio::task::spawn_blocking(sql_operations.tracked(move || {
                             let store = cache;
                             store.cache_roles(&observations, now)
-                        })
+                        }))
                         .await
                         {
                             Ok(Ok(conflicts)) => {

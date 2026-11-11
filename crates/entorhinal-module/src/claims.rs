@@ -183,15 +183,14 @@ impl Worker {
                     return Ok(counts);
                 };
                 let now = (self.clock)();
-                let guard = self.sql_operations.begin();
                 let watches = self.watches.clone();
-                let conflicts = tokio::task::spawn_blocking(move || {
-                    let _guard = guard;
-                    let store = cache;
-                    watches.cache_claims(&store, &observations, now)
-                })
-                .await
-                .map_err(|e| HandlerError::new("storage_error", e.to_string()))??;
+                let conflicts =
+                    tokio::task::spawn_blocking(self.sql_operations.tracked(move || {
+                        let store = cache;
+                        watches.cache_claims(&store, &observations, now)
+                    }))
+                    .await
+                    .map_err(|e| HandlerError::new("storage_error", e.to_string()))??;
                 self.health
                     .self_author_conflicts
                     .fetch_add(conflicts as u64, Ordering::Relaxed);
