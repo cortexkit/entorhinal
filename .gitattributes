@@ -2,3 +2,6 @@
 
 # Golden replies are byte-compared by their consumers; never convert line endings.
 crates/*/tests/golden/** -text
+
+# Magic Context's published agent-data samples are checked against their SHA256SUMS.
+crates/entorhinal-module/tests/fixtures/mc-agent-data-samples-v1/** -text

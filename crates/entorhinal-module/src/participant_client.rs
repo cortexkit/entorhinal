@@ -1190,3 +1190,7 @@ mod refusal_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "participant_client_mc_samples_tests.rs"]
+mod mc_samples_tests;

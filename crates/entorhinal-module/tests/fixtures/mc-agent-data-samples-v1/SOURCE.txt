@@ -1,0 +1,1 @@
+Copy of Magic Context's crates/mc-module/testdata/mc-agent-data-samples-v1 at tag mc-agent-data-samples-v1 (commit a9ec790a8e), byte-identical except this file. SHA256SUMS has SHA-256 79ea37226e971b8ffcd86c7fc5b9bba00515d332ea8721d184fe4020167e4226. Replace the folder only with a newer published copy; never edit a sample here.
