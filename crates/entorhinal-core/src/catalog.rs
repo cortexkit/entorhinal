@@ -76,14 +76,23 @@ impl RegistryStore {
         action: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T, CatalogWriteError>,
     ) -> Result<T, CatalogWriteError> {
         let mut failure = None;
-        self.db
+        let mut changed = false;
+        let result = self
+            .db
             .with_conn_fenced(|tx| {
-                action(tx).map_err(|e| {
+                let before = tx.total_changes();
+                let result = action(tx).map_err(|e| {
                     failure = Some(e);
                     rusqlite::Error::QueryReturnedNoRows
-                })
+                });
+                changed = tx.total_changes() != before;
+                result
             })
-            .map_err(|e| failure.unwrap_or(CatalogWriteError::Store(RegistryError::Store(e))))
+            .map_err(|e| failure.unwrap_or(CatalogWriteError::Store(RegistryError::Store(e))));
+        if result.is_ok() && changed {
+            self.notify_catalog_change();
+        }
+        result
     }
     pub fn catalog_registry_add(
         &self,

@@ -317,6 +317,7 @@ pub struct RegistryStore {
     root_records: bool,
     ids: Arc<binding::IdSource>,
     where_notifications: where_notify::WhereNotifications,
+    catalog_notifications: catalog_freshness::Notifications,
     foreign: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -436,6 +437,7 @@ impl RegistryStore {
             root_records: false,
             ids: Arc::new(binding::IdSource::Random),
             where_notifications: where_notify::WhereNotifications::default(),
+            catalog_notifications: catalog_freshness::Notifications::default(),
             foreign: Arc::default(),
         })
     }

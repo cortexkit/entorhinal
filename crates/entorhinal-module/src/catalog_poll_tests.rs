@@ -98,6 +98,8 @@ impl Fixture {
             wake: Arc::default(),
             sql: Arc::default(),
             watches: Arc::default(),
+            freshness_wake: Arc::default(),
+            snapshots: tokio::sync::Mutex::new(()),
             sources: Arc::new(move |store, scope| {
                 CatalogTrust::with_client(
                     store,
@@ -146,6 +148,222 @@ impl Drop for Fixture {
         self.slot.lock().unwrap().take();
         std::fs::remove_dir_all(&self.root).unwrap();
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn catalog_poll_deadline_marks_stale_and_notifies_while_http_is_pending() {
+    use entorhinal_core::catalog_trust::{CatalogStatus, TrustWrite};
+    use std::{future::Future, pin::Pin, task::Poll};
+    static NOW: AtomicI64 = AtomicI64::new(1_499_000);
+    fn deadline_clock() -> i64 {
+        NOW.load(Ordering::Relaxed)
+    }
+    struct Sink {
+        sender: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+        cancel: tokio::sync::watch::Sender<bool>,
+    }
+    #[async_trait::async_trait]
+    impl crate::watches::WatchTransport for Sink {
+        async fn emit(&self, bytes: Vec<u8>) -> Result<(), crate::HandlerError> {
+            self.sender.send(bytes).unwrap();
+            Ok(())
+        }
+        async fn ended(&self) {
+            let _ = self.cancel.subscribe().wait_for(|ended| *ended).await;
+        }
+    }
+    async fn next_notice(
+        mut watch: Pin<&mut impl Future<Output = subc_client_rs::HandlerOutcome>>,
+        receiver: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    ) -> Value {
+        let limit = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            std::future::poll_fn(|cx| {
+                assert!(
+                    watch.as_mut().poll(cx).is_pending(),
+                    "watch ended before freshness notice"
+                );
+                Poll::Ready(())
+            })
+            .await;
+            if let Ok(bytes) = receiver.try_recv() {
+                return serde_json::from_slice(&bytes).unwrap();
+            }
+            assert!(std::time::Instant::now() < limit,"freshness deadline passed without a status-watch notice while HTTP remained pending");
+            tokio::task::yield_now().await;
+        }
+    }
+    NOW.store(1_499_000, Ordering::Relaxed);
+    let f = Fixture::new().await;
+    let store = f.slot.lock().unwrap().as_ref().unwrap().clone();
+    let records = vectors("record");
+    let package = &records["packages"]["flow"];
+    let manifest = package["manifest_text"].as_str().unwrap().as_bytes();
+    crate::catalog_blob::BlobStore::new(store.store_folder())
+        .unwrap()
+        .publish(manifest)
+        .unwrap();
+    let pin: entorhinal_core::catalog_agent::CatalogPin = serde_json::from_value(json!({"name":"@example/hello-flow","version":"1.0.0","kind":"flow","manifest_sha256":package["manifest_sha256"],"archive_sha256":package["archive_sha256"],"publisher_fingerprint":records["keys"]["trusted"]["fingerprint"],"root":true,"range":"^1"})).unwrap();
+    store
+        .with_principal("test")
+        .catalog_set_pins(
+            entorhinal_core::catalog_agent::PinWriteRequest {
+                agent_id: f.agent.clone(),
+                pins: vec![pin.clone()],
+                request_key: None,
+            },
+            600_000,
+        )
+        .unwrap();
+    store
+        .catalog_sync_fast_lane(std::slice::from_ref(&pin), 600_000)
+        .unwrap();
+    let status = vectors("status")["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["record"]["name"] == pin.name)
+        .unwrap()
+        .clone();
+    store
+        .catalog_trust_transaction::<_, entorhinal_core::catalog::CatalogWriteError>(
+            "@example",
+            |registry, _, _| {
+                Ok((
+                    (),
+                    TrustWrite {
+                        statuses: vec![CatalogStatus {
+                            name: pin.name.clone(),
+                            version: pin.version.clone(),
+                            registry_url: registry.url.clone(),
+                            sequence: status["record"]["sequence"].as_u64().unwrap(),
+                            changed_at: status["record"]["changed_at"].as_str().unwrap().into(),
+                            published_at: status["record"]["published_at"].as_str().unwrap().into(),
+                            signer_index: 0,
+                            canonical: entorhinal_catalog::jcs::to_string(&status["record"])
+                                .unwrap(),
+                            signature: status["signature"].as_str().unwrap().into(),
+                            starter_proof: None,
+                        }],
+                        confirmed_at_ms: Some(600_000),
+                        ..Default::default()
+                    },
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        store.catalog_next_freshness_deadline().unwrap(),
+        Some(1_500_000)
+    );
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    f.fake.serve(
+        "/v1/scopes/example/status",
+        Reply {
+            entered: Some(entered.clone()),
+            release: Some(release),
+            ..Reply::bytes(
+                json!({"schema":"ck-status-feed/v1","scope":"example","feed_seq":1,"records":[]})
+                    .to_string(),
+            )
+        },
+    );
+    let mut worker = f.worker();
+    worker.clock = deadline_clock;
+    let sql = worker.sql.clone();
+    let mut handler = ProjectsHandler::with_runtime("deadline-watch".into(), deadline_clock);
+    handler.store = f.slot.clone();
+    handler.watches = worker.watches.clone();
+    let key = (991, 1);
+    handler.route_admissions().insert(
+        key,
+        crate::RouteAdmission::from_bind(Some(subc_protocol::Principal::Direct), None),
+    );
+    let task = tokio::spawn(worker.run());
+    crate::catalog_sql::tests::finish(entered.notified()).await;
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let sink = Sink {
+        sender,
+        cancel: tokio::sync::watch::channel(false).0,
+    };
+    let body = json!({"method":crate::watches::CATALOG,"params":{}})
+        .to_string()
+        .into_bytes();
+    let watch = handler.serve_watch(&sink, &body, key);
+    tokio::pin!(watch);
+    assert_eq!(
+        next_notice(watch.as_mut(), &mut receiver).await["kind"],
+        "resync"
+    );
+    NOW.store(1_500_000, Ordering::Relaxed);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let changed = next_notice(watch.as_mut(), &mut receiver).await;
+    assert_eq!(changed["kind"], "changes");
+    assert_eq!(
+        changed["changes"],
+        json!([{"name":pin.name,"version":pin.version}])
+    );
+    assert_eq!(
+        store.catalog_served_statuses().unwrap()[&(pin.name.clone(), pin.version.clone())]
+            ["stale_since_ms"],
+        1_500_000
+    );
+    assert_eq!(
+        f.health.catalog.completed_passes.load(Ordering::Relaxed),
+        0,
+        "the held HTTP pass must not have completed"
+    );
+    store
+        .catalog_trust_transaction::<_, entorhinal_core::catalog::CatalogWriteError>(
+            "@example",
+            |_, _, _| {
+                Ok((
+                    (),
+                    TrustWrite {
+                        confirmed_at_ms: Some(1_500_000),
+                        confirmed_scope: true,
+                        ..Default::default()
+                    },
+                ))
+            },
+        )
+        .unwrap();
+    let cleared = next_notice(watch.as_mut(), &mut receiver).await;
+    assert_eq!(cleared["kind"], "changes");
+    assert!(
+        store.catalog_served_statuses().unwrap()[&(pin.name.clone(), pin.version.clone())]
+            .get("stale_since_ms")
+            .is_none()
+    );
+    assert_eq!(
+        store.catalog_next_freshness_deadline().unwrap(),
+        Some(2_400_000)
+    );
+    store
+        .with_principal("test")
+        .catalog_set_pins(
+            entorhinal_core::catalog_agent::PinWriteRequest {
+                agent_id: f.agent.clone(),
+                pins: vec![],
+                request_key: None,
+            },
+            1_500_000,
+        )
+        .unwrap();
+    assert_eq!(
+        next_notice(watch.as_mut(), &mut receiver).await["kind"],
+        "changes"
+    );
+    assert_eq!(store.catalog_next_freshness_deadline().unwrap(), None);
+    sink.cancel.send_replace(true);
+    assert!(matches!(
+        watch.await,
+        subc_client_rs::HandlerOutcome::Streamed
+    ));
+    task.abort();
+    let _ = task.await;
+    sql.wait().await;
 }
 
 #[tokio::test(start_paused = true)]

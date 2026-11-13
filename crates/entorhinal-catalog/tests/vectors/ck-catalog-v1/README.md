@@ -25,14 +25,39 @@ prefrontal commit.
 | File | What it pins |
 | --- | --- |
 | `names.json` | The pure name-to-Basal-id function: valid names (short form, exactly 46 bytes, hashed form, two names sharing a 29-byte prefix, prefixes ending on a hyphen or on the separator, ASCII case folding, a 39-byte scope and a 64-byte package name at their limits), refused names with the part that failed (including the R1 boundary-hyphen cases `@a-/b` and `@a/-b` and the 40-byte scope and 65-byte name), the registry's binding check (`id_bound`, `name_not_canonical`), and scope claims (`scope_reserved` for `cortexkit`, `ck`, `catalog`, `registry`). |
-| `record.json` | JCS (RFC 8785) cases, two real packages (a skill with a script and a flow) as members, `ck.json` text and ustar archive bytes, their `ck-record/v1` records with canonical JCS text, SHA-256, the exact signing input and the Ed25519 signature, then negative cases with the refusal code each must produce. |
-| `archive.json` | The strict ustar reader: one valid archive with its SHA-256 and members, then one case per refusal (bad header checksum, wrong magic or version, base-256 size, missing terminator, non-zero bytes after the terminator, pax and GNU headers, links, directory entries, `..` and other bad paths, a path over 255 bytes, duplicates and case collisions, a truncated member, a missing `ck.json`, more than 1,000 members), each with its expected `archive_invalid` rule and offset; and the pure path rules (`path_invalid`, `path_too_long`, `path_not_ustar`). |
+| `record.json` | JCS (RFC 8785) cases, three real packages (a skill with a script, a script flow and a module flow) as members, `ck.json` text and ustar archive bytes, their `ck-record/v1` records with canonical JCS text, SHA-256, the exact signing input and the Ed25519 signature, then verification cases with expected outcomes. Standalone `flow_body_cases` pin the exactly-one script/module rule. |
+| `archive.json` | The strict ustar reader: one valid skill archive with its SHA-256 and members, then one case per refusal (bad header checksum, wrong magic or version, base-256 size, missing terminator, non-zero bytes after the terminator, pax and GNU headers, links, directory entries, `..` and other bad paths, a path over 255 bytes, duplicates and case collisions, a truncated member, a missing `ck.json`, more than 1,000 members), each with its expected `archive_invalid` rule and offset; valid script-flow and module-flow archive cases; and the pure path rules (`path_invalid`, `path_too_long`, `path_not_ustar`). |
 | `status.json` | Signed `ck-status/v1` records for one skill version (published, withdrawn, withdrawal reversed, tombstoned, plus a conflicting second record) and one flow version (published, revoked by key compromise, tombstoned), the client's apply cases (sequence order, `feed_rollback` for a lower sequence or the same sequence with other bytes, terminal states, signature and domain, a publisher-signed record, unknown registry key), the status feed (`feed_seq`, `?after=` replies including `feed_after_unavailable`, and the client's poll outcomes including `feed_rollback` and the full-feed fallback), the compromise-from time rule and the per-kind effect table. |
 | `statements.json` | The signed statements: `ck-registry-key/v1` (the registry status key chain), `ck-key-rotation/v1` (both signatures), `ck-key-cert/v1` (signed by the TEST-ONLY root, with key-window cases) and `ck-status-request/v1` (withdraw and unwithdraw with `after_sequence`), each with valid and negative cases. |
 | `resolver.json` | The semver dialect (range satisfaction, refused ranges and versions, precedence order), the capability token grammar `cap/<area>.<verb>@<major>`, and closure resolution cases with expected picks, pin moves and refusals. |
 | `starter-bundle.json` | A strict bundle ustar containing a persona and skill, with a root-certified `@cortexkit` signer, signed record and status envelopes, expected hashes and signing input. `bundle.json` binds each exact record-member byte sequence with `record_member_sha256`; changed record bytes are refused as `record_mismatch`. The bundle certificate member is `bundle.cert.json`; unlisted members are refused as `archive_invalid` with rule `member_unlisted`. Also includes a standalone invalid persona-manifest case: a body with `memory_scope` is refused as `manifest_invalid`. |
 | `generate.ts` | The generator and reference implementations. |
 | `generate.test.ts` | Fails when any committed file differs from what `generate.ts` produces. |
+
+## Automation packs update (2026-11-13)
+
+The contract now permits a flow body with `manifest` and exactly one of
+`script` or `module`. `@example/hello-module-flow` sits beside the original
+script flow in `record.json`'s packages, signed records and verification
+cases. It uses the same TEST-ONLY publisher key. Its archive contains
+`flow.json` and `flow.wasm`; the latter is the fixed eight-byte WebAssembly
+header/version sequence `00 61 73 6d 01 00 00 00`, never executed. Both flow
+archives also appear as valid cases in `archive.json`. The original packages,
+records and cases retain their bytes.
+
+Following the existing standalone persona-body case, `flow_body_cases`
+checks only the script/module choice: script and module bodies are valid;
+`flow_body_both` and `flow_body_neither` refuse `manifest_invalid`, field
+`body`. This is not a general manifest-schema validator and does not change
+record verification. These additions let Entorhinal's strict catalog-package
+parser pin both executable forms and their exclusivity rule.
+
+No vector here carries `pinned_status` or a generation sample (the installed
+package graph and its per-pin status from `catalog.agent_generation`, contract
+section 10.3). The signed registry status records in `status.json` are a
+different wire format, so they do not gain `stale_since_ms`. Entorhinal will
+publish generation samples with an available-but-stale pin and a revoked pin
+separately.
 
 ## How they were generated
 
@@ -87,8 +112,8 @@ The table below is rewritten by `generate.ts`; the check fails if it is stale.
 | File | sha256 |
 | --- | --- |
 | names.json | `4b69ce59ed5de553d490ff61fe7b1b3c7868dc665e4700eb6c43b77813ecccdc` |
-| record.json | `279ba8405e45141ccf2edaaee2c615b0405061dc0e564b7d11f1d6d9e82b2c2f` |
-| archive.json | `e5ac9b06742cc3dd6fae5aac1d707c51d603350348d02a66beecb024305a1191` |
+| record.json | `ef88ed8cefd527cccc12f19274f0a15dcd76b2f74c9b8124605f09cd3788acd6` |
+| archive.json | `c5f094673fb42bd3b2793bd15459a4cc19f624ab154378ef6e17aa927c45be40` |
 | status.json | `6e07ced5fe7178ccd76cca415644f8bf36ef44e532f0155a70345de939d6644b` |
 | statements.json | `378800f2f608175e8d4d96cf8c1f82d2451ac3887d63e6d211b33f921ce2d4b6` |
 | resolver.json | `be1e2296110dcca2a6c9fbc1df72200485a5ae1779a3b36bf8411f78ef215413` |

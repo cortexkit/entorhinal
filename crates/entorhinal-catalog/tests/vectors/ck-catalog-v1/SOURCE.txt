@@ -1,1 +1,1 @@
-Copy of prefrontal test-vectors/ck-catalog-v1 at e6635c6ae451f02618b945a3dbc244ed4c9c9f86, byte-identical except this file. Regenerate the vectors only with that commit's generate.ts.
+Copy of prefrontal test-vectors/ck-catalog-v1 at 0d2f79dc814d05a9509412ac693a72356e05f61a, byte-identical except this file. Regenerate the vectors only with that commit's generate.ts.

@@ -45,7 +45,9 @@ impl RegistryStore {
         ) -> Result<(T, TrustWrite), E>,
     ) -> Result<T, E> {
         let mut failure = None;
-        self.db.with_conn_fenced(|tx| {
+        let mut changed = false;
+        let result = self.db.with_conn_fenced(|tx| {
+            let before = tx.total_changes();
             let result = (|| {
                 let sql = |e: rusqlite::Error| E::from(CatalogWriteError::Store(e.into()));
                 let url = registry_for_scope(tx, scope).map_err(sql)?
@@ -81,8 +83,13 @@ impl RegistryStore {
                 }
                 Ok(value)
             })();
+            changed = tx.total_changes() != before;
             result.map_err(|e| { failure = Some(e); rusqlite::Error::QueryReturnedNoRows })
-        }).map_err(|e| failure.unwrap_or_else(|| E::from(CatalogWriteError::Store(crate::RegistryError::Store(e)))))
+        }).map_err(|e| failure.unwrap_or_else(|| E::from(CatalogWriteError::Store(crate::RegistryError::Store(e)))));
+        if result.is_ok() && changed {
+            self.notify_catalog_change();
+        }
+        result
     }
     /// Seed all initial holds atomically, including when no registry is configured.
     /// The closure must authenticate every hold before returning any writes.

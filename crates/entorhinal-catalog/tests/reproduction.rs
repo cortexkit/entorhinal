@@ -179,7 +179,7 @@ fn reproduce_readme() {
     let readme = fs::read(dir().join("README.md")).unwrap();
     assert_eq!(
         c::sha256_hex(&readme),
-        "5414127cdcc6791f12cc10244ea22b59bb69b7343fc93119e09c2076c77201eb"
+        "eb329280d3f3fa28b7f157c5a8012538fe6257a61c6d7e9880268e479c3ced5c"
     );
     let text = String::from_utf8(readme).unwrap();
     let mut checked = 0;
@@ -203,24 +203,24 @@ fn reproduce_source() {
     let bytes = fs::read(dir().join("SOURCE.txt")).unwrap();
     assert_eq!(
         c::sha256_hex(&bytes),
-        "251c7f5cb7ecfd636a8dbf9d5d28dda5d0cc6fcd265907a1da556509d5f98c2a"
+        "fe13a80365f063287fdabb2aa5af9c2b04dfc94e0cffb984ab4a3d67f2aeac69"
     );
     assert!(String::from_utf8(bytes)
         .unwrap()
-        .contains("e6635c6ae451f02618b945a3dbc244ed4c9c9f86"));
+        .contains("0d2f79dc814d05a9509412ac693a72356e05f61a"));
 }
 #[test]
 fn reproduce_generator() {
     assert_eq!(
         c::sha256_hex(fs::read(dir().join("generate.ts")).unwrap()),
-        "1353aedd963fbdd7aed3883ad80916419227a66c1fc6b1b3259fcc3beef5aff9"
+        "b2c6193b106c1281b3551845790959a2da7daee38872067d77eb318a2ed21298"
     );
 }
 #[test]
 fn reproduce_generator_test() {
     assert_eq!(
         c::sha256_hex(fs::read(dir().join("generate.test.ts")).unwrap()),
-        "bda06a92a44f10b9924b90a309291352c4f956e097e9c1e15e4a92f99b96d12b"
+        "f209a7ae42882e104b31810b95cb1fc02b92a8008ae44b87ef499bea65aa323c"
     );
 }
 #[test]
@@ -825,6 +825,40 @@ fn archive_case(name: &str, base: &[u8]) -> Vec<u8> {
     out
 }
 #[test]
+fn reproduce_flow_body_cases() {
+    let v = load("record.json");
+    let mut manifest: Value =
+        serde_json::from_str(s(&v["packages"]["flow"]["manifest_text"])).unwrap();
+    let module: Value =
+        serde_json::from_str(s(&v["packages"]["flow_module"]["manifest_text"])).unwrap();
+    let module_file = a(&module["files"])
+        .iter()
+        .find(|f| f["path"] == "flow.wasm")
+        .unwrap()
+        .clone();
+    manifest["files"].as_array_mut().unwrap().push(module_file);
+    for case in a(&v["flow_body_cases"]) {
+        manifest["body"] = case["body"].clone();
+        assert_eq!(
+            success(record::parse_manifest(manifest.to_string().as_bytes())),
+            case["expect"],
+            "{}",
+            case["name"]
+        );
+    }
+    for body in [
+        json!({"manifest":"flow.json","module":"unlisted.wasm"}),
+        json!({"manifest":"unlisted.json","module":"flow.wasm"}),
+    ] {
+        manifest["body"] = body;
+        assert_eq!(
+            success(record::parse_manifest(manifest.to_string().as_bytes())),
+            json!({"ok":false,"code":"manifest_invalid","field":"body"})
+        );
+    }
+}
+
+#[test]
 fn reproduce_archive() {
     let v = load("archive.json");
     let packages = load("record.json");
@@ -841,7 +875,16 @@ fn reproduce_archive() {
     }
     for case in a(&v["cases"]) {
         let name = s(&case["name"]);
-        let bytes = archive_case(name, &base);
+        let case_members = match name {
+            "flow_archive" => package_members(&packages["packages"]["flow"]),
+            "flow_module_archive" => package_members(&packages["packages"]["flow_module"]),
+            _ => members.clone(),
+        };
+        let bytes = if matches!(name, "flow_archive" | "flow_module_archive") {
+            archive::write(&case_members).unwrap()
+        } else {
+            archive_case(name, &base)
+        };
         if let Some(encoded) = case["archive_base64"].as_str() {
             assert_eq!(bytes, base64(encoded), "{name}");
         }
@@ -861,7 +904,7 @@ fn reproduce_archive() {
             let paths: Vec<_> = (1..=if name == "members_at_limit" { 997 } else { 0 })
                 .map(|i| format!("pad/{i:04}"))
                 .collect();
-            let mut ms = members.clone();
+            let mut ms = case_members;
             ms.extend(paths.iter().map(|p| Member::regular(p, b"")));
             let mut written = archive::write(&ms).unwrap();
             written.resize(written.len() + padding, 0);

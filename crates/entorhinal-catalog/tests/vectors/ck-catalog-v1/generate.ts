@@ -737,6 +737,46 @@ export const FLOW_PACKAGE = makePackage(
   ],
 )
 
+const FLOW_MODULE_ID = (() => {
+  const r = mapName("@example/hello-module-flow")
+  if (!r.ok) throw new Error("unreachable")
+  return r.id
+})()
+
+export const FLOW_MODULE_PACKAGE = makePackage(
+  "flow_module",
+  {
+    schema: "ck-package/v1",
+    name: "@example/hello-module-flow",
+    version: "1.0.0",
+    kind: "flow",
+    summary: "Test-vector WebAssembly flow; the module is never run",
+    license: "MIT",
+    source: "https://example.invalid/hello-module-flow",
+    requires: { capabilities: ["cap/example.read@1"], packages: {} },
+    body: { manifest: "flow.json", module: "flow.wasm" },
+  },
+  [
+    { path: "flow.json", content: `${JSON.stringify({ format: 1, id: FLOW_MODULE_ID, version: 3, purpose: "Test-vector module flow" }, null, 2)}\n` },
+    // Fixed WebAssembly header and version bytes; this fixture is never executed.
+    { path: "flow.wasm", content: "\0asm\x01\0\0\0" },
+  ],
+)
+
+function flowBodyVectors() {
+  // Isolate the exactly-one rule, not general manifest or archive-path validation.
+  const validateVariant = (body: Record<string, string>): VerifyResult =>
+    Object.hasOwn(body, "script") !== Object.hasOwn(body, "module") ? { ok: true } : { ok: false, code: "manifest_invalid", field: "body" }
+  const cases: { name: string; body: Record<string, string>; expect: VerifyResult }[] = [
+    { name: "flow_body_script", body: { manifest: "flow.json", script: "flow.js" }, expect: { ok: true } },
+    { name: "flow_body_module", body: { manifest: "flow.json", module: "flow.wasm" }, expect: { ok: true } },
+    { name: "flow_body_both", body: { manifest: "flow.json", script: "flow.js", module: "flow.wasm" }, expect: { ok: false, code: "manifest_invalid", field: "body" } },
+    { name: "flow_body_neither", body: { manifest: "flow.json" }, expect: { ok: false, code: "manifest_invalid", field: "body" } },
+  ]
+  for (const c of cases) expectSame(c.name, validateVariant(c.body), c.expect)
+  return cases
+}
+
 // ───────────────────────────── ck-record/v1 ─────────────────────────────
 
 const RECORD_FIELDS = ["schema", "name", "version", "manifest_sha256", "archive_sha256", "archive_bytes", "public_key", "log_head"]
@@ -875,9 +915,9 @@ function jcsVectors() {
 
 function recordVectors() {
   const trusted = [TEST_KEY_1.fingerprint]
-  const packages: Record<string, VectorPackage> = { skill: SKILL_PACKAGE, flow: FLOW_PACKAGE }
+  const packages = { skill: SKILL_PACKAGE, flow: FLOW_PACKAGE, flow_module: FLOW_MODULE_PACKAGE }
 
-  const valid = (["skill", "flow"] as const).map((label) => {
+  const valid = (["skill", "flow", "flow_module"] as const).map((label) => {
     const record = recordFor(packages[label], TEST_KEY_1)
     const { canonical, signature } = signCanonical(record, TEST_KEY_1, DOMAIN_RECORD)
     const result = verifyRecord(canonical, signature, packages[label], trusted)
@@ -897,6 +937,7 @@ function recordVectors() {
   const skillRecord = recordFor(SKILL_PACKAGE, TEST_KEY_1)
   const skillSigned = signCanonical(skillRecord, TEST_KEY_1, DOMAIN_RECORD)
   const flowRecord = recordFor(FLOW_PACKAGE, TEST_KEY_1)
+  const moduleFlowRecord = recordFor(FLOW_MODULE_PACKAGE, TEST_KEY_1)
   const signed = (record: Record<string, unknown>, key = TEST_KEY_1) => signCanonical(record, key, DOMAIN_RECORD)
   const without = (record: Record<string, unknown>, field: string) => {
     const copy = { ...record }
@@ -905,7 +946,7 @@ function recordVectors() {
   }
   const reordered = Object.fromEntries(Object.entries(skillRecord).reverse())
 
-  type Case = { name: string; note: string; package: "skill" | "flow"; served_text: string; signature: string; expect: VerifyResult }
+  type Case = { name: string; note: string; package: keyof typeof packages; served_text: string; signature: string; expect: VerifyResult }
   const cases: Case[] = [
     {
       name: "served_with_other_key_order_and_whitespace",
@@ -1010,6 +1051,7 @@ function recordVectors() {
     { name: "flow_version_on_skill", note: "flow_version is present only for kind flow", package: "skill", ...served(signed({ ...skillRecord, flow_version: 1 })), expect: { ok: false, code: "record_mismatch", field: "flow_version" } },
     { name: "flow_version_missing", note: "a flow record must carry flow.json's integer version", package: "flow", ...served(signed(without(flowRecord, "flow_version"))), expect: { ok: false, code: "record_mismatch", field: "flow_version" } },
     { name: "flow_version_mismatch", note: "flow.json says 3, the record says 2", package: "flow", ...served(signed({ ...flowRecord, flow_version: 2 })), expect: { ok: false, code: "record_mismatch", field: "flow_version" } },
+    { name: "module_flow_valid", note: "a module flow uses the same signed record and archive verification as a script flow", package: "flow_module", ...served(signed(moduleFlowRecord)), expect: { ok: true } },
   ]
   for (const c of cases) {
     const got = verifyRecord(c.served_text, c.signature, packages[c.package], trusted)
@@ -1038,9 +1080,10 @@ function recordVectors() {
     },
     keys: { trusted: keyOut(TEST_KEY_1), untrusted: keyOut(TEST_KEY_2) },
     jcs: jcsVectors(),
-    packages: { skill: packageOut(SKILL_PACKAGE), flow: packageOut(FLOW_PACKAGE) },
+    packages: { skill: packageOut(SKILL_PACKAGE), flow: packageOut(FLOW_PACKAGE), flow_module: packageOut(FLOW_MODULE_PACKAGE) },
     valid,
     cases,
+    flow_body_cases: flowBodyVectors(),
   }
 
   function served(s: { canonical: string; signature: string }) {
@@ -2004,6 +2047,8 @@ function archiveVectors() {
       build: { base: "valid", append_empty_members: { path_format: "pad/NNNN, NNNN a 4-digit decimal counting from 0001", first: "pad/0001", last: "pad/0998" } },
       expect: refuse("too_many_members", { offset: offsetOf([...base, ...pad(998)], 1000), member: "pad/0998" }),
     },
+    { name: "flow_archive", note: "the script flow package archive of record.json", archive: FLOW_PACKAGE.archive, expect: { ok: true, member_count: 3 } },
+    { name: "flow_module_archive", note: "the module flow package archive of record.json; flow.wasm is never run", archive: FLOW_MODULE_PACKAGE.archive, expect: { ok: true, member_count: 3 } },
   ]
   for (const c of cases) {
     const r = readArchive(c.archive)

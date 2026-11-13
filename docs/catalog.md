@@ -13,7 +13,9 @@ held skill and flow generations. Agent moves carry pinned package bytes through 
 `agent-data/v1` participant. Direct operators can publish packages; publishing
 remains unavailable until the vault's signing key is provisioned. Core's flow
 consumer serves flows; persona and memory-profile installation wait for their consumers.
-Flow bodies remain `{manifest, script}`; module-backed flows are not supported.
+Flow bodies are `{manifest, script | module}`, with exactly one executable file.
+Entorhinal verifies either shape and stays engine-agnostic; the flow consumer's
+check refuses engines it cannot run, before any consent card is shown.
 
 ```
 ck packages registry add https://registry.example --scope @example --key-id status-1 --public-key <64-lowercase-hex>
@@ -671,8 +673,10 @@ and is never replicated to other machines through the shared identity journal.
 Flows pinned by any live agent whose verified manifest requires at least one
 capability also use a ten-minute lane. Its failure retries are one minute,
 doubling to a ten-minute cap, independent of the hourly lane's backoff. Minute
-ticks discover pins from the content store (without refetching manifests) and
-observe freshness boundaries even during registry outages.
+ticks discover pins from the content store (without refetching manifests). An
+independent freshness timer wakes at the earliest persisted fifteen-minute
+deadline, including while a registry HTTP request is pending. Post-commit
+invalidations recompute that deadline after confirmation and lane changes.
 
 Migration 20 adds machine-local `catalog_status_confirmation` and
 `catalog_fast_lane` tables outside the journal. Signed `changed_at` describes a
@@ -698,7 +702,7 @@ identity watches. Notices are either `{kind:"resync", token}` or
 the process incarnation and a local status generation; malformed, foreign,
 future or expired tokens resync. A notice exceeding 192 KiB becomes a resync.
 The poller publishes committed status snapshots after each scope attempt and
-each freshness tick, with no store lock held during emission. Only state,
+each freshness deadline, with no store lock held during emission. Only state,
 blocking judgement and stale marker changes invalidate consumers; an ordinary
 confirmation advance while fresh is silent. A resync asks the consumer to read
 its generation or context statuses again. Byte-exact automation-pack examples

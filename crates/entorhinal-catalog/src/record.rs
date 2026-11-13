@@ -306,7 +306,7 @@ fn validate_manifest(v: Value) -> Result<Manifest, Refusal> {
     };
     let allowed: &[&str] = match m.kind {
         Kind::Skill => &["entry", "audience", "scripts"],
-        Kind::Flow => &["manifest", "script"],
+        Kind::Flow => &["manifest", "script", "module"],
         Kind::Persona => &[
             "prompt",
             "extends",
@@ -344,7 +344,11 @@ fn validate_manifest(v: Value) -> Result<Manifest, Refusal> {
         }
         Kind::Flow => {
             check_file(&m.body["manifest"])?;
-            check_file(&m.body["script"])?;
+            let executable = match (body.get("script"), body.get("module")) {
+                (Some(file), None) | (None, Some(file)) => file,
+                _ => return Err(err("body")),
+            };
+            check_file(executable)?;
         }
         Kind::Persona => {
             check_file(&m.body["prompt"])?;

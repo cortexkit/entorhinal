@@ -797,8 +797,10 @@ impl CatalogTrust {
                             &chain(current),
                             &pins,
                         );
-                        let mut write = TrustWrite::default();
-                        write.confirmed_at_ms = Some(now);
+                        let mut write = TrustWrite {
+                            confirmed_at_ms: Some(now),
+                            ..Default::default()
+                        };
                         let mut holds = rows.to_vec();
                         let mut results = Vec::new();
                         if pure

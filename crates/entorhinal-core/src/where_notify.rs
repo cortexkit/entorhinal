@@ -143,6 +143,9 @@ impl RegistryStore {
                 listener();
             }
         }
+        if result.is_ok() {
+            self.notify_catalog_change();
+        }
         result
     }
 }

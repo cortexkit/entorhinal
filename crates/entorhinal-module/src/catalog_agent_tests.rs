@@ -609,7 +609,7 @@ async fn catalog_flow_prepare_install_generation_ack_and_blocking_status() {
             .await,
         );
         assert_eq!(active["generation"]["state"], "active");
-        let calls = f.consumers.consumer.calls.lock().unwrap();
+        let calls = f.consumers.consumer.calls.lock().unwrap().clone();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].0, "catalog_consumer.check");
         assert_eq!(calls[0].1["packages"][0]["kind"], "flow");
@@ -674,6 +674,61 @@ async fn catalog_flow_prepare_names_missing_consumer() {
         .as_str()
         .unwrap()
         .contains("Flow"));
+}
+
+#[tokio::test]
+async fn catalog_module_flow_reaches_consumer_check_before_any_card() {
+    use base64::Engine;
+    let f = Fixture::flow().await;
+    let records = vectors("record");
+    let package = &records["packages"]["flow_module"];
+    let record = records["valid"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["record"]["name"] == "@example/hello-module-flow")
+        .unwrap();
+    let mut status = vectors("status")["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["record"]["name"] == FLOW_NAME)
+        .unwrap()["record"]
+        .clone();
+    status["name"] = record["record"]["name"].clone();
+    status["archive_sha256"] = record["record"]["archive_sha256"].clone();
+    let doc = signed(status, &vectors("statements")["keys"]["registry_status"][0]);
+    f.registry.serve("/v1/packages/example/hello-module-flow",Reply::bytes(json!({"name":record["record"]["name"],"versions":[{"version":"1.0.0","record":record["record"],"signature":record["signature"],"status":doc}]}).to_string()));
+    f.registry.serve(
+        "/v1/packages/example/hello-module-flow/1.0.0/ck.json",
+        Reply::bytes(package["manifest_text"].as_str().unwrap()),
+    );
+    f.registry.serve(
+        &format!(
+            "/v1/archives/{}",
+            package["archive_sha256"].as_str().unwrap()
+        ),
+        Reply::bytes(
+            base64::engine::general_purpose::STANDARD
+                .decode(package["archive_base64"].as_str().unwrap())
+                .unwrap(),
+        ),
+    );
+    *f.consumers.consumer.check_reply.lock().unwrap() = json!({"ok":false,"refusals":[{"package":"@example/hello-module-flow","version":"1.0.0","code":"engine_not_supported","message":"This consumer serves script flows only"}]});
+    let mut spec = f.spec("module-flow");
+    spec["spec"]["package"] = json!("@example/hello-module-flow");
+    let plan = f.prepare_spec(spec).await;
+    assert_eq!(plan["state"], "failed");
+    assert_eq!(plan["refusal"]["code"], "consumer_refused", "{plan}");
+    assert_eq!(
+        plan["refusal"]["detail"]["refusals"][0]["code"],
+        "engine_not_supported"
+    );
+    let calls = f.consumers.consumer.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "catalog_consumer.check");
+    assert_eq!(calls[0].1["packages"][0]["kind"], "flow");
+    assert_eq!(f.cingulate.card_count(), 0);
 }
 
 #[tokio::test]

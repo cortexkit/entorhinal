@@ -138,9 +138,14 @@ struct Worker {
     /// handle, so stopping waits for the count to reach zero.
     sql: Arc<SqlOperations>,
     watches: Arc<crate::watches::Watches>,
+    freshness_wake: Arc<tokio::sync::Notify>,
+    snapshots: tokio::sync::Mutex<()>,
 }
 impl Worker {
     async fn publish_statuses(&self) -> Result<(), &'static str> {
+        // The deadline and network lanes may finish together. Serialize their
+        // snapshots so an older read cannot overwrite a newer watch observation.
+        let _snapshot = self.snapshots.lock().await;
         let store = self.store().ok_or("store_unavailable")?;
         let statuses = crate::catalog_sql::run(self.sql.tracked(move || {
             store
@@ -259,7 +264,65 @@ impl Worker {
         }
         failure.map_or(Ok(()), Err)
     }
+    fn listen(&self) {
+        if let Some(store) = self.store() {
+            let wake = self.freshness_wake.clone();
+            store.set_catalog_change_listener(Arc::new(move || wake.notify_one()));
+        }
+    }
+    async fn next_freshness_deadline(&self) -> Result<Option<i64>, &'static str> {
+        let store = self.store().ok_or("store_unavailable")?;
+        crate::catalog_sql::run(self.sql.tracked(move || {
+            store
+                .catalog_next_freshness_deadline()
+                .map_err(|e| crate::catalog_blob::CatalogError::new("storage_error", e.to_string()))
+        }))
+        .await
+        .map_err(|e| e.code)
+    }
+    async fn run_freshness(&self) {
+        loop {
+            let notified = self.freshness_wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.store.upgrade().is_none() {
+                return;
+            }
+            if self.store().is_none() {
+                notified.await;
+                continue;
+            }
+            self.listen();
+            if let Err(code) = self.fast_scopes().await {
+                tracing::warn!(
+                    code,
+                    "catalog freshness membership refresh failed; retaining known lanes"
+                );
+            }
+            if let Err(code) = self.publish_statuses().await {
+                tracing::warn!(code, "catalog freshness watch snapshot failed");
+            }
+            match self.next_freshness_deadline().await {
+                Ok(Some(deadline)) => {
+                    let delay = Duration::from_millis(
+                        deadline.saturating_sub((self.clock)()).max(0) as u64,
+                    );
+                    tokio::select! { _ = notified => {}, _ = tokio::time::sleep(delay) => {} }
+                }
+                Ok(None) => notified.await,
+                Err(code) => {
+                    tracing::warn!(code, "catalog freshness deadline read failed");
+                    tokio::select! { _ = notified => {}, _ = tokio::time::sleep(Duration::from_secs(1)) => {} }
+                }
+            }
+        }
+    }
     async fn run(self) {
+        // Both futures belong to the one supervised task. Aborting it stops both
+        // lanes; stop_catalog_poll then awaits their tracked blocking SQL jobs.
+        tokio::join!(self.run_polls(), self.run_freshness());
+    }
+    async fn run_polls(&self) {
         let mut offset = None;
         let mut hourly = tokio::time::Instant::now();
         let mut fast = tokio::time::Instant::now();
@@ -272,6 +335,8 @@ impl Worker {
                 self.wake.notified().await;
                 continue;
             }
+            self.listen();
+            self.freshness_wake.notify_one();
             let fast_scopes = match self.fast_scopes().await {
                 Ok(scopes) => Ok(scopes),
                 Err(code) => {
@@ -334,8 +399,9 @@ impl Worker {
                     }
                 }
             }
-            // Minute ticks discover new live flow pins and observe freshness
-            // deadlines even while a registry is failing. Hourly retries retain
+            // Minute ticks discover registry scopes from flows newly pinned by
+            // live agents, so network polling includes newly installed packages.
+            // Freshness has its own exact-deadline timer. Hourly retries retain
             // their independent monotonic deadline and six-hour cap.
             let tick = tokio::time::Instant::now() + Duration::from_secs(60);
             let fast_due = if fast > tokio::time::Instant::now() {
@@ -385,6 +451,8 @@ impl ProjectsHandler {
             wake: self.catalog_poll_wake.clone(),
             sql: self.catalog_sql.clone(),
             watches: self.watches.clone(),
+            freshness_wake: Arc::default(),
+            snapshots: tokio::sync::Mutex::new(()),
         };
         *task = Some(tokio::spawn(worker.run()));
     }

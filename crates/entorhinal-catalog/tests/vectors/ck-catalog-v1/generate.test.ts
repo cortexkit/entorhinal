@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { readFileSync } from "node:fs"
 import { join } from "node:path"
-import { driftedFiles, DOMAIN_STARTER_BUNDLE, JSON_FILES, jcs, parseRange, parseStrictJson, parseVersion, resolve, satisfies, sha256Hex, signingInput, SKILL_PACKAGE, TEST_KEY_1, VECTOR_DIR, verifyRecord } from "./generate"
+import { driftedFiles, DOMAIN_STARTER_BUNDLE, FLOW_MODULE_PACKAGE, JSON_FILES, jcs, parseRange, parseStrictJson, parseVersion, readArchive, resolve, satisfies, sha256Hex, signingInput, SKILL_PACKAGE, TEST_KEY_1, VECTOR_DIR, verifyRecord } from "./generate"
 
 const committed = (name: string) => readFileSync(join(VECTOR_DIR, name), "utf8")
 
@@ -62,6 +62,72 @@ describe("ck-catalog-v1 test vectors", () => {
     const staleSum = (file: string) => (file === "README.md" ? committed(file).replace(/(\| names\.json \| `)[0-9a-f]/, "$1x") : committed(file))
     expect(staleSum("README.md")).not.toBe(committed("README.md"))
     expect(driftedFiles(staleSum)).toEqual(["README.md"])
+  })
+})
+
+describe("ck-catalog-v1 flow body variants", () => {
+  test("includes a signed module flow and both flow archives", () => {
+    const vector = JSON.parse(committed("record.json")) as {
+      packages: Record<string, { manifest_text: string; archive_base64: string; members: { path: string; content: string; sha256: string; bytes: number }[] }>
+      valid: { name: string; package: string; canonical: string; signature: string; key_fingerprint: string }[]
+      cases: { name: string; package: string; served_text: string; signature: string; expect: unknown }[]
+    }
+    const pkg = vector.packages.flow_module
+    const manifest = JSON.parse(pkg.manifest_text)
+    expect(manifest.name).toBe("@example/hello-module-flow")
+    expect(manifest.kind).toBe("flow")
+    expect(manifest.body).toEqual({ manifest: "flow.json", module: "flow.wasm" })
+    const wasm = Buffer.from([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00])
+    const moduleMember = pkg.members.find((m) => m.path === "flow.wasm")!
+    expect(Buffer.from(moduleMember.content)).toEqual(wasm)
+    expect(moduleMember.bytes).toBe(8)
+    expect(moduleMember.sha256).toBe(sha256Hex(wasm))
+    expect(manifest.files).toContainEqual({ path: "flow.wasm", sha256: sha256Hex(wasm), bytes: 8 })
+
+    const signed = vector.valid.find((record) => record.name === "flow_module_record")!
+    expect(signed.package).toBe("flow_module")
+    expect(signed.key_fingerprint).toBe(TEST_KEY_1.fingerprint)
+    expect(JSON.parse(signed.canonical)).toMatchObject({ name: "@example/hello-module-flow", public_key: TEST_KEY_1.publicKeyHex, flow_version: 3 })
+    expect(verifyRecord(signed.canonical, signed.signature, FLOW_MODULE_PACKAGE, [TEST_KEY_1.fingerprint])).toEqual({ ok: true })
+    const verification = vector.cases.find((c) => c.name === "module_flow_valid")!
+    expect(verification.package).toBe("flow_module")
+    expect(verification.served_text).toBe(signed.canonical)
+    expect(verification.signature).toBe(signed.signature)
+    expect(verification.expect).toEqual({ ok: true })
+
+    const archives = JSON.parse(committed("archive.json")) as { cases: { name: string; archive_base64: string; expect: unknown }[] }
+    for (const label of ["flow", "flow_module"]) {
+      const archiveCase = archives.cases.find((c) => c.name === `${label}_archive`)!
+      expect(archiveCase.archive_base64).toBe(vector.packages[label].archive_base64)
+      expect(archiveCase.expect).toEqual({ ok: true, member_count: 3 })
+      const read = readArchive(Buffer.from(archiveCase.archive_base64, "base64"))
+      expect(read.ok).toBe(true)
+      if (!read.ok) throw new Error(`archive refused: ${label}`)
+      expect([...read.members.keys()]).toEqual(["ck.json", "flow.json", label === "flow" ? "flow.js" : "flow.wasm"])
+      if (label === "flow_module") expect(read.members.get("flow.wasm")).toEqual(wasm)
+    }
+  })
+
+  test("preserves the original skill and script-flow package bytes", () => {
+    const vector = JSON.parse(committed("record.json")) as { packages: Record<string, { manifest_text: string; archive_base64: string }> }
+    const hashes = {
+      skill: ["0e9589220c8da2a19847f8762998ff13edab94b268fc4ee75157b8337ebd91be", "e238dc41dff661632518c120752f3e4d58168acb393fa0ca8f6881e718e0e398"],
+      flow: ["ec44fe2e3a506ed0d632a67e1ec6c6a243eb2a180f7d6e321815ca7b4a35042d", "89d6bee3b0bdffaf7646d000e4d98f60181df12e4894159b7cdba5e3ed6a4639"],
+    }
+    for (const [label, [manifestHash, archiveHash]] of Object.entries(hashes)) {
+      expect(sha256Hex(vector.packages[label].manifest_text)).toBe(manifestHash)
+      expect(sha256Hex(Buffer.from(vector.packages[label].archive_base64, "base64"))).toBe(archiveHash)
+    }
+  })
+
+  test("pins exactly one script or module in the standalone flow-body cases", () => {
+    const vector = JSON.parse(committed("record.json")) as { flow_body_cases: unknown[] }
+    expect(vector.flow_body_cases).toEqual([
+      { name: "flow_body_script", body: { manifest: "flow.json", script: "flow.js" }, expect: { ok: true } },
+      { name: "flow_body_module", body: { manifest: "flow.json", module: "flow.wasm" }, expect: { ok: true } },
+      { name: "flow_body_both", body: { manifest: "flow.json", script: "flow.js", module: "flow.wasm" }, expect: { ok: false, code: "manifest_invalid", field: "body" } },
+      { name: "flow_body_neither", body: { manifest: "flow.json" }, expect: { ok: false, code: "manifest_invalid", field: "body" } },
+    ])
   })
 })
 
