@@ -726,6 +726,10 @@ mod tests {
                     "catalog_registry_opt_out",
                     "catalog_feed",
                     "catalog_status",
+                    // When this machine last confirmed a version's status, and
+                    // which pinned flows it polls every ten minutes.
+                    "catalog_status_confirmation",
+                    "catalog_fast_lane",
                     "catalog_starter_proof",
                     "catalog_publisher_grant",
                     "catalog_audit",
