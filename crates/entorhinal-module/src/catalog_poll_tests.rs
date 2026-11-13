@@ -475,7 +475,9 @@ async fn startup_hourly_offset_and_backoff_recovers() {
     let f = Fixture::new().await;
     let mut completions = f.health.catalog.completions();
     assert!(f.health.catalog.report()["catalogLastSuccessMs"].is_null());
-    let task = tokio::spawn(f.worker().run());
+    let worker = f.worker();
+    let sql = worker.sql.clone();
+    let task = tokio::spawn(worker.run());
     let first = completed_pass(&mut completions, 1, Ok(())).await;
     assert_eq!(first["catalogScopesPolled"], 1);
     assert_eq!(first["catalogLastSuccessMs"], 600_000);
@@ -508,6 +510,10 @@ async fn startup_hourly_offset_and_backoff_recovers() {
     assert_eq!(hourly["catalogScopesPolled"], count + 1);
     task.abort();
     task.await.unwrap_err();
+    // Aborting the task leaves its blocking SQL jobs (the freshness timer's
+    // among them) running on side threads; wait for them before the fixture
+    // deletes the store's folder.
+    sql.wait().await;
     assert_eq!(delay(0, 600_000, 0), Duration::from_secs(600));
     assert_eq!(delay(600_000, 600_000, 0), Duration::from_secs(3600));
     assert_eq!(delay(-1, 600_000, 0), Duration::from_millis(600_001));
