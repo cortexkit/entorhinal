@@ -645,6 +645,21 @@ fn agent_identity_published_records_roundtrip_exactly() {
         );
         records.extend(batch);
     }
+    // The automation-pack samples keep exact bytes as strings; a flow pin's
+    // status there may carry `stale_since_ms`, which the crate must keep.
+    let packs: Vec<Value> = serde_json::from_slice(
+        &std::fs::read(root.join("catalog-packs-v1").join("context.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        !packs.is_empty(),
+        "published catalog-packs-v1/context.json: no records"
+    );
+    for record in packs {
+        let parse =
+            |key: &str| -> Value { serde_json::from_str(record[key].as_str().unwrap()).unwrap() };
+        records.push(json!({"request": parse("request_bytes"), "reply": parse("reply_bytes")}));
+    }
     assert_agent_identity_records("published identity vectors", &records);
 }
 
