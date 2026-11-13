@@ -118,8 +118,8 @@ impl RegistryStore {
                         {
                             return Err(refusal("record_mismatch"));
                         }
-                        // Step 1 accepts only skills, whose bodies have no cross-kind refs.
-                        // Non-skill closure members are refused below, before a plan is ready.
+                        // Skills and script flows have no cross-kind body references.
+                        // Core serves both kinds through its catalog consumers.
                         registry
                             .entry(r.name.clone())
                             .or_default()
@@ -197,10 +197,9 @@ impl RegistryStore {
                             json!({"code":"kind_slot_taken","detail":conflict}),
                         ));
                     }
-                    // Non-skill packages remain unsupported until their consumers are available.
-                    // Check root slots first so conflicts are rejected as soon as those kinds
-                    // become installable.
-                    if let Some(pin) = closure.iter().find(|pin| pin.kind != Kind::Skill) {
+                    // Core's flow consumer serves flows. Persona and memory-profile
+                    // packages wait for their consumers. Check root slots first.
+                    if let Some(pin) = closure.iter().find(|pin| !matches!(pin.kind, Kind::Skill | Kind::Flow)) {
                         return Err(CatalogResolveError::Refusal(
                             json!({"code":"kind_not_yet_supported","package":pin.name}),
                         ));

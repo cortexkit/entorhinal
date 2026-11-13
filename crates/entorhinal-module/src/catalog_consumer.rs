@@ -149,9 +149,8 @@ pub async fn discover(
             .iter()
             .any(|c| c.kinds.contains(&package.pin.kind))
         {
-            // Only skills are installable today. Their consumer is prefrontal-core,
-            // which caches installed skills for its sessions; preparation fails
-            // until a consumer for each package's kind is present.
+            // Core consumes installed skills and flows. Preparation fails until
+            // a consumer for each package's kind is present.
             return Err(unavailable(
                 WRITER_MODULE,
                 format!("no consumer for {:?}", package.pin.kind),

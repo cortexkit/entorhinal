@@ -167,8 +167,8 @@ fn invalid(message: &str) -> rusqlite::Error {
 /// Validate shared pins with one set of rules for local writes, remote apply,
 /// replay and verification. Pins can describe any catalog package kind. Plan
 /// preparation (resolving and checking an install or upgrade request) is
-/// stricter: it refuses any package that is not a `Kind::Skill`, because skills
-/// are the only kind with a consumer today.
+/// stricter: skills and flows install through core's consumers; persona and
+/// memory-profile packages wait for their consumers.
 pub fn validate_pins(pins: &[CatalogPin]) -> rusqlite::Result<()> {
     let mut seen = BTreeSet::new();
     for pin in pins {
@@ -585,7 +585,7 @@ pub(crate) fn blocked_status(
     Ok(pin_statuses(conn, pins)?.into_iter().find(status_blocks))
 }
 /// The trust transaction calls this after writing status rows, so degradation
-/// of active skills and its blocking reason commit together with the status.
+/// of active skills and flows and its blocking reason commit with the status.
 pub(crate) fn apply_status_effects(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     let ids = tx
         .prepare(
@@ -595,12 +595,12 @@ pub(crate) fn apply_status_effects(tx: &Transaction<'_>) -> rusqlite::Result<()>
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for id in ids {
         let generation = read_generation(tx, &id)?;
-        let skills = generation
+        let installable = generation
             .closure
             .into_iter()
-            .filter(|p| p.kind == Kind::Skill)
+            .filter(|p| matches!(p.kind, Kind::Skill | Kind::Flow))
             .collect::<Vec<_>>();
-        if let Some(status) = blocked_status(tx, &skills)? {
+        if let Some(status) = blocked_status(tx, &installable)? {
             let code = if status["state"] == "tombstoned" {
                 "pinned_tombstoned"
             } else {
@@ -769,7 +769,7 @@ impl RegistryStore {
                 live(tx,&plan.agent_id)?;
                 if plan.state != "pending" { return Err(CatalogWriteError::Refused("invalid_transition")); }
                 validate_pins(&pins).map_err(store_error)?;
-                if let Some(pin) = pins.iter().find(|p| p.kind != Kind::Skill) {
+                if let Some(pin) = pins.iter().find(|p| !matches!(p.kind, Kind::Skill | Kind::Flow)) {
                     tx.execute("UPDATE catalog_plan SET state='failed',refusal=?1 WHERE plan_id=?2",params![json!({"code":"kind_not_yet_supported","package":pin.name}).to_string(),id]).map_err(store_error)?;
                 } else {
                     if current_digest(tx,&plan.agent_id).map_err(store_error)? != plan.base_pin_digest { return Err(CatalogWriteError::Refused("plan_stale")); }

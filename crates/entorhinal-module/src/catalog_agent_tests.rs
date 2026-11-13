@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use subc_client_rs::{CatalogList, SupervisorListResponse};
 
 const NAME: &str = "@example/hello-skill";
+const FLOW_NAME: &str = "@example/hello-flow";
 const URL: &str = "https://registry.example.invalid";
 fn consumer_role() -> Value {
     json!({"role":"internal_service","service_id":catalog_consumer::SERVICE,"transport":"bulk","agent_facing":false,"operations":["catalog_consumer.check","catalog_consumer.prefetch"]})
@@ -197,6 +198,32 @@ fn clock() -> i64 {
     100
 }
 impl Fixture {
+    async fn flow() -> Self {
+        let f = Self::new().await;
+        *f.consumers.capability.lock().unwrap() = catalog_consumer::FLOW.into();
+        *f.consumers.consumer.check_reply.lock().unwrap() =
+            json!({"ok":true,"card_section":"Verified flow section"});
+        let status = vectors("status")["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["record"]["name"] == FLOW_NAME)
+            .unwrap()
+            .clone();
+        let feed = json!({"schema":"ck-status-feed/v1","scope":"example","feed_seq":1,"records":[{"feed_seq":1,"record":status["record"],"signature":status["signature"]}]});
+        for path in [
+            "/v1/scopes/example/status",
+            "/v1/scopes/example/status?after=1",
+        ] {
+            f.registry.serve(path, Reply::bytes(feed.to_string()));
+        }
+        f
+    }
+    async fn prepare_flow(&self, key: &str) -> Value {
+        let mut spec = self.spec(key);
+        spec["spec"]["package"] = json!(FLOW_NAME);
+        self.prepare_spec(spec).await
+    }
     async fn new() -> Self {
         let mut tools = Tools::new();
         tools.handler.clock = clock;
@@ -532,6 +559,113 @@ async fn tool_result_limits_catalog_replies() {
         ),
         "tool_result_too_large"
     );
+}
+
+#[tokio::test]
+async fn catalog_flow_prepare_install_generation_ack_and_blocking_status() {
+    for state in ["revoked", "tombstoned"] {
+        let f = Fixture::flow().await;
+        let plan = f.prepare_flow("flow").await;
+        assert_eq!(plan["state"], "ready", "{plan}");
+        assert_eq!(plan["closure"][0]["kind"], "flow");
+        f.cingulate
+            .script("consent.await", Effect::Answer("approve_once"));
+        let installed = tool_result(f.install(&plan).await);
+        let id = &installed["generation_id"];
+        let agent = &f.tools.agents[0];
+        let card = f
+            .cingulate
+            .calls()
+            .into_iter()
+            .find(|c| c.method == "consent.request")
+            .unwrap()
+            .params;
+        assert_eq!(card["facts"][0]["label"], "Flows (prefrontal-core)");
+        assert_eq!(card["facts"][0]["value"], "Verified flow section");
+        let read = result(
+            f.op(
+                crate::tests::reserved(crate::WRITER_MODULE),
+                AGENT_GENERATION,
+                json!({"agent_id":agent}),
+            )
+            .await,
+        );
+        assert_eq!(read["ready"][0]["closure"][0]["kind"], "flow");
+        let ack = json!({"agent_id":agent,"generation_id":id});
+        let active = result(
+            f.op(
+                crate::tests::reserved(crate::WRITER_MODULE),
+                ACK_ACTIVATION,
+                ack.clone(),
+            )
+            .await,
+        );
+        assert_eq!(active["generation"]["state"], "active");
+        let calls = f.consumers.consumer.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "catalog_consumer.check");
+        assert_eq!(calls[0].1["packages"][0]["kind"], "flow");
+        assert_eq!(calls[1].0, "catalog_consumer.prefetch");
+        drop(calls);
+        let mut status = vectors("status")["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["record"]["name"] == FLOW_NAME)
+            .unwrap()["record"]
+            .clone();
+        status["state"] = json!(state);
+        status["sequence"] = json!(2);
+        status["reason"] = json!("registry security notice");
+        status["compromise_from"] = if state == "revoked" {
+            status["published_at"].clone()
+        } else {
+            Value::Null
+        };
+        let doc = signed(status, &vectors("statements")["keys"]["registry_status"][0]);
+        let feed = json!({"schema":"ck-status-feed/v1","scope":"example","feed_seq":2,"records":[{"feed_seq":2,"record":doc["record"],"signature":doc["signature"]}]});
+        f.registry.serve(
+            "/v1/scopes/example/status?after=1",
+            Reply::bytes(feed.to_string()),
+        );
+        let mut trust = (f.tools.handler.catalog_agent.sources)(f.store(), "@example").unwrap();
+        refresh(&mut trust).await.unwrap();
+        let read = result(
+            f.op(
+                crate::tests::reserved(crate::WRITER_MODULE),
+                AGENT_GENERATION,
+                json!({"agent_id":agent}),
+            )
+            .await,
+        );
+        assert_eq!(read["active"]["state"], "degraded");
+        assert_eq!(read["active"]["error"]["code"], format!("pinned_{state}"));
+        assert_eq!(
+            error_code(
+                f.op(
+                    crate::tests::reserved(crate::WRITER_MODULE),
+                    ACK_ACTIVATION,
+                    ack
+                )
+                .await
+            ),
+            "activation_blocked"
+        );
+    }
+}
+
+#[tokio::test]
+async fn catalog_flow_prepare_names_missing_consumer() {
+    let f = Fixture::flow().await;
+    *f.consumers.capability.lock().unwrap() = catalog_consumer::SKILL.into();
+    let plan = f.prepare_flow("missing-flow").await;
+    assert_eq!(plan["state"], "failed");
+    assert_eq!(plan["refusal"]["code"], "consumer_unavailable");
+    assert_eq!(plan["refusal"]["detail"]["module_id"], crate::WRITER_MODULE);
+    assert!(plan["refusal"]["detail"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("Flow"));
 }
 
 #[tokio::test]
