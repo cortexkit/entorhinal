@@ -4349,6 +4349,9 @@ async fn repair_preview_is_open_and_cutover_refusal_precedes_confirmation() {
     );
 }
 
+#[path = "catalog_pack_vectors.rs"]
+mod packs;
+
 #[tokio::test]
 async fn catalog_generation_v1_records_match_published_files() {
     use entorhinal_core::catalog_agent::{

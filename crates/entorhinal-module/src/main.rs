@@ -2412,7 +2412,8 @@ fn request_operation(body: &[u8]) -> RequestSummary {
             None | Some(Value::Null) | Some(Value::Bool(true))
         ))
         || request.method == watches::IDENTITY
-        || request.method == watches::WHERE;
+        || request.method == watches::WHERE
+        || request.method == watches::CATALOG;
     RequestSummary {
         operation,
         method: loggable_method(&request.method).map(str::to_owned),
@@ -2736,6 +2737,7 @@ fn manifest() -> ModuleManifest {
             })).chain([
                 (watches::IDENTITY, "Watch process-local fleet identity changes until cancelled or drained."),
                 (watches::WHERE, "Watch process-local agent whereabouts changes until cancelled or drained."),
+                (watches::CATALOG, "Watch pinned catalog status and freshness changes until cancelled or drained."),
             ].into_iter().map(|(method, description)| {
                 management_operation(method, ManagementOperationKind::Query, description)
             })).chain([claims::WHERE, claims::WHERE_MANY].into_iter().map(|method| {
@@ -2798,6 +2800,7 @@ fn manifest() -> ModuleManifest {
     .operation_delivery(BTreeMap::from([
         (watches::IDENTITY.to_owned(), OperationDelivery::WATCH),
         (watches::WHERE.to_owned(), OperationDelivery::WATCH),
+        (watches::CATALOG.to_owned(), OperationDelivery::WATCH),
     ]))
     .build()
 }

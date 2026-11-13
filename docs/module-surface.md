@@ -361,6 +361,7 @@ the cache, so it works offline and never waits on engram.
 | `node.self {}` | query | any | This machine's identity-log identity: `{author: string or null, display_name: string or null, sharing: "disabled" or "enabling" or "joining" or "enabled"}` inside the usual `{result: ...}` envelope. Unknown params refuse `invalid_request`. |
 | `agent.fleet_identity_watch` | watch | any | Stream of changes to `agent.fleet_identity`. Opens with `{token?}` and sends `resync` or `changes` notices; on `resync`, read `agent.fleet_identity` once. |
 | `agent.where_watch` | watch | any | Stream of changes to whereabouts. Opens with `{agentIds?, cursor?}` and sends `resync` or `changes` notices carrying a cursor; on `resync`, read `agent.where_many` once. |
+| `catalog.status_watch` | watch | any | Pinned package status invalidations. Opens with `{token?}`; `changes` lists `{name, version}` identities whose state, blocking judgement or stale marker changed. `resync` requires rereading generation or context status. Tokens bind the process incarnation and local status generation. Shares the 16-watch cap and 192 KiB notice limit. |
 | `agent.refresh_claims` | mutate | Direct | Refresh live agents' cached claims from engram. |
 | `role.read` | query | any | Which machine holds a role, from the cached claim. |
 | `role.take` | mutate | Direct, with operator confirmation | Make this machine the role's holder. |

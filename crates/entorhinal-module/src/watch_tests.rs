@@ -1,5 +1,5 @@
 use super::*;
-use crate::watches::{WatchTransport, IDENTITY, WHERE};
+use crate::watches::{WatchTransport, CATALOG, IDENTITY, WHERE};
 use crate::{HandlerError, ModuleHandler, RequestCtx};
 use async_trait::async_trait;
 use std::{future::Future, pin::Pin, task::Poll, time::Duration};
@@ -406,7 +406,7 @@ async fn watch_capacity_is_shared_releases_on_cancel_and_sends_nothing_after_can
         receivers.push(receiver);
     }
     let bodies = (0..16)
-        .map(|i| request(if i % 2 == 0 { IDENTITY } else { WHERE }, json!({})))
+        .map(|i| request([IDENTITY, WHERE, CATALOG][i % 3], json!({})))
         .collect::<Vec<_>>();
     let mut watches = sinks
         .iter()
@@ -469,6 +469,123 @@ async fn watch_capacity_is_shared_releases_on_cancel_and_sends_nothing_after_can
             .load(std::sync::atomic::Ordering::Relaxed),
         0
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn catalog_status_watch_resume_state_blocked_and_stale_changes() {
+    let f = Fixture::new("catalog-watch").await;
+    let statuses = |state: &str, blocked: bool, stale: Option<i64>| {
+        let mut value = json!({"state":state,"blocked":blocked});
+        if let Some(stale) = stale {
+            value["stale_since_ms"] = json!(stale);
+        }
+        std::collections::BTreeMap::from([(("@example/flow".into(), "1.0.0".into()), value)])
+    };
+    let (sink, mut receiver) = Sink::new();
+    let body = request(CATALOG, json!({}));
+    let watch = f.handler.serve_watch(&sink, &body, READER);
+    tokio::pin!(watch);
+    pending(watch.as_mut()).await;
+    let opening = notice(&mut receiver);
+    assert_eq!(
+        opening,
+        json!({"kind":"resync","token":format!("{INCARNATION}:0")})
+    );
+    for (index, (state, blocked, stale)) in [
+        ("available", false, None),
+        ("available", false, Some(900_100)),
+        ("available", false, None),
+        ("revoked", false, None),
+        ("revoked", true, None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        f.handler
+            .watches
+            .observe_catalog(statuses(state, blocked, stale));
+        pending(watch.as_mut()).await;
+        let change = notice(&mut receiver);
+        assert_eq!(change["kind"], "changes");
+        assert_eq!(change["generation"], index + 1);
+        assert_eq!(
+            change["changes"],
+            json!([{"name":"@example/flow","version":"1.0.0"}])
+        );
+    }
+    f.handler
+        .watches
+        .observe_catalog(statuses("revoked", true, None));
+    pending(watch.as_mut()).await;
+    quiet(&mut receiver);
+    sink.cancel.send_replace(true);
+    assert!(matches!(watch.await, HandlerOutcome::Streamed));
+    for (token, expected) in [
+        (format!("{INCARNATION}:3"), "changes"),
+        ("foreign:5".into(), "resync"),
+        (format!("{INCARNATION}:6"), "resync"),
+        ("malformed".into(), "resync"),
+    ] {
+        let (sink, mut receiver) = Sink::new();
+        let body = request(CATALOG, json!({"token":token}));
+        let watch = f.handler.serve_watch(&sink, &body, READER);
+        tokio::pin!(watch);
+        pending(watch.as_mut()).await;
+        assert_eq!(notice(&mut receiver)["kind"], expected);
+        sink.cancel.send_replace(true);
+        assert!(matches!(watch.await, HandlerOutcome::Streamed));
+    }
+    let (sink, mut receiver) = Sink::new();
+    let body = request(CATALOG, json!({"token":format!("{INCARNATION}:5")}));
+    let watch = f.handler.serve_watch(&sink, &body, READER);
+    tokio::pin!(watch);
+    pending(watch.as_mut()).await;
+    quiet(&mut receiver);
+    f.handler.draining.send_replace(true);
+    assert!(matches!(watch.await, HandlerOutcome::Streamed));
+}
+
+#[tokio::test(start_paused = true)]
+async fn catalog_status_watch_size_and_history_overflow_resync() {
+    let f = Fixture::new("catalog-watch-bounds").await;
+    let (sink, mut receiver) = Sink::new();
+    let body = request(CATALOG, json!({"token":format!("{INCARNATION}:0")}));
+    let watch = f.handler.serve_watch(&sink, &body, READER);
+    tokio::pin!(watch);
+    pending(watch.as_mut()).await;
+    quiet(&mut receiver);
+    let oversized = (0..4000)
+        .map(|i| {
+            (
+                (
+                    format!("@example/flow-{i:04}-{}", "x".repeat(40)),
+                    "1.0.0".into(),
+                ),
+                json!({"state":"available","blocked":false}),
+            )
+        })
+        .collect();
+    f.handler.watches.observe_catalog(oversized);
+    pending(watch.as_mut()).await;
+    assert_eq!(notice(&mut receiver)["kind"], "resync");
+    sink.cancel.send_replace(true);
+    assert!(matches!(watch.await, HandlerOutcome::Streamed));
+    for i in 0..257 {
+        f.handler
+            .watches
+            .observe_catalog(std::collections::BTreeMap::from([(
+                ("@example/flow".into(), "1.0.0".into()),
+                json!({"state":"available","blocked":false,"stale_since_ms":i}),
+            )]));
+    }
+    let (sink, mut receiver) = Sink::new();
+    let body = request(CATALOG, json!({"token":format!("{INCARNATION}:1")}));
+    let watch = f.handler.serve_watch(&sink, &body, READER);
+    tokio::pin!(watch);
+    pending(watch.as_mut()).await;
+    assert_eq!(notice(&mut receiver)["kind"], "resync");
+    sink.cancel.send_replace(true);
+    assert!(matches!(watch.await, HandlerOutcome::Streamed));
 }
 
 #[tokio::test(start_paused = true)]

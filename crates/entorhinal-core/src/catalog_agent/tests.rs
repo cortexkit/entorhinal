@@ -400,7 +400,7 @@ fn kind_operation_scope_and_liveness_gates() {
     );
     plan(&f.store, "kind", &id);
     let mut bad = pin("@acme/a", "1.0.0", true);
-    bad.kind = Kind::Flow;
+    bad.kind = Kind::Persona;
     let failed = f
         .store
         .catalog_plan_ready("kind", &id, vec![bad], 4)
@@ -413,6 +413,16 @@ fn kind_operation_scope_and_liveness_gates() {
     refused(
         f.store.catalog_approve_plan("kind", &id, "g", 5),
         "invalid_transition",
+    );
+    plan(&f.store, "flow-kind", &id);
+    let mut flow = pin("@acme/flow", "1.0.0", true);
+    flow.kind = Kind::Flow;
+    assert_eq!(
+        f.store
+            .catalog_plan_ready("flow-kind", &id, vec![flow], 4)
+            .unwrap()
+            .state,
+        "ready"
     );
     plan(&f.store, "live", &id);
     f.store

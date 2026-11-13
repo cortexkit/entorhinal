@@ -18,6 +18,7 @@ use crate::{HandlerError, ProjectsHandler, RouteKey, WireRequest};
 
 pub(crate) const IDENTITY: &str = "agent.fleet_identity_watch";
 pub(crate) const WHERE: &str = "agent.where_watch";
+pub(crate) const CATALOG: &str = "catalog.status_watch";
 const NOTICE_LIMIT: usize = 192 * 1024;
 const HISTORY_LIMIT: usize = 256;
 const QUIET: Duration = Duration::from_millis(200);
@@ -35,11 +36,20 @@ struct WhereBatch {
     all_agents: bool,
 }
 
+#[derive(Default)]
+struct CatalogHistory {
+    generation: u64,
+    statuses: BTreeMap<(String, String), Value>,
+    batches: VecDeque<(u64, BTreeSet<(String, String)>)>,
+}
+
 pub(crate) struct Watches {
     slots: Semaphore,
     cache_writer: Mutex<()>,
     history: Mutex<WhereHistory>,
     changed: Notify,
+    catalog: Mutex<CatalogHistory>,
+    catalog_changed: Notify,
 }
 
 impl Default for Watches {
@@ -49,11 +59,36 @@ impl Default for Watches {
             cache_writer: Mutex::new(()),
             history: Mutex::new(WhereHistory::default()),
             changed: Notify::new(),
+            catalog: Mutex::default(),
+            catalog_changed: Notify::new(),
         }
     }
 }
 
 impl Watches {
+    /// Called with committed snapshots, after the blocking SQL job has released
+    /// every store handle. Transport emission happens only in the watch task.
+    pub(crate) fn observe_catalog(&self, statuses: BTreeMap<(String, String), Value>) {
+        let mut history = self.catalog.lock().unwrap();
+        let changes = statuses
+            .keys()
+            .chain(history.statuses.keys())
+            .filter(|key| statuses.get(*key) != history.statuses.get(*key))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        history.statuses = statuses;
+        if changes.is_empty() {
+            return;
+        }
+        history.generation += 1;
+        let generation = history.generation;
+        history.batches.push_back((generation, changes));
+        if history.batches.len() > HISTORY_LIMIT {
+            history.batches.pop_front();
+        }
+        drop(history);
+        self.catalog_changed.notify_waiters();
+    }
     pub(crate) fn resync_all(&self) {
         let mut history = self.history.lock().unwrap();
         history.seq += 1;
@@ -172,7 +207,7 @@ impl Drop for Slot<'_> {
 }
 
 pub(super) fn is_watch(method: &str) -> bool {
-    matches!(method, IDENTITY | WHERE)
+    matches!(method, IDENTITY | WHERE | CATALOG)
 }
 
 fn decode<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, HandlerError> {
@@ -201,7 +236,8 @@ impl ProjectsHandler {
             }
             // Validate before consuming a slot, with exactly the existing read
             // contracts: no ambient fields and the same where_many id checks.
-            let identity = if request.method == IDENTITY {
+            let catalog = request.method == CATALOG;
+            let identity = if request.method == IDENTITY || catalog {
                 Some(decode::<IdentityRequest>(request.params.clone())?)
             } else {
                 None
@@ -238,7 +274,8 @@ impl ProjectsHandler {
                 _ = draining.wait_for(|stopping| *stopping) => Ok(()),
                 result = async {
                     if let Some(request) = identity {
-                        self.identity_watch(transport, request).await
+                        if catalog { self.catalog_status_watch(transport,request).await }
+                        else { self.identity_watch(transport, request).await }
                     } else if let Some(request) = whereabouts {
                         self.where_watch(transport, request).await
                     } else {
@@ -271,6 +308,67 @@ impl ProjectsHandler {
             self.health.watch_resyncs.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
+    }
+
+    async fn catalog_status_watch(
+        &self,
+        transport: &impl WatchTransport,
+        request: IdentityRequest,
+    ) -> Result<(), HandlerError> {
+        let notified = self.watches.catalog_changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let mut since = request
+            .token
+            .as_ref()
+            .and_then(Value::as_str)
+            .and_then(|token| {
+                let (incarnation, generation) = token.rsplit_once(':')?;
+                let generation = generation.parse::<u64>().ok()?;
+                (incarnation == self.incarnation && token == format!("{incarnation}:{generation}"))
+                    .then_some(generation)
+            });
+        loop {
+            let (generation, changes) = {
+                let history = self.watches.catalog.lock().unwrap();
+                let changes = since
+                    .filter(|seq| {
+                        *seq <= history.generation
+                            && history
+                                .batches
+                                .front()
+                                .is_none_or(|(first, _)| *seq >= first - 1)
+                    })
+                    .map(|seq| {
+                        history
+                            .batches
+                            .iter()
+                            .filter(|(generation, _)| *generation > seq)
+                            .flat_map(|(_, keys)| keys.iter().cloned())
+                            .collect::<BTreeSet<_>>()
+                    });
+                (history.generation, changes)
+            };
+            let token = format!("{}:{generation}", self.incarnation);
+            let resync = json!({"kind":"resync","token":token});
+            match changes {
+                None => self.notice(transport, resync.clone(), resync).await?,
+                Some(changes) if !changes.is_empty() => {
+                    let changes = changes
+                        .into_iter()
+                        .map(|(name, version)| json!({"name":name,"version":version}))
+                        .collect::<Vec<_>>();
+                    self.notice(transport,json!({"kind":"changes","token":token,"generation":generation,"changes":changes}),resync).await?;
+                }
+                Some(_) => {}
+            }
+            since = Some(generation);
+            #[cfg(test)]
+            self.health.watch_waiting.notify_waiters();
+            (&mut notified).await;
+            notified.set(self.watches.catalog_changed.notified());
+            notified.as_mut().enable();
+        }
     }
 
     async fn identity_watch(

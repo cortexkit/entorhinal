@@ -137,8 +137,21 @@ struct Worker {
     /// stop a job already on the blocking pool, and that job holds a store
     /// handle, so stopping waits for the count to reach zero.
     sql: Arc<SqlOperations>,
+    watches: Arc<crate::watches::Watches>,
 }
 impl Worker {
+    async fn publish_statuses(&self) -> Result<(), &'static str> {
+        let store = self.store().ok_or("store_unavailable")?;
+        let statuses = crate::catalog_sql::run(self.sql.tracked(move || {
+            store
+                .catalog_served_statuses()
+                .map_err(|e| crate::catalog_blob::CatalogError::new("storage_error", e.to_string()))
+        }))
+        .await
+        .map_err(|e| e.code)?;
+        self.watches.observe_catalog(statuses);
+        Ok(())
+    }
     fn store(&self) -> Option<RegistryStore> {
         self.store
             .upgrade()?
@@ -240,6 +253,9 @@ impl Worker {
             if let Err(error) = result {
                 failure = Some(error);
             }
+            if let Err(error) = self.publish_statuses().await {
+                failure = Some(error);
+            }
         }
         failure.map_or(Ok(()), Err)
     }
@@ -278,6 +294,9 @@ impl Worker {
                     }
                 }
             };
+            if let Err(code) = self.publish_statuses().await {
+                tracing::warn!(code, "catalog status watch snapshot failed");
+            }
             let now = tokio::time::Instant::now();
             if now >= hourly {
                 let result = match offset {
@@ -365,6 +384,7 @@ impl ProjectsHandler {
             clock: self.clock,
             wake: self.catalog_poll_wake.clone(),
             sql: self.catalog_sql.clone(),
+            watches: self.watches.clone(),
         };
         *task = Some(tokio::spawn(worker.run()));
     }

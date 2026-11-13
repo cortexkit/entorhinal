@@ -54,7 +54,7 @@ The binary picks its role from its own name: run as `ck-projects`, `ck-workspace
 
 - **Capabilities:** `project-identity/v1` and `agent-identity/v1` (modules that need identity declare these `required`), `bind-no-project/v1`, `permissions/v1`, `tool-provider/v1`, `agent-data/v1` and tool-provider call modes. It requires nothing: a `requires` entry on engram would make the daemon refuse every route here, reads included, while engram is down.
 - **Surfaces:** the management surface of module `entorhinal` (every operation in `docs/module-surface.md`), the tool-provider role (agent tools), and the `agent-data` internal service (its own move participant).
-- **Watches:** `agent.fleet_identity_watch` and `agent.where_watch` are delivered as watches. At most 16 are open at once across all callers.
+- **Watches:** `agent.fleet_identity_watch`, `agent.where_watch` and `catalog.status_watch` are delivered as watches. At most 16 are open at once across all callers.
 
 ## State
 
@@ -117,7 +117,7 @@ All start after HELLO_ACK. Each holds the store weakly and takes a handle only f
 - **Role refresh** (`roles.rs`): reads role claims every 30 s.
 - **Move driver** (`move_driver.rs`): drives open moves, polls the move inbox every 30 s, and releases finished cuts.
 - **Session upkeep** (`session_upkeep.rs`): writes end times from the liveness feed and prunes bindings that ended more than 30 days ago.
-- **Catalog status poll** (`catalog_poll.rs`): refreshes package status for the registry scopes agents' pins use, at startup and then hourly at a stored random offset, backing off up to 6 h after failures.
+- **Catalog status poll** (`catalog_poll.rs`): refreshes package status for the registry scopes agents' pins use, at startup and then hourly at a stored random offset, backing off up to 6 h after failures. Live flows requiring capabilities also refresh every ten minutes, retry failures after one minute (doubling to ten), and become stale after fifteen minutes without confirmation.
 - **Starter bundle seed** (`catalog_seed.rs`): seeds the content store once if a starter bundle is present and the store is empty.
 
 ## Rules that bite

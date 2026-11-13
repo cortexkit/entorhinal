@@ -137,6 +137,28 @@ fn advance(tx: &Transaction<'_>, now: i64) -> rusqlite::Result<()> {
 }
 
 impl RegistryStore {
+    /// Only fields that change a consumer's hold decision belong in this watch
+    /// snapshot. Signed reason text and confirmation-clock advances are not news.
+    pub fn catalog_served_statuses(
+        &self,
+    ) -> Result<std::collections::BTreeMap<(String, String), serde_json::Value>, RegistryError>
+    {
+        self.read(|conn| {
+            let pins = conn.prepare("SELECT DISTINCT p.name,p.version,p.kind,s.canonical FROM catalog_pin p JOIN agent a USING(agent_id) LEFT JOIN catalog_status s ON s.name=p.name AND s.version=p.version WHERE a.terminal_reason IS NULL ORDER BY p.name,p.version")?.query_map([], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut statuses = std::collections::BTreeMap::new();
+            for (name,version,kind,text) in pins {
+                let mut served = if let Some(text) = text {
+                    let value: serde_json::Value = serde_json::from_str(&text).map_err(|e|rusqlite::Error::FromSqlConversionFailure(3,rusqlite::types::Type::Text,Box::new(e)))?;
+                    serde_json::json!({"state":value["state"],"blocked":crate::catalog_agent::status_blocks(&value)})
+                } else { serde_json::Value::Null };
+                if kind == "flow" && !served.is_null() {
+                    if let Some(since) = stale_since(conn,&name,&version)? { served["stale_since_ms"] = serde_json::json!(since); }
+                }
+                statuses.insert((name,version),served);
+            }
+            Ok(statuses)
+        })
+    }
     pub fn catalog_fast_scopes(&self) -> Result<Vec<String>, RegistryError> {
         self.read(|conn| {
             let names = conn.prepare("SELECT DISTINCT f.name FROM catalog_fast_lane f JOIN catalog_pin p ON p.name=f.name AND p.version=f.version JOIN agent a USING(agent_id) WHERE a.terminal_reason IS NULL AND p.kind='flow'")?.query_map([],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;

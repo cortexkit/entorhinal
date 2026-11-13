@@ -1698,6 +1698,7 @@ mod tests {
             "agent.where_many",
             "node.self",
             "agent.where_watch",
+            "catalog.status_watch",
             "agent.move_status",
             "agent.moves",
             "role.read",
@@ -1789,7 +1790,7 @@ mod tests {
             ])
         );
         assert_eq!(manifest["capabilities"]["requires"], json!([]));
-        // Exactly the two streaming queries are declared as watches; every
+        // Only the streaming queries are declared as watches; every
         // other declared operation stays unary.
         let typed = crate::manifest();
         let watched = operations
@@ -1799,7 +1800,11 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(
             watched,
-            BTreeSet::from(["agent.fleet_identity_watch", "agent.where_watch"])
+            BTreeSet::from([
+                "agent.fleet_identity_watch",
+                "agent.where_watch",
+                "catalog.status_watch"
+            ])
         );
     }
 }

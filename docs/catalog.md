@@ -691,6 +691,19 @@ existing bytes.
 
 ### Integration decisions
 
+`catalog.status_watch {token?}` is open to every principal and uses the same held
+watch transport, shared 16-watch cap, cancellation and drain lifecycle as the
+identity watches. Notices are either `{kind:"resync", token}` or
+`{kind:"changes", token, generation, changes:[{name, version}]}`. Tokens combine
+the process incarnation and a local status generation; malformed, foreign,
+future or expired tokens resync. A notice exceeding 192 KiB becomes a resync.
+The poller publishes committed status snapshots after each scope attempt and
+each freshness tick, with no store lock held during emission. Only state,
+blocking judgement and stale marker changes invalidate consumers; an ordinary
+confirmation advance while fresh is silent. A resync asks the consumer to read
+its generation or context statuses again. Byte-exact automation-pack examples
+are in [`test-vectors/catalog-packs-v1`](../test-vectors/catalog-packs-v1/README.md).
+
 The agent-targeted prepare shape resolves the placement-tier ambiguity for this
 skill-and-flow implementation; the consumer kind capabilities follow the daemon's
 actual grammar rather than the earlier proposed slash-separated markers. Check and

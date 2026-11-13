@@ -257,6 +257,11 @@ fn held_status_and_capabilities_control_eligibility_and_kind_gate() {
         "1.0.0"
     );
     versions[0].manifest.kind = Kind::Flow;
+    assert!(f
+        .store
+        .catalog_resolve(&id, CatalogSubject::Install(spec("a")), &versions, &[])
+        .is_ok());
+    versions[0].manifest.kind = Kind::MemoryProfile;
     let Err(CatalogResolveError::Refusal(error)) =
         f.store
             .catalog_resolve(&id, CatalogSubject::Install(spec("a")), &versions, &[])

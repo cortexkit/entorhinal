@@ -97,6 +97,7 @@ impl Fixture {
             clock,
             wake: Arc::default(),
             sql: Arc::default(),
+            watches: Arc::default(),
             sources: Arc::new(move |store, scope| {
                 CatalogTrust::with_client(
                     store,

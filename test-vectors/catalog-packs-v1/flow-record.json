@@ -1,0 +1,3 @@
+[
+  {"record":{"archive_bytes":4608,"archive_sha256":"89d6bee3b0bdffaf7646d000e4d98f60181df12e4894159b7cdba5e3ed6a4639","flow_version":3,"log_head":null,"manifest_sha256":"ec44fe2e3a506ed0d632a67e1ec6c6a243eb2a180f7d6e321815ca7b4a35042d","name":"@example/hello-flow","public_key":"0e978e688821ea26f678b53d3185fa919db857e369969074f172688027b0c6f4","schema":"ck-record/v1","version":"1.0.0"},"signature":"5c9c8b8dde3c2c71f3ef1c09db0603cf2ea5a5f30e0c59f2c98ff724b53bff92bd54397d6b102f694616c73b811059f9cd23fe95d7ab890dfdb200d21b80c20a"}
+]
