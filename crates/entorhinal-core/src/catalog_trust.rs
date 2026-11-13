@@ -27,6 +27,10 @@ pub struct TrustWrite {
     pub statuses: Vec<CatalogStatus>,
     pub feed_seq: Option<u64>,
     pub feed_etag: Option<String>,
+    /// Local receipt time, never the signed status change time.
+    pub confirmed_at_ms: Option<i64>,
+    /// A complete successful feed (including 304) confirms held scope statuses.
+    pub confirmed_scope: bool,
 }
 impl RegistryStore {
     /// The verifier runs against current mapping, chain and holds inside the same
@@ -63,6 +67,15 @@ impl RegistryStore {
                     }
                 }
                 write_statuses(tx, &write.statuses).map_err(sql)?;
+                if let Some(now) = write.confirmed_at_ms {
+                    for row in &write.statuses {
+                        crate::catalog_freshness::confirm(tx, &row.name, &row.version, now).map_err(sql)?;
+                    }
+                    if write.confirmed_scope {
+                        let versions = tx.prepare("SELECT name,version FROM catalog_status WHERE registry_url=?1 AND substr(name,1,length(?2)+1)=?2||'/'").map_err(sql)?.query_map(params![url,scope], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).map_err(sql)?.collect::<rusqlite::Result<Vec<_>>>().map_err(sql)?;
+                        for (name,version) in versions { crate::catalog_freshness::confirm(tx,&name,&version,now).map_err(sql)?; }
+                    }
+                }
                 if let Some(seq) = write.feed_seq {
                     tx.execute("INSERT INTO catalog_feed(scope,registry_url,feed_seq,etag) VALUES(?1,?2,?3,?4) ON CONFLICT(scope) DO UPDATE SET registry_url=excluded.registry_url,feed_seq=excluded.feed_seq,etag=excluded.etag", params![scope,url,seq,write.feed_etag]).map_err(sql)?;
                 }

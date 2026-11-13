@@ -7,12 +7,13 @@ which lists the modules registered on the wire.
 The module configures registry trust, verifies packages, walks successor chains,
 ingests status feeds, and holds local publisher grants. The core store also holds
 shared agent pins and local plans/generations. Agent tools prepare verified skill
-closures, obtain user consent and stage generations for consumer prefetch and
-core's activation acknowledgement. Background status polling protects held skill
-generations. Agent moves carry pinned package bytes through entorhinal's own
+and script-flow closures, obtain user consent and stage generations for consumer
+prefetch and core's activation acknowledgement. Background status polling protects
+held skill and flow generations. Agent moves carry pinned package bytes through entorhinal's own
 `agent-data/v1` participant. Direct operators can publish packages; publishing
-remains unavailable until the vault's signing key is provisioned. Non-skill
-installation is not exposed yet.
+remains unavailable until the vault's signing key is provisioned. Core's flow
+consumer serves flows; persona and memory-profile installation wait for their consumers.
+Flow bodies remain `{manifest, script}`; module-backed flows are not supported.
 
 ```
 ck packages registry add https://registry.example --scope @example --key-id status-1 --public-key <64-lowercase-hex>
@@ -454,7 +455,7 @@ scope and the install-time first-party certificate result beside each generation
 this is deliberately not copied with shared pins. Plan creation is self-targeted,
 live-agent-only, and accepts install/upgrade for the calling agent, not `hire` (creating another agent)
 or workspace/project-wide placement targets. A ready closure containing
-any non-skill member becomes failed with `kind_not_yet_supported` and its package
+a persona or memory-profile member becomes failed with `kind_not_yet_supported` and its package
 name. Plans start pending and become ready or failed. Approval of a ready plan
 creates one approved generation; installed is reserved for consumer bookkeeping.
 Readiness, activation and degradation are separate store transactions. Approval
@@ -603,8 +604,9 @@ generation at install time. Publisher grants never make a package first-party.
 The fact is machine-local: shared pins do not carry it, and a machine receiving a move
 must certify CortexKit keys against its own root. The generation optionally includes
 `pinned_status: [{name, version, state, reason}]`, listing only closure versions
-whose held status is not `available`. The field is **absent**, not an empty list,
-when there is no status news. Pin identities and digests do not change.
+whose held status is not `available` or whose fast-lane confirmation is stale.
+Stale entries add `stale_since_ms` without changing the last verified `state`.
+The field is **absent**, not an empty list, when there is no status news. Pin identities and digests do not change.
 
 For a **withdrawn** pin, core sees the same `active` (or `ready`) generation, its
 nonblocking `pinned_status` notice, and no new error. Existing pins remain usable;
@@ -622,7 +624,7 @@ replay past newly learned blocking status. Prepare fails with `version_revoked` 
 The revocation test uses only registry-attested `published_at`: at or after
 `compromise_from` is blocked, strictly earlier remains usable, and an unknown
 publication time is blocked. A tombstone is unconditional. Status ingestion and
-its effects on active skill generations commit in the **same SQLite transaction**,
+its effects on active skill and flow generations commit in the **same SQLite transaction**,
 whether the status came from a background feed or version verification during
 prepare. Failed effects roll back status, feed cursor and ETag together. Health
 and core generation reads never need HTTP.
@@ -666,10 +668,31 @@ its blocking reason on subsequent status news. The local scheduling table is
 created lazily for stores predating polling. The offset belongs to this local store
 and is never replicated to other machines through the shared identity journal.
 
+Flows pinned by any live agent whose verified manifest requires at least one
+capability also use a ten-minute lane. Its failure retries are one minute,
+doubling to a ten-minute cap, independent of the hourly lane's backoff. Minute
+ticks discover pins from the content store (without refetching manifests) and
+observe freshness boundaries even during registry outages.
+
+Migration 20 adds machine-local `catalog_status_confirmation` and
+`catalog_fast_lane` tables outside the journal. Signed `changed_at` describes a
+registry event, not a confirmation, so it cannot serve as this clock. Every
+successful registry status read, including duplicates and complete feed 304s,
+records a confirmation transactionally. Lane entry and confirmations survive a
+restart; migration 19 is unchanged. Install records lane entry in its pin
+transaction; other incoming live pins are discovered on the next minute tick.
+A pin becomes stale 900,000 ms after its last confirmation in the lane (or entry
+if never confirmed there). `stale_since_ms` is that deadline, and clears on a
+successful confirmation. It appears on generation `pinned_status` notices and
+on `context.session`'s flow-pin `status` object. Skills and capability-free flows
+never receive it. Staleness does not degrade generations or block activation:
+core holds execution until status is fresh again. Fresh replies retain their
+existing bytes.
+
 ### Integration decisions
 
 The agent-targeted prepare shape resolves the placement-tier ambiguity for this
-skill-only implementation; the consumer kind capabilities follow the daemon's
+skill-and-flow implementation; the consumer kind capabilities follow the daemon's
 actual grammar rather than the earlier proposed slash-separated markers. Check and
 prefetch share one consumer interface, human sections use existing Cingulate fields,
 and activation uses the existing reserved-core admission identity. Existing

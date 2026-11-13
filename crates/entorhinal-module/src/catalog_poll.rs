@@ -11,6 +11,14 @@ use std::sync::{
 use std::time::Duration;
 
 const HOUR_MS: u64 = 3_600_000;
+const FAST_MS: u64 = 600_000;
+fn fast_delay(failures: u64) -> Duration {
+    Duration::from_millis(if failures == 0 {
+        FAST_MS
+    } else {
+        (60_000 * (1u64 << failures.saturating_sub(1).min(4))).min(FAST_MS)
+    })
+}
 const ERRORS: &[&str] = &[
     "catalog_poll_failed",
     "store_unavailable",
@@ -160,6 +168,54 @@ impl Worker {
         }))
         .await
         .map_err(|e| e.code)?;
+        self.scopes(scopes).await
+    }
+    async fn fast_scopes(&self) -> Result<Vec<String>, &'static str> {
+        let store = self.store().ok_or("store_unavailable")?;
+        let now = (self.clock)();
+        crate::catalog_sql::run(self.sql.tracked(move || {
+            store.catalog_advance_freshness(now).map_err(|e| {
+                crate::catalog_blob::CatalogError::new("storage_error", e.to_string())
+            })?;
+            let pins = store.catalog_live_flow_pins().map_err(|e| {
+                crate::catalog_blob::CatalogError::new("storage_error", e.to_string())
+            })?;
+            let blobs = crate::catalog_blob::BlobStore::new(store.store_folder())?;
+            let mut fast = Vec::new();
+            for pin in pins {
+                let manifest = entorhinal_catalog::record::parse_manifest(
+                    &blobs.read_verified(&pin.manifest_sha256)?,
+                )
+                .map_err(|e| {
+                    crate::catalog_blob::CatalogError::new("invalid_reply", format!("{e:?}"))
+                })?;
+                if manifest.kind == entorhinal_catalog::Kind::Flow
+                    && manifest.name == pin.name
+                    && manifest.version == pin.version
+                    && !manifest.requires.capabilities.is_empty()
+                {
+                    fast.push(pin);
+                }
+            }
+            store.catalog_sync_fast_lane(&fast, now).map_err(|e| {
+                crate::catalog_blob::CatalogError::new("storage_error", e.to_string())
+            })?;
+            Ok::<_, crate::catalog_blob::CatalogError>(
+                fast.iter()
+                    .filter_map(|p| {
+                        entorhinal_catalog::names::map_name(&p.name)
+                            .ok()
+                            .map(|n| format!("@{}", n.scope))
+                    })
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
+            )
+        }))
+        .await
+        .map_err(|e| e.code)
+    }
+    async fn scopes(&self, scopes: Vec<String>) -> Result<(), &'static str> {
         let mut failure = None;
         for scope in scopes {
             self.health.catalog.scopes.fetch_add(1, Ordering::Relaxed);
@@ -175,6 +231,8 @@ impl Worker {
             let result = match trust {
                 Ok(mut trust) => {
                     trust.use_weak_store(self.store.clone());
+                    trust.sql = self.sql.clone();
+                    trust.clock = self.clock;
                     poll(&mut trust).await
                 }
                 Err(e) => Err(e),
@@ -187,6 +245,9 @@ impl Worker {
     }
     async fn run(self) {
         let mut offset = None;
+        let mut hourly = tokio::time::Instant::now();
+        let mut fast = tokio::time::Instant::now();
+        let mut fast_failures: u64 = 0;
         loop {
             if self.store.upgrade().is_none() {
                 return;
@@ -195,18 +256,75 @@ impl Worker {
                 self.wake.notified().await;
                 continue;
             }
-            let result = match offset {
-                Some(_) => self.pass().await,
-                None => match self.offset().await {
-                    Ok(value) => {
-                        offset = Some(value);
-                        self.pass().await
+            let fast_scopes = match self.fast_scopes().await {
+                Ok(scopes) => Ok(scopes),
+                Err(code) => {
+                    tracing::warn!(
+                        code,
+                        "catalog fast-lane manifest discovery failed; retaining known lanes"
+                    );
+                    match self.store() {
+                        Some(store) => crate::catalog_sql::run(self.sql.tracked(move || {
+                            store.catalog_fast_scopes().map_err(|e| {
+                                crate::catalog_blob::CatalogError::new(
+                                    "storage_error",
+                                    e.to_string(),
+                                )
+                            })
+                        }))
+                        .await
+                        .map_err(|e| e.code),
+                        None => Err("store_unavailable"),
                     }
-                    Err(e) => Err(e),
-                },
+                }
             };
-            let failures = self.health.catalog.finish(result, (self.clock)());
-            tokio::time::sleep(delay((self.clock)(), offset.unwrap_or(0), failures)).await;
+            let now = tokio::time::Instant::now();
+            if now >= hourly {
+                let result = match offset {
+                    Some(_) => self.pass().await,
+                    None => match self.offset().await {
+                        Ok(value) => {
+                            offset = Some(value);
+                            self.pass().await
+                        }
+                        Err(e) => Err(e),
+                    },
+                };
+                let failures = self.health.catalog.finish(result, (self.clock)());
+                hourly = tokio::time::Instant::now()
+                    + delay((self.clock)(), offset.unwrap_or(0), failures);
+                if fast_scopes.as_ref().is_ok_and(|s| !s.is_empty()) {
+                    fast_failures = if result.is_ok() {
+                        0
+                    } else {
+                        fast_failures.saturating_add(1)
+                    };
+                    fast = tokio::time::Instant::now() + fast_delay(fast_failures);
+                }
+            } else if now >= fast {
+                if let Ok(scopes) = fast_scopes {
+                    if !scopes.is_empty() {
+                        let result = self.scopes(scopes).await;
+                        fast_failures = if result.is_ok() {
+                            0
+                        } else {
+                            fast_failures.saturating_add(1)
+                        };
+                        self.health.catalog.finish(result, (self.clock)());
+                        fast = tokio::time::Instant::now() + fast_delay(fast_failures);
+                    }
+                }
+            }
+            // Minute ticks discover new live flow pins and observe freshness
+            // deadlines even while a registry is failing. Hourly retries retain
+            // their independent monotonic deadline and six-hour cap.
+            let tick = tokio::time::Instant::now() + Duration::from_secs(60);
+            let fast_due = if fast > tokio::time::Instant::now() {
+                fast
+            } else {
+                tick
+            };
+            tokio::time::sleep_until(hourly.min(fast_due).min(tick)).await;
         }
     }
 }

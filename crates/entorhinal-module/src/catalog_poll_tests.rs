@@ -12,6 +12,7 @@ struct Fixture {
     slot: Arc<Mutex<Option<RegistryStore>>>,
     fake: FakeRegistry,
     health: Arc<HealthGauges>,
+    agent: String,
 }
 impl Fixture {
     async fn new() -> Self {
@@ -72,6 +73,7 @@ impl Fixture {
             slot: Arc::new(Mutex::new(Some(store))),
             fake,
             health: Arc::default(),
+            agent: agent.into(),
         };
         f.feed();
         f
@@ -142,6 +144,105 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         self.slot.lock().unwrap().take();
         std::fs::remove_dir_all(&self.root).unwrap();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn catalog_poll_flow_ten_minute_lane_and_minute_backoff() {
+    let f = Fixture::new().await;
+    let store = f.slot.lock().unwrap().as_ref().unwrap().clone();
+    let record = vectors("record");
+    let package = &record["packages"]["flow"];
+    let bytes = package["manifest_text"].as_str().unwrap().as_bytes();
+    crate::catalog_blob::BlobStore::new(store.store_folder())
+        .unwrap()
+        .publish(bytes)
+        .unwrap();
+    let agent = store.catalog_live_flow_pins().unwrap();
+    assert!(agent.is_empty());
+    store
+        .with_principal("test")
+        .catalog_set_pins(
+            entorhinal_core::catalog_agent::PinWriteRequest {
+                agent_id: f.agent.clone(),
+                pins: vec![entorhinal_core::catalog_agent::CatalogPin {
+                    name: "@example/hello-flow".into(),
+                    version: "1.0.0".into(),
+                    kind: entorhinal_catalog::Kind::Flow,
+                    manifest_sha256: entorhinal_catalog::sha256_hex(bytes),
+                    archive_sha256: package["archive_sha256"].as_str().unwrap().into(),
+                    publisher_fingerprint: record["keys"]["trusted"]["fingerprint"]
+                        .as_str()
+                        .unwrap()
+                        .into(),
+                    root: true,
+                    range: Some("^1".into()),
+                }],
+                request_key: None,
+            },
+            100,
+        )
+        .unwrap();
+    let mut completions = f.health.catalog.completions();
+    let worker = f.worker();
+    let sql = worker.sql.clone();
+    let task = tokio::spawn(worker.run());
+    completed_pass(&mut completions, 1, Ok(())).await;
+    tokio::time::advance(Duration::from_millis(FAST_MS - 1)).await;
+    assert_eq!(f.health.catalog.report()["catalogScopesPolled"], 1);
+    tokio::time::advance(Duration::from_millis(1)).await;
+    completed_pass(&mut completions, 2, Ok(())).await;
+    f.fake.serve(
+        "/v1/scopes/example/status?after=1",
+        Reply {
+            status: 503,
+            ..Reply::bytes("")
+        },
+    );
+    let mut number = 3;
+    for ms in [600_000, 60_000, 120_000, 240_000, 480_000, 600_000] {
+        tokio::time::advance(Duration::from_millis(ms)).await;
+        completed_pass(&mut completions, number, Err("registry_http_error")).await;
+        number += 1;
+    }
+    f.feed();
+    tokio::time::advance(Duration::from_millis(600_000)).await;
+    completed_pass(&mut completions, number, Ok(())).await;
+    task.abort();
+    let _ = task.await;
+    sql.wait().await;
+    let mut no_caps: Value = serde_json::from_slice(bytes).unwrap();
+    no_caps["requires"]["capabilities"] = json!([]);
+    let mut pin = store.catalog_live_flow_pins().unwrap().remove(0);
+    pin.manifest_sha256 = crate::catalog_blob::BlobStore::new(store.store_folder())
+        .unwrap()
+        .publish(no_caps.to_string().as_bytes())
+        .unwrap();
+    store
+        .with_principal("test")
+        .catalog_set_pins(
+            entorhinal_core::catalog_agent::PinWriteRequest {
+                agent_id: f.agent.clone(),
+                pins: vec![pin],
+                request_key: None,
+            },
+            101,
+        )
+        .unwrap();
+    assert!(
+        f.worker().fast_scopes().await.unwrap().is_empty(),
+        "a flow with no required capabilities stays on the hourly lane"
+    );
+    for (failure, ms) in [
+        (0, 600_000),
+        (1, 60_000),
+        (2, 120_000),
+        (3, 240_000),
+        (4, 480_000),
+        (5, 600_000),
+        (99, 600_000),
+    ] {
+        assert_eq!(fast_delay(failure), Duration::from_millis(ms));
     }
 }
 #[tokio::test(start_paused = true)]

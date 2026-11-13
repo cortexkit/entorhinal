@@ -23,6 +23,7 @@ pub mod agent;
 mod binding;
 pub mod catalog;
 pub mod catalog_agent;
+pub mod catalog_freshness;
 pub mod catalog_grants;
 pub mod catalog_resolution;
 pub mod catalog_trust;
@@ -221,7 +222,7 @@ CREATE TABLE member_name (
 );
 "#;
 
-const MIGRATIONS: [Migration; 19] = [
+const MIGRATIONS: [Migration; 20] = [
     Migration {
         version: 1,
         statements: V1_SCHEMA,
@@ -297,6 +298,10 @@ const MIGRATIONS: [Migration; 19] = [
     Migration {
         version: 19,
         statements: catalog::V19_CATALOG_REGISTRY_OPT_OUT,
+    },
+    Migration {
+        version: 20,
+        statements: catalog_freshness::V20_CATALOG_FRESHNESS,
     },
 ];
 
@@ -1809,6 +1814,63 @@ mod tests {
                 path: scratch.root.join(file).to_string_lossy().into_owned(),
             },
         }
+    }
+
+    #[test]
+    fn catalog_freshness_migration_is_additive_and_survives_reopen() {
+        let scratch = TestStore::new("catalog-freshness-upgrade");
+        let descriptor = legacy_descriptor(&scratch, "freshness.db");
+        let old =
+            RegistryStore::open_with_migrations(&descriptor, &MIGRATIONS[..MIGRATIONS.len() - 1])
+                .unwrap();
+        drop(old);
+        let store = RegistryStore::open(&descriptor).unwrap();
+        store
+            .db
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "INSERT INTO catalog_status_confirmation VALUES('@example/flow','1.0.0',123)",
+                    [],
+                )?;
+                tx.execute(
+                    "INSERT INTO catalog_fast_lane VALUES('@example/flow','1.0.0',100,NULL)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+        let store = RegistryStore::open(&descriptor).unwrap();
+        let confirmed: i64 = store
+            .read(|conn| {
+                conn.query_row(
+                    "SELECT last_confirmed_ms FROM catalog_status_confirmation",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(confirmed, 123);
+        store.catalog_advance_freshness(900_123).unwrap();
+        assert_eq!(
+            store
+                .read(|conn| conn.query_row(
+                    "SELECT stale_since_ms FROM catalog_fast_lane",
+                    [],
+                    |r| r.get::<_, Option<i64>>(0)
+                ))
+                .unwrap(),
+            Some(900_123)
+        );
+        assert!(store.verify().unwrap().ok);
+        drop(store);
+        let error =
+            RegistryStore::open_with_migrations(&descriptor, &MIGRATIONS[..MIGRATIONS.len() - 1])
+                .unwrap_err();
+        assert!(error.to_string().contains(&format!(
+            "schema version {}",
+            MIGRATIONS.last().unwrap().version
+        )));
     }
 
     /// A store last opened by a binary whose chain ends at migration 7 gains

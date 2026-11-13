@@ -232,10 +232,18 @@ pub struct CatalogTrust {
     cortexkit_root: Option<String>,
     registry: CatalogRegistry,
     refused_links: std::collections::BTreeSet<String>,
+    pub(crate) clock: fn() -> i64,
+    pub(crate) sql: std::sync::Arc<crate::move_driver::SqlOperations>,
 }
 enum StoreAccess {
     Held(RegistryStore),
     Weak(std::sync::Weak<std::sync::Mutex<Option<RegistryStore>>>),
+}
+async fn sql<T: Send + 'static>(
+    tracker: &std::sync::Arc<crate::move_driver::SqlOperations>,
+    work: impl FnOnce() -> Result<T, CatalogError> + Send + 'static,
+) -> Result<T, CatalogError> {
+    crate::catalog_sql::run(tracker.tracked(work)).await
 }
 impl CatalogTrust {
     pub(crate) fn use_weak_store(
@@ -273,6 +281,8 @@ impl CatalogTrust {
             cortexkit_root: CORTEXKIT_ROOT.map(str::to_owned),
             registry,
             refused_links: Default::default(),
+            clock: crate::unix_millis,
+            sql: Default::default(),
         })
     }
     #[cfg(test)]
@@ -299,6 +309,8 @@ impl CatalogTrust {
             cortexkit_root: CORTEXKIT_ROOT.map(str::to_owned),
             registry,
             refused_links: Default::default(),
+            clock: crate::unix_millis,
+            sql: Default::default(),
         })
     }
     #[cfg(test)]
@@ -324,7 +336,7 @@ impl CatalogTrust {
         // Accepted prefix links survive a later refusal. The refusal is returned
         // after the transaction commits that prefix, never by rolling it back.
         let store = self.store()?;
-        let (registry, refusal) = crate::catalog_sql::run(move || {
+        let (registry, refusal) = sql(&self.sql, move || {
             store.catalog_trust_transaction::<_, CatalogError>(&scope, |current, _, _| {
                 identity(&expected, current)?;
                 let mut next = current.clone();
@@ -534,7 +546,8 @@ impl CatalogTrust {
             let status_sig = status_sig.to_owned();
             let pin = pin.clone();
             let root = root.map(str::to_owned);
-            let result = crate::catalog_sql::run(move || {
+            let now = (self.clock)();
+            let result = sql(&self.sql, move || {
                 store.catalog_trust_transaction::<_, CatalogError>(&scope, |current, held, _| {
                     identity(&expected, current)?;
                     let applied = accept(
@@ -547,6 +560,7 @@ impl CatalogTrust {
                     )?;
                     let write = TrustWrite {
                         statuses: vec![row(&applied.held, &status_sig, &current.url)],
+                        confirmed_at_ms: Some(now),
                         ..Default::default()
                     };
                     Ok((applied, write))
@@ -623,7 +637,7 @@ impl CatalogTrust {
         // Recheck this version's current status and selected registry after
         // downloads. A higher status sequence or a replacement registry makes
         // the earlier acceptance stale, so its bytes must not be published.
-        crate::catalog_sql::run(move || {
+        sql(&self.sql, move || {
             store.catalog_trust_transaction::<_, CatalogError>(&scope, |current, held, _| {
                 identity(&expected, current)?;
                 accept(
@@ -649,7 +663,7 @@ impl CatalogTrust {
         self.refresh_registry_keys().await?;
         let store = self.store()?;
         let scope = self.scope.clone();
-        let (etag, after) = crate::catalog_sql::run(move || {
+        let (etag, after) = sql(&self.sql, move || {
             Ok::<_, CatalogError>((
                 store.catalog_feed_etag(&scope).map_err(store_error)?,
                 store.catalog_feed_seq(&scope).map_err(store_error)?,
@@ -693,10 +707,18 @@ impl CatalogTrust {
                 let store = self.store()?;
                 let scope = self.scope.clone();
                 let expected = self.registry.clone();
-                crate::catalog_sql::run(move || {
+                let now = (self.clock)();
+                sql(&self.sql, move || {
                     store.catalog_trust_transaction::<_, CatalogError>(&scope, |current, _, _| {
                         identity(&expected, current)?;
-                        Ok(((), TrustWrite::default()))
+                        Ok((
+                            (),
+                            TrustWrite {
+                                confirmed_at_ms: Some(now),
+                                confirmed_scope: true,
+                                ..Default::default()
+                            },
+                        ))
                     })
                 })
                 .await?;
@@ -734,7 +756,8 @@ impl CatalogTrust {
             let scope = self.scope.clone();
             let store = self.store()?;
             let root = self.cortexkit_root.clone();
-            let outcome = crate::catalog_sql::run(move || {
+            let now = (self.clock)();
+            let outcome = sql(&self.sql, move || {
                 store.catalog_trust_transaction::<_, CatalogError>(
                     &scope,
                     |current, rows, cursor| {
@@ -775,6 +798,7 @@ impl CatalogTrust {
                             &pins,
                         );
                         let mut write = TrustWrite::default();
+                        write.confirmed_at_ms = Some(now);
                         let mut holds = rows.to_vec();
                         let mut results = Vec::new();
                         if pure
@@ -828,6 +852,7 @@ impl CatalogTrust {
                         if all_ok {
                             write.feed_seq = Some(seq);
                             write.feed_etag = response.etag.clone();
+                            write.confirmed_scope = pure.refusal.is_none();
                         }
                         let rollback = results
                             .iter()

@@ -222,7 +222,11 @@ fn generation_reply(generation: &entorhinal_core::catalog_agent::CatalogGenerati
     }
     let statuses = &generation.pinned_status;
     if !statuses.is_empty() {
-        reply["pinned_status"] = json!(statuses.iter().map(|s| json!({"name":s["name"],"version":s["version"],"state":s["state"],"reason":s["reason"]})).collect::<Vec<_>>());
+        reply["pinned_status"] = json!(statuses.iter().map(|s| {
+            let mut status = json!({"name":s["name"],"version":s["version"],"state":s["state"],"reason":s["reason"]});
+            if let Some(since) = s.get("stale_since_ms") { status["stale_since_ms"] = since.clone(); }
+            status
+        }).collect::<Vec<_>>());
     }
     reply
 }
@@ -430,7 +434,9 @@ async fn prepare(
             .unwrap_or(false);
         let scripts = &verified.manifest.body["scripts"];
         let has_scripts = scripts.as_array().is_some_and(|a| !a.is_empty())
-            || scripts.as_object().is_some_and(|a| !a.is_empty());
+            || scripts.as_object().is_some_and(|a| !a.is_empty())
+            || (verified.manifest.kind == entorhinal_catalog::Kind::Flow
+                && !verified.manifest.body["script"].is_null());
         let mut package = PreparedPackage {
             pin,
             trust: "first_contact".into(),

@@ -427,7 +427,7 @@ pub struct CatalogGeneration {
     pub created_at_ms: i64,
     pub activated_at_ms: Option<i64>,
     pub error: Option<Value>,
-    /// Non-available pin statuses read in the same transaction as the generation.
+    /// Non-available or stale pin statuses read with the generation.
     /// The module serializes only their public notice fields and omits an empty list.
     #[serde(skip)]
     pub pinned_status: Vec<Value>,
@@ -570,8 +570,15 @@ pub(crate) fn pin_statuses(conn: &Connection, pins: &[CatalogPin]) -> rusqlite::
             )
             .optional()?;
         if let Some(text) = text {
-            let value: Value = decode(text)?;
-            if value["state"] != "available" {
+            let mut value: Value = decode(text)?;
+            if pin.kind == Kind::Flow {
+                if let Some(since) =
+                    crate::catalog_freshness::stale_since(conn, &pin.name, &pin.version)?
+                {
+                    value["stale_since_ms"] = json!(since);
+                }
+            }
+            if value["state"] != "available" || value.get("stale_since_ms").is_some() {
                 statuses.push(value);
             }
         }
@@ -1125,6 +1132,11 @@ impl JournalWriter<'_> {
                 now,
                 self.principal,
             )?;
+            for package in &detail.packages {
+                if package.pin.kind == Kind::Flow && !package.capabilities.is_empty() {
+                    tx.execute("INSERT OR IGNORE INTO catalog_fast_lane(name,version,entered_at_ms) VALUES(?1,?2,?3)", params![package.pin.name,package.pin.version,now])?;
+                }
+            }
             action.value = json!({"generation_id":generation_id});
             Ok(action)
         })

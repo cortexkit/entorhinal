@@ -215,7 +215,13 @@ impl Fixture {
             "/v1/scopes/example/status",
             "/v1/scopes/example/status?after=1",
         ] {
-            f.registry.serve(path, Reply::bytes(feed.to_string()));
+            f.registry.serve(
+                path,
+                Reply {
+                    headers: vec![("ETag".into(), "\"flow-1\"".into())],
+                    ..Reply::bytes(feed.to_string())
+                },
+            );
         }
         f
     }
@@ -252,11 +258,13 @@ impl Fixture {
             .unwrap();
         let url = registry.url.clone();
         tools.handler.catalog_agent.sources = Arc::new(move |store, scope| {
-            crate::catalog_trust::CatalogTrust::with_client(
+            let mut trust = crate::catalog_trust::CatalogTrust::with_client(
                 store,
                 scope,
                 RegistryClient::loopback(&url, std::slice::from_ref(&url), Limits::MODULE),
-            )
+            )?;
+            trust.clock = clock;
+            Ok(trust)
         });
         let consumer = Arc::new(FakeConsumer {
             store,
@@ -666,6 +674,81 @@ async fn catalog_flow_prepare_names_missing_consumer() {
         .as_str()
         .unwrap()
         .contains("Flow"));
+}
+
+#[tokio::test]
+async fn catalog_flow_fresh_stale_context_generation_and_ack() {
+    let f = Fixture::flow().await;
+    f.grant();
+    let plan = f.prepare_flow("stale-flow").await;
+    assert_eq!(plan["closure"][0]["has_scripts"], true);
+    f.cingulate
+        .script("consent.await", Effect::Answer("approve_once"));
+    let installed = tool_result(f.install(&plan).await);
+    assert_eq!(
+        f.cingulate.card_count(),
+        1,
+        "flow scripts cannot bypass consent with a publisher grant"
+    );
+    let agent = &f.tools.agents[0];
+    let id = installed["generation_id"].as_str().unwrap();
+    let store = f.store();
+    assert!(
+        generation_reply(&store.catalog_generation(id, agent).unwrap())
+            .get("pinned_status")
+            .is_none()
+    );
+    let fresh = store.context_session(agent, "freshness").unwrap();
+    assert_eq!(
+        fresh["pins"][0]["status"],
+        json!({"state":"available","blocked":false})
+    );
+    store.catalog_advance_freshness(900_100).unwrap();
+    let stale = generation_reply(&store.catalog_generation(id, agent).unwrap());
+    assert_eq!(stale["state"], "ready");
+    assert_eq!(stale["pinned_status"][0]["state"], "available");
+    assert_eq!(stale["pinned_status"][0]["stale_since_ms"], 900_100);
+    let context = store.context_session(agent, "freshness").unwrap();
+    assert_eq!(
+        context["pins"][0]["status"],
+        json!({"state":"available","blocked":false,"stale_since_ms":900_100})
+    );
+    let ack = result(
+        f.op(
+            crate::tests::reserved(crate::WRITER_MODULE),
+            ACK_ACTIVATION,
+            json!({"agent_id":agent,"generation_id":id}),
+        )
+        .await,
+    );
+    assert_eq!(ack["generation"]["state"], "active");
+    f.registry.serve(
+        "/v1/scopes/example/status?after=1",
+        Reply {
+            status: 304,
+            ..Reply::bytes("")
+        },
+    );
+    let mut trust = (f.tools.handler.catalog_agent.sources)(store.clone(), "@example").unwrap();
+    trust.clock = || 1_000_000;
+    refresh(&mut trust).await.unwrap();
+    assert!(
+        generation_reply(&store.catalog_generation(id, agent).unwrap())
+            .get("pinned_status")
+            .is_none()
+    );
+    store.catalog_advance_freshness(1_899_999).unwrap();
+    assert!(
+        generation_reply(&store.catalog_generation(id, agent).unwrap())
+            .get("pinned_status")
+            .is_none()
+    );
+    store.catalog_advance_freshness(1_900_000).unwrap();
+    assert_eq!(
+        generation_reply(&store.catalog_generation(id, agent).unwrap())["pinned_status"][0]
+            ["stale_since_ms"],
+        1_900_000
+    );
 }
 
 #[tokio::test]

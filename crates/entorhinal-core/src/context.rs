@@ -63,7 +63,7 @@ impl RegistryStore {
         checkpoint();
         let agent = agent::resolve_agent_in(conn, id, self.generation_from_connection(conn)?)?;
         let generations = conn.prepare("SELECT generation_id,state FROM catalog_generation WHERE agent_id=?1 AND state IN ('active','degraded','ready') ORDER BY created_at_ms,generation_id")?.query_map([id],|r| Ok(json!({"generation_id":r.get::<_,String>(0)?,"state":r.get::<_,String>(1)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut pins = conn.prepare("SELECT name,version,kind,manifest_sha256,archive_sha256,publisher_fingerprint FROM catalog_pin WHERE agent_id=?1 AND kind IN ('memory-profile','persona') ORDER BY name COLLATE BINARY")?.query_map([id],|r| Ok(json!({"name":r.get::<_,String>(0)?,"version":r.get::<_,String>(1)?,"kind":r.get::<_,String>(2)?,"manifest_sha256":r.get::<_,String>(3)?,"archive_sha256":r.get::<_,String>(4)?,"publisher_fingerprint":r.get::<_,String>(5)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut pins = conn.prepare("SELECT name,version,kind,manifest_sha256,archive_sha256,publisher_fingerprint FROM catalog_pin WHERE agent_id=?1 AND kind IN ('memory-profile','persona','flow') ORDER BY name COLLATE BINARY")?.query_map([id],|r| Ok(json!({"name":r.get::<_,String>(0)?,"version":r.get::<_,String>(1)?,"kind":r.get::<_,String>(2)?,"manifest_sha256":r.get::<_,String>(3)?,"archive_sha256":r.get::<_,String>(4)?,"publisher_fingerprint":r.get::<_,String>(5)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
         // Each pin carries the registry status entorhinal holds for its exact
         // version, from this same read, so a reader polling this reply sees a
         // revocation as soon as entorhinal has accepted it. `blocked` is
@@ -93,6 +93,15 @@ impl RegistryStore {
                 }),
                 None => Value::Null,
             };
+            if pin["kind"] == "flow" && !pin["status"].is_null() {
+                if let Some(since) = crate::catalog_freshness::stale_since(
+                    conn,
+                    pin["name"].as_str().unwrap(),
+                    pin["version"].as_str().unwrap(),
+                )? {
+                    pin["status"]["stale_since_ms"] = json!(since);
+                }
+            }
         }
         Ok(
             json!({"agent":agent,"catalog_generations":generations,"pins":pins,"where":whereabouts,"stamp":stamp(self,conn,incarnation)?}),
