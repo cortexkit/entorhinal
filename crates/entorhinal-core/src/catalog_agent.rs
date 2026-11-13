@@ -167,8 +167,10 @@ fn invalid(message: &str) -> rusqlite::Error {
 /// Validate shared pins with one set of rules for local writes, remote apply,
 /// replay and verification. Pins can describe any catalog package kind. Plan
 /// preparation (resolving and checking an install or upgrade request) is
-/// stricter: skills and flows install through core's consumers; persona and
-/// memory-profile packages wait for their consumers.
+/// stricter: only skills and flows install, because a package installs only
+/// when a local module declares the matching `ck-catalog-consumer-<kind>/v1`
+/// capability to check and prefetch it, and core declares those two today.
+/// Persona and memory-profile packages are refused `kind_not_yet_supported`.
 pub fn validate_pins(pins: &[CatalogPin]) -> rusqlite::Result<()> {
     let mut seen = BTreeSet::new();
     for pin in pins {

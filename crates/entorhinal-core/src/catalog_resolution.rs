@@ -197,8 +197,10 @@ impl RegistryStore {
                             json!({"code":"kind_slot_taken","detail":conflict}),
                         ));
                     }
-                    // Core's flow consumer serves flows. Persona and memory-profile
-                    // packages wait for their consumers. Check root slots first.
+                    // Only skills and flows have a consumer module (one declaring
+                    // `ck-catalog-consumer-<kind>/v1`) today, so persona and
+                    // memory-profile packages are refused. Root slots are checked
+                    // first, so slot conflicts keep their own refusal.
                     if let Some(pin) = closure.iter().find(|pin| !matches!(pin.kind, Kind::Skill | Kind::Flow)) {
                         return Err(CatalogResolveError::Refusal(
                             json!({"code":"kind_not_yet_supported","package":pin.name}),

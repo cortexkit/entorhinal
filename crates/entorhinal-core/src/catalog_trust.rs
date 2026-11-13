@@ -29,7 +29,7 @@ pub struct TrustWrite {
     pub feed_etag: Option<String>,
     /// Local receipt time, never the signed status change time.
     pub confirmed_at_ms: Option<i64>,
-    /// A complete successful feed (including 304) confirms held scope statuses.
+    /// A complete successful feed (including 304) confirms the statuses already held for that feed's scope.
     pub confirmed_scope: bool,
 }
 impl RegistryStore {
