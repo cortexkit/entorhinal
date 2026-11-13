@@ -1,5 +1,7 @@
 [
   {"case":"opening-resync","request_bytes":"{\"method\":\"catalog.status_watch\",\"params\":{}}","outcome":"notice","reply_bytes":"{\"kind\":\"resync\",\"token\":\"0123456789abcdef:1\"}"},
   {"case":"stale-pin-changes","request_bytes":"{\"method\":\"catalog.status_watch\",\"params\":{}}","outcome":"notice","reply_bytes":"{\"changes\":[{\"name\":\"@example/hello-flow\",\"version\":\"1.0.0\"}],\"generation\":2,\"kind\":\"changes\",\"token\":\"0123456789abcdef:2\"}"},
-  {"case":"foreign-token-resync","request_bytes":"{\"method\":\"catalog.status_watch\",\"params\":{\"token\":\"foreign:2\"}}","outcome":"notice","reply_bytes":"{\"kind\":\"resync\",\"token\":\"0123456789abcdef:2\"}"}
+  {"case":"foreign-token-resync","request_bytes":"{\"method\":\"catalog.status_watch\",\"params\":{\"token\":\"foreign:2\"}}","outcome":"notice","reply_bytes":"{\"kind\":\"resync\",\"token\":\"0123456789abcdef:2\"}"},
+  {"case":"stale-cleared-changes","request_bytes":"{\"method\":\"catalog.status_watch\",\"params\":{}}","outcome":"notice","reply_bytes":"{\"changes\":[{\"name\":\"@example/hello-flow\",\"version\":\"1.0.0\"}],\"generation\":3,\"kind\":\"changes\",\"token\":\"0123456789abcdef:3\"}"},
+  {"case":"revoked-pin-changes","request_bytes":"{\"method\":\"catalog.status_watch\",\"params\":{}}","outcome":"notice","reply_bytes":"{\"changes\":[{\"name\":\"@example/hello-flow\",\"version\":\"1.0.0\"}],\"generation\":4,\"kind\":\"changes\",\"token\":\"0123456789abcdef:4\"}"}
 ]

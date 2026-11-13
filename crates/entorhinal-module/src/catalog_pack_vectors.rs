@@ -235,8 +235,6 @@ async fn catalog_packs_v1_records_match_published_files() {
         .observe_catalog(store.catalog_served_statuses().unwrap());
     let changed = tokio::select! { biased; _ = &mut watch => panic!("watch ended"), bytes = receiver.recv() => bytes.unwrap() };
     watch_record(&mut watches, "stale-pin-changes", json!({}), changed);
-    sink.cancel.send_replace(true);
-    assert!(matches!(watch.await, HandlerOutcome::Streamed));
     let stale = record(
         &f,
         &mut generations,
@@ -260,21 +258,39 @@ async fn catalog_packs_v1_records_match_published_files() {
         READER,
     )
     .await;
-    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-    let sink = Watch {
-        sender,
+    // A foreign token gets a resync, while the first watch stays open for
+    // the clearing and revocation notices that follow.
+    let (foreign_sender, mut foreign_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let foreign_sink = Watch {
+        sender: foreign_sender,
         cancel: tokio::sync::watch::channel(false).0,
     };
     let params = json!({"token":"foreign:2"});
     let body = json!({"method":"catalog.status_watch","params":params})
         .to_string()
         .into_bytes();
-    let foreign = f.handler.serve_watch(&sink, &body, READER);
+    let foreign = f.handler.serve_watch(&foreign_sink, &body, READER);
     tokio::pin!(foreign);
-    let bytes = tokio::select! { biased; _ = &mut foreign => panic!("watch ended"), bytes = receiver.recv() => bytes.unwrap() };
+    let bytes = tokio::select! { biased; _ = &mut foreign => panic!("watch ended"), bytes = foreign_receiver.recv() => bytes.unwrap() };
     watch_record(&mut watches, "foreign-token-resync", params, bytes);
-    sink.cancel.send_replace(true);
+    foreign_sink.cancel.send_replace(true);
     assert!(matches!(foreign.await, HandlerOutcome::Streamed));
+    // A complete feed with no new records confirms the held status, which
+    // clears the stale marker; the open watch reports that as a change.
+    registry.serve(
+        "/v1/scopes/example/status",
+        Reply::bytes(
+            json!({"schema":"ck-status-feed/v1","scope":"example","feed_seq":1,"records":[]})
+                .to_string(),
+        ),
+    );
+    trust.clock = || 950_000;
+    trust.apply_scope_feed().await.unwrap();
+    f.handler
+        .watches
+        .observe_catalog(store.catalog_served_statuses().unwrap());
+    let cleared = tokio::select! { biased; _ = &mut watch => panic!("watch ended"), bytes = receiver.recv() => bytes.unwrap() };
+    watch_record(&mut watches, "stale-cleared-changes", json!({}), cleared);
     let mut status = vectors("status")["records"]
         .as_array()
         .unwrap()
@@ -291,6 +307,13 @@ async fn catalog_packs_v1_records_match_published_files() {
     registry.serve("/v1/scopes/example/status", Reply::bytes(feed.to_string()));
     trust.clock = || 1_000_000;
     trust.apply_scope_feed().await.unwrap();
+    f.handler
+        .watches
+        .observe_catalog(store.catalog_served_statuses().unwrap());
+    let revocation = tokio::select! { biased; _ = &mut watch => panic!("watch ended"), bytes = receiver.recv() => bytes.unwrap() };
+    watch_record(&mut watches, "revoked-pin-changes", json!({}), revocation);
+    sink.cancel.send_replace(true);
+    assert!(matches!(watch.await, HandlerOutcome::Streamed));
     let revoked = record(
         &f,
         &mut generations,

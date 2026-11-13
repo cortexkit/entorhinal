@@ -23,13 +23,22 @@ comparison.
     refused with `activation_blocked` after revocation.
 - `context.json`: `fresh-flow-context` and `stale-flow-context`, showing the same
   flow pin's per-pin status before and after the freshness deadline.
-- `status-watch.json`: `opening-resync`, `stale-pin-changes`, and
-  `foreign-token-resync`, all emitted by `catalog.status_watch`.
+- `status-watch.json`, all emitted by `catalog.status_watch`:
+  - `opening-resync`: the first notice of a new watch;
+  - `stale-pin-changes`: the flow pin passed its freshness deadline;
+  - `foreign-token-resync`: a watch opened with another process's token;
+  - `stale-cleared-changes`: a complete registry feed confirmed the held status,
+    clearing `stale_since_ms` (added in `catalog-packs-v1.1`);
+  - `revoked-pin-changes`: the registry revoked the pinned version (added in
+    `catalog-packs-v1.1`).
+  A `changes` notice names the versions whose served status moved; read the
+  generation or `context.session` again for the new status.
 
 Agent, plan, generation and process-incarnation identities are fixed fixture
 values. Local times are fixed: lane entry/confirmation at 100 ms, plan readiness
 at 200 ms, generation creation at 300 ms and activation at 700 ms. The freshness
-tick observes the 900100 ms deadline. Registry dates and signatures are the
+tick observes the 900100 ms deadline, a feed confirms the status again at
+950000 ms, and the revocation feed applies at 1000000 ms.
 published TEST-ONLY catalog vectors, not operator keys. No temporary paths or
 random ids enter the samples. Setup uses store transitions; the separate flow
 installation regression tests cover prepare, consumer checks, consent and install.
