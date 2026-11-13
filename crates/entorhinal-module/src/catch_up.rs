@@ -1367,7 +1367,10 @@ mod tests {
         tokio::time::advance(Duration::from_secs(60)).await;
         tokio::task::yield_now().await;
         assert_eq!(fail.calls(), 0);
-        crate::tests::stop_catch_up(&f.handler).await;
+        // `on_hello_ack` started every store task, not only catch-up; the
+        // catalog poller's minute tick runs blocking SQL that would keep the
+        // store open while Windows deletes the scratch folder.
+        crate::tests::stop_store_tasks(&f.handler).await;
         crate::tests::stop_catch_up(&disabled.handler).await;
     }
 
