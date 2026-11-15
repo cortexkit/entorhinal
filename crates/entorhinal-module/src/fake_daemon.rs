@@ -25,6 +25,8 @@ impl DaemonSnapshot {
                     .into_iter()
                     .map(|value| serde_json::from_value::<SupervisorEntry>(value).unwrap())
                     .collect(),
+                daemon: None,
+                agent_commands: None,
             },
             catalog: serde_json::from_value(json!({
                 "generation": generation, "modules": catalog, "subc_ops": [],
