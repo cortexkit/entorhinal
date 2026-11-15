@@ -259,6 +259,7 @@ pub(crate) fn install_moved_bindings(
     activated_at_ms: Option<i64>,
     refs: &[MoveRef],
     carried: &[CarriedBinding],
+    changed: &mut Vec<crate::SessionChangeKey>,
 ) -> rusqlite::Result<CarriedInstall> {
     let carried: BTreeMap<(&str, &str), &CarriedBinding> =
         carried.iter().map(|b| (b.key(), b)).collect();
@@ -355,6 +356,11 @@ pub(crate) fn install_moved_bindings(
                 ],
             )?;
             outcome.installed += 1;
+            if let Some(key) =
+                crate::session_notify::key_for_ref(tx, &row.ref_kind, &row.session_ref)?
+            {
+                changed.push(key);
+            }
         }
         // Verbatim, including `since_ms` from the source machine's clock: the
         // display rows these values are compared with were stamped by that

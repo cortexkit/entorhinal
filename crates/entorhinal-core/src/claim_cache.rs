@@ -756,7 +756,10 @@ mod tests {
                         assert!(completed.try_recv().is_err());
                     }));
                 });
-                assert!(RegistryStore::register_session_in(tx, &registration()).is_ok());
+                assert!(
+                    RegistryStore::register_session_in(tx, &registration(), &mut Vec::new())
+                        .is_ok()
+                );
                 Ok(thread)
             })
             .unwrap();

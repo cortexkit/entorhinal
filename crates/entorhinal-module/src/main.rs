@@ -2475,9 +2475,7 @@ fn request_operation(body: &[u8]) -> RequestSummary {
             request.params.get("wait"),
             None | Some(Value::Null) | Some(Value::Bool(true))
         ))
-        || request.method == watches::IDENTITY
-        || request.method == watches::WHERE
-        || request.method == watches::CATALOG;
+        || watches::is_watch(&request.method);
     RequestSummary {
         operation,
         method: loggable_method(&request.method).map(str::to_owned),
@@ -2802,6 +2800,7 @@ fn manifest() -> ModuleManifest {
                 (watches::IDENTITY, "Watch process-local fleet identity changes until cancelled or drained."),
                 (watches::WHERE, "Watch process-local agent whereabouts changes until cancelled or drained."),
                 (watches::CATALOG, "Watch pinned catalog status and freshness changes until cancelled or drained."),
+                (watches::SESSIONS, "Watch an agent's session binding changes, including runner moves, until cancelled or drained."),
             ].into_iter().map(|(method, description)| {
                 management_operation(method, ManagementOperationKind::Query, description)
             })).chain([claims::WHERE, claims::WHERE_MANY].into_iter().map(|method| {
@@ -2858,13 +2857,14 @@ fn manifest() -> ModuleManifest {
         requires: Vec::new(),
         must_never_reach: Vec::new(),
     }))
-    // The two watch queries hold their route open and stream changes until
+    // Watch queries hold their route open and stream changes until
     // cancelled or drained. Declaring them as watches lets the daemon and its
     // clients subscribe to them instead of treating them as one-shot queries.
     .operation_delivery(BTreeMap::from([
         (watches::IDENTITY.to_owned(), OperationDelivery::WATCH),
         (watches::WHERE.to_owned(), OperationDelivery::WATCH),
         (watches::CATALOG.to_owned(), OperationDelivery::WATCH),
+        (watches::SESSIONS.to_owned(), OperationDelivery::WATCH),
     ]))
     .build()
 }

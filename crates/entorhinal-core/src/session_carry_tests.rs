@@ -200,6 +200,50 @@ fn activating(f: &Fixture, refs: &[MoveRef]) -> AgentMove {
 }
 
 #[test]
+fn sessions_activation_notifies_committed_host_keys_only() {
+    let f = Fixture::new();
+    let live = binding("live", Some("broca"), vec![entry("yes", 100)]);
+    let bare = binding("placeholder", None, vec![]);
+    let refs = vec![move_ref(&live), move_ref(&bare)];
+    let next = activating(&f, &refs);
+    let reader = std::sync::Arc::new(f.store.clone());
+    let weak = std::sync::Arc::downgrade(&reader);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    f.store
+        .set_session_change_listener(std::sync::Arc::new(move |keys| {
+            // A separate read connection must already see the complete imported row
+            // and network history when the post-commit listener runs.
+            let rows = weak
+                .upgrade()
+                .unwrap()
+                .changed_agent_sessions(AGENT, &[("broca".into(), "live".into())], false)
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].network, "yes");
+            sender.send(keys).unwrap();
+        }));
+    f.store
+        .activate_agent_move_carrying(&next, &refs, &[live])
+        .unwrap();
+    assert_eq!(
+        receiver.try_recv().unwrap(),
+        vec![crate::SessionChangeKey {
+            agent_id: AGENT.into(),
+            harness: "broca".into(),
+            session_id: "live".into(),
+        }]
+    );
+    assert!(f
+        .store
+        .activate_agent_move_carrying(&next, &refs, &[])
+        .is_err());
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+}
+
+#[test]
 fn activation_installs_carried_rows_and_history_verbatim() {
     let f = Fixture::new();
     let live = binding(

@@ -105,6 +105,14 @@ objects deny unknown fields; a field outside the listed schema is an
   and defaults to 100; `cursor` is the opaque `next_cursor` of the previous
   page. Rows run newest registration first, ties in `(ref_kind, ref)` order.
   Each row carries `network`, the current value, `unknown` with no history.
+- `agent.sessions_watch`: exactly `{agent_id, open?}`, open to every principal.
+  Opens with `{kind:"resync", sessions:[...]}` using the same rows and order as
+  the default `agent.sessions` page. If more than 100 rows match, it sends only
+  `{kind:"resync", truncated:true}` and the client reads `agent.sessions`.
+  Committed binding changes send `{kind:"changes", sessions:[...],
+  removed:[{harness,session}]}`; with `open:true`, an ended binding is removed.
+  Lag or a notice above 192 KiB forces resync. The watch shares the 16-watch
+  cap, debounces at 200 ms quiet / 1 s ceiling, and ends on cancellation or drain.
 - `agent.session_for_runner`: exactly `{runner, session}`. A session
   registered without a runner is `not_found` here; look it up with
   `agent.for_session`. The reply carries `network`, the current value
@@ -122,6 +130,10 @@ a backfill makes the data local.
 
 ## Files
 
+- **`sessions-watch.json`**: real served StreamData frames from one `open:true`
+  subscription: opening resync, one registration change, then one end reported
+  as removed. Unlike unary samples, the request is the watch params object,
+  frames contain exact notice bodies, and the read route is `callosum`.
 - **`sessions-open.json`**: two open-only pages skip the ended worker and show
   the filter-specific cursor.
 - **`sessions-held-on.json`**: lists a finished worker with `heldOn`, followed by
@@ -251,7 +263,7 @@ a backfill makes the data local.
   exactly two rows. All five records use clock `700` and incarnation
   `0123456789abcdef`; the complete canonical scratch root is mapped explicitly
   to `/fixture/head-project`, including in registration requests.
-- **`SHA256SUMS`**: SHA-256 hashes of the twenty JSON vector files, with
+- **`SHA256SUMS`**: SHA-256 hashes of the twenty-one JSON vector files, with
   names relative to this directory. The first ten lines are pinned by
   `served_vectors::agent_session_samples_keep_their_pinned_bytes_and_checksums`.
 
@@ -278,6 +290,7 @@ a backfill makes the data local.
 | `session-lookup-cases.json` | `5e2a306b6a05bd4ab1c922c0c57541d16e3fb33c2c403a797fe5a34edb774107` |
 | `sessions-head-runners.json` | `7fc7eb2e343958034adbf283d6304e201cb43fd64d89f4f42a96ce06765d2a1b` |
 | `node-self.json` | `bda136c8fd751a28a70d452f8cf4b48bf1700774fc5eeffde8abe39d96b38e08` |
+| `sessions-watch.json` | `980cd6b43063981601f7b7e325d9108f120aa8e075df67355a2d1b93efb0af1e` |
 
 ## Reproduce and verify
 
@@ -290,6 +303,7 @@ ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked sessio
 ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked served_vectors::session_lookup_cases_match_published_file -- --exact --nocapture
 ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked served_vectors::sessions_head_runners_match_published_file -- --exact --nocapture
 ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked served_vectors::node_self_records_match_published_file -- --exact --nocapture
+ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked served_vectors_sessions_watch_records_match_published_file -- --nocapture
 ```
 
 Refresh their hashes from the repository root with:

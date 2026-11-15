@@ -3,22 +3,25 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    sync::{atomic::Ordering, Mutex},
+    sync::{atomic::Ordering, Arc, Mutex},
     time::Duration,
 };
 
 use async_trait::async_trait;
-use entorhinal_core::{claim_cache::ClaimObservation, RegistryError, RegistryStore};
+use entorhinal_core::{
+    claim_cache::ClaimObservation, RegistryError, RegistryStore, SessionChangeKey,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use subc_client_rs::{HandlerOutcome, RequestCtx};
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{broadcast, Notify, Semaphore};
 
 use crate::{HandlerError, ProjectsHandler, RouteKey, WireRequest};
 
 pub(crate) const IDENTITY: &str = "agent.fleet_identity_watch";
 pub(crate) const WHERE: &str = "agent.where_watch";
 pub(crate) const CATALOG: &str = "catalog.status_watch";
+pub(crate) const SESSIONS: &str = "agent.sessions_watch";
 const NOTICE_LIMIT: usize = 192 * 1024;
 const HISTORY_LIMIT: usize = 256;
 const QUIET: Duration = Duration::from_millis(200);
@@ -50,6 +53,7 @@ pub(crate) struct Watches {
     changed: Notify,
     catalog: Mutex<CatalogHistory>,
     catalog_changed: Notify,
+    sessions_changed: broadcast::Sender<Arc<Vec<SessionChangeKey>>>,
 }
 
 impl Default for Watches {
@@ -61,6 +65,7 @@ impl Default for Watches {
             changed: Notify::new(),
             catalog: Mutex::default(),
             catalog_changed: Notify::new(),
+            sessions_changed: broadcast::channel(HISTORY_LIMIT).0,
         }
     }
 }
@@ -199,6 +204,14 @@ struct WhereRequest {
     cursor: Option<Cursor>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionsRequest {
+    agent_id: String,
+    #[serde(default)]
+    open: bool,
+}
+
 struct Slot<'a>(&'a crate::HealthGauges);
 impl Drop for Slot<'_> {
     fn drop(&mut self) {
@@ -207,7 +220,7 @@ impl Drop for Slot<'_> {
 }
 
 pub(super) fn is_watch(method: &str) -> bool {
-    matches!(method, IDENTITY | WHERE | CATALOG)
+    matches!(method, IDENTITY | WHERE | CATALOG | SESSIONS)
 }
 
 fn decode<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, HandlerError> {
@@ -243,11 +256,30 @@ impl ProjectsHandler {
                 None
             };
             let whereabouts = if request.method == WHERE {
-                let request: WhereRequest = decode(request.params)?;
+                let request: WhereRequest = decode(request.params.clone())?;
                 if let Some(ids) = &request.agent_ids {
                     crate::claims::validate_where_ids(ids)?;
                 }
                 Some(request)
+            } else {
+                None
+            };
+            let sessions = if request.method == SESSIONS {
+                let request: SessionsRequest = decode(request.params)?;
+                let watches = Arc::downgrade(&self.watches);
+                self.with_agent_store(|store| {
+                    store.set_session_change_listener(Arc::new(move |keys| {
+                        if let Some(watches) = watches.upgrade() {
+                            let _ = watches.sessions_changed.send(Arc::new(keys));
+                        }
+                    }));
+                    Ok(())
+                })?;
+                // Subscribe before the snapshot so a concurrent commit is either
+                // already visible there or queued for the next notice.
+                let receiver = self.watches.sessions_changed.subscribe();
+                let initial = self.sessions_resync(&request)?;
+                Some((request, receiver, initial))
             } else {
                 None
             };
@@ -278,6 +310,8 @@ impl ProjectsHandler {
                         else { self.identity_watch(transport, request).await }
                     } else if let Some(request) = whereabouts {
                         self.where_watch(transport, request).await
+                    } else if let Some((request, receiver, initial)) = sessions {
+                        self.sessions_watch(transport, request, receiver, initial).await
                     } else {
                         Err(HandlerError::new("unknown_method", "not a watch operation"))
                     }
@@ -530,6 +564,116 @@ impl ProjectsHandler {
             notified.as_mut().enable();
             debounce(&self.watches.changed).await;
         }
+    }
+
+    fn sessions_resync(&self, request: &SessionsRequest) -> Result<Value, HandlerError> {
+        let page = self.with_agent_store(|store| {
+            store.agent_sessions_filtered(
+                &request.agent_id,
+                None,
+                crate::sessions::SESSIONS_LIMIT_DEFAULT,
+                request.open,
+            )
+        })?;
+        Ok(if page.next.is_some() {
+            json!({"kind":"resync","truncated":true})
+        } else {
+            json!({"kind":"resync","sessions":self.session_rows(page.sessions)})
+        })
+    }
+
+    async fn sessions_watch(
+        &self,
+        transport: &impl WatchTransport,
+        request: SessionsRequest,
+        mut receiver: broadcast::Receiver<Arc<Vec<SessionChangeKey>>>,
+        initial: Value,
+    ) -> Result<(), HandlerError> {
+        let truncated = json!({"kind":"resync","truncated":true});
+        self.notice(transport, initial, truncated.clone()).await?;
+        loop {
+            let mut keys = BTreeSet::new();
+            let mut lagged = false;
+            while keys.is_empty() && !lagged {
+                #[cfg(test)]
+                self.health.watch_waiting.notify_waiters();
+                session_keys(
+                    receiver.recv().await,
+                    &request.agent_id,
+                    &mut keys,
+                    &mut lagged,
+                )?;
+            }
+            let ceiling = tokio::time::sleep(CEILING);
+            let quiet = tokio::time::sleep(QUIET);
+            tokio::pin!(ceiling, quiet);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut ceiling => break,
+                    _ = &mut quiet => break,
+                    batch = receiver.recv() => {
+                        if session_keys(batch, &request.agent_id, &mut keys, &mut lagged)? {
+                            quiet.as_mut().reset(tokio::time::Instant::now() + QUIET);
+                        }
+                    }
+                }
+            }
+            if lagged {
+                self.notice(
+                    transport,
+                    self.sessions_resync(&request)?,
+                    truncated.clone(),
+                )
+                .await?;
+                continue;
+            }
+            let keys = keys.into_iter().collect::<Vec<_>>();
+            let rows = self.with_agent_store(|store| {
+                Ok(store.changed_agent_sessions(&request.agent_id, &keys, request.open)?)
+            })?;
+            let present = rows
+                .iter()
+                .filter_map(|row| Some((row.harness.clone()?, row.session.clone()?)))
+                .collect::<BTreeSet<_>>();
+            let removed = keys
+                .into_iter()
+                .filter(|key| !present.contains(key))
+                .map(|(harness, session)| json!({"harness":harness,"session":session}))
+                .collect::<Vec<_>>();
+            self.notice(
+                transport,
+                json!({"kind":"changes","sessions":self.session_rows(rows),"removed":removed}),
+                truncated.clone(),
+            )
+            .await?;
+        }
+    }
+}
+
+fn session_keys(
+    batch: Result<Arc<Vec<SessionChangeKey>>, broadcast::error::RecvError>,
+    agent: &str,
+    keys: &mut BTreeSet<(String, String)>,
+    lagged: &mut bool,
+) -> Result<bool, HandlerError> {
+    match batch {
+        Ok(batch) => {
+            let mut relevant = false;
+            for key in batch.iter().filter(|key| key.agent_id == agent) {
+                relevant = true;
+                keys.insert((key.harness.clone(), key.session_id.clone()));
+            }
+            Ok(relevant)
+        }
+        Err(broadcast::error::RecvError::Lagged(_)) => {
+            *lagged = true;
+            Ok(true)
+        }
+        Err(broadcast::error::RecvError::Closed) => Err(HandlerError::new(
+            "stream_closed",
+            "session change source closed",
+        )),
     }
 }
 

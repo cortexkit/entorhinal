@@ -1691,6 +1691,7 @@ mod tests {
             "agent.session_for_ref",
             "agent.session_liveness",
             "agent.sessions",
+            "agent.sessions_watch",
             "agent.session_for_runner",
             "agent.session_residence",
             "agent.session_for_harness",
@@ -1803,6 +1804,7 @@ mod tests {
             BTreeSet::from([
                 "agent.fleet_identity_watch",
                 "agent.where_watch",
+                "agent.sessions_watch",
                 "catalog.status_watch"
             ])
         );

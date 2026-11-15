@@ -72,7 +72,7 @@ const PROJECT_ROOT_MAX: usize = 4096;
 const LIVENESS_REFS_MAX: usize = 256;
 /// A runner is a module id, bounded like the other module ids callers send.
 const RUNNER_MAX: usize = 64;
-const SESSIONS_LIMIT_DEFAULT: usize = 100;
+pub(super) const SESSIONS_LIMIT_DEFAULT: usize = 100;
 const SESSIONS_LIMIT_MAX: usize = 500;
 
 /// What the daemon answered when asked which module provides a capability.
@@ -1045,13 +1045,22 @@ impl ProjectsHandler {
         let page = self.with_agent_store(|store| {
             store.agent_sessions_filtered(&request.agent_id, cursor.as_ref(), limit, request.open)
         })?;
+        let sessions = self.session_rows(page.sessions);
+        self.encode_read_result(json!({
+            "sessions": sessions,
+            "next_cursor": page.next.as_ref().map(|cursor| {
+                let encoded = encode_cursor(cursor);
+                if request.open { format!("open:{encoded}") } else { encoded }
+            }),
+        }))
+    }
+
+    pub(super) fn session_rows(&self, rows: Vec<entorhinal_core::AgentSession>) -> Vec<Value> {
         let state = self
             .liveness
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let sessions: Vec<Value> = page
-            .sessions
-            .into_iter()
+        rows.into_iter()
             .map(|row| {
                 let mirrored = match (&row.harness, &row.session) {
                     (Some(harness), Some(session)) => {
@@ -1081,15 +1090,7 @@ impl ProjectsHandler {
                 }
                 reply
             })
-            .collect();
-        drop(state);
-        self.encode_read_result(json!({
-            "sessions": sessions,
-            "next_cursor": page.next.as_ref().map(|cursor| {
-                let encoded = encode_cursor(cursor);
-                if request.open { format!("open:{encoded}") } else { encoded }
-            }),
-        }))
+            .collect()
     }
 
     pub(super) fn agent_session_liveness(&self, params: Value) -> Result<Vec<u8>, HandlerError> {

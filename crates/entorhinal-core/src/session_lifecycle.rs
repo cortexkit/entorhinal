@@ -88,6 +88,23 @@ pub struct AgentSession {
     pub held_on: Option<String>,
 }
 
+impl AgentSession {
+    pub(crate) fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            runner: row.get(0)?,
+            session: row.get(1)?,
+            harness: row.get(2)?,
+            ref_kind: row.get(3)?,
+            session_ref: row.get(4)?,
+            project_root: row.get(5)?,
+            registered_at_ms: row.get(6)?,
+            ended_at_ms: row.get(7)?,
+            network: row.get(8)?,
+            held_on: row.get(9)?,
+        })
+    }
+}
+
 /// Where the next page starts: just after this row in list order. Keyset
 /// paging keeps a cursor valid across inserts, which land on earlier pages.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,11 +157,17 @@ impl RegistryStore {
         runner: Option<&str>,
         now_ms: i64,
     ) -> Result<SessionEnd, AgentMutationError> {
+        let mut key = None;
         let outcome = self.db.with_conn_fenced(|tx| {
-            Ok(Self::end_session_in(
-                tx, harness, session_id, runner, now_ms,
-            ))
+            let result = Self::end_session_in(tx, harness, session_id, runner, now_ms);
+            if matches!(result, Ok(SessionEnd::Ended { .. })) {
+                key = crate::session_notify::key_for_host(tx, harness, session_id)?;
+            }
+            Ok(result)
         });
+        if matches!(outcome, Ok(Ok(_))) {
+            self.notify_session_changes(key.into_iter().collect());
+        }
         match outcome {
             Ok(result) => result,
             Err(error) => Err(session_refusal("storage_error", error.to_string(), None)),
@@ -204,7 +227,9 @@ impl RegistryStore {
     /// reported `gone`, in one transaction. A binding that already ended keeps
     /// its first end time. Returns how many bindings were stamped.
     pub fn stamp_gone_sessions(&self, stamps: &[GoneSession]) -> Result<usize, RegistryError> {
-        self.db
+        let mut keys = Vec::new();
+        let result = self
+            .db
             .with_conn_fenced(|tx| {
                 let mut statement = tx.prepare_cached(
                     "UPDATE session_binding SET ended_at_ms=?3
@@ -213,16 +238,30 @@ impl RegistryStore {
                 )?;
                 let mut stamped = 0;
                 for stamp in stamps {
-                    stamped += statement.execute(params![
+                    let changed = statement.execute(params![
                         stamp.harness,
                         stamp.session_id,
                         stamp.ended_at_ms,
                         stamp.runner
                     ])?;
+                    stamped += changed;
+                    if changed != 0 {
+                        if let Some(key) = crate::session_notify::key_for_host(
+                            tx,
+                            &stamp.harness,
+                            &stamp.session_id,
+                        )? {
+                            keys.push(key);
+                        }
+                    }
                 }
                 Ok(stamped)
             })
-            .map_err(RegistryError::Store)
+            .map_err(RegistryError::Store);
+        if result.is_ok() {
+            self.notify_session_changes(keys);
+        }
+        result
     }
 
     /// Delete bindings whose session ended more than [`SESSION_RETENTION_MS`]
@@ -235,21 +274,42 @@ impl RegistryStore {
         let cutoff = now_ms.saturating_sub(SESSION_RETENTION_MS);
         let mut pruned = 0;
         loop {
+            let mut keys = Vec::new();
             let deleted = self
                 .db
                 .with_conn_fenced(|tx| {
-                    tx.execute(
+                    let mut statement = tx.prepare(
                         "DELETE FROM session_binding WHERE rowid IN (
                              SELECT rowid FROM session_binding
                              WHERE ended_at_ms IS NOT NULL AND ended_at_ms < ?1
                                AND agent_id NOT IN (
                                    SELECT agent_id FROM agent_move
                                    WHERE step NOT IN ('released','aborted','done','taken_over'))
-                             LIMIT ?2)",
-                        params![cutoff, PRUNE_BATCH],
-                    )
+                              LIMIT ?2) RETURNING agent_id,harness,session_id",
+                    )?;
+                    let rows = statement
+                        .query_map(params![cutoff, PRUNE_BATCH], |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, Option<String>>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                            ))
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    let deleted = rows.len();
+                    for (agent_id, harness, session_id) in rows {
+                        if let (Some(harness), Some(session_id)) = (harness, session_id) {
+                            keys.push(crate::SessionChangeKey {
+                                agent_id,
+                                harness,
+                                session_id,
+                            });
+                        }
+                    }
+                    Ok(deleted)
                 })
                 .map_err(RegistryError::Store)?;
+            self.notify_session_changes(keys);
             pruned += deleted;
             if (deleted as i64) < PRUNE_BATCH {
                 return Ok(pruned);
@@ -345,20 +405,7 @@ impl RegistryStore {
                         i64::try_from(limit).unwrap_or(i64::MAX).saturating_add(1),
                         crate::NETWORK_ABSENT,
                     ],
-                    |row| {
-                        Ok(AgentSession {
-                            runner: row.get(0)?,
-                            session: row.get(1)?,
-                            harness: row.get(2)?,
-                            ref_kind: row.get(3)?,
-                            session_ref: row.get(4)?,
-                            project_root: row.get(5)?,
-                            registered_at_ms: row.get(6)?,
-                            ended_at_ms: row.get(7)?,
-                            network: row.get(8)?,
-                            held_on: row.get(9)?,
-                        })
-                    },
+                    AgentSession::from_row,
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             let next = if sessions.len() > limit {

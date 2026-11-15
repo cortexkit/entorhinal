@@ -44,6 +44,7 @@ mod root_keys;
 pub mod session_carry;
 pub mod session_lifecycle;
 pub mod session_network;
+mod session_notify;
 pub mod session_residence;
 pub mod shared_entry;
 pub mod store_origin;
@@ -63,6 +64,7 @@ pub use session_lifecycle::{
 pub use session_network::{
     NetworkChange, NetworkEntry, NetworkStamp, NETWORK_ABSENT, NETWORK_HISTORY_MAX,
 };
+pub use session_notify::SessionChangeKey;
 
 // The schema-migration namespace, NOT the module id, and deliberately left as
 // "projects" while the module id moved to "entorhinal".
@@ -317,6 +319,7 @@ pub struct RegistryStore {
     root_records: bool,
     ids: Arc<binding::IdSource>,
     where_notifications: where_notify::WhereNotifications,
+    session_notifications: session_notify::SessionNotifications,
     catalog_notifications: catalog_freshness::Notifications,
     foreign: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -437,6 +440,7 @@ impl RegistryStore {
             root_records: false,
             ids: Arc::new(binding::IdSource::Random),
             where_notifications: where_notify::WhereNotifications::default(),
+            session_notifications: session_notify::SessionNotifications::default(),
             catalog_notifications: catalog_freshness::Notifications::default(),
             foreign: Arc::default(),
         })
@@ -1124,9 +1128,18 @@ impl RegistryStore {
         &self,
         request: &SessionRegistration<'_>,
     ) -> Result<SessionBinding, agent::AgentMutationError> {
+        let mut keys = Vec::new();
         let outcome = self
             .db
-            .with_conn_fenced(|tx| Ok(Self::register_session_in(tx, request)));
+            .with_conn_fenced(|tx| Ok(Self::register_session_in(tx, request, &mut keys)));
+        if matches!(outcome, Ok(Ok(_))) {
+            keys.push(SessionChangeKey {
+                agent_id: request.agent_id.to_owned(),
+                harness: request.harness.to_owned(),
+                session_id: request.session_id.to_owned(),
+            });
+            self.notify_session_changes(keys);
+        }
         match outcome {
             Ok(result) => result,
             Err(error) => Err(session_refusal("storage_error", error.to_string(), None)),
@@ -1139,6 +1152,7 @@ impl RegistryStore {
     fn register_session_in(
         tx: &Transaction<'_>,
         request: &SessionRegistration<'_>,
+        keys: &mut Vec<SessionChangeKey>,
     ) -> Result<SessionBinding, agent::AgentMutationError> {
         let cut_over = tx
             .query_row(
@@ -1321,6 +1335,9 @@ impl RegistryStore {
             )?),
             None => None,
         };
+        if let Some(key) = session_notify::key_for_ref(tx, previous_kind, previous_ref)? {
+            keys.push(key);
+        }
         // The existing foreign key is immediate. Defer it until commit so both
         // keys can be updated without deleting the binding or its history.
         // Roll back all writes on error, since refusals are returned as values

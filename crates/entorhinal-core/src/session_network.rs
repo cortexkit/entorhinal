@@ -223,6 +223,7 @@ impl RegistryStore {
         // A malformed value is refused before the binding is looked up, so
         // it reads the same for a known and an unknown session.
         check_network(network)?;
+        let mut key = None;
         let outcome = self.db.with_conn_fenced(|tx| {
             let binding: Option<(String, String)> = tx
                 .query_row(
@@ -244,8 +245,15 @@ impl RegistryStore {
                 Ok(plan) => plan,
                 Err(refusal) => return Ok(Err(refusal)),
             };
-            apply_network_plan(tx, &ref_kind, &session_ref, network, plan, clock).map(Ok)
+            let result = apply_network_plan(tx, &ref_kind, &session_ref, network, plan, clock)?;
+            if matches!(result, NetworkChange::Recorded(_)) {
+                key = crate::session_notify::key_for_host(tx, harness, session_id)?;
+            }
+            Ok(Ok(result))
         });
+        if matches!(outcome, Ok(Ok(_))) {
+            self.notify_session_changes(key.into_iter().collect());
+        }
         match outcome {
             Ok(result) => result,
             Err(error) => Err(session_refusal("storage_error", error.to_string(), None)),

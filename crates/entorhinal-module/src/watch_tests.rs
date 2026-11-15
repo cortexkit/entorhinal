@@ -1,5 +1,5 @@
 use super::*;
-use crate::watches::{WatchTransport, CATALOG, IDENTITY, WHERE};
+use crate::watches::{WatchTransport, CATALOG, IDENTITY, SESSIONS, WHERE};
 use crate::{HandlerError, ModuleHandler, RequestCtx};
 use async_trait::async_trait;
 use std::{future::Future, pin::Pin, task::Poll, time::Duration};
@@ -7,6 +7,9 @@ use tokio::sync::{mpsc, watch};
 
 #[path = "where_watch_derived_tests.rs"]
 mod derived;
+
+#[path = "sessions_watch_tests.rs"]
+mod sessions;
 
 struct Sink {
     sender: mpsc::UnboundedSender<Vec<u8>>,
@@ -396,7 +399,7 @@ async fn where_resume_filters_versions_stale_known_and_ring_overflow() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn watch_capacity_is_shared_releases_on_cancel_and_sends_nothing_after_cancel() {
+async fn watches_capacity_is_shared_releases_on_cancel_and_sends_nothing_after_cancel() {
     let f = seeded("watch-capacity").await;
     let mut sinks = Vec::new();
     let mut receivers = Vec::new();
@@ -406,7 +409,17 @@ async fn watch_capacity_is_shared_releases_on_cancel_and_sends_nothing_after_can
         receivers.push(receiver);
     }
     let bodies = (0..16)
-        .map(|i| request([IDENTITY, WHERE, CATALOG][i % 3], json!({})))
+        .map(|i| {
+            let method = [IDENTITY, WHERE, CATALOG, SESSIONS][i % 4];
+            request(
+                method,
+                if method == SESSIONS {
+                    json!({"agent_id":HEAD})
+                } else {
+                    json!({})
+                },
+            )
+        })
         .collect::<Vec<_>>();
     let mut watches = sinks
         .iter()
@@ -806,7 +819,24 @@ struct Served {
 
 impl Served {
     async fn new(label: &str) -> Self {
+        Self::with_sessions(label, false).await
+    }
+
+    async fn with_sessions(label: &str, session_writes: bool) -> Self {
         let mut fixture = seeded(label).await;
+        if session_writes {
+            let resolver = crate::sessions::FakeResolver::new();
+            for capability in [
+                crate::sessions::ORCHESTRATOR_CAPABILITY,
+                crate::sessions::HOST_CAPABILITY,
+            ] {
+                resolver.set(
+                    capability,
+                    crate::sessions::ProviderResolution::Provider(WRITER_MODULE.into()),
+                );
+            }
+            fixture.handler.provider_resolver = resolver;
+        }
         let handler = Arc::new(std::mem::replace(
             &mut fixture.handler,
             ProjectsHandler::with_runtime(INCARNATION.into(), || 700),

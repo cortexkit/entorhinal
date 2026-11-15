@@ -798,54 +798,61 @@ impl RegistryStore {
         refs: &[MoveRef],
         carried: &[crate::session_carry::CarriedBinding],
     ) -> Result<(AgentMove, crate::session_carry::CarriedInstall), AgentMutationError> {
-        self.with_where_move_changes(|tx| {
-            let current = load_move(tx, &row.cut_id)?;
-            if current.side != MoveSide::Receiver
-                || current.step != MoveStep::Activating
-                || row.step != MoveStep::Activated
-                || row.activated_at_ms.is_none()
-            {
-                return Ok(Err(crate::session_refusal(
-                    "invalid_state",
-                    "invalid activation checkpoint",
-                    Some(move_detail(&current)),
-                )));
-            }
-            // Check all owners before inserting anything: a refusal must not
-            // leave a partial set of moved-in bindings.
-            for r in refs {
-                let owner: Option<String> = tx
-                    .query_row(
-                        "SELECT agent_id FROM session_binding WHERE ref_kind=?1 AND ref=?2",
-                        params![r.ref_kind, r.reference],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
-                if owner.is_some_and(|id| id != row.agent_id) {
+        let mut keys = Vec::new();
+        let result = self
+            .with_where_move_changes(|tx| {
+                let current = load_move(tx, &row.cut_id)?;
+                if current.side != MoveSide::Receiver
+                    || current.step != MoveStep::Activating
+                    || row.step != MoveStep::Activated
+                    || row.activated_at_ms.is_none()
+                {
                     return Ok(Err(crate::session_refusal(
-                        "ref_bound_elsewhere",
-                        "incoming reference has another owner",
-                        Some(serde_json::json!({"ref_kind":r.ref_kind,"ref":r.reference})),
+                        "invalid_state",
+                        "invalid activation checkpoint",
+                        Some(move_detail(&current)),
                     )));
                 }
-            }
-            let installed = crate::session_carry::install_moved_bindings(
-                tx,
-                &row.agent_id,
-                row.activated_at_ms,
-                refs,
-                carried,
-            )?;
-            let mut next = row.clone();
-            next.abort_requested = current.abort_requested;
-            next.cut_accept =
-                Some(serde_json::json!({"state":"pending","attempts":0,"retry_at_ms":0}));
-            next.plan["_cut_release"] =
-                serde_json::json!({"state":"pending","attempts":0,"retry_at_ms":0});
-            next.write(tx, false)?;
-            Ok(Ok((next, installed)))
-        })
-        .map_err(|e| crate::session_refusal("storage_error", e.to_string(), None))?
+                // Check all owners before inserting anything: a refusal must not
+                // leave a partial set of moved-in bindings.
+                for r in refs {
+                    let owner: Option<String> = tx
+                        .query_row(
+                            "SELECT agent_id FROM session_binding WHERE ref_kind=?1 AND ref=?2",
+                            params![r.ref_kind, r.reference],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    if owner.is_some_and(|id| id != row.agent_id) {
+                        return Ok(Err(crate::session_refusal(
+                            "ref_bound_elsewhere",
+                            "incoming reference has another owner",
+                            Some(serde_json::json!({"ref_kind":r.ref_kind,"ref":r.reference})),
+                        )));
+                    }
+                }
+                let installed = crate::session_carry::install_moved_bindings(
+                    tx,
+                    &row.agent_id,
+                    row.activated_at_ms,
+                    refs,
+                    carried,
+                    &mut keys,
+                )?;
+                let mut next = row.clone();
+                next.abort_requested = current.abort_requested;
+                next.cut_accept =
+                    Some(serde_json::json!({"state":"pending","attempts":0,"retry_at_ms":0}));
+                next.plan["_cut_release"] =
+                    serde_json::json!({"state":"pending","attempts":0,"retry_at_ms":0});
+                next.write(tx, false)?;
+                Ok(Ok((next, installed)))
+            })
+            .map_err(|e| crate::session_refusal("storage_error", e.to_string(), None))?;
+        if result.is_ok() {
+            self.notify_session_changes(keys);
+        }
+        result
     }
 
     pub fn set_move_cut_accept(
