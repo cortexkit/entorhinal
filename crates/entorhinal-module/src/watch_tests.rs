@@ -398,6 +398,44 @@ async fn where_resume_filters_versions_stale_known_and_ring_overflow() {
     assert!(matches!(watch.await, HandlerOutcome::Streamed));
 }
 
+/// The 16-watch limit is per route: one caller holding 16 watches (an app with
+/// many chats open) must not refuse another caller's watch.
+#[tokio::test(start_paused = true)]
+async fn watches_capacity_is_per_route() {
+    let f = seeded("watch-capacity-per-route").await;
+    let mut held = Vec::new();
+    for _ in 0..16 {
+        let (sink, receiver) = Sink::new();
+        held.push((sink, receiver));
+    }
+    let body = request(IDENTITY, json!({}));
+    let mut watches = held
+        .iter()
+        .map(|(sink, _)| Box::pin(f.handler.serve_watch(sink, &body, READER)))
+        .collect::<Vec<_>>();
+    for watch in &mut watches {
+        pending(watch.as_mut()).await;
+    }
+    let (other, mut other_receiver) = Sink::new();
+    let accepted = f.handler.serve_watch(&other, &body, CORE);
+    tokio::pin!(accepted);
+    pending(accepted.as_mut()).await;
+    notice(&mut other_receiver);
+    assert_eq!(
+        f.handler
+            .health
+            .watches_open
+            .load(std::sync::atomic::Ordering::Relaxed),
+        17
+    );
+    other.cancel.send_replace(true);
+    assert!(matches!(accepted.await, HandlerOutcome::Streamed));
+    for ((sink, _), watch) in held.iter().zip(watches) {
+        sink.cancel.send_replace(true);
+        assert!(matches!(watch.await, HandlerOutcome::Streamed));
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn watches_capacity_is_shared_releases_on_cancel_and_sends_nothing_after_cancel() {
     let f = seeded("watch-capacity").await;

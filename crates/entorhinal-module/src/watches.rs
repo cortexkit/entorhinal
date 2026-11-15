@@ -24,6 +24,13 @@ pub(crate) const CATALOG: &str = "catalog.status_watch";
 pub(crate) const SESSIONS: &str = "agent.sessions_watch";
 const NOTICE_LIMIT: usize = 192 * 1024;
 const HISTORY_LIMIT: usize = 256;
+/// Watches one route may hold open. Each holds one daemon request slot on its
+/// route, so this stays well under the daemon's per-route in-flight limit, and
+/// one caller (an app with many chats open, a phone) cannot crowd out others.
+const WATCHES_PER_ROUTE: usize = 16;
+/// Watches open across all routes. Each costs one task and a small history
+/// cursor, so the bound is about runaway callers, not memory.
+const WATCHES_TOTAL: usize = 64;
 const QUIET: Duration = Duration::from_millis(200);
 const CEILING: Duration = Duration::from_secs(1);
 
@@ -48,6 +55,7 @@ struct CatalogHistory {
 
 pub(crate) struct Watches {
     slots: Semaphore,
+    per_route: Mutex<BTreeMap<RouteKey, usize>>,
     cache_writer: Mutex<()>,
     history: Mutex<WhereHistory>,
     changed: Notify,
@@ -59,7 +67,8 @@ pub(crate) struct Watches {
 impl Default for Watches {
     fn default() -> Self {
         Self {
-            slots: Semaphore::new(16),
+            slots: Semaphore::new(WATCHES_TOTAL),
+            per_route: Mutex::default(),
             cache_writer: Mutex::new(()),
             history: Mutex::new(WhereHistory::default()),
             changed: Notify::new(),
@@ -219,6 +228,40 @@ impl Drop for Slot<'_> {
     }
 }
 
+/// One route's share of the watch limit, returned when the watch ends.
+struct RouteSlot<'a> {
+    watches: &'a Watches,
+    key: RouteKey,
+}
+
+impl Watches {
+    fn take_route_slot(&self, key: RouteKey) -> Option<RouteSlot<'_>> {
+        let mut held = self.per_route.lock().unwrap_or_else(|e| e.into_inner());
+        let count = held.entry(key).or_default();
+        if *count >= WATCHES_PER_ROUTE {
+            return None;
+        }
+        *count += 1;
+        Some(RouteSlot { watches: self, key })
+    }
+}
+
+impl Drop for RouteSlot<'_> {
+    fn drop(&mut self) {
+        let mut held = self
+            .watches
+            .per_route
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = held.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 {
+                held.remove(&self.key);
+            }
+        }
+    }
+}
+
 pub(super) fn is_watch(method: &str) -> bool {
     matches!(method, IDENTITY | WHERE | CATALOG | SESSIONS)
 }
@@ -283,8 +326,18 @@ impl ProjectsHandler {
             } else {
                 None
             };
+            let _route_slot = self.watches.take_route_slot(key).ok_or_else(|| {
+                // Published in fleet-watch-v1's watch-capacity sample.
+                HandlerError::new(
+                    "watch_capacity",
+                    format!("at most {WATCHES_PER_ROUTE} watches may be open"),
+                )
+            })?;
             let _permit = self.watches.slots.try_acquire().map_err(|_| {
-                HandlerError::new("watch_capacity", "at most 16 watches may be open")
+                HandlerError::new(
+                    "watch_capacity",
+                    format!("at most {WATCHES_TOTAL} watches may be open on this machine"),
+                )
             })?;
             self.health.watches_open.fetch_add(1, Ordering::Relaxed);
             let _slot = Slot(&self.health);

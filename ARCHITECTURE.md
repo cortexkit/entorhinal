@@ -54,7 +54,7 @@ The binary picks its role from its own name: run as `ck-projects`, `ck-workspace
 
 - **Capabilities:** `project-identity/v1` and `agent-identity/v1` (modules that need identity declare these `required`), `bind-no-project/v1`, `permissions/v1`, `tool-provider/v1`, `agent-data/v1` and tool-provider call modes. It requires nothing: a `requires` entry on engram would make the daemon refuse every route here, reads included, while engram is down.
 - **Surfaces:** the management surface of module `entorhinal` (every operation in `docs/module-surface.md`), the tool-provider role (agent tools), and the `agent-data` internal service (its own move participant).
-- **Watches:** `agent.fleet_identity_watch`, `agent.where_watch` and `catalog.status_watch` are delivered as watches. At most 16 are open at once across all callers.
+- **Watches:** `agent.fleet_identity_watch`, `agent.where_watch`, `agent.sessions_watch` and `catalog.status_watch` are delivered as watches. One route holds at most 16, and at most 64 are open across all callers.
 
 ## State
 

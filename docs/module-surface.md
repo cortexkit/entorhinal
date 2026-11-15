@@ -473,8 +473,9 @@ entry errs toward `no`: an entry never says `yes` for a time the agent had no
 network.
 
 Both watches are declared with watch delivery in the manifest. A notice is
-at most 192 KiB; a larger batch becomes one `resync`. At most 16 watches are
-open at once, and a 17th is refused `watch_capacity` before it streams. A watch
+at most 192 KiB; a larger batch becomes one `resync`. One route may hold at most
+16 watches open, of any kind, and at most 64 are open on the machine; a watch past
+either limit is refused `watch_capacity` before it streams. A watch
 ends when its caller cancels, its route closes or the module drains. Served
 examples of every notice shape are in `test-vectors/fleet-watch-v1/`.
 
