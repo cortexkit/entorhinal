@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use cortexkit_agent_identity as aid;
 use cortexkit_project_identity as pid;
@@ -1718,6 +1722,10 @@ async fn project_resolve_v1_records_roundtrip_through_project_identity() {
         "resolve-remote.json",
         project_resolve_remote_v1_records().await,
     ));
+    files.push((
+        "enumerate-file-ids.json",
+        project_enumerate_file_ids_records().await,
+    ));
     for (name, served) in files {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../test-vectors/project-resolve-v1")
@@ -2185,6 +2193,152 @@ async fn project_resolve_v1_records() -> [(&'static str, Vec<String>); 4] {
         ("enumerate.json", enumerate_records),
         ("resolve-root-records.json", identity_records),
     ]
+}
+
+#[tokio::test]
+async fn project_enumerate_file_ids_records_match_published_file() {
+    published_file(
+        "project-resolve-v1",
+        "enumerate-file-ids.json",
+        project_enumerate_file_ids_records().await,
+    );
+}
+
+/// `enumerate` with a workspace root, a bound git root and a plain-folder root,
+/// so each carries `fileId`. File identities differ per machine and run, so the
+/// published bytes replace each one with a fixed value of the same format and
+/// the test checks separately that the served values match the shared crate.
+async fn project_enumerate_file_ids_records() -> Vec<String> {
+    let fixture = SessionFixture::new("served-project-enumerate-file-ids-v1").await;
+    fixture
+        .handler
+        .store
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .set_root_records(false);
+    let workspace = fixture.dir.join("workspace");
+    let git_root = workspace.join("git-checkout");
+    let plain_root = workspace.join("plain-folder");
+    std::fs::create_dir_all(git_root.join(".git")).unwrap();
+    std::fs::write(git_root.join(".git/config"), "[core]\n\tbare = false\n").unwrap();
+    std::fs::create_dir_all(&plain_root).unwrap();
+    let canonical = |path: &PathBuf| {
+        crate::tests::canonical_test_path(path)
+            .to_string_lossy()
+            .into_owned()
+    };
+    let (workspace, git_root, plain_root) = (
+        canonical(&workspace),
+        canonical(&git_root),
+        canonical(&plain_root),
+    );
+    for (method, params) in [
+        (
+            "register",
+            json!({"projectId":"pj-file-ids","name":"File Ids","roots":[git_root, plain_root]}),
+        ),
+        (
+            "assign_workspace",
+            json!({"projectId":"pj-file-ids","workspaceId":"ws-file-ids","workspaceName":"File Ids"}),
+        ),
+        (
+            "set_workspace_root",
+            json!({"workspaceId":"ws-file-ids","root":workspace}),
+        ),
+    ] {
+        let (_, reply) = fixture
+            .record(SESSION_CORE, WRITER_MODULE, method, params)
+            .await;
+        assert!(
+            reply.get("result").is_some(),
+            "fixture {method} failed: {reply}"
+        );
+    }
+    std::fs::write(
+        PathBuf::from(&git_root).join(".git/cortexkit-root-incarnation"),
+        format!("{}\n", "0123456789abcdef".repeat(4)),
+    )
+    .unwrap();
+    let store = fixture.store();
+    store
+        .bind_root(&git_root, "project-enumerate-file-ids")
+        .unwrap();
+    store
+        .approve_root(&git_root, "project-enumerate-file-ids")
+        .unwrap();
+    fixture
+        .handler
+        .store
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .set_root_records(true);
+
+    let (mut record, reply) = fixture
+        .record(SESSION_READER, READER_MODULE, "enumerate", json!({}))
+        .await;
+    let result = &reply["result"];
+    let records = result["projects"][0]["rootRecords"].as_array().unwrap();
+    let identities = [
+        (
+            result["workspaces"][0]["fileId"].clone(),
+            &workspace,
+            "unix:1:100",
+        ),
+        (records[0]["fileId"].clone(), &git_root, "unix:1:101"),
+        (records[1]["fileId"].clone(), &plain_root, "unix:1:102"),
+    ];
+    for (served, path, stable) in identities {
+        let served = served.as_str().expect("every readable root carries fileId");
+        assert_eq!(
+            served,
+            expected_file_id(Path::new(path)),
+            "{path}: fileId differs from the shared crate's format"
+        );
+        record = record.replace(&json_string_contents(served), stable);
+    }
+    assert_eq!(records[0]["identity"], "bound");
+    assert_eq!(records[1]["identity"], "unverifiable");
+    if let Some(epoch) = records[0]["registrationEpoch"].as_str() {
+        record = record.replace(epoch, "00000000000000000000000000000001");
+    }
+    let scratch_root = canonical(&fixture.dir);
+    let paths = [
+        (git_root, "/fixture/workspace/git-checkout".to_string()),
+        (plain_root, "/fixture/workspace/plain-folder".to_string()),
+        (workspace, "/fixture/workspace".to_string()),
+    ];
+    vec![normalize_project_record(
+        record,
+        &scratch_root,
+        &paths,
+        &[],
+        &reply,
+    )]
+}
+
+/// The identity `cortexkit-project-identity` would build for `path`, so the test
+/// fails if entorhinal's format ever drifts from the daemon's.
+fn expected_file_id(path: &Path) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(path).unwrap();
+        pid::file_id_unix(metadata.dev(), metadata.ino())
+    }
+    #[cfg(windows)]
+    {
+        // The format check is the crate's; the numbers come from entorhinal's
+        // own reader, which is the only Windows file-index reader here.
+        let served = entorhinal_core::file_id(path).unwrap();
+        let mut parts = served.split(':').skip(1);
+        let serial: u32 = parts.next().unwrap().parse().unwrap();
+        let index: u64 = parts.next().unwrap().parse().unwrap();
+        pid::file_id_windows(serial, index)
+    }
 }
 
 #[tokio::test]

@@ -2049,6 +2049,7 @@ impl ProjectsHandler {
     fn enumerate(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
         let params = serde_json::from_value::<EnumerateParams>(params).map_err(invalid_params)?;
         let mut reply = self.with_store(|store| store.enumerate(params.workspace_id.as_deref()))?;
+        entorhinal_core::fill_file_ids(&mut reply);
         self.annotate_liveness(&mut reply);
         self.record_query(reply.generation, &self.health.enumerate_count);
         self.encode_read_result(reply)

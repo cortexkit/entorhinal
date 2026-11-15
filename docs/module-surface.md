@@ -87,7 +87,7 @@ concepts.
 | `resolve_remote` | query | Find the project owning a GitHub repository through its live owned remotes. |
 | `resolve_root_key` | query | List local roots mapped to a project's machine-neutral root key. |
 | `preview_attach_root` | query | Match a checkout to an existing project and root key without attaching it. |
-| `enumerate` | query | List registered projects with workspace assignments, tags and liveness activity. |
+| `enumerate` | query | List registered projects with workspace assignments, tags and liveness activity. Workspace roots and root records carry an opaque `fileId` (the folder's file-system identity, compared only for equality) when the folder can be read. |
 | `journal_tail` | query | Read the newest registry journal entries. |
 | `trust` | query | Show the project a path belongs to and each root's identity and approval. |
 | `verify` | query | Check registry invariants and replay the journal on a copy, reporting drift without writing. |

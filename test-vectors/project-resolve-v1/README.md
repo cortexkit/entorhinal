@@ -16,7 +16,7 @@ These reads are open to every principal, including flow-scoped routes. `Projects
 
 ## Versions
 
-The original `resolve.json`, `resolve-project-id.json`, and `enumerate.json` capture replies from entorhinal module version **0.1.28**. The additional `resolve-root-records.json` and `resolve-remote.json` replies were captured from **0.1.46**; regenerating with that version also preserves the original files byte for byte.
+The original `resolve.json`, `resolve-project-id.json`, and `enumerate.json` capture replies from entorhinal module version **0.1.28**. The additional `resolve-root-records.json` and `resolve-remote.json` replies were captured from **0.1.46**; regenerating with that version also preserves the original files byte for byte. `enumerate-file-ids.json` was captured from **0.1.61**, which adds `fileId`; every other file is unchanged by it.
 
 ## Files and fields
 
@@ -40,6 +40,8 @@ A successful `resolve_remote` result always includes `status`, `generation`, and
 
 A successful `enumerate` result includes `workspaces`, `projects`, `generation`, and the handler-added `incarnation`. Workspace entries contain `name`, `root`, and `workspaceId`; `root` is `null` when no workspace root is set. Project entries contain `projectId`, `name`, `roots`, `implicit`, `refKind`, and `rootRecords` in this root-record-enabled fixture. `workspaceId` is omitted for unplaced projects. `deviceFingerprint` and `lastRouteActivityMs` are omitted when unavailable. Empty `roots` and `rootRecords` are represented as arrays.
 
+`enumerate` also gives each workspace with a `root`, and each of its root records, a `fileId`: the folder's file-system identity, read from disk when the request is served. It is an opaque string compared only for equality, built as `cortexkit-project-identity`'s `file_id_unix` (`unix:<dev>:<ino>`) or `file_id_windows` (`windows:<volumeSerial>:<fileIndex>`) build it, in decimal. It is omitted when the folder cannot be read, and it never appears in `resolve` replies. It lets a caller notice that a path now names a different folder, including workspace roots and plain folders, which have no checkout token. The real values differ per machine and per run, so `enumerate-file-ids.json` replaces each with a fixed value of the Unix form (`unix:1:100`, `unix:1:101`, `unix:1:102`), and the generating test checks the served values against the shared crate's format.
+
 The implicit path id `pj-implicit1-30f9d5fcd6aa4ef2` demonstrates the derivation: BLAKE3 of the canonical path's UTF-8 bytes, taking the first 8 digest bytes as 16 lowercase hexadecimal characters and prefixing `pj-implicit1-`. The alias input is the corresponding id for `/fixture/alias-source`.
 
 - **`resolve.json`**: exact registered root (`via: root`), its subfolder (`via: walk`), an external linked worktree (`via: worktree`, with `worktreeOf`), an unregistered implicit directory, a removed registered root (`gone: true`), and the missing-`canonicalRoot` refusal.
@@ -47,12 +49,14 @@ The implicit path id `pj-implicit1-30f9d5fcd6aa4ef2` demonstrates the derivation
 - **`resolve-project-id.json`**: a current project id, an implicit id retained as an alias after promotion, and an unknown id (`via: gone`, `gone: true`).
 - **`resolve-remote.json`**: eight records, in order: found `example-org/widgets`; none for `example-org/missing`; ambiguous `example-org/shared` after a registered checkout's config changes; case-insensitive found `EXAMPLE-ORG/WiDgEtS`; found `example-org/hidden`; none for hidden after its config becomes unreadable; found widgets despite the unreadable root; and malformed params `{}` refused for missing `owner`. A separate fixture preserves every existing file's bytes and generations.
 - **`enumerate.json`**: an unfiltered `{}` request returning two projects in one workspace, with names for mapping project ids to dashboard labels.
-- **`SHA256SUMS`**: SHA-256 hashes of the five JSON files, with names relative to this directory.
+- **`enumerate-file-ids.json`**: an unfiltered `{}` request with a workspace root at `/fixture/workspace` and one project whose two roots are a bound, approved git checkout and a plain folder (`unverifiable`). The workspace and both root records carry `fileId`.
+- **`SHA256SUMS`**: SHA-256 hashes of the six JSON files, with names relative to this directory.
 
 ## SHA-256 hashes
 
 | File | SHA-256 |
 | --- | --- |
+| `enumerate-file-ids.json` | `d61153f6de4935012cfbcd7e3902d5145c0e96a2801a640f569d49bead57d07b` |
 | `enumerate.json` | `89afedb88fa4ddec219f4932df22f26ca8395022c5c1dd399e3e50c9d50b94dd` |
 | `resolve-project-id.json` | `4af3d3d6dd6b279146da2e50dd48dd507674f2806f6ac35e8f04b380bc5e901e` |
 | `resolve-remote.json` | `e0504720dc0f4a81b532fbe4e0cfa4a43d0fa1b218f703cbc3efca5387e17cba` |
@@ -64,7 +68,7 @@ The implicit path id `pj-implicit1-30f9d5fcd6aa4ef2` demonstrates the derivation
 From the repository root, regenerate the vector files from the real handler with:
 
 ```sh
-ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked project_resolve_ -- --nocapture
+ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked served_vectors::project_ -- --nocapture
 ```
 
 Refresh the `project-resolve-v1` manifest from the repository root with:
@@ -74,14 +78,14 @@ python3 - <<'PY'
 import hashlib
 from pathlib import Path
 root = Path('test-vectors/project-resolve-v1')
-names = ['enumerate.json', 'resolve-project-id.json', 'resolve-remote.json', 'resolve-root-records.json', 'resolve.json']
+names = ['enumerate-file-ids.json', 'enumerate.json', 'resolve-project-id.json', 'resolve-remote.json', 'resolve-root-records.json', 'resolve.json']
 root.joinpath('SHA256SUMS').write_text(''.join(
     f'{hashlib.sha256(root.joinpath(name).read_bytes()).hexdigest()}  {name}\n'
     for name in names), encoding='utf-8')
 PY
 ```
 
-Without `ENTO_WRITE_SERVED_VECTORS=1`, the non-ignored `served_vectors::project_resolve_v1_records_match_published_files` and `served_vectors::project_resolve_remote_v1_records_match_published_file` tests regenerate all five files from entorhinal's real request handling and compare each file byte for byte. Both tests also run under nextest:
+Without `ENTO_WRITE_SERVED_VECTORS=1`, the non-ignored `served_vectors::project_resolve_v1_records_match_published_files` and `served_vectors::project_resolve_remote_v1_records_match_published_file` tests regenerate all five files from entorhinal's real request handling, and `served_vectors::project_enumerate_file_ids_records_match_published_file` regenerates the sixth, and compare each file byte for byte. These tests also run under nextest:
 
 ```sh
 cargo nextest run --workspace --all-targets --locked -E 'test(served_vectors::project_resolve_)'

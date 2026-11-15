@@ -119,6 +119,11 @@ pub struct RootRecord {
     /// has since been retired.
     pub identity: &'static str,
     pub approval: Approval,
+    /// The folder's file-system identity, read from disk at request time; see
+    /// [`crate::file_id`]. Only `enumerate` fills it, and it is omitted when the
+    /// folder cannot be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -430,6 +435,7 @@ fn root_record(conn: &Connection, root: &str) -> rusqlite::Result<RootRecord> {
         registration_epoch: binding.map(|bound| bound.epoch),
         identity,
         approval,
+        file_id: None,
     })
 }
 
@@ -474,6 +480,7 @@ fn worktree_record(
         registration_epoch: None,
         identity,
         approval: unapproved(),
+        file_id: None,
     };
     let (Some(source), Some(epoch)) = (source_root, attached_epoch) else {
         return Ok(none("unbound"));
@@ -503,6 +510,7 @@ fn worktree_record(
         registration_epoch: Some(bound.epoch),
         identity: "bound",
         approval,
+        file_id: None,
     })
 }
 

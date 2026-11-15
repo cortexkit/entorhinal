@@ -636,6 +636,7 @@ impl RegistryStore {
                             workspace_id: row.get(0)?,
                             name: row.get(1)?,
                             root: row.get(2)?,
+                            file_id: None,
                         }])
                     },
                 )
@@ -653,6 +654,7 @@ impl RegistryStore {
                             workspace_id: row.get(0)?,
                             name: row.get(1)?,
                             root: row.get(2)?,
+                            file_id: None,
                         })
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1531,6 +1533,10 @@ pub struct WorkspaceSummary {
     pub name: String,
     /// Same meaning as `ResolveReply::workspace_root`.
     pub root: Option<String>,
+    /// The root folder's file-system identity, read at request time; see
+    /// [`file_id`]. Omitted when there is no root or it cannot be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1723,6 +1729,70 @@ fn device_id(path: &Path) -> Option<u64> {
 #[cfg(not(any(unix, windows)))]
 fn device_id(_path: &Path) -> Option<u64> {
     None
+}
+
+/// The file-system identity of a folder as an opaque string, for callers that
+/// must notice when a path has been pointed at a different folder (a workspace
+/// root or plain folder has no checkout token to show that). The format is the
+/// one `cortexkit-project-identity`'s `file_id_unix`/`file_id_windows` build:
+/// `unix:<dev>:<ino>` or `windows:<volumeSerial>:<fileIndex>`, decimal. Callers
+/// compare it only for equality. `None` when the folder cannot be read.
+#[cfg(unix)]
+pub fn file_id(path: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(format!("unix:{}:{}", metadata.dev(), metadata.ino()))
+}
+
+#[cfg(windows)]
+// Windows exposes a directory's volume and file index only through its handle-based FFI.
+#[allow(unsafe_code)]
+pub fn file_id(path: &Path) -> Option<String> {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
+    };
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .ok()?;
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // The owned file keeps the directory handle valid for this metadata read.
+    let succeeded = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) };
+    if succeeded == 0 {
+        return None;
+    }
+    let index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    Some(format!(
+        "windows:{}:{index}",
+        information.dwVolumeSerialNumber
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn file_id(_path: &Path) -> Option<String> {
+    None
+}
+
+/// Stamp every local root and workspace root in an `enumerate` reply with its
+/// file identity. The served `enumerate` operation calls this, so only that
+/// reply carries it: the daemon reads it there to notice a folder swapped under
+/// an unchanged path, and `resolve`, on every worker launch's path, stays as it
+/// was. Store-level reads leave it out, so their committed golden replies hold.
+pub fn fill_file_ids(reply: &mut EnumerateReply) {
+    for workspace in &mut reply.workspaces {
+        workspace.file_id = workspace
+            .root
+            .as_deref()
+            .and_then(|root| file_id(Path::new(root)));
+    }
+    for project in &mut reply.projects {
+        for record in project.root_records.iter_mut().flatten() {
+            record.file_id = file_id(Path::new(&record.root));
+        }
+    }
 }
 
 pub(crate) fn now_unix_millis() -> i64 {
