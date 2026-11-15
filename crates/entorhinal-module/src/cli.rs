@@ -4338,6 +4338,31 @@ mod cli_transport_tests {
                         (FrameType::Pong, vec![])
                     } else if frame.header.ty == FrameType::Request && frame.header.channel == 0 {
                         let request: Value = serde_json::from_slice(&frame.body).unwrap();
+                        // The SDK asks the daemon what it supports before its
+                        // first route.open. A real daemon answers at once; an
+                        // unanswered probe would spend this test's short call
+                        // deadline before the request is ever sent.
+                        let reply = if request["op"] == "server.describe" {
+                            Some(
+                                json!({"op":"server.describe","protocol_ver":2,"subc_ops":[],"capabilities":[],"connected_clients":1}),
+                            )
+                        } else {
+                            None
+                        };
+                        if let Some(reply) = reply {
+                            let reply = Frame::build_with_version(
+                                frame.header.ver,
+                                FrameType::Response,
+                                Flags::new(false, Priority::Interactive, false),
+                                frame.header.channel,
+                                frame.header.epoch,
+                                frame.header.corr,
+                                serde_json::to_vec(&reply).unwrap(),
+                            )
+                            .unwrap();
+                            write_frame(&mut stream, &reply).await.unwrap();
+                            continue;
+                        }
                         if request["op"] != "route.open" {
                             continue;
                         }
@@ -4401,7 +4426,11 @@ mod cli_transport_tests {
                     .1
                     .starts_with("daemon reported route closure:"));
             } else {
-                assert!(matches!(error, CallFailure::Unknown(_)));
+                assert!(
+                    matches!(error, CallFailure::Unknown(_)),
+                    "expected an unknown outcome, got {:?}",
+                    error.display()
+                );
                 assert_eq!(
                     error.display(),
                     (
