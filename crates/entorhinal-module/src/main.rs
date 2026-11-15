@@ -2592,6 +2592,10 @@ fn printed_manifest() -> serde_json::Result<String> {
 fn manifest() -> ModuleManifest {
     ModuleManifest::builder(MODULE_ID, env!("CARGO_PKG_VERSION"))
     .protocol_ver(PROTOCOL_VERSION)
+    // The SDK registers over the private channel the daemon hands a launched
+    // module, and entorhinal names no consumer identity on its own calls, so
+    // a settings-protected install can admit it.
+    .registration_channel(true)
     .provides(vec![ProviderRole::ManagementSurface {
             operations: vec![
                 management_operation("project.set_domain", ManagementOperationKind::Mutate, "Set or clear a project's opaque memory domain; Direct requires operator confirmation, executive may relay."),
