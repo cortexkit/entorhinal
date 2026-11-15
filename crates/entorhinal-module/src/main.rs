@@ -698,6 +698,12 @@ fn route_key(handle: &RouteHandle) -> RouteKey {
 const WRITER_MODULE: &str = "prefrontal-core";
 
 /// Methods that change the registry or the liveness state derived from it.
+/// The daemon's channel-0 registry read for its settings gate; the reply is
+/// `enumerate {}`'s result. See `ProjectsHandler::control_enumerate`.
+const PROJECTS_ENUMERATE_CONTROL_OP: &str = "projects.enumerate";
+/// Well inside the daemon's 10 s timeout for `projects.enumerate`.
+const CONTROL_ENUMERATE_DEADLINE: Duration = Duration::from_secs(5);
+
 const MUTATING_METHODS: &[&str] = &[
     user_profile::SET,
     store_origin::ADOPT,
@@ -1183,6 +1189,25 @@ impl ModuleHandler for ProjectsHandler {
         // channel. The blocking worker rolls back while preserving the pending
         // entry for log-read recovery, rather than holding a batch open at stop.
         self.draining.send_replace(true);
+    }
+
+    fn control_ops(&self) -> Vec<String> {
+        vec![PROJECTS_ENUMERATE_CONTROL_OP.to_string()]
+    }
+
+    async fn on_control_request(
+        &self,
+        op: &str,
+        _body: Value,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Value, subc_protocol::ErrorBody> {
+        if op != PROJECTS_ENUMERATE_CONTROL_OP {
+            return Err(subc_protocol::ErrorBody::new(
+                "unsupported_op",
+                format!("entorhinal serves no control op {op}"),
+            ));
+        }
+        self.control_enumerate().await
     }
 
     async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
@@ -2106,6 +2131,44 @@ impl ProjectsHandler {
     /// canonical_root falls inside one of the project's roots. This is the
     /// consumer the liveness feed exists for; without it the accepted batches
     /// would annotate nothing.
+    /// `projects.enumerate` for the daemon's settings gate: the same reply as a
+    /// routed `enumerate {}`, wrapped as `{op, result}`. The daemon has no route
+    /// of its own, so it asks on the control channel, where only it can call.
+    /// The read runs on the blocking pool under a deadline well inside the
+    /// daemon's 10 s call timeout, because `fileId` stats every root on disk and
+    /// a stalled volume must cost a refusal, not a hung plan.
+    async fn control_enumerate(&self) -> Result<Value, subc_protocol::ErrorBody> {
+        let unavailable =
+            |message: &str| subc_protocol::ErrorBody::new("unavailable", message.to_string());
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .ok_or_else(|| unavailable("store not open yet"))?;
+        let read = tokio::task::spawn_blocking(move || {
+            let mut reply = store.enumerate(None)?;
+            entorhinal_core::fill_file_ids(&mut reply);
+            Ok::<_, RegistryError>(reply)
+        });
+        let mut reply = match tokio::time::timeout(CONTROL_ENUMERATE_DEADLINE, read).await {
+            Ok(Ok(Ok(reply))) => reply,
+            Ok(Ok(Err(error))) => {
+                return Err(unavailable(&format!("registry read failed: {error}")))
+            }
+            Ok(Err(_)) => return Err(unavailable("registry read failed")),
+            Err(_) => return Err(unavailable("registry read took longer than 5 s")),
+        };
+        self.annotate_liveness(&mut reply);
+        self.record_query(reply.generation, &self.health.enumerate_count);
+        let body = self
+            .encode_read_result(reply)
+            .map_err(|error| unavailable(&error.message))?;
+        let mut body: Value = serde_json::from_slice(&body)
+            .map_err(|error| unavailable(&format!("registry reply did not encode: {error}")))?;
+        Ok(json!({"op": PROJECTS_ENUMERATE_CONTROL_OP, "result": body["result"].take()}))
+    }
+
     fn annotate_liveness(&self, reply: &mut entorhinal_core::EnumerateReply) {
         let state = self
             .liveness

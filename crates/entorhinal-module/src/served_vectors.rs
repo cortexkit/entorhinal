@@ -2320,6 +2320,78 @@ async fn project_enumerate_file_ids_records() -> Vec<String> {
     )]
 }
 
+/// The daemon's `projects.enumerate` control op must answer exactly what a
+/// routed `enumerate {}` answers, because the settings gate compares the
+/// recorded facts against either at commit.
+#[tokio::test]
+async fn projects_enumerate_control_op_matches_routed_enumerate() {
+    use subc_client_rs::ModuleHandler;
+    let fixture = SessionFixture::new("served-projects-enumerate-control").await;
+    let root = fixture.dir.join("checkout");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::write(root.join(".git/config"), "[core]\n\tbare = false\n").unwrap();
+    let root = crate::tests::canonical_test_path(&root)
+        .to_string_lossy()
+        .into_owned();
+    let (_, reply) = fixture
+        .record(
+            SESSION_CORE,
+            WRITER_MODULE,
+            "register",
+            json!({"projectId":"pj-control","name":"Control","roots":[root]}),
+        )
+        .await;
+    assert!(reply.get("result").is_some(), "register failed: {reply}");
+    let (_, routed) = fixture
+        .record(SESSION_READER, READER_MODULE, "enumerate", json!({}))
+        .await;
+
+    assert_eq!(
+        fixture.handler.control_ops(),
+        vec!["projects.enumerate".to_string()]
+    );
+    let control = fixture
+        .handler
+        .on_control_request(
+            "projects.enumerate",
+            json!({"op":"projects.enumerate"}),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(control["op"], "projects.enumerate");
+    assert_eq!(control["result"], routed["result"]);
+    assert!(control["result"]["projects"][0]["rootRecords"][0]["fileId"].is_string());
+    serde_json::from_value::<pid::EnumerateReply>(control["result"].clone())
+        .expect("control reply decodes as the shared EnumerateReply");
+
+    let unknown = fixture
+        .handler
+        .on_control_request(
+            "projects.other",
+            json!({"op":"projects.other"}),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(unknown.code, "unsupported_op");
+
+    fixture.handler.store.lock().unwrap().take();
+    let closed = fixture
+        .handler
+        .on_control_request(
+            "projects.enumerate",
+            json!({"op":"projects.enumerate"}),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (closed.code.as_str(), closed.message.as_str()),
+        ("unavailable", "store not open yet")
+    );
+}
+
 /// The identity `cortexkit-project-identity` would build for `path`, so the test
 /// fails if entorhinal's format ever drifts from the daemon's.
 fn expected_file_id(path: &Path) -> String {

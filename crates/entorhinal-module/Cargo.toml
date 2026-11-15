@@ -37,6 +37,7 @@ subc-client-rs = { workspace = true }
 subc-control = { workspace = true }
 subc-protocol = { workspace = true }
 tokio = { workspace = true }
+tokio-util = "0.7"
 getrandom = { workspace = true }
 
 [dev-dependencies]

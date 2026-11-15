@@ -142,6 +142,18 @@ Tests: `attach_surface_writes_are_attributed_only_to_direct_and_core`,
 `rebind_wire_refuses_flow_and_unadmitted_principal_without_binding`,
 `carrying_placement_prompts_exactly_and_cached_reply_is_unchanged`.
 
+### Daemon control op
+
+The daemon has no route of its own, so its settings gate reads the registry
+through one channel-0 control op that entorhinal lists in its HELLO
+`control_ops`. Only the daemon can send it, so there is no principal check.
+
+| Op | Reply |
+|---|---|
+| `projects.enumerate` | `{op: "projects.enumerate", result}`, where `result` equals a routed `enumerate {}` result (`fileId` and `incarnation` included). It is read on the blocking pool with a 5 s deadline, inside the daemon's 10 s timeout. Before the store opens, or on a failed or slow read, it answers an ERROR frame with code `unavailable`. |
+
+Test: `projects_enumerate_control_op_matches_routed_enumerate`.
+
 ## User profile
 
 | Operation | Kind | Who | What it does |

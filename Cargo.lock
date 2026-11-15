@@ -494,6 +494,7 @@ dependencies = [
  "subc-protocol",
  "subc-transport",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "windows-sys 0.61.2",
