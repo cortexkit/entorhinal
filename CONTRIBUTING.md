@@ -12,6 +12,7 @@ cargo command at a time.
 
 ```sh
 scripts/check-cortexkit-layout.sh
+scripts/check-file-sizes.sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --all-targets --locked
@@ -22,6 +23,10 @@ cargo test --workspace --all-targets --locked
   (`release-notes/`, `skills/`, `rules/`) and `WORKER.md`. It exits 0 when
   clean, 1 when a disallowed file is tracked, and 2 when the `.gitignore`
   rules it relies on are missing.
+- `scripts/check-file-sizes.sh` enforces the Linux CI limit of fewer than 5,000
+  hand-written lines per Rust source file, excluding tests, examples and generated
+  files, and prevents files already at or above that limit from growing beyond
+  `scripts/file-size-baseline.txt`.
 - `cargo fmt --all -- --check` prints nothing and exits 0 when the tree is
   formatted.
 - Clippy runs with `-D warnings`, so any warning fails the gate.
