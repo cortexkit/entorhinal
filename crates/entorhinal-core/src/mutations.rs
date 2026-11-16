@@ -541,7 +541,17 @@ impl super::JournalWriter<'_> {
             } else {
                 None
             };
+            let placements = if super::log_schema::log_enabled(tx)? && crate::placement::active(tx)?
+            {
+                Some(crate::placement::placements(tx)?)
+            } else {
+                None
+            };
             let mut action = action(tx).map_err(fail)?;
+            if let Some(before) = placements {
+                crate::placement::record_live(tx, &before, &mut action)
+                    .map_err(|e| fail(e.into()))?;
+            }
             if let Some(commit) = &self.consent {
                 let evidence = if action.payload.get("entry").is_some() {
                     &mut action.payload["entry"]
@@ -1677,6 +1687,8 @@ impl RegistryStore {
 // Machine-local driver checkpoints and settings (agent_move, move_setting) are
 // deliberately excluded: the identity journal cannot reconstruct them.
 pub(crate) const DERIVED_TABLES: &[&str] = &[
+    "placement_fact",
+    "placement_state",
     "user_expertise",
     "user_profile",
     "catalog_pin",
@@ -1727,6 +1739,24 @@ fn set_workspace_root_projection(
 }
 
 fn delete_and_replay(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    replay_with_observer(tx, true, &mut |_, _, _, _, _, _| Ok(()))
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+}
+
+// Verification requires a readable clock on every row. Backfill instead checks
+// the clock only after a row changes placement, and returns its named refusal.
+pub(crate) fn replay_with_observer(
+    tx: &Transaction<'_>,
+    strict_times: bool,
+    observer: &mut impl FnMut(
+        i64,
+        &str,
+        &str,
+        Option<i64>,
+        &crate::placement::Placements,
+        &crate::placement::Placements,
+    ) -> Result<(), RegistryError>,
+) -> Result<(), RegistryError> {
     // Historical claims and tombstoned ids are projections too. Defer foreign
     // keys because an agent's merge target or supervisor may be replayed later.
     tx.execute_batch("PRAGMA defer_foreign_keys=ON;")?;
@@ -1741,7 +1771,7 @@ fn delete_and_replay(tx: &Transaction<'_>) -> rusqlite::Result<()> {
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
-                r.get::<_, i64>(3)?,
+                r.get::<_, rusqlite::types::Value>(3)?,
                 r.get::<_, String>(4)?,
                 r.get::<_, String>(5)?,
                 r.get::<_, Option<Vec<u8>>>(6)?,
@@ -1755,8 +1785,21 @@ fn delete_and_replay(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     // under the wrong rules. Replay never writes `identity_log_state`.
     let mut enabled = false;
     for (seq, op, payload, now, stream, origin, entry) in rows {
+        let before = crate::placement::placements(tx)?;
+        let time = match now {
+            rusqlite::types::Value::Integer(n) => Some(n),
+            _ => None,
+        };
+        if strict_times && time.is_none() {
+            return Err(domain(
+                "journal_time_unreadable",
+                format!("unreadable journal time at seq {seq}"),
+            ));
+        }
+        let now = time.unwrap_or(0);
         let value: Value = serde_json::from_str(&payload)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        crate::placement::replay_facts(tx, &value)?;
         let request = value.get("request").cloned().unwrap_or(value);
         if op == "store.adopt" {
             crate::store_origin::clear_local_projections(
@@ -1803,6 +1846,14 @@ fn delete_and_replay(tx: &Transaction<'_>) -> rusqlite::Result<()> {
                 image.restore(tx, seq, origin == "log")?;
             }
         }
+        observer(
+            seq,
+            &op,
+            &origin,
+            time,
+            &before,
+            &crate::placement::placements(tx)?,
+        )?;
     }
     Ok(())
 }

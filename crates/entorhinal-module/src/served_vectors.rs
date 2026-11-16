@@ -88,6 +88,14 @@ impl Fixture {
     }
 
     async fn with_confirmer(label: &str, confirmer: std::sync::Arc<Approve>) -> Self {
+        let fixture = Self::empty(label, confirmer);
+        // A rootless project is valid. Its fleet placement has no canonicalRoot,
+        // so scratch paths and Windows drive letters never enter the records.
+        fixture.success(DIRECT,"register",json!({"projectId":"served-project","name":"Served project","roots":[],"workspaceId":"served-workspace"})).await;
+        fixture
+    }
+
+    fn empty(label: &str, confirmer: std::sync::Arc<Approve>) -> Self {
         let (dir, descriptor) = crate::tests::scratch_descriptor(label);
         let handler = ProjectsHandler::with_runtime(INCARNATION.into(), || 700)
             .with_operator_confirmer(confirmer);
@@ -108,21 +116,11 @@ impl Fixture {
                 .route_admissions()
                 .insert(route, RouteAdmission::from_bind(Some(principal), None));
         }
-        let fixture = Self {
+        Self {
             dir,
             handler,
             descriptor,
-        };
-        // A rootless project is valid. Its fleet placement has no canonicalRoot,
-        // so scratch paths and Windows drive letters never enter the records.
-        fixture
-            .success(
-                DIRECT,
-                "register",
-                json!({"projectId":"served-project","name":"Served project","roots":[],"workspaceId":"served-workspace"}),
-            )
-            .await;
-        fixture
+        }
     }
 
     async fn outcome(&self, route: RouteKey, op: &str, request: Value) -> HandlerOutcome {
@@ -5688,4 +5686,165 @@ async fn catalog_consumer_v1_requests_match_published_files() {
             "requests":prefetch_requests
         }),
     );
+}
+
+#[tokio::test]
+async fn served_vectors_placement_facts_v1() {
+    let f = Fixture::empty(
+        "placement-vectors",
+        Arc::new(Approve {
+            summaries: std::sync::Mutex::new(vec![]),
+        }),
+    );
+    let mut records = vec![f.record("placement.read", json!({})).await.0];
+    let store = f.handler.with_store(|s| Ok(s.clone())).unwrap();
+    store
+        .with_principal("test")
+        .register_at(
+            entorhinal_core::RegisterRequest {
+                project_id: Some("served-project".into()),
+                name: "Served project".into(),
+                workspace_id: Some("served-workspace".into()),
+                ..Default::default()
+            },
+            700,
+        )
+        .unwrap();
+    store
+        .with_principal("test")
+        .register_at(
+            entorhinal_core::RegisterRequest {
+                project_id: Some("second-project".into()),
+                name: "Second".into(),
+                ..Default::default()
+            },
+            701,
+        )
+        .unwrap();
+    store
+        .apply_entry("identity_log.enable", "{}", "operator", None, |tx| {
+            tx.execute(
+                "UPDATE identity_log_state SET state='enabled' WHERE id=1",
+                [],
+            )?;
+            tx.execute(
+                "INSERT INTO self_identity VALUES(1,?1,1)",
+                ["ab".repeat(16)],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let commit = |id: &str, op: &dyn Fn() -> Result<Vec<u8>, entorhinal_core::RegistryError>| {
+        let head = store.identity_log_status().unwrap().last_applied_position;
+        store
+            .shared_attempt(
+                id.into(),
+                head,
+                move |_| entorhinal_core::SharedSettlement::Commit(head + 1),
+                op,
+            )
+            .unwrap();
+    };
+    commit("backfill", &|| {
+        store
+            .with_principal("test")
+            .placement_backfill(Default::default(), 702)
+    });
+    let (first, page) = f.record("placement.read", json!({"limit":1})).await;
+    assert!(page["result"]["next"].is_string());
+    records.push(first);
+    records.push(
+        f.record(
+            "placement.read",
+            json!({"after":page["result"]["next"],"limit":1}),
+        )
+        .await
+        .0,
+    );
+    commit("register-null", &|| {
+        store.with_principal("test").register_at(
+            entorhinal_core::RegisterRequest {
+                project_id: Some("null-project".into()),
+                name: "Null".into(),
+                ..Default::default()
+            },
+            703,
+        )
+    });
+    let (record, page) = f.record("placement.read", json!({"limit":2})).await;
+    assert_eq!(page["result"]["through"], 2);
+    let after_backfill = page["result"]["next"].clone();
+    // Each following page isolates the fact added by one placement operation.
+    drop(record);
+    let (register, page) = f
+        .record("placement.read", json!({"after":after_backfill,"limit":1}))
+        .await;
+    assert_eq!(page["result"]["facts"][0]["workspace_id"], Value::Null);
+    records.push(register);
+    commit("assign", &|| {
+        store.with_principal("test").assign_workspace_at(
+            entorhinal_core::AssignWorkspaceRequest {
+                project_id: "null-project".into(),
+                workspace_id: "served-workspace".into(),
+                ..Default::default()
+            },
+            704,
+        )
+    });
+    let (page1, page) = f.record("placement.read", json!({"limit":3})).await;
+    drop(page1);
+    let after_register = page["result"]["next"].clone();
+    records.push(
+        f.record("placement.read", json!({"after":after_register}))
+            .await
+            .0,
+    );
+    commit("same-workspace", &|| {
+        store.with_principal("test").assign_workspace_at(
+            entorhinal_core::AssignWorkspaceRequest {
+                project_id: "null-project".into(),
+                workspace_id: "served-workspace".into(),
+                ..Default::default()
+            },
+            705,
+        )
+    });
+    records.push(
+        f.record("placement.read", json!({"after":after_register}))
+            .await
+            .0,
+    );
+    commit("remove", &|| {
+        store.with_principal("test").remove_at(
+            entorhinal_core::RemoveRequest {
+                project_id: Some("null-project".into()),
+                workspace_id: None,
+                successor_project_id: None,
+                request_key: None,
+                actor: None,
+            },
+            706,
+        )
+    });
+    let (_, page) = f.record("placement.read", json!({"limit":4})).await;
+    records.push(
+        f.record("placement.read", json!({"after":page["result"]["next"]}))
+            .await
+            .0,
+    );
+    published_file("placement-facts-v1", "records.json", records);
+}
+
+#[test]
+fn served_vectors_placement_facts_checksums_and_field_order() {
+    use sha2::{Digest, Sha256};
+    let directory =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-vectors/placement-facts-v1");
+    let records = std::fs::read(directory.join("records.json")).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(directory.join("SHA256SUMS")).unwrap(),
+        format!("{:x}  records.json\n", Sha256::digest(&records))
+    );
+    let wire = String::from_utf8(records).unwrap();
+    assert!(wire.contains(r#"{"fact_id":"e:register-null:null-project","supersedes":null,"project_id":"null-project","workspace_id":null,"effective_from_ms":703,"recorded_at_ms":703}"#));
 }

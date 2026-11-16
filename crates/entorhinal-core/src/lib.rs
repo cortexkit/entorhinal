@@ -37,6 +37,7 @@ pub mod move_record;
 pub mod move_store;
 mod mutations;
 mod ownership;
+pub mod placement;
 mod read_connection;
 pub mod remote_apply;
 pub mod role_cache;
@@ -224,7 +225,7 @@ CREATE TABLE member_name (
 );
 "#;
 
-const MIGRATIONS: [Migration; 20] = [
+const MIGRATIONS: [Migration; 21] = [
     Migration {
         version: 1,
         statements: V1_SCHEMA,
@@ -304,6 +305,10 @@ const MIGRATIONS: [Migration; 20] = [
     Migration {
         version: 20,
         statements: catalog_freshness::V20_CATALOG_FRESHNESS,
+    },
+    Migration {
+        version: 21,
+        statements: placement::V21_PLACEMENT,
     },
 ];
 

@@ -26,6 +26,10 @@ thread_local! {
     static ATTEMPT: RefCell<Option<Attempt>> = const { RefCell::new(None) };
 }
 
+pub(crate) fn entry_id() -> Option<String> {
+    ATTEMPT.with(|slot| slot.borrow().as_ref().map(|attempt| attempt.id.clone()))
+}
+
 impl RegistryStore {
     /// Look up a reply by request key and operation name, and refuse a key that
     /// was already used for a different operation. Otherwise a request could

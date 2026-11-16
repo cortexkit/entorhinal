@@ -11,6 +11,8 @@ use std::{future::Future, path::Path, sync::atomic::AtomicUsize};
 const DIRECT: RouteKey = (90, 1);
 const CORE: RouteKey = (91, 1);
 const SHARED: &[&str] = &[
+    "placement_fact",
+    "placement_state",
     "project",
     "workspace",
     "workspace_document",
@@ -4830,4 +4832,175 @@ async fn adopt_store_shared_restore_rejoins_with_new_author_and_installs_agents(
         Some("22222222222222222222222222222222")
     );
     b.clean_rebuild().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn placement_facts_two_machine_snapshot_retry_skew_and_rebuild() {
+    let log = FakeLog::default();
+    let mut a = Machine::new("placement-a", Arc::new(log.clone()));
+    a.handler.operator_confirmer = Arc::new(crate::served_vectors::Approve {
+        summaries: std::sync::Mutex::new(vec![]),
+    });
+    a.handler.clock = || 900;
+    a.store()
+        .with_principal("test")
+        .register_at(
+            entorhinal_core::RegisterRequest {
+                name: "minted".into(),
+                workspace_id: Some("W1".into()),
+                ..Default::default()
+            },
+            900,
+        )
+        .unwrap();
+    let initial = a.call("enumerate", json!({})).await.unwrap();
+    let project = initial["projects"][0]["projectId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    a.store()
+        .with_principal("test")
+        .assign_workspace_at(
+            entorhinal_core::AssignWorkspaceRequest {
+                project_id: project.clone(),
+                workspace_id: "W2".into(),
+                ..Default::default()
+            },
+            900,
+        )
+        .unwrap();
+    assert_eq!(
+        a.call("placement.read", json!({})).await.unwrap()["facts"],
+        json!([])
+    );
+    a.enable_without_agents().await;
+    let first = a
+        .call("placement.backfill", json!({"requestKey":"backfill"}))
+        .await
+        .unwrap();
+    assert_eq!(first["facts"], 2);
+    let history = a.call("placement.read", json!({})).await.unwrap();
+    let author = a.call("node.self", json!({})).await.unwrap();
+    let identity = author["author"].as_str().unwrap();
+    assert_eq!(
+        history["facts"][0]["fact_id"],
+        format!("b:{identity}:1:{project}")
+    );
+    assert_eq!(history["facts"][0]["workspace_id"], "W1");
+    assert_eq!(history["facts"][1]["workspace_id"], "W2");
+    // Superseding snapshots must carry the same facts as the change entry.
+    let prefix = log.client().read(0, 128).await.unwrap();
+    let remote = |entry: &crate::log_client::LogEntry| entorhinal_core::remote_apply::RemoteEntry {
+        position: entry.position as i64,
+        entry_id: crate::log_client::encode_hex(&entry.entry_id),
+        author: entry.author.clone(),
+        signer: crate::log_client::encode_hex(&entry.signer),
+        key_id: json!({"family":entry.key_id.family,"epoch":entry.key_id.epoch}).to_string(),
+        envelope_version: entry.envelope_version as i64,
+        kind: entry.kind.clone(),
+        entry: entry.entry.clone(),
+    };
+    let replay_prefix = prefix.entries.iter().map(remote).collect::<Vec<_>>();
+    let plan = a
+        .store()
+        .prepare_supersede(&"ef".repeat(16), 900, prefix.head, &replay_prefix)
+        .unwrap();
+    assert_eq!(plan.bodies.len(), 1);
+    let image: Value = serde_json::from_slice(&plan.bodies[0]).unwrap();
+    assert_eq!(
+        image["tables"]["placement_fact"]["upsert"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        image["tables"]["placement_state"]["upsert"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    log.client()
+        .append(&crate::log_client::AppendRequest {
+            expected_head: prefix.head,
+            entry_id: [0xee; 16],
+            kind: crate::log_client::EntryKind::Snapshot,
+            data: plan.bodies.into_iter().next().unwrap(),
+        })
+        .await
+        .unwrap();
+    a.catch_up().await;
+    let mut b = Machine::new("placement-b", Arc::new(log.with_author([0x22; 16])));
+    b.enable().await;
+    assert_eq!(
+        b.query("SELECT COUNT(*) FROM registry_journal WHERE op='shared.snapshot' AND instr(CAST(entry AS TEXT),'placement_fact')>0"),
+        vec![vec![Cell::Integer(1)]]
+    );
+    assert_eq!(a.rows("placement_fact"), b.rows("placement_fact"));
+    assert_eq!(a.rows("placement_state"), b.rows("placement_state"));
+    assert_eq!(b.call("placement.read", json!({})).await.unwrap(), history);
+    b.handler.clock = || 100;
+    let params = json!({"projectId":project,"workspaceId":"W3","requestKey":"skew"});
+    let response = b.call("assign_workspace", params.clone()).await.unwrap();
+    assert_eq!(b.call("assign_workspace", params).await.unwrap(), response);
+    a.catch_up().await;
+    assert_eq!(a.rows("placement_fact"), b.rows("placement_fact"));
+    let page = a.call("placement.read", json!({})).await.unwrap();
+    assert_eq!(page["facts"].as_array().unwrap().len(), 3);
+    assert_eq!(page["facts"][2]["recorded_at_ms"], 100);
+    assert_eq!(page["facts"][2]["effective_from_ms"], 900);
+    let entries = log.client().read(0, 128).await.unwrap();
+    let committed = entries.entries.last().unwrap();
+    assert_eq!(
+        page["facts"][2]["fact_id"],
+        format!(
+            "e:{}:{project}",
+            crate::log_client::encode_hex(&committed.entry_id)
+        )
+    );
+    a.clean_rebuild().await;
+    b.clean_rebuild().await;
+    assert_eq!(
+        a.call("placement.backfill", json!({})).await.unwrap_err(),
+        "placement_already_backfilled"
+    );
+    assert!(a.bytes_on(CORE, "placement.read", json!({})).await.is_ok());
+    assert_eq!(
+        a.bytes_on(CORE, "placement.backfill", json!({}))
+            .await
+            .unwrap_err(),
+        "write_not_permitted"
+    );
+    for params in [
+        json!({"limit":1025}),
+        json!({"limit":0}),
+        json!({"bogus":1}),
+        json!({"after":"bad"}),
+    ] {
+        assert_eq!(
+            a.call("placement.read", params).await.unwrap_err(),
+            "invalid_request"
+        );
+    }
+    let page1 = a.call("placement.read", json!({"limit":1})).await.unwrap();
+    let page2 = a
+        .call("placement.read", json!({"limit":2,"after":page1["next"]}))
+        .await
+        .unwrap();
+    assert_eq!(page1["through"], 1);
+    assert_eq!(page2["through"], 3);
+    assert_eq!(page2["next"], Value::Null);
+    let foreign = b
+        .call("placement.read", json!({"after":page1["next"],"limit":1}))
+        .await
+        .unwrap();
+    // Give the other process a different incarnation before exercising restart.
+    b.handler.incarnation = "other-process".into();
+    let restarted = b
+        .call("placement.read", json!({"after":page1["next"],"limit":1}))
+        .await
+        .unwrap();
+    assert_eq!(foreign["through"], 2);
+    assert_eq!(restarted["through"], 1);
 }

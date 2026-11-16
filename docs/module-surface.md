@@ -5,6 +5,33 @@ with the rule that decides who may call it. The manifest
 (`manifest()` in `crates/entorhinal-module/src/main.rs`) declares each one as
 a query or a mutation; `ck-entorhinal --manifest` prints it.
 
+## Placement facts
+
+- `placement.read {after?, limit?}` is open to every principal and uses the read
+  connection. It returns `{"result":{"facts":[…],"next":…|null,"through":N}}`.
+  `limit` defaults to 256 and must be 1–1024; unknown parameters and invalid
+  limits or cursors refuse `invalid_request`. The opaque cursor carries the
+  serving process's incarnation (its random per-start identifier); a cursor
+  naming another incarnation restarts at position 0. `through`
+  is the highest position served (or the starting position for an empty page).
+- Each fact has fields in order: `fact_id`, `supersedes`, `project_id`,
+  `workspace_id`, `effective_from_ms`, `recorded_at_ms`. The nullable fields
+  `supersedes` and `workspace_id` are always present. Effective time is clamped
+  non-decreasing per project; recorded time
+  retains the writer clock. `supersedes` is currently always null.
+- `placement.backfill {requestKey?}` is a one-time shared write for Direct clients
+  (local processes such as `ck`), with operator presence confirmation
+  (`ck projects placement-backfill`). It replays
+  this machine's journal and ships exact rows, including deterministic ids.
+  It refuses `sharing_not_enabled`, `placement_already_backfilled`,
+  `placement_facts_exist`, or `placement_history_time_unknown` (with the seq).
+  An empty history still activates future facts. After activation, every change
+  to project existence or effective workspace journals its facts atomically,
+  including registration, upgrades, seed import, compound writes and removal;
+  same-workspace assignment produces none. Snapshots carry facts and activation
+  to joined machines. Backfill ids are `b:<author>:<seq>:<project_id>`; later ids
+  are `e:<entry_id>:<project_id>`. Request-key retries add nothing.
+
 ## Capabilities
 
 entorhinal provides `project-identity/v1`, `agent-identity/v1`,
