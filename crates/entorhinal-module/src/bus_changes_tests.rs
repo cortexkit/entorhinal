@@ -13,6 +13,7 @@ struct Control {
     block: AtomicBool,
     entered: Notify,
     release: Notify,
+    reconnected: Notify,
 }
 
 struct FakeSink {
@@ -41,7 +42,7 @@ impl Sink for FakeSink {
     }
 
     async fn connection_changed(&mut self) {
-        std::future::pending().await
+        self.control.reconnected.notified().await
     }
 }
 
@@ -105,6 +106,22 @@ const KEYS: &[&str] = &[
     "registry",
     "role.connector_home",
 ];
+
+#[tokio::test]
+async fn bus_changes_reconnect_rewrites_every_key() {
+    let f = Fixture::new("bus-reconnect").await;
+    let mut published = Published::start(&f.handler, Arc::default());
+    let first = published.take(KEYS).await;
+    published.idle().await;
+    published.quiet();
+    // Nothing changed in the store, but the new connection may face an empty,
+    // re-provisioned bucket, so all five markers must be written again.
+    published.control.reconnected.notify_one();
+    assert_eq!(published.take(KEYS).await, first);
+    published.idle().await;
+    published.quiet();
+    f.handler.stop_bus_changes().await;
+}
 
 #[tokio::test]
 async fn bus_changes_startup_write_kinds_and_unchanged_wakes() {

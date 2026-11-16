@@ -319,7 +319,10 @@ impl Worker {
                 _ = &mut commits => {},
                 _ = &mut roles => {},
                 _ = &mut catalog => {},
-                _ = sink.connection_changed() => {},
+                // A new connection may face a bucket ck-bus re-provisioned empty,
+                // so every key is written again rather than trusting what this
+                // process last put.
+                _ = sink.connection_changed() => last.clear(),
             }
         }
     }

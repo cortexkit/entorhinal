@@ -41,13 +41,55 @@ fn production_https_bundled_roots_and_limits() {
     assert!(
         RegistryClient::new("https://a.test", &["https://b.test".into()], Limits::MODULE).is_err()
     );
+    // The catalog trusts only the bundled web roots, so an operating-system
+    // trust store (where any local admin can add a root) must never reach the
+    // registry client. The bus client's NATS crate links the platform store for
+    // its own loopback connection, so the check is on the HTTPS stack's own
+    // dependencies rather than on the whole lockfile.
     let lock = include_str!("../../../Cargo.lock");
-    for forbidden in ["openssl-sys", "native-tls", "security-framework"] {
+    let dependencies = |package: &str| -> Vec<&str> {
+        let start = lock
+            .find(&format!("\nname = \"{package}\"\n"))
+            .unwrap_or_else(|| panic!("{package} missing from Cargo.lock"));
+        let entry = &lock[start..];
+        let entry = &entry[..entry[1..]
+            .find("\n[[package]]")
+            .map_or(entry.len(), |end| end + 1)];
+        entry
+            .lines()
+            .skip_while(|line| *line != "dependencies = [")
+            .skip(1)
+            .take_while(|line| *line != "]")
+            .map(|line| {
+                line.trim()
+                    .trim_matches(|c| c == '"' || c == ',')
+                    .split(' ')
+                    .next()
+                    .unwrap()
+            })
+            .collect()
+    };
+    for forbidden in ["openssl-sys", "native-tls"] {
         assert!(
             !lock.contains(&format!("name = \"{forbidden}\"")),
             "{forbidden}"
         );
     }
+    for package in ["reqwest", "hyper-rustls"] {
+        let deps = dependencies(package);
+        for forbidden in [
+            "rustls-native-certs",
+            "rustls-platform-verifier",
+            "hyper-tls",
+            "native-tls",
+        ] {
+            assert!(
+                !deps.contains(&forbidden),
+                "{package} depends on {forbidden}"
+            );
+        }
+    }
+    assert!(dependencies("reqwest").contains(&"webpki-roots"));
     assert_eq!(Limits::MODULE.connect, Duration::from_secs(10));
     assert_eq!(Limits::MODULE.archive_timeout, Duration::from_secs(120));
     assert_eq!(Limits::MODULE.json_timeout, Duration::from_secs(30));
