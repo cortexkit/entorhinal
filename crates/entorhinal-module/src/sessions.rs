@@ -16,7 +16,15 @@
 //! is refreshed once, never on a timer. Closing a route or changing its
 //! principal invalidates its cache. No fixed module name decides admission.
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use entorhinal_core::{RegistryStore, SessionRegistration};
@@ -115,21 +123,191 @@ impl ProviderResolution {
 #[async_trait]
 pub(super) trait ProviderResolver: Send + Sync {
     async fn resolve_provider(&self, capability: &str) -> ProviderResolution;
+
+    fn cache_health(&self) -> ProviderCacheHealth {
+        ProviderCacheHealth::default()
+    }
+
+    async fn stop(&self) {}
+}
+
+#[derive(Default)]
+pub(super) struct ProviderCacheHealth {
+    pub(super) hits: u64,
+    pub(super) misses: u64,
+    pub(super) watch_live: bool,
+}
+
+#[derive(Default)]
+struct ProviderCacheState {
+    epoch: u64,
+    live: bool,
+    answers: HashMap<String, ProviderResolution>,
+    resolving: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
+}
+
+/// Shared by all routes, but useful only while catalog changes can be observed.
+struct CachedProviderResolver {
+    source: Arc<dyn ProviderResolver>,
+    state: Mutex<ProviderCacheState>,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    watch_live: AtomicBool,
+}
+
+impl CachedProviderResolver {
+    fn new(source: Arc<dyn ProviderResolver>) -> Self {
+        Self {
+            source,
+            state: Mutex::new(ProviderCacheState::default()),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            watch_live: AtomicBool::new(false),
+        }
+    }
+
+    fn invalidate(&self, live: bool) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.epoch = state.epoch.wrapping_add(1);
+        state.live = live;
+        state.answers.clear();
+        self.watch_live.store(live, Ordering::Relaxed);
+    }
+}
+
+#[async_trait]
+impl ProviderResolver for CachedProviderResolver {
+    async fn resolve_provider(&self, capability: &str) -> ProviderResolution {
+        let resolving = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state
+                .resolving
+                .entry(capability.into())
+                .or_default()
+                .clone()
+        };
+        let _lookup = resolving.lock().await;
+        let (epoch, live) = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.live {
+                if let Some(answer) = state.answers.get(capability) {
+                    self.hits.fetch_add(1, Ordering::Relaxed);
+                    return answer.clone();
+                }
+            }
+            (state.epoch, state.live)
+        };
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        let answer = self.source.resolve_provider(capability).await;
+        if live && !matches!(answer, ProviderResolution::Transport(_)) {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            // The epoch check and insertion share the invalidation lock, so a
+            // notice racing this lookup cannot leave its old answer cached.
+            if state.live && state.epoch == epoch {
+                state.answers.insert(capability.into(), answer.clone());
+            }
+        }
+        answer
+    }
+
+    fn cache_health(&self) -> ProviderCacheHealth {
+        ProviderCacheHealth {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            watch_live: self.watch_live.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Owns the process-wide cache and its lazily started catalog subscription.
+pub(super) struct SubcProviderResolver {
+    connection: Arc<SubcProviderConnection>,
+    cache: Arc<CachedProviderResolver>,
+    watch_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    stop: tokio_util::sync::CancellationToken,
+}
+
+impl SubcProviderResolver {
+    pub(super) fn from_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Self {
+        let connection = Arc::new(SubcProviderConnection::from_args(args));
+        Self {
+            cache: Arc::new(CachedProviderResolver::new(connection.clone())),
+            connection,
+            watch_task: Mutex::new(None),
+            stop: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    fn start_watch(&self) {
+        let mut task = self.watch_task.lock().unwrap_or_else(|e| e.into_inner());
+        if task.is_some() || self.stop.is_cancelled() {
+            return;
+        }
+        let connection = self.connection.clone();
+        let cache = self.cache.clone();
+        let stop = self.stop.clone();
+        *task = Some(tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                _ = stop.cancelled() => {},
+                _ = watch_providers(&connection, &cache) => {},
+            }
+            cache.invalidate(false);
+        }));
+    }
+}
+
+impl Drop for SubcProviderResolver {
+    fn drop(&mut self) {
+        self.stop.cancel();
+    }
+}
+
+#[async_trait]
+impl ProviderResolver for SubcProviderResolver {
+    async fn resolve_provider(&self, capability: &str) -> ProviderResolution {
+        self.start_watch();
+        let answer = self.cache.resolve_provider(capability).await;
+        if matches!(answer, ProviderResolution::Transport(_)) {
+            self.cache.invalidate(false);
+            self.connection.reset_watch.notify_one();
+        }
+        answer
+    }
+
+    fn cache_health(&self) -> ProviderCacheHealth {
+        self.cache.cache_health()
+    }
+
+    async fn stop(&self) {
+        self.stop.cancel();
+        let task = self
+            .watch_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(task) = task {
+            let _ = task.await;
+        }
+        self.cache.invalidate(false);
+    }
 }
 
 /// Resolves through the daemon named by `--subc`. The consumer connection is
 /// opened on the first session write, never at startup, and dropped after a
 /// transport failure so the next request reconnects.
-pub(super) struct SubcProviderResolver {
+struct SubcProviderConnection {
     connection_file: Option<PathBuf>,
     consumer: tokio::sync::Mutex<Option<Arc<SubcConsumer>>>,
+    reset_watch: tokio::sync::Notify,
 }
 
-impl SubcProviderResolver {
-    pub(super) fn from_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Self {
+impl SubcProviderConnection {
+    fn from_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Self {
         Self {
             connection_file: super::log_client::subc_connection_file(args),
             consumer: tokio::sync::Mutex::new(None),
+            reset_watch: tokio::sync::Notify::new(),
         }
     }
 
@@ -149,8 +327,75 @@ impl SubcProviderResolver {
     }
 }
 
+async fn watch_providers(connection: &SubcProviderConnection, cache: &CachedProviderResolver) {
+    let mut outage = false;
+    let mut delay = Duration::from_secs(1);
+    loop {
+        let mut watched_consumer = None;
+        let result: Result<(), String> = async {
+            let consumer = connection.consumer().await?;
+            watched_consumer = Some(consumer.clone());
+            let mut subscription = consumer.catalog_watch().await.map_err(|e| e.to_string())?;
+            // The first notice is the subscription's acknowledgement, not a
+            // separate ACK frame. Until it arrives, lookups must stay uncached.
+            tokio::select! {
+                biased;
+                _ = connection.reset_watch.notified() => return Err("consumer replaced".into()),
+                notice = subscription.next() => match notice {
+                    Ok(Some(_)) => {},
+                    Ok(None) => return Err("catalog watch ended".into()),
+                    Err(error) => return Err(error.to_string()),
+                },
+            }
+            {
+                let slot = connection.consumer.lock().await;
+                if !slot
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &consumer))
+                {
+                    return Err("consumer replaced".into());
+                }
+                cache.invalidate(true);
+            }
+            if outage {
+                tracing::info!("session provider catalog watch recovered");
+                outage = false;
+            }
+            delay = Duration::from_secs(1);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = connection.reset_watch.notified() => return Err("consumer replaced".into()),
+                    notice = subscription.next() => match notice {
+                        Ok(Some(_)) => cache.invalidate(true),
+                        Ok(None) => return Err("catalog watch ended".into()),
+                        Err(error) => return Err(error.to_string()),
+                    },
+                }
+            }
+        }
+        .await;
+        cache.invalidate(false);
+        if let Some(consumer) = watched_consumer {
+            let mut slot = connection.consumer.lock().await;
+            if slot
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &consumer))
+            {
+                slot.take();
+            }
+        }
+        if !outage {
+            tracing::warn!(error = %result.unwrap_err(), "session provider catalog watch unavailable; retrying with backoff (repeats are not logged)");
+            outage = true;
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_secs(60));
+    }
+}
+
 #[async_trait]
-impl ProviderResolver for SubcProviderResolver {
+impl ProviderResolver for SubcProviderConnection {
     async fn resolve_provider(&self, capability: &str) -> ProviderResolution {
         let consumer = match self.consumer().await {
             Ok(consumer) => consumer,
@@ -2520,6 +2765,256 @@ pub(super) mod tests {
                 self.release.notified().await;
             }
             answer
+        }
+    }
+
+    async fn wait_provider_watch(resolver: &SubcProviderResolver, live: bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while resolver.cache_health().watch_live != live {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("provider watch did not reach the expected state");
+    }
+
+    #[tokio::test]
+    async fn provider_cache_wire_watch_is_lazy_invalidates_reconnects_and_stops() {
+        use crate::fake_daemon::{DaemonCall, DaemonSnapshot, FakeDaemon, WireDaemon};
+
+        let mut f = Fixture::new("provider-wire-watch", false);
+        let daemon = FakeDaemon::new(DaemonSnapshot::new(1, vec![], vec![]));
+        let connection_file = f.dir.join("subc.json");
+        let _wire = WireDaemon::start(daemon.clone(), &connection_file).await;
+        let resolver = Arc::new(SubcProviderResolver::from_args([
+            "--subc".into(),
+            connection_file.into_os_string(),
+        ]));
+        f.handler.provider_resolver = resolver.clone();
+        assert!(daemon.calls().is_empty());
+        assert!(resolver.connection.consumer.lock().await.is_none());
+        assert!(resolver.watch_task.lock().unwrap().is_none());
+        resolver.resolve_provider(HOST_CAPABILITY).await;
+        wait_provider_watch(&resolver, true).await;
+
+        let lists = || {
+            daemon
+                .calls()
+                .iter()
+                .filter(|call| matches!(call, DaemonCall::CatalogList))
+                .count()
+        };
+        resolver.cache.invalidate(true);
+        let before = lists();
+        for route_id in 100..150 {
+            let route = (route_id, 1);
+            f.bind(route, Some(reserved("host")), false);
+            assert_eq!(
+                f.handler
+                    .route_session_providers(
+                        "projects.session_liveness",
+                        &f.handler.admission_for(route)
+                    )
+                    .await
+                    .host,
+                ProviderResolution::Unprovided,
+            );
+        }
+        assert_eq!(
+            lists() - before,
+            1,
+            "fifty fresh routes share the live cache"
+        );
+        let epoch = resolver.cache.state.lock().unwrap().epoch;
+        daemon.catalog_notice(Some(2));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while resolver.cache.state.lock().unwrap().epoch == epoch {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        resolver.resolve_provider(HOST_CAPABILITY).await;
+        assert_eq!(lists() - before, 2, "a wire notice clears the cache");
+
+        daemon.catalog_notice(None);
+        wait_provider_watch(&resolver, false).await;
+        for _ in 0..3 {
+            resolver.resolve_provider(HOST_CAPABILITY).await;
+        }
+        assert_eq!(
+            lists() - before,
+            5,
+            "closed watch never serves cached answers"
+        );
+        wait_provider_watch(&resolver, true).await;
+        let recovered = lists();
+        resolver.resolve_provider(HOST_CAPABILITY).await;
+        resolver.resolve_provider(HOST_CAPABILITY).await;
+        assert_eq!(lists() - recovered, 1);
+        assert_eq!(
+            daemon
+                .calls()
+                .iter()
+                .filter(|call| matches!(call, DaemonCall::CatalogWatch))
+                .count(),
+            2
+        );
+        let metrics = f.handler.health().await.metrics.unwrap();
+        let health = resolver.cache_health();
+        assert_eq!(metrics["providerCacheHits"], health.hits);
+        assert_eq!(metrics["providerCacheMisses"], health.misses);
+        assert_eq!(metrics["providerWatchLive"], true);
+
+        f.handler
+            .on_draining(
+                subc_client_rs::RouteCloseReason::Restart,
+                std::time::SystemTime::now(),
+            )
+            .await;
+        assert!(!resolver.cache_health().watch_live);
+        assert!(resolver.watch_task.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn provider_cache_fifty_routes_share_one_daemon_resolution() {
+        let mut f = Fixture::new("process-provider-cache", false);
+        f.resolver.set(HOST_CAPABILITY, provider("prefrontal-core"));
+        let gate = GateResolver::new(f.resolver.clone());
+        let cache = Arc::new(CachedProviderResolver::new(gate.clone()));
+        cache.invalidate(true);
+        f.handler.provider_resolver = cache.clone();
+        let f = Arc::new(f);
+        let mut lookups = tokio::task::JoinSet::new();
+        for route_id in 100..150 {
+            let route = (route_id, 1);
+            f.bind(route, Some(reserved("prefrontal-core")), false);
+            let f = f.clone();
+            lookups.spawn(async move {
+                f.handler
+                    .route_session_providers(
+                        "projects.session_liveness",
+                        &f.handler.admission_for(route),
+                    )
+                    .await
+                    .host
+            });
+        }
+        gate.entered.notified().await;
+        assert_eq!(f.resolver.calls(), 1);
+        gate.release.notify_one();
+        while let Some(answer) = lookups.join_next().await {
+            assert_eq!(answer.unwrap(), provider("prefrontal-core"));
+        }
+        assert_eq!(f.resolver.calls(), 1);
+        assert_eq!(cache.cache_health().hits, 49);
+        assert_eq!(cache.cache_health().misses, 1);
+    }
+
+    #[tokio::test]
+    async fn provider_cache_notice_clears_all_capabilities() {
+        let source = FakeResolver::new();
+        source.set(HOST_CAPABILITY, provider("host-old"));
+        source.set(ORCHESTRATOR_CAPABILITY, ProviderResolution::Unprovided);
+        let cache = CachedProviderResolver::new(source.clone());
+        cache.invalidate(true);
+        assert_eq!(
+            cache.resolve_provider(HOST_CAPABILITY).await,
+            provider("host-old")
+        );
+        assert_eq!(
+            cache.resolve_provider(ORCHESTRATOR_CAPABILITY).await,
+            ProviderResolution::Unprovided
+        );
+        source.set(HOST_CAPABILITY, provider("host-new"));
+        source.set(ORCHESTRATOR_CAPABILITY, provider("orchestrator-new"));
+        cache.invalidate(true);
+        assert_eq!(
+            cache.resolve_provider(HOST_CAPABILITY).await,
+            provider("host-new")
+        );
+        assert_eq!(
+            cache.resolve_provider(ORCHESTRATOR_CAPABILITY).await,
+            provider("orchestrator-new")
+        );
+        assert_eq!(source.calls(), 4);
+    }
+
+    #[tokio::test]
+    async fn provider_cache_watch_down_always_resolves_and_recovery_starts_empty() {
+        let source = FakeResolver::new();
+        source.set(HOST_CAPABILITY, provider("host-old"));
+        let cache = CachedProviderResolver::new(source.clone());
+        cache.invalidate(true);
+        cache.resolve_provider(HOST_CAPABILITY).await;
+        cache.invalidate(false);
+        source.set(HOST_CAPABILITY, provider("host-new"));
+        for _ in 0..3 {
+            assert_eq!(
+                cache.resolve_provider(HOST_CAPABILITY).await,
+                provider("host-new")
+            );
+        }
+        assert_eq!(source.calls(), 4);
+        assert!(!cache.cache_health().watch_live);
+        cache.invalidate(true);
+        cache.resolve_provider(HOST_CAPABILITY).await;
+        cache.resolve_provider(HOST_CAPABILITY).await;
+        assert_eq!(source.calls(), 5);
+    }
+
+    #[tokio::test]
+    async fn provider_cache_invalidation_during_resolution_cannot_store_old_answer() {
+        let source = FakeResolver::new();
+        source.set(HOST_CAPABILITY, provider("host-old"));
+        let gate = GateResolver::new(source.clone());
+        let cache = CachedProviderResolver::new(gate.clone());
+        cache.invalidate(true);
+        let lookup = cache.resolve_provider(HOST_CAPABILITY);
+        tokio::pin!(lookup);
+        tokio::select! {
+            _ = gate.entered.notified() => {},
+            _ = &mut lookup => panic!("lookup completed before release"),
+        }
+        cache.invalidate(true);
+        source.set(HOST_CAPABILITY, provider("host-new"));
+        gate.release.notify_one();
+        assert_eq!(lookup.await, provider("host-old"));
+        assert_eq!(
+            cache.resolve_provider(HOST_CAPABILITY).await,
+            provider("host-new")
+        );
+        assert_eq!(source.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn provider_cache_transport_is_never_cached_but_definite_answers_are() {
+        let source = FakeResolver::new();
+        let cache = CachedProviderResolver::new(source.clone());
+        cache.invalidate(true);
+        source.set(
+            HOST_CAPABILITY,
+            ProviderResolution::Transport("offline".into()),
+        );
+        for _ in 0..3 {
+            assert!(matches!(
+                cache.resolve_provider(HOST_CAPABILITY).await,
+                ProviderResolution::Transport(_)
+            ));
+        }
+        assert_eq!(source.calls(), 3);
+        for answer in [
+            provider("host"),
+            ProviderResolution::Unprovided,
+            ProviderResolution::Ambiguous(vec!["first".into(), "second".into()]),
+            ProviderResolution::InvalidIdentifier,
+        ] {
+            cache.invalidate(true);
+            source.set(HOST_CAPABILITY, answer.clone());
+            let before = source.calls();
+            assert_eq!(cache.resolve_provider(HOST_CAPABILITY).await, answer);
+            assert_eq!(cache.resolve_provider(HOST_CAPABILITY).await, answer);
+            assert_eq!(source.calls(), before + 1);
         }
     }
 

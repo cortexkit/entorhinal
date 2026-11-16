@@ -40,6 +40,7 @@ impl DaemonSnapshot {
 pub(crate) enum DaemonCall {
     SupervisorList,
     CatalogList,
+    CatalogWatch,
     Open {
         target: RouteTarget,
         principal: String,
@@ -57,6 +58,7 @@ pub(crate) struct FakeDaemon {
     calls: Arc<Mutex<Vec<DaemonCall>>>,
     participant: Option<Arc<crate::fake_participant::FakeParticipant>>,
     request_bytes: Arc<Mutex<Vec<Vec<u8>>>>,
+    catalog_notices: tokio::sync::broadcast::Sender<Option<u64>>,
 }
 
 impl FakeDaemon {
@@ -66,6 +68,7 @@ impl FakeDaemon {
             calls: Arc::new(Mutex::new(Vec::new())),
             participant: None,
             request_bytes: Arc::default(),
+            catalog_notices: tokio::sync::broadcast::channel(16).0,
         }
     }
 
@@ -87,6 +90,11 @@ impl FakeDaemon {
 
     pub(crate) fn calls(&self) -> Vec<DaemonCall> {
         self.calls.lock().unwrap().clone()
+    }
+
+    /// `None` ends open catalog subscriptions; a generation sends a notice.
+    pub(crate) fn catalog_notice(&self, generation: Option<u64>) {
+        self.catalog_notices.send(generation).unwrap();
     }
 
     fn admit(&self, target: &RouteTarget, principal: &str) -> Result<(), TransportError> {
@@ -222,8 +230,16 @@ impl WireDaemon {
         };
         write_atomic(connection_file, &info).unwrap();
         let task = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            serve_wire(daemon, info, stream).await;
+            let mut peers = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    peer = peers.join_next(), if !peers.is_empty() => { peer.unwrap().unwrap(); },
+                    accepted = listener.accept() => {
+                        let (stream, _) = accepted.unwrap();
+                        peers.spawn(serve_wire(daemon.clone(), info.clone(), stream));
+                    },
+                }
+            }
         });
         Self { task }
     }
@@ -254,8 +270,39 @@ async fn serve_wire(
     )
     .await
     .unwrap();
+    let (mut reader, mut writer) = stream.into_split();
     let mut routes = BTreeMap::new();
-    while let Ok(Some(frame)) = read_frame(&mut stream).await {
+    let mut catalog_notices = daemon.catalog_notices.subscribe();
+    let mut catalog_watches: Vec<subc_protocol::EnvelopeHeader> = Vec::new();
+    'frames: loop {
+        let next_frame = read_frame(&mut reader);
+        tokio::pin!(next_frame);
+        let frame = loop {
+            tokio::select! {
+            frame = &mut next_frame => match frame {
+                Ok(Some(frame)) => break frame,
+                _ => break 'frames,
+            },
+            notice = catalog_notices.recv(), if !catalog_watches.is_empty() => {
+                let notice = notice.unwrap();
+                for header in &catalog_watches {
+                    let (ty, body) = match notice {
+                        Some(generation) => (FrameType::StreamData, json!({"op":"catalog.watch", "generation":generation})),
+                        None => (FrameType::StreamEnd, json!({})),
+                    };
+                    let reply = Frame::build_with_version(
+                        header.ver, ty, Flags::new(false, Priority::Interactive, false),
+                        header.channel, header.epoch, header.corr, serde_json::to_vec(&body).unwrap(),
+                    ).unwrap();
+                    if write_frame(&mut writer, &reply).await.is_err() || writer.flush().await.is_err() {
+                        return;
+                    }
+                }
+                if notice.is_none() { catalog_watches.clear(); }
+                continue;
+            },
+            }
+        };
         let (ty, body) = if frame.header.ty == FrameType::Ping {
             (FrameType::Pong, vec![])
         } else if frame.header.ty != FrameType::Request {
@@ -274,6 +321,28 @@ async fn serve_wire(
                     Ok(
                         json!({"op": "catalog.list", "generation": list.generation, "modules": list.modules, "subc_ops": []}),
                     )
+                }
+                "catalog.watch" => {
+                    daemon.calls.lock().unwrap().push(DaemonCall::CatalogWatch);
+                    catalog_watches.push(frame.header);
+                    let generation = daemon.snapshot.lock().unwrap().catalog.generation;
+                    let reply = Frame::build_with_version(
+                        frame.header.ver,
+                        FrameType::StreamData,
+                        Flags::new(false, Priority::Interactive, false),
+                        frame.header.channel,
+                        frame.header.epoch,
+                        frame.header.corr,
+                        serde_json::to_vec(&json!({"op":"catalog.watch", "generation":generation}))
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    if write_frame(&mut writer, &reply).await.is_err()
+                        || writer.flush().await.is_err()
+                    {
+                        break;
+                    }
+                    continue;
                 }
                 "route.open" => {
                     let identity = request["identity"].as_object().unwrap();
@@ -361,7 +430,7 @@ async fn serve_wire(
             body,
         )
         .unwrap();
-        if write_frame(&mut stream, &reply).await.is_err() || stream.flush().await.is_err() {
+        if write_frame(&mut writer, &reply).await.is_err() || writer.flush().await.is_err() {
             break;
         }
     }

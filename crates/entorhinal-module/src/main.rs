@@ -1214,6 +1214,7 @@ impl ModuleHandler for ProjectsHandler {
         // channel. The blocking worker rolls back while preserving the pending
         // entry for log-read recovery, rather than holding a batch open at stop.
         self.draining.send_replace(true);
+        self.provider_resolver.stop().await;
     }
 
     fn control_ops(&self) -> Vec<String> {
@@ -1415,7 +1416,8 @@ impl ModuleHandler for ProjectsHandler {
             (!ready).then(|| "projects storage is not ready".to_string())
         };
         let catalog = self.health.catalog.report();
-        HealthReport {
+        let providers = self.provider_resolver.cache_health();
+        let mut report = HealthReport {
             status,
             detail,
             metrics: Some(self.health.bus_changes_metrics(self.health.cut_release_metrics(self.health.origin.metrics(self.session_upkeep.metrics(self.session_binding_metrics(json!({
@@ -1466,7 +1468,13 @@ impl ModuleHandler for ProjectsHandler {
                     "watchNoticesSent": self.health.watch_notices.load(Ordering::Relaxed),
                     "watchResyncsSent": self.health.watch_resyncs.load(Ordering::Relaxed),
             }))))))),
+        };
+        if let Some(metrics) = report.metrics.as_mut() {
+            metrics["providerCacheHits"] = json!(providers.hits);
+            metrics["providerCacheMisses"] = json!(providers.misses);
+            metrics["providerWatchLive"] = json!(providers.watch_live);
         }
+        report
     }
 }
 
