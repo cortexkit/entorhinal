@@ -1,4 +1,4 @@
-//! Revision hints only. Consumers re-read the owning operation for actual data.
+//! Revision hints and acknowledged placement facts on the same bus connection.
 
 use std::{
     collections::BTreeMap,
@@ -11,7 +11,7 @@ use cortexkit_bus_client::{BusClient, BusClientOptions};
 use cortexkit_bus_naming::AccountNames;
 use cortexkit_bus_nats::NatsRegister;
 use cortexkit_bus_trait::Register;
-use entorhinal_core::{user_profile::UserGetRequest, RegistryStore};
+use entorhinal_core::{placement::PlacementFact, user_profile::UserGetRequest, RegistryStore};
 use serde::Serialize;
 use tokio::sync::{watch, Notify};
 
@@ -48,6 +48,7 @@ struct Catalog {
 pub(super) trait Sink: Send {
     async fn ready(&mut self) -> Result<(), String>;
     async fn put(&mut self, key: &str, value: Vec<u8>) -> Result<(), String>;
+    async fn publish(&mut self, fact_id: &str, body: Vec<u8>) -> Result<(), String>;
     async fn connection_changed(&mut self);
 }
 
@@ -60,7 +61,7 @@ struct BusSink {
 }
 
 impl BusSink {
-    async fn register(&mut self) -> Result<&NatsRegister, String> {
+    async fn client(&mut self) -> Result<&BusClient, String> {
         if let Some(changes) = self.changes.as_mut() {
             match changes.has_changed() {
                 Ok(true) => {
@@ -89,6 +90,11 @@ impl BusSink {
             self.changes = Some(client.connection_changes());
             self.client = Some(client);
         }
+        Ok(self.client.as_ref().expect("connected client"))
+    }
+
+    async fn register(&mut self) -> Result<&NatsRegister, String> {
+        self.client().await?;
         if self.register.is_none() {
             let client = self.client.as_ref().expect("connected client");
             let bucket = AccountNames::derive(client.acct())
@@ -123,6 +129,15 @@ impl Sink for BusSink {
             self.register = None;
         }
         result.map(|_| ())
+    }
+
+    async fn publish(&mut self, fact_id: &str, body: Vec<u8>) -> Result<(), String> {
+        self.client()
+            .await?
+            .publish_event("placement_fact", 1, None, fact_id, body)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
     async fn connection_changed(&mut self) {
@@ -203,6 +218,58 @@ impl ProjectsHandler {
 }
 
 impl Worker {
+    async fn placement_sql<T: Send + 'static>(
+        &self,
+        action: impl FnOnce(RegistryStore) -> Result<T, entorhinal_core::RegistryError> + Send + 'static,
+    ) -> Result<T, String> {
+        let slot = self.store.clone();
+        tokio::task::spawn_blocking(self.sql.tracked(move || {
+            let slot = slot.upgrade().ok_or("placement store unavailable")?;
+            let store = slot
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or("placement store unavailable")?;
+            drop(slot);
+            if store.is_foreign() {
+                return Err("placement store is foreign".into());
+            }
+            action(store).map_err(|e| e.to_string())
+        }))
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn publish_placement(&self, sink: &mut impl Sink) -> Result<bool, String> {
+        let state = self
+            .placement_sql(|store| store.placement_publication())
+            .await?;
+        self.health
+            .placement_facts_published
+            .store(state.published, Ordering::Relaxed);
+        self.health
+            .placement_facts_unpublished
+            .store(state.unpublished, Ordering::Relaxed);
+        let Some(fact) = state.next else {
+            return Ok(false);
+        };
+        let body = placement_body(&fact)?;
+        sink.publish(&fact.fact_id, body).await?;
+        // The read job owns no store lease by the time the bus await begins.
+        // Only an acknowledged message earns a local checkpoint.
+        self.placement_sql(move |store| {
+            store.placement_mark_published(&fact.fact_id, super::unix_millis())
+        })
+        .await?;
+        self.health
+            .placement_facts_published
+            .fetch_add(1, Ordering::Relaxed);
+        self.health
+            .placement_facts_unpublished
+            .fetch_sub(1, Ordering::Relaxed);
+        Ok(true)
+    }
+
     async fn snapshot(&self) -> Result<Option<Values>, String> {
         let slot = self.store.clone();
         let incarnation = self.incarnation.clone();
@@ -282,7 +349,7 @@ impl Worker {
             if self.store.strong_count() == 0 {
                 return;
             }
-            let result = match self.snapshot().await {
+            let markers = match self.snapshot().await {
                 Ok(Some(values)) => publish(&mut sink, &mut last, values, &self.health).await,
                 Ok(None) => {
                     tokio::time::sleep(INITIAL_BACKOFF).await;
@@ -290,6 +357,11 @@ impl Worker {
                 }
                 Err(error) => Err(error),
             };
+            // Try both outputs even when one fails: a missing KV bucket must
+            // not strand facts, and an EVENT outage must not strand markers.
+            let placement = self.publish_placement(&mut sink).await;
+            let more = matches!(placement, Ok(true));
+            let result = markers.and(placement.map(|_| ()));
             if let Err(error) = result {
                 self.health
                     .bus_changes_connected
@@ -313,6 +385,9 @@ impl Worker {
                 failed_attempts = 0;
             }
             backoff = INITIAL_BACKOFF;
+            if more {
+                continue;
+            }
             #[cfg(test)]
             self.idle.notify_one();
             tokio::select! {
@@ -326,6 +401,14 @@ impl Worker {
             }
         }
     }
+}
+
+pub(super) fn placement_body(fact: &PlacementFact) -> Result<Vec<u8>, String> {
+    let body = serde_json::to_vec(fact).map_err(|e| e.to_string())?;
+    if body.len() >= 4096 {
+        return Err("placement fact must be under 4 KiB".into());
+    }
+    Ok(body)
 }
 
 fn encode(value: &impl Serialize) -> Result<Vec<u8>, String> {
@@ -357,6 +440,19 @@ async fn publish(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bus_changes_placement_body_bounded() {
+        let fact = PlacementFact {
+            fact_id: "x".repeat(4096),
+            supersedes: None,
+            project_id: "project".into(),
+            workspace_id: None,
+            effective_from_ms: 0,
+            recorded_at_ms: 0,
+        };
+        assert!(placement_body(&fact).is_err());
+    }
 
     #[test]
     fn bus_changes_marker_bytes_are_ordered_and_bounded() {

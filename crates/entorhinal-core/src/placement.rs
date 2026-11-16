@@ -2,7 +2,7 @@
 //! that would recalculate timestamps or ids during replay.
 use std::collections::{BTreeMap, BTreeSet};
 
-use rusqlite::{params, Connection, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -28,6 +28,13 @@ CREATE TABLE placement_state (
 );
 "#;
 
+pub(crate) const V22_PLACEMENT_PUBLISHED: &str = r#"
+CREATE TABLE placement_fact_published (
+    fact_id TEXT PRIMARY KEY,
+    published_at_ms INTEGER NOT NULL
+);
+"#;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlacementFact {
@@ -37,6 +44,12 @@ pub struct PlacementFact {
     pub workspace_id: Option<String>,
     pub effective_from_ms: i64,
     pub recorded_at_ms: i64,
+}
+
+pub struct PublicationState {
+    pub next: Option<PlacementFact>,
+    pub published: u64,
+    pub unpublished: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,6 +193,24 @@ pub(crate) fn replay_facts(tx: &Transaction<'_>, payload: &Value) -> rusqlite::R
 }
 
 impl RegistryStore {
+    /// Machine-local delivery checkpoints do not travel with the shared facts.
+    pub fn placement_publication(&self) -> Result<PublicationState, RegistryError> {
+        self.read(|conn| {
+            let unpublished = conn.query_row("SELECT count(*) FROM placement_fact f WHERE NOT EXISTS (SELECT 1 FROM placement_fact_published p WHERE p.fact_id=f.fact_id)", [], |r| r.get(0))?;
+            let published = conn.query_row("SELECT count(*) FROM placement_fact f JOIN placement_fact_published p USING(fact_id)", [], |r| r.get(0))?;
+            let next = conn.query_row("SELECT fact_id,supersedes,project_id,workspace_id,effective_from_ms,recorded_at_ms FROM placement_fact f WHERE NOT EXISTS (SELECT 1 FROM placement_fact_published p WHERE p.fact_id=f.fact_id) ORDER BY pos LIMIT 1", [], |r| Ok(PlacementFact { fact_id:r.get(0)?,supersedes:r.get(1)?,project_id:r.get(2)?,workspace_id:r.get(3)?,effective_from_ms:r.get(4)?,recorded_at_ms:r.get(5)? })).optional()?;
+            Ok(PublicationState { next, published, unpublished })
+        })
+    }
+
+    /// Call only after the bus server acknowledges the fact's message id.
+    pub fn placement_mark_published(&self, fact_id: &str, now: i64) -> Result<(), RegistryError> {
+        self.db.with_conn_fenced(|tx| {
+            tx.execute("INSERT OR IGNORE INTO placement_fact_published(fact_id,published_at_ms) VALUES(?1,?2)", params![fact_id,now])?;
+            Ok(())
+        }).map_err(RegistryError::Store)
+    }
+
     pub fn placement_read(
         &self,
         request: ReadRequest,

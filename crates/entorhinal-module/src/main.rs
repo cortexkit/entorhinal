@@ -391,6 +391,8 @@ struct HealthGauges {
     bus_changes_puts: AtomicU64,
     bus_changes_failures: AtomicU64,
     bus_changes_connected: AtomicBool,
+    placement_facts_published: AtomicU64,
+    placement_facts_unpublished: AtomicU64,
     origin: store_origin::Origin,
     catalog: catalog_poll::Gauges,
     store_ready: AtomicBool,
@@ -469,6 +471,10 @@ impl HealthGauges {
         metrics["busChangesPuts"] = json!(self.bus_changes_puts.load(Ordering::Relaxed));
         metrics["busChangesFailures"] = json!(self.bus_changes_failures.load(Ordering::Relaxed));
         metrics["busChangesConnected"] = json!(self.bus_changes_connected.load(Ordering::Relaxed));
+        metrics["placementFactsPublished"] =
+            json!(self.placement_facts_published.load(Ordering::Relaxed));
+        metrics["placementFactsUnpublished"] =
+            json!(self.placement_facts_unpublished.load(Ordering::Relaxed));
         metrics
     }
 

@@ -31,6 +31,13 @@ a query or a mutation; `ck-entorhinal --manifest` prints it.
   same-workspace assignment produces none. Snapshots carry facts and activation
   to joined machines. Backfill ids are `b:<author>:<seq>:<project_id>`; later ids
   are `e:<entry_id>:<project_id>`. Request-key retries add nothing.
+- The existing bus publisher also sends each unpublished fact, in insertion
+  order, to `ck.{acct}.event.entorhinal.placement_fact.v1`. The body is exactly
+  the serialized fact object above, including null fields and without a result
+  wrapper, and must be under 4 KiB. `Nats-Msg-Id` is the `fact_id`. Local
+  checkpoints are written only after the EVENT server acknowledges delivery;
+  remote-applied facts are published too. Failures retry with the change
+  publisher's backoff, independently of KV marker updates.
 
 ## Capabilities
 
@@ -61,8 +68,12 @@ See [agent-move-contract.md](agent-move-contract.md) section 11.
 
 The bus publisher adds `busChangesPuts` (successful KV puts),
 `busChangesFailures` (failed publishing attempts) and `busChangesConnected`
-(whether the last publishing pass could open and use the bucket). All are
-cached atomics; a bus outage never delays health or registry reads.
+(whether the last publishing pass succeeded for both the KV change markers
+described below and placement facts).
+`placementFactsPublished` counts current facts with a local acknowledged
+checkpoint; `placementFactsUnpublished` counts current facts still awaiting one.
+Checkpoints whose facts no longer exist do not count. All are cached atomics;
+a bus outage never delays health or registry reads.
 
 ## Bus change markers
 

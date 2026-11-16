@@ -736,6 +736,7 @@ mod tests {
                     // which pinned flows it polls every ten minutes.
                     "catalog_status_confirmation",
                     "catalog_fast_lane",
+                    "placement_fact_published",
                     "catalog_starter_proof",
                     "catalog_publisher_grant",
                     "catalog_audit",

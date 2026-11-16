@@ -6,7 +6,7 @@ use tokio::sync::{mpsc, Notify};
 use tokio::time::{timeout, Duration};
 
 #[derive(Default)]
-struct Control {
+pub(super) struct Control {
     fail: AtomicBool,
     attempts: AtomicU64,
     attempted: Notify,
@@ -14,11 +14,16 @@ struct Control {
     entered: Notify,
     release: Notify,
     reconnected: Notify,
+    publish_fail: AtomicBool,
+    publish_block: AtomicBool,
+    publish_attempted: Notify,
+    publish_release: Notify,
 }
 
 struct FakeSink {
     control: Arc<Control>,
     puts: mpsc::UnboundedSender<(String, Vec<u8>)>,
+    events: mpsc::UnboundedSender<(String, Vec<u8>)>,
 }
 
 #[async_trait::async_trait]
@@ -44,32 +49,55 @@ impl Sink for FakeSink {
     async fn connection_changed(&mut self) {
         self.control.reconnected.notified().await
     }
+
+    async fn publish(&mut self, fact_id: &str, body: Vec<u8>) -> Result<(), String> {
+        self.events.send((fact_id.into(), body)).unwrap();
+        self.control.publish_attempted.notify_one();
+        if self.control.publish_block.swap(false, Ordering::Relaxed) {
+            self.control.publish_release.notified().await;
+        }
+        if self.control.publish_fail.load(Ordering::Relaxed) {
+            return Err("EVENT unavailable".into());
+        }
+        Ok(())
+    }
 }
 
-struct Published {
+pub(super) struct Published {
     control: Arc<Control>,
     puts: mpsc::UnboundedReceiver<(String, Vec<u8>)>,
+    events: mpsc::UnboundedReceiver<(String, Vec<u8>)>,
     idle: Arc<Notify>,
 }
 
 impl Published {
-    fn start(handler: &ProjectsHandler, control: Arc<Control>) -> Self {
+    pub(super) fn start(handler: &ProjectsHandler, control: Arc<Control>) -> Self {
         let (puts, receiver) = mpsc::unbounded_channel();
+        let (events, event_receiver) = mpsc::unbounded_channel();
         let idle = handler.start_bus_changes_with_sink(FakeSink {
             control: control.clone(),
             puts,
+            events,
         });
         Self {
             control,
             puts: receiver,
+            events: event_receiver,
             idle,
         }
     }
 
-    async fn idle(&self) {
+    pub(super) async fn idle(&self) {
         timeout(Duration::from_secs(5), self.idle.notified())
             .await
             .expect("publisher idle");
+    }
+
+    pub(super) async fn event(&mut self) -> (String, Vec<u8>) {
+        timeout(Duration::from_secs(5), self.events.recv())
+            .await
+            .unwrap()
+            .unwrap()
     }
 
     async fn take(&mut self, expected: &[&str]) -> BTreeMap<String, Value> {
@@ -97,6 +125,238 @@ impl Published {
             Err(mpsc::error::TryRecvError::Empty)
         ));
     }
+}
+
+fn placement_commit(
+    store: &RegistryStore,
+    id: &str,
+    action: impl Fn() -> Result<Vec<u8>, entorhinal_core::RegistryError>,
+) {
+    let head = store.identity_log_status().unwrap().last_applied_position;
+    store
+        .shared_attempt(
+            id.into(),
+            head,
+            move |_| entorhinal_core::SharedSettlement::Commit(head + 1),
+            action,
+        )
+        .unwrap();
+}
+
+fn backfill(f: &Fixture) {
+    let store = f.handler.with_store(|s| Ok(s.clone())).unwrap();
+    store
+        .apply_entry("identity_log.enable", "{}", "operator", None, |tx| {
+            tx.execute(
+                "UPDATE identity_log_state SET state='enabled' WHERE id=1",
+                [],
+            )?;
+            tx.execute(
+                "INSERT INTO self_identity VALUES(1,?1,1)",
+                ["ab".repeat(16)],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    placement_commit(&store, "backfill", || {
+        store
+            .with_principal("test")
+            .placement_backfill(Default::default(), 702)
+    });
+}
+
+fn assign(f: &Fixture) {
+    let store = f.handler.with_store(|s| Ok(s.clone())).unwrap();
+    placement_commit(&store, "assign", || {
+        store.with_principal("test").assign_workspace_at(
+            entorhinal_core::AssignWorkspaceRequest {
+                project_id: "served-project".into(),
+                workspace_id: "other".into(),
+                ..Default::default()
+            },
+            703,
+        )
+    });
+}
+
+fn publication(f: &Fixture) -> entorhinal_core::placement::PublicationState {
+    f.handler.with_store(|s| s.placement_publication()).unwrap()
+}
+
+#[tokio::test]
+async fn bus_changes_placement_pos_order_and_exact_bodies() {
+    let f = Fixture::new("bus-placement-order").await;
+    backfill(&f);
+    assign(&f);
+    let facts = f
+        .handler
+        .with_store(|s| s.placement_read(Default::default(), INCARNATION))
+        .unwrap()
+        .facts;
+    assert_eq!(facts.len(), 2);
+    let mut published = Published::start(&f.handler, Arc::default());
+    for fact in facts {
+        let (id, body) = published.event().await;
+        assert_eq!(id, fact.fact_id);
+        assert_eq!(body, serde_json::to_vec(&fact).unwrap());
+        assert!(body.len() < 4096);
+        assert!(String::from_utf8(body)
+            .unwrap()
+            .contains("\"supersedes\":null"));
+    }
+    published.idle().await;
+    assert_eq!(publication(&f).published, 2);
+    assert_eq!(publication(&f).unpublished, 0);
+    let health = f.handler.health().await.metrics.unwrap();
+    assert_eq!(health["placementFactsPublished"], 2);
+    assert_eq!(health["placementFactsUnpublished"], 0);
+    f.handler.stop_bus_changes().await;
+}
+
+#[tokio::test]
+async fn bus_changes_placement_failed_publish_retries_only_marks_after_ack() {
+    let f = Fixture::new("bus-placement-retry").await;
+    backfill(&f);
+    let control = Arc::new(Control::default());
+    control.publish_fail.store(true, Ordering::Relaxed);
+    let mut published = Published::start(&f.handler, control);
+    let first = published.event().await;
+    assert_eq!(publication(&f).published, 0);
+    assert_eq!(publication(&f).unpublished, 1);
+    published
+        .control
+        .publish_block
+        .store(true, Ordering::Relaxed);
+    published
+        .control
+        .publish_fail
+        .store(false, Ordering::Relaxed);
+    assert_eq!(published.event().await, first);
+    f.handler.bus_changes_sql.wait().await;
+    assert_eq!(publication(&f).published, 0);
+    // No lease survives the bus await: even closing and reopening the store
+    // is safe while the server acknowledgement is pending.
+    f.handler.catalog_sql.wait().await;
+    f.handler.store.lock().unwrap().take();
+    let store = RegistryStore::open(&f.descriptor).unwrap();
+    *f.handler.store.lock().unwrap() = Some(store);
+    published.control.publish_release.notify_one();
+    published.idle().await;
+    assert_eq!(publication(&f).published, 1);
+    assert_eq!(publication(&f).unpublished, 0);
+    f.handler.stop_bus_changes().await;
+}
+
+#[tokio::test]
+async fn bus_changes_placement_restart_does_not_republish() {
+    let f = Fixture::new("bus-placement-restart").await;
+    backfill(&f);
+    let mut first = Published::start(&f.handler, Arc::default());
+    first.event().await;
+    first.idle().await;
+    f.handler.stop_bus_changes().await;
+    f.handler.catalog_sql.wait().await;
+    f.handler.store.lock().unwrap().take();
+    *f.handler.store.lock().unwrap() = Some(RegistryStore::open(&f.descriptor).unwrap());
+    let mut restarted = Published::start(&f.handler, Arc::default());
+    restarted.take(KEYS).await;
+    restarted.idle().await;
+    assert!(matches!(
+        restarted.events.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    assert_eq!(publication(&f).published, 1);
+    f.handler.stop_bus_changes().await;
+}
+
+#[tokio::test]
+async fn bus_changes_placement_failure_keeps_markers_updating() {
+    let f = Fixture::new("bus-placement-markers").await;
+    backfill(&f);
+    let control = Arc::new(Control::default());
+    control.publish_fail.store(true, Ordering::Relaxed);
+    let mut published = Published::start(&f.handler, control);
+    let initial = published.take(KEYS).await;
+    published.event().await;
+    assign(&f);
+    f.handler.commits.notify_waiters();
+    let updated = published.take(&["registry"]).await;
+    assert!(
+        updated["registry"]["generation"].as_i64() > initial["registry"]["generation"].as_i64()
+    );
+    assert_eq!(publication(&f).published, 0);
+    f.handler.stop_bus_changes().await;
+}
+
+#[tokio::test]
+async fn bus_changes_placement_publishes_while_kv_bucket_fails() {
+    let f = Fixture::new("bus-placement-kv-failure").await;
+    backfill(&f);
+    let control = Arc::new(Control::default());
+    control.fail.store(true, Ordering::Relaxed);
+    let mut published = Published::start(&f.handler, control);
+    published.event().await;
+    // The next pass observes the durable checkpoint even though KV still fails.
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if publication(&f).published == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(publication(&f).unpublished, 0);
+    published.quiet();
+    f.handler.stop_bus_changes().await;
+}
+
+#[tokio::test]
+async fn bus_changes_placement_remote_apply_wakes_publisher() {
+    let mut f = Fixture::new("bus-placement-remote").await;
+    let log = crate::fake_log::FakeLog::default();
+    let store = f.handler.store.lock().unwrap().take().unwrap();
+    f.handler =
+        ProjectsHandler::with_log_connector(INCARNATION.into(), || 700, Arc::new(log.clone()));
+    *f.handler.store.lock().unwrap() = Some(store);
+    f.handler
+        .with_store(|s| {
+            s.apply_entry("identity_log.enable", "{}", "test", None, |tx| {
+                tx.execute("UPDATE identity_log_state SET state='enabled'", [])?;
+                Ok(())
+            })
+        })
+        .unwrap();
+    let mut published = Published::start(&f.handler, Arc::default());
+    published.take(KEYS).await;
+    published.idle().await;
+    let fact = entorhinal_core::placement::PlacementFact {
+        fact_id: "e:remote:served-project".into(),
+        supersedes: None,
+        project_id: "served-project".into(),
+        workspace_id: None,
+        effective_from_ms: 900,
+        recorded_at_ms: 900,
+    };
+    let mut row = serde_json::to_value(&fact).unwrap();
+    row["pos"] = json!(1);
+    log.client().append(&crate::log_client::AppendRequest {
+        expected_head: 0, entry_id: [0x55;16], kind: crate::log_client::EntryKind::Change,
+        data: serde_json::to_vec(&json!({"op":"project.shared","tables":{"placement_fact":{"upsert":[row],"delete":[]}}})).unwrap(),
+    }).await.unwrap();
+    let store = f.handler.with_store(|s| Ok(s.clone())).unwrap();
+    f.handler
+        .catch_up(&store, tokio::time::Instant::now() + Duration::from_secs(5))
+        .await
+        .unwrap();
+    drop(store);
+    let (id, body) = published.event().await;
+    assert_eq!(id, fact.fact_id);
+    assert_eq!(body, serde_json::to_vec(&fact).unwrap());
+    published.idle().await;
+    assert_eq!(publication(&f).published, 1);
+    f.handler.stop_bus_changes().await;
 }
 
 const KEYS: &[&str] = &[
@@ -245,6 +505,21 @@ async fn bus_changes_missing_bucket_retries_and_recovers_without_blocking_reads_
         Duration::from_secs(5),
         published.control.attempted.notified(),
     )
+    .await
+    .unwrap();
+    // Both outputs are attempted before recording an outage. The placement
+    // read may still be on the blocking pool after the fake KV attempt wakes us.
+    timeout(Duration::from_secs(1), async {
+        while f
+            .handler
+            .health
+            .bus_changes_failures
+            .load(Ordering::Relaxed)
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
     .await
     .unwrap();
     assert!(!f

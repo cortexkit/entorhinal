@@ -5832,6 +5832,35 @@ async fn served_vectors_placement_facts_v1() {
             .await
             .0,
     );
+    let facts = store
+        .placement_read(Default::default(), INCARNATION)
+        .unwrap()
+        .facts;
+    drop(store);
+    let mut publisher = bus_changes_tests::Published::start(&f.handler, Arc::default());
+    let subject = cortexkit_bus_naming::AccountNames::derive("fixture")
+        .unwrap()
+        .event_subject("entorhinal", "placement_fact", 1)
+        .unwrap()
+        .replacen("fixture", "{acct}", 1);
+    let mut events = Vec::new();
+    for (index, fact) in facts.iter().enumerate() {
+        let (id, body) = publisher.event().await;
+        assert_eq!(id, fact.fact_id);
+        assert_eq!(body, serde_json::to_vec(fact).unwrap());
+        if index == 0 || id == "e:assign:null-project" {
+            let body = String::from_utf8(body).unwrap();
+            assert!(records.iter().any(|record| record.contains(&body)));
+            events.push(format!(
+                "  {}",
+                json!({"subject":subject,"headers":{"Nats-Msg-Id":id},"body":body})
+            ));
+        }
+    }
+    publisher.idle().await;
+    f.handler.stop_bus_changes().await;
+    assert_eq!(events.len(), 2);
+    published_file("placement-facts-v1", "event.json", events);
     published_file("placement-facts-v1", "records.json", records);
 }
 
@@ -5841,10 +5870,28 @@ fn served_vectors_placement_facts_checksums_and_field_order() {
     let directory =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-vectors/placement-facts-v1");
     let records = std::fs::read(directory.join("records.json")).unwrap();
+    let events = std::fs::read(directory.join("event.json")).unwrap();
     assert_eq!(
         std::fs::read_to_string(directory.join("SHA256SUMS")).unwrap(),
-        format!("{:x}  records.json\n", Sha256::digest(&records))
+        format!(
+            "{:x}  records.json\n{:x}  event.json\n",
+            Sha256::digest(&records),
+            Sha256::digest(&events)
+        )
     );
+    let events: Vec<Value> = serde_json::from_slice(&events).unwrap();
+    assert_eq!(events.len(), 2);
+    for event in events {
+        assert_eq!(
+            event["subject"],
+            "ck.{acct}.event.entorhinal.placement_fact.v1"
+        );
+        let body = event["body"].as_str().unwrap();
+        assert!(body.len() < 4096);
+        assert!(std::str::from_utf8(&records).unwrap().contains(body));
+        let fact: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(event["headers"], json!({"Nats-Msg-Id":fact["fact_id"]}));
+    }
     let wire = String::from_utf8(records).unwrap();
     assert!(wire.contains(r#"{"fact_id":"e:register-null:null-project","supersedes":null,"project_id":"null-project","workspace_id":null,"effective_from_ms":703,"recorded_at_ms":703}"#));
 }
