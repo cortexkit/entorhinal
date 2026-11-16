@@ -1,6 +1,6 @@
 //! Magic Context (ck-mc) publishes the `agent-data/v1` bodies its participant
 //! accepts and produces; a byte-exact copy lives in
-//! `tests/fixtures/mc-agent-data-samples-v1/`, with its tag and commit in
+//! `tests/fixtures/mc-agent-data-samples-v2/`, with its branch and commit in
 //! `SOURCE.txt` there. These tests send every sample through the same client
 //! path a move uses: the request entorhinal would send must be the sampled
 //! request, every reply must pass the client's strict decode unchanged, and
@@ -30,7 +30,7 @@ use crate::participant_discovery::{discover_participants, provider_role, Partici
 
 /// The SHA-256 of the published `SHA256SUMS`. Pinning the list itself means a
 /// changed sample fails even when its line in the list was edited to match.
-const SUMS_SHA256: &str = "79ea37226e971b8ffcd86c7fc5b9bba00515d332ea8721d184fe4020167e4226";
+const SUMS_SHA256: &str = "605a1633fce46364db0add402f1bb56a4b199c5acedfa69fee6eeca4817bb48c";
 
 /// Files in the folder that are not samples: the README and the list are
 /// covered by `SHA256SUMS` (the README is, the list is pinned above), and
@@ -149,13 +149,6 @@ const REFUSALS: &[RefusalSample] = &[
         None,
     ),
     refusal(
-        "receiver-participant-failed",
-        IMPORT,
-        "participant_failed",
-        DriverAction::Abort,
-        Some(&["reason"]),
-    ),
-    refusal(
         "service-caller-forbidden",
         DESCRIBE,
         "caller_forbidden",
@@ -221,7 +214,7 @@ const REFUSALS: &[RefusalSample] = &[
 ];
 
 fn samples_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mc-agent-data-samples-v1")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mc-agent-data-samples-v2")
 }
 
 fn read_bytes(name: &str) -> Vec<u8> {

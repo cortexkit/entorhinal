@@ -4,4 +4,4 @@
 crates/*/tests/golden/** -text
 
 # Magic Context's published agent-data samples are checked against their SHA256SUMS.
-crates/entorhinal-module/tests/fixtures/mc-agent-data-samples-v1/** -text
+crates/entorhinal-module/tests/fixtures/mc-agent-data-samples-v2/** -text

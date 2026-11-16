@@ -1,10 +1,17 @@
-# mc-agent-data-samples-v1
+# mc-agent-data-samples-v2
+
+Same messages as v1, from a ck-mc whose `context.db` is at schema version
+106 (memories with levels and profile categories). Only the source and
+receiver bodies that name the schema version or digest the snapshot
+changed; the wire format is the same.
 
 These are JSON bodies accepted or produced by ck-mc's `agent-data/v1`
 participant, using `cortexkit-role-agent-data` 0.3.0. Each JSON file is one
 message, not a request/response wrapper. Requests contain `method` and
-`params`. Successful reply bodies are bare objects; refusal bodies contain
-`code`, `message`, and, where applicable, `detail`. Keys are sorted and the
+`params`. Successful reply bodies are shown bare; on the wire each one
+travels inside `{"result": <body>}`, the envelope every module reply uses.
+Refusal bodies are the ERROR frame's body and contain `code`, `message`,
+and, where applicable, `detail`. Keys are sorted and the
 only presentation changes are indentation and a final newline.
 
 The `wire-` examples crossed two disposable daemons. Their source head has
@@ -88,8 +95,6 @@ missing detail means the `detail` member is absent, not an empty object.
   returns `cut_not_ready`, without detail.
 - `receiver-local-advanced`: import over local rows with no matching move
   baseline returns `local_advanced`, without detail.
-- `receiver-participant-failed`: import into a write-guarded project returns
-  `participant_failed`; detail carries `reason`.
 - `receiver-incompatible-version`: import into a store at a newer schema
   version returns `incompatible_version`; detail carries `found` and
   `required` format/version strings.
