@@ -692,6 +692,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn placement_facts_head_moved_uses_only_committed_entry_id_and_request_retry_adds_nothing(
+    ) {
+        let tap = Tap::new(0);
+        let mut f = Fixture::new("placement-head-moved", connector(&tap));
+        f.store()
+            .apply_entry("fixture.identity", "{}", "test", None, |tx| {
+                tx.execute(
+                    "INSERT INTO self_identity VALUES(1,?1,1)",
+                    ["01".repeat(16)],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        f.handler.operator_confirmer = Arc::new(crate::served_vectors::Approve {
+            summaries: Mutex::new(vec![]),
+        });
+        f.handler.route_admissions().insert(
+            ROUTE,
+            RouteAdmission::from_bind(Some(Principal::Direct), None),
+        );
+        f.call("placement.backfill", json!({})).await.unwrap();
+        f.handler.route_admissions().insert(
+            ROUTE,
+            RouteAdmission::from_bind(
+                Some(Principal::Reserved {
+                    module_id: WRITER_MODULE.into(),
+                }),
+                None,
+            ),
+        );
+        tap.races.store(1, Ordering::SeqCst);
+        let request = register("P", "placement-retry");
+        let first = f.call("register", request.clone()).await.unwrap();
+        let sends = tap.sends();
+        assert_eq!(sends.len(), 3);
+        assert_ne!(sends[1]["entry_id"], sends[2]["entry_id"]);
+        let page = f
+            .store()
+            .placement_read(Default::default(), "test")
+            .unwrap();
+        assert_eq!(page.facts.len(), 1);
+        let fact = page
+            .facts
+            .iter()
+            .find(|fact| fact.project_id == "P")
+            .unwrap();
+        assert_eq!(
+            fact.fact_id,
+            format!("e:{}:P", sends[2]["entry_id"].as_str().unwrap())
+        );
+        assert_eq!(f.call("register", request).await.unwrap(), first);
+        assert_eq!(
+            f.store()
+                .placement_read(Default::default(), "test")
+                .unwrap()
+                .facts,
+            page.facts
+        );
+        assert_eq!(tap.sends().len(), 3);
+        assert!(f.store().verify().unwrap().replay.ok);
+    }
+
+    #[tokio::test]
     async fn create_defaults_are_atomic_explicit_avatars_win_and_entropy_failure_refuses() {
         fn failed_entropy() -> Result<entorhinal_core::agent::StoredAgentAvatar, HandlerError> {
             Err(HandlerError::new("storage_error", "entropy unavailable"))
@@ -1199,6 +1262,7 @@ mod tests {
                     json!({"canonicalRoot":crate::tests::canonical_test_path(&f.dir)}),
                 ),
                 ("enumerate", json!({})),
+                ("placement.read", json!({})),
                 ("verify", json!({})),
                 ("agent.resolve", json!({"agent_id":id})),
             ] {
@@ -2683,6 +2747,7 @@ mod tests {
 
 #[derive(Clone)]
 enum Write {
+    PlacementBackfill(entorhinal_core::placement::BackfillRequest),
     ManifestAvatar(Arc<agent_ops::AvatarBatchApproval>, usize),
     CatalogInstall(String, Box<entorhinal_core::agent::consent::ConsentCommit>),
     Consent(
@@ -2709,6 +2774,9 @@ enum Write {
 impl Write {
     fn decode(method: &str, params: Value) -> Result<Self, HandlerError> {
         Ok(match method {
+            "placement.backfill" => {
+                Self::PlacementBackfill(serde_json::from_value(params).map_err(invalid_params)?)
+            }
             super::user_profile::SET => Self::User(super::user_profile::decode_set(params)?),
             "project.set_domain" => {
                 Self::Domain(serde_json::from_value(params).map_err(invalid_params)?)
@@ -2746,6 +2814,7 @@ impl Write {
         principal: &str,
     ) -> Result<Option<Vec<u8>>, HandlerError> {
         let key = match self {
+            Self::PlacementBackfill(r) => r.request_key.as_deref(),
             Self::User(req) => return store.probe_user_set(req).map_err(Into::into),
             Self::ManifestAvatar(approval, index) => return approval.probe(store, *index),
             Self::Consent(_, commit) | Self::CatalogInstall(_, commit) => {
@@ -2801,6 +2870,7 @@ impl Write {
             .with_create_avatar(avatar)
             .with_confirmation(placement_confirmation(principal, approval));
         match self {
+            Self::PlacementBackfill(r) => writer.placement_backfill(r, now),
             Self::User(req) => writer.user_set(req, now, approval),
             Self::ManifestAvatar(approval, index) => return approval.apply(store, index, now),
             Self::CatalogInstall(id, commit) => {
@@ -2917,6 +2987,7 @@ fn shared_candidate(op: &str) -> bool {
     matches!(
         op,
         "project.set_domain"
+            | "placement.backfill"
             | "user.set"
             | "workspace.set_document"
             | "register"
@@ -3069,7 +3140,11 @@ impl ProjectsHandler {
         let direct = !agent_write
             && matches!(admission.principal, Some(Principal::Direct))
             && (agent_ops::CONFIRMABLE_METHODS.contains(&request.method.as_str())
-                || request.method == super::user_profile::SET);
+                || request.method == super::user_profile::SET
+                || request.method == "placement.backfill");
+        if request.method == "placement.backfill" {
+            authorize_write(&request.method, admission.principal.as_ref())?;
+        }
         if request.method == super::user_profile::SET {
             super::user_profile::admit(admission.principal.as_ref(), admission.flow_id.as_deref())?;
         }
@@ -3198,7 +3273,15 @@ impl ProjectsHandler {
         let mut approval = None;
         let mut budget_start = received;
         if direct {
-            let precheck = if let Some(Write::User(req)) = &prepared {
+            let precheck = if let Some(Write::PlacementBackfill(req)) = &prepared {
+                if let Some(body) =
+                    store.shared_request_cache("placement.backfill", req.request_key.as_deref())?
+                {
+                    AgentPrecheck::Cached(body)
+                } else {
+                    AgentPrecheck::Ready(store.placement_backfill_precheck()?)
+                }
+            } else if let Some(Write::User(req)) = &prepared {
                 store.precheck_user_confirmation(req)?
             } else {
                 store.precheck_agent_confirmation(

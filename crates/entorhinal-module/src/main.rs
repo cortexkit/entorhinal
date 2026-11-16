@@ -705,6 +705,7 @@ const PROJECTS_ENUMERATE_CONTROL_OP: &str = "projects.enumerate";
 const CONTROL_ENUMERATE_DEADLINE: Duration = Duration::from_secs(5);
 
 const MUTATING_METHODS: &[&str] = &[
+    "placement.backfill",
     user_profile::SET,
     store_origin::ADOPT,
     "project.set_domain",
@@ -813,6 +814,7 @@ fn authorize_write(method: &str, principal: Option<&Principal>) -> Result<(), Ha
         return Ok(());
     }
     if method == store_origin::ADOPT
+        || method == "placement.backfill"
         || method == "move_root_to_new_project"
         || method == "identity_log.enable"
         || catalog_ops::WRITES.contains(&method)
@@ -1773,6 +1775,22 @@ impl ProjectsHandler {
                 "served_path_required",
                 "store adoption requires operator confirmation on the served path",
             )),
+            "placement.backfill" => Err(HandlerError::new(
+                "operator_presence_unavailable",
+                "placement backfill requires the served confirmation path",
+            )),
+            "placement.read" => {
+                let request = serde_json::from_value(request.params)
+                    .map_err(|e| HandlerError::new("invalid_request", e.to_string()))?;
+                #[derive(Serialize)]
+                struct Reply {
+                    result: entorhinal_core::placement::PlacementPage,
+                }
+                let result =
+                    self.with_store(|store| store.placement_read(request, &self.incarnation))?;
+                serde_json::to_vec(&Reply { result })
+                    .map_err(|e| HandlerError::new("encode_failed", e.to_string()))
+            }
             "enumerate" => self.enumerate(request.params),
             "journal_tail" => self.journal_tail(request.params),
             "register" => self.register(request.params, &principal),
@@ -2660,6 +2678,10 @@ fn manifest() -> ModuleManifest {
                     ManagementOperationKind::Mutate,
                     "Enable the shared identity log or join it (operator only).",
                 ),
+                management_operation("placement.read", ManagementOperationKind::Query,
+                    "Page shared project placement facts in insertion order (open to every principal)."),
+                management_operation("placement.backfill", ManagementOperationKind::Mutate,
+                    "Share this machine's journal placement history once (Direct only, with operator confirmation)."),
                 management_operation(
                     store_origin::ADOPT,
                     ManagementOperationKind::Mutate,
@@ -3513,6 +3535,7 @@ mod tests {
             if *method == store_origin::ADOPT
                 || *method == "move_root_to_new_project"
                 || *method == "identity_log.enable"
+                || *method == "placement.backfill"
                 || catalog_ops::WRITES.contains(method)
                 || *method == catalog_publish::PUBLISH
                 || *method == catalog_seed::SEED
@@ -5341,6 +5364,8 @@ mod tests {
             ("refresh_root_key", "mutate"),
             ("rebind_root", "mutate"),
             ("identity_log.enable", "mutate"),
+            ("placement.backfill", "mutate"),
+            ("placement.read", "query"),
             ("resolve_root_key", "query"),
             ("preview_attach_root", "query"),
             ("identity_log.status", "query"),

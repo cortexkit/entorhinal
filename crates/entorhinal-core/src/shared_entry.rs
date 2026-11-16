@@ -25,6 +25,8 @@ pub const PROJECT_SHARED_TABLES: &[&str] = &[
     "catalog_pin",
     "user_profile",
     "user_expertise",
+    "placement_state",
+    "placement_fact",
 ];
 pub const AGENT_SHARED_TABLES: &[&str] = &["agent", "agent_name_claim"];
 pub const MEMBER_SHARED_TABLES: &[&str] = &["member_name"];
@@ -242,7 +244,11 @@ impl SharedState {
                 .filter(|table| {
                     !matches!(
                         **table,
-                        "workspace_document" | "user_profile" | "user_expertise"
+                        "workspace_document"
+                            | "user_profile"
+                            | "user_expertise"
+                            | "placement_state"
+                            | "placement_fact"
                     ) || !self.0[**table].is_empty()
                 })
                 .map(|table| {

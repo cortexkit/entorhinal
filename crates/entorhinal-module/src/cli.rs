@@ -408,6 +408,7 @@ usage: ck projects <verb> [args] [--subc <connection file>] [--json]
   unapprove <dir>         withdraw that approval
   trust <dir>             show each root's identity and approval
   verify                  check the store against its journal
+  placement-backfill      share placement history once, after operator confirmation
   adopt-store [--same-machine]
                           adopt a foreign store after operator confirmation
   log status              show local identity log state
@@ -740,6 +741,12 @@ fn build_at(command: &Command, cwd: &str) -> Result<(String, Value), String> {
                 .into(),
                 params,
             )
+        }
+        (Face::Projects, "placement-backfill") => {
+            if !command.args.is_empty() {
+                return Err("placement-backfill accepts no arguments".into());
+            }
+            ("placement.backfill".into(), json!({}))
         }
         (Face::Projects, "adopt-store") => {
             let same_machine = match command
@@ -1637,7 +1644,11 @@ fn call(
             let options = placement_call_options(method);
             if matches!(
                 method,
-                "assign_workspace" | "register" | "project.set_domain" | "workspace.set_document"
+                "assign_workspace"
+                    | "register"
+                    | "project.set_domain"
+                    | "workspace.set_document"
+                    | "placement.backfill"
             ) || super::catalog_ops::WRITES.contains(&method)
                 || method == super::catalog_publish::PUBLISH
             {
@@ -1688,6 +1699,7 @@ fn placement_call_options(method: &str) -> subc_client_rs::CallOptions {
     if matches!(
         method,
         "assign_workspace"
+            | "placement.backfill"
             | "register"
             | "project.set_domain"
             | "workspace.set_document"
@@ -2253,6 +2265,27 @@ mod tests {
             parse_as(Face::Agents, &["adopt-store", "--same-machine"]),
             Invocation::Refuse(_)
         ));
+    }
+
+    #[test]
+    fn placement_facts_cli_backfill_has_no_arguments_and_waits_for_presence() {
+        let Invocation::Command(command) = parse_as(Face::Projects, &["placement-backfill"]) else {
+            panic!()
+        };
+        assert_eq!(
+            build(&command).unwrap(),
+            ("placement.backfill".into(), json!({}))
+        );
+        assert_eq!(
+            placement_call_options("placement.backfill").timeout,
+            Duration::from_secs(300)
+        );
+        let Invocation::Command(command) =
+            parse_as(Face::Projects, &["placement-backfill", "extra"])
+        else {
+            panic!()
+        };
+        assert!(build(&command).is_err());
     }
 
     /// argv[0]'s file stem selects the face; anything unrecognised (including
