@@ -7,6 +7,7 @@ use super::{
     encode_result,
     participant_client::{self, AgentRef, PlannedParticipant},
     participant_discovery::discover_participants,
+    sessions::MoveLiveness,
     HandlerError, ProjectsHandler, RouteKey,
 };
 use cortexkit_role_agent_data::busy::BusyState;
@@ -422,6 +423,16 @@ impl ProjectsHandler {
     }
 }
 
+/// Whether `runner` is a participant in this move that holds `reference`.
+fn freezes(plan: &[PlannedParticipant], runner: &str, reference: &MoveRef) -> bool {
+    plan.iter().any(|participant| {
+        participant.client.module_id == runner
+            && participant.refs.iter().any(|held| {
+                held.ref_kind == reference.ref_kind && held.r#ref == reference.reference
+            })
+    })
+}
+
 impl ProjectsHandler {
     async fn move_idle(
         &self,
@@ -432,13 +443,25 @@ impl ProjectsHandler {
             .iter()
             .map(|r| (r.ref_kind.as_str(), r.reference.as_str()))
             .collect();
-        let answers = self.read_session_liveness(&refs_for_liveness)?;
+        let answers = self.read_move_liveness(&refs_for_liveness)?;
         let mut busy = Vec::new();
         for (reference, answer) in refs.iter().zip(answers) {
-            if answer.state != "gone" {
-                busy.push(json!({"ref_kind":reference.ref_kind,"ref":reference.reference,"participant":"agent.session_liveness",
-                    "reason_code":if answer.state == "active" {"session_active"} else {"liveness_unknown"}, "reason":answer.cause}));
-            }
+            let (reason_code, reason) = match answer {
+                MoveLiveness::Gone => continue,
+                // An idle session is safe to move only when the module that
+                // runs it takes part in the move for that exact ref: its
+                // `prepare` refuses while a turn runs and freezes the session
+                // before answering. A host that is not a participant (such as
+                // an OpenCode or Pi process) can keep writing during the move,
+                // so its session must be closed first.
+                MoveLiveness::Idle {
+                    runner: Some(runner),
+                } if freezes(plan, &runner, reference) => continue,
+                MoveLiveness::Idle { .. } | MoveLiveness::Active => ("session_active", None),
+                MoveLiveness::Unknown(cause) => ("liveness_unknown", cause),
+            };
+            busy.push(json!({"ref_kind":reference.ref_kind,"ref":reference.reference,"participant":"agent.session_liveness",
+                "reason_code":reason_code, "reason":reason}));
         }
         for participant in plan {
             match participant.client.busy(&participant.refs).await {
@@ -872,6 +895,62 @@ mod tests {
             .unwrap();
         assert_eq!(code(f.move_(ENGRAM, &id).await), "agent_busy");
         assert!(f.store().list_agent_moves().unwrap().is_empty());
+    }
+
+    /// An idle session may move only when its own runner is the participant
+    /// that holds its ref, because that participant freezes it at `prepare`.
+    /// An active session, or an idle one whose runner is unknown or not in the
+    /// move, still refuses.
+    #[tokio::test]
+    async fn idle_session_moves_only_when_its_runner_is_the_freezing_participant() {
+        for (runner, state, admitted) in [
+            (Some("data"), "idle", true),
+            (None, "idle", false),
+            (Some("elsewhere"), "idle", false),
+            (Some("data"), "active", false),
+        ] {
+            let f = Fixture::new(2).await;
+            let id = f.create().await;
+            f.store()
+                .register_session(&entorhinal_core::SessionRegistration {
+                    agent_id: &id,
+                    ref_kind: "session",
+                    session_ref: "r",
+                    harness: "host",
+                    session_id: "r",
+                    project_root: Some("/project"),
+                    registered_by: "host",
+                    runner,
+                    network: None,
+                    now_ms: 700,
+                })
+                .unwrap();
+            {
+                let mut mirror = f.handler.liveness.lock().unwrap();
+                mirror.stale = false;
+                mirror.sessions.insert(
+                    crate::SessionKey::new("host", "r"),
+                    crate::MirrorEntry {
+                        state: state.into(),
+                        canonical_root: "/project".into(),
+                        last_activity_ms: 700,
+                        cause: None,
+                    },
+                );
+            }
+            let outcome = f.move_(ORCH, &id).await;
+            if admitted {
+                result(outcome);
+            } else {
+                match outcome {
+                    HandlerOutcome::ErrorWithDetail { code, detail, .. } => {
+                        assert_eq!(code, "agent_busy", "{runner:?} {state}");
+                        assert_eq!(detail["refs"][0]["reason_code"], "session_active");
+                    }
+                    other => panic!("expected agent_busy for {runner:?} {state}: {other:?}"),
+                }
+            }
+        }
     }
 
     #[tokio::test]

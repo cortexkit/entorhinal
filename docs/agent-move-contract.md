@@ -135,17 +135,23 @@ on refusal:
 7. Participant discovery: every required participant must be available, and
    every bound session reference kind must be covered by a participant
    (`participant_unavailable`).
-8. Idle: every bound session must read `gone` in session liveness, and every
-   participant must report the agent idle. Otherwise `agent_busy`, with a list
-   naming each reference and reason (`session_active`, `liveness_unknown`, a
-   participant's reason code, or `busy_unknown`).
+8. Idle: every bound session must read `gone` in session liveness, or `idle`
+   when the session's recorded runner is itself a participant in this move
+   holding that reference (its `prepare` refuses while a turn runs and freezes
+   the session before answering). A host that is not a participant, such as an
+   OpenCode or Pi process, could keep writing during the move, so its sessions
+   must be closed. Every participant must also report the agent idle.
+   Otherwise `agent_busy`, with a list naming each reference and reason
+   (`session_active`, `liveness_unknown`, a participant's reason code, or
+   `busy_unknown`).
 9. The checkpoint is inserted at `preparing` in one transaction that re-checks
    the slot and cap and fences new session registrations for the agent
    (`agent_moving` in [session-liveness-contract.md](session-liveness-contract.md)).
 
 The reply is `{cut_id, step}`.
 
-Tests: `preconditions_refuse_in_order_with_named_codes`,
+Tests: `idle_session_moves_only_when_its_runner_is_the_freezing_participant`,
+`preconditions_refuse_in_order_with_named_codes`,
 `busy_refusal_is_read_only_and_names_liveness_and_participant_reasons`,
 `engram_requires_setting_and_idle_while_orchestrator_never_prompts`,
 `direct_rechecks_claim_open_moves_and_idle_after_confirmation`,

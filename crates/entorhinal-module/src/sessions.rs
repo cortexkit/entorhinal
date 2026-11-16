@@ -853,6 +853,36 @@ impl super::LivenessState {
     }
 }
 
+/// One bound session as move admission sees it. Unlike [`LivenessAnswer`],
+/// this keeps `idle` apart from `active` and carries the recorded runner, so
+/// admission can accept an idle session whose own runner freezes it.
+pub(super) enum MoveLiveness {
+    Gone,
+    Idle { runner: Option<String> },
+    Active,
+    Unknown(Option<String>),
+}
+
+impl super::LivenessState {
+    fn move_liveness(&self, key: &SessionKey, runner: Option<&String>) -> MoveLiveness {
+        let entry = self.sessions.get(key);
+        if self.stale {
+            return MoveLiveness::Unknown(entry.and_then(|entry| entry.cause.clone()));
+        }
+        match entry {
+            Some(entry) => match entry.state.as_str() {
+                "idle" => MoveLiveness::Idle {
+                    runner: runner.cloned(),
+                },
+                "active" => MoveLiveness::Active,
+                _ => MoveLiveness::Unknown(entry.cause.clone()),
+            },
+            None if self.gone.contains(key) => MoveLiveness::Gone,
+            None => MoveLiveness::Unknown(None),
+        }
+    }
+}
+
 impl ProjectsHandler {
     /// The agent-orchestrator/v1 role relays moves confirmed by the operator's
     /// phone; agent-host/v1 only registers host sessions and has no move authority.
@@ -1384,6 +1414,32 @@ impl ProjectsHandler {
             .collect();
         drop(state);
         Ok(answers)
+    }
+
+    /// Session liveness for move admission, in request order. A binding with
+    /// no host session (no harness or session id) has nothing open to move.
+    pub(super) fn read_move_liveness(
+        &self,
+        refs: &[(&str, &str)],
+    ) -> Result<Vec<MoveLiveness>, HandlerError> {
+        let bindings = self.with_store(|store| store.session_bindings_for_refs(refs))?;
+        let state = self
+            .liveness
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(bindings
+            .iter()
+            .map(|binding| match binding {
+                Some(binding) => match (&binding.harness, &binding.session_id) {
+                    (Some(harness), Some(session_id)) => state.move_liveness(
+                        &SessionKey::new(harness, session_id),
+                        binding.runner.as_ref(),
+                    ),
+                    _ => MoveLiveness::Gone,
+                },
+                None => MoveLiveness::Unknown(None),
+            })
+            .collect())
     }
 }
 
