@@ -359,8 +359,13 @@ impl Worker {
             };
             // Try both outputs even when one fails: a missing KV bucket must
             // not strand facts, and an EVENT outage must not strand markers.
-            let placement = self.publish_placement(&mut sink).await;
-            let more = matches!(placement, Ok(true));
+            // Drain the whole fact backlog in this pass, because a marker
+            // failure below sleeps the backoff and would otherwise release
+            // only one fact per backoff interval.
+            let mut placement = self.publish_placement(&mut sink).await;
+            while matches!(placement, Ok(true)) {
+                placement = self.publish_placement(&mut sink).await;
+            }
             let result = markers.and(placement.map(|_| ()));
             if let Err(error) = result {
                 self.health
@@ -385,9 +390,6 @@ impl Worker {
                 failed_attempts = 0;
             }
             backoff = INITIAL_BACKOFF;
-            if more {
-                continue;
-            }
             #[cfg(test)]
             self.idle.notify_one();
             tokio::select! {

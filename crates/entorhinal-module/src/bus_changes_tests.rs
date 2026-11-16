@@ -313,6 +313,22 @@ async fn bus_changes_placement_publishes_while_kv_bucket_fails() {
 }
 
 #[tokio::test]
+async fn bus_changes_placement_drains_backlog_while_kv_fails() {
+    let f = Fixture::new("bus-placement-drain").await;
+    backfill(&f);
+    assign(&f);
+    let control = Arc::new(Control::default());
+    control.fail.store(true, Ordering::Relaxed);
+    let mut published = Published::start(&f.handler, control);
+    published.event().await;
+    published.event().await;
+    // Both facts went out in the first pass, before any backoff retry
+    // could call ready() a second time.
+    assert_eq!(published.control.attempts.load(Ordering::Relaxed), 1);
+    f.handler.stop_bus_changes().await;
+}
+
+#[tokio::test]
 async fn bus_changes_placement_remote_apply_wakes_publisher() {
     let mut f = Fixture::new("bus-placement-remote").await;
     let log = crate::fake_log::FakeLog::default();
