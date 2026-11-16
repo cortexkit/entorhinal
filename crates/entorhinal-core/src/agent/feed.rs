@@ -44,6 +44,21 @@ fn all_claims(conn: &Connection) -> rusqlite::Result<Vec<AgentNameClaim>> {
 }
 
 impl RegistryStore {
+    /// Newest identity entry the changes feed can serve, excluding project-only
+    /// journal writes that advance the feed's scan cursor but carry no identity.
+    pub fn agent_change_generation(&self) -> Result<i64, AgentMutationError> {
+        self.read_agent(|conn| {
+            Ok(conn.query_row(
+                &format!(
+                    "SELECT COALESCE(MAX(seq), 0) FROM registry_journal WHERE op IN ({})",
+                    change_ops_sql()
+                ),
+                [],
+                |row| row.get(0),
+            )?)
+        })
+    }
+
     /// Read all rows, all claim history and the journal head in one transaction.
     /// This head is a safe first cursor even if a writer commits during transfer.
     pub fn agent_snapshot(&self) -> Result<AgentSnapshotReply, AgentMutationError> {

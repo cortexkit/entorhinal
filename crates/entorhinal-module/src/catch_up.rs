@@ -61,6 +61,9 @@ impl ProjectsHandler {
 
 impl Drop for ProjectsHandler {
     fn drop(&mut self) {
+        if let Some(task) = self.bus_changes_task.get_mut().unwrap().take() {
+            task.abort();
+        }
         if let Some(task) = self.catch_up_task.get_mut().unwrap().take() {
             task.abort();
         }

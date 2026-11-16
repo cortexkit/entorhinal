@@ -119,6 +119,7 @@ All start after HELLO_ACK. Each holds the store weakly and takes a handle only f
 - **Session upkeep** (`session_upkeep.rs`): writes end times from the liveness feed and prunes bindings that ended more than 30 days ago.
 - **Catalog status poll** (`catalog_poll.rs`): refreshes package status for the registry scopes agents' pins use, at startup and then hourly at a stored random offset, backing off up to 6 h after failures. Live flows requiring capabilities also refresh every ten minutes, retry failures after one minute (doubling to ten), and become stale after fifteen minutes without confirmation.
 - **Starter bundle seed** (`catalog_seed.rs`): seeds the content store once if a starter bundle is present and the store is empty.
+- **Bus change publisher** (`bus_changes.rs`): keeps five revision markers in the account-local `entorhinal.changes` KV bucket current after committed journal, role-cache and catalog-status changes; retries bus outages without delaying reads.
 
 ## Rules that bite
 

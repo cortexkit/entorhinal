@@ -29,6 +29,9 @@ use crate::{
 #[path = "watch_tests.rs"]
 mod watch_tests;
 
+#[path = "bus_changes_tests.rs"]
+mod bus_changes_tests;
+
 #[path = "served_vectors/session_residence_tests.rs"]
 mod session_residence_tests;
 

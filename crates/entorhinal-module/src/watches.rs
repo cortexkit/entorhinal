@@ -80,6 +80,14 @@ impl Default for Watches {
 }
 
 impl Watches {
+    pub(crate) fn catalog_generation(&self) -> u64 {
+        self.catalog.lock().unwrap().generation
+    }
+
+    pub(crate) fn catalog_changed(&self) -> &Notify {
+        &self.catalog_changed
+    }
+
     /// Called with committed snapshots, after the blocking SQL job has released
     /// every store handle. Transport emission happens only in the watch task.
     pub(crate) fn observe_catalog(&self, statuses: BTreeMap<(String, String), Value>) {

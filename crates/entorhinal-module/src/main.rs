@@ -58,6 +58,7 @@ const DEFAULT_STORAGE_NAMESPACE: &str = "default";
 
 mod agent_ops;
 mod agent_reads;
+mod bus_changes;
 mod catalog_agent;
 mod catalog_blob;
 mod catalog_builtin;
@@ -387,6 +388,9 @@ impl RequestLatency {
 
 #[derive(Default)]
 struct HealthGauges {
+    bus_changes_puts: AtomicU64,
+    bus_changes_failures: AtomicU64,
+    bus_changes_connected: AtomicBool,
     origin: store_origin::Origin,
     catalog: catalog_poll::Gauges,
     store_ready: AtomicBool,
@@ -461,6 +465,13 @@ struct HealthGauges {
 }
 
 impl HealthGauges {
+    fn bus_changes_metrics(&self, mut metrics: Value) -> Value {
+        metrics["busChangesPuts"] = json!(self.bus_changes_puts.load(Ordering::Relaxed));
+        metrics["busChangesFailures"] = json!(self.bus_changes_failures.load(Ordering::Relaxed));
+        metrics["busChangesConnected"] = json!(self.bus_changes_connected.load(Ordering::Relaxed));
+        metrics
+    }
+
     fn cut_release_metrics(&self, mut metrics: Value) -> Value {
         metrics["cutReleasesPending"] = json!(self.cut_releases_pending.load(Ordering::Relaxed));
         metrics["cutReleasesReleased"] = json!(self.cut_releases_released.load(Ordering::Relaxed));
@@ -606,6 +617,9 @@ struct ProjectsHandler {
     consent_coordinator: consent::ConsentCoordinator,
     consent_connector: Arc<dyn consent_client::ConsentConnector>,
     commits: Arc<tokio::sync::Notify>,
+    role_cache_changed: Arc<tokio::sync::Notify>,
+    bus_changes_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    bus_changes_sql: Arc<move_driver::SqlOperations>,
     feed_waits: tokio::sync::Semaphore,
     feed_clock: Arc<dyn agent_reads::FeedClock>,
     watches: Arc<watches::Watches>,
@@ -1002,6 +1016,9 @@ impl ProjectsHandler {
                 )),
             }),
             commits: Arc::new(tokio::sync::Notify::new()),
+            role_cache_changed: Arc::default(),
+            bus_changes_task: Mutex::new(None),
+            bus_changes_sql: Arc::default(),
             feed_waits: tokio::sync::Semaphore::new(8),
             feed_clock: Arc::new(agent_reads::TokioFeedClock),
             watches: Arc::default(),
@@ -1356,6 +1373,7 @@ impl ModuleHandler for ProjectsHandler {
         self.move_wake.notify_one();
         self.move_wake.notify_waiters();
         self.start_session_upkeep();
+        self.start_bus_changes();
     }
 
     async fn health(&self) -> HealthReport {
@@ -1392,7 +1410,7 @@ impl ModuleHandler for ProjectsHandler {
         HealthReport {
             status,
             detail,
-            metrics: Some(self.health.cut_release_metrics(self.health.origin.metrics(self.session_upkeep.metrics(self.session_binding_metrics(json!({
+            metrics: Some(self.health.bus_changes_metrics(self.health.cut_release_metrics(self.health.origin.metrics(self.session_upkeep.metrics(self.session_binding_metrics(json!({
                     "storeReady": ready,
                     "catalogLastSuccessMs": catalog["catalogLastSuccessMs"],
                     "catalogLastError": catalog["catalogLastError"],
@@ -1439,7 +1457,7 @@ impl ModuleHandler for ProjectsHandler {
                     "watchesOpen": self.health.watches_open.load(Ordering::Relaxed),
                     "watchNoticesSent": self.health.watch_notices.load(Ordering::Relaxed),
                     "watchResyncsSent": self.health.watch_resyncs.load(Ordering::Relaxed),
-            })))))),
+            }))))))),
         }
     }
 }
@@ -3431,6 +3449,7 @@ mod tests {
         handler.stop_catalog_poll().await;
         handler.stop_role_refresh().await;
         handler.stop_session_upkeep().await;
+        handler.stop_bus_changes().await;
         // Every store install starts blocking catalog jobs (the built-in registry
         // and the starter seed) that hold a store handle; Windows cannot delete a
         // scratch folder while one is still open.

@@ -32,6 +32,37 @@ bindings this machine installed as they were on the source) and
 because another binding here already held their host or runner session).
 See [agent-move-contract.md](agent-move-contract.md) section 11.
 
+The bus publisher adds `busChangesPuts` (successful KV puts),
+`busChangesFailures` (failed publishing attempts) and `busChangesConnected`
+(whether the last publishing pass could open and use the bucket). All are
+cached atomics; a bus outage never delays health or registry reads.
+
+## Bus change markers
+
+Entorhinal writes the account-local `entorhinal.changes` KV bucket, whose
+physical name comes from `AccountNames::module_bucket_name("entorhinal", "changes")`.
+ck-bus provisions it with history 1, no TTL and a 512-byte value cap;
+prefrontal-core, Plexus and Magic Context have read access. The values are
+revision hints only, never names, paths or rows. Watch a key, then re-read the
+owning operation for data.
+
+| Key | Value | Owning operation |
+|---|---|---|
+| `registry` | `{"generation":N,"incarnation":"…"}` | `enumerate`: journal head and process incarnation; any journal write may advance it. |
+| `agents` | `{"generation":N,"incarnation":"…"}` | `agent.changes`: newest identity-change journal sequence, excluding project-only writes. |
+| `profile` | `{"token":"…"}` | Unscoped `user.get`: exactly its content-derived change token. |
+| `role.connector_home` | `{"epoch":N}` | `role.read`: this machine's cached claim epoch for `connector_home`. |
+| `catalog.status` | `{"generation":N}` | `catalog.status_watch`: the process-local pinned-version status generation. |
+
+One background task publishes all five keys on startup, then only values that
+differ from its last successful puts. It wakes on committed journal writes,
+committed role-cache updates and catalog status changes. It uses a separate
+SubcConsumer client connection and BusClient credentials, not the module's
+registered connection. A missing bucket or unavailable bus is retryable with
+1-second exponential backoff capped at 60 seconds: one warning starts the
+outage and one recovery message reports the failed-attempt count. Stores from
+another machine do not publish. Existing replies and samples are unchanged.
+
 ## Admission, in general
 
 The daemon stamps each route with a principal when it opens. entorhinal

@@ -261,6 +261,7 @@ impl ProjectsHandler {
                         .map_err(Into::into)
                 })
                 .await?;
+                self.role_cache_changed.notify_waiters();
                 encode_result(json!({"epoch":epoch,"held_here":true}))
             }
         }
@@ -280,6 +281,7 @@ impl ProjectsHandler {
         let health = self.health.clone();
         let clock = self.clock;
         let sql_operations = self.role_refresh_sql.clone();
+        let role_cache_changed = self.role_cache_changed.clone();
         *task = Some(tokio::spawn(async move {
             let mut ticks = tokio::time::interval_at(
                 Instant::now() + Duration::from_secs(30),
@@ -386,6 +388,7 @@ impl ProjectsHandler {
                         .await
                         {
                             Ok(Ok(conflicts)) => {
+                                role_cache_changed.notify_waiters();
                                 health
                                     .self_author_conflicts
                                     .fetch_add(conflicts as u64, Ordering::Relaxed);

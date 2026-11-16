@@ -21,6 +21,10 @@ test = false
 entorhinal-core = { path = "../entorhinal-core" }
 base64 = "0.22"
 cortexkit-claustrum-client = "0.11.0"
+cortexkit-bus-client = "0.1.1"
+cortexkit-bus-naming = "0.4.1"
+cortexkit-bus-nats = "0.5.0"
+cortexkit-bus-trait = "0.3.1"
 sha2 = "0.10.9"
 entorhinal-catalog = { path = "../entorhinal-catalog" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
