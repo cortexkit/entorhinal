@@ -4120,7 +4120,7 @@ mod tests {
                 session_id: "new",
                 project_root: Some("/new"),
                 registered_by: "host",
-                runner: None,
+                runner: Some("host"),
                 network: None,
                 now_ms: clock(),
             };

@@ -862,7 +862,7 @@ mod tests {
         f.handler.start_catch_up();
         f.log.wait_for_calls(calls + 1).await;
         assert!(f.handler.writer.try_lock().is_err());
-        let params = json!({"agent_id":id,"ref_kind":"test","ref":"r","harness":"pi","session_id":"s","project_root":"/project"});
+        let params = json!({"agent_id":id,"ref_kind":"test","ref":"r","harness":"pi","session_id":"s","runner":"pi","project_root":"/project"});
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             f.call(HOST, "agent.register_session", params),
@@ -935,7 +935,7 @@ mod tests {
             "held_here"
         );
         let calls = record.calls.load(Ordering::Relaxed);
-        assert_eq!(result(handler.handle_served_request(&body("agent.register_session",json!({"agent_id":id,"ref_kind":"test","ref":"ref","harness":"pi","session_id":"s","project_root":"/project"})),HOST).await)["agent_id"],id);
+        assert_eq!(result(handler.handle_served_request(&body("agent.register_session",json!({"agent_id":id,"ref_kind":"test","ref":"ref","harness":"pi","session_id":"s","runner":"pi","project_root":"/project"})),HOST).await)["agent_id"],id);
         assert_eq!(record.calls.load(Ordering::Relaxed), calls);
         drop(handler);
     }

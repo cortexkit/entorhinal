@@ -42,6 +42,28 @@ CREATE INDEX session_binding_open_agent
 /// ended is never pruned, however old it is.
 pub const SESSION_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 
+/// New registrations must name their hosting module, even when an older
+/// binding has no runner recorded.
+pub(crate) fn registration_runner(runner: Option<&str>) -> Result<&str, AgentMutationError> {
+    let runner =
+        runner.ok_or_else(|| session_refusal("invalid_request", "missing field `runner`", None))?;
+    if runner.is_empty() || runner.len() > 64 {
+        return Err(session_refusal(
+            "invalid_request",
+            "runner must be 1 to 64 bytes",
+            None,
+        ));
+    }
+    if runner.chars().any(char::is_control) {
+        return Err(session_refusal(
+            "invalid_request",
+            "runner must not contain control characters",
+            None,
+        ));
+    }
+    Ok(runner)
+}
+
 /// Rows deleted per retention transaction, so a large backlog never holds the
 /// writer connection for long and other writes interleave between batches.
 const PRUNE_BATCH: i64 = 500;

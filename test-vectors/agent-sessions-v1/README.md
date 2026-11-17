@@ -41,7 +41,7 @@ objects deny unknown fields; a field outside the listed schema is an
 `invalid_request`.
 
 - `agent.register_session`: exactly
-  `{agent_id, ref_kind, ref, harness, session_id, project_root?}`. The reference
+  `{agent_id, ref_kind, ref, harness, session_id, runner, project_root?}`. The reference
   kind is 1–64 bytes, reference 1–512 bytes, harness 1–32 bytes, session ID
   1–256 bytes, and a supplied project root 1–4096 bytes (not null). Omitting the
   root keeps a stored root on re-registration or re-key; a new binding without
@@ -53,8 +53,8 @@ objects deny unknown fields; a field outside the listed schema is an
   `held_elsewhere` claim with the other machine's name, a `caller_forbidden` request
   from `plexus`, and an unknown field.
   A different reference for the same agent, reference kind and host session
-  re-keys that binding in place, keeping its caller role, runner unless supplied,
-  and network history, and clearing its end time. A different agent still
+  re-keys that binding in place, keeping its caller role
+  and network history, recording the required runner, and clearing its end time. A different agent still
   refuses `session_bound_elsewhere`; an occupied re-key destination refuses
   `ref_bound_elsewhere`. Open moves and claim checks still apply.
 - `agent.for_session`: exactly `{harness, session_id}`. Harness is 1–32 bytes
@@ -66,8 +66,8 @@ objects deny unknown fields; a field outside the listed schema is an
   `project_root: null`), and `not_found`. The reply carries `runner`, the
   module ID of the llm-runner hosting the session, only when the binding has
   one recorded; a binding without one omits the key rather than sending
-  `null`. Re-registering without a runner keeps the recorded one, so the
-  reply still names it.
+  `null`. Historical bindings without a runner remain readable; every new
+  registration, including re-registration, must name a runner.
 - `agent.where`: exactly `{agent_id}`, where the string has entorhinal's form
   `agent_` followed by 8 or 16 lowercase hexadecimal digits. The file includes
   an agent never previously read from the claim cache
@@ -76,10 +76,12 @@ objects deny unknown fields; a field outside the listed schema is an
 - Both moving samples keep top-level `status` at `held_here`; the presence of
   `moving` for a non-terminal move on this machine is the signal, and its `side`
   identifies which end this machine is.
-- `agent.register_session` may also carry an optional `runner`: the module ID
+- `agent.register_session` requires `runner`: the module ID
   of the llm-runner hosting the session, 1–64 bytes with no control
   characters. It is taken out before the strict decode above, so the
   unknown-field refusal is unchanged, and it is never echoed in the reply.
+  Missing, null or empty runners refuse `invalid_request` before any write;
+  `register-session-missing-runner.json` records the missing-field refusal.
 - `agent.end_session`: exactly `{harness, session, runner?}`. Harness is 1–32
   bytes, session 1–256 bytes, runner as above. Accepted only from the sole
   provider of `agent-orchestrator/v1`. The end time is the handler's clock.
@@ -174,9 +176,9 @@ a backfill makes the data local.
 - **`register-session-rekey.json`**: captured from the real handler on the
   unreleased session re-key implementation after 0.1.42, with a separate
   two-agent fixture and the same fixed clock. Four records show the initial
-  binding, its same-agent re-key without a root or runner, another agent's
-  refused re-key, and a new registration without `project_root` (null in the
-  reply). All older JSON samples remain byte-identical.
+  binding, its same-agent re-key without a root and with the required runner,
+  another agent's refused re-key, and a new registration without `project_root`
+  (null in the reply). All earlier reply byte sequences remain unchanged.
 - **`end-session.json`**: ending a worker (`found: true` with the end time),
   the repeat (the same first end time, nothing written), an unknown session
   (`found: false`), and `runner_mismatch` for a runner other than the
@@ -184,7 +186,7 @@ a backfill makes the data local.
 - **`sessions.json`**: one agent's two pages at `limit: 2`: a live Broca worker
   (`active` from the reconciled liveness bucket, network `no` after `yes`) and
   an ended worker (`gone`, network `unknown` with no history), then a Pi
-  session registered with `runner: null` (`gone` because it is absent from the
+  historical session inserted directly without a runner (`gone` because it is absent from the
   authoritative bucket, network `unknown`),
   whose page has `next_cursor: null`.
 - **`session-for-runner.json`**: the live worker found by `{runner, session}`
@@ -255,16 +257,18 @@ a backfill makes the data local.
   records add a populated `project.canonicalRoot`, tag and labels. No fleet
   field lacks a populated example after these additions. Nonzero log position,
   wild avatars, workspace-head/hiree roles and an empty fleet remain unsampled.
-- **`sessions-head-runners.json`**: One project head has two OpenCode sessions,
-  registered through `agent.register_session` as `prefrontal-core`. The phone's
+- **`register-session-head.json`**: Two OpenCode session registrations name
+  their runners. Their reply shape is unchanged and does not echo the runner.
+- **`sessions-head-runners.json`**: Historical rows inserted directly for a
+  project's designated agent (its head) have two OpenCode sessions. The phone's
   first `agent.sessions` read shows the core-plugin session with `runner: null`
   and the hosted session with `runner: "thalamus-harness"`. Re-registering the
   plugin session with the same harness/session ID, a new ref and that runner
   replaces its runner and re-keys its ref in place; the second read still has
-  exactly two rows. All five records use clock `700` and incarnation
+  exactly two rows. All three records use clock `700` and incarnation
   `0123456789abcdef`; the complete canonical scratch root is mapped explicitly
   to `/fixture/head-project`, including in registration requests.
-- **`SHA256SUMS`**: SHA-256 hashes of the twenty-one JSON vector files, with
+- **`SHA256SUMS`**: SHA-256 hashes of the twenty-three JSON vector files, with
   names relative to this directory. The first ten lines are pinned by
   `served_vectors::agent_session_samples_keep_their_pinned_bytes_and_checksums`.
 
@@ -273,7 +277,7 @@ a backfill makes the data local.
 | File | SHA-256 |
 | --- | --- |
 | `for-session.json` | `dd41914934a9b85b35670a815bef17de84752d8da7d05a1bf8833f3edbd1996b` |
-| `register-session.json` | `756975d9e0697109b0f7a70c0a08dfa18b2fc5222915e1051870948b1836d6a0` |
+| `register-session.json` | `445d3a8fdf1671aeab797443d2041b5710281c22e9477679fb2eee03e9401f21` |
 | `session-for-ref.json` | `3e9e99950c167a2b2c5b3315fca35d353f50bc29e8ad93afe616c15e7cb703f6` |
 | `where.json` | `faacea127dcaaa7181329562e4de553851aebf700358b3267864e894166b911e` |
 | `where-many.json` | `422b8592c531c3c22e161b7a926f3ac61df6155fca2a9660bb159b1a0054d565` |
@@ -285,13 +289,15 @@ a backfill makes the data local.
 | `session-for-runner.json` | `b62878e6c91d98cc81ff0f993205edd4a88b5eaf49d649bab81feca02696203e` |
 | `sessions.json` | `e9b77127661e0352b508d923c5cd2e718c0b14c63662b8b2cb8e2f8b872f79e1` |
 | `set-session-network.json` | `d6bdd5717154e0c6b5d6675b9f6f03580be9e8cb41c2cf8ae5cd2925ffe831f9` |
-| `register-session-rekey.json` | `1dcb2af2bcc9f346a9ebac36369f70cb9805e53c0585110d9b675f25f4442b96` |
+| `register-session-rekey.json` | `c3e7e23bcfe25718cccd77725774554d1032cb5cc2502bee27ac19aae2b09767` |
 | `sessions-held-on.json` | `ce3ab0bb16f03a0f7aa605805234c80b42e3f92b2d0e384dd15ac8a7e2af9caa` |
 | `sessions-open.json` | `01d785e934526b457d9f958ac94d8a0829526729e0f418e114ea8faab3a86af7` |
 | `session-lookup-cases.json` | `5e2a306b6a05bd4ab1c922c0c57541d16e3fb33c2c403a797fe5a34edb774107` |
-| `sessions-head-runners.json` | `7fc7eb2e343958034adbf283d6304e201cb43fd64d89f4f42a96ce06765d2a1b` |
+| `sessions-head-runners.json` | `d800ab54312a41b8de31b63f3909d1018a58922d5bb113a45807e76988b1eb1b` |
 | `node-self.json` | `bda136c8fd751a28a70d452f8cf4b48bf1700774fc5eeffde8abe39d96b38e08` |
 | `sessions-watch.json` | `980cd6b43063981601f7b7e325d9108f120aa8e075df67355a2d1b93efb0af1e` |
+| `register-session-head.json` | `ddeb70078b3404ab8d5f06c90a301fcc474ab4ff8fcedf508b16bfdecc3adf7c` |
+| `register-session-missing-runner.json` | `0743fc894172825942eebecea6d6d23625458caf82ef0f4ef2b4dfbc03b90e16` |
 
 ## Reproduce and verify
 
@@ -314,7 +320,7 @@ python3 - <<'PY'
 import hashlib
 from pathlib import Path
 root = Path('test-vectors/agent-sessions-v1')
-names = ['for-session.json', 'register-session.json', 'session-for-ref.json', 'where.json', 'where-many.json', 'where-moving-receiver.json', 'where-moving-source.json', 'where-sharing-off.json', 'end-session.json', 'register-session-runner.json', 'session-for-runner.json', 'sessions.json', 'set-session-network.json', 'register-session-rekey.json', 'sessions-held-on.json', 'sessions-open.json', 'session-lookup-cases.json', 'sessions-head-runners.json', 'session-for-harness.json', 'node-self.json']
+names = ['for-session.json', 'register-session.json', 'session-for-ref.json', 'where.json', 'where-many.json', 'where-moving-receiver.json', 'where-moving-source.json', 'where-sharing-off.json', 'end-session.json', 'register-session-runner.json', 'session-for-runner.json', 'sessions.json', 'set-session-network.json', 'register-session-rekey.json', 'sessions-held-on.json', 'sessions-open.json', 'session-lookup-cases.json', 'sessions-head-runners.json', 'session-for-harness.json', 'node-self.json', 'sessions-watch.json', 'register-session-head.json', 'register-session-missing-runner.json']
 root.joinpath('SHA256SUMS').write_text(''.join(
     f'{hashlib.sha256(root.joinpath(name).read_bytes()).hexdigest()}  {name}\n'
     for name in names), encoding='utf-8')
@@ -344,8 +350,8 @@ recorded runner.
 
 1. A runner-bearing Pi session, with current network `no` and history `yes`
    at 700 then `no` at 701. Its reply is identical to the runner lookup reply.
-2. An OpenCode session with ID `head`, registered without a runner: the reply
-   includes `runner: null`.
+2. A historical OpenCode session with ID `head`, inserted directly without
+   a runner: the reply includes `runner: null`.
 3. An ended session whose data is held on `source-machine`, with `heldOn`
    and `ended_at_ms: 710`.
 4. An unknown session (`not_found`).

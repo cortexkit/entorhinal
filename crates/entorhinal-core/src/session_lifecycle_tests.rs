@@ -107,6 +107,19 @@ impl Fixture {
             .unwrap()
     }
 
+    fn legacy_binding(&self, request: &SessionRegistration<'_>) {
+        self.store.db.with_conn_fenced(|tx| {
+            tx.execute(
+                "INSERT INTO session_binding(ref_kind,ref,agent_id,harness,session_id,project_root,registered_by,registered_at_ms)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![request.ref_kind, request.session_ref, request.agent_id,
+                    request.harness, request.session_id, request.project_root,
+                    request.registered_by, request.now_ms],
+            )?;
+            Ok(())
+        }).unwrap();
+    }
+
     fn open_move(&self, agent_id: &str, cut_id: &str, step: &str) {
         self.store
             .db
@@ -194,11 +207,23 @@ fn migration_15_backfills_null_runner_and_end_and_indexes_agent() {
     assert_eq!(page.sessions[0].project_root, None);
 }
 
-/// Registering records a named runner, keeps it when a later registration
-/// names none, replaces it when one names another, and always clears the end
-/// time because the session is live again.
 #[test]
-fn registration_records_runner_keeps_it_when_absent_and_clears_end() {
+fn registration_requires_runner_before_writing() {
+    let f = Fixture::new();
+    for runner in [None, Some("")] {
+        let result = f.store.register_session(&registration("s1", runner, 10));
+        assert!(result.is_err(), "registration accepted runner {runner:?}");
+        let refusal = result.unwrap_err();
+        assert_eq!(refusal.code, "invalid_request");
+        assert!(refusal.message.contains("runner"));
+        assert_eq!(f.count(), 0, "refusal must not create a binding");
+    }
+}
+
+/// Registering records the required runner, replaces it when another is
+/// named, and always clears the end time because the session is live again.
+#[test]
+fn registration_records_runner_and_clears_end() {
     let f = Fixture::new();
     f.store
         .register_session(&registration("s1", Some("broca"), 10))
@@ -207,7 +232,7 @@ fn registration_records_runner_keeps_it_when_absent_and_clears_end() {
     f.store.end_session("broca", "s1", None, 20).unwrap();
     assert_eq!(f.lifecycle("s1"), Some((Some("broca".into()), Some(20))));
     f.store
-        .register_session(&registration("s1", None, 30))
+        .register_session(&registration("s1", Some("broca"), 30))
         .unwrap();
     assert_eq!(f.lifecycle("s1"), Some((Some("broca".into()), None)));
     f.store
@@ -220,24 +245,39 @@ fn registration_records_runner_keeps_it_when_absent_and_clears_end() {
 }
 
 #[test]
-fn registration_rekey_same_agent_succeeds_and_reopens_in_place() {
+fn registration_rekey_adds_runner_to_legacy_row_and_reopens_in_place() {
     let f = Fixture::new();
-    f.store
-        .register_session(&registration("s1", None, 10))
-        .unwrap();
-    f.store.end_session("broca", "s1", None, 20).unwrap();
-    let mut request = registration("s1", None, 30);
+    f.bind(AGENT, "s1", 10, None, Some(20));
+    let rowid = || {
+        f.store
+            .read(|conn| {
+                conn.query_row(
+                    "SELECT rowid FROM session_binding WHERE harness='broca' AND session_id='s1'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap()
+    };
+    let original_rowid = rowid();
+    let mut request = registration("s1", Some("broca"), 30);
     request.session_ref = "ref-new";
     request.registered_by = "host";
+    request.project_root = None;
     let binding = f.store.register_session(&request).unwrap();
     assert_eq!(binding.session_ref, "ref-new");
+    assert_eq!(binding.agent_id, AGENT);
+    assert_eq!(binding.ref_kind, "broca-session");
+    assert_eq!(binding.harness.as_deref(), Some("broca"));
+    assert_eq!(binding.project_root.as_deref(), Some("/project"));
     assert_eq!(binding.registered_by, "orchestrator");
     assert_eq!(binding.registered_at_ms, 30);
-    assert_eq!(f.lifecycle("s1"), Some((None, None)));
+    assert_eq!(f.lifecycle("s1"), Some((Some("broca".into()), None)));
+    assert_eq!(rowid(), original_rowid);
     assert_eq!(f.count(), 1);
     assert_eq!(
         f.store
-            .session_bindings_for_refs(&[("broca-session", "ref-1")])
+            .session_bindings_for_refs(&[("broca-session", "s1")])
             .unwrap(),
         vec![None]
     );
@@ -247,9 +287,9 @@ fn registration_rekey_same_agent_succeeds_and_reopens_in_place() {
 fn registration_rekey_different_agent_is_refused() {
     let f = Fixture::new();
     f.store
-        .register_session(&registration("s1", None, 10))
+        .register_session(&registration("s1", Some("broca"), 10))
         .unwrap();
-    let mut request = registration("s1", None, 30);
+    let mut request = registration("s1", Some("broca"), 30);
     request.session_ref = "ref-new";
     request.agent_id = OTHER;
     let refusal = f.store.register_session(&request).unwrap_err();
@@ -277,7 +317,7 @@ fn registration_rekey_keeps_runner() {
     f.store
         .register_session(&registration("s1", Some("runner"), 10))
         .unwrap();
-    let mut request = registration("s1", None, 30);
+    let mut request = registration("s1", Some("runner"), 30);
     request.session_ref = "ref-new";
     f.store.register_session(&request).unwrap();
     assert_eq!(f.lifecycle("s1"), Some((Some("runner".into()), None)));
@@ -298,7 +338,7 @@ fn registration_rekey_keeps_runner() {
 #[test]
 fn registration_rekey_follows_network_history() {
     let f = Fixture::new();
-    let mut request = registration("s1", None, 10);
+    let mut request = registration("s1", Some("broca"), 10);
     request.network = Some(crate::NetworkStamp {
         network: "yes",
         clock: || 10,
@@ -352,10 +392,10 @@ fn registration_rekey_follows_network_history() {
 fn registration_rekey_during_open_move_is_refused() {
     let f = Fixture::new();
     f.store
-        .register_session(&registration("s1", None, 10))
+        .register_session(&registration("s1", Some("broca"), 10))
         .unwrap();
     f.open_move(AGENT, "cut-rekey", "published");
-    let mut request = registration("s1", None, 30);
+    let mut request = registration("s1", Some("broca"), 30);
     request.session_ref = "ref-new";
     let refusal = f.store.register_session(&request).unwrap_err();
     assert_eq!(refusal.code, "agent_moving");
@@ -377,9 +417,9 @@ fn registration_rekey_during_open_move_is_refused() {
 fn registration_rekey_absent_project_root_keeps_stored_value() {
     let f = Fixture::new();
     f.store
-        .register_session(&registration("s1", None, 10))
+        .register_session(&registration("s1", Some("broca"), 10))
         .unwrap();
-    let mut request = registration("s1", None, 30);
+    let mut request = registration("s1", Some("broca"), 30);
     request.project_root = None;
     request.session_ref = "ref-new";
     assert_eq!(
@@ -423,12 +463,12 @@ fn registration_rekey_absent_project_root_keeps_stored_value() {
 fn registration_rekey_refuses_occupied_destination_and_other_ref_kind() {
     let f = Fixture::new();
     f.store
-        .register_session(&registration("s1", None, 10))
+        .register_session(&registration("s1", Some("broca"), 10))
         .unwrap();
-    let mut occupied = registration("s2", None, 20);
+    let mut occupied = registration("s2", Some("broca"), 20);
     occupied.session_ref = "ref-taken";
     f.store.register_session(&occupied).unwrap();
-    let mut request = registration("s1", None, 30);
+    let mut request = registration("s1", Some("broca"), 30);
     request.session_ref = "ref-taken";
     assert_eq!(
         f.store.register_session(&request).unwrap_err().code,
@@ -454,7 +494,7 @@ fn registration_rekey_refuses_occupied_destination_and_other_ref_kind() {
 #[test]
 fn registration_rekey_network_refusal_and_write_failure_leave_old_binding() {
     let f = Fixture::new();
-    let mut request = registration("s1", None, 10);
+    let mut request = registration("s1", Some("broca"), 10);
     request.network = Some(crate::NetworkStamp {
         network: "yes",
         clock: || 10,
@@ -499,7 +539,7 @@ fn registration_rekey_network_refusal_and_write_failure_leave_old_binding() {
 fn registration_rekey_checks_original_network_history_capacity() {
     let f = Fixture::new();
     f.store
-        .register_session(&registration("s1", None, 10))
+        .register_session(&registration("s1", Some("broca"), 10))
         .unwrap();
     f.store.db.with_conn_fenced(|tx| {
         for since in 0..crate::NETWORK_HISTORY_MAX {
@@ -507,7 +547,7 @@ fn registration_rekey_checks_original_network_history_capacity() {
         }
         Ok(())
     }).unwrap();
-    let mut request = registration("s1", None, 30);
+    let mut request = registration("s1", Some("broca"), 30);
     request.session_ref = "ref-new";
     request.network = Some(crate::NetworkStamp {
         network: "no",
@@ -782,7 +822,7 @@ fn lifecycle_writes_append_no_journal_entry() {
         .unwrap();
     f.store.end_session("broca", "s1", None, 20).unwrap();
     f.store
-        .register_session(&registration("s1", None, 30))
+        .register_session(&registration("s1", Some("broca"), 30))
         .unwrap();
     f.store
         .stamp_gone_sessions(&[GoneSession {
@@ -839,14 +879,14 @@ fn registration_refuses_a_runner_session_bound_elsewhere() {
     );
     assert_eq!(f.count(), 1, "the refused registration wrote nothing");
 
-    // The reference keeps its runner when re-registered without one, so
-    // moving it onto a session id that runner already uses is refused too.
+    // Moving another reference onto a session id the named runner already
+    // uses is refused too.
     f.store
         .register_session(&hosted("ref-3", "broca", "s3", Some("broca")))
         .unwrap();
     assert_eq!(
         f.store
-            .register_session(&hosted("ref-3", "other-harness", "s1", None))
+            .register_session(&hosted("ref-3", "other-harness", "s1", Some("broca")))
             .unwrap_err()
             .code,
         "session_bound_elsewhere"
@@ -857,12 +897,10 @@ fn registration_refuses_a_runner_session_bound_elsewhere() {
     f.store
         .register_session(&hosted("ref-4", "thalamus", "s1", Some("thalamus-harness")))
         .unwrap();
-    f.store
-        .register_session(&hosted("ref-5", "pi", "s1", None))
-        .unwrap();
+    f.legacy_binding(&hosted("ref-5", "pi", "s1", None));
     // Re-registering the owning reference is not a conflict with itself.
     f.store
-        .register_session(&hosted("ref-1", "broca", "s1", None))
+        .register_session(&hosted("ref-1", "broca", "s1", Some("broca")))
         .unwrap();
 }
 
@@ -933,9 +971,7 @@ fn session_binding_for_runner_finds_only_runner_rows() {
     f.store
         .register_session(&hosted("ref-1", "broca", "s1", Some("broca")))
         .unwrap();
-    f.store
-        .register_session(&hosted("ref-2", "pi", "s2", None))
-        .unwrap();
+    f.legacy_binding(&hosted("ref-2", "pi", "s2", None));
     f.store.end_session("broca", "s1", None, 20).unwrap();
     assert_eq!(
         f.store.session_binding_for_runner("broca", "s1").unwrap(),
@@ -971,9 +1007,7 @@ fn session_binding_for_harness_includes_runnerless_rows() {
     f.store
         .register_session(&hosted("ref-1", "pi", "s1", Some("broca")))
         .unwrap();
-    f.store
-        .register_session(&hosted("ref-2", "opencode", "s2", None))
-        .unwrap();
+    f.legacy_binding(&hosted("ref-2", "opencode", "s2", None));
     f.store.end_session("pi", "s1", None, 20).unwrap();
     assert_eq!(
         f.store.session_binding_for_harness("pi", "s1").unwrap(),
@@ -1007,9 +1041,7 @@ fn end_session_leaves_runner_empty_when_another_binding_holds_it() {
     f.store
         .register_session(&hosted("ref-1", "broca", "s1", Some("broca")))
         .unwrap();
-    f.store
-        .register_session(&hosted("ref-2", "pi", "s1", None))
-        .unwrap();
+    f.legacy_binding(&hosted("ref-2", "pi", "s1", None));
     assert_eq!(
         f.store.end_session("pi", "s1", Some("broca"), 30).unwrap(),
         SessionEnd::Ended { ended_at_ms: 30 }

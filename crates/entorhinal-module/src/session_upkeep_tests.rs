@@ -174,10 +174,7 @@ async fn end_session_replies_found_repeat_unknown_and_runner_mismatch() {
     let mut hosted = registration(&agent, "r1", "broca", "s1");
     hosted["runner"] = json!("broca");
     result(f.register(EXECUTIVE, hosted).await);
-    result(
-        f.register(EXECUTIVE, registration(&agent, "r2", "broca", "s2"))
-            .await,
-    );
+    f.legacy_session(&agent, "r2", "broca", "s2");
 
     assert_eq!(
         code(
@@ -246,11 +243,33 @@ async fn end_session_replies_found_repeat_unknown_and_runner_mismatch() {
     }
 }
 
-/// Registration takes an optional runner without changing its reply bytes,
-/// keeps the runner when a later registration names none, and clears an end
-/// time because the session is live again.
 #[tokio::test]
-async fn registration_runner_is_optional_validated_and_not_echoed() {
+async fn registration_requires_runner_before_writing() {
+    let f = Fixture::new("register-requires-runner", true);
+    let agent = f.create("Runner");
+    f.providers(provider(WRITER_MODULE), provider(WRITER_MODULE));
+    for runner in [None, Some(json!("")), Some(Value::Null)] {
+        let mut params = registration(&agent, "r1", "broca", "s1");
+        params.as_object_mut().unwrap().remove("runner");
+        if let Some(runner) = runner {
+            params["runner"] = runner;
+        }
+        let outcome = f.register(EXECUTIVE, params).await;
+        match outcome {
+            HandlerOutcome::Error { code, message } => {
+                assert_eq!(code, "invalid_request");
+                assert!(message.contains("runner"), "{message}");
+            }
+            other => panic!("expected a runner refusal, got {other:?}"),
+        }
+        assert!(listed(&f, &agent).is_empty(), "refusal must bind nothing");
+    }
+}
+
+/// Registration records the runner without changing its reply bytes and
+/// clears an end time because the session is live again.
+#[tokio::test]
+async fn registration_runner_is_required_validated_and_not_echoed() {
     let f = Fixture::new("register-runner", true);
     let agent = f.create("Runner");
     f.providers(provider(WRITER_MODULE), provider(WRITER_MODULE));
@@ -260,18 +279,17 @@ async fn registration_runner_is_optional_validated_and_not_echoed() {
     let HandlerOutcome::Response(first) = f.register(EXECUTIVE, with_runner).await else {
         panic!("registration with a runner refused");
     };
+    let reply: Value = serde_json::from_slice(&first).unwrap();
+    assert!(reply["result"].get("runner").is_none(), "{reply}");
     result(end(&f, EXECUTIVE, json!({"harness":"broca","session":"s1"})).await);
     let HandlerOutcome::Response(second) = f.register(EXECUTIVE, plain).await else {
-        panic!("registration without a runner refused");
+        panic!("re-registration with a runner refused");
     };
     assert_eq!(first, second, "the runner is not part of the reply");
     let row = sessions(&f, json!({"agent_id":agent}))["sessions"][0].clone();
-    assert_eq!(row["runner"], "broca", "an absent runner keeps the old one");
+    assert_eq!(row["runner"], "broca");
     assert_eq!(row["ended_at_ms"], Value::Null, "re-registration reopens");
 
-    let mut null_runner = registration(&agent, "r2", "broca", "s2");
-    null_runner["runner"] = Value::Null;
-    result(f.register(EXECUTIVE, null_runner).await);
     for runner in [json!(""), json!("x".repeat(65)), json!("a\u{7}b"), json!(5)] {
         let mut params = registration(&agent, "r3", "broca", "s3");
         params["runner"] = runner.clone();
@@ -283,7 +301,7 @@ async fn registration_runner_is_optional_validated_and_not_echoed() {
     }
     assert_eq!(
         listed(&f, &agent).len(),
-        2,
+        1,
         "refused registrations bind nothing"
     );
 }
@@ -596,10 +614,7 @@ async fn session_for_runner_resolves_runner_rows_for_any_caller() {
     let mut hosted = registration(&agent, "r1", "broca", "s1");
     hosted["runner"] = json!("broca");
     result(f.register(EXECUTIVE, hosted).await);
-    result(
-        f.register(EXECUTIVE, registration(&agent, "r2", "pi", "s2"))
-            .await,
-    );
+    f.legacy_session(&agent, "r2", "pi", "s2");
     for principal in [None, Some(Principal::Direct), Some(reserved("thalamus"))] {
         f.bind(CALLER, principal, true);
         assert_eq!(
@@ -672,10 +687,7 @@ async fn session_for_harness_resolves_all_rows_for_any_caller() {
     hosted["runner"] = json!("broca");
     hosted["network"] = json!("no");
     result(f.register(EXECUTIVE, hosted).await);
-    result(
-        f.register(EXECUTIVE, registration(&agent, "r2", "opencode", "s2"))
-            .await,
-    );
+    f.legacy_session(&agent, "r2", "opencode", "s2");
     store(&f).end_session("pi", "s1", None, NOW).unwrap();
     let calls = f.resolver.calls();
     for principal in [None, Some(Principal::Direct), Some(reserved("thalamus"))] {

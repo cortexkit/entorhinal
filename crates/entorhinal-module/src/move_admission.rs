@@ -784,7 +784,7 @@ mod tests {
                     session_id: reference,
                     project_root: Some("/project"),
                     registered_by: "host",
-                    runner: None,
+                    runner: Some("host"),
                     network: None,
                     now_ms: 700,
                 })
@@ -911,20 +911,31 @@ mod tests {
         ] {
             let f = Fixture::new(2).await;
             let id = f.create().await;
-            f.store()
-                .register_session(&entorhinal_core::SessionRegistration {
-                    agent_id: &id,
-                    ref_kind: "session",
-                    session_ref: "r",
-                    harness: "host",
-                    session_id: "r",
-                    project_root: Some("/project"),
-                    registered_by: "host",
-                    runner,
-                    network: None,
-                    now_ms: 700,
-                })
-                .unwrap();
+            if let Some(runner) = runner {
+                f.store()
+                    .register_session(&entorhinal_core::SessionRegistration {
+                        agent_id: &id,
+                        ref_kind: "session",
+                        session_ref: "r",
+                        harness: "host",
+                        session_id: "r",
+                        project_root: Some("/project"),
+                        registered_by: "host",
+                        runner: Some(runner),
+                        network: None,
+                        now_ms: 700,
+                    })
+                    .unwrap();
+            } else {
+                f.store().apply_entry("fixture.legacy_session", "{}", "fixture", None, |tx| {
+                    tx.execute(
+                        "INSERT INTO session_binding(ref_kind,ref,agent_id,harness,session_id,project_root,registered_by,registered_at_ms)
+                         VALUES('session','r',?1,'host','r','/project','host',700)",
+                        [&id],
+                    )?;
+                    Ok(())
+                }).unwrap();
+            }
             {
                 let mut mirror = f.handler.liveness.lock().unwrap();
                 mirror

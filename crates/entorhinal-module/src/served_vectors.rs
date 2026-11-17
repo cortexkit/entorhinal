@@ -1582,6 +1582,21 @@ impl SessionFixture {
             .unwrap();
     }
 
+    /// Historical rows may have no runner; keep those read cases independent
+    /// of registrations, which now always name their hosting module.
+    fn seed_binding(&self, request: &Value, runner: Option<&str>) {
+        self.store().apply_entry("fixture.session", "{}", "fixture", None, |tx| {
+            tx.execute(
+                "INSERT INTO session_binding(ref_kind,ref,agent_id,harness,session_id,project_root,registered_by,registered_at_ms,runner)
+                 VALUES(?1,?2,?3,?4,?5,?6,'orchestrator',700,?7)",
+                params![request["ref_kind"].as_str().unwrap(), request["ref"].as_str().unwrap(),
+                    request["agent_id"].as_str().unwrap(), request["harness"].as_str().unwrap(),
+                    request["session_id"].as_str().unwrap(), request["project_root"].as_str().unwrap_or(""), runner],
+            )?;
+            Ok(())
+        }).unwrap();
+    }
+
     async fn record(
         &self,
         route: RouteKey,
@@ -2601,9 +2616,8 @@ async fn node_self_records_match_published_file() {
     );
 }
 
-#[tokio::test]
-async fn session_records_match_published_files() {
-    let fixture = SessionFixture::new("served-sessions").await;
+async fn session_records_fixture(label: &str) -> SessionFixture {
+    let fixture = SessionFixture::new(label).await;
     let source = fixture.snapshot();
     for (id, name) in [
         (SESSION_AGENT, "Session Agent"),
@@ -2627,6 +2641,12 @@ async fn session_records_match_published_files() {
     );
     fixture.cache_claims();
     fixture.seed_legacy_binding();
+    fixture
+}
+
+#[tokio::test]
+async fn session_records_match_published_files() {
+    let fixture = session_records_fixture("served-sessions").await;
 
     let registration = json!({
         "agent_id":SESSION_AGENT,
@@ -2634,6 +2654,7 @@ async fn session_records_match_published_files() {
         "ref":SESSION_REF,
         "harness":"pi",
         "session_id":"session-001",
+        "runner":"pi-runner",
         "project_root":"/workspace/session-vectors"
     });
     let (register_record, registered) = fixture
@@ -2652,6 +2673,7 @@ async fn session_records_match_published_files() {
         "ref":SESSION_REF,
         "harness":"pi",
         "session_id":"session-002",
+        "runner":"pi-runner",
         "project_root":"/workspace/session-vectors/reopened"
     });
     let (reregister_record, reregistered) = fixture
@@ -2659,7 +2681,7 @@ async fn session_records_match_published_files() {
             SESSION_REGISTRAR,
             WRITER_MODULE,
             "agent.register_session",
-            re_registration,
+            re_registration.clone(),
         )
         .await;
     assert_eq!(reregistered["result"]["session_id"], "session-002");
@@ -2670,6 +2692,7 @@ async fn session_records_match_published_files() {
         "ref":OPENCODE_REF,
         "harness":"opencode",
         "session_id":"opencode-session-001",
+        "runner":"opencode",
         "project_root":"/workspace/session-vectors/opencode"
     });
     let (opencode_record, opencode_reply) = fixture
@@ -2677,7 +2700,7 @@ async fn session_records_match_published_files() {
             SESSION_REGISTRAR,
             WRITER_MODULE,
             "agent.register_session",
-            opencode_registration,
+            opencode_registration.clone(),
         )
         .await;
     assert_eq!(opencode_reply["result"]["registered_by"], "orchestrator");
@@ -2719,6 +2742,27 @@ async fn session_records_match_published_files() {
         .await;
     assert_eq!(forbidden_reply["code"], "caller_forbidden");
 
+    let mut missing_runner = registration.clone();
+    missing_runner.as_object_mut().unwrap().remove("runner");
+    let (missing_runner_record, missing_runner_reply) = fixture
+        .record(
+            SESSION_REGISTRAR,
+            WRITER_MODULE,
+            "agent.register_session",
+            missing_runner,
+        )
+        .await;
+    assert_eq!(missing_runner_reply["code"], "invalid_request");
+    assert!(missing_runner_reply["message"]
+        .as_str()
+        .unwrap()
+        .contains("runner"));
+    published_file(
+        "agent-sessions-v1",
+        "register-session-missing-runner.json",
+        vec![missing_runner_record],
+    );
+
     let mut unknown_field = registration;
     unknown_field["unexpected"] = json!(true);
     let (unknown_field_record, unknown_field_reply) = fixture
@@ -2743,6 +2787,12 @@ async fn session_records_match_published_files() {
             unknown_field_record,
         ],
     );
+
+    // The read samples retain rows from before runners were required, in a
+    // separate store from the runner-bearing registration samples above.
+    let fixture = session_records_fixture("served-session-reads").await;
+    fixture.seed_binding(&re_registration, None);
+    fixture.seed_binding(&opencode_registration, None);
 
     let (for_session_found, found_session) = fixture
         .record(
@@ -3025,8 +3075,6 @@ async fn session_lookup_cases_match_published_file() {
             "project_root":root,"network":"yes"}),
         json!({"agent_id":AGENT,"ref_kind":"broca-session","ref":NULL_REF,
             "harness":"broca","session_id":"lookup-rootless","runner":"lookup-runner"}),
-        json!({"agent_id":AGENT,"ref_kind":"pi-session","ref":BARE_REF,
-            "harness":"pi","session_id":"lookup-runnerless"}),
     ] {
         let (_, reply) = fixture
             .record(
@@ -3038,6 +3086,11 @@ async fn session_lookup_cases_match_published_file() {
             .await;
         assert_eq!(reply["result"]["registered_by"], "orchestrator", "{reply}");
     }
+    fixture.seed_binding(
+        &json!({"agent_id":AGENT,"ref_kind":"pi-session","ref":BARE_REF,
+        "harness":"pi","session_id":"lookup-runnerless"}),
+        None,
+    );
     let (_, ended) = fixture
         .record(
             SESSION_REGISTRAR,
@@ -3374,16 +3427,25 @@ async fn sessions_head_runners_match_published_file() {
 
     let core = json!({
         "agent_id":AGENT, "ref_kind":"opencode-session", "ref":CORE_REF,
-        "harness":"opencode", "session_id":"head-core-plugin", "project_root":root
+        "harness":"opencode", "session_id":"head-core-plugin", "project_root":root,
+        "runner":"opencode"
     });
     let thalamus = json!({
         "agent_id":AGENT, "ref_kind":"opencode-session", "ref":THALAMUS_REF,
         "harness":"opencode", "session_id":"head-thalamus", "project_root":root,
         "runner":RUNNER
     });
-    let mut records = Vec::new();
-    for params in [core.clone(), thalamus] {
-        let (record, reply) = fixture
+    let registrations = SessionFixture::new("served-head-registrations").await;
+    let source = registrations.snapshot();
+    seed_agent(&source, AGENT, "Orchard Head", None, false, false);
+    drop(source);
+    assert!(matches!(
+        registrations.import().await,
+        HandlerOutcome::Response(_)
+    ));
+    let mut registration_records = Vec::new();
+    for params in [core.clone(), thalamus.clone()] {
+        let (record, reply) = registrations
             .record(
                 SESSION_REGISTRAR,
                 WRITER_MODULE,
@@ -3392,8 +3454,20 @@ async fn sessions_head_runners_match_published_file() {
             )
             .await;
         assert_eq!(reply["result"]["registered_by"], "orchestrator", "{reply}");
-        records.push(record);
+        registration_records.push(record.replace(
+            &json_string_contents(&root),
+            &json_string_contents(FIXED_ROOT),
+        ));
     }
+    published_file(
+        "agent-sessions-v1",
+        "register-session-head.json",
+        registration_records,
+    );
+
+    fixture.seed_binding(&core, None);
+    fixture.seed_binding(&thalamus, Some(RUNNER));
+    let mut records = Vec::new();
 
     for (reference, runner) in [(CORE_REF, None), (REKEYED_REF, Some(RUNNER))] {
         if let Some(runner) = runner {
@@ -3485,7 +3559,7 @@ async fn session_rekey_records_match_published_files() {
     records.push(record);
     let mut rekey = initial;
     rekey["ref"] = json!("runner-session-ref");
-    for field in ["project_root", "runner", "network"] {
+    for field in ["project_root", "network"] {
         rekey.as_object_mut().unwrap().remove(field);
     }
     let (record, reply) = fixture
@@ -3775,9 +3849,17 @@ async fn session_lifecycle_records_match_published_files() {
         "register-session-runner.json",
         vec![register_record],
     );
-    for params in [
-        worker(ENDED_WORKER_REF, "broca-ended"),
-        json!({
+    let (_, reply) = fixture
+        .record(
+            SESSION_REGISTRAR,
+            WRITER_MODULE,
+            "agent.register_session",
+            worker(ENDED_WORKER_REF, "broca-ended"),
+        )
+        .await;
+    assert!(reply.get("result").is_some(), "{reply}");
+    fixture.seed_binding(
+        &json!({
             "agent_id":SESSION_AGENT,
             "ref_kind":"pi-session",
             "ref":NO_RUNNER_REF,
@@ -3785,17 +3867,8 @@ async fn session_lifecycle_records_match_published_files() {
             "session_id":"pi-session-001",
             "project_root":"/workspace/session-vectors"
         }),
-    ] {
-        let (_, reply) = fixture
-            .record(
-                SESSION_REGISTRAR,
-                WRITER_MODULE,
-                "agent.register_session",
-                params,
-            )
-            .await;
-        assert!(reply.get("result").is_some(), "{reply}");
-    }
+        None,
+    );
 
     let mut end_records = Vec::new();
     for (params, expected) in [
@@ -4084,13 +4157,18 @@ async fn session_for_harness_records_match_published_file() {
         (NO_RUNNER_REF, "opencode", "head", None),
         (ENDED_WORKER_REF, "pi", "remote-ended", Some("broca")),
     ] {
+        let params = json!({"agent_id":SESSION_AGENT,"ref_kind":"pi-session","ref":session_ref,
+            "harness":harness,"session_id":session,"runner":runner,"project_root":root});
+        if runner.is_none() {
+            fixture.seed_binding(&params, None);
+            continue;
+        }
         let (_, reply) = fixture
             .record(
                 SESSION_REGISTRAR,
                 WRITER_MODULE,
                 "agent.register_session",
-                json!({"agent_id":SESSION_AGENT,"ref_kind":"pi-session","ref":session_ref,
-                    "harness":harness,"session_id":session,"runner":runner,"project_root":root}),
+                params,
             )
             .await;
         assert!(reply.get("result").is_some(), "{reply}");
@@ -4190,6 +4268,8 @@ async fn session_for_harness_records_match_published_file() {
 /// `session-for-ref.json` was re-pinned when `agent.session_for_ref` began
 /// naming a recorded runner: it gained a record with a runner, and its
 /// existing records kept their bytes.
+/// `register-session.json` was re-pinned when its requests gained the required
+/// runner; every reply kept its bytes.
 const PINNED_SESSION_SAMPLES: [(&str, &str); 10] = [
     (
         "for-session.json",
@@ -4197,7 +4277,7 @@ const PINNED_SESSION_SAMPLES: [(&str, &str); 10] = [
     ),
     (
         "register-session.json",
-        "756975d9e0697109b0f7a70c0a08dfa18b2fc5222915e1051870948b1836d6a0",
+        "445d3a8fdf1671aeab797443d2041b5710281c22e9477679fb2eee03e9401f21",
     ),
     (
         "session-for-ref.json",

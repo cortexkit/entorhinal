@@ -726,20 +726,23 @@ fn runner_bounds(runner: &str) -> Result<(), HandlerError> {
     Ok(())
 }
 
-/// Take the optional `runner` out of a registration before the strict decode
+/// Take the required `runner` out of a registration before the strict decode
 /// of the rest. Registration's field set and its `unknown field` refusal are a
 /// published contract that callers decode byte for byte, and listing `runner`
 /// among the expected fields would change that refusal's text.
-fn take_runner(params: &mut Value) -> Result<Option<String>, HandlerError> {
-    let Some(object) = params.as_object_mut() else {
-        return Ok(None);
-    };
-    match object.remove("runner") {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(runner)) => Ok(Some(runner)),
+fn take_runner(params: &mut Value) -> Result<String, HandlerError> {
+    match params
+        .as_object_mut()
+        .and_then(|object| object.remove("runner"))
+    {
+        None => Err(HandlerError::new(
+            "invalid_request",
+            "missing field `runner`",
+        )),
+        Some(Value::String(runner)) => Ok(runner),
         Some(_) => Err(HandlerError::new(
             "invalid_request",
-            "runner must be a string or null",
+            "runner must be a string",
         )),
     }
 }
@@ -752,7 +755,7 @@ fn network_bounds(network: &str) -> Result<(), HandlerError> {
 /// Take the optional `network` out of a registration before the strict
 /// decode of the rest, for the same reason as `runner`: listing it among the
 /// expected fields would change the published unknown-field refusal. Null
-/// reads as absent, like a null runner.
+/// reads as absent.
 fn take_network(params: &mut Value) -> Result<Option<String>, HandlerError> {
     let Some(object) = params.as_object_mut() else {
         return Ok(None);
@@ -1038,9 +1041,7 @@ pub(super) fn register_session_on_store(
     if let Some(root) = &request.project_root {
         bounded("project_root", root, PROJECT_ROOT_MAX)?;
     }
-    if let Some(runner) = &runner {
-        runner_bounds(runner)?;
-    }
+    runner_bounds(&runner)?;
     let binding = store
         .register_session(&SessionRegistration {
             agent_id: &request.agent_id,
@@ -1050,7 +1051,7 @@ pub(super) fn register_session_on_store(
             session_id: &request.session_id,
             project_root: request.project_root.as_deref(),
             registered_by: role.as_str(),
-            runner: runner.as_deref(),
+            runner: Some(&runner),
             network: network
                 .as_deref()
                 .map(|network| entorhinal_core::NetworkStamp { network, clock }),
@@ -1058,8 +1059,8 @@ pub(super) fn register_session_on_store(
         })
         .map_err(HandlerError::from)?;
     // The reply is the binding as before; neither the runner nor the network
-    // value is echoed, so the reply bytes callers decode strictly are the
-    // same with or without them.
+    // value is echoed, so the reply bytes callers decode strictly remain
+    // unchanged when the required runner is recorded.
     encode_result(binding)
 }
 
@@ -1525,6 +1526,24 @@ pub(super) mod tests {
                 .into()
         }
 
+        /// Insert a historical binding with no recorded runner.
+        pub(crate) fn legacy_session(
+            &self,
+            agent: &str,
+            reference: &str,
+            harness: &str,
+            session: &str,
+        ) {
+            self.handler.with_store(|store| store.apply_entry("fixture.session", "{}", "fixture", None, |tx| {
+                tx.execute(
+                    "INSERT INTO session_binding(ref_kind,ref,agent_id,harness,session_id,project_root,registered_by,registered_at_ms)
+                     VALUES('pi',?1,?2,?3,?4,'/project','orchestrator',?5)",
+                    rusqlite::params![reference, agent, harness, session, NOW],
+                )?;
+                Ok(())
+            })).unwrap();
+        }
+
         pub(crate) fn bind(&self, route: RouteKey, principal: Option<Principal>, flow: bool) {
             self.handler.route_admissions().insert(
                 route,
@@ -1657,6 +1676,7 @@ pub(super) mod tests {
             "ref":session_ref,
             "harness":harness,
             "session_id":session_id,
+            "runner":harness,
             "project_root":project_root,
         })
     }
@@ -2263,6 +2283,7 @@ pub(super) mod tests {
             "harness":"pi",
             "session_id":"s2",
             "project_root":root,
+            "runner":"pi",
             "incarnation":"0123456789abcdef",
         });
         for principal in [
@@ -2296,14 +2317,14 @@ pub(super) mod tests {
                 "harness":"pi",
                 "session_id":"s3",
                 "project_root":" /new-root/ ",
+                "runner":"pi",
                 "incarnation":"0123456789abcdef",
             })
         );
     }
 
     /// The reply names the runner recorded for the binding and omits the key
-    /// when none was recorded, rather than sending null. Re-registering
-    /// without a runner keeps the recorded one, so the read still names it.
+    /// when none was recorded on a historical row, rather than sending null.
     #[tokio::test]
     async fn session_for_ref_names_the_recorded_runner_and_omits_an_unrecorded_one() {
         let f = Fixture::new("session-for-ref-runner", true);
@@ -2312,10 +2333,7 @@ pub(super) mod tests {
         let mut hosted = registration(&agent, "hosted", "broca", "s1");
         hosted["runner"] = json!("broca");
         result(f.register(EXECUTIVE, hosted).await);
-        result(
-            f.register(EXECUTIVE, registration(&agent, "plain", "pi", "s2"))
-                .await,
-        );
+        f.legacy_session(&agent, "plain", "pi", "s2");
         let hosted_params = json!({"ref_kind":"pi","ref":"hosted"});
         let mut expected = json!({
             "agent_id":agent,
@@ -2340,7 +2358,7 @@ pub(super) mod tests {
         assert_eq!(
             f.sync_ok(CALLER, SESSION_FOR_REF, hosted_params),
             expected,
-            "re-registering without a runner keeps the recorded one"
+            "re-registering records the named runner"
         );
 
         let plain = f.sync_ok(

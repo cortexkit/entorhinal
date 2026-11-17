@@ -2222,7 +2222,7 @@ mod moves {
                 session_id: reference,
                 project_root: Some("/project"),
                 registered_by: "host",
-                runner: None,
+                runner: Some("host"),
                 network: None,
                 now_ms: clock(),
             })
@@ -4391,7 +4391,7 @@ async fn avatar_incident_pair() -> (Machine, Machine, Arc<FakeLog>, Value, Strin
 
 fn registration_body(id: &str) -> Vec<u8> {
     serde_json::to_vec(&json!({"method":sessions::REGISTER_SESSION,"params":{
-        "agent_id":id,"ref_kind":"pi","ref":"avatar-ref","harness":"pi","session_id":"avatar-session","project_root":"/project"
+        "agent_id":id,"ref_kind":"pi","ref":"avatar-ref","harness":"pi","session_id":"avatar-session","runner":"pi","project_root":"/project"
     }})).unwrap()
 }
 

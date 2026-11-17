@@ -1620,7 +1620,7 @@ mod tests {
             session_id: "s",
             project_root: Some("/project"),
             registered_by: "host",
-            runner: None,
+            runner: Some("host"),
             network: None,
             now_ms: 1,
         }
