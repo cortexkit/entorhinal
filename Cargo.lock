@@ -592,7 +592,7 @@ dependencies = [
 
 [[package]]
 name = "entorhinal-module"
-version = "0.1.72"
+version = "0.1.73"
 dependencies = [
  "async-nats",
  "async-trait",
