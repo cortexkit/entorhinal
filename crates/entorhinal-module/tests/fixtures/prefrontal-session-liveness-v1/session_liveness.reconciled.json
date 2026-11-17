@@ -1,0 +1,6 @@
+{
+  "bucket": "CK_BOX_TEST_PREFRONTAL_CORE_SESSION_LIVENESS",
+  "key": "_reconciled",
+  "operation": "PUT",
+  "value": "{\"bootId\":\"<process incarnation>\",\"sessions\":1}"
+}

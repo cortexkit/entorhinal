@@ -155,6 +155,13 @@ impl Mirror {
             }
             Update::Delete(key) => {
                 if let Some(identity) = self.keys.remove(&key) {
+                    // The writer once keyed sessions differently. If a rewrite
+                    // under the new key lands before the old key's delete, the
+                    // session is still live under the new key and must not
+                    // read `gone`.
+                    if self.keys.values().any(|other| *other == identity) {
+                        return Ok(None);
+                    }
                     self.sessions.remove(&identity);
                     return Ok(Some(identity));
                 }

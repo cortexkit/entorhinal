@@ -124,6 +124,80 @@ fn liveness_bus_decodes_prefrontal_values_and_orders_keys_before_marker() {
     ));
 }
 
+/// Prefrontal's recorded bucket rows (hex-encoded session keys, the literal
+/// marker key) drive the mirror through a full pass: marker delete, entry,
+/// marker put, then the entry's delete.
+#[test]
+fn liveness_bus_reads_prefrontal_recorded_rows() {
+    fn row(name: &str) -> Update {
+        let path = format!(
+            "{}/tests/fixtures/prefrontal-session-liveness-v1/session_liveness.{name}.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let row: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let key = row["key"].as_str().unwrap().to_owned();
+        match row["operation"].as_str().unwrap() {
+            "PUT" => Update::Put(key, row["value"].as_str().unwrap().as_bytes().to_vec()),
+            "DEL" => Update::Delete(key),
+            other => panic!("unexpected operation {other}"),
+        }
+    }
+    let session = SessionKey::new("broca", "session_sample");
+    let mut state = LivenessState::default();
+    state.bus.watch_live = true;
+    state.bus.finish_replay();
+    state.bus.apply(row("reconciled.deleted")).unwrap();
+    state.bus.apply(row("active")).unwrap();
+    assert!(!state.bus.authoritative());
+    state.bus.apply(row("reconciled")).unwrap();
+    assert!(state.bus.authoritative());
+    assert!(matches!(state.read(&session), Read::Active));
+    state.bus.apply(row("idle")).unwrap();
+    assert!(matches!(state.read(&session), Read::Idle));
+    assert_eq!(state.bus.apply(row("gone")).unwrap(), Some(session.clone()));
+    assert!(matches!(state.read(&session), Read::Gone));
+    state.bus.apply(row("reconciled.deleted")).unwrap();
+    assert!(!state.bus.authoritative());
+}
+
+/// The writer's switch to hex keys deletes each old raw-id key. If the new
+/// key's rewrite arrives first, the old key's delete must not end the session.
+#[test]
+fn liveness_bus_old_key_delete_keeps_session_rewritten_under_new_key() {
+    let session = SessionKey::new("broca", "session_sample");
+    let mut state = LivenessState::default();
+    state.bus.watch_live = true;
+    state.bus.finish_replay();
+    state
+        .bus
+        .apply(put(
+            "broca.session_sample",
+            "broca",
+            "session_sample",
+            "idle",
+        ))
+        .unwrap();
+    state
+        .bus
+        .apply(put(
+            "broca.73657373696f6e5f73616d706c65",
+            "broca",
+            "session_sample",
+            "idle",
+        ))
+        .unwrap();
+    state.bus.apply(marker()).unwrap();
+    assert_eq!(
+        state
+            .bus
+            .apply(Update::Delete("broca.session_sample".into()))
+            .unwrap(),
+        None
+    );
+    assert!(matches!(state.read(&session), Read::Idle));
+}
+
 #[derive(Debug, PartialEq)]
 enum Event {
     Open,

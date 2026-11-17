@@ -1,0 +1,3 @@
+Copied unchanged from prefrontal test-vectors/bus-rows-v1/ at 89b6ec4d58eb8109fb393144c642d3f4bd1b5470:
+the session-liveness bucket rows prefrontal writes, recorded from its real writer.
+Refresh by copying the five files and their SHA256SUMS lines again.

@@ -1,0 +1,6 @@
+{
+  "bucket": "CK_BOX_TEST_PREFRONTAL_CORE_SESSION_LIVENESS",
+  "key": "broca.73657373696f6e5f73616d706c65",
+  "operation": "PUT",
+  "value": "{\"harness\":\"broca\",\"lastActivityMs\":17,\"projectId\":\"project_sample\",\"sessionId\":\"session_sample\",\"state\":\"active\"}"
+}
