@@ -1668,7 +1668,11 @@ fn normalize_project_record(
 
 #[tokio::test]
 async fn project_resolve_v1_records_match_published_files() {
-    for (name, records) in project_resolve_v1_records().await {
+    for (name, records) in project_resolve_v1_records()
+        .await
+        .into_iter()
+        .chain(project_root_keys_v1_records().await)
+    {
         published_file("project-resolve-v1", name, records);
     }
 }
@@ -1742,6 +1746,7 @@ async fn project_resolve_v1_records_roundtrip_through_project_identity() {
         "enumerate-file-ids.json",
         project_enumerate_file_ids_records().await,
     ));
+    files.extend(project_root_keys_v1_records().await);
     for (name, served) in files {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../test-vectors/project-resolve-v1")
@@ -2208,6 +2213,161 @@ async fn project_resolve_v1_records() -> [(&'static str, Vec<String>); 4] {
         ("resolve-project-id.json", project_id_records),
         ("enumerate.json", enumerate_records),
         ("resolve-root-records.json", identity_records),
+    ]
+}
+
+async fn project_root_keys_v1_records() -> [(&'static str, Vec<String>); 2] {
+    // Keep key assignment and ownership changes in a separate store so the
+    // existing examples retain their generations and exact reply bytes.
+    let fixture = SessionFixture::new("served-project-root-keys-v1").await;
+    let store = fixture.store();
+    let plan = store.prepare_enable("project-root-keys-v1", 700).unwrap();
+    let parts = plan
+        .bodies
+        .into_iter()
+        .map(|data| entorhinal_core::enable_state::EnablePart {
+            entry_id: [1; 16],
+            data,
+        })
+        .collect::<Vec<_>>();
+    store.begin_enable(&parts, &plan.backfill).unwrap();
+    store.finish_enable(700, WRITER_MODULE, None).unwrap();
+
+    let remote = fixture.dir.join("remote-checkout");
+    let label = fixture.dir.join("label-checkout");
+    for path in [&remote, &label] {
+        std::fs::create_dir_all(path.join(".git")).unwrap();
+        std::fs::write(path.join(".git/config"), "[core]\n\tbare = false\n").unwrap();
+    }
+    std::fs::write(
+        remote.join(".git/config"),
+        concat!(
+            "[remote \"origin\"]\n\turl = https://github.com/example-org/widgets.git\n",
+            "[remote \"upstream\"]\n\turl = https://github.com/example-upstream/widgets.git\n",
+        ),
+    )
+    .unwrap();
+    let canonical = |path: &PathBuf| {
+        crate::tests::canonical_test_path(path)
+            .to_string_lossy()
+            .into_owned()
+    };
+    let remote = canonical(&remote);
+    let label = canonical(&label);
+    store
+        .register(entorhinal_core::RegisterRequest {
+            project_id: Some("pj-root-keys".into()),
+            name: "Root Keys".into(),
+            roots: vec![remote.clone(), label.clone()],
+            label: Some("operator-assets".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    let scratch_root = canonical(&fixture.dir);
+    let paths = [
+        (remote.clone(), "/fixture/remote-checkout".to_string()),
+        (label.clone(), "/fixture/label-checkout".to_string()),
+    ];
+    let mut resolve_records = Vec::new();
+    for (path, key) in [
+        (
+            &remote,
+            json!({"kind":"remote","rootKey":"example-org/widgets"}),
+        ),
+        (&label, json!({"kind":"label","rootKey":"operator-assets"})),
+    ] {
+        let (record, reply) = fixture
+            .record(
+                SESSION_READER,
+                READER_MODULE,
+                "resolve",
+                json!({"canonicalRoot":path}),
+            )
+            .await;
+        let roots = reply["result"]["rootRecords"].as_array().unwrap();
+        let root = roots.iter().find(|root| root["root"] == *path).unwrap();
+        assert_eq!(root["rootKey"], key);
+        assert_eq!(root["rootKeyMismatch"], false);
+        resolve_records.push(normalize_project_record(
+            record,
+            &scratch_root,
+            &paths,
+            &[],
+            &reply,
+        ));
+    }
+
+    let (mut record, reply) = fixture
+        .record(SESSION_READER, READER_MODULE, "enumerate", json!({}))
+        .await;
+    let projects = reply["result"]["projects"].as_array().unwrap();
+    assert_eq!(projects.len(), 1);
+    assert_eq!(projects[0]["projectId"], "pj-root-keys");
+    let roots = projects[0]["rootRecords"].as_array().unwrap();
+    assert_eq!(roots.len(), 2);
+    for (root, path, key, stable_file_id) in [
+        (
+            &roots[0],
+            &label,
+            json!({"kind":"label","rootKey":"operator-assets"}),
+            "unix:1:100",
+        ),
+        (
+            &roots[1],
+            &remote,
+            json!({"kind":"remote","rootKey":"example-org/widgets"}),
+            "unix:1:101",
+        ),
+    ] {
+        assert_eq!(root["root"], *path);
+        assert_eq!(root["rootKey"], key);
+        assert_eq!(root["rootKeyMismatch"], false);
+        let file_id = root["fileId"].as_str().unwrap();
+        assert_eq!(file_id, expected_file_id(Path::new(path)));
+        record = record.replace(&json_string_contents(file_id), stable_file_id);
+    }
+    let enumerate_records = vec![normalize_project_record(
+        record,
+        &scratch_root,
+        &paths,
+        &[],
+        &reply,
+    )];
+
+    // Ownership can change without reassigning the durable key. The next
+    // resolve reports the old key alongside the current remotes and mismatch.
+    store
+        .set_owned_remotes(entorhinal_core::SetOwnedRemotesRequest {
+            root: remote.clone(),
+            remotes: Some(vec!["upstream".into()]),
+            ..Default::default()
+        })
+        .unwrap();
+    let (record, reply) = fixture
+        .record(
+            SESSION_READER,
+            READER_MODULE,
+            "resolve",
+            json!({"canonicalRoot":remote}),
+        )
+        .await;
+    let roots = reply["result"]["rootRecords"].as_array().unwrap();
+    let root = roots.iter().find(|root| root["root"] == remote).unwrap();
+    assert_eq!(
+        root["rootKey"],
+        json!({"kind":"remote","rootKey":"example-org/widgets"})
+    );
+    assert_eq!(root["rootKeyMismatch"], true);
+    resolve_records.push(normalize_project_record(
+        record,
+        &scratch_root,
+        &paths,
+        &[],
+        &reply,
+    ));
+    [
+        ("resolve-root-keys.json", resolve_records),
+        ("enumerate-root-keys.json", enumerate_records),
     ]
 }
 
