@@ -178,7 +178,8 @@ a backfill makes the data local.
   two-agent fixture and the same fixed clock. Four records show the initial
   binding, its same-agent re-key without a root and with the required runner,
   another agent's refused re-key, and a new registration without `project_root`
-  (null in the reply). All earlier reply byte sequences remain unchanged.
+  (null in the reply). Each reply keeps the bytes it had before `runner`
+  became required; only the requests gained a runner.
 - **`end-session.json`**: ending a worker (`found: true` with the end time),
   the repeat (the same first end time, nothing written), an unknown session
   (`found: false`), and `runner_mismatch` for a runner other than the
@@ -186,8 +187,9 @@ a backfill makes the data local.
 - **`sessions.json`**: one agent's two pages at `limit: 2`: a live Broca worker
   (`active` from the reconciled liveness bucket, network `no` after `yes`) and
   an ended worker (`gone`, network `unknown` with no history), then a Pi
-  historical session inserted directly without a runner (`gone` because it is absent from the
-  authoritative bucket, network `unknown`),
+  historical session inserted directly without a runner (`gone`: prefrontal's
+  session-liveness bucket is reconciled and doesn't list it, network
+  `unknown`),
   whose page has `next_cursor: null`.
 - **`session-for-runner.json`**: the live worker found by `{runner, session}`
   with its history `yes` at 700 then `no` at 710, the ended worker with no
@@ -260,8 +262,8 @@ a backfill makes the data local.
 - **`register-session-head.json`**: Two OpenCode session registrations name
   their runners. Their reply shape is unchanged and does not echo the runner.
 - **`sessions-head-runners.json`**: Historical rows inserted directly for a
-  project's designated agent (its head) have two OpenCode sessions. The phone's
-  first `agent.sessions` read shows the core-plugin session with `runner: null`
+  project's designated agent (its head) have two OpenCode sessions. The first
+  `agent.sessions` read shows the core-plugin session with `runner: null`
   and the hosted session with `runner: "thalamus-harness"`. Re-registering the
   plugin session with the same harness/session ID, a new ref and that runner
   replaces its runner and re-keys its ref in place; the second read still has
