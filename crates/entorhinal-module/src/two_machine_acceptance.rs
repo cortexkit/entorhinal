@@ -122,7 +122,12 @@ impl Machine {
         handler
     }
 
-    fn restart(&mut self, connector: Arc<dyn LogConnector>) {
+    /// Stops the old handler's background tasks before reopening the store.
+    /// Claim refresh reads the store on blocking threads once sharing is on,
+    /// and a pass left running would keep the database open, so Windows could
+    /// not delete the scratch folder at the end of the test.
+    async fn restart(&mut self, connector: Arc<dyn LogConnector>) {
+        crate::tests::stop_store_tasks(&self.handler).await;
         self.handler.store.lock().unwrap().take();
         self.handler = Self::open(&self.descriptor, connector);
     }
@@ -1474,7 +1479,7 @@ async fn absent_engram_all_reads_startup_and_same_key_core_retry() {
         .unwrap();
     let id = created["agent"]["agent_id"].as_str().unwrap();
     let absent = Arc::new(Absent::default());
-    m.restart(absent.clone());
+    m.restart(absent.clone()).await;
     assert_eq!(m.handler.health().await.status, HealthStatus::Ok);
     assert_eq!(
         absent.calls.load(Ordering::SeqCst),
@@ -1536,10 +1541,10 @@ async fn absent_engram_all_reads_startup_and_same_key_core_retry() {
         m.store().identity_log_status().unwrap().pending_write_count,
         0
     );
-    m.restart(log.clone());
+    m.restart(log.clone()).await;
     let committed = m.bytes_on(CORE, "register", request.clone()).await.unwrap();
     let journal = m.rows("registry_journal");
-    m.restart(Arc::new(FailConnector::default()));
+    m.restart(Arc::new(FailConnector::default())).await;
     assert_eq!(
         m.bytes_on(CORE, "register", request).await.unwrap(),
         committed
@@ -1563,7 +1568,7 @@ async fn absent_engram_local_writes_keep_keys_and_workspace_timestamps() {
     let clone = m.repo("clone", &[("origin", "local/p")]);
     m.call("attach_root", json!({"path":clone})).await.unwrap();
     let fail = Arc::new(FailConnector::default());
-    m.restart(fail.clone());
+    m.restart(fail.clone()).await;
     let shared = m.shared();
     let head = log.head();
     m.approve(&clone).await;
@@ -4559,7 +4564,7 @@ async fn avatar_batch_drain_interrupts_append_without_waiting_for_network_and_re
     // from the log, then resume only the remaining manifest entries.
     log.release_next().unwrap();
     b.catch_up().await;
-    a.restart(log.clone());
+    a.restart(log.clone()).await;
     a.handler.operator_confirmer = Arc::new(crate::served_vectors::Approve {
         summaries: std::sync::Mutex::new(vec![]),
     });
@@ -4577,12 +4582,14 @@ async fn avatar_batch_drain_interrupts_append_without_waiting_for_network_and_re
     b.catch_up().await;
     assert_eq!(a.shared(), b.shared());
     assert!(b.store().verify().unwrap().ok);
+    crate::tests::stop_store_tasks(&a.handler).await;
+    crate::tests::stop_store_tasks(&b.handler).await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn cold_fleet_and_avatar_reads_do_not_wait_for_background_log_read() {
-    let (mut a, _b, log, _, id) = avatar_incident_pair().await;
-    a.restart(log.clone());
+    let (mut a, b, log, _, id) = avatar_incident_pair().await;
+    a.restart(log.clone()).await;
     let calls = log.calls();
     log.on_read(crate::fake_log::Action::Hang);
     a.handler.start_catch_up();
@@ -4607,6 +4614,7 @@ async fn cold_fleet_and_avatar_reads_do_not_wait_for_background_log_read() {
         assert_eq!(log.calls(), calls + 1, "read contacted the shared log");
     }
     crate::tests::stop_store_tasks(&a.handler).await;
+    crate::tests::stop_store_tasks(&b.handler).await;
 }
 
 #[async_trait]
