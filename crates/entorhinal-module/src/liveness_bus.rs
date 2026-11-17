@@ -1,10 +1,9 @@
 //! Ordered session-liveness mirror. Only a live watch with a reconciliation
-//! marker and a finished initial replay may replace the pushed feed. A key
+//! marker and a finished initial replay is authoritative. A key
 //! updated after the marker replays later, so both conditions are necessary.
 
 use std::{
     collections::BTreeMap,
-    path::Path,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -78,24 +77,14 @@ impl LivenessState {
                 None => Read::Gone,
             };
         }
-        let entry = self.sessions.get(key);
-        let cause = entry.and_then(|entry| entry.cause.as_deref());
-        if self.stale {
-            return Read::Unknown(cause);
-        }
-        match entry.map(|entry| entry.state.as_str()) {
-            Some("active") => Read::Active,
-            Some("idle") => Read::Idle,
-            None if self.gone.contains(key) => Read::Gone,
-            _ => Read::Unknown(cause),
-        }
+        Read::Unknown(None)
     }
 
     pub(super) fn readable(&self) -> bool {
-        self.bus.authoritative() || (!self.stale && !self.sessions.is_empty())
+        self.bus.authoritative()
     }
 
-    pub(super) fn project_activity(&self, project_id: &str, roots: &[String]) -> Option<i64> {
+    pub(super) fn project_activity(&self, project_id: &str) -> Option<i64> {
         if self.bus.authoritative() {
             self.bus
                 .sessions
@@ -107,18 +96,7 @@ impl LivenessState {
                 .map(|(_, entry)| entry.last_activity_ms)
                 .max()
         } else {
-            self.sessions
-                .values()
-                .filter(|entry| {
-                    roots.iter().any(|root| {
-                        entorhinal_core::path_prefix_or_equal(
-                            Path::new(root),
-                            Path::new(&entry.canonical_root),
-                        )
-                    })
-                })
-                .map(|entry| entry.last_activity_ms)
-                .max()
+            None
         }
     }
 }
@@ -369,7 +347,7 @@ impl Worker {
                     Some((kind, attempts)) if *kind == error.kind => *attempts += 1,
                     _ => {
                         tracing::warn!(target: "liveness", kind = error.kind, detail = error.message,
-                            previous = ?outage, "bus liveness unavailable; using pushed feed (repeats are counted, not logged)");
+                            previous = ?outage, "bus liveness unavailable; sessions are unknown (repeats are counted, not logged)");
                         outage = Some((error.kind, 1));
                     }
                 }
@@ -419,4 +397,4 @@ impl ProjectsHandler {
 
 #[cfg(test)]
 #[path = "liveness_bus_tests.rs"]
-mod tests;
+pub(super) mod tests;

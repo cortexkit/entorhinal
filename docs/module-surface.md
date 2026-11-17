@@ -177,7 +177,6 @@ concepts.
 | `approve_project`, `unapprove_project` | mutate | The same for every root of the project a path belongs to; approval refuses unless every root is identified. |
 | `seed_import` | mutate | Bulk-import registrations from a seed file (recovery). |
 | `rebuild` | mutate | Rebuild the derived tables by replaying the journal (recovery). |
-| `projects.session_liveness` | mutate | The session liveness feed. Host only; never journaled. See [session-liveness-contract.md](session-liveness-contract.md). |
 
 `refresh_root_key` takes `{root}` and returns `{projectId, name, root, rootKey,
 generation, noop}`. It fills only a missing key; repeating the same refresh is a
@@ -437,7 +436,7 @@ the cache, so it works offline and never waits on engram.
 | `agent.session_for_harness {harness, session}` | query | any | Resolve a host session regardless of its runner, with exactly the same reply as `agent.session_for_runner`: `agent_id`, `runner` (null when unrecorded), `session`, `harness`, `ref_kind`, `ref`, `project_root`, `ended_at_ms`, `network`, `network_history` and `incarnation`, plus `heldOn` when data is on another machine. Requires a 1–32-byte harness and 1–256-byte session; unknown fields or malformed requests refuse `invalid_request`, and unknown sessions refuse `not_found`. |
 | `agent.for_session` | query | any | The agent and reference bound to a host session. |
 | `agent.session_for_ref` | query | any | The agent, host session and project root bound to a reference, with `runner` (the bare module id of the llm-runner hosting the session) only when the binding has one recorded; a binding without one omits the key rather than sending `null`. Re-registering without a runner keeps the recorded one, so the reply still names it. |
-| `agent.session_liveness` | query | any | `active`, `gone` or `unknown` for up to 256 references, in order. |
+| `agent.session_liveness` | query | any | `active`, `gone` or `unknown` for up to 256 references, in order, from the trusted `prefrontal-core.session-liveness` bus mirror; `unknown` while the watch is unavailable or unreconciled. See [session-liveness-contract.md](session-liveness-contract.md). |
 | `agent.where` | query | any | Which machine holds an agent, from the cached claim, plus any blocked move's participant and ref explanation. |
 | `agent.where_many` | query | any | Cached claim results for 1–64 agent ids in request order; unknown agents are omitted. |
 | `node.self {}` | query | any | This machine's identity-log identity: `{author: string or null, display_name: string or null, sharing: "disabled" or "enabling" or "joining" or "enabled"}` inside the usual `{result: ...}` envelope. Unknown params refuse `invalid_request`. |
@@ -517,10 +516,10 @@ before recording anything. See [session binding moves](agent-move-contract.md#11
 for stream versions, installation and collision behavior.
 
 Session bindings are machine-local and never journaled. A binding is marked
-ended by `agent.end_session` or when the host's liveness feed reports the
-session `gone` (never from `lapsed`, `unknown` or absence from a snapshot); a
-feed entry's optional `runner` limits that to a binding of the same runner or
-of none. Bindings that ended more than 30 days ago are pruned shortly after
+ended by `agent.end_session` or an observed DEL for a previously decoded
+session in the authoritative bus mirror, never from missing keys or an
+unavailable watch. The mirror requires a live watch, a finished initial replay
+and a valid `_reconciled` marker. Bindings that ended more than 30 days ago are pruned shortly after
 startup and hourly after that, except every binding of an agent with an open
 move. A binding that never ended is never pruned. Held-elsewhere ended rows
 follow the same 30-day rule; pruning removes only metadata and history, never

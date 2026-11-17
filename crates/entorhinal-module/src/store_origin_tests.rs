@@ -177,11 +177,7 @@ async fn store_origin_first_start_adopts_equal_is_normal_and_no_id_is_unchecked(
 #[tokio::test]
 async fn foreign_store_refuses_every_write_class_before_decoding_or_confirmation() {
     let f = Fixture::new(Some(OLD), Some(NEW)).await;
-    for method in MUTATING_METHODS
-        .iter()
-        .copied()
-        .filter(|m| !matches!(*m, "projects.session_liveness" | ADOPT))
-    {
+    for method in MUTATING_METHODS.iter().copied().filter(|m| *m != ADOPT) {
         for key in [DIRECT, CORE] {
             refused(
                 f.call(method, json!({}), key).await,
@@ -408,40 +404,6 @@ async fn adopt_store_declined_and_non_direct_change_nothing_same_machine_keeps_a
     assert_eq!(
         f.handler.with_store(RegistryStore::generation).unwrap(),
         before
-    );
-    f.stop().await;
-}
-
-#[tokio::test]
-async fn foreign_store_liveness_feed_updates_only_its_memory_mirror() {
-    let f = Fixture::new(Some(OLD), Some(NEW)).await;
-    let key = (72, 1);
-    f.handler.route_admissions().insert(
-        key,
-        RouteAdmission::from_bind(
-            Some(Principal::Reserved {
-                module_id: "host".into(),
-            }),
-            None,
-        ),
-    );
-    let providers = sessions::ResolvedProviders {
-        host: sessions::ProviderResolution::Provider("host".into()),
-        orchestrator: sessions::ProviderResolution::Unprovided,
-    };
-    let generation = f.handler.with_store(RegistryStore::generation).unwrap();
-    let bytes = f.handler.execute_with(WireRequest{method:"projects.session_liveness".into(),params:json!({"seq":1,"snapshot":true,"sessions":[{"sessionId":"session","canonicalRoot":"/tmp/project","state":"active"}]})},key,Some(&providers)).unwrap();
-    assert_eq!(
-        serde_json::from_slice::<Value>(&bytes).unwrap()["result"]["tracked"],
-        1
-    );
-    assert_eq!(
-        f.handler.health.liveness_sessions.load(Ordering::Relaxed),
-        1
-    );
-    assert_eq!(
-        f.handler.with_store(RegistryStore::generation).unwrap(),
-        generation
     );
     f.stop().await;
 }

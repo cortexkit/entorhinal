@@ -30,13 +30,10 @@ fn carry_bindings(node: &MoveMachine, fault: SourceFault) {
     ));
 }
 
-/// Tell the liveness mirror these sessions are gone, so a move may take them.
+/// Reconcile an empty bucket so the registered sessions read as gone.
 fn sessions_gone(node: &MoveMachine) {
     let mut state = node.machine.handler.liveness.lock().unwrap();
-    state.stale = false;
-    for session in SESSIONS {
-        state.gone.insert(crate::SessionKey::new(HARNESS, session));
-    }
+    crate::liveness_bus::tests::reconcile(&mut state);
 }
 
 fn session_ref(session: &str) -> String {

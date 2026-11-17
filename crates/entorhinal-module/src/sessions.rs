@@ -5,7 +5,7 @@
 //! A session is registered by the module that starts it for an agent. Two
 //! reserved capabilities may do that: `agent-orchestrator/v1`, held by the
 //! module that owns the agent's work, and `agent-host/v1`, held by the module
-//! that hosts sessions and feeds their liveness. The subc daemon binds each
+//! that hosts sessions. The subc daemon binds each
 //! reserved capability to exactly one module id, so the caller is admitted
 //! when its daemon-stamped principal is `reserved:<that module id>`.
 //!
@@ -64,7 +64,7 @@ pub(super) const READ_METHODS: &[&str] = &[
 
 /// The module that owns an agent's work and registers the sessions it starts.
 pub(super) const ORCHESTRATOR_CAPABILITY: &str = "agent-orchestrator/v1";
-/// The module that hosts sessions and is the source of their liveness.
+/// The module that hosts sessions and may register their bindings.
 pub(super) const HOST_CAPABILITY: &str = "agent-host/v1";
 
 /// How long one capability lookup may take. The lookup is a local round trip
@@ -422,8 +422,7 @@ impl ProviderResolver for SubcProviderConnection {
     }
 }
 
-/// Session capabilities for one request. Feed batches resolve only the host;
-/// their unused orchestrator slot admits no one.
+/// Session capabilities for one request.
 #[derive(Clone, Debug)]
 pub(super) struct ResolvedProviders {
     pub(super) orchestrator: ProviderResolution,
@@ -536,8 +535,8 @@ pub(super) fn admit_session_registration(
 /// Admit `agent.end_session` or `agent.set_session_network` (`method`):
 /// only the sole provider of `agent-orchestrator/v1`, matched against the
 /// route's daemon-stamped principal. The host provider registers sessions but
-/// does not end them; its clean ends arrive through the liveness feed
-/// instead. Without a resolved sole orchestrator, refuse
+/// does not end them; observed deletes in the liveness bucket may end bindings
+/// through upkeep instead. Without a resolved sole orchestrator, refuse
 /// `orchestrator_unbound`; any other caller gets `caller_forbidden`.
 pub(super) fn admit_orchestrator_write(
     method: &str,
@@ -572,32 +571,6 @@ pub(super) fn admit_orchestrator_write(
         "caller_forbidden",
         format!(
             "'{method}' is accepted only from the provider of {ORCHESTRATOR_CAPABILITY}; this route was opened by {}",
-            super::principal_label(principal)
-        ),
-    ))
-}
-
-/// Only the sole host claimant may feed liveness. Missing or failed resolution
-/// takes precedence over caller admission, including on the synchronous seam.
-pub(super) fn admit_liveness_feed(
-    providers: Option<&ResolvedProviders>,
-    principal: Option<&Principal>,
-) -> Result<(), HandlerError> {
-    let host = providers.and_then(|providers| providers.host.sole());
-    let Some(host) = host else {
-        return Err(HandlerError {
-            code: "host_unbound".into(),
-            message: format!("no sole provider of {HOST_CAPABILITY} was resolved for this batch"),
-            detail: providers.map(|providers| json!({HOST_CAPABILITY: providers.host.outcome()})),
-        });
-    };
-    if matches!(principal, Some(Principal::Reserved { module_id }) if module_id == host) {
-        return Ok(());
-    }
-    Err(HandlerError::new(
-        "caller_forbidden",
-        format!(
-            "'projects.session_liveness' is accepted only from the provider of {HOST_CAPABILITY}; this route was opened by {}",
             super::principal_label(principal)
         ),
     ))
@@ -973,12 +946,9 @@ impl ProjectsHandler {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let registration = method == REGISTER_SESSION;
-        // Ending a session and recording its network need only the
-        // orchestrator's provider; the feed needs only the host's;
-        // registration needs both.
-        let ending = method == END_SESSION || method == SET_SESSION_NETWORK;
-        let wants_host = !ending;
-        let wants_orchestrator = registration || ending;
+        // Registration admits either provider; other session writes admit
+        // only the orchestrator's provider.
+        let wants_host = registration;
         let mut providers = ResolvedProviders {
             host: cached
                 .host
@@ -995,21 +965,18 @@ impl ProjectsHandler {
         self.resolve_needed_providers(
             &mut providers,
             wants_host && cached.host.is_none(),
-            wants_orchestrator && cached.orchestrator.is_none(),
+            cached.orchestrator.is_none(),
         )
         .await;
         let transport_failed = |providers: &ResolvedProviders| {
             (wants_host && matches!(providers.host, ProviderResolution::Transport(_)))
-                || (wants_orchestrator
-                    && matches!(providers.orchestrator, ProviderResolution::Transport(_)))
+                || matches!(providers.orchestrator, ProviderResolution::Transport(_))
         };
         let would_refuse = if registration {
             admit_session_registration(Some(&providers), admission.principal.as_ref()).is_err()
-        } else if ending {
+        } else {
             admit_orchestrator_write(method, Some(&providers), admission.principal.as_ref())
                 .is_err()
-        } else {
-            admit_liveness_feed(Some(&providers), admission.principal.as_ref()).is_err()
         };
         if would_refuse && !transport_failed(&providers) {
             // Fresh answers already read above need no second lookup. Only
@@ -1017,7 +984,7 @@ impl ProjectsHandler {
             self.resolve_needed_providers(
                 &mut providers,
                 wants_host && cached.host.is_some(),
-                wants_orchestrator && cached.orchestrator.is_some(),
+                cached.orchestrator.is_some(),
             )
             .await;
         }
@@ -1035,9 +1002,7 @@ impl ProjectsHandler {
             if wants_host {
                 cache.host = Some(providers.host.clone());
             }
-            if wants_orchestrator {
-                cache.orchestrator = Some(providers.orchestrator.clone());
-            }
+            cache.orchestrator = Some(providers.orchestrator.clone());
         }
         providers
     }
@@ -1618,11 +1583,21 @@ pub(super) mod tests {
                 .count()
         }
 
-        pub(crate) async fn feed(&self, batch: Value) -> Value {
-            result(
-                self.served(EXECUTIVE, "projects.session_liveness", batch)
-                    .await,
-            )
+        pub(crate) fn bus_sessions(&self, sessions: &[(&str, &str, &str)]) {
+            let mut state = self.handler.liveness.lock().unwrap();
+            state.bus = crate::liveness_bus::Mirror::default();
+            for (harness, session, status) in sessions {
+                state
+                    .bus
+                    .apply(crate::liveness_bus::tests::put(
+                        &format!("{harness}.{session}"),
+                        harness,
+                        session,
+                        status,
+                    ))
+                    .unwrap();
+            }
+            crate::liveness_bus::tests::reconcile(&mut state);
         }
 
         fn liveness(&self, refs: Value) -> Vec<u8> {
@@ -1935,9 +1910,7 @@ pub(super) mod tests {
         // The reference already belongs to another agent, whatever session
         // key is offered, and even once that session has ended.
         f.resolver.set(HOST_CAPABILITY, provider("prefrontal-core"));
-        f.feed(json!({"seq":1,"snapshot":true,"sessions":[
-            {"harness":"pi","sessionId":"s1","canonicalRoot":"/w","state":"gone"}]}))
-            .await;
+        f.bus_sessions(&[]);
         for session_id in ["s1", "s9"] {
             let (code, detail) = refusal(
                 f.register(EXECUTIVE, registration(&second, "r1", "pi", session_id))
@@ -2389,8 +2362,7 @@ pub(super) mod tests {
         );
     }
 
-    /// Every mapping, in request order, with the exact reply bytes: `cause`
-    /// appears only on an `unknown` answer whose entry carried one.
+    /// Exact ordered replies cover live, absent and unknown session keys.
     #[tokio::test]
     async fn session_liveness_maps_every_state_in_request_order() {
         let f = Fixture::new("liveness-map", true);
@@ -2400,10 +2372,7 @@ pub(super) mod tests {
             ("active", "pi", "s-active"),
             ("idle", "pi", "s-idle"),
             ("gone", "pi", "s-gone"),
-            ("lapsed", "pi", "s-lapsed"),
-            ("odd", "pi", "s-odd"),
             ("missing", "pi", "s-missing"),
-            ("caused", "pi", "s-caused"),
             ("twin", "opencode", "s-active"),
         ] {
             result(
@@ -2414,41 +2383,31 @@ pub(super) mod tests {
                 .await,
             );
         }
-        let refs: Vec<Value> = [
-            "unbound", "twin", "active", "idle", "gone", "lapsed", "odd", "missing", "caused",
-        ]
-        .iter()
-        .map(|session_ref| json!({"ref_kind":"pi","ref":session_ref}))
-        .collect();
-        let refs = json!(refs);
-        // Before the first snapshot the mirror trusts no reported state:
-        // every ref answers `unknown`, but an entry's `cause` (here
-        // `host_not_seen`) is still passed through on its answer.
-        f.feed(json!({"seq":1,"sessions":[
-            {"harness":"pi","sessionId":"s-active","canonicalRoot":"/w","state":"active"},
-            {"harness":"pi","sessionId":"s-caused","canonicalRoot":"/w","state":"lapsed","cause":"host_not_seen"}]})).await;
+        let refs = json!(["unbound", "twin", "active", "idle", "gone", "missing"]
+            .map(|session_ref| json!({"ref_kind":"pi","ref":session_ref})));
+        {
+            let mut state = f.handler.liveness.lock().unwrap();
+            state
+                .bus
+                .apply(crate::liveness_bus::tests::put(
+                    "pi.s-active",
+                    "pi",
+                    "s-active",
+                    "active",
+                ))
+                .unwrap();
+        }
         assert_eq!(
             String::from_utf8(f.liveness(refs.clone())).unwrap(),
-            r#"{"result":{"incarnation":"0123456789abcdef","refs":[{"state":"unknown"},{"state":"unknown"},{"state":"unknown"},{"state":"unknown"},{"state":"unknown"},{"state":"unknown"},{"state":"unknown"},{"state":"unknown"},{"cause":"host_not_seen","state":"unknown"}]}}"#
+            r#"{"result":{"incarnation":"0123456789abcdef","refs":[{"state":"unknown"},{"state":"unknown"},{"state":"unknown"},{"state":"unknown"},{"state":"unknown"},{"state":"unknown"}]}}"#
         );
-        f.feed(json!({"seq":2,"snapshot":true,"sessions":[
-            {"harness":"pi","sessionId":"s-active","canonicalRoot":"/w","state":"active","cause":"ignored"},
-            {"harness":"pi","sessionId":"s-idle","canonicalRoot":"/w","state":"idle"},
-            {"harness":"pi","sessionId":"s-gone","canonicalRoot":"/w","state":"active"},
-            {"harness":"pi","sessionId":"s-lapsed","canonicalRoot":"/w","state":"lapsed"},
-            {"harness":"pi","sessionId":"s-odd","canonicalRoot":"/w","state":"hibernating","cause":"something new"},
-            {"harness":"pi","sessionId":"s-caused","canonicalRoot":"/w","state":"lapsed","cause":"lease_expired"}]})).await;
-        f.feed(json!({"seq":3,"sessions":[
-            {"harness":"pi","sessionId":"s-gone","canonicalRoot":"/w","state":"gone","cause":"ignored"}]})).await;
+        f.bus_sessions(&[("pi", "s-active", "active"), ("pi", "s-idle", "idle")]);
         assert_eq!(
-            String::from_utf8(f.liveness(refs.clone())).unwrap(),
-            r#"{"result":{"incarnation":"0123456789abcdef","refs":[{"state":"unknown"},{"state":"unknown"},{"state":"active"},{"state":"active"},{"state":"gone"},{"state":"unknown"},{"cause":"something new","state":"unknown"},{"state":"unknown"},{"cause":"lease_expired","state":"unknown"}]}}"#
+            String::from_utf8(f.liveness(refs)).unwrap(),
+            r#"{"result":{"incarnation":"0123456789abcdef","refs":[{"state":"unknown"},{"state":"gone"},{"state":"active"},{"state":"active"},{"state":"gone"},{"state":"gone"}]}}"#
         );
         // The same session id under another harness is another session.
-        f.feed(json!({"seq":4,"sessions":[
-            {"harness":"opencode","sessionId":"s-active","canonicalRoot":"/w","state":"idle"},
-            {"harness":"pi","sessionId":"s-active","canonicalRoot":"/w","state":"gone"}]}))
-            .await;
+        f.bus_sessions(&[("opencode", "s-active", "idle")]);
         let answers: Value = serde_json::from_slice(&f.liveness(json!([
             {"ref_kind":"pi","ref":"twin"},{"ref_kind":"pi","ref":"active"}])))
         .unwrap();
@@ -2456,12 +2415,7 @@ pub(super) mod tests {
             answers["result"]["refs"],
             json!([{"state":"active"},{"state":"gone"}])
         );
-        // A later report revives a session whose `gone` was a lapse in
-        // reporting, and a snapshot forgets every `gone`.
-        f.feed(json!({"seq":5,"sessions":[
-            {"harness":"pi","sessionId":"s-active","canonicalRoot":"/w","state":"active"}]}))
-            .await;
-        f.feed(json!({"seq":6,"snapshot":true,"sessions":[]})).await;
+        f.handler.liveness.lock().unwrap().bus = crate::liveness_bus::Mirror::default();
         let answers: Value = serde_json::from_slice(&f.liveness(json!([
             {"ref_kind":"pi","ref":"active"},{"ref_kind":"pi","ref":"gone"}])))
         .unwrap();
@@ -2503,31 +2457,6 @@ pub(super) mod tests {
             f.resolver.calls(),
             2,
             "one lookup for each capability, not each registration"
-        );
-        f.feed(json!({"seq":1,"snapshot":true,"sessions":[]})).await;
-        assert_eq!(
-            f.resolver.calls(),
-            2,
-            "the feed reuses this route's cached host"
-        );
-    }
-
-    #[tokio::test]
-    async fn registration_after_feed_resolves_only_the_missing_orchestrator() {
-        let f = Fixture::new("register-cache-after-feed", true);
-        let agent = f.create("Cached");
-        f.providers(provider("prefrontal-core"), provider("prefrontal-core"));
-        f.feed(json!({"seq":1,"snapshot":true,"sessions":[]})).await;
-        assert_eq!(f.resolver.calls(), 1);
-        let reply = result(
-            f.register(EXECUTIVE, registration(&agent, "r1", "pi", "s1"))
-                .await,
-        );
-        assert_eq!(reply["registered_by"], "orchestrator");
-        assert_eq!(
-            f.resolver.calls(),
-            2,
-            "registration reuses the host already resolved by the feed"
         );
     }
 
@@ -2595,188 +2524,6 @@ pub(super) mod tests {
                 .await,
         );
         assert_eq!(f.resolver.calls(), 4);
-    }
-
-    #[tokio::test]
-    async fn feed_batches_resolve_host_once_per_route_and_invalidate_on_close() {
-        let f = Fixture::new("feed-cache", false);
-        f.resolver.set(HOST_CAPABILITY, provider("prefrontal-core"));
-        for seq in 1..=4 {
-            f.feed(json!({"seq":seq,"snapshot":seq == 1,"sessions":[]}))
-                .await;
-        }
-        assert_eq!(f.resolver.calls(), 1);
-        let old = f.handler.admission_for(EXECUTIVE).providers;
-        assert_eq!(
-            old.cached.lock().unwrap().host,
-            Some(provider("prefrontal-core"))
-        );
-        f.handler
-            .on_route_gone(&RouteHandle::detached(EXECUTIVE.0, EXECUTIVE.1))
-            .await;
-        let cache = old.cached.lock().unwrap().clone();
-        assert!(
-            cache.invalidated,
-            "closing the route retires even retained admissions"
-        );
-        assert!(cache.host.is_none());
-        let next = (EXECUTIVE.0, EXECUTIVE.1 + 1);
-        f.bind(next, Some(reserved("prefrontal-core")), false);
-        result(
-            f.served(
-                next,
-                "projects.session_liveness",
-                json!({"seq":1,"snapshot":true,"sessions":[]}),
-            )
-            .await,
-        );
-        assert_eq!(
-            f.resolver.calls(),
-            2,
-            "a new route cannot inherit the closed route's answer"
-        );
-    }
-
-    #[tokio::test]
-    async fn feed_cached_mismatch_refreshes_once_before_refusal() {
-        let f = Fixture::new("feed-cache-mismatch", false);
-        f.bind(CALLER, Some(reserved("non-host")), false);
-        f.resolver.set(HOST_CAPABILITY, provider("first-host"));
-        let before = mirror(&f);
-        assert_eq!(
-            code(
-                f.served(
-                    CALLER,
-                    "projects.session_liveness",
-                    json!({"seq":1,"snapshot":true,"sessions":[]})
-                )
-                .await
-            ),
-            "caller_forbidden"
-        );
-        assert_eq!(
-            f.resolver.calls(),
-            1,
-            "a fresh refusal does not trigger another lookup"
-        );
-        f.resolver.set(HOST_CAPABILITY, provider("second-host"));
-        assert_eq!(
-            code(
-                f.served(
-                    CALLER,
-                    "projects.session_liveness",
-                    json!({"seq":1,"snapshot":true,"sessions":[]})
-                )
-                .await
-            ),
-            "caller_forbidden"
-        );
-        assert_eq!(
-            f.resolver.calls(),
-            2,
-            "a cached mismatch gets exactly one refresh"
-        );
-        assert_eq!(
-            f.handler
-                .admission_for(CALLER)
-                .providers
-                .cached
-                .lock()
-                .unwrap()
-                .host,
-            Some(provider("second-host"))
-        );
-        assert_eq!(mirror(&f), before);
-    }
-
-    #[tokio::test]
-    async fn feed_cached_unbound_refreshes_before_deciding() {
-        let f = Fixture::new("feed-cache-unbound", false);
-        assert_eq!(
-            code(
-                f.served(
-                    EXECUTIVE,
-                    "projects.session_liveness",
-                    json!({"seq":1,"snapshot":true,"sessions":[]})
-                )
-                .await
-            ),
-            "host_unbound"
-        );
-        assert_eq!(f.resolver.calls(), 1);
-        f.resolver.set(HOST_CAPABILITY, provider("prefrontal-core"));
-        f.feed(json!({"seq":1,"snapshot":true,"sessions":[]})).await;
-        assert_eq!(
-            f.resolver.calls(),
-            2,
-            "unbound cache is refreshed once before admission"
-        );
-        f.feed(json!({"seq":2,"sessions":[]})).await;
-        assert_eq!(f.resolver.calls(), 2);
-    }
-
-    #[tokio::test]
-    async fn feed_principal_change_invalidates_the_old_admission() {
-        let f = Fixture::new("feed-cache-principal", false);
-        f.resolver.set(HOST_CAPABILITY, provider("prefrontal-core"));
-        f.feed(json!({"seq":1,"snapshot":true,"sessions":[]})).await;
-        let old = f.handler.admission_for(EXECUTIVE).providers;
-        f.resolver
-            .set(HOST_CAPABILITY, provider("thalamus-harness"));
-        let request = subc_client_rs::RouteBindRequest::new(
-            RouteHandle::detached(EXECUTIVE.0, EXECUTIVE.1),
-            subc_protocol::RouteTarget::ToolProvider {
-                module_id: "entorhinal".into(),
-            },
-            subc_protocol::BindIdentity::new("test", "bind"),
-        )
-        .with_principal(reserved("thalamus-harness"));
-        f.handler.on_bind(&request).await;
-        assert!(old.cached.lock().unwrap().invalidated);
-        assert!(old.cached.lock().unwrap().host.is_none());
-        assert!(mirror(&f).stale);
-        f.feed(json!({"seq":2,"sessions":[]})).await;
-        assert_eq!(f.resolver.calls(), 2);
-        assert_eq!(
-            mirror(&f).sender,
-            Some((EXECUTIVE, reserved("thalamus-harness")))
-        );
-    }
-
-    #[tokio::test]
-    async fn feed_transport_failure_is_not_cached() {
-        let f = Fixture::new("feed-cache-transport", false);
-        f.resolver.set(
-            HOST_CAPABILITY,
-            ProviderResolution::Transport("catalog unavailable".into()),
-        );
-        for _ in 0..2 {
-            assert_eq!(
-                code(
-                    f.served(
-                        EXECUTIVE,
-                        "projects.session_liveness",
-                        json!({"seq":1,"snapshot":true,"sessions":[]})
-                    )
-                    .await
-                ),
-                "host_unbound"
-            );
-            assert!(f
-                .handler
-                .admission_for(EXECUTIVE)
-                .providers
-                .cached
-                .lock()
-                .unwrap()
-                .host
-                .is_none());
-        }
-        assert_eq!(f.resolver.calls(), 2);
-        f.resolver.set(HOST_CAPABILITY, provider("prefrontal-core"));
-        f.feed(json!({"seq":1,"snapshot":true,"sessions":[]})).await;
-        f.feed(json!({"seq":2,"sessions":[]})).await;
-        assert_eq!(f.resolver.calls(), 3);
     }
 
     struct GateResolver {
@@ -2852,12 +2599,9 @@ pub(super) mod tests {
             f.bind(route, Some(reserved("host")), false);
             assert_eq!(
                 f.handler
-                    .route_session_providers(
-                        "projects.session_liveness",
-                        &f.handler.admission_for(route)
-                    )
+                    .route_session_providers(END_SESSION, &f.handler.admission_for(route))
                     .await
-                    .host,
+                    .orchestrator,
                 ProviderResolution::Unprovided,
             );
         }
@@ -2920,7 +2664,8 @@ pub(super) mod tests {
     #[tokio::test]
     async fn provider_cache_fifty_routes_share_one_daemon_resolution() {
         let mut f = Fixture::new("process-provider-cache", false);
-        f.resolver.set(HOST_CAPABILITY, provider("prefrontal-core"));
+        f.resolver
+            .set(ORCHESTRATOR_CAPABILITY, provider("prefrontal-core"));
         let gate = GateResolver::new(f.resolver.clone());
         let cache = Arc::new(CachedProviderResolver::new(gate.clone()));
         cache.invalidate(true);
@@ -2933,12 +2678,9 @@ pub(super) mod tests {
             let f = f.clone();
             lookups.spawn(async move {
                 f.handler
-                    .route_session_providers(
-                        "projects.session_liveness",
-                        &f.handler.admission_for(route),
-                    )
+                    .route_session_providers(END_SESSION, &f.handler.admission_for(route))
                     .await
-                    .host
+                    .orchestrator
             });
         }
         gate.entered.notified().await;
@@ -3060,23 +2802,17 @@ pub(super) mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn concurrent_feed_first_use_shares_one_resolution() {
-        let mut f = Fixture::new("feed-cache-concurrent", false);
-        f.resolver.set(HOST_CAPABILITY, provider("prefrontal-core"));
+    async fn concurrent_session_write_first_use_shares_one_resolution() {
+        let mut f = Fixture::new("session-cache-concurrent", false);
+        f.resolver
+            .set(ORCHESTRATOR_CAPABILITY, provider("prefrontal-core"));
         let gate = GateResolver::new(f.resolver.clone());
         f.handler.provider_resolver = gate.clone();
+        let admission = f.handler.admission_for(EXECUTIVE);
         let both = async {
             tokio::join!(
-                f.served(
-                    EXECUTIVE,
-                    "projects.session_liveness",
-                    json!({"seq":1,"snapshot":true,"sessions":[]})
-                ),
-                f.served(
-                    EXECUTIVE,
-                    "projects.session_liveness",
-                    json!({"seq":2,"sessions":[]})
-                )
+                f.handler.route_session_providers(END_SESSION, &admission),
+                f.handler.route_session_providers(END_SESSION, &admission)
             )
         };
         tokio::pin!(both);
@@ -3086,27 +2822,25 @@ pub(super) mod tests {
         let (first, second) = tokio::time::timeout(Duration::from_secs(1), both)
             .await
             .unwrap();
-        result(first);
-        result(second);
+        assert_eq!(first.orchestrator, provider("prefrontal-core"));
+        assert_eq!(second.orchestrator, provider("prefrontal-core"));
         assert_eq!(
             f.resolver.calls(),
             1,
-            "concurrent batches share the first lookup"
+            "concurrent session writes share the first lookup"
         );
     }
 
     #[tokio::test(start_paused = true)]
     async fn closing_a_route_during_resolution_cannot_repopulate_its_cache() {
-        let mut f = Fixture::new("feed-cache-inflight", false);
-        f.resolver.set(HOST_CAPABILITY, provider("prefrontal-core"));
+        let mut f = Fixture::new("session-cache-inflight", false);
+        f.resolver
+            .set(ORCHESTRATOR_CAPABILITY, provider("prefrontal-core"));
         let gate = GateResolver::new(f.resolver.clone());
         f.handler.provider_resolver = gate.clone();
-        let old = f.handler.admission_for(EXECUTIVE).providers;
-        let first = f.served(
-            EXECUTIVE,
-            "projects.session_liveness",
-            json!({"seq":1,"snapshot":true,"sessions":[]}),
-        );
+        let admission = f.handler.admission_for(EXECUTIVE);
+        let old = admission.providers.clone();
+        let first = f.handler.route_session_providers(END_SESSION, &admission);
         tokio::pin!(first);
         tokio::select! { _ = gate.entered.notified() => {}, _ = &mut first => panic!("request completed before the catalog answered") }
         f.handler
@@ -3114,470 +2848,57 @@ pub(super) mod tests {
             .await;
         f.bind(EXECUTIVE, Some(reserved("prefrontal-core")), false);
         gate.release.notify_one();
-        assert_eq!(code(first.await), "host_unbound");
-        assert!(old.cached.lock().unwrap().host.is_none());
-        assert!(f
-            .handler
-            .admission_for(EXECUTIVE)
+        assert_eq!(first.await.orchestrator, ProviderResolution::Unprovided);
+        assert!(old.cached.lock().unwrap().orchestrator.is_none());
+        let admission = f.handler.admission_for(EXECUTIVE);
+        assert!(admission
             .providers
             .cached
             .lock()
             .unwrap()
-            .host
+            .orchestrator
             .is_none());
-        assert_eq!(mirror(&f).last_seq, None);
-        f.feed(json!({"seq":1,"snapshot":true,"sessions":[]})).await;
+        assert_eq!(
+            f.handler
+                .route_session_providers(END_SESSION, &admission)
+                .await
+                .orchestrator,
+            provider("prefrontal-core")
+        );
         assert_eq!(f.resolver.calls(), 2);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn feed_resolution_timeout_is_not_cached() {
-        let mut f = Fixture::new("feed-cache-timeout", false);
-        f.resolver.set(HOST_CAPABILITY, provider("prefrontal-core"));
+    async fn session_write_resolution_timeout_is_not_cached() {
+        let mut f = Fixture::new("session-cache-timeout", false);
+        f.resolver
+            .set(ORCHESTRATOR_CAPABILITY, provider("prefrontal-core"));
         let gate = GateResolver::new(f.resolver.clone());
         f.handler.provider_resolver = gate;
-        assert_eq!(
-            code(
-                f.served(
-                    EXECUTIVE,
-                    "projects.session_liveness",
-                    json!({"seq":1,"snapshot":true,"sessions":[]})
-                )
-                .await
-            ),
-            "host_unbound"
-        );
-        assert!(f
+        let admission = f.handler.admission_for(EXECUTIVE);
+        let providers = f
             .handler
-            .admission_for(EXECUTIVE)
+            .route_session_providers(END_SESSION, &admission)
+            .await;
+        assert!(matches!(
+            providers.orchestrator,
+            ProviderResolution::Transport(_)
+        ));
+        assert!(admission
             .providers
             .cached
             .lock()
             .unwrap()
-            .host
+            .orchestrator
             .is_none());
-        f.feed(json!({"seq":1,"snapshot":true,"sessions":[]})).await;
-        assert_eq!(f.resolver.calls(), 2);
-    }
-
-    #[derive(Debug, PartialEq, Eq)]
-    struct MirrorSnapshot {
-        last_seq: Option<u64>,
-        stale: bool,
-        sessions: super::super::MirrorSessions,
-        gone: std::collections::BTreeSet<super::super::SessionKey>,
-        sender: Option<(RouteKey, Principal)>,
-    }
-
-    fn mirror(f: &Fixture) -> MirrorSnapshot {
-        let state = f.handler.liveness.lock().unwrap();
-        MirrorSnapshot {
-            last_seq: state.last_seq,
-            stale: state.stale,
-            sessions: state.sessions.clone(),
-            gone: state.gone.clone(),
-            sender: state.sender.clone(),
-        }
-    }
-
-    fn feed_refs() -> Value {
-        json!([
-            {"ref_kind":"pi","ref":"r1"},
-            {"ref_kind":"pi","ref":"r2"},
-            {"ref_kind":"pi","ref":"r3"},
-            {"ref_kind":"pi","ref":"unbound"}
-        ])
-    }
-
-    async fn live_feed_fixture(label: &str) -> Fixture {
-        let f = Fixture::new(label, true);
-        f.providers(provider("prefrontal-core"), provider("prefrontal-core"));
-        let agent = f.create("Live");
-        for session_ref in ["r1", "r2", "r3"] {
-            result(
-                f.register(
-                    EXECUTIVE,
-                    registration(&agent, session_ref, "pi", session_ref),
-                )
-                .await,
-            );
-        }
-        std::fs::create_dir(f.dir.join("repo")).unwrap();
-        let root = crate::tests::canonical_test_path(f.dir.join("repo"));
-        f.sync_ok(
-            EXECUTIVE,
-            "register",
-            json!({"projectId":"P","name":"P","roots":[root]}),
-        );
-        f.feed(json!({"seq":10,"snapshot":true,"sessions":[
-            {"harness":"pi","sessionId":"r1","canonicalRoot":root,"state":"active","lastActivityMs":100},
-            {"harness":"pi","sessionId":"r2","canonicalRoot":root,"state":"gone"},
-            {"harness":"pi","sessionId":"r3","canonicalRoot":root,"state":"lapsed","cause":"lease_expired","lastActivityMs":90}
-        ]})).await;
-        assert_eq!(
-            f.sync_ok(CALLER, "enumerate", json!({}))["projects"][0]["lastRouteActivityMs"],
-            100
-        );
-        f
-    }
-
-    fn assert_feed_unknown(f: &Fixture) {
-        let answers: Value = serde_json::from_slice(&f.liveness(feed_refs())).unwrap();
-        assert_eq!(
-            answers["result"]["refs"],
-            json!([
-                {"state":"unknown"}, {"state":"unknown"},
-                {"state":"unknown","cause":"lease_expired"}, {"state":"unknown"}
-            ])
-        );
-        assert_eq!(
-            f.sync_ok(CALLER, "enumerate", json!({}))["projects"][0]["lastRouteActivityMs"],
-            Value::Null
-        );
-    }
-
-    #[tokio::test]
-    async fn liveness_feed_unbound_preserves_mirror_sequence_and_latch() {
-        let f = live_feed_fixture("feed-unbound").await;
-        for stale in [false, true] {
-            f.handler.liveness.lock().unwrap().stale = stale;
-            let before = mirror(&f);
-            let answers = f.liveness(feed_refs());
-            let enumerated = f.sync_ok(CALLER, "enumerate", json!({}));
-            for unavailable in [
-                ProviderResolution::Unprovided,
-                ProviderResolution::Ambiguous(vec![
-                    "prefrontal-core".into(),
-                    "thalamus-harness".into(),
-                ]),
-                ProviderResolution::Transport("catalog unavailable".into()),
-                ProviderResolution::InvalidIdentifier,
-            ] {
-                f.resolver.set(HOST_CAPABILITY, unavailable.clone());
-                f.bind(EXECUTIVE, Some(reserved("prefrontal-core")), false);
-                let calls = f.resolver.calls();
-                let batches = f
-                    .handler
-                    .health
-                    .liveness_batches
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                let refusals = f
-                    .handler
-                    .health
-                    .liveness_refusals
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                let (code, detail) = refusal(
-                    f.served(
-                        EXECUTIVE,
-                        "projects.session_liveness",
-                        json!({"seq":1,"snapshot":true,"sessions":[]}),
-                    )
-                    .await,
-                );
-                assert_eq!(code, "host_unbound");
-                assert_eq!(
-                    detail,
-                    Some(json!({HOST_CAPABILITY: unavailable.outcome()}))
-                );
-                assert_eq!(
-                    f.resolver.calls(),
-                    calls + 1,
-                    "a fresh feed route resolves only the host"
-                );
-                assert_eq!(mirror(&f), before);
-                assert_eq!(f.liveness(feed_refs()), answers);
-                assert_eq!(f.sync_ok(CALLER, "enumerate", json!({})), enumerated);
-                assert_eq!(
-                    f.handler
-                        .health
-                        .liveness_batches
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                    batches
-                );
-                assert_eq!(
-                    f.handler
-                        .health
-                        .liveness_refusals
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                    refusals + 1
-                );
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn liveness_feed_non_host_callers_preserve_every_answer() {
-        let f = live_feed_fixture("feed-forbidden").await;
-        let before = mirror(&f);
-        let answers = f.liveness(feed_refs());
-        for principal in [
-            Some(Principal::Direct),
-            Some(reserved("another-module")),
-            None,
-        ] {
-            f.bind(CALLER, principal, false);
-            assert_eq!(
-                code(
-                    f.served(
-                        CALLER,
-                        "projects.session_liveness",
-                        json!({"seq":11,"snapshot":true,"sessions":[]})
-                    )
-                    .await
-                ),
-                "caller_forbidden"
-            );
-            assert_eq!(mirror(&f), before);
-            assert_eq!(f.liveness(feed_refs()), answers);
-        }
-    }
-
-    #[tokio::test]
-    async fn liveness_feed_sync_seam_has_no_cached_provider() {
-        let f = live_feed_fixture("feed-sync").await;
-        let before = mirror(&f);
-        let calls = f.resolver.calls();
-        assert_eq!(
-            code(f.sync(
-                EXECUTIVE,
-                "projects.session_liveness",
-                json!({"seq":11,"snapshot":true,"sessions":[]})
-            )),
-            "host_unbound"
-        );
-        assert_eq!(mirror(&f), before);
-        assert_eq!(f.resolver.calls(), calls);
-    }
-
-    #[tokio::test]
-    async fn liveness_feed_flow_refuses_before_resolution() {
-        let f = live_feed_fixture("feed-flow").await;
-        f.bind(CALLER, Some(reserved("prefrontal-core")), true);
-        let before = mirror(&f);
-        let calls = f.resolver.calls();
-        assert_eq!(
-            code(
-                f.served(CALLER, "projects.session_liveness", Value::Null)
-                    .await
-            ),
-            "flow_scope_not_admitted"
-        );
-        assert_eq!(mirror(&f), before);
-        assert_eq!(f.resolver.calls(), calls);
-    }
-
-    #[tokio::test]
-    async fn liveness_feed_rebinding_to_thalamus_latches_until_snapshot() {
-        let f = live_feed_fixture("feed-rebinding").await;
-        let previous_cache = f.handler.admission_for(EXECUTIVE).providers;
-        f.bind(CALLER, Some(reserved("thalamus-harness")), false);
-        assert_eq!(
-            code(
-                f.served(
-                    CALLER,
-                    "projects.session_liveness",
-                    json!({"seq":11,"sessions":[]})
-                )
-                .await
-            ),
-            "caller_forbidden"
-        );
-        f.resolver
-            .set(HOST_CAPABILITY, provider("thalamus-harness"));
-        let orchestrator_route = (53, 1);
-        f.bind(orchestrator_route, Some(reserved("prefrontal-core")), false);
-        let before = mirror(&f);
-        assert_eq!(
-            code(
-                f.served(
-                    orchestrator_route,
-                    "projects.session_liveness",
-                    json!({"seq":11,"snapshot":true,"sessions":[]})
-                )
-                .await
-            ),
-            "caller_forbidden"
-        );
-        assert_eq!(
-            mirror(&f),
-            before,
-            "the orchestrator is not the rebound host"
-        );
-
-        let calls = f.resolver.calls();
-        let reply = result(
-            f.served(
-                CALLER,
-                "projects.session_liveness",
-                json!({"seq":11,"sessions":[]}),
-            )
-            .await,
-        );
-        assert_eq!(
-            f.resolver.calls(),
-            calls + 1,
-            "the new module's cached mismatch refreshes once"
-        );
-        assert_eq!(reply["accepted"], true);
-        assert!(
-            previous_cache.cached.lock().unwrap().invalidated,
-            "a different host principal retires the previous sender's claimant cache"
-        );
-        assert_eq!(
-            reply["snapshotRequested"], true,
-            "a new principal invalidates the old complete mirror even at a contiguous sequence"
-        );
-        assert_eq!(
-            mirror(&f).sender,
-            Some((CALLER, reserved("thalamus-harness")))
-        );
         assert_eq!(
             f.handler
-                .health
-                .liveness_gaps
-                .load(std::sync::atomic::Ordering::Relaxed),
-            0
-        );
-        assert_feed_unknown(&f);
-
-        let reply = result(
-            f.served(
-                CALLER,
-                "projects.session_liveness",
-                json!({"seq":12,"sessions":[]}),
-            )
-            .await,
-        );
-        assert_eq!(reply["snapshotRequested"], true);
-        assert_feed_unknown(&f);
-        let reply = result(f.served(CALLER, "projects.session_liveness", json!({"seq":1,"snapshot":true,"sessions":[
-            {"harness":"pi","sessionId":"r1","canonicalRoot":crate::tests::canonical_test_path(f.dir.join("repo")),"state":"idle","lastActivityMs":200}
-        ]})).await);
-        assert_eq!(reply["snapshotRequested"], false);
-        let answers: Value = serde_json::from_slice(&f.liveness(feed_refs())).unwrap();
-        assert_eq!(answers["result"]["refs"][0], json!({"state":"active"}));
-        assert_eq!(
-            f.sync_ok(CALLER, "enumerate", json!({}))["projects"][0]["lastRouteActivityMs"],
-            200
-        );
-    }
-
-    #[tokio::test]
-    async fn liveness_feed_recorded_route_closing_latches_until_snapshot() {
-        let f = live_feed_fixture("feed-route-close").await;
-        f.bind(CALLER, Some(reserved("prefrontal-core")), false);
-        let reply = result(
-            f.served(
-                CALLER,
-                "projects.session_liveness",
-                json!({"seq":11,"sessions":[]}),
-            )
-            .await,
-        );
-        assert_eq!(
-            reply["snapshotRequested"], false,
-            "a new route for the same principal is not a principal change"
-        );
-        assert_eq!(
-            mirror(&f).sender,
-            Some((CALLER, reserved("prefrontal-core")))
-        );
-        let before = mirror(&f);
-        f.handler
-            .on_route_gone(&RouteHandle::detached(EXECUTIVE.0, EXECUTIVE.1))
-            .await;
-        assert_eq!(
-            mirror(&f),
-            before,
-            "closing an earlier sender route does not invalidate the current mirror"
-        );
-        f.handler
-            .on_route_gone(&RouteHandle::detached(CALLER.0, CALLER.1))
-            .await;
-        let after = mirror(&f);
-        assert!(
-            after.stale,
-            "closing the recorded sender route invalidates the mirror"
-        );
-        assert_eq!(after.last_seq, before.last_seq);
-        assert_eq!(after.sessions, before.sessions);
-        assert_feed_unknown(&f);
-
-        f.bind(EXECUTIVE, Some(reserved("prefrontal-core")), false);
-        let reply = f.feed(json!({"seq":12,"sessions":[]})).await;
-        assert_eq!(reply["snapshotRequested"], true);
-        assert_feed_unknown(&f);
-        let reply = f.feed(json!({"seq":1,"snapshot":true,"sessions":[
-            {"harness":"pi","sessionId":"r1","canonicalRoot":crate::tests::canonical_test_path(f.dir.join("repo")),"state":"active","lastActivityMs":200}
-        ]})).await;
-        assert_eq!(reply["snapshotRequested"], false);
-        let answers: Value = serde_json::from_slice(&f.liveness(feed_refs())).unwrap();
-        assert_eq!(answers["result"]["refs"][0], json!({"state":"active"}));
-        assert_eq!(
-            f.sync_ok(CALLER, "enumerate", json!({}))["projects"][0]["lastRouteActivityMs"],
-            200
-        );
-    }
-
-    /// Batches carrying `lapsed` or a state this build does not know are
-    /// applied, not refused, and enumerate's annotation counts those sessions
-    /// exactly as it counts any other: it depends on the set of sessions and
-    /// their roots, never on their state or harness.
-    #[tokio::test]
-    async fn unfamiliar_states_are_accepted_and_leave_enumerate_annotation_unchanged() {
-        let annotate = |sessions: Value| async move {
-            let handler = super::super::tests::liveness_handler();
-            let reply: Value = serde_json::from_slice(
-                &super::super::tests::served_liveness(
-                    &handler,
-                    json!({"seq":1,"snapshot":true,"sessions":sessions}),
-                )
+                .route_session_providers(END_SESSION, &admission)
                 .await
-                .unwrap(),
-            )
-            .unwrap();
-            assert_eq!(reply["result"]["accepted"], true);
-            let mut enumerated = entorhinal_core::EnumerateReply {
-                generation: 1,
-                workspaces: vec![],
-                projects: vec![entorhinal_core::ProjectView {
-                    project_id: "p".into(),
-                    name: "p".into(),
-                    roots: vec!["/w/proj".into()],
-                    implicit: false,
-                    ref_kind: "local".into(),
-                    device_fingerprint: None,
-                    workspace_id: None,
-                    last_route_activity_ms: None,
-                    root_records: None,
-                }],
-            };
-            handler.annotate_liveness(&mut enumerated);
-            (
-                reply["result"]["tracked"].clone(),
-                enumerated.projects[0].last_route_activity_ms,
-            )
-        };
-        let nested = std::path::Path::new("/w/proj").join("sub");
-        let nested = nested.to_str().unwrap();
-        let familiar = annotate(json!([
-            {"sessionId":"s1","canonicalRoot":"/w/proj","state":"active","lastActivityMs":500},
-            {"sessionId":"s2","canonicalRoot":nested,"state":"idle","lastActivityMs":900}]))
-        .await;
-        assert_eq!(familiar, (json!(2), Some(900)));
-        for (state, harness) in [
-            ("lapsed", "pi"),
-            ("hibernating", "opencode"),
-            ("lapsed", ""),
-        ] {
-            assert_eq!(
-                annotate(json!([
-                    {"sessionId":"s1","canonicalRoot":"/w/proj","state":"active","lastActivityMs":500},
-                    {"harness":harness,"sessionId":"s2","canonicalRoot":nested,"state":state,"lastActivityMs":900,"cause":"lease_expired"}])).await,
-                familiar,
-                "{state} under '{harness}'"
-            );
-        }
+                .orchestrator,
+            provider("prefrontal-core")
+        );
+        assert_eq!(f.resolver.calls(), 2);
     }
 }
 

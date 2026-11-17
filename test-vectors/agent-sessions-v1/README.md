@@ -182,9 +182,10 @@ a backfill makes the data local.
   (`found: false`), and `runner_mismatch` for a runner other than the
   recorded one.
 - **`sessions.json`**: one agent's two pages at `limit: 2`: a live Broca worker
-  (`active` from the host's liveness snapshot, network `no` after `yes`) and
+  (`active` from the reconciled liveness bucket, network `no` after `yes`) and
   an ended worker (`gone`, network `unknown` with no history), then a Pi
-  session registered with `runner: null` (`unknown`, network `unknown`),
+  session registered with `runner: null` (`gone` because it is absent from the
+  authoritative bucket, network `unknown`),
   whose page has `next_cursor: null`.
 - **`session-for-runner.json`**: the live worker found by `{runner, session}`
   with its history `yes` at 700 then `no` at 710, the ended worker with no

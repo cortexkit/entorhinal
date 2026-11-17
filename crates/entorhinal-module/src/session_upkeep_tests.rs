@@ -1,4 +1,4 @@
-//! Session end, the per-agent session list, the liveness feed's end stamps and
+//! Session end, the per-agent session list, queued end stamps and
 //! retention, through the real handler.
 
 use serde_json::{json, Value};
@@ -300,7 +300,7 @@ async fn agent_sessions_pages_and_maps_liveness() {
         ("r-active", "s-active"),
         ("r-idle", "s-idle"),
         ("r-gone", "s-gone"),
-        ("r-lapsed", "s-lapsed"),
+        ("r-missing", "s-missing"),
         ("r-ended", "s-ended"),
     ] {
         result(
@@ -319,15 +319,18 @@ async fn agent_sessions_pages_and_maps_liveness() {
         )
         .await,
     );
-    f.feed(json!({"seq":1,"snapshot":true,"sessions":[
-        {"harness":"broca","sessionId":"s-active","canonicalRoot":"/w","state":"active"},
-        {"harness":"broca","sessionId":"s-idle","canonicalRoot":"/w","state":"idle"},
-        {"harness":"broca","sessionId":"s-gone","canonicalRoot":"/w","state":"active"},
-        {"harness":"broca","sessionId":"s-lapsed","canonicalRoot":"/w","state":"lapsed"}]}))
-        .await;
-    f.feed(json!({"seq":2,"sessions":[
-        {"harness":"broca","sessionId":"s-gone","canonicalRoot":"/w","state":"gone"}]}))
-        .await;
+    let before = sessions(&f, json!({"agent_id":agent}));
+    for row in before["sessions"].as_array().unwrap() {
+        assert_eq!(
+            row["liveness"],
+            if row["ref"] == "r-ended" {
+                "gone"
+            } else {
+                "unknown"
+            }
+        );
+    }
+    f.bus_sessions(&[("broca", "s-active", "active"), ("broca", "s-idle", "idle")]);
 
     let mut seen = Vec::new();
     let mut cursor = Value::Null;
@@ -372,7 +375,7 @@ async fn agent_sessions_pages_and_maps_liveness() {
             json!({"agent_id":agent,"limit":1,"open":true,"cursor":page["next_cursor"]}),
         );
     }
-    assert_eq!(open_seen, ["r-active", "r-gone", "r-idle", "r-lapsed"]);
+    assert_eq!(open_seen, ["r-active", "r-gone", "r-idle", "r-missing"]);
     for params in [
         json!({"agent_id":agent,"open":true,"cursor":unfiltered["next_cursor"]}),
         json!({"agent_id":agent,"cursor":first_open["next_cursor"]}),
@@ -388,7 +391,7 @@ async fn agent_sessions_pages_and_maps_liveness() {
             ("r-ended", "gone"),
             ("r-gone", "gone"),
             ("r-idle", "active"),
-            ("r-lapsed", "unknown"),
+            ("r-missing", "gone"),
         ]
         .map(|(r, l)| (r.to_owned(), l.to_owned()))
     );
@@ -477,66 +480,9 @@ async fn moved_in_reference_lists_unknown_until_registered() {
     );
 }
 
-/// An explicit `gone` on the feed stamps the binding's end time on the
-/// blocking pool after the batch replied. `lapsed`, `unknown`, absence from a
-/// snapshot and a `gone` naming another runner stamp nothing.
+/// A stamp that cannot be written is counted without blocking its producer.
 #[tokio::test]
-async fn liveness_gone_stamps_the_binding_but_lapsed_and_absence_do_not() {
-    let f = Fixture::new("upkeep-gone", true);
-    let agent = f.create("Watched");
-    f.providers(provider(WRITER_MODULE), provider(WRITER_MODULE));
-    for (session_ref, session_id, runner) in [
-        ("r-gone", "s-gone", None),
-        ("r-lapsed", "s-lapsed", None),
-        ("r-unknown", "s-unknown", None),
-        ("r-absent", "s-absent", None),
-        ("r-other", "s-other", Some("broca")),
-        ("r-same", "s-same", Some("broca")),
-    ] {
-        let mut params = registration(&agent, session_ref, "broca", session_id);
-        if let Some(runner) = runner {
-            params["runner"] = json!(runner);
-        }
-        result(f.register(EXECUTIVE, params).await);
-    }
-    let active =
-        |id: &str| json!({"harness":"broca","sessionId":id,"canonicalRoot":"/w","state":"active"});
-    f.feed(json!({"seq":1,"snapshot":true,"sessions":[
-        active("s-gone"), active("s-lapsed"), active("s-unknown"), active("s-absent"),
-        active("s-other"), active("s-same")]}))
-        .await;
-    // The writer task is not running yet, so the batch can only have queued
-    // its stamps: its reply does not wait for SQLite.
-    f.feed(json!({"seq":2,"sessions":[
-        {"harness":"broca","sessionId":"s-gone","canonicalRoot":"/w","state":"gone"},
-        {"harness":"broca","sessionId":"s-lapsed","canonicalRoot":"/w","state":"lapsed"},
-        {"harness":"broca","sessionId":"s-unknown","canonicalRoot":"/w","state":"unknown"},
-        {"harness":"broca","sessionId":"s-other","canonicalRoot":"/w","state":"gone","runner":"thalamus-harness"},
-        {"harness":"broca","sessionId":"s-same","canonicalRoot":"/w","state":"gone","runner":"broca"}]}))
-    .await;
-    f.feed(json!({"seq":3,"snapshot":true,"sessions":[active("s-lapsed")]}))
-        .await;
-    assert_eq!(ended_at(&f, &agent, "s-gone"), Value::Null);
-
-    f.handler.start_session_upkeep();
-    until(&f, false, || ended_at(&f, &agent, "s-same") == NOW).await;
-    assert_eq!(ended_at(&f, &agent, "s-gone"), NOW);
-    for open in ["s-lapsed", "s-unknown", "s-absent", "s-other"] {
-        assert_eq!(ended_at(&f, &agent, open), Value::Null, "{open}");
-    }
-    assert_eq!(
-        f.handler
-            .session_upkeep
-            .stamped
-            .load(std::sync::atomic::Ordering::Relaxed),
-        2
-    );
-    f.handler.stop_session_upkeep().await;
-}
-
-/// A stamp that cannot be written is counted and never refuses the batch.
-#[tokio::test]
-async fn a_failed_stamp_is_counted_and_never_refuses_the_batch() {
+async fn a_failed_stamp_is_counted_without_blocking_the_producer() {
     let f = Fixture::new("upkeep-failure", true);
     let agent = f.create("Unlucky");
     f.providers(provider(WRITER_MODULE), provider(WRITER_MODULE));
@@ -544,7 +490,6 @@ async fn a_failed_stamp_is_counted_and_never_refuses_the_batch() {
         f.register(EXECUTIVE, registration(&agent, "r1", "broca", "s1"))
             .await,
     );
-    f.feed(json!({"seq":1,"snapshot":true,"sessions":[]})).await;
     let held = f.handler.store.lock().unwrap().take();
     let failures = || {
         f.handler
@@ -553,11 +498,14 @@ async fn a_failed_stamp_is_counted_and_never_refuses_the_batch() {
             .load(std::sync::atomic::Ordering::Relaxed)
     };
     f.handler.start_session_upkeep();
-    let reply = f
-        .feed(json!({"seq":2,"sessions":[
-            {"harness":"broca","sessionId":"s1","canonicalRoot":"/w","state":"gone"}]}))
-        .await;
-    assert_eq!(reply["accepted"], true);
+    f.handler
+        .session_upkeep
+        .push(vec![entorhinal_core::GoneSession {
+            harness: "broca".into(),
+            session_id: "s1".into(),
+            runner: None,
+            ended_at_ms: NOW,
+        }]);
     until(&f, false, || failures() == 1).await;
     f.handler.stop_session_upkeep().await;
     *f.handler.store.lock().unwrap() = held;

@@ -20,36 +20,32 @@ pub(crate) fn marker() -> Update {
     )
 }
 
-fn pushed(state: &mut LivenessState, key: &SessionKey, value: &str) {
-    state.stale = false;
-    state.sessions.insert(
-        key.clone(),
-        super::super::MirrorEntry {
-            state: value.into(),
-            canonical_root: "/p".into(),
-            last_activity_ms: 99,
-            cause: None,
-        },
-    );
+pub(crate) fn reconcile(state: &mut LivenessState) {
+    state.bus.watch_started();
+    state.bus.finish_replay();
+    state.bus.apply(marker()).unwrap();
 }
 
 #[test]
-fn liveness_bus_marker_selects_complete_mirror_and_preserves_fallback_latch() {
+fn liveness_bus_requires_live_reconciled_replay() {
     let mut state = LivenessState::default();
     let key = SessionKey::new("broca", "session_sample");
-    pushed(&mut state, &key, "active");
     state.bus.watch_live = true;
     state.bus.finish_replay();
     state
         .bus
         .apply(put("opaque.with.dots", "broca", "session_sample", "idle"))
         .unwrap();
-    assert!(matches!(state.read(&key), Read::Active));
+    assert!(matches!(state.read(&key), Read::Unknown(None)));
+    assert!(!state.readable());
+    assert_eq!(state.project_activity("project_sample"), None);
     assert!(matches!(
         state.read(&SessionKey::new("other", "missing")),
         Read::Unknown(None)
     ));
     state.bus.apply(marker()).unwrap();
+    assert!(state.readable());
+    assert_eq!(state.project_activity("project_sample"), Some(18));
     assert!(matches!(state.read(&key), Read::Idle));
     assert!(matches!(
         state.read(&SessionKey::new("other", "missing")),
@@ -61,11 +57,12 @@ fn liveness_bus_marker_selects_complete_mirror_and_preserves_fallback_latch() {
         "served replies still collapse idle"
     );
     state.bus.apply(Update::Delete(MARKER.into())).unwrap();
-    assert!(matches!(state.read(&key), Read::Active));
-    state.stale = true;
     assert!(matches!(state.read(&key), Read::Unknown(None)));
+    assert!(!state.readable());
+    assert_eq!(state.project_activity("project_sample"), None);
     state.bus.apply(marker()).unwrap();
     state.bus.watch_live = false;
+    assert!(!state.readable());
     assert!(
         matches!(state.read(&key), Read::Unknown(None)),
         "a marker alone cannot vouch for a dead watch"
@@ -112,8 +109,8 @@ fn liveness_bus_decodes_prefrontal_values_and_orders_keys_before_marker() {
         state.read(&SessionKey::new("harness.dotted", "s.dotted")),
         Read::Active
     ));
-    assert_eq!(state.project_activity("project_sample", &[]), Some(18));
-    assert_eq!(state.project_activity("unrelated", &[]), None);
+    assert_eq!(state.project_activity("project_sample"), Some(18));
+    assert_eq!(state.project_activity("unrelated"), None);
     state
         .bus
         .apply(Update::Delete("broca.session_sample".into()))
@@ -278,7 +275,6 @@ fn start(handler: &ProjectsHandler) -> Control {
 async fn liveness_bus_key_updated_after_marker_waits_for_initial_replay() {
     let handler = ProjectsHandler::with_runtime("bus-late-key".into(), || 7);
     let late = SessionKey::new("broca", "late");
-    pushed(&mut handler.liveness.lock().unwrap(), &late, "active");
     let mut control = start(&handler);
     control.event(Event::Open).await;
     control.ready().await;
@@ -288,7 +284,7 @@ async fn liveness_bus_key_updated_after_marker_waits_for_initial_replay() {
         let state = handler.liveness.lock().unwrap();
         assert!(!state.bus.authoritative());
         assert!(
-            matches!(state.read(&late), Read::Active),
+            matches!(state.read(&late), Read::Unknown(None)),
             "a late replayed live key must not look gone"
         );
     }
@@ -308,8 +304,7 @@ async fn liveness_bus_key_updated_after_marker_waits_for_initial_replay() {
 #[tokio::test]
 async fn liveness_bus_empty_bucket_waits_for_marker_on_first_delivery() {
     let handler = ProjectsHandler::with_runtime("bus-empty".into(), || 7);
-    let key = SessionKey::new("broca", "pushed");
-    pushed(&mut handler.liveness.lock().unwrap(), &key, "active");
+    let key = SessionKey::new("broca", "missing");
     let mut control = start(&handler);
     control.event(Event::Open).await;
     control.ready().await;
@@ -319,7 +314,7 @@ async fn liveness_bus_empty_bucket_waits_for_marker_on_first_delivery() {
         .load(Ordering::Relaxed));
     assert!(matches!(
         handler.liveness.lock().unwrap().read(&key),
-        Read::Active
+        Read::Unknown(None)
     ));
     // An empty watch emits no row. Its first later delivery carries
     // seen_current=true, which supplies the replay boundary with that row.
@@ -444,13 +439,6 @@ async fn liveness_bus_upkeep_stamps_only_observed_authoritative_deletes() {
     control.apply(put("opaque2", "broca", "s2", "idle")).await;
     control.complete(marker()).await;
     control.apply(Update::Delete("never.observed".into())).await;
-    // An authoritative live bus entry defeats an older pushed terminal report,
-    // without changing the pushed batch's accepted/snapshotRequested reply.
-    let reply = f.feed(json!({"seq":1,"snapshot":true,"sessions":[{
-        "harness":"broca","sessionId":"s1","state":"gone","canonicalRoot":"/p","lastActivityMs":18
-    }]})).await;
-    assert_eq!(reply["accepted"], true);
-    assert_eq!(reply["snapshotRequested"], false);
     assert_eq!(
         f.handler.read_session_liveness(&[("pi", "r1")]).unwrap()[0].state,
         "active"
@@ -469,7 +457,7 @@ async fn liveness_bus_upkeep_stamps_only_observed_authoritative_deletes() {
     assert_eq!(
         ended("s1"),
         None,
-        "neither an incomplete bus delete nor a superseded pushed gone may end this binding"
+        "an incomplete bus delete must not end this binding"
     );
     control.apply(Update::Delete("opaque1".into())).await;
     loop {

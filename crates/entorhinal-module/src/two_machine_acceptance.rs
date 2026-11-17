@@ -4441,8 +4441,8 @@ async fn avatar_batch_keeps_one_runtime_worker_available_and_local_writes_bounde
             ("agent.fleet_identity", json!({})),
             ("agent.avatar_read", json!({"agentIds":[id]})),
             (
-                "projects.session_liveness",
-                json!({"seq":index+1,"snapshot":true,"sessions":[]}),
+                "agent.session_liveness",
+                json!({"refs":[{"ref_kind":"pi","ref":"avatar-ref"}]}),
             ),
         ] {
             let mut read = Box::pin(a.bytes_on(CORE, method, params));

@@ -123,10 +123,7 @@ async fn capture(reference: &str, abort: bool) -> Vec<String> {
     // liveness answer that no session process is still running.
     {
         let mut liveness = pair.a.machine.handler.liveness.lock().unwrap();
-        liveness.stale = false;
-        liveness
-            .gone
-            .insert(crate::SessionKey::new(HARNESS, SESSION));
+        crate::liveness_bus::tests::reconcile(&mut liveness);
     }
     let cut = pair.a.admit_to(B, "example-move").await.unwrap();
     if abort {

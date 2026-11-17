@@ -3872,17 +3872,20 @@ async fn session_lifecycle_records_match_published_files() {
     assert_eq!(reply, json!({"result":{"network":"no","since_ms":710}}));
     network_records.push(record);
 
-    // The host reports the live worker active; the others are not mirrored.
-    let (_, fed) = fixture
-        .record(
-            SESSION_CORE,
-            WRITER_MODULE,
-            "projects.session_liveness",
-            json!({"seq":1,"snapshot":true,"sessions":[
-                {"harness":"broca","sessionId":"broca-live","canonicalRoot":"/workspace/session-vectors","state":"active","runner":"broca"}]}),
-        )
-        .await;
-    assert_eq!(fed["result"]["accepted"], true);
+    // The reconciled bucket contains only the live worker.
+    {
+        let mut state = fixture.handler.liveness.lock().unwrap();
+        state
+            .bus
+            .apply(crate::liveness_bus::tests::put(
+                "broca.broca-live",
+                "broca",
+                "broca-live",
+                "active",
+            ))
+            .unwrap();
+        crate::liveness_bus::tests::reconcile(&mut state);
+    }
     let (first_page, first) = fixture
         .record(
             SESSION_READER,
@@ -3916,10 +3919,7 @@ async fn session_lifecycle_records_match_published_files() {
             json!({"agent_id":SESSION_AGENT,"cursor":cursor,"limit":2}),
         )
         .await;
-    assert_eq!(
-        liveness(&second),
-        [(json!(NO_RUNNER_REF), json!("unknown"))]
-    );
+    assert_eq!(liveness(&second), [(json!(NO_RUNNER_REF), json!("gone"))]);
     assert!(second["result"]["sessions"][0]["runner"].is_null());
     assert!(second["result"]["next_cursor"].is_null());
     published_file(

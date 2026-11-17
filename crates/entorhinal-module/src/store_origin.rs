@@ -101,7 +101,7 @@ impl ProjectsHandler {
         Ok(())
     }
     pub(super) fn admit_store_method(&self, method: &str) -> Result<(), HandlerError> {
-        if !matches!(method, "projects.session_liveness" | ADOPT)
+        if method != ADOPT
             && (MUTATING_METHODS.contains(&method)
                 || (cortexkit_role_agent_data::REQUIRED_OPS.contains(&method)
                     && !matches!(

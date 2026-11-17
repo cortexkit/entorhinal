@@ -1,11 +1,11 @@
-//! Background upkeep of session bindings: writing the end times the liveness
-//! feed reports, and pruning bindings whose session ended long ago.
+//! Background upkeep of session bindings: writing end times from observed
+//! liveness bucket deletes, and pruning bindings whose session ended long ago.
 //!
-//! The liveness feed arrives several times a second and must never wait on
-//! SQLite, so a `gone` report only appends to an in-memory queue and wakes
+//! The bucket watch must never wait on SQLite, so an authoritative observed
+//! delete only appends to an in-memory queue and wakes
 //! this task. The task drains everything queued so far and writes it in one
 //! transaction on the blocking pool. A failed write is counted and logged once
-//! per kind; it never reaches the feed's reply.
+//! per kind; it never blocks the bucket watch.
 //!
 //! Like claim refresh, the task holds the handler's store slot weakly and
 //! takes a store handle only for one blocking job, so dropping the handler or
@@ -57,7 +57,7 @@ impl Failure {
     }
 }
 
-/// The queue between the liveness feed and the writer task, and the task's
+/// The queue between the bucket watch and the writer task, and the task's
 /// counters. Every counter is an atomic so the health report reads them
 /// without a lock.
 #[derive(Default)]

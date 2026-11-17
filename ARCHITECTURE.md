@@ -8,7 +8,7 @@ It owns:
 - **Workspaces:** named groups of projects. Agent names are unique within a workspace.
 - **Agent identity:** names, roles, tags, labels, avatars and placement. Agent identity moved here from prefrontal-core in a one-time import; core keeps a read replica fed from entorhinal.
 - **Residence:** which machine holds each agent or role (a claim record in engram, cached here), and moving an idle agent between machines.
-- **Sessions:** which agent each host session belongs to, which runner hosts it, when it ended, and its live state from the host's liveness feed.
+- **Sessions:** which agent each host session belongs to, which runner hosts it, when it ended, and its live state from prefrontal's session-liveness bus bucket.
 - **Agent tools and consent:** the tools agents call to create workspaces, projects, heads and hires, with consent cards, standing grants and an audit.
 - **Packages:** the CortexKit package catalog on this machine (registries, verified package files, each agent's pinned packages) and publishing.
 - **The user profile:** the operator's name, form of address and expertise, shared to every machine.
@@ -17,7 +17,7 @@ It owns:
 
 All traffic goes through daemon routes; entorhinal opens no network ports. The only network traffic it starts itself is HTTPS to package registries.
 
-- **prefrontal-core (the executive)** registers repositories, relays agent identity changes, reads `agent.changes` into its replica, registers and ends sessions as the `agent-orchestrator/v1` provider, and feeds session liveness as the `agent-host/v1` provider.
+- **prefrontal-core (the executive)** registers repositories, relays agent identity changes, reads `agent.changes` into its replica, registers and ends sessions as the `agent-orchestrator/v1` provider, and writes the session-liveness bus bucket entorhinal watches.
 - **Any module** reads project and agent identity. Magic Context keys memories on project ids and reads `context.*`; Plexus reads role claims; the apps read fleet identity and locations through Callosum.
 - **engram** hosts the shared identity log (`agent-sync` service: `identity_log.*` and the `record.*` claim records) and the session door used to carry move data (`session-door` service: `cut.*`).
 - **Cingulate** shows consent cards on the operator's phone and reads and revokes standing grants through `permissions/v1`.
@@ -81,7 +81,6 @@ Package files live outside SQLite, in a content-addressed folder beside the stor
 | `agent.move` | `Direct` after a presence prompt, the `agent-orchestrator/v1` provider (which relays moves the operator starts from the phone, with no prompt here), or `reserved:engram` for a lid-close move when the operator turned those on |
 | `agent.register_session` | the provider of `agent-orchestrator/v1` or `agent-host/v1`, resolved from the daemon per route and cached |
 | `agent.end_session`, `agent.set_session_network` | the provider of `agent-orchestrator/v1` |
-| The session liveness feed | the provider of `agent-host/v1` |
 | `user.get` | `reserved:prefrontal-core`, `reserved:callosum` or `Direct` |
 | `user.set` | `reserved:prefrontal-core`, `reserved:callosum`, or `Direct` after a presence prompt |
 | `permissions.list`, `permissions.revoke` | `Direct` or `reserved:cingulate` |
@@ -102,7 +101,7 @@ A route opened under a flow's scope refuses every write (`flow_scope_not_admitte
 
 **An agent tool call** (`tool_writes.rs`) names its caller only through the scope stamp. The write is validated, then authorized by a standing grant, the head's ownership of its own hire, or a consent card answered on the phone through Cingulate. It is then validated again and committed with its audit row.
 
-**Session registration** binds a session reference to a host session for one agent. Registering an existing session again under a new reference, harness or runner updates the same row in place. The liveness feed's batches update an in-memory mirror; ended sessions are written back to their bindings by a background task.
+**Session registration** binds a session reference to a host session for one agent. Registering an existing session again under a new reference, harness or runner updates the same row in place. A watch of prefrontal's session-liveness bucket updates an in-memory mirror; observed deletes from an authoritative mirror queue binding end stamps for a background task.
 
 **A move** is admitted in one transaction that records a checkpoint only if no new session started. On the source, the move driver has every participant freeze and export the agent's data, seals the cut in engram's session door, and publishes the move. The receiving machine picks it up from its inbox, has the participants import the data, takes the claim, and activates them. Only after activation does the source release its copy. Each step is recorded before the next, is idempotent and survives a restart. `docs/agent-move-contract.md` defines every step and refusal.
 
@@ -116,7 +115,8 @@ All start after HELLO_ACK. Each holds the store weakly and takes a handle only f
 - **Claim refresh** (`claims.rs`): reads agent claims from engram when signalled: at startup, after an engram reconnect, after an agent is created or another machine's entries are applied, on the next catch-up tick after a failed pass, and on `ck agents where --refresh`. It has no timer of its own.
 - **Role refresh** (`roles.rs`): reads role claims every 30 s.
 - **Move driver** (`move_driver.rs`): drives open moves, polls the move inbox every 30 s, and releases finished cuts.
-- **Session upkeep** (`session_upkeep.rs`): writes end times from the liveness feed and prunes bindings that ended more than 30 days ago.
+- **Session liveness** (`liveness_bus.rs`): watches `prefrontal-core.session-liveness`, replays its rows and reconciliation marker, and clears and retries the mirror after an outage.
+- **Session upkeep** (`session_upkeep.rs`): writes end times from observed authoritative bucket deletes and prunes bindings that ended more than 30 days ago.
 - **Catalog status poll** (`catalog_poll.rs`): refreshes package status for the registry scopes agents' pins use, at startup and then hourly at a stored random offset, backing off up to 6 h after failures. Live flows requiring capabilities also refresh every ten minutes, retry failures after one minute (doubling to ten), and become stale after fifteen minutes without confirmation.
 - **Starter bundle seed** (`catalog_seed.rs`): seeds the content store once if a starter bundle is present and the store is empty.
 - **Bus change publisher** (`bus_changes.rs`): keeps five revision markers in the account-local `entorhinal.changes` KV bucket current after committed journal, role-cache and catalog-status changes; retries bus outages without delaying reads.
@@ -131,7 +131,7 @@ All start after HELLO_ACK. Each holds the store weakly and takes a handle only f
 6. **`Direct` is not the operator.** Every local process connects as `Direct`, agent shells included. Agent identity writes, profile writes and operator-only actions from `Direct` therefore need a presence prompt, and refuse `operator_presence_unavailable` where none exists (Linux).
 7. **A store from another machine is read-only.** The store records the daemon's machine id at first start. A store restored onto a different machine refuses every write (`store_from_another_machine`) and starts no background task acting as this machine until the operator adopts it with `ck projects adopt-store`.
 8. **Identity is not residence.** Agent identity is shared. Which machine holds an agent is a claim in engram, cached locally and changed only by a move. With sharing `disabled`, every live agent reads as unclaimed at epoch 0.
-9. **Session liveness is volatile.** It lives in memory, starts stale after a restart, and answers `unknown` until the host sends a snapshot. Moves treat `unknown` and `lapsed` as busy.
+9. **Session liveness is volatile.** It lives in memory and trusts only a live bucket watch with a finished initial replay and a valid `_reconciled` marker. Until all three hold, session keys answer `unknown`. Moves treat `unknown` as busy. Only an observed DEL in an authoritative mirror may queue an end stamp, never absence alone.
 10. **Absent is not zero.** Fields such as `lastErrorAt`, a workspace root or a session's `runner` are left out when unknown. A reader must not treat a missing value as 0 or "none".
 11. **Two reply shapes.** Module routes wrap success as `{"result": …}`. Tool routes answer bare `tool-provider/v1` bodies.
 12. **A migration is one-way.** A binary refuses a newer store, so a release that migrates is placed with a store snapshot and rolled back by restoring it. A migration that has never shipped may be amended in place instead of adding a new one.

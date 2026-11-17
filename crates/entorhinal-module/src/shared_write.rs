@@ -1215,8 +1215,8 @@ mod tests {
             .unwrap();
         let lock = f.handler.writer.lock().await;
         ready(f.call(
-            "projects.session_liveness",
-            json!({"seq":1,"snapshot":true,"sessions":[]}),
+            "agent.session_liveness",
+            json!({"refs":[{"ref_kind":"pi","ref":"missing"}]}),
         ))
         .unwrap();
         drop(lock);
@@ -3160,14 +3160,6 @@ impl ProjectsHandler {
         } else {
             principal_label(admission.principal.as_ref())
         };
-        // Liveness is volatile, not a SQLite mutation. It must not queue behind
-        // a transaction waiting for the log.
-        if request.method == "projects.session_liveness" {
-            let providers = self
-                .route_session_providers(&request.method, &admission)
-                .await;
-            return self.execute_with(request, key, Some(&providers));
-        }
         // Session registration is machine-local, but uses the same SQLite
         // writer connection as shared writes. Wait for its synchronous mutex
         // off the runtime. Do not join the shared-log writer queue: background

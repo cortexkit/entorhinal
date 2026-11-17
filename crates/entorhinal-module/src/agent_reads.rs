@@ -661,8 +661,8 @@ mod tests {
         let mut requests = read_requests(f.head(), std::path::Path::new(&root));
         requests.push(("resolve_remote", json!({"owner":"owner","repo":"repo"})));
         requests.push((
-            "projects.session_liveness",
-            json!({"seq":1,"snapshot":true,"sessions":[]}),
+            "agent.session_liveness",
+            json!({"refs":[{"ref_kind":"pi","ref":"missing"}]}),
         ));
         for (method, params) in &mut requests {
             if matches!(*method, "agent.resolve" | "agent.github_identity") {
@@ -671,13 +671,7 @@ mod tests {
         }
         let expected = requests
             .iter()
-            .map(|(method, params)| {
-                if *method == "projects.session_liveness" {
-                    json!({"code":"host_unbound"})
-                } else {
-                    f.ok(method, params.clone())
-                }
-            })
+            .map(|(method, params)| f.ok(method, params.clone()))
             .collect::<Vec<_>>();
         let (parked_tx, parked_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -703,11 +697,7 @@ mod tests {
                 for (method, params) in requests {
                     let start = Instant::now();
                     let outcome = handler.handle_request(&body(method, params), OPERATOR);
-                    let reply = if method == "projects.session_liveness" {
-                        json!({"code":wire_error(outcome).code})
-                    } else {
-                        success(outcome)
-                    };
+                    let reply = success(outcome);
                     let _ = reply_tx.send((method, reply, start.elapsed()));
                 }
             });
@@ -744,14 +734,7 @@ mod tests {
         for ((method, reply, _), expected) in received.into_iter().zip(expected) {
             assert_eq!(reply, expected, "{method} must see only committed state");
         }
-        let mirror = f.handler.liveness.lock().unwrap();
-        assert!(mirror.sessions.is_empty());
-        assert_eq!(mirror.last_seq, None);
-        assert!(
-            mirror.stale,
-            "the unresolved sync feed must not clear the latch"
-        );
-        assert_eq!(mirror.sender, None);
+        assert!(!f.handler.liveness.lock().unwrap().readable());
     }
 
     #[tokio::test]
@@ -1731,7 +1714,6 @@ mod tests {
             "remove",
             "seed_import",
             "rebuild",
-            "projects.session_liveness",
             "add_root",
             "refresh_root_key",
             "rebind_root",

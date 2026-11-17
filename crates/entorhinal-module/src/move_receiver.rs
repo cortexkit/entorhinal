@@ -3260,8 +3260,7 @@ mod tests {
         assert_eq!(f.row().hold.unwrap()["reason_code"], "liveness_unknown");
         {
             let mut liveness = f.liveness.lock().unwrap();
-            liveness.stale = false;
-            liveness.gone.insert(SessionKey::new("host", "s"));
+            crate::liveness_bus::tests::reconcile(&mut liveness);
         }
         f.until(&mut receiver, Step::Claimed).await;
     }
@@ -4079,12 +4078,7 @@ mod tests {
             let f = Fixture::new(held).await;
             if held {
                 f.store().apply_entry("fixture", "{}", "fixture", None, |tx| tx.execute_batch("UPDATE session_binding SET harness='host',session_id='old',project_root='/old',registered_by='host';")).unwrap();
-                f.liveness
-                    .lock()
-                    .unwrap()
-                    .gone
-                    .insert(SessionKey::new("host", "old"));
-                f.liveness.lock().unwrap().stale = false;
+                crate::liveness_bus::tests::reconcile(&mut f.liveness.lock().unwrap());
             }
             let before = f
                 .store()

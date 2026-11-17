@@ -927,16 +927,13 @@ mod tests {
                 .unwrap();
             {
                 let mut mirror = f.handler.liveness.lock().unwrap();
-                mirror.stale = false;
-                mirror.sessions.insert(
-                    crate::SessionKey::new("host", "r"),
-                    crate::MirrorEntry {
-                        state: state.into(),
-                        canonical_root: "/project".into(),
-                        last_activity_ms: 700,
-                        cause: None,
-                    },
-                );
+                mirror
+                    .bus
+                    .apply(crate::liveness_bus::tests::put(
+                        "host.r", "host", "r", state,
+                    ))
+                    .unwrap();
+                crate::liveness_bus::tests::reconcile(&mut mirror);
             }
             let outcome = f.move_(ORCH, &id).await;
             if admitted {
@@ -955,11 +952,11 @@ mod tests {
 
     #[tokio::test]
     async fn liveness_bus_move_admission_selects_bus_only_after_marker() {
-        for (bus_state, reconciled, pushed_state, admitted) in [
-            ("idle", true, "active", true),
-            ("active", true, "idle", false),
-            ("idle", false, "active", false),
-            ("active", false, "idle", true),
+        for (bus_state, reconciled, admitted) in [
+            ("idle", true, true),
+            ("active", true, false),
+            ("idle", false, false),
+            ("active", false, false),
         ] {
             let f = Fixture::new(2).await;
             let id = f.create().await;
@@ -979,16 +976,6 @@ mod tests {
                 .unwrap();
             {
                 let mut state = f.handler.liveness.lock().unwrap();
-                state.stale = false;
-                state.sessions.insert(
-                    crate::SessionKey::new("host", "r"),
-                    crate::MirrorEntry {
-                        state: pushed_state.into(),
-                        canonical_root: "/project".into(),
-                        last_activity_ms: 700,
-                        cause: None,
-                    },
-                );
                 state.bus.watch_started();
                 state.bus.finish_replay();
                 state.bus.apply(crate::liveness_bus::Update::Put("opaque".into(), serde_json::to_vec(&json!({
@@ -1011,7 +998,14 @@ mod tests {
                 match outcome {
                     HandlerOutcome::ErrorWithDetail { code, detail, .. } => {
                         assert_eq!(code, "agent_busy");
-                        assert_eq!(detail["refs"][0]["reason_code"], "session_active");
+                        assert_eq!(
+                            detail["refs"][0]["reason_code"],
+                            if reconciled {
+                                "session_active"
+                            } else {
+                                "liveness_unknown"
+                            }
+                        );
                     }
                     other => {
                         panic!("expected busy for {bus_state}, reconciled={reconciled}: {other:?}")

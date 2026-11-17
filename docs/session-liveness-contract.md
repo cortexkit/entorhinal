@@ -1,20 +1,20 @@
 # Session liveness contract
 
 This contract covers how entorhinal learns which agent sessions are alive and
-how it answers others. Three operations take part:
+how it answers others. Two operations and a bus bucket take part:
 
 - `agent.register_session` binds an agent's session reference to the host
   session running it.
-- `projects.session_liveness` is the feed: the session host pushes the state of
-  its sessions to entorhinal.
+- `prefrontal-core.session-liveness` is the bus bucket entorhinal watches for
+  session states.
 - `agent.session_liveness` answers `active`, `gone` or `unknown` for session
   references.
 
 `agent.for_session` and `agent.session_for_ref` read the bindings.
 
 The code is in `crates/entorhinal-module/src/sessions.rs` (admission,
-registration, answers), `ProjectsHandler::session_liveness` and
-`LivenessState` in `crates/entorhinal-module/src/main.rs` (the feed), and
+registration, answers), `crates/entorhinal-module/src/liveness_bus.rs` (the
+bucket mirror), and
 `RegistryStore::register_session` in `crates/entorhinal-core/src/lib.rs` (the
 binding row). Test names below are functions in those files' test modules.
 
@@ -27,8 +27,8 @@ binding row). Test names below are functions in those files' test modules.
 | binding | One `session_binding` row: reference, agent, session key, project root (1–4096 bytes), the role that registered it and when. |
 | orchestrator | The sole provider of `agent-orchestrator/v1`, as the daemon resolves it. |
 | host | The sole provider of `agent-host/v1`, as the daemon resolves it. |
-| mirror | entorhinal's in-memory copy of the host's session states, built from the feed. |
-| stale | The mirror cannot vouch for anything and is waiting for a snapshot. |
+| mirror | entorhinal's in-memory copy of the bucket's session states. |
+| authoritative | The mirror has a live watch, a finished initial replay and a valid reconciliation marker. |
 
 The answer vocabulary of `agent.session_liveness` is closed: `active`, `gone`,
 `unknown`.
@@ -74,49 +74,47 @@ Tests: `a_host_provider_other_than_the_executive_registers_as_host`,
 `registration_refuses_cutover_agent_ref_and_session_in_order`,
 `re_registering_a_reference_updates_its_session_and_role`.
 
-## 3. The feed
+## 3. The bucket
 
-A batch is `{seq, snapshot?, sessions?}`. `seq` is required; `snapshot`
-defaults to `false`; `sessions` defaults to empty. Each session carries
-`sessionId`, `canonicalRoot` and `state`, and optionally `harness`,
-`lastActivityMs` and `cause`. The reply is
-`{accepted, snapshotRequested, tracked}`.
+Entorhinal uses its credentialed bus connection to watch the local
+`prefrontal-core.session-liveness` KV bucket in stream order, with history and
+tombstones. It never polls a session host.
 
-1. **Admission.** Only `reserved:<host>` may send a batch. If the host does not
-   resolve to one provider, the batch refuses `host_unbound`; another caller
-   refuses `caller_forbidden`. A refused batch changes nothing: not the mirror,
-   not the sequence, not the stale latch.
-2. **Snapshots.** A batch with `snapshot: true` replaces the whole mirror,
-   whatever its `seq`, and clears the stale latch. An empty snapshot is
-   information: it says the host tracks nothing. Only an explicit
-   `snapshot: true` counts; a batch that omits it is a delta.
-3. **Deltas.** On first contact any `seq` is accepted as the baseline, but the
-   mirror stays stale. Afterwards a delta at or below the last applied `seq` is
-   refused without being applied and makes the mirror stale; a delta that
-   skips ahead is applied and makes the mirror stale.
-4. **The stale latch.** The mirror starts stale when the module starts. It also
-   goes stale when the sending principal changes or the sender's route closes.
-   It stays stale until a snapshot arrives, and every reply while stale carries
-   `snapshotRequested: true`.
-5. **States.** A session reported `gone` leaves the mirror and is remembered in
-   a separate set, capped at 4,096 sessions; when the cap is exceeded the
-   oldest is forgotten. Any other state string is kept as sent, including
-   states this build does not know.
-6. **Volatile.** The mirror lives in memory only. It is never journaled and is
-   lost on restart, which is why a restarted module starts stale.
+1. **Keys and values.** A session key is written as
+   `<harness>.<hex-encoded sessionId>` (for example,
+   `broca.73657373696f6e5f73616d706c65` for `session_sample`).
+   Entorhinal treats the KV key as opaque: identities come from the JSON value,
+   not from splitting the key. A value
+   carries `harness`, `sessionId`, `state` (`active` or `idle`),
+   `lastActivityMs` and nullable `projectId`. Unknown fields are ignored.
+   Prefrontal reports `active` while the session's head is in a nonterminal
+   residence flip (a handover in progress on one machine), and fails closed
+   to `active` if it cannot read flips. Entorhinal relies on that state to
+   refuse a cross-machine move mid-handover with `session_active`.
+2. **Reconciliation.** `_reconciled` carries `{bootId, sessions}`. A valid PUT
+   marks reconciliation complete; deleting it withdraws that marker. Other
+   underscore-prefixed PUTs are ignored.
+3. **Trust.** The mirror is authoritative only when all three conditions hold:
+   the watch is live, its initial replay is finished, and a valid `_reconciled`
+   marker has arrived. A session updated after the marker may replay later,
+   so the marker alone is not enough. An empty bucket also waits for a marker
+   and the replay boundary.
+4. **Outages.** Startup, a failed watch, a connection replacement or a decode
+   error leaves session liveness `unknown`. Entorhinal clears the mirror and
+   retries with bounded backoff; a new watch must replay and reconcile again.
+   The mirror is volatile and never journaled.
+5. **Upkeep.** Only an observed DEL for a previously decoded session may enqueue
+   an end stamp, and only when the mirror is authoritative and the session is
+   gone. A surviving key for the same identity prevents that stamp. Initial
+   tombstones, missing keys and watch failures do not stamp bindings ended:
+   the bucket does not cover every host.
 
-Tests: `liveness_feed_non_host_callers_preserve_every_answer`,
-`liveness_feed_unbound_preserves_mirror_sequence_and_latch`,
-`liveness_feed_flow_refuses_before_resolution`,
-`a_fresh_receiver_asks_for_a_snapshot_until_one_arrives`,
-`a_snapshot_replaces_the_mirror_and_an_empty_one_still_counts`,
-`a_batch_that_does_not_say_it_is_a_snapshot_cannot_clear_staleness`,
-`session_liveness_gap_detection_and_snapshot_rebase`,
-`an_equal_sequence_batch_cannot_resurrect_a_gone_session`,
-`an_older_batch_cannot_resurrect_a_session_that_is_already_gone`,
-`liveness_feed_rebinding_to_thalamus_latches_until_snapshot`,
-`liveness_feed_recorded_route_closing_latches_until_snapshot`,
-`unfamiliar_states_are_accepted_and_leave_enumerate_annotation_unchanged`.
+Tests: `liveness_bus_requires_live_reconciled_replay`,
+`liveness_bus_decodes_prefrontal_values_and_orders_keys_before_marker`,
+`liveness_bus_key_updated_after_marker_waits_for_initial_replay`,
+`liveness_bus_empty_bucket_waits_for_marker_on_first_delivery`,
+`liveness_bus_watch_error_clears_rewatches_and_replays_marker`,
+`liveness_bus_upkeep_stamps_only_observed_authoritative_deletes`.
 
 ## 4. Answers
 
@@ -128,38 +126,36 @@ its byte bounds, refuses `invalid_request`. It is a read, open to every caller.
 |---|---|
 | No binding for the reference | `unknown` |
 | Binding with no session key | `gone` |
-| Mirror stale | `unknown` (with the mirrored `cause`, if any) |
+| Mirror not authoritative | `unknown` |
 | Mirror entry says `active` or `idle` | `active` |
-| Mirror entry says anything else | `unknown` (with its `cause`, if any) |
-| No mirror entry, key in the `gone` set | `gone` |
-| No mirror entry, key not remembered | `unknown` |
+| Authoritative mirror has no entry for the session key | `gone` |
 
 What is guaranteed:
 
-- `active` only when the mirror is not stale and the host's latest report for
+- `active` only when the mirror is authoritative and the bucket's latest value for
   that session key is `active` or `idle`.
-- `gone` is never produced for a session whose latest report was not `gone`,
-  except for a binding that has no session key at all.
-- Forgetting a `gone` session (the 4,096 cap, or a snapshot) can only turn its
-  answer into `unknown`, never into `active`. Callers treat `unknown` as busy.
+- A missing session key is `gone` only in an authoritative mirror, except for
+  a binding that has no session key at all.
+- Losing authority makes session-key answers `unknown`, never `gone`.
+  Callers treat `unknown` as busy.
 
-What is not guaranteed: that the host's reports are current. entorhinal
-answers from the last reports it received; it never polls the host.
+What is not guaranteed: that the bucket covers every host or that its values
+are current. Entorhinal answers from the last values it received.
 
 Tests: `session_liveness_maps_every_state_in_request_order`,
 `malformed_session_requests_are_invalid_request`.
 
 ## 5. Use in `enumerate`
 
-When the mirror is not stale and not empty, `enumerate` sets each project's
+When the mirror is authoritative, `enumerate` sets each project's
 `last_route_activity_ms` to the newest `lastActivityMs` among mirrored
-sessions whose `canonicalRoot` is inside one of the project's roots. A `gone`
-session never counts. When the mirror is stale or empty, the field is left
+sessions whose `projectId` matches the project. A deleted session never
+counts. When the mirror is not authoritative or no session matches, the field is left
 absent: absent means "not known", not "no activity". Other modules use this
 field to find folders nobody works in; entorhinal itself never removes
 anything because of it.
 
-Test: `enumerate_annotation_joins_liveness_by_root_containment`.
+Test: `enumerate_annotation_joins_liveness_by_project_id`.
 
 ## 6. Lookups
 
