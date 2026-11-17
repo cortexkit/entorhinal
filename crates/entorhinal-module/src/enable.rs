@@ -1635,7 +1635,11 @@ mod tests {
         );
         assert_eq!(&f.journal()[..journal.len()], journal);
         assert_without_agents_finished(&f, &log, &parts).await;
-        crate::tests::stop_catch_up(&f.handler).await;
+        // Finishing the enable also starts claim refresh, whose pass reads the
+        // store on a blocking thread. Stop every store task, not only
+        // catch-up, so no thread still holds the database when the fixture
+        // deletes its folder (Windows refuses to delete an open file).
+        crate::tests::stop_store_tasks(&f.handler).await;
     }
 
     #[tokio::test(start_paused = true)]
