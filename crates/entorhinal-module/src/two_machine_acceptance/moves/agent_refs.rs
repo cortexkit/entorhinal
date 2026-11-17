@@ -39,11 +39,12 @@ async fn no_agent_declarer_preserves_legacy_plan_record_and_every_wire_request()
     let record = String::from_utf8(record.body.unwrap())
         .unwrap()
         .replace(&cut, "<cut>");
-    // These literal bytes were captured with the admission and planner from
-    // before agent refs were supported. Only the random cut ID is normalized;
-    // decoding and re-encoding the record would hide wire-format changes.
-    assert_eq!(plan.as_bytes(), br#"{"agent_id":"agent_0123456789abcdef","claim_version":0,"from":"01010101010101010101010101010101","participants":[{"external":[],"module_id":"broca","refs":[{"ref":"ref-session","ref_kind":"session"}]}],"to":"02020202020202020202020202020202"}"#);
-    assert_eq!(record.as_bytes(), br#"{"v":1,"cut_id":"<cut>","agent_id":"agent_0123456789abcdef","from":"01010101010101010101010101010101","to":"02020202020202020202020202020202","state":"published","claim_version":0,"participants":[{"module_id":"broca","refs":[{"ref_kind":"session","ref":"ref-session"}],"external":[]}],"reason":null,"detail":null}"#);
+    // These literal bytes retain the planner's shape from before agent refs
+    // were supported, with claim_version 1 now supplied by initial ownership.
+    // Only the random cut ID is normalized; decoding and re-encoding the
+    // record would hide wire-format changes.
+    assert_eq!(plan.as_bytes(), br#"{"agent_id":"agent_0123456789abcdef","claim_version":1,"from":"01010101010101010101010101010101","participants":[{"external":[],"module_id":"broca","refs":[{"ref":"ref-session","ref_kind":"session"}]}],"to":"02020202020202020202020202020202"}"#);
+    assert_eq!(record.as_bytes(), br#"{"v":1,"cut_id":"<cut>","agent_id":"agent_0123456789abcdef","from":"01010101010101010101010101010101","to":"02020202020202020202020202020202","state":"published","claim_version":1,"participants":[{"module_id":"broca","refs":[{"ref_kind":"session","ref":"ref-session"}],"external":[]}],"reason":null,"detail":null}"#);
     assert_eq!(source.as_bytes(), br#"[["agent_data.describe",{}],["agent_data.busy",{"refs":[{"ref":"ref-session","ref_kind":"session"}]}],["agent_data.prepare",{"cutId":"<cut>","refs":[{"ref":"ref-session","ref_kind":"session"}]}],["agent_data.export",{"cutId":"<cut>","refs":[{"ref":"ref-session","ref_kind":"session"}]}],["agent_data.release",{"cutId":"<cut>","holder":"02020202020202020202020202020202","refs":[{"ref":"ref-session","ref_kind":"session"}]}]]"#);
     assert_eq!(receiver.as_bytes(), br#"[["agent_data.describe",{}],["agent_data.diverged",{"cutId":"<cut>","refs":[{"ref":"ref-session","ref_kind":"session"}]}],["agent_data.import",{"cutId":"<cut>","refs":[{"ref":"ref-session","ref_kind":"session"}]}],["agent_data.activate",{"cutId":"<cut>","refs":[{"ref":"ref-session","ref_kind":"session"}]}]]"#);
 }

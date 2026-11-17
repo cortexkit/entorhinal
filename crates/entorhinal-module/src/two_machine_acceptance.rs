@@ -8,6 +8,9 @@ use crate::log_client::{LogConnector, LogTransport, TransportError};
 use rusqlite::{types::Value as Cell, Connection, OpenFlags};
 use std::{future::Future, path::Path, sync::atomic::AtomicUsize};
 
+#[path = "initial_claim_acceptance.rs"]
+mod initial_claims;
+
 const DIRECT: RouteKey = (90, 1);
 const CORE: RouteKey = (91, 1);
 const SHARED: &[&str] = &[
@@ -2160,10 +2163,13 @@ mod moves {
             )
         }
         async fn admit_to(&self, to: &str, key: &str) -> Result<String, String> {
+            self.admit_agent_to(AGENT, to, key).await
+        }
+        async fn admit_agent_to(&self, agent: &str, to: &str, key: &str) -> Result<String, String> {
             // Admission is the real handler arm. The test owns scheduling so it
             // can stop at durable checkpoints without racing the polling task.
             let bytes = drive(self.machine.handler.admit_move(
-                json!({"agent_id":AGENT,"to":to,"request_key":key}),
+                json!({"agent_id":agent,"to":to,"request_key":key}),
                 CORE,
                 tokio::time::Instant::now(),
             ))
@@ -2446,6 +2452,19 @@ mod moves {
     mod import_losses;
 
     #[tokio::test(start_paused = true)]
+    async fn initial_claim_allows_move_admission_from_its_holder() {
+        let f = Pair::new(&[("pi", "pi-session")]).await;
+        drive(f.a.machine.handler.wait_claim_refresh())
+            .await
+            .unwrap();
+        let claim = f.a.store().agent_where(AGENT).unwrap();
+        assert_eq!(claim.status, "held_here");
+        assert_eq!(claim.epoch, 1);
+        let cut = f.a.admit_to(B, "newly-claimed").await.unwrap();
+        assert_eq!(f.a.row(&cut).claim_version, Some(1));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn full_move_three_participants_preserves_refs_claim_and_local_journals() {
         let f = Pair::new(&[
             ("broca", "broca-session"),
@@ -2463,7 +2482,7 @@ mod moves {
         let claim: Value =
             serde_json::from_slice(f.b.claim().await.body.as_deref().unwrap()).unwrap();
         assert_eq!(claim["holder"], B);
-        assert_eq!(claim["epoch"], 1);
+        assert_eq!(claim["epoch"], 2);
         // Read the source's persisted cache before any further handler call.
         // Release must have installed the receiver's claim without a refresh request.
         let source_cache = f.a.store().cached_agent_claim(AGENT).unwrap();
@@ -2474,7 +2493,7 @@ mod moves {
             Some(B),
             "release must refresh the source claim cache to the receiver"
         );
-        assert_eq!(source_cache.map(|claim| claim.epoch), Some(1));
+        assert_eq!(source_cache.map(|claim| claim.epoch), Some(2));
         let a_where = f.a.where_().await;
         assert_eq!(a_where["status"], "held_elsewhere", "{a_where}");
         assert_eq!(a_where["holder"], B);
@@ -2669,7 +2688,9 @@ mod moves {
     #[tokio::test(start_paused = true)]
     async fn version_three_epoch_zero_uses_record_version_not_cache_version() {
         let f = Pair::new(&[("pi", "pi-session")]).await;
-        put_claim(&f.a, 3, None, 0, None, A);
+        // A populated holder prevents initial claiming even at epoch zero.
+        // The cache still normalizes it to version zero; admission must not.
+        put_claim(&f.a, 3, Some(A), 0, None, A);
         let cut = f.published("epoch-zero").await;
         assert_eq!(f.a.row(&cut).claim_version, Some(3));
         f.finish(&cut).await;
@@ -2690,9 +2711,14 @@ mod moves {
             "claim_stale",
         ] {
             let f = Pair::new(&[("pi", "pi-session")]).await;
+            // Establish initial ownership before measuring admission's writes.
+            drive(f.a.machine.handler.wait_claim_refresh())
+                .await
+                .unwrap();
+            f.a.records.calls.lock().unwrap().clear();
             let target = match code {
                 "not_holder" => {
-                    put_claim(&f.a, 1, Some(B), 1, None, B);
+                    put_claim(&f.a, 2, Some(B), 1, None, B);
                     B
                 }
                 "agent_busy" => {
@@ -2770,7 +2796,7 @@ mod moves {
         }
     }
     #[tokio::test(start_paused = true)]
-    async fn moved_claim_aborts_without_take_and_claimed_abort_returns_epoch_two_to_a() {
+    async fn moved_claim_aborts_without_take_and_claimed_abort_returns_epoch_three_to_a() {
         for claimed in [false, true] {
             let f = Pair::new(&[("pi", "pi-session")]).await;
             let cut = f.published("abort-claim").await;
@@ -2787,7 +2813,7 @@ mod moves {
             if claimed {
                 f.b.abort(&cut);
             } else {
-                put_claim(&f.a, 1, Some(A), 1, None, A);
+                put_claim(&f.a, 2, Some(A), 1, None, A);
             }
             f.b.receiver_until(&cut, MoveStep::Aborted).await;
             f.a.source_until(&cut, MoveStep::Aborted).await;
@@ -2798,7 +2824,7 @@ mod moves {
             let body: Value =
                 serde_json::from_slice(f.b.claim().await.body.as_deref().unwrap()).unwrap();
             assert_eq!(body["holder"], A);
-            assert_eq!(body["epoch"], if claimed { 2 } else { 1 });
+            assert_eq!(body["epoch"], if claimed { 3 } else { 1 });
             assert_eq!(f.a.where_().await["status"], "held_here");
             assert_eq!(f.b.where_().await["status"], "held_elsewhere");
             assert_eq!(
@@ -2985,7 +3011,7 @@ mod moves {
         f.b.restart().await;
         assert_eq!(f.a.record(&cut).await.state, MoveState::Released);
         let claim = f.b.claim().await;
-        assert_eq!(claim.version, 1);
+        assert_eq!(claim.version, 2);
         assert_eq!(
             f.a.register(AGENT, "pi-session", "new").unwrap_err().code,
             "held_elsewhere"
@@ -3029,10 +3055,10 @@ mod moves {
                     f.finish(&cut).await;
                 }
                 let claim = f.b.claim().await;
-                assert_eq!(claim.version, if returning { 2 } else { 1 });
+                assert_eq!(claim.version, if returning { 3 } else { 2 });
                 let body: Value = serde_json::from_slice(claim.body.as_deref().unwrap()).unwrap();
                 assert_eq!(body["holder"], if returning { A } else { B });
-                assert_eq!(body["epoch"], if returning { 2 } else { 1 });
+                assert_eq!(body["epoch"], if returning { 3 } else { 2 });
                 f.clean();
             }
         }
@@ -3644,6 +3670,11 @@ mod moves {
     async fn admission_registration_orders_same_key_and_unique_index_use_real_transactions() {
         for before_insert in [false, true] {
             let mut f = Pair::new(&[("pi", "pi-session")]).await;
+            // Gate admission's preflight read, not the refresh worker's read
+            // that establishes initial ownership before preflight can start.
+            drive(f.a.machine.handler.wait_claim_refresh())
+                .await
+                .unwrap();
             if before_insert {
                 *f.a.discovery.gate.trap.lock().unwrap() =
                     Some(("pi".into(), "agent_data.busy".into(), true));
@@ -3800,7 +3831,7 @@ mod moves {
                     .iter()
                     .any(|r| matches!(r, Request::Abort(_))));
             }
-            assert_eq!(f.b.claim().await.version, 1);
+            assert_eq!(f.b.claim().await.version, 2);
         }
     }
     #[tokio::test(start_paused = true)]
@@ -3813,22 +3844,22 @@ mod moves {
             if mode != "no-take" {
                 let mut row = f.b.row(&cut);
                 row.claim_take_body = Some(
-                    json!({"v":1,"agent_id":AGENT,"holder":B,"epoch":1,"cut_id":cut,"reason":null}),
+                    json!({"v":1,"agent_id":AGENT,"holder":B,"epoch":2,"cut_id":cut,"reason":null}),
                 );
-                row.claim_take_version = Some(0);
+                row.claim_take_version = Some(1);
                 f.b.store().update_agent_move(&row).unwrap();
             }
             put_claim(
                 &f.b,
-                1,
+                2,
                 Some(B),
-                if mode == "wrong-epoch" { 2 } else { 1 },
+                if mode == "wrong-epoch" { 3 } else { 2 },
                 Some(&cut),
                 if mode == "wrong-author" { A } else { B },
             );
             if mode == "matching" {
                 f.finish(&cut).await;
-                assert_eq!(f.b.claim().await.version, 1);
+                assert_eq!(f.b.claim().await.version, 2);
             } else {
                 let mut receiver = f.b.receiver(&cut);
                 for _ in 0..3 {
@@ -3961,7 +3992,7 @@ mod moves {
             }
             let cut = f.published(op).await;
             f.finish(&cut).await;
-            assert_eq!(f.b.claim().await.version, 1);
+            assert_eq!(f.b.claim().await.version, 2);
             if op != "record.cas" {
                 let node = if ["agent_data.import", "agent_data.activate"].contains(&op) {
                     &f.b
@@ -3980,6 +4011,13 @@ mod moves {
     #[tokio::test(start_paused = true)]
     async fn concurrent_sources_append_one_inbox_without_overwriting_each_other() {
         let f = Pair::with_receiver_refs(&[("pi", "pi-session")], true).await;
+        // Each source owns a different agent. Shared ownership of one live
+        // agent would correctly refuse the second source before inbox append.
+        let other_agent = "agent_1111111111111111";
+        f.b.store().apply_entry("fixture", "{}", "fixture", None, |tx| tx.execute_batch(
+            "INSERT INTO agent(agent_id,name,tag,role,created_at_ms,updated_at_ms) VALUES('agent_1111111111111111','Other','O','assistant',1,1);
+             INSERT INTO session_binding(ref_kind,ref,agent_id,harness,session_id,project_root,registered_by,registered_at_ms) VALUES('pi-session','ref-pi-session','agent_1111111111111111',NULL,NULL,'','move',1);"
+        )).unwrap();
         let target = "03030303030303030303030303030303";
         for node in [&f.a, &f.b] {
             node.store()
@@ -3995,7 +4033,10 @@ mod moves {
                 .script("cut.seal", DoorEffect::Seal(SealState::Published, None));
         }
         let a = f.a.admit_to(target, "append-a").await.unwrap();
-        let b = f.b.admit_to(target, "append-b").await.unwrap();
+        let b =
+            f.b.admit_agent_to(other_agent, target, "append-b")
+                .await
+                .unwrap();
         f.a.source_until(&a, MoveStep::Sealed).await;
         f.b.source_until(&b, MoveStep::Sealed).await;
         let barrier = Arc::new(tokio::sync::Barrier::new(2));

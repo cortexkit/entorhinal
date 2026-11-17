@@ -3177,6 +3177,7 @@ impl ProjectsHandler {
             let store = self.with_store(|s| Ok(s.clone()))?;
             let now = (self.clock)();
             let clock = self.clock;
+            let refresh = self.claim_refresh.clone();
             let worker = tokio::task::spawn_blocking(move || {
                 // On a single-worker test runtime this panics before SQLite if
                 // registration is ever moved from this blocking thread back onto
@@ -3185,7 +3186,14 @@ impl ProjectsHandler {
                 // blocking thread.
                 #[cfg(test)]
                 tokio::task::block_in_place(|| {});
-                sessions::register_session_on_store(&store, request.params, role, now, clock)
+                sessions::register_session_on_store(
+                    &store,
+                    request.params,
+                    role,
+                    now,
+                    clock,
+                    &refresh,
+                )
             });
             return timeout_at(received + DEADLINE, worker)
                 .await

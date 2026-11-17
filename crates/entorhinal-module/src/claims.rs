@@ -5,7 +5,7 @@
 use super::{
     claim_codec::AgentClaim,
     encode_result,
-    record_client::{RecordClient, MANY_CAP},
+    record_client::{CasRequest, CasSettlement, RecordClient, RecordError, RecordReply, MANY_CAP},
     HandlerError, HealthGauges, ProjectsHandler, RouteKey,
 };
 use entorhinal_core::{
@@ -50,6 +50,7 @@ pub(crate) struct RefreshCounts {
 }
 type Waiter = oneshot::Sender<Result<RefreshCounts, HandlerError>>;
 
+#[derive(Clone)]
 pub(crate) struct RefreshQueue {
     sender: mpsc::UnboundedSender<Option<Waiter>>,
     receiver: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Option<Waiter>>>>,
@@ -93,15 +94,17 @@ impl Worker {
     }
 
     async fn pass(&self) -> Result<RefreshCounts, HandlerError> {
-        let agents = {
-            let Some(store) = self.store() else {
-                return Ok(RefreshCounts::default());
-            };
-            if store.is_foreign() || store.identity_log_status()?.state != "enabled" {
-                return Ok(RefreshCounts::default());
-            }
-            store.live_claim_agents()?
+        let Some(store) = self.store() else {
+            return Ok(RefreshCounts::default());
         };
+        let agents = tokio::task::spawn_blocking(self.sql_operations.tracked(move || {
+            if store.is_foreign() || store.identity_log_status()?.state != "enabled" {
+                return Ok(Vec::new());
+            }
+            store.live_claim_agents()
+        }))
+        .await
+        .map_err(|e| HandlerError::new("storage_error", e.to_string()))??;
         let mut counts = RefreshCounts::default();
         let mut reads_succeeded = 0;
         for chunk in agents.chunks(MANY_CAP) {
@@ -115,10 +118,46 @@ impl Worker {
                     Ok(page) => page,
                     Err(error) => (vec![Err(error); subjects.len()], None),
                 };
+                let Some(store) = self.store() else {
+                    return Ok(counts);
+                };
+                let (bindings, known_author) =
+                    tokio::task::spawn_blocking(self.sql_operations.tracked(move || {
+                        let bindings = if store.is_foreign()
+                            || store.identity_log_status()?.state != "enabled"
+                        {
+                            Vec::new()
+                        } else {
+                            store.local_claim_bindings()?
+                        };
+                        Ok::<_, entorhinal_core::RegistryError>((
+                            bindings,
+                            store.persisted_self_author()?,
+                        ))
+                    }))
+                    .await
+                    .map_err(|e| HandlerError::new("storage_error", e.to_string()))??;
                 let mut observations = Vec::new();
                 for (id, reply) in chunk[offset..].iter().zip(entries) {
                     if reply.is_ok() {
                         reads_succeeded += 1;
+                    }
+                    let local = bindings.iter().find(|(agent, _)| agent == id);
+                    let reply = match reply {
+                        Ok(reply)
+                            if local.is_some()
+                                && known_author
+                                    .as_deref()
+                                    .is_none_or(|author| author == reply.self_author) =>
+                        {
+                            self.claim_if_missing(id, reply).await
+                        }
+                        other => other,
+                    };
+                    if local.is_some_and(|(_, open)| *open) {
+                        if let Ok(reply) = &reply {
+                            self.report_conflict(id, reply);
+                        }
                     }
                     let observation = match reply {
                         Ok(reply) if reply.absent => {
@@ -215,6 +254,93 @@ impl Worker {
             ));
         }
         Ok(counts)
+    }
+
+    async fn claim_if_missing(
+        &self,
+        id: &str,
+        reply: RecordReply,
+    ) -> Result<RecordReply, RecordError> {
+        if reply.stale
+            || (!reply.absent
+                && !AgentClaim::decode(id, reply.body.as_deref().unwrap_or_default())
+                    .is_ok_and(|claim| claim.epoch == 0 && claim.holder.is_none()))
+        {
+            return Ok(reply);
+        }
+        // The cache collapses absent and epoch-zero records. Only a fresh
+        // record read supplies the version that may be replaced safely.
+        let current = self.records.read(&format!("claim:{id}")).await?;
+        if current.stale
+            || current.self_author != reply.self_author
+            || (!current.absent
+                && !AgentClaim::decode(id, current.body.as_deref().unwrap_or_default())
+                    .is_ok_and(|claim| claim.epoch == 0 && claim.holder.is_none()))
+        {
+            return Ok(current);
+        }
+        let claim = AgentClaim {
+            v: 1,
+            agent_id: id.to_owned(),
+            holder: Some(reply.self_author.clone()),
+            epoch: 1,
+            cut_id: None,
+            reason: None,
+        };
+        let mut write_id = [0; 16];
+        getrandom::getrandom(&mut write_id)
+            .map_err(|_| RecordError::refusal("unavailable", None))?;
+        let request = CasRequest {
+            subject: format!("claim:{id}"),
+            expected_version: current.version,
+            body: serde_json::to_vec(&claim)
+                .map_err(|_| RecordError::refusal("claim_malformed", None))?,
+            write_id,
+        };
+        match self
+            .records
+            .cas_settled(&request, &reply.self_author, |body| {
+                AgentClaim::decode(id, body)
+            })
+            .await?
+        {
+            CasSettlement::Landed(version) => Ok(RecordReply {
+                absent: false,
+                version,
+                body: Some(request.body),
+                author: Some(reply.self_author.clone()),
+                self_author: reply.self_author,
+                stale: false,
+            }),
+            CasSettlement::Moved(current) => Ok(current),
+        }
+    }
+
+    fn report_conflict(&self, id: &str, reply: &RecordReply) {
+        if !reply.stale
+            && reply
+                .body
+                .as_deref()
+                .and_then(|body| AgentClaim::decode(id, body).ok())
+                .is_some_and(|claim| {
+                    claim
+                        .holder
+                        .as_deref()
+                        .is_some_and(|holder| holder != reply.self_author)
+                })
+            && self
+                .health
+                .claim_conflict_agents
+                .lock()
+                .unwrap()
+                .insert(id.to_owned())
+        {
+            self.health.claim_conflicts.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                agent_id = id,
+                "agent claim belongs to another computer while a local session is open"
+            );
+        }
     }
 }
 

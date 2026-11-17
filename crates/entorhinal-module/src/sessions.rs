@@ -1019,7 +1019,14 @@ impl ProjectsHandler {
         role: SessionRole,
     ) -> Result<Vec<u8>, HandlerError> {
         let store = self.with_store(|s| Ok(s.clone()))?;
-        register_session_on_store(&store, params, role, (self.clock)(), self.clock)
+        register_session_on_store(
+            &store,
+            params,
+            role,
+            (self.clock)(),
+            self.clock,
+            &self.claim_refresh,
+        )
     }
 }
 
@@ -1031,6 +1038,7 @@ pub(super) fn register_session_on_store(
     role: SessionRole,
     now: i64,
     clock: fn() -> i64,
+    refresh: &crate::claims::RefreshQueue,
 ) -> Result<Vec<u8>, HandlerError> {
     let mut params = params;
     let runner = take_runner(&mut params)?;
@@ -1058,6 +1066,13 @@ pub(super) fn register_session_on_store(
             now_ms: now,
         })
         .map_err(HandlerError::from)?;
+    if binding.held_on.is_none()
+        && store
+            .cached_agent_claim(&binding.agent_id)?
+            .is_none_or(|claim| claim.epoch == 0)
+    {
+        refresh.signal();
+    }
     // The reply is the binding as before; neither the runner nor the network
     // value is echoed, so the reply bytes callers decode strictly remain
     // unchanged when the required runner is recorded.

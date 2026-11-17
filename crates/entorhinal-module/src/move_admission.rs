@@ -1039,6 +1039,9 @@ mod tests {
                 .with_reason("pending writes"),
         );
         let before = f.discovery.participant.held();
+        // Initial ownership is background work, not a side effect of refused
+        // move admission. Finish it before counting admission's record calls.
+        f.handler.wait_claim_refresh().await.unwrap();
         f.clear_calls();
         let generation = f.store().generation().unwrap();
         let outcome = f.move_(ORCH, &id).await;
@@ -1129,11 +1132,13 @@ mod tests {
             TARGET,
         );
         assert_eq!(code(f.move_(ORCH, &id).await), "not_holder");
+        // Keep the epoch-zero cache sentinel, but a populated holder prevents
+        // the initial-claim pass from replacing this raw version-two record.
         f.records.record.put(
             &format!("claim:{id}"),
             2,
             serde_json::to_vec(
-                &json!({"v":1,"agent_id":id,"holder":null,"epoch":0,"cut_id":null,"reason":null}),
+                &json!({"v":1,"agent_id":id,"holder":f.records.record.author,"epoch":0,"cut_id":null,"reason":null}),
             )
             .unwrap(),
             TARGET,

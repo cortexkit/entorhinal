@@ -235,6 +235,25 @@ fn apply(
 }
 
 impl RegistryStore {
+    /// Live agents with a binding stored here, including ended sessions. The
+    /// boolean distinguishes an open local session for conflict reporting.
+    pub fn local_claim_bindings(&self) -> Result<Vec<(String, bool)>, RegistryError> {
+        self.read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT a.agent_id, EXISTS(SELECT 1 FROM session_binding s
+                    WHERE s.agent_id=a.agent_id AND s.held_on IS NULL AND s.ended_at_ms IS NULL)
+                 FROM agent a WHERE a.terminal_reason IS NULL
+                    AND EXISTS(SELECT 1 FROM session_binding s
+                        WHERE s.agent_id=a.agent_id AND s.held_on IS NULL)
+                 ORDER BY a.agent_id",
+            )?;
+            let rows = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect();
+            rows
+        })
+    }
+
     /// The agent pass snapshots its subject set before any remote call.
     pub fn live_claim_agents(&self) -> Result<Vec<String>, RegistryError> {
         self.read(|conn| {

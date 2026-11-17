@@ -68,6 +68,7 @@ pub(crate) struct FakeRecord {
     pub scoped: AtomicBool,
     pub calls: AtomicUsize,
     pub batches: Mutex<Vec<Vec<String>>>,
+    pub cas_attempts: Mutex<Vec<Value>>,
     changed: tokio::sync::Notify,
     principal: Mutex<String>,
     errors: Mutex<HashMap<String, String>>,
@@ -88,10 +89,19 @@ impl FakeRecord {
             scoped: AtomicBool::new(false),
             calls: AtomicUsize::new(0),
             batches: Mutex::new(Vec::new()),
+            cas_attempts: Mutex::new(Vec::new()),
             changed: tokio::sync::Notify::new(),
             principal: Mutex::new("reserved:entorhinal".into()),
             errors: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// A second computer shares cloud records but has independent local copies
+    /// and pending-write state.
+    pub(crate) fn for_author(&self, author: [u8; 16]) -> Arc<Self> {
+        let mut peer = Self::new(author);
+        Arc::get_mut(&mut peer).unwrap().cloud = self.cloud.clone();
+        peer
     }
 
     /// Preserve the highest confirmed record and any unanswered write on
@@ -430,6 +440,7 @@ impl LogTransport for FakeRecord {
                 json!({"next":if entries.len() == subjects.len() { None } else { Some(entries.len()) },"entries":entries})
             }
             CAS => {
+                self.cas_attempts.lock().unwrap().push(params.clone());
                 let s = subject(&params)?;
                 let body = decode_hex(
                     params["body"]
