@@ -4606,7 +4606,7 @@ async fn cold_fleet_and_avatar_reads_do_not_wait_for_background_log_read() {
         );
         assert_eq!(log.calls(), calls + 1, "read contacted the shared log");
     }
-    crate::tests::stop_catch_up(&a.handler).await;
+    crate::tests::stop_store_tasks(&a.handler).await;
 }
 
 #[async_trait]

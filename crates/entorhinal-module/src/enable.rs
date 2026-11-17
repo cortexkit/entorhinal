@@ -2028,7 +2028,7 @@ mod tests {
             f.store().generation().unwrap()
         );
         assert!(f.store().generation().unwrap() > cursor);
-        crate::tests::stop_catch_up(&f.handler).await;
+        crate::tests::stop_store_tasks(&f.handler).await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -2160,7 +2160,8 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(b.store().identity_log_status().unwrap().state, "enabled");
         assert_eq!(b.shared(), a.shared());
-        crate::tests::stop_catch_up(&b.handler).await;
+        crate::tests::stop_store_tasks(&b.handler).await;
+        crate::tests::stop_store_tasks(&a.handler).await;
     }
 
     #[tokio::test(start_paused = true)]

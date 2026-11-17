@@ -1377,7 +1377,7 @@ mod tests {
         // catalog poller's minute tick runs blocking SQL that would keep the
         // store open while Windows deletes the scratch folder.
         crate::tests::stop_store_tasks(&f.handler).await;
-        crate::tests::stop_catch_up(&disabled.handler).await;
+        crate::tests::stop_store_tasks(&disabled.handler).await;
     }
 
     #[tokio::test(start_paused = true)]

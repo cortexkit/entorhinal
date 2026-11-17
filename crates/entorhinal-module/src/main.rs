@@ -3126,6 +3126,10 @@ mod tests {
         )
     }
 
+    /// Stops only catch-up. A test that ends with sharing enabled must call
+    /// `stop_store_tasks` instead: claim refresh then reads the store on a
+    /// blocking thread, and Windows can't delete a scratch folder while it
+    /// does.
     pub(super) async fn stop_catch_up(handler: &ProjectsHandler) {
         let task = handler.catch_up_task.lock().unwrap().take();
         if let Some(task) = task {
