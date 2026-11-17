@@ -255,9 +255,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-bus-naming"
-version = "0.4.1"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3a24f2395a05513dd72156f57957fd80de801f32af20552cbc1fe4b40d86dc6"
+checksum = "80ef546ce7b3c9796810c1ffe36a7daf23d82a4af8772f7336704c248beddcfe"
 
 [[package]]
 name = "cortexkit-bus-nats"
@@ -594,6 +594,7 @@ dependencies = [
 name = "entorhinal-module"
 version = "0.1.68"
 dependencies = [
+ "async-nats",
  "async-trait",
  "base64 0.22.1",
  "chrono",
@@ -613,6 +614,7 @@ dependencies = [
  "ed25519-dalek",
  "entorhinal-catalog",
  "entorhinal-core",
+ "futures-util",
  "getrandom 0.2.17",
  "reqwest",
  "rusqlite",

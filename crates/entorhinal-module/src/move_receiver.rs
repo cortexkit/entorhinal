@@ -1033,16 +1033,15 @@ impl Receiver {
                     continue;
                 };
                 let key = SessionKey::new(harness, session);
-                let entry = state.sessions.get(&key);
-                if !state.stale && state.gone.contains(&key) && entry.is_none() {
+                let answer = state.answer(&key);
+                if answer.state == "gone" {
                     continue;
                 }
-                let active = !state.stale
-                    && entry.is_some_and(|e| matches!(e.state.as_str(), "active" | "idle"));
+                let active = answer.state == "active";
                 return Err(Failure::hold(
                     "agent_busy",
                     json!({"ref":r.reference,"ref_kind":r.ref_kind,
-                    "reason_code":if active {"session_active"} else {"liveness_unknown"},"note":entry.and_then(|e| e.cause.clone())}),
+                    "reason_code":if active {"session_active"} else {"liveness_unknown"},"note":answer.cause}),
                 ));
             }
         }

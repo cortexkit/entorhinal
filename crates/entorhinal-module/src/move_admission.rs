@@ -954,6 +954,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn liveness_bus_move_admission_selects_bus_only_after_marker() {
+        for (bus_state, reconciled, pushed_state, admitted) in [
+            ("idle", true, "active", true),
+            ("active", true, "idle", false),
+            ("idle", false, "active", false),
+            ("active", false, "idle", true),
+        ] {
+            let f = Fixture::new(2).await;
+            let id = f.create().await;
+            f.store()
+                .register_session(&entorhinal_core::SessionRegistration {
+                    agent_id: &id,
+                    ref_kind: "session",
+                    session_ref: "r",
+                    harness: "host",
+                    session_id: "r",
+                    project_root: Some("/project"),
+                    registered_by: "host",
+                    runner: Some("data"),
+                    network: None,
+                    now_ms: 700,
+                })
+                .unwrap();
+            {
+                let mut state = f.handler.liveness.lock().unwrap();
+                state.stale = false;
+                state.sessions.insert(
+                    crate::SessionKey::new("host", "r"),
+                    crate::MirrorEntry {
+                        state: pushed_state.into(),
+                        canonical_root: "/project".into(),
+                        last_activity_ms: 700,
+                        cause: None,
+                    },
+                );
+                state.bus.watch_started();
+                state.bus.finish_replay();
+                state.bus.apply(crate::liveness_bus::Update::Put("opaque".into(), serde_json::to_vec(&json!({
+                    "harness":"host","sessionId":"r","state":bus_state,"lastActivityMs":700,"projectId":null
+                })).unwrap())).unwrap();
+                if reconciled {
+                    state
+                        .bus
+                        .apply(crate::liveness_bus::Update::Put(
+                            "_reconciled".into(),
+                            br#"{"bootId":"move","sessions":1}"#.to_vec(),
+                        ))
+                        .unwrap();
+                }
+            }
+            let outcome = f.move_(ORCH, &id).await;
+            if admitted {
+                result(outcome);
+            } else {
+                match outcome {
+                    HandlerOutcome::ErrorWithDetail { code, detail, .. } => {
+                        assert_eq!(code, "agent_busy");
+                        assert_eq!(detail["refs"][0]["reason_code"], "session_active");
+                    }
+                    other => {
+                        panic!("expected busy for {bus_state}, reconciled={reconciled}: {other:?}")
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn busy_refusal_is_read_only_and_names_liveness_and_participant_reasons() {
         let f = Fixture::new(2).await;
         let id = f.create().await;

@@ -78,6 +78,7 @@ mod claims;
 mod cli;
 #[cfg(test)]
 mod fake_registry;
+mod liveness_bus;
 // Agent write execution asks for consent while holding the caller's tool call,
 // before committing any authorized mutation.
 #[allow(dead_code)]
@@ -388,6 +389,10 @@ impl RequestLatency {
 
 #[derive(Default)]
 struct HealthGauges {
+    liveness_bus_connected: AtomicBool,
+    liveness_bus_authoritative: AtomicBool,
+    liveness_bus_sessions: AtomicU64,
+    liveness_bus_failures: AtomicU64,
     bus_changes_puts: AtomicU64,
     bus_changes_failures: AtomicU64,
     bus_changes_connected: AtomicBool,
@@ -468,6 +473,16 @@ struct HealthGauges {
 
 impl HealthGauges {
     fn bus_changes_metrics(&self, mut metrics: Value) -> Value {
+        metrics["livenessBusConnected"] =
+            json!(if self.liveness_bus_connected.load(Ordering::Relaxed) {
+                "enabled"
+            } else {
+                "disabled"
+            });
+        metrics["livenessBusAuthoritative"] =
+            json!(self.liveness_bus_authoritative.load(Ordering::Relaxed));
+        metrics["livenessBusSessions"] = json!(self.liveness_bus_sessions.load(Ordering::Relaxed));
+        metrics["livenessBusFailures"] = json!(self.liveness_bus_failures.load(Ordering::Relaxed));
         metrics["busChangesPuts"] = json!(self.bus_changes_puts.load(Ordering::Relaxed));
         metrics["busChangesFailures"] = json!(self.bus_changes_failures.load(Ordering::Relaxed));
         metrics["busChangesConnected"] = json!(self.bus_changes_connected.load(Ordering::Relaxed));
@@ -492,6 +507,7 @@ impl HealthGauges {
 /// future GC-candidacy signals, so a wrong, late, or absent feed can never
 /// corrupt topology.
 struct LivenessState {
+    bus: liveness_bus::Mirror,
     /// Last accepted per-emitter sequence number; None until first contact.
     last_seq: Option<u64>,
     /// True until a snapshot has rebased the mirror: from startup, and again
@@ -598,6 +614,7 @@ impl Default for LivenessState {
     fn default() -> Self {
         Self {
             last_seq: None,
+            bus: liveness_bus::Mirror::default(),
             stale: true,
             sender: None,
             sessions: MirrorSessions::default(),
@@ -625,6 +642,7 @@ struct ProjectsHandler {
     commits: Arc<tokio::sync::Notify>,
     role_cache_changed: Arc<tokio::sync::Notify>,
     bus_changes_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    liveness_bus_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     bus_changes_sql: Arc<move_driver::SqlOperations>,
     feed_waits: tokio::sync::Semaphore,
     feed_clock: Arc<dyn agent_reads::FeedClock>,
@@ -1026,6 +1044,7 @@ impl ProjectsHandler {
             commits: Arc::new(tokio::sync::Notify::new()),
             role_cache_changed: Arc::default(),
             bus_changes_task: Mutex::new(None),
+            liveness_bus_task: Mutex::new(None),
             bus_changes_sql: Arc::default(),
             feed_waits: tokio::sync::Semaphore::new(8),
             feed_clock: Arc::new(agent_reads::TokioFeedClock),
@@ -1383,6 +1402,7 @@ impl ModuleHandler for ProjectsHandler {
         self.move_wake.notify_waiters();
         self.start_session_upkeep();
         self.start_bus_changes();
+        self.start_liveness_bus();
     }
 
     async fn health(&self) -> HealthReport {
@@ -2062,6 +2082,13 @@ impl ProjectsHandler {
             }
         }
         let tracked = state.sessions.len() as u64;
+        ended.retain(|stamp| {
+            !state.bus.authoritative()
+                || matches!(
+                    state.read(&SessionKey::new(&stamp.harness, &stamp.session_id)),
+                    liveness_bus::Read::Gone
+                )
+        });
         drop(state);
         // Queue only: the writer task does the SQL, so a slow or failing
         // write never delays this batch. A store from another machine takes no
@@ -2224,25 +2251,12 @@ impl ProjectsHandler {
             .liveness
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.stale || state.sessions.is_empty() {
+        if !state.readable() {
             return;
         }
         for project in &mut reply.projects {
-            let newest = state
-                .sessions
-                .values()
-                .map(|entry| (&entry.state, &entry.canonical_root, entry.last_activity_ms))
-                .filter(|&(_, root, _)| {
-                    project.roots.iter().any(|project_root| {
-                        entorhinal_core::path_prefix_or_equal(
-                            Path::new(project_root),
-                            Path::new(root),
-                        )
-                    })
-                })
-                .map(|(_, _, activity)| activity)
-                .max();
-            project.last_route_activity_ms = newest;
+            project.last_route_activity_ms =
+                state.project_activity(&project.project_id, &project.roots);
         }
     }
 
@@ -3479,6 +3493,7 @@ mod tests {
     }
 
     pub(super) async fn stop_store_tasks(handler: &ProjectsHandler) {
+        handler.stop_liveness_bus().await;
         stop_catch_up(handler).await;
         handler.stop_move_driver().await;
         handler.stop_claim_refresh().await;

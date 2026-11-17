@@ -827,28 +827,19 @@ fn decode_cursor(cursor: &str) -> Result<entorhinal_core::SessionCursor, Handler
 }
 
 impl super::LivenessState {
-    /// Map a bound session's mirrored state to the answer callers act on.
-    /// `active` and `idle` both mean the host process is open. A mirror still
-    /// waiting for a snapshot cannot vouch for anything, so every session
-    /// reads `unknown` until one arrives.
-    fn answer(&self, key: &SessionKey) -> LivenessAnswer {
-        let entry = self.sessions.get(key);
-        if self.stale {
-            return LivenessAnswer::unknown(entry.and_then(|entry| entry.cause.clone()));
-        }
-        match entry {
-            Some(entry) => match entry.state.as_str() {
-                "active" | "idle" => LivenessAnswer {
-                    state: "active",
-                    cause: None,
-                },
-                _ => LivenessAnswer::unknown(entry.cause.clone()),
+    /// Preserve the served contract: idle is an open, hence active, session.
+    pub(super) fn answer(&self, key: &SessionKey) -> LivenessAnswer {
+        use super::liveness_bus::Read;
+        match self.read(key) {
+            Read::Active | Read::Idle => LivenessAnswer {
+                state: "active",
+                cause: None,
             },
-            None if self.gone.contains(key) => LivenessAnswer {
+            Read::Gone => LivenessAnswer {
                 state: "gone",
                 cause: None,
             },
-            None => LivenessAnswer::unknown(None),
+            Read::Unknown(cause) => LivenessAnswer::unknown(cause.map(str::to_owned)),
         }
     }
 }
@@ -865,20 +856,14 @@ pub(super) enum MoveLiveness {
 
 impl super::LivenessState {
     fn move_liveness(&self, key: &SessionKey, runner: Option<&String>) -> MoveLiveness {
-        let entry = self.sessions.get(key);
-        if self.stale {
-            return MoveLiveness::Unknown(entry.and_then(|entry| entry.cause.clone()));
-        }
-        match entry {
-            Some(entry) => match entry.state.as_str() {
-                "idle" => MoveLiveness::Idle {
-                    runner: runner.cloned(),
-                },
-                "active" => MoveLiveness::Active,
-                _ => MoveLiveness::Unknown(entry.cause.clone()),
+        use super::liveness_bus::Read;
+        match self.read(key) {
+            Read::Idle => MoveLiveness::Idle {
+                runner: runner.cloned(),
             },
-            None if self.gone.contains(key) => MoveLiveness::Gone,
-            None => MoveLiveness::Unknown(None),
+            Read::Active => MoveLiveness::Active,
+            Read::Gone => MoveLiveness::Gone,
+            Read::Unknown(cause) => MoveLiveness::Unknown(cause.map(str::to_owned)),
         }
     }
 }
