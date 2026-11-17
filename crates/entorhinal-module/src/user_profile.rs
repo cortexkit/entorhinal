@@ -10,7 +10,7 @@ pub(super) fn admit(principal: Option<&Principal>, flow: Option<&str>) -> Result
     let allowed = match principal {
         Some(Principal::Direct) => true,
         Some(Principal::Reserved { module_id }) => {
-            matches!(module_id.as_str(), "prefrontal-core" | "callosum")
+            super::is_writer_module(module_id) || module_id == "callosum"
         }
         _ => false,
     };

@@ -627,6 +627,16 @@ fn route_key(handle: &RouteHandle) -> RouteKey {
 /// user's decisions.
 const WRITER_MODULE: &str = "prefrontal-core";
 
+/// The executive's module id after its rename. Until every machine has been
+/// cut over, the executive may reach this module under either id, so
+/// admission accepts both; the old id is dropped once the rename is done.
+const WRITER_MODULE_RENAMED: &str = "prefrontal";
+
+/// Whether `module_id` is the executive, under its current or renamed id.
+fn is_writer_module(module_id: &str) -> bool {
+    module_id == WRITER_MODULE || module_id == WRITER_MODULE_RENAMED
+}
+
 /// Methods that change the registry or the liveness state derived from it.
 /// The daemon's channel-0 registry read for its settings gate; the reply is
 /// `enumerate {}`'s result. See `ProjectsHandler::control_enumerate`.
@@ -778,7 +788,7 @@ fn authorize_write(method: &str, principal: Option<&Principal>) -> Result<(), Ha
             ));
         }
         return match principal {
-            Some(Principal::Reserved { module_id }) if module_id == WRITER_MODULE => Ok(()),
+            Some(Principal::Reserved { module_id }) if is_writer_module(module_id) => Ok(()),
             Some(Principal::Direct) => Err(HandlerError::new(
                 "direct_identity_write_not_admitted",
                 format!("'{method}' must be called through {WRITER_MODULE}'s relay; Direct agent identity writes are not admitted"),
@@ -794,7 +804,7 @@ fn authorize_write(method: &str, principal: Option<&Principal>) -> Result<(), Ha
     }
     match principal {
         Some(Principal::Direct) => Ok(()),
-        Some(Principal::Reserved { module_id }) if module_id == WRITER_MODULE => Ok(()),
+        Some(Principal::Reserved { module_id }) if is_writer_module(module_id) => Ok(()),
         other => Err(HandlerError {
             code: "write_not_permitted".to_string(),
             detail: None,
@@ -3208,27 +3218,35 @@ mod tests {
             } else {
                 assert!(direct.is_ok(), "{method} from direct");
             }
-            let executive = authorize_write(method, Some(&reserved(WRITER_MODULE)));
-            if *method == store_origin::ADOPT
-                || *method == "move_root_to_new_project"
-                || *method == "identity_log.enable"
-                || *method == "placement.backfill"
-                || catalog_ops::WRITES.contains(method)
-                || *method == catalog_publish::PUBLISH
-                || *method == catalog_seed::SEED
-            {
-                assert_eq!(executive.unwrap_err().code, "write_not_permitted");
-            } else if matches!(
-                *method,
-                "agent.repair_workspaces"
-                    | "agent.apply_avatar_manifest"
-                    | "workspace.set_document"
-            ) {
-                assert_eq!(executive.unwrap_err().code, "direct_caller_required");
-            } else {
-                assert!(executive.is_ok(), "{method} from {WRITER_MODULE}");
+            // The executive is admitted under its current and its renamed id.
+            for executive_id in [WRITER_MODULE, WRITER_MODULE_RENAMED] {
+                let executive = authorize_write(method, Some(&reserved(executive_id)));
+                if *method == store_origin::ADOPT
+                    || *method == "move_root_to_new_project"
+                    || *method == "identity_log.enable"
+                    || *method == "placement.backfill"
+                    || catalog_ops::WRITES.contains(method)
+                    || *method == catalog_publish::PUBLISH
+                    || *method == catalog_seed::SEED
+                {
+                    assert_eq!(executive.unwrap_err().code, "write_not_permitted");
+                } else if matches!(
+                    *method,
+                    "agent.repair_workspaces"
+                        | "agent.apply_avatar_manifest"
+                        | "workspace.set_document"
+                ) {
+                    assert_eq!(executive.unwrap_err().code, "direct_caller_required");
+                } else {
+                    assert!(executive.is_ok(), "{method} from {executive_id}");
+                }
             }
-            for refused in [Some(reserved("aft")), Some(Principal::Unverified), None] {
+            for refused in [
+                Some(reserved("aft")),
+                Some(reserved("prefrontal-core-x")),
+                Some(Principal::Unverified),
+                None,
+            ] {
                 let error = authorize_write(method, refused.as_ref())
                     .expect_err("a write from any other principal must be refused");
                 assert_eq!(

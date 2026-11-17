@@ -550,7 +550,7 @@ impl ProjectsHandler {
     ) -> Result<(), HandlerError> {
         let admission = self.admission_for(key);
         if admission.flow_id.is_some()
-            || !matches!(admission.principal,Some(subc_protocol::Principal::Reserved {ref module_id}) if module_id == crate::WRITER_MODULE)
+            || !matches!(admission.principal,Some(subc_protocol::Principal::Reserved {ref module_id}) if crate::is_writer_module(module_id))
         {
             return Err(HandlerError::new(
                 "caller_forbidden",

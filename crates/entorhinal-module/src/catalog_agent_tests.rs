@@ -1378,7 +1378,9 @@ async fn catalog_prepare_idempotence_validation_and_admission() {
     for principal in [
         subc_protocol::Principal::Direct,
         subc_protocol::Principal::Unverified,
-        crate::tests::reserved("prefrontal"),
+        // "prefrontal" is the executive's renamed id and is admitted; a near
+        // miss of either id is not.
+        crate::tests::reserved("prefrontal-core-x"),
         crate::tests::reserved("basal-ganglia"),
     ] {
         for op in [AGENT_GENERATION, ACK_ACTIVATION] {

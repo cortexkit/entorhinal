@@ -119,6 +119,13 @@ async fn user_profile_route_admission_ignores_request_claims_and_forbids_flows()
         .await
         .unwrap();
     }
+    // The executive's renamed id reads the profile the same way.
+    let renamed = (703, 1);
+    f.handler.route_admissions().insert(
+        renamed,
+        RouteAdmission::from_bind(Some(reserved("prefrontal")), None),
+    );
+    f.call(renamed, GET, json!({})).await.unwrap();
     assert_eq!(f.count(), 0);
     let forbidden = (704, 1);
     for principal in [None, Some(Principal::Unverified), Some(reserved("other"))] {
