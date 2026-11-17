@@ -225,7 +225,7 @@ CREATE TABLE member_name (
 );
 "#;
 
-const MIGRATIONS: [Migration; 22] = [
+const MIGRATIONS: [Migration; 23] = [
     Migration {
         version: 1,
         statements: V1_SCHEMA,
@@ -313,6 +313,10 @@ const MIGRATIONS: [Migration; 22] = [
     Migration {
         version: 22,
         statements: placement::V22_PLACEMENT_PUBLISHED,
+    },
+    Migration {
+        version: 23,
+        statements: user_profile::V23_USER_TIME_ZONE,
     },
 ];
 

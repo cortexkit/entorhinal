@@ -252,9 +252,19 @@ with the same `project_id`, or with none if the original read was unscoped.
 replies), and `scope:{"kind":"workspace|project","id":"…"}` only for expertise.
 Fields are `name` (1–64 characters), `address_as` (1–64), `pronouns` (1–32),
 `computer_savviness` (integer 1–3), `verbosity` (`concise|balanced|verbose`),
-and `expertise` (1–300). Actor is 1–128 characters. Text is trimmed and must be
-nonempty; controls, newlines, tabs, Unicode line separators, bidi overrides and
-isolates are refused. Limits count Unicode characters, not bytes.
+`time_zone` (1–64), and `expertise` (1–300). Actor is 1–128 characters. Text is
+trimmed and must be nonempty; controls, newlines, tabs, Unicode line separators,
+bidi overrides and isolates are refused. Limits count Unicode characters, not bytes.
+
+`time_zone` is person-level and global, returned inside `user` beside the other
+global fields and omitted when unset. Local sets require an IANA name in the
+bundled time zone database, including `UTC`, `Etc/GMT+3` and aliases such as
+`US/Pacific`. Trimming preserves the exact name and casing without
+canonicalization; unknown names refuse `invalid_value`. Null clears it.
+Shared entries and join snapshots validate only the name's grammar: 1–64 ASCII
+letters, digits, `/`, `_`, `+` or `-`, with no empty slash-separated path parts.
+They never consult the receiving computer's time zone database, so an older
+database cannot interrupt catch-up of a zone added on another computer.
 
 Scopes must exist; implicit project ids refuse `unknown_scope`. Scope removal
 cascades to expertise in the same transaction on either machine. A successful
@@ -274,6 +284,9 @@ The two shared tables travel through the identity log as `user.set` entries and
 join snapshots; sharing off keeps writes local. They participate in verify and
 rebuild but never appear in `agent.changes` or project `journal_tail`. The log
 retains earlier values after clearing, and its hosted entries are encrypted.
+Time zones use the existing `user.set` field/value entry envelope; entries for
+other fields keep their original bytes. Older readers refuse an unknown field,
+so deploy readers that understand `time_zone` before publishing writes to it.
 Published handler-generated samples: [user-profile-v1](../test-vectors/user-profile-v1/README.md).
 
 ## Memory context

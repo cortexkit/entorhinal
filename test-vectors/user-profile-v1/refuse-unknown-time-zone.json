@@ -1,0 +1,20 @@
+{
+  "op": "user.set",
+  "principal": {
+    "kind": "reserved",
+    "moduleId": "prefrontal-core"
+  },
+  "reply": {
+    "outcome": "error",
+    "refusal": {
+      "code": "invalid_value",
+      "detail": null,
+      "message": "unknown IANA time zone name"
+    }
+  },
+  "request": {
+    "field": "time_zone",
+    "request_key": "unknown-time-zone",
+    "value": "Future/Unlisted_City"
+  }
+}

@@ -10,6 +10,7 @@ description = "Pure domain and journal-spine store for the ck-entorhinal registr
 [dependencies]
 entorhinal-catalog = { path = "../entorhinal-catalog" }
 blake3 = { workspace = true }
+chrono-tz = { version = "0.10", default-features = false }
 cortexkit-paths = { workspace = true }
 cortexkit-lease = { workspace = true }
 cortexkit-store = { workspace = true }

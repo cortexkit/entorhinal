@@ -48,6 +48,7 @@ CREATE TRIGGER user_workspace_removed AFTER DELETE ON workspace BEGIN
  DELETE FROM user_expertise WHERE scope_kind='workspace' AND scope_id=OLD.workspace_id;
 END;
 "#;
+pub(crate) const V23_USER_TIME_ZONE: &str = "ALTER TABLE user_profile ADD COLUMN time_zone TEXT;";
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -132,7 +133,7 @@ fn normalize(
     scope: Option<&UserScope>,
 ) -> Result<Value, RegistryError> {
     let limit = match field {
-        "name" | "address_as" => Some(64),
+        "name" | "address_as" | "time_zone" => Some(64),
         "pronouns" => Some(32),
         "expertise" => Some(300),
         "computer_savviness" | "verbosity" => None,
@@ -156,11 +157,19 @@ fn normalize(
         return Ok(Value::Null);
     }
     if let Some(limit) = limit {
-        return value
+        let value = value
             .as_str()
             .ok_or_else(|| domain("invalid_value", "value must be text"))
-            .and_then(|s| text(s, limit))
-            .map(Value::String);
+            .and_then(|s| text(s, limit))?;
+        if field == "time_zone"
+            && (!value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"/_+-".contains(&b))
+                || value.split('/').any(str::is_empty))
+        {
+            return Err(domain("invalid_value", "invalid time zone name grammar"));
+        }
+        return Ok(Value::String(value));
     }
     match field {
         "computer_savviness" if value.as_i64().is_some_and(|v| (1..=3).contains(&v)) => {
@@ -221,6 +230,16 @@ impl UserSetRequest {
             ));
         }
         self.value = normalize(&self.field, &self.value, self.scope.as_ref())?;
+        // Only local requests consult the bundled database. Shared entries and
+        // snapshots may come from computers with a newer database of zone names.
+        if self.field == "time_zone"
+            && self
+                .value
+                .as_str()
+                .is_some_and(|name| name.parse::<chrono_tz::Tz>().is_err())
+        {
+            return Err(domain("invalid_value", "unknown IANA time zone name"));
+        }
         self.actor = self.actor.as_deref().map(|v| text(v, 128)).transpose()?;
         Ok(self)
     }
@@ -295,7 +314,7 @@ impl UserEntry {
                 &format!("UPDATE user_profile SET {}=?1 WHERE id=1", self.field),
                 [value],
             )?;
-            tx.execute("DELETE FROM user_profile WHERE name IS NULL AND address_as IS NULL AND pronouns IS NULL AND computer_savviness IS NULL AND verbosity IS NULL", [])?;
+            tx.execute("DELETE FROM user_profile WHERE name IS NULL AND address_as IS NULL AND pronouns IS NULL AND computer_savviness IS NULL AND verbosity IS NULL AND time_zone IS NULL", [])?;
         }
         Ok(())
     }
@@ -310,9 +329,9 @@ pub(crate) fn replay_user(tx: &Transaction<'_>, value: Value) -> rusqlite::Resul
 }
 
 fn record(conn: &Connection) -> rusqlite::Result<Value> {
-    let user = conn.query_row("SELECT name,address_as,pronouns,computer_savviness,verbosity FROM user_profile WHERE id=1", [], |r| {
+    let user = conn.query_row("SELECT name,address_as,pronouns,computer_savviness,verbosity,time_zone FROM user_profile WHERE id=1", [], |r| {
         let mut user = Map::new();
-        for (i, field) in ["name","address_as","pronouns","computer_savviness","verbosity"].iter().enumerate() {
+        for (i, field) in ["name","address_as","pronouns","computer_savviness","verbosity","time_zone"].iter().enumerate() {
             let value = if i == 3 { r.get::<_,Option<i64>>(i)?.map(Value::from) } else { r.get::<_,Option<String>>(i)?.map(Value::from) };
             if let Some(value) = value { user.insert((*field).into(),value); }
         }
@@ -483,12 +502,13 @@ impl JournalWriter<'_> {
 }
 
 /// Snapshots contain complete rows rather than individual field writes. Validate
-/// the resulting state with the same value and scope rules as local changes.
+/// the resulting state with the shared-entry grammar and scope rules, without
+/// requiring the receiver's time zone database to know every shared zone name.
 pub(crate) fn validate_projection(conn: &Connection) -> rusqlite::Result<()> {
     // Local clears remove an all-absent row. Require the same representation
     // in snapshots too, so a later no-op cannot change the stored state without
     // a journal entry.
-    let empty_row: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM user_profile WHERE name IS NULL AND address_as IS NULL AND pronouns IS NULL AND computer_savviness IS NULL AND verbosity IS NULL)",[],|r|r.get(0))?;
+    let empty_row: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM user_profile WHERE name IS NULL AND address_as IS NULL AND pronouns IS NULL AND computer_savviness IS NULL AND verbosity IS NULL AND time_zone IS NULL)",[],|r|r.get(0))?;
     if empty_row {
         return Err(sql_error(domain(
             "invalid_value",

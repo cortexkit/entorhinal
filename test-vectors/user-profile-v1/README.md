@@ -19,7 +19,8 @@ In sequence:
 
 1. `get-empty.json`: empty user object and expertise list; no defaults or nulls.
 2. `set-name.json`, `set-address-as.json`, `set-pronouns.json`,
-   `set-computer-savviness.json`, `set-verbosity.json`: set all five global fields.
+   `set-computer-savviness.json`, `set-verbosity.json`: set the five original
+   global fields.
 3. `set-workspace-expertise.json`, `set-project-expertise.json`: set both scopes.
 4. `get-project-override.json`: project expertise overrides workspace expertise.
 5. `get-workspace-fallback.json`: the other project inherits its workspace line.
@@ -30,6 +31,14 @@ In sequence:
    `refuse-unknown-scope.json`, `refuse-implicit-project.json`,
    `refuse-global-scope.json`, `refuse-request-key-reused.json`: the principal
    value, text, scope, shape and request-key refusals.
+9. `set-time-zone.json`: trims ` US/Pacific ` without canonicalizing the alias.
+10. `get-time-zone.json`: returns `time_zone` alongside the other global fields.
+11. `clear-time-zone.json`: clears the zone and omits it from the user object.
+12. `refuse-unknown-time-zone.json`: an unknown IANA name refuses `invalid_value`.
+
+The time zone samples follow all original calls, preserving the original sample
+bytes. This folder publishes handler calls, not shared-entry samples; time zone
+shared entries are covered by the core profile tests.
 
 `SHA256SUMS` lists the SHA-256 of each JSON file. The byte-compare test checks
 both regenerated samples and sums. To intentionally regenerate only this set:

@@ -365,6 +365,7 @@ fn user_profile_remote_validation_snapshots_cascades_and_replay() {
         "pronouns",
         "computer_savviness",
         "verbosity",
+        "time_zone",
     ] {
         row.insert(field.into(), Value::Null);
     }
@@ -540,3 +541,6 @@ fn user_profile_text_rules_count_characters_and_validate_remote_changes() {
     }
     f.verify();
 }
+
+#[path = "user_profile_time_zone_tests.rs"]
+mod time_zone;

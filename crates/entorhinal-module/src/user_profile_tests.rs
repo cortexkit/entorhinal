@@ -396,6 +396,45 @@ async fn user_profile_published_vectors_regenerate_real_handler_bytes() {
         assert_eq!(generated.2["code"], code, "{name}");
         samples.push(generated);
     }
+    samples.push(
+        sample(
+            &f,
+            "set-time-zone.json",
+            SET,
+            set("time_zone", json!(" US/Pacific "), "set-time-zone"),
+        )
+        .await,
+    );
+    assert_eq!(
+        samples.last().unwrap().2["result"]["user"]["time_zone"],
+        "US/Pacific"
+    );
+    samples.push(sample(&f, "get-time-zone.json", GET, json!({})).await);
+    samples.push(
+        sample(
+            &f,
+            "clear-time-zone.json",
+            SET,
+            set("time_zone", Value::Null, "clear-time-zone"),
+        )
+        .await,
+    );
+    assert!(samples.last().unwrap().2["result"]["user"]
+        .get("time_zone")
+        .is_none());
+    let invalid = sample(
+        &f,
+        "refuse-unknown-time-zone.json",
+        SET,
+        set(
+            "time_zone",
+            json!("Future/Unlisted_City"),
+            "unknown-time-zone",
+        ),
+    )
+    .await;
+    assert_eq!(invalid.2["code"], "invalid_value");
+    samples.push(invalid);
     let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../test-vectors/user-profile-v1");
     let update = std::env::var_os("UPDATE_USER_PROFILE_VECTORS").is_some();
@@ -454,4 +493,76 @@ async fn user_profile_refuses_bad_shapes_keys_and_actor_values_before_confirmati
     let reply = f.call(PHONE, SET, request).await.unwrap();
     assert!(reply.get("actor").is_none());
     assert_eq!(reply["user"], json!({"name":"Mira"}));
+}
+
+#[tokio::test]
+async fn user_profile_time_zone_admission_and_exact_confirmation() {
+    let f = Fixture::new(false);
+    for key in [CORE, PHONE] {
+        let got = f
+            .call(
+                key,
+                SET,
+                set("time_zone", json!("UTC"), &format!("relay-{}", key.0)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(got["user"]["time_zone"], "UTC");
+    }
+    let renamed = (704, 1);
+    f.handler.route_admissions().insert(
+        renamed,
+        RouteAdmission::from_bind(Some(reserved("prefrontal")), None),
+    );
+    f.call(
+        renamed,
+        SET,
+        set("time_zone", json!("Etc/GMT+3"), "renamed"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(f.count(), 0);
+    for (request, expected) in [
+        (
+            set("time_zone", json!("Future/Unlisted_City"), "unknown-zone"),
+            "invalid_value",
+        ),
+        (
+            json!({"field":"time_zone","value":"UTC","scope":{"kind":"workspace","id":"example-studio"},"request_key":"scoped-zone"}),
+            "invalid_request",
+        ),
+    ] {
+        assert_eq!(f.call(DIRECT, SET, request).await.unwrap_err(), expected);
+    }
+    assert_eq!(f.count(), 0);
+    let got = f
+        .call(
+            DIRECT,
+            SET,
+            set("time_zone", json!(" US/Pacific "), "direct-zone"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(got["user"]["time_zone"], "US/Pacific");
+    f.call(DIRECT, SET, set("time_zone", Value::Null, "direct-clear"))
+        .await
+        .unwrap();
+    assert_eq!(
+        f.prompt.summaries.lock().unwrap().as_slice(),
+        [
+            "set user time_zone to \"US/Pacific\"",
+            "set user time_zone to clear"
+        ]
+    );
+    let declined = Fixture::new(true);
+    assert_eq!(
+        declined
+            .call(DIRECT, SET, set("time_zone", json!("UTC"), "declined-zone"))
+            .await
+            .unwrap_err(),
+        "operator_declined"
+    );
+    assert!(declined.call(DIRECT, GET, json!({})).await.unwrap()["user"]
+        .get("time_zone")
+        .is_none());
 }
