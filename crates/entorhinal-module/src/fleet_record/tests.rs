@@ -315,7 +315,8 @@ fn fleet_record_refuses_ambiguous_or_noncanonical_envelopes() {
 
 #[tokio::test]
 async fn fleet_record_epoch_rpc_replays_vault_samples() {
-    // Exact bodies from Claustrum's fleet-epoch-vectors-v1 tag, at
+    // Exact bodies from the claustrum (credential vault) repository's
+    // fleet-epoch-vectors-v1 tag, file
     // crates/credentials-module/tests/fixtures/fleet-epoch-v1/cases.json.
     // The wire response wraps each body in a `result` field.
     let seal = r#"{"method":"fleet.epoch_seal","params":{"aad":"cmVjb3JkOmlkZW50aXR5Ojc","plaintext":"ZmxlZXQgc2FtcGxlIHBsYWludGV4dA"}}"#;

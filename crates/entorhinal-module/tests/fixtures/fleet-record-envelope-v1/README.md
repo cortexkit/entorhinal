@@ -12,6 +12,6 @@ compact JSON serializer (all property names are ASCII and all numbers are small
 integers) and libsodium. The Ed25519 seed is byte `51` repeated 32 times, and
 `key_version` is the first eight SHA-256 bytes of the public key, in hex.
 For each sample, XChaCha20-Poly1305 uses the envelope nonce, the key byte `31`
-repeated 32 times, and the JCS of `{aad,epoch,v}` as its associated data. Here
+repeated 32 times, and the RFC 8785 canonical JSON (JCS) of `{aad,epoch,v}` as its associated data. Here
 `aad` is unpadded base64url of `aad_utf8` and `v` is `ck-fleet-epoch-aad/v1`.
 These are public synthetic keys and fixed nonces for test vectors only.
