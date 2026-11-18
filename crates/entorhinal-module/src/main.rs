@@ -101,6 +101,7 @@ mod fake_daemon;
 #[cfg(test)]
 #[allow(dead_code)]
 mod fake_door;
+mod fleet_record;
 mod incarnation;
 mod member;
 mod memory_context;
