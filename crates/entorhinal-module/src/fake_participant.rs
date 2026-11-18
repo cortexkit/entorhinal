@@ -90,6 +90,9 @@ impl FakeParticipant {
     pub(crate) fn set_prepare(&self, reply: PrepareReply) {
         self.state.lock().unwrap().prepare = reply;
     }
+    pub(crate) fn set_optional(&self) {
+        self.state.lock().unwrap().description.optional = true;
+    }
     pub(crate) fn set_import(&self, reply: ImportReply) {
         self.state.lock().unwrap().import = reply;
     }

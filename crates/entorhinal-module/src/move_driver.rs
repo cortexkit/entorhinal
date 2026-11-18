@@ -1,7 +1,7 @@
 //! Machine-local move tasks. Remote calls never own a store handle or the writer.
 
 use crate::{
-    door_client::DoorClient,
+    door_client::{CutItem, DoorClient},
     move_receiver::{poll_inbox, CutAccept, Receiver},
     move_source::Source,
     participant_discovery::ParticipantDiscovery,
@@ -14,7 +14,7 @@ use cortexkit_role_agent_data::{
 };
 use entorhinal_core::{move_store::AgentMove, RegistryError, RegistryStore};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex, Weak,
@@ -23,6 +23,29 @@ use std::{
 };
 
 pub(crate) const POLL: Duration = Duration::from_secs(30);
+
+pub(crate) type SkippedStreams = BTreeMap<String, Vec<String>>;
+
+pub(crate) fn skipped_streams(items: &[CutItem], skipped: &[String]) -> SkippedStreams {
+    let mut streams = SkippedStreams::new();
+    for item in items {
+        if let Some(module) = item.stream.strip_prefix("reserved:") {
+            if skipped
+                .binary_search_by(|id| id.as_str().cmp(module))
+                .is_ok()
+            {
+                streams
+                    .entry(module.into())
+                    .or_default()
+                    .push(item.session_ref.clone());
+            }
+        }
+    }
+    for refs in streams.values_mut() {
+        refs.sort_unstable();
+    }
+    streams
+}
 
 type Owner = (String, bool);
 #[derive(Default)]

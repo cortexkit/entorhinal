@@ -256,20 +256,22 @@ impl ProjectsHandler {
 }
 /// The public move view leaves out the private plan, so copy out the one plan
 /// fact an operator needs: which participants this receiver skipped because
-/// they are not installed here and the source sent no data for them.
+/// they are not installed here.
 fn show_skipped(view: &mut Value, row: &entorhinal_core::move_store::AgentMove) {
     let skipped = super::move_receiver::skipped_participants(row);
     if !skipped.is_empty() {
         view["skipped_participants"] = json!(skipped);
     }
 }
-/// Copy out, from the private plan, what participants reported dropping while
-/// importing on this machine. A move with any losses must not read as a clean
-/// success; without losses the view gains no key at all.
+/// Add import drops to any optional-skip losses already in the status view.
 fn show_losses(view: &mut Value, row: &entorhinal_core::move_store::AgentMove) {
     let losses = super::move_receiver::import_losses(row);
     if !losses.is_empty() {
-        view["losses"] = json!(losses);
+        if let Some(existing) = view["losses"].as_array_mut() {
+            existing.extend(losses);
+        } else {
+            view["losses"] = json!(losses);
+        }
     }
 }
 pub(crate) fn elapsed(value: &mut Value, now: i64) {

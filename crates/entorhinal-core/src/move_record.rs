@@ -149,6 +149,8 @@ pub struct MoveParticipant {
     pub module_id: String,
     pub refs: Vec<MoveRef>,
     pub external: Vec<ExternalRef>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub optional: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,6 +168,8 @@ pub struct MoveRecord {
     /// field when that set is empty: older machines reject unknown record fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pin_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<String>,
     pub reason: Option<MoveReason>,
     pub detail: Option<Value>,
 }
@@ -309,6 +313,18 @@ fn validate_move(subject: &str, record: &MoveRecord) -> Result<(), CodecError> {
     {
         return Err(CodecError::ParticipantUnsorted);
     }
+    if !record.skipped.is_empty()
+        && (record.state == MoveRecordState::Published
+            || record.skipped.windows(2).any(|pair| pair[0] >= pair[1])
+            || record.skipped.iter().any(|module| {
+                !record
+                    .participants
+                    .iter()
+                    .any(|p| p.optional && p.module_id == *module)
+            }))
+    {
+        return Err(CodecError::MalformedBody);
+    }
     if let Some(detail) = &record.detail {
         if serde_json::to_vec(detail)
             .map_err(|_| CodecError::MalformedBody)?
@@ -329,10 +345,29 @@ fn validate_move(subject: &str, record: &MoveRecord) -> Result<(), CodecError> {
     Ok(())
 }
 
-fn check_move_size(state: MoveRecordState, len: usize) -> Result<(), CodecError> {
+fn check_move_size(record: &MoveRecord, len: usize) -> Result<(), CodecError> {
+    let state = record.state;
     if len > BODY_CAP {
-        Err(CodecError::BodyTooLarge)
-    } else if state != MoveRecordState::Aborted && len > MOVE_BODY_CAP {
+        return Err(CodecError::BodyTooLarge);
+    }
+    // In the worst case the receiver must list every optional module. Leave
+    // room at publication so staging the move cannot run out of record space.
+    let mut len = len;
+    if state == MoveRecordState::Published {
+        let optional: Vec<_> = record
+            .participants
+            .iter()
+            .filter(|p| p.optional)
+            .map(|p| &p.module_id)
+            .collect();
+        if !optional.is_empty() {
+            len += ",\"skipped\":".len()
+                + serde_json::to_vec(&optional)
+                    .map_err(|_| CodecError::MalformedBody)?
+                    .len();
+        }
+    }
+    if state != MoveRecordState::Aborted && len > MOVE_BODY_CAP {
         Err(CodecError::MoveTooLarge)
     } else {
         Ok(())
@@ -344,7 +379,7 @@ fn check_move_size(state: MoveRecordState, len: usize) -> Result<(), CodecError>
 pub fn encode_move_record(subject: &str, record: &MoveRecord) -> Result<Vec<u8>, CodecError> {
     validate_move(subject, record)?;
     let body = serde_json::to_vec(record).map_err(|_| CodecError::MalformedBody)?;
-    check_move_size(record.state, body.len())?;
+    check_move_size(record, body.len())?;
     Ok(body)
 }
 
@@ -356,7 +391,7 @@ pub fn decode_move_record(subject: &str, body: &[u8]) -> Result<MoveRecord, Code
     }
     let record: MoveRecord = serde_json::from_slice(body).map_err(|_| CodecError::MalformedBody)?;
     validate_move(subject, &record)?;
-    check_move_size(record.state, body.len())?;
+    check_move_size(&record, body.len())?;
     Ok(record)
 }
 
@@ -519,7 +554,9 @@ pub fn check_record_author(record: &MoveRecord, author: &str) -> Result<(), Code
     let matches = match required_writer(record.state) {
         RecordWriter::Source => author == record.from,
         RecordWriter::Receiver => author == record.to,
-        RecordWriter::Either => author == record.from || author == record.to,
+        RecordWriter::Either => {
+            author == record.to || (author == record.from && record.skipped.is_empty())
+        }
     };
     if matches {
         Ok(())
@@ -580,6 +617,7 @@ mod tests {
     const CUT: &str = "0123456789abcdef0123456789abcdef";
     const SUBJECT: &str = "move:0123456789abcdef0123456789abcdef";
     const MOVE_FIXTURE: &str = r#"{"v":1,"cut_id":"0123456789abcdef0123456789abcdef","agent_id":"agent-a","from":"machine-a","to":"machine-b","state":"published","claim_version":3,"participants":[{"module_id":"alpha","refs":[{"ref_kind":"pi-session","ref":"session-a"}],"external":[{"ref_kind":"pi-session","ref":"session-a","note":"Copy the transcript","check":{"digest":"abc","row":7}}]},{"module_id":"beta","refs":[{"ref_kind":"pi-session","ref":"session-a"}],"external":[]}],"reason":null,"detail":null}"#;
+    const OPTIONAL_MOVE_FIXTURE: &str = r#"{"v":1,"cut_id":"0123456789abcdef0123456789abcdef","agent_id":"agent-a","from":"machine-a","to":"machine-b","state":"staged","claim_version":3,"participants":[{"module_id":"alpha","refs":[{"ref_kind":"pi-session","ref":"session-a"}],"external":[{"ref_kind":"pi-session","ref":"session-a","note":"Copy the transcript","check":{"digest":"abc","row":7}}]},{"module_id":"beta","refs":[{"ref_kind":"pi-session","ref":"session-a"}],"external":[],"optional":true}],"skipped":["beta"],"reason":null,"detail":null}"#;
     const INBOX_FIXTURE: &str = r#"{"v":1,"pending":[{"cut_id":"0123456789abcdef0123456789abcdef","from":"machine-a","agent_id":"agent-a"}]}"#;
 
     fn record() -> MoveRecord {
@@ -592,9 +630,11 @@ mod tests {
             state: MoveRecordState::Published,
             claim_version: 3,
             pin_digest: None,
+            skipped: vec![],
             participants: vec![
                 MoveParticipant {
                     module_id: "alpha".into(),
+                    optional: false,
                     refs: vec![MoveRef {
                         ref_kind: "pi-session".into(),
                         reference: "session-a".into(),
@@ -608,6 +648,7 @@ mod tests {
                 },
                 MoveParticipant {
                     module_id: "beta".into(),
+                    optional: false,
                     refs: vec![MoveRef {
                         ref_kind: "pi-session".into(),
                         reference: "session-a".into(),
@@ -618,6 +659,61 @@ mod tests {
             reason: None,
             detail: None,
         }
+    }
+
+    #[test]
+    fn move_record_optional_skips_round_trip_and_legacy_bytes_do_not_change() {
+        assert_eq!(
+            encode_move_record(SUBJECT, &record()).unwrap(),
+            MOVE_FIXTURE.as_bytes()
+        );
+        let mut staged = record();
+        staged.state = MoveRecordState::Staged;
+        staged.participants[1].optional = true;
+        staged.skipped.push("beta".into());
+        assert_eq!(
+            encode_move_record(SUBJECT, &staged).unwrap(),
+            OPTIONAL_MOVE_FIXTURE.as_bytes()
+        );
+        assert_eq!(
+            decode_move_record(SUBJECT, OPTIONAL_MOVE_FIXTURE.as_bytes()).unwrap(),
+            staged
+        );
+        assert_eq!(
+            check_pinned_plan(&record(), &staged),
+            Err(CodecError::PlanMismatch)
+        );
+
+        let mut published = staged.clone();
+        published.state = MoveRecordState::Published;
+        assert_eq!(
+            encode_move_record(SUBJECT, &published),
+            Err(CodecError::MalformedBody)
+        );
+        published.skipped.clear();
+        assert_eq!(check_pinned_plan(&published, &staged), Ok(()));
+
+        let aborted = aborted_record(&staged, MoveReason::Operator, None);
+        assert_eq!(aborted.skipped, ["beta"]);
+        assert_eq!(check_record_author(&aborted, "machine-b"), Ok(()));
+        assert_eq!(
+            check_record_author(&aborted, "machine-a"),
+            Err(CodecError::AuthorMismatch)
+        );
+
+        for invalid in [vec!["alpha"], vec!["missing"], vec!["beta", "beta"]] {
+            staged.skipped = invalid.into_iter().map(str::to_owned).collect();
+            assert_eq!(
+                encode_move_record(SUBJECT, &staged),
+                Err(CodecError::MalformedBody)
+            );
+        }
+        staged.participants[0].optional = true;
+        staged.skipped = vec!["beta".into(), "alpha".into()];
+        assert_eq!(
+            encode_move_record(SUBJECT, &staged),
+            Err(CodecError::MalformedBody)
+        );
     }
 
     #[test]

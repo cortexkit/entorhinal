@@ -67,6 +67,20 @@ and elapsed `waiting_ms` in move status and `agent.where`. It never interprets
 an absent inbox entry as evidence of rejection. The operator can abort this wait
 with the existing move-abort command, upgrade the target, and retry.
 
+The source copies `optional` from `agent_data.describe` into the immutable
+participant plan. Each participant entry writes `optional: true` only when
+opted in; absent or false means required. `skipped` is a sorted, unique list of
+module IDs from the optional participants in that plan. It is omitted when
+empty. The receiver first writes it on `staged` and carries it unchanged to
+`claimed`, `activated`, and an abort after `staged`. The source copies it
+unchanged from `activated` to `released`. Neither `published` nor an abort
+directly from `published` carries `skipped`.
+
+Moves without optional participants retain their prior wire bytes. Both
+machines must run an Entorhinal version that understands these members before
+any participant sends `optional: true` (agent-data 0.3.2): older strict decoders
+reject the new describe and move record members.
+
 Tests: `transition_table_exhaustively_refuses_every_unlisted_row`,
 `author_check_maps_every_state_to_its_required_writer`,
 `move_codec_refuses_unknown_state`,
@@ -295,7 +309,9 @@ Guaranteed:
 - The claim moves at most once per move, and an aborted move after the claim
   take returns it.
 - The source releases participants only after reading an `activated` record
-  written by the receiver for the plan it published.
+  written by the receiver for the plan it published. It never releases an
+  optional participant named in `skipped`, so that participant's data remains
+  on the source for a later move back or re-carry.
 - A move never chooses between two divergent copies; it holds as a fork.
 
 Not guaranteed:
@@ -332,13 +348,20 @@ and the move has not aborted, `agent.move_status` and `agent.moves` include
 `losses`: one `{participant, session_ref, reason, count}` entry per reason,
 sorted by participant, then `session_ref` (the item's `sessionRef`), then
 reason. Reasons and counts are shown as given; entorhinal never branches on a
-reason. A move whose replies report no drops has no `losses` key, and its
-replies are unchanged. Losses are not written to the shared move record, so
-only the receiving machine shows them. A `dropped` map that breaks the
+reason. These import drops are not written to the shared move record, so only
+the receiving machine shows them. A `dropped` map that breaks the
 contract's rules (empty, more than 16 reasons, a reason outside
 `[a-z][a-z0-9_]{0,63}`, or a count outside 1 to 2^53 - 1) is an invalid reply:
 the receiver records a `contract_violation` naming the broken rule and stops
 the step, as it does for an out-of-contract refusal code.
+
+On both machines, each sealed stream of a skipped optional participant adds a
+loss using the same entry shape, with reason `optional_participant_absent`,
+count `1`, `source` (the source machine's author ID), and `source_name` if its
+display name is known. Only the participant IDs are shared in `skipped`; both
+machines record the losses in their local checkpoints. An optional participant
+that sealed no items is still skipped but adds no loss. A move without losses
+has no `losses` key, and aborted moves show no losses.
 
 `agent.set_lid_close_moves {enabled, request_key}` is `Direct` only
 (`caller_forbidden` otherwise) and asks for operator confirmation when the value changes.
@@ -480,13 +503,18 @@ other refs for every step, including a move back. It obeys the same receiver
 set-matching and absent-participant rules. A participant is absent only when it
 is neither configured in the receiver's supervisor nor registered in its
 catalog; a configured-but-disabled or warming module is not absent and still
-holds the move until it is ready. An absent participant is skipped if it has no
+holds the move until it is ready. An absent optional participant is skipped
+even if it has items. An absent required participant is skipped if it has no
 planned refs, or if the sealed cut manifest contains no item with its
-`reserved:<module_id>` stream, even when it was routed the agent ref. The latter
-check reads engram's authenticated `cut.read` manifest and requires its author
-to match the move's source; an unreadable manifest or author mismatch holds
-without deciding a skip. An absent participant with planned refs and sealed
-items still stops the move with `participant_unavailable` and `absent: true`.
+`reserved:<module_id>` stream, even when it was routed the agent ref. The
+receiver reads engram's authenticated `cut.read` manifest for these stream
+checks and requires its author to match the move's source; an unreadable
+manifest or author mismatch holds without deciding a skip. An absent required
+participant with planned refs and sealed items still stops the move with
+`participant_unavailable` and `absent: true`.
+Required no-items skips remain receiver-local, and the source releases those
+participants as usual. A present optional participant follows the normal
+participant protocol, including release.
 The receiver persists the skipped set once and reuses it through import,
 activation, abort cleanup and restarts, including when an abort arrives before
 preconditions run.

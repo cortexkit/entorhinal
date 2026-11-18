@@ -314,7 +314,53 @@ fn public_move(conn: &rusqlite::Connection, row: &AgentMove) -> rusqlite::Result
         }
         object.insert("cut_release".into(), release);
     }
+    let losses = optional_skip_losses(conn, row)?;
+    if !losses.is_empty() {
+        object.insert("losses".into(), Value::Array(losses));
+    }
     Ok(value)
+}
+
+fn optional_skip_losses(
+    conn: &rusqlite::Connection,
+    row: &AgentMove,
+) -> rusqlite::Result<Vec<Value>> {
+    if row.step == MoveStep::Aborted {
+        return Ok(Vec::new());
+    }
+    let progress = match row.side {
+        MoveSide::Source => "_source",
+        MoveSide::Receiver => "_receiver",
+    };
+    let Some(streams) = row.plan[progress]["skipped_streams"].as_object() else {
+        return Ok(Vec::new());
+    };
+    let Some(source) = row.plan["from"].as_str() else {
+        return Ok(Vec::new());
+    };
+    let source_name = crate::claim_cache::holder_name(conn, Some(source))?;
+    let mut losses = Vec::new();
+    for (participant, refs) in streams {
+        for session_ref in refs
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            let mut loss = serde_json::json!({
+                "participant": participant,
+                "session_ref": session_ref,
+                "reason": "optional_participant_absent",
+                "count": 1,
+                "source": source,
+            });
+            if let Some(name) = &source_name {
+                loss["source_name"] = serde_json::json!(name);
+            }
+            losses.push(loss);
+        }
+    }
+    Ok(losses)
 }
 
 pub(crate) type WhereMoveView = (Option<Value>, Vec<Value>, Vec<Value>, Vec<Value>);

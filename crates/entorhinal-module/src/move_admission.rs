@@ -268,6 +268,7 @@ impl ProjectsHandler {
             .iter()
             .map(|p| MoveParticipant {
                 module_id: p.client.module_id.clone(),
+                optional: p.description.optional,
                 refs: p
                     .refs
                     .iter()

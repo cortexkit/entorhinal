@@ -8,7 +8,8 @@ use crate::{
     },
     log_client::TransportError,
     move_driver::{
-        backoff, digest_reason, participant_action, PeerRefusal, RefusalLog, Worker, POLL,
+        backoff, digest_reason, participant_action, skipped_streams, PeerRefusal, RefusalLog,
+        SkippedStreams, Worker, POLL,
     },
     participant_client::{
         AgentRef, ClientError, CutRequest, ParticipantClient, Refs, ReleaseRequest,
@@ -38,6 +39,12 @@ struct Progress {
     prepared: bool,
     #[serde(default)]
     items: Vec<CutItem>,
+    /// Once the receiver has staged an optional plan, it cannot change which
+    /// participants the source must leave untouched, even across a restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    skipped: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    skipped_streams: SkippedStreams,
     #[serde(default)]
     errors: Vec<Value>,
     #[serde(default)]
@@ -96,6 +103,7 @@ impl Plan {
             participants: self.participants.clone(),
             pin_digest: self.pin_digest.clone(),
             state: State::Published,
+            skipped: Vec::new(),
             reason: None,
             detail: None,
         }
@@ -329,6 +337,18 @@ impl Source {
         };
         if let Some((record, version)) = observed.as_ref().filter(|_| watching) {
             row.record_version = *version as i64;
+            if matches!(
+                record.state,
+                State::Staged | State::Claimed | State::Activated | State::Released
+            ) && plan.source.skipped.is_none()
+                && plan.participants.iter().any(|p| p.optional)
+            {
+                plan.source.skipped_streams = skipped_streams(&plan.source.items, &record.skipped);
+                plan.source.skipped = Some(record.skipped.clone());
+                self.save(&mut row, &plan, false)
+                    .await
+                    .map_err(|f| HandlerError::new(&f.code, f.detail.to_string()))?;
+            }
             if record.state == State::Aborted && row.step != Step::Releasing {
                 let reason = record.reason.clone().map(String::from);
                 if row.reason != reason || row.abort_requested.is_none() {
@@ -563,6 +583,14 @@ impl Source {
         .and_then(|record| {
             wire::check_record_author(&record, reply.author.as_deref().unwrap_or_default())?;
             wire::check_pinned_plan(&plan.record(&self.cut), &record)?;
+            if plan
+                .source
+                .skipped
+                .as_ref()
+                .is_some_and(|skipped| *skipped != record.skipped)
+            {
+                return Err(wire::CodecError::PlanMismatch);
+            }
             Ok(record)
         });
         match verified {
@@ -1173,6 +1201,10 @@ impl Source {
             }
         }
         for participant in plan.participants.clone() {
+            if participant.optional && record.skipped.binary_search(&participant.module_id).is_ok()
+            {
+                continue;
+            }
             let request = self.request(&participant)?;
             let release = ReleaseRequest::new(request.refs, request.cut_id, plan.to.clone());
             let reply = self
