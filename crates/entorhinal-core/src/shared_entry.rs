@@ -760,6 +760,14 @@ mod tests {
                     "catalog_generation",
                     "catalog_transition",
                     "user_request",
+                    // Hub transport state: this machine's cached KV values,
+                    // unsettled writes, trust anchors and held key epochs.
+                    "hub_kv_cache",
+                    "hub_attempt",
+                    "hub_attempt_send",
+                    "hub_anchor",
+                    "hub_held_epoch",
+                    "hub_epoch_status",
                 ];
                 let schema = conn
                     .prepare("SELECT name FROM sqlite_schema WHERE type='table'")?
