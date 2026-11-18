@@ -231,6 +231,27 @@ fn save_attempt(
 }
 
 impl RegistryStore {
+    pub fn hub_log_base(&self) -> Result<Option<i64>, RegistryError> {
+        self.read(|conn| {
+            conn.query_row(
+                "SELECT hub_log_base FROM identity_log_state WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+        })
+    }
+
+    pub fn journal_log_position(&self, entry_id: &str) -> Result<Option<i64>, RegistryError> {
+        self.read(|conn| {
+            conn.query_row(
+                "SELECT log_position FROM registry_journal WHERE entry_id=?1 AND log_position IS NOT NULL",
+                [entry_id],
+                |row| row.get(0),
+            )
+            .optional()
+        })
+    }
+
     pub fn hub_attempt(&self, request_key: &str) -> Result<Option<HubAttempt>, RegistryError> {
         self.read(|conn| load_attempt(conn, request_key))
     }

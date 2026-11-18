@@ -3,7 +3,7 @@
 // This writer is used only when the registry selects the hub instead of engram.
 #![allow(dead_code)]
 
-use std::sync::OnceLock;
+use std::{future::Future, sync::OnceLock};
 
 use cortexkit_claustrum_client::CredentialResolver;
 use entorhinal_catalog::jcs;
@@ -18,7 +18,7 @@ use tokio::time::{timeout_at, Instant};
 
 use crate::{
     fleet_record::{self, vault::EpochVault, Header, UnverifiedRecord, VerifiedRecord, LOG_KEY},
-    hub_transport::{self, Session},
+    hub_transport::{self, Hub, Session},
     HandlerError,
 };
 
@@ -76,20 +76,24 @@ pub(super) struct KvEntry {
 }
 
 pub(super) trait Transport {
-    async fn log_entry(
+    fn log_entry(
         &self,
         sequence: u64,
         deadline: Instant,
-    ) -> Result<Option<Vec<u8>>, HandlerError>;
-    async fn log_head(&self, deadline: Instant) -> Result<u64, HandlerError>;
-    async fn kv_entry(&self, key: &str, deadline: Instant)
-        -> Result<Option<KvEntry>, HandlerError>;
-    async fn send(
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, HandlerError>> + Send;
+    fn log_head(&self, deadline: Instant)
+        -> impl Future<Output = Result<u64, HandlerError>> + Send;
+    fn kv_entry(
+        &self,
+        key: &str,
+        deadline: Instant,
+    ) -> impl Future<Output = Result<Option<KvEntry>, HandlerError>> + Send;
+    fn send(
         &self,
         write: &HubAttemptWrite,
         op_id: &str,
         deadline: Instant,
-    ) -> Result<Option<u64>, HandlerError>;
+    ) -> impl Future<Output = Result<Option<u64>, HandlerError>> + Send;
 }
 
 impl Transport for Session {
@@ -140,12 +144,65 @@ impl Transport for Session {
     }
 }
 
+impl Transport for Hub {
+    async fn log_entry(
+        &self,
+        sequence: u64,
+        deadline: Instant,
+    ) -> Result<Option<Vec<u8>>, HandlerError> {
+        self.session(deadline)
+            .await?
+            .1
+            .log_entry(sequence, deadline)
+            .await
+    }
+
+    async fn log_head(&self, deadline: Instant) -> Result<u64, HandlerError> {
+        self.session(deadline).await?.1.log_head(deadline).await
+    }
+
+    async fn kv_entry(
+        &self,
+        key: &str,
+        deadline: Instant,
+    ) -> Result<Option<KvEntry>, HandlerError> {
+        Transport::kv_entry(&self.session(deadline).await?.1, key, deadline).await
+    }
+
+    async fn send(
+        &self,
+        write: &HubAttemptWrite,
+        op_id: &str,
+        deadline: Instant,
+    ) -> Result<Option<u64>, HandlerError> {
+        let (box_id, session) = self.session(deadline).await?;
+        if !write.value.is_empty()
+            && UnverifiedRecord::parse(&write.key, &write.value)?
+                .header()
+                .writer
+                != box_id.to_string()
+        {
+            return Err(HandlerError::new(
+                "record_invalid",
+                "fleet record writer does not match the bus box ID",
+            ));
+        }
+        session.send(write, op_id, deadline).await
+    }
+}
+
 /// The hub backend supplies verification keys and checks which epoch may be
 /// used for writing. A fence reads the epoch record from the hub, not the cache,
 /// and ensures the vault holds the named key.
 pub(super) trait Trust {
-    async fn writer_epoch(&self, deadline: Instant) -> Result<u64, HandlerError>;
-    async fn verification_key(&self, record: &UnverifiedRecord) -> Result<String, HandlerError>;
+    fn writer_epoch(
+        &self,
+        deadline: Instant,
+    ) -> impl Future<Output = Result<u64, HandlerError>> + Send;
+    fn verification_key(
+        &self,
+        record: &UnverifiedRecord,
+    ) -> impl Future<Output = Result<String, HandlerError>> + Send;
 }
 
 pub(super) struct Writer<'a, T, U> {
@@ -250,12 +307,12 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
     ) -> Result<Landed, HandlerError> {
         let mut rebases = 0;
         let mut resent = false;
-        let mut ack = None;
+        let mut sent = None;
         loop {
             let Some(row) = self.store.hub_attempt(request.request_key)? else {
                 let (write, op_id) = self.build(request, first, next.is_some(), deadline).await?;
                 if self.save(&write, &op_id, None)? {
-                    ack = self.send(&write, &op_id, deadline).await?;
+                    sent = self.send(&write, &op_id, true, deadline).await?;
                 }
                 continue;
             };
@@ -267,12 +324,12 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
             }
             let write = &row.write;
             let op_id = current_op_id(write, &row)?;
-            if Instant::now() >= deadline && ack.is_none() {
+            if Instant::now() >= deadline && sent.is_none() {
                 return Err(hub_transport::unsettled(&op_id));
             }
-            let settlement = if let Some((acked, landed)) = ack.take() {
-                if acked == *write {
-                    Settlement::Landed(landed)
+            let settlement = if let Some((submitted, result)) = sent.take() {
+                if submitted == *write {
+                    result
                 } else {
                     self.settle(&row, &op_id, deadline).await?
                 }
@@ -298,7 +355,7 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
                         .advance_hub_attempt(&row, &landed.op_id, &write, &send)?
                     {
                         resent = false;
-                        ack = self.send(&write, &op_id, deadline).await?;
+                        sent = self.send(&write, &op_id, true, deadline).await?;
                     }
                     continue;
                 }
@@ -320,7 +377,7 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
                     if let Some((write, op_id)) = self.rebase(request, &row, deadline).await? {
                         rebases += 1;
                         resent = false;
-                        ack = self.send(&write, &op_id, deadline).await?;
+                        sent = self.send(&write, &op_id, true, deadline).await?;
                     }
                     continue;
                 }
@@ -334,8 +391,8 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
                         .map_err(|e| during_settlement(e, &op_id))?;
                     if self.save(&write, &next_id, Some(&row))? {
                         resent = true;
-                        ack = self
-                            .send(&write, &next_id, deadline)
+                        sent = self
+                            .send(&write, &next_id, false, deadline)
                             .await
                             .map_err(|e| during_settlement(e, &op_id))?;
                     }
@@ -435,8 +492,9 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
         &self,
         write: &HubAttemptWrite,
         op_id: &str,
+        first_at_position: bool,
         deadline: Instant,
-    ) -> Result<Option<(HubAttemptWrite, Landed)>, HandlerError> {
+    ) -> Result<Option<(HubAttemptWrite, Settlement)>, HandlerError> {
         match self.transport.send(write, op_id, deadline).await {
             Ok(position)
                 if !write.step.starts_with(SNAPSHOT)
@@ -445,19 +503,43 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
             {
                 Ok(Some((
                     write.clone(),
-                    Landed {
+                    Settlement::Landed(Landed {
                         op_id: op_id.into(),
                         position,
-                    },
+                    }),
                 )))
             }
-            // A refused replacement may have lost to an older send of the
-            // same operation. Read the position/key before inferring a loss.
+            Err(error)
+                if error.code == "head_moved"
+                    && first_at_position
+                    && !write.step.starts_with(SNAPSHOT) =>
+            {
+                Ok(Some((write.clone(), Settlement::HeadMoved)))
+            }
+            // A replacement can lose to the first send, and an independent
+            // snapshot resumer can win with the same derived ID. Look up the
+            // exact position even if the tail closed the row in the meantime.
+            result
+                if write.key == LOG_KEY
+                    && (result.is_ok()
+                        || result.as_ref().is_err_and(|error| {
+                            matches!(error.code.as_str(), "head_moved" | "hub_write_unsettled")
+                        })) =>
+            {
+                let Some(row) = self.store.hub_attempt(&write.request_key)? else {
+                    return Err(invalid_attempt());
+                };
+                if row.write != *write {
+                    return Ok(None);
+                }
+                let result = self.settle(&row, op_id, deadline).await?;
+                Ok(Some((write.clone(), result)))
+            }
             Ok(_) => Ok(None),
             Err(error)
                 if matches!(
                     error.code.as_str(),
-                    "head_moved" | "revision_moved" | "hub_write_unsettled"
+                    "revision_moved" | "hub_write_unsettled"
                 ) =>
             {
                 Ok(None)
@@ -565,8 +647,8 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
             .await
     }
 
-    /// Only called after a read has proved the old log position is occupied
-    /// by a different entry; a CAS refusal alone isn't sufficient.
+    /// Rebase after a definite first-send compare-and-swap refusal or after
+    /// finding a different entry at the unacknowledged send's position.
     async fn rebase(
         &self,
         request: &Request<'_>,
@@ -779,7 +861,7 @@ fn during_settlement(error: HandlerError, op_id: &str) -> HandlerError {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 fn matches_position(write: &HubAttemptWrite, position: u64) -> bool {
     if write.key == LOG_KEY {

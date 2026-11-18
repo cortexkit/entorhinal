@@ -102,6 +102,7 @@ mod fake_daemon;
 #[allow(dead_code)]
 mod fake_door;
 mod fleet_record;
+mod hub_identity_log;
 // The hub backend starts this transport only when the store selects it.
 #[allow(dead_code)]
 mod hub_transport;

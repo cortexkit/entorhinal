@@ -14,6 +14,8 @@ use tokio::{
 
 use super::*;
 
+mod identity_log;
+
 const PREFIX: &str = "ckdel.0123456789abcdef0123456789abcdef.entorhinal";
 
 fn port() -> u16 {

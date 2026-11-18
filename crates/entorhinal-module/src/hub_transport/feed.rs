@@ -90,6 +90,7 @@ pub(crate) struct Feed<T> {
     open: Box<Open<T>>,
     subscription: Option<Subscription<T>>,
     cursor: Option<u64>,
+    durable_cursor: bool,
     backoff: Duration,
     retry_at: Option<Instant>,
     outage: Outage,
@@ -128,10 +129,22 @@ impl<T> Feed<T> {
             open: Box::new(move |cursor| Box::pin(open(cursor))),
             subscription: None,
             cursor,
+            durable_cursor: false,
             backoff: INITIAL_BACKOFF,
             retry_at: None,
             outage: Outage::default(),
         }
+    }
+
+    /// Let the identity log check redeliveries against its journal and resume
+    /// from committed progress, including when a snapshot is still buffered.
+    pub(crate) fn with_durable_cursor(mut self) -> Self {
+        self.durable_cursor = true;
+        self
+    }
+
+    pub(crate) fn applied(&mut self, sequence: u64) {
+        self.cursor = Some(sequence);
     }
 
     fn name(&self) -> &'static str {
@@ -198,6 +211,9 @@ impl<T> Feed<T> {
             {
                 Delivery::Item(Ok((sequence, item))) => {
                     self.reached();
+                    if self.durable_cursor {
+                        return item;
+                    }
                     if self.cursor.is_none_or(|last| sequence > last) {
                         self.cursor = Some(sequence);
                         return item;
