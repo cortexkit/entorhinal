@@ -46,12 +46,17 @@ impl Drop for Rig {
 
 impl Rig {
     fn new() -> Self {
+        // The counter keeps names unique within this test process: macOS's clock
+        // ticks in microseconds, so two rigs started together can read the same
+        // time and would otherwise share one folder and one store lease.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/scratch")
             .join(format!(
-                "hub-transport-{}-{}",
+                "hub-transport-{}-{}-{}",
                 std::process::id(),
-                SystemTime::UNIX_EPOCH.elapsed().unwrap().as_nanos()
+                SystemTime::UNIX_EPOCH.elapsed().unwrap().as_nanos(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));
         fs::create_dir_all(&dir).unwrap();
         Self {
