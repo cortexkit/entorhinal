@@ -209,12 +209,22 @@ impl RecordClient {
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value, RecordError> {
+        self.call_with_drain(method, params, false).await
+    }
+
+    async fn call_with_drain(
+        &self,
+        method: &str,
+        params: Value,
+        drain: bool,
+    ) -> Result<Value, RecordError> {
+        let mut dispatched = false;
         // Each hop includes connection establishment in the read deadline.
         tokio::time::timeout(super::catch_up::READ_DEADLINE, async {
             let subject = (method == CAS).then(|| params["subject"].as_str().unwrap_or_default());
             let check = || {
                 self.fence
-                    .record(subject)
+                    .record(subject, drain)
                     .map_err(|code| RecordError::Refused {
                         code: code.into(),
                         detail: None,
@@ -223,6 +233,7 @@ impl RecordClient {
             check()?;
             let transport = self.connector.connect().await?;
             check()?;
+            dispatched = true;
             let bytes = transport.call(method, params).await?;
             let envelope: Value = serde_json::from_slice(&bytes).map_err(protocol)?;
             envelope
@@ -231,7 +242,13 @@ impl RecordClient {
                 .ok_or_else(|| protocol("record reply has no result envelope"))
         })
         .await
-        .unwrap_or_else(|_| Err(RecordError::refusal("unavailable", None)))
+        .unwrap_or_else(|_| {
+            if drain && dispatched {
+                Err(RecordError::NoReply)
+            } else {
+                Err(RecordError::refusal("unavailable", None))
+            }
+        })
     }
 
     pub(crate) async fn read(&self, subject: &str) -> Result<RecordReply, RecordError> {
@@ -341,6 +358,20 @@ impl RecordClient {
     }
 
     pub(crate) async fn cas(&self, request: &CasRequest) -> Result<u64, RecordError> {
+        self.cas_with_drain(request, false).await
+    }
+
+    /// A drain may write after the applied marker, but must prove that its own
+    /// CAS advanced the version. The old body can already match before it lands.
+    pub(crate) async fn cas_drain(&self, request: &CasRequest) -> Result<u64, RecordError> {
+        let version = self.cas_with_drain(request, true).await?;
+        if request.expected_version.checked_add(1) != Some(version) {
+            return Err(protocol("drain CAS did not return its next version"));
+        }
+        Ok(version)
+    }
+
+    async fn cas_with_drain(&self, request: &CasRequest, drain: bool) -> Result<u64, RecordError> {
         validate_subject(&request.subject)?;
         if request.body.len() > BODY_CAP {
             return Err(RecordError::refusal(
@@ -349,8 +380,8 @@ impl RecordClient {
             ));
         }
         let params = json!({"subject":request.subject,"expected_version":request.expected_version,"body":encode_hex(&request.body),"write_id":encode_hex(&request.write_id)});
-        let reply = match self.call(CAS, params.clone()).await {
-            Err(RecordError::NoReply) => self.call(CAS, params).await?,
+        let reply = match self.call_with_drain(CAS, params.clone(), drain).await {
+            Err(RecordError::NoReply) => self.call_with_drain(CAS, params, drain).await?,
             other => other?,
         };
         let version = reply["version"]

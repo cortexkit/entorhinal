@@ -23,6 +23,8 @@ use crate::{
 };
 
 pub(super) const EXCLUDE: &str = "identity_log.hub_switch";
+mod drain;
+pub(super) use drain::MigrationImage;
 const PROPOSAL: &str = "hubswitch";
 const HUB_PROTOCOL: u64 = 1;
 const CUTS: &str = "engram-hub-cuts/v1";
@@ -74,7 +76,11 @@ impl LegacyFence {
         Ok(())
     }
 
-    pub(crate) fn record(&self, cas_subject: Option<&str>) -> Result<(), &'static str> {
+    pub(crate) fn record(
+        &self,
+        cas_subject: Option<&str>,
+        drain: bool,
+    ) -> Result<(), &'static str> {
         let Some(store) = self.store() else {
             return Ok(());
         };
@@ -82,6 +88,17 @@ impl LegacyFence {
             return Err(PENDING);
         }
         if let Some(subject) = cas_subject {
+            if drain {
+                return if (subject.starts_with("claim:") || subject.starts_with("role:"))
+                    && matches!(
+                        store.engram_freeze().map_err(|_| "storage_error")?,
+                        Some(EngramFreeze::Applied { .. })
+                    ) {
+                    Ok(())
+                } else {
+                    Err(PENDING)
+                };
+            }
             if !subject.starts_with("hubquiet:")
                 && !subject.starts_with("hubdrained:")
                 && store
@@ -278,6 +295,7 @@ async fn put<T: Serialize>(
 pub(super) struct Switch {
     probe: Arc<dyn Probe>,
     moves: Arc<Mutex<()>>,
+    drain: Arc<tokio::sync::Mutex<drain::Progress>>,
 }
 
 #[async_trait::async_trait]
@@ -321,6 +339,7 @@ impl Switch {
         Self {
             probe: Arc::new(DaemonProbe { hub, discovery }),
             moves,
+            drain: Default::default(),
         }
     }
 
@@ -352,10 +371,21 @@ impl Switch {
         log: &LogClient,
         records: &RecordClient,
         deadline: Instant,
-    ) -> Result<(), HandlerError> {
-        timeout_at(deadline, self.gate(store, log, records, deadline))
-            .await
-            .map_err(|_| HandlerError::new("hub_switch_waiting", "switch gate deadline expired"))?
+    ) -> Result<Option<MigrationImage>, HandlerError> {
+        timeout_at(deadline, async {
+            if let Some(EngramFreeze::Applied {
+                position,
+                author,
+                body,
+            }) = store.engram_freeze()?
+            {
+                return drain::prepare(&self.drain, store, records, position, &author, body).await;
+            }
+            self.gate(store, log, records, deadline).await?;
+            Ok(None)
+        })
+        .await
+        .map_err(|_| HandlerError::new("hub_switch_waiting", "switch deadline expired"))?
     }
 
     async fn gate(

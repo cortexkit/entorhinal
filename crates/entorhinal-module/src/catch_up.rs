@@ -2,7 +2,10 @@
 //! stay uncommitted, so a restart can fetch their parts again from durable progress.
 
 use super::{log_client, HandlerError, HealthGauges, ProjectsHandler};
-use entorhinal_core::{remote_apply::RemoteEntry, RegistryError, RegistryStore};
+use entorhinal_core::{
+    remote_apply::{EngramFreeze, RemoteEntry},
+    RegistryError, RegistryStore,
+};
 use std::sync::{atomic::Ordering, Arc, Mutex, Weak};
 use std::time::Duration;
 use tokio::time::{timeout_at, Instant};
@@ -191,6 +194,15 @@ impl Worker {
                         }
                         self.health.hub_membership.store(1, Ordering::Release);
                     }
+                    continue;
+                }
+                if let (Some(switch), Ok(Some(EngramFreeze::Applied { .. }))) =
+                    (&self.hub_switch, store.engram_freeze())
+                {
+                    let result = switch
+                        .advance(&store, &self.log, &self.records, deadline)
+                        .await;
+                    log_switch_result(&mut gate_error, &result);
                     continue;
                 }
                 let selection = if let Some(switch) = &self.hub_switch {

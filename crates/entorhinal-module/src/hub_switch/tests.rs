@@ -7,6 +7,8 @@ use crate::{
 use cortexkit_store_types::StorageDescriptor;
 use std::{path::PathBuf, time::Duration};
 
+mod drain;
+
 const A: &str = "11111111111111111111111111111111";
 const B: &str = "22222222222222222222222222222222";
 const BOX_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -40,6 +42,10 @@ struct Fixture {
 
 impl Fixture {
     fn new(member_b: bool) -> Self {
+        Self::for_author(member_b, [0x11; 16])
+    }
+
+    fn for_author(member_b: bool, author: [u8; 16]) -> Self {
         let (dir, descriptor) = crate::tests::scratch_descriptor("hub-switch");
         let store = RegistryStore::open(&descriptor).unwrap();
         store
@@ -52,17 +58,20 @@ impl Fixture {
                 Ok(())
             })
             .unwrap();
-        assert!(store.learn_verified_self_author(A, 1).unwrap());
+        assert!(store
+            .learn_verified_self_author(&encode_hex(&author), 1)
+            .unwrap());
         store.role_read("connector_home").unwrap();
         Self {
             dir,
             descriptor,
             slot: Arc::new(Mutex::new(Some(store))),
-            records: FakeRecord::new([0x11; 16]),
-            log: FakeLog::default().with_author([0x11; 16]),
+            records: FakeRecord::new(author),
+            log: FakeLog::default().with_author(author),
             switch: Switch {
                 probe: Arc::new(EmptyHub),
                 moves: Arc::default(),
+                drain: Default::default(),
             },
         }
     }
@@ -77,12 +86,18 @@ impl Fixture {
         RecordClient::new(Arc::new(FakeRecordConnector(self.records.clone())))
             .fenced(LegacyFence::new(&self.slot))
     }
-    async fn tick(&self) -> Result<(), HandlerError> {
+    async fn tick(&self) -> Result<Option<MigrationImage>, HandlerError> {
+        self.tick_with(&self.record_client()).await
+    }
+    async fn tick_with(
+        &self,
+        records: &RecordClient,
+    ) -> Result<Option<MigrationImage>, HandlerError> {
         self.switch
             .advance(
                 &self.store(),
                 &self.log.client().fenced(LegacyFence::new(&self.slot)),
-                &self.record_client(),
+                records,
                 Instant::now() + Duration::from_secs(2),
             )
             .await
@@ -101,6 +116,37 @@ impl Fixture {
             1,
             json!({"v":1,"migration_id":MIGRATION,"excluded":[]}),
             A,
+        );
+    }
+
+    fn apply_verified(&self, author: &str, body: Value) {
+        let store = self.store();
+        let position = store.identity_log_status().unwrap().last_applied_position + 1;
+        store
+            .apply_remote_entry(
+                &entorhinal_core::remote_apply::RemoteEntry {
+                    position,
+                    entry_id: format!("{position:032x}"),
+                    author: author.into(),
+                    signer: A.into(),
+                    key_id: "test".into(),
+                    envelope_version: 1,
+                    kind: "change".into(),
+                    entry: serde_json::to_vec(&body).unwrap(),
+                },
+                Some(&self.records.author),
+            )
+            .unwrap();
+    }
+
+    fn freeze_at_marker(&self, author: &str, roles: &[&str], excluded: &[&str]) {
+        self.apply_verified(
+            author,
+            json!({
+                "op":"log.migrated", "hub":true, "migration_id":MIGRATION,
+                "roles":roles, "excluded":excluded,
+                "tables_digest":self.store().migration_tables_digest().unwrap(),
+            }),
         );
     }
 }
@@ -148,10 +194,20 @@ async fn hub_switch_requires_every_verified_readiness_and_current_quiet() {
     );
     f.tick().await.unwrap();
     assert_eq!(f.log.head(), 0, "an old proposal's quiet must not count");
+    let mut peer = Fixture::for_author(true, [0x22; 16]);
+    peer.records = f.records.for_author([0x22; 16]);
+    peer.store().role_read("other").unwrap();
+    let peer_roles = peer.store().role_subjects().unwrap();
+    assert!(!f
+        .store()
+        .role_subjects()
+        .unwrap()
+        .iter()
+        .any(|name| name == "other"));
     f.put(
         &format!("hubquiet:{B}"),
         2,
-        json!({"v":1,"migration_id":MIGRATION,"roles":["other"]}),
+        json!({"v":1,"migration_id":MIGRATION,"roles":peer_roles}),
         B,
     );
     f.tick().await.unwrap();
@@ -159,6 +215,29 @@ async fn hub_switch_requires_every_verified_readiness_and_current_quiet() {
     let marker: MigrationMarker = serde_json::from_slice(&page.entries[0].entry).unwrap();
     assert_eq!(marker.roles, ["connector_home", "other"]);
     assert_eq!(page.head, 1);
+    // The follower can drain and image even if the marker writer stops here.
+    let marker = serde_json::to_value(marker).unwrap();
+    peer.apply_verified(A, marker.clone());
+    let follower_image = peer.tick().await.unwrap().unwrap();
+    assert!(
+        f.record_client()
+            .read(&format!("hubdrained:{A}"))
+            .await
+            .unwrap()
+            .absent
+    );
+    assert_eq!(
+        f.record_client().read("role:other").await.unwrap().version,
+        1
+    );
+    f.apply_verified(A, marker);
+    let writer_image = f.tick().await.unwrap().unwrap();
+    assert_eq!(writer_image, follower_image);
+    assert_eq!(writer_image.image.roles[1].role, "other");
+    assert_eq!(
+        f.record_client().read("role:other").await.unwrap().version,
+        2
+    );
 }
 
 #[tokio::test]
