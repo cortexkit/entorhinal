@@ -208,6 +208,43 @@ pub(crate) struct StatusReply {
     pub(crate) failure: Option<Value>,
 }
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct HubStatusReply {
+    #[serde(flatten)]
+    pub(crate) status: StatusReply,
+    pub(crate) upload: Option<UploadProgress>,
+    pub(crate) takeover: Option<HubTakeover>,
+}
+
+impl HubStatusReply {
+    pub(crate) fn upload_failure(&self) -> Option<(&str, Option<&Value>)> {
+        let upload = self
+            .upload
+            .as_ref()
+            .filter(|upload| upload.state == "failed")?;
+        Some((
+            upload.code.as_deref().unwrap_or("failed"),
+            upload.detail.as_ref(),
+        ))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct UploadProgress {
+    state: String,
+    code: Option<String>,
+    detail: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct HubTakeover {
+    // cut.takeover returns the state directly; cut.status nests it under takeover.
+    #[serde(alias = "takeover")]
+    pub(crate) state: TakeoverState,
+    pub(crate) code: Option<String>,
+    pub(crate) detail: Option<Value>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ReadReply {
     pub(crate) items: Vec<CutItem>,
@@ -391,6 +428,15 @@ impl DoorClient {
     pub(crate) async fn status(&self, cut: &CutRequest) -> Result<StatusReply, DoorError> {
         self.call(Request::Status(cut.clone())).await
     }
+    pub(crate) async fn seal_hub(
+        &self,
+        request: &SealRequest,
+    ) -> Result<HubStatusReply, DoorError> {
+        self.call(Request::Seal(request.clone())).await
+    }
+    pub(crate) async fn status_hub(&self, cut: &CutRequest) -> Result<HubStatusReply, DoorError> {
+        self.call(Request::Status(cut.clone())).await
+    }
     pub(crate) async fn read(&self, cut: &CutRequest) -> Result<ReadReply, DoorError> {
         self.call(Request::Read(cut.clone())).await
     }
@@ -419,7 +465,7 @@ impl DoorClient {
         cut_id: &str,
         author: &str,
         cut: &SealedCut,
-    ) -> Result<TakeoverReply, DoorError> {
+    ) -> Result<HubTakeover, DoorError> {
         self.call(Request::Takeover(TakeoverRequest {
             cut_id: cut_id.into(),
             author: Some(author.into()),

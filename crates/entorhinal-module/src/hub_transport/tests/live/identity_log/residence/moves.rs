@@ -2,14 +2,15 @@ use super::*;
 use crate::{
     door_client::Request as DoorRequest,
     fake_daemon::{DaemonSnapshot, FakeDaemon},
-    fake_door::FakeDoor,
-    fake_participant::FakeParticipant,
+    fake_door::{Effect as DoorEffect, FakeDoor},
+    fake_participant::{Effect as ParticipantEffect, FakeParticipant},
     hub_moves::{move_key, State},
     hub_residence::MovePosition,
+    log_client::TransportError,
     move_driver::{SqlOperations, Worker},
     move_receiver::{poll_hub, Receiver},
     move_source::Source,
-    participant_client::AgentRef,
+    participant_client::{AgentRef, Refusal},
     participant_discovery::{provider_role, ParticipantDiscovery},
 };
 use entorhinal_core::move_store::{AgentMove, MoveSide, MoveStep};
@@ -165,6 +166,30 @@ impl Moving {
             self.rig.b.handler.liveness.clone(),
         )
     }
+    fn receiver_door(&self) -> FakeDoor {
+        self.door.for_author(std::array::from_fn(|i| {
+            u8::from_str_radix(&B[2 * i..2 * i + 2], 16).unwrap()
+        }))
+    }
+    fn door_count(&self, author: &str, op: &str) -> usize {
+        self.door
+            .calls()
+            .iter()
+            .filter(|call| {
+                call.author == author && call.request.op() == op && call.request.cut_id() == CUT
+            })
+            .count()
+    }
+    async fn finish_receiver_abort(&self) {
+        self.receiver_tick().await;
+        self.watch(State::Aborted).await;
+        self.receiver_tick().await;
+        assert_eq!(
+            self.receiver.row(CUT).await.unwrap().step,
+            MoveStep::Aborted
+        );
+        assert_eq!(self.a.move_origin(MIGRATED).unwrap(), (1, A.into()));
+    }
     async fn watch(&self, state: State) {
         until(|| {
             [&self.a, &self.b].iter().all(|hub| {
@@ -225,8 +250,19 @@ async fn hub_move_restarts_through_the_full_handoff() {
     assert_eq!(f.receiver.row(CUT).await.unwrap().step, MoveStep::Claimed);
     f.receiver_tick().await;
     f.watch(State::Activated).await;
+    // The receiver can clean up while the source is offline. Once the source
+    // comes back, its own terminal checkpoint must queue a separate release.
+    crate::cut_release::tick(&f.receiver).await.unwrap();
+    assert_eq!(f.door_count(B, "cut.release"), 1);
+    assert_eq!(f.door_count(A, "cut.release"), 0);
     f.source_tick().await;
     f.watch(State::Released).await;
+    crate::cut_release::tick(&f.source).await.unwrap();
+    assert_eq!(f.door_count(A, "cut.release"), 1);
+    assert_eq!(
+        f.source.row(CUT).await.unwrap().plan["_cut_release"]["state"],
+        "released"
+    );
     f.receiver_tick().await;
     assert_eq!(f.source.row(CUT).await.unwrap().step, MoveStep::Released);
     assert_eq!(f.receiver.row(CUT).await.unwrap().step, MoveStep::Done);
@@ -604,4 +640,177 @@ async fn hub_move_missing_hub_object_aborts_before_claim() {
     assert_eq!(f.receiver.row(CUT).await.unwrap().step, MoveStep::Aborted);
     assert!(f.to.calls().is_empty());
     assert_eq!(f.a.move_origin(MIGRATED).unwrap(), (1, A.into()));
+}
+
+#[tokio::test]
+async fn hub_move_receiver_aborts_its_door_on_preclaim_stop() {
+    let Some(f) = Moving::new().await else {
+        return;
+    };
+    f.publish().await;
+    f.to.script(
+        "agent_data.import",
+        ParticipantEffect::Refuse(Refusal {
+            code: "local_advanced".into(),
+            detail: None,
+            message: None,
+        }),
+    );
+    poll_hub(&f.receiver, &f.b).await.unwrap();
+    f.receiver_tick().await;
+    // A lost response forces the receiver to repeat the successful abort.
+    f.receiver_door()
+        .script("cut.abort", DoorEffect::LoseReply(TransportError::NoReply));
+    f.finish_receiver_abort().await;
+    assert_eq!(f.door_count(B, "cut.abort"), 2);
+    assert_eq!(f.door_count(B, "cut.accept"), 0);
+    assert!(f.to.staged().is_empty());
+}
+
+#[tokio::test]
+async fn hub_move_upload_failure_aborts_without_resealing() {
+    let Some(f) = Moving::new().await else {
+        return;
+    };
+    f.door.script(
+        "cut.status",
+        DoorEffect::UploadFailed("unavailable".into(), Some(json!({"vaultCode":"closed"}))),
+    );
+    f.source_tick().await;
+    assert!(!f.from.frozen().is_empty());
+    f.source_tick().await;
+    f.source_tick().await;
+    let row = f.source.row(CUT).await.unwrap();
+    assert_eq!(row.step, MoveStep::Aborted);
+    assert_eq!(row.reason.as_deref(), Some("unavailable"));
+    assert_eq!(row.detail.unwrap()["detail"]["vaultCode"], "closed");
+    assert_eq!(f.door_count(A, "cut.seal"), 1);
+    assert_eq!(f.door_count(A, "cut.abort"), 1);
+    assert!(f.from.frozen().is_empty());
+    assert_eq!(row.record_version, 0);
+    assert!(f.a.watched_move(CUT).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn hub_move_cut_store_full_aborts_at_seal() {
+    let Some(f) = Moving::new().await else {
+        return;
+    };
+    f.door
+        .script("cut.seal", DoorEffect::Refuse("cut_store_full".into()));
+    f.source_tick().await;
+    assert!(!f.from.frozen().is_empty());
+    f.source_tick().await;
+    f.source_tick().await;
+    let row = f.source.row(CUT).await.unwrap();
+    assert_eq!(row.step, MoveStep::Aborted);
+    assert_eq!(row.reason.as_deref(), Some("cut_store_full"));
+    assert_eq!(row.detail.unwrap()["op"], "cut.seal");
+    assert_eq!(f.door_count(A, "cut.seal"), 1);
+    assert_eq!(f.door_count(A, "cut.abort"), 1);
+    assert!(f.from.frozen().is_empty());
+    assert_eq!(row.record_version, 0);
+    assert!(f.a.watched_move(CUT).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn hub_move_key_unavailable_aborts_at_takeover() {
+    let Some(f) = Moving::new().await else {
+        return;
+    };
+    f.publish().await;
+    f.receiver_door()
+        .script("cut.takeover", DoorEffect::Refuse("key_unavailable".into()));
+    poll_hub(&f.receiver, &f.b).await.unwrap();
+    f.receiver_tick().await;
+    f.finish_receiver_abort().await;
+    f.source_tick().await;
+    let row = f.source.row(CUT).await.unwrap();
+    assert_eq!(row.step, MoveStep::Aborted);
+    assert_eq!(row.reason.as_deref(), Some("key_unavailable"));
+    assert_eq!(f.door_count(B, "cut.takeover"), 1);
+    assert_eq!(f.door_count(B, "cut.abort"), 1);
+    assert_eq!(f.door_count(A, "cut.abort"), 1);
+    assert!(f.from.frozen().is_empty());
+}
+
+#[tokio::test]
+async fn hub_move_failed_takeover_status_aborts_with_door_detail() {
+    let Some(f) = Moving::new().await else {
+        return;
+    };
+    f.publish().await;
+    let door = f.receiver_door();
+    door.script(
+        "cut.takeover",
+        DoorEffect::Takeover(crate::door_client::TakeoverProgress {
+            state: crate::door_client::TakeoverState::InProgress,
+            session_ref: None,
+            code: None,
+        }),
+    );
+    door.script(
+        "cut.status",
+        DoorEffect::HubTakeoverFailed("unavailable".into(), Some(json!({"vaultCode":"closed"}))),
+    );
+    poll_hub(&f.receiver, &f.b).await.unwrap();
+    f.receiver_tick().await;
+    f.receiver_tick().await;
+    f.finish_receiver_abort().await;
+    let row = f.receiver.row(CUT).await.unwrap();
+    assert_eq!(row.reason.as_deref(), Some("unavailable"));
+    assert_eq!(row.detail.unwrap()["detail"]["vaultCode"], "closed");
+    assert_eq!(f.door_count(B, "cut.takeover"), 1);
+    assert_eq!(f.door_count(B, "cut.abort"), 1);
+}
+
+#[tokio::test]
+async fn hub_move_import_pending_retries_inside_the_step() {
+    let Some(mut f) = Moving::new().await else {
+        return;
+    };
+    f.publish().await;
+    f.to.script(
+        "agent_data.import",
+        ParticipantEffect::Refuse(Refusal {
+            code: "cut_import_pending".into(),
+            detail: None,
+            message: None,
+        }),
+    );
+    poll_hub(&f.receiver, &f.b).await.unwrap();
+    f.receiver_tick().await;
+    let row = f.receiver.row(CUT).await.unwrap();
+    assert_eq!(row.step, MoveStep::PickedUp);
+    assert!(row.abort_requested.is_none());
+    assert_eq!(row.hold.unwrap()["code"], "cut_import_pending");
+    f.receiver.clock = || crate::unix_millis() + 1_000;
+    f.receiver_tick().await;
+    assert_eq!(f.receiver.row(CUT).await.unwrap().step, MoveStep::Imported);
+    assert_eq!(f.door_count(B, "cut.takeover"), 1);
+}
+
+#[tokio::test]
+async fn hub_move_cut_accepted_during_abort_holds_the_fork() {
+    let Some(f) = Moving::new().await else {
+        return;
+    };
+    f.stage().await;
+    f.abort();
+    f.receiver_door()
+        .script("cut.abort", DoorEffect::Refuse("cut_accepted".into()));
+    f.receiver_tick().await;
+    f.watch(State::Aborted).await;
+    f.receiver_tick().await;
+    let row = f.receiver.row(CUT).await.unwrap();
+    assert_eq!(row.step, MoveStep::Staged);
+    assert_eq!(row.hold.unwrap()["code"], "cut_accepted");
+    assert_eq!(
+        row.plan["_receiver"]["activation_fork"]["code"],
+        "cut_accepted"
+    );
+    assert!(f.to.staged().is_empty());
+    f.receiver_tick().await;
+    assert_eq!(f.door_count(B, "cut.abort"), 1);
+    assert_eq!(f.receiver.row(CUT).await.unwrap().step, MoveStep::Staged);
 }

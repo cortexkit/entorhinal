@@ -9,17 +9,31 @@ fn conflict() -> Failure {
     failure
 }
 
-fn cut_failure(op: &str, error: DoorError, claimed: bool) -> Failure {
+fn cut_hold(op: &str, error: &DoorError) -> Failure {
     let mut failure = Failure::hold(error.code(), json!({"op":op,"code":error.code()}));
-    if let DoorError::Refused { message, .. } = &error {
+    if let DoorError::Refused { message, .. } = error {
         failure.refusal = Some(Box::new(PeerRefusal {
             message: message.clone(),
         }));
     }
+    failure
+}
+
+fn cut_failure(op: &str, error: DoorError, claimed: bool) -> Failure {
+    let mut failure = cut_hold(op, &error);
     if !error.retryable() {
         failure.action = Some(DriverAction::TerminalForStep);
         if !claimed {
-            failure.reason = Some(MoveReason::DoorRefused);
+            failure.reason = Some(match &error {
+                DoorError::Refused { code, detail, .. }
+                    if op == "cut.takeover" && code == "key_unavailable" =>
+                {
+                    failure.detail["detail"] = json!(detail);
+                    failure.detail = wire::bounded_detail(&failure.detail);
+                    MoveReason::from(code.clone())
+                }
+                _ => MoveReason::DoorRefused,
+            });
         }
     }
     failure
@@ -52,7 +66,7 @@ impl Receiver {
             cut_id: self.cut.clone(),
         };
         let previous = if progress.takeover_sent {
-            match self.worker.door.status(&cut).await {
+            match self.worker.door.status_hub(&cut).await {
                 Ok(status) => status.takeover,
                 Err(DoorError::Refused { code, .. }) if code == "not_found" => None,
                 Err(error) => return Err(cut_failure("cut.status", error, false)),
@@ -60,26 +74,22 @@ impl Receiver {
         } else {
             None
         };
-        let (state, code) = match previous {
-            Some(status) if status.state != TakeoverState::NotStarted => {
-                (status.state, status.code)
-            }
+        let takeover = match previous {
+            Some(status) if status.state != TakeoverState::NotStarted => status,
             _ => {
                 progress.takeover_sent = true;
                 self.save(row, progress).await?;
                 if row.abort_requested.is_some() {
                     return Ok(false);
                 }
-                let reply = self
-                    .worker
+                self.worker
                     .door
                     .takeover_hub(&self.cut, &published.writer, &published.body.cut)
                     .await
-                    .map_err(|error| cut_failure("cut.takeover", error, false))?;
-                (reply.takeover, reply.code)
+                    .map_err(|error| cut_failure("cut.takeover", error, false))?
             }
         };
-        match state {
+        match takeover.state {
             TakeoverState::Taken => {
                 let read = self
                     .worker
@@ -98,34 +108,43 @@ impl Receiver {
                 Ok(true)
             }
             TakeoverState::Failed => {
-                let Some(code) = code else {
-                    return Err(Failure::abort(
-                        MoveReason::DoorRefused,
-                        json!({"op":"cut.takeover","code":"failed"}),
-                    ));
-                };
-                let failure = cut_failure(
-                    "cut.takeover",
-                    DoorError::Refused {
-                        code,
-                        detail: None,
-                        message: None,
-                    },
-                    false,
+                // A failed job is terminal even if its code, when returned by a
+                // door call instead of a completed job, would allow a retry.
+                let code = takeover.code.unwrap_or_else(|| "failed".into());
+                let mut failure = Failure::hold(
+                    &code,
+                    wire::bounded_detail(
+                        &json!({"op":"cut.takeover","code":code,"detail":takeover.detail}),
+                    ),
                 );
-                if failure.reason.is_none() {
-                    // A failed retryable job is restarted with the same cut locator.
-                    let _ = self
-                        .worker
-                        .door
-                        .takeover_hub(&self.cut, &published.writer, &published.body.cut)
-                        .await
-                        .map_err(|error| cut_failure("cut.takeover", error, false))?;
-                }
+                failure.reason = Some(MoveReason::from(code));
+                failure.refusal = Some(Box::new(PeerRefusal { message: None }));
                 Err(failure)
             }
             _ => Ok(false),
         }
+    }
+
+    pub(super) async fn abort_hub_cut(&self) -> Result<(), Failure> {
+        let cut = DoorCut {
+            cut_id: self.cut.clone(),
+        };
+        self.worker
+            .door
+            .abort(&cut)
+            .await
+            .map(|_| ())
+            .map_err(|error| {
+                // The move is already aborting. A failed cleanup call must not
+                // replace the abort reason with a second abort request.
+                let mut failure = cut_hold("cut.abort", &error);
+                match failure.code.as_str() {
+                    "cut_accepted" => failure.action = Some(DriverAction::TerminalForStep),
+                    "caller_forbidden" | "invalid_request" => failure.violation = true,
+                    _ => {}
+                }
+                failure
+            })
     }
 
     pub(super) async fn advance_hub(

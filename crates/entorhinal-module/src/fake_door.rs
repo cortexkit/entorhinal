@@ -21,8 +21,10 @@ pub(crate) enum Effect {
     FailBefore(TransportError),
     LoseReply(TransportError),
     Seal(SealState, Option<Value>),
+    UploadFailed(String, Option<Value>),
     Handoff(HandoffReply),
     Takeover(TakeoverProgress),
+    HubTakeoverFailed(String, Option<Value>),
     Release(bool),
 }
 
@@ -42,6 +44,10 @@ pub(crate) struct Cut {
     pub(crate) aborted: bool,
     takeovers: BTreeMap<String, TakeoverProgress>,
     receiver: Option<String>,
+    upload: Option<Value>,
+    hub_takeover_detail: Option<Value>,
+    hub_import_aborted: bool,
+    hub_import_accepted: bool,
 }
 
 #[derive(Default)]
@@ -439,25 +445,33 @@ fn takeover(state: TakeoverState) -> TakeoverProgress {
 }
 
 fn local_status(cut: &Cut) -> Value {
-    json!(StatusReply {
+    let mut status = json!(StatusReply {
         state: cut.state,
         manifest_sha256: (cut.state == SealState::Sealed).then(|| "opaque-manifest".into()),
         sealed_key: (cut.state == SealState::Sealed).then(|| "opaque-key".into()),
         handoff: Some(cut.handoff.clone()),
         takeover: None,
         failure: cut.failure.clone()
-    })
+    });
+    if let Some(upload) = &cut.upload {
+        status["upload"] = upload.clone();
+    }
+    status
 }
 
 fn remote_status(cut: &Cut, author: &str) -> Value {
-    json!(StatusReply {
+    let mut status = json!(StatusReply {
         state: cut.state,
         manifest_sha256: None,
         sealed_key: None,
         handoff: None,
         takeover: cut.takeovers.get(author).cloned(),
         failure: None
-    })
+    });
+    if let Some(detail) = &cut.hub_takeover_detail {
+        status["takeover"]["detail"] = detail.clone();
+    }
+    status
 }
 
 fn latch(state: &mut State, cut_id: &str) {
@@ -481,6 +495,9 @@ fn apply_effect(state: &mut State, cut_id: &str, author: &str, effect: Option<&E
                 cut.handoff = handoff(HandoffState::Aborted);
             }
         }
+        Some(Effect::UploadFailed(code, detail)) if cut.receiver.is_some() => {
+            cut.upload = Some(json!({"state":"failed","code":code,"detail":detail}));
+        }
         Some(Effect::Handoff(next))
             if !matches!(
                 cut.handoff.state,
@@ -496,6 +513,19 @@ fn apply_effect(state: &mut State, cut_id: &str, author: &str, effect: Option<&E
                 .is_none_or(|progress| progress.state != TakeoverState::Taken) =>
         {
             cut.takeovers.insert(author.into(), next.clone());
+        }
+        Some(Effect::HubTakeoverFailed(code, detail))
+            if cut.receiver.as_deref() == Some(author) =>
+        {
+            cut.takeovers.insert(
+                author.into(),
+                TakeoverProgress {
+                    state: TakeoverState::Failed,
+                    session_ref: None,
+                    code: Some(code.clone()),
+                },
+            );
+            cut.hub_takeover_detail = detail.clone();
         }
         _ => {}
     }
@@ -572,6 +602,10 @@ fn execute(
                     aborted: false,
                     takeovers: BTreeMap::new(),
                     receiver: seal.receiver.clone(),
+                    upload: None,
+                    hub_takeover_detail: None,
+                    hub_import_aborted: false,
+                    hub_import_accepted: false,
                 },
             );
         }
@@ -663,7 +697,7 @@ fn execute(
                 if cut.receiver.as_deref() != Some(author) {
                     return Err(refuse("hub_not_granted", None));
                 }
-                if cut.aborted {
+                if cut.aborted || cut.hub_import_aborted {
                     return Err(refuse("cut_object_missing", None));
                 }
                 if request.author.as_ref() != Some(&cut.author)
@@ -689,14 +723,31 @@ fn execute(
                 *progress = takeover(TakeoverState::InProgress);
             }
             apply_effect(state, cut_id, author, effect);
-            let progress = &state.cuts[cut_id].takeovers[author];
-            Ok(json!(TakeoverReply {
+            let cut = &state.cuts[cut_id];
+            let progress = &cut.takeovers[author];
+            let mut reply = json!(TakeoverReply {
                 takeover: progress.state,
                 session_ref: progress.session_ref.clone(),
                 code: progress.code.clone()
-            }))
+            });
+            if let Some(detail) = &cut.hub_takeover_detail {
+                reply["detail"] = detail.clone();
+            }
+            Ok(reply)
         }
         Request::Abort(_) => {
+            if cut.receiver.as_deref() == Some(author) {
+                if cut.hub_import_accepted {
+                    return Err(refuse("cut_accepted", None));
+                }
+                let cut = state.cuts.get_mut(cut_id).unwrap();
+                cut.hub_import_aborted = true;
+                cut.takeovers.remove(author);
+                return Ok(json!(AbortReply {
+                    handoff: HandoffState::Aborted,
+                    state: SealState::Aborted,
+                }));
+            }
             // Once either handoff or takeover starts, abort cannot restore ownership.
             // Earlier aborts keep published cuts readable but cancel pending ones
             // permanently (AGENT_SYNC.md, Abort).
@@ -751,6 +802,9 @@ fn execute(
                 .iter()
                 .map(|item| item.session_ref.clone())
                 .collect();
+            if cut.receiver.as_deref() == Some(author) {
+                state.cuts.get_mut(cut_id).unwrap().hub_import_accepted = true;
+            }
             let lifted: Vec<_> = refs
                 .into_iter()
                 .filter(|reference| {

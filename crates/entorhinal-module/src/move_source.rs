@@ -4,7 +4,8 @@
 use crate::{
     claim_codec::AgentClaim,
     door_client::{
-        CutItem, CutRequest as DoorCut, DoorError, HandoffState, SealRequest, SealState,
+        CutItem, CutRequest as DoorCut, DoorError, HandoffState, HubStatusReply, SealRequest,
+        SealState, StatusReply,
     },
     hub_moves::{self, SeenMove, State as HubState},
     hub_residence::{MovePosition, MoveTransfer, Residence},
@@ -72,6 +73,9 @@ struct Progress {
     /// existed still decode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     seal_refused: Option<String>,
+    /// A failed hub upload cannot be restarted by replaying the seal.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    terminal_hub_seal: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sealed_cut: Option<crate::door_client::SealedCut>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -150,6 +154,7 @@ struct Failure {
     diagnostic: bool,
     unknown: bool,
     contract_violation: bool,
+    terminal_hub_seal: bool,
     /// Set when the door or a participant answered with a refusal (or a
     /// terminal seal state), as opposed to a lost reply or a local store or
     /// record error. Boxed to keep `Result<_, Failure>` small.
@@ -166,6 +171,7 @@ impl Failure {
             diagnostic: false,
             unknown: false,
             contract_violation: false,
+            terminal_hub_seal: false,
             refusal: None,
         }
     }
@@ -198,6 +204,7 @@ impl Failure {
             refusal: (!unknown).then(|| Box::new(PeerRefusal { message })),
             unknown,
             contract_violation,
+            terminal_hub_seal: false,
         }
     }
     fn door(op: &str, error: DoorError) -> Self {
@@ -214,6 +221,14 @@ impl Failure {
                 failure.unknown = true;
             }
         }
+        failure
+    }
+    fn hub_seal(op: &str, error: DoorError) -> Self {
+        let mut failure = Self::door(op, error);
+        failure.terminal_hub_seal = matches!(
+            failure.code.as_str(),
+            "cut_store_full" | "hub_unavailable" | "key_unavailable"
+        );
         failure
     }
     fn refuse(&mut self, message: Option<String>) {
@@ -246,6 +261,7 @@ impl Failure {
     }
     fn retryable(&self) -> bool {
         !self.contract_violation
+            && !self.terminal_hub_seal
             && if self.module.is_some() {
                 matches!(
                     self.action(),
@@ -342,6 +358,12 @@ impl Source {
     async fn save(&self, row: &mut AgentMove, plan: &Plan, clear: bool) -> Result<(), Failure> {
         row.plan =
             serde_json::to_value(plan).map_err(|_| Failure::new("plan.save", "plan_malformed"))?;
+        if plan.hub_gen.is_some() && row.step == Step::Released {
+            // The receiver releases the hub objects; the source still has a
+            // local reservation. Queue its release with the terminal checkpoint
+            // so a restart cannot miss it. The store preserves any prior outcome.
+            row.plan["_cut_release"] = json!({"state":"pending","attempts":0,"retry_at_ms":0});
+        }
         self.worker.save(row, clear).await?;
         Ok(())
     }
@@ -467,7 +489,7 @@ impl Source {
         plan: &mut Plan,
         error: Failure,
     ) -> Result<Option<Duration>, HandlerError> {
-        if error.code == "move_state_conflict" {
+        if error.code == "move_state_conflict" && !error.terminal_hub_seal {
             // An inconsistent move/residence pair cannot authorize an abort or a handover.
             let detail = error.detail();
             plan.source.contract_violation = Some(detail.clone());
@@ -556,7 +578,10 @@ impl Source {
                 .map_err(|f| HandlerError::new(&f.code, f.detail.to_string()))?;
             Ok(Some(delay.min(POLL)))
         } else {
-            let reason = if error.op.starts_with("cut.") {
+            let reason = if error.terminal_hub_seal {
+                plan.source.terminal_hub_seal = true;
+                MoveReason::from(error.code.clone())
+            } else if error.op.starts_with("cut.") {
                 MoveReason::DoorRefused
             } else if matches!(error.code.as_str(), "move_too_large" | "record_too_large") {
                 MoveReason::MoveTooLarge
@@ -574,9 +599,15 @@ impl Source {
             if error.op == "cut.seal" && error.refused() && row.step == Step::Exported {
                 plan.source.seal_refused = Some(error.code.clone());
             }
-            row.abort_requested = Some(json!({"reason":reason,"detail":error.detail()}));
+            let detail = error.detail();
+            let detail = if error.terminal_hub_seal {
+                wire::bounded_detail(&detail)
+            } else {
+                detail
+            };
+            row.abort_requested = Some(json!({"reason":reason,"detail":detail}));
             row.reason = Some(reason);
-            row.detail = Some(error.detail());
+            row.detail = Some(detail);
             self.save(row, plan, false)
                 .await
                 .map_err(|f| HandlerError::new(&f.code, f.detail.to_string()))?;
@@ -1015,16 +1046,12 @@ impl Source {
         }
     }
 
-    async fn seal_hub(
-        &self,
-        row: &mut AgentMove,
-        plan: &mut Plan,
-    ) -> Result<crate::door_client::StatusReply, Failure> {
+    async fn seal_hub(&self, row: &mut AgentMove, plan: &mut Plan) -> Result<StatusReply, Failure> {
         if row.seal_sent {
-            match self.worker.door.status(&self.door_cut()).await {
-                Ok(status) => return Ok(status),
+            match self.worker.door.status_hub(&self.door_cut()).await {
+                Ok(status) => return Self::check_hub_upload(status),
                 Err(DoorError::Refused { code, .. }) if code == "not_found" => {}
-                Err(error) => return Err(Failure::door("cut.status", error)),
+                Err(error) => return Err(Failure::hub_seal("cut.status", error)),
             }
         } else {
             self.check_target(plan)?;
@@ -1040,16 +1067,33 @@ impl Source {
                 )));
             }
         }
-        self.worker
+        let sealed = self
+            .worker
             .door
-            .seal(&self.seal_request(plan))
+            .seal_hub(&self.seal_request(plan))
             .await
-            .map_err(|e| Failure::door("cut.seal", e))?;
-        self.worker
+            .map_err(|e| Failure::hub_seal("cut.seal", e))?;
+        Self::check_hub_upload(sealed)?;
+        let status = self
+            .worker
             .door
-            .status(&self.door_cut())
+            .status_hub(&self.door_cut())
             .await
-            .map_err(|e| Failure::door("cut.status", e))
+            .map_err(|e| Failure::hub_seal("cut.status", e))?;
+        Self::check_hub_upload(status)
+    }
+
+    fn check_hub_upload(status: HubStatusReply) -> Result<StatusReply, Failure> {
+        if let Some((code, detail)) = status.upload_failure() {
+            // The upload job is terminal for this cut, even if the same code
+            // would be retryable from a different door operation.
+            let mut failure = Failure::new("cut.status", code);
+            failure.detail = detail.cloned().unwrap_or(Value::Null);
+            failure.refuse(None);
+            failure.terminal_hub_seal = true;
+            return Err(failure);
+        }
+        Ok(status.status)
     }
 
     async fn publish_hub(&self, row: &mut AgentMove, plan: &mut Plan) -> Result<(), Failure> {
@@ -1362,9 +1406,11 @@ impl Source {
             }
         }
         self.abort_participants(row, plan).await?;
-        // A seal the door refused created no cut there, so a recorded refusal
-        // skips both door calls.
-        if row.seal_sent && plan.source.seal_refused.is_none() {
+        if row.seal_sent && plan.source.terminal_hub_seal {
+            // A failed hub upload may still have reserved space. Abort the
+            // original cut without replaying its terminal seal.
+            self.abort_door_cut().await?;
+        } else if row.seal_sent && plan.source.seal_refused.is_none() {
             // seal_sent is durable before the send, so it does not prove the door
             // received the seal. Repeat the identical seal so the door reaches a
             // known state, then abort that cut.
