@@ -273,7 +273,7 @@ struct Progress {
     takeover_sent: bool,
     /// Plan participants this machine leaves out of the whole receiver side of the
     /// move: each was neither configured nor registered here when the
-    /// preconditions ran, and the source sent no refs for it, so there is no
+    /// preconditions ran, and it had no planned refs or sealed cut items, so there is no
     /// data to import, check for forks, activate or undo. `None` means the
     /// preconditions have not decided yet. Once decided, every later step and
     /// every restart reads this set instead of asking the daemon again, so a
@@ -352,7 +352,7 @@ pub(crate) fn import_losses(row: &AgentMove) -> Vec<Value> {
 }
 
 /// The plan participants this receiver calls: every one except those
-/// recorded as skipped because they are absent here and carry no refs.
+/// recorded as skipped because they are absent here and carry no data.
 fn called<'a>(plan: &'a MoveRecord, progress: &Progress) -> Vec<&'a wire::MoveParticipant> {
     plan.participants
         .iter()
@@ -360,22 +360,19 @@ fn called<'a>(plan: &'a MoveRecord, progress: &Progress) -> Vec<&'a wire::MovePa
         .collect()
 }
 
-/// Plan participants this machine can leave out of the move: the source sent no
-/// refs for them, and this machine neither configures nor registers them, so they
-/// cannot hold local data for the agent and have nothing staged to undo.
-fn absent_without_refs(
-    plan: &MoveRecord,
+/// Plan participants this machine neither configures nor registers.
+fn absent_participants<'a>(
+    plan: &'a MoveRecord,
     supervisor: &SupervisorListResponse,
     catalog: &CatalogList,
-) -> Vec<String> {
+) -> Vec<&'a wire::MoveParticipant> {
     let absent = |module: &str| {
         !supervisor.modules.iter().any(|m| m.module_id == module)
             && !catalog.modules.iter().any(|m| m.module_id == module)
     };
     plan.participants
         .iter()
-        .filter(|p| p.refs.is_empty() && absent(&p.module_id))
-        .map(|p| p.module_id.clone())
+        .filter(|p| absent(&p.module_id))
         .collect()
 }
 
@@ -607,6 +604,64 @@ impl Receiver {
         })?;
         Ok((supervisor, catalog))
     }
+    async fn decide_skipped_absent(
+        &self,
+        row: &mut AgentMove,
+        plan: &MoveRecord,
+        progress: &mut Progress,
+        supervisor: &SupervisorListResponse,
+        catalog: &CatalogList,
+    ) -> Result<(), Failure> {
+        if progress.skipped_absent.is_some() {
+            return Ok(());
+        }
+        let absent = absent_participants(plan, supervisor, catalog);
+        // Only a sealed manifest from the source can prove that planned refs
+        // carry no data. Do not add a door dependency to the no-ref rule.
+        let items = if absent.iter().any(|p| !p.refs.is_empty()) {
+            let read = self
+                .worker
+                .door
+                .read(&DoorCut {
+                    cut_id: self.cut.clone(),
+                })
+                .await
+                .map_err(|e| {
+                    let mut failure =
+                        Failure::hold(e.code(), json!({"op":"cut.read","error":format!("{e:?}")}));
+                    if let crate::door_client::DoorError::Refused { message, .. } = e {
+                        failure.refusal = Some(Box::new(PeerRefusal { message }));
+                    }
+                    failure
+                })?;
+            if read.author != plan.from {
+                tracing::warn!(cut = %self.cut, expected_author = %plan.from, author = %read.author,
+                    "sealed cut author does not match move source");
+                let mut failure = Failure::hold(
+                    "cut_author_mismatch",
+                    json!({"op":"cut.read","expected_author":plan.from,"author":read.author}),
+                );
+                failure.diagnostic = true;
+                return Err(failure);
+            }
+            read.items
+        } else {
+            Vec::new()
+        };
+        progress.skipped_absent = Some(
+            absent
+                .into_iter()
+                .filter(|p| {
+                    p.refs.is_empty()
+                        || !items
+                            .iter()
+                            .any(|item| item.stream == format!("reserved:{}", p.module_id))
+                })
+                .map(|p| p.module_id.clone())
+                .collect(),
+        );
+        self.save(row, progress).await
+    }
     fn request(&self, p: &wire::MoveParticipant) -> Result<CutRequest, Failure> {
         Ok(CutRequest::new(
             Refs::new(
@@ -835,17 +890,15 @@ impl Receiver {
         self.catalog_preflight(plan).await?;
         let (supervisor, catalog) = self.discovery_lists().await?;
         // The source plans every module that declares agent data, even one with
-        // no refs for this agent. A module that is not on this machine at all cannot
-        // hold local data for the agent, and with no refs the source carries none,
+        // no data for this agent. A module that is not on this machine at all cannot
+        // hold local data for the agent. With no refs or no sealed items it carries none,
         // so skip it for the rest of the move. Decide once and persist the set:
         // later steps and restarts must not call a module this machine never checked.
         // A configured but disabled or warming module is not absent: it may still
         // keep data on disk, so the move holds below until it is enabled and
         // its fork check (agent_data.diverged) can run.
-        if progress.skipped_absent.is_none() {
-            progress.skipped_absent = Some(absent_without_refs(plan, &supervisor, &catalog));
-            self.save(row, progress).await?;
-        }
+        self.decide_skipped_absent(row, plan, progress, &supervisor, &catalog)
+            .await?;
         for p in called(plan, progress) {
             let configured = supervisor
                 .modules
@@ -1601,13 +1654,13 @@ impl Receiver {
         // participants to skip. Decide here with the same rule, before any
         // participant call, so cleanup never waits on a module this machine lacks.
         // That is safe even if an older receiver already imported: a
-        // participant with no refs staged nothing, so it has nothing to undo.
+        // participant with no refs or sealed items staged nothing to undo.
         // Persisting the set makes a restart mid-cleanup skip the same modules.
         let undecided = progress.skipped_absent.is_none();
         if undecided {
             let (supervisor, catalog) = self.discovery_lists().await?;
-            progress.skipped_absent = Some(absent_without_refs(plan, &supervisor, &catalog));
-            self.save(row, progress).await?;
+            self.decide_skipped_absent(row, plan, progress, &supervisor, &catalog)
+                .await?;
         }
         self.settle_pending(row, plan, progress).await?;
         let request = row
@@ -2031,6 +2084,9 @@ mod tests {
     }
     impl Fixture {
         async fn new(held: bool) -> Self {
+            Self::with_items(held, Vec::new()).await
+        }
+        async fn with_items(held: bool, mut items: Vec<crate::door_client::CutItem>) -> Self {
             NOW.with(|n| n.set(1000));
             let (dir, descriptor) = scratch_descriptor("move-receiver");
             let store = RegistryStore::open(&descriptor).unwrap();
@@ -2096,7 +2152,10 @@ mod tests {
                 end_offset: 42,
                 digest: "a".repeat(64),
             };
-            door.set_stream(item.clone());
+            items.push(item);
+            for item in &items {
+                door.set_stream(item.clone());
+            }
             door.script(
                 "cut.seal",
                 crate::fake_door::Effect::Seal(crate::door_client::SealState::Published, None),
@@ -2104,7 +2163,7 @@ mod tests {
             door.client()
                 .seal(&SealRequest {
                     cut_id: CUT.into(),
-                    items: vec![item],
+                    items,
                 })
                 .await
                 .unwrap();
@@ -2983,8 +3042,21 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn receiver_skips_an_absent_participant_with_no_refs_for_the_whole_move() {
+        check_absent_participant_completes(json!([]), 1, 1).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receiver_itemless_absent_participant_completes_with_planned_refs() {
+        check_absent_participant_completes(json!([{"ref_kind":"session","ref":"r2"}]), 2, 2).await;
+    }
+
+    async fn check_absent_participant_completes(
+        refs: Value,
+        bound_refs: usize,
+        expected_reads: usize,
+    ) {
         let f = Fixture::new(false).await;
-        let broca = add_broca(&f, json!([])).await;
+        let broca = add_broca(&f, refs).await;
         f.pickup().await;
         let mut receiver = f.receiver();
         f.until(&mut receiver, Step::Activated).await;
@@ -3004,13 +3076,30 @@ mod tests {
         }
         assert!(!broca_reached(&f, &broca), "{:?}", broca.calls());
         assert_eq!(skipped_participants(&f.row()), vec!["broca".to_string()]);
-        assert_eq!(f.store().agent_bound_refs(AGENT).unwrap().len(), 1);
+        assert_eq!(f.store().agent_bound_refs(AGENT).unwrap().len(), bound_refs);
+        assert_eq!(
+            f.door
+                .calls()
+                .iter()
+                .filter(|c| matches!(c.request, crate::door_client::Request::Read(_)))
+                .count(),
+            expected_reads
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn receiver_restart_keeps_the_recorded_skip_even_once_the_participant_appears() {
+        check_absent_participant_restart(json!([])).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receiver_itemless_absent_participant_restart_keeps_skip() {
+        check_absent_participant_restart(json!([{"ref_kind":"session","ref":"r2"}])).await;
+    }
+
+    async fn check_absent_participant_restart(refs: Value) {
         let f = Fixture::new(false).await;
-        let broca = add_broca(&f, json!([])).await;
+        let broca = add_broca(&f, refs).await;
         f.pickup().await;
         // Hold the move just after the preconditions decided the skip.
         f.refuse("agent_data.diverged", "external_not_present");
@@ -3022,6 +3111,10 @@ mod tests {
         // broca is now installed and ready here, but the move already recorded
         // that this machine never checked it, so the restarted receiver must not call it.
         f.discovery.daemon.restart(snapshot_with_broca(true, true));
+        f.door.for_author([2; 16]).script(
+            "cut.read",
+            crate::fake_door::Effect::Refuse("unavailable".into()),
+        );
         let mut restarted = f.receiver();
         f.until(&mut restarted, Step::Activated).await;
         assert!(!broca_reached(&f, &broca), "{:?}", broca.calls());
@@ -3040,8 +3133,17 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn receiver_cleanup_before_preconditions_skips_an_absent_participant_with_no_refs() {
+        check_absent_participant_early_abort(json!([])).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receiver_itemless_absent_participant_early_abort_keeps_skip() {
+        check_absent_participant_early_abort(json!([{"ref_kind":"session","ref":"r2"}])).await;
+    }
+
+    async fn check_absent_participant_early_abort(refs: Value) {
         let f = Fixture::new(false).await;
-        let broca = add_broca(&f, json!([])).await;
+        let broca = add_broca(&f, refs).await;
         f.pickup().await;
         source_aborts(&f);
         let mut receiver = f.receiver();
@@ -3057,8 +3159,17 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn receiver_restart_mid_cleanup_keeps_skipping_the_absent_participant() {
+        check_absent_participant_cleanup_restart(json!([])).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receiver_itemless_absent_participant_restart_mid_cleanup_keeps_skip() {
+        check_absent_participant_cleanup_restart(json!([{"ref_kind":"session","ref":"r2"}])).await;
+    }
+
+    async fn check_absent_participant_cleanup_restart(refs: Value) {
         let f = Fixture::new(false).await;
-        let broca = add_broca(&f, json!([])).await;
+        let broca = add_broca(&f, refs).await;
         f.pickup().await;
         source_aborts(&f);
         // data's abort lands but its reply is lost (twice, past the client's own
@@ -3085,8 +3196,17 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn receiver_absent_participant_with_refs_still_aborts_as_unavailable() {
-        let f = Fixture::new(false).await;
+    async fn receiver_absent_participant_with_cut_items_still_aborts_as_unavailable() {
+        let f = Fixture::with_items(
+            false,
+            vec![crate::door_client::CutItem {
+                session_ref: "b".repeat(32),
+                stream: "reserved:broca".into(),
+                end_offset: 7,
+                digest: "b".repeat(64),
+            }],
+        )
+        .await;
         let broca = add_broca(&f, json!([{"ref_kind":"session","ref":"r2"}])).await;
         f.pickup().await;
         let mut receiver = f.receiver();
@@ -3102,6 +3222,77 @@ mod tests {
         assert!(!broca_reached(&f, &broca), "{:?}", broca.calls());
         assert!(!data_ops(&f).contains(&"agent_data.import"));
         assert_eq!(f.claim_cas_count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receiver_absent_manifest_failure_holds_without_deciding_including_early_cleanup() {
+        for early_abort in [false, true] {
+            for wrong_author in [false, true] {
+                let mut f = Fixture::new(false).await;
+                let broca = add_broca(&f, json!([{"ref_kind":"session","ref":"r2"}])).await;
+                f.pickup().await;
+                if early_abort {
+                    source_aborts(&f);
+                }
+                if wrong_author {
+                    let door = FakeDoor::new([3; 16]);
+                    let items = f.door.cut(CUT).unwrap().items;
+                    for item in &items {
+                        door.set_stream(item.clone());
+                    }
+                    door.script(
+                        "cut.seal",
+                        crate::fake_door::Effect::Seal(
+                            crate::door_client::SealState::Published,
+                            None,
+                        ),
+                    );
+                    door.client()
+                        .seal(&SealRequest {
+                            cut_id: CUT.into(),
+                            items,
+                        })
+                        .await
+                        .unwrap();
+                    f.worker.door = door.for_author([2; 16]).client();
+                } else {
+                    f.door.for_author([2; 16]).script(
+                        "cut.read",
+                        crate::fake_door::Effect::Refuse("unavailable".into()),
+                    );
+                }
+                let mut receiver = f.receiver();
+                receiver.tick().await.unwrap();
+                let row = f.row();
+                assert_eq!(row.step, Step::PickedUp);
+                assert!(row.plan["_receiver"].get("skipped_absent").is_none());
+                let hold = row.hold.unwrap();
+                assert_eq!(
+                    hold["code"],
+                    if wrong_author {
+                        "cut_author_mismatch"
+                    } else {
+                        "unavailable"
+                    }
+                );
+                assert_eq!(hold["op"], "cut.read");
+                assert!(data_ops(&f).is_empty());
+                assert!(!broca_reached(&f, &broca));
+                f.worker.door = f.door.for_author([2; 16]).client();
+                let mut restarted = f.receiver();
+                f.until(
+                    &mut restarted,
+                    if early_abort {
+                        Step::Aborted
+                    } else {
+                        Step::Activated
+                    },
+                )
+                .await;
+                assert_eq!(skipped_participants(&f.row()), vec!["broca".to_string()]);
+                assert!(!broca_reached(&f, &broca));
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]

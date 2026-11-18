@@ -473,8 +473,19 @@ ref sets, saved plan, move record and wire requests remain unchanged.
 Entorhinal's own participant does not declare `agent`; it continues to carry
 only package closures and session bindings. The agent ref is frozen with the
 other refs for every step, including a move back. It obeys the same receiver
-set-matching and absent-participant rules: a missing participant holding agent
-data cannot be skipped, so the receiver stops the move.
+set-matching and absent-participant rules. A participant is absent only when it
+is neither configured in the receiver's supervisor nor registered in its
+catalog; a configured-but-disabled or warming module is not absent and still
+holds the move until it is ready. An absent participant is skipped if it has no
+planned refs, or if the sealed cut manifest contains no item with its
+`reserved:<module_id>` stream, even when it was routed the agent ref. The latter
+check reads engram's authenticated `cut.read` manifest and requires its author
+to match the move's source; an unreadable manifest or author mismatch holds
+without deciding a skip. An absent participant with planned refs and sealed
+items still stops the move with `participant_unavailable` and `absent: true`.
+The receiver persists the skipped set once and reuses it through import,
+activation, abort cleanup and restarts, including when an abort arrives before
+preconditions run.
 
 **Source.** Admission inserts the source checkpoint in the transaction that
 fences new registrations for the agent (section 4). `prepare` then reads every
