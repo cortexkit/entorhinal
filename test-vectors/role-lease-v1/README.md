@@ -24,7 +24,7 @@ handler; an empty `StreamEnd` body is shown as `null`.
   second route with the same principal cannot ack, as marked by the fixture's
   `differentRoute` annotation. Explicit release also requires the original route.
 - `refusals.json`: an empty name part, a role assigned to a different module,
-  a Direct caller and a flow-scoped caller (marked `flowScoped`) are refused.
+  a Direct caller (a local process the daemon admits without a module identity, such as a terminal command) and a flow-scoped caller (marked `flowScoped`) are refused.
 - `sharing-disabled.json`: both admitted consumers get generation 1 locally,
   including a fresh notice at the 20-second renewal.
 - `engram-sharing.json`: Plexus follows the Engram claim's epoch and stops
