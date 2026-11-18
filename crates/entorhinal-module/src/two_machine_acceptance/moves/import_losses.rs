@@ -112,3 +112,177 @@ async fn a_move_without_drops_keeps_its_status_replies_unchanged() {
     }
     f.clean();
 }
+
+async fn optional_move_pair() -> Pair {
+    let f = Pair::new(&[
+        ("aft", "aft-session"),
+        ("broca", "broca-session"),
+        ("pi", "pi-session"),
+    ])
+    .await;
+    f.a.discovery.peers["aft"].set_optional();
+    // Broca is required and has a planned ref, but sealed no items.
+    f.a.discovery.peers["broca"].set_prepare(PrepareReply::new(vec![], vec![]));
+    f.b.discovery
+        .daemon
+        .restart(snapshot(&[("pi", "pi-session")], true, true));
+    f
+}
+
+fn optional_move_losses() -> Value {
+    json!([{"participant":"aft","session_ref":AFT_STREAM,"reason":"optional_participant_absent",
+        "count":1,"source":A,"source_name":"Desk"}])
+}
+
+#[tokio::test(start_paused = true)]
+async fn optional_move_receiver_skips_sealed_items_and_keeps_the_decision_across_restart() {
+    let mut f = optional_move_pair().await;
+    let cut = f.published("optional-receiver").await;
+    let published = f.a.record(&cut).await;
+    assert!(published.participants[0].optional);
+    assert!(published.skipped.is_empty());
+    assert!(f
+        .a
+        .door
+        .cut(&cut)
+        .unwrap()
+        .items
+        .iter()
+        .any(|i| i.session_ref == AFT_STREAM));
+
+    f.b.pickup().await;
+    f.b.receiver_until(&cut, MoveStep::Imported).await;
+    assert_eq!(
+        status(&f.b, &cut).await["skipped_participants"],
+        json!(["aft", "broca"])
+    );
+    f.b.restart().await;
+    // Installing AFT after the decision must not make it active for this cut.
+    f.b.discovery.daemon.restart(snapshot(
+        &[("aft", "aft-session"), ("pi", "pi-session")],
+        true,
+        true,
+    ));
+    for (step, state) in [
+        (MoveStep::Staged, MoveState::Staged),
+        (MoveStep::Claimed, MoveState::Claimed),
+        (MoveStep::Activated, MoveState::Activated),
+    ] {
+        f.b.receiver_until(&cut, step).await;
+        let record = f.b.record(&cut).await;
+        assert_eq!(record.state, state);
+        assert_eq!(record.skipped, ["aft"]);
+    }
+    f.finish(&cut).await;
+    f.b.restart().await;
+    let row = status(&f.b, &cut).await;
+    assert_eq!(row["step"], "done");
+    assert_eq!(row["losses"], optional_move_losses());
+    assert_eq!(listed(&f.b, &cut).await["losses"], row["losses"]);
+    for module in ["aft", "broca"] {
+        assert!(f.b.discovery.peers[module].calls().is_empty());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn optional_move_source_keeps_skipped_data_but_releases_required_no_items() {
+    let mut f = optional_move_pair().await;
+    f.a.discovery.peers["pi"].set_optional();
+    let cut = f.published("optional-source").await;
+    f.b.pickup().await;
+    f.b.receiver_until(&cut, MoveStep::Staged).await;
+    drive(f.a.source(&cut).tick()).await.unwrap();
+    f.a.restart().await;
+    assert_eq!(status(&f.a, &cut).await["losses"], optional_move_losses());
+    f.finish(&cut).await;
+    assert_eq!(f.a.record(&cut).await.skipped, ["aft"]);
+    let aft = &f.a.discovery.peers["aft"];
+    assert!(aft
+        .calls()
+        .iter()
+        .any(|call| matches!(call, Request::Export(_))));
+    assert!(!aft
+        .calls()
+        .iter()
+        .any(|call| matches!(call, Request::Release(_))));
+    assert!(aft.tombstones().is_empty());
+    for (module, kind) in [("broca", "broca-session"), ("pi", "pi-session")] {
+        assert_eq!(
+            f.a.discovery.peers[module].tombstones()[&AgentRef::new(kind, format!("ref-{kind}"))],
+            B
+        );
+    }
+    let row = status(&f.a, &cut).await;
+    assert_eq!(row["step"], "released");
+    assert_eq!(row["losses"], optional_move_losses());
+    assert_eq!(listed(&f.a, &cut).await["losses"], row["losses"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn optional_move_absent_required_participant_with_items_still_aborts() {
+    let f = Pair::new(&[("aft", "aft-session"), ("pi", "pi-session")]).await;
+    f.b.discovery
+        .daemon
+        .restart(snapshot(&[("pi", "pi-session")], true, true));
+    let cut = f.published("required-with-items").await;
+    f.b.pickup().await;
+    f.b.receiver_until(&cut, MoveStep::Aborted).await;
+    f.a.source_until(&cut, MoveStep::Aborted).await;
+    let record = f.a.record(&cut).await;
+    assert_eq!(record.state, MoveState::Aborted);
+    assert_eq!(
+        record.detail,
+        Some(json!({"code":"participant_unavailable","module_id":"aft","absent":true}))
+    );
+    assert!(record.skipped.is_empty());
+    assert!(status(&f.b, &cut).await.get("losses").is_none());
+    assert!(f.b.discovery.peers["aft"].calls().is_empty());
+    f.clean();
+}
+
+#[tokio::test(start_paused = true)]
+async fn optional_move_abort_cleanup_skips_absent_modules_before_and_after_staging() {
+    for step in [MoveStep::PickedUp, MoveStep::Staged] {
+        let mut f = optional_move_pair().await;
+        let cut = f.published("optional-abort").await;
+        f.b.pickup().await;
+        f.b.receiver_until(&cut, step).await;
+        f.b.abort(&cut);
+        f.b.restart().await;
+        f.b.receiver_until(&cut, MoveStep::Aborted).await;
+        f.a.source_until(&cut, MoveStep::Aborted).await;
+        let record = f.a.record(&cut).await;
+        assert_eq!(record.state, MoveState::Aborted);
+        assert_eq!(
+            record.skipped,
+            if step == MoveStep::Staged {
+                vec!["aft"]
+            } else {
+                vec![]
+            }
+        );
+        for node in [&f.a, &f.b] {
+            assert!(status(node, &cut).await.get("losses").is_none());
+        }
+        assert!(f.b.discovery.peers["aft"].calls().is_empty());
+        f.clean();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn optional_move_skipped_without_items_has_no_loss_but_is_not_released() {
+    let f = optional_move_pair().await;
+    f.a.discovery.peers["aft"].set_prepare(PrepareReply::new(vec![], vec![]));
+    let cut = f.published("optional-no-items").await;
+    f.finish(&cut).await;
+    assert_eq!(f.a.record(&cut).await.skipped, ["aft"]);
+    assert!(f.b.discovery.peers["aft"].calls().is_empty());
+    assert!(!f.a.discovery.peers["aft"]
+        .calls()
+        .iter()
+        .any(|call| matches!(call, Request::Release(_))));
+    for node in [&f.a, &f.b] {
+        assert!(status(node, &cut).await.get("losses").is_none());
+        assert!(listed(node, &cut).await.get("losses").is_none());
+    }
+}

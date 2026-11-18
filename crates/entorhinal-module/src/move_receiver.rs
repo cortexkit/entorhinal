@@ -5,7 +5,8 @@ use crate::{
     claim_codec::AgentClaim,
     door_client::CutRequest as DoorCut,
     move_driver::{
-        backoff, digest_reason, participant_action, PeerRefusal, RefusalLog, Worker, POLL,
+        backoff, digest_reason, participant_action, skipped_streams, PeerRefusal, RefusalLog,
+        SkippedStreams, Worker, POLL,
     },
     participant_client::{AgentRef, ClientError, CutRequest, ImportReply, ParticipantClient, Refs},
     participant_discovery::Participant,
@@ -273,14 +274,15 @@ struct Progress {
     takeover_sent: bool,
     /// Plan participants this machine leaves out of the whole receiver side of the
     /// move: each was neither configured nor registered here when the
-    /// preconditions ran, and it had no planned refs or sealed cut items, so there is no
-    /// data to import, check for forks, activate or undo. `None` means the
-    /// preconditions have not decided yet. Once decided, every later step and
+    /// preconditions ran, and it was optional or had no data in the cut.
+    /// `None` means the preconditions have not decided yet. Every later step and
     /// every restart reads this set instead of asking the daemon again, so a
     /// module installed mid-move is never called for a cut it never saw.
     /// Rows written before this field existed decode as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     skipped_absent: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    skipped_streams: SkippedStreams,
     /// Entries each participant reported dropping while it imported this cut,
     /// keyed by participant, then by the staged stream's `sessionRef`, then by
     /// the participant's own reason, with the count it gave. Each participant's
@@ -298,6 +300,13 @@ impl Progress {
         self.skipped_absent
             .as_ref()
             .is_some_and(|skipped| skipped.iter().any(|m| m == module))
+    }
+    fn optional_skips(&self, plan: &MoveRecord) -> Vec<String> {
+        plan.participants
+            .iter()
+            .filter(|p| p.optional && self.skips(&p.module_id))
+            .map(|p| p.module_id.clone())
+            .collect()
     }
     /// Keep what one participant's import reply says it dropped, replacing
     /// anything an earlier reply from the same participant recorded.
@@ -352,7 +361,7 @@ pub(crate) fn import_losses(row: &AgentMove) -> Vec<Value> {
 }
 
 /// The plan participants this receiver calls: every one except those
-/// recorded as skipped because they are absent here and carry no data.
+/// recorded as skipped because they are absent here.
 fn called<'a>(plan: &'a MoveRecord, progress: &Progress) -> Vec<&'a wire::MoveParticipant> {
     plan.participants
         .iter()
@@ -376,9 +385,8 @@ fn absent_participants<'a>(
         .collect()
 }
 
-/// Participants a receiver row recorded as skipped (absent on that machine with
-/// nothing to carry), for move status. Empty for source rows and for rows
-/// whose preconditions have not run yet.
+/// Participants a receiver row recorded as skipped, for move status.
+/// Empty for source rows and for rows whose preconditions have not run yet.
 pub(crate) fn skipped_participants(row: &AgentMove) -> Vec<String> {
     if row.side != MoveSide::Receiver {
         return Vec::new();
@@ -616,9 +624,9 @@ impl Receiver {
             return Ok(());
         }
         let absent = absent_participants(plan, supervisor, catalog);
-        // Only a sealed manifest from the source can prove that planned refs
-        // carry no data. Do not add a door dependency to the no-ref rule.
-        let items = if absent.iter().any(|p| !p.refs.is_empty()) {
+        // The sealed manifest proves whether a required participant with refs
+        // carries no data and names the streams lost for an optional skip.
+        let items = if absent.iter().any(|p| p.optional || !p.refs.is_empty()) {
             let read = self
                 .worker
                 .door
@@ -652,7 +660,8 @@ impl Receiver {
             absent
                 .into_iter()
                 .filter(|p| {
-                    p.refs.is_empty()
+                    p.optional
+                        || p.refs.is_empty()
                         || !items
                             .iter()
                             .any(|item| item.stream == format!("reserved:{}", p.module_id))
@@ -660,6 +669,7 @@ impl Receiver {
                 .map(|p| p.module_id.clone())
                 .collect(),
         );
+        progress.skipped_streams = skipped_streams(&items, &progress.optional_skips(plan));
         self.save(row, progress).await
     }
     fn request(&self, p: &wire::MoveParticipant) -> Result<CutRequest, Failure> {
@@ -891,8 +901,8 @@ impl Receiver {
         let (supervisor, catalog) = self.discovery_lists().await?;
         // The source plans every module that declares agent data, even one with
         // no data for this agent. A module that is not on this machine at all cannot
-        // hold local data for the agent. With no refs or no sealed items it carries none,
-        // so skip it for the rest of the move. Decide once and persist the set:
+        // hold local data for the agent. Skip an optional module or one that
+        // carries no data for the rest of the move. Decide once and persist the set:
         // later steps and restarts must not call a module this machine never checked.
         // A configured but disabled or warming module is not absent: it may still
         // keep data on disk, so the move holds below until it is enabled and
@@ -1264,8 +1274,9 @@ impl Receiver {
             Step::Imported => {
                 self.catalog_preflight(plan).await?;
                 if observed.state == State::Published {
-                    self.cas_move(row, plan, State::Published, State::Staged)
-                        .await?;
+                    let mut staged = observed.clone();
+                    staged.skipped = progress.optional_skips(plan);
+                    self.cas_move(row, &staged, State::Staged).await?;
                 } else if observed.state != State::Staged {
                     return Err(Failure::hold(
                         "invalid_state",
@@ -1282,8 +1293,7 @@ impl Receiver {
                 // taking the agent claim. Cleanup must return that claim to the
                 // source before ending the receiver move, so ownership is not stranded.
                 if observed.state != State::Claimed {
-                    self.cas_move(row, plan, State::Staged, State::Claimed)
-                        .await?;
+                    self.cas_move(row, &observed, State::Claimed).await?;
                 }
                 Self::step(row, progress, Step::Claimed);
                 self.save(row, progress).await?;
@@ -1316,8 +1326,7 @@ impl Receiver {
                 // Resend activation even if its CAS landed before a crash. The
                 // pinned participant operations are idempotent for this cut.
                 if observed.state == State::Claimed {
-                    self.cas_move(row, plan, State::Claimed, State::Activated)
-                        .await?;
+                    self.cas_move(row, &observed, State::Activated).await?;
                 } else if !matches!(observed.state, State::Activated | State::Released) {
                     return Err(Failure::hold(
                         "invalid_state",
@@ -1407,14 +1416,13 @@ impl Receiver {
     async fn cas_move(
         &self,
         row: &mut AgentMove,
-        plan: &MoveRecord,
-        from: State,
+        record: &MoveRecord,
         to: State,
     ) -> Result<(), Failure> {
-        wire::check_transition(Some(from), to, MoveSide::Receiver)
+        wire::check_transition(Some(record.state), to, MoveSide::Receiver)
             .map_err(|e| Failure::hold(e.code(), Value::Null))?;
         let subject = format!("move:{}", self.cut);
-        let mut body = plan.clone();
+        let mut body = record.clone();
         body.state = to;
         if to == State::Aborted {
             body.reason = row
@@ -1433,7 +1441,7 @@ impl Receiver {
         match self
             .worker
             .records
-            .cas_settled(&request, &plan.to, |b| {
+            .cas_settled(&request, &record.to, |b| {
                 wire::decode_move_record(&subject, b).map_err(|e| e.code())
             })
             .await?
@@ -1653,8 +1661,7 @@ impl Receiver {
         // An abort can arrive before the preconditions decided which absent
         // participants to skip. Decide here with the same rule, before any
         // participant call, so cleanup never waits on a module this machine lacks.
-        // That is safe even if an older receiver already imported: a
-        // participant with no refs or sealed items staged nothing to undo.
+        // A module that was absent did not stage anything to undo.
         // Persisting the set makes a restart mid-cleanup skip the same modules.
         let undecided = progress.skipped_absent.is_none();
         if undecided {
@@ -1744,8 +1751,7 @@ impl Receiver {
         let (record, version) = self.read_move(plan).await?;
         row.record_version = checked_version(version)?;
         if record.state != State::Aborted {
-            self.cas_move(row, plan, record.state, State::Aborted)
-                .await?;
+            self.cas_move(row, &record, State::Aborted).await?;
         }
         self.apply_claim(row).await?;
         remove_inbox(&self.worker, &plan.to, &self.cut).await?;

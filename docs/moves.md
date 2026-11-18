@@ -109,10 +109,14 @@ Things a move can report:
   `losses`, a list of `{participant, session_ref, reason, count}`. `session_ref`
   names the staged stream the participant imported: for a harness session it is
   the same value as the session's ref, so it can be looked up; for other kinds
-  it is the participant's own stream handle. Losses are recorded on the
-  machine that ran the import and survive restarts; the source machine does
-  not see them. A move with no drops has no `losses` key, and an aborted
-  move shows none because nothing it staged was kept.
+  it is the participant's own stream handle. Import drops are recorded on the
+  receiving machine only. A move also completes with losses if the receiver
+  does not have an optional participant that sealed items. Both machines list
+  one `optional_participant_absent` loss per skipped stream, with the source
+  machine ID in `source` and its display name in `source_name` when known.
+  The source keeps the optional participant's data for a later move back or
+  re-carry. Losses survive restarts. A move with no losses omits `losses`, and
+  an aborted move shows none because nothing it staged was kept.
 
 ## Cancel a move
 
