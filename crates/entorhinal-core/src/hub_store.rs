@@ -163,6 +163,17 @@ fn load_attempt(conn: &Connection, request_key: &str) -> rusqlite::Result<Option
     Ok(attempt)
 }
 
+fn attempts_by_op(conn: &Connection, op_id: &str) -> rusqlite::Result<Vec<HubAttempt>> {
+    let mut stmt = conn
+        .prepare("SELECT request_key FROM hub_attempt_send WHERE op_id=?1 ORDER BY request_key")?;
+    let keys = stmt
+        .query_map([op_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    keys.iter()
+        .map(|key| load_attempt(conn, key)?.ok_or(rusqlite::Error::QueryReturnedNoRows))
+        .collect()
+}
+
 pub(crate) fn record_attempt_outcome(
     tx: &Transaction<'_>,
     write: &HubAttemptWrite,
@@ -189,9 +200,46 @@ pub(crate) fn record_attempt_outcome(
     Ok(changed == 1)
 }
 
+fn save_attempt(
+    tx: &Transaction<'_>,
+    write: &HubAttemptWrite,
+    send: &HubAttemptSend,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO hub_attempt(request_key,params_digest,key,expected,value,step)
+         VALUES(?1,?2,?3,?4,?5,?6)
+         ON CONFLICT(request_key) DO UPDATE SET
+             key=excluded.key,expected=excluded.expected,value=excluded.value,step=excluded.step,
+             outcome=NULL,outcome_op_id=NULL,outcome_at_ms=NULL",
+        params![
+            write.request_key,
+            write.params_digest,
+            write.key,
+            write.expected,
+            write.value,
+            write.step
+        ],
+    )?;
+    // Keep the first send's clock and process. A later resend must not
+    // extend the time that a lease can be held for the same op id.
+    tx.execute(
+        "INSERT INTO hub_attempt_send(request_key,op_id,sent_at_ms,process) VALUES(?1,?2,?3,?4)
+         ON CONFLICT(request_key,op_id) DO NOTHING",
+        params![write.request_key, send.op_id, send.sent_at_ms, send.process],
+    )?;
+    Ok(())
+}
+
 impl RegistryStore {
     pub fn hub_attempt(&self, request_key: &str) -> Result<Option<HubAttempt>, RegistryError> {
         self.read(|conn| load_attempt(conn, request_key))
+    }
+
+    /// A derived snapshot id can appear in more than one local request.
+    pub fn hub_attempts_by_op(&self, op_id: &str) -> Result<Vec<HubAttempt>, RegistryError> {
+        self.db
+            .with_conn_fenced(|tx| attempts_by_op(tx, op_id))
+            .map_err(RegistryError::Store)
     }
 
     /// Save the bytes and send identity together before publishing. To change
@@ -213,21 +261,63 @@ impl RegistryStore {
                 {
                     return Ok(false);
                 }
-                tx.execute(
-                    "INSERT INTO hub_attempt(request_key,params_digest,key,expected,value,step)
-                     VALUES(?1,?2,?3,?4,?5,?6)
-                     ON CONFLICT(request_key) DO UPDATE SET
-                         key=excluded.key,expected=excluded.expected,value=excluded.value,step=excluded.step",
-                    params![write.request_key,write.params_digest,write.key,write.expected,write.value,write.step],
-                )?;
-                // The hub may acknowledge the original send after a resend.
-                // Keep its timestamp and process so a lease cannot start its
-                // acting window at the later send or in a different process.
-                tx.execute(
-                    "INSERT INTO hub_attempt_send(request_key,op_id,sent_at_ms,process) VALUES(?1,?2,?3,?4)
-                     ON CONFLICT(request_key,op_id) DO NOTHING",
-                    params![write.request_key,send.op_id,send.sent_at_ms,send.process],
-                )?;
+                save_attempt(tx, write, send)?;
+                Ok(true)
+            })
+            .map_err(RegistryError::Store)
+    }
+
+    /// Close requests matching an applied operation and its current target.
+    /// An op id in the send history alone does not identify the current step.
+    pub fn record_hub_attempt_outcome_by_op(
+        &self,
+        key: &str,
+        position: u64,
+        outcome: &HubAttemptOutcome,
+        matches_current: impl Fn(&HubAttemptWrite, u64) -> bool,
+    ) -> Result<usize, RegistryError> {
+        self.db
+            .with_conn_fenced(|tx| {
+                let mut settled = 0;
+                for row in attempts_by_op(tx, &outcome.op_id)? {
+                    if row.outcome.is_none()
+                        && row.write.key == key
+                        && matches_current(&row.write, position)
+                        && record_attempt_outcome(tx, &row.write, outcome)?
+                    {
+                        settled += 1;
+                    }
+                }
+                Ok(settled)
+            })
+            .map_err(RegistryError::Store)
+    }
+
+    /// Replace a landed intermediate step and save the next send in one
+    /// transaction. The targets must differ so a late delivery from the
+    /// earlier step can never settle the new one.
+    pub fn advance_hub_attempt(
+        &self,
+        previous: &HubAttempt,
+        landed_op_id: &str,
+        next: &HubAttemptWrite,
+        send: &HubAttemptSend,
+    ) -> Result<bool, RegistryError> {
+        self.db
+            .with_conn_fenced(|tx| {
+                let prior = &previous.write;
+                if prior.request_key != next.request_key
+                    || prior.params_digest != next.params_digest
+                    || prior.key == next.key
+                    || prior.step == next.step
+                    || previous.outcome.is_some()
+                    || !previous.op_ids.iter().any(|op| op.op_id == landed_op_id)
+                    || previous.op_ids.iter().any(|op| op.op_id == send.op_id)
+                    || load_attempt(tx, &prior.request_key)?.as_ref() != Some(previous)
+                {
+                    return Ok(false);
+                }
+                save_attempt(tx, next, send)?;
                 Ok(true)
             })
             .map_err(RegistryError::Store)

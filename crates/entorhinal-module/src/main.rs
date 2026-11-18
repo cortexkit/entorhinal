@@ -105,6 +105,7 @@ mod fleet_record;
 // The hub backend starts this transport only when the store selects it.
 #[allow(dead_code)]
 mod hub_transport;
+mod hub_write;
 mod incarnation;
 mod member;
 mod memory_context;

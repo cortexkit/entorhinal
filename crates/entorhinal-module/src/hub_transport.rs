@@ -20,6 +20,7 @@ use async_nats::{
         consumer::{push, DeliverPolicy},
         context::PublishErrorKind,
         kv,
+        stream::DirectGetErrorKind,
     },
     HeaderMap, HeaderValue,
 };
@@ -38,7 +39,7 @@ use crate::{log_client::SubcConnector, HandlerError, HealthGauges};
 
 const DOMAIN: &str = "hub";
 const LOG_STREAM: &str = "HUB_IDLOG";
-const LOG_SUBJECT: &str = "ck.fleet.idlog";
+pub(super) const LOG_SUBJECT: &str = "ck.fleet.idlog";
 const BUCKET: &str = "residence";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -308,32 +309,47 @@ impl Session {
             .map_err(|error| Failure::kind("log_stream", error.kind()))
     }
 
+    pub(super) async fn log_entry(
+        &self,
+        sequence: u64,
+        deadline: Instant,
+    ) -> Result<Option<Vec<u8>>, HandlerError> {
+        self.confirm_hub(deadline, async {
+            match self.log().await?.direct_get(sequence).await {
+                Ok(message) => Ok(Some(message.payload.to_vec())),
+                Err(error) if error.kind() == DirectGetErrorKind::NotFound => Ok(None),
+                Err(error) => Err(Failure::kind("log_entry", error.kind())),
+            }
+        })
+        .await
+    }
+
+    pub(super) async fn log_head(&self, deadline: Instant) -> Result<u64, HandlerError> {
+        self.confirm_hub(deadline, async {
+            Ok(self.log().await?.cached_info().state.last_sequence)
+        })
+        .await
+    }
+
+    pub(super) async fn kv_entry(
+        &self,
+        key: &str,
+        deadline: Instant,
+    ) -> Result<Option<kv::Entry>, HandlerError> {
+        self.confirm_hub(deadline, async {
+            self.kv()
+                .await?
+                .entry(key)
+                .await
+                .map_err(|error| Failure::kind("kv_entry", error.kind()))
+        })
+        .await
+    }
+
     pub(super) async fn update(
         &self,
         key: &str,
         bytes: Vec<u8>,
-        expected: u64,
-        op_id: &str,
-        deadline: Instant,
-    ) -> Result<u64, HandlerError> {
-        self.write_kv(key, Some(bytes), expected, op_id, deadline)
-            .await
-    }
-
-    pub(super) async fn delete(
-        &self,
-        key: &str,
-        expected: u64,
-        op_id: &str,
-        deadline: Instant,
-    ) -> Result<u64, HandlerError> {
-        self.write_kv(key, None, expected, op_id, deadline).await
-    }
-
-    async fn write_kv(
-        &self,
-        key: &str,
-        bytes: Option<Vec<u8>>,
         expected: u64,
         op_id: &str,
         deadline: Instant,
@@ -351,22 +367,43 @@ impl Session {
             NATS_EXPECTED_LAST_SUBJECT_SEQUENCE,
             HeaderValue::from(expected),
         );
-        if bytes.is_none() {
-            headers.insert("KV-Operation", "DEL");
-        }
         // Store::update combines submission and PubAck. Keep those stages
         // separate without changing the domain-qualified subject or CAS header.
         let subject = format!("$JS.{DOMAIN}.API.$KV.{BUCKET}.{key}");
         self.confirm_hub(deadline, self.kv()).await?;
-        self.publish(
-            subject,
-            headers,
-            bytes.unwrap_or_default(),
-            op_id,
-            "revision_moved",
-            deadline,
-        )
-        .await
+        self.publish(subject, headers, bytes, op_id, "revision_moved", deadline)
+            .await
+    }
+
+    pub(super) async fn delete(
+        &self,
+        key: &str,
+        expected: u64,
+        op_id: &str,
+        deadline: Instant,
+    ) -> Result<(), HandlerError> {
+        let kv = self.confirm_hub(deadline, self.kv()).await?;
+        if self.client.connection_state() != State::Connected || Instant::now() >= deadline {
+            self.health.hub.failed();
+            return Err(unavailable(
+                "bus disconnected before delete or no time left",
+            ));
+        }
+        // The Store API combines submission and acknowledgment. After the
+        // preflight we can't tell whether a timeout preceded submission.
+        match timeout_at(deadline, kv.delete_expect_revision(key, Some(expected))).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) if error.kind() == kv::DeleteErrorKind::InvalidKey => {
+                Err(HandlerError::new("invalid_params", "invalid hub KV key"))
+            }
+            Ok(Err(error)) if error.kind() == kv::DeleteErrorKind::WrongLastRevision => Err(
+                HandlerError::new("revision_moved", "hub compare-and-set refused"),
+            ),
+            _ => {
+                self.health.hub.failed();
+                Err(unsettled(op_id))
+            }
+        }
     }
 
     pub(super) async fn append(
@@ -456,21 +493,21 @@ impl Session {
             Ok(Err(error)) if error.kind() == PublishErrorKind::WrongLastSequence => Err(
                 HandlerError::new(cas_refusal, "hub compare-and-set refused"),
             ),
-            Ok(Err(error)) if error.kind() == PublishErrorKind::StreamNotFound => {
-                self.health.hub.failed();
-                Err(unavailable("no responder for hub publish"))
-            }
             _ => {
                 self.health.hub.failed();
-                let mut error = HandlerError::new(
-                    "hub_write_unsettled",
-                    "hub publish acknowledgment unavailable",
-                );
-                error.detail = Some(json!({"op_id": op_id}));
-                Err(error)
+                Err(unsettled(op_id))
             }
         }
     }
+}
+
+pub(super) fn unsettled(op_id: &str) -> HandlerError {
+    let mut error = HandlerError::new(
+        "hub_write_unsettled",
+        "hub publish acknowledgment unavailable",
+    );
+    error.detail = Some(json!({"op_id": op_id}));
+    error
 }
 
 fn unavailable(reason: &str) -> HandlerError {

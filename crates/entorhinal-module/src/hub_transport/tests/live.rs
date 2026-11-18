@@ -172,6 +172,7 @@ async fn hub_transport_live_leaf_outage_resumes_and_never_queues_unsent_write() 
         .create_stream(jetstream::stream::Config {
             name: LOG_STREAM.into(),
             subjects: vec![LOG_SUBJECT.into()],
+            allow_direct: true,
             ..Default::default()
         })
         .await
@@ -312,13 +313,31 @@ async fn hub_transport_live_leaf_outage_resumes_and_never_queues_unsent_write() 
         .await
         .unwrap_err();
     assert_eq!(stale.code, "revision_moved");
-    let deleted = session()
+    assert_eq!(session().log_head(deadline()).await.unwrap(), 3);
+    assert_eq!(
+        session().log_entry(2, deadline()).await.unwrap().unwrap(),
+        b"initial"
+    );
+    assert!(session().log_entry(4, deadline()).await.unwrap().is_none());
+    let stale = session()
+        .delete("residence.alfa", first, "stale-delete", deadline())
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code, "revision_moved");
+    session()
         .delete("residence.alfa", entry.revision, "delete", deadline())
         .await
         .unwrap();
     let marker = within(watch.next()).await;
+    assert!(marker.revision > entry.revision);
+    assert_eq!(marker.operation, kv::Operation::Delete);
+    let current = session()
+        .kv_entry("residence.alfa", deadline())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
-        (marker.revision, marker.operation),
-        (deleted, kv::Operation::Delete)
+        (current.revision, current.operation),
+        (marker.revision, kv::Operation::Delete)
     );
 }

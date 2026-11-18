@@ -35,7 +35,7 @@ pub(super) struct Header {
 }
 
 impl Header {
-    fn sealed(&self) -> Result<bool, HandlerError> {
+    pub(super) fn sealed(&self) -> Result<bool, HandlerError> {
         if !is_hex(&self.writer, 32)
             || !is_hex(&self.entry_id, 32)
             || self.writer_ep > MAX_SAFE_INTEGER
@@ -287,6 +287,13 @@ impl UnverifiedRecord {
 
     pub(super) fn key_version(&self) -> &str {
         &self.key_version
+    }
+
+    pub(super) fn epoch(&self) -> Option<u64> {
+        match &self.body {
+            Body::Sealed(body) => Some(body.epoch),
+            Body::Unsealed(_) => None,
+        }
     }
 
     pub(super) fn verify(self, trusted_key_hex: &str) -> Result<VerifiedRecord, HandlerError> {
