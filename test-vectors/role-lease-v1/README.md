@@ -25,6 +25,11 @@ handler; an empty `StreamEnd` body is shown as `null`.
   `differentRoute` annotation. Explicit release also requires the original route.
 - `refusals.json`: an empty name part, a role assigned to a different module,
   a Direct caller and a flow-scoped caller (marked `flowScoped`) are refused.
+- `sharing-disabled.json`: both admitted consumers get generation 1 locally,
+  including a fresh notice at the 20-second renewal.
+- `engram-sharing.json`: Plexus follows the Engram claim's epoch and stops
+  holding when the claim becomes stale. Magic Context holds locally even with
+  Engram sharing enabled.
 
 ## Names and admission
 
@@ -46,12 +51,25 @@ Before each irreversible act, check the deadline and record `gen` (the role's
 ownership generation) in the module's journal. Refuse a generation older than
 the highest one the journal has seen for that role.
 
+The notice shape is the same in all sharing modes:
+
+1. **Sharing disabled:** An admitted role is granted locally as generation 1,
+   renewed every 20 seconds, and stops when its watch closes. No writes occur.
+2. **Engram sharing (not on the hub):** `connector_home` holds at the claim's
+   epoch only while the cached `role.read` is `held_here` and not `stale`.
+   `dreamer.*` is still local generation 1.
+3. **Hub mode:** The hub's role record arbitrates ownership. A candidate has
+   no acting window before its first confirmed renewal. If the hub becomes
+   unreachable, no renewal extends the window and the holder must stop by the
+   last notice's deadline.
+
 ## Reproduce and verify
 
 From the repository root:
 
 ```sh
 ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked served_role_lease_v1_records_match_published_files -- --nocapture
+ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked served_role_lease_v1_non_hub_records_match_published_files -- --nocapture
 ```
 
 Without `ENTO_WRITE_SERVED_VECTORS` the drift test byte-compares the served

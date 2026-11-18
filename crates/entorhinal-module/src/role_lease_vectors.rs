@@ -179,3 +179,135 @@ async fn served_role_lease_v1_records_match_published_files() {
     module.shutdown().await;
     crate::tests::stop_store_tasks(&handler).await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn served_role_lease_v1_non_hub_records_match_published_files() {
+    let mut fixture = Fixture::new("served-role-lease-non-hub").await;
+    let start = tokio::time::Instant::now();
+    let clock = Arc::new(AtomicU64::new(100_000));
+    let now = clock.clone();
+    Arc::get_mut(&mut fixture.handler.role_leases)
+        .unwrap()
+        .sample_clock(move || now.load(Ordering::Relaxed));
+    let store = store(&fixture);
+    let handler = Arc::new(std::mem::replace(
+        &mut fixture.handler,
+        ProjectsHandler::with_runtime(INCARNATION.into(), || 700),
+    ));
+    let served = handler.clone();
+    let mut module = ModuleHarness::start(move |_| ServedHandler(served), []).await;
+    let plexus = bind(&mut module, 1821, reserved("plexus"), None).await;
+    let mc = bind(&mut module, 1822, reserved("magic-context"), None).await;
+    let p = json!({"kind":"reserved","moduleId":"plexus"});
+    let m = json!({"kind":"reserved","moduleId":"magic-context"});
+    let mut disabled = Vec::new();
+
+    // Capture the second notice causally: time is not advanced until the
+    // first notice has travelled through the route and been acknowledged.
+    for (role, route, principal) in [(CONNECTOR, plexus, &p), (GLOBAL, mc, &m)] {
+        let params = json!({"role":role});
+        let corr = module
+            .send_request(route, request(WATCH, params.clone()))
+            .await;
+        let first = frame(&mut module, corr, FrameType::StreamData).await;
+        let notice = ack_frame(&mut module, route, role, &first).await;
+        assert_eq!(notice["holding"], true);
+        assert_eq!(notice["gen"], 1);
+        clock.fetch_add(20_000, Ordering::Relaxed);
+        tokio::time::advance(Duration::from_millis(20_001)).await;
+        let renewed = frame(&mut module, corr, FrameType::StreamData).await;
+        let notice = ack_frame(&mut module, route, role, &renewed).await;
+        assert_eq!(notice["issued_at_ms"], clock.load(Ordering::Relaxed));
+        assert_eq!(notice["valid_for_ms"], 45_000);
+        module.cancel_request(route, corr).await;
+        frame(&mut module, corr, FrameType::StreamEnd).await;
+        disabled.push(output(WATCH, &params, principal, &[first, renewed]));
+    }
+    assert_eq!(handler.role_leases.held(), 0);
+    publish("sharing-disabled.json", disabled);
+
+    store
+        .apply_entry("fixture.lease", "{}", "fixture", None, |tx| {
+            tx.execute(
+                "UPDATE identity_log_state SET state='enabled' WHERE id=1",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let set_claim = |stale| {
+        store
+            .cache_roles(
+                &[(
+                    CONNECTOR.into(),
+                    ClaimObservation::Present {
+                        self_author: SELF_AUTHOR.into(),
+                        claim: CachedClaim {
+                            holder: Some(SELF_AUTHOR.into()),
+                            epoch: 12,
+                            cut_id: None,
+                            version: 36,
+                            read_at_ms: 700,
+                            stale,
+                            integrity_failed: false,
+                        },
+                    },
+                )],
+                700,
+            )
+            .unwrap();
+        handler.role_cache_changed.notify_waiters();
+    };
+    set_claim(false);
+    let params = json!({"role":CONNECTOR});
+    let corr = module
+        .send_request(plexus, request(WATCH, params.clone()))
+        .await;
+    let claim = frame(&mut module, corr, FrameType::StreamData).await;
+    let notice = ack_frame(&mut module, plexus, CONNECTOR, &claim).await;
+    assert_eq!(notice["gen"], 12);
+    assert_eq!(notice["holding"], true);
+    set_claim(true);
+    let stale = frame(&mut module, corr, FrameType::StreamData).await;
+    let notice = ack_frame(&mut module, plexus, CONNECTOR, &stale).await;
+    assert_eq!(notice["gen"], 12);
+    assert_eq!(notice["holding"], false);
+    module.cancel_request(plexus, corr).await;
+    frame(&mut module, corr, FrameType::StreamEnd).await;
+
+    let dreamer = json!({"role":GLOBAL});
+    let corr = module
+        .send_request(mc, request(WATCH, dreamer.clone()))
+        .await;
+    let local = frame(&mut module, corr, FrameType::StreamData).await;
+    let notice = ack_frame(&mut module, mc, GLOBAL, &local).await;
+    assert_eq!(notice["gen"], 1);
+    assert_eq!(notice["holding"], true);
+    publish(
+        "engram-sharing.json",
+        vec![
+            output(WATCH, &params, &p, &[claim, stale]),
+            output(WATCH, &dreamer, &m, &[local]),
+        ],
+    );
+    assert!(start.elapsed() >= Duration::from_secs(40));
+    module.shutdown().await;
+    crate::tests::stop_store_tasks(&handler).await;
+}
+
+async fn ack_frame(
+    module: &mut ModuleHarness,
+    route: RouteHandle,
+    role: &str,
+    notice: &Frame,
+) -> Value {
+    let notice: Value = serde_json::from_slice(&notice.body).unwrap();
+    let id = module
+        .send_request(
+            route,
+            request(ACK, json!({"role":role,"seq":notice["seq"]})),
+        )
+        .await;
+    frame(module, id, FrameType::Response).await;
+    notice
+}
