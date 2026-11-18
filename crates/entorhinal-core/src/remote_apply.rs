@@ -336,7 +336,21 @@ impl RegistryStore {
         entries: &[RemoteEntry],
         self_author: Option<&str>,
     ) -> Result<i64, RegistryError> {
-        self.install_snapshot(entries, None, self_author)
+        self.install_snapshot(entries, None, self_author, None)
+    }
+
+    pub fn apply_hub_remote_snapshot(
+        &self,
+        entries: &[RemoteEntry],
+        writer_episodes: &[u64],
+    ) -> Result<i64, RegistryError> {
+        if entries.len() != writer_episodes.len() {
+            return Err(domain(
+                "apply_failed",
+                "snapshot writer episodes are incomplete",
+            ));
+        }
+        self.install_snapshot(entries, None, None, Some(writer_episodes))
     }
 
     /// Commit the incoming shared rows, their journal entries and the joining
@@ -350,7 +364,7 @@ impl RegistryStore {
         head: i64,
         self_author: Option<&str>,
     ) -> Result<i64, RegistryError> {
-        self.install_snapshot(entries, Some(head), self_author)
+        self.install_snapshot(entries, Some(head), self_author, None)
     }
 
     fn install_snapshot(
@@ -358,6 +372,7 @@ impl RegistryStore {
         entries: &[RemoteEntry],
         join_head: Option<i64>,
         self_author: Option<&str>,
+        writer_episodes: Option<&[u64]>,
     ) -> Result<i64, RegistryError> {
         let parts = entries
             .iter()
@@ -475,6 +490,9 @@ impl RegistryStore {
                         entry: canonical_bytes(if i == 0 { &merged } else { &empty }),
                     };
                     seq = apply(tx, &replay_entry)?;
+                    if let Some(episodes) = writer_episodes {
+                        crate::hub_store::record_log_writer(tx, entry, episodes[i])?;
+                    }
                     let payload: String = tx.query_row(
                         "SELECT payload_json FROM registry_journal WHERE seq=?1",
                         [seq],
@@ -516,10 +534,30 @@ impl RegistryStore {
         entry: &RemoteEntry,
         self_author: Option<&str>,
     ) -> Result<i64, RegistryError> {
+        self.apply_remote_entry_with_writer(entry, self_author, None)
+    }
+
+    pub fn apply_hub_remote_entry(
+        &self,
+        entry: &RemoteEntry,
+        writer_ep: u64,
+    ) -> Result<i64, RegistryError> {
+        self.apply_remote_entry_with_writer(entry, None, Some(writer_ep))
+    }
+
+    fn apply_remote_entry_with_writer(
+        &self,
+        entry: &RemoteEntry,
+        self_author: Option<&str>,
+        writer_ep: Option<u64>,
+    ) -> Result<i64, RegistryError> {
         let error = std::cell::RefCell::new(None);
         let result = self.with_where_changes(|tx| {
             (|| {
                 let seq = apply(tx, entry)?;
+                if let Some(episode) = writer_ep {
+                    crate::hub_store::record_log_writer(tx, entry, episode)?;
+                }
                 learn_identity(tx, self_author)?;
                 Ok(seq)
             })()

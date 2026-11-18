@@ -80,7 +80,7 @@ fn episode_invalid() -> HandlerError {
     )
 }
 
-fn unknown_key() -> HandlerError {
+pub(super) fn unknown_key() -> HandlerError {
     HandlerError::new(
         "signature_invalid",
         "no trusted fleet record key for the writer episode",
@@ -707,6 +707,28 @@ impl<T: Transport> Membership<T> {
             .timeline
             .before(box_id, applied.saturating_add(1));
         state.closed.is_none().then_some(state.episode)
+    }
+
+    pub(super) fn current_member_episode(&self, box_id: &str, applied: u64) -> Option<u64> {
+        let view = self.view.read().unwrap();
+        view.through?;
+        if !view.current.iter().any(|peer| peer.box_id == box_id) {
+            return None;
+        }
+        let state = view
+            .proof
+            .timeline
+            .before(box_id, applied.saturating_add(1));
+        state.closed.is_none().then_some(state.episode)
+    }
+
+    pub(super) fn episode_closed(&self, box_id: &str, episode: u64, applied: u64) -> bool {
+        let view = self.view.read().unwrap();
+        let state = view
+            .proof
+            .timeline
+            .before(box_id, applied.saturating_add(1));
+        episode < state.episode || (episode == state.episode && state.closed.is_some())
     }
 
     pub(super) fn can_write(&self, applied: u64) -> Option<u64> {

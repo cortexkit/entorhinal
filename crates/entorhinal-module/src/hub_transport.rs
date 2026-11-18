@@ -42,6 +42,28 @@ const LOG_STREAM: &str = "HUB_IDLOG";
 pub(super) const LOG_SUBJECT: &str = "ck.fleet.idlog";
 const BUCKET: &str = "residence";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_KV_VALUE: i32 = 16 * 1024;
+const MAX_KV_BYTES: i64 = 64 * 1024 * 1024;
+
+pub(super) enum KvDelivery {
+    Empty,
+    Entry(kv::Entry),
+}
+
+pub(super) fn check_kv_size(key: &str, len: usize) -> Result<(), HandlerError> {
+    let fits = if key.starts_with("wrapjoin.") {
+        len <= 12 * 1024
+    } else {
+        len < 4 * 1024
+    };
+    if !fits {
+        return Err(HandlerError::new(
+            "record_too_large",
+            "fleet KV value exceeds its write limit",
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Default)]
 pub(super) struct Gauges {
@@ -191,6 +213,20 @@ impl Hub {
         })
     }
 
+    pub(super) fn residence_watch(self: &Arc<Self>) -> Feed<KvDelivery> {
+        let hub = self.clone();
+        Feed::kv(self.health.clone(), move |_| {
+            let hub = hub.clone();
+            async move {
+                hub.open(Instant::now() + REQUEST_TIMEOUT)
+                    .await?
+                    .residence_watch()
+                    .await
+            }
+        })
+        .with_durable_cursor()
+    }
+
     /// `applied` is a Hub stream sequence, not the registry's rebased position.
     pub(super) fn tail(self: &Arc<Self>, applied: u64) -> Feed<LogDelivery> {
         let hub = self.clone();
@@ -218,6 +254,40 @@ pub(super) struct LogDelivery {
 }
 
 impl Binding {
+    async fn residence_watch(self) -> Result<Subscription<KvDelivery>, Failure> {
+        let kv = self.session.kv().await?;
+        let watch = kv
+            .watch_with_history(">")
+            .await
+            .map_err(|error| Failure::kind("kv_watch", error.kind()))?;
+        // Read the bucket state after installing the watch so a write between
+        // binding and subscribing cannot be mistaken for an empty replay.
+        let status = self
+            .session
+            .kv()
+            .await?
+            .status()
+            .await
+            .map_err(|error| Failure::kind("kv_status", error.kind()))?;
+        let config = &status.info.config;
+        if status.history() != 1
+            || !status.max_age().is_zero()
+            || config.max_message_size != MAX_KV_VALUE
+            || config.max_bytes != MAX_KV_BYTES
+        {
+            return Err(Failure::code("kv_bucket_config_invalid"));
+        }
+        let empty = futures_util::stream::iter(
+            (status.values() == 0).then_some(Ok((0, KvDelivery::Empty))),
+        );
+        Ok(Subscription::new(
+            self.changes,
+            empty.chain(watch.map(|event| {
+                map_kv_delivery(event).map(|(revision, entry)| (revision, KvDelivery::Entry(entry)))
+            })),
+        ))
+    }
+
     async fn watch(self, cursor: Option<u64>) -> Result<Subscription<kv::Entry>, Failure> {
         let kv = self.session.kv().await?;
         let watch = match cursor {
@@ -225,19 +295,7 @@ impl Binding {
             None => kv.watch_with_history(">").await,
         }
         .map_err(|error| Failure::kind("kv_watch", error.kind()))?;
-        Ok(Subscription::new(
-            self.changes,
-            watch.map(|event| match event {
-                Ok(entry) => Ok((entry.revision, entry)),
-                Err(error) => Err(error
-                    .source()
-                    .and_then(|source| source.downcast_ref::<push::OrderedError>())
-                    .map_or_else(
-                        || Failure::kind("kv_delivery", error.kind()),
-                        |ordered| Failure::kind("kv_delivery", ordered.kind()),
-                    )),
-            }),
-        ))
+        Ok(Subscription::new(self.changes, watch.map(map_kv_delivery)))
     }
 
     async fn tail(self, applied: u64) -> Result<Subscription<LogDelivery>, Failure> {
@@ -275,6 +333,20 @@ impl Binding {
             }),
         ))
     }
+}
+
+fn map_kv_delivery(
+    event: Result<kv::Entry, kv::WatcherError>,
+) -> Result<(u64, kv::Entry), Failure> {
+    event.map(|entry| (entry.revision, entry)).map_err(|error| {
+        error
+            .source()
+            .and_then(|source| source.downcast_ref::<push::OrderedError>())
+            .map_or_else(
+                || Failure::kind("kv_delivery", error.kind()),
+                |ordered| Failure::kind("kv_delivery", ordered.kind()),
+            )
+    })
 }
 
 pub(super) struct Session {
@@ -354,6 +426,7 @@ impl Session {
         op_id: &str,
         deadline: Instant,
     ) -> Result<u64, HandlerError> {
+        check_kv_size(key, bytes.len())?;
         if !key.split('.').all(|token| {
             !token.is_empty()
                 && token
@@ -382,6 +455,15 @@ impl Session {
         op_id: &str,
         deadline: Instant,
     ) -> Result<(), HandlerError> {
+        if !["move.", "wrapreq.", "rolehandback.", "wrapjoin.", "wrap."]
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
+        {
+            return Err(HandlerError::new(
+                "kv_delete_forbidden",
+                "fleet key cannot be deleted",
+            ));
+        }
         let kv = self.confirm_hub(deadline, self.kv()).await?;
         if self.client.connection_state() != State::Connected || Instant::now() >= deadline {
             self.health.hub.failed();

@@ -3178,6 +3178,8 @@ impl ProjectsHandler {
             let now = (self.clock)();
             let clock = self.clock;
             let refresh = self.claim_refresh.clone();
+            let residence = self.residence();
+            let hub_selected = self.hub_backend_selected();
             let worker = tokio::task::spawn_blocking(move || {
                 // On a single-worker test runtime this panics before SQLite if
                 // registration is ever moved from this blocking thread back onto
@@ -3186,13 +3188,20 @@ impl ProjectsHandler {
                 // blocking thread.
                 #[cfg(test)]
                 tokio::task::block_in_place(|| {});
-                sessions::register_session_on_store(
-                    &store,
-                    request.params,
-                    role,
-                    now,
-                    clock,
-                    &refresh,
+                crate::hub_residence::with_claim_context(
+                    residence.as_deref(),
+                    hub_selected,
+                    |context| {
+                        sessions::register_session_on_store(
+                            &store,
+                            request.params,
+                            role,
+                            now,
+                            clock,
+                            &refresh,
+                            context,
+                        )
+                    },
                 )
             });
             return timeout_at(received + DEADLINE, worker)
@@ -3269,6 +3278,30 @@ impl ProjectsHandler {
             ));
         }
         bootstrap_fence(&store, &state, &request)?;
+        let hub_create = if request.method == "agent.create" && self.hub_backend_selected() {
+            let residence = self.residence().ok_or_else(|| {
+                HandlerError::new("hub_not_ready", "hub residence watch is not installed")
+            })?;
+            let prepared = prepared.as_ref().expect("create is a shared write");
+            prepared.probe(&store, &request.method, &principal)?;
+            let key = request.params["request_key"]
+                .as_str()
+                .filter(|key| !key.is_empty())
+                .ok_or_else(|| {
+                    HandlerError::new("request_key_required", "request_key is required")
+                })?;
+            let digest = crate::hub_write::params_digest(&request.method, &request.params)?;
+            if store.hub_attempt(key)?.is_some() {
+                return self.attach_incarnation(
+                    residence
+                        .create(key, &digest, None, received + DEADLINE)
+                        .await?,
+                );
+            }
+            Some((residence, key.to_owned(), digest))
+        } else {
+            None
+        };
         let mut confirmation = None;
         let mut approval = None;
         let mut budget_start = received;
@@ -3347,6 +3380,45 @@ impl ProjectsHandler {
         } else {
             received + DEADLINE
         };
+        if let Some((residence, request_key, digest)) = hub_create {
+            let agent_id = (self.agent_id_draw)()?;
+            let avatar = if request.params.get("avatar").is_none_or(Value::is_null) {
+                Some((self.agent_avatar_draw)()?)
+            } else {
+                None
+            };
+            let now = (self.clock)();
+            let write = prepared.expect("create is a shared write");
+            let preview = |store: &RegistryStore, saved: Option<&Value>| {
+                let id = saved
+                    .and_then(|body| body["agent_id"].as_str())
+                    .unwrap_or(&agent_id);
+                let time = saved
+                    .and_then(|body| body["row"]["updated_at_ms"].as_i64())
+                    .unwrap_or(now);
+                preview_hub_create(store, || {
+                    write.clone().run(
+                        store,
+                        &principal,
+                        time,
+                        id,
+                        avatar.clone(),
+                        approval.as_ref(),
+                    )
+                })
+            };
+            let create = residence.create(&request_key, &digest, Some(&preview), deadline);
+            let reply = if let Some(guard) = &mut confirmation {
+                tokio::select! {
+                    biased;
+                    _ = guard.cancelled.wait_for(|closed| *closed) => return Err(agent_ops::OperatorConfirmError::Declined.into()),
+                    result = create => result,
+                }
+            } else {
+                create.await
+            }?;
+            return self.record_mutation(self.attach_incarnation(reply));
+        }
         let lock = timeout_at(deadline, self.writer.clone().lock_owned());
         let lock_result = if let Some(guard) = &mut confirmation {
             tokio::select! {
@@ -3533,6 +3605,47 @@ impl ProjectsHandler {
             return self.record_mutation(Ok(body));
         }
         unreachable!()
+    }
+}
+
+fn preview_hub_create(
+    store: &RegistryStore,
+    apply: impl FnOnce() -> Result<Vec<u8>, HandlerError>,
+) -> Result<Value, HandlerError> {
+    let captured = Arc::new(std::sync::Mutex::new(None));
+    let slot = captured.clone();
+    let status = store.identity_log_status()?;
+    if status.state != "enabled" {
+        return Err(HandlerError::new(
+            "hub_not_ready",
+            "hub identity log is not enabled",
+        ));
+    }
+    let result = store.shared_attempt(
+        crate::hub_write::new_op_id()?,
+        status.last_applied_position,
+        move |bytes| {
+            *slot.lock().unwrap() = Some(bytes);
+            SharedSettlement::Rollback {
+                sent: false,
+                code: "hub_create_preview".into(),
+                message: "record the create after-image without committing locally".into(),
+            }
+        },
+        apply,
+    );
+    match result {
+        Err(error) if error.code == "hub_create_preview" => {
+            let bytes = captured.lock().unwrap().take().ok_or_else(|| {
+                HandlerError::new("storage_error", "create preview has no after-image")
+            })?;
+            serde_json::from_slice(&bytes).map_err(invalid_params)
+        }
+        Err(error) => Err(error),
+        Ok(_) => Err(HandlerError::new(
+            "hub_not_ready",
+            "agent create did not produce a shared after-image",
+        )),
     }
 }
 

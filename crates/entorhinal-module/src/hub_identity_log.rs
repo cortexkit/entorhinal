@@ -106,12 +106,12 @@ impl<T: LogTransport, U: Trust> Trust for MemberTrust<'_, T, U> {
 
 pub(super) struct IdentityLog<T, U> {
     link: Arc<Link<T, U>>,
-    store: RegistryStore,
+    pub(super) store: RegistryStore,
     health: Arc<HealthGauges>,
     writer: Arc<tokio::sync::Mutex<()>>,
-    commits: Arc<Notify>,
-    box_id: BoxId,
-    base: i64,
+    pub(super) commits: Arc<Notify>,
+    pub(super) box_id: BoxId,
+    pub(super) base: i64,
     membership: Arc<Membership<T>>,
 }
 
@@ -193,6 +193,7 @@ pub(super) struct AcceptedKv {
     pub record: VerifiedRecord,
     pub body: Value,
     pub writer_current: bool,
+    pub applied: u64,
 }
 
 impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
@@ -209,6 +210,85 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
             && crate::hub_membership::box_id(holder))
     }
 
+    pub(super) fn current_member_episode(&self, holder: &str, applied: u64) -> Option<u64> {
+        self.membership.current_member_episode(holder, applied)
+    }
+
+    pub(super) fn episode_closed(&self, holder: &str, episode: u64, applied: u64) -> bool {
+        self.membership.episode_closed(holder, episode, applied)
+    }
+
+    pub(super) async fn log_head(&self, deadline: Instant) -> Result<u64, HandlerError> {
+        self.link.transport.log_head(deadline).await
+    }
+
+    pub(super) fn writer_episode(&self) -> Result<u64, HandlerError> {
+        if self.membership_ready() {
+            if let Some(episode) = self.membership.can_write(self.applied_sequence()?) {
+                return Ok(episode);
+            }
+        }
+        Err(HandlerError::new(
+            "hub_not_ready",
+            "hub membership barrier has not passed",
+        ))
+    }
+
+    pub(super) async fn write_residence(
+        &self,
+        request: &hub_write::Request<'_>,
+        step: &Step,
+        next: Option<hub_write::NextStep<'_>>,
+        replan: Option<&dyn LogReplan>,
+        deadline: Instant,
+    ) -> Result<hub_write::Landed, HandlerError> {
+        let _guard = timeout_at(deadline, self.writer.lock())
+            .await
+            .map_err(|_| {
+                HandlerError::new("identity_log_contended", "waiting for the hub writer")
+            })?;
+        let row = self.store.hub_attempt(request.request_key)?;
+        if row.as_ref().is_none_or(|row| row.outcome.is_none())
+            && self.writer_episode()? != request.writer_ep
+        {
+            return Err(HandlerError::new(
+                "member_episode_invalid",
+                "residence writer's episode has closed",
+            ));
+        }
+        let trust = MemberTrust {
+            epoch: self.link.trust.as_ref(),
+            membership: &self.membership,
+            store: &self.store,
+            base: self.base,
+        };
+        Writer {
+            replan,
+            ..self.link.writer(&self.store, &trust)
+        }
+        .run(request, step, next, deadline)
+        .await
+    }
+
+    pub(super) async fn record_residence_applied(
+        &self,
+        record: &VerifiedRecord,
+        revision: u64,
+        deadline: Instant,
+    ) -> Result<(), HandlerError> {
+        let trust = MemberTrust {
+            epoch: self.link.trust.as_ref(),
+            membership: &self.membership,
+            store: &self.store,
+            base: self.base,
+        };
+        self.link
+            .writer(&self.store, &trust)
+            .record_applied(record, revision, deadline)
+            .await?;
+        Ok(())
+    }
+
     pub(super) async fn verify_kv(
         &self,
         key: &str,
@@ -222,21 +302,31 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
             "epoch" | "wrap" | "wrapreq" | "wrapjoin"
         );
         let applied = self.applied_sequence()?;
-        let (record, observed_head) = self
-            .membership
-            .verify_kv(record, applied, sight, deadline)
-            .await?;
-        if !join {
-            if let Some(head) = observed_head {
-                wait_for_applied(self, head, deadline).await?;
-            }
+        let record = if join {
+            self.membership
+                .verify_kv(record, applied, sight, deadline)
+                .await?
+                .0
+        } else {
+            let key = match self.membership.kv_key(&record, applied, sight)? {
+                Some(key) => key,
+                None => {
+                    let head = self.link.transport.log_head(deadline).await?;
+                    self.membership.discover(head, deadline).await?;
+                    wait_for_applied(self, head, deadline).await?;
+                    self.membership
+                        .kv_key(&record, self.applied_sequence()?, sight)?
+                        .ok_or_else(crate::hub_membership::unknown_key)?
+                }
+            };
             if !self.membership_ready() {
                 return Err(HandlerError::new(
                     "hub_membership_stale",
                     "hub membership view is catching up",
                 ));
             }
-        }
+            record.verify(&key)?
+        };
         let applied = self.applied_sequence()?;
         let writer_current = record.header().kind != "wrapreq"
             && self
@@ -267,6 +357,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
             record,
             body,
             writer_current,
+            applied,
         })
     }
 
@@ -382,7 +473,7 @@ where
     }
 }
 
-async fn wait_for_applied<T: LogTransport, U: Trust + Send + Sync + 'static>(
+pub(super) async fn wait_for_applied<T: LogTransport, U: Trust + Send + Sync + 'static>(
     log: &IdentityLog<T, U>,
     sequence: u64,
     deadline: Instant,
@@ -726,14 +817,21 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
                 self.check_supersede(through, &snapshot.entries, deadline)
                     .await?;
             }
-            self.store.apply_remote_snapshot(&snapshot.entries, None)?;
+            let episodes = snapshot
+                .records
+                .iter()
+                .map(|record| record.header().writer_ep)
+                .collect::<Vec<_>>();
+            self.store
+                .apply_hub_remote_snapshot(&snapshot.entries, &episodes)?;
             self.committed(position);
             for (entry, record) in snapshot.entries.iter().zip(&snapshot.records) {
                 self.settle_applied(record, hub_sequence(self.base, entry.position)?, deadline)
                     .await;
             }
         } else {
-            self.store.apply_remote_entry(&entry, None)?;
+            self.store
+                .apply_hub_remote_entry(&entry, header.writer_ep)?;
             self.committed(position);
             self.settle_applied(&record, delivery.sequence, deadline)
                 .await;

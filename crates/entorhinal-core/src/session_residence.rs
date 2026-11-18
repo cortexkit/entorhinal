@@ -45,6 +45,28 @@ impl RegistryStore {
         runner: &str,
         session: &str,
     ) -> Result<SessionResidence, RegistryError> {
+        self.session_residence_with(runner, session, |conn, agent| {
+            claim_cache::load_claim_view(conn, agent, self.is_foreign())
+        })
+    }
+
+    pub fn hub_session_residence(
+        &self,
+        runner: &str,
+        session: &str,
+        context: &claim_cache::HubClaimContext<'_>,
+    ) -> Result<SessionResidence, RegistryError> {
+        self.session_residence_with(runner, session, |conn, agent| {
+            claim_cache::hub_claim_view(conn, agent, context)
+        })
+    }
+
+    fn session_residence_with(
+        &self,
+        runner: &str,
+        session: &str,
+        view: impl FnOnce(&rusqlite::Connection, &str) -> rusqlite::Result<claim_cache::ClaimView>,
+    ) -> Result<SessionResidence, RegistryError> {
         self.read(|conn| {
             let Some(binding) =
                 session_lifecycle::session_binding_for_key_in(conn, "runner", runner, session)?
@@ -68,7 +90,7 @@ impl RegistryStore {
             {
                 return Ok(result);
             }
-            let view = claim_cache::load_claim_view(conn, &binding.agent_id, self.is_foreign())?;
+            let view = view(conn, &binding.agent_id)?;
             result.state = if !view.known
                 || view.claim.stale
                 || view.claim.integrity_failed

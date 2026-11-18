@@ -471,6 +471,7 @@ stay on the computer that launched them and do not block a move.
 | `agent.refresh_claims` | mutate | Direct | Refresh live agents' cached claims from engram. |
 | `role.read` | query | any | Which machine holds a role, from the cached claim. |
 | `role.take` | mutate | Direct, with operator confirmation | Make this machine the role's holder. |
+| `agent.take` | mutate | Direct, with operator confirmation | On a ready hub, take an agent held by a removed computer, a past membership episode, or a legacy Engram author not mapped to a hub member (`engram:<author>`); also claims migrated agents with no residence. Refuses `holder_is_member` for a current holder, `claim_pending` while the creator must write the first claim, `claim_integrity_failed` for a refused claim, `hub_not_ready` while the hub view catches up, and `caller_forbidden`, `operator_declined`, or `operator_presence_unavailable` when authorization or confirmation fails. |
 
 `node.self` reads one local read-only snapshot without contacting engram or
 writing a journal entry. `author` is the opaque identity-log author compared with

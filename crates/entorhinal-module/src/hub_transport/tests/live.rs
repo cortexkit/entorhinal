@@ -1,6 +1,5 @@
 use std::{
     fs::{self, File},
-    net::TcpListener as PortReservation,
     path::PathBuf,
     process::{Child, Command, Stdio},
     time::SystemTime,
@@ -18,12 +17,16 @@ mod identity_log;
 
 const PREFIX: &str = "ckdel.0123456789abcdef0123456789abcdef.entorhinal";
 
-fn port() -> u16 {
-    PortReservation::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+#[derive(serde::Deserialize)]
+struct PortsFile {
+    nats: Vec<String>,
+    #[serde(default)]
+    monitoring: Vec<String>,
+}
+
+struct BoundPorts {
+    client: u16,
+    leaf: Option<u16>,
 }
 
 struct Rig {
@@ -57,10 +60,22 @@ impl Rig {
         }
     }
 
-    async fn start(&mut self, name: &str, config: &str, port: u16) {
+    async fn start(&mut self, name: &str, config: &str, has_leaf_listener: bool) -> BoundPorts {
         let path = self.dir.join(format!("{name}.conf"));
         let log = self.dir.join(format!("{name}.log"));
-        fs::write(&path, config).unwrap();
+        let ports_dir = serde_json::to_string(&self.dir).unwrap();
+        let monitor = if has_leaf_listener {
+            "http: \"127.0.0.1:-1\"\n"
+        } else {
+            ""
+        };
+        // NATS binds its own ports. Picking a free port in the test first
+        // leaves it open for another parallel test to claim before NATS starts.
+        fs::write(
+            &path,
+            format!("listen: \"127.0.0.1:-1\"\nports_file_dir: {ports_dir}\n{monitor}{config}"),
+        )
+        .unwrap();
         self.children.push(
             Command::new("nats-server")
                 .arg("-c")
@@ -70,13 +85,81 @@ impl Rig {
                 .spawn()
                 .unwrap(),
         );
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while TcpStream::connect(("127.0.0.1", port)).await.is_err() {
+        let child = self.children.last_mut().unwrap();
+        let ports_file = self.dir.join(format!("nats-server_{}.ports", child.id()));
+        let failure = |reason: &str| -> ! {
+            panic!(
+                "{name} did not start ({reason}): {}",
+                fs::read_to_string(&log).unwrap()
+            );
+        };
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let ports = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    failure(&format!("nats-server exited with {status}"));
+                }
+                match fs::read(&ports_file) {
+                    Ok(bytes) => match serde_json::from_slice::<PortsFile>(&bytes) {
+                        Ok(ports) => break ports,
+                        Err(error) if error.is_eof() => {} // NATS may still be writing the file.
+                        Err(error) => failure(&format!("invalid ports file: {error}")),
+                    },
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => failure(&format!("could not read ports file: {error}")),
+                }
                 sleep(Duration::from_millis(20)).await;
+            };
+            let client = ports
+                .nats
+                .first()
+                .and_then(|url| reqwest::Url::parse(url).ok()?.port())
+                .unwrap_or_else(|| failure("missing client port"));
+            let leaf = if has_leaf_listener {
+                // NATS reports client and monitor addresses in the ports
+                // file, but only /varz reports the bound leaf listener.
+                let monitor_url = ports
+                    .monitoring
+                    .first()
+                    .and_then(|url| reqwest::Url::parse(url).ok()?.join("/varz").ok())
+                    .unwrap_or_else(|| failure("missing monitoring address"));
+                let response = reqwest::Client::builder()
+                    .no_proxy()
+                    .build()
+                    .unwrap()
+                    .get(monitor_url)
+                    .send()
+                    .await
+                    .and_then(reqwest::Response::error_for_status)
+                    .unwrap_or_else(|error| {
+                        failure(&format!("could not query leaf port: {error}"))
+                    });
+                let bytes = response
+                    .bytes()
+                    .await
+                    .unwrap_or_else(|error| failure(&format!("could not read /varz: {error}")));
+                let varz: Value = serde_json::from_slice(&bytes)
+                    .unwrap_or_else(|error| failure(&format!("invalid /varz: {error}")));
+                Some(
+                    varz["leaf"]["port"]
+                        .as_u64()
+                        .and_then(|port| u16::try_from(port).ok())
+                        .filter(|port| *port != 0)
+                        .unwrap_or_else(|| failure("missing leaf listener in /varz")),
+                )
+            } else {
+                None
+            };
+            for port in std::iter::once(client).chain(leaf) {
+                TcpStream::connect(("127.0.0.1", port))
+                    .await
+                    .unwrap_or_else(|error| {
+                        failure(&format!("listener {port} was not ready: {error}"))
+                    });
             }
+            BoundPorts { client, leaf }
         })
         .await
-        .unwrap_or_else(|_| panic!("{name} did not start: {}", fs::read_to_string(log).unwrap()));
+        .unwrap_or_else(|_| failure("startup hang guard elapsed"))
     }
 }
 
@@ -121,30 +204,27 @@ async fn hub_transport_live_leaf_outage_resumes_and_never_queues_unsent_write() 
         result => assert!(result.unwrap().status.success()),
     }
     let mut rig = Rig::new();
-    let hub_port = port();
-    let leaf_port = port();
-    let hub_leaf_port = port();
-    let (proxy_port, link) = leaf_link(hub_leaf_port).await;
-    rig.start(
-        "hub",
-        &format!(
-            r#"
-        listen: 127.0.0.1:{hub_port}
+    let hub_ports = rig
+        .start(
+            "hub",
+            &format!(
+                r#"
         server_name: hub
         jetstream {{ domain: hub, store_dir: {:?} }}
-        leafnodes {{ listen: 127.0.0.1:{hub_leaf_port}, no_advertise: true }}
+        leafnodes {{ listen: "127.0.0.1:-1", no_advertise: true }}
         mappings {{ "$JS.hub.API.$KV.residence.>" : "$KV.residence.>" }}
     "#,
-            rig.dir.join("store").to_string_lossy()
-        ),
-        hub_port,
-    )
-    .await;
-    rig.start(
-        "leaf",
-        &format!(
-            r#"
-        listen: 127.0.0.1:{leaf_port}
+                rig.dir.join("store").to_string_lossy()
+            ),
+            true,
+        )
+        .await;
+    let (proxy_port, link) = leaf_link(hub_ports.leaf.unwrap()).await;
+    let leaf_ports = rig
+        .start(
+            "leaf",
+            &format!(
+                r#"
         server_name: leaf
         leafnodes {{ remotes: [{{ url: "nats-leaf://127.0.0.1:{proxy_port}" }}] }}
         authorization {{ users: [{{ user: test, pass: test,
@@ -154,18 +234,21 @@ async fn hub_transport_live_leaf_outage_resumes_and_never_queues_unsent_write() 
             }}
         }}] }}
     "#
-        ),
-        leaf_port,
-    )
-    .await;
+            ),
+            false,
+        )
+        .await;
 
-    let admin = async_nats::connect(format!("127.0.0.1:{hub_port}"))
+    let admin = async_nats::connect(format!("127.0.0.1:{}", hub_ports.client))
         .await
         .unwrap();
     let admin = jetstream::new(admin);
     let kv = admin
         .create_key_value(kv::Config {
             bucket: BUCKET.into(),
+            history: 1,
+            max_value_size: MAX_KV_VALUE,
+            max_bytes: MAX_KV_BYTES,
             ..Default::default()
         })
         .await
@@ -183,7 +266,7 @@ async fn hub_transport_live_leaf_outage_resumes_and_never_queues_unsent_write() 
     let client = async_nats::ConnectOptions::new()
         .user_and_password("test".into(), "test".into())
         .custom_inbox_prefix(PREFIX)
-        .connect(format!("127.0.0.1:{leaf_port}"))
+        .connect(format!("127.0.0.1:{}", leaf_ports.client))
         .await
         .unwrap();
     let health = Arc::new(HealthGauges::default());
@@ -321,20 +404,36 @@ async fn hub_transport_live_leaf_outage_resumes_and_never_queues_unsent_write() 
         b"initial"
     );
     assert!(session().log_entry(4, deadline()).await.unwrap().is_none());
+    let forbidden = session()
+        .delete(
+            "residence.alfa",
+            entry.revision,
+            "forbidden-delete",
+            deadline(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(forbidden.code, "kv_delete_forbidden");
+    let target = "wrapreq.alfa";
+    let revision = session()
+        .update(target, b"request".to_vec(), 0, "wrap-request", deadline())
+        .await
+        .unwrap();
+    assert_eq!(within(watch.next()).await.revision, revision);
     let stale = session()
-        .delete("residence.alfa", first, "stale-delete", deadline())
+        .delete(target, first, "stale-delete", deadline())
         .await
         .unwrap_err();
     assert_eq!(stale.code, "revision_moved");
     session()
-        .delete("residence.alfa", entry.revision, "delete", deadline())
+        .delete(target, revision, "delete", deadline())
         .await
         .unwrap();
     let marker = within(watch.next()).await;
     assert!(marker.revision > entry.revision);
     assert_eq!(marker.operation, kv::Operation::Delete);
     let current = session()
-        .kv_entry("residence.alfa", deadline())
+        .kv_entry(target, deadline())
         .await
         .unwrap()
         .unwrap();

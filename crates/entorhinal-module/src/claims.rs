@@ -346,7 +346,7 @@ impl Worker {
 
 impl ProjectsHandler {
     pub(super) fn start_claim_refresh(&self) {
-        if self.health.origin.is_foreign() {
+        if self.health.origin.is_foreign() || self.hub_backend_selected() {
             return;
         }
         let mut task = self.claim_refresh_task.lock().unwrap();
@@ -407,7 +407,9 @@ impl ProjectsHandler {
     /// This only enqueues a request for the refresh task: the write that
     /// created the agent must not wait for engram before replying.
     pub(super) fn refresh_claims_for_new_agent(&self) {
-        self.claim_refresh.signal();
+        if !self.hub_backend_selected() {
+            self.claim_refresh.signal();
+        }
     }
 
     pub(super) fn admit_claim_refresh(&self, key: RouteKey) -> Result<(), HandlerError> {
@@ -446,6 +448,12 @@ impl ProjectsHandler {
     /// is running. Move admission needs the same refresh for module callers as
     /// for operator routes with a Direct principal, so both check current ownership.
     pub(super) async fn wait_claim_refresh(&self) -> Result<RefreshCounts, HandlerError> {
+        if self.hub_backend_selected() {
+            return Err(HandlerError::new(
+                "hub_claims_watched",
+                "the hub residence watch refreshes claims",
+            ));
+        }
         self.start_claim_refresh();
         let (sender, receiver) = oneshot::channel();
         self.claim_refresh
@@ -498,15 +506,20 @@ impl ProjectsHandler {
     }
 
     fn agent_where_value(&self, agent_id: &str) -> Result<Value, HandlerError> {
+        if let Some(residence) = self.residence() {
+            let location = self.with_agent_store(|store| {
+                residence.with_context(|context| store.hub_agent_where(agent_id, context))
+            })?;
+            let mut value = serde_json::to_value(location).map_err(crate::invalid_params)?;
+            if let Some(moving) = value.get_mut("moving") {
+                crate::move_ops::elapsed(moving, (self.clock)());
+            }
+            return Ok(value);
+        }
         let location = self.with_agent_store(|store| store.agent_where(agent_id));
-        // The hub residence read will replace this branch. The engram cache
-        // can name a non-box holder or predate a removal even after catch-up.
-        let hub_mode = self
-            .health
-            .hub_membership
-            .load(std::sync::atomic::Ordering::Acquire)
-            != 0;
-        if hub_mode
+        // Cutover may start the log before it installs the residence watch.
+        // Never use the engram cache once the hub is selected.
+        if self.hub_backend_selected()
             && (location.is_ok()
                 || location
                     .as_ref()

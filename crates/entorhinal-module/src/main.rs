@@ -104,6 +104,7 @@ mod fake_door;
 mod fleet_record;
 mod hub_identity_log;
 mod hub_membership;
+mod hub_residence;
 // The hub backend starts this transport only when the store selects it.
 #[allow(dead_code)]
 mod hub_transport;
@@ -558,6 +559,7 @@ struct ProjectsHandler {
     writer: Arc<tokio::sync::Mutex<()>>,
     draining: tokio::sync::watch::Sender<bool>,
     catch_up_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    hub_residence: Mutex<Option<hub_residence::Running>>,
     catch_up_wake: Arc<tokio::sync::Notify>,
     record_client: record_client::RecordClient,
     participant_discovery: Arc<dyn participant_discovery::ParticipantDiscovery>,
@@ -705,6 +707,7 @@ const MUTATING_METHODS: &[&str] = &[
     sessions::END_SESSION,
     sessions::SET_SESSION_NETWORK,
     "agent.refresh_claims",
+    hub_residence::TAKE,
     "member.set_name",
     "role.take",
     "agent.move",
@@ -730,6 +733,7 @@ const SELF_ADMITTED_METHODS: &[&str] = &[
     claims::REFRESH,
     member::SET_NAME,
     roles::TAKE,
+    hub_residence::TAKE,
     move_admission::MOVE,
     move_ops::ABORT,
     move_ops::SET_LID,
@@ -967,6 +971,7 @@ impl ProjectsHandler {
             writer: Arc::new(tokio::sync::Mutex::new(())),
             draining: tokio::sync::watch::channel(false).0,
             catch_up_task: Mutex::new(None),
+            hub_residence: Mutex::new(None),
             catch_up_wake: Arc::default(),
             record_client: record_client::RecordClient::new(record_connector),
             participant_discovery: Arc::new(participant_discovery::SubcParticipantDiscovery::new(
@@ -1071,6 +1076,9 @@ impl ProjectsHandler {
         }
         if method == roles::TAKE {
             self.admit_role_take(key)?;
+        }
+        if method == hub_residence::TAKE {
+            self.admit_residence_take(key)?;
         }
         if method == claims::REFRESH {
             self.admit_claim_refresh(key)?;
@@ -1506,6 +1514,8 @@ impl ProjectsHandler {
             self.enable_log(request.params, key, received).await
         } else if request.method == roles::TAKE {
             self.take_role(request.params, key, received).await
+        } else if request.method == hub_residence::TAKE {
+            self.take_residence(request.params, key, received).await
         } else if request.method == claims::REFRESH {
             self.refresh_agent_claims(request.params, key).await
         } else if request.method == move_admission::MOVE {
@@ -1762,6 +1772,10 @@ impl ProjectsHandler {
                 "served_path_required",
                 "role.take requires the asynchronous served path",
             )),
+            hub_residence::TAKE => Err(HandlerError::new(
+                "served_path_required",
+                "agent.take requires the asynchronous served path",
+            )),
             claims::WHERE => self.agent_where(request.params),
             claims::WHERE_MANY => self.agent_where_many(request.params),
             claims::REFRESH => Err(HandlerError::new(
@@ -1776,6 +1790,14 @@ impl ProjectsHandler {
             move_ops::REFS => self.move_refs(request.params),
             move_ops::MOVES => self.moves(request.params),
             method if agent_ops::MUTATING_METHODS.contains(&method) => {
+                if method == "agent.create"
+                    && self.health.hub_membership.load(Ordering::Acquire) != 0
+                {
+                    return Err(HandlerError::new(
+                        "served_path_required",
+                        "hub agent creation requires the asynchronous served path",
+                    ));
+                }
                 self.agent_mutation(method, request.params, &principal)
             }
             method if agent_reads::READ_METHODS.contains(&method) => {
@@ -2543,6 +2565,8 @@ fn manifest() -> ModuleManifest {
                 management_operation(method, ManagementOperationKind::Query, "Read the role record's subject and version, the fence engram checks before admitting holder-only work.")
             })).chain(std::iter::once(roles::TAKE).map(|method| {
                 management_operation(method, ManagementOperationKind::Mutate, "Take a role from Direct with operator confirmation and an idempotent request id.")
+            })).chain(std::iter::once(hub_residence::TAKE).map(|method| {
+                management_operation(method, ManagementOperationKind::Mutate, "Take an agent held on a removed computer, with Direct operator confirmation.")
             })).chain(std::iter::once(move_admission::MOVE).map(|method| {
                 management_operation(method, ManagementOperationKind::Mutate, agent_operation_description(method))
             })).chain(move_ops::READS.iter().map(|method| {
@@ -3312,6 +3336,7 @@ mod tests {
                 "agent.refresh_claims",
                 "member.set_name",
                 "role.take",
+                "agent.take",
                 "agent.move",
                 "agent.move_abort",
                 "agent.set_lid_close_moves",

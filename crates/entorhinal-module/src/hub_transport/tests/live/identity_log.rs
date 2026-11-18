@@ -14,6 +14,7 @@ use tokio::sync::{oneshot, Barrier};
 
 const A: &str = "0123456789abcdef0123456789abcdef";
 const B: &str = "fedcba9876543210fedcba9876543210";
+const C: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const BASE: i64 = 17;
 
 struct Leaf {
@@ -23,6 +24,7 @@ struct Leaf {
     gate: StdMutex<Option<Gate>>,
     sends: StdMutex<Vec<(u64, String, Vec<u8>)>>,
     reads: StdMutex<Vec<u64>>,
+    refuse_kv: std::sync::atomic::AtomicBool,
 }
 
 enum Gate {
@@ -64,8 +66,19 @@ impl Transport for Leaf {
         self.session().log_head(deadline).await
     }
 
-    async fn kv_entry(&self, _: &str, _: Instant) -> Result<Option<KvEntry>, HandlerError> {
-        unreachable!("identity log never reads KV")
+    async fn kv_entry(
+        &self,
+        key: &str,
+        deadline: Instant,
+    ) -> Result<Option<KvEntry>, HandlerError> {
+        Ok(self
+            .session()
+            .kv_entry(key, deadline)
+            .await?
+            .map(|entry| KvEntry {
+                revision: entry.revision,
+                value: (entry.operation == kv::Operation::Put).then(|| entry.value.to_vec()),
+            }))
     }
 
     async fn send(
@@ -74,7 +87,22 @@ impl Transport for Leaf {
         id: &str,
         deadline: Instant,
     ) -> Result<Option<u64>, HandlerError> {
-        assert_eq!(write.key, LOG_SUBJECT);
+        if write.key != LOG_SUBJECT {
+            if self.refuse_kv.load(Ordering::Acquire) {
+                return Err(unavailable("fixture stopped residence before send"));
+            }
+            return self
+                .session()
+                .update(
+                    &write.key,
+                    write.value.clone(),
+                    write.expected,
+                    id,
+                    deadline,
+                )
+                .await
+                .map(Some);
+        }
         let record = UnverifiedRecord::parse(LOG_SUBJECT, &write.value).unwrap();
         assert_eq!(record.header().writer, self.box_id.to_string());
         assert_eq!(record.header().entry_id, id);
@@ -117,13 +145,12 @@ async fn leaf(
     id: &str,
     health: Arc<HealthGauges>,
 ) -> Arc<Leaf> {
-    let listen = port();
     let prefix = format!("ckdel.{id}.entorhinal");
-    rig.start(
-        name,
-        &format!(
-            r#"
-        listen: 127.0.0.1:{listen}
+    let ports = rig
+        .start(
+            name,
+            &format!(
+                r#"
         server_name: {name}
         leafnodes {{ remotes: [{{ url: "nats-leaf://127.0.0.1:{hub_port}" }}] }}
         authorization {{ users: [{{ user: test, pass: test, permissions: {{
@@ -131,14 +158,14 @@ async fn leaf(
             subscribe: ["{prefix}.>"]
         }} }}] }}
     "#
-        ),
-        listen,
-    )
-    .await;
+            ),
+            false,
+        )
+        .await;
     let client = async_nats::ConnectOptions::new()
         .user_and_password("test".into(), "test".into())
         .custom_inbox_prefix(prefix)
-        .connect(format!("127.0.0.1:{listen}"))
+        .connect(format!("127.0.0.1:{}", ports.client))
         .await
         .unwrap();
     let leaf = Arc::new(Leaf {
@@ -148,6 +175,7 @@ async fn leaf(
         gate: StdMutex::default(),
         sends: StdMutex::default(),
         reads: StdMutex::default(),
+        refuse_kv: std::sync::atomic::AtomicBool::new(false),
     });
     within(async {
         while leaf.session().log().await.is_err() {
@@ -187,23 +215,25 @@ fn activate(
     handler: &ProjectsHandler,
     leaf: Arc<Leaf>,
     keys: &Arc<TestKeys>,
-) -> IdentityLog<Leaf, TestKeys> {
-    handler
-        .activate_hub_identity_log(
-            leaf.box_id.clone(),
-            Link {
-                transport: leaf,
-                trust: keys.clone(),
-                signer: Arc::new(ClaustrumCredentialResolver::with_target(keys.clone(), 0)),
-                vault: keys.clone(),
-                peers: Arc::new(crate::hub_membership::tests::Roster(
-                    [A, B]
-                        .map(|id| crate::hub_membership::tests::anchor(id, keys))
-                        .to_vec(),
-                )),
-            },
-        )
-        .unwrap()
+) -> Arc<IdentityLog<Leaf, TestKeys>> {
+    Arc::new(
+        handler
+            .activate_hub_identity_log(
+                leaf.box_id.clone(),
+                Link {
+                    transport: leaf,
+                    trust: keys.clone(),
+                    signer: Arc::new(ClaustrumCredentialResolver::with_target(keys.clone(), 0)),
+                    vault: keys.clone(),
+                    peers: Arc::new(crate::hub_membership::tests::Roster(
+                        [A, B, C]
+                            .map(|id| crate::hub_membership::tests::anchor(id, keys))
+                            .to_vec(),
+                    )),
+                },
+            )
+            .unwrap(),
+    )
 }
 
 fn body(method: &str, params: Value) -> Vec<u8> {
@@ -356,7 +386,7 @@ impl Invocation<'_> {
 struct Node {
     handler: ProjectsHandler,
     leaf: Arc<Leaf>,
-    log: IdentityLog<Leaf, TestKeys>,
+    log: Arc<IdentityLog<Leaf, TestKeys>>,
 }
 
 struct IdentityRig {
@@ -364,6 +394,7 @@ struct IdentityRig {
     b: Node,
     keys: Arc<TestKeys>,
     stream: jetstream::stream::Stream,
+    kv: kv::Store,
     _processes: Rig,
 }
 
@@ -391,24 +422,22 @@ impl IdentityRig {
             }
         }
         let mut rig = Rig::new();
-        let hub = port();
-        let leaf_port = port();
-        rig.start(
-            "hub",
-            &format!(
-                r#"
-        listen: 127.0.0.1:{hub}
+        let hub_ports = rig
+            .start(
+                "hub",
+                &format!(
+                    r#"
         server_name: hub
         jetstream {{ domain: hub, store_dir: {:?} }}
-        leafnodes {{ listen: 127.0.0.1:{leaf_port}, no_advertise: true }}
+        leafnodes {{ listen: "127.0.0.1:-1", no_advertise: true }}
     "#,
-                rig.dir.join("log").to_string_lossy()
-            ),
-            hub,
-        )
-        .await;
+                    rig.dir.join("log").to_string_lossy()
+                ),
+                true,
+            )
+            .await;
         let admin = jetstream::new(
-            async_nats::connect(format!("127.0.0.1:{hub}"))
+            async_nats::connect(format!("127.0.0.1:{}", hub_ports.client))
                 .await
                 .unwrap(),
         );
@@ -422,9 +451,20 @@ impl IdentityRig {
             })
             .await
             .unwrap();
+        let kv = admin
+            .create_key_value(kv::Config {
+                bucket: BUCKET.into(),
+                history: 1,
+                max_value_size: MAX_KV_VALUE,
+                max_bytes: MAX_KV_BYTES,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
 
         let a = handler(store(&rig, "box-a"), A);
         let b = handler(store(&rig, "box-b"), B);
+        let leaf_port = hub_ports.leaf.unwrap();
         let leaf_a = leaf(&mut rig, leaf_port, "leaf-a", A, a.health.clone()).await;
         let leaf_b = leaf(&mut rig, leaf_port, "leaf-b", B, b.health.clone()).await;
         let keys = Arc::new(TestKeys::new());
@@ -451,10 +491,13 @@ impl IdentityRig {
             },
             keys,
             stream,
+            kv,
             _processes: rig,
         })
     }
 }
+
+mod residence;
 
 #[tokio::test]
 async fn hub_identity_log_two_leaf_rig_applies_and_wakes_then_rebases_and_settles_lost_ack() {

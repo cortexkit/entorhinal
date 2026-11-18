@@ -150,6 +150,29 @@ pub(crate) fn check_registration_claim(
 #[cfg(test)]
 thread_local! { static REGISTRATION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) }; }
 
+pub(crate) fn check_hub_registration(
+    tx: &Transaction<'_>,
+    id: &str,
+    context: &HubClaimContext<'_>,
+) -> Result<(), agent::AgentMutationError> {
+    let view = hub_claim_view(tx, id, context)?;
+    if view.claim.integrity_failed {
+        return Err(refusal("claim_integrity_failed", None));
+    }
+    if view.claim.stale || view.claim.epoch == 0 {
+        return Err(refusal("claim_unavailable", None));
+    }
+    if view.status() != "held_here" {
+        return Err(refusal(
+            "held_elsewhere",
+            Some(serde_json::json!({
+                "holder":view.claim.holder,"holder_name":view.holder_name(tx)?,"epoch":view.claim.epoch
+            })),
+        ));
+    }
+    Ok(())
+}
+
 fn unclaimed(now: i64, stale: bool, integrity_failed: bool) -> CachedClaim {
     CachedClaim {
         holder: None,
@@ -314,7 +337,23 @@ impl RegistryStore {
     /// A read snapshot joins the cache, identity and display name. Nulls are
     /// retained on the wire so unknown values never masquerade as empty text.
     pub fn agent_where(&self, id: &str) -> Result<AgentWhere, agent::AgentMutationError> {
-        self.read(|conn| Ok(agent_where_in(conn, id, self.is_foreign())))
+        self.agent_where_with(id, |conn| load_claim_view(conn, id, self.is_foreign()))
+    }
+
+    pub fn hub_agent_where(
+        &self,
+        id: &str,
+        context: &HubClaimContext<'_>,
+    ) -> Result<AgentWhere, agent::AgentMutationError> {
+        self.agent_where_with(id, |conn| hub_claim_view(conn, id, context))
+    }
+
+    fn agent_where_with(
+        &self,
+        id: &str,
+        view: impl FnOnce(&Connection) -> rusqlite::Result<ClaimView>,
+    ) -> Result<AgentWhere, agent::AgentMutationError> {
+        self.read(|conn| Ok(agent_where_with(conn, id, view)))
             .map_err(|e| {
                 refusal(
                     "storage_error",
@@ -329,6 +368,60 @@ pub(crate) struct ClaimView {
     pub claim: CachedClaim,
     pub own: Option<String>,
     pub read_at_ms: Option<i64>,
+    holder_box: Option<String>,
+    hub: bool,
+}
+
+pub struct HubClaimContext<'a> {
+    pub local_box: &'a str,
+    pub fresh: &'a dyn Fn(&str, Option<u64>) -> bool,
+    pub holder_current: &'a dyn Fn(&str, u64, i64) -> bool,
+    pub seed_expected: &'a dyn Fn(&str) -> bool,
+}
+
+pub(crate) fn hub_claim_view(
+    conn: &Connection,
+    id: &str,
+    context: &HubClaimContext<'_>,
+) -> rusqlite::Result<ClaimView> {
+    let cached = crate::hub_store::kv_cached(conn, &format!("residence.{id}"))?;
+    let revision = cached.as_ref().map(|row| row.revision);
+    let integrity = cached.as_ref().is_some_and(|row| row.integrity_failed);
+    let body = cached.as_ref().and_then(|row| row.body.as_ref());
+    let pending = body.is_none()
+        && (crate::hub_store::agent_creator(conn, id, i64::MAX)?.is_some()
+            || (context.seed_expected)(id));
+    let mut claim = unclaimed(0, pending || !(context.fresh)(id, revision), integrity);
+    let mut holder_box = None;
+    if let Some(body) = body {
+        claim.holder = body["holder"].as_str().map(str::to_owned);
+        claim.epoch = body["gen"].as_i64().unwrap_or_default();
+        claim.cut_id = body["cut_id"].as_str().map(str::to_owned);
+        let applied = conn.query_row(
+            "SELECT last_applied_position FROM identity_log_state WHERE id=1",
+            [],
+            |row| row.get(0),
+        )?;
+        holder_box = claim.holder.clone().filter(|holder| {
+            (context.holder_current)(
+                holder,
+                body["holder_ep"].as_u64().unwrap_or_default(),
+                applied,
+            )
+        });
+    }
+    Ok(ClaimView {
+        known: cached.is_some() || !claim.stale,
+        own: if body.is_none() || holder_box.is_some() {
+            Some(context.local_box.to_owned())
+        } else {
+            None
+        },
+        claim,
+        read_at_ms: cached.and_then(|row| row.read_at_ms),
+        holder_box,
+        hub: true,
+    })
 }
 
 impl ClaimView {
@@ -379,6 +472,8 @@ pub(crate) fn load_claim_view(
         claim,
         own: self_author(conn)?,
         read_at_ms,
+        holder_box: None,
+        hub: false,
     })
 }
 
@@ -387,11 +482,19 @@ pub(crate) fn agent_where_in(
     id: &str,
     foreign: bool,
 ) -> Result<AgentWhere, agent::AgentMutationError> {
+    agent_where_with(conn, id, |conn| load_claim_view(conn, id, foreign))
+}
+
+fn agent_where_with(
+    conn: &Connection,
+    id: &str,
+    view: impl FnOnce(&Connection) -> rusqlite::Result<ClaimView>,
+) -> Result<AgentWhere, agent::AgentMutationError> {
     let row = agent::load_row(conn, id)?.ok_or_else(|| refusal("unknown_agent", None))?;
     if let Some(gone) = row.gone() {
         return Err(refusal("gone", Some(gone)));
     }
-    let view = load_claim_view(conn, id, foreign)?;
+    let view = view(conn)?;
     if view.claim.integrity_failed {
         return Err(refusal("claim_integrity_failed", None));
     }
@@ -404,7 +507,11 @@ pub(crate) fn agent_where_in(
         known: view.known,
         status,
         holder_name,
-        holder_box: crate::member_box::lookup(conn, claim.holder.as_deref())?,
+        holder_box: if view.hub {
+            view.holder_box
+        } else {
+            crate::member_box::lookup(conn, claim.holder.as_deref())?
+        },
         holder: claim.holder,
         epoch: claim.epoch,
         cut_id: claim.cut_id,
@@ -779,10 +886,13 @@ mod tests {
                         assert!(completed.try_recv().is_err());
                     }));
                 });
-                assert!(
-                    RegistryStore::register_session_in(tx, &registration(), &mut Vec::new())
-                        .is_ok()
-                );
+                assert!(RegistryStore::register_session_in(
+                    tx,
+                    &registration(),
+                    &mut Vec::new(),
+                    None
+                )
+                .is_ok());
                 Ok(thread)
             })
             .unwrap();

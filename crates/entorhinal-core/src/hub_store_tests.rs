@@ -80,6 +80,7 @@ fn hub_store_migration_preserves_legacy_progress_and_requires_snapshot_for_downg
             assert_eq!(move_state, (7, None));
             for table in [
                 "hub_kv_cache",
+                "hub_log_writer",
                 "hub_attempt",
                 "hub_attempt_send",
                 "hub_anchor",
