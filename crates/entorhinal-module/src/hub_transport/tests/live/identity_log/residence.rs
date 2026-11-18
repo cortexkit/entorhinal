@@ -749,3 +749,5 @@ async fn lease_handback_role_take_preference_steers_a_vacant_role() {
         }
     }).await;
 }
+
+mod moves;

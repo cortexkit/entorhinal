@@ -6,6 +6,8 @@ use crate::{
     door_client::{
         CutItem, CutRequest as DoorCut, DoorError, HandoffState, SealRequest, SealState,
     },
+    hub_moves::{self, SeenMove, State as HubState},
+    hub_residence::{MovePosition, MoveTransfer, Residence},
     log_client::TransportError,
     move_driver::{
         backoff, digest_reason, participant_action, skipped_streams, PeerRefusal, RefusalLog,
@@ -70,6 +72,14 @@ struct Progress {
     /// existed still decode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     seal_refused: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sealed_cut: Option<crate::door_client::SealedCut>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    handing: Option<(SeenMove, MoveTransfer)>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    publish_started: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    exports_with_items: Vec<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -84,6 +94,8 @@ struct Plan {
     from: String,
     to: String,
     claim_version: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hub_gen: Option<i64>,
     participants: Vec<MoveParticipant>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pin_digest: Option<String>,
@@ -92,6 +104,13 @@ struct Plan {
 }
 
 impl Plan {
+    fn hub_record(&self, cut: &str) -> Result<hub_moves::Move, Failure> {
+        Ok(hub_moves::Move::published(
+            &self.record(cut),
+            self.hub_gen.ok_or_else(state_conflict)?,
+            self.source.sealed_cut.clone().ok_or_else(state_conflict)?,
+        ))
+    }
     fn record(&self, cut: &str) -> MoveRecord {
         MoveRecord {
             v: 1,
@@ -108,6 +127,19 @@ impl Plan {
             detail: None,
         }
     }
+}
+
+fn state_conflict() -> Failure {
+    hub_failure(hub_moves::conflict())
+}
+
+fn hub_failure(error: HandlerError) -> Failure {
+    let mut failure = Failure::new("hub.move", &error.code);
+    failure.detail = error
+        .detail
+        .unwrap_or_else(|| json!({"message":error.message}));
+    failure.diagnostic = error.code != "record_too_large";
+    failure
 }
 
 struct Failure {
@@ -220,8 +252,14 @@ impl Failure {
                     Some(DriverAction::RetryWithinStep | DriverAction::Retry)
                 )
             } else {
-                ["cut_not_ready", "unavailable", "handoff_not_covered"]
-                    .contains(&self.code.as_str())
+                matches!(
+                    self.code.as_str(),
+                    "cut_not_ready"
+                        | "unavailable"
+                        | "handoff_not_covered"
+                        | "cut_store_full"
+                        | "hub_unavailable"
+                )
             }
     }
 }
@@ -326,9 +364,20 @@ impl Source {
         // fail signature, author, or persisted-plan checks cannot advance the row.
         let watching = matches!(row.step, Step::Sealed | Step::Published | Step::Releasing);
         let poll = watching || self.last_poll.is_none_or(|last| last.elapsed() >= POLL);
+        let mut hub_seen = None;
         let observed = if poll {
             self.last_poll = Some(tokio::time::Instant::now());
-            match self.read_move(&plan).await {
+            let read = if plan.hub_gen.is_some() {
+                self.read_hub_move(&plan).map(|seen| {
+                    hub_seen = seen;
+                    hub_seen
+                        .as_ref()
+                        .map(|seen| (seen.body.participant_plan(), seen.revision))
+                })
+            } else {
+                self.read_move(&plan).await
+            };
+            match read {
                 Ok(record) => record,
                 Err(error) => return self.failed(&mut row, &mut plan, error).await,
             }
@@ -359,7 +408,12 @@ impl Source {
                 self.save(&mut row, &plan, false)
                     .await
                     .map_err(|f| HandlerError::new(&f.code, f.detail.to_string()))?;
-            } else if record.state != State::Published && row.abort_requested.is_some() {
+            } else if record.state != State::Published
+                && row.abort_requested.is_some()
+                && !hub_seen
+                    .as_ref()
+                    .is_some_and(|seen| seen.body.state == HubState::Staged)
+            {
                 self.refuse_abort(&mut row, &plan, record.state).await?;
             }
             if record.state == State::Activated && row.step != Step::Releasing {
@@ -391,9 +445,11 @@ impl Source {
             return Ok(Some(remaining.min(POLL)));
         }
         let result = if row.abort_requested.is_some() && row.step != Step::Releasing {
-            self.cleanup(&mut row, &mut plan, observed).await
+            self.cleanup(&mut row, &mut plan, observed, hub_seen.as_ref())
+                .await
         } else {
-            self.advance(&mut row, &mut plan, observed).await
+            self.advance(&mut row, &mut plan, observed, hub_seen.as_ref())
+                .await
         };
         match result {
             Ok(delay) => Ok(if row.step.is_terminal() {
@@ -411,6 +467,17 @@ impl Source {
         plan: &mut Plan,
         error: Failure,
     ) -> Result<Option<Duration>, HandlerError> {
+        if error.code == "move_state_conflict" {
+            // An inconsistent move/residence pair cannot authorize an abort or a handover.
+            let detail = error.detail();
+            plan.source.contract_violation = Some(detail.clone());
+            row.hold = Some(detail.clone());
+            row.detail = Some(detail);
+            self.save(row, plan, false)
+                .await
+                .map_err(|failure| HandlerError::new(&failure.code, failure.detail.to_string()))?;
+            return Ok(Some(POLL));
+        }
         if error.refused() {
             self.refusals.note(
                 &self.cut,
@@ -491,8 +558,10 @@ impl Source {
         } else {
             let reason = if error.op.starts_with("cut.") {
                 MoveReason::DoorRefused
-            } else if error.code == "move_too_large" {
+            } else if matches!(error.code.as_str(), "move_too_large" | "record_too_large") {
                 MoveReason::MoveTooLarge
+            } else if error.code == "participant_unavailable_on_target" {
+                MoveReason::Other(error.code.clone())
             } else if error.code == "inbox_full" {
                 MoveReason::ReceiverInboxFull
             } else {
@@ -603,6 +672,50 @@ impl Source {
         }
     }
 
+    fn hub(&self) -> Result<std::sync::Arc<Residence>, Failure> {
+        self.worker.hub().ok_or_else(|| {
+            hub_failure(HandlerError::new(
+                "hub_not_ready",
+                "hub move watch is not installed",
+            ))
+        })
+    }
+
+    fn read_hub_move(&self, plan: &Plan) -> Result<Option<SeenMove>, Failure> {
+        let seen = self.hub()?.watched_move(&self.cut).map_err(hub_failure)?;
+        if let Some(seen) = &seen {
+            plan.hub_record(&self.cut)?
+                .pin(&seen.body)
+                .map_err(hub_failure)?;
+            if plan
+                .source
+                .skipped
+                .as_ref()
+                .is_some_and(|skipped| skipped != &seen.body.skipped)
+            {
+                return Err(state_conflict());
+            }
+        }
+        Ok(seen)
+    }
+
+    fn check_target(&self, plan: &Plan) -> Result<(), Failure> {
+        let Some(target) = self.hub()?.watched_node(&plan.to).map_err(hub_failure)? else {
+            return Ok(());
+        };
+        for p in &plan.participants {
+            if !p.optional
+                && !target.supports(p)
+                && plan.source.exports_with_items.contains(&p.module_id)
+            {
+                let mut failure = Failure::new("move.export", "participant_unavailable_on_target");
+                failure.detail = json!({"module":p.module_id});
+                return Err(failure);
+            }
+        }
+        Ok(())
+    }
+
     async fn freeze_export(&mut self, row: &mut AgentMove, plan: &mut Plan) -> Result<(), Failure> {
         let mut participants = plan.participants.clone();
         let mut items = Vec::new();
@@ -672,13 +785,27 @@ impl Source {
             });
             self.save(row, plan, false).await?;
             let result = client.export(&self.request(&participant)?).await;
-            if let Err(e) = result {
-                let failure = Failure::participant("agent_data.export", &participant.module_id, e);
-                if !failure.unknown {
-                    plan.source.pending = None;
-                    self.save(row, plan, false).await?;
+            match result {
+                Ok(export) => {
+                    if plan.hub_gen.is_some()
+                        && !export.items.is_empty()
+                        && !plan
+                            .source
+                            .exports_with_items
+                            .contains(&participant.module_id)
+                    {
+                        plan.source.exports_with_items.push(participant.module_id);
+                    }
                 }
-                return Err(failure);
+                Err(e) => {
+                    let failure =
+                        Failure::participant("agent_data.export", &participant.module_id, e);
+                    if !failure.unknown {
+                        plan.source.pending = None;
+                        self.save(row, plan, false).await?;
+                    }
+                    return Err(failure);
+                }
             }
             plan.source.pending = None;
             self.save(row, plan, false).await?;
@@ -694,8 +821,12 @@ impl Source {
         row: &mut AgentMove,
         plan: &mut Plan,
         observed: Option<(MoveRecord, u64)>,
+        hub_seen: Option<&SeenMove>,
     ) -> Result<Duration, Failure> {
-        if !self.resumed && matches!(row.step, Step::Exported | Step::Sealed) {
+        if !self.resumed
+            && (row.step == Step::Exported && (!row.seal_sent || plan.hub_gen.is_none())
+                || row.step == Step::Sealed && plan.hub_gen.is_none())
+        {
             self.freeze_export(row, plan).await?;
             if row.abort_requested.is_some() {
                 return Ok(Duration::ZERO);
@@ -703,10 +834,7 @@ impl Source {
             if row.seal_sent {
                 self.worker
                     .door
-                    .seal(&SealRequest {
-                        cut_id: self.cut.clone(),
-                        items: plan.source.items.clone(),
-                    })
+                    .seal(&self.seal_request(plan))
                     .await
                     .map_err(|e| Failure::door("cut.seal", e))?;
             }
@@ -724,15 +852,14 @@ impl Source {
                 Ok(Duration::ZERO)
             }
             Step::Exported => {
-                let status = if !row.seal_sent {
+                let status = if plan.hub_gen.is_some() {
+                    self.seal_hub(row, plan).await?
+                } else if !row.seal_sent {
                     row.seal_sent = true;
                     self.save(row, plan, false).await?;
                     self.worker
                         .door
-                        .seal(&SealRequest {
-                            cut_id: self.cut.clone(),
-                            items: plan.source.items.clone(),
-                        })
+                        .seal(&self.seal_request(plan))
                         .await
                         .map_err(|e| Failure::door("cut.seal", e))?
                 } else {
@@ -740,10 +867,7 @@ impl Source {
                     // door received the request. Repeat the identical seal to recover.
                     self.worker
                         .door
-                        .seal(&SealRequest {
-                            cut_id: self.cut.clone(),
-                            items: plan.source.items.clone(),
-                        })
+                        .seal(&self.seal_request(plan))
                         .await
                         .map_err(|e| Failure::door("cut.seal", e))?;
                     self.worker
@@ -758,7 +882,24 @@ impl Source {
                 }
                 plan.source.seal_state = Some(status.state);
                 match status.state {
-                    SealState::Published => {
+                    SealState::Sealed if plan.hub_gen.is_some() => {
+                        let (Some(manifest_sha256), Some(sealed_key)) =
+                            (status.manifest_sha256, status.sealed_key)
+                        else {
+                            return Err(state_conflict());
+                        };
+                        if manifest_sha256.is_empty() || sealed_key.is_empty() {
+                            return Err(state_conflict());
+                        }
+                        plan.source.sealed_cut = Some(crate::door_client::SealedCut {
+                            manifest_sha256,
+                            sealed_key,
+                        });
+                        Self::change_step(row, plan, Step::Sealed);
+                        self.save(row, plan, false).await?;
+                        Ok(Duration::ZERO)
+                    }
+                    SealState::Published if plan.hub_gen.is_none() => {
                         Self::change_step(row, plan, Step::Sealed);
                         self.save(row, plan, false).await?;
                         Ok(Duration::ZERO)
@@ -786,6 +927,17 @@ impl Source {
                 }
             }
             Step::Sealed => {
+                if plan.hub_gen.is_some() {
+                    if hub_seen.is_none() {
+                        self.publish_hub(row, plan).await?;
+                    }
+                    plan.source
+                        .published_at_ms
+                        .get_or_insert_with(|| (self.worker.clock)());
+                    Self::change_step(row, plan, Step::Published);
+                    self.save(row, plan, false).await?;
+                    return Ok(Duration::ZERO);
+                }
                 if observed.is_none() {
                     let (_, inbox) = self.inbox(&plan.to).await?;
                     if inbox.pending.len() >= wire::INBOX_CAP
@@ -812,6 +964,30 @@ impl Source {
                 Ok(Duration::ZERO)
             }
             Step::Published => {
+                if let Some(seen) = hub_seen {
+                    if matches!(seen.body.state, HubState::Staged | HubState::Handing) {
+                        return self.hand_over(row, plan, seen).await;
+                    }
+                    if seen.body.state == HubState::Handed {
+                        let hub = self.hub()?;
+                        let position = hub.move_position(&seen.body).map_err(hub_failure)?;
+                        if position == MovePosition::Source {
+                            let position = hub
+                                .move_live_position(&seen.body)
+                                .await
+                                .map_err(hub_failure)?;
+                            if !matches!(position, MovePosition::Receiver | MovePosition::Returned)
+                            {
+                                return Err(state_conflict());
+                            }
+                        } else if !matches!(
+                            position,
+                            MovePosition::Receiver | MovePosition::Returned
+                        ) {
+                            return Err(state_conflict());
+                        }
+                    }
+                }
                 if let Some((record, _)) = observed {
                     if record.state == State::Released {
                         Self::change_step(row, plan, Step::Released);
@@ -820,7 +996,7 @@ impl Source {
                 }
                 Ok(POLL)
             }
-            Step::Releasing => self.release(row, plan, observed).await,
+            Step::Releasing => self.release(row, plan, observed, hub_seen).await,
             _ => Ok(POLL),
         }
     }
@@ -828,6 +1004,129 @@ impl Source {
     fn door_cut(&self) -> DoorCut {
         DoorCut {
             cut_id: self.cut.clone(),
+        }
+    }
+
+    fn seal_request(&self, plan: &Plan) -> SealRequest {
+        SealRequest {
+            cut_id: self.cut.clone(),
+            items: plan.source.items.clone(),
+            receiver: plan.hub_gen.map(|_| plan.to.clone()),
+        }
+    }
+
+    async fn seal_hub(
+        &self,
+        row: &mut AgentMove,
+        plan: &mut Plan,
+    ) -> Result<crate::door_client::StatusReply, Failure> {
+        if row.seal_sent {
+            match self.worker.door.status(&self.door_cut()).await {
+                Ok(status) => return Ok(status),
+                Err(DoorError::Refused { code, .. }) if code == "not_found" => {}
+                Err(error) => return Err(Failure::door("cut.status", error)),
+            }
+        } else {
+            self.check_target(plan)?;
+            row.seal_sent = true;
+            self.save(row, plan, false).await?;
+            if row.abort_requested.is_some() {
+                // No seal was sent, so cleanup has no door work to settle.
+                row.seal_sent = false;
+                self.save(row, plan, false).await?;
+                return Err(hub_failure(HandlerError::new(
+                    "abort_requested",
+                    "move was cancelled before seal",
+                )));
+            }
+        }
+        self.worker
+            .door
+            .seal(&self.seal_request(plan))
+            .await
+            .map_err(|e| Failure::door("cut.seal", e))?;
+        self.worker
+            .door
+            .status(&self.door_cut())
+            .await
+            .map_err(|e| Failure::door("cut.status", e))
+    }
+
+    async fn publish_hub(&self, row: &mut AgentMove, plan: &mut Plan) -> Result<(), Failure> {
+        let body = plan.hub_record(&self.cut)?;
+        if !plan.source.publish_started {
+            plan.source.publish_started = true;
+            self.save(row, plan, false).await?;
+        }
+        match self.hub()?.write_move(&body, None).await {
+            Ok(revision) => {
+                row.record_version = revision as i64;
+                Ok(())
+            }
+            Err(error) => {
+                if error.code == "record_too_large" {
+                    plan.source.publish_started = false;
+                    self.save(row, plan, false).await?;
+                }
+                Err(hub_failure(error))
+            }
+        }
+    }
+
+    async fn hand_over(
+        &self,
+        row: &mut AgentMove,
+        plan: &mut Plan,
+        seen: &SeenMove,
+    ) -> Result<Duration, Failure> {
+        let hub = self.hub()?;
+        if plan.source.handing.is_none() {
+            if seen.body.state != HubState::Staged {
+                return Err(state_conflict());
+            }
+            let transfer = hub.plan_transfer(&seen.body, None).map_err(hub_failure)?;
+            plan.source.handing = Some((seen.clone(), transfer));
+            self.save(row, plan, false).await?;
+            if row.abort_requested.is_some() {
+                return Ok(Duration::ZERO);
+            }
+        }
+        let (staged, transfer) = plan.source.handing.as_ref().ok_or_else(state_conflict)?;
+        let mut handing = staged.body.clone();
+        handing.state = HubState::Handing;
+        let handing_revision = match hub.write_move(&handing, Some(staged)).await {
+            Ok(revision) => revision,
+            // A competing receiver abort may have bumped the staged revision.
+            Err(error) if error.code == "hub_write_superseded" => return Ok(POLL),
+            Err(error) => return Err(hub_failure(error)),
+        };
+        if let Err(error) = hub.transfer_move(&handing, transfer, false).await {
+            if error.code == "hub_write_superseded" {
+                if hub
+                    .move_live_position(&handing)
+                    .await
+                    .map_err(hub_failure)?
+                    == MovePosition::Forced
+                {
+                    return Ok(POLL);
+                }
+                return Err(state_conflict());
+            }
+            return Err(hub_failure(error));
+        }
+        let mut handed = handing.clone();
+        handed.state = HubState::Handed;
+        let previous = SeenMove {
+            body: handing,
+            revision: handing_revision,
+            writer: plan.from.clone(),
+            writer_ep: staged.writer_ep,
+        };
+        match hub.write_move(&handed, Some(&previous)).await {
+            Ok(_) => Ok(POLL),
+            // The receiver can finish directly from handing after residence lands.
+            Err(error) if error.code == "hub_write_superseded" => Ok(POLL),
+            Err(error) => Err(hub_failure(error)),
         }
     }
 
@@ -972,6 +1271,7 @@ impl Source {
         row: &mut AgentMove,
         plan: &mut Plan,
         observed: Option<(MoveRecord, u64)>,
+        hub_seen: Option<&SeenMove>,
     ) -> Result<Duration, Failure> {
         self.settle_pending(row, plan).await?;
         let request = row
@@ -986,9 +1286,29 @@ impl Source {
         self.save(row, plan, false).await?;
         let shared = matches!(row.step, Step::Sealed | Step::Published);
         if shared {
+            if plan.hub_gen.is_some() && hub_seen.is_none() && plan.source.publish_started {
+                // Settle a pending publication before undoing the participants' freeze.
+                self.publish_hub(row, plan).await?;
+                return Ok(POLL);
+            }
             match observed {
-                Some((record, version)) if record.state == State::Published => {
+                Some((record, version))
+                    if record.state == State::Published
+                        || hub_seen.is_some_and(|seen| seen.body.state == HubState::Staged) =>
+                {
                     let aborted = wire::aborted_record(&record, reason, row.detail.as_ref());
+                    if let Some(seen) = hub_seen {
+                        let mut next = seen.body.clone();
+                        next.state = HubState::Aborted;
+                        next.reason = aborted.reason;
+                        next.detail = aborted.detail;
+                        match self.hub()?.write_move(&next, Some(seen)).await {
+                            Ok(_) => {}
+                            Err(error) if error.code == "hub_write_superseded" => {}
+                            Err(error) => return Err(hub_failure(error)),
+                        }
+                        return Ok(POLL);
+                    }
                     let settlement = self
                         .cas(plan, Some(State::Published), version, &aborted)
                         .await?;
@@ -1002,7 +1322,27 @@ impl Source {
                     return Ok(Duration::ZERO);
                 }
                 Some((record, _)) if record.state == State::Aborted => {
-                    self.apply_claim(row, false).await?;
+                    if let Some(seen) = hub_seen {
+                        let hub = self.hub()?;
+                        if let Some((staged, _)) = &plan.source.handing {
+                            let mut handing = staged.body.clone();
+                            handing.state = HubState::Handing;
+                            match hub.write_move(&handing, Some(staged)).await {
+                                Ok(_) => {}
+                                Err(error) if error.code == "hub_write_superseded" => {}
+                                Err(error) => return Err(hub_failure(error)),
+                            }
+                        }
+                        if !matches!(
+                            hub.move_position(&seen.body).map_err(hub_failure)?,
+                            MovePosition::Source | MovePosition::Returned
+                        ) || hub.move_member(&plan.from).map_err(hub_failure)?.is_none()
+                        {
+                            return Err(state_conflict());
+                        }
+                    } else {
+                        self.apply_claim(row, false).await?;
+                    }
                     if row.seal_sent {
                         self.abort_door_cut().await?;
                     }
@@ -1031,10 +1371,7 @@ impl Source {
             let resealed = self
                 .worker
                 .door
-                .seal(&SealRequest {
-                    cut_id: self.cut.clone(),
-                    items: plan.source.items.clone(),
-                })
+                .seal(&self.seal_request(plan))
                 .await
                 .map_err(|e| Failure::door("cut.seal", e));
             match resealed {
@@ -1156,6 +1493,7 @@ impl Source {
         row: &mut AgentMove,
         plan: &mut Plan,
         observed: Option<(MoveRecord, u64)>,
+        hub_seen: Option<&SeenMove>,
     ) -> Result<Duration, Failure> {
         let Some((record, version)) = observed else {
             return Err(RecordError::refusal("unavailable", None).into());
@@ -1168,7 +1506,9 @@ impl Source {
         if record.state != State::Activated {
             return Err(Failure::new("record.read", "invalid_state"));
         }
-        self.apply_claim(row, true).await?;
+        if hub_seen.is_none() {
+            self.apply_claim(row, true).await?;
+        }
         let handoff = self
             .worker
             .door
@@ -1201,6 +1541,9 @@ impl Source {
             }
         }
         for participant in plan.participants.clone() {
+            if plan.hub_gen.is_some() && plan.source.enforced.contains_key(&participant.module_id) {
+                continue;
+            }
             if participant.optional && record.skipped.binary_search(&participant.module_id).is_ok()
             {
                 continue;
@@ -1223,6 +1566,18 @@ impl Source {
         }
         let mut released = record;
         released.state = State::Released;
+        if let Some(seen) = hub_seen {
+            let mut body = seen.body.clone();
+            body.state = HubState::Released;
+            row.record_version = self
+                .hub()?
+                .write_move(&body, Some(seen))
+                .await
+                .map_err(hub_failure)? as i64;
+            Self::change_step(row, plan, Step::Released);
+            self.save(row, plan, true).await?;
+            return Ok(Duration::ZERO);
+        }
         match self
             .cas(plan, Some(State::Activated), version, &released)
             .await?

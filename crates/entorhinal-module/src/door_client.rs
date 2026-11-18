@@ -77,6 +77,38 @@ pub(crate) struct SealRequest {
     #[serde(rename = "cutId")]
     pub(crate) cut_id: String,
     pub(crate) items: Vec<CutItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) receiver: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SealedCut {
+    pub(crate) manifest_sha256: String,
+    pub(crate) sealed_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TakeoverRequest {
+    pub(crate) cut_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) author: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) manifest_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) sealed_key: Option<String>,
+}
+
+impl From<CutRequest> for TakeoverRequest {
+    fn from(cut: CutRequest) -> Self {
+        Self {
+            cut_id: cut.cut_id,
+            author: None,
+            manifest_sha256: None,
+            sealed_key: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,7 +123,7 @@ pub(crate) enum Request {
     #[serde(rename = "cut.handoff")]
     Handoff(CutRequest),
     #[serde(rename = "cut.takeover")]
-    Takeover(CutRequest),
+    Takeover(TakeoverRequest),
     #[serde(rename = "cut.abort")]
     Abort(CutRequest),
     #[serde(rename = "cut.accept")]
@@ -117,10 +149,10 @@ impl Request {
     pub(crate) fn cut_id(&self) -> &str {
         match self {
             Self::Seal(request) => &request.cut_id,
+            Self::Takeover(request) => &request.cut_id,
             Self::Status(request)
             | Self::Read(request)
             | Self::Handoff(request)
-            | Self::Takeover(request)
             | Self::Abort(request)
             | Self::Accept(request)
             | Self::Release(request) => &request.cut_id,
@@ -133,6 +165,7 @@ impl Request {
 pub(crate) enum SealState {
     Pending,
     Published,
+    Sealed,
     Failed,
     Aborted,
 }
@@ -163,6 +196,10 @@ pub(crate) type SealReply = StatusReply;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct StatusReply {
     pub(crate) state: SealState,
+    #[serde(rename = "manifestSha256", skip_serializing_if = "Option::is_none")]
+    pub(crate) manifest_sha256: Option<String>,
+    #[serde(rename = "sealedKey", skip_serializing_if = "Option::is_none")]
+    pub(crate) sealed_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) handoff: Option<HandoffReply>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -247,7 +284,7 @@ impl DoorError {
     pub(crate) fn retryable(&self) -> bool {
         matches!(self, Self::OutcomeUnknown)
             || matches!(self, Self::Refused { code, .. }
-                if code == "unavailable" || code == "handoff_not_covered")
+                if matches!(code.as_str(), "unavailable" | "handoff_not_covered" | "cut_store_full" | "hub_unavailable"))
     }
 
     pub(crate) fn code(&self) -> &str {
@@ -375,7 +412,21 @@ impl DoorClient {
         self.call(Request::Handoff(cut.clone())).await
     }
     pub(crate) async fn takeover(&self, cut: &CutRequest) -> Result<TakeoverReply, DoorError> {
-        self.call(Request::Takeover(cut.clone())).await
+        self.call(Request::Takeover(cut.clone().into())).await
+    }
+    pub(crate) async fn takeover_hub(
+        &self,
+        cut_id: &str,
+        author: &str,
+        cut: &SealedCut,
+    ) -> Result<TakeoverReply, DoorError> {
+        self.call(Request::Takeover(TakeoverRequest {
+            cut_id: cut_id.into(),
+            author: Some(author.into()),
+            manifest_sha256: Some(cut.manifest_sha256.clone()),
+            sealed_key: Some(cut.sealed_key.clone()),
+        }))
+        .await
     }
     pub(crate) async fn abort(&self, cut: &CutRequest) -> Result<AbortReply, DoorError> {
         self.call(Request::Abort(cut.clone())).await
@@ -431,6 +482,7 @@ mod tests {
     }
     fn seal() -> SealRequest {
         SealRequest {
+            receiver: None,
             cut_id: ID.into(),
             items: vec![CutItem {
                 session_ref: REF.into(),
@@ -627,7 +679,7 @@ mod tests {
             Request::Seal(seal()),
             Request::Read(cut()),
             Request::Handoff(cut()),
-            Request::Takeover(cut()),
+            Request::Takeover(cut().into()),
             Request::Abort(cut()),
             Request::Accept(cut()),
         ];

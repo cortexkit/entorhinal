@@ -105,6 +105,7 @@ mod fleet_record;
 mod hub_epoch;
 mod hub_identity_log;
 mod hub_membership;
+mod hub_moves;
 mod hub_residence;
 // The hub backend starts this transport only when the store selects it.
 #[allow(dead_code)]
