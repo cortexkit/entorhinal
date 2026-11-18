@@ -292,7 +292,9 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
         .await
     }
 
-    /// Only the explicit enable/cutover path may create the first epoch.
+    /// Mint the first shared key epoch. Only the hub switch may call this (the
+    /// operator's `ck projects log enable` on a fresh account, or the cutover
+    /// from engram); recovery and removal handling never create epoch 1.
     pub(super) async fn bootstrap(&self, deadline: Instant) -> Result<(), HandlerError> {
         let _guard = timeout_at(deadline, self.changing.lock())
             .await
@@ -1301,7 +1303,9 @@ mod tests {
 
     #[test]
     fn hub_epoch_removal_intake_decodes_callosum_vectors_with_or_without_box_id() {
-        // device-removed-vectors-v1.1: permanent-with-box-id and supersession-with-box-id.
+        // A permanent removal and a supersession, each carrying a box id. Copied
+        // from callosum's test-vectors/device-removed-v1/box-id-cases.json (tag
+        // device-removed-vectors-v1.1).
         let one = RemovalEvent::decode(br#"{"fingerprint":"72cd6e8422c407fb6d098690f1130b7d","removal_id":"100:permanent:7","box_id":"0123456789abcdef0123456789abcdef"}"#).unwrap();
         let two = RemovalEvent::decode(br#"{"fingerprint":"75877bb41d393b5fb8455ce60ecd8dda","removal_id":"200:9:8","box_id":"0123456789abcdef0123456789abcdef"}"#).unwrap();
         assert_eq!(one.box_id.as_deref(), Some(A));
