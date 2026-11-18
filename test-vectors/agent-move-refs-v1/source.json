@@ -1,0 +1,3 @@
+[
+  {"op":"agent.move_refs","request":{"cutId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"principal":{"kind":"reserved","moduleId":"occipital"},"reply":{"result":{"agentId":"agent_0123456789abcdef","cutId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","refs":[{"ref":"p","ref_kind":"pi"},{"ref":"a","ref_kind":"session"},{"ref":"z","ref_kind":"session"}]}}}
+]

@@ -898,6 +898,18 @@ impl RegistryStore {
             .collect())
     }
 
+    /// Read the committed checkpoint without waiting for the writer connection.
+    pub fn agent_move_snapshot(&self, cut_id: &str) -> Result<Option<AgentMove>, RegistryError> {
+        self.read(|conn| {
+            conn.query_row(
+                &format!("SELECT {MOVE_COLUMNS} FROM agent_move WHERE cut_id=?1"),
+                [cut_id],
+                AgentMove::from_row,
+            )
+            .optional()
+        })
+    }
+
     pub fn agent_move(&self, cut_id: &str) -> Result<Option<AgentMove>, RegistryError> {
         self.db
             .with_conn_fenced(|conn| {

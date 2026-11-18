@@ -1,0 +1,3 @@
+[
+  {"op":"agent.move_refs","request":{"cutId":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"principal":{"kind":"reserved","moduleId":"occipital"},"reply":{"code":"unknown_move","detail":null,"message":"no local move has that cut_id"}}
+]
