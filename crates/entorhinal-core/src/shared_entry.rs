@@ -763,6 +763,7 @@ mod tests {
                     // Hub transport state: this machine's cached KV values,
                     // unsettled writes, trust anchors and held key epochs.
                     "hub_kv_cache",
+                    "hub_log_writer",
                     "hub_attempt",
                     "hub_attempt_send",
                     "hub_anchor",

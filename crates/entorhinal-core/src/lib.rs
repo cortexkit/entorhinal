@@ -1163,10 +1163,18 @@ impl RegistryStore {
         &self,
         request: &SessionRegistration<'_>,
     ) -> Result<SessionBinding, agent::AgentMutationError> {
+        self.register_session_with_claim(request, None)
+    }
+
+    pub fn register_session_with_claim(
+        &self,
+        request: &SessionRegistration<'_>,
+        hub: Option<&claim_cache::HubClaimContext<'_>>,
+    ) -> Result<SessionBinding, agent::AgentMutationError> {
         let mut keys = Vec::new();
         let outcome = self
             .db
-            .with_conn_fenced(|tx| Ok(Self::register_session_in(tx, request, &mut keys)));
+            .with_conn_fenced(|tx| Ok(Self::register_session_in(tx, request, &mut keys, hub)));
         if matches!(outcome, Ok(Ok(_))) {
             keys.push(SessionChangeKey {
                 agent_id: request.agent_id.to_owned(),
@@ -1188,6 +1196,7 @@ impl RegistryStore {
         tx: &Transaction<'_>,
         request: &SessionRegistration<'_>,
         keys: &mut Vec<SessionChangeKey>,
+        hub: Option<&claim_cache::HubClaimContext<'_>>,
     ) -> Result<SessionBinding, agent::AgentMutationError> {
         let runner = session_lifecycle::registration_runner(request.runner)?;
         let role = session_lifecycle::registration_role(request.role)?;
@@ -1239,7 +1248,11 @@ impl RegistryStore {
             ));
         }
         move_store::check_moving_registration(tx, request)?;
-        claim_cache::check_registration_claim(tx, request.agent_id)?;
+        if let Some(hub) = hub {
+            claim_cache::check_hub_registration(tx, request.agent_id, hub)?;
+        } else {
+            claim_cache::check_registration_claim(tx, request.agent_id)?;
+        }
         let by_ref = tx
             .query_row(
                 &format!("SELECT {SESSION_BINDING_COLUMNS} FROM session_binding WHERE ref_kind=?1 AND ref=?2"),

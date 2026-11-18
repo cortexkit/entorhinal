@@ -1037,13 +1037,20 @@ impl ProjectsHandler {
         role: SessionRole,
     ) -> Result<Vec<u8>, HandlerError> {
         let store = self.with_store(|s| Ok(s.clone()))?;
-        register_session_on_store(
-            &store,
-            params,
-            role,
-            (self.clock)(),
-            self.clock,
-            &self.claim_refresh,
+        crate::hub_residence::with_claim_context(
+            self.residence().as_deref(),
+            self.hub_backend_selected(),
+            |context| {
+                register_session_on_store(
+                    &store,
+                    params,
+                    role,
+                    (self.clock)(),
+                    self.clock,
+                    &self.claim_refresh,
+                    context,
+                )
+            },
         )
     }
 }
@@ -1057,6 +1064,7 @@ pub(super) fn register_session_on_store(
     now: i64,
     clock: fn() -> i64,
     refresh: &crate::claims::RefreshQueue,
+    claim: Option<&entorhinal_core::claim_cache::HubClaimContext<'_>>,
 ) -> Result<Vec<u8>, HandlerError> {
     let mut params = params;
     let runner = take_runner(&mut params)?;
@@ -1069,24 +1077,26 @@ pub(super) fn register_session_on_store(
         bounded("project_root", root, PROJECT_ROOT_MAX)?;
     }
     runner_bounds(&runner)?;
+    let registration = SessionRegistration {
+        agent_id: &request.agent_id,
+        ref_kind: &request.ref_kind,
+        session_ref: &request.session_ref,
+        harness: &request.harness,
+        session_id: &request.session_id,
+        project_root: request.project_root.as_deref(),
+        registered_by: role.as_str(),
+        runner: Some(&runner),
+        role: session_role.as_deref(),
+        network: network
+            .as_deref()
+            .map(|network| entorhinal_core::NetworkStamp { network, clock }),
+        now_ms: now,
+    };
     let binding = store
-        .register_session(&SessionRegistration {
-            agent_id: &request.agent_id,
-            ref_kind: &request.ref_kind,
-            session_ref: &request.session_ref,
-            harness: &request.harness,
-            session_id: &request.session_id,
-            project_root: request.project_root.as_deref(),
-            registered_by: role.as_str(),
-            runner: Some(&runner),
-            role: session_role.as_deref(),
-            network: network
-                .as_deref()
-                .map(|network| entorhinal_core::NetworkStamp { network, clock }),
-            now_ms: now,
-        })
+        .register_session_with_claim(&registration, claim)
         .map_err(HandlerError::from)?;
-    if binding.held_on.is_none()
+    if claim.is_none()
+        && binding.held_on.is_none()
         && store
             .cached_agent_claim(&binding.agent_id)?
             .is_none_or(|claim| claim.epoch == 0)
@@ -1190,9 +1200,18 @@ impl ProjectsHandler {
         let request: SessionForRunnerRequest = decode(params)?;
         runner_bounds(&request.runner)?;
         bounded("session", &request.session, SESSION_ID_MAX)?;
-        encode_result(
-            self.with_store(|store| store.session_residence(&request.runner, &request.session))?,
-        )
+        encode_result(crate::hub_residence::with_claim_context(
+            self.residence().as_deref(),
+            self.hub_backend_selected(),
+            |context| {
+                self.with_store(|store| match context {
+                    Some(context) => {
+                        store.hub_session_residence(&request.runner, &request.session, context)
+                    }
+                    None => store.session_residence(&request.runner, &request.session),
+                })
+            },
+        )?)
     }
 
     /// The binding a runner's session id names, so a caller holding only

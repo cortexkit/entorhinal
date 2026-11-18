@@ -166,6 +166,9 @@ async fn hub_transport_live_leaf_outage_resumes_and_never_queues_unsent_write() 
     let kv = admin
         .create_key_value(kv::Config {
             bucket: BUCKET.into(),
+            history: 1,
+            max_value_size: MAX_KV_VALUE,
+            max_bytes: MAX_KV_BYTES,
             ..Default::default()
         })
         .await
@@ -321,20 +324,36 @@ async fn hub_transport_live_leaf_outage_resumes_and_never_queues_unsent_write() 
         b"initial"
     );
     assert!(session().log_entry(4, deadline()).await.unwrap().is_none());
+    let forbidden = session()
+        .delete(
+            "residence.alfa",
+            entry.revision,
+            "forbidden-delete",
+            deadline(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(forbidden.code, "kv_delete_forbidden");
+    let target = "wrapreq.alfa";
+    let revision = session()
+        .update(target, b"request".to_vec(), 0, "wrap-request", deadline())
+        .await
+        .unwrap();
+    assert_eq!(within(watch.next()).await.revision, revision);
     let stale = session()
-        .delete("residence.alfa", first, "stale-delete", deadline())
+        .delete(target, first, "stale-delete", deadline())
         .await
         .unwrap_err();
     assert_eq!(stale.code, "revision_moved");
     session()
-        .delete("residence.alfa", entry.revision, "delete", deadline())
+        .delete(target, revision, "delete", deadline())
         .await
         .unwrap();
     let marker = within(watch.next()).await;
     assert!(marker.revision > entry.revision);
     assert_eq!(marker.operation, kv::Operation::Delete);
     let current = session()
-        .kv_entry("residence.alfa", deadline())
+        .kv_entry(target, deadline())
         .await
         .unwrap()
         .unwrap();

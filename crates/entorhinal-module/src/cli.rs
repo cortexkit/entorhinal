@@ -462,6 +462,7 @@ usage: ck agents <verb> [args] [--subc <connection file>] [--json]
   avatars --manifest <file> [--replace] [--yes]
                              preview owner-minted avatars; --yes applies with operator confirmation
   where <agent> [--refresh]  cached checkout claim; optionally refresh first
+  take <agent>              take residence from a removed computer with operator confirmation
   move <agent> --to <machine>
                              move an idle agent to another named machine
   moves                     open moves and the last 32 finished moves
@@ -930,6 +931,7 @@ fn agent_write(method: &str) -> bool {
             | "agent.repair_workspaces"
             | "agent.apply_avatar_manifest"
             | "agent.move"
+            | "agent.take"
             | "agent.move_abort"
             | "agent.set_lid_close_moves"
             | "agent.set_hire_cap"
@@ -949,6 +951,7 @@ fn build_agents(command: &Command) -> Result<(String, Value), String> {
         "list" => "agent.list",
         "show" => "agent.resolve",
         "where" => "agent.where",
+        "take" => "agent.take",
         "move" => "agent.move",
         "moves" => "agent.moves",
         "move-abort" => "agent.move_abort",
@@ -1566,7 +1569,7 @@ async fn execute_agents(
         timeout: Duration::from_secs(300),
         ..subc_client_rs::CallOptions::default()
     }).await.map_err(|failure| {
-        let uncertain = matches!(&failure, CallFailure::Unknown(_)) || matches!(&failure, CallFailure::Refused { code, .. } if code == "engram_outcome_unknown");
+        let uncertain = matches!(&failure, CallFailure::Unknown(_)) || matches!(&failure, CallFailure::Refused { code, .. } if code == "engram_outcome_unknown" || code == "hub_write_unsettled");
         let (exit, mut message) = failure.display();
         if uncertain { message.push_str(&format!("\n{retry}")); }
         (exit, message)

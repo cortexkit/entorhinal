@@ -55,7 +55,7 @@ pub(super) enum Payload {
     Delete,
 }
 
-type NextStep<'a> = &'a (dyn Fn(&Value) -> Result<Step, HandlerError> + Sync);
+pub(super) type NextStep<'a> = &'a (dyn Fn(&Value) -> Result<Step, HandlerError> + Sync);
 
 pub(super) trait LogReplan: Sync {
     fn wait_for_head(
@@ -270,7 +270,7 @@ enum Rebase {
     RowChanged,
 }
 
-fn new_op_id() -> Result<String, HandlerError> {
+pub(super) fn new_op_id() -> Result<String, HandlerError> {
     let mut bytes = [0; 16];
     getrandom::getrandom(&mut bytes)
         .map_err(|error| HandlerError::new("storage_error", error.to_string()))?;
@@ -351,7 +351,7 @@ fn recorded(op_id: String, outcome: Outcome) -> HubAttemptOutcome {
     }
 }
 
-const CONTINUE: &str = "continue:";
+pub(super) const CONTINUE: &str = "continue:";
 const SNAPSHOT: &str = "snapshot:";
 
 impl<T: Transport, U: Trust> Writer<'_, T, U> {
@@ -497,7 +497,33 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
             return Err(invalid_attempt());
         }
         let (value, op_id) = match &step.payload {
-            Payload::Delete if step.key != LOG_KEY => (Vec::new(), new_op_id()?),
+            Payload::Delete if step.key != LOG_KEY => {
+                let cached = self.store.hub_kv_cached(&step.key)?;
+                let last_body = cached
+                    .as_ref()
+                    .filter(|row| row.accepted_revision == Some(step.expected))
+                    .and_then(|row| row.body.as_ref());
+                let allowed = if let Some(mint) = step
+                    .key
+                    .strip_prefix("wrap.")
+                    .and_then(|wrap| wrap.split('.').nth(1))
+                {
+                    let epoch = self.store.hub_kv_cached("epoch")?.and_then(|row| row.body);
+                    epoch
+                        .as_ref()
+                        .and_then(crate::hub_residence::committed_mint)
+                        .is_some_and(|committed| committed != mint)
+                } else {
+                    crate::hub_residence::delete_allowed_without_epoch(&step.key, last_body)
+                };
+                if !allowed || step.expected == 0 {
+                    return Err(HandlerError::new(
+                        "kv_delete_forbidden",
+                        "fleet key cannot be deleted at this revision",
+                    ));
+                }
+                (Vec::new(), new_op_id()?)
+            }
             Payload::Delete => return Err(invalid_attempt()),
             Payload::Record {
                 kind,
@@ -665,7 +691,11 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
                 "vault sealed under an epoch other than the writer fence",
             ));
         }
-        Ok(prepared.into_bytes())
+        let bytes = prepared.into_bytes();
+        if header.key != LOG_KEY {
+            hub_transport::check_kv_size(&header.key, bytes.len())?;
+        }
+        Ok(bytes)
     }
 
     async fn verify(&self, record: UnverifiedRecord) -> Result<VerifiedRecord, HandlerError> {

@@ -26,7 +26,16 @@ CREATE TABLE hub_kv_cache (
     revision INTEGER NOT NULL CHECK(revision > 0),
     accepted_revision INTEGER NULL CHECK(accepted_revision > 0 AND accepted_revision <= revision),
     value BLOB NULL CHECK(value IS NULL OR accepted_revision IS NOT NULL),
+    body TEXT NULL CHECK(body IS NULL OR value IS NOT NULL),
+    read_at_ms INTEGER NULL,
     integrity_failed INTEGER NOT NULL CHECK(integrity_failed IN (0,1))
+);
+
+CREATE TABLE hub_log_writer (
+    position INTEGER PRIMARY KEY CHECK(position > 0),
+    entry_id TEXT NOT NULL UNIQUE,
+    box TEXT NOT NULL,
+    episode INTEGER NOT NULL CHECK(episode >= 0)
 );
 
 CREATE TABLE hub_attempt (
@@ -96,6 +105,68 @@ pub struct HubAnchor {
 }
 
 pub const MEMBERSHIP_OPS: &[&str] = &["member.key", "member.removed", "member.admitted"];
+
+pub(crate) fn record_log_writer(
+    tx: &Transaction<'_>,
+    entry: &crate::remote_apply::RemoteEntry,
+    episode: u64,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO hub_log_writer(position,entry_id,box,episode) VALUES(?1,?2,?3,?4)",
+        params![entry.position, entry.entry_id, entry.author, episode],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn agent_creator(
+    conn: &Connection,
+    id: &str,
+    through: i64,
+) -> rusqlite::Result<Option<(String, u64)>> {
+    conn.query_row(
+        "SELECT w.box,w.episode FROM registry_journal j JOIN hub_log_writer w
+           ON w.position=j.log_position AND w.entry_id=j.entry_id
+          WHERE j.op='agent.create' AND json_extract(j.payload_json,'$.entry.agent_id')=?1 AND w.position<=?2
+          ORDER BY w.position LIMIT 1",
+        params![id, through],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubKvCached {
+    pub revision: u64,
+    pub accepted_revision: Option<u64>,
+    pub value: Option<Vec<u8>>,
+    pub body: Option<Value>,
+    pub read_at_ms: Option<i64>,
+    pub integrity_failed: bool,
+}
+
+pub(crate) fn kv_cached(conn: &Connection, key: &str) -> rusqlite::Result<Option<HubKvCached>> {
+    conn.query_row(
+        "SELECT revision,accepted_revision,value,body,read_at_ms,integrity_failed
+           FROM hub_kv_cache WHERE key=?1",
+        [key],
+        |row| {
+            let body = row.get::<_, Option<String>>(3)?;
+            Ok(HubKvCached {
+                revision: row.get(0)?,
+                accepted_revision: row.get(1)?,
+                value: row.get(2)?,
+                body: body
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()
+                    .map_err(decode_error)?,
+                read_at_ms: row.get(4)?,
+                integrity_failed: row.get(5)?,
+            })
+        },
+    )
+    .optional()
+}
 
 pub(crate) fn replay_membership(
     tx: &Transaction<'_>,
@@ -261,6 +332,92 @@ fn save_attempt(
 }
 
 impl RegistryStore {
+    pub fn hub_created_agent(
+        &self,
+        request_key: &str,
+    ) -> Result<Option<(i64, crate::agent::AgentRow)>, RegistryError> {
+        self.read(|conn| {
+            conn.query_row(
+                "SELECT j.seq,json_extract(j.payload_json,'$.entry.row') FROM registry_journal j
+                   JOIN hub_attempt_send s ON s.op_id=j.entry_id
+                   JOIN hub_log_writer w ON w.position=j.log_position AND w.entry_id=j.entry_id
+                  WHERE s.request_key=?1 AND j.op='agent.create' LIMIT 1",
+                [request_key],
+                |row| {
+                    let body: String = row.get(1)?;
+                    Ok((
+                        row.get(0)?,
+                        serde_json::from_str(&body).map_err(decode_error)?,
+                    ))
+                },
+            )
+            .optional()
+        })
+    }
+
+    pub fn hub_agent_creator(&self, id: &str) -> Result<Option<(String, u64)>, RegistryError> {
+        self.hub_agent_creator_through(id, i64::MAX)
+    }
+
+    pub fn hub_agent_creator_through(
+        &self,
+        id: &str,
+        through: i64,
+    ) -> Result<Option<(String, u64)>, RegistryError> {
+        self.read(|conn| agent_creator(conn, id, through))
+    }
+
+    pub fn hub_kv_cached(&self, key: &str) -> Result<Option<HubKvCached>, RegistryError> {
+        self.read(|conn| kv_cached(conn, key))
+    }
+
+    /// Install a verified value (or an allowed delete with no body). A refusal
+    /// advances the observed revision but preserves the previously accepted value.
+    pub fn record_hub_kv(
+        &self,
+        key: &str,
+        revision: u64,
+        accepted: Option<(&[u8], Option<&Value>)>,
+        now: i64,
+    ) -> Result<bool, RegistryError> {
+        self.with_where_changes(|tx| {
+            if let Some((value, body)) = accepted {
+                Ok(tx.execute(
+                    "INSERT INTO hub_kv_cache(key,revision,accepted_revision,value,body,read_at_ms,integrity_failed)
+                     VALUES(?1,?2,?2,?3,?4,?5,0)
+                     ON CONFLICT(key) DO UPDATE SET revision=?2,accepted_revision=?2,value=?3,body=?4,read_at_ms=?5,integrity_failed=0
+                     WHERE revision<?2 OR (revision=?2 AND integrity_failed=0 AND value=?3)",
+                    params![key, revision, value, body.map(Value::to_string), now],
+                )? != 0)
+            } else {
+                Ok(tx.execute(
+                    "INSERT INTO hub_kv_cache(key,revision,integrity_failed,read_at_ms) VALUES(?1,?2,1,?3)
+                     ON CONFLICT(key) DO UPDATE SET revision=?2,integrity_failed=1
+                     WHERE revision<?2 OR (revision=?2 AND integrity_failed=0)",
+                    params![key, revision, now],
+                )? != 0)
+            }
+        })
+        .map_err(RegistryError::Store)
+    }
+
+    pub fn open_hub_attempts(&self, step_prefix: &str) -> Result<Vec<HubAttempt>, RegistryError> {
+        self.read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT request_key FROM hub_attempt WHERE outcome IS NULL
+                   AND substr(step,1,length(?1))=?1 ORDER BY request_key",
+            )?;
+            let keys = stmt.query_map([step_prefix], |row| row.get::<_, String>(0))?;
+            let mut rows = Vec::new();
+            for key in keys {
+                if let Some(row) = load_attempt(conn, &key?)? {
+                    rows.push(row);
+                }
+            }
+            Ok(rows)
+        })
+    }
+
     pub fn hub_anchors(&self) -> Result<Vec<HubAnchor>, RegistryError> {
         self.read(|conn| {
             conn.prepare("SELECT box,episode,key_version,pub FROM hub_anchor")?
