@@ -2455,6 +2455,7 @@ mod moves {
     mod catalog_moves;
     mod cut_releases;
     mod import_losses;
+    mod move_refs;
 
     #[tokio::test(start_paused = true)]
     async fn initial_claim_allows_move_admission_from_its_holder() {

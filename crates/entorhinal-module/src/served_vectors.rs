@@ -420,7 +420,7 @@ fn assert_avatar_reply(actual: &Value, expected: &Value) {
     );
 }
 
-fn published_file(directory: &str, name: &str, records: Vec<String>) {
+pub(crate) fn published_file(directory: &str, name: &str, records: Vec<String>) {
     if agent_identity_vector(directory, name) {
         let records: Vec<Value> = records
             .iter()

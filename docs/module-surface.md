@@ -578,6 +578,7 @@ Rules are in [agent-move-contract.md](agent-move-contract.md); the guide is
 |---|---|---|---|
 | `agent.move {agent_id, to, request_key}` | mutate | Direct with operator confirmation; orchestrator; `reserved:engram` while lid-close moves are on | Start moving an idle agent to a named machine. |
 | `agent.move_status {cut_id}` | query | any | One move's local checkpoint, including any optional participant explanation for a diverged block. |
+| `agent.move_refs {cutId}` | query | any | Read `{cutId, agentId, refs: [{ref_kind, ref}]}` from the local move's frozen plan, on source or receiver. Refs are sorted, with synthetic `agent`, `package-closure` and `session-bindings` refs excluded. `cutId` is 32 lowercase hex characters; an unknown cut refuses `unknown_move`, and unknown request members refuse `invalid_request`. |
 | `agent.moves` | query | any | Open moves, then the 32 most recently finished, including optional participant explanations for diverged blocks. |
 | `agent.move_abort {cut_id, request_key}` | mutate | Direct with operator confirmation; orchestrator | Cancel a move before its boundary. Only Direct can retry a stuck abort. |
 | `agent.set_lid_close_moves {enabled, request_key}` | mutate | Direct with operator confirmation | Allow or deny engram's lid-close moves on this machine. |

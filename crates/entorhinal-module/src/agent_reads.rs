@@ -1685,6 +1685,7 @@ mod tests {
             "agent.where_watch",
             "catalog.status_watch",
             "agent.move_status",
+            "agent.move_refs",
             "agent.moves",
             "role.read",
             "role.fence",

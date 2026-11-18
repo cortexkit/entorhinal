@@ -51,7 +51,10 @@ async fn no_agent_declarer_preserves_legacy_plan_record_and_every_wire_request()
 
 // Declarations and session bindings are independent: agent-wide data must move
 // even when the agent has never had a session.
-async fn pair_with_refs(declarations: &[(&str, &[&str])], sessions: &[AgentRef]) -> Pair {
+pub(super) async fn pair_with_refs(
+    declarations: &[(&str, &[&str])],
+    sessions: &[AgentRef],
+) -> Pair {
     let mut pair = Pair::new(&[]).await;
     let modules: Vec<_> = declarations.iter().map(|(m, _)| (*m, "")).collect();
     for (source, node) in [(true, &mut pair.a), (false, &mut pair.b)] {

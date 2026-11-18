@@ -4,23 +4,40 @@
 use super::agent_ops::{ConfirmationGuard, OperatorConfirmError};
 use super::shared_write::OPERATOR_BOUND;
 use super::{encode_result, HandlerError, ProjectsHandler, RouteKey};
-use entorhinal_core::{move_store::MoveSetting, RegistryStore};
+use cortexkit_role_agent_data::refs::CutId;
+use entorhinal_core::{
+    move_record::MoveParticipant,
+    move_store::MoveSetting,
+    session_carry::{PACKAGE_CLOSURE_KIND, SESSION_BINDINGS_KIND},
+    RegistryStore,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use subc_protocol::Principal;
 use tokio::time::{timeout_at, Instant};
 
 pub(super) const STATUS: &str = "agent.move_status";
+pub(super) const REFS: &str = "agent.move_refs";
 pub(super) const MOVES: &str = "agent.moves";
 pub(super) const ABORT: &str = "agent.move_abort";
 pub(super) const SET_LID: &str = "agent.set_lid_close_moves";
-pub(super) const READS: &[&str] = &[STATUS, MOVES];
+pub(super) const READS: &[&str] = &[STATUS, REFS, MOVES];
 pub(super) const WRITES: &[&str] = &[ABORT, SET_LID];
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StatusRequest {
     cut_id: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RefsRequest {
+    #[serde(rename = "cutId")]
+    cut_id: CutId,
+}
+#[derive(Deserialize)]
+struct RefsPlan {
+    participants: Vec<MoveParticipant>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -56,6 +73,29 @@ fn unknown_move() -> HandlerError {
 }
 
 impl ProjectsHandler {
+    pub(super) fn move_refs(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
+        let request: RefsRequest = parse(params)?;
+        let row = self
+            .with_store(|s| s.agent_move_snapshot(request.cut_id.as_str()))?
+            .ok_or_else(unknown_move)?;
+        // Both checkpoint formats keep the routed refs in participants. Read
+        // that frozen set, not bindings that can change after admission.
+        let plan: RefsPlan = serde_json::from_value(row.plan)
+            .map_err(|e| HandlerError::new("plan_malformed", e.to_string()))?;
+        let refs: std::collections::BTreeSet<_> = plan
+            .participants
+            .into_iter()
+            .flat_map(|p| p.refs)
+            .filter(|r| {
+                !matches!(
+                    r.ref_kind.as_str(),
+                    "agent" | PACKAGE_CLOSURE_KIND | SESSION_BINDINGS_KIND
+                )
+            })
+            .collect();
+        encode_result(json!({"cutId":request.cut_id,"agentId":row.agent_id,"refs":refs}))
+    }
+
     pub(super) fn move_status(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
         let request: StatusRequest = parse(params)?;
         let (view, row) = self.with_store(|s| {
@@ -370,6 +410,134 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 1,
         }
+    }
+
+    #[tokio::test]
+    async fn move_refs_are_frozen_sorted_session_refs_open_to_every_principal() {
+        let f = Fixture::new(Ok(()));
+        let cut = "0123456789abcdef0123456789abcdef";
+        let mut row = row(cut);
+        row.plan["participants"] = json!([
+            {"module_id":"both","refs":[
+                {"ref_kind":"session","ref":"z"},
+                {"ref_kind":"agent","ref":cut},
+                {"ref_kind":"pi","ref":"b"},
+                {"ref_kind":"session","ref":"a"}
+            ],"external":[]},
+            {"module_id":"duplicate","refs":[{"ref_kind":"session","ref":"a"}],"external":[]},
+            {"module_id":"entorhinal","refs":[
+                {"ref_kind":PACKAGE_CLOSURE_KIND,"ref":cut},
+                {"ref_kind":SESSION_BINDINGS_KIND,"ref":cut}
+            ],"external":[]}
+        ]);
+        f.store().insert_agent_move(&row).unwrap();
+        let generation = f.store().generation().unwrap();
+        let _writer = f.handler.writer.lock().await;
+        for principal in [
+            Some(Principal::Direct),
+            Some(reserved("orchestrator")),
+            Some(reserved("other")),
+            Some(Principal::Unverified),
+            None,
+        ] {
+            for flow in [false, true] {
+                f.handler.route_admissions().insert(
+                    OTHER,
+                    RouteAdmission::from_bind(
+                        principal.clone(),
+                        flow.then(|| flow_stamp(Some("flow"))).as_ref(),
+                    ),
+                );
+                let reply = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    f.call(REFS, json!({"cutId":cut}), OTHER),
+                )
+                .await
+                .expect("move_refs must bypass the shared writer");
+                assert_eq!(
+                    result(reply),
+                    json!({"cutId":cut,"agentId":cut,"refs":[
+                        {"ref_kind":"pi","ref":"b"},
+                        {"ref_kind":"session","ref":"a"},
+                        {"ref_kind":"session","ref":"z"}
+                    ]})
+                );
+            }
+        }
+        assert_eq!(f.store().generation().unwrap(), generation);
+        assert_eq!(f.store().agent_move(cut).unwrap().unwrap(), row);
+    }
+
+    #[tokio::test]
+    async fn move_refs_refuse_unknown_cuts_members_and_malformed_cut_ids() {
+        let f = Fixture::new(Ok(()));
+        let cut = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            code(f.call(REFS, json!({"cutId":cut}), OTHER).await),
+            "unknown_move"
+        );
+        for params in [
+            json!({"cutId":cut,"unexpected":true}),
+            json!({"cut_id":cut}),
+            json!({}),
+            json!({"cutId":12}),
+            json!({"cutId":""}),
+            json!({"cutId":"a".repeat(31)}),
+            json!({"cutId":"a".repeat(33)}),
+            json!({"cutId":"A".repeat(32)}),
+            json!({"cutId":"g".repeat(32)}),
+        ] {
+            assert_eq!(
+                code(f.call(REFS, params.clone(), OTHER).await),
+                "invalid_request",
+                "{params}"
+            );
+        }
+    }
+
+    #[test]
+    fn move_refs_read_committed_plan_before_parked_database_writer_is_released() {
+        use std::{sync::mpsc, thread, time::Duration};
+
+        let f = Fixture::new(Ok(()));
+        let cut = "0123456789abcdef0123456789abcdef";
+        f.store().insert_agent_move(&row(cut)).unwrap();
+        let (parked_tx, parked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let received = thread::scope(|scope| {
+            let handler = &f.handler;
+            let writer = scope.spawn(move || {
+                handler
+                    .with_store(|store| {
+                        store.apply_entry("fixture", "{}", "test", None, |tx| {
+                            tx.execute("UPDATE agent_move SET agent_id='uncommitted'", [])?;
+                            parked_tx.send(()).unwrap();
+                            // Keep the writer parked beyond the read deadline, but
+                            // release it even when a regression blocks the read.
+                            let _ = release_rx.recv_timeout(Duration::from_secs(60));
+                            tx.execute_batch("SELECT * FROM missing_rollback_sentinel")
+                        })
+                    })
+                    .unwrap_err();
+            });
+            parked_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+            scope.spawn(move || {
+                let reply = handler.handle_request(
+                    &serde_json::to_vec(&json!({"method":REFS,"params":{"cutId":cut}})).unwrap(),
+                    OTHER,
+                );
+                let _ = reply_tx.send(reply);
+            });
+            let received = reply_rx.recv_timeout(Duration::from_secs(30));
+            release_tx.send(()).unwrap();
+            writer.join().unwrap();
+            received
+        });
+        assert_eq!(
+            result(received.expect("move_refs waited for the database writer")),
+            json!({"cutId":cut,"agentId":cut,"refs":[]})
+        );
     }
 
     #[tokio::test]

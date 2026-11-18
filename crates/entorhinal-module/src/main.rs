@@ -1758,6 +1758,7 @@ impl ProjectsHandler {
                 "move writes require the asynchronous served path",
             )),
             move_ops::STATUS => self.move_status(request.params),
+            move_ops::REFS => self.move_refs(request.params),
             move_ops::MOVES => self.moves(request.params),
             method if agent_ops::MUTATING_METHODS.contains(&method) => {
                 self.agent_mutation(method, request.params, &principal)
@@ -2667,6 +2668,7 @@ fn agent_operation_description(method: &str) -> &'static str {
         "agent.refresh_claims" => "Refresh live agents' claim records from engram without waiting for the shared-log writer.",
         "agent.move" => "Admit an idle agent move to a named member, with Direct confirmation, an orchestrator relay or enabled lid-close moves.",
         "agent.move_status" => "Read a local move checkpoint, holds, warnings and diagnostics without calling a participant or engram.",
+        "agent.move_refs" => "Read the frozen session references carried by a local move, excluding synthetic participant references.",
         "agent.moves" => "Read open local moves followed by the last 32 finished moves, including warnings and diagnostics.",
         "agent.move_abort" => "Request move cleanup before the irreversible boundary; Direct confirms, or the orchestrator relays. Only Direct can retry a stuck abort.",
         "agent.set_lid_close_moves" => "Enable or disable engram's lid-close moves on this machine, from Direct with operator confirmation.",
@@ -4716,6 +4718,7 @@ mod tests {
             ("identity_log.status", "query"),
             ("agent.move", "mutate"),
             ("agent.move_status", "query"),
+            ("agent.move_refs", "query"),
             ("agent.moves", "query"),
             ("agent.move_abort", "mutate"),
             ("agent.set_lid_close_moves", "mutate"),
