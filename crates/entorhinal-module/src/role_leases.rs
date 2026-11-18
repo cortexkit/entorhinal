@@ -497,6 +497,9 @@ pub(super) struct CandidateRequest {
 pub(super) trait Backend: Send + Sync {
     fn local_box(&self) -> &str;
     fn role(&self, name: &str) -> Result<Observation, HandlerError>;
+    fn role_high_water(&self, _name: &str) -> Result<i64, HandlerError> {
+        Ok(0)
+    }
     fn preferred(&self, role: &str) -> Result<Option<Preferred>, HandlerError>;
     fn handback(&self, role: &str, box_id: &str) -> Result<Option<CandidateRequest>, HandlerError>;
     fn link_events(&self) -> (&Notify, &Notify);
@@ -554,15 +557,24 @@ fn lease_gen_moved() -> HandlerError {
     )
 }
 
-fn change(step: &'static str, prior: &Observation, local: &str) -> Result<Change, HandlerError> {
+pub(super) fn next_gen(current: i64, high_water: i64) -> Result<i64, HandlerError> {
+    current
+        .max(high_water)
+        .checked_add(1)
+        .ok_or_else(|| HandlerError::new("record_invalid", "role generation is exhausted"))
+}
+
+fn change(
+    step: &'static str,
+    prior: &Observation,
+    local: &str,
+    high_water: i64,
+) -> Result<Change, HandlerError> {
     let writer_ep = prior
         .local_episode
         .ok_or_else(|| HandlerError::new("hub_not_ready", "local membership is not ready"))?;
     let gen = if matches!(step, ACQUIRE | TRANSFER) {
-        prior
-            .gen()
-            .checked_add(1)
-            .ok_or_else(|| HandlerError::new("record_invalid", "role generation is exhausted"))?
+        next_gen(prior.gen(), high_water)?
     } else {
         prior.gen()
     };
@@ -584,19 +596,24 @@ impl Leases {
         client: &Client,
         mut controls: mpsc::Receiver<Control>,
         notices: watch::Sender<View>,
+        mut local_gen: Option<i64>,
     ) -> Result<(), HandlerError> {
         let mut installed = self.backend.subscribe();
         loop {
             let backend = installed.borrow_and_update().clone();
             if let Some(backend) = backend {
+                local_gen = None;
                 tokio::select! {
                     result = self.run_candidate(role, client, backend.as_ref(), &mut controls, &notices) => return result,
-                    _ = installed.changed() => { notices.send_replace(View::default()); }
+                    _ = installed.changed() => {
+                        let gen = notices.borrow().gen;
+                        notices.send_replace(View { gen, ..View::default() });
+                    }
                 }
             } else {
                 let changed = handler.role_cache_changed.notified();
                 let now = self.now();
-                let next = handler.local_role_view(role, now);
+                let next = handler.local_role_view(role, now, &mut local_gen);
                 let current = *notices.borrow();
                 let due = current
                     .until_ms
@@ -690,15 +707,20 @@ impl Leases {
                     failed_since = None;
                 }
                 let mine = current.own(local);
+                let high_water = backend.role_high_water(role)?;
+                let needs_new_gen = mine && current.gen() < high_water;
+                let visible_gen = current.gen().max(high_water);
                 if !mine || current.gen() != prior.gen {
                     offered = None;
                 }
                 notices.send_if_modified(|view| {
-                    if current.gen() == view.gen && (mine || view.until_ms.is_none()) {
+                    if visible_gen == view.gen
+                        && ((mine && !needs_new_gen) || view.until_ms.is_none())
+                    {
                         return false;
                     }
                     *view = View {
-                        gen: current.gen(),
+                        gen: visible_gen,
                         ..View::default()
                     };
                     true
@@ -711,7 +733,8 @@ impl Leases {
                     && client.awaiting.lock().unwrap().is_none()
                     && *client.view.lock().unwrap() == *notices.borrow()
                 {
-                    let can_acquire = (slot_free && defer.is_none())
+                    let can_acquire = needs_new_gen
+                        || (slot_free && defer.is_none())
                         || (!mine && (slot_free || current.holder_current) && now >= count_done);
                     if pending.as_ref().is_some_and(|op| match op.step {
                         RENEW => !mine || current.gen() != op.body.gen,
@@ -732,8 +755,16 @@ impl Leases {
                     };
                     if due.is_some_and(|time| now >= time) {
                         if pending.is_none() {
-                            let mut next =
-                                change(if mine { RENEW } else { ACQUIRE }, &current, local)?;
+                            let mut next = change(
+                                if mine && !needs_new_gen {
+                                    RENEW
+                                } else {
+                                    ACQUIRE
+                                },
+                                &current,
+                                local,
+                                high_water,
+                            )?;
                             if slot_free {
                                 next.vacancy_preference = Some(defer.map_or(0, |p| p.revision));
                             }
@@ -908,7 +939,7 @@ impl Leases {
                                     view.handback = false;
                                     let observed = backend.role(role)?;
                                     if observed.ready && observed.own(local) && observed.gen() == request.gen {
-                                        let renewal = change(RENEW, &observed, local)?;
+                                        let renewal = change(RENEW, &observed, local, 0)?;
                                         let deadline = Instant::now() + Duration::from_secs(5);
                                         if let Ok(confirmed) = backend.write(role, &renewal, deadline).await {
                                             wait_revision = confirmed.revision;
@@ -981,7 +1012,12 @@ impl Leases {
         if !backend.reread_offer(role, target, gen, deadline).await? {
             return Ok(None);
         }
-        let mut transfer = change(TRANSFER, &current, backend.local_box())?;
+        let mut transfer = change(
+            TRANSFER,
+            &current,
+            backend.local_box(),
+            backend.role_high_water(role)?,
+        )?;
         transfer.body.holder = Some(target.box_id.clone());
         transfer.body.holder_ep = target.episode;
         backend
@@ -1014,7 +1050,7 @@ impl Leases {
                 ));
             }
             if current.revision >= wait_revision {
-                let op = change(RELEASE, &current, backend.local_box())?;
+                let op = change(RELEASE, &current, backend.local_box(), 0)?;
                 backend.write(role, &op, deadline).await?;
                 return Ok(());
             }
@@ -1033,7 +1069,7 @@ fn decode<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, HandlerErr
 }
 
 impl ProjectsHandler {
-    fn local_role_view(&self, role: &str, now: u64) -> View {
+    fn local_role_view(&self, role: &str, now: u64, grant: &mut Option<i64>) -> View {
         if self.hub_backend_selected() || self.admit_store_write().is_err() {
             return View::default();
         }
@@ -1049,15 +1085,27 @@ impl ProjectsHandler {
                     || (role.starts_with("dreamer.")
                         && matches!(state.as_str(), "enabled" | "enabling" | "joining"))
                 {
-                    return Ok(local(1));
+                    let high_water = store.role_gen_high_water(role)?;
+                    let gen = match *grant {
+                        Some(gen) if gen >= high_water => gen,
+                        _ => store.grant_local_role_gen(role)?,
+                    };
+                    *grant = Some(gen);
+                    return Ok(local(gen));
                 }
+                *grant = None;
                 if role == "connector_home" && state == "enabled" {
                     let read = store.role_read(role)?;
+                    let high_water = store.role_gen_high_water(role)?;
+                    if read.epoch > high_water {
+                        store.observe_role_gen(role, read.epoch)?;
+                    }
+                    let gen = read.epoch.max(high_water);
                     return Ok(if read.held_here && !read.stale {
-                        local(read.epoch)
+                        local(gen)
                     } else {
                         View {
-                            gen: read.epoch,
+                            gen,
                             ..View::default()
                         }
                     });
@@ -1218,10 +1266,11 @@ impl ProjectsHandler {
     ) -> Result<(), HandlerError> {
         let (release, releases) = mpsc::channel(1);
         let (client, registration) = self.role_leases.register(role.clone(), key, release)?;
+        let mut local_gen = None;
         let initial = if self.role_leases.backend.borrow().is_some() {
             View::default()
         } else {
-            self.local_role_view(&role, self.role_leases.now())
+            self.local_role_view(&role, self.role_leases.now(), &mut local_gen)
         };
         let (source, views) = watch::channel(initial);
         #[cfg(test)]
@@ -1234,7 +1283,7 @@ impl ProjectsHandler {
         tokio::select! {
             biased;
             result = self.role_leases.notices(transport, &client, registration, views) => result,
-            result = self.role_leases.drive(self, &role, &client, releases, source) => result,
+            result = self.role_leases.drive(self, &role, &client, releases, source, local_gen) => result,
         }
     }
 }

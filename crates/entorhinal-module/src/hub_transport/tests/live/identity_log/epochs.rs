@@ -310,7 +310,6 @@ impl EpochNode {
         let leaf = self.node.leaf.clone();
         let feed = Feed::kv(self.node.handler.health.clone(), move |cursor| {
             Binding {
-                box_id: leaf.box_id.clone(),
                 session: leaf.session(),
                 changes: None,
             }

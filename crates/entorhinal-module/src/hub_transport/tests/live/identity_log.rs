@@ -49,7 +49,6 @@ impl LogTransport for Leaf {
         let leaf = self.clone();
         Feed::log(self.health.clone(), applied, move |cursor| {
             Binding {
-                box_id: leaf.box_id.clone(),
                 session: leaf.session(),
                 changes: None,
             }

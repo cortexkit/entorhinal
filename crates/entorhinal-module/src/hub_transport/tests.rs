@@ -23,7 +23,15 @@ async fn hub_health_is_absent_for_unswitched_store_and_reads_stay_local() {
         assert!(report.get(key).is_none(), "dormant metric {key}");
     }
 
-    let _hub = Hub::new(SubcConnector::default(), handler.health.clone());
+    let hub = Hub::new(SubcConnector::default(), handler.health.clone());
+    assert!(handler
+        .health()
+        .await
+        .metrics
+        .unwrap()
+        .get("hubConnected")
+        .is_none());
+    hub.activate();
     let state = &handler.health.hub;
     let report = handler.health().await.metrics.unwrap();
     assert_eq!(report["hubConnected"], false);

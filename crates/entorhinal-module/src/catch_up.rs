@@ -15,6 +15,7 @@ pub(crate) struct Worker {
     health: Arc<HealthGauges>,
     log: log_client::LogClient,
     records: super::record_client::RecordClient,
+    hub_switch: Option<super::hub_switch::Switch>,
     wake: Arc<tokio::sync::Notify>,
     writer: Arc<tokio::sync::Mutex<()>>,
     commits: Arc<tokio::sync::Notify>,
@@ -29,6 +30,7 @@ impl ProjectsHandler {
             health: self.health.clone(),
             log: self.log_client.clone(),
             records: self.record_client.clone(),
+            hub_switch: self.hub_switch.clone(),
             wake: self.catch_up_wake.clone(),
             writer: self.writer.clone(),
             commits: self.commits.clone(),
@@ -159,6 +161,8 @@ impl Worker {
 
     async fn background(self) {
         let mut outage = OutageLog::default();
+        let mut switch_error = None;
+        let mut gate_error = None;
         let mut ticks = tokio::time::interval(INTERVAL);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -179,6 +183,24 @@ impl Worker {
                 if store.is_foreign() {
                     continue;
                 }
+                let hub_base = store.hub_log_base();
+                if !matches!(hub_base, Ok(None)) {
+                    if matches!(hub_base, Ok(Some(_))) {
+                        if let Some(switch) = &self.hub_switch {
+                            let _ = switch.discover(&store, deadline).await;
+                        }
+                        self.health.hub_membership.store(1, Ordering::Release);
+                    }
+                    continue;
+                }
+                let selection = if let Some(switch) = &self.hub_switch {
+                    let discovery_deadline = deadline.min(Instant::now() + Duration::from_secs(5));
+                    let selected = switch.discover(&store, discovery_deadline).await;
+                    log_switch_result(&mut switch_error, &selected);
+                    selected.ok()
+                } else {
+                    None
+                };
                 // Disabled stores never contact engram. An enabling store has
                 // snapshot parts saved in SQLite with their entry ids and bytes:
                 // retry those appends rather than import the log as if this
@@ -219,10 +241,20 @@ impl Worker {
                             if let Some(line) = outage.succeeded() {
                                 tracing::info!(target: "identity_log", "{line}");
                             }
-                            if let Err(error) =
-                                self.publish_member_box(&store, writer, deadline).await
-                            {
-                                tracing::warn!(target: "identity_log", "publishing member box: {}: {}", error.code, error.message);
+                            if selection == Some(super::hub_switch::Startup::Migrate) {
+                                if let Some(switch) = &self.hub_switch {
+                                    let result = switch
+                                        .advance(&store, &self.log, &self.records, deadline)
+                                        .await;
+                                    log_switch_result(&mut gate_error, &result);
+                                }
+                            }
+                            if matches!(store.engram_freeze(), Ok(None)) {
+                                if let Err(error) =
+                                    self.publish_member_box(&store, writer, deadline).await
+                                {
+                                    tracing::warn!(target: "identity_log", "publishing member box: {}: {}", error.code, error.message);
+                                }
                             }
                         }
                     }
@@ -586,6 +618,19 @@ impl Worker {
                 .fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
+    }
+}
+
+fn log_switch_result<T>(last: &mut Option<(String, String)>, result: &Result<T, HandlerError>) {
+    let current = result
+        .as_ref()
+        .err()
+        .map(|error| (error.code.clone(), error.message.clone()));
+    if current != *last {
+        if let Some((code, message)) = &current {
+            tracing::warn!(target: "identity_log", "switch gate: {code}: {message}");
+        }
+        *last = current;
     }
 }
 

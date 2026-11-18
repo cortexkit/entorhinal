@@ -24,7 +24,7 @@ use async_nats::{
     },
     HeaderMap, HeaderValue,
 };
-use cortexkit_bus_client::{BusClient, BusClientOptions};
+use cortexkit_bus_client::{BusClient, BusClientOptions, HubClient};
 use cortexkit_bus_naming::federation::BoxId;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -115,19 +115,52 @@ impl Failure {
 
 pub(super) struct Hub {
     connector: SubcConnector,
-    bus: Mutex<Option<BusClient>>,
+    bus: Mutex<Option<HubClient>>,
+    local_bus: Mutex<Option<BusClient>>,
     health: Arc<HealthGauges>,
 }
 
 impl Hub {
-    /// Construct only after the registry has selected the hub backend.
     pub(super) fn new(connector: SubcConnector, health: Arc<HealthGauges>) -> Arc<Self> {
-        health.hub.active.store(true, Ordering::Relaxed);
         Arc::new(Self {
             connector,
             bus: Mutex::default(),
+            local_bus: Mutex::default(),
             health,
         })
+    }
+
+    pub(super) fn activate(&self) {
+        self.health.hub.active.store(true, Ordering::Relaxed);
+    }
+
+    async fn bus_consumer(&self) -> Result<Arc<subc_client_rs::consumer::SubcConsumer>, Failure> {
+        self.connector
+            .consumer()
+            .await
+            .map_err(|error| match error {
+                crate::log_client::TransportError::Refusal { code, .. } => Failure(code),
+                _ => Failure::code("daemon_unavailable"),
+            })
+    }
+
+    fn bus_options() -> BusClientOptions {
+        let mut options =
+            BusClientOptions::new(crate::MODULE_ID).expect("valid entorhinal module id");
+        options.request_timeout = REQUEST_TIMEOUT;
+        options
+    }
+
+    fn bus_failure(error: cortexkit_bus_client::Error) -> Failure {
+        use cortexkit_bus_client::Error;
+        match error {
+            Error::HubUnavailable => Failure::code("hub_unavailable"),
+            Error::HubNotGranted => Failure::code("hub_not_granted"),
+            Error::Refused(code) => Failure(code),
+            Error::Reply(_) => Failure::code("invalid_credential_reply"),
+            Error::Transport(_) => Failure::code("credential_unavailable"),
+            _ => Failure::code("bus_connect_failed"),
+        }
     }
 
     async fn binding(&self) -> Result<Binding, Failure> {
@@ -139,44 +172,54 @@ impl Hub {
             *bus = None;
         }
         if bus.is_none() {
-            let subc = self
-                .connector
-                .consumer()
-                .await
-                .map_err(|error| match error {
-                    crate::log_client::TransportError::Refusal { code, .. } => Failure(code),
-                    _ => Failure::code("daemon_unavailable"),
-                })?;
-            let mut options =
-                BusClientOptions::new(crate::MODULE_ID).expect("valid entorhinal module id");
-            options.request_timeout = REQUEST_TIMEOUT;
-            *bus = Some(BusClient::connect(subc, options).await.map_err(|error| {
-                use cortexkit_bus_client::Error;
-                match error {
-                    Error::Refused(code) => Failure(code),
-                    Error::Reply(_) => Failure::code("invalid_credential_reply"),
-                    Error::Transport(_) => Failure::code("credential_unavailable"),
-                    _ => Failure::code("bus_connect_failed"),
-                }
-            })?);
+            *bus = Some(
+                HubClient::connect(self.bus_consumer().await?, Self::bus_options())
+                    .await
+                    .map_err(Self::bus_failure)?,
+            );
         }
         let bus = bus.as_ref().expect("initialized bus client");
-        let box_id = bus
-            .box_id()
-            .ok_or_else(|| Failure::code("not_box_account"))?;
         let mut changes = bus.connection_changes();
         changes.borrow_and_update();
-        let connection = bus.connection();
-        // Reject the legacy inbox fallback. The bus client validates the issued
-        // ckdel prefix and configures new_inbox() with it; never construct it here.
-        if !connection.inbox_prefix().starts_with("ckdel.") {
-            return Err(Failure::code("missing_deliver_prefix"));
-        }
+        let client = bus.client().map_err(Self::bus_failure)?;
+        let mut js = bus.jetstream().map_err(Self::bus_failure)?;
+        js.set_timeout(REQUEST_TIMEOUT);
         Ok(Binding {
-            box_id,
-            session: Session::new(connection.client(), self.health.clone()),
+            session: Session {
+                client,
+                js,
+                health: self.health.clone(),
+            },
             changes: Some(changes),
         })
+    }
+
+    /// The hub credential is managed independently. Use the usual box account
+    /// only to check the signed writer ID; hub requests use the hub session.
+    pub(super) async fn box_id(&self, deadline: Instant) -> Result<BoxId, HandlerError> {
+        let lookup = async {
+            let mut bus = self.local_bus.lock().await;
+            if bus
+                .as_ref()
+                .is_some_and(|client| client.connection_changes().has_changed().is_err())
+            {
+                *bus = None;
+            }
+            if bus.is_none() {
+                *bus = Some(
+                    BusClient::connect(self.bus_consumer().await?, Self::bus_options())
+                        .await
+                        .map_err(Self::bus_failure)?,
+                );
+            }
+            bus.as_ref()
+                .and_then(BusClient::box_id)
+                .ok_or_else(|| Failure::code("not_box_account"))
+        };
+        timeout_at(deadline, lookup)
+            .await
+            .map_err(|_| unavailable("bus_connect_timeout"))?
+            .map_err(|error| unavailable(&error.0))
     }
 
     async fn open(&self, deadline: Instant) -> Result<Binding, Failure> {
@@ -187,12 +230,9 @@ impl Hub {
 
     /// One connection snapshot for a bounded read or write, not a cached
     /// connection to hold across credential replacements.
-    pub(super) async fn session(
-        &self,
-        deadline: Instant,
-    ) -> Result<(BoxId, Session), HandlerError> {
+    pub(super) async fn session(&self, deadline: Instant) -> Result<Session, HandlerError> {
         match self.open(deadline).await {
-            Ok(binding) => Ok((binding.box_id, binding.session)),
+            Ok(binding) => Ok(binding.session),
             Err(error) => {
                 self.health.hub.failed();
                 Err(unavailable(&error.0))
@@ -256,7 +296,6 @@ impl Hub {
 }
 
 struct Binding {
-    box_id: BoxId,
     session: Session,
     changes: Option<watch::Receiver<u64>>,
 }
@@ -369,6 +408,7 @@ pub(super) struct Session {
 }
 
 impl Session {
+    #[cfg(test)]
     fn new(client: async_nats::Client, health: Arc<HealthGauges>) -> Self {
         let mut js = jetstream::with_domain(client.clone(), DOMAIN);
         js.set_timeout(REQUEST_TIMEOUT);

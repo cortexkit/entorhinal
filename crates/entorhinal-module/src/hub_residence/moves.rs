@@ -355,13 +355,13 @@ impl Residence {
     pub(crate) async fn advertise_node(
         &self,
         participants: Vec<Participant>,
+        engram_hub_cuts: bool,
     ) -> Result<(), HandlerError> {
         let key = moves::node_key(&self.box_id);
         let previous = self.move_cached(&key)?;
-        if self
-            .watched_node(&self.box_id)?
-            .is_some_and(|node| node.participants == participants)
-        {
+        if self.watched_node(&self.box_id)?.is_some_and(|node| {
+            node.participants == participants && node.engram_hub_cuts == engram_hub_cuts
+        }) {
             return Ok(());
         }
         let expected = previous.as_ref().map_or(0, |row| row.revision);
@@ -378,6 +378,7 @@ impl Residence {
                 v: 1,
                 box_id: self.box_id.clone(),
                 participants,
+                engram_hub_cuts,
                 written_at: (self.clock)()
             })
         };

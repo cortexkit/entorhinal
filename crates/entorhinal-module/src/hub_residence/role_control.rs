@@ -325,19 +325,33 @@ impl Residence {
         deadline: Instant,
     ) -> Result<Vec<u8>, HandlerError> {
         let saved = self.store.hub_attempt(&input.request_id)?;
-        let (step, writer_ep, forced) = if let Some(saved) = &saved {
+        let (step, writer_ep, forced_gen) = if let Some(saved) = &saved {
             if saved.write.params_digest != digest {
                 return Err(HandlerError::new(
                     "request_key_conflict",
                     "request_id has different arguments",
                 ));
             }
-            let forced = match saved.write.step.as_str() {
-                FORCE => true,
-                PREFER => false,
+            let forced_gen = match saved.write.step.as_str() {
+                FORCE => {
+                    let verified = self
+                        .backend
+                        .verify(&saved.write.key, &saved.write.value, deadline)
+                        .await?;
+                    Some(
+                        serde_json::from_value::<role_leases::Record>(verified.body)
+                            .map_err(crate::invalid_params)?
+                            .gen,
+                    )
+                }
+                PREFER => None,
                 _ => return Err(bad_record("invalid saved role take step")),
             };
-            (resume_only(), self.request_episode(Some(saved))?, forced)
+            (
+                resume_only(),
+                self.request_episode(Some(saved))?,
+                forced_gen,
+            )
         } else {
             let current = self.role(&input.role)?;
             if !current.ready {
@@ -355,15 +369,21 @@ impl Residence {
             let writer_ep = self.backend.writer_episode()?;
             let forced = !current.holder_current
                 && current.record.as_ref().is_some_and(|r| r.holder.is_some());
-            let step = if forced {
-                let mut record =
-                    role_leases::Record::new(&self.box_id, writer_ep, current.gen() + 1, false);
+            let (step, forced_gen) = if forced {
+                let gen = role_leases::next_gen(
+                    current.gen(),
+                    self.store.role_gen_high_water(&input.role)?,
+                )?;
+                let mut record = role_leases::Record::new(&self.box_id, writer_ep, gen, false);
                 record.forced = true;
-                record_step(
-                    FORCE,
-                    format!("role.{}", input.role),
-                    current.revision,
-                    json!(record),
+                (
+                    record_step(
+                        FORCE,
+                        format!("role.{}", input.role),
+                        current.revision,
+                        json!(record),
+                    ),
+                    Some(gen),
                 )
             } else {
                 let key = preference_key(&input.role);
@@ -387,9 +407,9 @@ impl Residence {
                     box_id: self.box_id.clone(),
                     writer: self.box_id.clone(),
                 };
-                record_step(PREFER, key, revision, json!(record))
+                (record_step(PREFER, key, revision, json!(record)), None)
             };
-            (step, writer_ep, forced)
+            (step, writer_ep, forced_gen)
         };
         self.backend
             .write(
@@ -407,8 +427,9 @@ impl Residence {
             .await?;
         // A completed attempt retains its original step, so a preference
         // replay doesn't report that the role subsequently arrived here.
-        encode_result(if forced {
-            json!({"epoch": input.expected_epoch + 1, "held_here": true})
+        encode_result(if let Some(gen) = forced_gen {
+            self.store.observe_role_gen(&input.role, gen)?;
+            json!({"epoch": gen, "held_here": true})
         } else {
             json!({"epoch": input.expected_epoch, "held_here": false, "handback_requested": true})
         })

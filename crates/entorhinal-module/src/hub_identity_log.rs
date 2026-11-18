@@ -71,7 +71,6 @@ impl LogTransport for Hub {
     ) -> Result<Vec<String>, HandlerError> {
         self.session(deadline)
             .await?
-            .1
             .join_keys(prefix, deadline)
             .await
     }

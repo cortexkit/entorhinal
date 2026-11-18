@@ -1,0 +1,657 @@
+//! Discovers the fleet backend and fences the legacy writer before migration.
+
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, Mutex, Weak},
+};
+
+use entorhinal_core::{
+    remote_apply::{EngramFreeze, MigrationMarker},
+    RegistryStore,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use tokio::time::{timeout_at, Instant};
+
+use crate::{
+    hub_membership::{box_id, peers::Callosum},
+    hub_transport::Hub,
+    log_client::{AppendRequest, EntryKind, LogClient, LogError, SubcConnector},
+    participant_discovery::ParticipantDiscovery,
+    record_client::{CasRequest, RecordClient, RecordReply},
+    HandlerError, ProjectsHandler, RouteKey,
+};
+
+pub(super) const EXCLUDE: &str = "identity_log.hub_switch";
+const PROPOSAL: &str = "hubswitch";
+const HUB_PROTOCOL: u64 = 1;
+const CUTS: &str = "engram-hub-cuts/v1";
+const PENDING: &str = "hub_switch_pending";
+
+pub(crate) fn pending() -> HandlerError {
+    HandlerError::new(PENDING, "the identity log is switching to the hub")
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct LegacyFence(Option<Weak<Mutex<Option<RegistryStore>>>>);
+
+impl LegacyFence {
+    pub(crate) fn new(slot: &Arc<Mutex<Option<RegistryStore>>>) -> Self {
+        Self(Some(Arc::downgrade(slot)))
+    }
+
+    fn store(&self) -> Option<RegistryStore> {
+        self.0.as_ref()?.upgrade()?.lock().unwrap().clone()
+    }
+
+    pub(crate) fn log(&self, append: Option<(&AppendRequest, bool)>) -> Result<(), &'static str> {
+        let Some(store) = self.store() else {
+            return Ok(());
+        };
+        if store.hub_log_base().map_err(|_| "storage_error")?.is_some() {
+            return Err(PENDING);
+        }
+        if let Some((request, marker)) = append {
+            match store.engram_freeze().map_err(|_| "storage_error")? {
+                Some(EngramFreeze::Pending {
+                    expected_head,
+                    entry_id,
+                    body,
+                }) if marker => {
+                    if request.expected_head != expected_head as u64
+                        || request.entry_id != entry_id
+                        || request.kind != EntryKind::Change
+                        || serde_json::to_vec(&body).map_err(|_| "storage_error")? != request.data
+                    {
+                        return Err(PENDING);
+                    }
+                }
+                Some(_) => return Err(PENDING),
+                None if marker => return Err(PENDING),
+                None => {}
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record(&self, cas_subject: Option<&str>) -> Result<(), &'static str> {
+        let Some(store) = self.store() else {
+            return Ok(());
+        };
+        if store.hub_log_base().map_err(|_| "storage_error")?.is_some() {
+            return Err(PENDING);
+        }
+        if let Some(subject) = cas_subject {
+            if !subject.starts_with("hubquiet:")
+                && !subject.starts_with("hubdrained:")
+                && store
+                    .engram_freeze()
+                    .map_err(|_| "storage_error")?
+                    .is_some()
+            {
+                return Err(PENDING);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Snapshot verification supplies this evidence. Without it, a nonempty log
+/// cannot be distinguished from a different switch or an incomplete enable.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum HubHistory<'a> {
+    Empty,
+    Unverified,
+    Complete,
+    Incomplete {
+        engram_through: u64,
+        enable_id: Option<&'a str>,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Startup {
+    Hub,
+    Follow,
+    ResumeMigration,
+    ResumeEnable,
+    Wait,
+    Migrate,
+    NoHistory,
+}
+
+/// Snapshot seeding and activation supply the verified history and ownership
+/// of agents and roles through `SnapshotClaims`, then follow or resume the log.
+pub(super) fn select(
+    store: &RegistryStore,
+    history: HubHistory<'_>,
+) -> Result<Startup, HandlerError> {
+    if store.hub_log_base()?.is_some() {
+        return Ok(Startup::Hub);
+    }
+    Ok(match history {
+        HubHistory::Complete => Startup::Follow,
+        HubHistory::Incomplete {
+            engram_through: 1..,
+            ..
+        } => Startup::ResumeMigration,
+        HubHistory::Incomplete {
+            enable_id: Some(id),
+            ..
+        } if store.hub_enable_id()?.as_deref() == Some(id) => Startup::ResumeEnable,
+        HubHistory::Incomplete { .. } => Startup::Wait,
+        HubHistory::Empty if store.identity_log_status()?.state != "disabled" => Startup::Migrate,
+        HubHistory::Empty => Startup::NoHistory,
+        HubHistory::Unverified => {
+            return Err(HandlerError::new(
+                "hub_switch_unverified_log",
+                "the hub log is nonempty and its snapshot has not been verified",
+            ))
+        }
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Proposal {
+    v: u64,
+    migration_id: String,
+    excluded: BTreeSet<String>,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Readiness {
+    v: u64,
+    #[serde(rename = "box")]
+    box_id: String,
+    entorhinal_hub: u64,
+    engram_hub_cuts: bool,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Quiet {
+    v: u64,
+    migration_id: String,
+    roles: BTreeSet<String>,
+}
+
+impl Proposal {
+    fn from_reply(reply: &RecordReply) -> Result<Option<Self>, HandlerError> {
+        if reply.absent {
+            return Ok(None);
+        }
+        decoded::<Self>(reply)
+            .filter(|p| {
+                p.v == 1 && box_id(&p.migration_id) && p.excluded.iter().all(|id| box_id(id))
+            })
+            .map(Some)
+            .ok_or_else(|| {
+                HandlerError::new("hub_switch_invalid_proposal", "invalid hub switch proposal")
+            })
+    }
+}
+
+fn decoded<T: serde::de::DeserializeOwned>(reply: &RecordReply) -> Option<T> {
+    if reply.stale {
+        return None;
+    }
+    serde_json::from_slice(reply.body.as_deref()?).ok()
+}
+
+fn member_ready(reply: &RecordReply, author: &str, box_id: &str) -> bool {
+    reply.author.as_deref() == Some(author)
+        && decoded::<Readiness>(reply).is_some_and(|node| {
+            node.v == 1
+                && node.box_id == box_id
+                && node.entorhinal_hub >= HUB_PROTOCOL
+                && node.engram_hub_cuts
+        })
+}
+
+pub(super) async fn local_hub_cuts(
+    discovery: &dyn ParticipantDiscovery,
+    deadline: Instant,
+) -> Result<bool, HandlerError> {
+    let catalog = timeout_at(deadline, discovery.catalog_list())
+        .await
+        .map_err(|_| {
+            HandlerError::new(
+                "hub_switch_catalog_unavailable",
+                "module catalog deadline expired",
+            )
+        })?
+        .map_err(|_| {
+            HandlerError::new(
+                "hub_switch_catalog_unavailable",
+                "module catalog unavailable",
+            )
+        })?;
+    Ok(catalog.modules.iter().any(|module| {
+        module.module_id.as_str() == "engram"
+            && module
+                .capabilities
+                .as_ref()
+                .is_some_and(|caps| caps.provides.iter().any(|cap| cap == CUTS))
+    }))
+}
+
+fn record_error(error: crate::record_client::RecordError) -> HandlerError {
+    HandlerError::new(error.code(), format!("switch record: {error:?}"))
+}
+
+async fn read(records: &RecordClient, subject: &str) -> Result<RecordReply, HandlerError> {
+    let reply = records.read(subject).await.map_err(record_error)?;
+    if reply.stale {
+        return Err(HandlerError::new(
+            "engram_unavailable",
+            "switch record read was stale",
+        ));
+    }
+    Ok(reply)
+}
+
+async fn put<T: Serialize>(
+    records: &RecordClient,
+    subject: String,
+    reply: &RecordReply,
+    body: &T,
+) -> Result<(), HandlerError> {
+    let mut write_id = [0; 16];
+    getrandom::getrandom(&mut write_id)
+        .map_err(|e| HandlerError::new("storage_error", e.to_string()))?;
+    records
+        .cas(&CasRequest {
+            subject,
+            expected_version: reply.version,
+            write_id,
+            body: serde_json::to_vec(body).map_err(crate::invalid_params)?,
+        })
+        .await
+        .map_err(record_error)?;
+    Ok(())
+}
+
+#[derive(Clone)]
+pub(super) struct Switch {
+    probe: Arc<dyn Probe>,
+    moves: Arc<Mutex<()>>,
+}
+
+#[async_trait::async_trait]
+trait Probe: Send + Sync {
+    fn activate(&self);
+    async fn head(&self, deadline: Instant) -> Result<u64, HandlerError>;
+    async fn local_box(&self, deadline: Instant) -> Result<String, HandlerError>;
+    async fn hub_cuts(&self, deadline: Instant) -> Result<bool, HandlerError>;
+}
+
+struct DaemonProbe {
+    hub: Arc<Hub>,
+    discovery: Arc<dyn ParticipantDiscovery>,
+}
+
+#[async_trait::async_trait]
+impl Probe for DaemonProbe {
+    fn activate(&self) {
+        self.hub.activate();
+    }
+
+    async fn head(&self, deadline: Instant) -> Result<u64, HandlerError> {
+        self.hub.session(deadline).await?.log_head(deadline).await
+    }
+
+    async fn local_box(&self, deadline: Instant) -> Result<String, HandlerError> {
+        Ok(self.hub.box_id(deadline).await?.to_string())
+    }
+
+    async fn hub_cuts(&self, deadline: Instant) -> Result<bool, HandlerError> {
+        local_hub_cuts(self.discovery.as_ref(), deadline).await
+    }
+}
+
+impl Switch {
+    pub(super) fn new(
+        hub: Arc<Hub>,
+        moves: Arc<Mutex<()>>,
+        discovery: Arc<dyn ParticipantDiscovery>,
+    ) -> Self {
+        Self {
+            probe: Arc::new(DaemonProbe { hub, discovery }),
+            moves,
+        }
+    }
+
+    /// The snapshot verifier can inspect exact stream sequences through this
+    /// same hub transport, without consulting engram for backend discovery.
+    pub(super) async fn discover(
+        &self,
+        store: &RegistryStore,
+        deadline: Instant,
+    ) -> Result<Startup, HandlerError> {
+        if store.hub_log_base()?.is_some() {
+            self.probe.activate();
+            return Ok(Startup::Hub);
+        }
+        let head = self.probe.head(deadline).await?;
+        select(
+            store,
+            if head == 0 {
+                HubHistory::Empty
+            } else {
+                HubHistory::Unverified
+            },
+        )
+    }
+
+    pub(super) async fn advance(
+        &self,
+        store: &RegistryStore,
+        log: &LogClient,
+        records: &RecordClient,
+        deadline: Instant,
+    ) -> Result<(), HandlerError> {
+        timeout_at(deadline, self.gate(store, log, records, deadline))
+            .await
+            .map_err(|_| HandlerError::new("hub_switch_waiting", "switch gate deadline expired"))?
+    }
+
+    async fn gate(
+        &self,
+        store: &RegistryStore,
+        log: &LogClient,
+        records: &RecordClient,
+        deadline: Instant,
+    ) -> Result<(), HandlerError> {
+        let status = store.identity_log_status()?;
+        if status.state != "enabled" || status.last_applied_position != status.last_seen_head {
+            return Ok(());
+        }
+        let freeze = store.engram_freeze()?;
+        if matches!(&freeze, Some(EngramFreeze::Applied { .. })) {
+            return Ok(());
+        }
+        let Some(author) = store.persisted_self_author()? else {
+            return Ok(());
+        };
+        let Some(own_box) = store.own_member_box()? else {
+            return Ok(());
+        };
+        if self.probe.local_box(deadline).await? != own_box {
+            return Err(HandlerError::new(
+                "hub_switch_member_mismatch",
+                "the local member box does not match the bus credential",
+            ));
+        }
+        if freeze.is_none() {
+            let node = Readiness {
+                v: 1,
+                box_id: own_box.clone(),
+                entorhinal_hub: HUB_PROTOCOL,
+                engram_hub_cuts: self.probe.hub_cuts(deadline).await?,
+            };
+            let subject = format!("node:{own_box}");
+            let reply = read(records, &subject).await?;
+            if reply.self_author != author {
+                return Err(HandlerError::new(
+                    "hub_switch_member_mismatch",
+                    "engram returned a different local author",
+                ));
+            }
+            if reply.author.as_deref() != Some(&author)
+                || decoded::<Readiness>(&reply).as_ref() != Some(&node)
+            {
+                put(records, subject, &reply, &node).await?;
+            }
+        }
+
+        let reply = read(records, PROPOSAL).await?;
+        let proposal = Proposal::from_reply(&reply)?;
+        let included: Vec<_> = store
+            .switch_members()?
+            .into_iter()
+            .filter(|(_, id)| proposal.as_ref().is_none_or(|p| !p.excluded.contains(id)))
+            .collect();
+        let mut not_ready = BTreeSet::new();
+        for (author, id) in &included {
+            match records.read(&format!("node:{id}")).await {
+                Ok(reply) if member_ready(&reply, author, id) => {}
+                _ => {
+                    not_ready.insert(id.clone());
+                }
+            }
+        }
+        if !not_ready.is_empty() {
+            return Err(HandlerError {
+                code: "hub_switch_members_not_ready".into(),
+                message: format!(
+                    "switch readiness missing for {}",
+                    not_ready.iter().cloned().collect::<Vec<_>>().join(", ")
+                ),
+                detail: Some(json!({"boxes":not_ready})),
+            });
+        }
+        if !included
+            .iter()
+            .any(|(member, id)| member == &author && id == &own_box)
+        {
+            return Err(HandlerError::new(
+                "hub_switch_excluded",
+                "the local member is excluded from the switch",
+            ));
+        }
+        let Some(proposal) = proposal else {
+            return put(
+                records,
+                PROPOSAL.into(),
+                &reply,
+                &Proposal {
+                    v: 1,
+                    migration_id: crate::hub_write::new_op_id()?,
+                    excluded: BTreeSet::new(),
+                },
+            )
+            .await;
+        };
+
+        {
+            let _lock = self.moves.lock().unwrap();
+            store.pause_legacy_moves()?;
+            if !store.list_open_agent_moves()?.is_empty() {
+                return Ok(());
+            }
+        }
+        let inbox = read(records, &format!("inbox:{author}")).await?;
+        if !inbox.absent
+            && !entorhinal_core::move_record::decode_inbox_record(
+                inbox.body.as_deref().unwrap_or_default(),
+            )
+            .map_err(|e| HandlerError::new(e.code(), "invalid switch inbox"))?
+            .pending
+            .is_empty()
+        {
+            return Ok(());
+        }
+        let own = Quiet {
+            v: 1,
+            migration_id: proposal.migration_id.clone(),
+            roles: store.role_subjects()?.into_iter().collect(),
+        };
+        let subject = format!("hubquiet:{author}");
+        let quiet = read(records, &subject).await?;
+        if quiet.author.as_deref() != Some(&author)
+            || decoded::<Quiet>(&quiet).as_ref() != Some(&own)
+        {
+            put(records, subject, &quiet, &own).await?;
+        }
+        let mut roles = own.roles;
+        for (member, _) in included {
+            if member == author {
+                continue;
+            }
+            let reply = read(records, &format!("hubquiet:{member}")).await?;
+            let Some(quiet) = quiet_for(&reply, &member, &proposal.migration_id) else {
+                return Ok(());
+            };
+            roles.extend(quiet.roles);
+        }
+        if read(records, PROPOSAL).await?.version != reply.version
+            || self.discover(store, deadline).await? != Startup::Migrate
+        {
+            return Ok(());
+        }
+        let (expected_head, entry_id, body) = match freeze {
+            Some(EngramFreeze::Pending {
+                expected_head,
+                entry_id,
+                body,
+            }) => (expected_head, entry_id, body),
+            _ => {
+                let mut entry_id = [0; 16];
+                getrandom::getrandom(&mut entry_id)
+                    .map_err(|e| HandlerError::new("storage_error", e.to_string()))?;
+                let marker = MigrationMarker {
+                    op: "log.migrated".into(),
+                    hub: true,
+                    migration_id: proposal.migration_id.clone(),
+                    excluded: proposal.excluded.iter().cloned().collect(),
+                    roles: roles.iter().cloned().collect(),
+                    tables_digest: String::new(),
+                };
+                let EngramFreeze::Pending {
+                    expected_head,
+                    entry_id,
+                    body,
+                } = store.prepare_migration_marker(
+                    status.last_applied_position,
+                    entry_id,
+                    marker,
+                )?
+                else {
+                    return Ok(());
+                };
+                (expected_head, entry_id, body)
+            }
+        };
+        // The durable freeze survives an unknown result. Catch-up settles it
+        // by reading the verified next slot, not by trusting an append reply.
+        if expected_head != status.last_applied_position
+            || body.migration_id != proposal.migration_id
+        {
+            return Ok(());
+        }
+        let request = AppendRequest {
+            expected_head: expected_head as u64,
+            entry_id,
+            kind: EntryKind::Change,
+            data: serde_json::to_vec(&body).map_err(crate::invalid_params)?,
+        };
+        match log.append_migration_marker(&request).await {
+            Ok(_) | Err(LogError::NoReply | LogError::HeadMoved { .. }) => Ok(()),
+            Err(error) => Err(HandlerError::new(
+                "hub_switch_marker_failed",
+                format!("marker append: {error:?}"),
+            )),
+        }
+    }
+}
+
+fn quiet_for(reply: &RecordReply, author: &str, migration_id: &str) -> Option<Quiet> {
+    (reply.author.as_deref() == Some(author))
+        .then(|| decoded::<Quiet>(reply))
+        .flatten()
+        .filter(|quiet| {
+            quiet.v == 1
+                && quiet.migration_id == migration_id
+                && quiet.roles.len() <= 256
+                && quiet
+                    .roles
+                    .iter()
+                    .all(|role| entorhinal_core::role_cache::valid_role(role))
+        })
+}
+
+impl ProjectsHandler {
+    pub(super) async fn exclude_switch_member(
+        &self,
+        params: Value,
+        route: RouteKey,
+        received: Instant,
+    ) -> Result<Vec<u8>, HandlerError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Input {
+            without: String,
+        }
+        let Input { without } = serde_json::from_value(params).map_err(crate::invalid_params)?;
+        if !box_id(&without) {
+            return Err(HandlerError::new(
+                "invalid_request",
+                "--without requires a 32-digit box ID",
+            ));
+        }
+        self.admit_store_write()?;
+        let mut confirmation =
+            crate::agent_ops::ConfirmationGuard::take(&self.confirmation_slot, route)?;
+        if !self.route_admissions().contains_key(&route) {
+            return Err(crate::agent_ops::OperatorConfirmError::Declined.into());
+        }
+        let deadline = received + crate::shared_write::OPERATOR_BOUND;
+        let summary = format!("Switch the registry log to the hub without {without}? Agents held there stay held by engram:<author>. Do not bring this computer back on its old build; upgrade it, re-pair, and join with an empty registry.");
+        let peers = Callosum {
+            connector: SubcConnector::from_args(std::env::args_os().skip(1)),
+            fingerprint: Arc::new(|| {
+                Err(HandlerError::new(
+                    "hub_unavailable",
+                    "local fingerprint not requested by switch",
+                ))
+            }),
+        };
+        let operation = async {
+            self.operator_confirmer
+                .confirm_operator(&summary, route)
+                .await?;
+            let _writer = self.writer.lock().await;
+            let store = self.with_store(|s| Ok(s.clone()))?;
+            if store.identity_log_status()?.state != "enabled" {
+                return Err(HandlerError::new(
+                    "identity_log_disabled",
+                    "switch exclusions require an enabled legacy log",
+                ));
+            }
+            if store.hub_log_base()?.is_some() || store.engram_freeze()?.is_some() {
+                return Err(pending());
+            }
+            if store.own_member_box()?.as_ref() == Some(&without)
+                || peers.lists_box(&without).await?
+            {
+                return Err(HandlerError::new(
+                    "member_still_paired",
+                    format!("remove {without} in Callosum before excluding it"),
+                ));
+            }
+            let reply = read(&self.record_client, PROPOSAL).await?;
+            let mut excluded =
+                Proposal::from_reply(&reply)?.map_or_else(BTreeSet::new, |p| p.excluded);
+            excluded.insert(without);
+            let proposal = Proposal {
+                v: 1,
+                migration_id: crate::hub_write::new_op_id()?,
+                excluded,
+            };
+            put(&self.record_client, PROPOSAL.into(), &reply, &proposal).await?;
+            self.catch_up_wake.notify_one();
+            crate::encode_result(json!(proposal))
+        };
+        tokio::select! {
+            biased;
+            _ = confirmation.cancelled.wait_for(|closed| *closed) => Err(crate::agent_ops::OperatorConfirmError::Declined.into()),
+            result = timeout_at(deadline, operation) => result.map_err(|_| HandlerError::from(crate::agent_ops::OperatorConfirmError::Declined))?,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

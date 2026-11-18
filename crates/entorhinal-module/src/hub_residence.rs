@@ -838,6 +838,10 @@ impl role_leases::Backend for Residence {
         &self.box_id
     }
 
+    fn role_high_water(&self, name: &str) -> Result<i64, HandlerError> {
+        Ok(self.store.role_gen_high_water(name)?)
+    }
+
     fn role(&self, name: &str) -> Result<role_leases::Observation, HandlerError> {
         let key = format!("role.{name}");
         let watched = self.watched.read().unwrap();
@@ -977,6 +981,7 @@ impl role_leases::Backend for Residence {
         let revision = landed
             .position
             .ok_or_else(|| bad_record("landed role write has no revision"))?;
+        self.store.observe_role_gen(role, change.body.gen)?;
         let sent_ms = self
             .store
             .hub_attempt(&change.request_key)?

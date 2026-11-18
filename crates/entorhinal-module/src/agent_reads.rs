@@ -1731,6 +1731,7 @@ mod tests {
             "rebind_root",
             "attach_root",
             "identity_log.enable",
+            "identity_log.hub_switch",
             "remove_root",
             "move_root_to_new_project",
             "attach_derived_parent",
