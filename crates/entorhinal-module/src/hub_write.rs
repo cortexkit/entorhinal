@@ -3,7 +3,7 @@
 // This writer is used only when the registry selects the hub instead of engram.
 #![allow(dead_code)]
 
-use std::sync::OnceLock;
+use std::{future::Future, sync::OnceLock};
 
 use cortexkit_claustrum_client::CredentialResolver;
 use entorhinal_catalog::jcs;
@@ -11,6 +11,7 @@ use entorhinal_core::{
     hub_store::{HubAttempt, HubAttemptOutcome, HubAttemptSend, HubAttemptWrite},
     RegistryStore,
 };
+use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -18,11 +19,12 @@ use tokio::time::{timeout_at, Instant};
 
 use crate::{
     fleet_record::{self, vault::EpochVault, Header, UnverifiedRecord, VerifiedRecord, LOG_KEY},
-    hub_transport::{self, Session},
+    hub_transport::{self, Hub, Session},
     HandlerError,
 };
 
 const MAX_LOG_REBASES: usize = 5;
+pub(super) const PROJECTION_SNAPSHOT_KIND: &str = "shared.snapshot";
 
 pub(super) struct Request<'a> {
     pub request_key: &'a str,
@@ -55,12 +57,38 @@ pub(super) enum Payload {
 
 type NextStep<'a> = &'a (dyn Fn(&Value) -> Result<Step, HandlerError> + Sync);
 
+pub(super) trait LogReplan: Sync {
+    fn wait_for_head(
+        &self,
+        sequence: u64,
+        deadline: Instant,
+    ) -> BoxFuture<'_, Result<(), HandlerError>>;
+
+    /// Rebuild the body against the applied head, keeping the pre-drawn IDs and
+    /// timestamps from the saved body. Only validation refusals close the attempt.
+    fn after_image(&self, saved: &Value) -> Result<Replanned, HandlerError>;
+}
+
+pub(super) enum Replanned {
+    Body(Value),
+    Refused(HandlerError),
+}
+
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum Outcome {
-    Landed { position: Option<u64> },
-    Superseded { revision: u64 },
+    Landed {
+        position: Option<u64>,
+    },
+    Superseded {
+        revision: u64,
+    },
     HeadMoved,
+    Refused {
+        code: String,
+        message: String,
+        detail: Option<Value>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -76,20 +104,24 @@ pub(super) struct KvEntry {
 }
 
 pub(super) trait Transport {
-    async fn log_entry(
+    fn log_entry(
         &self,
         sequence: u64,
         deadline: Instant,
-    ) -> Result<Option<Vec<u8>>, HandlerError>;
-    async fn log_head(&self, deadline: Instant) -> Result<u64, HandlerError>;
-    async fn kv_entry(&self, key: &str, deadline: Instant)
-        -> Result<Option<KvEntry>, HandlerError>;
-    async fn send(
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, HandlerError>> + Send;
+    fn log_head(&self, deadline: Instant)
+        -> impl Future<Output = Result<u64, HandlerError>> + Send;
+    fn kv_entry(
+        &self,
+        key: &str,
+        deadline: Instant,
+    ) -> impl Future<Output = Result<Option<KvEntry>, HandlerError>> + Send;
+    fn send(
         &self,
         write: &HubAttemptWrite,
         op_id: &str,
         deadline: Instant,
-    ) -> Result<Option<u64>, HandlerError>;
+    ) -> impl Future<Output = Result<Option<u64>, HandlerError>> + Send;
 }
 
 impl Transport for Session {
@@ -140,12 +172,65 @@ impl Transport for Session {
     }
 }
 
+impl Transport for Hub {
+    async fn log_entry(
+        &self,
+        sequence: u64,
+        deadline: Instant,
+    ) -> Result<Option<Vec<u8>>, HandlerError> {
+        self.session(deadline)
+            .await?
+            .1
+            .log_entry(sequence, deadline)
+            .await
+    }
+
+    async fn log_head(&self, deadline: Instant) -> Result<u64, HandlerError> {
+        self.session(deadline).await?.1.log_head(deadline).await
+    }
+
+    async fn kv_entry(
+        &self,
+        key: &str,
+        deadline: Instant,
+    ) -> Result<Option<KvEntry>, HandlerError> {
+        Transport::kv_entry(&self.session(deadline).await?.1, key, deadline).await
+    }
+
+    async fn send(
+        &self,
+        write: &HubAttemptWrite,
+        op_id: &str,
+        deadline: Instant,
+    ) -> Result<Option<u64>, HandlerError> {
+        let (box_id, session) = self.session(deadline).await?;
+        if !write.value.is_empty()
+            && UnverifiedRecord::parse(&write.key, &write.value)?
+                .header()
+                .writer
+                != box_id.to_string()
+        {
+            return Err(HandlerError::new(
+                "record_invalid",
+                "fleet record writer does not match the bus box ID",
+            ));
+        }
+        session.send(write, op_id, deadline).await
+    }
+}
+
 /// The hub backend supplies verification keys and checks which epoch may be
 /// used for writing. A fence reads the epoch record from the hub, not the cache,
 /// and ensures the vault holds the named key.
 pub(super) trait Trust {
-    async fn writer_epoch(&self, deadline: Instant) -> Result<u64, HandlerError>;
-    async fn verification_key(&self, record: &UnverifiedRecord) -> Result<String, HandlerError>;
+    fn writer_epoch(
+        &self,
+        deadline: Instant,
+    ) -> impl Future<Output = Result<u64, HandlerError>> + Send;
+    fn verification_key(
+        &self,
+        record: &UnverifiedRecord,
+    ) -> impl Future<Output = Result<String, HandlerError>> + Send;
 }
 
 pub(super) struct Writer<'a, T, U> {
@@ -154,6 +239,7 @@ pub(super) struct Writer<'a, T, U> {
     pub trust: &'a U,
     pub signer: &'a dyn CredentialResolver,
     pub vault: &'a dyn EpochVault,
+    pub replan: Option<&'a dyn LogReplan>,
 }
 
 enum Settlement {
@@ -161,6 +247,12 @@ enum Settlement {
     Superseded(u64),
     HeadMoved,
     Resend,
+}
+
+enum Rebase {
+    Send(HubAttemptWrite, String),
+    Refused(HandlerError),
+    RowChanged,
 }
 
 fn new_op_id() -> Result<String, HandlerError> {
@@ -224,6 +316,15 @@ fn reply(outcome: HubAttemptOutcome) -> Result<Landed, HandlerError> {
             Err(error)
         }
         Outcome::HeadMoved => Err(moved()),
+        Outcome::Refused {
+            code,
+            message,
+            detail,
+        } => Err(HandlerError {
+            code,
+            message,
+            detail,
+        }),
     }
 }
 
@@ -250,12 +351,12 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
     ) -> Result<Landed, HandlerError> {
         let mut rebases = 0;
         let mut resent = false;
-        let mut ack = None;
+        let mut sent = None;
         loop {
             let Some(row) = self.store.hub_attempt(request.request_key)? else {
                 let (write, op_id) = self.build(request, first, next.is_some(), deadline).await?;
                 if self.save(&write, &op_id, None)? {
-                    ack = self.send(&write, &op_id, deadline).await?;
+                    sent = self.send(&write, &op_id, true, deadline).await?;
                 }
                 continue;
             };
@@ -267,12 +368,12 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
             }
             let write = &row.write;
             let op_id = current_op_id(write, &row)?;
-            if Instant::now() >= deadline && ack.is_none() {
+            if Instant::now() >= deadline && sent.is_none() {
                 return Err(hub_transport::unsettled(&op_id));
             }
-            let settlement = if let Some((acked, landed)) = ack.take() {
-                if acked == *write {
-                    Settlement::Landed(landed)
+            let settlement = if let Some((submitted, result)) = sent.take() {
+                if submitted == *write {
+                    result
                 } else {
                     self.settle(&row, &op_id, deadline).await?
                 }
@@ -298,7 +399,7 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
                         .advance_hub_attempt(&row, &landed.op_id, &write, &send)?
                     {
                         resent = false;
-                        ack = self.send(&write, &op_id, deadline).await?;
+                        sent = self.send(&write, &op_id, true, deadline).await?;
                     }
                     continue;
                 }
@@ -312,18 +413,37 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
                     recorded(op_id, Outcome::Superseded { revision })
                 }
                 Settlement::HeadMoved
-                    if write.step.starts_with(SNAPSHOT) || rebases == MAX_LOG_REBASES =>
+                    if write.step.starts_with(SNAPSHOT)
+                        || self.replan.is_none()
+                        || rebases == MAX_LOG_REBASES
+                        || UnverifiedRecord::parse(&write.key, &write.value)?
+                            .header()
+                            .kind
+                            == PROJECTION_SNAPSHOT_KIND =>
                 {
                     recorded(op_id, Outcome::HeadMoved)
                 }
-                Settlement::HeadMoved => {
-                    if let Some((write, op_id)) = self.rebase(request, &row, deadline).await? {
+                Settlement::HeadMoved => match self.rebase(request, &row, deadline).await? {
+                    Rebase::Send(write, op_id) => {
                         rebases += 1;
                         resent = false;
-                        ack = self.send(&write, &op_id, deadline).await?;
+                        sent = self.send(&write, &op_id, true, deadline).await?;
+                        continue;
                     }
-                    continue;
-                }
+                    Rebase::RowChanged => continue,
+                    Rebase::Refused(HandlerError {
+                        code,
+                        message,
+                        detail,
+                    }) => recorded(
+                        op_id,
+                        Outcome::Refused {
+                            code,
+                            message,
+                            detail,
+                        },
+                    ),
+                },
                 Settlement::Resend => {
                     if resent {
                         return Err(hub_transport::unsettled(&op_id));
@@ -334,8 +454,8 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
                         .map_err(|e| during_settlement(e, &op_id))?;
                     if self.save(&write, &next_id, Some(&row))? {
                         resent = true;
-                        ack = self
-                            .send(&write, &next_id, deadline)
+                        sent = self
+                            .send(&write, &next_id, false, deadline)
                             .await
                             .map_err(|e| during_settlement(e, &op_id))?;
                     }
@@ -435,8 +555,9 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
         &self,
         write: &HubAttemptWrite,
         op_id: &str,
+        first_at_position: bool,
         deadline: Instant,
-    ) -> Result<Option<(HubAttemptWrite, Landed)>, HandlerError> {
+    ) -> Result<Option<(HubAttemptWrite, Settlement)>, HandlerError> {
         match self.transport.send(write, op_id, deadline).await {
             Ok(position)
                 if !write.step.starts_with(SNAPSHOT)
@@ -445,19 +566,43 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
             {
                 Ok(Some((
                     write.clone(),
-                    Landed {
+                    Settlement::Landed(Landed {
                         op_id: op_id.into(),
                         position,
-                    },
+                    }),
                 )))
             }
-            // A refused replacement may have lost to an older send of the
-            // same operation. Read the position/key before inferring a loss.
+            Err(error)
+                if error.code == "head_moved"
+                    && first_at_position
+                    && !write.step.starts_with(SNAPSHOT) =>
+            {
+                Ok(Some((write.clone(), Settlement::HeadMoved)))
+            }
+            // A replacement can lose to the first send, and an independent
+            // snapshot resumer can win with the same derived ID. Look up the
+            // exact position even if the tail closed the row in the meantime.
+            result
+                if write.key == LOG_KEY
+                    && (result.is_ok()
+                        || result.as_ref().is_err_and(|error| {
+                            matches!(error.code.as_str(), "head_moved" | "hub_write_unsettled")
+                        })) =>
+            {
+                let Some(row) = self.store.hub_attempt(&write.request_key)? else {
+                    return Err(invalid_attempt());
+                };
+                if row.write != *write {
+                    return Ok(None);
+                }
+                let result = self.settle(&row, op_id, deadline).await?;
+                Ok(Some((write.clone(), result)))
+            }
             Ok(_) => Ok(None),
             Err(error)
                 if matches!(
                     error.code.as_str(),
-                    "head_moved" | "revision_moved" | "hub_write_unsettled"
+                    "revision_moved" | "hub_write_unsettled"
                 ) =>
             {
                 Ok(None)
@@ -565,14 +710,15 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
             .await
     }
 
-    /// Only called after a read has proved the old log position is occupied
-    /// by a different entry; a CAS refusal alone isn't sufficient.
+    /// Rebase after a definite first-send compare-and-swap refusal or after
+    /// finding a different entry at the unacknowledged send's position.
     async fn rebase(
         &self,
         request: &Request<'_>,
         row: &HubAttempt,
         deadline: Instant,
-    ) -> Result<Option<(HubAttemptWrite, String)>, HandlerError> {
+    ) -> Result<Rebase, HandlerError> {
+        let replan = self.replan.ok_or_else(invalid_attempt)?;
         let expected = self.transport.log_head(deadline).await?;
         if expected <= row.write.expected {
             return Err(HandlerError::new(
@@ -580,21 +726,34 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
                 "hub head is behind the occupied position",
             ));
         }
+        replan.wait_for_head(expected, deadline).await?;
+        let (mut header, saved_body) = self.saved(&row.write, deadline).await?;
+        if header.writer != request.writer {
+            return Err(invalid_attempt());
+        }
+        let body = match replan.after_image(&saved_body)? {
+            Replanned::Body(body) => body,
+            Replanned::Refused(error) => return Ok(Rebase::Refused(error)),
+        };
+        header.writer_ep = request.writer_ep;
+        let op_id = new_op_id()?;
+        header.entry_id = op_id.clone();
         let saved = UnverifiedRecord::parse(&row.write.key, &row.write.value)?;
-        let epoch = self.fence(saved.header(), deadline).await?;
+        let epoch = self.fence(&header, deadline).await?;
         if saved.epoch() > epoch {
             return Err(HandlerError::new(
                 "epoch_key_unavailable",
                 "writer fence is behind the saved record",
             ));
         }
-        let (mut write, op_id) = self
-            .replace_bytes(request, row.write.clone(), new_op_id()?, epoch, deadline)
-            .await?;
+        let mut write = row.write.clone();
+        write.value = self.prepare(&header, &body, epoch, deadline).await?;
         write.expected = expected;
-        Ok(self
-            .save(&write, &op_id, Some(row))?
-            .then_some((write, op_id)))
+        Ok(if self.save(&write, &op_id, Some(row))? {
+            Rebase::Send(write, op_id)
+        } else {
+            Rebase::RowChanged
+        })
     }
 
     async fn replace_bytes(
@@ -779,7 +938,7 @@ fn during_settlement(error: HandlerError, op_id: &str) -> HandlerError {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 fn matches_position(write: &HubAttemptWrite, position: u64) -> bool {
     if write.key == LOG_KEY {

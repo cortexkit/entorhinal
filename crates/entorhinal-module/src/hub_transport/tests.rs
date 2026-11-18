@@ -202,6 +202,38 @@ async fn hub_tail_reopens_from_last_delivery_after_credential_replacement() {
     assert_eq!(next.await, 9);
 }
 
+#[tokio::test(start_paused = true)]
+async fn hub_identity_log_feed_reopens_from_commit_and_delivers_snapshot_prefix_again() {
+    let health = Arc::new(HealthGauges::default());
+    let (signal, changes) = watch::channel(0);
+    let mut opens = 0;
+    let mut feed = Feed::log(health, 7, move |cursor| {
+        opens += 1;
+        let mut changes = changes.clone();
+        changes.borrow_and_update();
+        async move {
+            let (sequence, label) = match (opens, cursor) {
+                (1, Some(7)) => (8, "part one"),
+                (2, Some(7)) => (8, "part one again"),
+                (3, Some(8)) => (9, "next entry"),
+                _ => panic!("unexpected open {opens} at {cursor:?}"),
+            };
+            Ok(Subscription::new(
+                Some(changes),
+                stream::iter([Ok((sequence, label))]).chain(stream::pending()),
+            ))
+        }
+    })
+    .with_durable_cursor();
+
+    assert_eq!(feed.next().await, "part one");
+    signal.send_replace(1);
+    assert_eq!(feed.next().await, "part one again");
+    feed.applied(8);
+    signal.send_replace(2);
+    assert_eq!(feed.next().await, "next entry");
+}
+
 async fn within<F: Future>(future: F) -> F::Output {
     tokio::time::timeout(Duration::from_secs(12), future)
         .await

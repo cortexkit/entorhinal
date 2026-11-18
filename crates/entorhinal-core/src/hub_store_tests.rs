@@ -53,6 +53,8 @@ fn hub_store_migration_preserves_legacy_progress_and_requires_snapshot_for_downg
 
     let store = RegistryStore::open(&live).unwrap();
     assert_eq!(store.identity_log_status().unwrap(), legacy_status);
+    assert_eq!(store.hub_log_base().unwrap(), None);
+    assert_eq!(store.journal_log_position("unknown").unwrap(), None);
     store
         .read(|conn| {
             let flags = conn.query_row(

@@ -1,6 +1,5 @@
 use super::*;
 use std::{
-    cell::RefCell,
     collections::{HashMap, VecDeque},
     path::PathBuf,
     sync::{
@@ -34,7 +33,7 @@ const REQUEST: Request<'static> = Request {
     writer_ep: 0,
 };
 
-struct TestKeys {
+pub(crate) struct TestKeys {
     epoch: AtomicU64,
     signing: SigningKey,
     sealed: Mutex<Vec<Seal>>,
@@ -43,7 +42,7 @@ struct TestKeys {
 type Seal = (SealedBody, Vec<u8>, Vec<u8>);
 
 impl TestKeys {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             epoch: AtomicU64::new(1),
             signing: SigningKey::from_bytes(&[42; 32]),
@@ -175,24 +174,24 @@ impl HubState {
 
 struct Recorder<'a> {
     store: &'a RegistryStore,
-    hub: &'a RefCell<HubState>,
+    hub: &'a Mutex<HubState>,
 }
 
 impl Transport for Recorder<'_> {
     async fn log_entry(&self, seq: u64, _: Instant) -> Result<Option<Vec<u8>>, HandlerError> {
-        let hub = self.hub.borrow();
+        let hub = self.hub.lock().unwrap();
         hub.check_link()?;
         Ok(hub.logs.get((seq - 1) as usize).cloned())
     }
 
     async fn log_head(&self, _: Instant) -> Result<u64, HandlerError> {
-        let hub = self.hub.borrow();
+        let hub = self.hub.lock().unwrap();
         hub.check_link()?;
         Ok(hub.logs.len() as u64)
     }
 
     async fn kv_entry(&self, key: &str, _: Instant) -> Result<Option<KvEntry>, HandlerError> {
-        let hub = self.hub.borrow();
+        let hub = self.hub.lock().unwrap();
         hub.check_link()?;
         Ok(hub.kv.get(key).map(|entry| KvEntry {
             revision: entry.revision,
@@ -218,7 +217,7 @@ impl Transport for Recorder<'_> {
             .iter()
             .any(|op| op.op_id == id && !op.process.is_empty()));
         {
-            let mut hub = self.hub.borrow_mut();
+            let mut hub = self.hub.lock().unwrap();
             hub.check_link()?;
             hub.sends.push((write.clone(), id.into()));
             match hub.actions.pop_front() {
@@ -255,7 +254,7 @@ struct Fixture {
     descriptor: StorageDescriptor,
     keys: Arc<TestKeys>,
     signer: ClaustrumCredentialResolver,
-    hub: RefCell<HubState>,
+    hub: Mutex<HubState>,
 }
 
 impl Fixture {
@@ -269,7 +268,7 @@ impl Fixture {
             descriptor,
             keys,
             signer,
-            hub: RefCell::default(),
+            hub: Mutex::default(),
         }
     }
 
@@ -291,15 +290,16 @@ impl Fixture {
             trust: &self.keys,
             signer: &self.signer,
             vault: self.keys.as_ref(),
+            replan: None,
         }
     }
 
     fn action(&self, action: Action) {
-        self.hub.borrow_mut().actions.push_back(action);
+        self.hub.lock().unwrap().actions.push_back(action);
     }
 
     fn reconnect(&self) {
-        self.hub.borrow_mut().offline = false;
+        self.hub.lock().unwrap().offline = false;
     }
 }
 
@@ -392,7 +392,7 @@ async fn hub_write_rotation_reseals_lost_ack_log_and_kv_at_same_expected() {
             let outcome = second.outcome.unwrap();
             assert_eq!(&outcome.op_id, expected_id);
             assert_eq!(outcome.value, json!({"status":"landed", "position":1}));
-            let hub = f.hub.borrow();
+            let hub = f.hub.lock().unwrap();
             assert_eq!(hub.sends.len(), 2);
             assert_eq!(hub.logs.len() as u64 + hub.revision, 1);
             assert_eq!(hub.sends[0].0, first.write);
@@ -427,7 +427,7 @@ async fn hub_write_restart_second_cas_settles_superseded_without_a_write() {
             .await
             .unwrap()
             .0;
-        assert_eq!(f.hub.borrow_mut().commit(&second).unwrap(), Some(2));
+        assert_eq!(f.hub.lock().unwrap().commit(&second).unwrap(), Some(2));
         op_id
     };
     f.reconnect();
@@ -441,7 +441,7 @@ async fn hub_write_restart_second_cas_settles_superseded_without_a_write() {
             .unwrap_err();
         assert_eq!(error.code, "hub_write_superseded");
         assert_eq!(error.detail, Some(json!({"op_id":op_id,"revision":2})));
-        f.hub.borrow_mut().offline = true;
+        f.hub.lock().unwrap().offline = true;
     }
     let different = Request {
         params_digest: "different",
@@ -455,8 +455,8 @@ async fn hub_write_restart_second_cas_settles_superseded_without_a_write() {
             .code,
         "request_key_conflict"
     );
-    assert_eq!(f.hub.borrow().sends.len(), 1);
-    assert_eq!(f.hub.borrow().revision, 2);
+    assert_eq!(f.hub.lock().unwrap().sends.len(), 1);
+    assert_eq!(f.hub.lock().unwrap().revision, 2);
     assert_eq!(
         row(&store).outcome.unwrap().value,
         json!({"status":"superseded","revision":2})
@@ -546,8 +546,21 @@ async fn hub_write_agent_create_advances_same_row_and_watch_settles_by_op_after_
             position: Some(1)
         }
     );
-    assert_eq!(f.hub.borrow().sends.len(), 2);
-    assert_eq!((f.hub.borrow().logs.len(), f.hub.borrow().revision), (1, 1));
+    let hub = f.hub.lock().unwrap();
+    assert_eq!(hub.sends.len(), 2);
+    assert_eq!((hub.logs.len(), hub.revision), (1, 1));
+}
+
+struct ReadyPlan;
+
+impl LogReplan for ReadyPlan {
+    fn wait_for_head(&self, _: u64, _: Instant) -> BoxFuture<'_, Result<(), HandlerError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn after_image(&self, saved: &Value) -> Result<Replanned, HandlerError> {
+        Ok(Replanned::Body(saved.clone()))
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -555,7 +568,10 @@ async fn hub_write_log_reads_exact_lost_ack_position_and_rebases_only_on_other_e
     let f = Fixture::new("hub-log-rebase");
     let store = f.store();
     let transport = f.recorder(&store);
-    let writer = f.writer(&transport);
+    let writer = Writer {
+        replan: Some(&ReadyPlan),
+        ..f.writer(&transport)
+    };
     let body = json!({"agent_id":"agent-1","created_at_ms":42});
     let plan = step(LOG_KEY, 0, body.clone());
     let foreign = writer
@@ -584,7 +600,7 @@ async fn hub_write_log_reads_exact_lost_ack_position_and_rebases_only_on_other_e
         writer.saved(&pending.write, deadline()).await.unwrap().1,
         body
     );
-    f.hub.borrow_mut().logs.push(foreign);
+    f.hub.lock().unwrap().logs.push(foreign);
     f.reconnect();
     assert_eq!(
         writer.run(&REQUEST, &plan, None, deadline()).await.unwrap(),
@@ -593,7 +609,7 @@ async fn hub_write_log_reads_exact_lost_ack_position_and_rebases_only_on_other_e
             position: Some(2)
         }
     );
-    let hub = f.hub.borrow();
+    let hub = f.hub.lock().unwrap();
     assert_eq!(hub.logs.len(), 3);
     assert_eq!(hub.sends.len(), 2);
     assert_ne!(hub.sends[0].1, hub.sends[1].1);
@@ -644,7 +660,7 @@ async fn hub_write_snapshot_keeps_derived_id_and_matches_an_independent_resumer(
             position: Some(1)
         }
     );
-    let hub = f.hub.borrow();
+    let hub = f.hub.lock().unwrap();
     assert_eq!(hub.logs.len(), 1);
     assert_eq!(hub.sends.len(), 2);
     assert_eq!(hub.sends[0].1, hub.sends[1].1);
@@ -675,7 +691,7 @@ async fn hub_write_retry_same_revision_resends_exact_bytes_and_keeps_first_send_
     let landed = writer.run(&REQUEST, &plan, None, deadline()).await.unwrap();
     assert_eq!(landed.op_id, sent[0].op_id);
     assert_eq!(row(&store).op_ids, sent);
-    let hub = f.hub.borrow();
+    let hub = f.hub.lock().unwrap();
     assert_eq!(hub.sends.len(), 2);
     assert_eq!(hub.sends[0], hub.sends[1]);
 }
@@ -693,7 +709,7 @@ async fn hub_write_delete_settles_conditionally_without_deleting_newer_values() 
             .await
             .unwrap()
             .0;
-        assert_eq!(f.hub.borrow_mut().commit(&initial).unwrap(), Some(1));
+        assert_eq!(f.hub.lock().unwrap().commit(&initial).unwrap(), Some(1));
         let delete = Step {
             name: "delete".into(),
             expected: 1,
@@ -715,7 +731,7 @@ async fn hub_write_delete_settles_conditionally_without_deleting_newer_values() 
                 .await
                 .unwrap()
                 .0;
-            assert_eq!(f.hub.borrow_mut().commit(&next).unwrap(), Some(3));
+            assert_eq!(f.hub.lock().unwrap().commit(&next).unwrap(), Some(3));
         }
         f.reconnect();
         let result = writer.run(&REQUEST, &delete, None, deadline()).await;
@@ -723,7 +739,7 @@ async fn hub_write_delete_settles_conditionally_without_deleting_newer_values() 
             let error = result.unwrap_err();
             assert_eq!(error.code, "hub_write_superseded");
             assert_eq!(error.detail, Some(json!({"op_id":id,"revision":3})));
-            assert!(f.hub.borrow().kv[&put.key].value.is_some());
+            assert!(f.hub.lock().unwrap().kv[&put.key].value.is_some());
         } else {
             assert_eq!(
                 result.unwrap(),
@@ -733,7 +749,7 @@ async fn hub_write_delete_settles_conditionally_without_deleting_newer_values() 
                 }
             );
         }
-        assert_eq!(f.hub.borrow().sends.len(), 1);
-        assert_eq!(f.hub.borrow().sends[0].0.expected, 1);
+        assert_eq!(f.hub.lock().unwrap().sends.len(), 1);
+        assert_eq!(f.hub.lock().unwrap().sends[0].0.expected, 1);
     }
 }
