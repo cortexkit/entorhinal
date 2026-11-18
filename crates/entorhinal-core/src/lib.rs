@@ -2011,6 +2011,7 @@ mod tests {
                     "runner",
                     "ended_at_ms",
                     "held_on",
+                    "role",
                 ],
             ),
             (
