@@ -239,3 +239,72 @@ fn hub_store_attempt_retention_is_seven_days_after_the_first_outcome() {
         [new_send]
     );
 }
+
+#[test]
+fn hub_store_attempt_advances_once_and_ignores_an_old_target_after_restart() {
+    let f = Fixture::new("hub-attempt-step");
+    let path = descriptor(&f, "attempt.db");
+    let store = RegistryStore::open(&path).unwrap();
+    let log = HubAttemptWrite {
+        key: "ck.fleet.idlog".into(),
+        step: "agent.create".into(),
+        expected: 5,
+        ..write("request")
+    };
+    let append = send("log-id", 1, "original-process");
+    assert!(store.persist_hub_attempt(&log, &append, None).unwrap());
+    let before = store.hub_attempts_by_op("log-id").unwrap().pop().unwrap();
+    let residence = write("request");
+    let create = send("kv-id", 2, "original-process");
+    assert!(!store
+        .advance_hub_attempt(&before, "unknown", &residence, &create)
+        .unwrap());
+    assert!(store
+        .advance_hub_attempt(&before, "log-id", &residence, &create)
+        .unwrap());
+    assert!(!store
+        .advance_hub_attempt(&before, "log-id", &residence, &create)
+        .unwrap());
+    drop(store);
+
+    let store = RegistryStore::open(&path).unwrap();
+    let open = store.hub_attempt("request").unwrap().unwrap();
+    assert_eq!(open.write, residence);
+    assert_eq!(open.outcome, None);
+    assert_eq!(open.op_ids, [create, append]);
+    assert_eq!(store.hub_attempts_by_op("log-id").unwrap(), [open]);
+    let outcome = HubAttemptOutcome {
+        op_id: "log-id".into(),
+        value: json!({"status":"landed", "position":6}),
+        recorded_at_ms: 1_000,
+    };
+    assert_eq!(
+        store
+            .record_hub_attempt_outcome_by_op(&log.key, 6, &outcome, |_, _| true)
+            .unwrap(),
+        0
+    );
+
+    let outcome = HubAttemptOutcome {
+        op_id: "kv-id".into(),
+        value: json!({"status":"landed", "position":84}),
+        ..outcome
+    };
+    let settle = |position| {
+        store
+            .record_hub_attempt_outcome_by_op(
+                &residence.key,
+                position,
+                &outcome,
+                |write, position| position > write.expected,
+            )
+            .unwrap()
+    };
+    assert_eq!(settle(83), 0);
+    assert_eq!(settle(84), 1);
+    assert_eq!(settle(84), 0);
+    assert_eq!(
+        store.hub_attempt("request").unwrap().unwrap().outcome,
+        Some(outcome)
+    );
+}
