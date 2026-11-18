@@ -685,9 +685,9 @@ impl LogReplan for CreateReplan<'_> {
     }
 }
 
-// This step cannot build a write; it is only passed when an existing attempt
-// already supplies the persisted bytes. If that attempt has meanwhile been
-// pruned, there are no bytes to resend, so the step sends nothing.
+// A placeholder passed only when an existing attempt already holds the
+// persisted bytes: the writer resends those bytes, and this step's own
+// payload (an empty delete) is never sent.
 fn resume_only() -> Step {
     Step {
         name: String::new(),
