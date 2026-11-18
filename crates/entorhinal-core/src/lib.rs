@@ -225,7 +225,7 @@ CREATE TABLE member_name (
 );
 "#;
 
-const MIGRATIONS: [Migration; 23] = [
+const MIGRATIONS: [Migration; 24] = [
     Migration {
         version: 1,
         statements: V1_SCHEMA,
@@ -317,6 +317,10 @@ const MIGRATIONS: [Migration; 23] = [
     Migration {
         version: 23,
         statements: user_profile::V23_USER_TIME_ZONE,
+    },
+    Migration {
+        version: 24,
+        statements: session_lifecycle::V24_SESSION_ROLE,
     },
 ];
 
@@ -1044,6 +1048,8 @@ pub struct SessionRegistration<'a> {
     /// The required llm-runner module hosting the session. A missing or empty
     /// value refuses `invalid_request` before writing the binding.
     pub runner: Option<&'a str>,
+    /// `head` (the default) moves with the agent; `delegated` stays here.
+    pub role: Option<&'a str>,
     /// Whether the session's agent can reach the network, when the caller
     /// said. It is appended to the binding's network history only when it
     /// differs from the current value; `None` records nothing.
@@ -1054,6 +1060,8 @@ pub struct SessionRegistration<'a> {
 /// One row of `session_binding`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SessionBinding {
+    #[serde(skip_serializing_if = "session_lifecycle::is_head_role")]
+    pub role: String,
     pub agent_id: String,
     pub ref_kind: String,
     #[serde(rename = "ref")]
@@ -1087,12 +1095,13 @@ impl SessionBinding {
             registered_at_ms: row.get(7)?,
             held_on: row.get(8)?,
             runner: row.get(9)?,
+            role: row.get(10)?,
         })
     }
 }
 
 const SESSION_BINDING_COLUMNS: &str =
-    "agent_id,ref_kind,ref,harness,session_id,NULLIF(project_root,''),registered_by,registered_at_ms,held_on,runner";
+    "agent_id,ref_kind,ref,harness,session_id,NULLIF(project_root,''),registered_by,registered_at_ms,held_on,runner,role";
 
 fn session_refusal(
     code: &str,
@@ -1136,6 +1145,10 @@ impl RegistryStore {
     /// and session id under a new reference kind and harness for the same
     /// agent: the session moved to a new host kind and kept its id. Omitting the project root keeps a recorded root on either
     /// kind of registration; a new binding without one reads as unknown.
+    /// The session role is independent of the registering capability: omission
+    /// stores `head`, `delegated` stays on the origin during a move, and any
+    /// other value refuses `invalid_request` before writing. Re-registration
+    /// and both kinds of re-key update the session role in place.
     pub fn register_session(
         &self,
         request: &SessionRegistration<'_>,
@@ -1167,6 +1180,7 @@ impl RegistryStore {
         keys: &mut Vec<SessionChangeKey>,
     ) -> Result<SessionBinding, agent::AgentMutationError> {
         let runner = session_lifecycle::registration_runner(request.runner)?;
+        let role = session_lifecycle::registration_role(request.role)?;
         let cut_over = tx
             .query_row(
                 "SELECT 1 FROM registry_journal WHERE op=?1 LIMIT 1",
@@ -1380,13 +1394,13 @@ impl RegistryStore {
             // A registration means the session is live, so it clears any end
             // time an earlier run of the same reference left behind.
             tx.execute(
-                "INSERT INTO session_binding(agent_id,ref_kind,ref,harness,session_id,project_root,registered_by,registered_at_ms,runner,ended_at_ms)
-             VALUES(?1,?2,?3,?4,?5,COALESCE(?6,''),?7,?8,?9,NULL)
+                "INSERT INTO session_binding(agent_id,ref_kind,ref,harness,session_id,project_root,registered_by,registered_at_ms,runner,ended_at_ms,role)
+             VALUES(?1,?2,?3,?4,?5,COALESCE(?6,''),?7,?8,?9,NULL,?10)
              ON CONFLICT(ref_kind,ref) DO UPDATE SET harness=excluded.harness,
                   session_id=excluded.session_id,
                   project_root=COALESCE(?6, session_binding.project_root),
                  registered_by=excluded.registered_by, registered_at_ms=excluded.registered_at_ms,
-                 runner=excluded.runner, ended_at_ms=NULL",
+                 runner=excluded.runner, ended_at_ms=NULL, role=excluded.role",
                 params![
                     request.agent_id,
                     request.ref_kind,
@@ -1396,7 +1410,8 @@ impl RegistryStore {
                     request.project_root,
                     registered_by,
                     request.now_ms,
-                    runner
+                    runner,
+                    role
                 ],
             )?;
             // After the binding exists, because each history row references it.

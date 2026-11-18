@@ -143,7 +143,7 @@ fn carried_rows(conn: &Connection, agent_id: &str) -> rusqlite::Result<Vec<Carri
     let mut statement = conn.prepare(
         "SELECT ref_kind, ref, runner, harness, session_id, project_root, registered_by,
                 registered_at_ms, ended_at_ms, held_on
-         FROM session_binding WHERE agent_id=?1 ORDER BY ref_kind, ref",
+         FROM session_binding WHERE agent_id=?1 AND role='head' ORDER BY ref_kind, ref",
     )?;
     let mut rows = statement
         .query_map([agent_id], |row| {
@@ -169,7 +169,7 @@ fn carried_rows(conn: &Connection, agent_id: &str) -> rusqlite::Result<Vec<Carri
 }
 
 impl RegistryStore {
-    /// Every binding of the agent moving out under `cut_id`, with its network
+    /// Every head binding of the agent moving out under `cut_id`, with its network
     /// history, read in one snapshot. The snapshot also shows the open source
     /// move, which since admission has refused every new registration for
     /// the agent, and its plan, whose binding refs must still be present:

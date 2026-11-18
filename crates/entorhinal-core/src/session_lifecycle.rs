@@ -38,6 +38,26 @@ CREATE INDEX session_binding_open_agent
     WHERE ended_at_ms IS NULL;
 "#;
 
+/// Existing bindings are head sessions. Delegated work and its runner stay on
+/// the computer that launched them when the head agent moves.
+pub const V24_SESSION_ROLE: &str = "ALTER TABLE session_binding ADD COLUMN role TEXT NOT NULL DEFAULT 'head' CHECK(role IN ('head','delegated'));";
+
+pub(crate) fn is_head_role(role: &str) -> bool {
+    role == "head"
+}
+
+pub(crate) fn registration_role(role: Option<&str>) -> Result<&str, AgentMutationError> {
+    match role {
+        None | Some("head") => Ok("head"),
+        Some("delegated") => Ok("delegated"),
+        Some(_) => Err(session_refusal(
+            "invalid_request",
+            "role must be head or delegated",
+            None,
+        )),
+    }
+}
+
 /// How long a binding is kept after its session ended. A binding that never
 /// ended is never pruned, however old it is.
 pub const SESSION_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
@@ -95,6 +115,8 @@ pub struct GoneSession {
 /// another machine and has not been opened here yet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AgentSession {
+    #[serde(skip_serializing_if = "is_head_role")]
+    pub role: String,
     pub runner: Option<String>,
     pub session: Option<String>,
     pub harness: Option<String>,
@@ -123,6 +145,7 @@ impl AgentSession {
             ended_at_ms: row.get(7)?,
             network: row.get(8)?,
             held_on: row.get(9)?,
+            role: row.get(10)?,
         })
     }
 }
@@ -140,6 +163,8 @@ pub struct SessionCursor {
 /// harness-and-session pair.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RunnerSessionBinding {
+    #[serde(skip_serializing_if = "is_head_role")]
+    pub role: String,
     pub agent_id: String,
     pub runner: Option<String>,
     pub session: String,
@@ -406,7 +431,7 @@ impl RegistryStore {
                         COALESCE((SELECT network FROM session_network AS history
                                   WHERE history.ref_kind=session_binding.ref_kind
                                     AND history.ref=session_binding.ref
-                                  ORDER BY since_ms DESC LIMIT 1), ?6), held_on
+                                  ORDER BY since_ms DESC LIMIT 1), ?6), held_on, role
                  FROM session_binding
                   WHERE agent_id=?1
                     {open_clause}
@@ -473,7 +498,7 @@ pub(crate) fn session_binding_for_key_in(
     conn.query_row(
         &format!(
             "SELECT agent_id, runner, session_id, harness, ref_kind, ref,
-                NULLIF(project_root,''), ended_at_ms, held_on
+                NULLIF(project_root,''), ended_at_ms, held_on, role
          FROM session_binding WHERE {key_column}=?1 AND session_id=?2"
         ),
         params![key, session],
@@ -490,6 +515,7 @@ pub(crate) fn session_binding_for_key_in(
                 network: crate::NETWORK_ABSENT.to_owned(),
                 network_history: Vec::new(),
                 held_on: row.get(8)?,
+                role: row.get(9)?,
             })
         },
     )

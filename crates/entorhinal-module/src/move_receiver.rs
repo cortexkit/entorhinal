@@ -4304,6 +4304,7 @@ mod tests {
             );
             f.store().apply_entry("fixture", "{}", "fixture", None, |tx| tx.execute_batch("INSERT INTO agent(agent_id,name,tag,role,created_at_ms,updated_at_ms) VALUES('agent_abcdef0123456789','Other','O','assistant',1,1);")).unwrap();
             let request = entorhinal_core::SessionRegistration {
+                role: None,
                 agent_id: "agent_abcdef0123456789",
                 ref_kind: "session",
                 session_ref: "r",
@@ -4318,6 +4319,7 @@ mod tests {
             let e = f.store().register_session(&request).unwrap_err();
             assert_eq!(HandlerError::from(e).code, "ref_bound_elsewhere");
             let request = entorhinal_core::SessionRegistration {
+                role: None,
                 agent_id: AGENT,
                 ..request
             };

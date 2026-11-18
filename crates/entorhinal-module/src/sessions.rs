@@ -773,6 +773,22 @@ fn take_network(params: &mut Value) -> Result<Option<String>, HandlerError> {
     }
 }
 
+/// Remove the optional session role before strict decoding so existing
+/// unknown-field refusals keep their published bytes.
+fn take_session_role(params: &mut Value) -> Result<Option<String>, HandlerError> {
+    match params
+        .as_object_mut()
+        .and_then(|object| object.remove("role"))
+    {
+        None => Ok(None),
+        Some(Value::String(role)) if role == "head" || role == "delegated" => Ok(Some(role)),
+        Some(_) => Err(HandlerError::new(
+            "invalid_request",
+            "role must be head or delegated",
+        )),
+    }
+}
+
 /// The opaque `agent.sessions` cursor: base64url of the last listed row's
 /// `[registered_at_ms, ref_kind, ref]`.
 fn encode_cursor(cursor: &entorhinal_core::SessionCursor) -> String {
@@ -1043,6 +1059,7 @@ pub(super) fn register_session_on_store(
     let mut params = params;
     let runner = take_runner(&mut params)?;
     let network = take_network(&mut params)?;
+    let session_role = take_session_role(&mut params)?;
     let request: RegisterSessionRequest = decode(params)?;
     ref_bounds(&request.ref_kind, &request.session_ref)?;
     session_key_bounds(&request.harness, &request.session_id)?;
@@ -1060,6 +1077,7 @@ pub(super) fn register_session_on_store(
             project_root: request.project_root.as_deref(),
             registered_by: role.as_str(),
             runner: Some(&runner),
+            role: session_role.as_deref(),
             network: network
                 .as_deref()
                 .map(|network| entorhinal_core::NetworkStamp { network, clock }),
@@ -1246,6 +1264,9 @@ impl ProjectsHandler {
         if let Some(runner) = binding.runner {
             reply["runner"] = json!(runner);
         }
+        if binding.role == "delegated" {
+            reply["role"] = json!(binding.role);
+        }
         self.encode_read_result(reply)
     }
 
@@ -1328,6 +1349,9 @@ impl ProjectsHandler {
                 });
                 if let Some(holder) = row.held_on {
                     reply["heldOn"] = json!(holder);
+                }
+                if row.role == "delegated" {
+                    reply["role"] = json!(row.role);
                 }
                 reply
             })

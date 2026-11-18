@@ -106,6 +106,7 @@ fn registration<'a>(
     clock: fn() -> i64,
 ) -> SessionRegistration<'a> {
     SessionRegistration {
+        role: None,
         agent_id: AGENT,
         ref_kind: "broca-session",
         session_ref: "ref-1",

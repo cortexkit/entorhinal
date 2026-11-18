@@ -3821,6 +3821,138 @@ async fn session_rekey_records_match_published_files() {
 }
 
 #[tokio::test]
+async fn session_role_records_match_published_files() {
+    let fixture = SessionFixture::new("served-session-roles").await;
+    let source = fixture.snapshot();
+    seed_agent(&source, SESSION_AGENT, "Session Agent", None, false, false);
+    drop(source);
+    assert!(matches!(
+        fixture.import().await,
+        HandlerOutcome::Response(_)
+    ));
+    let params = json!({
+        "agent_id":SESSION_AGENT, "ref_kind":"broca-session", "ref":"delegated-ref",
+        "harness":"broca", "session_id":"delegated-session", "runner":"broca",
+        "project_root":"/fixture/project", "role":"delegated"
+    });
+    let (registration, reply) = fixture
+        .record(
+            SESSION_REGISTRAR,
+            WRITER_MODULE,
+            "agent.register_session",
+            params.clone(),
+        )
+        .await;
+    assert_eq!(reply["result"]["role"], "delegated");
+    published_file(
+        "agent-sessions-v1",
+        "register-session-delegated.json",
+        vec![registration],
+    );
+    let mut reads = Vec::new();
+    for (method, params) in [
+        ("agent.sessions", json!({"agent_id":SESSION_AGENT})),
+        (
+            "agent.session_for_ref",
+            json!({"ref_kind":"broca-session","ref":"delegated-ref"}),
+        ),
+        (
+            "agent.session_for_runner",
+            json!({"runner":"broca","session":"delegated-session"}),
+        ),
+        (
+            "agent.session_for_harness",
+            json!({"harness":"broca","session":"delegated-session"}),
+        ),
+    ] {
+        let (record, reply) = fixture
+            .record(SESSION_READER, READER_MODULE, method, params)
+            .await;
+        let row = if method == "agent.sessions" {
+            &reply["result"]["sessions"][0]
+        } else {
+            &reply["result"]
+        };
+        assert_eq!(row["role"], "delegated", "{method}: {reply}");
+        reads.push(record);
+    }
+    published_file("agent-sessions-v1", "sessions-delegated.json", reads);
+    let before = fixture
+        .store()
+        .session_binding_for("broca", "delegated-session")
+        .unwrap();
+    let mut unknown = params;
+    unknown["role"] = json!("worker");
+    unknown["network"] = json!("yes");
+    let (refusal, reply) = fixture
+        .record(
+            SESSION_REGISTRAR,
+            WRITER_MODULE,
+            "agent.register_session",
+            unknown,
+        )
+        .await;
+    assert_eq!(reply["code"], "invalid_request");
+    assert_eq!(
+        fixture
+            .store()
+            .session_binding_for("broca", "delegated-session")
+            .unwrap(),
+        before
+    );
+    assert!(fixture
+        .store()
+        .session_binding_for_runner("broca", "delegated-session")
+        .unwrap()
+        .unwrap()
+        .network_history
+        .is_empty());
+    published_file(
+        "agent-sessions-v1",
+        "register-session-unknown-role.json",
+        vec![refusal],
+    );
+}
+
+#[test]
+fn session_role_published_identity_types_drop_role() {
+    fn check<R: DeserializeOwned + Serialize>(reply: &Value) {
+        let decoded: aid::Outcome<R> = serde_json::from_value(reply.clone()).unwrap();
+        let encoded = serde_json::to_value(decoded).unwrap();
+        assert_eq!(reply["result"]["role"], "delegated");
+        assert!(
+            encoded["result"].get("role").is_none(),
+            "published types now retain role; update this compatibility test"
+        );
+        let mut without_role = reply.clone();
+        without_role["result"]
+            .as_object_mut()
+            .unwrap()
+            .remove("role");
+        assert_eq!(
+            encoded, without_role,
+            "only the unsupported role may be dropped"
+        );
+    }
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../test-vectors/agent-sessions-v1/sessions-delegated.json");
+    let records: Vec<Value> = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    for record in records {
+        match record["request"]["method"].as_str().unwrap() {
+            "agent.sessions" => {}
+            "agent.session_for_ref" => check::<aid::AgentSessionForRefReply>(&record["reply"]),
+            "agent.session_for_runner" => {
+                check::<aid::AgentSessionForRunnerReply>(&record["reply"])
+            }
+            "agent.session_for_harness" => {
+                check::<aid::AgentSessionForHarnessReply>(&record["reply"])
+            }
+            other => panic!("unexpected delegated sample {other}"),
+        }
+    }
+}
+
+#[tokio::test]
 async fn moving_agent_where_records_match_published_files() {
     const CUT_ID: &str = "cut-moving-agent";
 

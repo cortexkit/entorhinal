@@ -490,6 +490,7 @@ mod tests {
     }
     fn registration() -> SessionRegistration<'static> {
         SessionRegistration {
+            role: None,
             agent_id: ID,
             ref_kind: "test",
             session_ref: "ref",

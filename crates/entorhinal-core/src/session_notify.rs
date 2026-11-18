@@ -73,7 +73,7 @@ impl RegistryStore {
                         COALESCE((SELECT network FROM session_network AS history
                                   WHERE history.ref_kind=session_binding.ref_kind
                                     AND history.ref=session_binding.ref
-                                  ORDER BY since_ms DESC LIMIT 1), ?4),held_on
+                                  ORDER BY since_ms DESC LIMIT 1), ?4),held_on,role
                  FROM session_binding WHERE agent_id=?1 AND harness=?2 AND session_id=?3
                    AND (NOT ?5 OR ended_at_ms IS NULL)",
             )?;

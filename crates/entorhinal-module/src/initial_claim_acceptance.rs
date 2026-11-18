@@ -52,6 +52,7 @@ impl Pair {
         machine
             .store()
             .register_session(&SessionRegistration {
+                role: None,
                 agent_id: agent,
                 ref_kind: "pi-session",
                 session_ref: session,
