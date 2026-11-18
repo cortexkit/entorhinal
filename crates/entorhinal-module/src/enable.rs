@@ -438,14 +438,15 @@ impl ProjectsHandler {
             })?;
         let store = self.with_store(|s| Ok(s.clone()))?;
         let result = if let Some(switch) = &self.hub_switch {
-            self.enable_hub(
+            // Hub snapshot recovery is large; other requests share the RPC dispatcher.
+            Box::pin(self.enable_hub(
                 switch,
                 &store,
                 params.without_agents,
                 key,
                 received,
                 deadline,
-            )
+            ))
             .await
         } else {
             self.enable_locked(

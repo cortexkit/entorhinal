@@ -509,7 +509,8 @@ impl Switch {
         }
         let base = image.map_or(0, |image| image.engram_through);
         let log = self.identity_log(store, runtime, base, deadline).await?;
-        if !snapshot::transfer(&log, image, deadline).await? {
+        // Keep multipart verification and epoch recovery off the caller's stack.
+        if !Box::pin(snapshot::transfer(&log, image, deadline)).await? {
             return Err(waiting());
         }
         // Activation is retried independently after the base has committed.

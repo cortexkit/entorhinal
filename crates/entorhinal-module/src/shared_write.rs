@@ -3321,9 +3321,7 @@ impl ProjectsHandler {
             let digest = crate::hub_write::params_digest(&request.method, &request.params)?;
             if store.hub_attempt(key)?.is_some() {
                 return self.attach_incarnation(
-                    residence
-                        .create(key, &digest, None, received + DEADLINE)
-                        .await?,
+                    Box::pin(residence.create(key, &digest, None, received + DEADLINE)).await?,
                 );
             }
             Some((residence, key.to_owned(), digest))
@@ -3435,7 +3433,8 @@ impl ProjectsHandler {
                     )
                 })
             };
-            let create = residence.create(&request_key, &digest, Some(&preview), deadline);
+            let create =
+                Box::pin(residence.create(&request_key, &digest, Some(&preview), deadline));
             let reply = if let Some(guard) = &mut confirmation {
                 tokio::select! {
                     biased;
@@ -3471,14 +3470,15 @@ impl ProjectsHandler {
                 ));
             }
             let write = prepared.expect("shared write was decoded");
-            let result = self.hub_shared_write(
+            // Keep the hub-only future out of the local and legacy write state machine.
+            let result = Box::pin(self.hub_shared_write(
                 &store,
                 &request,
                 write,
                 &principal,
                 approval.as_ref(),
                 deadline,
-            );
+            ));
             let body = if let Some(guard) = &mut confirmation {
                 tokio::select! {
                     biased;
