@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use entorhinal_catalog::MAX_SAFE_INTEGER;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::{json, Value};
 use subc_client_rs::{CallOptions, SubcConsumer};
 use subc_protocol::{BindIdentity, RouteTarget};
 
@@ -11,11 +12,71 @@ use super::{HandlerError, SealedBody, VAULT_LIMIT};
 
 #[async_trait]
 pub(crate) trait EpochVault: Send + Sync {
+    fn control(&self) -> Option<&dyn EpochControl> {
+        None
+    }
+
     /// Seal with the epoch currently installed in the vault. Before persisting
     /// or sending the record, the hub writer must ensure the returned epoch
     /// matches the one authorized by the hub's epoch state.
     async fn seal(&self, aad: &[u8], plaintext: &[u8]) -> Result<SealedBody, HandlerError>;
     async fn open(&self, aad: &[u8], body: &SealedBody) -> Result<Vec<u8>, HandlerError>;
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PendingMint {
+    pub epoch: u64,
+    pub mint_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EpochStatus {
+    pub current: Option<u64>,
+    pub held: Vec<u64>,
+    pub pending: Option<PendingMint>,
+    pub sealing_blocked_by: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Minted {
+    pub epoch: u64,
+    pub mint_id: String,
+    pub wraps: Vec<MintedWrap>,
+}
+
+impl Minted {
+    pub(crate) fn mint(&self) -> PendingMint {
+        PendingMint {
+            epoch: self.epoch,
+            mint_id: self.mint_id.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MintedWrap {
+    pub member_id: String,
+    pub wrap: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Imported {
+    pub epochs: Vec<u64>,
+    pub already_held: bool,
+}
+
+#[async_trait]
+pub(crate) trait EpochControl: Send + Sync {
+    async fn status(&self) -> Result<EpochStatus, HandlerError>;
+    async fn mint(&self, members: &[String]) -> Result<Minted, HandlerError>;
+    async fn commit(&self, mint: &PendingMint) -> Result<(), HandlerError>;
+    async fn discard(&self, mint: &PendingMint) -> Result<(), HandlerError>;
+    async fn import(&self, wrap: &Value) -> Result<Imported, HandlerError>;
 }
 
 pub(crate) struct SubcEpochVault {
@@ -47,10 +108,63 @@ impl SubcEpochVault {
             ResultBody::Success(value) => Ok(value),
         }
     }
+
+    async fn finish(
+        &self,
+        method: &'static str,
+        state: &str,
+        mint: &PendingMint,
+    ) -> Result<(), HandlerError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Finished {
+            epoch: u64,
+            state: String,
+        }
+        let done: Finished = self
+            .request(
+                method,
+                json!({"epoch": mint.epoch, "mint_id": mint.mint_id}),
+            )
+            .await?;
+        if done.epoch != mint.epoch || done.state != state {
+            return Err(invalid_reply("vault finished a different fleet epoch"));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl EpochControl for SubcEpochVault {
+    async fn status(&self) -> Result<EpochStatus, HandlerError> {
+        self.request("fleet.epoch_status", json!({})).await
+    }
+
+    async fn mint(&self, members: &[String]) -> Result<Minted, HandlerError> {
+        self.request("fleet.epoch_mint", json!({"members": members}))
+            .await
+    }
+
+    async fn commit(&self, mint: &PendingMint) -> Result<(), HandlerError> {
+        self.finish("fleet.epoch_commit", "current", mint).await
+    }
+
+    async fn discard(&self, mint: &PendingMint) -> Result<(), HandlerError> {
+        self.finish("fleet.epoch_discard", "discarded", mint).await
+    }
+
+    async fn import(&self, wrap: &Value) -> Result<Imported, HandlerError> {
+        self.request("fleet.epoch_import", json!({"wrap": wrap}))
+            .await
+    }
 }
 
 #[async_trait]
 impl EpochVault for SubcEpochVault {
+    fn control(&self) -> Option<&dyn EpochControl> {
+        Some(self)
+    }
+
     async fn seal(&self, aad: &[u8], plaintext: &[u8]) -> Result<SealedBody, HandlerError> {
         let body: SealedBody = self
             .request(

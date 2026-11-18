@@ -48,13 +48,14 @@ pub(super) struct MemberKey {
     pub history: Vec<Key>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct Removed {
-    box_id: String,
-    removal_id: Option<String>,
-    epoch: u64,
-    key_history: Vec<Key>,
+pub(super) struct Removed {
+    pub box_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub removal_id: Option<String>,
+    pub epoch: u64,
+    pub key_history: Vec<Key>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -276,6 +277,15 @@ pub(super) struct PeerAnchor {
 pub(super) trait PeerKeysRead: Send + Sync {
     async fn peer_keys_read(&self) -> Result<Vec<PeerAnchor>, HandlerError>;
     async fn own_fingerprint(&self) -> Result<String, HandlerError>;
+
+    async fn fleet_peers(&self) -> Result<Vec<(String, String)>, HandlerError> {
+        Ok(self
+            .peer_keys_read()
+            .await?
+            .into_iter()
+            .map(|peer| (peer.box_id, peer.fingerprint))
+            .collect())
+    }
 }
 
 pub(super) struct AnchorSource {
@@ -355,6 +365,7 @@ struct Proof {
     history: Keys,
     published: BTreeMap<Episode, u64>,
     last_publication: BTreeMap<Episode, (u64, MemberKey)>,
+    fingerprints: BTreeMap<String, BTreeMap<u64, String>>,
     verified: BTreeMap<u64, [u8; 32]>,
 }
 
@@ -490,6 +501,11 @@ fn derive(
                         .entry(episode)
                         .and_modify(|first| *first = (*first).min(sequence))
                         .or_insert(sequence);
+                    proof
+                        .fingerprints
+                        .entry(key.fingerprint.clone())
+                        .or_default()
+                        .insert(sequence, key.box_id.clone());
                     let latest = proof
                         .last_publication
                         .entry((key.box_id.clone(), candidate.record.header().writer_ep))
@@ -592,13 +608,14 @@ impl<T: Transport> Membership<T> {
         self.scan_with(head, current, deadline).await
     }
 
-    pub(super) async fn refresh(&self, deadline: Instant) -> Result<(), HandlerError> {
+    pub(super) async fn refresh(&self, deadline: Instant) -> Result<bool, HandlerError> {
         let current = self.source.read(deadline).await?;
         if self.view.read().unwrap().current != current {
             let head = self.transport.log_head(deadline).await?;
             self.scan_with(head, current, deadline).await?;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     async fn scan_with(
@@ -752,6 +769,47 @@ impl<T: Transport> Membership<T> {
             return None;
         }
         Some(state.episode)
+    }
+
+    pub(super) fn removed_at(
+        &self,
+        box_id: &str,
+        applied: u64,
+    ) -> Option<(u64, u64, Option<String>)> {
+        let view = self.view.read().unwrap();
+        let state = view
+            .proof
+            .timeline
+            .before(box_id, applied.saturating_add(1));
+        state
+            .closed
+            .map(|closed| (state.episode, closed.epoch, closed.removal_id))
+    }
+
+    pub(super) fn removal_applied(
+        &self,
+        box_id: &str,
+        epoch: u64,
+        id: Option<&str>,
+        applied: u64,
+    ) -> bool {
+        let view = self.view.read().unwrap();
+        let history = &view.proof.timeline;
+        let position = match id {
+            Some(id) => history.removals.get(id),
+            None => history.anonymous.get(&(box_id.to_owned(), epoch)),
+        };
+        position.is_some_and(|position| *position <= applied)
+    }
+
+    pub(super) fn box_for_fingerprint(&self, fingerprint: &str, applied: u64) -> Option<String> {
+        let view = self.view.read().unwrap();
+        view.proof
+            .fingerprints
+            .get(fingerprint)?
+            .range(..=applied)
+            .next_back()
+            .map(|(_, id)| id.clone())
     }
 }
 

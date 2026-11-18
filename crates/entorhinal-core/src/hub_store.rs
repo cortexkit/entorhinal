@@ -104,6 +104,28 @@ pub struct HubAnchor {
     pub public_key: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubOwnMint {
+    pub epoch: u64,
+    pub mint_id: String,
+    pub committed: bool,
+    pub revision: u64,
+}
+
+pub enum HubEpochSource<'a> {
+    Mint(&'a str),
+    Join(&'a str),
+}
+
+impl HubEpochSource<'_> {
+    fn parts(&self) -> (&'static str, &str) {
+        match self {
+            Self::Mint(id) => ("mint", id),
+            Self::Join(id) => ("join", id),
+        }
+    }
+}
+
 pub const MEMBERSHIP_OPS: &[&str] = &["member.key", "member.removed", "member.admitted"];
 
 pub(crate) fn record_log_writer(
@@ -369,6 +391,90 @@ impl RegistryStore {
 
     pub fn hub_kv_cached(&self, key: &str) -> Result<Option<HubKvCached>, RegistryError> {
         self.read(|conn| kv_cached(conn, key))
+    }
+
+    pub fn hub_own_mint(&self) -> Result<Option<HubOwnMint>, RegistryError> {
+        self.read(|conn| {
+            conn.query_row(
+                "SELECT epoch,mint_id,state,revision FROM hub_epoch_status WHERE id=1",
+                [],
+                |row| {
+                    Ok(HubOwnMint {
+                        epoch: row.get(0)?,
+                        mint_id: row.get(1)?,
+                        committed: row.get::<_, String>(2)? == "committed",
+                        revision: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+        })
+    }
+
+    pub fn record_hub_own_mint(&self, mint: &HubOwnMint) -> Result<(), RegistryError> {
+        self.db.with_conn_fenced(|tx| {
+            tx.execute(
+                "INSERT INTO hub_epoch_status(id,epoch,state,mint_id,revision) VALUES(1,?1,?2,?3,?4)
+                 ON CONFLICT(id) DO UPDATE SET epoch=?1,state=?2,mint_id=?3,revision=?4
+                 WHERE hub_epoch_status.revision<=?4",
+                params![mint.epoch, if mint.committed { "committed" } else { "pending" }, mint.mint_id, mint.revision],
+            )?;
+            Ok(())
+        }).map_err(RegistryError::Store)
+    }
+
+    pub fn clear_hub_own_mint(&self, epoch: u64, mint_id: &str) -> Result<(), RegistryError> {
+        self.db
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "DELETE FROM hub_epoch_status WHERE id=1 AND epoch=?1 AND mint_id=?2",
+                    params![epoch, mint_id],
+                )?;
+                Ok(())
+            })
+            .map_err(RegistryError::Store)
+    }
+
+    pub fn record_hub_held_epochs(
+        &self,
+        source: HubEpochSource<'_>,
+        epochs: &[u64],
+    ) -> Result<(), RegistryError> {
+        let (kind, id) = source.parts();
+        self.db
+            .with_conn_fenced(|tx| {
+                for epoch in epochs {
+                    tx.execute(
+                        "INSERT INTO hub_held_epoch(epoch,source_kind,source_id) VALUES(?1,?2,?3)
+                     ON CONFLICT(epoch,source_kind,source_id) DO NOTHING",
+                        params![epoch, kind, id],
+                    )?;
+                }
+                Ok(())
+            })
+            .map_err(RegistryError::Store)
+    }
+
+    /// Each join row names an epoch actually carried by that join wrap.
+    pub fn hub_holds_epoch(&self, epoch: u64, mint_id: &str) -> Result<bool, RegistryError> {
+        self.read(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM hub_held_epoch WHERE epoch=?1 AND
+                            (source_kind='join' OR (source_kind='mint' AND source_id=?2)))",
+                params![epoch, mint_id],
+                |row| row.get(0),
+            )
+        })
+    }
+
+    pub fn hub_has_epoch(&self, epoch: u64) -> Result<bool, RegistryError> {
+        self.read(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM hub_held_epoch WHERE epoch=?1)",
+                [epoch],
+                |row| row.get(0),
+            )
+        })
     }
 
     /// Install a verified value (or an allowed delete with no body). A refusal

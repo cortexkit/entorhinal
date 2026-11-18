@@ -213,6 +213,19 @@ impl Hub {
         })
     }
 
+    pub(super) fn epoch_watch(self: &Arc<Self>) -> Feed<kv::Entry> {
+        let hub = self.clone();
+        Feed::epoch(self.health.clone(), move |_| {
+            let hub = hub.clone();
+            async move {
+                hub.open(Instant::now() + REQUEST_TIMEOUT)
+                    .await?
+                    .watch(None)
+                    .await
+            }
+        })
+    }
+
     pub(super) fn residence_watch(self: &Arc<Self>) -> Feed<KvDelivery> {
         let hub = self.clone();
         Feed::kv(self.health.clone(), move |_| {

@@ -18,6 +18,42 @@ fn descriptor(f: &Fixture, file: &str) -> StorageDescriptor {
 }
 
 #[test]
+fn hub_epoch_store_retains_exact_mint_and_join_provenance() {
+    let f = Fixture::new("hub-epoch-store");
+    let descriptor = descriptor(&f, "provenance.db");
+    let store = RegistryStore::open(&descriptor).unwrap();
+    let mut own = HubOwnMint {
+        epoch: 2,
+        mint_id: "winning".into(),
+        committed: false,
+        revision: 12,
+    };
+    store.record_hub_own_mint(&own).unwrap();
+    store
+        .record_hub_held_epochs(HubEpochSource::Mint("old"), &[1])
+        .unwrap();
+    store
+        .record_hub_held_epochs(HubEpochSource::Join("request"), &[1, 2])
+        .unwrap();
+    drop(store);
+    let store = RegistryStore::open(&descriptor).unwrap();
+    assert_eq!(store.hub_own_mint().unwrap(), Some(own.clone()));
+    store.clear_hub_own_mint(2, "lost").unwrap();
+    assert_eq!(store.hub_own_mint().unwrap(), Some(own.clone()));
+    own.committed = true;
+    own.revision = 13;
+    store.record_hub_own_mint(&own).unwrap();
+    assert_eq!(store.hub_own_mint().unwrap(), Some(own));
+    assert!(store.hub_holds_epoch(2, "winning").unwrap());
+    assert!(!store.hub_has_epoch(3).unwrap());
+    store
+        .record_hub_held_epochs(HubEpochSource::Mint("m3"), &[3])
+        .unwrap();
+    assert!(store.hub_holds_epoch(3, "m3").unwrap());
+    assert!(!store.hub_holds_epoch(3, "other").unwrap());
+}
+
+#[test]
 fn hub_store_migration_preserves_legacy_progress_and_requires_snapshot_for_downgrade() {
     let f = Fixture::new("hub-migration");
     let live = descriptor(&f, "legacy.db");
