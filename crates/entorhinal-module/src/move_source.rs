@@ -3312,43 +3312,9 @@ mod tests {
         );
     }
 
-    /// Collects the fields of each `move` target event as one line.
-    struct MoveLog(Arc<Mutex<Vec<String>>>);
-    impl tracing::Subscriber for MoveLog {
-        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-            true
-        }
-        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-        fn event(&self, event: &tracing::Event<'_>) {
-            struct Fields(String);
-            impl tracing::field::Visit for Fields {
-                fn record_debug(
-                    &mut self,
-                    field: &tracing::field::Field,
-                    value: &dyn std::fmt::Debug,
-                ) {
-                    self.0.push_str(&format!("{}={value:?};", field.name()));
-                }
-            }
-            if event.metadata().target() == "move" {
-                let mut fields = Fields(String::new());
-                event.record(&mut fields);
-                self.0.lock().unwrap().push(fields.0);
-            }
-        }
-        fn enter(&self, _: &tracing::span::Id) {}
-        fn exit(&self, _: &tracing::span::Id) {}
-    }
-
     #[tokio::test(start_paused = true)]
     async fn source_refusals_log_once_per_code_and_keep_the_message_in_detail() {
         let f = Fixture::new();
-        let lines = Arc::new(Mutex::new(Vec::new()));
-        let _subscriber = tracing::subscriber::set_default(MoveLog(lines.clone()));
         let mut source = f.source();
         f.until(&mut source, Step::Exported).await;
         for _ in 0..3 {
@@ -3370,7 +3336,7 @@ mod tests {
             door_ops(&f).iter().filter(|op| *op == "cut.seal").count(),
             4
         );
-        let lines = lines.lock().unwrap();
+        let lines = &source.refusals.lines;
         assert_eq!(lines.len(), 2, "{lines:?}");
         for (line, code, message) in [
             (&lines[0], "cut_not_ready", "streams settling"),

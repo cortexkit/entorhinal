@@ -150,7 +150,16 @@ pub(crate) struct PeerRefusal {
 /// identifiers and the peer's own message, never a request body or session
 /// content.
 #[derive(Default)]
-pub(crate) struct RefusalLog(HashSet<(String, String, String)>);
+pub(crate) struct RefusalLog {
+    seen: HashSet<(String, String, String)>,
+    /// The fields of every line this log wrote, so tests can check what was
+    /// logged without a thread-local tracing subscriber: tracing caches each
+    /// call site's interest process-wide, so under a parallel test run a
+    /// scoped subscriber can miss events that another thread's default
+    /// subscriber had already marked as uninteresting.
+    #[cfg(test)]
+    pub(crate) lines: Vec<String>,
+}
 
 impl RefusalLog {
     pub(crate) fn note(
@@ -161,7 +170,12 @@ impl RefusalLog {
         code: &str,
         message: Option<&str>,
     ) {
-        if self.0.insert((peer.into(), op.into(), code.into())) {
+        if self.seen.insert((peer.into(), op.into(), code.into())) {
+            #[cfg(test)]
+            self.lines.push(format!(
+                "cut={cut:?};peer={peer:?};op={op:?};code={code:?};message={:?};",
+                message.unwrap_or("")
+            ));
             tracing::warn!(
                 target: "move",
                 cut,
