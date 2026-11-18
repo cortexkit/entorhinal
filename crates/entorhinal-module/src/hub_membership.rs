@@ -869,8 +869,9 @@ impl<T: Transport> Membership<T> {
         let (key, arrival_head) = match self.kv_key(&record, applied, sight)? {
             Some(key) => (key, None),
             None => {
-                // Own the delivery while proof discovery runs to the head
-                // observed for this arrival, before refusing the revision.
+                // Hold this unverified value (don't apply or refuse it yet)
+                // while key discovery scans to the log head seen on its
+                // arrival; refuse the revision only if no key is found by then.
                 let head = self.transport.log_head(deadline).await?;
                 self.discover(head, deadline).await?;
                 (

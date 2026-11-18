@@ -594,8 +594,8 @@ fn apply(tx: &Transaction<'_>, entry: &RemoteEntry) -> rusqlite::Result<i64> {
                 {
                     return Err(invalid("snapshot sets box of another author"));
                 }
-                // Check agent after-images inside project.shared just as we
-                // check an agent.* entry that changes those rows directly.
+                // A project.shared entry can carry full agent rows too; check
+                // them as strictly as an agent.* entry that changes them.
                 if project.op == "project.shared" {
                     for agent in &project.agents {
                         check_agent_entry(tx, agent)?;

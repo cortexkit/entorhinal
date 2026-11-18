@@ -113,7 +113,9 @@ mod tests {
 
     #[test]
     fn hub_membership_peer_keys_read_decodes_the_callosum_management_shape() {
-        // Callosum peer-keys-vectors-v3.0, non_vault_sees_only_verification_keys.
+        // A non-vault caller's reply: only verification keys are visible. Copied
+        // from callosum's test-vectors/peer-keys-v3/cases.json (tag
+        // peer-keys-vectors-v3.0), case non_vault_sees_only_verification_keys.
         let mut reply = json!({"peers":[{
             "fingerprint":"72cd6e8422c407fb6d098690f1130b7d",
             "key_record":{"keys":{"fleet_record_ed25519":{"pub":"ee05","version":"13"},"msgsig_ed25519":{"pub":"bb02","version":"5"}}},

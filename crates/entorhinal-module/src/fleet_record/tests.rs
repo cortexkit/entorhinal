@@ -272,7 +272,12 @@ async fn fleet_record_control_kinds_are_signed_without_an_epoch() {
                 input: None,
             },
         ]);
-        let body = json!({"\u{e000}": "BMP", "\u{10000}": [null, 0.000001]});
+        let mut body = json!({"\u{e000}": "BMP", "\u{10000}": [null, 0.000001]});
+        if kind == "member.key" {
+            // A key announcement must name the vault's current signing key.
+            body["version"] = FIXTURE_KEY_ID.into();
+            body["pub"] = text(&vectors, "public_key_hex").into();
+        }
         let prepared = prepare(&vault.signer(), &vault.epoch_vault(), &header, &body)
             .await
             .unwrap();
@@ -287,9 +292,19 @@ async fn fleet_record_control_kinds_are_signed_without_an_epoch() {
             .unwrap()
             .verify(text(&vectors, "public_key_hex"))
             .unwrap();
+        // The literal pins JCS's UTF-16 key order; a key announcement adds
+        // ASCII members that sort ahead of both.
+        let expected = if kind == "member.key" {
+            format!(
+                "{{\"pub\":\"{}\",\"version\":\"{FIXTURE_KEY_ID}\",\"\u{10000}\":[null,0.000001],\"\u{e000}\":\"BMP\"}}",
+                text(&vectors, "public_key_hex")
+            )
+        } else {
+            "{\"\u{10000}\":[null,0.000001],\"\u{e000}\":\"BMP\"}".to_owned()
+        };
         assert_eq!(
             read.open(&vault.epoch_vault()).await.unwrap(),
-            "{\"\u{10000}\":[null,0.000001],\"\u{e000}\":\"BMP\"}".as_bytes()
+            expected.as_bytes()
         );
         vault.done();
     }
