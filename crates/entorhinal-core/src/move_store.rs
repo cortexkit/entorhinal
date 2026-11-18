@@ -528,7 +528,7 @@ impl RegistryStore {
         }
     }
 
-    /// Read the agent's live bound (ref_kind, ref) pairs in stable order. Participants
+    /// Read the agent's open head (ref_kind, ref) pairs in stable order. Participants
     /// move data by these pairs, not by the source machine's host-session identifiers.
     pub fn agent_bound_refs(&self, agent_id: &str) -> Result<Vec<MoveRef>, RegistryError> {
         self.read(|conn| bound_refs(conn, agent_id))
@@ -537,7 +537,7 @@ impl RegistryStore {
     pub fn agent_has_bindings(&self, agent_id: &str) -> Result<bool, RegistryError> {
         self.read(|conn| {
             conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM session_binding WHERE agent_id=?1)",
+                "SELECT EXISTS(SELECT 1 FROM session_binding WHERE agent_id=?1 AND role='head')",
                 [agent_id],
                 |r| r.get(0),
             )
@@ -1051,7 +1051,7 @@ impl RegistryStore {
 
 fn bound_refs(conn: &rusqlite::Connection, agent_id: &str) -> rusqlite::Result<Vec<MoveRef>> {
     let mut stmt = conn.prepare(
-        "SELECT ref_kind,ref FROM session_binding WHERE agent_id=?1 AND ended_at_ms IS NULL ORDER BY ref_kind,ref",
+        "SELECT ref_kind,ref FROM session_binding WHERE agent_id=?1 AND ended_at_ms IS NULL AND role='head' ORDER BY ref_kind,ref",
     )?;
     let rows = stmt
         .query_map([agent_id], |r| {
@@ -1613,6 +1613,7 @@ mod tests {
 
     fn registration(agent: &str) -> crate::SessionRegistration<'_> {
         crate::SessionRegistration {
+            role: None,
             agent_id: agent,
             ref_kind: "session",
             session_ref: "r",

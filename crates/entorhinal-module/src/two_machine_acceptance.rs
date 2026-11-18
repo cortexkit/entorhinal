@@ -2226,6 +2226,7 @@ mod moves {
         ) -> Result<entorhinal_core::SessionBinding, entorhinal_core::agent::AgentMutationError>
         {
             self.store().register_session(&SessionRegistration {
+                role: None,
                 agent_id: agent,
                 ref_kind: kind,
                 session_ref: reference,

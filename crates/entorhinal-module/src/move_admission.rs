@@ -777,6 +777,7 @@ mod tests {
         {
             self.store()
                 .register_session(&entorhinal_core::SessionRegistration {
+                    role: None,
                     agent_id: id,
                     ref_kind: "session",
                     session_ref: reference,
@@ -897,6 +898,53 @@ mod tests {
         assert!(f.store().list_agent_moves().unwrap().is_empty());
     }
 
+    #[tokio::test]
+    async fn session_role_running_delegated_sessions_do_not_consume_cap_or_block_admission() {
+        let f = Fixture::new(2).await;
+        let id = f.create().await;
+        for n in 0..257 {
+            let reference = format!("delegated-{n}");
+            f.store()
+                .register_session(&entorhinal_core::SessionRegistration {
+                    agent_id: &id,
+                    ref_kind: "session",
+                    session_ref: &reference,
+                    harness: "host",
+                    session_id: &reference,
+                    project_root: Some("/project"),
+                    registered_by: "host",
+                    runner: Some("data"),
+                    role: Some("delegated"),
+                    network: None,
+                    now_ms: 700,
+                })
+                .unwrap();
+            f.discovery.participant.set_busy(
+                AgentRef::new("session", &reference),
+                BusyRef::new(BusyState::Busy),
+            );
+            let mut mirror = f.handler.liveness.lock().unwrap();
+            mirror
+                .bus
+                .apply(crate::liveness_bus::tests::put(
+                    &format!("host.{reference}"),
+                    "host",
+                    &reference,
+                    "active",
+                ))
+                .unwrap();
+            crate::liveness_bus::tests::reconcile(&mut mirror);
+        }
+        f.register(&id, "head").unwrap();
+        f.store().end_session("host", "head", None, 701).unwrap();
+        let moved = result(f.move_(ORCH, &id).await);
+        assert_eq!(moved["step"], "preparing");
+        let row = f.store().list_agent_moves().unwrap().pop().unwrap();
+        for participant in row.plan["participants"].as_array().unwrap() {
+            assert!(participant["refs"].as_array().unwrap().is_empty());
+        }
+    }
+
     /// An idle session may move only when its own runner is the participant
     /// that holds its ref, because that participant freezes it at `prepare`.
     /// An active session, or an idle one whose runner is unknown or not in the
@@ -914,6 +962,7 @@ mod tests {
             if let Some(runner) = runner {
                 f.store()
                     .register_session(&entorhinal_core::SessionRegistration {
+                        role: None,
                         agent_id: &id,
                         ref_kind: "session",
                         session_ref: "r",
@@ -973,6 +1022,7 @@ mod tests {
             let id = f.create().await;
             f.store()
                 .register_session(&entorhinal_core::SessionRegistration {
+                    role: None,
                     agent_id: &id,
                     ref_kind: "session",
                     session_ref: "r",

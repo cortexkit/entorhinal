@@ -138,6 +138,63 @@ fn agent_move(cut: &str, side: MoveSide, step: MoveStep, refs: &[MoveRef]) -> Ag
 }
 
 #[test]
+fn session_role_cut_and_records_leave_delegated_bindings_on_origin() {
+    let f = Fixture::new();
+    let head = binding("head", Some("broca"), vec![]);
+    let delegated = binding("delegated", Some("broca"), vec![entry("yes", 100)]);
+    let mut delegated_ended = binding("delegated-ended", Some("broca"), vec![]);
+    delegated_ended.ended_at_ms = Some(200);
+    for row in [&delegated, &delegated_ended] {
+        f.bind(AGENT, row);
+    }
+    f.store
+        .db
+        .with_conn_fenced(|tx| tx.execute("UPDATE session_binding SET role='delegated'", []))
+        .unwrap();
+    assert!(!f.store.agent_has_bindings(AGENT).unwrap());
+    f.bind(AGENT, &head);
+    let refs = f.store.agent_bound_refs(AGENT).unwrap();
+    assert_eq!(refs, vec![move_ref(&head)]);
+    assert!(f.store.agent_has_bindings(AGENT).unwrap());
+    let late = binding("late-delegated", Some("broca"), vec![]);
+    f.bind(AGENT, &late);
+    f.store
+        .db
+        .with_conn_fenced(|tx| {
+            tx.execute(
+                "UPDATE session_binding SET role='delegated' WHERE ref=?1",
+                [&late.session_ref],
+            )
+        })
+        .unwrap();
+    let mut row = agent_move("cut", MoveSide::Source, MoveStep::Preparing, &refs);
+    row.request_key = Some("role-move".into());
+    row.request_body = Some(json!({"agent_id":AGENT}));
+    f.store.admit_agent_move(&row, &refs).unwrap();
+    assert_eq!(
+        f.store.export_session_bindings("cut", AGENT).unwrap(),
+        vec![head]
+    );
+    for row in [&delegated, &delegated_ended] {
+        let stored = f
+            .store
+            .session_binding_for("broca", row.session_id.as_deref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.role, "delegated");
+        assert!(stored.held_on.is_none());
+    }
+    assert_eq!(
+        f.store
+            .session_binding_for_runner("broca", "delegated")
+            .unwrap()
+            .unwrap()
+            .network_history,
+        delegated.network_history
+    );
+}
+
+#[test]
 fn export_reads_every_binding_with_its_history_under_the_open_source_move() {
     let f = Fixture::new();
     let live = binding(

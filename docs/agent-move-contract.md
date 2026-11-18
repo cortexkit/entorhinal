@@ -133,9 +133,9 @@ on refusal:
 6. `move_in_progress` when the agent already has an open move; `move_cap` at
    four open moves.
 7. Participant discovery: every required participant must be available, and
-   every bound session reference kind must be covered by a participant
+   every carried session reference kind must be covered by a participant
    (`participant_unavailable`).
-8. Idle: every bound session must read `gone` in session liveness, or `idle`
+8. Idle: every carried session must read `gone` in session liveness, or `idle`
    when the session's recorded runner is itself a participant in this move
    holding that reference (its `prepare` refuses while a turn runs and freezes
    the session before answering). A host that is not a participant, such as an
@@ -438,9 +438,13 @@ be overwritten by a late transfer completion.
 ## 11. Session bindings
 
 A binding row (`session_binding`) and its network history (`session_network`)
-are machine-local. Only bindings with `ended_at_ms IS NULL` at admission
+are machine-local. Only head bindings with `ended_at_ms IS NULL` at admission
 enter the participant ref set as `(ref_kind, ref)`. That set is fixed for the
-whole move: ending a session afterwards does not remove its ref. Finished
+whole move: ending a session afterwards does not remove its ref. Delegated
+bindings, open or finished, stay bound on the origin computer with their runner
+sessions and network history: neither refs nor metadata for them travel. Their
+liveness and number do not affect admission, its transactional session-set
+recheck, or the 256-ref cap. An omitted session role means head. Finished head
 bindings never enter participant prepare, export, import, activate, release
 or abort calls; only their metadata travels in entorhinal's own stream.
 Admission refuses more than 256 live session refs as `live_ref_cap`, with detail

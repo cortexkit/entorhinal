@@ -141,6 +141,7 @@ fn registration<'a>(
     now_ms: i64,
 ) -> SessionRegistration<'a> {
     SessionRegistration {
+        role: None,
         agent_id: AGENT,
         ref_kind: "broca-session",
         session_ref: "ref-1",
@@ -152,6 +153,107 @@ fn registration<'a>(
         network: None,
         now_ms,
     }
+}
+
+#[test]
+fn session_role_absent_and_migrated_rows_store_head() {
+    let f = Fixture::with_migrations(&MIGRATIONS[..23]);
+    f.bind(AGENT, "legacy", 1, Some("broca"), None);
+    drop(f.store);
+    let store = RegistryStore::open_with_migrations(&f.descriptor, &MIGRATIONS).unwrap();
+    let legacy = store
+        .session_binding_for("broca", "legacy")
+        .unwrap()
+        .unwrap();
+    assert_eq!(legacy.role, "head");
+    assert!(serde_json::to_value(legacy).unwrap().get("role").is_none());
+    let binding = store
+        .register_session(&registration("new", Some("broca"), 2))
+        .unwrap();
+    assert_eq!(binding.role, "head");
+    let stored: String = store
+        .read(|conn| {
+            conn.query_row(
+                "SELECT role FROM session_binding WHERE session_id='new'",
+                [],
+                |row| row.get(0),
+            )
+        })
+        .unwrap();
+    assert_eq!(stored, "head");
+}
+
+#[test]
+fn session_role_unknown_refuses_without_writes() {
+    let f = Fixture::new();
+    let mut request = registration("s1", Some("broca"), 10);
+    request.role = Some("worker");
+    request.network = Some(crate::NetworkStamp {
+        network: "yes",
+        clock: || 10,
+    });
+    assert_eq!(
+        f.store.register_session(&request).unwrap_err().code,
+        "invalid_request"
+    );
+    assert_eq!(f.count(), 0);
+    let history: i64 = f
+        .store
+        .read(|conn| conn.query_row("SELECT COUNT(*) FROM session_network", [], |row| row.get(0)))
+        .unwrap();
+    assert_eq!(history, 0);
+    request.role = None;
+    f.store.register_session(&request).unwrap();
+    request.role = Some("worker");
+    assert_eq!(
+        f.store.register_session(&request).unwrap_err().code,
+        "invalid_request"
+    );
+    assert_eq!(
+        f.store
+            .session_binding_for("broca", "s1")
+            .unwrap()
+            .unwrap()
+            .role,
+        "head"
+    );
+}
+
+#[test]
+fn session_role_reregistration_and_rekeys_update_in_place() {
+    let f = Fixture::new();
+    let mut request = registration("s1", Some("broca"), 10);
+    request.network = Some(crate::NetworkStamp {
+        network: "yes",
+        clock: || 10,
+    });
+    f.store.register_session(&request).unwrap();
+    request.role = Some("delegated");
+    let binding = f.store.register_session(&request).unwrap();
+    assert_eq!(binding.role, "delegated");
+    request.session_ref = "rekeyed";
+    request.role = Some("head");
+    assert_eq!(f.store.register_session(&request).unwrap().role, "head");
+    request.ref_kind = "new-host-kind";
+    request.session_ref = "new-host-ref";
+    request.harness = "new-host";
+    request.role = Some("delegated");
+    assert_eq!(
+        f.store.register_session(&request).unwrap().role,
+        "delegated"
+    );
+    assert_eq!(f.count(), 1);
+    let read = f
+        .store
+        .session_binding_for_runner("broca", "s1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.role, "delegated");
+    assert_eq!(read.network_history.len(), 1);
+    assert_eq!(
+        f.store.agent_sessions(AGENT, None, 100).unwrap().sessions[0].role,
+        "delegated"
+    );
 }
 
 /// A store just before migration 15 keeps its bindings across it, with no
@@ -777,6 +879,7 @@ fn agent_sessions_pages_newest_first_and_cursor_survives_inserts() {
     assert_eq!(
         second.sessions[0],
         AgentSession {
+            role: "head".into(),
             runner: None,
             session: Some("b".into()),
             harness: Some("broca".into()),
@@ -845,6 +948,7 @@ fn hosted<'a>(
     runner: Option<&'a str>,
 ) -> SessionRegistration<'a> {
     SessionRegistration {
+        role: None,
         agent_id: AGENT,
         ref_kind: "broca-session",
         session_ref,
@@ -976,6 +1080,7 @@ fn session_binding_for_runner_finds_only_runner_rows() {
     assert_eq!(
         f.store.session_binding_for_runner("broca", "s1").unwrap(),
         Some(crate::RunnerSessionBinding {
+            role: "head".into(),
             agent_id: AGENT.into(),
             runner: Some("broca".into()),
             session: "s1".into(),

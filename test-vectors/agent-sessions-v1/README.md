@@ -41,7 +41,7 @@ objects deny unknown fields; a field outside the listed schema is an
 `invalid_request`.
 
 - `agent.register_session`: exactly
-  `{agent_id, ref_kind, ref, harness, session_id, runner, project_root?}`. The reference
+  `{agent_id, ref_kind, ref, harness, session_id, runner, project_root?, role?}`. The reference
   kind is 1–64 bytes, reference 1–512 bytes, harness 1–32 bytes, session ID
   1–256 bytes, and a supplied project root 1–4096 bytes (not null). Omitting the
   root keeps a stored root on re-registration or re-key; a new binding without
@@ -92,6 +92,12 @@ objects deny unknown fields; a field outside the listed schema is an
   is never echoed in the reply. A value that differs from the binding's
   current one is appended to its network history, stamped with the
   handler's clock when it commits.
+- `agent.register_session` may carry `role: "head" | "delegated"`. Absent stores
+  `head`; null, a non-string or another value refuses `invalid_request` before
+  writing. Re-registration and re-keying update it in place. Binding replies
+  and session-list/watch rows include `role` only for `delegated`, so all older
+  samples remain byte-identical. Delegated refs and records stay on the origin
+  computer when the head agent moves.
 - `agent.set_session_network`: exactly `{harness, session, network}`.
   Harness is 1–32 bytes, session 1–256 bytes, network as above. Accepted
   only from the sole provider of `agent-orchestrator/v1`. Replies
@@ -270,9 +276,16 @@ a backfill makes the data local.
   exactly two rows. All three records use clock `700` and incarnation
   `0123456789abcdef`; the complete canonical scratch root is mapped explicitly
   to `/fixture/head-project`, including in registration requests.
-- **`SHA256SUMS`**: SHA-256 hashes of the twenty-three JSON vector files, with
+- **`SHA256SUMS`**: SHA-256 hashes of every JSON vector file, with
   names relative to this directory. The first ten lines are pinned by
   `served_vectors::agent_session_samples_keep_their_pinned_bytes_and_checksums`.
+- **`register-session-delegated.json`**: delegated registration and reply,
+  captured from the real served handler with clock `700`.
+- **`sessions-delegated.json`**: the registered delegated binding returned by
+  `agent.sessions`, `agent.session_for_ref`, `agent.session_for_runner` and
+  `agent.session_for_harness`; every row includes `role: "delegated"`.
+- **`register-session-unknown-role.json`**: unknown role `worker` refuses
+  `invalid_request`, leaving the binding and its network history unchanged.
 
 ## SHA-256 hashes
 
@@ -300,8 +313,22 @@ a backfill makes the data local.
 | `sessions-watch.json` | `980cd6b43063981601f7b7e325d9108f120aa8e075df67355a2d1b93efb0af1e` |
 | `register-session-head.json` | `ddeb70078b3404ab8d5f06c90a301fcc474ab4ff8fcedf508b16bfdecc3adf7c` |
 | `register-session-missing-runner.json` | `0743fc894172825942eebecea6d6d23625458caf82ef0f4ef2b4dfbc03b90e16` |
+| `register-session-delegated.json` | `39b69f33fb77b2b121ac0cf6033eae24aca28738aab90683e2e89618d856f345` |
+| `sessions-delegated.json` | `b210b3e6b3e0530cf0cb0cf8be597a2ea76ef72dea342a7de3d294abb2511c16` |
+| `register-session-unknown-role.json` | `0fa48df18d199c86dd771ab81cad438d032900f8bcb2b93ec40fc6b2553e3721` |
 
 ## Reproduce and verify
+
+The delegated lookup replies are also decoded and re-encoded through
+`cortexkit-agent-identity` 0.1.3 in
+`served_vectors::session_role_published_identity_types_drop_role`. Its
+`AgentSessionForRefReply`, `AgentSessionForRunnerReply` and
+`AgentSessionForHarnessReply` types accept the replies but drop `role` on
+re-encoding. They do not round-trip these new records exactly. The existing
+exact-roundtrip checks are unchanged; no dependency or reply is altered to
+hide the missing field.
+`served_vectors::agent_identity_published_records_roundtrip_exactly` does not
+cover `agent.sessions`.
 
 From the repository root, generate the vector files with:
 
@@ -313,6 +340,7 @@ ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked served
 ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked served_vectors::sessions_head_runners_match_published_file -- --exact --nocapture
 ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked served_vectors::node_self_records_match_published_file -- --exact --nocapture
 ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked served_vectors_sessions_watch_records_match_published_file -- --nocapture
+ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked session_role_records_match_published_files -- --nocapture
 ```
 
 Refresh their hashes from the repository root with:
@@ -322,7 +350,7 @@ python3 - <<'PY'
 import hashlib
 from pathlib import Path
 root = Path('test-vectors/agent-sessions-v1')
-names = ['for-session.json', 'register-session.json', 'session-for-ref.json', 'where.json', 'where-many.json', 'where-moving-receiver.json', 'where-moving-source.json', 'where-sharing-off.json', 'end-session.json', 'register-session-runner.json', 'session-for-runner.json', 'sessions.json', 'set-session-network.json', 'register-session-rekey.json', 'sessions-held-on.json', 'sessions-open.json', 'session-lookup-cases.json', 'sessions-head-runners.json', 'session-for-harness.json', 'node-self.json', 'sessions-watch.json', 'register-session-head.json', 'register-session-missing-runner.json']
+names = ['for-session.json', 'register-session.json', 'session-for-ref.json', 'where.json', 'where-many.json', 'where-moving-receiver.json', 'where-moving-source.json', 'where-sharing-off.json', 'end-session.json', 'register-session-runner.json', 'session-for-runner.json', 'sessions.json', 'set-session-network.json', 'register-session-rekey.json', 'sessions-held-on.json', 'sessions-open.json', 'session-lookup-cases.json', 'sessions-head-runners.json', 'session-for-harness.json', 'node-self.json', 'sessions-watch.json', 'register-session-head.json', 'register-session-missing-runner.json', 'register-session-delegated.json', 'sessions-delegated.json', 'register-session-unknown-role.json']
 root.joinpath('SHA256SUMS').write_text(''.join(
     f'{hashlib.sha256(root.joinpath(name).read_bytes()).hexdigest()}  {name}\n'
     for name in names), encoding='utf-8')

@@ -48,6 +48,7 @@ fn register_sessions(pair: &Pair) {
         pair.a
             .store()
             .register_session(&SessionRegistration {
+                role: None,
                 agent_id: AGENT,
                 ref_kind: KIND,
                 session_ref: &reference,
@@ -272,6 +273,90 @@ async fn moved_bindings_and_network_history_read_the_same_on_both_machines_and_b
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn session_role_move_leaves_running_delegated_session_and_history_on_origin() {
+    let pair = bindings_pair(SourceFault::default()).await;
+    pair.a
+        .store()
+        .register_session(&SessionRegistration {
+            agent_id: AGENT,
+            ref_kind: KIND,
+            session_ref: "ref-delegated",
+            harness: HARNESS,
+            session_id: "delegated",
+            project_root: Some("/work/project"),
+            registered_by: "host",
+            runner: Some(RUNNER),
+            role: Some("delegated"),
+            network: Some(NetworkStamp {
+                network: "yes",
+                clock,
+            }),
+            now_ms: clock(),
+        })
+        .unwrap();
+    pair.a.discovery.peers["broca"].hold(AgentRef::new(KIND, "ref-delegated"));
+    {
+        let mut state = pair.a.machine.handler.liveness.lock().unwrap();
+        state
+            .bus
+            .apply(crate::liveness_bus::tests::put(
+                "broca.delegated",
+                HARNESS,
+                "delegated",
+                "active",
+            ))
+            .unwrap();
+        crate::liveness_bus::tests::reconcile(&mut state);
+    }
+    let before = pair
+        .a
+        .store()
+        .session_binding_for_runner(RUNNER, "delegated")
+        .unwrap()
+        .unwrap();
+    let cut = pair.published("leave-delegated").await;
+    for participant in pair.a.record(&cut).await.participants {
+        assert!(participant
+            .refs
+            .iter()
+            .all(|r| r.reference != "ref-delegated"));
+    }
+    pair.finish(&cut).await;
+    assert_eq!(
+        pair.a
+            .store()
+            .session_binding_for_runner(RUNNER, "delegated")
+            .unwrap(),
+        Some(before)
+    );
+    assert!(pair
+        .b
+        .store()
+        .session_binding_for_runner(RUNNER, "delegated")
+        .unwrap()
+        .is_none());
+    assert!(pair
+        .b
+        .store()
+        .session_bindings_for_refs(&[(KIND, "ref-delegated")])
+        .unwrap()[0]
+        .is_none());
+    assert!(pair
+        .b
+        .store()
+        .session_binding_for_runner(RUNNER, "live-1")
+        .unwrap()
+        .is_some());
+    for node in [&pair.a, &pair.b] {
+        for request in node.discovery.peers["broca"].calls() {
+            if let Some(refs) = request.refs() {
+                assert!(refs.as_slice().iter().all(|r| r.r#ref != "ref-delegated"));
+            }
+        }
+    }
+}
+
 /// An agent with no bindings and no catalog pins leaves entorhinal out of
 /// the move, as before bindings were carried, and opens no stream of its
 /// own, even though entorhinal is listed as a participant.
@@ -454,6 +539,7 @@ async fn held_elsewhere_registration_and_rekey_refuse_without_writes() {
             .b
             .store()
             .register_session(&SessionRegistration {
+                role: None,
                 agent_id: AGENT,
                 ref_kind: KIND,
                 session_ref: reference,

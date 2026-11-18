@@ -4,6 +4,7 @@ use entorhinal_core::{SessionRegistration, SESSION_RETENTION_MS};
 fn register(f: &Fixture, agent: &str, reference: &str, harness: &str, session: &str, runner: &str) {
     store(f)
         .register_session(&SessionRegistration {
+            role: None,
             agent_id: agent,
             ref_kind: harness,
             session_ref: reference,

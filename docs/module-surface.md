@@ -437,6 +437,18 @@ Claims say which of the operator's machines holds an agent or a role. They are
 records in engram that entorhinal caches locally; every read here answers from
 the cache, so it works offline and never waits on engram.
 
+`agent.register_session` accepts optional `role: "head" | "delegated"`.
+Omission stores `head`, including for existing bindings; any other value
+(including null or a non-string) refuses `invalid_request` before writing.
+Re-registration, reference re-keying and host-kind changes update the session
+role in place while preserving the existing network history. This field is
+independent of `registered_by`, which records the admitting capability.
+Registration replies and binding rows in `agent.sessions`, `agent.sessions_watch`,
+`agent.session_for_ref`, `agent.session_for_runner` and `agent.session_for_harness`
+include `role` only for `delegated`; head replies omit it, preserving existing
+bytes. Head sessions move with the agent. Delegated sessions and their records
+stay on the computer that launched them and do not block a move.
+
 | Operation | Kind | Who | What it does |
 |---|---|---|---|
 | `agent.register_session` | mutate | orchestrator or host | Bind an agent's session reference to its host session. Optional `project_root` is a 1–4096-byte string when sent (not null); omission keeps a stored root, or stores unknown for a new binding. Unknown roots read as null in `agent.session_for_ref`, `agent.sessions` and `agent.session_for_runner`. Required `runner` names the llm-runner module hosting it (1–64 bytes, no control characters); omission, null or an empty value refuses `invalid_request` before writing. Re-registration records the named runner, and any re-registration clears the end time. A runner and session id already bound to another binding refuse `session_bound_elsewhere`. Optional `network` (`yes`, `no` or `unknown`; `null` is absent, anything else refuses `invalid_request`) is appended to the binding's network history when it differs from the current value, stamped at commit; a full history refuses `network_history_full` and registers nothing. The reply never echoes `runner` or `network`. |
