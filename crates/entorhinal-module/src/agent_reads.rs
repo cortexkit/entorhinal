@@ -1772,7 +1772,8 @@ mod tests {
                 "permissions/v1",
                 "tool-provider/v1",
                 "agent-data/v1",
-                "call-modes/v1"
+                "call-modes/v1",
+                "agent-session-role/v1"
             ])
         );
         assert_eq!(manifest["capabilities"]["requires"], json!([]));

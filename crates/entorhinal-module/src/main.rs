@@ -2563,7 +2563,11 @@ fn manifest() -> ModuleManifest {
             permissions::CAPABILITY.to_owned(),
             cortexkit_role_tool_provider::PROVIDES.to_owned(),
             cortexkit_role_agent_data::PROVIDES.to_owned(),
-            cortexkit_role_tool_provider::CALL_MODES_CAPABILITY.to_owned()],
+            cortexkit_role_tool_provider::CALL_MODES_CAPABILITY.to_owned(),
+            // `agent.register_session` accepts `role`. An older entorhinal
+            // refuses the unknown field, so callers send it only while the
+            // live provider declares this.
+            sessions::SESSION_ROLE_CAPABILITY.to_owned()],
         // Entorhinal calls engram (the module hosting the shared identity log)
         // only to write shared state, and serves every read without it. So
         // nothing is declared here: a `requires` entry makes the daemon refuse
@@ -4702,7 +4706,8 @@ mod tests {
                 "permissions/v1",
                 "tool-provider/v1",
                 "agent-data/v1",
-                "call-modes/v1"
+                "call-modes/v1",
+                "agent-session-role/v1"
             ])
         );
         assert_eq!(value["capabilities"]["requires"], json!([]));

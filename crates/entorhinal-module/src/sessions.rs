@@ -71,6 +71,8 @@ pub(super) const HOST_CAPABILITY: &str = "agent-host/v1";
 /// to the daemon; one that has not answered by then counts as a transport
 /// failure, which admits no one.
 const RESOLVE_DEADLINE: Duration = Duration::from_secs(5);
+/// Declared capability: `agent.register_session` accepts `role`.
+pub(crate) const SESSION_ROLE_CAPABILITY: &str = "agent-session-role/v1";
 
 const REF_KIND_MAX: usize = 64;
 const REF_MAX: usize = 512;

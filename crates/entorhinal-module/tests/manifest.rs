@@ -77,7 +77,8 @@ fn manifest_flag_prints_the_manifest_with_the_provided_capability() {
             "permissions/v1",
             "tool-provider/v1",
             "agent-data/v1",
-            "call-modes/v1"
+            "call-modes/v1",
+            "agent-session-role/v1"
         ])
     );
     assert_eq!(
