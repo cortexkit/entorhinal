@@ -7,7 +7,7 @@ members = ["crates/entorhinal-core", "crates/entorhinal-module", "crates/entorhi
 # no sibling checkouts beside it.
 subc-client-rs = "0.40.3"
 subc-control = "0.40.0"
-subc-protocol = "0.37.0"
+subc-protocol = "0.37.4"
 subc-transport = "0.18.0"
 
 cortexkit-bus-client = "0.1.7"
