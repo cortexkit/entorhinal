@@ -10,7 +10,7 @@ subc-control = "0.40.0"
 subc-protocol = "0.37.4"
 subc-transport = "0.18.0"
 
-cortexkit-bus-client = "0.1.7"
+cortexkit-bus-client = "0.1.8"
 cortexkit-bus-naming = "0.5.0"
 cortexkit-bus-nats = "0.5.4"
 cortexkit-paths = "0.1.1"

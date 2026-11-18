@@ -271,14 +271,11 @@ async fn hub_transport_live_leaf_outage_resumes_and_never_queues_unsent_write() 
         .unwrap();
     let health = Arc::new(HealthGauges::default());
     let session = || Session::new(client.clone(), health.clone());
-    let box_id: BoxId = "0123456789abcdef0123456789abcdef".parse().unwrap();
     let mut watch = Feed::kv(health.clone(), {
         let client = client.clone();
         let health = health.clone();
-        let box_id = box_id.clone();
         move |cursor| {
             Binding {
-                box_id: box_id.clone(),
                 session: Session::new(client.clone(), health.clone()),
                 changes: None,
             }
@@ -290,7 +287,6 @@ async fn hub_transport_live_leaf_outage_resumes_and_never_queues_unsent_write() 
         let health = health.clone();
         move |cursor| {
             Binding {
-                box_id: box_id.clone(),
                 session: Session::new(client.clone(), health.clone()),
                 changes: None,
             }

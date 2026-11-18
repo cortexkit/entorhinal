@@ -189,7 +189,6 @@ async fn served_role_lease_v1_non_hub_records_match_published_files() {
     Arc::get_mut(&mut fixture.handler.role_leases)
         .unwrap()
         .sample_clock(move || now.load(Ordering::Relaxed));
-    let store = store(&fixture);
     let handler = Arc::new(std::mem::replace(
         &mut fixture.handler,
         ProjectsHandler::with_runtime(INCARNATION.into(), || 700),
@@ -226,6 +225,10 @@ async fn served_role_lease_v1_non_hub_records_match_published_files() {
     assert_eq!(handler.role_leases.held(), 0);
     publish("sharing-disabled.json", disabled);
 
+    // The published sharing samples each start from a fresh store.
+    let (fresh_dir, descriptor) = crate::tests::scratch_descriptor("served-role-lease-engram");
+    let store = entorhinal_core::RegistryStore::open(&descriptor).unwrap();
+    *handler.store.lock().unwrap() = Some(store.clone());
     store
         .apply_entry("fixture.lease", "{}", "fixture", None, |tx| {
             tx.execute(
@@ -290,9 +293,33 @@ async fn served_role_lease_v1_non_hub_records_match_published_files() {
             output(WATCH, &dreamer, &m, &[local]),
         ],
     );
+    module.cancel_request(mc, corr).await;
+    frame(&mut module, corr, FrameType::StreamEnd).await;
+    store
+        .record_hub_kv(
+            "role.dreamer.global",
+            1,
+            Some((b"verified role", Some(&json!({"gen":12})))),
+            700,
+        )
+        .unwrap();
+    let corr = module
+        .send_request(mc, request(WATCH, dreamer.clone()))
+        .await;
+    let regrant = frame(&mut module, corr, FrameType::StreamData).await;
+    let notice = ack_frame(&mut module, mc, GLOBAL, &regrant).await;
+    assert_eq!(notice["gen"], 13);
+    assert_eq!(notice["holding"], true);
+    publish(
+        "local-after-hub.json",
+        vec![output(WATCH, &dreamer, &m, &[regrant])],
+    );
     assert!(start.elapsed() >= Duration::from_secs(40));
     module.shutdown().await;
     crate::tests::stop_store_tasks(&handler).await;
+    handler.store.lock().unwrap().take();
+    drop(store);
+    let _ = std::fs::remove_dir_all(fresh_dir);
 }
 
 async fn ack_frame(

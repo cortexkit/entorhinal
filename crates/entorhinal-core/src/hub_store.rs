@@ -13,11 +13,17 @@ ALTER TABLE identity_log_state ADD COLUMN hub_ready INTEGER NOT NULL DEFAULT 0
     CHECK(hub_ready IN (0,1) AND (hub_ready = 0 OR hub_log_base IS NOT NULL));
 -- The freeze records both the migration id and whether the marker is pending or applied.
 ALTER TABLE identity_log_state ADD COLUMN engram_frozen TEXT NULL;
+ALTER TABLE identity_log_state ADD COLUMN hub_quieting INTEGER NOT NULL DEFAULT 0 CHECK(hub_quieting IN (0,1));
 ALTER TABLE identity_log_state ADD COLUMN enable_id TEXT NULL;
 ALTER TABLE identity_log_state ADD COLUMN enable_snapshot_digest TEXT NULL;
 
 ALTER TABLE agent_move ADD COLUMN receiver_decision TEXT NULL
     CHECK(receiver_decision IS NULL OR (side = 'receiver' AND receiver_decision IN ('abort','activate')));
+
+CREATE TABLE role_gen_high_water (
+    role TEXT PRIMARY KEY NOT NULL,
+    gen INTEGER NOT NULL CHECK(gen > 0)
+);
 
 -- Refusing a revision marks the key without throwing away its last accepted
 -- value. Watch liveness and lease timing are never restored from these rows.
@@ -488,13 +494,19 @@ impl RegistryStore {
     ) -> Result<bool, RegistryError> {
         self.with_where_changes(|tx| {
             if let Some((value, body)) = accepted {
-                Ok(tx.execute(
+                let updated = tx.execute(
                     "INSERT INTO hub_kv_cache(key,revision,accepted_revision,value,body,read_at_ms,integrity_failed)
                      VALUES(?1,?2,?2,?3,?4,?5,0)
                      ON CONFLICT(key) DO UPDATE SET revision=?2,accepted_revision=?2,value=?3,body=?4,read_at_ms=?5,integrity_failed=0
                      WHERE revision<?2 OR (revision=?2 AND integrity_failed=0 AND value=?3)",
                     params![key, revision, value, body.map(Value::to_string), now],
-                )? != 0)
+                )? != 0;
+                if updated {
+                    if let (Some(role), Some(gen)) = (key.strip_prefix("role."), body.and_then(|v| v["gen"].as_i64())) {
+                        crate::role_cache::raise_gen(tx, role, gen)?;
+                    }
+                }
+                Ok(updated)
             } else {
                 Ok(tx.execute(
                     "INSERT INTO hub_kv_cache(key,revision,integrity_failed,read_at_ms) VALUES(?1,?2,1,?3)

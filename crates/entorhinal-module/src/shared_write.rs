@@ -3780,6 +3780,13 @@ impl ChangeWriter<'_> {
                         message: "log head moved".into(),
                     }
                 }
+                Ok(Err(LogError::Refused { code, .. })) if code == "hub_switch_pending" => {
+                    return SharedSettlement::Rollback {
+                        sent: false,
+                        code,
+                        message: crate::hub_switch::pending().message,
+                    };
+                }
                 Ok(Err(LogError::IdReused)) | Ok(Ok(_)) => {
                     self.health.log_state.store(3, Ordering::Relaxed);
                     tracing::warn!(entry_id = %log_client::encode_hex(&request.entry_id), "identity log invariant: entry id reused or invalid receipt position");

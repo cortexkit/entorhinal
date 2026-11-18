@@ -107,6 +107,7 @@ mod hub_identity_log;
 mod hub_membership;
 mod hub_moves;
 mod hub_residence;
+mod hub_switch;
 // The hub backend starts this transport only when the store selects it.
 #[allow(dead_code)]
 mod hub_transport;
@@ -565,6 +566,8 @@ struct ProjectsHandler {
     draining: tokio::sync::watch::Sender<bool>,
     catch_up_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     hub_residence: Mutex<Option<hub_residence::Running>>,
+    hub_switch: Option<hub_switch::Switch>,
+    legacy_move_admission: Arc<Mutex<()>>,
     catch_up_wake: Arc<tokio::sync::Notify>,
     record_client: record_client::RecordClient,
     participant_discovery: Arc<dyn participant_discovery::ParticipantDiscovery>,
@@ -685,6 +688,7 @@ const MUTATING_METHODS: &[&str] = &[
     "rebind_root",
     "attach_root",
     "identity_log.enable",
+    hub_switch::EXCLUDE,
     catalog_ops::ADD,
     catalog_ops::REPIN,
     catalog_ops::REMOVE,
@@ -783,6 +787,7 @@ fn authorize_write(method: &str, principal: Option<&Principal>) -> Result<(), Ha
         || method == "placement.backfill"
         || method == "move_root_to_new_project"
         || method == "identity_log.enable"
+        || method == hub_switch::EXCLUDE
         || catalog_ops::WRITES.contains(&method)
         || method == catalog_publish::PUBLISH
         || method == catalog_seed::SEED
@@ -953,10 +958,29 @@ impl ProjectsHandler {
             inner: record_connector,
             wake: move_wake.clone(),
         });
+        let store = Arc::new(Mutex::new(None));
+        let fence = hub_switch::LegacyFence::new(&store);
+        let legacy_move_admission = Arc::new(Mutex::new(()));
+        let participant_discovery: Arc<dyn participant_discovery::ParticipantDiscovery> = Arc::new(
+            participant_discovery::SubcParticipantDiscovery::new(Arc::new(
+                log_client::SubcConnector::from_args(std::env::args_os().skip(1)),
+            )),
+        );
+        let health = Arc::new(HealthGauges::default());
+        let hub_switch = (!cfg!(test)).then(|| {
+            hub_switch::Switch::new(
+                hub_transport::Hub::new(
+                    log_client::SubcConnector::from_args(std::env::args_os().skip(1)),
+                    health.clone(),
+                ),
+                legacy_move_admission.clone(),
+                participant_discovery.clone(),
+            )
+        });
         Self {
-            store: Arc::new(Mutex::new(None)),
+            store,
             hello_refusal: Arc::new(HelloRefusal::default()),
-            health: Arc::new(HealthGauges::default()),
+            health,
             liveness: Arc::new(Mutex::new(LivenessState::default())),
             route_admissions,
             incarnation,
@@ -979,18 +1003,16 @@ impl ProjectsHandler {
             watches: Arc::default(),
             role_leases: Arc::default(),
             lease_retry_budget: LEASE_HELD_RETRY_BUDGET,
-            log_client: log_client::LogClient::new(connector),
+            log_client: log_client::LogClient::new(connector).fenced(fence.clone()),
             writer: Arc::new(tokio::sync::Mutex::new(())),
             draining: tokio::sync::watch::channel(false).0,
             catch_up_task: Mutex::new(None),
             hub_residence: Mutex::new(None),
+            hub_switch,
+            legacy_move_admission,
             catch_up_wake: Arc::default(),
-            record_client: record_client::RecordClient::new(record_connector),
-            participant_discovery: Arc::new(participant_discovery::SubcParticipantDiscovery::new(
-                Arc::new(log_client::SubcConnector::from_args(
-                    std::env::args_os().skip(1),
-                )),
-            )),
+            record_client: record_client::RecordClient::new(record_connector).fenced(fence),
+            participant_discovery,
             catalog_agent: catalog_agent::CatalogAgent::default(),
             catalog_publish: catalog_publish::Publisher::default(),
             catalog_seeder: catalog_seed::Seeder::default(),
@@ -1539,6 +1561,14 @@ impl ProjectsHandler {
                 .await
         } else if request.method == "identity_log.enable" {
             self.enable_log(request.params, key, received).await
+        } else if request.method == hub_switch::EXCLUDE {
+            match self.admit(hub_switch::EXCLUDE, key) {
+                Ok(_) => {
+                    self.exclude_switch_member(request.params, key, received)
+                        .await
+                }
+                Err(error) => Err(error),
+            }
         } else if request.method == roles::TAKE {
             self.take_role(request.params, key, received).await
         } else if request.method == hub_residence::TAKE {
@@ -2438,6 +2468,11 @@ fn manifest() -> ModuleManifest {
                     ManagementOperationKind::Mutate,
                     "Enable the shared identity log or join it (operator only).",
                 ),
+                management_operation(
+                    hub_switch::EXCLUDE,
+                    ManagementOperationKind::Mutate,
+                    "Exclude an unpaired computer from the hub switch (Direct only, with confirmation).",
+                ),
                 management_operation("placement.read", ManagementOperationKind::Query,
                     "Page shared project placement facts in insertion order (open to every principal)."),
                 management_operation("placement.backfill", ManagementOperationKind::Mutate,
@@ -2824,6 +2859,9 @@ fn install_store_with_time(
                 opened.set_root_records(true);
             }
             enable::refresh(health, &opened);
+            if opened.hub_log_base().is_ok_and(|base| base.is_some()) {
+                health.hub_membership.store(1, Ordering::Release);
+            }
             health
                 .generation
                 .store(opened.generation().unwrap_or(0), Ordering::Relaxed);
@@ -3311,6 +3349,7 @@ mod tests {
                 if *method == store_origin::ADOPT
                     || *method == "move_root_to_new_project"
                     || *method == "identity_log.enable"
+                    || *method == hub_switch::EXCLUDE
                     || *method == "placement.backfill"
                     || catalog_ops::WRITES.contains(method)
                     || *method == catalog_publish::PUBLISH

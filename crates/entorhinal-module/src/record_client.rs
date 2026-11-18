@@ -180,6 +180,7 @@ pub(crate) enum CasSettlement {
 #[derive(Clone)]
 pub(crate) struct RecordClient {
     connector: Arc<dyn LogConnector>,
+    fence: super::hub_switch::LegacyFence,
 }
 
 /// Tests that exercise only the identity log must not open a live record route.
@@ -196,13 +197,32 @@ impl LogConnector for UnavailableConnector {
 
 impl RecordClient {
     pub(crate) fn new(connector: Arc<dyn LogConnector>) -> Self {
-        Self { connector }
+        Self {
+            connector,
+            fence: Default::default(),
+        }
+    }
+
+    pub(crate) fn fenced(mut self, fence: super::hub_switch::LegacyFence) -> Self {
+        self.fence = fence;
+        self
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value, RecordError> {
         // Each hop includes connection establishment in the read deadline.
         tokio::time::timeout(super::catch_up::READ_DEADLINE, async {
+            let subject = (method == CAS).then(|| params["subject"].as_str().unwrap_or_default());
+            let check = || {
+                self.fence
+                    .record(subject)
+                    .map_err(|code| RecordError::Refused {
+                        code: code.into(),
+                        detail: None,
+                    })
+            };
+            check()?;
             let transport = self.connector.connect().await?;
+            check()?;
             let bytes = transport.call(method, params).await?;
             let envelope: Value = serde_json::from_slice(&bytes).map_err(protocol)?;
             envelope

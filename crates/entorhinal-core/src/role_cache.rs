@@ -148,6 +148,28 @@ fn read_role(conn: &Connection, role: &str) -> Result<RoleRead, AgentMutationErr
 }
 
 impl RegistryStore {
+    pub fn role_gen_high_water(&self, role: &str) -> Result<i64, RegistryError> {
+        self.read(|conn| gen_high_water(conn, role))
+    }
+
+    pub fn observe_role_gen(&self, role: &str, gen: i64) -> Result<(), RegistryError> {
+        self.db
+            .with_conn_fenced(|tx| raise_gen(tx, role, gen))
+            .map_err(RegistryError::Store)
+    }
+
+    pub fn grant_local_role_gen(&self, role: &str) -> Result<i64, RegistryError> {
+        self.db
+            .with_conn_fenced(|tx| {
+                let gen = gen_high_water(tx, role)?
+                    .checked_add(1)
+                    .ok_or(rusqlite::Error::InvalidQuery)?;
+                raise_gen(tx, role, gen)?;
+                Ok(gen)
+            })
+            .map_err(RegistryError::Store)
+    }
+
     /// Installed stores retain their observations, but no prior read proves
     /// freshness in this process. A verified refresh or landed take can replace
     /// the stale observation.
@@ -355,6 +377,28 @@ impl RegistryStore {
             })
             .map_err(RegistryError::Store)
     }
+}
+
+fn gen_high_water(conn: &Connection, role: &str) -> rusqlite::Result<i64> {
+    Ok(conn
+        .query_row(
+            "SELECT gen FROM role_gen_high_water WHERE role=?1",
+            [role],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0))
+}
+
+pub(crate) fn raise_gen(tx: &Transaction<'_>, role: &str, gen: i64) -> rusqlite::Result<()> {
+    if gen > 0 {
+        tx.execute(
+            "INSERT INTO role_gen_high_water(role,gen) VALUES(?1,?2)
+            ON CONFLICT(role) DO UPDATE SET gen=excluded.gen WHERE excluded.gen>gen",
+            params![role, gen],
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

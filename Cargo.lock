@@ -242,9 +242,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-bus-client"
-version = "0.1.7"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd5170c5e54a8c17bb90b7b53aeca0c862ea497956fabdbb7477780a51378fd5"
+checksum = "afe8e269de2876a651756b755a4140607a250ad1f375be096bf1cd9191d5032e"
 dependencies = [
  "async-nats",
  "async-trait",

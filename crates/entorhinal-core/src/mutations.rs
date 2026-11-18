@@ -1841,6 +1841,8 @@ pub(crate) fn replay_with_observer(
                 super::shared_entry::replay_member_name(tx, image)?;
             } else if op == "member.set_box" {
                 crate::member_box::replay(tx, image)?;
+            } else if op == "log.migrated" {
+                // The marker changes the log backend, not the shared projection.
             } else if crate::hub_store::MEMBERSHIP_OPS.contains(&op.as_str()) {
                 let position = position.ok_or_else(|| {
                     domain(

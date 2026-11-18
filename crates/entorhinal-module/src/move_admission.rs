@@ -77,6 +77,9 @@ impl ProjectsHandler {
         if let Some(bytes) = self.move_replay(&request.request_key, &request_body)? {
             return Ok(bytes);
         }
+        if self.with_store(RegistryStore::legacy_moves_paused)? {
+            return Err(crate::hub_switch::pending());
+        }
         if !self.with_store(RegistryStore::move_authority_cut_over)? {
             return Err(HandlerError::new(
                 "authority_not_cut_over",
@@ -361,6 +364,10 @@ impl ProjectsHandler {
         };
         if confirmation.as_ref().is_some_and(|g| *g.cancelled.borrow()) {
             return Err(OperatorConfirmError::Declined.into());
+        }
+        let _admission = self.legacy_move_admission.lock().unwrap();
+        if hub.is_none() && self.with_store(RegistryStore::legacy_moves_paused)? {
+            return Err(crate::hub_switch::pending());
         }
         let row = self.with_agent_store(|s| s.admit_agent_move(&row, &refs))?;
         reply(&row)

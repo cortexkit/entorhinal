@@ -416,7 +416,7 @@ async fn hub_move_does_not_seal_when_a_required_export_has_no_target_provider() 
     let Some(f) = Moving::new().await else {
         return;
     };
-    f.b.advertise_node(Vec::new()).await.unwrap();
+    f.b.advertise_node(Vec::new(), true).await.unwrap();
     until(|| f.a.watched_node(B).ok().flatten().is_some()).await;
     f.source_tick().await;
     assert_eq!(f.source.row(CUT).await.unwrap().step, MoveStep::Exported);

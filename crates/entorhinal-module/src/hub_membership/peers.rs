@@ -50,6 +50,15 @@ impl PeerKeysRead for Callosum {
 }
 
 impl Callosum {
+    pub(crate) async fn lists_box(&self, box_id: &str) -> Result<bool, HandlerError> {
+        let reply = self.read().await?;
+        Ok(reply["peers"]
+            .as_array()
+            .ok_or_else(invalid_reply)?
+            .iter()
+            .any(|peer| peer["machine_id"].as_str() == Some(box_id)))
+    }
+
     async fn read(&self) -> Result<Value, HandlerError> {
         let consumer = self.connector.consumer().await.map_err(|_| unavailable())?;
         let bytes = consumer

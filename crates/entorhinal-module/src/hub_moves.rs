@@ -247,6 +247,8 @@ pub(super) struct Node {
     #[serde(rename = "box")]
     pub box_id: String,
     pub participants: Vec<Participant>,
+    #[serde(default)]
+    pub engram_hub_cuts: bool,
     pub written_at: i64,
 }
 

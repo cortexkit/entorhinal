@@ -197,16 +197,38 @@ pub(crate) trait LogConnector: Send + Sync {
 #[derive(Clone)]
 pub(crate) struct LogClient {
     connector: Arc<dyn LogConnector>,
+    fence: super::hub_switch::LegacyFence,
 }
 
 impl LogClient {
     /// Construction does no I/O. Only append and log-read can open a route.
     pub(crate) fn new(connector: Arc<dyn LogConnector>) -> Self {
-        Self { connector }
+        Self {
+            connector,
+            fence: Default::default(),
+        }
     }
 
-    async fn call(&self, method: &str, params: Value) -> Result<Value, LogError> {
+    pub(crate) fn fenced(mut self, fence: super::hub_switch::LegacyFence) -> Self {
+        self.fence = fence;
+        self
+    }
+
+    async fn call(
+        &self,
+        method: &str,
+        params: Value,
+        append: Option<(&AppendRequest, bool)>,
+    ) -> Result<Value, LogError> {
+        let check = || {
+            self.fence.log(append).map_err(|code| LogError::Refused {
+                code: code.into(),
+                detail: None,
+            })
+        };
+        check()?;
         let transport = self.connector.connect().await?;
+        check()?;
         let bytes = transport.call(method, params).await?;
         let envelope: Value = serde_json::from_slice(&bytes).map_err(protocol)?;
         envelope
@@ -216,6 +238,21 @@ impl LogClient {
     }
 
     pub(crate) async fn append(&self, request: &AppendRequest) -> Result<AppendReply, LogError> {
+        self.append_with_permit(request, false).await
+    }
+
+    pub(super) async fn append_migration_marker(
+        &self,
+        request: &AppendRequest,
+    ) -> Result<AppendReply, LogError> {
+        self.append_with_permit(request, true).await
+    }
+
+    async fn append_with_permit(
+        &self,
+        request: &AppendRequest,
+        marker: bool,
+    ) -> Result<AppendReply, LogError> {
         if request.data.len() > ENTRY_DATA_CAP {
             return Err(LogError::TooLarge {
                 field: "entry.data".into(),
@@ -230,6 +267,7 @@ impl LogClient {
                     "entry_id": encode_hex(&request.entry_id),
                     "entry": {"kind":request.kind.as_str(), "data":encode_hex(&request.data)},
                 }),
+                Some((request, marker)),
             )
             .await?;
         let reply: AppendReply = serde_json::from_value(reply).map_err(protocol)?;
@@ -245,7 +283,7 @@ impl LogClient {
     pub(crate) async fn read(&self, after: u64, limit: usize) -> Result<ReadReply, LogError> {
         let limit = limit.clamp(1, PAGE_ENTRIES_CAP);
         let reply = self
-            .call(READ, json!({"after":after, "limit":limit}))
+            .call(READ, json!({"after":after, "limit":limit}), None)
             .await?;
         #[derive(Deserialize)]
         struct Page {

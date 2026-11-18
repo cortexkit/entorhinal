@@ -658,7 +658,15 @@ async fn advertise_nodes(worker: Worker) {
             })
             .collect();
         participants.sort_by(|a, b| a.module.cmp(&b.module));
-        let _ = hub.advertise_node(participants).await;
+        let Ok(engram_hub_cuts) = crate::hub_switch::local_hub_cuts(
+            worker.discovery.as_ref(),
+            tokio::time::Instant::now() + crate::catch_up::READ_DEADLINE,
+        )
+        .await
+        else {
+            continue;
+        };
+        let _ = hub.advertise_node(participants, engram_hub_cuts).await;
     }
 }
 

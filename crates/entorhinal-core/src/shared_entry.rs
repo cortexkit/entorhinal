@@ -143,6 +143,11 @@ fn row_key(row: &SharedRow, keys: &[String]) -> SharedRow {
 }
 
 impl SharedState {
+    pub(crate) fn canonical_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
+        // The map keys and each table's rows already have a deterministic order.
+        serde_json::to_vec(&self.0)
+    }
+
     pub fn capture(conn: &Connection) -> rusqlite::Result<Self> {
         let mut tables = BTreeMap::new();
         for table in PROJECT_SHARED_TABLES
@@ -729,6 +734,7 @@ mod tests {
                     "session_network",
                     "claim_cache",
                     "role_cache",
+                    "role_gen_high_water",
                     "role_take_request",
                     "self_identity",
                     "store_origin",

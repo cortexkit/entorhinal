@@ -812,3 +812,60 @@ async fn lease_handback_vacancy_ignores_removed_preferred_box() {
     assert!(a.ack_waiting().await.iter().any(|notice| notice.holding));
     assert_eq!(hub.writes(ACQUIRE)[0].holder.as_deref(), Some(A));
 }
+
+#[test]
+fn role_gen_high_water_carries_hub_observation_across_restart_and_local_takes() {
+    let (dir, descriptor) = crate::tests::scratch_descriptor("role-gen-high-water");
+    let handler = ProjectsHandler::with_log_connector(
+        "role-gen".into(),
+        || 1,
+        Arc::new(crate::fake_log::FakeLog::default()),
+    );
+    let store = entorhinal_core::RegistryStore::open(&descriptor).unwrap();
+    *handler.store.lock().unwrap() = Some(store.clone());
+    let mut grant = None;
+    let fresh = handler.local_role_view(ROLE, 1, &mut grant);
+    assert_eq!(fresh.gen, 1);
+    let renewed = handler.local_role_view(ROLE, 10_000, &mut grant);
+    assert_eq!(renewed.gen, 1);
+    assert!(renewed.until_ms > fresh.until_ms);
+    for _ in 0..2 {
+        handler.local_role_view(ROLE, 10_000, &mut None);
+    }
+    let observed = Observation {
+        ready: true,
+        watch: (0, 0),
+        revision: 1,
+        record: Some(Record::new(A, 0, 2, false)),
+        local_episode: Some(0),
+        holder_current: true,
+    };
+    let take = change(
+        ACQUIRE,
+        &observed,
+        B,
+        store.role_gen_high_water(ROLE).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(take.body.gen, 4);
+
+    let hub_body = serde_json::json!({"gen": 12});
+    store
+        .record_hub_kv(
+            "role.connector_home",
+            1,
+            Some((b"verified", Some(&hub_body))),
+            99,
+        )
+        .unwrap();
+    assert_eq!(store.role_gen_high_water(ROLE).unwrap(), 12);
+    handler.store.lock().unwrap().take();
+    drop(store);
+    let restarted = entorhinal_core::RegistryStore::open(&descriptor).unwrap();
+    *handler.store.lock().unwrap() = Some(restarted.clone());
+    assert_eq!(handler.local_role_view(ROLE, 20_000, &mut None).gen, 13);
+    assert_eq!(restarted.role_gen_high_water("dreamer.global").unwrap(), 0);
+    handler.store.lock().unwrap().take();
+    drop(restarted);
+    let _ = std::fs::remove_dir_all(dir);
+}

@@ -190,13 +190,12 @@ impl Transport for Hub {
     ) -> Result<Option<Vec<u8>>, HandlerError> {
         self.session(deadline)
             .await?
-            .1
             .log_entry(sequence, deadline)
             .await
     }
 
     async fn log_head(&self, deadline: Instant) -> Result<u64, HandlerError> {
-        self.session(deadline).await?.1.log_head(deadline).await
+        self.session(deadline).await?.log_head(deadline).await
     }
 
     async fn kv_entry(
@@ -204,7 +203,7 @@ impl Transport for Hub {
         key: &str,
         deadline: Instant,
     ) -> Result<Option<KvEntry>, HandlerError> {
-        Transport::kv_entry(&self.session(deadline).await?.1, key, deadline).await
+        Transport::kv_entry(&self.session(deadline).await?, key, deadline).await
     }
 
     async fn send(
@@ -213,19 +212,21 @@ impl Transport for Hub {
         op_id: &str,
         deadline: Instant,
     ) -> Result<Option<u64>, HandlerError> {
-        let (box_id, session) = self.session(deadline).await?;
         if !write.value.is_empty()
             && UnverifiedRecord::parse(&write.key, &write.value)?
                 .header()
                 .writer
-                != box_id.to_string()
+                != self.box_id(deadline).await?.to_string()
         {
             return Err(HandlerError::new(
                 "record_invalid",
                 "fleet record writer does not match the bus box ID",
             ));
         }
-        session.send(write, op_id, deadline).await
+        self.session(deadline)
+            .await?
+            .send(write, op_id, deadline)
+            .await
     }
 }
 

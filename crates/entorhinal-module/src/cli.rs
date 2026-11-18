@@ -312,6 +312,20 @@ pub fn parse(face: Face, arguments: &[String]) -> Invocation {
             {
                 args.push(argument.clone());
             }
+            "--without"
+                if face == Face::Projects
+                    && verb.as_deref() == Some("log")
+                    && args.first().map(String::as_str) == Some("hub-switch") =>
+            {
+                let Some(value) = rest
+                    .next()
+                    .filter(|value| crate::hub_membership::box_id(value))
+                else {
+                    return Invocation::Refuse(format!("{argument} needs a 32-digit box ID"));
+                };
+                args.push(argument.clone());
+                args.push(value.clone());
+            }
             "--same-machine"
                 if face == Face::Projects && verb.as_deref() == Some("adopt-store") =>
             {
@@ -414,6 +428,7 @@ usage: ck projects <verb> [args] [--subc <connection file>] [--json]
   log status              show local identity log state
   log name <display name> set this member's shared display name
   log enable [--without-agents]
+  log hub-switch --without <box>
                           enable or join the shared log (operator only);
                           skip agent import only when the fleet has no agents
 
@@ -783,11 +798,13 @@ fn build_at(command: &Command, cwd: &str) -> Result<(String, Value), String> {
                 ["enable", "--without-agents"] => {
                     ("identity_log.enable".into(), json!({"without_agents":true}))
                 }
-                _ => {
-                    return Err(
-                        "log needs exactly one of: status, enable, name <display name>".into(),
-                    )
+                ["hub-switch", "--without", box_id] => {
+                    (crate::hub_switch::EXCLUDE.into(), json!({"without":box_id}))
                 }
+                _ => return Err(
+                    "log needs status, enable, name <display name>, or hub-switch --without <box>"
+                        .into(),
+                ),
             }
         }
         (Face::Projects, "remove") => (
@@ -2865,6 +2882,31 @@ mod tests {
                 panic!("log must parse")
             };
             assert_eq!(build(&command).unwrap(), (method.into(), json!({})));
+        }
+    }
+
+    #[test]
+    fn hub_switch_cli_maps_exact_without_flag() {
+        let id = "f".repeat(32);
+        let Invocation::Command(command) =
+            parse_as(Face::Projects, &["log", "hub-switch", "--without", &id])
+        else {
+            panic!("hub-switch --without must parse");
+        };
+        assert_eq!(
+            build(&command).unwrap(),
+            (crate::hub_switch::EXCLUDE.into(), json!({"without":id}))
+        );
+        for args in [
+            &["log", "hub-switch"][..],
+            &["log", "hub-switch", "--without"],
+            &["log", "hub-switch", "--without", "box", "extra"],
+        ] {
+            match parse_as(Face::Projects, args) {
+                Invocation::Command(command) => assert!(build(&command).is_err(), "{args:?}"),
+                Invocation::Refuse(_) => {}
+                _ => panic!("unexpected CLI result for {args:?}"),
+            }
         }
     }
 

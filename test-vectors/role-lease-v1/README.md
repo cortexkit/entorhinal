@@ -38,6 +38,8 @@ handler; an empty `StreamEnd` body is shown as `null`.
 - `engram-sharing.json`: Plexus follows the Engram claim's epoch and stops
   holding when the claim becomes stale. Magic Context holds locally even with
   Engram sharing enabled.
+- `local-after-hub.json`: after observing hub generation 12, a new local grant
+  to Magic Context uses generation 13.
 
 ## Names and admission
 
@@ -59,13 +61,20 @@ Before each irreversible act, check the deadline and record `gen` (the role's
 ownership generation) in the module's journal. Refuse a generation older than
 the highest one the journal has seen for that role.
 
+`gen` is monotonic per role on each computer across sharing modes. A new local
+grant exceeds the highest generation the computer has granted or observed;
+generation 1 is the first grant on a fresh store. A hub take exceeds both that
+local high-water mark and the current hub generation. Renewal keeps the same
+generation.
+
 The notice shape is the same in all sharing modes:
 
-1. **Sharing disabled:** An admitted role is granted locally as generation 1,
-   renewed every 20 seconds, and stops when its watch closes. No writes occur.
-2. **Engram sharing (not on the hub):** `connector_home` holds at the claim's
-   epoch only while the cached `role.read` is `held_here` and not `stale`.
-   `dreamer.*` is still local generation 1.
+1. **Sharing disabled:** An admitted role gets a new local generation, renewed
+   every 20 seconds. It stops when its watch closes. No network writes occur.
+2. **Engram sharing (not on the hub):** `connector_home` holds only while the
+   cached `role.read` is `held_here` and not `stale`. Its `gen` is the claim's
+   epoch or the local high-water mark, whichever is higher.
+   `dreamer.*` still uses a local generation.
 3. **Hub mode:** The hub's role record arbitrates ownership. A candidate has
    no acting window before its first confirmed renewal. If the hub becomes
    unreachable, no renewal extends the window and the holder must stop by the
