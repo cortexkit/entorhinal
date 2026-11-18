@@ -259,7 +259,7 @@ impl Worker {
         };
         if !author_known {
             // Read-only discovery also works for a joined store with no agents.
-            // A verified absent record still identifies the reader.
+            // Even when the requested claim record is absent, the verified read reply carries `self_author`, which identifies this computer.
             let reply = timeout_at(deadline, self.records.read("claim:agent_0000000000000000"))
                 .await
                 .map_err(|_| {

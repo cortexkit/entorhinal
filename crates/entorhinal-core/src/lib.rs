@@ -226,7 +226,7 @@ CREATE TABLE member_name (
 );
 "#;
 
-const MIGRATIONS: [Migration; 24] = [
+const MIGRATIONS: [Migration; 25] = [
     Migration {
         version: 1,
         statements: V1_SCHEMA,
