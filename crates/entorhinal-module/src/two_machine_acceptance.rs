@@ -2479,6 +2479,7 @@ mod moves {
     mod cut_releases;
     mod import_losses;
     mod move_refs;
+    mod occipital_samples;
 
     #[tokio::test(start_paused = true)]
     async fn initial_claim_allows_move_admission_from_its_holder() {

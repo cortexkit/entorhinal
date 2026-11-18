@@ -1,0 +1,27 @@
+[
+  {
+    "op": "agent_data.release",
+    "principal": {
+      "kind": "reserved",
+      "module_id": "entorhinal"
+    },
+    "reply": {
+      "result": {
+        "enforced": true
+      }
+    },
+    "request": {
+      "method": "agent_data.release",
+      "params": {
+        "cutId": "00000000000000000000000000000009",
+        "holder": "author-b",
+        "refs": [
+          {
+            "ref": "agent_0000000000000101",
+            "ref_kind": "agent"
+          }
+        ]
+      }
+    }
+  }
+]

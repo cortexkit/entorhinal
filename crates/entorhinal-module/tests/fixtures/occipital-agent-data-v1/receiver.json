@@ -1,0 +1,106 @@
+[
+  {
+    "op": "agent_data.diverged",
+    "principal": {
+      "kind": "reserved",
+      "module_id": "entorhinal"
+    },
+    "reply": {
+      "result": {
+        "refs": [
+          {
+            "state": "at_cut"
+          }
+        ]
+      }
+    },
+    "request": {
+      "method": "agent_data.diverged",
+      "params": {
+        "cutId": "00000000000000000000000000000009",
+        "refs": [
+          {
+            "ref": "agent_0000000000000101",
+            "ref_kind": "agent"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "op": "agent_data.import",
+    "principal": {
+      "kind": "reserved",
+      "module_id": "entorhinal"
+    },
+    "reply": {
+      "result": {
+        "items": [
+          {
+            "digest": "c1c6fd386972a24553660710ee9a42cd76706ea7b369aee814a6709f13a5afea",
+            "endOffset": 1275,
+            "sessionRef": "f7b4342b7a75b621b0ecb589aef60838"
+          }
+        ]
+      }
+    },
+    "request": {
+      "method": "agent_data.import",
+      "params": {
+        "cutId": "00000000000000000000000000000009",
+        "refs": [
+          {
+            "ref": "agent_0000000000000101",
+            "ref_kind": "agent"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "op": "agent_data.activate",
+    "principal": {
+      "kind": "reserved",
+      "module_id": "entorhinal"
+    },
+    "reply": {
+      "result": {}
+    },
+    "request": {
+      "method": "agent_data.activate",
+      "params": {
+        "cutId": "00000000000000000000000000000009",
+        "refs": [
+          {
+            "ref": "agent_0000000000000101",
+            "ref_kind": "agent"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "op": "agent_data.status",
+    "principal": {
+      "kind": "reserved",
+      "module_id": "entorhinal"
+    },
+    "reply": {
+      "result": {
+        "step": "activated"
+      }
+    },
+    "request": {
+      "method": "agent_data.status",
+      "params": {
+        "cutId": "00000000000000000000000000000009",
+        "refs": [
+          {
+            "ref": "agent_0000000000000101",
+            "ref_kind": "agent"
+          }
+        ]
+      }
+    }
+  }
+]

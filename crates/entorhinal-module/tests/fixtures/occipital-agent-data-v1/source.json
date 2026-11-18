@@ -1,0 +1,144 @@
+[
+  {
+    "op": "agent_data.describe",
+    "principal": {
+      "kind": "reserved",
+      "module_id": "entorhinal"
+    },
+    "reply": {
+      "result": {
+        "external": false,
+        "optional": true,
+        "ref_kinds": [
+          "agent"
+        ],
+        "stores": [
+          {
+            "name": "occipital-chat-display/v1",
+            "sync_class": "agent"
+          }
+        ]
+      }
+    },
+    "request": {
+      "method": "agent_data.describe",
+      "params": {}
+    }
+  },
+  {
+    "op": "agent_data.busy",
+    "principal": {
+      "kind": "reserved",
+      "module_id": "entorhinal"
+    },
+    "reply": {
+      "result": {
+        "refs": [
+          {
+            "state": "idle"
+          }
+        ]
+      }
+    },
+    "request": {
+      "method": "agent_data.busy",
+      "params": {
+        "refs": [
+          {
+            "ref": "agent_0000000000000101",
+            "ref_kind": "agent"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "op": "agent_data.prepare",
+    "principal": {
+      "kind": "reserved",
+      "module_id": "entorhinal"
+    },
+    "reply": {
+      "result": {
+        "external": [],
+        "items": [
+          {
+            "digest": "c1c6fd386972a24553660710ee9a42cd76706ea7b369aee814a6709f13a5afea",
+            "endOffset": 1275,
+            "format": "occipital-chat-display/v1",
+            "frozen": false,
+            "ref": "agent_0000000000000101",
+            "ref_kind": "agent",
+            "sessionRef": "f7b4342b7a75b621b0ecb589aef60838",
+            "stream": "reserved:occipital"
+          }
+        ]
+      }
+    },
+    "request": {
+      "method": "agent_data.prepare",
+      "params": {
+        "cutId": "00000000000000000000000000000009",
+        "refs": [
+          {
+            "ref": "agent_0000000000000101",
+            "ref_kind": "agent"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "op": "agent_data.export",
+    "principal": {
+      "kind": "reserved",
+      "module_id": "entorhinal"
+    },
+    "reply": {
+      "result": {
+        "items": [
+          {
+            "endOffset": 1275,
+            "sessionRef": "f7b4342b7a75b621b0ecb589aef60838"
+          }
+        ]
+      }
+    },
+    "request": {
+      "method": "agent_data.export",
+      "params": {
+        "cutId": "00000000000000000000000000000009",
+        "refs": [
+          {
+            "ref": "agent_0000000000000101",
+            "ref_kind": "agent"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "op": "agent_data.status",
+    "principal": {
+      "kind": "reserved",
+      "module_id": "entorhinal"
+    },
+    "reply": {
+      "result": {
+        "step": "exported"
+      }
+    },
+    "request": {
+      "method": "agent_data.status",
+      "params": {
+        "cutId": "00000000000000000000000000000009",
+        "refs": [
+          {
+            "ref": "agent_0000000000000101",
+            "ref_kind": "agent"
+          }
+        ]
+      }
+    }
+  }
+]

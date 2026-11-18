@@ -1,0 +1,90 @@
+[
+  {
+    "op": "agent_data.describe",
+    "principal": {
+      "kind": "reserved",
+      "module_id": "broca"
+    },
+    "reply": {
+      "code": "caller_forbidden",
+      "detail": null,
+      "message": "only Entorhinal moves agents"
+    },
+    "request": {
+      "method": "agent_data.describe",
+      "params": {}
+    }
+  },
+  {
+    "op": "agent_data.busy",
+    "principal": {
+      "kind": "reserved",
+      "module_id": "entorhinal"
+    },
+    "reply": {
+      "code": "invalid_request",
+      "detail": null,
+      "message": "Occipital holds no broca-session refs"
+    },
+    "request": {
+      "method": "agent_data.busy",
+      "params": {
+        "refs": [
+          {
+            "ref": "ses_moved",
+            "ref_kind": "broca-session"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "op": "agent_data.export",
+    "principal": {
+      "kind": "reserved",
+      "module_id": "entorhinal"
+    },
+    "reply": {
+      "code": "cut_unknown",
+      "detail": null,
+      "message": "prepare this cut first"
+    },
+    "request": {
+      "method": "agent_data.export",
+      "params": {
+        "cutId": "0000000000000000000000000000000b",
+        "refs": [
+          {
+            "ref": "agent_0000000000000101",
+            "ref_kind": "agent"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "op": "agent_data.release",
+    "principal": {
+      "kind": "reserved",
+      "module_id": "entorhinal"
+    },
+    "reply": {
+      "code": "id_reused",
+      "detail": null,
+      "message": "this cut was released to another holder"
+    },
+    "request": {
+      "method": "agent_data.release",
+      "params": {
+        "cutId": "00000000000000000000000000000009",
+        "holder": "author-c",
+        "refs": [
+          {
+            "ref": "agent_0000000000000101",
+            "ref_kind": "agent"
+          }
+        ]
+      }
+    }
+  }
+]

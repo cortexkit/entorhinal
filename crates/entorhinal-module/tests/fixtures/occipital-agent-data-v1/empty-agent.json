@@ -1,0 +1,51 @@
+[
+  {
+    "op": "agent_data.prepare",
+    "principal": {
+      "kind": "reserved",
+      "module_id": "entorhinal"
+    },
+    "reply": {
+      "result": {
+        "external": [],
+        "items": []
+      }
+    },
+    "request": {
+      "method": "agent_data.prepare",
+      "params": {
+        "cutId": "0000000000000000000000000000000a",
+        "refs": [
+          {
+            "ref": "agent_0000000000000101",
+            "ref_kind": "agent"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "op": "agent_data.import",
+    "principal": {
+      "kind": "reserved",
+      "module_id": "entorhinal"
+    },
+    "reply": {
+      "result": {
+        "items": []
+      }
+    },
+    "request": {
+      "method": "agent_data.import",
+      "params": {
+        "cutId": "0000000000000000000000000000000a",
+        "refs": [
+          {
+            "ref": "agent_0000000000000101",
+            "ref_kind": "agent"
+          }
+        ]
+      }
+    }
+  }
+]
