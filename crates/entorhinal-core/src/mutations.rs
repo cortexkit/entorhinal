@@ -1687,6 +1687,7 @@ impl RegistryStore {
 // Machine-local driver checkpoints and settings (agent_move, move_setting) are
 // deliberately excluded: the identity journal cannot reconstruct them.
 pub(crate) const DERIVED_TABLES: &[&str] = &[
+    "hub_membership",
     "placement_fact",
     "placement_state",
     "user_expertise",
@@ -1765,7 +1766,7 @@ pub(crate) fn replay_with_observer(
         tx.execute(&format!("DELETE FROM {table}"), [])?;
     }
     let mut stmt =
-        tx.prepare("SELECT seq,op,payload_json,created_at,stream,origin,entry FROM registry_journal ORDER BY seq")?;
+        tx.prepare("SELECT seq,op,payload_json,created_at,stream,origin,entry,log_position FROM registry_journal ORDER BY seq")?;
     let rows = stmt
         .query_map([], |r| {
             Ok((
@@ -1776,6 +1777,7 @@ pub(crate) fn replay_with_observer(
                 r.get::<_, String>(4)?,
                 r.get::<_, String>(5)?,
                 r.get::<_, Option<Vec<u8>>>(6)?,
+                r.get::<_, Option<i64>>(7)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1785,7 +1787,7 @@ pub(crate) fn replay_with_observer(
     // `identity_log_state` instead would replay rows written before enabling
     // under the wrong rules. Replay never writes `identity_log_state`.
     let mut enabled = false;
-    for (seq, op, payload, now, stream, origin, entry) in rows {
+    for (seq, op, payload, now, stream, origin, entry, position) in rows {
         let before = crate::placement::placements(tx)?;
         let time = match now {
             rusqlite::types::Value::Integer(n) => Some(n),
@@ -1839,6 +1841,14 @@ pub(crate) fn replay_with_observer(
                 super::shared_entry::replay_member_name(tx, image)?;
             } else if op == "member.set_box" {
                 crate::member_box::replay(tx, image)?;
+            } else if crate::hub_store::MEMBERSHIP_OPS.contains(&op.as_str()) {
+                let position = position.ok_or_else(|| {
+                    domain(
+                        "apply_failed",
+                        format!("missing hub membership position at seq {seq}"),
+                    )
+                })?;
+                crate::hub_store::replay_membership(tx, &op, &image, position)?;
             } else if op == "catalog.pin" {
                 super::catalog_agent::replay_pin(tx, image)?;
             } else if op == crate::user_profile::SET_OP {

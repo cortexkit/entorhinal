@@ -22,7 +22,8 @@ use tokio::{
 
 use crate::{
     fleet_record::{vault::EpochVault, UnverifiedRecord, VerifiedRecord, LOG_KEY},
-    hub_transport::{Feed, Hub, LogDelivery},
+    hub_membership::{AnchorSource, Membership, PeerKeysRead, Sight},
+    hub_transport::{Feed, FeedEvent, Hub, LogDelivery},
     hub_write::{
         self, LogReplan, Payload, Replanned, Step, Transport, Trust, Writer,
         PROJECTION_SNAPSHOT_KIND as SNAPSHOT,
@@ -47,27 +48,59 @@ pub(super) struct Link<T, U> {
     pub trust: Arc<U>,
     pub signer: Arc<dyn CredentialResolver>,
     pub vault: Arc<dyn EpochVault>,
+    pub peers: Arc<dyn PeerKeysRead>,
 }
 
 impl<T: LogTransport, U: Trust + Send + Sync + 'static> Link<T, U> {
-    fn writer<'a>(&'a self, store: &'a RegistryStore) -> Writer<'a, T, U> {
+    fn writer<'a, V: Trust>(&'a self, store: &'a RegistryStore, trust: &'a V) -> Writer<'a, T, V> {
         Writer {
             store,
             transport: &self.transport,
-            trust: &self.trust,
+            trust,
             signer: self.signer.as_ref(),
             vault: self.vault.as_ref(),
             replan: None,
         }
     }
+}
 
-    async fn verify(
+struct MemberTrust<'a, T, U> {
+    epoch: &'a U,
+    membership: &'a Membership<T>,
+    store: &'a RegistryStore,
+    base: i64,
+}
+
+impl<T: LogTransport, U: Trust> Trust for MemberTrust<'_, T, U> {
+    async fn writer_epoch(&self, deadline: Instant) -> Result<u64, HandlerError> {
+        self.epoch.writer_epoch(deadline).await
+    }
+
+    async fn verification_key(&self, record: &UnverifiedRecord) -> Result<String, HandlerError> {
+        self.membership.saved_key(record)
+    }
+
+    async fn verify_remote(
         &self,
         record: UnverifiedRecord,
-    ) -> Result<(String, VerifiedRecord), HandlerError> {
-        let key = self.trust.verification_key(&record).await?;
-        let record = record.verify(&key)?;
-        Ok((key, record))
+        log_position: Option<u64>,
+        deadline: Instant,
+    ) -> Result<VerifiedRecord, HandlerError> {
+        if let Some(sequence) = log_position {
+            self.membership
+                .verify_log(record, sequence, deadline)
+                .await
+                .map(|(_, record)| record)
+        } else {
+            let applied = hub_sequence(
+                self.base,
+                self.store.identity_log_status()?.last_applied_position,
+            )?;
+            self.membership
+                .verify_kv(record, applied, Sight::FirstOrAfterGap, deadline)
+                .await
+                .map(|(record, _)| record)
+        }
     }
 }
 
@@ -79,6 +112,7 @@ pub(super) struct IdentityLog<T, U> {
     commits: Arc<Notify>,
     box_id: BoxId,
     base: i64,
+    membership: Arc<Membership<T>>,
 }
 
 impl ProjectsHandler {
@@ -107,6 +141,15 @@ impl ProjectsHandler {
             ));
         }
         let link = Arc::new(link);
+        let membership = Arc::new(Membership::new(
+            link.transport.clone(),
+            store.clone(),
+            AnchorSource {
+                own_box: box_id.to_string(),
+                peers: link.peers.clone(),
+                signer: link.signer.clone(),
+            },
+        ));
         let feed = link.transport.tail(sequence).with_durable_cursor();
         let tail = Tail {
             link: link.clone(),
@@ -116,7 +159,11 @@ impl ProjectsHandler {
             base,
             applied,
             snapshot: Snapshot::default(),
+            membership: membership.clone(),
+            writer: self.writer.clone(),
+            connected_head: None,
         };
+        self.health.hub_membership.store(1, Ordering::Release);
         self.health.log_state.store(0, Ordering::Relaxed);
         crate::enable::refresh(&self.health, &store);
         *task = Some(tokio::spawn(tail.run(feed)));
@@ -128,6 +175,7 @@ impl ProjectsHandler {
             commits: self.commits.clone(),
             box_id,
             base,
+            membership,
         })
     }
 }
@@ -141,7 +189,87 @@ pub(super) struct PlannedAppend<'a> {
     pub body: Value,
 }
 
+pub(super) struct AcceptedKv {
+    pub record: VerifiedRecord,
+    pub body: Value,
+    pub writer_current: bool,
+}
+
 impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
+    pub(super) fn membership_ready(&self) -> bool {
+        self.health.hub_membership.load(Ordering::Acquire) == 2
+    }
+
+    pub(super) fn holder_current(&self, holder: &str, episode: u64) -> Result<bool, HandlerError> {
+        Ok(self.membership_ready()
+            && self
+                .membership
+                .open_episode(holder, self.applied_sequence()?)
+                == Some(episode)
+            && crate::hub_membership::box_id(holder))
+    }
+
+    pub(super) async fn verify_kv(
+        &self,
+        key: &str,
+        bytes: &[u8],
+        sight: Sight,
+        deadline: Instant,
+    ) -> Result<AcceptedKv, HandlerError> {
+        let record = UnverifiedRecord::parse(key, bytes)?;
+        let join = matches!(
+            record.header().kind.as_str(),
+            "epoch" | "wrap" | "wrapreq" | "wrapjoin"
+        );
+        let applied = self.applied_sequence()?;
+        let (record, observed_head) = self
+            .membership
+            .verify_kv(record, applied, sight, deadline)
+            .await?;
+        if !join {
+            if let Some(head) = observed_head {
+                wait_for_applied(self, head, deadline).await?;
+            }
+            if !self.membership_ready() {
+                return Err(HandlerError::new(
+                    "hub_membership_stale",
+                    "hub membership view is catching up",
+                ));
+            }
+        }
+        let applied = self.applied_sequence()?;
+        let writer_current = record.header().kind != "wrapreq"
+            && self
+                .membership
+                .open_episode(&record.header().writer, applied)
+                == Some(record.header().writer_ep);
+        if matches!(sight, Sight::ReplacesCached)
+            && record.header().kind != "wrapreq"
+            && !writer_current
+        {
+            return Err(HandlerError::new(
+                "member_episode_invalid",
+                "replacement writer is not in its current episode",
+            ));
+        }
+        let body = timeout_at(deadline, record.open(self.link.vault.as_ref()))
+            .await
+            .map_err(|_| HandlerError::new("hub_unavailable", "fleet KV open timed out"))??;
+        let body = serde_json::from_slice(&body).map_err(crate::invalid_params)?;
+        crate::hub_membership::validate_kv_body(&record, &body)?;
+        if !join && (!self.membership_ready() || self.applied_sequence()? != applied) {
+            return Err(HandlerError::new(
+                "hub_membership_stale",
+                "hub membership view is catching up",
+            ));
+        }
+        Ok(AcceptedKv {
+            record,
+            body,
+            writer_current,
+        })
+    }
+
     pub(super) fn applied_sequence(&self) -> Result<u64, HandlerError> {
         hub_sequence(
             self.base,
@@ -169,10 +297,26 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
                 "hub identity-log tail has stopped",
             ));
         }
-        let planner = Planner { log: self, replan };
+        if self.membership.can_write(self.applied_sequence()?) != Some(plan.writer_ep) {
+            return Err(HandlerError::new(
+                "member_episode_invalid",
+                "local box cannot write in that membership episode",
+            ));
+        }
+        let trust = MemberTrust {
+            epoch: self.link.trust.as_ref(),
+            membership: &self.membership,
+            store: &self.store,
+            base: self.base,
+        };
+        let planner = Planner {
+            log: self,
+            replan,
+            writer_ep: plan.writer_ep,
+        };
         Writer {
             replan: Some(&planner),
-            ..self.link.writer(&self.store)
+            ..self.link.writer(&self.store, &trust)
         }
         .run(
             &hub_write::Request {
@@ -201,6 +345,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
 struct Planner<'a, T, U, F> {
     log: &'a IdentityLog<T, U>,
     replan: F,
+    writer_ep: u64,
 }
 
 impl<T, U, F> LogReplan for Planner<'_, T, U, F>
@@ -218,6 +363,12 @@ where
     }
 
     fn after_image(&self, saved: &Value) -> Result<Replanned, HandlerError> {
+        if self.log.membership.can_write(self.log.applied_sequence()?) != Some(self.writer_ep) {
+            return Err(HandlerError::new(
+                "member_episode_invalid",
+                "local box cannot replan in that membership episode",
+            ));
+        }
         let outcome = (self.replan)(&self.log.store, saved)?;
         if let Replanned::Body(body) = &outcome {
             if op(body)? != op(saved)? {
@@ -302,28 +453,172 @@ struct Tail<T, U> {
     base: i64,
     applied: i64,
     snapshot: Snapshot,
+    membership: Arc<Membership<T>>,
+    writer: Arc<tokio::sync::Mutex<()>>,
+    connected_head: Option<u64>,
 }
 
 impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
     async fn run(mut self, mut feed: Feed<LogDelivery>) {
+        let mut local_keys = tokio::time::interval(Duration::from_secs(5));
+        local_keys.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut connected = false;
         loop {
-            let delivery = feed.next().await;
-            let sequence = delivery.sequence;
-            match self.apply(delivery).await {
-                Ok(true) => feed.applied(sequence),
-                Ok(false) => {}
-                Err(error) => {
-                    let state = match error.code.as_str() {
-                        "hub_log_gap" => 4,
-                        "signature_invalid" => 5,
-                        _ => 6,
-                    };
-                    self.health.log_state.store(state, Ordering::Relaxed);
-                    self.commits.notify_waiters();
-                    tracing::warn!(target: "identity_log", sequence, code = error.code, message = error.message, "hub identity-log tail stopped");
-                    return;
+            tokio::select! {
+                biased;
+                event = feed.next_event() => match event {
+                    FeedEvent::Disconnected => {
+                        connected = false;
+                        self.connected_head = None;
+                        self.update_barrier();
+                    }
+                    FeedEvent::Connected => {
+                        connected = true;
+                        self.connected_head = None;
+                        self.update_barrier();
+                        if let Err(error) = self.reconnect().await {
+                            if !self.retryable(&error) { self.stop(self.sequence() + 1, error); return; }
+                        }
+                    }
+                    FeedEvent::Item(delivery) => {
+                        let sequence = delivery.sequence;
+                        if self.connected_head.is_none() {
+                            loop {
+                                match self.reconnect().await {
+                                    Ok(()) => break,
+                                    Err(error) if self.retryable(&error) => tokio::time::sleep(Duration::from_secs(1)).await,
+                                    Err(error) => { self.stop(sequence, error); return; }
+                                }
+                            }
+                        }
+                        match self.apply(delivery).await {
+                            Ok(true) => feed.applied(sequence),
+                            Ok(false) => {}
+                            Err(error) if self.retryable(&error) => {
+                                // A head or discovery read can lose the hub
+                                // while processing a delivery. Start over at
+                                // the durable cursor, never skip that entry.
+                                connected = false;
+                                self.connected_head = None;
+                                self.snapshot = Snapshot::default();
+                                self.update_barrier();
+                                feed = self.link.transport.tail(self.sequence()).with_durable_cursor();
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                            }
+                            Err(error) => { self.stop(sequence, error); return; }
+                        }
+                    }
+                },
+                _ = local_keys.tick(), if connected => {
+                    let refreshed = if self.connected_head.is_none() { self.reconnect().await }
+                        else { self.membership.refresh(Instant::now() + READ_BUDGET).await };
+                    if let Err(error) = refreshed {
+                        if !self.retryable(&error) { self.stop(self.sequence() + 1, error); return; }
+                    }
                 }
             }
+            self.update_barrier();
+            if self.caught_up() {
+                self.publish_key().await;
+            }
+        }
+    }
+
+    fn sequence(&self) -> u64 {
+        hub_sequence(self.base, self.applied).expect("valid applied hub position")
+    }
+
+    fn retryable(&self, error: &HandlerError) -> bool {
+        matches!(
+            error.code.as_str(),
+            "hub_unavailable" | "credential_unavailable" | "vault_unavailable"
+        )
+    }
+
+    fn stop(&self, sequence: u64, error: HandlerError) {
+        self.health.hub_membership.store(1, Ordering::Release);
+        let state = match error.code.as_str() {
+            "hub_log_gap" => 4,
+            "signature_invalid" | "member_episode_invalid" | "membership_discovery_unresolved" => 5,
+            _ => 6,
+        };
+        self.health.log_state.store(state, Ordering::Relaxed);
+        self.commits.notify_waiters();
+        tracing::warn!(target: "identity_log", sequence, code = error.code, message = error.message, "hub identity-log tail stopped");
+    }
+
+    async fn reconnect(&mut self) -> Result<(), HandlerError> {
+        let deadline = Instant::now() + READ_BUDGET;
+        let head = self.link.transport.log_head(deadline).await?;
+        if head < self.sequence() {
+            return Err(HandlerError::new(
+                "hub_log_gap",
+                "hub head is behind the applied cursor",
+            ));
+        }
+        self.membership.discover(head, deadline).await?;
+        self.connected_head = Some(head);
+        Ok(())
+    }
+
+    fn caught_up(&self) -> bool {
+        self.connected_head
+            .is_some_and(|head| self.sequence() >= head)
+    }
+
+    fn update_barrier(&self) {
+        let ready = self.caught_up() && self.membership.can_write(self.sequence()).is_some();
+        self.health
+            .hub_membership
+            .store(if ready { 2 } else { 1 }, Ordering::Release);
+    }
+
+    async fn publish_key(&self) {
+        let Some((episode, key)) = self.membership.publication(self.sequence()) else {
+            return;
+        };
+        if !self.store.hub_snapshot_applied(self.base).unwrap_or(false) {
+            return;
+        }
+        let Ok(_guard) = self.writer.try_lock() else {
+            return;
+        };
+        let digest = entorhinal_catalog::sha256_hex(
+            serde_json::to_vec(&key).expect("serializable member.key"),
+        );
+        let request_key = format!("member.key:{}:{}:{digest}", key.box_id, self.sequence());
+        let trust = MemberTrust {
+            epoch: self.link.trust.as_ref(),
+            membership: &self.membership,
+            store: &self.store,
+            base: self.base,
+        };
+        let result = self
+            .link
+            .writer(&self.store, &trust)
+            .run(
+                &hub_write::Request {
+                    request_key: &request_key,
+                    params_digest: &digest,
+                    writer: &key.box_id,
+                    writer_ep: episode,
+                },
+                &Step {
+                    name: "member.key".into(),
+                    key: LOG_KEY.into(),
+                    expected: self.sequence(),
+                    payload: Payload::Record {
+                        kind: "member.key".into(),
+                        body: serde_json::to_value(&key).expect("serializable member.key"),
+                        snapshot_id: None,
+                    },
+                },
+                None,
+                Instant::now() + READ_BUDGET,
+            )
+            .await;
+        if let Err(error) = result {
+            tracing::debug!(target: "identity_log", code = error.code, "hub member key not published yet");
         }
     }
 
@@ -363,8 +658,13 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
         }
         let deadline = Instant::now() + READ_BUDGET;
         let version = unverified.key_version().to_owned();
+        let membership =
+            entorhinal_core::hub_store::MEMBERSHIP_OPS.contains(&unverified.header().kind.as_str());
         let (signer, record, entry) = timeout_at(deadline, async {
-            let (signer, record) = self.link.verify(unverified).await?;
+            let (signer, record) = self
+                .membership
+                .verify_log(unverified, delivery.sequence, deadline)
+                .await?;
             let entry = record.open(self.link.vault.as_ref()).await?;
             Ok::<_, HandlerError>((signer, record, entry))
         })
@@ -378,7 +678,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
         let body: Value = serde_json::from_slice(&entry)
             .map_err(|error| HandlerError::new("record_invalid", error.to_string()))?;
         let header = record.header();
-        if op(&body)? != header.kind {
+        if !membership && op(&body)? != header.kind {
             return Err(HandlerError::new(
                 "record_invalid",
                 "hub log envelope kind differs from body op",
@@ -392,7 +692,14 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
             signer,
             key_id: version,
             envelope_version: 1,
-            kind: if snapshot { "snapshot" } else { "change" }.into(),
+            kind: if membership {
+                header.kind.as_str()
+            } else if snapshot {
+                "snapshot"
+            } else {
+                "change"
+            }
+            .into(),
             entry,
         };
         if snapshot || self.snapshot.identity.is_some() {
@@ -468,11 +775,8 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
                     )
                 })?;
             let record = UnverifiedRecord::parse(LOG_KEY, &bytes)?;
-            let (_, record) = timeout_at(deadline, self.link.verify(record))
-                .await
-                .map_err(|_| {
-                    HandlerError::new("hub_unavailable", "supersede author check timed out")
-                })??;
+            let key = self.membership.log_key(&record, sequence)?;
+            let record = record.verify(&key)?;
             if &record.header().writer != author {
                 return Err(HandlerError::new(
                     "record_invalid",
@@ -485,6 +789,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
 
     fn committed(&mut self, position: i64) {
         self.applied = position;
+        self.update_barrier();
         crate::enable::refresh(&self.health, &self.store);
         if let Ok(generation) = self.store.generation() {
             self.health
@@ -495,9 +800,15 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
     }
 
     async fn settle_applied(&self, record: &VerifiedRecord, sequence: u64, deadline: Instant) {
+        let trust = MemberTrust {
+            epoch: self.link.trust.as_ref(),
+            membership: &self.membership,
+            store: &self.store,
+            base: self.base,
+        };
         if let Err(error) = self
             .link
-            .writer(&self.store)
+            .writer(&self.store, &trust)
             .record_applied(record, sequence, deadline)
             .await
         {

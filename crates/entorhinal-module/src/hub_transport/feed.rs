@@ -94,6 +94,14 @@ pub(crate) struct Feed<T> {
     backoff: Duration,
     retry_at: Option<Instant>,
     outage: Outage,
+    live: bool,
+    pending: Option<T>,
+}
+
+pub(crate) enum FeedEvent<T> {
+    Connected,
+    Disconnected,
+    Item(T),
 }
 
 enum Kind {
@@ -133,6 +141,8 @@ impl<T> Feed<T> {
             backoff: INITIAL_BACKOFF,
             retry_at: None,
             outage: Outage::default(),
+            live: false,
+            pending: None,
         }
     }
 
@@ -154,7 +164,8 @@ impl<T> Feed<T> {
         }
     }
 
-    fn set_live(&self, live: bool) {
+    fn set_live(&mut self, live: bool) {
+        self.live = live;
         let gauge = match self.kind {
             Kind::Kv => &self.health.hub.kv_watch_live,
             Kind::Log => &self.health.hub.log_tail_live,
@@ -186,6 +197,17 @@ impl<T> Feed<T> {
     /// feed; a new feed starts from the caller's durable applied sequence.
     pub(crate) async fn next(&mut self) -> T {
         loop {
+            if let FeedEvent::Item(item) = self.next_event().await {
+                return item;
+            }
+        }
+    }
+
+    pub(crate) async fn next_event(&mut self) -> FeedEvent<T> {
+        if let Some(item) = self.pending.take() {
+            return FeedEvent::Item(item);
+        }
+        loop {
             if let Some(at) = self.retry_at {
                 sleep_until(at).await;
                 self.retry_at = None;
@@ -195,10 +217,11 @@ impl<T> Feed<T> {
                     Ok(subscription) => {
                         self.subscription = Some(subscription);
                         self.reached();
+                        return FeedEvent::Connected;
                     }
                     Err(error) => {
                         self.retry_open(error);
-                        continue;
+                        return FeedEvent::Disconnected;
                     }
                 }
             }
@@ -210,13 +233,19 @@ impl<T> Feed<T> {
                 .await
             {
                 Delivery::Item(Ok((sequence, item))) => {
+                    let recovered = !self.live;
                     self.reached();
-                    if self.durable_cursor {
-                        return item;
-                    }
-                    if self.cursor.is_none_or(|last| sequence > last) {
-                        self.cursor = Some(sequence);
-                        return item;
+                    if self.durable_cursor || self.cursor.is_none_or(|last| sequence > last) {
+                        if !self.durable_cursor {
+                            self.cursor = Some(sequence);
+                        }
+                        if recovered {
+                            self.pending = Some(item);
+                            return FeedEvent::Connected;
+                        }
+                        return FeedEvent::Item(item);
+                    } else if recovered {
+                        return FeedEvent::Connected;
                     }
                 }
                 Delivery::Item(Err(error)) => {
@@ -227,11 +256,16 @@ impl<T> Feed<T> {
                         // until credential maintenance replaces the connection.
                         self.retry_at = Some(Instant::now() + INITIAL_BACKOFF);
                     }
+                    return FeedEvent::Disconnected;
                 }
-                Delivery::Ended(error) => self.retry_open(error),
+                Delivery::Ended(error) => {
+                    self.retry_open(error);
+                    return FeedEvent::Disconnected;
+                }
                 Delivery::Replaced => {
                     self.set_live(false);
                     self.subscription = None;
+                    return FeedEvent::Disconnected;
                 }
             }
         }

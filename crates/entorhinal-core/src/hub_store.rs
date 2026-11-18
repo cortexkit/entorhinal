@@ -59,6 +59,13 @@ CREATE TABLE hub_anchor (
     PRIMARY KEY(box, episode, key_version)
 );
 
+-- Membership is replayed from the hub journal, not included in snapshots.
+CREATE TABLE hub_membership (
+    position INTEGER PRIMARY KEY CHECK(position > 0),
+    kind TEXT NOT NULL,
+    body TEXT NOT NULL
+);
+
 -- For a join wrap, the rows sharing its request id give exactly the epochs
 -- carried by that wrap, even after a later import supplies another source.
 CREATE TABLE hub_held_epoch (
@@ -79,6 +86,29 @@ CREATE TABLE hub_epoch_status (
 "#;
 
 const ATTEMPT_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubAnchor {
+    pub box_id: String,
+    pub episode: u64,
+    pub version: String,
+    pub public_key: Vec<u8>,
+}
+
+pub const MEMBERSHIP_OPS: &[&str] = &["member.key", "member.removed", "member.admitted"];
+
+pub(crate) fn replay_membership(
+    tx: &Transaction<'_>,
+    kind: &str,
+    body: &Value,
+    position: i64,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO hub_membership(position,kind,body) VALUES(?1,?2,?3)",
+        params![position, kind, body.to_string()],
+    )?;
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HubAttemptWrite {
@@ -231,6 +261,58 @@ fn save_attempt(
 }
 
 impl RegistryStore {
+    pub fn hub_anchors(&self) -> Result<Vec<HubAnchor>, RegistryError> {
+        self.read(|conn| {
+            conn.prepare("SELECT box,episode,key_version,pub FROM hub_anchor")?
+                .query_map([], |r| {
+                    Ok(HubAnchor {
+                        box_id: r.get(0)?,
+                        episode: r.get(1)?,
+                        version: r.get(2)?,
+                        public_key: r.get(3)?,
+                    })
+                })?
+                .collect()
+        })
+    }
+
+    pub fn persist_hub_anchors(&self, anchors: &[HubAnchor]) -> Result<(), RegistryError> {
+        self.db
+            .with_conn_fenced(|tx| {
+                for anchor in anchors {
+                    let count = tx.execute(
+                        "INSERT INTO hub_anchor(box,episode,key_version,pub) VALUES(?1,?2,?3,?4)
+                     ON CONFLICT(box,episode,key_version) DO UPDATE SET pub=excluded.pub
+                     WHERE hub_anchor.pub=excluded.pub",
+                        params![
+                            anchor.box_id,
+                            anchor.episode,
+                            anchor.version,
+                            anchor.public_key
+                        ],
+                    )?;
+                    if count != 1 {
+                        return Err(rusqlite::Error::InvalidParameterName(
+                            "conflicting public keys for one hub anchor".into(),
+                        ));
+                    }
+                }
+                Ok(())
+            })
+            .map_err(RegistryError::Store)
+    }
+
+    pub fn hub_snapshot_applied(&self, base: i64) -> Result<bool, RegistryError> {
+        self.read(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM registry_journal
+                               WHERE op='shared.snapshot' AND log_position>?1)",
+                [base],
+                |r| r.get(0),
+            )
+        })
+    }
+
     pub fn hub_log_base(&self) -> Result<Option<i64>, RegistryError> {
         self.read(|conn| {
             conn.query_row(

@@ -83,6 +83,7 @@ fn hub_store_migration_preserves_legacy_progress_and_requires_snapshot_for_downg
                 "hub_attempt",
                 "hub_attempt_send",
                 "hub_anchor",
+                "hub_membership",
                 "hub_held_epoch",
                 "hub_epoch_status",
             ] {

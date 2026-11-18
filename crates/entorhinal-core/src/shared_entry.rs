@@ -766,6 +766,8 @@ mod tests {
                     "hub_attempt",
                     "hub_attempt_send",
                     "hub_anchor",
+                    // Reconstructed from hub journal rows, not transferred as snapshot rows.
+                    "hub_membership",
                     "hub_held_epoch",
                     "hub_epoch_status",
                 ];

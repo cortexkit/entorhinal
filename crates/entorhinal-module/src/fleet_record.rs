@@ -11,9 +11,11 @@ pub(super) mod vault;
 
 use cortexkit_claustrum_client::{CredentialResolver, PublicKeyAlgorithm};
 use ed25519_dalek::{Signature, VerifyingKey};
-use entorhinal_catalog::{decode_hex, is_hex, jcs, MAX_SAFE_INTEGER};
+pub(super) use entorhinal_catalog::is_hex;
+use entorhinal_catalog::{decode_hex, jcs, MAX_SAFE_INTEGER};
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 use crate::HandlerError;
 use vault::EpochVault;
@@ -191,6 +193,13 @@ pub(super) async fn prepare(
         {
             return Err(signature_invalid());
         }
+        if header.kind == "member.key"
+            && (body["version"].as_str() != Some(&public.key_id)
+                || body["pub"].as_str() != Some(&public.public_key_hex))
+        {
+            // Rebuild member.key from the vault reply when its signing key changes.
+            return Err(signature_invalid());
+        }
         let mut fields = header.aad_fields();
         fields.insert("key_version".into(), public.key_id.clone().into());
         let epoch = if sealed {
@@ -225,7 +234,7 @@ pub(super) async fn prepare(
     Err(signature_invalid())
 }
 
-/// Untrusted metadata for selecting a trusted key. The body is not exposed.
+/// Untrusted data for selecting a trusted key. Never apply it before verifying.
 #[derive(Debug)]
 pub(super) struct UnverifiedRecord {
     header: Header,
@@ -236,6 +245,15 @@ pub(super) struct UnverifiedRecord {
 }
 
 impl UnverifiedRecord {
+    pub(super) fn membership_kind(bytes: &[u8]) -> bool {
+        #[derive(Deserialize)]
+        struct Kind<'a> {
+            kind: &'a str,
+        }
+        serde_json::from_slice::<Kind<'_>>(bytes)
+            .is_ok_and(|kind| entorhinal_core::hub_store::MEMBERSHIP_OPS.contains(&kind.kind))
+    }
+
     pub(super) fn parse(expected_key: &str, bytes: &[u8]) -> Result<Self, HandlerError> {
         // A full record can be larger than its signing input only by the sig field.
         if bytes.len() > MAX_ENVELOPE_BYTES {
@@ -287,6 +305,21 @@ impl UnverifiedRecord {
 
     pub(super) fn key_version(&self) -> &str {
         &self.key_version
+    }
+
+    pub(super) fn unsealed(&self) -> Option<&Value> {
+        match &self.body {
+            Body::Unsealed(body) => Some(body),
+            Body::Sealed(_) => None,
+        }
+    }
+
+    pub(super) fn signed_by(&self, public_key: &str) -> bool {
+        verifies(public_key, &self.input, &self.sig)
+    }
+
+    pub(super) fn signing_id(&self) -> [u8; 32] {
+        Sha256::digest(self.input.as_bytes()).into()
     }
 
     pub(super) fn epoch(&self) -> Option<u64> {

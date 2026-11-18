@@ -103,6 +103,7 @@ mod fake_daemon;
 mod fake_door;
 mod fleet_record;
 mod hub_identity_log;
+mod hub_membership;
 // The hub backend starts this transport only when the store selects it.
 #[allow(dead_code)]
 mod hub_transport;
@@ -396,6 +397,8 @@ impl RequestLatency {
 #[derive(Default)]
 struct HealthGauges {
     hub: hub_transport::Gauges,
+    // 0: legacy backend, 1: waiting for the hub membership barrier, 2: ready.
+    hub_membership: AtomicU64,
     liveness_bus_connected: AtomicBool,
     liveness_bus_authoritative: AtomicBool,
     liveness_bus_sessions: AtomicU64,
