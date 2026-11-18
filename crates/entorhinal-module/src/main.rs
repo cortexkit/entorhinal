@@ -102,6 +102,7 @@ mod fake_daemon;
 #[allow(dead_code)]
 mod fake_door;
 mod fleet_record;
+mod hub_epoch;
 mod hub_identity_log;
 mod hub_membership;
 mod hub_residence;

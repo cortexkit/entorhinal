@@ -22,6 +22,35 @@ pub(crate) struct Callosum {
 #[async_trait]
 impl PeerKeysRead for Callosum {
     async fn peer_keys_read(&self) -> Result<Vec<PeerAnchor>, HandlerError> {
+        decode(&self.read().await?)
+    }
+
+    async fn own_fingerprint(&self) -> Result<String, HandlerError> {
+        (self.fingerprint)()
+    }
+
+    async fn fleet_peers(&self) -> Result<Vec<(String, String)>, HandlerError> {
+        let reply = self.read().await?;
+        let peers = reply["peers"].as_array().ok_or_else(invalid_reply)?;
+        Ok(peers
+            .iter()
+            .filter_map(|peer| {
+                if peer["class"]
+                    .as_str()
+                    .is_some_and(|class| class != "computer")
+                {
+                    return None;
+                }
+                let id = peer["machine_id"].as_str().filter(|id| box_id(id))?;
+                let fingerprint = peer["fingerprint"].as_str().filter(|id| box_id(id))?;
+                Some((id.to_owned(), fingerprint.to_owned()))
+            })
+            .collect())
+    }
+}
+
+impl Callosum {
+    async fn read(&self) -> Result<Value, HandlerError> {
         let consumer = self.connector.consumer().await.map_err(|_| unavailable())?;
         let bytes = consumer
             .call(
@@ -45,11 +74,7 @@ impl PeerKeysRead for Callosum {
                 unavailable()
             })?;
         let reply: Value = serde_json::from_slice(&bytes).map_err(|_| invalid_reply())?;
-        decode(reply.get("result").unwrap_or(&reply))
-    }
-
-    async fn own_fingerprint(&self) -> Result<String, HandlerError> {
-        (self.fingerprint)()
+        Ok(reply.get("result").cloned().unwrap_or(reply))
     }
 }
 

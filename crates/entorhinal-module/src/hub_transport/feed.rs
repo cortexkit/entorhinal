@@ -117,6 +117,7 @@ pub(crate) enum FeedEvent<T> {
 enum Kind {
     Kv,
     Log,
+    Epoch,
 }
 
 impl<T> Feed<T> {
@@ -139,6 +140,14 @@ impl<T> Feed<T> {
         Fut: Future<Output = Result<Subscription<T>, Failure>> + Send + 'static,
     {
         Self::new(health, Kind::Log, Some(applied), open)
+    }
+
+    pub(super) fn epoch<F, Fut>(health: Arc<HealthGauges>, open: F) -> Self
+    where
+        F: FnMut(Option<u64>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<Subscription<T>, Failure>> + Send + 'static,
+    {
+        Self::new(health, Kind::Epoch, None, open)
     }
 
     fn new<F, Fut>(health: Arc<HealthGauges>, kind: Kind, cursor: Option<u64>, mut open: F) -> Self
@@ -176,6 +185,7 @@ impl<T> Feed<T> {
         match self.kind {
             Kind::Kv => "residence_kv",
             Kind::Log => "identity_log",
+            Kind::Epoch => "fleet_epoch",
         }
     }
 
@@ -184,6 +194,7 @@ impl<T> Feed<T> {
         let gauge = match self.kind {
             Kind::Kv => &self.health.hub.kv_watch_live,
             Kind::Log => &self.health.hub.log_tail_live,
+            Kind::Epoch => return,
         };
         gauge.store(live, Ordering::Relaxed);
     }

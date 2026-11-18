@@ -195,12 +195,19 @@ pub(super) struct Running {
     pub service: Arc<Residence>,
     watch: tokio::task::JoinHandle<()>,
     recovery: tokio::task::JoinHandle<()>,
+    epochs: Option<(
+        Arc<dyn crate::hub_epoch::RemovalIntake>,
+        tokio::task::JoinHandle<()>,
+    )>,
 }
 
 impl Drop for Running {
     fn drop(&mut self) {
         self.watch.abort();
         self.recovery.abort();
+        if let Some((_, task)) = &self.epochs {
+            task.abort();
+        }
     }
 }
 
@@ -227,6 +234,13 @@ impl ProjectsHandler {
                 "hub residence watch already installed",
             ));
         }
+        let epochs = crate::hub_epoch::Controller::new(log.clone())
+            .zip(log.epoch_watch())
+            .map(|(controller, feed)| {
+                let watcher = controller.clone();
+                let task = tokio::spawn(async move { watcher.watch(feed).await });
+                (controller as Arc<dyn crate::hub_epoch::RemovalIntake>, task)
+            });
         let service = Arc::new(Residence {
             store: log.store.clone(),
             box_id: log.box_id.to_string(),
@@ -241,9 +255,25 @@ impl ProjectsHandler {
         *running = Some(Running {
             watch: tokio::spawn(service.clone().watch(feed)),
             recovery: tokio::spawn(service.clone().recover()),
+            epochs,
             service: service.clone(),
         });
         Ok(service)
+    }
+
+    pub(super) async fn hub_device_removed(
+        &self,
+        bytes: &[u8],
+        deadline: Instant,
+    ) -> Result<(), HandlerError> {
+        let intake = self
+            .hub_residence
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|running| running.epochs.as_ref().map(|(intake, _)| intake.clone()))
+            .ok_or_else(not_ready)?;
+        intake.deliver(bytes, deadline).await
     }
 
     pub(super) fn residence(&self) -> Option<Arc<Residence>> {

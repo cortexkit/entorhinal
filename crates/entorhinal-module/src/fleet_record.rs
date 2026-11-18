@@ -98,6 +98,13 @@ pub(super) struct SealedBody {
     ciphertext: String,
 }
 
+#[cfg(test)]
+impl SealedBody {
+    pub(super) fn fixture_ciphertext(&self) -> (u64, &str) {
+        (self.epoch, &self.ciphertext)
+    }
+}
+
 #[derive(Debug)]
 enum Body {
     Sealed(SealedBody),
@@ -355,6 +362,13 @@ impl VerifiedRecord {
         match &self.body {
             Body::Sealed(body) => Some(body.epoch),
             Body::Unsealed(_) => None,
+        }
+    }
+
+    pub(super) fn unsealed(&self) -> Option<&Value> {
+        match &self.body {
+            Body::Unsealed(body) => Some(body),
+            Body::Sealed(_) => None,
         }
     }
 

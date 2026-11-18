@@ -25,6 +25,7 @@ struct Leaf {
     sends: StdMutex<Vec<(u64, String, Vec<u8>)>>,
     reads: StdMutex<Vec<u64>>,
     refuse_kv: std::sync::atomic::AtomicBool,
+    epoch_gate: StdMutex<Option<(String, Gate)>>,
 }
 
 enum Gate {
@@ -91,7 +92,26 @@ impl Transport for Leaf {
             if self.refuse_kv.load(Ordering::Acquire) {
                 return Err(unavailable("fixture stopped residence before send"));
             }
-            return self
+            if write.value.is_empty() {
+                self.session()
+                    .delete(&write.key, write.expected, id, deadline)
+                    .await?;
+                return Ok(None);
+            }
+            let gate = {
+                let mut configured = self.epoch_gate.lock().unwrap();
+                if configured.as_ref().is_some_and(|(key, _)| {
+                    write.key.starts_with(key) || write.request_key.starts_with(key)
+                }) {
+                    configured.take().map(|(_, gate)| gate)
+                } else {
+                    None
+                }
+            };
+            if let Some(Gate::Race(barrier)) = &gate {
+                barrier.wait().await;
+            }
+            let revision = self
                 .session()
                 .update(
                     &write.key,
@@ -100,8 +120,12 @@ impl Transport for Leaf {
                     id,
                     deadline,
                 )
-                .await
-                .map(Some);
+                .await?;
+            if let Some(Gate::LoseAck(committed, release)) = gate {
+                committed.send(()).unwrap();
+                release.await.unwrap();
+            }
+            return Ok(Some(revision));
         }
         let record = UnverifiedRecord::parse(LOG_SUBJECT, &write.value).unwrap();
         assert_eq!(record.header().writer, self.box_id.to_string());
@@ -176,6 +200,7 @@ async fn leaf(
         sends: StdMutex::default(),
         reads: StdMutex::default(),
         refuse_kv: std::sync::atomic::AtomicBool::new(false),
+        epoch_gate: StdMutex::default(),
     });
     within(async {
         while leaf.session().log().await.is_err() {
@@ -497,6 +522,7 @@ impl IdentityRig {
     }
 }
 
+mod epochs;
 mod residence;
 
 #[tokio::test]

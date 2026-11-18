@@ -1,0 +1,1316 @@
+//! The signed epoch register, its writer fence, and removal-driven rotation.
+#![allow(dead_code)]
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Duration,
+};
+
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use entorhinal_core::{
+    hub_store::{HubEpochSource, HubOwnMint},
+    RegistryStore,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use tokio::{
+    sync::{Mutex, Notify},
+    time::{timeout_at, Instant},
+};
+
+use crate::{
+    fleet_record::{
+        vault::{EpochControl, EpochVault, PendingMint},
+        UnverifiedRecord, LOG_KEY,
+    },
+    hub_identity_log::{wait_for_applied, IdentityLog, LogTransport},
+    hub_membership::{box_id, Membership, Removed, Sight},
+    hub_transport::{Feed, FeedEvent},
+    hub_write::{self, Payload, Step, Transport, Trust},
+    HandlerError,
+};
+
+const KEY: &str = "epoch";
+const RECOVERY: Duration = Duration::from_secs(60);
+const BUDGET: Duration = Duration::from_secs(25);
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum State {
+    Pending,
+    Committed,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+struct DropBox {
+    #[serde(rename = "box")]
+    box_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    removal_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct Epoch {
+    e: u64,
+    state: State,
+    minter: String,
+    mint_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_e: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_mint_id: Option<String>,
+    base_recipients: BTreeSet<String>,
+    recipients: BTreeSet<String>,
+    removed: Vec<DropBox>,
+}
+
+impl Epoch {
+    fn validate(&self) -> Result<(), HandlerError> {
+        let mut ids = BTreeSet::new();
+        let mut removed = BTreeSet::new();
+        let base_valid = match (self.base_e, self.base_mint_id.as_deref()) {
+            (None, None) => self.e == 1 && self.base_recipients.is_empty(),
+            (Some(base), Some(id)) => {
+                base > 0
+                    && base.checked_add(1) == Some(self.e)
+                    && mint_id(id)
+                    && !self.base_recipients.is_empty()
+            }
+            _ => false,
+        };
+        if !(1..=u32::MAX as u64).contains(&self.e)
+            || !base_valid
+            || !mint_id(&self.mint_id)
+            || !self.recipients.contains(&self.minter)
+            || self.recipients.len() > 64
+            || self.base_recipients.len() > 64
+            || !self
+                .recipients
+                .iter()
+                .chain(&self.base_recipients)
+                .all(|id| box_id(id))
+            || self.removed.iter().any(|entry| {
+                !box_id(&entry.box_id)
+                    || !removed.insert(&entry.box_id)
+                    || entry
+                        .removal_id
+                        .as_ref()
+                        .is_some_and(|id| id.is_empty() || !ids.insert(id))
+            })
+        {
+            return Err(invalid("invalid epoch value"));
+        }
+        Ok(())
+    }
+
+    fn accepts(&self, next: &Self) -> bool {
+        if self.e != next.e {
+            return next.e > self.e;
+        }
+        if self.base_e != next.base_e
+            || self.base_mint_id != next.base_mint_id
+            || self.base_recipients != next.base_recipients
+        {
+            return false;
+        }
+        if self.mint_id != next.mint_id {
+            return self.state == State::Pending
+                && self
+                    .removed
+                    .iter()
+                    .all(|removed| next.removed.contains(removed));
+        }
+        if self.minter != next.minter || self.removed != next.removed {
+            return false;
+        }
+        match (self.state, next.state) {
+            (State::Pending, State::Committed) => self.recipients.is_subset(&next.recipients),
+            (State::Committed, State::Committed) => {
+                self.recipients.len() < next.recipients.len()
+                    && self.recipients.is_subset(&next.recipients)
+            }
+            _ => false,
+        }
+    }
+
+    fn mint(&self) -> PendingMint {
+        PendingMint {
+            epoch: self.e,
+            mint_id: self.mint_id.clone(),
+        }
+    }
+
+    fn committed_key(&self) -> Option<(u64, &str)> {
+        match self.state {
+            State::Committed => Some((self.e, &self.mint_id)),
+            State::Pending => self.base_e.zip(self.base_mint_id.as_deref()),
+        }
+    }
+
+    fn contains_removal(&self, removal_id: &str) -> bool {
+        self.removed
+            .iter()
+            .any(|entry| entry.removal_id.as_deref() == Some(removal_id))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemovalEvent {
+    fingerprint: String,
+    box_id: Option<String>,
+    removal_id: String,
+}
+
+impl RemovalEvent {
+    fn decode(bytes: &[u8]) -> Result<Self, HandlerError> {
+        let event: Self =
+            serde_json::from_slice(bytes).map_err(|_| invalid("invalid device_removed body"))?;
+        if !box_id(&event.fingerprint)
+            || event.box_id.as_deref().is_some_and(|id| !box_id(id))
+            || event.removal_id.is_empty()
+        {
+            return Err(invalid("invalid device_removed identifiers"));
+        }
+        Ok(event)
+    }
+}
+
+/// Feed the bus controller's `m_entorhinal` durable for
+/// `ck.{acct}.event.callosum.device_removed.v1` into `deliver`. A successful
+/// result can be acknowledged; a failure leaves the delivery for retry.
+pub(super) struct Controller<T, U> {
+    log: Arc<IdentityLog<T, U>>,
+    reader: Arc<EpochReader<T>>,
+    changing: Mutex<()>,
+}
+
+#[async_trait::async_trait]
+pub(super) trait RemovalIntake: Send + Sync {
+    async fn deliver(&self, bytes: &[u8], deadline: Instant) -> Result<(), HandlerError>;
+}
+
+#[async_trait::async_trait]
+impl<T: LogTransport, U: Trust + Send + Sync + 'static> RemovalIntake for Controller<T, U> {
+    async fn deliver(&self, bytes: &[u8], deadline: Instant) -> Result<(), HandlerError> {
+        Controller::deliver(self, bytes, deadline).await
+    }
+}
+
+impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
+    pub(super) fn new(log: Arc<IdentityLog<T, U>>) -> Option<Arc<Self>> {
+        Some(Arc::new(Self {
+            reader: log.epoch.clone()?,
+            log,
+            changing: Mutex::new(()),
+        }))
+    }
+
+    pub(super) async fn deliver(
+        &self,
+        bytes: &[u8],
+        deadline: Instant,
+    ) -> Result<(), HandlerError> {
+        let event = RemovalEvent::decode(bytes)?;
+        let _guard = timeout_at(deadline, self.changing.lock())
+            .await
+            .map_err(|_| busy())?;
+        // Read the register before the log head. The next mint is allowed only
+        // after the previous mint's removals have been appended.
+        let observed = self.reader.read(deadline).await?.ok_or_else(unavailable)?;
+        let applied = self.caught_up(deadline).await?;
+        if self
+            .reader
+            .membership
+            .removal_applied("", 0, Some(&event.removal_id), applied)
+        {
+            return Ok(());
+        }
+        if observed.epoch.contains_removal(&event.removal_id) {
+            return Ok(());
+        }
+        let peer_box = if event.box_id.is_none() {
+            timeout_at(deadline, self.log.peer_keys().fleet_peers())
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .and_then(|peers| {
+                    peers
+                        .into_iter()
+                        .find_map(|(id, fp)| (fp == event.fingerprint).then_some(id))
+                })
+        } else {
+            None
+        };
+        let box_id = event
+            .box_id
+            .or(peer_box)
+            .or_else(|| {
+                self.reader
+                    .membership
+                    .box_for_fingerprint(&event.fingerprint, applied)
+            })
+            .ok_or_else(|| {
+                HandlerError::new("removal_box_unknown", "device removal has no known box id")
+            })?;
+        if box_id == self.reader.own_box {
+            return Err(HandlerError::new(
+                "member_episode_invalid",
+                "removed box cannot rotate its own fleet epoch",
+            ));
+        }
+        let removal = DropBox {
+            box_id,
+            removal_id: Some(event.removal_id),
+        };
+        if let Some((_, epoch, None)) = self.reader.membership.removed_at(&removal.box_id, applied)
+        {
+            return self.append_removal(&removal, epoch, deadline).await;
+        }
+        if observed.epoch.state == State::Pending {
+            return Err(HandlerError::new(
+                "epoch_rotation_pending",
+                "removal will be retried after the pending mint",
+            ));
+        }
+        self.reconcile(Some(&observed), deadline).await?;
+        self.append_missing(&observed, deadline).await?;
+        if !observed.epoch.recipients.contains(&removal.box_id) {
+            return self
+                .append_removal(&removal, observed.epoch.e, deadline)
+                .await;
+        }
+        self.reader.ensure(&observed, deadline).await?;
+        self.rotate(
+            Some(&observed),
+            Some((&removal, &event.fingerprint)),
+            deadline,
+        )
+        .await
+    }
+
+    /// Only the explicit enable/cutover path may create the first epoch.
+    pub(super) async fn bootstrap(&self, deadline: Instant) -> Result<(), HandlerError> {
+        let _guard = timeout_at(deadline, self.changing.lock())
+            .await
+            .map_err(|_| busy())?;
+        let observed = self.reader.read(deadline).await?;
+        self.reconcile(observed.as_ref(), deadline).await?;
+        match observed {
+            None => self.rotate(None, None, deadline).await,
+            Some(observed) if observed.epoch.state == State::Committed => {
+                self.reader.ensure(&observed, deadline).await
+            }
+            Some(_) => Err(unavailable()),
+        }
+    }
+
+    async fn caught_up(&self, deadline: Instant) -> Result<u64, HandlerError> {
+        let head = self.log.log_head(deadline).await?;
+        wait_for_applied(&self.log, head, deadline).await?;
+        self.log.applied_sequence()
+    }
+
+    async fn append_missing(
+        &self,
+        current: &Observed,
+        deadline: Instant,
+    ) -> Result<(), HandlerError> {
+        for removal in &current.epoch.removed {
+            self.append_removal(removal, current.epoch.e, deadline)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn append_removal(
+        &self,
+        removal: &DropBox,
+        epoch: u64,
+        deadline: Instant,
+    ) -> Result<(), HandlerError> {
+        let identity = match &removal.removal_id {
+            Some(id) => json!([id]),
+            None => json!([removal.box_id, epoch]),
+        };
+        let digest = hub_write::params_digest("member.removed", &identity)?;
+        let entry_id = &digest[..32];
+        loop {
+            let applied = self.caught_up(deadline).await?;
+            if self.reader.membership.removal_applied(
+                &removal.box_id,
+                epoch,
+                removal.removal_id.as_deref(),
+                applied,
+            ) {
+                return Ok(());
+            }
+            let (closing_episode, closing_epoch) = if let Some((episode, old_epoch, None)) =
+                self.reader.membership.removed_at(&removal.box_id, applied)
+            {
+                (episode, old_epoch)
+            } else {
+                (
+                    self.reader
+                        .membership
+                        .open_episode(&removal.box_id, applied)
+                        .ok_or_else(|| invalid("removal would close an already closed episode"))?,
+                    epoch,
+                )
+            };
+            let body = serde_json::to_value(Removed {
+                box_id: removal.box_id.clone(),
+                removal_id: removal.removal_id.clone(),
+                epoch: closing_epoch,
+                key_history: self
+                    .reader
+                    .membership
+                    .history(&removal.box_id, closing_episode),
+            })
+            .expect("serializable removal");
+            let request_key = format!("epoch.removed:{entry_id}:{applied}");
+            match self
+                .log
+                .write_epoch_step(
+                    &request_key,
+                    &digest,
+                    &Step {
+                        name: "member.removed".into(),
+                        key: LOG_KEY.into(),
+                        expected: applied,
+                        payload: Payload::Record {
+                            kind: "member.removed".into(),
+                            body,
+                            snapshot_id: Some(entry_id.into()),
+                        },
+                    },
+                    deadline,
+                )
+                .await
+            {
+                Ok(landed) => {
+                    wait_for_applied(
+                        &self.log,
+                        landed
+                            .position
+                            .ok_or_else(|| invalid("missing removal position"))?,
+                        deadline,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                Err(error) if error.code == "head_moved" && Instant::now() < deadline => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn put(
+        &self,
+        request_key: &str,
+        key: &str,
+        expected: u64,
+        body: Value,
+        deadline: Instant,
+    ) -> Result<u64, HandlerError> {
+        let kind = key.split('.').next().expect("key kind");
+        let digest = hub_write::params_digest(key, &body)?;
+        self.log
+            .write_epoch_step(
+                request_key,
+                &digest,
+                &Step {
+                    name: kind.into(),
+                    key: key.into(),
+                    expected,
+                    payload: Payload::Record {
+                        kind: kind.into(),
+                        body,
+                        snapshot_id: None,
+                    },
+                },
+                deadline,
+            )
+            .await?
+            .position
+            .ok_or_else(|| invalid("missing epoch write revision"))
+    }
+
+    async fn rotate(
+        &self,
+        previous: Option<&Observed>,
+        event: Option<(&DropBox, &str)>,
+        deadline: Instant,
+    ) -> Result<(), HandlerError> {
+        self.log.writer_episode()?;
+        let applied = self.caught_up(deadline).await?;
+        let own_box = &self.reader.own_box;
+        let state = previous.map(|previous| &previous.epoch);
+        let (e, base_e, base_mint_id, base_recipients, mut removed) = match state {
+            Some(state) if state.state == State::Pending => (
+                state.e,
+                state.base_e,
+                state.base_mint_id.clone(),
+                state.base_recipients.clone(),
+                state.removed.clone(),
+            ),
+            Some(state) => (
+                state.e + 1,
+                Some(state.e),
+                Some(state.mint_id.clone()),
+                state.recipients.clone(),
+                Vec::new(),
+            ),
+            None => (1, None, None, BTreeSet::new(), Vec::new()),
+        };
+        let roster = timeout_at(deadline, self.log.peer_keys().fleet_peers())
+            .await
+            .map_err(|_| busy())??;
+        let mut peers: BTreeMap<_, _> = roster.iter().cloned().collect();
+        if peers.len() != roster.len()
+            || roster
+                .iter()
+                .map(|(_, fp)| fp)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != roster.len()
+        {
+            return Err(invalid("duplicate Callosum fleet identity"));
+        }
+        let fingerprint = timeout_at(deadline, self.log.peer_keys().own_fingerprint())
+            .await
+            .map_err(|_| busy())??;
+        if !box_id(&fingerprint) {
+            return Err(invalid("invalid local Callosum fingerprint"));
+        }
+        peers.insert(own_box.clone(), fingerprint.clone());
+        if let Some((removal, fingerprint)) = event {
+            peers.retain(|id, peer| {
+                *id == *own_box || (id != &removal.box_id && peer != fingerprint)
+            });
+            if !removed.iter().any(|item| item.box_id == removal.box_id) {
+                removed.push(removal.clone());
+            }
+        }
+        for id in &base_recipients {
+            if !peers.contains_key(id) && !removed.iter().any(|removal| &removal.box_id == id) {
+                removed.push(DropBox {
+                    box_id: id.clone(),
+                    removal_id: None,
+                });
+            }
+        }
+        let mut withheld_repair = false;
+        for removal in &removed {
+            // An explicitly admitted replacement episode may participate in a
+            // later attempt. A roster re-pair alone does not authorize a wrap.
+            if !self.reader.membership.removal_applied(
+                &removal.box_id,
+                e,
+                removal.removal_id.as_deref(),
+                applied,
+            ) || self
+                .reader
+                .membership
+                .removed_at(&removal.box_id, applied)
+                .is_some()
+            {
+                withheld_repair |= peers.remove(&removal.box_id).is_some();
+            }
+        }
+        if !peers.contains_key(own_box) {
+            return Err(HandlerError::new(
+                "member_episode_invalid",
+                "removed box cannot supersede a mint",
+            ));
+        }
+        let members: Vec<_> = peers
+            .values()
+            .map(|fp| format!("fed-computer:{fp}"))
+            .collect();
+        let result = timeout_at(deadline, self.reader.control().mint(&members))
+            .await
+            .map_err(|_| busy())?;
+        let minted = match result {
+            Ok(minted) => minted,
+            Err(error)
+                if error.code == "fleet_members_mismatch"
+                    && withheld_repair
+                    && state.is_some_and(|state| state.state == State::Pending) =>
+            {
+                self.append_missing(previous.expect("pending epoch"), deadline)
+                    .await?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        let mint = minted.mint();
+        let pending = Epoch {
+            e,
+            state: State::Pending,
+            minter: own_box.clone(),
+            mint_id: mint.mint_id.clone(),
+            base_e,
+            base_mint_id,
+            base_recipients,
+            recipients: peers.keys().cloned().collect(),
+            removed,
+        };
+        let by_member: BTreeMap<_, _> = peers
+            .iter()
+            .filter(|(id, _)| *id != own_box)
+            .map(|(id, fp)| (format!("fed-computer:{fp}"), id))
+            .collect();
+        let produced: BTreeSet<_> = minted.wraps.iter().map(|wrap| &wrap.member_id).collect();
+        if mint.epoch != e
+            || produced.len() != minted.wraps.len()
+            || !by_member.keys().eq(produced)
+            || pending.validate().is_err()
+        {
+            timeout_at(deadline, self.reader.control().discard(&mint))
+                .await
+                .map_err(|_| busy())??;
+            return Err(invalid("vault minted an unexpected epoch or recipients"));
+        }
+        let expected = previous.map_or(0, |old| old.revision);
+        let revision = match self
+            .put(
+                &format!("epoch.pending:{}", mint.mint_id),
+                KEY,
+                expected,
+                json!(pending),
+                deadline,
+            )
+            .await
+        {
+            Ok(revision) => revision,
+            Err(error) => return self.settle_lost_mint(&mint, error, deadline).await,
+        };
+        self.reader.store.record_hub_own_mint(&HubOwnMint {
+            epoch: e,
+            mint_id: mint.mint_id.clone(),
+            committed: false,
+            revision,
+        })?;
+        if let Some(old) =
+            previous.filter(|old| old.epoch.state == State::Pending && old.epoch.minter == *own_box)
+        {
+            self.reader.read(deadline).await?;
+            self.delete_wraps(&old.epoch.mint(), deadline).await?;
+        }
+        for wrapped in minted.wraps {
+            let id = by_member[&wrapped.member_id];
+            let key = wrap_key(e, &mint.mint_id, id);
+            self.put(
+                &key,
+                &key,
+                0,
+                json!({"v":1,"epoch":e,"mint_id":mint.mint_id,"to":id,"wrap":wrapped.wrap}),
+                deadline,
+            )
+            .await?;
+        }
+        let committed = Epoch {
+            state: State::Committed,
+            ..pending
+        };
+        match self
+            .put(
+                &format!("epoch.commit:{}", mint.mint_id),
+                KEY,
+                revision,
+                json!(committed),
+                deadline,
+            )
+            .await
+        {
+            Ok(revision) => {
+                let observed = Observed {
+                    revision,
+                    epoch: committed,
+                };
+                self.reader.ensure(&observed, deadline).await?;
+                self.append_missing(&observed, deadline).await
+            }
+            Err(error) => self.settle_lost_mint(&mint, error, deadline).await,
+        }
+    }
+
+    async fn settle_lost_mint(
+        &self,
+        mint: &PendingMint,
+        error: HandlerError,
+        deadline: Instant,
+    ) -> Result<(), HandlerError> {
+        let current = self.reader.read(deadline).await?;
+        if let Some(current) = current {
+            if current.epoch.mint_id == mint.mint_id {
+                if current.epoch.state == State::Committed {
+                    self.reader.ensure(&current, deadline).await?;
+                    return self.append_missing(&current, deadline).await;
+                }
+            } else if current.epoch.e >= mint.epoch {
+                self.reconcile(Some(&current), deadline).await?;
+                if current.epoch.state == State::Committed {
+                    self.reader.ensure(&current, deadline).await?;
+                    if let Some(attempt) = self
+                        .reader
+                        .store
+                        .hub_attempt(&format!("epoch.pending:{}", mint.mint_id))?
+                    {
+                        let own = UnverifiedRecord::parse(KEY, &attempt.write.value)?;
+                        let own: Epoch = serde_json::from_value(
+                            own.unsealed()
+                                .ok_or_else(|| invalid("missing mint attempt body"))?
+                                .clone(),
+                        )
+                        .map_err(|_| invalid("invalid mint attempt body"))?;
+                        if own
+                            .removed
+                            .iter()
+                            .all(|removal| current.epoch.removed.contains(removal))
+                        {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+        Err(error)
+    }
+
+    async fn discard(&self, mint: &PendingMint, deadline: Instant) -> Result<(), HandlerError> {
+        timeout_at(deadline, self.reader.control().discard(mint))
+            .await
+            .map_err(|_| busy())??;
+        Ok(())
+    }
+
+    async fn delete_wraps(
+        &self,
+        mint: &PendingMint,
+        deadline: Instant,
+    ) -> Result<(), HandlerError> {
+        let Some(attempt) = self
+            .reader
+            .store
+            .hub_attempt(&format!("epoch.pending:{}", mint.mint_id))?
+        else {
+            return Ok(());
+        };
+        let signed = UnverifiedRecord::parse(KEY, &attempt.write.value)?;
+        let Some(body) = signed.unsealed() else {
+            return Err(invalid("missing abandoned mint body"));
+        };
+        let epoch: Epoch = serde_json::from_value(body.clone())
+            .map_err(|_| invalid("invalid abandoned mint body"))?;
+        if epoch.minter != self.reader.own_box
+            || epoch.e != mint.epoch
+            || epoch.mint_id != mint.mint_id
+        {
+            return Err(invalid("abandoned mint does not belong to this box"));
+        }
+        for id in epoch
+            .recipients
+            .iter()
+            .filter(|id| *id != &self.reader.own_box)
+        {
+            let key = wrap_key(epoch.e, &epoch.mint_id, id);
+            let Some(entry) = self.reader.transport.kv_entry(&key, deadline).await? else {
+                continue;
+            };
+            if entry.value.is_none() {
+                continue;
+            }
+            let request = format!("delete.{key}");
+            let digest = hub_write::params_digest(&request, &json!(entry.revision))?;
+            self.log
+                .write_epoch_step(
+                    &request,
+                    &digest,
+                    &Step {
+                        name: "epoch.wrap_delete".into(),
+                        key,
+                        expected: entry.revision,
+                        payload: Payload::Delete,
+                    },
+                    deadline,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn reconcile(
+        &self,
+        current: Option<&Observed>,
+        deadline: Instant,
+    ) -> Result<(), HandlerError> {
+        let status = timeout_at(deadline, self.reader.control().status())
+            .await
+            .map_err(|_| busy())??;
+        let saved = self.reader.store.hub_own_mint()?;
+        let pending = status.pending.as_ref().cloned().or_else(|| {
+            saved
+                .as_ref()
+                .filter(|saved| !saved.committed)
+                .map(|saved| PendingMint {
+                    epoch: saved.epoch,
+                    mint_id: saved.mint_id.clone(),
+                })
+        });
+        let Some(mint) = pending else {
+            return Ok(());
+        };
+        if let Some(current) = current {
+            let epoch = &current.epoch;
+            if epoch.mint_id == mint.mint_id && epoch.e == mint.epoch {
+                return if epoch.state == State::Committed {
+                    self.reader.ensure(current, deadline).await
+                } else {
+                    Ok(())
+                };
+            }
+            if epoch.base_e == Some(mint.epoch)
+                && epoch.base_mint_id.as_deref() == Some(&mint.mint_id)
+            {
+                // The next mint read this one committed before the local vault
+                // finished. Retain that key before importing a newer epoch.
+                timeout_at(deadline, self.reader.control().commit(&mint))
+                    .await
+                    .map_err(|_| busy())??;
+                self.reader
+                    .store
+                    .record_hub_held_epochs(HubEpochSource::Mint(&mint.mint_id), &[mint.epoch])?;
+                self.reader
+                    .store
+                    .clear_hub_own_mint(mint.epoch, &mint.mint_id)?;
+                return Ok(());
+            }
+        }
+        let request_key = format!("epoch.pending:{}", mint.mint_id);
+        if let Some(attempt) = self.reader.store.hub_attempt(&request_key)? {
+            if attempt.outcome.is_none()
+                && attempt.write.expected == current.map_or(0, |entry| entry.revision)
+            {
+                // Settle the unacknowledged pending write before discarding its
+                // key. If it lands, the live watch will recover the missing wraps.
+                let saved = UnverifiedRecord::parse(KEY, &attempt.write.value)?;
+                let body = saved
+                    .unsealed()
+                    .ok_or_else(|| invalid("missing pending mint body"))?;
+                self.put(
+                    &request_key,
+                    KEY,
+                    attempt.write.expected,
+                    body.clone(),
+                    deadline,
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+        self.discard(&mint, deadline).await?;
+        self.delete_wraps(&mint, deadline).await?;
+        self.reader
+            .store
+            .clear_hub_own_mint(mint.epoch, &mint.mint_id)?;
+        Ok(())
+    }
+
+    async fn observe(&self, deadline: Instant) -> Result<Option<Observed>, HandlerError> {
+        let _guard = timeout_at(deadline, self.changing.lock())
+            .await
+            .map_err(|_| busy())?;
+        let current = self.reader.read(deadline).await?;
+        self.reconcile(current.as_ref(), deadline).await?;
+        if let Some(current) = current
+            .as_ref()
+            .filter(|current| current.epoch.state == State::Committed)
+        {
+            // A new/re-paired box may need the join flow rather than a wrap for
+            // this mint. Its absence does not stop observation of the epoch.
+            if current.epoch.recipients.contains(&self.reader.own_box) {
+                if let Err(error) = self.reader.ensure(current, deadline).await {
+                    if error.code != "epoch_key_unavailable" {
+                        return Err(error);
+                    }
+                }
+            }
+            if current.epoch.minter == self.reader.own_box && self.log.writer_episode().is_ok() {
+                self.append_missing(current, deadline).await?;
+            }
+        }
+        Ok(current)
+    }
+
+    async fn recover(&self, revision: u64, deadline: Instant) -> Result<(), HandlerError> {
+        let _guard = timeout_at(deadline, self.changing.lock())
+            .await
+            .map_err(|_| busy())?;
+        let Some(current) = self
+            .reader
+            .read(deadline)
+            .await?
+            .filter(|current| current.revision == revision)
+        else {
+            return Ok(());
+        };
+        self.log.writer_episode()?;
+        self.reconcile(Some(&current), deadline).await?;
+        match current.epoch.state {
+            State::Pending => {
+                if current.epoch.minter == self.reader.own_box {
+                    self.discard(&current.epoch.mint(), deadline).await?;
+                }
+                self.rotate(Some(&current), None, deadline).await
+            }
+            State::Committed => self.append_missing(&current, deadline).await,
+        }
+    }
+
+    pub(super) async fn watch(&self, feed: Feed<async_nats::jetstream::kv::Entry>) {
+        self.watch_for(feed, RECOVERY).await;
+    }
+
+    pub(super) async fn watch_for(
+        &self,
+        mut feed: Feed<async_nats::jetstream::kv::Entry>,
+        recovery_delay: Duration,
+    ) {
+        let mut live = false;
+        let mut observed = None;
+        let mut retry_on_membership = false;
+        loop {
+            let timer = observed.as_ref().and_then(Observation::deadline);
+            let changed = tokio::select! {
+                biased;
+                event = feed.next_event() => match event {
+                    FeedEvent::Disconnected => { live = false; observed = None; retry_on_membership = false; false }
+                    FeedEvent::Connected => { live = true; observed = None; true }
+                    FeedEvent::Item(entry) => entry.key == KEY || entry.key.ends_with(&format!(".{}", self.reader.own_box)) && entry.key.starts_with("wrap."),
+                },
+                _ = self.reader.membership_changed.notified(), if live && retry_on_membership => {
+                    retry_on_membership = false;
+                    if let Some(watch) = observed.as_mut() { watch.retry(Instant::now()); }
+                    false
+                },
+                _ = async { tokio::time::sleep_until(timer.expect("armed timer")).await }, if live && timer.is_some() => {
+                    let watch = observed.as_mut().expect("armed observation");
+                    watch.recovered = true;
+                    if let Err(error) = self.recover(watch.revision, Instant::now() + BUDGET).await {
+                        tracing::debug!(code = error.code, "fleet epoch recovery deferred");
+                        if error.code == "fleet_members_mismatch" { retry_on_membership = true; }
+                        else { watch.retry(Instant::now() + Duration::from_secs(5)); }
+                    }
+                    false
+                },
+                _ = self.reader.ready.notified(), if live && observed.is_none() => true,
+            };
+            if live && changed {
+                match self.observe(Instant::now() + BUDGET).await {
+                    Ok(Some(current)) => {
+                        if observed
+                            .as_ref()
+                            .is_none_or(|watch| watch.revision != current.revision)
+                        {
+                            let needs_recovery = current.epoch.state == State::Pending
+                                || !current.epoch.removed.is_empty();
+                            observed = Some(Observation::new(
+                                current.revision,
+                                Instant::now(),
+                                needs_recovery.then_some(recovery_delay),
+                            ));
+                            retry_on_membership = false;
+                        }
+                    }
+                    Ok(None) => observed = None,
+                    Err(error) => {
+                        tracing::debug!(code = error.code, "fleet epoch observation deferred")
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct Observation {
+    revision: u64,
+    due: Option<Instant>,
+    recovered: bool,
+}
+
+impl Observation {
+    fn new(revision: u64, now: Instant, recovery: Option<Duration>) -> Self {
+        Self {
+            revision,
+            due: recovery.map(|delay| now + delay),
+            recovered: false,
+        }
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        if self.recovered {
+            None
+        } else {
+            self.due
+        }
+    }
+
+    fn retry(&mut self, at: Instant) {
+        self.due = Some(at);
+        self.recovered = false;
+    }
+}
+
+fn mint_id(value: &str) -> bool {
+    value.len() == 22
+        && URL_SAFE_NO_PAD
+            .decode(value)
+            .is_ok_and(|bytes| bytes.len() == 16)
+}
+
+fn invalid(message: &str) -> HandlerError {
+    HandlerError::new("record_invalid", message)
+}
+
+fn unavailable() -> HandlerError {
+    HandlerError::new(
+        "epoch_key_unavailable",
+        "writer does not hold the committed fleet epoch",
+    )
+}
+
+fn busy() -> HandlerError {
+    HandlerError::new("hub_unavailable", "fleet epoch operation timed out")
+}
+
+fn wrap_key(e: u64, mint: &str, box_id: &str) -> String {
+    format!("wrap.{e}.{mint}.{box_id}")
+}
+
+#[derive(Clone)]
+struct Observed {
+    revision: u64,
+    epoch: Epoch,
+}
+
+/// All paths that read the epoch register share the same accepted predecessor.
+/// The writer uses a direct read even when the watch has already seen the value.
+pub(super) struct EpochReader<T> {
+    pub transport: Arc<T>,
+    pub membership: Arc<Membership<T>>,
+    pub store: RegistryStore,
+    pub vault: Arc<dyn EpochVault>,
+    pub own_box: String,
+    pub base: i64,
+    reading: Mutex<()>,
+    importing: Mutex<()>,
+    pub ready: Notify,
+    pub membership_changed: Notify,
+}
+
+impl<T: Transport> EpochReader<T> {
+    pub(super) fn new(
+        transport: Arc<T>,
+        membership: Arc<Membership<T>>,
+        store: RegistryStore,
+        vault: Arc<dyn EpochVault>,
+        own_box: String,
+        base: i64,
+    ) -> Self {
+        Self {
+            transport,
+            membership,
+            store,
+            vault,
+            own_box,
+            base,
+            reading: Mutex::new(()),
+            importing: Mutex::new(()),
+            ready: Notify::new(),
+            membership_changed: Notify::new(),
+        }
+    }
+
+    fn control(&self) -> &dyn EpochControl {
+        self.vault
+            .control()
+            .expect("epoch lifecycle requires a vault controller")
+    }
+
+    fn applied(&self) -> Result<u64, HandlerError> {
+        crate::hub_identity_log::hub_sequence(
+            self.base,
+            self.store.identity_log_status()?.last_applied_position,
+        )
+    }
+
+    async fn read(&self, deadline: Instant) -> Result<Option<Observed>, HandlerError> {
+        let _guard = timeout_at(deadline, self.reading.lock())
+            .await
+            .map_err(|_| busy())?;
+        let previous = self.store.hub_kv_cached(KEY)?;
+        let Some(entry) = self.transport.kv_entry(KEY, deadline).await? else {
+            return if previous.is_none() {
+                Ok(None)
+            } else {
+                Err(invalid("epoch register disappeared"))
+            };
+        };
+        if let Some(old) = &previous {
+            if entry.revision < old.revision {
+                return Err(invalid("epoch register revision went backwards"));
+            }
+            if entry.revision == old.revision {
+                if !old.integrity_failed && old.value == entry.value {
+                    let epoch = serde_json::from_value(
+                        old.body
+                            .clone()
+                            .ok_or_else(|| invalid("missing epoch body"))?,
+                    )
+                    .map_err(|_| invalid("invalid stored epoch"))?;
+                    return Ok(Some(Observed {
+                        revision: entry.revision,
+                        epoch,
+                    }));
+                }
+                return Err(invalid("epoch register failed integrity checks"));
+            }
+        }
+        let decoded = async {
+            let bytes = entry
+                .value
+                .as_ref()
+                .ok_or_else(|| invalid("epoch cannot be deleted"))?;
+            let old = previous
+                .and_then(|row| row.body)
+                .map(serde_json::from_value::<Epoch>)
+                .transpose()
+                .map_err(|_| invalid("invalid stored epoch"))?;
+            let sight = if old.is_some() {
+                Sight::ReplacesCached
+            } else {
+                Sight::FirstOrAfterGap
+            };
+            let (record, _) = self
+                .membership
+                .verify_kv(
+                    UnverifiedRecord::parse(KEY, bytes)?,
+                    self.applied()?,
+                    sight,
+                    deadline,
+                )
+                .await?;
+            let body = record
+                .unsealed()
+                .ok_or_else(|| invalid("epoch must be unsealed"))?;
+            let epoch: Epoch =
+                serde_json::from_value(body.clone()).map_err(|_| invalid("invalid epoch body"))?;
+            epoch.validate()?;
+            let join = old.as_ref().is_some_and(|old| {
+                old.e == epoch.e
+                    && old.mint_id == epoch.mint_id
+                    && old.state == State::Committed
+                    && epoch.state == State::Committed
+            });
+            if (!join && epoch.state == State::Pending && record.header().writer != epoch.minter)
+                || old.as_ref().is_some_and(|old| !old.accepts(&epoch))
+            {
+                return Err(invalid("invalid epoch transition"));
+            }
+            self.store.record_hub_kv(
+                KEY,
+                entry.revision,
+                Some((bytes, Some(body))),
+                crate::unix_millis(),
+            )?;
+            Ok(Some(Observed {
+                revision: entry.revision,
+                epoch,
+            }))
+        }
+        .await;
+        if decoded.as_ref().is_err_and(|error: &HandlerError| {
+            matches!(
+                error.code.as_str(),
+                "record_invalid" | "signature_invalid" | "member_episode_invalid"
+            )
+        }) {
+            self.store
+                .record_hub_kv(KEY, entry.revision, None, crate::unix_millis())?;
+        }
+        decoded
+    }
+
+    pub(super) async fn fence(&self, deadline: Instant) -> Result<u64, HandlerError> {
+        let observed = self.read(deadline).await?.ok_or_else(unavailable)?;
+        let (e, mint) = observed.epoch.committed_key().ok_or_else(unavailable)?;
+        if !self.store.hub_holds_epoch(e, mint)? {
+            // A pending value has no new committed key to import. The named
+            // base is usable only with previously recorded provenance.
+            if observed.epoch.state != State::Committed {
+                return Err(unavailable());
+            }
+            self.ensure(&observed, deadline).await?;
+        }
+        self.store
+            .hub_holds_epoch(e, mint)?
+            .then_some(e)
+            .ok_or_else(unavailable)
+    }
+
+    pub(super) async fn require_for_open(
+        &self,
+        epoch: u64,
+        deadline: Instant,
+    ) -> Result<(), HandlerError> {
+        if !self.store.hub_has_epoch(epoch)? {
+            self.fence(deadline).await?;
+            if !self.store.hub_has_epoch(epoch)? {
+                return Err(unavailable());
+            }
+        }
+        Ok(())
+    }
+
+    async fn ensure(&self, observed: &Observed, deadline: Instant) -> Result<(), HandlerError> {
+        let epoch = &observed.epoch;
+        if epoch.state != State::Committed {
+            return Err(unavailable());
+        }
+        let _guard = timeout_at(deadline, self.importing.lock())
+            .await
+            .map_err(|_| busy())?;
+        if self.store.hub_holds_epoch(epoch.e, &epoch.mint_id)? {
+            return Ok(());
+        }
+        if epoch.minter == self.own_box {
+            timeout_at(deadline, self.control().commit(&epoch.mint()))
+                .await
+                .map_err(|_| busy())??;
+            self.store.record_hub_own_mint(&HubOwnMint {
+                epoch: epoch.e,
+                mint_id: epoch.mint_id.clone(),
+                committed: true,
+                revision: observed.revision,
+            })?;
+        } else {
+            let key = wrap_key(epoch.e, &epoch.mint_id, &self.own_box);
+            let entry = self
+                .transport
+                .kv_entry(&key, deadline)
+                .await?
+                .and_then(|entry| entry.value)
+                .ok_or_else(unavailable)?;
+            let (record, _) = self
+                .membership
+                .verify_kv(
+                    UnverifiedRecord::parse(&key, &entry)?,
+                    self.applied()?,
+                    Sight::FirstOrAfterGap,
+                    deadline,
+                )
+                .await?;
+            let body = record
+                .unsealed()
+                .ok_or_else(|| invalid("wrap must be unsealed"))?;
+            if record.header().writer != epoch.minter
+                || body["v"] != 1
+                || body["epoch"] != epoch.e
+                || body["mint_id"] != epoch.mint_id
+                || body["to"] != self.own_box
+            {
+                return Err(invalid("wrap does not match the committed mint"));
+            }
+            let wrap = body
+                .get("wrap")
+                .ok_or_else(|| invalid("missing epoch wrap"))?;
+            let imported = timeout_at(deadline, self.control().import(wrap))
+                .await
+                .map_err(|_| busy())??;
+            if imported.epochs.as_slice() != [epoch.e]
+                && !(imported.already_held && imported.epochs.is_empty())
+            {
+                return Err(invalid("vault imported a different fleet epoch"));
+            }
+        }
+        self.store
+            .record_hub_held_epochs(HubEpochSource::Mint(&epoch.mint_id), &[epoch.e])?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const A: &str = "0123456789abcdef0123456789abcdef";
+    const B: &str = "fedcba9876543210fedcba9876543210";
+    const C: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn pending() -> Epoch {
+        Epoch {
+            e: 2,
+            state: State::Pending,
+            minter: A.into(),
+            mint_id: URL_SAFE_NO_PAD.encode([1; 16]),
+            base_e: Some(1),
+            base_mint_id: Some(URL_SAFE_NO_PAD.encode([2; 16])),
+            base_recipients: [A, B].map(str::to_owned).into(),
+            recipients: [A].map(str::to_owned).into(),
+            removed: vec![DropBox {
+                box_id: B.into(),
+                removal_id: Some("100:permanent:7".into()),
+            }],
+        }
+    }
+
+    #[test]
+    fn hub_epoch_accepts_only_commit_join_and_pending_supersession_at_same_epoch() {
+        let pending = pending();
+        pending.validate().unwrap();
+        let committed = Epoch {
+            state: State::Committed,
+            ..pending.clone()
+        };
+        assert!(pending.accepts(&committed));
+        assert!(!committed.accepts(&pending));
+        assert!(!committed.accepts(&committed));
+        let mut joined = committed.clone();
+        joined.recipients.insert(C.into());
+        assert!(committed.accepts(&joined));
+        assert!(!joined.accepts(&committed));
+        let mut winner = Epoch {
+            mint_id: URL_SAFE_NO_PAD.encode([3; 16]),
+            ..pending.clone()
+        };
+        assert!(pending.accepts(&winner));
+        winner.state = State::Committed;
+        assert!(pending.accepts(&winner));
+        assert!(!committed.accepts(&winner));
+        winner.removed.clear();
+        assert!(!pending.accepts(&winner));
+        let mut forged = joined;
+        forged.base_mint_id = Some(URL_SAFE_NO_PAD.encode([4; 16]));
+        assert!(!committed.accepts(&forged));
+    }
+
+    #[test]
+    fn hub_epoch_removal_intake_decodes_callosum_vectors_with_or_without_box_id() {
+        // device-removed-vectors-v1.1: permanent-with-box-id and supersession-with-box-id.
+        let one = RemovalEvent::decode(br#"{"fingerprint":"72cd6e8422c407fb6d098690f1130b7d","removal_id":"100:permanent:7","box_id":"0123456789abcdef0123456789abcdef"}"#).unwrap();
+        let two = RemovalEvent::decode(br#"{"fingerprint":"75877bb41d393b5fb8455ce60ecd8dda","removal_id":"200:9:8","box_id":"0123456789abcdef0123456789abcdef"}"#).unwrap();
+        assert_eq!(one.box_id.as_deref(), Some(A));
+        assert_ne!(one.removal_id, two.removal_id);
+        let old = RemovalEvent::decode(
+            br#"{"fingerprint":"72cd6e8422c407fb6d098690f1130b7d","removal_id":"100:permanent:7"}"#,
+        )
+        .unwrap();
+        assert!(old.box_id.is_none());
+        assert_eq!(old.removal_id, one.removal_id);
+    }
+}

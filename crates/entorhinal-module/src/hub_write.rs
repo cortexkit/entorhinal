@@ -936,6 +936,14 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
         let opened = timeout_at(deadline, record.open(self.vault))
             .await
             .map_err(|_| hub_transport::unsettled(&record.header().entry_id))??;
+        if record.header().kind == "member.removed" {
+            // Two recovery writers can have different trusted key histories
+            // for the same removal. The verified winner closes that episode.
+            let observed: Value = serde_json::from_slice(&opened).map_err(|_| invalid_attempt())?;
+            return Ok(["box_id", "epoch", "removal_id"]
+                .into_iter()
+                .all(|field| observed[field] == body[field]));
+        }
         Ok(opened == expected.as_bytes())
     }
 

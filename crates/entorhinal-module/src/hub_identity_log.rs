@@ -22,6 +22,7 @@ use tokio::{
 
 use crate::{
     fleet_record::{vault::EpochVault, UnverifiedRecord, VerifiedRecord, LOG_KEY},
+    hub_epoch::EpochReader,
     hub_membership::{AnchorSource, Membership, PeerKeysRead, Sight},
     hub_transport::{Feed, FeedEvent, Hub, LogDelivery},
     hub_write::{
@@ -35,11 +36,19 @@ const READ_BUDGET: Duration = Duration::from_secs(25);
 
 pub(super) trait LogTransport: Transport + Send + Sync + 'static {
     fn tail(self: &Arc<Self>, applied: u64) -> Feed<LogDelivery>;
+
+    fn epoch_watch(self: &Arc<Self>) -> Option<Feed<async_nats::jetstream::kv::Entry>> {
+        None
+    }
 }
 
 impl LogTransport for Hub {
     fn tail(self: &Arc<Self>, applied: u64) -> Feed<LogDelivery> {
         self.tail(applied)
+    }
+
+    fn epoch_watch(self: &Arc<Self>) -> Option<Feed<async_nats::jetstream::kv::Entry>> {
+        Some(self.epoch_watch())
     }
 }
 
@@ -66,6 +75,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Link<T, U> {
 
 struct MemberTrust<'a, T, U> {
     epoch: &'a U,
+    epoch_reader: Option<&'a EpochReader<T>>,
     membership: &'a Membership<T>,
     store: &'a RegistryStore,
     base: i64,
@@ -73,7 +83,10 @@ struct MemberTrust<'a, T, U> {
 
 impl<T: LogTransport, U: Trust> Trust for MemberTrust<'_, T, U> {
     async fn writer_epoch(&self, deadline: Instant) -> Result<u64, HandlerError> {
-        self.epoch.writer_epoch(deadline).await
+        match self.epoch_reader {
+            Some(reader) => reader.fence(deadline).await,
+            None => self.epoch.writer_epoch(deadline).await,
+        }
     }
 
     async fn verification_key(&self, record: &UnverifiedRecord) -> Result<String, HandlerError> {
@@ -113,6 +126,7 @@ pub(super) struct IdentityLog<T, U> {
     pub(super) box_id: BoxId,
     pub(super) base: i64,
     membership: Arc<Membership<T>>,
+    pub(super) epoch: Option<Arc<EpochReader<T>>>,
 }
 
 impl ProjectsHandler {
@@ -150,6 +164,16 @@ impl ProjectsHandler {
                 signer: link.signer.clone(),
             },
         ));
+        let epoch = link.vault.control().map(|_| {
+            Arc::new(EpochReader::new(
+                link.transport.clone(),
+                membership.clone(),
+                store.clone(),
+                link.vault.clone(),
+                box_id.to_string(),
+                base,
+            ))
+        });
         let feed = link.transport.tail(sequence).with_durable_cursor();
         let tail = Tail {
             link: link.clone(),
@@ -162,6 +186,8 @@ impl ProjectsHandler {
             membership: membership.clone(),
             writer: self.writer.clone(),
             connected_head: None,
+            epoch: epoch.clone(),
+            highest_epoch: None,
         };
         self.health.hub_membership.store(1, Ordering::Release);
         self.health.log_state.store(0, Ordering::Relaxed);
@@ -176,6 +202,7 @@ impl ProjectsHandler {
             box_id,
             base,
             membership,
+            epoch,
         })
     }
 }
@@ -197,6 +224,45 @@ pub(super) struct AcceptedKv {
 }
 
 impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
+    pub(super) fn epoch_watch(&self) -> Option<Feed<async_nats::jetstream::kv::Entry>> {
+        self.link.transport.epoch_watch()
+    }
+
+    pub(super) fn peer_keys(&self) -> &dyn PeerKeysRead {
+        self.link.peers.as_ref()
+    }
+
+    pub(super) async fn write_epoch_step(
+        &self,
+        request_key: &str,
+        digest: &str,
+        step: &Step,
+        deadline: Instant,
+    ) -> Result<hub_write::Landed, HandlerError> {
+        let writer_ep = self.writer_episode()?;
+        let trust = MemberTrust {
+            epoch: self.link.trust.as_ref(),
+            epoch_reader: self.epoch.as_deref(),
+            membership: &self.membership,
+            store: &self.store,
+            base: self.base,
+        };
+        self.link
+            .writer(&self.store, &trust)
+            .run(
+                &hub_write::Request {
+                    request_key,
+                    params_digest: digest,
+                    writer: &self.box_id.to_string(),
+                    writer_ep,
+                },
+                step,
+                None,
+                deadline,
+            )
+            .await
+    }
+
     pub(super) fn membership_ready(&self) -> bool {
         self.health.hub_membership.load(Ordering::Acquire) == 2
     }
@@ -258,6 +324,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
         }
         let trust = MemberTrust {
             epoch: self.link.trust.as_ref(),
+            epoch_reader: self.epoch.as_deref(),
             membership: &self.membership,
             store: &self.store,
             base: self.base,
@@ -278,6 +345,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
     ) -> Result<(), HandlerError> {
         let trust = MemberTrust {
             epoch: self.link.trust.as_ref(),
+            epoch_reader: self.epoch.as_deref(),
             membership: &self.membership,
             store: &self.store,
             base: self.base,
@@ -302,6 +370,12 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
             "epoch" | "wrap" | "wrapreq" | "wrapjoin"
         );
         let applied = self.applied_sequence()?;
+        if let Some(epoch) = record.epoch() {
+            if let Some(old) = self.store.hub_kv_cached(key)?.and_then(|row| row.value) {
+                let previous = UnverifiedRecord::parse(key, &old)?.epoch();
+                reject_rollback(previous, Some(epoch))?;
+            }
+        }
         let record = if join {
             self.membership
                 .verify_kv(record, applied, sight, deadline)
@@ -341,6 +415,9 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
                 "member_episode_invalid",
                 "replacement writer is not in its current episode",
             ));
+        }
+        if let (Some(reader), Some(epoch)) = (&self.epoch, record.epoch()) {
+            reader.require_for_open(epoch, deadline).await?;
         }
         let body = timeout_at(deadline, record.open(self.link.vault.as_ref()))
             .await
@@ -396,6 +473,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
         }
         let trust = MemberTrust {
             epoch: self.link.trust.as_ref(),
+            epoch_reader: self.epoch.as_deref(),
             membership: &self.membership,
             store: &self.store,
             base: self.base,
@@ -511,7 +589,7 @@ fn op(body: &Value) -> Result<&str, HandlerError> {
         .ok_or_else(|| HandlerError::new("record_invalid", "identity-log body has no op"))
 }
 
-fn hub_sequence(base: i64, applied: i64) -> Result<u64, HandlerError> {
+pub(super) fn hub_sequence(base: i64, applied: i64) -> Result<u64, HandlerError> {
     applied
         .checked_sub(base)
         .and_then(|sequence| u64::try_from(sequence).ok())
@@ -547,6 +625,8 @@ struct Tail<T, U> {
     membership: Arc<Membership<T>>,
     writer: Arc<tokio::sync::Mutex<()>>,
     connected_head: Option<u64>,
+    epoch: Option<Arc<EpochReader<T>>>,
+    highest_epoch: Option<u64>,
 }
 
 impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
@@ -601,10 +681,12 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
                     }
                 },
                 _ = local_keys.tick(), if connected => {
-                    let refreshed = if self.connected_head.is_none() { self.reconnect().await }
+                    let refreshed = if self.connected_head.is_none() { self.reconnect().await.map(|()| false) }
                         else { self.membership.refresh(Instant::now() + READ_BUDGET).await };
-                    if let Err(error) = refreshed {
-                        if !self.retryable(&error) { self.stop(self.sequence() + 1, error); return; }
+                    match refreshed {
+                        Ok(true) => if let Some(epoch) = &self.epoch { epoch.membership_changed.notify_one(); },
+                        Err(error) if !self.retryable(&error) => { self.stop(self.sequence() + 1, error); return; }
+                        _ => {}
                     }
                 }
             }
@@ -622,7 +704,10 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
     fn retryable(&self, error: &HandlerError) -> bool {
         matches!(
             error.code.as_str(),
-            "hub_unavailable" | "credential_unavailable" | "vault_unavailable"
+            "hub_unavailable"
+                | "credential_unavailable"
+                | "vault_unavailable"
+                | "epoch_key_unavailable"
         )
     }
 
@@ -648,6 +733,24 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
             ));
         }
         self.membership.discover(head, deadline).await?;
+        if self.highest_epoch.is_none() {
+            // Unsealed membership entries don't carry an epoch. Recover the
+            // highest applied epoch from the last sealed entry at the cursor.
+            for sequence in (1..=self.sequence()).rev() {
+                let bytes = self
+                    .link
+                    .transport
+                    .log_entry(sequence, deadline)
+                    .await?
+                    .ok_or_else(|| {
+                        HandlerError::new("hub_log_gap", "missing applied hub log entry")
+                    })?;
+                if let Some(epoch) = UnverifiedRecord::parse(LOG_KEY, &bytes)?.epoch() {
+                    self.highest_epoch = Some(epoch);
+                    break;
+                }
+            }
+        }
         self.connected_head = Some(head);
         Ok(())
     }
@@ -659,9 +762,15 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
 
     fn update_barrier(&self) {
         let ready = self.caught_up() && self.membership.can_write(self.sequence()).is_some();
-        self.health
+        let previous = self
+            .health
             .hub_membership
-            .store(if ready { 2 } else { 1 }, Ordering::Release);
+            .swap(if ready { 2 } else { 1 }, Ordering::AcqRel);
+        if ready && previous != 2 {
+            if let Some(epoch) = &self.epoch {
+                epoch.ready.notify_one();
+            }
+        }
     }
 
     async fn publish_key(&self) {
@@ -680,6 +789,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
         let request_key = format!("member.key:{}:{}:{digest}", key.box_id, self.sequence());
         let trust = MemberTrust {
             epoch: self.link.trust.as_ref(),
+            epoch_reader: self.epoch.as_deref(),
             membership: &self.membership,
             store: &self.store,
             base: self.base,
@@ -756,6 +866,16 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
                 .membership
                 .verify_log(unverified, delivery.sequence, deadline)
                 .await?;
+            let floor = self
+                .snapshot
+                .records
+                .last()
+                .and_then(VerifiedRecord::epoch)
+                .or(self.highest_epoch);
+            reject_rollback(floor, record.epoch())?;
+            if let (Some(reader), Some(e)) = (&self.epoch, record.epoch()) {
+                reader.require_for_open(e, deadline).await?;
+            }
             let entry = record.open(self.link.vault.as_ref()).await?;
             Ok::<_, HandlerError>((signer, record, entry))
         })
@@ -824,6 +944,11 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
                 .collect::<Vec<_>>();
             self.store
                 .apply_hub_remote_snapshot(&snapshot.entries, &episodes)?;
+            self.highest_epoch = snapshot
+                .records
+                .last()
+                .and_then(VerifiedRecord::epoch)
+                .or(self.highest_epoch);
             self.committed(position);
             for (entry, record) in snapshot.entries.iter().zip(&snapshot.records) {
                 self.settle_applied(record, hub_sequence(self.base, entry.position)?, deadline)
@@ -832,7 +957,13 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
         } else {
             self.store
                 .apply_hub_remote_entry(&entry, header.writer_ep)?;
+            self.highest_epoch = record.epoch().or(self.highest_epoch);
             self.committed(position);
+            if header.kind == "member.admitted" {
+                if let Some(epoch) = &self.epoch {
+                    epoch.membership_changed.notify_one();
+                }
+            }
             self.settle_applied(&record, delivery.sequence, deadline)
                 .await;
         }
@@ -900,6 +1031,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
     async fn settle_applied(&self, record: &VerifiedRecord, sequence: u64, deadline: Instant) {
         let trust = MemberTrust {
             epoch: self.link.trust.as_ref(),
+            epoch_reader: self.epoch.as_deref(),
             membership: &self.membership,
             store: &self.store,
             base: self.base,
@@ -915,6 +1047,19 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
             tracing::warn!(target: "identity_log", sequence, code = error.code, "could not record outcome for an applied hub entry");
         }
     }
+}
+
+fn reject_rollback(previous: Option<u64>, next: Option<u64>) -> Result<(), HandlerError> {
+    if previous
+        .zip(next)
+        .is_some_and(|(previous, next)| next < previous)
+    {
+        return Err(HandlerError::new(
+            "epoch_rollback",
+            "sealed record uses an older fleet epoch",
+        ));
+    }
+    Ok(())
 }
 
 fn position_conflict() -> HandlerError {

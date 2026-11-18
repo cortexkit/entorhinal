@@ -122,6 +122,8 @@ fn tail_with(
             membership,
             writer: Arc::default(),
             connected_head: None,
+            epoch: None,
+            highest_epoch: None,
         },
     )
 }
