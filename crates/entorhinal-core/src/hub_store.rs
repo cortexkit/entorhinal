@@ -236,10 +236,9 @@ impl RegistryStore {
     }
 
     /// A derived snapshot id can appear in more than one local request.
+    /// Reads on the read connection, so it never waits for the writer.
     pub fn hub_attempts_by_op(&self, op_id: &str) -> Result<Vec<HubAttempt>, RegistryError> {
-        self.db
-            .with_conn_fenced(|tx| attempts_by_op(tx, op_id))
-            .map_err(RegistryError::Store)
+        self.read(|conn| attempts_by_op(conn, op_id))
     }
 
     /// Save the bytes and send identity together before publishing. To change
