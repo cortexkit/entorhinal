@@ -2,13 +2,25 @@ use cortexkit_test_support::{ckdev_binary, ScratchDir};
 use std::process::Command;
 
 fn child(scratch: &ScratchDir) -> Command {
-    let binary = scratch.path().join(if cfg!(windows) {
-        "ckdev-projects.exe"
-    } else {
-        "ckdev-projects"
-    });
-    std::fs::copy(ckdev_binary(env!("CARGO_BIN_EXE_ck-entorhinal")), &binary).unwrap();
-    let mut child = Command::new(binary);
+    // On Unix the face comes from argv[0], so run the shared ckdev copy under
+    // that name. Copying the binary again here would let another test's fork
+    // inherit the still-open write descriptor, and exec would then fail with
+    // "Text file busy". Windows has no argv[0] override, so it gets a copy
+    // named for the face; its exec has no such race.
+    #[cfg(unix)]
+    let mut child = {
+        use std::os::unix::process::CommandExt;
+        let _ = scratch;
+        let mut child = Command::new(ckdev_binary(env!("CARGO_BIN_EXE_ck-entorhinal")));
+        child.arg0("ckdev-projects");
+        child
+    };
+    #[cfg(windows)]
+    let mut child = {
+        let binary = scratch.path().join("ckdev-projects.exe");
+        std::fs::copy(ckdev_binary(env!("CARGO_BIN_EXE_ck-entorhinal")), &binary).unwrap();
+        Command::new(binary)
+    };
     child.env_clear();
     #[cfg(windows)]
     for name in ["SYSTEMROOT", "PATH"] {
