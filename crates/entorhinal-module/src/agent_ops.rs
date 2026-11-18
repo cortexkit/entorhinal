@@ -1375,6 +1375,7 @@ mod tests {
                     let direct_only = *method == crate::store_origin::ADOPT
                         || *method == "placement.backfill"
                         || *method == "move_root_to_new_project"
+                        || *method == crate::hub_switch::EXCLUDE
                         || *method == "workspace.set_document"
                         || crate::catalog_ops::WRITES
                             .iter()
