@@ -1,0 +1,53 @@
+{
+  "public_key_hex": "c050c5637a44fa8629fff3cccce2300cb362a63d99d95fc54145266f4332445a",
+  "log": {
+    "aad_utf8": "{\"entry_id\":\"02020202020202020202020202020202\",\"key\":\"ck.fleet.idlog\",\"kind\":\"member.set_name\",\"v\":1,\"writer\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\",\"writer_ep\":0}",
+    "plaintext_utf8": "{\"author\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\",\"display_name\":\"Büro 🛰\",\"op\":\"member.set_name\"}",
+    "signing_input_utf8": "ck-fleet-record/v1\n{\"ciphertext\":\"CiKYjTDF4FbuFsgjt8xZD8knFfg5CdwbLldXpP6GmtEvTaAbYOmAgFYFOikVPeTOeE-cqeX2HMh3YVqUlB6QZdFkMco_SIrhvf3g3TJGHe78v0nWztqLqESwfLpIMI5K8rxsXfM0RXr_hefJT_zaeA\",\"entry_id\":\"02020202020202020202020202020202\",\"epoch\":1,\"key\":\"ck.fleet.idlog\",\"key_version\":\"4b735ac174e40636\",\"kind\":\"member.set_name\",\"nonce\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYX\",\"v\":1,\"writer\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\",\"writer_ep\":0}",
+    "envelope_utf8": "{\"ciphertext\":\"CiKYjTDF4FbuFsgjt8xZD8knFfg5CdwbLldXpP6GmtEvTaAbYOmAgFYFOikVPeTOeE-cqeX2HMh3YVqUlB6QZdFkMco_SIrhvf3g3TJGHe78v0nWztqLqESwfLpIMI5K8rxsXfM0RXr_hefJT_zaeA\",\"entry_id\":\"02020202020202020202020202020202\",\"epoch\":1,\"key\":\"ck.fleet.idlog\",\"key_version\":\"4b735ac174e40636\",\"kind\":\"member.set_name\",\"nonce\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYX\",\"sig\":\"7f1a26df27bb34616f3932f0192c4220c0030e1baed109fb1d9bd67dba9c59af63563b8b3f1943162abf3a0a2e4cb18d3372de131aaba9c14bb4554a1baf6700\",\"v\":1,\"writer\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\",\"writer_ep\":0}"
+  },
+  "residence": {
+    "aad_utf8": "{\"entry_id\":\"03030303030303030303030303030303\",\"key\":\"residence.agent-17\",\"kind\":\"residence\",\"v\":1,\"writer\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\",\"writer_ep\":2}",
+    "plaintext_utf8": "{\"forced\":false,\"gen\":4,\"holder\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\",\"holder_ep\":2,\"v\":1,\"writer\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\"}",
+    "signing_input_utf8": "ck-fleet-record/v1\n{\"ciphertext\":\"5C7rGr7W32k6JK3Go4Owb3Pe3QiaDKtoyq6Zm_ZCwsMAquNY_jJDApVJNrOf4m8sKbk-o5F1ESFAnsC-QQ5R4KQQJlenHrDWWUTJ44dWq_d-EHlhdYFKcWbtKaKG63p47_NkhqQYGQvWTBAFu4fwWMKh7omWxkat6XJUMC4kVH46DWv1-Dc7vzQJCEO7zj_E6EVzZg\",\"entry_id\":\"03030303030303030303030303030303\",\"epoch\":3,\"key\":\"residence.agent-17\",\"key_version\":\"4b735ac174e40636\",\"kind\":\"residence\",\"nonce\":\"wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX\",\"v\":1,\"writer\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\",\"writer_ep\":2}",
+    "envelope_utf8": "{\"ciphertext\":\"5C7rGr7W32k6JK3Go4Owb3Pe3QiaDKtoyq6Zm_ZCwsMAquNY_jJDApVJNrOf4m8sKbk-o5F1ESFAnsC-QQ5R4KQQJlenHrDWWUTJ44dWq_d-EHlhdYFKcWbtKaKG63p47_NkhqQYGQvWTBAFu4fwWMKh7omWxkat6XJUMC4kVH46DWv1-Dc7vzQJCEO7zj_E6EVzZg\",\"entry_id\":\"03030303030303030303030303030303\",\"epoch\":3,\"key\":\"residence.agent-17\",\"key_version\":\"4b735ac174e40636\",\"kind\":\"residence\",\"nonce\":\"wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX\",\"sig\":\"fc43ca4e2993690474f1fe86e71b187bd17008cde8171db0042c4ded3f877f96f0e429b23f07979e9619e74f5252e9debda591e3ff3d2dcbfc0164f58f2cdc00\",\"v\":1,\"writer\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\",\"writer_ep\":2}"
+  },
+  "negative": [
+    {
+      "altered": "key",
+      "destination": "residence.agent-18",
+      "envelope_utf8": "{\"ciphertext\":\"5C7rGr7W32k6JK3Go4Owb3Pe3QiaDKtoyq6Zm_ZCwsMAquNY_jJDApVJNrOf4m8sKbk-o5F1ESFAnsC-QQ5R4KQQJlenHrDWWUTJ44dWq_d-EHlhdYFKcWbtKaKG63p47_NkhqQYGQvWTBAFu4fwWMKh7omWxkat6XJUMC4kVH46DWv1-Dc7vzQJCEO7zj_E6EVzZg\",\"entry_id\":\"03030303030303030303030303030303\",\"epoch\":3,\"key\":\"residence.agent-18\",\"key_version\":\"4b735ac174e40636\",\"kind\":\"residence\",\"nonce\":\"wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX\",\"sig\":\"fc43ca4e2993690474f1fe86e71b187bd17008cde8171db0042c4ded3f877f96f0e429b23f07979e9619e74f5252e9debda591e3ff3d2dcbfc0164f58f2cdc00\",\"v\":1,\"writer\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\",\"writer_ep\":2}",
+      "error": "signature_invalid"
+    },
+    {
+      "altered": "writer",
+      "destination": "residence.agent-17",
+      "envelope_utf8": "{\"ciphertext\":\"5C7rGr7W32k6JK3Go4Owb3Pe3QiaDKtoyq6Zm_ZCwsMAquNY_jJDApVJNrOf4m8sKbk-o5F1ESFAnsC-QQ5R4KQQJlenHrDWWUTJ44dWq_d-EHlhdYFKcWbtKaKG63p47_NkhqQYGQvWTBAFu4fwWMKh7omWxkat6XJUMC4kVH46DWv1-Dc7vzQJCEO7zj_E6EVzZg\",\"entry_id\":\"03030303030303030303030303030303\",\"epoch\":3,\"key\":\"residence.agent-17\",\"key_version\":\"4b735ac174e40636\",\"kind\":\"residence\",\"nonce\":\"wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX\",\"sig\":\"fc43ca4e2993690474f1fe86e71b187bd17008cde8171db0042c4ded3f877f96f0e429b23f07979e9619e74f5252e9debda591e3ff3d2dcbfc0164f58f2cdc00\",\"v\":1,\"writer\":\"a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2\",\"writer_ep\":2}",
+      "error": "signature_invalid"
+    },
+    {
+      "altered": "writer_ep",
+      "destination": "residence.agent-17",
+      "envelope_utf8": "{\"ciphertext\":\"5C7rGr7W32k6JK3Go4Owb3Pe3QiaDKtoyq6Zm_ZCwsMAquNY_jJDApVJNrOf4m8sKbk-o5F1ESFAnsC-QQ5R4KQQJlenHrDWWUTJ44dWq_d-EHlhdYFKcWbtKaKG63p47_NkhqQYGQvWTBAFu4fwWMKh7omWxkat6XJUMC4kVH46DWv1-Dc7vzQJCEO7zj_E6EVzZg\",\"entry_id\":\"03030303030303030303030303030303\",\"epoch\":3,\"key\":\"residence.agent-17\",\"key_version\":\"4b735ac174e40636\",\"kind\":\"residence\",\"nonce\":\"wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX\",\"sig\":\"fc43ca4e2993690474f1fe86e71b187bd17008cde8171db0042c4ded3f877f96f0e429b23f07979e9619e74f5252e9debda591e3ff3d2dcbfc0164f58f2cdc00\",\"v\":1,\"writer\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\",\"writer_ep\":1}",
+      "error": "signature_invalid"
+    },
+    {
+      "altered": "entry_id",
+      "destination": "residence.agent-17",
+      "envelope_utf8": "{\"ciphertext\":\"5C7rGr7W32k6JK3Go4Owb3Pe3QiaDKtoyq6Zm_ZCwsMAquNY_jJDApVJNrOf4m8sKbk-o5F1ESFAnsC-QQ5R4KQQJlenHrDWWUTJ44dWq_d-EHlhdYFKcWbtKaKG63p47_NkhqQYGQvWTBAFu4fwWMKh7omWxkat6XJUMC4kVH46DWv1-Dc7vzQJCEO7zj_E6EVzZg\",\"entry_id\":\"04040404040404040404040404040404\",\"epoch\":3,\"key\":\"residence.agent-17\",\"key_version\":\"4b735ac174e40636\",\"kind\":\"residence\",\"nonce\":\"wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX\",\"sig\":\"fc43ca4e2993690474f1fe86e71b187bd17008cde8171db0042c4ded3f877f96f0e429b23f07979e9619e74f5252e9debda591e3ff3d2dcbfc0164f58f2cdc00\",\"v\":1,\"writer\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\",\"writer_ep\":2}",
+      "error": "signature_invalid"
+    },
+    {
+      "altered": "epoch",
+      "destination": "residence.agent-17",
+      "envelope_utf8": "{\"ciphertext\":\"5C7rGr7W32k6JK3Go4Owb3Pe3QiaDKtoyq6Zm_ZCwsMAquNY_jJDApVJNrOf4m8sKbk-o5F1ESFAnsC-QQ5R4KQQJlenHrDWWUTJ44dWq_d-EHlhdYFKcWbtKaKG63p47_NkhqQYGQvWTBAFu4fwWMKh7omWxkat6XJUMC4kVH46DWv1-Dc7vzQJCEO7zj_E6EVzZg\",\"entry_id\":\"03030303030303030303030303030303\",\"epoch\":2,\"key\":\"residence.agent-17\",\"key_version\":\"4b735ac174e40636\",\"kind\":\"residence\",\"nonce\":\"wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX\",\"sig\":\"fc43ca4e2993690474f1fe86e71b187bd17008cde8171db0042c4ded3f877f96f0e429b23f07979e9619e74f5252e9debda591e3ff3d2dcbfc0164f58f2cdc00\",\"v\":1,\"writer\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\",\"writer_ep\":2}",
+      "error": "signature_invalid"
+    },
+    {
+      "altered": "sig",
+      "destination": "residence.agent-17",
+      "envelope_utf8": "{\"ciphertext\":\"5C7rGr7W32k6JK3Go4Owb3Pe3QiaDKtoyq6Zm_ZCwsMAquNY_jJDApVJNrOf4m8sKbk-o5F1ESFAnsC-QQ5R4KQQJlenHrDWWUTJ44dWq_d-EHlhdYFKcWbtKaKG63p47_NkhqQYGQvWTBAFu4fwWMKh7omWxkat6XJUMC4kVH46DWv1-Dc7vzQJCEO7zj_E6EVzZg\",\"entry_id\":\"03030303030303030303030303030303\",\"epoch\":3,\"key\":\"residence.agent-17\",\"key_version\":\"4b735ac174e40636\",\"kind\":\"residence\",\"nonce\":\"wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX\",\"sig\":\"00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\",\"v\":1,\"writer\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\",\"writer_ep\":2}",
+      "error": "signature_invalid"
+    }
+  ]
+}
