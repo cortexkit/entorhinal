@@ -11,6 +11,7 @@ use entorhinal_core::{
     hub_store::{HubAttempt, HubAttemptOutcome, HubAttemptSend, HubAttemptWrite},
     RegistryStore,
 };
+use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -23,6 +24,7 @@ use crate::{
 };
 
 const MAX_LOG_REBASES: usize = 5;
+pub(super) const PROJECTION_SNAPSHOT_KIND: &str = "shared.snapshot";
 
 pub(super) struct Request<'a> {
     pub request_key: &'a str,
@@ -55,12 +57,38 @@ pub(super) enum Payload {
 
 type NextStep<'a> = &'a (dyn Fn(&Value) -> Result<Step, HandlerError> + Sync);
 
+pub(super) trait LogReplan: Sync {
+    fn wait_for_head(
+        &self,
+        sequence: u64,
+        deadline: Instant,
+    ) -> BoxFuture<'_, Result<(), HandlerError>>;
+
+    /// Rebuild the body against the applied head, keeping the pre-drawn IDs and
+    /// timestamps from the saved body. Only validation refusals close the attempt.
+    fn after_image(&self, saved: &Value) -> Result<Replanned, HandlerError>;
+}
+
+pub(super) enum Replanned {
+    Body(Value),
+    Refused(HandlerError),
+}
+
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum Outcome {
-    Landed { position: Option<u64> },
-    Superseded { revision: u64 },
+    Landed {
+        position: Option<u64>,
+    },
+    Superseded {
+        revision: u64,
+    },
     HeadMoved,
+    Refused {
+        code: String,
+        message: String,
+        detail: Option<Value>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -211,6 +239,7 @@ pub(super) struct Writer<'a, T, U> {
     pub trust: &'a U,
     pub signer: &'a dyn CredentialResolver,
     pub vault: &'a dyn EpochVault,
+    pub replan: Option<&'a dyn LogReplan>,
 }
 
 enum Settlement {
@@ -218,6 +247,12 @@ enum Settlement {
     Superseded(u64),
     HeadMoved,
     Resend,
+}
+
+enum Rebase {
+    Send(HubAttemptWrite, String),
+    Refused(HandlerError),
+    RowChanged,
 }
 
 fn new_op_id() -> Result<String, HandlerError> {
@@ -281,6 +316,15 @@ fn reply(outcome: HubAttemptOutcome) -> Result<Landed, HandlerError> {
             Err(error)
         }
         Outcome::HeadMoved => Err(moved()),
+        Outcome::Refused {
+            code,
+            message,
+            detail,
+        } => Err(HandlerError {
+            code,
+            message,
+            detail,
+        }),
     }
 }
 
@@ -369,18 +413,37 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
                     recorded(op_id, Outcome::Superseded { revision })
                 }
                 Settlement::HeadMoved
-                    if write.step.starts_with(SNAPSHOT) || rebases == MAX_LOG_REBASES =>
+                    if write.step.starts_with(SNAPSHOT)
+                        || self.replan.is_none()
+                        || rebases == MAX_LOG_REBASES
+                        || UnverifiedRecord::parse(&write.key, &write.value)?
+                            .header()
+                            .kind
+                            == PROJECTION_SNAPSHOT_KIND =>
                 {
                     recorded(op_id, Outcome::HeadMoved)
                 }
-                Settlement::HeadMoved => {
-                    if let Some((write, op_id)) = self.rebase(request, &row, deadline).await? {
+                Settlement::HeadMoved => match self.rebase(request, &row, deadline).await? {
+                    Rebase::Send(write, op_id) => {
                         rebases += 1;
                         resent = false;
                         sent = self.send(&write, &op_id, true, deadline).await?;
+                        continue;
                     }
-                    continue;
-                }
+                    Rebase::RowChanged => continue,
+                    Rebase::Refused(HandlerError {
+                        code,
+                        message,
+                        detail,
+                    }) => recorded(
+                        op_id,
+                        Outcome::Refused {
+                            code,
+                            message,
+                            detail,
+                        },
+                    ),
+                },
                 Settlement::Resend => {
                     if resent {
                         return Err(hub_transport::unsettled(&op_id));
@@ -654,7 +717,8 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
         request: &Request<'_>,
         row: &HubAttempt,
         deadline: Instant,
-    ) -> Result<Option<(HubAttemptWrite, String)>, HandlerError> {
+    ) -> Result<Rebase, HandlerError> {
+        let replan = self.replan.ok_or_else(invalid_attempt)?;
         let expected = self.transport.log_head(deadline).await?;
         if expected <= row.write.expected {
             return Err(HandlerError::new(
@@ -662,21 +726,34 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
                 "hub head is behind the occupied position",
             ));
         }
+        replan.wait_for_head(expected, deadline).await?;
+        let (mut header, saved_body) = self.saved(&row.write, deadline).await?;
+        if header.writer != request.writer {
+            return Err(invalid_attempt());
+        }
+        let body = match replan.after_image(&saved_body)? {
+            Replanned::Body(body) => body,
+            Replanned::Refused(error) => return Ok(Rebase::Refused(error)),
+        };
+        header.writer_ep = request.writer_ep;
+        let op_id = new_op_id()?;
+        header.entry_id = op_id.clone();
         let saved = UnverifiedRecord::parse(&row.write.key, &row.write.value)?;
-        let epoch = self.fence(saved.header(), deadline).await?;
+        let epoch = self.fence(&header, deadline).await?;
         if saved.epoch() > epoch {
             return Err(HandlerError::new(
                 "epoch_key_unavailable",
                 "writer fence is behind the saved record",
             ));
         }
-        let (mut write, op_id) = self
-            .replace_bytes(request, row.write.clone(), new_op_id()?, epoch, deadline)
-            .await?;
+        let mut write = row.write.clone();
+        write.value = self.prepare(&header, &body, epoch, deadline).await?;
         write.expected = expected;
-        Ok(self
-            .save(&write, &op_id, Some(row))?
-            .then_some((write, op_id)))
+        Ok(if self.save(&write, &op_id, Some(row))? {
+            Rebase::Send(write, op_id)
+        } else {
+            Rebase::RowChanged
+        })
     }
 
     async fn replace_bytes(

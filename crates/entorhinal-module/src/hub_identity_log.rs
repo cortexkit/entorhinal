@@ -13,6 +13,7 @@ use entorhinal_core::{
     remote_apply::{snapshot_part_info, snapshot_supersedes_through, RemoteEntry},
     RegistryStore,
 };
+use futures_util::future::BoxFuture;
 use serde_json::Value;
 use tokio::{
     sync::Notify,
@@ -22,12 +23,14 @@ use tokio::{
 use crate::{
     fleet_record::{vault::EpochVault, UnverifiedRecord, VerifiedRecord, LOG_KEY},
     hub_transport::{Feed, Hub, LogDelivery},
-    hub_write::{self, Payload, Step, Transport, Trust, Writer},
+    hub_write::{
+        self, LogReplan, Payload, Replanned, Step, Transport, Trust, Writer,
+        PROJECTION_SNAPSHOT_KIND as SNAPSHOT,
+    },
     HandlerError, HealthGauges, ProjectsHandler,
 };
 
 const READ_BUDGET: Duration = Duration::from_secs(25);
-const SNAPSHOT: &str = "shared.snapshot";
 
 pub(super) trait LogTransport: Transport + Send + Sync + 'static {
     fn tail(self: &Arc<Self>, applied: u64) -> Feed<LogDelivery>;
@@ -54,6 +57,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Link<T, U> {
             trust: &self.trust,
             signer: self.signer.as_ref(),
             vault: self.vault.as_ref(),
+            replan: None,
         }
     }
 
@@ -72,6 +76,7 @@ pub(super) struct IdentityLog<T, U> {
     store: RegistryStore,
     health: Arc<HealthGauges>,
     writer: Arc<tokio::sync::Mutex<()>>,
+    commits: Arc<Notify>,
     box_id: BoxId,
     base: i64,
 }
@@ -120,25 +125,39 @@ impl ProjectsHandler {
             store,
             health: self.health.clone(),
             writer: self.writer.clone(),
+            commits: self.commits.clone(),
             box_id,
             base,
         })
     }
 }
 
+pub(super) struct PlannedAppend<'a> {
+    pub request_key: &'a str,
+    pub params_digest: &'a str,
+    pub writer_ep: u64,
+    /// Capture the applied sequence before reading the store to build `body`.
+    pub expected: u64,
+    pub body: Value,
+}
+
 impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
-    /// Append an already planned identity change. IDs and timestamps in `body`
-    /// belong to that plan; the durable writer only replaces the envelope ID
-    /// when it rebases or reseals the same operation.
+    pub(super) fn applied_sequence(&self) -> Result<u64, HandlerError> {
+        hub_sequence(
+            self.base,
+            self.store.identity_log_status()?.last_applied_position,
+        )
+    }
+
+    /// Retry at the same position with the saved body. A new position needs a
+    /// fresh body built against the applied store, not a copy of old rows.
     pub(super) async fn append(
         &self,
-        request_key: &str,
-        params_digest: &str,
-        writer_ep: u64,
-        body: Value,
+        plan: PlannedAppend<'_>,
+        replan: impl Fn(&RegistryStore, &Value) -> Result<Replanned, HandlerError> + Send + Sync,
         deadline: Instant,
     ) -> Result<hub_write::Landed, HandlerError> {
-        let kind = op(&body)?.to_owned();
+        let kind = op(&plan.body)?.to_owned();
         let _guard = timeout_at(deadline, self.writer.lock())
             .await
             .map_err(|_| {
@@ -150,31 +169,97 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
                 "hub identity-log tail has stopped",
             ));
         }
-        let applied = self.store.identity_log_status()?.last_applied_position;
-        self.link
-            .writer(&self.store)
-            .run(
-                &hub_write::Request {
-                    request_key,
-                    params_digest,
-                    writer: &self.box_id.to_string(),
-                    writer_ep,
+        let planner = Planner { log: self, replan };
+        Writer {
+            replan: Some(&planner),
+            ..self.link.writer(&self.store)
+        }
+        .run(
+            &hub_write::Request {
+                request_key: plan.request_key,
+                params_digest: plan.params_digest,
+                writer: &self.box_id.to_string(),
+                writer_ep: plan.writer_ep,
+            },
+            &Step {
+                name: kind.clone(),
+                key: LOG_KEY.into(),
+                expected: plan.expected,
+                payload: Payload::Record {
+                    kind,
+                    body: plan.body,
+                    snapshot_id: None,
                 },
-                &Step {
-                    name: kind.clone(),
-                    key: LOG_KEY.into(),
-                    expected: hub_sequence(self.base, applied)?,
-                    payload: Payload::Record {
-                        kind,
-                        body,
-                        snapshot_id: None,
-                    },
-                },
-                None,
-                deadline,
-            )
-            .await
+            },
+            None,
+            deadline,
+        )
+        .await
     }
+}
+
+struct Planner<'a, T, U, F> {
+    log: &'a IdentityLog<T, U>,
+    replan: F,
+}
+
+impl<T, U, F> LogReplan for Planner<'_, T, U, F>
+where
+    T: LogTransport,
+    U: Trust + Send + Sync + 'static,
+    F: Fn(&RegistryStore, &Value) -> Result<Replanned, HandlerError> + Sync,
+{
+    fn wait_for_head(
+        &self,
+        sequence: u64,
+        deadline: Instant,
+    ) -> BoxFuture<'_, Result<(), HandlerError>> {
+        Box::pin(wait_for_applied(self.log, sequence, deadline))
+    }
+
+    fn after_image(&self, saved: &Value) -> Result<Replanned, HandlerError> {
+        let outcome = (self.replan)(&self.log.store, saved)?;
+        if let Replanned::Body(body) = &outcome {
+            if op(body)? != op(saved)? {
+                return Err(HandlerError::new(
+                    "record_invalid",
+                    "re-plan changed the identity-log operation",
+                ));
+            }
+        }
+        Ok(outcome)
+    }
+}
+
+async fn wait_for_applied<T: LogTransport, U: Trust + Send + Sync + 'static>(
+    log: &IdentityLog<T, U>,
+    sequence: u64,
+    deadline: Instant,
+) -> Result<(), HandlerError> {
+    let unavailable = || {
+        HandlerError::new(
+            "hub_unavailable",
+            format!("hub tail did not apply through sequence {sequence}"),
+        )
+    };
+    timeout_at(deadline, async {
+        loop {
+            // Register before reading progress so a concurrent commit cannot
+            // leave the re-plan parked behind a cursor it has already reached.
+            let notified = log.commits.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if log.applied_sequence()? >= sequence {
+                return Ok(());
+            }
+            if matches!(log.health.log_state.load(Ordering::Relaxed), 4..=6) {
+                return Err(unavailable());
+            }
+            notified.await;
+        }
+    })
+    .await
+    .map_err(|_| unavailable())?
 }
 
 fn op(body: &Value) -> Result<&str, HandlerError> {
@@ -234,6 +319,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
                         _ => 6,
                     };
                     self.health.log_state.store(state, Ordering::Relaxed);
+                    self.commits.notify_waiters();
                     tracing::warn!(target: "identity_log", sequence, code = error.code, message = error.message, "hub identity-log tail stopped");
                     return;
                 }

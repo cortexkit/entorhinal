@@ -290,6 +290,7 @@ impl Fixture {
             trust: &self.keys,
             signer: &self.signer,
             vault: self.keys.as_ref(),
+            replan: None,
         }
     }
 
@@ -550,12 +551,27 @@ async fn hub_write_agent_create_advances_same_row_and_watch_settles_by_op_after_
     assert_eq!((hub.logs.len(), hub.revision), (1, 1));
 }
 
+struct ReadyPlan;
+
+impl LogReplan for ReadyPlan {
+    fn wait_for_head(&self, _: u64, _: Instant) -> BoxFuture<'_, Result<(), HandlerError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn after_image(&self, saved: &Value) -> Result<Replanned, HandlerError> {
+        Ok(Replanned::Body(saved.clone()))
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn hub_write_log_reads_exact_lost_ack_position_and_rebases_only_on_other_entry() {
     let f = Fixture::new("hub-log-rebase");
     let store = f.store();
     let transport = f.recorder(&store);
-    let writer = f.writer(&transport);
+    let writer = Writer {
+        replan: Some(&ReadyPlan),
+        ..f.writer(&transport)
+    };
     let body = json!({"agent_id":"agent-1","created_at_ms":42});
     let plan = step(LOG_KEY, 0, body.clone());
     let foreign = writer
