@@ -7,6 +7,7 @@ use super::{
     claim_codec::RoleClaim,
     encode_result,
     record_client::{CasRequest, CasSettlement, RecordError, RecordReply, MANY_CAP},
+    role_leases::Backend as _,
     HandlerError, ProjectsHandler, RouteKey,
 };
 use entorhinal_core::{
@@ -84,29 +85,14 @@ impl ProjectsHandler {
         }
         let request: Request = serde_json::from_value(params)
             .map_err(|e| HandlerError::new("invalid_request", e.to_string()))?;
-        if !valid_role(&request.role) {
+        if !super::role_leases::valid_role(&request.role) {
             return Err(HandlerError::new("invalid_request", "invalid role"));
         }
-        let store = self.with_store(|s| Ok(s.clone()))?;
-        // The hub role read will replace this branch; only legacy mode can
-        // serve observations from the engram role cache.
-        if self
-            .health
-            .hub_membership
-            .load(std::sync::atomic::Ordering::Acquire)
-            != 0
-        {
-            return encode_result(entorhinal_core::role_cache::RoleRead {
-                role: request.role,
-                stale: true,
-                known: false,
-                held_here: false,
-                epoch: 0,
-                holder: None,
-                holder_name: None,
-                source: None,
-            });
+        if self.hub_backend_selected() {
+            let (result, _) = self.hub_role_read(&request.role)?;
+            return encode_result(result);
         }
+        let store = self.with_store(|s| Ok(s.clone()))?;
         encode_result(store.role_read(&request.role)?)
     }
 
@@ -118,13 +104,67 @@ impl ProjectsHandler {
         }
         let request: Request = serde_json::from_value(params)
             .map_err(|e| HandlerError::new("invalid_request", e.to_string()))?;
-        if !valid_role(&request.role) {
+        if !super::role_leases::valid_role(&request.role) {
             return Err(HandlerError::new("invalid_request", "invalid role"));
+        }
+        if self.hub_backend_selected() {
+            let (read, version) = self.hub_role_read(&request.role)?;
+            return encode_result(entorhinal_core::role_cache::RoleFence {
+                subject: format!("role.{}", read.role),
+                version,
+                epoch: read.epoch,
+                held_here: read.held_here,
+                holder: read.holder,
+                stale: read.stale,
+                role: read.role,
+            });
         }
         encode_result(
             self.with_store(|s| Ok(s.clone()))?
                 .role_fence(&request.role)?,
         )
+    }
+
+    fn hub_role_read(
+        &self,
+        role: &str,
+    ) -> Result<(entorhinal_core::role_cache::RoleRead, i64), HandlerError> {
+        let mut read = entorhinal_core::role_cache::RoleRead {
+            role: role.into(),
+            stale: true,
+            known: false,
+            held_here: false,
+            epoch: 0,
+            holder: None,
+            holder_name: None,
+            source: None,
+        };
+        let Some(service) = self.residence() else {
+            return Ok((read, 0));
+        };
+        let observed = service.role(role)?;
+        read.stale = !observed.ready;
+        read.known = observed.ready || observed.record.is_some();
+        if let Some(record) = observed.record {
+            read.epoch = record.gen;
+            read.held_here = observed.ready
+                && observed.holder_current
+                && record.holder.as_deref() == Some(service.local_box())
+                && self.role_leases.holding(role, record.gen);
+            read.holder = record.holder;
+            read.source = Some("hub".into());
+            if let Some(holder) = read.holder.as_deref() {
+                let store = self.with_store(|s| Ok(s.clone()))?;
+                read.holder_name = store
+                    .resolve_move_member(holder)
+                    .ok()
+                    .filter(|(id, _)| id == holder)
+                    .map(|(_, name)| name);
+            }
+        }
+        let revision = i64::try_from(observed.revision)
+            .map_err(|_| HandlerError::new("record_invalid", "role revision is out of range"))?;
+        Ok((read, revision))
     }
 
     pub(super) async fn take_role(

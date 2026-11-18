@@ -463,6 +463,19 @@ impl Session {
         op_id: &str,
         deadline: Instant,
     ) -> Result<u64, HandlerError> {
+        self.update_record(key, bytes, expected, op_id, deadline, false)
+            .await
+    }
+
+    pub(super) async fn update_record(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        expected: u64,
+        op_id: &str,
+        deadline: Instant,
+        fenced_renewal: bool,
+    ) -> Result<u64, HandlerError> {
         check_kv_size(key, bytes.len())?;
         if !key.split('.').all(|token| {
             !token.is_empty()
@@ -480,7 +493,11 @@ impl Session {
         // Store::update combines submission and PubAck. Keep those stages
         // separate without changing the domain-qualified subject or CAS header.
         let subject = format!("$JS.{DOMAIN}.API.$KV.{BUCKET}.{key}");
-        self.confirm_hub(deadline, self.kv()).await?;
+        // A renewal reads the current `epoch` record from this bucket before
+        // sealing, so a second reachability probe of the bucket adds no check.
+        if !fenced_renewal {
+            self.confirm_hub(deadline, self.kv()).await?;
+        }
         self.publish(subject, headers, bytes, op_id, "revision_moved", deadline)
             .await
     }

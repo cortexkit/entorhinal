@@ -1699,6 +1699,7 @@ mod tests {
             "agent.moves",
             "role.read",
             "role.fence",
+            "role.lease",
         ];
         let expected_mutations = [
             "placement.backfill",
@@ -1755,6 +1756,8 @@ mod tests {
             "agent.set_lid_close_moves",
             "member.set_name",
             "role.take",
+            "role.lease.ack",
+            "role.lease.release",
             "agent.take",
         ];
         for (kind, names) in [
@@ -1802,7 +1805,8 @@ mod tests {
                 "agent.fleet_identity_watch",
                 "agent.where_watch",
                 "agent.sessions_watch",
-                "catalog.status_watch"
+                "catalog.status_watch",
+                "role.lease",
             ])
         );
     }

@@ -779,7 +779,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
     }
 
     fn stop(&self, sequence: u64, error: HandlerError) {
-        self.health.hub_membership.store(1, Ordering::Release);
+        self.set_barrier(false);
         let state = match error.code.as_str() {
             "hub_log_gap" => 4,
             "signature_invalid" | "member_episode_invalid" | "membership_discovery_unresolved" => 5,
@@ -829,10 +829,18 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
 
     fn update_barrier(&self) {
         let ready = self.caught_up() && self.membership.can_write(self.sequence()).is_some();
-        let previous = self
-            .health
-            .hub_membership
-            .swap(if ready { 2 } else { 1 }, Ordering::AcqRel);
+        self.set_barrier(ready);
+    }
+
+    fn set_barrier(&self, ready: bool) {
+        let state = if ready { 2 } else { 1 };
+        let previous = self.health.hub_membership.swap(state, Ordering::AcqRel);
+        if previous != state {
+            self.health
+                .hub_membership_incarnation
+                .fetch_add(1, Ordering::AcqRel);
+            self.commits.notify_waiters();
+        }
         if ready && previous != 2 {
             if let Some(epoch) = &self.epoch {
                 epoch.ready.notify_one();
