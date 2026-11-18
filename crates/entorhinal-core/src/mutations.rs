@@ -1694,6 +1694,7 @@ pub(crate) const DERIVED_TABLES: &[&str] = &[
     "catalog_pin",
     "catalog_pin_set",
     "member_name",
+    "member_box",
     "agent_name_claim",
     "agent",
     "workspace_document",
@@ -1816,6 +1817,8 @@ pub(crate) fn replay_with_observer(
         if origin == "here" && op != "project.shared" && op != "shared.snapshot" {
             if op == "member.set_name" {
                 super::shared_entry::replay_member_name(tx, request)?;
+            } else if op == "member.set_box" {
+                crate::member_box::replay(tx, request)?;
             } else {
                 replay(tx, seq, &op, request, now, enabled)?;
             }
@@ -1834,6 +1837,8 @@ pub(crate) fn replay_with_observer(
             // an `agent.set_namespace` row (the correction's last one).
             if op == "member.set_name" {
                 super::shared_entry::replay_member_name(tx, image)?;
+            } else if op == "member.set_box" {
+                crate::member_box::replay(tx, image)?;
             } else if op == "catalog.pin" {
                 super::catalog_agent::replay_pin(tx, image)?;
             } else if op == crate::user_profile::SET_OP {

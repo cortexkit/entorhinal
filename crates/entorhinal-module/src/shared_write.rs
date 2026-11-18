@@ -3470,96 +3470,29 @@ impl ProjectsHandler {
         };
         for retry in 0..=RETRIES {
             self.catch_up(&store, deadline).await?;
-            let status = store.identity_log_status().map_err(storage_error)?;
-            let head = status.last_applied_position;
-            let pending_count = status.pending_write_count;
-            let mut id = [0; 16];
-            getrandom::getrandom(&mut id)
-                .map_err(|e| HandlerError::new("storage_error", e.to_string()))?;
-            let (bytes_tx, bytes_rx) = tokio::sync::oneshot::channel();
-            let (decision_tx, decision_rx) = std::sync::mpsc::channel();
-            let worker_store = store.clone();
             let operation = write.clone();
             let principal = principal.clone();
             let stable_id = agent_id.clone();
             let stable_avatar = avatar.clone();
             let approval = approval.clone();
-            let health = self.health.clone();
-            #[cfg(test)]
-            let commit_hook = self.shared_commit_hook.clone();
-            let worker = tokio::task::spawn_blocking(move || {
-                // Dropping the request must not release exclusion before this
-                // worker has committed or rolled back its SQLite transaction.
-                let mut bytes_tx = Some(bytes_tx);
-                let result = worker_store.shared_attempt(
-                    log_client::encode_hex(&id),
-                    head,
-                    move |bytes| {
-                        // Preparation reaches this callback only after the pending
-                        // row committed. Publish before the append can park.
-                        health
-                            .log_pending
-                            .store(pending_count + 1, Ordering::Relaxed);
-                        let _ = bytes_tx.take().unwrap().send(bytes);
-                        let decision =
-                            decision_rx
-                                .recv()
-                                .unwrap_or_else(|_| SharedSettlement::Rollback {
-                                    sent: true,
-                                    code: "engram_outcome_unknown".into(),
-                                    message: "settlement waiter was cancelled".into(),
-                                });
-                        #[cfg(test)]
-                        if matches!(decision, SharedSettlement::Commit(_)) {
-                            if let Some(hook) = &commit_hook {
-                                hook();
-                            }
-                        }
-                        decision
-                    },
-                    || {
-                        operation.run(
-                            &worker_store,
-                            &principal,
-                            now,
-                            &stable_id,
-                            stable_avatar,
-                            approval.as_ref(),
-                        )
-                    },
-                );
-                (writer, result)
-            });
-            let mut committed_position = None;
-            let mut proven_unsent = false;
-            if let Ok(bytes) = bytes_rx.await {
-                let append = AppendRequest {
-                    expected_head: head as u64,
-                    entry_id: id,
-                    kind: EntryKind::Change,
-                    data: bytes,
-                };
-                let decision = self.settle(&append, settlement).await;
-                match &decision {
-                    SharedSettlement::Commit(position) => committed_position = Some(*position),
-                    SharedSettlement::Rollback { sent, .. } => proven_unsent = !sent,
-                }
-                let _ = decision_tx.send(decision);
+            let (returned_writer, result) = ChangeWriter {
+                log: &self.log_client,
+                health: &self.health,
+                #[cfg(test)]
+                commit_hook: self.shared_commit_hook.clone(),
             }
-            let (returned_writer, result) = worker
-                .await
-                .map_err(|e| HandlerError::new("storage_error", e.to_string()))?;
+            .append(&store, writer, settlement, move |store| {
+                operation.run(
+                    store,
+                    &principal,
+                    now,
+                    &stable_id,
+                    stable_avatar,
+                    approval.as_ref(),
+                )
+            })
+            .await?;
             writer = returned_writer;
-            if result.is_ok() || proven_unsent {
-                super::enable::refresh(&self.health, &store);
-                if let Some(position) = committed_position.filter(|_| result.is_ok()) {
-                    self.health.log_applied.store(position, Ordering::Relaxed);
-                    self.health.log_head.fetch_max(position, Ordering::Relaxed);
-                }
-            }
-            if let Err(error) = &result {
-                super::enable::record_error(&self.health, error);
-            }
             if result.as_ref().is_err_and(|e| e.code == "head_moved") {
                 if retry == RETRIES {
                     return Err(HandlerError::new(
@@ -3601,6 +3534,106 @@ impl ProjectsHandler {
         }
         unreachable!()
     }
+}
+
+pub(super) struct ChangeWriter<'a> {
+    pub(super) log: &'a log_client::LogClient,
+    pub(super) health: &'a Arc<HealthGauges>,
+    #[cfg(test)]
+    pub(super) commit_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl ChangeWriter<'_> {
+    pub(super) async fn append(
+        &self,
+        store: &RegistryStore,
+        writer: tokio::sync::OwnedMutexGuard<()>,
+        settlement: Instant,
+        operation: impl FnOnce(&RegistryStore) -> Result<Vec<u8>, HandlerError> + Send + 'static,
+    ) -> Result<
+        (
+            tokio::sync::OwnedMutexGuard<()>,
+            Result<Vec<u8>, HandlerError>,
+        ),
+        HandlerError,
+    > {
+        let status = store.identity_log_status().map_err(storage_error)?;
+        let head = status.last_applied_position;
+        let pending_count = status.pending_write_count;
+        let mut id = [0; 16];
+        getrandom::getrandom(&mut id)
+            .map_err(|e| HandlerError::new("storage_error", e.to_string()))?;
+        let (bytes_tx, bytes_rx) = tokio::sync::oneshot::channel();
+        let (decision_tx, decision_rx) = std::sync::mpsc::channel();
+        let worker_store = store.clone();
+        let health = Arc::clone(self.health);
+        #[cfg(test)]
+        let commit_hook = self.commit_hook.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            // Dropping the request must not release exclusion before this
+            // worker has committed or rolled back its SQLite transaction.
+            let mut bytes_tx = Some(bytes_tx);
+            let result = worker_store.shared_attempt(
+                log_client::encode_hex(&id),
+                head,
+                move |bytes| {
+                    // Preparation reaches this callback only after the pending
+                    // row committed. Publish before the append can park.
+                    health
+                        .log_pending
+                        .store(pending_count + 1, Ordering::Relaxed);
+                    let _ = bytes_tx.take().unwrap().send(bytes);
+                    let decision =
+                        decision_rx
+                            .recv()
+                            .unwrap_or_else(|_| SharedSettlement::Rollback {
+                                sent: true,
+                                code: "engram_outcome_unknown".into(),
+                                message: "settlement waiter was cancelled".into(),
+                            });
+                    #[cfg(test)]
+                    if matches!(decision, SharedSettlement::Commit(_)) {
+                        if let Some(hook) = &commit_hook {
+                            hook();
+                        }
+                    }
+                    decision
+                },
+                || operation(&worker_store),
+            );
+            (writer, result)
+        });
+        let mut committed_position = None;
+        let mut proven_unsent = false;
+        if let Ok(bytes) = bytes_rx.await {
+            let append = AppendRequest {
+                expected_head: head as u64,
+                entry_id: id,
+                kind: EntryKind::Change,
+                data: bytes,
+            };
+            let decision = self.settle(&append, settlement).await;
+            match &decision {
+                SharedSettlement::Commit(position) => committed_position = Some(*position),
+                SharedSettlement::Rollback { sent, .. } => proven_unsent = !sent,
+            }
+            let _ = decision_tx.send(decision);
+        }
+        let (returned_writer, result) = worker
+            .await
+            .map_err(|e| HandlerError::new("storage_error", e.to_string()))?;
+        if result.is_ok() || proven_unsent {
+            super::enable::refresh(self.health, store);
+            if let Some(position) = committed_position.filter(|_| result.is_ok()) {
+                self.health.log_applied.store(position, Ordering::Relaxed);
+                self.health.log_head.fetch_max(position, Ordering::Relaxed);
+            }
+        }
+        if let Err(error) = &result {
+            super::enable::record_error(self.health, error);
+        }
+        Ok((returned_writer, result))
+    }
 
     async fn settle(&self, request: &AppendRequest, bound: Instant) -> SharedSettlement {
         let mut sent = false;
@@ -3620,7 +3653,7 @@ impl ProjectsHandler {
             sent = true;
             match timeout_at(
                 bound.min(Instant::now() + SEND_WAIT),
-                self.log_client.append(request),
+                self.log.append(request),
             )
             .await
             {

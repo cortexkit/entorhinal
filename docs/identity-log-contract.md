@@ -34,6 +34,7 @@ Entry kinds are closed: `change` and `snapshot`. Entry operations are closed:
 |---|---|---|
 | `change` | `project.shared` | Row upserts and deletes for the shared project tables, plus any agents a placement change carried. |
 | `change` | `member.set_name` | One machine's display name. |
+| `change` | `member.set_box` | One machine's daemon box id, keyed by its log author. |
 | `change` | `user.set` | One validated user-profile field change, with its principal and optional actor audit label. |
 | `change` | `agent.create`, `agent.rename`, `agent.update_tag`, `agent.set_labels`, `agent.set_avatar`, `agent.set_github_identity`, `agent.dispose`, `agent.merge`, `agent.set_namespace` | The complete after-image of one agent and its name claims. |
 | `snapshot` | `shared.snapshot` | One part of a complete copy of the shared state. |
@@ -51,7 +52,7 @@ Only these tables travel (`PROJECT_SHARED_TABLES`, `AGENT_SHARED_TABLES` and
 - `workspace`, `project`, `project_workspace`, `project_alias`,
   `project_root_key`;
 - `agent`, `agent_name_claim`;
-- `member_name`.
+- `member_name`, `member_box`;
 - `user_profile`, `user_expertise` (personal data, excluded from both public journal feeds).
 
 Aliases of implicit (path-derived) project ids are not shared. Everything else
@@ -69,7 +70,8 @@ Test: `consent_workspace_and_hire_replicate_without_local_authority_rows`.
 These methods produce a shared entry when the log is enabled: `register`,
 `assign_workspace`, `upgrade_implicit`, `remove`, `seed_import`, `add_root`,
 `attach_root`, `member.set_name`, `user.set`, every agent identity write except
-`agent.import`, and agent tool writes. Other writes stay local.
+`agent.import`, and agent tool writes. The module also publishes `member.set_box`
+automatically when needed (section 9). Other writes stay local.
 
 1. **One writer.** Shared writes run one at a time under the module's writer
    lock. Reads use a separate connection and never wait for it.
@@ -193,13 +195,18 @@ returns:
    a `signed_by_self` flag; a missing or malformed one stalls catch-up.
 2. A `member.set_name` entry must name the same author as the entry. A machine can
    name only itself.
-3. A snapshot that carries a member name must carry its own author's name.
+3. A `member.set_box` entry must carry its log author and a box id, both exactly
+   32 lowercase hex characters. A snapshot may carry its own author's member name
+   or box id on its first part only.
 4. A superseding snapshot must have one author, who wrote every entry it
    replaces (section 6).
 5. The key that signed an entry is not taken as its author.
 
 A refused entry stops catch-up with `identity_log_stalled`; nothing after it is
-applied until it is resolved.
+applied until it is resolved. An older reader that does not understand
+`member.set_box` stalls for the rest of the process. After upgrading and
+restarting, it reads again from the last committed position and applies the
+previously refused entry before proceeding.
 
 Tests: `read_requires_signed_by_self_and_catch_up_stalls`,
 `read_requires_author_and_catch_up_stalls`,
@@ -241,7 +248,7 @@ Tests: `empty_enable_is_idempotent_admits_create_and_reports_status`,
 `import_consent_order_and_flag_rules`,
 `attach_surface_enable_is_direct_only_and_fails_closed`.
 
-## 9. Machine names
+## 9. Machine names and box ids
 
 `member.set_name {display_name}` names this machine in the log. It is `Direct`
 only (`caller_forbidden` otherwise). The name is trimmed and must then be 1–64
@@ -250,7 +257,18 @@ the log is disabled, `identity_log_enabling` during bootstrap, and
 `self_author_unknown` until this machine has learned its own author pseudonym from
 the log. Names are what `ck agents move <agent> --to <machine>` matches against.
 
-Test: `s3_name_refusals_precede_decode_writer_and_engram_in_order`.
+`member.set_box {author, box_id}` is a log operation, not a callable method.
+After startup catch-up or enable/join, the module publishes its daemon box id
+from HELLO_ACK only if sharing is enabled and its stored mapping is absent or
+different. If the author is unknown, it learns it from a verified record read
+without creating a record. A store recorded as belonging to another computer
+does not publish. Publication failures are logged and retried by the background
+catch-up worker. Superseding snapshots
+preserve the author's box mapping from the replaced prefix.
+
+Tests: `s3_name_refusals_precede_decode_writer_and_engram_in_order`,
+`member_box_empty_join_learns_author_and_retries_failed_read`,
+`member_box_unknown_operation_retries_same_position_after_restart`.
 
 ## 10. Status
 

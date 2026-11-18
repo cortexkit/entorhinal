@@ -66,6 +66,7 @@ fn partition(id: &str, image: ProjectEntry, base: u64) -> Result<Vec<Vec<u8>>, R
         tables: BTreeMap::new(),
         agents: vec![],
         member_name: None,
+        member_box: None,
         requesting_agent_id: None,
         authorization: None,
     };
@@ -98,6 +99,7 @@ fn partition(id: &str, image: ProjectEntry, base: u64) -> Result<Vec<Vec<u8>>, R
     let mut images = vec![];
     let mut current = empty();
     current.member_name = image.member_name;
+    current.member_box = image.member_box;
     for (name, unit) in units {
         // Reserve maximum-width counts and replacement metadata before packing
         // rows; adding supersedes_through must never push a part over the cap.
@@ -231,6 +233,19 @@ impl RegistryStore {
                 "snapshot drops member name",
             ));
         }
+        if first.get("member_box").is_none()
+            && log_entries.iter().any(|entry| {
+                let value: serde_json::Value =
+                    serde_json::from_slice(&entry.entry).unwrap_or_default();
+                value["op"] == "member.set_box"
+                    || value.get("member_box").is_some_and(|row| !row.is_null())
+            })
+        {
+            return Err(domain(
+                "supersede_drops_member_box",
+                "snapshot drops member box",
+            ));
+        }
         Ok(plan)
     }
 
@@ -263,6 +278,7 @@ impl RegistryStore {
         let (mut image, backfill) = self.read(|conn| {
             let mut image = SharedState::capture(conn)?.snapshot(entries);
             image.member_name = conn.query_row("SELECT author,display_name FROM member_name WHERE author=(SELECT self_author FROM self_identity WHERE id=1)", [], |r| Ok(crate::shared_entry::MemberName { author:r.get(0)?, display_name:r.get(1)? })).optional()?;
+            image.member_box = crate::member_box::own_row(conn)?;
             let mut keys = crate::shared_entry::TableChanges::default();
             let mut mappings = vec![];
             let roots = conn.prepare("SELECT project_id,canonical_root FROM project_root ORDER BY canonical_root")?
@@ -311,7 +327,7 @@ impl RegistryStore {
                 }
             }
             image.tables.insert("project_root_key".into(), keys.clone());
-            let backfill = Backfill { image: ProjectEntry { op: "project.shared".into(), tables: [("project_root_key".into(), keys)].into(), agents: vec![], member_name: None, requesting_agent_id: None, authorization: None }, mappings, base };
+            let backfill = Backfill { image: ProjectEntry { op: "project.shared".into(), tables: [("project_root_key".into(), keys)].into(), agents: vec![], member_name: None, member_box: None, requesting_agent_id: None, authorization: None }, mappings, base };
             Ok(Ok((image, backfill)))
         })??;
         image.agents.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
@@ -485,6 +501,10 @@ fn agent_history(
                 return Err(invalid("member name author differs from log author".into()));
             }
             vec![]
+        } else if entry.kind == "change" && value["op"] == "member.set_box" {
+            crate::member_box::decode(value, Some(&entry.author))
+                .map_err(|e| invalid(e.to_string()))?;
+            vec![]
         } else if entry.kind == "change" {
             let agent: AgentChangeEntry =
                 serde_json::from_value(value).map_err(|e| invalid(e.to_string()))?;
@@ -627,6 +647,7 @@ mod tests {
             tables: BTreeMap::new(),
             agents: vec![],
             member_name: None,
+            member_box: None,
             requesting_agent_id: None,
             authorization: None,
         };
@@ -673,6 +694,7 @@ mod tests {
             tables: BTreeMap::new(),
             agents: vec![],
             member_name: None,
+            member_box: None,
             requesting_agent_id: None,
             authorization: None,
         };
@@ -906,6 +928,7 @@ mod tests {
             tables: Default::default(),
             agents: vec![moved.clone()],
             member_name: None,
+            member_box: None,
             requesting_agent_id: None,
             authorization: None,
         };

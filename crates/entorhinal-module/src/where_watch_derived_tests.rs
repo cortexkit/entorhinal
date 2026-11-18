@@ -142,6 +142,43 @@ async fn where_derived_member_rename_resyncs() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn member_box_change_resyncs_where_watch() {
+    let f = seeded("where-derived-member-box").await;
+    let store = store(&f);
+    sharing_on(&store);
+    store
+        .cache_agent_claims(&[(HEAD.into(), held(OTHER))], 700)
+        .unwrap();
+    let body = request(
+        WHERE,
+        json!({"agentIds":[HEAD],"cursor":{"incarnation":INCARNATION,"seq":0}}),
+    );
+    let (sink, mut receiver) = Sink::new();
+    let watch = f.handler.serve_watch(&sink, &body, READER);
+    tokio::pin!(watch);
+    pending(watch.as_mut()).await;
+    quiet(&mut receiver);
+    let box_id = "ab".repeat(16);
+    store
+        .apply_remote_entry(
+            &remote(
+                1,
+                json!({"op":"member.set_box","author":OTHER,"box_id":box_id}),
+            ),
+            None,
+        )
+        .unwrap();
+    debounce(watch.as_mut()).await;
+    resync(&mut receiver, 1);
+    assert_eq!(
+        store.agent_where(HEAD).unwrap().holder_box.as_deref(),
+        Some(box_id.as_str())
+    );
+    sink.cancel.send_replace(true);
+    assert!(matches!(watch.await, HandlerOutcome::Streamed));
+}
+
+#[tokio::test(start_paused = true)]
 async fn where_derived_self_author_learning_resyncs() {
     for source in ["role_cache", "role_take", "remote_apply"] {
         let f = seeded(&format!("where-derived-self-{source}")).await;

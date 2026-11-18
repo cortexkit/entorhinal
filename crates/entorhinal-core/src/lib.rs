@@ -33,6 +33,7 @@ mod memory;
 pub use memory::{SetProjectDomainRequest, SetWorkspaceDocumentRequest, WorkspaceDocument};
 pub mod enable_state;
 mod log_schema;
+mod member_box;
 pub mod move_record;
 pub mod move_store;
 mod mutations;
@@ -321,6 +322,10 @@ const MIGRATIONS: [Migration; 24] = [
     Migration {
         version: 24,
         statements: session_lifecycle::V24_SESSION_ROLE,
+    },
+    Migration {
+        version: 25,
+        statements: member_box::V25_MEMBER_BOX,
     },
 ];
 
@@ -1976,7 +1981,7 @@ mod tests {
     }
 
     /// A store last opened by a binary whose chain ends at migration 7 gains
-    /// all six session, claim, role and name tables, with exactly these
+    /// the session, claim, role and member tables, with exactly these
     /// columns, when this binary opens it.
     #[test]
     fn opening_a_v7_store_creates_every_session_and_claim_table() {
@@ -1995,7 +2000,7 @@ mod tests {
         assert_eq!(missing, 0, "a V7 store has no session tables yet");
         drop(old);
         let store = RegistryStore::open(&descriptor).unwrap();
-        let expected: [(&str, &[&str]); 6] = [
+        let expected: [(&str, &[&str]); 7] = [
             (
                 "session_binding",
                 &[
@@ -2055,6 +2060,7 @@ mod tests {
             ),
             ("self_identity", &["id", "self_author", "learned_at_ms"]),
             ("member_name", &["author", "display_name"]),
+            ("member_box", &["author", "box_id"]),
         ];
         store
             .read(|conn| {

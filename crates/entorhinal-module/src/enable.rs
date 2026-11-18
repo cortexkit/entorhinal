@@ -424,6 +424,9 @@ impl ProjectsHandler {
             record_error(&self.health, error);
         }
         result?;
+        if self.health.origin.daemon_id().is_some() {
+            self.catch_up_wake.notify_one();
+        }
         self.start_claim_refresh();
         self.claim_refresh.signal();
         self.identity_log_status()

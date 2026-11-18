@@ -46,6 +46,7 @@ enum Decoded {
     Project(ProjectEntry),
     Agent(Box<AgentChangeEntry>),
     Member(crate::shared_entry::MemberName),
+    MemberBox(crate::member_box::MemberBox),
     Pins(crate::catalog_agent::CatalogPinSet),
     User(crate::user_profile::UserEntry),
 }
@@ -64,6 +65,8 @@ struct SnapshotPart {
     supersedes_through: Option<u64>,
     #[serde(default)]
     member_name: Option<crate::shared_entry::MemberName>,
+    #[serde(default)]
+    member_box: Option<crate::member_box::MemberBox>,
 }
 
 fn snapshot_part(entry: &RemoteEntry) -> Result<SnapshotPart, RegistryError> {
@@ -78,7 +81,12 @@ fn snapshot_part(entry: &RemoteEntry) -> Result<SnapshotPart, RegistryError> {
         || part.part == 0
         || part.parts == 0
         || part.part > part.parts
-        || (part.part != 1 && value.get("member_name").is_some())
+        || (part.part != 1
+            && (value.get("member_name").is_some() || value.get("member_box").is_some()))
+        || part
+            .member_box
+            .as_ref()
+            .is_some_and(|row| row.author != entry.author)
         || part
             .member_name
             .as_ref()
@@ -375,12 +383,16 @@ impl RegistryStore {
             tables: Default::default(),
             agents: vec![],
             member_name: None,
+            member_box: None,
             requesting_agent_id: None,
             authorization: None,
         };
         for part in parts {
             if part.member_name.is_some() {
                 merged.member_name = part.member_name;
+            }
+            if part.member_box.is_some() {
+                merged.member_box = part.member_box;
             }
             for (table, changes) in part.tables {
                 if !changes.delete.is_empty() {
@@ -400,6 +412,7 @@ impl RegistryStore {
             tables: Default::default(),
             agents: vec![],
             member_name: None,
+            member_box: None,
             requesting_agent_id: None,
             authorization: None,
         };
@@ -426,6 +439,9 @@ impl RegistryStore {
                     let had_name: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM member_name WHERE author=?1)", [&entries[0].author], |r| r.get(0))?;
                     if had_name && merged.member_name.is_none() {
                         return Err(invalid_entry("supersede invariant: snapshot drops member name"));
+                    }
+                    if merged.member_box.is_none() && crate::member_box::lookup(tx, Some(&entries[0].author))?.is_some() {
+                        return Err(invalid_entry("supersede invariant: snapshot drops member box"));
                     }
                     let before = crate::shared_entry::SharedState::capture(tx)?;
                     let history = stored_agent_entries(tx)?;
@@ -558,6 +574,13 @@ fn apply(tx: &Transaction<'_>, entry: &RemoteEntry) -> rusqlite::Result<i64> {
             {
                 return Err(invalid("snapshot names another author"));
             }
+            if project
+                .member_box
+                .as_ref()
+                .is_some_and(|row| row.author != entry.author)
+            {
+                return Err(invalid("snapshot sets box of another author"));
+            }
             // The agents a placement carry or the workspace correction
             // changed pass the same checks as a standalone agent entry.
             if project.op == "project.shared" {
@@ -575,6 +598,9 @@ fn apply(tx: &Transaction<'_>, entry: &RemoteEntry) -> rusqlite::Result<i64> {
                 return Err(invalid("member name author differs from log author"));
             }
             Decoded::Member(member.name)
+        }
+        ("change", "member.set_box") => {
+            Decoded::MemberBox(crate::member_box::decode(value, Some(&entry.author))?)
         }
         ("change", "catalog.pin") => {
             let pins: crate::catalog_agent::CatalogPinSet =
@@ -700,6 +726,25 @@ fn apply(tx: &Transaction<'_>, entry: &RemoteEntry) -> rusqlite::Result<i64> {
                 // stored alongside it unchanged, for audit and so replay
                 // restores exactly what was received.
                 tag(tx, seq, entry, &payload)?;
+                seq
+            }
+            Decoded::MemberBox(row) => {
+                let seq = append(
+                    tx,
+                    "member.set_box",
+                    &json!({}),
+                    "log",
+                    None,
+                    0,
+                    "entorhinal",
+                )?;
+                row.restore(tx)?;
+                tag(
+                    tx,
+                    seq,
+                    entry,
+                    &json!({"signer":entry.signer,"key_id":entry.key_id}),
+                )?;
                 seq
             }
             Decoded::Member(name) => {
@@ -1049,6 +1094,7 @@ mod tests {
             tables: BTreeMap::new(),
             agents: vec![],
             member_name: None,
+            member_box: None,
             requesting_agent_id: None,
             authorization: None,
         }

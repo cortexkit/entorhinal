@@ -49,6 +49,8 @@ pub struct AgentWhere {
     pub status: &'static str,
     pub holder: Option<String>,
     pub holder_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub holder_box: Option<String>,
     pub epoch: i64,
     pub cut_id: Option<String>,
     pub read_at_ms: Option<i64>,
@@ -402,6 +404,7 @@ pub(crate) fn agent_where_in(
         known: view.known,
         status,
         holder_name,
+        holder_box: crate::member_box::lookup(conn, claim.holder.as_deref())?,
         holder: claim.holder,
         epoch: claim.epoch,
         cut_id: claim.cut_id,

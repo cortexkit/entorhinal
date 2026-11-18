@@ -154,6 +154,7 @@ fn document_entry(doc: &WorkspaceDocument) -> crate::shared_entry::ProjectEntry 
         .into(),
         agents: vec![],
         member_name: None,
+        member_box: None,
         requesting_agent_id: None,
         authorization: None,
     }

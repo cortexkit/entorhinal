@@ -2805,6 +2805,109 @@ async fn session_records_fixture(label: &str) -> SessionFixture {
 }
 
 #[tokio::test]
+async fn member_box_records_match_published_files() {
+    let fixture = session_records_fixture("served-member-box").await;
+    let box_id = "ab".repeat(16);
+    let holder = "22".repeat(16);
+    fixture
+        .store()
+        .apply_entry("fixture.holder", "{}", "fixture", None, |tx| {
+            tx.execute(
+                "UPDATE claim_cache SET holder=?1 WHERE agent_id=?2",
+                params![holder, WHERE_ELSEWHERE],
+            )?;
+            tx.execute(
+                "INSERT INTO member_name(author,display_name) VALUES(?1,'Other machine')",
+                [&holder],
+            )?;
+            tx.execute(
+                "UPDATE self_identity SET self_author=?1 WHERE id=1",
+                ["11".repeat(16)],
+            )?;
+            tx.execute(
+                "UPDATE claim_cache SET holder=?1 WHERE agent_id=?2",
+                params!["11".repeat(16), WHERE_HERE],
+            )?;
+            tx.execute(
+                "INSERT INTO member_name(author,display_name) VALUES(?1,'This machine')",
+                ["11".repeat(16)],
+            )?;
+            tx.execute(
+                "UPDATE identity_log_state SET state='enabled' WHERE id=1",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let where_params = json!({"agent_id":WHERE_ELSEWHERE});
+    let (unknown, reply) = fixture
+        .record(
+            SESSION_READER,
+            READER_MODULE,
+            "agent.where",
+            where_params.clone(),
+        )
+        .await;
+    assert_eq!(reply["result"]["status"], "held_elsewhere");
+    assert!(reply["result"].get("holder_box").is_none());
+    published_file("agent-sessions-v1", "where-box-unknown.json", vec![unknown]);
+
+    fixture
+        .store()
+        .apply_remote_entry(
+            &entorhinal_core::remote_apply::RemoteEntry {
+                position: 1,
+                entry_id: "01".repeat(16),
+                author: holder.clone(),
+                signer: "02".repeat(16),
+                key_id: "03".repeat(16),
+                envelope_version: 1,
+                kind: "change".into(),
+                entry: serde_json::to_vec(
+                    &json!({"op":"member.set_box","author":holder,"box_id":box_id}),
+                )
+                .unwrap(),
+            },
+            None,
+        )
+        .unwrap();
+    let (known, reply) = fixture
+        .record(SESSION_READER, READER_MODULE, "agent.where", where_params)
+        .await;
+    assert_eq!(reply["result"]["status"], "held_elsewhere");
+    assert_eq!(reply["result"]["holder_box"], box_id);
+    published_file("agent-sessions-v1", "where-holder-box.json", vec![known]);
+
+    let (many, reply) = fixture
+        .record(
+            SESSION_READER,
+            READER_MODULE,
+            "agent.where_many",
+            json!({"agentIds":[WHERE_ELSEWHERE,WHERE_HERE]}),
+        )
+        .await;
+    assert_eq!(reply["result"]["agents"][0]["holder_box"], box_id);
+    assert!(reply["result"]["agents"][1].get("holder_box").is_none());
+    published_file(
+        "agent-sessions-v1",
+        "where-many-holder-box.json",
+        vec![many],
+    );
+
+    let own_box = "cd".repeat(16);
+    fixture
+        .handler
+        .health
+        .origin
+        .set_daemon(Some(own_box.clone()));
+    let (node, reply) = fixture
+        .record(SESSION_READER, READER_MODULE, "node.self", json!({}))
+        .await;
+    assert_eq!(reply["result"]["box_id"], own_box);
+    published_file("agent-sessions-v1", "node-self-box.json", vec![node]);
+}
+
+#[tokio::test]
 async fn session_records_match_published_files() {
     let fixture = session_records_fixture("served-sessions").await;
 

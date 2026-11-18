@@ -10,6 +10,8 @@ use std::{future::Future, path::Path, sync::atomic::AtomicUsize};
 
 #[path = "initial_claim_acceptance.rs"]
 mod initial_claims;
+#[path = "member_box_acceptance.rs"]
+mod member_boxes;
 
 const DIRECT: RouteKey = (90, 1);
 const CORE: RouteKey = (91, 1);
@@ -25,6 +27,7 @@ const SHARED: &[&str] = &[
     "agent_name_claim",
     "project_root_key",
     "member_name",
+    "member_box",
     "catalog_pin_set",
     "catalog_pin",
 ];
@@ -635,6 +638,7 @@ async fn s3_names_replicate_to_where_and_survive_supersede_for_late_joiner() {
         a.store().persisted_self_author().unwrap(),
         Some("11".repeat(16))
     );
+    // This fixture has no daemon box id, so joining does not need to learn its author.
     assert_eq!(b.store().persisted_self_author().unwrap(), None);
     assert_eq!(
         b.call("member.set_name", json!({"display_name":"Joiner"}))
@@ -680,6 +684,19 @@ async fn s3_names_replicate_to_where_and_survive_supersede_for_late_joiner() {
     assert_eq!(where_reply["status"], "held_elsewhere");
     assert_eq!(where_reply["holder_name"], "Studio");
 
+    // Populate the mapping through the shared writer before replacing the prefix.
+    let studio_box = "ab".repeat(16);
+    a.handler.health.origin.set_daemon(Some(studio_box.clone()));
+    let writer = a.handler.writer.clone().lock_owned().await;
+    drive(a.handler.catch_up_worker().publish_member_box(
+        &a.store(),
+        writer,
+        tokio::time::Instant::now() + Duration::from_secs(25),
+    ))
+    .await
+    .unwrap();
+    b.catch_up().await;
+
     // Reset the enable flag to disabled without dropping shared rows, as a
     // restored copy must re-enable by superseding its own existing log prefix.
     a.store()
@@ -697,6 +714,10 @@ async fn s3_names_replicate_to_where_and_survive_supersede_for_late_joiner() {
         value["member_name"],
         json!({"author":"11".repeat(16),"display_name":"Studio"})
     );
+    assert_eq!(
+        value["member_box"],
+        json!({"author":"11".repeat(16),"box_id":studio_box})
+    );
     let c_record = FakeRecord::new([0x33; 16]);
     c_record.put(&format!("claim:{agent}"), 1, claim, &"11".repeat(16));
     c_record.offline.store(true, Ordering::Relaxed);
@@ -707,6 +728,7 @@ async fn s3_names_replicate_to_where_and_survive_supersede_for_late_joiner() {
     );
     c.enable_without_agents().await;
     assert_eq!(c.rows("member_name"), b.rows("member_name"));
+    assert_eq!(c.rows("member_box"), b.rows("member_box"));
     assert_eq!(c.store().persisted_self_author().unwrap(), None);
     c_record.offline.store(false, Ordering::Relaxed);
     c.bytes_on(DIRECT, "agent.refresh_claims", json!({}))

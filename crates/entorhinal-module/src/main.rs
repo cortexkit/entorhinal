@@ -548,6 +548,7 @@ struct ProjectsHandler {
     writer: Arc<tokio::sync::Mutex<()>>,
     draining: tokio::sync::watch::Sender<bool>,
     catch_up_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    catch_up_wake: Arc<tokio::sync::Notify>,
     record_client: record_client::RecordClient,
     participant_discovery: Arc<dyn participant_discovery::ParticipantDiscovery>,
     catalog_agent: catalog_agent::CatalogAgent,
@@ -956,6 +957,7 @@ impl ProjectsHandler {
             writer: Arc::new(tokio::sync::Mutex::new(())),
             draining: tokio::sync::watch::channel(false).0,
             catch_up_task: Mutex::new(None),
+            catch_up_wake: Arc::default(),
             record_client: record_client::RecordClient::new(record_connector),
             participant_discovery: Arc::new(participant_discovery::SubcParticipantDiscovery::new(
                 Arc::new(log_client::SubcConnector::from_args(
@@ -1233,6 +1235,7 @@ impl ModuleHandler for ProjectsHandler {
                 let module_started_at = self.module_started_at;
                 let catalog_poll_wake = self.catalog_poll_wake.clone();
                 let catalog_sql = self.catalog_sql.clone();
+                let catch_up_wake = self.catch_up_wake.clone();
                 tokio::spawn(async move {
                     let outcome = retry_open_while_lease_held(&descriptor, retry_budget).await;
                     install_store_with_time(
@@ -1248,6 +1251,7 @@ impl ModuleHandler for ProjectsHandler {
                     // ready and reported the store as failing, which the daemon
                     // counts against the module.
                     health.store_opening.store(false, Ordering::Release);
+                    catch_up_wake.notify_one();
                     claim_refresh.signal();
                     role_refresh.notify_one();
                     move_wake.notify_one();

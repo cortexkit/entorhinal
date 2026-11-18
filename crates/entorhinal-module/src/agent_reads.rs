@@ -140,7 +140,17 @@ impl ProjectsHandler {
         match method {
             "node.self" => {
                 let _: EmptyRequest = decode(params)?;
-                encode_result(self.with_store(RegistryStore::node_self)?)
+                #[derive(serde::Serialize)]
+                struct SelfReply<'a> {
+                    #[serde(flatten)]
+                    node: entorhinal_core::claim_cache::NodeSelf,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    box_id: Option<&'a str>,
+                }
+                encode_result(SelfReply {
+                    node: self.with_store(RegistryStore::node_self)?,
+                    box_id: self.health.origin.daemon_id(),
+                })
             }
             "agent.snapshot" => {
                 let _: EmptyRequest = decode(params)?;

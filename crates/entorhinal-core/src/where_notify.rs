@@ -24,6 +24,7 @@ struct AgentLiveness {
 struct Dependencies {
     self_author: Option<String>,
     names: Vec<(String, String)>,
+    boxes: Vec<(String, String)>,
     sharing_off: bool,
     agents: Vec<AgentLiveness>,
 }
@@ -47,6 +48,16 @@ impl Dependencies {
         let names = if exists(conn, "member_name")? {
             let mut statement =
                 conn.prepare("SELECT author,display_name FROM member_name ORDER BY author")?;
+            let rows = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        } else {
+            Vec::new()
+        };
+        let boxes = if exists(conn, "member_box")? {
+            let mut statement =
+                conn.prepare("SELECT author,box_id FROM member_box ORDER BY author")?;
             let rows = statement
                 .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -84,6 +95,7 @@ impl Dependencies {
         Ok(Self {
             self_author,
             names,
+            boxes,
             sharing_off,
             agents,
         })

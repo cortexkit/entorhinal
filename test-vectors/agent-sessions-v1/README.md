@@ -169,6 +169,13 @@ a backfill makes the data local.
   `Workshop machine`, and enabled with no name. The enabled cases include a
   differently named member so another machine's name cannot stand in for this
   machine's own record.
+- **`where-box-unknown.json`** and **`where-holder-box.json`**: the same
+  `held_elsewhere` claim before and after its author shares a box id. When
+  known, `holder_box` is the daemon's 32-digit lowercase hex id, distinct from
+  `holder` (the engram author); otherwise the field is omitted.
+- **`where-many-holder-box.json`**: a mixed batch with a box id for the remote
+  holder and no known box id for the local holder.
+- **`node-self-box.json`**: `node.self` with the daemon id supplied as `box_id`.
 - **`where-sharing-off.json`**: on a machine that has never turned sharing on, an
   agent with no claim is a verified `unclaimed` (`known: true`), because no
   other machine can hold it.
@@ -313,6 +320,10 @@ a backfill makes the data local.
 | `sessions-watch.json` | `980cd6b43063981601f7b7e325d9108f120aa8e075df67355a2d1b93efb0af1e` |
 | `register-session-head.json` | `ddeb70078b3404ab8d5f06c90a301fcc474ab4ff8fcedf508b16bfdecc3adf7c` |
 | `register-session-missing-runner.json` | `0743fc894172825942eebecea6d6d23625458caf82ef0f4ef2b4dfbc03b90e16` |
+| `where-box-unknown.json` | `ee3a137255a9521646bee703d734ad81e5a0c6972f6bfb493132087856a07b22` |
+| `where-holder-box.json` | `42ee303abd2a271d4f8ec5609ec73c401f5fdc3b389e2d1fd5115affef03c74a` |
+| `where-many-holder-box.json` | `1ade6493e2aa6ee6fec5cba2f616e8182ac030d874e807736cebf384af266759` |
+| `node-self-box.json` | `00bcf6099d11a10ce63c551c24cd49f6dfc536d1dd3169d9a4500f0605894efd` |
 | `register-session-delegated.json` | `39b69f33fb77b2b121ac0cf6033eae24aca28738aab90683e2e89618d856f345` |
 | `sessions-delegated.json` | `b210b3e6b3e0530cf0cb0cf8be597a2ea76ef72dea342a7de3d294abb2511c16` |
 | `register-session-unknown-role.json` | `0fa48df18d199c86dd771ab81cad438d032900f8bcb2b93ec40fc6b2553e3721` |
@@ -339,6 +350,7 @@ ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked sessio
 ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked served_vectors::session_lookup_cases_match_published_file -- --exact --nocapture
 ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked served_vectors::sessions_head_runners_match_published_file -- --exact --nocapture
 ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked served_vectors::node_self_records_match_published_file -- --exact --nocapture
+ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked served_vectors::member_box_records_match_published_files -- --exact --nocapture
 ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked served_vectors_sessions_watch_records_match_published_file -- --nocapture
 ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked session_role_records_match_published_files -- --nocapture
 ```
@@ -350,7 +362,7 @@ python3 - <<'PY'
 import hashlib
 from pathlib import Path
 root = Path('test-vectors/agent-sessions-v1')
-names = ['for-session.json', 'register-session.json', 'session-for-ref.json', 'where.json', 'where-many.json', 'where-moving-receiver.json', 'where-moving-source.json', 'where-sharing-off.json', 'end-session.json', 'register-session-runner.json', 'session-for-runner.json', 'sessions.json', 'set-session-network.json', 'register-session-rekey.json', 'sessions-held-on.json', 'sessions-open.json', 'session-lookup-cases.json', 'sessions-head-runners.json', 'session-for-harness.json', 'node-self.json', 'sessions-watch.json', 'register-session-head.json', 'register-session-missing-runner.json', 'register-session-delegated.json', 'sessions-delegated.json', 'register-session-unknown-role.json']
+names = ['for-session.json', 'register-session.json', 'session-for-ref.json', 'where.json', 'where-many.json', 'where-moving-receiver.json', 'where-moving-source.json', 'where-sharing-off.json', 'end-session.json', 'register-session-runner.json', 'session-for-runner.json', 'sessions.json', 'set-session-network.json', 'register-session-rekey.json', 'sessions-held-on.json', 'sessions-open.json', 'session-lookup-cases.json', 'sessions-head-runners.json', 'session-for-harness.json', 'node-self.json', 'sessions-watch.json', 'register-session-head.json', 'register-session-missing-runner.json', 'where-box-unknown.json', 'where-holder-box.json', 'where-many-holder-box.json', 'node-self-box.json', 'register-session-delegated.json', 'sessions-delegated.json', 'register-session-unknown-role.json']
 root.joinpath('SHA256SUMS').write_text(''.join(
     f'{hashlib.sha256(root.joinpath(name).read_bytes()).hexdigest()}  {name}\n'
     for name in names), encoding='utf-8')
@@ -358,7 +370,7 @@ PY
 ```
 
 Without `ENTO_WRITE_SERVED_VECTORS=1`, the non-ignored session, lifecycle,
-re-key, lookup-case and node-self tests regenerate their JSON from the real handler and
+re-key, lookup-case, node-self and member-box tests regenerate their JSON from the real handler and
 compare the bytes against the published files on each run. Verify the new file
 with both Cargo's test runner and nextest:
 
