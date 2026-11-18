@@ -3,7 +3,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, RwLock},
+    sync::{atomic::Ordering, Arc, RwLock, Weak},
     time::Duration,
 };
 
@@ -25,7 +25,7 @@ use crate::{
     hub_membership::Sight,
     hub_transport::{check_kv_size, Feed, FeedEvent, KvDelivery},
     hub_write::{self, LogReplan, Payload, Replanned, Step, Trust},
-    HandlerError, HealthGauges, ProjectsHandler, RouteKey,
+    role_leases, HandlerError, HealthGauges, ProjectsHandler, RouteKey,
 };
 
 pub(super) const TAKE: &str = "agent.take";
@@ -83,6 +83,9 @@ impl Record {
 pub(super) trait SnapshotClaims: Send + Sync {
     fn claim(&self, agent: &str) -> Option<(Option<String>, i64)>;
     fn hub_ready(&self) -> bool;
+    fn role(&self, _name: &str) -> Option<(Option<String>, i64)> {
+        None
+    }
 }
 
 #[async_trait]
@@ -175,6 +178,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Backend for IdentityLog<
 #[derive(Default)]
 struct Watched {
     initial: bool,
+    incarnation: u64,
     revisions: HashMap<String, u64>,
     held: HashSet<String>,
 }
@@ -189,6 +193,8 @@ pub(super) struct Residence {
     commits: Arc<Notify>,
     watched: RwLock<Watched>,
     clock: fn() -> i64,
+    role_leases: Weak<role_leases::Leases>,
+    link: Notify,
 }
 
 pub(super) struct Running {
@@ -251,6 +257,8 @@ impl ProjectsHandler {
             health: self.health.clone(),
             watched: RwLock::default(),
             clock: self.clock,
+            role_leases: Arc::downgrade(&self.role_leases),
+            link: Notify::new(),
         });
         *running = Some(Running {
             watch: tokio::spawn(service.clone().watch(feed)),
@@ -258,6 +266,7 @@ impl ProjectsHandler {
             epochs,
             service: service.clone(),
         });
+        self.role_leases.attach(Some(service.clone()));
         Ok(service)
     }
 
@@ -286,6 +295,7 @@ impl ProjectsHandler {
 
     #[cfg(test)]
     pub(super) async fn stop_hub_residence(&self) {
+        self.role_leases.attach(None);
         let running = self.hub_residence.lock().unwrap().take();
         if let Some(mut running) = running {
             running.watch.abort();
@@ -374,6 +384,28 @@ pub(super) fn with_claim_context<R>(
 }
 
 impl Residence {
+    fn reset_role_watch(&self) {
+        let mut watched = self.watched.write().unwrap();
+        watched.initial = false;
+        watched.incarnation += 1;
+        watched.revisions.retain(|key, _| !key.starts_with("role."));
+        self.link.notify_waiters();
+    }
+
+    fn finish_initial_watch(&self) {
+        let mut watched = self.watched.write().unwrap();
+        if !watched.initial {
+            watched.initial = true;
+            self.link.notify_waiters();
+        }
+    }
+
+    fn role_changed(&self, key: &str) {
+        if let Some((name, leases)) = key.strip_prefix("role.").zip(self.role_leases.upgrade()) {
+            leases.changed(name);
+        }
+    }
+
     async fn watch(self: Arc<Self>, mut feed: Feed<KvDelivery>) {
         let mut pending: HashMap<String, HeldDelivery> = HashMap::new();
         let mut retry = tokio::time::interval(Duration::from_secs(1));
@@ -381,8 +413,11 @@ impl Residence {
         loop {
             tokio::select! {
                 event = feed.next_event() => match event {
-                    FeedEvent::Connected | FeedEvent::Disconnected => self.watched.write().unwrap().initial = false,
-                    FeedEvent::Item(KvDelivery::Empty) => self.watched.write().unwrap().initial = true,
+                    FeedEvent::Connected | FeedEvent::Disconnected => {
+                        pending.retain(|key, _| !key.starts_with("role."));
+                        self.reset_role_watch();
+                    }
+                    FeedEvent::Item(KvDelivery::Empty) => self.finish_initial_watch(),
                     FeedEvent::Item(KvDelivery::Entry(entry)) => {
                         let seen_current = entry.seen_current;
                         if pending.get(&entry.key).is_none_or(|old| old.entry.revision <= entry.revision) {
@@ -392,7 +427,7 @@ impl Residence {
                             self.observe_or_hold(HeldDelivery { entry, arrival_head }, &mut pending).await;
                         }
                         if seen_current {
-                            self.watched.write().unwrap().initial = true;
+                            self.finish_initial_watch();
                         }
                     }
                 },
@@ -410,6 +445,7 @@ impl Residence {
         mut delivery: HeldDelivery,
         pending: &mut HashMap<String, HeldDelivery>,
     ) {
+        let key = delivery.entry.key.clone();
         let result = self
             .observe_at(
                 &delivery.entry,
@@ -427,6 +463,10 @@ impl Residence {
         } else {
             watched.held.remove(&delivery.entry.key);
         }
+        drop(watched);
+        // Notify only the affected role. Renewal events must not wake every
+        // candidate on the machine.
+        self.role_changed(&key);
     }
 
     #[cfg(test)]
@@ -475,16 +515,27 @@ impl Residence {
             }
             return Ok(());
         }
-        let Some(agent) = key.strip_prefix("residence.") else {
+        let (name, role) = if let Some(role) = key.strip_prefix("role.") {
+            if !role_leases::valid_role(role) {
+                return self.refuse(key, revision, "invalid_role_name");
+            }
+            (role, true)
+        } else if let Some(agent) = key.strip_prefix("residence.") {
+            if !entorhinal_core::agent::valid_agent_id(agent) {
+                return self.refuse(key, revision, "invalid_agent_id");
+            }
+            (agent, false)
+        } else {
             return Ok(());
         };
-        if !entorhinal_core::agent::valid_agent_id(agent) {
-            return self.refuse(key, revision, "invalid_agent_id");
-        }
-        match self
-            .judge(agent, key, value, old.as_ref(), arrival_head, deadline)
-            .await
-        {
+        let result = if role {
+            self.judge_role(name, key, value, old.as_ref(), deadline)
+                .await
+        } else {
+            self.judge(name, key, value, old.as_ref(), arrival_head, deadline)
+                .await
+        };
+        match result {
             Ok(accepted) => {
                 self.accept(key, revision, value, Some(&accepted.body))?;
                 if let Err(error) = self
@@ -656,6 +707,137 @@ impl Residence {
             return Err(bad_record("residence body is not authorized"));
         }
         Ok(accepted)
+    }
+
+    async fn judge_role(
+        &self,
+        name: &str,
+        key: &str,
+        bytes: &[u8],
+        old: Option<&HubKvCached>,
+        deadline: Instant,
+    ) -> Result<AcceptedKv, HandlerError> {
+        check_kv_size(key, bytes.len())?;
+        let accepted = self.backend.verify(key, bytes, deadline).await?;
+        let body: role_leases::Record = serde_json::from_value(accepted.body.clone())
+            .map_err(|error| bad_record(&error.to_string()))?;
+        let previous = old
+            .and_then(|row| row.body.as_ref())
+            .cloned()
+            .map(serde_json::from_value::<role_leases::Record>)
+            .transpose()
+            .map_err(crate::invalid_params)?;
+        let header = accepted.record.header();
+        let current = |holder: &str, episode| {
+            self.backend.current_member(holder, accepted.applied) == Some(episode)
+        };
+        let writer_current = current(&header.writer, header.writer_ep);
+        let historical =
+            self.backend
+                .episode_closed(&header.writer, header.writer_ep, accepted.applied);
+        let seed = self.snapshot.role(name);
+        if !role_leases::accepts(
+            &body,
+            previous.as_ref(),
+            header,
+            writer_current,
+            historical,
+            seed,
+            current,
+        ) {
+            return Err(bad_record("role body is not authorized"));
+        }
+        Ok(accepted)
+    }
+}
+
+#[async_trait]
+impl role_leases::Backend for Residence {
+    fn local_box(&self) -> &str {
+        &self.box_id
+    }
+
+    fn role(&self, name: &str) -> Result<role_leases::Observation, HandlerError> {
+        let key = format!("role.{name}");
+        let watched = self.watched.read().unwrap();
+        let row = self.store.hub_kv_cached(&key)?;
+        let revision = row.as_ref().map_or(0, |row| row.revision);
+        let ready = self.snapshot.hub_ready()
+            && self.backend.membership_ready()
+            && watched.initial
+            && !watched.held.contains(&key)
+            && row.as_ref().map_or_else(
+                || self.snapshot.role(name).is_none_or(|(_, gen)| gen == 0),
+                |row| !row.integrity_failed && watched.revisions.get(&key) == Some(&revision),
+            );
+        let record = row
+            .and_then(|row| row.body)
+            .map(serde_json::from_value::<role_leases::Record>)
+            .transpose()
+            .map_err(crate::invalid_params)?;
+        let applied = self.backend.applied()?;
+        Ok(role_leases::Observation {
+            ready,
+            watch: (
+                watched.incarnation,
+                self.health
+                    .hub_membership_incarnation
+                    .load(Ordering::Acquire),
+            ),
+            revision,
+            local_episode: self.backend.writer_episode().ok(),
+            holder_current: record.as_ref().is_some_and(|record| {
+                record.holder.as_deref().is_some_and(|holder| {
+                    self.backend.current_member(holder, applied) == Some(record.holder_ep)
+                })
+            }),
+            record,
+        })
+    }
+
+    fn link_events(&self) -> (&Notify, &Notify) {
+        (&self.link, &self.commits)
+    }
+
+    async fn write(
+        &self,
+        role: &str,
+        change: &role_leases::Change,
+        deadline: Instant,
+    ) -> Result<role_leases::Confirmed, HandlerError> {
+        let key = format!("role.{role}");
+        let body = json!(change.body);
+        let digest = hub_write::params_digest(change.step, &json!([key, change.expected, body]))?;
+        let request = hub_write::Request {
+            request_key: &change.request_key,
+            params_digest: &digest,
+            writer: &self.box_id,
+            writer_ep: change.writer_ep,
+        };
+        let step = Step {
+            name: change.step.into(),
+            key,
+            expected: change.expected,
+            payload: Payload::Record {
+                kind: "role".into(),
+                body,
+                snapshot_id: None,
+            },
+        };
+        let landed = self
+            .backend
+            .write(&request, &step, None, None, deadline)
+            .await?;
+        let revision = landed
+            .position
+            .ok_or_else(|| bad_record("landed role write has no revision"))?;
+        let sent_ms = self
+            .store
+            .hub_attempt(&change.request_key)?
+            .map(|row| hub_write::landed_send_ms(&row, &landed))
+            .transpose()?
+            .flatten();
+        Ok(role_leases::Confirmed { revision, sent_ms })
     }
 }
 

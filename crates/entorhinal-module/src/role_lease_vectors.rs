@@ -74,22 +74,21 @@ async fn served_role_lease_v1_records_match_published_files() {
     let mut fixture = Fixture::new("served-role-lease").await;
     let clock = Arc::new(AtomicU64::new(100_000));
     let now = clock.clone();
-    fixture
-        .handler
-        .role_leases
-        .sample_clock(move || now.load(Ordering::Relaxed));
+    let leases = Arc::get_mut(&mut fixture.handler.role_leases).unwrap();
+    leases.sample_clock(move || now.load(Ordering::Relaxed));
     let sources = [
-        (CONNECTOR, 7, 145_000, false),
-        (WORKSPACE, 4, 145_000, false),
-        (GLOBAL, 9, 120_000, true),
+        (CONNECTOR, 7, Some(145_000), false),
+        (WORKSPACE, 4, Some(145_000), false),
+        (GLOBAL, 9, Some(120_000), true),
+        (PROJECT, 0, None, false),
     ]
     .map(|(role, gen, until, handback)| {
         let (tx, rx) = watch::channel(View {
             gen,
-            until_ms: Some(until),
+            until_ms: until,
             handback,
         });
-        fixture.handler.role_leases.sample_view(role, rx);
+        leases.sample_view(role, rx);
         tx
     });
     let handler = Arc::new(std::mem::replace(

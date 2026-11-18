@@ -168,9 +168,16 @@ impl Transport for Session {
                 .await
                 .map(|()| None)
         } else {
-            self.update(&write.key, bytes.clone(), write.expected, op_id, deadline)
-                .await
-                .map(Some)
+            self.update_record(
+                &write.key,
+                bytes.clone(),
+                write.expected,
+                op_id,
+                deadline,
+                write.step == crate::role_leases::RENEW,
+            )
+            .await
+            .map(Some)
         }
     }
 }
@@ -277,13 +284,32 @@ pub(super) fn new_op_id() -> Result<String, HandlerError> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-fn clock() -> Result<&'static (std::time::Instant, String), HandlerError> {
-    static CLOCK: OnceLock<(std::time::Instant, String)> = OnceLock::new();
-    if let Some(clock) = CLOCK.get() {
-        return Ok(clock);
+fn process_id() -> Result<&'static str, HandlerError> {
+    static PROCESS: OnceLock<String> = OnceLock::new();
+    if let Some(process) = PROCESS.get() {
+        return Ok(process);
     }
-    let _ = CLOCK.set((std::time::Instant::now(), new_op_id()?));
-    Ok(CLOCK.get().expect("clock initialized"))
+    let _ = PROCESS.set(new_op_id()?);
+    Ok(PROCESS.get().expect("process ID initialized"))
+}
+
+pub(super) fn landed_send_ms(
+    row: &HubAttempt,
+    landed: &Landed,
+) -> Result<Option<u64>, HandlerError> {
+    let process = process_id()?;
+    Ok(matching_send_ms(&row.op_ids, &landed.op_id, process))
+}
+
+pub(super) fn matching_send_ms(
+    sends: &[HubAttemptSend],
+    op_id: &str,
+    process: &str,
+) -> Option<u64> {
+    sends
+        .iter()
+        .find(|send| send.op_id == op_id && send.process == process)
+        .map(|send| send.sent_at_ms)
 }
 
 fn current_op_id(write: &HubAttemptWrite, row: &HubAttempt) -> Result<String, HandlerError> {
@@ -573,11 +599,10 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
     }
 
     fn send_record(op_id: &str) -> Result<HubAttemptSend, HandlerError> {
-        let (started, process) = clock()?;
         Ok(HubAttemptSend {
             op_id: op_id.into(),
-            sent_at_ms: started.elapsed().as_millis() as u64,
-            process: process.clone(),
+            sent_at_ms: crate::role_leases::monotonic_ms(),
+            process: process_id()?.into(),
         })
     }
 

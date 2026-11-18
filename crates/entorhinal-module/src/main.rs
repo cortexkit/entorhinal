@@ -402,6 +402,7 @@ struct HealthGauges {
     hub: hub_transport::Gauges,
     // 0: legacy backend, 1: waiting for the hub membership barrier, 2: ready.
     hub_membership: AtomicU64,
+    hub_membership_incarnation: AtomicU64,
     liveness_bus_connected: AtomicBool,
     liveness_bus_authoritative: AtomicBool,
     liveness_bus_sessions: AtomicU64,
@@ -554,7 +555,7 @@ struct ProjectsHandler {
     feed_waits: tokio::sync::Semaphore,
     feed_clock: Arc<dyn agent_reads::FeedClock>,
     watches: Arc<watches::Watches>,
-    role_leases: role_leases::Leases,
+    role_leases: Arc<role_leases::Leases>,
     /// Unit tests shorten this policy; production uses the ten-second default.
     lease_retry_budget: Duration,
     #[allow(dead_code)]
@@ -713,6 +714,8 @@ const MUTATING_METHODS: &[&str] = &[
     hub_residence::TAKE,
     "member.set_name",
     "role.take",
+    role_leases::ACK,
+    role_leases::RELEASE,
     "agent.move",
     "agent.move_abort",
     "agent.set_lid_close_moves",
@@ -736,6 +739,8 @@ const SELF_ADMITTED_METHODS: &[&str] = &[
     claims::REFRESH,
     member::SET_NAME,
     roles::TAKE,
+    role_leases::ACK,
+    role_leases::RELEASE,
     hub_residence::TAKE,
     move_admission::MOVE,
     move_ops::ABORT,
@@ -969,7 +974,7 @@ impl ProjectsHandler {
             feed_waits: tokio::sync::Semaphore::new(8),
             feed_clock: Arc::new(agent_reads::TokioFeedClock),
             watches: Arc::default(),
-            role_leases: role_leases::Leases::default(),
+            role_leases: Arc::default(),
             lease_retry_budget: LEASE_HELD_RETRY_BUDGET,
             log_client: log_client::LogClient::new(connector),
             writer: Arc::new(tokio::sync::Mutex::new(())),
@@ -1459,8 +1464,16 @@ impl ProjectsHandler {
         if let Err(error) = self.admit_store_method(&request.method) {
             return error.into_outcome();
         }
-        if request.method == role_leases::ACK {
-            return match self.ack_role_lease(request.params, key) {
+        if matches!(
+            request.method.as_str(),
+            role_leases::ACK | role_leases::RELEASE
+        ) {
+            let result = if request.method == role_leases::ACK {
+                self.ack_role_lease(request.params, key)
+            } else {
+                self.release_role_lease(request.params, key).await
+            };
+            return match result {
                 Ok(body) => HandlerOutcome::Response(body),
                 Err(error) => error.into_outcome(),
             };
@@ -2563,8 +2576,8 @@ fn manifest() -> ModuleManifest {
                 (watches::IDENTITY, "Watch process-local fleet identity changes until cancelled or drained."),
                 (watches::WHERE, "Watch process-local agent whereabouts changes until cancelled or drained."),
                 (watches::CATALOG, "Watch pinned catalog status and freshness changes until cancelled or drained."),
-                 (watches::SESSIONS, "Watch an agent's session binding changes, including runner moves, until cancelled or drained."),
-                 (role_leases::WATCH, "Watch the local acting window for a role and become a candidate while the watch remains open."),
+                (watches::SESSIONS, "Watch an agent's session binding changes, including runner moves, until cancelled or drained."),
+                (role_leases::WATCH, "Watch the local acting window for a role and become a candidate while the watch remains open."),
             ].into_iter().map(|(method, description)| {
                 management_operation(method, ManagementOperationKind::Query, description)
             })).chain([claims::WHERE, claims::WHERE_MANY].into_iter().map(|method| {
@@ -2573,11 +2586,14 @@ fn manifest() -> ModuleManifest {
                 management_operation(method, ManagementOperationKind::Mutate, agent_operation_description(method))
             })).chain(std::iter::once(roles::READ).map(|method| {
                 management_operation(method, ManagementOperationKind::Query, "Read a cached role claim without waiting for engram.")
-             })).chain(std::iter::once(roles::FENCE).map(|method| {
+            })).chain(std::iter::once(roles::FENCE).map(|method| {
                 management_operation(method, ManagementOperationKind::Query, "Read the role record's subject and version, the fence engram checks before admitting holder-only work.")
-             })).chain(std::iter::once(role_leases::ACK).map(|method| {
-                 management_operation(method, ManagementOperationKind::Mutate, "Acknowledge a role lease notice on its watch route.")
-             })).chain(std::iter::once(roles::TAKE).map(|method| {
+            })).chain([
+                (role_leases::ACK, "Acknowledge a role lease notice on its watch route."),
+                (role_leases::RELEASE, "Release a role on its watch route after stopping work."),
+            ].into_iter().map(|(method, description)| {
+                management_operation(method, ManagementOperationKind::Mutate, description)
+            })).chain(std::iter::once(roles::TAKE).map(|method| {
                 management_operation(method, ManagementOperationKind::Mutate, "Take a role from Direct with operator confirmation and an idempotent request id.")
             })).chain(std::iter::once(hub_residence::TAKE).map(|method| {
                 management_operation(method, ManagementOperationKind::Mutate, "Take an agent held on a removed computer, with Direct operator confirmation.")
@@ -2636,8 +2652,8 @@ fn manifest() -> ModuleManifest {
         (watches::IDENTITY.to_owned(), OperationDelivery::WATCH),
         (watches::WHERE.to_owned(), OperationDelivery::WATCH),
         (watches::CATALOG.to_owned(), OperationDelivery::WATCH),
-         (watches::SESSIONS.to_owned(), OperationDelivery::WATCH),
-         (role_leases::WATCH.to_owned(), OperationDelivery::WATCH),
+        (watches::SESSIONS.to_owned(), OperationDelivery::WATCH),
+        (role_leases::WATCH.to_owned(), OperationDelivery::WATCH),
     ]))
     .build()
 }
@@ -3351,6 +3367,8 @@ mod tests {
                 "agent.refresh_claims",
                 "member.set_name",
                 "role.take",
+                "role.lease.ack",
+                "role.lease.release",
                 "agent.take",
                 "agent.move",
                 "agent.move_abort",
