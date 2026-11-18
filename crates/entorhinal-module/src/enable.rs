@@ -18,6 +18,31 @@ struct EnableParams {
     without_agents: bool,
 }
 
+enum FreshHubEnable {
+    Enrolled,
+    Confirm,
+    JoinEngram(u64),
+}
+
+fn fresh_hub_enable(
+    page: Result<log_client::ReadReply, LogError>,
+    health: &HealthGauges,
+) -> Result<FreshHubEnable, HandlerError> {
+    match page {
+        Ok(page) if page.head == 0 && page.entries.is_empty() => Ok(FreshHubEnable::Enrolled),
+        Ok(page) if page.head > 0 => Ok(FreshHubEnable::JoinEngram(page.head)),
+        Err(LogError::KeyUnavailable) => Ok(FreshHubEnable::Confirm),
+        Err(LogError::Refused { code, .. }) if code == "module_not_found" => {
+            Ok(FreshHubEnable::Confirm)
+        }
+        Err(error) => Err(log_error(error, health)),
+        Ok(_) => Err(HandlerError::new(
+            "identity_log_invariant",
+            "invalid empty engram log reply",
+        )),
+    }
+}
+
 pub(super) fn refresh(health: &HealthGauges, store: &RegistryStore) {
     if let Ok(status) = store.identity_log_status() {
         refresh_status(health, &status);
@@ -46,6 +71,11 @@ pub(super) fn refresh_status(health: &HealthGauges, status: &entorhinal_core::Id
 }
 
 pub(super) fn status_state(health: &HealthGauges) -> &'static str {
+    match health.hub_switch_state.load(Ordering::Relaxed) {
+        1 => return "hub_switch_waiting",
+        2 => return "hub_migration_mismatch",
+        _ => (),
+    }
     let mode = health.log_mode.load(Ordering::Relaxed);
     if mode == 1 {
         return "enabling";
@@ -407,14 +437,26 @@ impl ProjectsHandler {
                 HandlerError::new("identity_log_contended", "writer lock deadline expired")
             })?;
         let store = self.with_store(|s| Ok(s.clone()))?;
-        let result = self
-            .enable_locked(
+        let result = if let Some(switch) = &self.hub_switch {
+            // Hub snapshot recovery is large; other requests share the RPC dispatcher.
+            Box::pin(self.enable_hub(
+                switch,
+                &store,
+                params.without_agents,
+                key,
+                received,
+                deadline,
+            ))
+            .await
+        } else {
+            self.enable_locked(
                 &store,
                 params.without_agents,
                 deadline,
                 &principal_label(admission.principal.as_ref()),
             )
-            .await;
+            .await
+        };
         refresh(&self.health, &store);
         self.health
             .generation
@@ -424,12 +466,89 @@ impl ProjectsHandler {
             record_error(&self.health, error);
         }
         result?;
+        if store.hub_log_base()?.is_some() {
+            self.catch_up_wake.notify_one();
+            return self.identity_log_status();
+        }
         if self.health.origin.daemon_id().is_some() {
             self.catch_up_wake.notify_one();
         }
         self.start_claim_refresh();
         self.claim_refresh.signal();
         self.identity_log_status()
+    }
+
+    async fn enable_hub(
+        &self,
+        switch: &hub_switch::Switch,
+        store: &RegistryStore,
+        without_agents: bool,
+        key: RouteKey,
+        received: Instant,
+        deadline: Instant,
+    ) -> Result<(), HandlerError> {
+        if store.hub_log_base()?.is_some() {
+            return Ok(());
+        }
+        let runtime = hub_switch::Runtime::new(self);
+        if store.hub_enable_plan()?.is_some() {
+            return switch.finish(store, &runtime, None, deadline).await;
+        }
+        match store.identity_log_status()?.state.as_str() {
+            "enabled" => return Ok(()),
+            "enabling" => {
+                return resume(
+                    store,
+                    &self.log_client,
+                    &self.health,
+                    deadline,
+                    "entorhinal",
+                )
+                .await
+            }
+            "joining" => return self.catch_up(store, deadline).await,
+            _ => (),
+        }
+        if switch.head(deadline).await? > 0 {
+            return switch.finish(store, &runtime, None, deadline).await;
+        }
+        let page = timeout_at(deadline, self.log_client.read(0, 1))
+            .await
+            .map_err(|_| HandlerError::new("engram_unavailable", "enable head deadline expired"))?;
+        let presence = match fresh_hub_enable(page, &self.health)? {
+            FreshHubEnable::Enrolled => false,
+            FreshHubEnable::JoinEngram(head) => {
+                store.check_enable_preconditions(head)?;
+                return self.catch_up(store, deadline).await;
+            }
+            FreshHubEnable::Confirm => true,
+        };
+        store.check_enable_preconditions(0)?;
+        store.check_agent_import_preconditions(without_agents)?;
+        let deadline = if presence {
+            let mut confirmation =
+                agent_ops::ConfirmationGuard::take(&self.confirmation_slot, key)?;
+            if !self.route_admissions().contains_key(&key) {
+                return Err(agent_ops::OperatorConfirmError::Declined.into());
+            }
+            let summary = "Start a new shared registry for this account? Computers already sharing through engram won't see it.";
+            tokio::select! {
+                biased;
+                _ = confirmation.cancelled.wait_for(|closed| *closed) => return Err(agent_ops::OperatorConfirmError::Declined.into()),
+                result = timeout_at(received + shared_write::OPERATOR_BOUND, self.operator_confirmer.confirm_operator(summary, key)) => {
+                    result.map_err(|_| HandlerError::from(agent_ops::OperatorConfirmError::Declined))??;
+                }
+            }
+            Instant::now() + Duration::from_secs(25)
+        } else {
+            deadline
+        };
+        if switch.head(deadline).await? > 0 {
+            return switch.finish(store, &runtime, None, deadline).await;
+        }
+        switch.prepare_enable(store, deadline).await?;
+        self.catch_up_wake.notify_one();
+        switch.finish(store, &runtime, None, deadline).await
     }
 
     async fn enable_locked(
@@ -496,6 +615,48 @@ impl ProjectsHandler {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hub_snapshot_enable_requires_enrollment_or_explicit_confirmation_and_never_guesses_an_outage(
+    ) {
+        use super::*;
+        let health = HealthGauges::default();
+        let read = |head| {
+            Ok(log_client::ReadReply {
+                head,
+                entries: vec![],
+            })
+        };
+        assert!(matches!(
+            fresh_hub_enable(read(0), &health).unwrap(),
+            FreshHubEnable::Enrolled
+        ));
+        assert!(matches!(
+            fresh_hub_enable(read(2), &health).unwrap(),
+            FreshHubEnable::JoinEngram(2)
+        ));
+        assert!(matches!(
+            fresh_hub_enable(Err(LogError::KeyUnavailable), &health).unwrap(),
+            FreshHubEnable::Confirm
+        ));
+        let refused = |code: &str| {
+            Err(LogError::Refused {
+                code: code.into(),
+                detail: None,
+            })
+        };
+        assert!(matches!(
+            fresh_hub_enable(refused("module_not_found"), &health).unwrap(),
+            FreshHubEnable::Confirm
+        ));
+        for error in [
+            Err(LogError::Unavailable),
+            Err(LogError::NoReply),
+            refused("service_not_found"),
+        ] {
+            assert!(fresh_hub_enable(error, &health).is_err());
+        }
+        assert!(fresh_hub_enable(Err(LogError::NotMember), &health).is_err());
+    }
     use super::*;
     use crate::{
         fake_log::{Action, FakeLog},

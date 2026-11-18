@@ -14,6 +14,7 @@ use std::{
 };
 
 mod joining;
+mod snapshot_enable;
 
 const D: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 

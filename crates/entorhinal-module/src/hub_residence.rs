@@ -87,9 +87,21 @@ impl Record {
 pub(super) trait SnapshotClaims: Send + Sync {
     fn claim(&self, agent: &str) -> Option<(Option<String>, i64)>;
     fn hub_ready(&self) -> bool;
+    fn required_keys(&self) -> &[String] {
+        &[]
+    }
     fn role(&self, _name: &str) -> Option<(Option<String>, i64)> {
         None
     }
+}
+
+#[derive(Clone)]
+pub(super) struct Runtime {
+    slot: Arc<std::sync::Mutex<Option<Running>>>,
+    health: Arc<HealthGauges>,
+    clock: fn() -> i64,
+    role_leases: Arc<role_leases::Leases>,
+    move_wake: Arc<crate::move_driver::MoveWake>,
 }
 
 #[async_trait]
@@ -219,6 +231,7 @@ pub(super) struct Running {
     pub service: Arc<Residence>,
     watch: tokio::task::JoinHandle<()>,
     recovery: tokio::task::JoinHandle<()>,
+    seed: Option<tokio::task::JoinHandle<()>>,
     epochs: Option<(
         Arc<dyn crate::hub_epoch::RemovalIntake>,
         tokio::task::JoinHandle<()>,
@@ -229,6 +242,9 @@ impl Drop for Running {
     fn drop(&mut self) {
         self.watch.abort();
         self.recovery.abort();
+        if let Some(task) = &self.seed {
+            task.abort();
+        }
         if let Some((_, task)) = &self.epochs {
             task.abort();
         }
@@ -251,7 +267,28 @@ impl ProjectsHandler {
         feed: Feed<KvDelivery>,
         snapshot: Arc<dyn SnapshotClaims>,
     ) -> Result<Arc<Residence>, HandlerError> {
-        let mut running = self.hub_residence.lock().unwrap();
+        self.hub_residence_runtime().activate(log, feed, snapshot)
+    }
+
+    pub(super) fn hub_residence_runtime(&self) -> Runtime {
+        Runtime {
+            slot: self.hub_residence.clone(),
+            health: self.health.clone(),
+            clock: self.clock,
+            role_leases: self.role_leases.clone(),
+            move_wake: self.move_wake.clone(),
+        }
+    }
+}
+
+impl Runtime {
+    pub(super) fn activate<T: LogTransport, U: Trust + Send + Sync + 'static>(
+        &self,
+        log: Arc<IdentityLog<T, U>>,
+        feed: Feed<KvDelivery>,
+        snapshot: Arc<dyn SnapshotClaims>,
+    ) -> Result<Arc<Residence>, HandlerError> {
+        let mut running = self.slot.lock().unwrap();
         if running.is_some() {
             return Err(HandlerError::new(
                 "hub_not_ready",
@@ -282,6 +319,7 @@ impl ProjectsHandler {
         *running = Some(Running {
             watch: tokio::spawn(service.clone().watch(feed)),
             recovery: tokio::spawn(service.clone().recover()),
+            seed: None,
             epochs,
             service: service.clone(),
         });
@@ -290,6 +328,35 @@ impl ProjectsHandler {
         Ok(service)
     }
 
+    pub(super) fn start_seeds<T: LogTransport, U: Trust + Send + Sync + 'static>(
+        &self,
+        log: Arc<IdentityLog<T, U>>,
+        seeds: Arc<crate::hub_switch::snapshot::Seeds>,
+    ) {
+        let mut slot = self.slot.lock().unwrap();
+        let Some(running) = slot.as_mut() else {
+            return;
+        };
+        running.seed = Some(tokio::spawn(async move {
+            loop {
+                let notified = log.commits.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if !log.membership_ready() {
+                    notified.await;
+                    continue;
+                }
+                match seeds.write(&log, Instant::now() + BUDGET).await {
+                    Ok(()) => return,
+                    Err(error) => tracing::debug!(code = error.code, "snapshot seed deferred"),
+                }
+                tokio::select! { _ = notified => {}, _ = tokio::time::sleep(Duration::from_secs(1)) => {} }
+            }
+        }));
+    }
+}
+
+impl ProjectsHandler {
     pub(super) async fn hub_device_removed(
         &self,
         bytes: &[u8],
@@ -350,10 +417,19 @@ fn timed_out(error: &HandlerError) -> bool {
 }
 
 impl Residence {
-    fn ready(&self) -> bool {
+    pub(super) fn ready(&self) -> bool {
+        self.ready_with(&self.watched.read().unwrap())
+    }
+
+    fn ready_with(&self, watched: &Watched) -> bool {
         self.snapshot.hub_ready()
             && self.backend.membership_ready()
-            && self.watched.read().unwrap().initial
+            && watched.initial
+            && self
+                .snapshot
+                .required_keys()
+                .iter()
+                .all(|key| watched.revisions.contains_key(key) && !watched.held.contains(key))
     }
 
     fn fresh(&self, agent: &str, revision: Option<u64>) -> bool {
@@ -409,9 +485,7 @@ impl Residence {
         let mut watched = self.watched.write().unwrap();
         watched.initial = false;
         watched.incarnation += 1;
-        watched.revisions.retain(|key, _| {
-            role_key_name(key).is_none() && !key.starts_with("move.") && !key.starts_with("node.")
-        });
+        watched.revisions.clear();
         watched.move_times.clear();
         self.link.notify_waiters();
     }
@@ -643,6 +717,7 @@ impl Residence {
             .store
             .record_hub_kv(key, revision, None, (self.clock)())?
         {
+            self.watched.write().unwrap().revisions.remove(key);
             self.health
                 .hub
                 .kv_records_refused
@@ -847,9 +922,7 @@ impl role_leases::Backend for Residence {
         let watched = self.watched.read().unwrap();
         let row = self.store.hub_kv_cached(&key)?;
         let revision = row.as_ref().map_or(0, |row| row.revision);
-        let ready = self.snapshot.hub_ready()
-            && self.backend.membership_ready()
-            && watched.initial
+        let ready = self.ready_with(&watched)
             && !watched.held.contains(&key)
             && row.as_ref().map_or_else(
                 || self.snapshot.role(name).is_none_or(|(_, gen)| gen == 0),

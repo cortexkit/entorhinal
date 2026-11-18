@@ -13,7 +13,7 @@ use crate::agent::{AgentChangeEntry, AgentMutationError, AgentPrecheck, Placemen
 
 #[path = "pending.rs"]
 pub(crate) mod pending;
-pub use pending::SharedSettlement;
+pub use pending::{HubConsent, HubContinuation, HubRoots, SharedSettlement};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -1817,7 +1817,9 @@ pub(crate) fn replay_with_observer(
             continue;
         }
         if origin == "here" && op != "project.shared" && op != "shared.snapshot" {
-            if op == "member.set_name" {
+            if op == crate::pending::HUB_LOCAL {
+                crate::pending::replay_hub_local(tx, request)?;
+            } else if op == "member.set_name" {
                 super::shared_entry::replay_member_name(tx, request)?;
             } else if op == "member.set_box" {
                 crate::member_box::replay(tx, request)?;
@@ -1843,6 +1845,10 @@ pub(crate) fn replay_with_observer(
                 crate::member_box::replay(tx, image)?;
             } else if op == "log.migrated" {
                 // The marker changes the log backend, not the shared projection.
+            } else if op == crate::enable_state::HUB_SNAPSHOT {
+                let snapshot =
+                    serde_json::from_value(image).map_err(super::shared_entry::decode_error)?;
+                crate::enable_state::restore_hub_snapshot(tx, &snapshot, seq)?;
             } else if crate::hub_store::MEMBERSHIP_OPS.contains(&op.as_str()) {
                 let position = position.ok_or_else(|| {
                     domain(

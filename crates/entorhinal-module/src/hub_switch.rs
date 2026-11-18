@@ -14,16 +14,23 @@ use serde_json::{json, Value};
 use tokio::time::{timeout_at, Instant};
 
 use crate::{
-    hub_membership::{box_id, peers::Callosum},
+    fleet_record::UnverifiedRecord,
+    hub_identity_log::{IdentityLog, Link},
+    hub_membership::{
+        box_id,
+        peers::{Callosum, LocalIdentity},
+    },
     hub_transport::Hub,
+    hub_write::Trust,
     log_client::{AppendRequest, EntryKind, LogClient, LogError, SubcConnector},
     participant_discovery::ParticipantDiscovery,
     record_client::{CasRequest, RecordClient, RecordReply},
-    HandlerError, ProjectsHandler, RouteKey,
+    HandlerError, HealthGauges, ProjectsHandler, RouteKey,
 };
 
 pub(super) const EXCLUDE: &str = "identity_log.hub_switch";
 mod drain;
+pub(super) mod snapshot;
 pub(super) use drain::MigrationImage;
 const PROPOSAL: &str = "hubswitch";
 const HUB_PROTOCOL: u64 = 1;
@@ -304,11 +311,15 @@ trait Probe: Send + Sync {
     async fn head(&self, deadline: Instant) -> Result<u64, HandlerError>;
     async fn local_box(&self, deadline: Instant) -> Result<String, HandlerError>;
     async fn hub_cuts(&self, deadline: Instant) -> Result<bool, HandlerError>;
+    fn transport(&self) -> Option<(&Arc<Hub>, &Arc<Callosum>)> {
+        None
+    }
 }
 
 struct DaemonProbe {
     hub: Arc<Hub>,
     discovery: Arc<dyn ParticipantDiscovery>,
+    peers: Arc<Callosum>,
 }
 
 #[async_trait::async_trait]
@@ -328,6 +339,50 @@ impl Probe for DaemonProbe {
     async fn hub_cuts(&self, deadline: Instant) -> Result<bool, HandlerError> {
         local_hub_cuts(self.discovery.as_ref(), deadline).await
     }
+
+    fn transport(&self) -> Option<(&Arc<Hub>, &Arc<Callosum>)> {
+        Some((&self.hub, &self.peers))
+    }
+}
+
+struct BootstrapTrust;
+
+impl Trust for BootstrapTrust {
+    async fn writer_epoch(&self, _deadline: Instant) -> Result<u64, HandlerError> {
+        Err(HandlerError::new(
+            "epoch_key_unavailable",
+            "fleet epoch control is unavailable",
+        ))
+    }
+
+    async fn verification_key(&self, _record: &UnverifiedRecord) -> Result<String, HandlerError> {
+        Err(crate::hub_membership::unknown_key())
+    }
+}
+
+type DaemonLog = IdentityLog<Hub, BootstrapTrust>;
+
+#[derive(Clone)]
+pub(super) struct Runtime {
+    health: Arc<HealthGauges>,
+    writer: Arc<tokio::sync::Mutex<()>>,
+    commits: Arc<tokio::sync::Notify>,
+    tail: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    shared: Arc<Mutex<Option<Arc<dyn crate::hub_identity_log::SharedLog>>>>,
+    residence: crate::hub_residence::Runtime,
+}
+
+impl Runtime {
+    pub(super) fn new(handler: &ProjectsHandler) -> Self {
+        Self {
+            health: handler.health.clone(),
+            writer: handler.writer.clone(),
+            commits: handler.commits.clone(),
+            tail: handler.hub_tail_task.clone(),
+            shared: handler.hub_shared_log.clone(),
+            residence: handler.hub_residence_runtime(),
+        }
+    }
 }
 
 impl Switch {
@@ -337,10 +392,145 @@ impl Switch {
         discovery: Arc<dyn ParticipantDiscovery>,
     ) -> Self {
         Self {
-            probe: Arc::new(DaemonProbe { hub, discovery }),
+            probe: Arc::new(DaemonProbe {
+                hub,
+                discovery,
+                peers: Arc::new(Callosum {
+                    connector: SubcConnector::from_args(std::env::args_os().skip(1)),
+                    local: Arc::new(LocalIdentity::default()),
+                }),
+            }),
             moves,
             drain: Default::default(),
         }
+    }
+
+    async fn identity_log(
+        &self,
+        store: &RegistryStore,
+        runtime: &Runtime,
+        base: i64,
+        deadline: Instant,
+    ) -> Result<Arc<DaemonLog>, HandlerError> {
+        let (hub, peers) = self
+            .probe
+            .transport()
+            .ok_or_else(|| HandlerError::new("hub_unavailable", "hub switch has no transport"))?;
+        let connection = crate::log_client::subc_connection_file(std::env::args_os().skip(1))
+            .ok_or_else(|| {
+                HandlerError::new(
+                    "credential_unavailable",
+                    "supervised vault connection unavailable",
+                )
+            })?;
+        let box_id = hub.box_id(deadline).await?;
+        let vault = hub.fleet_vault(deadline).await?;
+        let signer = cortexkit_claustrum_client::ClaustrumCredentialResolver::new(
+            connection,
+            crate::MODULE_ID,
+        );
+        Ok(Arc::new(IdentityLog::new(
+            store.clone(),
+            runtime.health.clone(),
+            runtime.writer.clone(),
+            runtime.commits.clone(),
+            box_id,
+            base,
+            Link {
+                transport: hub.clone(),
+                trust: Arc::new(BootstrapTrust),
+                signer: Arc::new(signer),
+                vault: Arc::new(vault),
+                peers: peers.clone(),
+            },
+        )))
+    }
+
+    pub(super) async fn start_installed(
+        &self,
+        store: &RegistryStore,
+        runtime: &Runtime,
+        base: i64,
+        deadline: Instant,
+    ) -> Result<(), HandlerError> {
+        self.probe.activate();
+        if runtime.tail.lock().unwrap().is_some() {
+            return Ok(());
+        }
+        let snapshot = store.installed_hub_snapshot()?;
+        let log = self.identity_log(store, runtime, base, deadline).await?;
+        let seeds = Arc::new(snapshot::Seeds::new(snapshot.image));
+        let (hub, _) = self.probe.transport().expect("daemon transport");
+        let tail = log.start_installed_tail()?;
+        if let Err(error) =
+            runtime
+                .residence
+                .activate(log.clone(), hub.residence_watch(), seeds.clone())
+        {
+            tail.abort();
+            return Err(error);
+        }
+        *runtime.tail.lock().unwrap() = Some(tail);
+        *runtime.shared.lock().unwrap() = Some(log.clone());
+        runtime.residence.start_seeds(log, seeds);
+        Ok(())
+    }
+
+    pub(super) async fn head(&self, deadline: Instant) -> Result<u64, HandlerError> {
+        self.probe.head(deadline).await
+    }
+
+    pub(super) async fn finish(
+        &self,
+        store: &RegistryStore,
+        runtime: &Runtime,
+        image: Option<&MigrationImage>,
+        deadline: Instant,
+    ) -> Result<(), HandlerError> {
+        let local = store
+            .hub_enable_plan()?
+            .map(|plan| {
+                let snapshot: MigrationImage = serde_json::from_str(&plan.preimage)
+                    .map_err(|_| snapshot::mismatch("invalid saved hub enable image"))?;
+                if snapshot.migration_id != plan.enable_id
+                    || entorhinal_catalog::sha256_hex(plan.preimage.as_bytes())
+                        != plan.snapshot_digest
+                {
+                    return Err(snapshot::mismatch(
+                        "saved hub enable image differs from its plan",
+                    ));
+                }
+                Ok(snapshot)
+            })
+            .transpose()?;
+        let image = image.or(local.as_ref());
+        if image.is_none() {
+            store.check_enable_preconditions(1)?;
+        }
+        let base = image.map_or(0, |image| image.engram_through);
+        let log = self.identity_log(store, runtime, base, deadline).await?;
+        // Keep multipart verification and epoch recovery off the caller's stack.
+        if !Box::pin(snapshot::transfer(&log, image, deadline)).await? {
+            return Err(waiting());
+        }
+        // Activation is retried independently after the base has committed.
+        runtime
+            .health
+            .hub_membership
+            .store(1, std::sync::atomic::Ordering::Release);
+        crate::enable::refresh(&runtime.health, store);
+        runtime.commits.notify_waiters();
+        Ok(())
+    }
+
+    pub(super) async fn prepare_enable(
+        &self,
+        store: &RegistryStore,
+        deadline: Instant,
+    ) -> Result<(), HandlerError> {
+        let box_id = self.probe.local_box(deadline).await?;
+        store.begin_hub_enable(&crate::hub_write::new_op_id()?, &box_id)?;
+        Ok(())
     }
 
     /// The snapshot verifier can inspect exact stream sequences through this
@@ -588,6 +778,13 @@ impl Switch {
     }
 }
 
+pub(super) fn waiting() -> HandlerError {
+    HandlerError::new(
+        "hub_switch_waiting",
+        "waiting for the fleet switch or operator enable",
+    )
+}
+
 fn quiet_for(reply: &RecordReply, author: &str, migration_id: &str) -> Option<Quiet> {
     (reply.author.as_deref() == Some(author))
         .then(|| decoded::<Quiet>(reply))
@@ -632,12 +829,7 @@ impl ProjectsHandler {
         let summary = format!("Switch the registry log to the hub without {without}? Agents held there stay held by engram:<author>. Do not bring this computer back on its old build; upgrade it, re-pair, and join with an empty registry.");
         let peers = Callosum {
             connector: SubcConnector::from_args(std::env::args_os().skip(1)),
-            fingerprint: Arc::new(|| {
-                Err(HandlerError::new(
-                    "hub_unavailable",
-                    "local fingerprint not requested by switch",
-                ))
-            }),
+            local: Arc::new(LocalIdentity::default()),
         };
         let operation = async {
             self.operator_confirmer

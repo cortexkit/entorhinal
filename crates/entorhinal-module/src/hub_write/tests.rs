@@ -430,6 +430,7 @@ async fn hub_write_restart_second_cas_settles_superseded_without_a_write() {
                 &REQUEST,
                 &step(RESIDENCE, 1, json!({"gen":2})),
                 false,
+                None,
                 deadline(),
             )
             .await
@@ -587,6 +588,7 @@ async fn hub_write_log_reads_exact_lost_ack_position_and_rebases_only_on_other_e
             &REQUEST,
             &step(LOG_KEY, 0, json!({"agent_id":"other"})),
             false,
+            None,
             deadline(),
         )
         .await
@@ -655,7 +657,7 @@ async fn hub_write_snapshot_keeps_derived_id_and_matches_an_independent_resumer(
         ..REQUEST
     };
     let independent = writer
-        .build(&another_writer, &plan, false, deadline())
+        .build(&another_writer, &plan, false, None, deadline())
         .await
         .unwrap()
         .0
@@ -713,7 +715,7 @@ async fn hub_write_delete_settles_conditionally_without_deleting_newer_values() 
         let writer = f.writer(&transport);
         let put = step("wrapreq.box", 0, json!({"request_id":1}));
         let initial = writer
-            .build(&REQUEST, &put, false, deadline())
+            .build(&REQUEST, &put, false, None, deadline())
             .await
             .unwrap()
             .0;
@@ -735,7 +737,7 @@ async fn hub_write_delete_settles_conditionally_without_deleting_newer_values() 
         if replacement {
             let next = step(&put.key, 2, json!({"request_id":2}));
             let next = writer
-                .build(&REQUEST, &next, false, deadline())
+                .build(&REQUEST, &next, false, None, deadline())
                 .await
                 .unwrap()
                 .0;

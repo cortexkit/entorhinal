@@ -1,13 +1,18 @@
 use super::{box_id, fleet_record, Key, PeerAnchor, PeerKeysRead};
-use crate::{log_client::SubcConnector, HandlerError};
+use crate::{
+    log_client::{service_call_error, SubcConnector, TransportError},
+    HandlerError,
+};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use subc_client_rs::CallOptions;
 use subc_protocol::{BindIdentity, RouteTarget};
 
 const METHOD: &str = "callosum.peer_keys_read";
+const IDENTITY: &str = "callosum.identity_read";
 
 pub(in crate::hub_membership) fn key_id(bytes: &[u8]) -> String {
     entorhinal_catalog::hex(&Sha256::digest(bytes)[..8])
@@ -15,8 +20,112 @@ pub(in crate::hub_membership) fn key_id(bytes: &[u8]) -> String {
 
 pub(crate) struct Callosum {
     pub connector: SubcConnector,
-    // The local transport identity is supplied separately from the peer roster.
-    pub fingerprint: std::sync::Arc<dyn Fn() -> Result<String, HandlerError> + Send + Sync>,
+    pub local: Arc<dyn LocalComputer>,
+}
+
+#[async_trait]
+pub(crate) trait LocalComputer: Send + Sync {
+    async fn member_id(&self) -> Result<String, HandlerError>;
+}
+
+#[derive(Default)]
+pub(crate) struct LocalIdentity {
+    saved: tokio::sync::OnceCell<Result<String, HandlerError>>,
+}
+
+#[async_trait]
+impl LocalComputer for LocalIdentity {
+    async fn member_id(&self) -> Result<String, HandlerError> {
+        let result = self
+            .saved
+            .get_or_try_init(|| async {
+                let connector = SubcConnector::from_args(std::env::args_os().skip(1));
+                let response = call(&connector, IDENTITY).await;
+                match response {
+                    Err(error) if error.code == "local_identity_unavailable" => Err(error),
+                    result => Ok(result.and_then(identity)),
+                }
+            })
+            .await?;
+        result.clone()
+    }
+}
+
+fn identity(reply: Value) -> Result<String, HandlerError> {
+    let fingerprint = reply["fingerprint_hex"]
+        .as_str()
+        .filter(|id| box_id(id))
+        .ok_or_else(invalid_reply)?;
+    Ok(format!("fed-computer:{fingerprint}"))
+}
+
+fn identity_error(error: TransportError) -> HandlerError {
+    match error {
+        TransportError::Refusal { code, .. } if code == "fed_internal" => {
+            HandlerError::new("fed_internal", "Callosum could not read its local identity")
+        }
+        TransportError::Refusal { code, .. } if code != "fed_not_ready" => {
+            HandlerError::new(&code, "Callosum refused its local identity read")
+        }
+        _ => HandlerError::new(
+            "local_identity_unavailable",
+            "Callosum local identity is not available yet",
+        ),
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    struct TestComputer(Value);
+
+    #[async_trait]
+    impl LocalComputer for TestComputer {
+        async fn member_id(&self) -> Result<String, HandlerError> {
+            identity(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn hub_callosum_identity_reply_accepts_new_fields_but_not_bad_fingerprints() {
+        let reply = json!({"fingerprint_hex":"ab".repeat(16), "x25519_pubkey_hex":"23".repeat(32),
+            "ed25519_pubkey_hex":"45".repeat(32), "future":true});
+        let callosum = Callosum {
+            connector: SubcConnector::default(),
+            local: Arc::new(TestComputer(reply)),
+        };
+        assert_eq!(callosum.own_fingerprint().await.unwrap(), "ab".repeat(16));
+        for fingerprint in ["AB".repeat(16), "ab".repeat(15), "g0".repeat(16)] {
+            assert_eq!(
+                identity(json!({"fingerprint_hex":fingerprint}))
+                    .unwrap_err()
+                    .code,
+                "invalid_reply"
+            );
+        }
+    }
+
+    fn refusal(code: &str) -> TransportError {
+        TransportError::Refusal {
+            code: code.into(),
+            detail: None,
+            message: None,
+        }
+    }
+
+    #[test]
+    fn hub_callosum_identity_not_ready_can_retry() {
+        assert_eq!(
+            identity_error(refusal("fed_not_ready")).code,
+            "local_identity_unavailable"
+        );
+    }
+
+    #[test]
+    fn hub_callosum_identity_internal_is_not_retried() {
+        assert_eq!(identity_error(refusal("fed_internal")).code, "fed_internal");
+    }
 }
 
 #[async_trait]
@@ -26,7 +135,13 @@ impl PeerKeysRead for Callosum {
     }
 
     async fn own_fingerprint(&self) -> Result<String, HandlerError> {
-        (self.fingerprint)()
+        self.local
+            .member_id()
+            .await?
+            .strip_prefix("fed-computer:")
+            .filter(|id| box_id(id))
+            .map(str::to_owned)
+            .ok_or_else(invalid_reply)
     }
 
     async fn fleet_peers(&self) -> Result<Vec<(String, String)>, HandlerError> {
@@ -60,31 +175,37 @@ impl Callosum {
     }
 
     async fn read(&self) -> Result<Value, HandlerError> {
-        let consumer = self.connector.consumer().await.map_err(|_| unavailable())?;
-        let bytes = consumer
-            .call(
-                RouteTarget::ManagementSurface {
-                    module_id: "callosum".into(),
-                },
-                BindIdentity::new(crate::MODULE_ID, "fleet-membership"),
-                json!({"method":METHOD,"params":{}})
-                    .to_string()
-                    .into_bytes(),
-                CallOptions::default(),
-            )
-            .await
-            .map_err(|error| {
-                crate::log_client::warn_call_error(
-                    "callosum",
-                    "management_surface",
-                    METHOD,
-                    &error,
-                );
-                unavailable()
-            })?;
-        let reply: Value = serde_json::from_slice(&bytes).map_err(|_| invalid_reply())?;
-        Ok(reply.get("result").cloned().unwrap_or(reply))
+        call(&self.connector, METHOD).await
     }
+}
+
+async fn call(connector: &SubcConnector, method: &str) -> Result<Value, HandlerError> {
+    let on_error = |error| {
+        if method == IDENTITY {
+            identity_error(error)
+        } else {
+            unavailable()
+        }
+    };
+    let consumer = connector.consumer().await.map_err(on_error)?;
+    let bytes = consumer
+        .call(
+            RouteTarget::ManagementSurface {
+                module_id: "callosum".into(),
+            },
+            BindIdentity::new(crate::MODULE_ID, "fleet-membership"),
+            json!({"method":method,"params":{}})
+                .to_string()
+                .into_bytes(),
+            CallOptions::default(),
+        )
+        .await
+        .map_err(|error| {
+            crate::log_client::warn_call_error("callosum", "management_surface", method, &error);
+            on_error(service_call_error(error))
+        })?;
+    let reply: Value = serde_json::from_slice(&bytes).map_err(|_| invalid_reply())?;
+    Ok(reply.get("result").cloned().unwrap_or(reply))
 }
 
 fn unavailable() -> HandlerError {

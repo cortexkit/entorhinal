@@ -432,6 +432,7 @@ struct HealthGauges {
     ready_recorded: AtomicBool,
     last_operation_ms: AtomicI64,
     log_state: AtomicU64,
+    hub_switch_state: AtomicU64,
     log_own_entries_applied: AtomicU64,
     log_mode: AtomicU64,
     log_applied: AtomicI64,
@@ -565,7 +566,9 @@ struct ProjectsHandler {
     writer: Arc<tokio::sync::Mutex<()>>,
     draining: tokio::sync::watch::Sender<bool>,
     catch_up_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    hub_residence: Mutex<Option<hub_residence::Running>>,
+    hub_residence: Arc<Mutex<Option<hub_residence::Running>>>,
+    hub_tail_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    hub_shared_log: Arc<Mutex<Option<Arc<dyn hub_identity_log::SharedLog>>>>,
     hub_switch: Option<hub_switch::Switch>,
     legacy_move_admission: Arc<Mutex<()>>,
     catch_up_wake: Arc<tokio::sync::Notify>,
@@ -1007,7 +1010,9 @@ impl ProjectsHandler {
             writer: Arc::new(tokio::sync::Mutex::new(())),
             draining: tokio::sync::watch::channel(false).0,
             catch_up_task: Mutex::new(None),
-            hub_residence: Mutex::new(None),
+            hub_residence: Arc::default(),
+            hub_tail_task: Arc::default(),
+            hub_shared_log: Arc::default(),
             hub_switch,
             legacy_move_admission,
             catch_up_wake: Arc::default(),
@@ -1941,6 +1946,9 @@ impl ProjectsHandler {
         enable::refresh_status(&self.health, &reply);
         let mut reply = serde_json::to_value(reply).map_err(invalid_params)?;
         reply["state"] = json!(enable::status_state(&self.health));
+        if self.hub_backend_selected() {
+            reply["hubReady"] = json!(self.residence().is_some_and(|residence| residence.ready()));
+        }
         reply["lastError"] = json!(enable::last_error(&self.health));
         reply["lastErrorAt"] = json!(enable::last_error_at(&self.health));
         self.encode_read_result(reply)
@@ -2200,7 +2208,7 @@ impl ProjectsHandler {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct HandlerError {
     code: String,
     message: String,

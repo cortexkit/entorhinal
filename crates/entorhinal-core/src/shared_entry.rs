@@ -897,6 +897,8 @@ mod tests {
                     "hub_log_writer",
                     "hub_attempt",
                     "hub_attempt_send",
+                    // Cached replies include machine-local paths and consent outcomes.
+                    "hub_local_reply",
                     "hub_anchor",
                     // Reconstructed from hub journal rows, not transferred as snapshot rows.
                     "hub_membership",

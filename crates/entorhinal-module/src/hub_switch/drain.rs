@@ -3,48 +3,14 @@ use crate::{
     claim_codec::{AgentClaim, RoleClaim},
     record_client::{CasRequest, RecordClient, RecordError, RecordReply, MANY_CAP},
 };
+pub(crate) use entorhinal_core::enable_state::{
+    HubClaim as Claim, HubImage as ClaimsAndRoles, HubRole as Role, HubSnapshot as MigrationImage,
+};
 use entorhinal_core::{
-    remote_apply::MigrationMarker,
-    shared_entry::{MigrationSource, SharedRow},
-    RegistryStore,
+    remote_apply::MigrationMarker, shared_entry::MigrationSource, RegistryStore,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use tokio::sync::Mutex;
-
-/// Snapshot preimage in JSON Canonicalization Scheme (JCS) key order:
-/// engram_through, excluded, image,
-/// migration_id, tables. The image contains claims (ordered by agent_id) and
-/// roles (ordered by role). Claim keys are agent_id, generation, holder;
-/// role keys are generation, holder, role.
-#[derive(Debug, PartialEq, Eq, Serialize)]
-pub(crate) struct MigrationImage {
-    pub engram_through: i64,
-    pub excluded: Vec<String>,
-    pub image: ClaimsAndRoles,
-    pub migration_id: String,
-    pub tables: BTreeMap<String, Vec<SharedRow>>,
-}
-
-#[derive(Debug, Default, PartialEq, Eq, Serialize)]
-pub(crate) struct ClaimsAndRoles {
-    pub claims: Vec<Claim>,
-    pub roles: Vec<Role>,
-}
-
-#[derive(Debug, PartialEq, Eq, Serialize)]
-pub(crate) struct Claim {
-    pub agent_id: String,
-    pub generation: i64,
-    pub holder: Option<String>,
-}
-
-#[derive(Debug, PartialEq, Eq, Serialize)]
-pub(crate) struct Role {
-    pub generation: i64,
-    pub holder: Option<String>,
-    pub role: String,
-}
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -237,6 +203,12 @@ pub(super) async fn prepare(
         ));
     };
     let source = store.capture_migration_source(position, marker.excluded.clone())?;
+    // The marker changes the cursor, not the shared tables it authenticates.
+    if store.migration_tables_digest()? != marker.tables_digest {
+        return Err(super::snapshot::mismatch(
+            "the shared tables differ from the engram marker",
+        ));
+    }
     if !source.included_authors().any(|member| member == author) {
         return Err(HandlerError::new(
             "hub_switch_excluded",

@@ -789,7 +789,7 @@ impl RegistryStore {
                 "SELECT seq, op, payload_json, actor, request_key, created_at, principal
                  FROM registry_journal
                   WHERE seq > ?1 AND op NOT IN ({}, '{}', '{}', 'user.set', 'store.adopt',
-                    'log.migrated', 'member.set_box', 'member.key', 'member.removed', 'member.admitted')
+                    'log.migrated', 'hub.snapshot', 'hub.local_write', 'member.set_box', 'member.key', 'member.removed', 'member.admitted')
                  ORDER BY seq
                  LIMIT ?2",
                 agent::change_ops_sql(),
