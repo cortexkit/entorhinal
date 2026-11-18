@@ -1,0 +1,66 @@
+[
+  {
+    "name": "busy-without-flows",
+    "reply": {
+      "result": {
+        "refs": [
+          {
+            "state": "idle"
+          }
+        ]
+      }
+    },
+    "request": {
+      "method": "agent_data.busy",
+      "params": {
+        "refs": [
+          {
+            "ref": "agent_0123456789abcdef",
+            "ref_kind": "agent"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "prepare-empty",
+    "reply": {
+      "result": {
+        "external": [],
+        "items": []
+      }
+    },
+    "request": {
+      "method": "agent_data.prepare",
+      "params": {
+        "cutId": "dddddddddddddddddddddddddddddddd",
+        "refs": [
+          {
+            "ref": "agent_0123456789abcdef",
+            "ref_kind": "agent"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "export-empty",
+    "reply": {
+      "result": {
+        "items": []
+      }
+    },
+    "request": {
+      "method": "agent_data.export",
+      "params": {
+        "cutId": "dddddddddddddddddddddddddddddddd",
+        "refs": [
+          {
+            "ref": "agent_0123456789abcdef",
+            "ref_kind": "agent"
+          }
+        ]
+      }
+    }
+  }
+]

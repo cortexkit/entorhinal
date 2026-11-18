@@ -1,0 +1,73 @@
+[
+  {
+    "name": "diverged-at-cut",
+    "reply": {
+      "result": {
+        "refs": [
+          {
+            "state": "at_cut"
+          }
+        ]
+      }
+    },
+    "request": {
+      "method": "agent_data.diverged",
+      "params": {
+        "cutId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "refs": [
+          {
+            "ref": "agent_0123456789abcdef",
+            "ref_kind": "agent"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "import-with-drops",
+    "reply": {
+      "result": {
+        "items": [
+          {
+            "digest": "35987f4fef1f8d055d1eca8f9b29b4e29d89477a283f115570b9d5630d164a75",
+            "dropped": {
+              "queued_event": 1
+            },
+            "endOffset": 1351,
+            "sessionRef": "d5acbf637b6119cbd2a2b3f32cc6f140"
+          }
+        ]
+      }
+    },
+    "request": {
+      "method": "agent_data.import",
+      "params": {
+        "cutId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "refs": [
+          {
+            "ref": "agent_0123456789abcdef",
+            "ref_kind": "agent"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "activate-with-flows",
+    "reply": {
+      "result": {}
+    },
+    "request": {
+      "method": "agent_data.activate",
+      "params": {
+        "cutId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "refs": [
+          {
+            "ref": "agent_0123456789abcdef",
+            "ref_kind": "agent"
+          }
+        ]
+      }
+    }
+  }
+]

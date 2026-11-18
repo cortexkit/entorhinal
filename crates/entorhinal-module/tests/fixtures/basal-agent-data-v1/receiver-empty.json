@@ -1,0 +1,40 @@
+[
+  {
+    "name": "import-empty",
+    "reply": {
+      "result": {
+        "items": []
+      }
+    },
+    "request": {
+      "method": "agent_data.import",
+      "params": {
+        "cutId": "dddddddddddddddddddddddddddddddd",
+        "refs": [
+          {
+            "ref": "agent_0123456789abcdef",
+            "ref_kind": "agent"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "activate-empty",
+    "reply": {
+      "result": {}
+    },
+    "request": {
+      "method": "agent_data.activate",
+      "params": {
+        "cutId": "dddddddddddddddddddddddddddddddd",
+        "refs": [
+          {
+            "ref": "agent_0123456789abcdef",
+            "ref_kind": "agent"
+          }
+        ]
+      }
+    }
+  }
+]

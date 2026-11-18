@@ -1,0 +1,28 @@
+[
+  {
+    "name": "import-without-drops",
+    "reply": {
+      "result": {
+        "items": [
+          {
+            "digest": "dd1838f72eb5e7d8230ded572606a42b9037512e73f5d77f81a31520404d63f3",
+            "endOffset": 1351,
+            "sessionRef": "fc3fb1c00974ea7fe51224aff64e1596"
+          }
+        ]
+      }
+    },
+    "request": {
+      "method": "agent_data.import",
+      "params": {
+        "cutId": "cccccccccccccccccccccccccccccccc",
+        "refs": [
+          {
+            "ref": "agent_0123456789abcdef",
+            "ref_kind": "agent"
+          }
+        ]
+      }
+    }
+  }
+]

@@ -1,0 +1,50 @@
+[
+  {
+    "error": {
+      "code": "busy",
+      "detail": {
+        "refs": [
+          {
+            "reason": "flow f-vector has a run in progress",
+            "reason_code": "run_active",
+            "ref": "agent_0123456789abcdef",
+            "ref_kind": "agent"
+          }
+        ]
+      },
+      "message": "flow f-vector has a run in progress"
+    },
+    "name": "activate-run-active",
+    "request": {
+      "method": "agent_data.activate",
+      "params": {
+        "cutId": "cccccccccccccccccccccccccccccccc",
+        "refs": [
+          {
+            "ref": "agent_0123456789abcdef",
+            "ref_kind": "agent"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "error": {
+      "code": "local_advanced",
+      "message": "flow f-vector already exists on this computer and belongs to agent_other; rename or remove one of them, then move again"
+    },
+    "name": "import-flow-id-clash",
+    "request": {
+      "method": "agent_data.import",
+      "params": {
+        "cutId": "cccccccccccccccccccccccccccccccc",
+        "refs": [
+          {
+            "ref": "agent_0123456789abcdef",
+            "ref_kind": "agent"
+          }
+        ]
+      }
+    }
+  }
+]
