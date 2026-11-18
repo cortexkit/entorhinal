@@ -1755,6 +1755,7 @@ mod tests {
             "agent.set_lid_close_moves",
             "member.set_name",
             "role.take",
+            "agent.take",
         ];
         for (kind, names) in [
             ("query", expected_queries.as_slice()),

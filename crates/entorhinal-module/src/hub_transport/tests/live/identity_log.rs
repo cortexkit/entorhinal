@@ -145,13 +145,12 @@ async fn leaf(
     id: &str,
     health: Arc<HealthGauges>,
 ) -> Arc<Leaf> {
-    let listen = port();
     let prefix = format!("ckdel.{id}.entorhinal");
-    rig.start(
-        name,
-        &format!(
-            r#"
-        listen: 127.0.0.1:{listen}
+    let ports = rig
+        .start(
+            name,
+            &format!(
+                r#"
         server_name: {name}
         leafnodes {{ remotes: [{{ url: "nats-leaf://127.0.0.1:{hub_port}" }}] }}
         authorization {{ users: [{{ user: test, pass: test, permissions: {{
@@ -159,14 +158,14 @@ async fn leaf(
             subscribe: ["{prefix}.>"]
         }} }}] }}
     "#
-        ),
-        listen,
-    )
-    .await;
+            ),
+            false,
+        )
+        .await;
     let client = async_nats::ConnectOptions::new()
         .user_and_password("test".into(), "test".into())
         .custom_inbox_prefix(prefix)
-        .connect(format!("127.0.0.1:{listen}"))
+        .connect(format!("127.0.0.1:{}", ports.client))
         .await
         .unwrap();
     let leaf = Arc::new(Leaf {
@@ -423,24 +422,22 @@ impl IdentityRig {
             }
         }
         let mut rig = Rig::new();
-        let hub = port();
-        let leaf_port = port();
-        rig.start(
-            "hub",
-            &format!(
-                r#"
-        listen: 127.0.0.1:{hub}
+        let hub_ports = rig
+            .start(
+                "hub",
+                &format!(
+                    r#"
         server_name: hub
         jetstream {{ domain: hub, store_dir: {:?} }}
-        leafnodes {{ listen: 127.0.0.1:{leaf_port}, no_advertise: true }}
+        leafnodes {{ listen: "127.0.0.1:-1", no_advertise: true }}
     "#,
-                rig.dir.join("log").to_string_lossy()
-            ),
-            hub,
-        )
-        .await;
+                    rig.dir.join("log").to_string_lossy()
+                ),
+                true,
+            )
+            .await;
         let admin = jetstream::new(
-            async_nats::connect(format!("127.0.0.1:{hub}"))
+            async_nats::connect(format!("127.0.0.1:{}", hub_ports.client))
                 .await
                 .unwrap(),
         );
@@ -467,6 +464,7 @@ impl IdentityRig {
 
         let a = handler(store(&rig, "box-a"), A);
         let b = handler(store(&rig, "box-b"), B);
+        let leaf_port = hub_ports.leaf.unwrap();
         let leaf_a = leaf(&mut rig, leaf_port, "leaf-a", A, a.health.clone()).await;
         let leaf_b = leaf(&mut rig, leaf_port, "leaf-b", B, b.health.clone()).await;
         let keys = Arc::new(TestKeys::new());
