@@ -498,9 +498,26 @@ impl ProjectsHandler {
     }
 
     fn agent_where_value(&self, agent_id: &str) -> Result<Value, HandlerError> {
-        let mut value =
-            serde_json::to_value(self.with_agent_store(|store| store.agent_where(agent_id))?)
-                .map_err(crate::invalid_params)?;
+        let location = self.with_agent_store(|store| store.agent_where(agent_id));
+        // The hub residence read will replace this branch. The engram cache
+        // can name a non-box holder or predate a removal even after catch-up.
+        let hub_mode = self
+            .health
+            .hub_membership
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0;
+        if hub_mode
+            && (location.is_ok()
+                || location
+                    .as_ref()
+                    .is_err_and(|error| error.code == "claim_integrity_failed"))
+        {
+            return Ok(
+                serde_json::json!({"known":false,"status":"unclaimed","holder":null,
+                "holder_name":null,"epoch":0,"cut_id":null,"read_at_ms":null,"stale":true}),
+            );
+        }
+        let mut value = serde_json::to_value(location?).map_err(crate::invalid_params)?;
         if let Some(moving) = value.get_mut("moving") {
             crate::move_ops::elapsed(moving, (self.clock)());
         }

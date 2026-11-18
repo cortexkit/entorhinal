@@ -49,6 +49,7 @@ enum Decoded {
     MemberBox(crate::member_box::MemberBox),
     Pins(crate::catalog_agent::CatalogPinSet),
     User(crate::user_profile::UserEntry),
+    Membership(Value),
 }
 
 #[derive(Deserialize)]
@@ -555,71 +556,85 @@ fn apply(tx: &Transaction<'_>, entry: &RemoteEntry) -> rusqlite::Result<i64> {
     if entry.envelope_version != ENVELOPE_VERSION {
         return Err(invalid("unknown envelope_version"));
     }
-    if !matches!(entry.kind.as_str(), "change" | "snapshot") {
+    let membership = crate::hub_store::MEMBERSHIP_OPS.contains(&entry.kind.as_str());
+    if !membership && !matches!(entry.kind.as_str(), "change" | "snapshot") {
         return Err(invalid("unknown entry kind"));
     }
     let value: Value = serde_json::from_slice(&entry.entry).map_err(decode_error)?;
-    let op = value
-        .get("op")
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid("missing entry op"))?;
-    let decoded = match (entry.kind.as_str(), op) {
-        ("change", "project.shared") | ("snapshot", "shared.snapshot") => {
-            let project: ProjectEntry = serde_json::from_value(value).map_err(decode_error)?;
-            project.validate(tx)?;
-            if project
-                .member_name
-                .as_ref()
-                .is_some_and(|name| name.author != entry.author)
-            {
-                return Err(invalid("snapshot names another author"));
-            }
-            if project
-                .member_box
-                .as_ref()
-                .is_some_and(|row| row.author != entry.author)
-            {
-                return Err(invalid("snapshot sets box of another author"));
-            }
-            // The agents a placement carry or the workspace correction
-            // changed pass the same checks as a standalone agent entry.
-            if project.op == "project.shared" {
-                for agent in &project.agents {
-                    check_agent_entry(tx, agent)?;
+    let decoded = if membership {
+        let base: Option<i64> = tx.query_row(
+            "SELECT hub_log_base FROM identity_log_state WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?;
+        if base.is_none_or(|base| entry.position <= base) || !value.is_object() {
+            return Err(invalid("invalid hub membership entry"));
+        }
+        Decoded::Membership(value)
+    } else {
+        let op = value
+            .get("op")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid("missing entry op"))?;
+        match (entry.kind.as_str(), op) {
+            ("change", "project.shared") | ("snapshot", "shared.snapshot") => {
+                let project: ProjectEntry = serde_json::from_value(value).map_err(decode_error)?;
+                project.validate(tx)?;
+                if project
+                    .member_name
+                    .as_ref()
+                    .is_some_and(|name| name.author != entry.author)
+                {
+                    return Err(invalid("snapshot names another author"));
                 }
+                if project
+                    .member_box
+                    .as_ref()
+                    .is_some_and(|row| row.author != entry.author)
+                {
+                    return Err(invalid("snapshot sets box of another author"));
+                }
+                // Check agent after-images inside project.shared just as we
+                // check an agent.* entry that changes those rows directly.
+                if project.op == "project.shared" {
+                    for agent in &project.agents {
+                        check_agent_entry(tx, agent)?;
+                    }
+                }
+                Decoded::Project(project)
             }
-            Decoded::Project(project)
-        }
-        ("change", "member.set_name") => {
-            let member: crate::shared_entry::MemberNameEntry =
-                serde_json::from_value(value).map_err(decode_error)?;
-            member.name.validate()?;
-            if member.name.author != entry.author {
-                return Err(invalid("member name author differs from log author"));
+            ("change", "member.set_name") => {
+                let member: crate::shared_entry::MemberNameEntry =
+                    serde_json::from_value(value).map_err(decode_error)?;
+                member.name.validate()?;
+                if member.name.author != entry.author {
+                    return Err(invalid("member name author differs from log author"));
+                }
+                Decoded::Member(member.name)
             }
-            Decoded::Member(member.name)
+            ("change", "member.set_box") => {
+                Decoded::MemberBox(crate::member_box::decode(value, Some(&entry.author))?)
+            }
+            ("change", "catalog.pin") => {
+                let pins: crate::catalog_agent::CatalogPinSet =
+                    serde_json::from_value(value).map_err(decode_error)?;
+                pins.validate(tx, true)?;
+                Decoded::Pins(pins)
+            }
+            ("change", "user.set") => {
+                let user: crate::user_profile::UserEntry =
+                    serde_json::from_value(value).map_err(decode_error)?;
+                user.validate(tx).map_err(crate::user_profile::sql_error)?;
+                Decoded::User(user)
+            }
+            ("change", op) if AGENT_OPS.contains(&op) => {
+                let agent: AgentChangeEntry =
+                    serde_json::from_value(value).map_err(decode_error)?;
+                check_agent_entry(tx, &agent)?;
+                Decoded::Agent(Box::new(agent))
+            }
+            _ => return Err(invalid("unknown entry op or kind/op mismatch")),
         }
-        ("change", "member.set_box") => {
-            Decoded::MemberBox(crate::member_box::decode(value, Some(&entry.author))?)
-        }
-        ("change", "catalog.pin") => {
-            let pins: crate::catalog_agent::CatalogPinSet =
-                serde_json::from_value(value).map_err(decode_error)?;
-            pins.validate(tx, true)?;
-            Decoded::Pins(pins)
-        }
-        ("change", "user.set") => {
-            let user: crate::user_profile::UserEntry =
-                serde_json::from_value(value).map_err(decode_error)?;
-            user.validate(tx).map_err(crate::user_profile::sql_error)?;
-            Decoded::User(user)
-        }
-        ("change", op) if AGENT_OPS.contains(&op) => {
-            let agent: AgentChangeEntry = serde_json::from_value(value).map_err(decode_error)?;
-            check_agent_entry(tx, &agent)?;
-            Decoded::Agent(Box::new(agent))
-        }
-        _ => return Err(invalid("unknown entry op or kind/op mismatch")),
     };
     let position: i64 = tx.query_row(
         "SELECT last_applied_position FROM identity_log_state WHERE id=1",
@@ -643,6 +658,13 @@ fn apply(tx: &Transaction<'_>, entry: &RemoteEntry) -> rusqlite::Result<i64> {
         // the same snapshot. Validate those references against the final state.
         tx.execute_batch("PRAGMA defer_foreign_keys=ON;")?;
         match decoded {
+            Decoded::Membership(body) => {
+                let payload = json!({"position":entry.position,"author":entry.author,"signer":entry.signer,"key_id":entry.key_id});
+                let seq = append(tx, &entry.kind, &payload, "log", None, 0, "entorhinal")?;
+                crate::hub_store::replay_membership(tx, &entry.kind, &body, entry.position)?;
+                tag(tx, seq, entry, &payload)?;
+                seq
+            }
             Decoded::User(user) => {
                 let payload = json!({"entry":user});
                 let seq = append(

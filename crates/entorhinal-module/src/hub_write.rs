@@ -225,7 +225,7 @@ impl Transport for Hub {
 /// The hub backend supplies verification keys and checks which epoch may be
 /// used for writing. A fence reads the epoch record from the hub, not the cache,
 /// and ensures the vault holds the named key.
-pub(super) trait Trust {
+pub(super) trait Trust: Sync {
     fn writer_epoch(
         &self,
         deadline: Instant,
@@ -234,6 +234,18 @@ pub(super) trait Trust {
         &self,
         record: &UnverifiedRecord,
     ) -> impl Future<Output = Result<String, HandlerError>> + Send;
+
+    fn verify_remote(
+        &self,
+        record: UnverifiedRecord,
+        _log_position: Option<u64>,
+        _deadline: Instant,
+    ) -> impl Future<Output = Result<VerifiedRecord, HandlerError>> + Send {
+        async move {
+            let key = self.verification_key(&record).await?;
+            record.verify(&key)
+        }
+    }
 }
 
 pub(super) struct Writer<'a, T, U> {
@@ -796,10 +808,15 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
             else {
                 return Ok(Settlement::Resend);
             };
-            return Ok(match self.matching_op(row, &bytes, deadline).await? {
-                Some(id) => landed(id, Some(position)),
-                None => Settlement::HeadMoved,
-            });
+            return Ok(
+                match self
+                    .matching_op(row, &bytes, Some(position), deadline)
+                    .await?
+                {
+                    Some(id) => landed(id, Some(position)),
+                    None => Settlement::HeadMoved,
+                },
+            );
         }
         let current = self
             .transport
@@ -827,7 +844,7 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
         }
         if !delete {
             if let Some(bytes) = entry.value {
-                if let Some(id) = self.matching_op(row, &bytes, deadline).await? {
+                if let Some(id) = self.matching_op(row, &bytes, None, deadline).await? {
                     return Ok(landed(id, Some(entry.revision)));
                 }
             }
@@ -851,6 +868,7 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
         &self,
         row: &HubAttempt,
         bytes: &[u8],
+        log_position: Option<u64>,
         deadline: Instant,
     ) -> Result<Option<String>, HandlerError> {
         let Ok(unverified) = UnverifiedRecord::parse(&row.write.key, bytes) else {
@@ -861,7 +879,10 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
         }
         let op_id = unverified.header().entry_id.clone();
         timeout_at(deadline, async {
-            let verified = self.verify(unverified).await?;
+            let verified = self
+                .trust
+                .verify_remote(unverified, log_position, deadline)
+                .await?;
             Ok(self
                 .matches_plaintext(row, &verified, deadline)
                 .await?

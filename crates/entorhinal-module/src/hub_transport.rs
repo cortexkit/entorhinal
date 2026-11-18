@@ -33,8 +33,8 @@ use tokio::{
     time::{timeout_at, Instant},
 };
 
-pub(super) use self::feed::Feed;
 use self::feed::Subscription;
+pub(super) use self::feed::{Feed, FeedEvent};
 use crate::{log_client::SubcConnector, HandlerError, HealthGauges};
 
 const DOMAIN: &str = "hub";

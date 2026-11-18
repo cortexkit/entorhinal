@@ -196,6 +196,11 @@ fn activate(
                 trust: keys.clone(),
                 signer: Arc::new(ClaustrumCredentialResolver::with_target(keys.clone(), 0)),
                 vault: keys.clone(),
+                peers: Arc::new(crate::hub_membership::tests::Roster(
+                    [A, B]
+                        .map(|id| crate::hub_membership::tests::anchor(id, keys))
+                        .to_vec(),
+                )),
             },
         )
         .unwrap()
@@ -425,6 +430,14 @@ impl IdentityRig {
         let keys = Arc::new(TestKeys::new());
         let log_a = activate(&a, leaf_a.clone(), &keys);
         let log_b = activate(&b, leaf_b.clone(), &keys);
+        // Finish the empty-log startup scan before recording exact reads spent
+        // on contention and lost acknowledgments below.
+        within(async {
+            while !log_a.membership_ready() || !log_b.membership_ready() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
         Some(Self {
             a: Node {
                 handler: a,

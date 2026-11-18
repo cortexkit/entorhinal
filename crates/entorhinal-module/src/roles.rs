@@ -87,10 +87,27 @@ impl ProjectsHandler {
         if !valid_role(&request.role) {
             return Err(HandlerError::new("invalid_request", "invalid role"));
         }
-        encode_result(
-            self.with_store(|s| Ok(s.clone()))?
-                .role_read(&request.role)?,
-        )
+        let store = self.with_store(|s| Ok(s.clone()))?;
+        // The hub role read will replace this branch; only legacy mode can
+        // serve observations from the engram role cache.
+        if self
+            .health
+            .hub_membership
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+        {
+            return encode_result(entorhinal_core::role_cache::RoleRead {
+                role: request.role,
+                stale: true,
+                known: false,
+                held_here: false,
+                epoch: 0,
+                holder: None,
+                holder_name: None,
+                source: None,
+            });
+        }
+        encode_result(store.role_read(&request.role)?)
     }
 
     pub(super) fn role_fence(&self, params: Value) -> Result<Vec<u8>, HandlerError> {

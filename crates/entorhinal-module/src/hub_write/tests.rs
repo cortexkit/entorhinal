@@ -43,15 +43,23 @@ type Seal = (SealedBody, Vec<u8>, Vec<u8>);
 
 impl TestKeys {
     pub(crate) fn new() -> Self {
+        Self::with_seed(42)
+    }
+
+    pub(crate) fn with_seed(seed: u8) -> Self {
         Self {
             epoch: AtomicU64::new(1),
-            signing: SigningKey::from_bytes(&[42; 32]),
+            signing: SigningKey::from_bytes(&[seed; 32]),
             sealed: Mutex::default(),
         }
     }
 
-    fn key_version(&self) -> String {
+    pub(crate) fn key_version(&self) -> String {
         sha256_hex(self.signing.verifying_key().as_bytes())[..16].to_owned()
+    }
+
+    pub(crate) fn public_hex(&self) -> String {
+        hex(self.signing.verifying_key().as_bytes())
     }
 }
 
