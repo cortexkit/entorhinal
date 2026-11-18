@@ -283,9 +283,16 @@ fn invalid_reply(message: &str) -> HandlerError {
     HandlerError::new("invalid_reply", message)
 }
 
+/// Map a vault refusal to the code Entorhinal's hub readers and writers act on.
+/// A missing or pending epoch key and a vault store failure are both worth
+/// retrying: the readers hold their place and try again, never skipping the
+/// record. Every other code passes through unchanged, so a bad tag
+/// (`fleet_epoch_open_failed`) or a damaged key in the vault (`corrupt`) stops
+/// the reader where it stands and is logged.
 fn refused(code: &str) -> HandlerError {
     let mapped = match code {
         "fleet_epoch_pending" | "fleet_epoch_unavailable" => "epoch_key_unavailable",
+        "store_error" => "vault_unavailable",
         code => code,
     };
     HandlerError::new(

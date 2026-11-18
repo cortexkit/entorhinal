@@ -348,6 +348,10 @@ async fn fleet_record_epoch_rpc_replays_vault_samples() {
             request: seal.into(),
             response: r#"{"result":{"error":{"class":"transient","code":"fleet_epoch_unavailable"}}}"#.into(),
         },
+        Call::Epoch {
+            request: seal.into(),
+            response: r#"{"result":{"error":{"class":"transient","code":"store_error"}}}"#.into(),
+        },
     ]);
     let aad = b"record:identity:7";
     let plaintext = b"fleet sample plaintext";
@@ -358,6 +362,12 @@ async fn fleet_record_epoch_rpc_replays_vault_samples() {
     assert_eq!(
         epoch_vault.seal(aad, plaintext).await.unwrap_err().code,
         "epoch_key_unavailable"
+    );
+    // A vault store failure is retried by hub readers and writers, like an
+    // outage, rather than stopping them.
+    assert_eq!(
+        epoch_vault.seal(aad, plaintext).await.unwrap_err().code,
+        "vault_unavailable"
     );
     vault.done();
 }
