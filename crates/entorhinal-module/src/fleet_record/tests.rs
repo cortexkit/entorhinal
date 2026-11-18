@@ -363,6 +363,57 @@ async fn fleet_record_epoch_rpc_replays_vault_samples() {
 }
 
 #[tokio::test]
+async fn hub_join_vault_requests_use_excluded_and_wrap_for_wire_shapes() {
+    let vault = VaultScript::new([
+        Call::Epoch {
+            request: r#"{"method":"fleet.epoch_mint","params":{"excluded":["fed-computer:peer"],"members":["fed-computer:self"]}}"#.into(),
+            response: r#"{"result":{"epoch":2,"mint_id":"mint","wraps":[]}}"#.into(),
+        },
+        Call::Epoch {
+            request: r#"{"method":"fleet.epoch_mint","params":{"excluded":["fed-computer:peer"],"members":["fed-computer:self"]}}"#.into(),
+            response: r#"{"result":{"error":{"class":"permanent","code":"invalid_params"}}}"#.into(),
+        },
+        Call::Epoch {
+            request: r#"{"method":"fleet.epoch_mint","params":{"members":["fed-computer:self"]}}"#.into(),
+            response: r#"{"result":{"error":{"class":"permanent","code":"fleet_members_mismatch"}}}"#.into(),
+        },
+        Call::Epoch {
+            request: r#"{"method":"fleet.epoch_wrap_for","params":{"member_id":"fed-computer:peer"}}"#.into(),
+            response: r#"{"result":{"wrap":{"ct":"ciphertext","enc":"encapsulation","from":"fed-computer:self","to":"fed-computer:peer","v":1}}}"#.into(),
+        },
+    ]);
+    let epoch_vault = vault.epoch_vault();
+    let control = epoch_vault.control().unwrap();
+    let members = ["fed-computer:self".into()];
+    assert_eq!(
+        control
+            .mint(&members, &["fed-computer:peer".into()])
+            .await
+            .unwrap()
+            .epoch,
+        2
+    );
+    assert_eq!(
+        control
+            .mint(&members, &["fed-computer:peer".into()])
+            .await
+            .err()
+            .unwrap()
+            .code,
+        "invalid_params"
+    );
+    assert_eq!(
+        control.mint(&members, &[]).await.err().unwrap().code,
+        "fleet_members_mismatch"
+    );
+    assert_eq!(
+        control.wrap_for("fed-computer:peer").await.unwrap()["ct"],
+        "ciphertext"
+    );
+    vault.done();
+}
+
+#[tokio::test]
 async fn fleet_record_key_rotation_rebuilds_with_the_reread_key() {
     let vectors = cases();
     let sample = &vectors["residence"];
