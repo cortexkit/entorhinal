@@ -21,7 +21,14 @@ fn descriptor(f: &Fixture, file: &str) -> StorageDescriptor {
 fn hub_store_migration_preserves_legacy_progress_and_requires_snapshot_for_downgrade() {
     let f = Fixture::new("hub-migration");
     let live = descriptor(&f, "legacy.db");
-    let legacy_chain = &MIGRATIONS[..25];
+    // The chain as shipped before the hub migration, found by its statements
+    // so later migrations neither change this test's meaning nor edit it.
+    let hub = MIGRATIONS
+        .iter()
+        .position(|m| m.statements == V26_HUB_STORE)
+        .unwrap();
+    let legacy_chain = &MIGRATIONS[..hub];
+    let (new, old) = (MIGRATIONS.len(), hub);
     let legacy = RegistryStore::open_with_migrations(&live, legacy_chain).unwrap();
     legacy
         .db
@@ -88,8 +95,8 @@ fn hub_store_migration_preserves_legacy_progress_and_requires_snapshot_for_downg
     drop(store);
 
     let error = RegistryStore::open_with_migrations(&live, legacy_chain).unwrap_err();
-    assert!(matches!(error, RegistryError::Database(ref msg)
-        if msg.contains("schema version 26, ahead of this binary's highest migration 25")));
+    let expected = format!("schema version {new}, ahead of this binary's highest migration {old}");
+    assert!(matches!(error, RegistryError::Database(ref msg) if msg.contains(&expected)));
     let reopened = RegistryStore::open(&live).unwrap();
     assert_eq!(reopened.identity_log_status().unwrap(), legacy_status);
     drop(reopened);
