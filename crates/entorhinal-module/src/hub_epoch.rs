@@ -1,6 +1,8 @@
 //! The signed epoch register, its writer fence, and removal-driven rotation.
 #![allow(dead_code)]
 
+mod joining;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -489,6 +491,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
             return Err(invalid("invalid local Callosum fingerprint"));
         }
         peers.insert(own_box.clone(), fingerprint.clone());
+        let counted = peers.clone();
         if let Some((removal, fingerprint)) = event {
             peers.retain(|id, peer| {
                 *id == *own_box || (id != &removal.box_id && peer != fingerprint)
@@ -505,22 +508,17 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
                 });
             }
         }
-        let mut withheld_repair = false;
+        // A box's return to the roster does not authorize a wrap while its
+        // membership removal is still in effect.
+        peers.retain(|id, _| self.reader.membership.removed_at(id, applied).is_none());
         for removal in &removed {
-            // An explicitly admitted replacement episode may participate in a
-            // later attempt. A roster re-pair alone does not authorize a wrap.
             if !self.reader.membership.removal_applied(
                 &removal.box_id,
                 e,
                 removal.removal_id.as_deref(),
                 applied,
-            ) || self
-                .reader
-                .membership
-                .removed_at(&removal.box_id, applied)
-                .is_some()
-            {
-                withheld_repair |= peers.remove(&removal.box_id).is_some();
+            ) {
+                peers.remove(&removal.box_id);
             }
         }
         if !peers.contains_key(own_box) {
@@ -533,14 +531,27 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
             .values()
             .map(|fp| format!("fed-computer:{fp}"))
             .collect();
-        let result = timeout_at(deadline, self.reader.control().mint(&members))
-            .await
-            .map_err(|_| busy())?;
+        let excluded: Vec<_> = counted
+            .iter()
+            .filter(|(id, _)| !peers.contains_key(*id))
+            .map(|(_, fp)| format!("fed-computer:{fp}"))
+            .collect();
+        let vault = self.reader.control();
+        let result = timeout_at(deadline, async {
+            match vault.mint(&members, &excluded).await {
+                Err(error) if !excluded.is_empty() && error.code == "invalid_params" => {
+                    vault.mint(&members, &[]).await
+                }
+                result => result,
+            }
+        })
+        .await
+        .map_err(|_| busy())?;
         let minted = match result {
             Ok(minted) => minted,
             Err(error)
                 if error.code == "fleet_members_mismatch"
-                    && withheld_repair
+                    && !excluded.is_empty()
                     && state.is_some_and(|state| state.state == State::Pending) =>
             {
                 self.append_missing(previous.expect("pending epoch"), deadline)
@@ -835,7 +846,10 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
         {
             // A new/re-paired box may need the join flow rather than a wrap for
             // this mint. Its absence does not stop observation of the epoch.
-            if current.epoch.recipients.contains(&self.reader.own_box) {
+            if current.epoch.recipients.contains(&self.reader.own_box)
+                && (current.epoch.minter == self.reader.own_box
+                    || self.reader.store.hub_has_epoch(1)?)
+            {
                 if let Err(error) = self.reader.ensure(current, deadline).await {
                     if error.code != "epoch_key_unavailable" {
                         return Err(error);
@@ -886,6 +900,8 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
         let mut live = false;
         let mut observed = None;
         let mut retry_on_membership = false;
+        let mut join_tick = tokio::time::interval(Duration::from_secs(2));
+        join_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             let timer = observed.as_ref().and_then(Observation::deadline);
             let changed = tokio::select! {
@@ -911,6 +927,12 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
                     false
                 },
                 _ = self.reader.ready.notified(), if live && observed.is_none() => true,
+                _ = join_tick.tick(), if live => {
+                    if let Err(error) = self.joins(Instant::now() + BUDGET).await {
+                        tracing::debug!(code = error.code, "fleet join reconciliation deferred");
+                    }
+                    false
+                },
             };
             if live && changed {
                 match self.observe(Instant::now() + BUDGET).await {
@@ -1171,12 +1193,33 @@ impl<T: Transport> EpochReader<T> {
         deadline: Instant,
     ) -> Result<(), HandlerError> {
         if !self.store.hub_has_epoch(epoch)? {
+            // A box without its first epoch needs a join wrap, not just the
+            // latest mint's key.
+            if !self.store.hub_has_epoch(1)? {
+                return Err(unavailable());
+            }
             self.fence(deadline).await?;
             if !self.store.hub_has_epoch(epoch)? {
                 return Err(unavailable());
             }
         }
         Ok(())
+    }
+
+    pub(super) fn admission_wrap_imported(&self, request_id: &str) -> Result<bool, HandlerError> {
+        if self
+            .store
+            .hub_attempt(&format!("join.request:{request_id}"))?
+            .is_none()
+        {
+            // A wiped box can restore keys with a new request in the same episode.
+            return Ok(true);
+        }
+        let key = format!("wrapjoin.{}.{request_id}", self.own_box);
+        Ok(self
+            .store
+            .hub_kv_cached(&key)?
+            .is_some_and(|row| row.body.is_some()))
     }
 
     async fn ensure(&self, observed: &Observed, deadline: Instant) -> Result<(), HandlerError> {

@@ -431,6 +431,30 @@ impl Session {
         .await
     }
 
+    pub(super) async fn join_keys(
+        &self,
+        prefix: &str,
+        deadline: Instant,
+    ) -> Result<Vec<String>, HandlerError> {
+        self.confirm_hub(deadline, async {
+            let mut keys = self
+                .kv()
+                .await?
+                .keys()
+                .await
+                .map_err(|error| Failure::kind("kv_keys", error.kind()))?;
+            let mut matching = Vec::new();
+            while let Some(key) = keys.next().await {
+                let key = key.map_err(|error| Failure::kind("kv_keys", error.kind()))?;
+                if key.starts_with(prefix) {
+                    matching.push(key);
+                }
+            }
+            Ok(matching)
+        })
+        .await
+    }
+
     pub(super) async fn update(
         &self,
         key: &str,

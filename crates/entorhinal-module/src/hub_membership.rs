@@ -166,6 +166,7 @@ struct Candidate {
 struct BoxState {
     episode: u64,
     closed: Option<Closure>,
+    admission_request: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,7 +180,7 @@ struct Timeline {
     boxes: BTreeMap<String, BTreeMap<u64, BoxState>>,
     removals: BTreeMap<String, u64>,
     anonymous: BTreeMap<(String, u64), u64>,
-    admissions: BTreeSet<(String, String)>,
+    admissions: BTreeMap<(String, String), String>,
 }
 
 impl Timeline {
@@ -238,7 +239,7 @@ impl Timeline {
             }
             Event::Admitted(admission) => {
                 let id = (admission.box_id.clone(), admission.after_removal_id.clone());
-                if self.admissions.contains(&id) {
+                if self.admissions.contains_key(&id) {
                     return Ok(None);
                 }
                 let state = self.before(&admission.box_id, sequence);
@@ -247,7 +248,7 @@ impl Timeline {
                 {
                     return Err(invalid("admission does not follow the named removal"));
                 }
-                self.admissions.insert(id);
+                self.admissions.insert(id, admission.request_id.clone());
                 self.boxes
                     .entry(admission.box_id.clone())
                     .or_default()
@@ -256,6 +257,7 @@ impl Timeline {
                         BoxState {
                             episode: state.episode + 1,
                             closed: None,
+                            admission_request: Some(admission.request_id.clone()),
                         },
                     );
                 Ok(None)
@@ -678,6 +680,16 @@ impl<T: Transport> Membership<T> {
         self.view.read().unwrap().through
     }
 
+    pub(super) fn current_anchor(&self, box_id: &str) -> Option<PeerAnchor> {
+        self.view
+            .read()
+            .unwrap()
+            .current
+            .iter()
+            .find(|peer| peer.box_id == box_id)
+            .cloned()
+    }
+
     pub(super) fn log_key(
         &self,
         record: &UnverifiedRecord,
@@ -800,6 +812,27 @@ impl<T: Transport> Membership<T> {
             None => history.anonymous.get(&(box_id.to_owned(), epoch)),
         };
         position.is_some_and(|position| *position <= applied)
+    }
+
+    pub(super) fn admission_request(&self, box_id: &str, removal_id: &str) -> Option<String> {
+        self.view
+            .read()
+            .unwrap()
+            .proof
+            .timeline
+            .admissions
+            .get(&(box_id.to_owned(), removal_id.to_owned()))
+            .cloned()
+    }
+
+    pub(super) fn episode_join_request(&self, box_id: &str, applied: u64) -> Option<String> {
+        self.view
+            .read()
+            .unwrap()
+            .proof
+            .timeline
+            .before(box_id, applied.saturating_add(1))
+            .admission_request
     }
 
     pub(super) fn box_for_fingerprint(&self, fingerprint: &str, applied: u64) -> Option<String> {

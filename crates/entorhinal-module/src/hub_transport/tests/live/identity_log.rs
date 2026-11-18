@@ -51,6 +51,14 @@ impl LogTransport for Leaf {
             .tail(cursor.unwrap())
         })
     }
+
+    async fn join_keys(
+        &self,
+        prefix: &str,
+        deadline: Instant,
+    ) -> Result<Vec<String>, HandlerError> {
+        self.session().join_keys(prefix, deadline).await
+    }
 }
 
 impl Transport for Leaf {
@@ -420,6 +428,7 @@ struct IdentityRig {
     keys: Arc<TestKeys>,
     stream: jetstream::stream::Stream,
     kv: kv::Store,
+    leaf_port: u16,
     _processes: Rig,
 }
 
@@ -517,6 +526,7 @@ impl IdentityRig {
             keys,
             stream,
             kv,
+            leaf_port,
             _processes: rig,
         })
     }

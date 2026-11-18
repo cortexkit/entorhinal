@@ -37,6 +37,19 @@ const READ_BUDGET: Duration = Duration::from_secs(25);
 pub(super) trait LogTransport: Transport + Send + Sync + 'static {
     fn tail(self: &Arc<Self>, applied: u64) -> Feed<LogDelivery>;
 
+    fn join_keys(
+        &self,
+        _prefix: &str,
+        _deadline: Instant,
+    ) -> impl std::future::Future<Output = Result<Vec<String>, HandlerError>> + Send {
+        async {
+            Err(HandlerError::new(
+                "hub_unavailable",
+                "join key listing unavailable",
+            ))
+        }
+    }
+
     fn epoch_watch(self: &Arc<Self>) -> Option<Feed<async_nats::jetstream::kv::Entry>> {
         None
     }
@@ -49,6 +62,18 @@ impl LogTransport for Hub {
 
     fn epoch_watch(self: &Arc<Self>) -> Option<Feed<async_nats::jetstream::kv::Entry>> {
         Some(self.epoch_watch())
+    }
+
+    async fn join_keys(
+        &self,
+        prefix: &str,
+        deadline: Instant,
+    ) -> Result<Vec<String>, HandlerError> {
+        self.session(deadline)
+            .await?
+            .1
+            .join_keys(prefix, deadline)
+            .await
     }
 }
 
@@ -240,6 +265,48 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
         deadline: Instant,
     ) -> Result<hub_write::Landed, HandlerError> {
         let writer_ep = self.writer_episode()?;
+        self.write_epoch_step_as(writer_ep, request_key, digest, step, deadline)
+            .await
+    }
+
+    pub(super) async fn write_join_request(
+        &self,
+        writer_ep: u64,
+        request_key: &str,
+        expected: u64,
+        body: Value,
+        deadline: Instant,
+    ) -> Result<(), HandlerError> {
+        let key = format!("wrapreq.{}", self.box_id);
+        let digest = hub_write::params_digest(&key, &body)?;
+        self.write_epoch_step_as(
+            writer_ep,
+            request_key,
+            &digest,
+            &Step {
+                name: "wrapreq".into(),
+                key,
+                expected,
+                payload: Payload::Record {
+                    kind: "wrapreq".into(),
+                    body,
+                    snapshot_id: None,
+                },
+            },
+            deadline,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn write_epoch_step_as(
+        &self,
+        writer_ep: u64,
+        request_key: &str,
+        digest: &str,
+        step: &Step,
+        deadline: Instant,
+    ) -> Result<hub_write::Landed, HandlerError> {
         let trust = MemberTrust {
             epoch: self.link.trust.as_ref(),
             epoch_reader: self.epoch.as_deref(),
@@ -779,6 +846,15 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
         };
         if !self.store.hub_snapshot_applied(self.base).unwrap_or(false) {
             return;
+        }
+        if let (Some(reader), Some(request)) = (
+            &self.epoch,
+            self.membership
+                .episode_join_request(&key.box_id, self.sequence()),
+        ) {
+            if !reader.admission_wrap_imported(&request).unwrap_or(false) {
+                return;
+            }
         }
         let Ok(_guard) = self.writer.try_lock() else {
             return;

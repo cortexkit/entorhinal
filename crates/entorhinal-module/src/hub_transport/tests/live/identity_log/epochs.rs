@@ -8,7 +8,12 @@ use crate::{
     hub_membership::{tests::anchor, PeerAnchor, PeerKeysRead},
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use std::{collections::BTreeSet, sync::atomic::AtomicU64};
+use std::{
+    collections::BTreeSet,
+    sync::atomic::{AtomicBool, AtomicU64},
+};
+
+mod joining;
 
 const D: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
@@ -35,12 +40,16 @@ struct KeyState {
     discards: Vec<String>,
     imports: Vec<u64>,
     commits: Vec<u64>,
+    mint_exclusions: Vec<Vec<String>>,
+    joins_served: Vec<String>,
+    joins_imported: Vec<Vec<u64>>,
 }
 
 #[derive(Default)]
 struct Fleet {
     next: AtomicU64,
     current: Arc<StdMutex<Vec<PeerAnchor>>>,
+    supports_excluded: AtomicBool,
 }
 
 struct Vault {
@@ -61,8 +70,16 @@ impl EpochControl for Vault {
         })
     }
 
-    async fn mint(&self, members: &[String]) -> Result<Minted, HandlerError> {
-        let expected: BTreeSet<_> = self
+    async fn mint(&self, members: &[String], excluded: &[String]) -> Result<Minted, HandlerError> {
+        let mut state = self.state.lock().unwrap();
+        state.mint_exclusions.push(excluded.to_vec());
+        if !excluded.is_empty() && !self.fleet.supports_excluded.load(Ordering::Acquire) {
+            return Err(HandlerError::new(
+                "invalid_params",
+                "legacy vault rejects excluded",
+            ));
+        }
+        let mut expected: BTreeSet<_> = self
             .fleet
             .current
             .lock()
@@ -70,13 +87,16 @@ impl EpochControl for Vault {
             .iter()
             .map(|peer| format!("fed-computer:{}", peer.fingerprint))
             .collect();
+        for member in excluded {
+            assert_ne!(member, &format!("fed-computer:{}", self.own));
+            assert!(expected.remove(member));
+        }
         if members.iter().cloned().collect::<BTreeSet<_>>() != expected {
             return Err(HandlerError::new(
                 "fleet_members_mismatch",
                 "unexpected stand-in members",
             ));
         }
-        let mut state = self.state.lock().unwrap();
         assert!(
             state.pending.is_none(),
             "must discard a pending vault mint first"
@@ -129,15 +149,40 @@ impl EpochControl for Vault {
             "discard before importing the winner"
         );
         assert_eq!(wrap["to"], format!("fed-computer:{}", self.own));
-        let e = wrap["fixture_epoch"].as_u64().unwrap();
-        let fresh = state.held.insert(e);
-        if fresh {
-            state.imports.push(e);
-        }
+        let epochs = if let Some(ct) = wrap["ct"].as_str() {
+            let bytes = URL_SAFE_NO_PAD.decode(ct).unwrap();
+            let keys: Vec<(u64, String)> = serde_json::from_slice(&bytes).unwrap();
+            let epochs: Vec<_> = keys.into_iter().map(|(epoch, _)| epoch).collect();
+            state.joins_imported.push(epochs.clone());
+            epochs
+        } else {
+            vec![wrap["fixture_epoch"].as_u64().unwrap()]
+        };
+        let epochs: Vec<_> = epochs
+            .into_iter()
+            .filter(|e| state.held.insert(*e))
+            .collect();
+        state.imports.extend(&epochs);
         Ok(Imported {
-            epochs: if fresh { vec![e] } else { vec![] },
-            already_held: !fresh,
+            already_held: epochs.is_empty(),
+            epochs,
         })
+    }
+
+    async fn wrap_for(&self, member_id: &str) -> Result<Value, HandlerError> {
+        assert_ne!(member_id, format!("fed-computer:{}", self.own));
+        assert!(self
+            .fleet
+            .current
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|peer| { member_id == format!("fed-computer:{}", peer.fingerprint) }));
+        let mut state = self.state.lock().unwrap();
+        state.joins_served.push(member_id.into());
+        let keys: Vec<_> = state.held.iter().map(|e| (*e, "x".repeat(96))).collect();
+        let ct = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&keys).unwrap());
+        Ok(json!({"v":1,"ct":ct,"enc":"fixture","from":self.own,"to":member_id}))
     }
 }
 
@@ -179,6 +224,23 @@ impl EpochNode {
         fleet: Arc<Fleet>,
         vault: Option<Arc<Vault>>,
     ) -> Self {
+        let node = Self::start(rig, name, leaf, fleet, vault);
+        within(async {
+            while !node.node.log.membership_ready() {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        node
+    }
+
+    fn start(
+        rig: &IdentityRig,
+        name: &str,
+        leaf: Arc<Leaf>,
+        fleet: Arc<Fleet>,
+        vault: Option<Arc<Vault>>,
+    ) -> Self {
         let id = leaf.box_id.to_string();
         let handler = handler(store(&rig._processes, name), &id);
         let own = id;
@@ -207,7 +269,22 @@ impl EpochNode {
                 state: StdMutex::default(),
             })
         });
-        let log = Arc::new(
+        let log = Self::activate(rig, &handler, &leaf, &vault);
+        let controller = Controller::new(log.clone()).unwrap();
+        Self {
+            node: Node { handler, leaf, log },
+            vault,
+            controller,
+        }
+    }
+
+    fn activate(
+        rig: &IdentityRig,
+        handler: &ProjectsHandler,
+        leaf: &Arc<Leaf>,
+        vault: &Arc<Vault>,
+    ) -> Arc<IdentityLog<Leaf, TestKeys>> {
+        Arc::new(
             handler
                 .activate_hub_identity_log(
                     leaf.box_id.clone(),
@@ -220,25 +297,13 @@ impl EpochNode {
                         )),
                         vault: vault.clone(),
                         peers: Arc::new(Peers {
-                            own,
-                            current: fleet.current.clone(),
+                            own: vault.own.clone(),
+                            current: vault.fleet.current.clone(),
                         }),
                     },
                 )
                 .unwrap(),
-        );
-        within(async {
-            while !log.membership_ready() {
-                sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await;
-        let controller = Controller::new(log.clone()).unwrap();
-        Self {
-            node: Node { handler, leaf, log },
-            vault,
-            controller,
-        }
+        )
     }
 
     fn watch(&self) -> WatchTask {
@@ -590,6 +655,10 @@ async fn hub_epoch_repaired_box_is_excluded_until_admission() {
     within(through(&b.node.handler, 1)).await;
     assert_eq!(register(&rig).await, pending);
     assert!(b.vault.state.lock().unwrap().pending.is_none());
+    assert_eq!(
+        b.vault.state.lock().unwrap().mint_exclusions,
+        [vec![format!("fed-computer:{}", "c".repeat(32))], vec![]]
+    );
     assert_eq!(history(&rig).await.len(), 1);
     assert_eq!(b.fence().await, 1);
     admit(&b, C, "400:permanent:10").await;

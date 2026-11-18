@@ -73,10 +73,11 @@ pub(crate) struct Imported {
 #[async_trait]
 pub(crate) trait EpochControl: Send + Sync {
     async fn status(&self) -> Result<EpochStatus, HandlerError>;
-    async fn mint(&self, members: &[String]) -> Result<Minted, HandlerError>;
+    async fn mint(&self, members: &[String], excluded: &[String]) -> Result<Minted, HandlerError>;
     async fn commit(&self, mint: &PendingMint) -> Result<(), HandlerError>;
     async fn discard(&self, mint: &PendingMint) -> Result<(), HandlerError>;
     async fn import(&self, wrap: &Value) -> Result<Imported, HandlerError>;
+    async fn wrap_for(&self, member_id: &str) -> Result<Value, HandlerError>;
 }
 
 pub(crate) struct SubcEpochVault {
@@ -140,9 +141,13 @@ impl EpochControl for SubcEpochVault {
         self.request("fleet.epoch_status", json!({})).await
     }
 
-    async fn mint(&self, members: &[String]) -> Result<Minted, HandlerError> {
-        self.request("fleet.epoch_mint", json!({"members": members}))
-            .await
+    async fn mint(&self, members: &[String], excluded: &[String]) -> Result<Minted, HandlerError> {
+        let params = if excluded.is_empty() {
+            json!({"members": members})
+        } else {
+            json!({"members": members, "excluded": excluded})
+        };
+        self.request("fleet.epoch_mint", params).await
     }
 
     async fn commit(&self, mint: &PendingMint) -> Result<(), HandlerError> {
@@ -156,6 +161,25 @@ impl EpochControl for SubcEpochVault {
     async fn import(&self, wrap: &Value) -> Result<Imported, HandlerError> {
         self.request("fleet.epoch_import", json!({"wrap": wrap}))
             .await
+    }
+
+    async fn wrap_for(&self, member_id: &str) -> Result<Value, HandlerError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wrapped {
+            wrap: Value,
+        }
+        let Wrapped { wrap } = self
+            .request("fleet.epoch_wrap_for", json!({"member_id": member_id}))
+            .await?;
+        if wrap["v"] != 1
+            || ["ct", "enc", "from", "to"]
+                .iter()
+                .any(|field| !wrap[*field].as_str().is_some_and(|s| !s.is_empty()))
+        {
+            return Err(invalid_reply("invalid fleet join wrap"));
+        }
+        Ok(wrap)
     }
 }
 
