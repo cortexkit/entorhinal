@@ -808,8 +808,9 @@ impl Leases {
                         wake_at = due;
                     }
                 }
-                // Keep control-key traffic independent of notice acknowledgments.
-                // A waiting candidate may have no acting window at all.
+                // Write or clear this computer's hand-back request whether or not the
+                // module has acknowledged its last notice: a waiting candidate may have
+                // no acting window, so it has nothing to acknowledge yet.
                 if current.revision >= wait_revision && allowed {
                     let own_request = backend.handback(role, local)?;
                     let wants_handback = !mine
