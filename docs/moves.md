@@ -114,8 +114,9 @@ Things a move can report:
   does not have an optional participant that sealed items. Both machines list
   one `optional_participant_absent` loss per skipped stream, with the source
   machine ID in `source` and its display name in `source_name` when known.
-  The source keeps the optional participant's data for a later move back or
-  re-carry. Losses survive restarts. A move with no losses omits `losses`, and
+  The source keeps the optional participant's data, so a later move can still
+  carry it: back to the source, or onward once the receiver runs that participant.
+  Losses survive restarts. A move with no losses omits `losses`, and
   an aborted move shows none because nothing it staged was kept.
 
 ## Cancel a move

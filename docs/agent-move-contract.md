@@ -310,8 +310,9 @@ Guaranteed:
   take returns it.
 - The source releases participants only after reading an `activated` record
   written by the receiver for the plan it published. It never releases an
-  optional participant named in `skipped`, so that participant's data remains
-  on the source for a later move back or re-carry.
+  optional participant named in `skipped`. That participant's data stays on the
+  source, so a later move can still carry it: back to the source, or onward once
+  the receiver runs that participant.
 - A move never chooses between two divergent copies; it holds as a fork.
 
 Not guaranteed:
