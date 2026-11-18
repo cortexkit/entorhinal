@@ -65,7 +65,10 @@ pub(super) trait LogReplan: Sync {
     ) -> BoxFuture<'_, Result<(), HandlerError>>;
 
     /// Rebuild the body against the applied head, keeping the pre-drawn IDs and
-    /// timestamps from the saved body. Only validation refusals close the attempt.
+    /// timestamps from the saved body. Return `Replanned::Refused` when the
+    /// operation is no longer valid there (a name now taken, a retired agent): the
+    /// attempt then records that refusal as its final outcome and is never resent.
+    /// An `Err` is a transient failure; the attempt stays open for a retry.
     fn after_image(&self, saved: &Value) -> Result<Replanned, HandlerError>;
 }
 
