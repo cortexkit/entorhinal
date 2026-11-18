@@ -72,6 +72,32 @@ impl Hub {
     fn current(&self, box_id: &str) -> bool {
         !box_id.starts_with("engram:") && !self.removed.lock().unwrap().contains(&box_id)
     }
+
+    pub(crate) fn request_sample_handback(&self) {
+        self.prefer(B);
+        self.requests.lock().unwrap().insert(
+            B.into(),
+            CandidateRequest {
+                revision: 7,
+                gen: 1,
+                episode: 0,
+            },
+        );
+        self.updates.notify_waiters();
+    }
+
+    pub(crate) fn withdraw_sample_handback(&self) {
+        self.requests.lock().unwrap().remove(B);
+        self.updates.notify_waiters();
+    }
+}
+
+pub(crate) fn sample_holder(leases: &mut Leases) -> Arc<Hub> {
+    let hub = Hub::new(Some(A), false);
+    let clock = hub.clone();
+    leases.sample_clock(move || clock.now());
+    leases.attach(Some(Arc::new(Peer::new(A, &hub, true))));
+    hub
 }
 
 struct Peer {
