@@ -14,6 +14,8 @@ pub(crate) struct Worker {
     store: Weak<Mutex<Option<RegistryStore>>>,
     health: Arc<HealthGauges>,
     log: log_client::LogClient,
+    records: super::record_client::RecordClient,
+    wake: Arc<tokio::sync::Notify>,
     writer: Arc<tokio::sync::Mutex<()>>,
     commits: Arc<tokio::sync::Notify>,
     role_refresh: Arc<tokio::sync::Notify>,
@@ -26,6 +28,8 @@ impl ProjectsHandler {
             store: Arc::downgrade(&self.store),
             health: self.health.clone(),
             log: self.log_client.clone(),
+            records: self.record_client.clone(),
+            wake: self.catch_up_wake.clone(),
             writer: self.writer.clone(),
             commits: self.commits.clone(),
             role_refresh: self.role_refresh.clone(),
@@ -158,9 +162,12 @@ impl Worker {
         let mut ticks = tokio::time::interval(INTERVAL);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            ticks.tick().await;
+            tokio::select! {
+                _ = ticks.tick() => {},
+                _ = self.wake.notified() => {},
+            }
             let deadline = Instant::now() + READ_DEADLINE;
-            let Ok(_writer) = timeout_at(deadline, self.writer.lock()).await else {
+            let Ok(writer) = timeout_at(deadline, self.writer.clone().lock_owned()).await else {
                 continue;
             };
             let Some(slot) = self.store.upgrade() else {
@@ -212,11 +219,95 @@ impl Worker {
                             if let Some(line) = outage.succeeded() {
                                 tracing::info!(target: "identity_log", "{line}");
                             }
+                            if let Err(error) =
+                                self.publish_member_box(&store, writer, deadline).await
+                            {
+                                tracing::warn!(target: "identity_log", "publishing member box: {}: {}", error.code, error.message);
+                            }
                         }
                     }
                 }
             }
         }
+    }
+
+    pub(super) async fn publish_member_box(
+        &self,
+        store: &RegistryStore,
+        writer: tokio::sync::OwnedMutexGuard<()>,
+        deadline: Instant,
+    ) -> Result<(), HandlerError> {
+        let Some(box_id) = self.health.origin.daemon_id() else {
+            return Ok(());
+        };
+        let box_id = box_id.to_owned();
+        let worker_store = store.clone();
+        let desired_box = box_id.clone();
+        let status = tokio::task::spawn_blocking(move || {
+            if worker_store.is_foreign()
+                || worker_store.identity_log_status()?.state != "enabled"
+                || worker_store.own_member_box()?.as_deref() == Some(&desired_box)
+            {
+                return Ok::<_, RegistryError>(None);
+            }
+            Ok(Some(worker_store.persisted_self_author()?.is_some()))
+        })
+        .await
+        .map_err(|e| HandlerError::new("storage_error", e.to_string()))??;
+        let Some(author_known) = status else {
+            return Ok(());
+        };
+        if !author_known {
+            // Read-only discovery also works for a joined store with no agents.
+            // A verified absent record still identifies the reader.
+            let reply = timeout_at(deadline, self.records.read("claim:agent_0000000000000000"))
+                .await
+                .map_err(|_| {
+                    HandlerError::new(
+                        "engram_unavailable",
+                        "member identity read deadline expired",
+                    )
+                })?
+                .map_err(|error| {
+                    HandlerError::new(
+                        error.code(),
+                        format!("member identity read failed: {error:?}"),
+                    )
+                })?;
+            if reply.stale {
+                return Err(HandlerError::new(
+                    "engram_unavailable",
+                    "member identity read was stale",
+                ));
+            }
+            let worker_store = store.clone();
+            let learned = tokio::task::spawn_blocking(move || {
+                worker_store.learn_verified_self_author(&reply.self_author, super::unix_millis())
+            })
+            .await
+            .map_err(|e| HandlerError::new("storage_error", e.to_string()))??;
+            if !learned {
+                self.health
+                    .self_author_conflicts
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(HandlerError::new(
+                    "self_author_conflict",
+                    "member identity differs from persisted author",
+                ));
+            }
+        }
+        let (_writer, result) = super::shared_write::ChangeWriter {
+            log: &self.log,
+            health: &self.health,
+            #[cfg(test)]
+            commit_hook: None,
+        }
+        .append(store, writer, deadline, move |store| {
+            Ok(store.set_own_member_box(box_id)?)
+        })
+        .await?;
+        result?;
+        self.applied(store)
     }
 
     fn stalled(&self, state: u64, position: u64, message: impl std::fmt::Display) -> HandlerError {

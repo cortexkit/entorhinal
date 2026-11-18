@@ -452,7 +452,7 @@ the cache, so it works offline and never waits on engram.
 | `agent.session_liveness` | query | any | `active`, `gone` or `unknown` for up to 256 references, in order, from the trusted `prefrontal-core.session-liveness` bus mirror; `unknown` while the watch is unavailable or unreconciled. See [session-liveness-contract.md](session-liveness-contract.md). |
 | `agent.where` | query | any | Which machine holds an agent, from the cached claim, plus any blocked move's participant and ref explanation. |
 | `agent.where_many` | query | any | Cached claim results for 1–64 agent ids in request order; unknown agents are omitted. |
-| `node.self {}` | query | any | This machine's identity-log identity: `{author: string or null, display_name: string or null, sharing: "disabled" or "enabling" or "joining" or "enabled"}` inside the usual `{result: ...}` envelope. Unknown params refuse `invalid_request`. |
+| `node.self {}` | query | any | This machine's identity-log identity: `{author: string or null, display_name: string or null, box_id?: string, sharing: "disabled" or "enabling" or "joining" or "enabled"}` inside the usual `{result: ...}` envelope. Unknown params refuse `invalid_request`. |
 | `agent.fleet_identity_watch` | watch | any | Stream of changes to `agent.fleet_identity`. Opens with `{token?}` and sends `resync` or `changes` notices; on `resync`, read `agent.fleet_identity` once. |
 | `agent.where_watch` | watch | any | Stream of changes to whereabouts. Opens with `{agentIds?, cursor?}` and sends `resync` or `changes` notices carrying a cursor; on `resync`, read `agent.where_many` once. |
 | `catalog.status_watch` | watch | any | Pinned package status invalidations. Opens with `{token?}`; `changes` lists `{name, version}` identities whose state, blocking judgement or stale marker changed. `resync` requires rereading generation or context status. Tokens bind the process incarnation and local status generation. Shares the 16-watch cap and 192 KiB notice limit. |
@@ -466,7 +466,15 @@ writing a journal entry. `author` is the opaque identity-log author compared wit
 learned its author. `display_name` is this author's own member name, as set by
 `ck projects log name` (`member.set_name`): the same value another machine sees
 as `holder_name`, or null when unset or when there is no author. `sharing` is the
-state reported by `identity_log.status`.
+state reported by `identity_log.status`. `box_id` is this computer's daemon
+machine id (32 lowercase hex), present once HELLO_ACK provides it even when
+sharing is disabled.
+
+`agent.where` and each `agent.where_many` row include `holder_box` when the cached
+claim has a holder and that author has shared its daemon machine id. They omit
+it when the box is unknown; `holder` remains the engram author and `holder_name`
+remains the display name. A changed box mapping invalidates `agent.where_watch`
+just like a changed member name.
 
 `agent.session_residence` is intended for restoring a session from backup before
 making it writable. Its precedence is:

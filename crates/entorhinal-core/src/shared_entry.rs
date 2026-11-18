@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::agent::AgentChangeEntry;
+pub use crate::member_box::MemberBox;
 
 pub type SharedRow = BTreeMap<String, Value>;
 
@@ -29,7 +30,7 @@ pub const PROJECT_SHARED_TABLES: &[&str] = &[
     "placement_fact",
 ];
 pub const AGENT_SHARED_TABLES: &[&str] = &["agent", "agent_name_claim"];
-pub const MEMBER_SHARED_TABLES: &[&str] = &["member_name"];
+pub const MEMBER_SHARED_TABLES: &[&str] = &["member_name", "member_box"];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -51,6 +52,8 @@ pub struct ProjectEntry {
     pub agents: Vec<AgentChangeEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member_name: Option<MemberName>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_box: Option<MemberBox>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requesting_agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -226,6 +229,7 @@ impl SharedState {
             tables,
             agents: vec![],
             member_name: None,
+            member_box: None,
             requesting_agent_id: None,
             authorization: None,
         })
@@ -263,6 +267,7 @@ impl SharedState {
                 .collect(),
             agents,
             member_name: None,
+            member_box: None,
             requesting_agent_id: None,
             authorization: None,
         }
@@ -332,7 +337,10 @@ pub(crate) fn record_local_entry(
             attribution(&mut entry)?;
             canonical_bytes(&entry)
         } else if op.starts_with("agent.")
-            || matches!(op, "member.set_name" | "catalog.pin" | "user.set")
+            || matches!(
+                op,
+                "member.set_name" | "member.set_box" | "catalog.pin" | "user.set"
+            )
         {
             canonical_bytes(payload.get("entry").unwrap_or(&payload))
         } else {
@@ -436,7 +444,8 @@ impl ProjectEntry {
         // the workspace correction, whose agent changes are all
         // `agent.set_namespace`.
         if !matches!(self.op.as_str(), "project.shared" | "shared.snapshot")
-            || (self.op == "project.shared" && self.member_name.is_some())
+            || (self.op == "project.shared"
+                && (self.member_name.is_some() || self.member_box.is_some()))
             || (self.op == "project.shared"
                 && self
                     .agents
@@ -489,6 +498,9 @@ impl ProjectEntry {
         if let Some(name) = &self.member_name {
             name.validate()?;
         }
+        if let Some(member_box) = &self.member_box {
+            member_box.validate()?;
+        }
         Ok(())
     }
 
@@ -505,6 +517,9 @@ impl ProjectEntry {
         self.validate(tx)?;
         if let Some(name) = &self.member_name {
             name.restore(tx)?;
+        }
+        if let Some(member_box) = &self.member_box {
+            member_box.restore(tx)?;
         }
         // Defer foreign-key checks to the end of this transaction, so rows that
         // reference each other (for example an agent merged into another agent
