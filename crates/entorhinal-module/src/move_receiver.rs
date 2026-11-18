@@ -849,6 +849,17 @@ impl Receiver {
                 },
             )),
             Err(mut f) => {
+                if hub_plan.is_some()
+                    && f.code == "cut_import_pending"
+                    && f.detail["module_id"].is_string()
+                {
+                    // Engram may still be blocking reads while it installs the
+                    // cut. A participant can pass up that transient refusal;
+                    // retry the step even though it is not a participant code.
+                    f.violation = false;
+                    f.reason = None;
+                    f.action = Some(DriverAction::RetryWithinStep);
+                }
                 if let Some(refusal) = &f.refusal {
                     self.refusals.note(
                         &self.cut,
@@ -874,7 +885,13 @@ impl Receiver {
                         .map_err(|e| HandlerError::new(&e.code, e.detail.to_string()))?;
                     return Ok(Some(POLL));
                 }
-                let irreversible = !row.step.before_boundary(MoveSide::Receiver);
+                let accepted_during_abort =
+                    hub_plan.is_some() && f.detail["op"] == "cut.abort" && f.code == "cut_accepted";
+                if accepted_during_abort {
+                    tracing::error!(cut_id = %self.cut, "engram accepted a cut whose hub move was aborted");
+                }
+                let irreversible =
+                    accepted_during_abort || !row.step.before_boundary(MoveSide::Receiver);
                 if irreversible {
                     f.reason = None;
                     f.diagnostic = true;
@@ -1871,6 +1888,12 @@ impl Receiver {
             progress.pending = None;
             progress.aborted.push(p.module_id.clone());
             self.save(row, progress).await?;
+        }
+        if hub {
+            // Discard participant staging before asking engram to clear its
+            // write block and release its reservation. After a crash, repeat
+            // the idempotent door call, not the checkpointed participant aborts.
+            self.abort_hub_cut().await?;
         }
         // The source may unfreeze as soon as it sees the shared abort. Publish
         // that state only after every receiver participant has restored its data.
