@@ -1,7 +1,6 @@
 use std::{future::Future, task::Poll};
 
 use futures_util::{poll, stream};
-use tracing_subscriber::fmt::{format::FmtSpan, MakeWriter};
 
 use super::*;
 use crate::tests::log_surface_handler;
@@ -91,38 +90,9 @@ async fn hub_watch_and_tail_keep_their_stream_on_transient_errors() {
     assert!(!health.hub.log_tail_live.load(Ordering::Relaxed));
 }
 
-#[derive(Clone, Default)]
-struct Log(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-struct LogWriter(Log);
-
-impl std::io::Write for LogWriter {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0 .0.lock().unwrap().extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for Log {
-    type Writer = LogWriter;
-    fn make_writer(&'a self) -> Self::Writer {
-        LogWriter(self.clone())
-    }
-}
-
 #[tokio::test(start_paused = true)]
 async fn hub_subscription_backoff_caps_and_logs_only_changes_and_recovery() {
     let health = Arc::new(HealthGauges::default());
-    let output = Log::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_span_events(FmtSpan::NONE)
-        .with_writer(output.clone())
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
     let start = Instant::now();
     let mut attempts = 0;
     let mut feed = Feed::log(health.clone(), 9, move |cursor| {
@@ -149,27 +119,13 @@ async fn hub_subscription_backoff_caps_and_logs_only_changes_and_recovery() {
     assert_eq!(feed.next().await, "recovered");
     assert_eq!(feed.next().await, "live");
     assert_eq!(health.hub.failures.load(Ordering::Relaxed), 8);
-    let logged = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
-    assert_eq!(logged.lines().count(), 3, "{logged}");
-    assert!(
-        logged
-            .lines()
-            .next()
-            .unwrap()
-            .contains("code=\"NoResponders\""),
-        "{logged}"
-    );
-    assert!(
-        logged.lines().nth(1).unwrap().contains("code=\"TimedOut\""),
-        "{logged}"
-    );
-    assert!(
-        logged
-            .lines()
-            .nth(2)
-            .unwrap()
-            .contains("hub subscription recovered"),
-        "{logged}"
+    assert_eq!(
+        feed.logged(),
+        [
+            "unavailable NoResponders",
+            "unavailable TimedOut",
+            "recovered after 8"
+        ]
     );
 }
 

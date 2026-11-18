@@ -60,6 +60,11 @@ impl<T> Subscription<T> {
 struct Outage {
     previous: Option<String>,
     failures: u64,
+    // The lines this outage chose to log. Tests read these rather than a
+    // captured subscriber: tracing caches per-callsite interest process-wide,
+    // so a capture can miss lines while other tests run.
+    #[cfg(test)]
+    logged: Vec<String>,
 }
 
 impl Outage {
@@ -69,6 +74,8 @@ impl Outage {
             return false;
         }
         tracing::warn!(target: "hub_transport", feed, code = error.0, "hub subscription unavailable");
+        #[cfg(test)]
+        self.logged.push(format!("unavailable {}", error.0));
         self.previous = Some(error.0);
         true
     }
@@ -76,6 +83,9 @@ impl Outage {
     fn recovered(&mut self, feed: &str) {
         if self.previous.take().is_some() {
             tracing::info!(target: "hub_transport", feed, failures = self.failures, "hub subscription recovered");
+            #[cfg(test)]
+            self.logged
+                .push(format!("recovered after {}", self.failures));
             self.failures = 0;
         }
     }
@@ -110,6 +120,11 @@ enum Kind {
 }
 
 impl<T> Feed<T> {
+    #[cfg(test)]
+    pub(super) fn logged(&self) -> &[String] {
+        &self.outage.logged
+    }
+
     pub(super) fn kv<F, Fut>(health: Arc<HealthGauges>, open: F) -> Self
     where
         F: FnMut(Option<u64>) -> Fut + Send + 'static,

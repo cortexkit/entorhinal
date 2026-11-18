@@ -686,7 +686,8 @@ impl LogReplan for CreateReplan<'_> {
 }
 
 // This step cannot build a write; it is only passed when an existing attempt
-// already supplies the persisted bytes. Concurrent expiry cannot send it.
+// already supplies the persisted bytes. If that attempt has meanwhile been
+// pruned, there are no bytes to resend, so the step sends nothing.
 fn resume_only() -> Step {
     Step {
         name: String::new(),

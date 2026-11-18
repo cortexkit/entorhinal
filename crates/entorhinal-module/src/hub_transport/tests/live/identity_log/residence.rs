@@ -117,8 +117,9 @@ fn migrate_identity(node: &Node, agent: &str, name: &str) {
 }
 
 fn attach_session(node: &Node, agent: &str) {
-    // Seed an existing binding so the session route can query the new claim
-    // without relying on registration succeeding during the pending interval.
+    // Seed an existing binding so the session route can query the new claim.
+    // Registering through the route would be refused while the agent's first
+    // claim is still being written, which this test doesn't exercise.
     store_of(&node.handler)
         .register_session(&entorhinal_core::SessionRegistration {
             agent_id: agent,
