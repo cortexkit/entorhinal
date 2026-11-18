@@ -102,6 +102,9 @@ mod fake_daemon;
 #[allow(dead_code)]
 mod fake_door;
 mod fleet_record;
+// The hub backend starts this transport only when the store selects it.
+#[allow(dead_code)]
+mod hub_transport;
 mod incarnation;
 mod member;
 mod memory_context;
@@ -390,6 +393,7 @@ impl RequestLatency {
 
 #[derive(Default)]
 struct HealthGauges {
+    hub: hub_transport::Gauges,
     liveness_bus_connected: AtomicBool,
     liveness_bus_authoritative: AtomicBool,
     liveness_bus_sessions: AtomicU64,
@@ -1364,6 +1368,7 @@ impl ModuleHandler for ProjectsHandler {
             }))))))),
         };
         if let Some(metrics) = report.metrics.as_mut() {
+            self.health.hub.report(metrics);
             metrics["providerCacheHits"] = json!(providers.hits);
             metrics["providerCacheMisses"] = json!(providers.misses);
             metrics["providerWatchLive"] = json!(providers.watch_live);
