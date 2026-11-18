@@ -21,13 +21,15 @@ use tokio::{
 use crate::{encode_result, watches::WatchTransport, HandlerError, ProjectsHandler, RouteKey};
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub(super) const WATCH: &str = "role.lease";
 pub(super) const ACK: &str = "role.lease.ack";
 pub(super) const RELEASE: &str = "role.lease.release";
+pub(super) const YIELD: &str = "role.lease.yield";
 pub(super) const RENEW: &str = "role.renew";
 const ACQUIRE: &str = "role.acquire";
+const TRANSFER: &str = "role.handback";
 const ACK_MS: u64 = 5_000;
 pub(super) const LEASE_MS: u64 = 60_000;
 const RENEW_MS: u64 = 20_000;
@@ -93,11 +95,11 @@ struct Client {
     acked: Notify,
     changed: Notify,
     view: Mutex<View>,
-    release: mpsc::Sender<Release>,
+    control: mpsc::Sender<Control>,
 }
 
 pub(super) struct Leases {
-    clients: Mutex<HashMap<String, Arc<Client>>>,
+    clients: Arc<Mutex<HashMap<String, Arc<Client>>>>,
     seq: AtomicU64,
     held: AtomicU64,
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
@@ -109,7 +111,7 @@ pub(super) struct Leases {
 impl Default for Leases {
     fn default() -> Self {
         Self {
-            clients: Mutex::default(),
+            clients: Arc::default(),
             seq: AtomicU64::default(),
             held: AtomicU64::default(),
             clock: Arc::new(monotonic_ms),
@@ -141,6 +143,25 @@ impl Drop for Registration<'_> {
     fn drop(&mut self) {
         self.holding(false);
         self.leases.clients.lock().unwrap().remove(&self.role);
+        if let Some(backend) = self.leases.backend.borrow().clone() {
+            let clients = self.leases.clients.clone();
+            let role = self.role.clone();
+            tokio::spawn(async move {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                if let Ok(Some(revision)) = backend
+                    .read_handback_revision(&role, backend.local_box(), deadline)
+                    .await
+                {
+                    // A reopened watch owns its request. A revision-checked
+                    // delete protects a new request that lands after this check.
+                    if !clients.lock().unwrap().contains_key(&role) {
+                        let _ = backend
+                            .delete_handback(&role, backend.local_box(), revision, deadline)
+                            .await;
+                    }
+                }
+            });
+        }
     }
 }
 
@@ -167,7 +188,7 @@ impl Leases {
         &self,
         role: String,
         route: RouteKey,
-        release: mpsc::Sender<Release>,
+        control: mpsc::Sender<Control>,
     ) -> Result<(Arc<Client>, Registration<'_>), HandlerError> {
         use std::collections::hash_map::Entry;
 
@@ -177,7 +198,7 @@ impl Leases {
             acked: Notify::new(),
             changed: Notify::new(),
             view: Mutex::default(),
-            release,
+            control,
         });
         match self.clients.lock().unwrap().entry(role.clone()) {
             Entry::Occupied(_) => {
@@ -220,6 +241,7 @@ impl Leases {
         mut registration: Registration<'_>,
         mut views: watch::Receiver<View>,
     ) -> Result<(), HandlerError> {
+        let mut requested = false;
         loop {
             let view = *views.borrow_and_update();
             let issued_at_ms = self.now();
@@ -236,9 +258,10 @@ impl Leases {
                 gen: view.gen,
                 valid_for_ms,
                 issued_at_ms,
-                handback: (holding && view.handback).then_some(true),
+                handback: (holding && (requested || view.handback)).then_some(view.handback),
                 seq,
             };
+            requested = holding && view.handback;
             let body = serde_json::to_vec(&notice).map_err(crate::invalid_params)?;
             registration.holding(holding);
             let expires = tokio::time::sleep(Duration::from_millis(valid_for_ms));
@@ -313,7 +336,7 @@ pub(super) struct Record {
 }
 
 impl Record {
-    fn new(writer: &str, episode: u64, gen: i64, released: bool) -> Self {
+    pub(super) fn new(writer: &str, episode: u64, gen: i64, released: bool) -> Self {
         Self {
             v: 1,
             holder: (!released).then(|| writer.to_owned()),
@@ -376,7 +399,9 @@ pub(super) fn accepts(
             .is_some_and(|holder| !is_current(holder, prior.holder_ep))
     });
     if body.forced {
-        return writer_current
+        // A reader without a consecutive predecessor can accept a historical
+        // holder. A closed episode can't replace a known predecessor.
+        return (writer_current || (historical && consecutive.is_none()))
             && body.gen > 1
             && body.holder.as_deref() == Some(header.writer.as_str())
             && body.holder_ep == header.writer_ep
@@ -386,10 +411,17 @@ pub(super) fn accepts(
     // that has since been removed. It cannot replace a known predecessor.
     (writer_current || (historical && consecutive.is_none()))
         && !replaced_removed
-        && body
-            .holder
-            .as_deref()
-            .is_none_or(|holder| !holder.starts_with("engram:"))
+        && body.holder.as_deref().is_some_and(|holder| {
+            box_id(holder)
+                && if holder == header.writer {
+                    body.holder_ep == header.writer_ep
+                } else {
+                    consecutive.is_none_or(|prior| {
+                        prior.holder.as_deref() == Some(header.writer.as_str())
+                            && prior.holder_ep == header.writer_ep
+                    })
+                }
+        })
 }
 
 pub(super) struct Observation {
@@ -410,7 +442,7 @@ impl Observation {
             })
     }
 
-    fn gen(&self) -> i64 {
+    pub(super) fn gen(&self) -> i64 {
         self.record.as_ref().map_or(0, |record| record.gen)
     }
 }
@@ -421,6 +453,7 @@ pub(super) struct Change {
     pub expected: u64,
     pub writer_ep: u64,
     pub body: Record,
+    pub vacancy_preference: Option<u64>,
 }
 
 pub(super) struct Confirmed {
@@ -428,11 +461,71 @@ pub(super) struct Confirmed {
     pub sent_ms: Option<u64>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Preference {
+    pub v: u64,
+    #[serde(rename = "box")]
+    pub box_id: String,
+    pub writer: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Handback {
+    pub v: u64,
+    #[serde(rename = "box")]
+    pub box_id: String,
+    pub gen: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Preferred {
+    pub revision: u64,
+    pub box_id: String,
+    pub episode: u64,
+}
+
+#[derive(Clone)]
+pub(super) struct CandidateRequest {
+    pub revision: u64,
+    pub gen: i64,
+    pub episode: u64,
+}
+
 #[async_trait::async_trait]
 pub(super) trait Backend: Send + Sync {
     fn local_box(&self) -> &str;
     fn role(&self, name: &str) -> Result<Observation, HandlerError>;
+    fn preferred(&self, role: &str) -> Result<Option<Preferred>, HandlerError>;
+    fn handback(&self, role: &str, box_id: &str) -> Result<Option<CandidateRequest>, HandlerError>;
     fn link_events(&self) -> (&Notify, &Notify);
+    async fn reread_offer(
+        &self,
+        role: &str,
+        target: &Preferred,
+        gen: i64,
+        deadline: Instant,
+    ) -> Result<bool, HandlerError>;
+    async fn read_handback_revision(
+        &self,
+        role: &str,
+        box_id: &str,
+        deadline: Instant,
+    ) -> Result<Option<u64>, HandlerError>;
+    async fn put_handback(
+        &self,
+        role: &str,
+        gen: i64,
+        deadline: Instant,
+    ) -> Result<(), HandlerError>;
+    async fn delete_handback(
+        &self,
+        role: &str,
+        box_id: &str,
+        revision: u64,
+        deadline: Instant,
+    ) -> Result<(), HandlerError>;
     async fn write(
         &self,
         role: &str,
@@ -441,16 +534,31 @@ pub(super) trait Backend: Send + Sync {
     ) -> Result<Confirmed, HandlerError>;
 }
 
-struct Release {
+struct Control {
     gen: i64,
-    reply: oneshot::Sender<Result<(), HandlerError>>,
+    yielding: bool,
+    reply: oneshot::Sender<Result<bool, HandlerError>>,
+}
+
+fn no_offer() -> HandlerError {
+    HandlerError::new(
+        "lease_handback_not_requested",
+        "there is no handback on this watch",
+    )
+}
+
+fn lease_gen_moved() -> HandlerError {
+    HandlerError::new(
+        "epoch_moved",
+        "the local role lease generation no longer matches",
+    )
 }
 
 fn change(step: &'static str, prior: &Observation, local: &str) -> Result<Change, HandlerError> {
     let writer_ep = prior
         .local_episode
         .ok_or_else(|| HandlerError::new("hub_not_ready", "local membership is not ready"))?;
-    let gen = if step == ACQUIRE {
+    let gen = if matches!(step, ACQUIRE | TRANSFER) {
         prior
             .gen()
             .checked_add(1)
@@ -464,6 +572,7 @@ fn change(step: &'static str, prior: &Observation, local: &str) -> Result<Change
         expected: prior.revision,
         writer_ep,
         body: Record::new(local, writer_ep, gen, step == RELEASE),
+        vacancy_preference: None,
     })
 }
 
@@ -473,7 +582,7 @@ impl Leases {
         handler: &ProjectsHandler,
         role: &str,
         client: &Client,
-        mut releases: mpsc::Receiver<Release>,
+        mut controls: mpsc::Receiver<Control>,
         notices: watch::Sender<View>,
     ) -> Result<(), HandlerError> {
         let mut installed = self.backend.subscribe();
@@ -481,7 +590,7 @@ impl Leases {
             let backend = installed.borrow_and_update().clone();
             if let Some(backend) = backend {
                 tokio::select! {
-                    result = self.run_candidate(role, client, backend.as_ref(), &mut releases, &notices) => return result,
+                    result = self.run_candidate(role, client, backend.as_ref(), &mut controls, &notices) => return result,
                     _ = installed.changed() => { notices.send_replace(View::default()); }
                 }
             } else {
@@ -501,10 +610,14 @@ impl Leases {
                     notices.send_replace(next);
                 }
                 tokio::select! {
-                    request = releases.recv() => {
+                    request = controls.recv() => {
                         if let Some(request) = request {
+                            if request.yielding {
+                                let _ = request.reply.send(Err(no_offer()));
+                                continue;
+                            }
                             let result = if next.gen == request.gen && next.until_ms.is_some() {
-                                Ok(())
+                                Ok(true)
                             } else {
                                 Err(HandlerError::new("epoch_moved", "the local role lease generation no longer matches"))
                             };
@@ -525,7 +638,7 @@ impl Leases {
         role: &str,
         client: &Client,
         backend: &dyn Backend,
-        releases: &mut mpsc::Receiver<Release>,
+        controls: &mut mpsc::Receiver<Control>,
         notices: &watch::Sender<View>,
     ) -> Result<(), HandlerError> {
         let (link, membership) = backend.link_events();
@@ -536,6 +649,10 @@ impl Leases {
         let mut renewal_due = 0;
         let mut retry_at = 0;
         let mut failed_since = None;
+        let mut offered: Option<Preferred> = None;
+        let mut expired_request: Option<(String, u64)> = None;
+        let mut cleanup: Option<(String, u64)> = None;
+        let mut signal_retry = 0;
         loop {
             // Register for readiness changes before reading the snapshot.
             let link_changed = link.notified();
@@ -545,7 +662,9 @@ impl Leases {
             let prior = *notices.borrow();
             let mut wake_at = None;
             let lapsed = prior.until_ms.is_some_and(|until| until <= now);
-            if lapsed {
+            if lapsed
+                || (current.record.is_some() && !current.holder_current && prior.until_ms.is_some())
+            {
                 notices.send_replace(View {
                     gen: prior.gen,
                     ..View::default()
@@ -557,12 +676,23 @@ impl Leases {
                     pending = None;
                 }
             } else {
-                let identity = (current.watch, current.revision);
+                let preferred = backend.preferred(role)?;
+                let slot_free = current
+                    .record
+                    .as_ref()
+                    .is_none_or(|row| row.holder.is_none());
+                let defer = preferred
+                    .as_ref()
+                    .filter(|p| slot_free && p.box_id != local);
+                let identity = (current.watch, current.revision, defer.map(|p| p.revision));
                 if last_seen.is_none_or(|(prior, _)| prior != identity) {
                     last_seen = Some((identity, now));
                     failed_since = None;
                 }
                 let mine = current.own(local);
+                if !mine || current.gen() != prior.gen {
+                    offered = None;
+                }
                 notices.send_if_modified(|view| {
                     if current.gen() == view.gen && (mine || view.until_ms.is_none()) {
                         return false;
@@ -573,10 +703,6 @@ impl Leases {
                     };
                     true
                 });
-                let slot_free = current
-                    .record
-                    .as_ref()
-                    .is_none_or(|row| row.holder.is_none());
                 let count_done = last_seen.unwrap().1.saturating_add(LEASE_MS);
                 let allowed =
                     failed_since.is_none_or(|first: u64| now.saturating_sub(first) < LINK_MS);
@@ -585,24 +711,47 @@ impl Leases {
                     && client.awaiting.lock().unwrap().is_none()
                     && *client.view.lock().unwrap() == *notices.borrow()
                 {
-                    if pending.as_ref().is_some_and(|op| {
-                        op.step == RENEW && (!mine || current.gen() != op.body.gen)
+                    let can_acquire = (slot_free && defer.is_none())
+                        || (!mine && (slot_free || current.holder_current) && now >= count_done);
+                    if pending.as_ref().is_some_and(|op| match op.step {
+                        RENEW => !mine || current.gen() != op.body.gen,
+                        ACQUIRE => !can_acquire || op.expected != current.revision,
+                        _ => false,
                     }) {
                         pending = None;
+                        expired_request = None;
                     }
-                    let due = if pending.is_some() || slot_free {
+                    let due = if pending.is_some() || can_acquire {
                         Some(retry_at)
                     } else if mine {
                         Some(renewal_due.max(retry_at))
-                    } else if current.holder_current {
+                    } else if slot_free || current.holder_current {
                         Some(count_done.max(retry_at))
                     } else {
                         None
                     };
                     if due.is_some_and(|time| now >= time) {
                         if pending.is_none() {
-                            pending =
-                                Some(change(if mine { RENEW } else { ACQUIRE }, &current, local)?);
+                            let mut next =
+                                change(if mine { RENEW } else { ACQUIRE }, &current, local)?;
+                            if slot_free {
+                                next.vacancy_preference = Some(defer.map_or(0, |p| p.revision));
+                            }
+                            pending = Some(next);
+                            if let Some(previous) = preferred.as_ref().filter(|p| {
+                                !mine
+                                    && current.record.as_ref().is_some_and(|r| {
+                                        r.holder.as_deref() == Some(p.box_id.as_str())
+                                    })
+                            }) {
+                                let deadline = Instant::now() + Duration::from_secs(5);
+                                expired_request = backend
+                                    .read_handback_revision(role, &previous.box_id, deadline)
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .map(|revision| (previous.box_id.clone(), revision));
+                            }
                         }
                         let op = pending.as_ref().unwrap();
                         let (step, gen) = (op.step, op.body.gen);
@@ -631,13 +780,14 @@ impl Leases {
                                             notices.send_replace(View {
                                                 gen,
                                                 until_ms: Some(until),
-                                                handback: false,
+                                                handback: offered.is_some(),
                                             });
                                         }
                                     }
                                 } else {
                                     // Acquisition alone never gives an acting window.
                                     renewal_due = 0;
+                                    cleanup = expired_request.take();
                                 }
                             }
                             Err(error) => {
@@ -649,6 +799,7 @@ impl Leases {
                                     failed_since.get_or_insert(now);
                                 } else {
                                     pending = None;
+                                    expired_request = None;
                                 }
                             }
                         }
@@ -657,15 +808,136 @@ impl Leases {
                         wake_at = due;
                     }
                 }
+                // Keep control-key traffic independent of notice acknowledgments.
+                // A waiting candidate may have no acting window at all.
+                if current.revision >= wait_revision && allowed {
+                    let own_request = backend.handback(role, local)?;
+                    let wants_handback = !mine
+                        && current.holder_current
+                        && preferred.as_ref().is_some_and(|p| p.box_id == local);
+                    let update_request = if wants_handback {
+                        own_request
+                            .as_ref()
+                            .is_none_or(|request| request.gen != current.gen())
+                    } else {
+                        own_request.is_some()
+                    };
+                    if cleanup.is_some() || update_request {
+                        if now >= signal_retry {
+                            let deadline = Instant::now() + Duration::from_secs(5);
+                            if let Some((box_id, revision)) = &cleanup {
+                                match backend
+                                    .delete_handback(role, box_id, *revision, deadline)
+                                    .await
+                                {
+                                    Ok(()) => cleanup = None,
+                                    Err(error) if error.code == "hub_write_superseded" => {
+                                        cleanup = None
+                                    }
+                                    Err(_) => {}
+                                }
+                            } else if wants_handback {
+                                let _ = backend.put_handback(role, current.gen(), deadline).await;
+                            } else if let Some(request) = own_request {
+                                let _ = backend
+                                    .delete_handback(role, local, request.revision, deadline)
+                                    .await;
+                            }
+                            signal_retry = self.now().saturating_add(RETRY_MS);
+                        }
+                        wake_at = Some(wake_at.map_or(signal_retry, |at| at.min(signal_retry)));
+                    }
+                }
+                if mine
+                    && offered.is_none()
+                    && current.revision >= wait_revision
+                    && client.awaiting.lock().unwrap().is_none()
+                    && *client.view.lock().unwrap() == *notices.borrow()
+                {
+                    if let Some(target) = preferred.filter(|p| p.box_id != local) {
+                        if backend
+                            .handback(role, &target.box_id)?
+                            .is_some_and(|request| {
+                                request.gen == current.gen() && request.episode == target.episode
+                            })
+                        {
+                            let announced = notices.send_if_modified(|view| {
+                                if view.until_ms.is_some_and(|until| until > self.now()) {
+                                    view.handback = true;
+                                    true
+                                } else {
+                                    false
+                                }
+                            });
+                            if announced {
+                                offered = Some(target);
+                            }
+                        }
+                    }
+                }
             }
             if let Some(until) = prior.until_ms.filter(|_| !lapsed) {
                 wake_at = Some(wake_at.map_or(until, |at| at.min(until)));
             }
             tokio::select! {
                 biased;
-                request = releases.recv() => {
+                request = controls.recv() => {
                     if let Some(request) = request {
-                        let result = self.release(backend, role, request.gen, wait_revision, client).await;
+                        if request.yielding {
+                            let result = match offered.as_ref() {
+                                Some(target) => self.transfer(backend, role, request.gen, wait_revision, target).await,
+                                None => Err(no_offer()),
+                            };
+                            let result = match result {
+                                Ok(Some(revision)) => {
+                                    offered = None;
+                                    pending = None;
+                                    wait_revision = revision;
+                                    let stopped = View { gen: request.gen, ..View::default() };
+                                    *client.view.lock().unwrap() = stopped;
+                                    notices.send_replace(stopped);
+                                    Ok(true)
+                                }
+                                Ok(None) => {
+                                    offered = None;
+                                    pending = None;
+                                    renewal_due = 0;
+                                    // Confirm a new renewal before extending the deadline.
+                                    let mut view = *notices.borrow();
+                                    view.handback = false;
+                                    let observed = backend.role(role)?;
+                                    if observed.ready && observed.own(local) && observed.gen() == request.gen {
+                                        let renewal = change(RENEW, &observed, local)?;
+                                        let deadline = Instant::now() + Duration::from_secs(5);
+                                        if let Ok(confirmed) = backend.write(role, &renewal, deadline).await {
+                                            wait_revision = confirmed.revision;
+                                            if let Some(sent) = confirmed.sent_ms.filter(|sent| *sent <= self.now()) {
+                                                renewal_due = sent.saturating_add(RENEW_MS);
+                                                let until = sent.saturating_add(ACT_MS);
+                                                view.until_ms = (until > self.now()).then_some(until);
+                                            }
+                                        }
+                                    }
+                                    notices.send_replace(view);
+                                    Ok(false)
+                                }
+                                Err(error) => {
+                                    if error.code == "hub_write_unsettled" {
+                                        // A same-generation renewal must win the revision
+                                        // before the module can safely resume acting.
+                                        pending = None;
+                                        renewal_due = 0;
+                                        let stopped = View { gen: request.gen, ..View::default() };
+                                        *client.view.lock().unwrap() = stopped;
+                                        notices.send_replace(stopped);
+                                    }
+                                    Err(error)
+                                }
+                            };
+                            let _ = request.reply.send(result);
+                            continue;
+                        }
+                        let result = self.release(backend, role, request.gen, wait_revision, client).await.map(|()| true);
                         let _ = request.reply.send(result);
                         // A clean stop never turns back into a candidate, even
                         // if the hub could not confirm the release.
@@ -684,6 +956,37 @@ impl Leases {
                 } => {}
             }
         }
+    }
+
+    async fn transfer(
+        &self,
+        backend: &dyn Backend,
+        role: &str,
+        gen: i64,
+        wait_revision: u64,
+        target: &Preferred,
+    ) -> Result<Option<u64>, HandlerError> {
+        let current = backend.role(role)?;
+        if !current.own(backend.local_box()) || current.gen() != gen {
+            return Err(lease_gen_moved());
+        }
+        if !current.ready || current.revision < wait_revision {
+            return Err(HandlerError::new(
+                "hub_not_ready",
+                "role watch is not current",
+            ));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        if !backend.reread_offer(role, target, gen, deadline).await? {
+            return Ok(None);
+        }
+        let mut transfer = change(TRANSFER, &current, backend.local_box())?;
+        transfer.body.holder = Some(target.box_id.clone());
+        transfer.body.holder_ep = target.episode;
+        backend
+            .write(role, &transfer, deadline)
+            .await
+            .map(|landed| Some(landed.revision))
     }
 
     async fn release(
@@ -829,6 +1132,23 @@ impl ProjectsHandler {
         params: Value,
         key: RouteKey,
     ) -> Result<Vec<u8>, HandlerError> {
+        self.control_role_lease(params, key, false).await
+    }
+
+    pub(super) async fn yield_role_lease(
+        &self,
+        params: Value,
+        key: RouteKey,
+    ) -> Result<Vec<u8>, HandlerError> {
+        self.control_role_lease(params, key, true).await
+    }
+
+    async fn control_role_lease(
+        &self,
+        params: Value,
+        key: RouteKey,
+        yielding: bool,
+    ) -> Result<Vec<u8>, HandlerError> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Request {
@@ -845,31 +1165,48 @@ impl ProjectsHandler {
                 "this watch has not held the specified role generation",
             ));
         }
+        if yielding
+            && (!view.handback
+                || !view
+                    .until_ms
+                    .is_some_and(|until| self.role_leases.now() < until))
+        {
+            return Err(no_offer());
+        }
         let (reply, result) = oneshot::channel();
         let closed = || {
             HandlerError::new(
                 "stream_closed",
-                "the role lease watch ended before release confirmed",
+                "the role lease watch ended before the control request confirmed",
             )
         };
         client
-            .release
-            .try_send(Release {
+            .control
+            .try_send(Control {
                 gen: request.gen,
+                yielding,
                 reply,
             })
             .map_err(|error| {
                 if matches!(error, mpsc::error::TrySendError::Full(_)) {
                     HandlerError::new(
-                        "lease_release_pending",
-                        "a release is already pending on this watch",
+                        if yielding {
+                            "lease_yield_pending"
+                        } else {
+                            "lease_release_pending"
+                        },
+                        "a lease control request is already pending on this watch",
                     )
                 } else {
                     closed()
                 }
             })?;
-        result.await.map_err(|_| closed())??;
-        encode_result(json!({"released":true}))
+        let done = result.await.map_err(|_| closed())??;
+        encode_result(if yielding {
+            json!({"yielded":done})
+        } else {
+            json!({"released":done})
+        })
     }
 
     pub(super) async fn serve_role_lease(

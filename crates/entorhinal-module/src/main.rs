@@ -716,6 +716,7 @@ const MUTATING_METHODS: &[&str] = &[
     "role.take",
     role_leases::ACK,
     role_leases::RELEASE,
+    role_leases::YIELD,
     "agent.move",
     "agent.move_abort",
     "agent.set_lid_close_moves",
@@ -741,6 +742,7 @@ const SELF_ADMITTED_METHODS: &[&str] = &[
     roles::TAKE,
     role_leases::ACK,
     role_leases::RELEASE,
+    role_leases::YIELD,
     hub_residence::TAKE,
     move_admission::MOVE,
     move_ops::ABORT,
@@ -1466,12 +1468,12 @@ impl ProjectsHandler {
         }
         if matches!(
             request.method.as_str(),
-            role_leases::ACK | role_leases::RELEASE
+            role_leases::ACK | role_leases::RELEASE | role_leases::YIELD
         ) {
-            let result = if request.method == role_leases::ACK {
-                self.ack_role_lease(request.params, key)
-            } else {
-                self.release_role_lease(request.params, key).await
+            let result = match request.method.as_str() {
+                role_leases::ACK => self.ack_role_lease(request.params, key),
+                role_leases::RELEASE => self.release_role_lease(request.params, key).await,
+                _ => self.yield_role_lease(request.params, key).await,
             };
             return match result {
                 Ok(body) => HandlerOutcome::Response(body),
@@ -2591,6 +2593,7 @@ fn manifest() -> ModuleManifest {
             })).chain([
                 (role_leases::ACK, "Acknowledge a role lease notice on its watch route."),
                 (role_leases::RELEASE, "Release a role on its watch route after stopping work."),
+                (role_leases::YIELD, "Yield a role to its preferred computer after finishing the current act."),
             ].into_iter().map(|(method, description)| {
                 management_operation(method, ManagementOperationKind::Mutate, description)
             })).chain(std::iter::once(roles::TAKE).map(|method| {
@@ -3369,6 +3372,7 @@ mod tests {
                 "role.take",
                 "role.lease.ack",
                 "role.lease.release",
+                "role.lease.yield",
                 "agent.take",
                 "agent.move",
                 "agent.move_abort",

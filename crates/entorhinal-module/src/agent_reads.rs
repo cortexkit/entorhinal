@@ -1758,6 +1758,7 @@ mod tests {
             "role.take",
             "role.lease.ack",
             "role.lease.release",
+            "role.lease.yield",
             "agent.take",
         ];
         for (kind, names) in [

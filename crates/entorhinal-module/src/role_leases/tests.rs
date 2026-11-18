@@ -8,8 +8,12 @@ const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const C: &str = "cccccccccccccccccccccccccccccccc";
 const ROUTE: RouteKey = (3, 1);
 
-struct Hub {
+pub(crate) struct Hub {
     row: Mutex<(u64, Option<Record>)>,
+    preferred: Mutex<Option<Preferred>>,
+    requests: Mutex<HashMap<String, CandidateRequest>>,
+    removed: Mutex<Vec<&'static str>>,
+    signal_revision: AtomicU64,
     attempts: Mutex<Vec<(&'static str, u64)>>,
     landed: Mutex<Vec<(&'static str, Record)>>,
     updates: Notify,
@@ -28,6 +32,10 @@ impl Hub {
                 holder.map(|box_id| Record::new(box_id, 0, 1, false)),
             )),
             attempts: Mutex::default(),
+            preferred: Mutex::default(),
+            requests: Mutex::default(),
+            removed: Mutex::default(),
+            signal_revision: AtomicU64::new(1),
             landed: Mutex::default(),
             updates: Notify::new(),
             race: race.then(|| Barrier::new(2)),
@@ -51,6 +59,19 @@ impl Hub {
             .map(|(_, row)| row.clone())
             .collect()
     }
+
+    fn prefer(&self, box_id: &str) {
+        *self.preferred.lock().unwrap() = Some(Preferred {
+            revision: self.signal_revision.fetch_add(1, Ordering::Relaxed),
+            box_id: box_id.into(),
+            episode: 0,
+        });
+        self.updates.notify_waiters();
+    }
+
+    fn current(&self, box_id: &str) -> bool {
+        !box_id.starts_with("engram:") && !self.removed.lock().unwrap().contains(&box_id)
+    }
 }
 
 struct Peer {
@@ -62,6 +83,16 @@ struct Peer {
 }
 
 impl Peer {
+    fn new(local: &'static str, hub: &Arc<Hub>, live: bool) -> Self {
+        Self {
+            local,
+            hub: hub.clone(),
+            watching: AtomicBool::new(live),
+            link_incarnation: AtomicU64::default(),
+            link: Notify::new(),
+        }
+    }
+
     fn link(&self, live: bool) {
         self.watching.store(live, Ordering::Relaxed);
         self.link_incarnation.fetch_add(1, Ordering::Relaxed);
@@ -79,7 +110,10 @@ impl Backend for Peer {
         let (revision, record) = self.hub.row.lock().unwrap().clone();
         Ok(Observation {
             revision,
-            holder_current: record.as_ref().is_some_and(|r| r.holder.is_some()),
+            holder_current: record
+                .as_ref()
+                .and_then(|r| r.holder.as_deref())
+                .is_some_and(|holder| self.hub.current(holder)),
             record,
             ready: self.watching.load(Ordering::Relaxed),
             local_episode: Some(0),
@@ -89,6 +123,75 @@ impl Backend for Peer {
 
     fn link_events(&self) -> (&Notify, &Notify) {
         (&self.link, &self.hub.updates)
+    }
+
+    fn preferred(&self, _: &str) -> Result<Option<Preferred>, HandlerError> {
+        Ok(self
+            .hub
+            .preferred
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|p| self.hub.current(&p.box_id)))
+    }
+
+    fn handback(&self, _: &str, box_id: &str) -> Result<Option<CandidateRequest>, HandlerError> {
+        Ok(self.hub.requests.lock().unwrap().get(box_id).cloned())
+    }
+
+    async fn reread_offer(
+        &self,
+        role: &str,
+        target: &Preferred,
+        gen: i64,
+        _: Instant,
+    ) -> Result<bool, HandlerError> {
+        Ok(self
+            .preferred(role)?
+            .is_some_and(|p| p.box_id == target.box_id && p.episode == target.episode)
+            && self
+                .handback(role, &target.box_id)?
+                .is_some_and(|r| r.gen == gen))
+    }
+
+    async fn read_handback_revision(
+        &self,
+        role: &str,
+        box_id: &str,
+        _: Instant,
+    ) -> Result<Option<u64>, HandlerError> {
+        Ok(self.handback(role, box_id)?.map(|request| request.revision))
+    }
+
+    async fn put_handback(&self, _: &str, gen: i64, _: Instant) -> Result<(), HandlerError> {
+        self.hub.requests.lock().unwrap().insert(
+            self.local.into(),
+            CandidateRequest {
+                revision: self.hub.signal_revision.fetch_add(1, Ordering::Relaxed),
+                gen,
+                episode: 0,
+            },
+        );
+        self.hub.updates.notify_waiters();
+        Ok(())
+    }
+
+    async fn delete_handback(
+        &self,
+        _: &str,
+        box_id: &str,
+        revision: u64,
+        _: Instant,
+    ) -> Result<(), HandlerError> {
+        let mut requests = self.hub.requests.lock().unwrap();
+        if requests
+            .get(box_id)
+            .is_some_and(|request| request.revision == revision)
+        {
+            requests.remove(box_id);
+            self.hub.updates.notify_waiters();
+        }
+        Ok(())
     }
 
     async fn write(&self, _: &str, change: &Change, _: Instant) -> Result<Confirmed, HandlerError> {
@@ -166,13 +269,7 @@ async fn tick(ms: u64) {
 
 impl ClientWatch {
     async fn open(local: &'static str, hub: &Arc<Hub>, live: bool) -> Self {
-        let peer = Arc::new(Peer {
-            local,
-            hub: hub.clone(),
-            watching: AtomicBool::new(live),
-            link_incarnation: AtomicU64::default(),
-            link: Notify::new(),
-        });
+        let peer = Arc::new(Peer::new(local, hub, live));
         let mut handler = ProjectsHandler::with_runtime("role-test".into(), || 0);
         handler.route_admissions().insert(
             ROUTE,
@@ -501,4 +598,191 @@ async fn lease_unreachable_hub_never_grants_and_stops_retrying_after_25_seconds(
     hub.reachable.store(true, Ordering::Relaxed);
     a.peer.link(true);
     assert!(a.ack_waiting().await.last().unwrap().holding);
+}
+
+async fn yield_from(client: &ClientWatch, gen: i64) -> Value {
+    let response = client
+        .handler
+        .handle_active_request(
+            &serde_json::to_vec(&json!({"method":YIELD,"params":{"role":ROLE,"gen":gen}})).unwrap(),
+            ROUTE,
+        )
+        .await;
+    let crate::HandlerOutcome::Response(response) = response else {
+        panic!("yield failed: {response:?}");
+    };
+    serde_json::from_slice::<Value>(&response).unwrap()["result"].clone()
+}
+
+#[tokio::test(start_paused = true)]
+async fn lease_handback_waits_for_safe_point_and_transfers_directly() {
+    let hub = Hub::new(Some(A), false);
+    let mut a = ClientWatch::open(A, &hub, true).await;
+    assert!(a.ack_waiting().await.iter().any(|notice| notice.holding));
+    hub.prefer(B);
+    let mut b = ClientWatch::open(B, &hub, true).await;
+    let mut c = ClientWatch::open(C, &hub, true).await;
+    b.ack_waiting().await;
+    c.ack_waiting().await;
+    assert!(a
+        .ack_waiting()
+        .await
+        .iter()
+        .any(|notice| notice.handback == Some(true)));
+
+    // The owner is still in an irreversible act and hasn't called yield.
+    for _ in 0..4 {
+        tick(RENEW_MS).await;
+        a.ack_waiting().await;
+        assert!(hub.writes(TRANSFER).is_empty());
+        assert_eq!(
+            hub.row
+                .lock()
+                .unwrap()
+                .1
+                .as_ref()
+                .unwrap()
+                .holder
+                .as_deref(),
+            Some(A)
+        );
+    }
+    assert!(hub.writes(RENEW).len() >= 4);
+    assert_eq!(yield_from(&a, 1).await, json!({"yielded":true}));
+    assert!(hub.writes(RELEASE).is_empty());
+    assert!(hub.writes(ACQUIRE).is_empty());
+    let transfers = hub.writes(TRANSFER);
+    assert_eq!(transfers.len(), 1);
+    assert_eq!(
+        (transfers[0].gen, transfers[0].holder.as_deref()),
+        (2, Some(B))
+    );
+    assert!(b
+        .ack_waiting()
+        .await
+        .iter()
+        .any(|notice| notice.holding && notice.gen == 2));
+    assert!(hub.requests.lock().unwrap().get(B).is_none());
+    assert!(c.ack_waiting().await.iter().all(|notice| !notice.holding));
+}
+
+#[tokio::test(start_paused = true)]
+async fn lease_handback_withdrawal_keeps_and_renews_holder() {
+    let hub = Hub::new(Some(A), false);
+    let mut a = ClientWatch::open(A, &hub, true).await;
+    a.ack_waiting().await;
+    hub.prefer(B);
+    let mut b = ClientWatch::open(B, &hub, true).await;
+    b.ack_waiting().await;
+    let offered = a
+        .ack_waiting()
+        .await
+        .into_iter()
+        .find(|notice| notice.handback == Some(true))
+        .unwrap();
+    tick(1_000).await;
+    drop(b);
+    pump().await;
+    assert!(hub.requests.lock().unwrap().get(B).is_none());
+    assert_eq!(yield_from(&a, 1).await, json!({"yielded":false}));
+    let cancelled = a
+        .ack_waiting()
+        .await
+        .into_iter()
+        .find(|notice| notice.handback == Some(false))
+        .unwrap();
+    assert!(cancelled.holding);
+    assert!(
+        cancelled.issued_at_ms + cancelled.valid_for_ms
+            > offered.issued_at_ms + offered.valid_for_ms
+    );
+    assert!(hub.writes(TRANSFER).is_empty());
+    assert_eq!(
+        hub.row
+            .lock()
+            .unwrap()
+            .1
+            .as_ref()
+            .unwrap()
+            .holder
+            .as_deref(),
+        Some(A)
+    );
+
+    let mut reopened = ClientWatch::open(B, &hub, true).await;
+    reopened.ack_waiting().await;
+    assert!(hub.requests.lock().unwrap().get(B).is_some());
+    assert!(a
+        .ack_waiting()
+        .await
+        .iter()
+        .any(|notice| notice.handback == Some(true)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn lease_handback_timeout_taker_clears_preferred_holders_request() {
+    let hub = Hub::new(Some(A), false);
+    hub.prefer(A);
+    // A vanished before removing its old request after becoming the holder.
+    hub.requests.lock().unwrap().insert(
+        A.into(),
+        CandidateRequest {
+            revision: 7,
+            episode: 0,
+            gen: 1,
+        },
+    );
+    let mut b = ClientWatch::open(B, &hub, true).await;
+    b.ack_waiting().await;
+    tick(LEASE_MS - 1).await;
+    assert!(hub.writes(ACQUIRE).is_empty());
+    tick(1).await;
+    b.ack_waiting().await;
+    assert_eq!(hub.writes(ACQUIRE)[0].holder.as_deref(), Some(B));
+    assert!(hub.requests.lock().unwrap().get(A).is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn lease_handback_vacancy_prefers_the_named_candidate() {
+    let hub = Hub::new(None, false);
+    hub.prefer(B);
+    let mut a = ClientWatch::open(A, &hub, true).await;
+    a.ack_waiting().await;
+    assert!(hub.writes(ACQUIRE).is_empty());
+    let mut b = ClientWatch::open(B, &hub, true).await;
+    assert!(b
+        .ack_waiting()
+        .await
+        .iter()
+        .any(|notice| notice.gen == 1 && notice.holding));
+    assert_eq!(hub.writes(ACQUIRE)[0].holder.as_deref(), Some(B));
+    assert_eq!(hub.writes(ACQUIRE).len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn lease_handback_vacancy_waits_a_fresh_sixty_seconds_for_missing_preferred_candidate() {
+    let hub = Hub::new(None, false);
+    hub.prefer(B);
+    let mut a = ClientWatch::open(A, &hub, true).await;
+    a.ack_waiting().await;
+    tick(LEASE_MS - 1).await;
+    assert!(hub.writes(ACQUIRE).is_empty());
+    a.peer.link(false);
+    pump().await;
+    a.peer.link(true);
+    pump().await;
+    tick(LEASE_MS - 1).await;
+    assert!(hub.writes(ACQUIRE).is_empty());
+    tick(1).await;
+    assert_eq!(hub.writes(ACQUIRE)[0].holder.as_deref(), Some(A));
+}
+
+#[tokio::test(start_paused = true)]
+async fn lease_handback_vacancy_ignores_removed_preferred_box() {
+    let hub = Hub::new(None, false);
+    hub.prefer(B);
+    hub.removed.lock().unwrap().push(B);
+    let mut a = ClientWatch::open(A, &hub, true).await;
+    assert!(a.ack_waiting().await.iter().any(|notice| notice.holding));
+    assert_eq!(hub.writes(ACQUIRE)[0].holder.as_deref(), Some(A));
 }

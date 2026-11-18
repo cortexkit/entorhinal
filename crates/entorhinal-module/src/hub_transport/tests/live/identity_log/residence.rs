@@ -519,3 +519,233 @@ async fn hub_residence_watch_refuses_forged_forced_values_and_continues_other_ke
         6
     );
 }
+
+#[derive(Default)]
+struct RoleConfirm(AtomicUsize);
+
+#[async_trait::async_trait]
+impl OperatorConfirmer for RoleConfirm {
+    async fn confirm_operator(
+        &self,
+        summary: &str,
+        route: RouteKey,
+    ) -> Result<(), OperatorConfirmError> {
+        assert_eq!(route, ROUTE);
+        assert!(summary.contains("Take role"));
+        self.0.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+async fn role_take(
+    handler: &ProjectsHandler,
+    role: &str,
+    epoch: i64,
+    request_id: &str,
+) -> HandlerOutcome {
+    handler.handle_active_request(&body("role.take", json!({
+        "role": role, "expected_epoch": epoch, "request_id": request_id, "reason": "switch computers",
+    })), ROUTE).await
+}
+
+fn role_read(handler: &ProjectsHandler, role: &str) -> Value {
+    result(handler.handle_request(&body("role.read", json!({"role":role})), ROUTE))
+}
+
+#[tokio::test]
+async fn lease_handback_role_take_replays_preference_and_force_takes_removed_holder() {
+    let Some(mut rig) = IdentityRig::new().await else {
+        return;
+    };
+    let confirm = Arc::new(RoleConfirm::default());
+    rig.b.handler.operator_confirmer = confirm.clone();
+    residence(&rig.b, Arc::new(Image::default()));
+    bind(&rig.b.handler, subc_protocol::Principal::Direct);
+
+    let role = "dreamer.global";
+    let key = format!("role.{role}");
+    let signed = fleet_record::prepare(
+        &ClaustrumCredentialResolver::with_target(rig.keys.clone(), 0),
+        rig.keys.as_ref(),
+        &Header {
+            kind: "role".into(),
+            key: key.clone(),
+            writer: A.into(),
+            writer_ep: 0,
+            entry_id: hub_write::new_op_id().unwrap(),
+        },
+        &json!({"v":1,"holder":A,"holder_ep":0,"writer":A,"gen":1,"lease_ms":60000}),
+    )
+    .await
+    .unwrap();
+    rig.kv
+        .update(&key, signed.into_bytes().into(), 0)
+        .await
+        .unwrap();
+    until(|| {
+        role_read(&rig.b.handler, role)["stale"] == false
+            && role_read(&rig.b.handler, role)["epoch"] == 1
+    })
+    .await;
+
+    let request = "00000000000000000000000000000001";
+    let store = store_of(&rig.b.handler);
+    let preference_reply = json!({"epoch":1,"held_here":false,"handback_requested":true});
+    assert_eq!(
+        result(role_take(&rig.b.handler, role, 1, request).await),
+        preference_reply
+    );
+    let prefer = store.hub_attempt(request).unwrap().unwrap();
+    assert_eq!(prefer.write.key, "roleprefer.dreamer.global");
+    assert_eq!(
+        result(role_take(&rig.b.handler, role, 1, request).await),
+        preference_reply
+    );
+    assert_eq!(
+        error(role_take(&rig.b.handler, role, 2, request).await),
+        "request_key_conflict"
+    );
+    assert_eq!(confirm.0.load(Ordering::Relaxed), 1);
+    assert_eq!(role_read(&rig.b.handler, role)["holder"], A);
+
+    let anchor = hub_membership::tests::anchor(A, &rig.keys);
+    let removal = json!({"box_id":A,"epoch":2,"removal_id":"remove-role-holder","key_history":[anchor.fleet_record_ed25519]});
+    let id = hub_write::new_op_id().unwrap();
+    let signed = fleet_record::prepare(
+        &ClaustrumCredentialResolver::with_target(rig.keys.clone(), 0),
+        rig.keys.as_ref(),
+        &Header {
+            kind: "member.removed".into(),
+            key: LOG_SUBJECT.into(),
+            writer: B.into(),
+            writer_ep: 0,
+            entry_id: id.clone(),
+        },
+        &removal,
+    )
+    .await
+    .unwrap();
+    rig.b
+        .leaf
+        .session()
+        .append(
+            signed.into_bytes(),
+            0,
+            &id,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    within(through(&rig.b.handler, 1)).await;
+    let forced_id = "00000000000000000000000000000002";
+    let forced_reply = json!({"epoch":2,"held_here":true});
+    assert_eq!(
+        result(role_take(&rig.b.handler, role, 1, forced_id).await),
+        forced_reply
+    );
+    until(|| role_read(&rig.b.handler, role)["holder"] == B).await;
+    let cached = store.hub_kv_cached(&key).unwrap().unwrap();
+    assert_eq!(
+        cached.body.unwrap(),
+        json!({"v":1,"holder":B,"holder_ep":0,"writer":B,"gen":2,"forced":true,"lease_ms":60000})
+    );
+    assert_eq!(
+        store.hub_attempt(forced_id).unwrap().unwrap().write.key,
+        key
+    );
+    assert_eq!(
+        result(role_take(&rig.b.handler, role, 1, forced_id).await),
+        forced_reply
+    );
+    assert_eq!(
+        result(role_take(&rig.b.handler, role, 1, request).await),
+        preference_reply
+    );
+    assert_eq!(confirm.0.load(Ordering::Relaxed), 2);
+}
+
+struct RoleNotices(tokio::sync::mpsc::UnboundedSender<Value>);
+
+#[async_trait::async_trait]
+impl crate::watches::WatchTransport for RoleNotices {
+    async fn emit(&self, body: Vec<u8>) -> Result<(), crate::HandlerError> {
+        self.0.send(serde_json::from_slice(&body).unwrap()).unwrap();
+        Ok(())
+    }
+    async fn ended(&self) {
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn lease_handback_role_take_preference_steers_a_vacant_role() {
+    let Some(mut rig) = IdentityRig::new().await else {
+        return;
+    };
+    let confirm = Arc::new(RoleConfirm::default());
+    rig.b.handler.operator_confirmer = confirm.clone();
+    for node in [&rig.a, &rig.b] {
+        residence(node, Arc::new(Image::default()));
+    }
+    bind(&rig.b.handler, subc_protocol::Principal::Direct);
+    let role = "dreamer.pj-vacant";
+    until(|| {
+        role_read(&rig.a.handler, role)["stale"] == false
+            && role_read(&rig.b.handler, role)["stale"] == false
+    })
+    .await;
+    let request_id = "00000000000000000000000000000003";
+    let reply = json!({"epoch":0,"held_here":false,"handback_requested":true});
+    assert_eq!(
+        result(role_take(&rig.b.handler, role, 0, request_id).await),
+        reply
+    );
+    assert!(role_read(&rig.b.handler, role)["holder"].is_null());
+    let route = (21, 1);
+    for node in [&rig.a, &rig.b] {
+        node.handler.route_admissions().insert(
+            route,
+            RouteAdmission {
+                principal: Some(crate::tests::reserved("magic-context")),
+                ..Default::default()
+            },
+        );
+    }
+    let (a_tx, mut a_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (b_tx, mut b_rx) = tokio::sync::mpsc::unbounded_channel();
+    let a_sink = RoleNotices(a_tx);
+    let b_sink = RoleNotices(b_tx);
+    let holds = async {
+        loop {
+            tokio::select! {
+                notice = a_rx.recv() => {
+                    let notice = notice.unwrap();
+                    assert_eq!(notice["holding"], false);
+                    rig.a.handler.ack_role_lease(json!({"role":role,"seq":notice["seq"]}), route).unwrap();
+                }
+                notice = b_rx.recv() => {
+                    let notice = notice.unwrap();
+                    rig.b.handler.ack_role_lease(json!({"role":role,"seq":notice["seq"]}), route).unwrap();
+                    if notice["holding"] == true {
+                        assert_eq!(notice["gen"], 1);
+                        break;
+                    }
+                }
+            }
+        }
+        assert_eq!(role_read(&rig.b.handler, role)["holder"], B);
+        assert_eq!(
+            result(role_take(&rig.b.handler, role, 0, request_id).await),
+            reply
+        );
+        assert_eq!(confirm.0.load(Ordering::Relaxed), 1);
+    };
+    within(async {
+        tokio::select! {
+            biased;
+            result = rig.a.handler.serve_role_lease(&a_sink, role.into(), route) => panic!("A's watch ended: {result:?}"),
+            result = rig.b.handler.serve_role_lease(&b_sink, role.into(), route) => panic!("B's watch ended: {result:?}"),
+            _ = holds => {}
+        }
+    }).await;
+}
