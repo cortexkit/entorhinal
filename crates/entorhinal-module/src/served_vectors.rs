@@ -634,6 +634,9 @@ fn agent_identity_published_records_roundtrip_exactly() {
         ("agent-sessions-v1", "where-sharing-off.json"),
         ("agent-sessions-v1", "where-moving-source.json"),
         ("agent-sessions-v1", "where-moving-receiver.json"),
+        ("agent-sessions-v1", "where-holder-box.json"),
+        ("agent-sessions-v1", "where-box-unknown.json"),
+        ("agent-sessions-v1", "where-many-holder-box.json"),
         ("agent-sessions-v1", "session-for-ref.json"),
         ("agent-sessions-v1", "session-for-runner.json"),
         ("agent-sessions-v1", "session-for-harness.json"),
@@ -4018,24 +4021,14 @@ async fn session_role_records_match_published_files() {
 }
 
 #[test]
-fn session_role_published_identity_types_drop_role() {
+fn session_role_round_trips_through_published_identity_types() {
+    // Readers that re-encode replies (Magic Context's strict context reader)
+    // must keep `role`, so the published types have to carry it byte for byte.
     fn check<R: DeserializeOwned + Serialize>(reply: &Value) {
         let decoded: aid::Outcome<R> = serde_json::from_value(reply.clone()).unwrap();
         let encoded = serde_json::to_value(decoded).unwrap();
         assert_eq!(reply["result"]["role"], "delegated");
-        assert!(
-            encoded["result"].get("role").is_none(),
-            "published types now retain role; update this compatibility test"
-        );
-        let mut without_role = reply.clone();
-        without_role["result"]
-            .as_object_mut()
-            .unwrap()
-            .remove("role");
-        assert_eq!(
-            encoded, without_role,
-            "only the unsupported role may be dropped"
-        );
+        assert_eq!(&encoded, reply, "published types must keep every member");
     }
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../test-vectors/agent-sessions-v1/sessions-delegated.json");

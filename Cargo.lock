@@ -231,9 +231,9 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "cortexkit-agent-identity"
-version = "0.1.3"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa1838c7c0e6d3d5a7c68d515f34b2a7efa5c909e8d3514a3600f84412145722"
+checksum = "6a1f3ef9430bc2fb8125ca780fe021d38731076bacd1b78d510134946ecb11b3"
 dependencies = [
  "cortexkit-project-identity",
  "serde",
