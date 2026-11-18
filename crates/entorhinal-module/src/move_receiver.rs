@@ -4,6 +4,8 @@
 use crate::{
     claim_codec::AgentClaim,
     door_client::CutRequest as DoorCut,
+    hub_moves::{Decision, SeenMove, State as HubState},
+    hub_residence::{MovePosition, MoveTransfer, Residence},
     move_driver::{
         backoff, digest_reason, participant_action, skipped_streams, PeerRefusal, RefusalLog,
         SkippedStreams, Worker, POLL,
@@ -33,6 +35,8 @@ use std::{
     time::Duration,
 };
 use subc_client_rs::{CatalogList, SupervisorListResponse};
+
+mod hub;
 
 fn error(code: &str) -> HandlerError {
     HandlerError::new(code, code)
@@ -148,6 +152,38 @@ pub(crate) async fn poll_inbox(worker: &Worker) -> Result<(), HandlerError> {
     worker.gauges().await
 }
 
+pub(crate) async fn poll_hub(worker: &Worker, hub: &Residence) -> Result<(), HandlerError> {
+    for seen in hub.watched_moves() {
+        let cut = seen.body.cut_id.clone();
+        if seen.body.receiver != hub.move_box() || seen.body.state != HubState::Published {
+            continue;
+        }
+        let lookup = cut.clone();
+        if worker.sql(move |s| s.agent_move(&lookup)).await?.is_some() {
+            continue;
+        }
+        let plan = seen.body.participant_plan();
+        let pending = PendingMove {
+            cut_id: cut,
+            from: seen.writer.clone(),
+            agent_id: plan.agent_id.clone(),
+        };
+        let mut row = pickup_row(
+            &plan,
+            &pending,
+            checked_version(seen.revision)?,
+            (worker.clock)(),
+        );
+        row.plan["_hub_move"] = json!(seen);
+        if let Err(e) = worker.sql(move |s| Ok(s.admit_received_move(&row))).await? {
+            if !matches!(e.code.as_str(), "move_in_progress" | "move_cap") {
+                tracing::debug!(code = e.code, "hub move not admitted");
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn reject_entry(
     worker: &Worker,
     own: &str,
@@ -254,6 +290,18 @@ async fn poll_entry(worker: &Worker, own: &str, entry: &PendingMove) -> Result<(
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Progress {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hub_decision: Option<Decision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hub_return: Option<MoveTransfer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hub_items: Option<Vec<crate::door_client::CutItem>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hub_accepted: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    hub_activated: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    hub_imported: Vec<String>,
     #[serde(default)]
     aborted: Vec<String>,
     #[serde(default)]
@@ -626,7 +674,9 @@ impl Receiver {
         let absent = absent_participants(plan, supervisor, catalog);
         // The sealed manifest proves whether a required participant with refs
         // carries no data and names the streams lost for an optional skip.
-        let items = if absent.iter().any(|p| p.optional || !p.refs.is_empty()) {
+        let items = if let Some(items) = &progress.hub_items {
+            items.clone()
+        } else if absent.iter().any(|p| p.optional || !p.refs.is_empty()) {
             let read = self
                 .worker
                 .door
@@ -699,9 +749,15 @@ impl Receiver {
         }
         let mut plan_value = row.plan.clone();
         // Release metadata is local bookkeeping, never part of the shared plan.
-        if let Some(plan) = plan_value.as_object_mut() {
+        let hub_plan: Option<SeenMove> = if let Some(plan) = plan_value.as_object_mut() {
             plan.remove("_cut_release");
-        }
+            plan.remove("_hub_move")
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|e| HandlerError::new("plan_malformed", e.to_string()))?
+        } else {
+            None
+        };
         let progress_value = plan_value
             .as_object_mut()
             .and_then(|v| v.remove("_receiver"));
@@ -712,11 +768,24 @@ impl Receiver {
             .unwrap_or_default();
         let plan: MoveRecord = serde_json::from_value(plan_value)
             .map_err(|e| HandlerError::new("plan_malformed", e.to_string()))?;
+        if let Some(checkpoint) = &hub_plan {
+            wire::check_pinned_plan(&checkpoint.body.participant_plan(), &plan)
+                .map_err(|err| error(err.code()))?;
+        }
         // Whether this pass ran abort cleanup, so a refusal from it backs off
         // instead of being answered with another immediate abort pass.
         let mut cleaning = false;
         let result: Result<Duration, Failure> = async {
-            let (observed, version) = self.read_move(&plan).await?;
+            let hub = hub_plan
+                .as_ref()
+                .map(|p| self.read_hub_move(p))
+                .transpose()?;
+            let hub = hub.as_ref().map(|(hub, seen)| (hub.as_ref(), seen));
+            let (observed, version) = if let Some((_, seen)) = hub {
+                (seen.body.participant_plan(), seen.revision)
+            } else {
+                self.read_move(&plan).await?
+            };
             row.record_version = checked_version(version)?;
             if observed.state == State::Aborted
                 && matches!(
@@ -749,6 +818,12 @@ impl Receiver {
                 )
                 .min(POLL));
             }
+            if let Some((hub, seen)) = hub {
+                let checkpoint = hub_plan.as_ref().ok_or_else(|| error("plan_malformed"))?;
+                return self
+                    .advance_hub(hub, seen, checkpoint, &mut row, &plan, &mut progress)
+                    .await;
+            }
             if row.abort_requested.is_some()
                 && matches!(
                     row.step,
@@ -756,9 +831,9 @@ impl Receiver {
                 )
             {
                 cleaning = true;
-                self.cleanup(&mut row, &plan, &mut progress).await?;
+                self.cleanup(&mut row, &plan, &mut progress, false).await?;
             } else {
-                self.advance(&mut row, &plan, &mut progress, observed)
+                self.advance(&mut row, &plan, &mut progress, observed, None)
                     .await?;
             }
             Ok(Duration::ZERO)
@@ -821,7 +896,7 @@ impl Receiver {
                     row.reason = Some(String::from(reason.clone()));
                     row.detail = Some(f.detail.clone());
                     row.abort_requested = Some(json!({"reason":row.reason,"detail":row.detail}));
-                    if cleaning {
+                    if cleaning || progress.hub_decision == Some(Decision::Abort) {
                         // The move is already aborting, so the next pass
                         // repeats the same cleanup calls. Back off as any
                         // other retry does (1 s doubling to 5 minutes); the
@@ -860,11 +935,16 @@ impl Receiver {
                 self.save(&mut row, &progress)
                     .await
                     .map_err(|e| HandlerError::new(&e.code, e.detail.to_string()))?;
-                Ok(Some(if f.reason.is_some() && !cleaning {
-                    Duration::ZERO
-                } else {
-                    backoff(row.attempts).min(POLL)
-                }))
+                Ok(Some(
+                    if f.reason.is_some()
+                        && !cleaning
+                        && progress.hub_decision != Some(Decision::Abort)
+                    {
+                        Duration::ZERO
+                    } else {
+                        backoff(row.attempts).min(POLL)
+                    },
+                ))
             }
         }
     }
@@ -1172,6 +1252,9 @@ impl Receiver {
                         .await
                         .map_err(|e| Failure::participant(&p.module_id, &pending.op, e))?;
                     progress.record_drops(&p.module_id, &reply);
+                    if progress.hub_items.is_some() {
+                        progress.hub_imported.push(p.module_id.clone());
+                    }
                 }
                 "agent_data.diverged" => {
                     client
@@ -1191,6 +1274,9 @@ impl Receiver {
                         .activate(&self.request(p)?)
                         .await
                         .map_err(|e| Failure::participant(&p.module_id, &pending.op, e))?;
+                    if progress.hub_decision == Some(Decision::Activate) {
+                        progress.hub_activated.push(p.module_id.clone());
+                    }
                 }
                 _ => {}
             }
@@ -1205,12 +1291,16 @@ impl Receiver {
         plan: &MoveRecord,
         progress: &mut Progress,
         observed: MoveRecord,
+        hub: Option<(&Residence, &SeenMove)>,
     ) -> Result<(), Failure> {
         match row.step {
             Step::PickedUp => {
                 self.settle_pending(row, plan, progress).await?;
                 self.preconditions(row, plan, progress).await?;
                 for p in called(plan, progress) {
+                    if hub.is_some() && progress.hub_imported.contains(&p.module_id) {
+                        continue;
+                    }
                     let client = self.client(&p.module_id).await?;
                     progress.pending = Some(PendingCall {
                         module: p.module_id.clone(),
@@ -1246,6 +1336,9 @@ impl Receiver {
                 self.local_writers(plan).await?;
                 self.catalog_preflight(plan).await?;
                 for p in called(plan, progress) {
+                    if hub.is_some() && progress.hub_imported.contains(&p.module_id) {
+                        continue;
+                    }
                     let client = self.client(&p.module_id).await?;
                     progress.pending = Some(PendingCall {
                         module: p.module_id.clone(),
@@ -1257,6 +1350,9 @@ impl Receiver {
                     // reply reports are durable before the move goes on.
                     if let Ok(reply) = &answer {
                         progress.record_drops(&p.module_id, reply);
+                        if hub.is_some() {
+                            progress.hub_imported.push(p.module_id.clone());
+                        }
                     }
                     if !matches!(answer, Err(ClientError::OutcomeUnknown)) {
                         progress.pending = None;
@@ -1276,8 +1372,18 @@ impl Receiver {
                 if observed.state == State::Published {
                     let mut staged = observed.clone();
                     staged.skipped = progress.optional_skips(plan);
-                    self.cas_move(row, &staged, State::Staged).await?;
-                } else if observed.state != State::Staged {
+                    if let Some((hub, seen)) = hub {
+                        let mut body = seen.body.clone();
+                        body.state = HubState::Staged;
+                        body.skipped = staged.skipped;
+                        row.record_version =
+                            checked_version(hub.write_move(&body, Some(seen)).await?)?;
+                    } else {
+                        self.cas_move(row, &staged, State::Staged).await?;
+                    }
+                } else if observed.state != State::Staged
+                    && !(hub.is_some() && observed.state == State::Claimed)
+                {
                     return Err(Failure::hold(
                         "invalid_state",
                         json!({"state":observed.state}),
@@ -1308,6 +1414,9 @@ impl Receiver {
             Step::Activating => {
                 self.settle_pending(row, plan, progress).await?;
                 for p in called(plan, progress) {
+                    if hub.is_some() && progress.hub_activated.contains(&p.module_id) {
+                        continue;
+                    }
                     let client = self.client(&p.module_id).await?;
                     progress.pending = Some(PendingCall {
                         module: p.module_id.clone(),
@@ -1315,6 +1424,9 @@ impl Receiver {
                     });
                     self.save(row, progress).await?;
                     let answer = client.activate(&self.request(p)?).await;
+                    if hub.is_some() && answer.is_ok() {
+                        progress.hub_activated.push(p.module_id.clone());
+                    }
                     if !matches!(answer, Err(ClientError::OutcomeUnknown)) {
                         progress.pending = None;
                         self.save(row, progress).await?;
@@ -1326,7 +1438,14 @@ impl Receiver {
                 // Resend activation even if its CAS landed before a crash. The
                 // pinned participant operations are idempotent for this cut.
                 if observed.state == State::Claimed {
-                    self.cas_move(row, &observed, State::Activated).await?;
+                    if let Some((hub, seen)) = hub {
+                        let mut body = seen.body.clone();
+                        body.state = HubState::Activated;
+                        row.record_version =
+                            checked_version(hub.write_move(&body, Some(seen)).await?)?;
+                    } else {
+                        self.cas_move(row, &observed, State::Activated).await?;
+                    }
                 } else if !matches!(observed.state, State::Activated | State::Released) {
                     return Err(Failure::hold(
                         "invalid_state",
@@ -1357,7 +1476,9 @@ impl Receiver {
                 *progress = activated_progress;
                 self.worker.gauges().await?;
                 self.worker.wake.notify_one();
-                remove_inbox(&self.worker, &plan.to, &self.cut).await?;
+                if hub.is_none() {
+                    remove_inbox(&self.worker, &plan.to, &self.cut).await?;
+                }
             }
             Step::Activated => {
                 remove_inbox(&self.worker, &plan.to, &self.cut).await?;
@@ -1657,6 +1778,7 @@ impl Receiver {
         row: &mut AgentMove,
         plan: &MoveRecord,
         progress: &mut Progress,
+        hub: bool,
     ) -> Result<(), Failure> {
         // An abort can arrive before the preconditions decided which absent
         // participants to skip. Decide here with the same rule, before any
@@ -1664,7 +1786,7 @@ impl Receiver {
         // A module that was absent did not stage anything to undo.
         // Persisting the set makes a restart mid-cleanup skip the same modules.
         let undecided = progress.skipped_absent.is_none();
-        if undecided {
+        if undecided && !hub {
             let (supervisor, catalog) = self.discovery_lists().await?;
             self.decide_skipped_absent(row, plan, progress, &supervisor, &catalog)
                 .await?;
@@ -1676,7 +1798,7 @@ impl Receiver {
             .ok_or_else(|| Failure::hold("abort_request_missing", Value::Null))?;
         row.reason = request["reason"].as_str().map(str::to_owned);
         row.detail = request.get("detail").filter(|d| !d.is_null()).cloned();
-        if row.claim_take_body.is_some() && row.claim_landed_version.is_none() {
+        if !hub && row.claim_take_body.is_some() && row.claim_landed_version.is_none() {
             // The persisted failure flag is not proof that an unanswered take lost.
             // Reconcile the exact attempt even when an earlier driver marked it failed.
             if let Err(failure) = self.take_claim(row, plan, progress).await {
@@ -1685,33 +1807,37 @@ impl Receiver {
                 }
             }
         }
-        self.return_claim(row, plan).await?;
-        let claim_reply = self
-            .worker
-            .records
-            .read(&format!("claim:{}", row.agent_id))
-            .await?;
-        if claim_reply.stale {
-            return Err(Failure::hold(
-                "unavailable",
-                json!({"op":"claim.cleanup.read"}),
-            ));
-        }
-        if !claim_reply.absent {
-            let claim = AgentClaim::decode(
-                &row.agent_id,
-                claim_reply.body.as_deref().unwrap_or_default(),
-            )
-            .map_err(|code| Failure::hold(code, json!({"op":"claim.cleanup.read"})))?;
-            if claim.holder.as_deref() == Some(&plan.to) {
+        if !hub {
+            self.return_claim(row, plan).await?;
+            let claim_reply = self
+                .worker
+                .records
+                .read(&format!("claim:{}", row.agent_id))
+                .await?;
+            if claim_reply.stale {
                 return Err(Failure::hold(
-                    "claim_moved",
-                    json!({"op":"claim.cleanup.read","cause":"receiver_still_holder"}),
+                    "unavailable",
+                    json!({"op":"claim.cleanup.read"}),
                 ));
+            }
+            if !claim_reply.absent {
+                let claim = AgentClaim::decode(
+                    &row.agent_id,
+                    claim_reply.body.as_deref().unwrap_or_default(),
+                )
+                .map_err(|code| Failure::hold(code, json!({"op":"claim.cleanup.read"})))?;
+                if claim.holder.as_deref() == Some(&plan.to) {
+                    return Err(Failure::hold(
+                        "claim_moved",
+                        json!({"op":"claim.cleanup.read","cause":"receiver_still_holder"}),
+                    ));
+                }
             }
         }
         for p in called(plan, progress) {
-            if progress.aborted.contains(&p.module_id) {
+            if progress.aborted.contains(&p.module_id)
+                || (hub && !progress.touched.contains(&p.module_id))
+            {
                 continue;
             }
             // Diverged checks for data past the cut; import stages received data.
@@ -1748,13 +1874,15 @@ impl Receiver {
         }
         // The source may unfreeze as soon as it sees the shared abort. Publish
         // that state only after every receiver participant has restored its data.
-        let (record, version) = self.read_move(plan).await?;
-        row.record_version = checked_version(version)?;
-        if record.state != State::Aborted {
-            self.cas_move(row, &record, State::Aborted).await?;
+        if !hub {
+            let (record, version) = self.read_move(plan).await?;
+            row.record_version = checked_version(version)?;
+            if record.state != State::Aborted {
+                self.cas_move(row, &record, State::Aborted).await?;
+            }
+            self.apply_claim(row).await?;
+            remove_inbox(&self.worker, &plan.to, &self.cut).await?;
         }
-        self.apply_claim(row).await?;
-        remove_inbox(&self.worker, &plan.to, &self.cut).await?;
         Self::step(row, progress, Step::Aborted);
         self.save(row, progress).await
     }
@@ -1819,13 +1947,19 @@ impl CutAccept {
             .ok_or_else(|| error("plan_malformed"))?;
         remove_inbox(&self.worker, own, &self.cut).await?;
         let attempts = accept["attempts"].as_i64().unwrap_or(0).saturating_add(1);
-        let result = self
-            .worker
-            .door
-            .accept(&DoorCut {
-                cut_id: self.cut.clone(),
-            })
-            .await;
+        let result = if row.plan.get("_hub_move").is_some() {
+            // The hub driver accepted the cut before activating any participant.
+            let lifted = serde_json::from_value(row.plan["_receiver"]["hub_accepted"].clone())
+                .map_err(|_| error("plan_malformed"))?;
+            Ok(crate::door_client::AcceptReply { lifted })
+        } else {
+            self.worker
+                .door
+                .accept(&DoorCut {
+                    cut_id: self.cut.clone(),
+                })
+                .await
+        };
         let (state, delay) = match result {
             Ok(reply) => (json!({"state":"accepted","lifted":reply.lifted}), None),
             Err(e) if e.code() == "unavailable" => {
@@ -2168,6 +2302,7 @@ mod tests {
             );
             door.client()
                 .seal(&SealRequest {
+                    receiver: None,
                     cut_id: CUT.into(),
                     items,
                 })
@@ -2392,6 +2527,7 @@ mod tests {
                 f.door
                     .client()
                     .seal(&SealRequest {
+                        receiver: None,
                         cut_id: BAD.into(),
                         items: f.door.cut(CUT).unwrap().items,
                     })
@@ -2682,6 +2818,7 @@ mod tests {
         f.door
             .client()
             .seal(&SealRequest {
+                receiver: None,
                 cut_id: OTHER.into(),
                 items: f.door.cut(CUT).unwrap().items,
             })
@@ -3255,6 +3392,7 @@ mod tests {
                     );
                     door.client()
                         .seal(&SealRequest {
+                            receiver: None,
                             cut_id: CUT.into(),
                             items,
                         })
@@ -4605,6 +4743,7 @@ mod tests {
         old_source
             .client()
             .seal(&SealRequest {
+                receiver: None,
                 cut_id: old_cut.into(),
                 items: vec![item],
             })

@@ -31,6 +31,11 @@ struct Leaf {
 enum Gate {
     Race(Arc<Barrier>),
     LoseAck(oneshot::Sender<()>, oneshot::Receiver<()>),
+    HoldKv {
+        held: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+        settled: oneshot::Sender<Result<u64, String>>,
+    },
 }
 
 impl Leaf {
@@ -118,6 +123,35 @@ impl Transport for Leaf {
             };
             if let Some(Gate::Race(barrier)) = &gate {
                 barrier.wait().await;
+            }
+            if let Some(Gate::HoldKv {
+                held,
+                release,
+                settled,
+            }) = gate
+            {
+                let (reply, waiting) = oneshot::channel();
+                let session = self.session();
+                let write = write.clone();
+                let id = id.to_owned();
+                tokio::spawn(async move {
+                    held.send(()).unwrap();
+                    release.await.unwrap();
+                    let outcome = session
+                        .update(
+                            &write.key,
+                            write.value,
+                            write.expected,
+                            &id,
+                            Instant::now() + Duration::from_secs(5),
+                        )
+                        .await;
+                    settled
+                        .send(outcome.as_ref().copied().map_err(|e| e.code.clone()))
+                        .unwrap();
+                    let _ = reply.send(outcome.map(Some));
+                });
+                return waiting.await.unwrap();
             }
             let revision = self
                 .session()

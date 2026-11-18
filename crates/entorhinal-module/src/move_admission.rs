@@ -99,8 +99,36 @@ impl ProjectsHandler {
                 detail: Some(gone),
             });
         }
-        let (mut claim_version, own) = self.move_claim(&request.agent_id).await?;
-        let (peer, peer_name) = self.with_agent_store(|s| s.resolve_move_member(&request.to))?;
+        let hub = if self.hub_backend_selected() {
+            Some(self.residence().ok_or_else(|| {
+                HandlerError::new("hub_not_ready", "hub move watch is not installed")
+            })?)
+        } else {
+            None
+        };
+        let (mut claim_version, own) = self.move_claim(&request.agent_id, hub.as_deref()).await?;
+        let (peer, peer_name) = match self.with_agent_store(|s| s.resolve_move_member(&request.to))
+        {
+            Err(error)
+                if error.code == "unknown_member"
+                    && hub.is_some()
+                    && crate::hub_membership::box_id(&request.to) =>
+            {
+                (request.to.clone(), request.to.clone())
+            }
+            result => result?,
+        };
+        let target = if let Some(hub) = &hub {
+            if hub.move_member(&peer)?.is_none() {
+                return Err(HandlerError::new(
+                    "unknown_member",
+                    "target is not a current fleet member",
+                ));
+            }
+            hub.watched_node(&peer)?
+        } else {
+            None
+        };
         if peer == own {
             return Err(HandlerError::new(
                 "invalid_request",
@@ -218,10 +246,24 @@ impl ProjectsHandler {
             if !self.route_admissions().contains_key(&key) {
                 return Err(OperatorConfirmError::Declined.into());
             }
-            let summary = format!(
+            let mut summary = format!(
                 "move agent \"{}\" (\"{}\") to \"{}\"",
                 agent.name, agent.agent_id, peer_name
             );
+            if let Some(target) = &target {
+                for participant in plan.iter().filter(|p| p.description.optional) {
+                    let module = &participant.client.module_id;
+                    if !target.participants.iter().any(|p| {
+                        &p.module == module
+                            && participant
+                                .refs
+                                .iter()
+                                .all(|r| p.ref_kinds.contains(&r.ref_kind))
+                    }) {
+                        summary.push_str(&format!("; {module} data stays on {own}"));
+                    }
+                }
+            }
             tokio::select! {
                 biased;
                 _ = guard.cancelled.wait_for(|closed| *closed) => return Err(OperatorConfirmError::Declined.into()),
@@ -233,7 +275,8 @@ impl ProjectsHandler {
                 return Err(OperatorConfirmError::Declined.into());
             }
             let recheck = async {
-                let (version, refreshed_own) = self.move_claim(&request.agent_id).await?;
+                let (version, refreshed_own) =
+                    self.move_claim(&request.agent_id, hub.as_deref()).await?;
                 if refreshed_own != own {
                     return Err(HandlerError::new(
                         "claim_integrity_failed",
@@ -285,6 +328,9 @@ impl ProjectsHandler {
             .map_err(|e| HandlerError::new("storage_error", e.to_string()))?;
         let now = (self.clock)();
         let mut move_plan = json!({"agent_id":agent.agent_id,"from":own,"to":peer,"claim_version":claim_version,"participants":participants});
+        if hub.is_some() {
+            move_plan["hub_gen"] = json!(claim_version);
+        }
         if let Some(digest) = pin_digest {
             move_plan["pin_digest"] = json!(digest);
         }
@@ -348,7 +394,14 @@ impl ProjectsHandler {
         Ok(())
     }
 
-    async fn move_claim(&self, agent_id: &str) -> Result<(i64, String), HandlerError> {
+    async fn move_claim(
+        &self,
+        agent_id: &str,
+        hub: Option<&crate::hub_residence::Residence>,
+    ) -> Result<(i64, String), HandlerError> {
+        if let Some(hub) = hub {
+            return hub.move_origin(agent_id);
+        }
         let refresh = self.wait_claim_refresh().await;
         let cached = self
             .with_store(|s| s.cached_agent_claim(agent_id))?

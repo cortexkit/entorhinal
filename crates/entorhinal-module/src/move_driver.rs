@@ -269,6 +269,7 @@ pub(crate) struct MoveWake {
     local: tokio::sync::Notify,
     reconnect: tokio::sync::watch::Sender<u64>,
     transport: std::sync::Mutex<Option<Arc<dyn crate::log_client::LogTransport>>>,
+    hub: std::sync::Mutex<Option<Weak<crate::hub_residence::Residence>>>,
     #[cfg(test)]
     passes: tokio::sync::watch::Sender<usize>,
 }
@@ -279,6 +280,7 @@ impl Default for MoveWake {
             local: tokio::sync::Notify::new(),
             reconnect: tokio::sync::watch::channel(0).0,
             transport: std::sync::Mutex::new(None),
+            hub: std::sync::Mutex::new(None),
             #[cfg(test)]
             passes: tokio::sync::watch::channel(0).0,
         }
@@ -286,6 +288,16 @@ impl Default for MoveWake {
 }
 
 impl MoveWake {
+    pub(crate) fn attach_hub(&self, hub: Option<&Arc<crate::hub_residence::Residence>>) {
+        *self.hub.lock().unwrap() = hub.map(Arc::downgrade);
+        self.hub_changed();
+    }
+
+    pub(crate) fn hub_changed(&self) {
+        self.reconnect
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
     pub(crate) fn notify_one(&self) {
         self.local.notify_one();
     }
@@ -375,6 +387,15 @@ pub(crate) struct Worker {
 }
 
 impl Worker {
+    pub(crate) fn hub(&self) -> Option<Arc<crate::hub_residence::Residence>> {
+        self.wake
+            .hub
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(Weak::upgrade)
+    }
+
     pub(crate) async fn cache_claims(
         &self,
         observations: Vec<(String, entorhinal_core::claim_cache::ClaimObservation)>,
@@ -506,6 +527,8 @@ impl ProjectsHandler {
             // so restarting the driver cannot leave an older releaser running.
             let mut releaser = tokio::task::JoinSet::new();
             releaser.spawn(crate::cut_release::run(worker.clone()));
+            releaser.spawn(advertise_nodes(worker.clone()));
+            releaser.spawn(reap_moves(worker.clone()));
             let mut interval = tokio::time::interval(POLL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut owners = TaskOwners::default();
@@ -531,7 +554,11 @@ impl ProjectsHandler {
                     {
                         continue;
                     }
-                    let _ = poll_inbox(&worker).await;
+                    if let Some(hub) = worker.hub() {
+                        let _ = crate::move_receiver::poll_hub(&worker, &hub).await;
+                    } else if worker.health.hub_membership.load(Ordering::Acquire) == 0 {
+                        let _ = poll_inbox(&worker).await;
+                    }
                     let Ok(rows) = worker.sql(RegistryStore::list_open_agent_moves).await else {
                         continue;
                     };
@@ -596,6 +623,68 @@ impl ProjectsHandler {
             let _ = driver.task.await;
             // Draining async tasks does not release stores held by spawn_blocking work.
             driver.sql.wait().await;
+        }
+    }
+}
+
+async fn advertise_nodes(worker: Worker) {
+    let mut interval = tokio::time::interval(Duration::from_secs(15));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        let Some(hub) = worker.hub() else {
+            continue;
+        };
+        let Ok(participants) =
+            crate::participant_discovery::discover_participants(worker.discovery.as_ref()).await
+        else {
+            continue;
+        };
+        let Ok(described) = crate::participant_client::describe_participants(&participants).await
+        else {
+            continue;
+        };
+        let mut participants: Vec<_> = described
+            .into_iter()
+            .map(|p| {
+                let mut ref_kinds = p.description.ref_kinds;
+                ref_kinds.sort();
+                ref_kinds.dedup();
+                crate::hub_moves::Participant {
+                    module: p.client.module_id,
+                    ref_kinds,
+                    optional: p.description.optional,
+                }
+            })
+            .collect();
+        participants.sort_by(|a, b| a.module.cmp(&b.module));
+        let _ = hub.advertise_node(participants).await;
+    }
+}
+
+async fn reap_moves(worker: Worker) {
+    let mut interval = tokio::time::interval(Duration::from_secs(60));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        let Some(hub) = worker.hub() else {
+            continue;
+        };
+        for seen in hub
+            .watched_moves()
+            .into_iter()
+            .filter(|seen| seen.body.state.terminal())
+        {
+            let source_done = if seen.body.source == hub.move_box() {
+                let cut = seen.body.cut_id.clone();
+                worker
+                    .sql(move |s| s.agent_move(&cut))
+                    .await
+                    .is_ok_and(|row| row.is_none_or(|row| row.step.is_terminal()))
+            } else {
+                false
+            };
+            let _ = hub.reap_move(&seen, source_done, (worker.clock)()).await;
         }
     }
 }

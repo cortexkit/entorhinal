@@ -32,7 +32,9 @@ pub(super) const TAKE: &str = "agent.take";
 const CREATE: &str = "agent.create";
 const CREATE_KV: &str = "residence.create";
 const BUDGET: Duration = Duration::from_secs(5);
+mod moves;
 mod role_control;
+pub(super) use moves::{Position as MovePosition, Transfer as MoveTransfer};
 use role_control::role_key_name;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -195,6 +197,7 @@ struct Watched {
     incarnation: u64,
     revisions: HashMap<String, u64>,
     held: HashSet<String>,
+    move_times: HashMap<String, i64>,
 }
 
 pub(super) struct Residence {
@@ -209,6 +212,7 @@ pub(super) struct Residence {
     clock: fn() -> i64,
     role_leases: Weak<role_leases::Leases>,
     link: Notify,
+    move_wake: Weak<crate::move_driver::MoveWake>,
 }
 
 pub(super) struct Running {
@@ -273,6 +277,7 @@ impl ProjectsHandler {
             clock: self.clock,
             role_leases: Arc::downgrade(&self.role_leases),
             link: Notify::new(),
+            move_wake: Arc::downgrade(&self.move_wake),
         });
         *running = Some(Running {
             watch: tokio::spawn(service.clone().watch(feed)),
@@ -281,6 +286,7 @@ impl ProjectsHandler {
             service: service.clone(),
         });
         self.role_leases.attach(Some(service.clone()));
+        self.move_wake.attach_hub(Some(&service));
         Ok(service)
     }
 
@@ -310,6 +316,7 @@ impl ProjectsHandler {
     #[cfg(test)]
     pub(super) async fn stop_hub_residence(&self) {
         self.role_leases.attach(None);
+        self.move_wake.attach_hub(None);
         let running = self.hub_residence.lock().unwrap().take();
         if let Some(mut running) = running {
             running.watch.abort();
@@ -402,9 +409,10 @@ impl Residence {
         let mut watched = self.watched.write().unwrap();
         watched.initial = false;
         watched.incarnation += 1;
-        watched
-            .revisions
-            .retain(|key, _| role_key_name(key).is_none());
+        watched.revisions.retain(|key, _| {
+            role_key_name(key).is_none() && !key.starts_with("move.") && !key.starts_with("node.")
+        });
+        watched.move_times.clear();
         self.link.notify_waiters();
     }
 
@@ -413,6 +421,9 @@ impl Residence {
         if !watched.initial {
             watched.initial = true;
             self.link.notify_waiters();
+            if let Some(wake) = self.move_wake.upgrade() {
+                wake.hub_changed();
+            }
         }
     }
 
@@ -430,7 +441,7 @@ impl Residence {
             tokio::select! {
                 event = feed.next_event() => match event {
                     FeedEvent::Connected | FeedEvent::Disconnected => {
-                        pending.retain(|key, _| role_key_name(key).is_none());
+                        pending.retain(|key, _| role_key_name(key).is_none() && !key.starts_with("move.") && !key.starts_with("node."));
                         self.reset_role_watch();
                     }
                     FeedEvent::Item(KvDelivery::Empty) => self.finish_initial_watch(),
@@ -478,11 +489,29 @@ impl Residence {
             pending.insert(delivery.entry.key.clone(), delivery);
         } else {
             watched.held.remove(&delivery.entry.key);
+            if key.starts_with("move.") {
+                if delivery.entry.operation == Operation::Put
+                    && watched.revisions.get(&key) == Some(&delivery.entry.revision)
+                {
+                    if let Ok(ms) =
+                        i64::try_from(delivery.entry.created.unix_timestamp_nanos() / 1_000_000)
+                    {
+                        watched.move_times.insert(key.clone(), ms);
+                    }
+                } else if delivery.entry.operation != Operation::Put {
+                    watched.move_times.remove(&key);
+                }
+            }
         }
         drop(watched);
         // Notify only the affected role. Renewal events must not wake every
         // candidate on the machine.
         self.role_changed(&key);
+        if key.starts_with("move.") || key.starts_with("residence.") {
+            if let Some(wake) = self.move_wake.upgrade() {
+                wake.hub_changed();
+            }
+        }
     }
 
     #[cfg(test)]
@@ -530,6 +559,23 @@ impl Residence {
                 self.refuse(key, revision, "delete_forbidden")?;
             }
             return Ok(());
+        }
+        if key.starts_with("move.") || key.starts_with("node.") {
+            match self
+                .judge_move_signal(key, value, old.as_ref(), deadline)
+                .await
+            {
+                Ok(accepted) => {
+                    self.accept(key, revision, value, Some(&accepted.body))?;
+                    self.backend
+                        .record_applied(&accepted.record, revision, deadline)
+                        .await
+                        .ok();
+                    return Ok(());
+                }
+                Err(error) if timed_out(&error) => return Err(error),
+                Err(error) => return self.refuse(key, revision, &error.code),
+            }
         }
         let (name, role) = if let Some(role) = key.strip_prefix("role.") {
             if !role_leases::valid_role(role) {
@@ -961,9 +1007,8 @@ pub(super) fn delete_allowed_without_epoch(key: &str, last: Option<&Value>) -> b
     !suffix.is_empty()
         && match kind {
             "wrapreq" | "rolehandback" | "wrapjoin" => true,
-            "move" => last.is_some_and(|body| {
-                matches!(body["state"].as_str(), Some("activated" | "aborted"))
-            }),
+            "move" => last
+                .is_some_and(|body| matches!(body["state"].as_str(), Some("released" | "aborted"))),
             _ => false,
         }
 }

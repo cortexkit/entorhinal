@@ -41,6 +41,7 @@ pub(crate) struct Cut {
     pub(crate) failure: Option<Value>,
     pub(crate) aborted: bool,
     takeovers: BTreeMap<String, TakeoverProgress>,
+    receiver: Option<String>,
 }
 
 #[derive(Default)]
@@ -440,6 +441,8 @@ fn takeover(state: TakeoverState) -> TakeoverProgress {
 fn local_status(cut: &Cut) -> Value {
     json!(StatusReply {
         state: cut.state,
+        manifest_sha256: (cut.state == SealState::Sealed).then(|| "opaque-manifest".into()),
+        sealed_key: (cut.state == SealState::Sealed).then(|| "opaque-key".into()),
         handoff: Some(cut.handoff.clone()),
         takeover: None,
         failure: cut.failure.clone()
@@ -448,7 +451,9 @@ fn local_status(cut: &Cut) -> Value {
 
 fn remote_status(cut: &Cut, author: &str) -> Value {
     json!(StatusReply {
-        state: SealState::Published,
+        state: cut.state,
+        manifest_sha256: None,
+        sealed_key: None,
         handoff: None,
         takeover: cut.takeovers.get(author).cloned(),
         failure: None
@@ -514,7 +519,7 @@ fn execute(
             .ok_or_else(|| refuse("cut_release_unknown", None))?;
         let outcome = if cut.aborted && cut.author == author {
             ReleaseOutcome::Aborted
-        } else if cut.state == SealState::Published {
+        } else if matches!(cut.state, SealState::Published | SealState::Sealed) {
             ReleaseOutcome::Published
         } else {
             return Err(refuse("cut_release_unknown", None));
@@ -530,7 +535,7 @@ fn execute(
         if let Some(cut) = state.cuts.get(cut_id) {
             // A matching seal replay reports its current state even if a stream
             // has since advanced (AGENT_SYNC.md, move step 3).
-            if cut.author != author || cut.items != seal.items {
+            if cut.author != author || cut.items != seal.items || cut.receiver != seal.receiver {
                 return Err(refuse("id_reused", None));
             }
         } else {
@@ -557,11 +562,16 @@ fn execute(
                 Cut {
                     author: author.into(),
                     items: seal.items.clone(),
-                    state: SealState::Pending,
+                    state: if seal.receiver.is_some() && effect.is_none() {
+                        SealState::Sealed
+                    } else {
+                        SealState::Pending
+                    },
                     handoff: handoff(HandoffState::NotStarted),
                     failure: None,
                     aborted: false,
                     takeovers: BTreeMap::new(),
+                    receiver: seal.receiver.clone(),
                 },
             );
         }
@@ -574,7 +584,10 @@ fn execute(
         .ok_or_else(|| refuse("not_found", None))?;
     match request {
         Request::Status(_) => {
-            if cut.author != author && cut.state != SealState::Published {
+            if cut.author != author
+                && cut.state != SealState::Published
+                && !cut.takeovers.contains_key(author)
+            {
                 return Err(refuse("not_found", None));
             }
             apply_effect(state, cut_id, author, effect);
@@ -588,7 +601,13 @@ fn execute(
         Request::Read(_) => {
             // Other devices see only published cuts (AGENT_SYNC.md, Resume step 1).
             // cut_ops::read also lets the sealer read its own local items early.
-            if cut.author != author && cut.state != SealState::Published {
+            if cut.author != author
+                && cut.state != SealState::Published
+                && !cut
+                    .takeovers
+                    .get(author)
+                    .is_some_and(|p| p.state == TakeoverState::Taken)
+            {
                 return Err(refuse("not_found", None));
             }
             Ok(json!(ReadReply {
@@ -602,7 +621,7 @@ fn execute(
             if cut.author != author {
                 return Err(refuse("not_found", None));
             }
-            if cut.state != SealState::Published {
+            if !matches!(cut.state, SealState::Published | SealState::Sealed) {
                 return Err(refuse("cut_not_published", None));
             }
             if cut.aborted {
@@ -627,7 +646,7 @@ fn execute(
             apply_effect(state, cut_id, author, effect);
             Ok(json!(state.cuts[cut_id].handoff))
         }
-        Request::Takeover(_) => {
+        Request::Takeover(request) => {
             // Takeover requires another device's published cut; it cannot acquire
             // this device's own cut (AGENT_SYNC.md, Resume step 5).
             if cut.author == author {
@@ -640,14 +659,32 @@ fn execute(
                     None,
                 ));
             }
-            if cut.state != SealState::Published {
+            if cut.state == SealState::Sealed {
+                if cut.receiver.as_deref() != Some(author) {
+                    return Err(refuse("hub_not_granted", None));
+                }
+                if cut.aborted {
+                    return Err(refuse("cut_object_missing", None));
+                }
+                if request.author.as_ref() != Some(&cut.author)
+                    || request.manifest_sha256.as_deref() != Some("opaque-manifest")
+                    || request.sealed_key.as_deref() != Some("opaque-key")
+                {
+                    return Err(refuse("verify_failed", None));
+                }
+            } else if cut.state != SealState::Published {
                 return Err(refuse("not_found", None));
             }
+            let default = if cut.state == SealState::Sealed && effect.is_none() {
+                TakeoverState::Taken
+            } else {
+                TakeoverState::InProgress
+            };
             let cut = state.cuts.get_mut(cut_id).unwrap();
             let progress = cut
                 .takeovers
                 .entry(author.into())
-                .or_insert_with(|| takeover(TakeoverState::InProgress));
+                .or_insert_with(|| takeover(default));
             if progress.state == TakeoverState::Failed {
                 *progress = takeover(TakeoverState::InProgress);
             }
@@ -669,7 +706,7 @@ fn execute(
             if !matches!(
                 cut.handoff.state,
                 HandoffState::NotStarted | HandoffState::Aborted
-            ) || !cut.takeovers.is_empty()
+            ) || (cut.receiver.is_none() && !cut.takeovers.is_empty())
             {
                 return Err(refuse("cut_handoff_started", None));
             }
@@ -698,7 +735,15 @@ fn execute(
                     None,
                 ));
             }
-            if cut.state != SealState::Published {
+            if cut.state == SealState::Sealed {
+                if !cut
+                    .takeovers
+                    .get(author)
+                    .is_some_and(|p| p.state == TakeoverState::Taken)
+                {
+                    return Err(refuse("cut_object_missing", None));
+                }
+            } else if cut.state != SealState::Published {
                 return Err(refuse("cut_not_published", None));
             }
             let refs: BTreeSet<_> = cut
@@ -743,6 +788,7 @@ mod tests {
     }
     fn seal(id: &str, items: Vec<CutItem>) -> SealRequest {
         SealRequest {
+            receiver: None,
             cut_id: id.into(),
             items,
         }
@@ -1311,6 +1357,7 @@ mod release_tests {
         door.script("cut.seal", Effect::Seal(SealState::Published, None));
         door.client()
             .seal(&SealRequest {
+                receiver: None,
                 cut_id: request.cut_id.clone(),
                 items: vec![item],
             })
