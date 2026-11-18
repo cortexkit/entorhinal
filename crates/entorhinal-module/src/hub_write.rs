@@ -70,10 +70,14 @@ pub(super) trait LogReplan: Sync {
     /// attempt then records that refusal as its final outcome and is never resent.
     /// An `Err` is a transient failure; the attempt stays open for a retry.
     fn after_image(&self, saved: &Value) -> Result<Replanned, HandlerError>;
+    fn after_image_with_id(&self, saved: &Value, _id: &str) -> Result<Replanned, HandlerError> {
+        self.after_image(saved)
+    }
 }
 
 pub(super) enum Replanned {
     Body(Value),
+    WithLocal(Value, Box<entorhinal_core::HubContinuation>),
     Refused(HandlerError),
 }
 
@@ -391,13 +395,43 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
         next: Option<NextStep<'_>>,
         deadline: Instant,
     ) -> Result<Landed, HandlerError> {
+        self.run_inner(request, first, next, None, deadline).await
+    }
+
+    pub(super) async fn run_local(
+        &self,
+        request: &Request<'_>,
+        first: &Step,
+        continuation: Option<&entorhinal_core::HubContinuation>,
+        deadline: Instant,
+    ) -> Result<Landed, HandlerError> {
+        self.run_inner(request, first, None, continuation, deadline)
+            .await
+    }
+
+    async fn run_inner(
+        &self,
+        request: &Request<'_>,
+        first: &Step,
+        next: Option<NextStep<'_>>,
+        continuation: Option<&entorhinal_core::HubContinuation>,
+        deadline: Instant,
+    ) -> Result<Landed, HandlerError> {
         let mut rebases = 0;
         let mut resent = false;
         let mut sent = None;
         loop {
             let Some(row) = self.store.hub_attempt(request.request_key)? else {
-                let (write, op_id) = self.build(request, first, next.is_some(), deadline).await?;
-                if self.save(&write, &op_id, None)? {
+                let (write, op_id) = self
+                    .build(
+                        request,
+                        first,
+                        next.is_some(),
+                        continuation.map(|local| local.entry_id.as_str()),
+                        deadline,
+                    )
+                    .await?;
+                if self.save(&write, &op_id, None, continuation)? {
                     sent = self.send(&write, &op_id, true, deadline).await?;
                 }
                 continue;
@@ -434,7 +468,7 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
                     if step.key == LOG_KEY || !matches!(step.payload, Payload::Record { .. }) {
                         return Err(invalid_attempt());
                     }
-                    let (write, op_id) = self.build(request, &step, false, deadline).await?;
+                    let (write, op_id) = self.build(request, &step, false, None, deadline).await?;
                     let send = Self::send_record(&op_id)?;
                     if self
                         .store
@@ -444,6 +478,9 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
                         sent = self.send(&write, &op_id, true, deadline).await?;
                     }
                     continue;
+                }
+                Settlement::Landed(landed) if write.step.starts_with("local:") => {
+                    return Ok(landed)
                 }
                 Settlement::Landed(landed) => recorded(
                     landed.op_id,
@@ -494,7 +531,7 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
                         .resend(request, &row, &op_id, deadline)
                         .await
                         .map_err(|e| during_settlement(e, &op_id))?;
-                    if self.save(&write, &next_id, Some(&row))? {
+                    if self.save(&write, &next_id, Some(&row), None)? {
                         resent = true;
                         sent = self
                             .send(&write, &next_id, false, deadline)
@@ -515,6 +552,7 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
         request: &Request<'_>,
         step: &Step,
         intermediate: bool,
+        local_id: Option<&str>,
         deadline: Instant,
     ) -> Result<(HubAttemptWrite, String), HandlerError> {
         if step.name.starts_with(CONTINUE)
@@ -560,7 +598,7 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
                 let op_id = match snapshot_id {
                     Some(id) if step.key == LOG_KEY && !intermediate => id.clone(),
                     Some(_) => return Err(invalid_attempt()),
-                    None => new_op_id()?,
+                    None => local_id.map(str::to_owned).map_or_else(new_op_id, Ok)?,
                 };
                 let header = Header {
                     kind: kind.clone(),
@@ -612,10 +650,14 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
         write: &HubAttemptWrite,
         op_id: &str,
         row: Option<&HubAttempt>,
+        continuation: Option<&entorhinal_core::HubContinuation>,
     ) -> Result<bool, HandlerError> {
-        Ok(self
-            .store
-            .persist_hub_attempt(write, &Self::send_record(op_id)?, row)?)
+        Ok(self.store.persist_hub_attempt_with_local(
+            write,
+            &Self::send_record(op_id)?,
+            row,
+            continuation,
+        )?)
     }
 
     async fn send(
@@ -802,12 +844,13 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
         if header.writer != request.writer {
             return Err(invalid_attempt());
         }
-        let body = match replan.after_image(&saved_body)? {
-            Replanned::Body(body) => body,
+        let op_id = new_op_id()?;
+        let (body, continuation) = match replan.after_image_with_id(&saved_body, &op_id)? {
+            Replanned::Body(body) => (body, None),
+            Replanned::WithLocal(body, continuation) => (body, Some(continuation)),
             Replanned::Refused(error) => return Ok(Rebase::Refused(error)),
         };
         header.writer_ep = request.writer_ep;
-        let op_id = new_op_id()?;
         header.entry_id = op_id.clone();
         let saved = UnverifiedRecord::parse(&row.write.key, &row.write.value)?;
         let epoch = self.fence(&header, deadline).await?;
@@ -820,11 +863,13 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
         let mut write = row.write.clone();
         write.value = self.prepare(&header, &body, epoch, deadline).await?;
         write.expected = expected;
-        Ok(if self.save(&write, &op_id, Some(row))? {
-            Rebase::Send(write, op_id)
-        } else {
-            Rebase::RowChanged
-        })
+        Ok(
+            if self.save(&write, &op_id, Some(row), continuation.as_deref())? {
+                Rebase::Send(write, op_id)
+            } else {
+                Rebase::RowChanged
+            },
+        )
     }
 
     async fn replace_bytes(

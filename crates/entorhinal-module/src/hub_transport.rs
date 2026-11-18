@@ -144,6 +144,17 @@ impl Hub {
             })
     }
 
+    pub(super) async fn fleet_vault(
+        &self,
+        deadline: Instant,
+    ) -> Result<crate::fleet_record::vault::SubcEpochVault, HandlerError> {
+        let consumer = timeout_at(deadline, self.bus_consumer())
+            .await
+            .map_err(|_| unavailable("daemon_connect_timeout"))?
+            .map_err(|error| unavailable(&error.0))?;
+        Ok(crate::fleet_record::vault::SubcEpochVault::new(consumer))
+    }
+
     fn bus_options() -> BusClientOptions {
         let mut options =
             BusClientOptions::new(crate::MODULE_ID).expect("valid entorhinal module id");

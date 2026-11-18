@@ -689,12 +689,18 @@ impl RegistryStore {
         self_author: Option<&str>,
         writer_ep: Option<u64>,
     ) -> Result<i64, RegistryError> {
+        let bindings = if writer_ep.is_some() {
+            self.check_hub_bindings(entry)?
+        } else {
+            vec![]
+        };
         let error = std::cell::RefCell::new(None);
         let result = self.with_where_changes(|tx| {
             (|| {
                 let seq = apply(tx, entry)?;
                 if let Some(episode) = writer_ep {
                     crate::hub_store::record_log_writer(tx, entry, episode)?;
+                    crate::pending::apply_hub_local(tx, entry, &bindings)?;
                 }
                 learn_identity(tx, self_author)?;
                 Ok(seq)

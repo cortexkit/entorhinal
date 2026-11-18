@@ -10,11 +10,65 @@ use serde_json::json;
 use crate::{
     agent::AgentChangeEntry,
     mutations::{append, domain},
-    shared_entry::{canonical_bytes, decode_error, ProjectEntry, RootKeyMapping, SharedState},
+    remote_apply::{EngramFreeze, RemoteEntry},
+    shared_entry::{
+        canonical_bytes, decode_error, ProjectEntry, RootKeyMapping, SharedRow, SharedState,
+        TableChanges, AGENT_SHARED_TABLES, PROJECT_SHARED_TABLES,
+    },
     RegistryError, RegistryStore,
 };
 
 pub const SNAPSHOT_CAP: usize = 200 * 1024;
+
+pub(crate) const HUB_SNAPSHOT: &str = "hub.snapshot";
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HubSnapshot {
+    pub engram_through: i64,
+    pub excluded: Vec<String>,
+    pub image: HubImage,
+    pub migration_id: String,
+    pub tables: BTreeMap<String, Vec<SharedRow>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HubImage {
+    pub claims: Vec<HubClaim>,
+    pub roles: Vec<HubRole>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HubClaim {
+    pub agent_id: String,
+    pub generation: i64,
+    pub holder: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HubRole {
+    pub generation: i64,
+    pub holder: Option<String>,
+    pub role: String,
+}
+
+impl HubSnapshot {
+    pub fn preimage(&self) -> Result<String, RegistryError> {
+        let value = serde_json::to_value(self).map_err(decode_error)?;
+        entorhinal_catalog::jcs::to_string(&value)
+            .map_err(|error| domain("hub_migration_mismatch", error.to_string()))
+    }
+}
+
+#[derive(PartialEq, Eq)]
+pub struct HubEnablePlan {
+    pub enable_id: String,
+    pub snapshot_digest: String,
+    pub preimage: String,
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct EnablePart {
@@ -135,6 +189,128 @@ fn partition(id: &str, image: ProjectEntry, base: u64) -> Result<Vec<Vec<u8>>, R
 }
 
 impl RegistryStore {
+    pub fn hub_enable_plan(&self) -> Result<Option<HubEnablePlan>, RegistryError> {
+        self.read(read_hub_plan)
+    }
+
+    /// Save the reviewed bytes before any network write. Reopening never relies
+    /// on a second capture of the local registry or a renewed presence approval.
+    pub fn begin_hub_enable(&self, enable_id: &str, box_id: &str) -> Result<(), RegistryError> {
+        self.with_where_changes(|tx| {
+            let mut tables = hub_tables(tx)?;
+            let names = tables.get_mut("member_name").expect("shared table");
+            let own: Option<String> = tx.query_row("SELECT self_author FROM self_identity WHERE id=1", [], |r| r.get(0)).optional()?.flatten();
+            let name = names.iter().find(|row| row["author"] == box_id)
+                .or_else(|| names.iter().find(|row| row["author"].as_str() == own.as_deref())).cloned();
+            *names = name.into_iter().map(|mut row| {
+                row.insert("author".into(), box_id.into());
+                row
+            }).collect();
+            let claims = tables["agent"].iter().map(|row| {
+                Ok(HubClaim {
+                    agent_id: row["agent_id"].as_str().ok_or_else(invalid_hub_snapshot)?.into(),
+                    holder: Some(box_id.into()),
+                    generation: 1,
+                })
+            }).collect::<rusqlite::Result<_>>()?;
+            let snapshot = HubSnapshot {
+                engram_through: 0,
+                excluded: vec![],
+                image: HubImage { claims, roles: vec![] },
+                migration_id: enable_id.into(),
+                tables,
+            };
+            let preimage = snapshot.preimage().map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            let digest = entorhinal_catalog::sha256_hex(preimage.as_bytes());
+            if tx.execute(
+                "UPDATE identity_log_state SET state='enabling',enable_id=?1,enable_snapshot_digest=?2,enable_parts=?3
+                 WHERE id=1 AND state='disabled' AND hub_log_base IS NULL AND enable_id IS NULL",
+                params![enable_id, digest, preimage],
+            )? != 1 {
+                return Err(invalid_hub_snapshot());
+            }
+            Ok(())
+        }).map_err(RegistryError::Store)
+    }
+
+    pub fn installed_hub_snapshot(&self) -> Result<HubSnapshot, RegistryError> {
+        self.read(|conn| {
+            let bytes: Vec<u8> = conn.query_row(
+                "SELECT entry FROM registry_journal WHERE op=?1 AND entry IS NOT NULL ORDER BY seq DESC LIMIT 1",
+                [HUB_SNAPSHOT],
+                |r| r.get(0),
+            )?;
+            serde_json::from_slice(&bytes).map_err(decode_error)
+        })
+    }
+
+    pub fn install_hub_snapshot(
+        &self,
+        snapshot: &HubSnapshot,
+        parts: &[(RemoteEntry, u64)],
+        own_box: &str,
+    ) -> Result<(), RegistryError> {
+        let preimage = snapshot.preimage()?;
+        let digest = entorhinal_catalog::sha256_hex(preimage.as_bytes());
+        let base = snapshot.engram_through;
+        let final_position = i64::try_from(parts.len())
+            .ok()
+            .filter(|n| *n != 0)
+            .and_then(|n| base.checked_add(n))
+            .ok_or_else(invalid_hub_snapshot)?;
+        let freeze = self.engram_freeze()?;
+        self.with_where_changes(|tx| {
+            let (state, cursor, old_base): (String, i64, Option<i64>) = tx.query_row(
+                "SELECT state,last_applied_position,hub_log_base FROM identity_log_state WHERE id=1",
+                [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            let allowed = match (state.as_str(), freeze.as_ref(), read_hub_plan(tx)?) {
+                ("enabling", None, Some(plan)) => base == 0 && cursor == 0
+                    && plan.enable_id == snapshot.migration_id && plan.snapshot_digest == digest
+                    && plan.preimage == preimage,
+                ("enabled", Some(EngramFreeze::Applied { position, body, .. }), None) => {
+                    base == *position && cursor == base && body.migration_id == snapshot.migration_id
+                        && body.excluded == snapshot.excluded
+                }
+                ("disabled", None, None) => cursor == 0 && tx.query_row(
+                    "SELECT NOT EXISTS(SELECT 1 FROM agent) AND NOT EXISTS(SELECT 1 FROM project) AND NOT EXISTS(SELECT 1 FROM workspace)", [], |r| r.get(0),
+                )?,
+                _ => false,
+            };
+            if old_base.is_some() || !allowed {
+                return Err(invalid_hub_snapshot());
+            }
+            tx.execute("INSERT INTO self_identity(id,self_author,learned_at_ms) VALUES(1,?1,?2)
+                ON CONFLICT(id) DO UPDATE SET self_author=excluded.self_author,learned_at_ms=excluded.learned_at_ms",
+                params![own_box, crate::now_unix_millis()])?;
+            ensure_cutover(tx, 0, "entorhinal")?;
+            if state != "enabled" {
+                append(tx, "identity_log.enable", &json!({}), "log", None, 0, "entorhinal")?;
+            }
+            for (index, (part, episode)) in parts.iter().enumerate() {
+                if part.position != base + index as i64 + 1 {
+                    return Err(invalid_hub_snapshot());
+                }
+                let seq = append(tx, HUB_SNAPSHOT, &json!({"snapshot_digest":digest}), "log", None, 0, "entorhinal")?;
+                let complete = part.position == final_position;
+                tx.execute(
+                    "UPDATE registry_journal SET stream=?1, origin='log', entry_id=?2, log_position=?3, entry=?4 WHERE seq=?5",
+                    params![if complete { "shared" } else { "local" }, part.entry_id, part.position, complete.then_some(preimage.as_bytes()), seq],
+                )?;
+                crate::hub_store::record_log_writer(tx, part, *episode)?;
+                if complete {
+                    restore_hub_snapshot(tx, snapshot, seq)?;
+                }
+            }
+            tx.execute(
+                "UPDATE identity_log_state SET state='enabled',hub_log_base=?1,last_applied_position=?2,last_seen_head=?2,
+                    hub_ready=0,hub_quieting=0,enable_id=NULL,enable_snapshot_digest=NULL,enable_parts=NULL WHERE id=1",
+                params![base, final_position],
+            )?;
+            Ok(())
+        }).map_err(RegistryError::Store)
+    }
+
     pub fn enable_registry_is_empty(&self) -> Result<bool, RegistryError> {
         self.read(|conn| conn.query_row(
             "SELECT NOT EXISTS(SELECT 1 FROM project) AND NOT EXISTS(SELECT 1 FROM workspace) AND NOT EXISTS(SELECT 1 FROM agent)",
@@ -422,6 +598,110 @@ impl RegistryStore {
     }
 }
 
+fn invalid_hub_snapshot() -> rusqlite::Error {
+    rusqlite::Error::InvalidParameterName("invalid hub snapshot or local bootstrap state".into())
+}
+
+fn read_hub_plan(conn: &rusqlite::Connection) -> rusqlite::Result<Option<HubEnablePlan>> {
+    conn.query_row(
+        "SELECT enable_id,enable_snapshot_digest,enable_parts FROM identity_log_state
+         WHERE id=1 AND enable_id IS NOT NULL AND hub_log_base IS NULL",
+        [],
+        |r| {
+            Ok(HubEnablePlan {
+                enable_id: r.get(0)?,
+                snapshot_digest: r.get(1)?,
+                preimage: r.get(2)?,
+            })
+        },
+    )
+    .optional()
+}
+
+fn hub_tables(conn: &rusqlite::Connection) -> rusqlite::Result<BTreeMap<String, Vec<SharedRow>>> {
+    let bytes = SharedState::capture(conn)?
+        .canonical_bytes()
+        .map_err(decode_error)?;
+    let mut tables: BTreeMap<String, Vec<SharedRow>> =
+        serde_json::from_slice(&bytes).map_err(decode_error)?;
+    tables.remove("member_box");
+    Ok(tables)
+}
+
+pub(crate) fn restore_hub_snapshot(
+    tx: &Transaction<'_>,
+    snapshot: &HubSnapshot,
+    seq: i64,
+) -> rusqlite::Result<()> {
+    let tables = &snapshot.tables;
+    let before = SharedState::capture(tx)?;
+    let expected = PROJECT_SHARED_TABLES
+        .iter()
+        .chain(AGENT_SHARED_TABLES)
+        .copied()
+        .chain(["member_name"]);
+    if tables.len() != expected.clone().count()
+        || !expected.into_iter().all(|name| tables.contains_key(name))
+    {
+        return Err(invalid_hub_snapshot());
+    }
+    let mut project = ProjectEntry {
+        op: "shared.snapshot".into(),
+        tables: PROJECT_SHARED_TABLES
+            .iter()
+            .map(|&name| {
+                (
+                    name.into(),
+                    TableChanges {
+                        upsert: tables[name].clone(),
+                        delete: vec![],
+                    },
+                )
+            })
+            .collect(),
+        agents: vec![],
+        member_name: None,
+        member_box: None,
+        requesting_agent_id: None,
+        authorization: None,
+    };
+    project.validate(tx)?;
+    project.delete_absent(tx, &before)?;
+    tx.execute_batch("PRAGMA defer_foreign_keys=ON; DELETE FROM agent_name_claim; DELETE FROM agent; DELETE FROM member_name;")?;
+    for name in ["agent", "agent_name_claim", "member_name"] {
+        let columns = tx
+            .prepare(&format!("PRAGMA table_info({name})"))?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let sql = format!(
+            "INSERT INTO {name}({}) VALUES({})",
+            columns.join(","),
+            vec!["?"; columns.len()].join(",")
+        );
+        let mut insert = tx.prepare(&sql)?;
+        for row in &tables[name] {
+            if row.len() != columns.len() {
+                return Err(invalid_hub_snapshot());
+            }
+            let values = columns
+                .iter()
+                .map(|key| match row.get(key) {
+                    Some(serde_json::Value::Null) => Ok(rusqlite::types::Value::Null),
+                    Some(serde_json::Value::String(value)) => Ok(value.clone().into()),
+                    Some(value) if value.is_i64() => Ok(value.as_i64().unwrap().into()),
+                    _ => Err(invalid_hub_snapshot()),
+                })
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            insert.execute(rusqlite::params_from_iter(values))?;
+        }
+    }
+    project.restore(tx, seq, false)?;
+    if hub_tables(tx)? != *tables {
+        return Err(invalid_hub_snapshot());
+    }
+    Ok(())
+}
+
 /// Reconstruct only agent history in memory. Change entries carry complete rows
 /// but only the claims inserted or released by that operation, so claims must
 /// accumulate across changes, even when a later tag/label update has none.
@@ -605,6 +885,60 @@ mod tests {
     use crate::remote_apply::RemoteEntry;
     use cortexkit_store::{Isolation, StorageBackend};
     use std::path::Path;
+
+    #[test]
+    fn hub_snapshot_replay_reproduces_existing_agents_and_filters_both_feeds() {
+        let f = crate::mutations::tests::Fixture::new("hub-snapshot-replay");
+        let store = &f.store;
+        let holder = "ab".repeat(16);
+        let id = "cd".repeat(16);
+        store.apply_entry("fixture.rows", "{}", "test", None, |tx| {
+            tx.execute_batch("INSERT INTO agent(agent_id,name,tag,role,created_at_ms,updated_at_ms)
+              VALUES('agent_0000000000000001','Ada','helper','assistant',1,1);
+              INSERT INTO agent_name_claim(agent_id,namespace_kind,namespace_key,normalized_name,display_name,claimed_at_ms)
+              VALUES('agent_0000000000000001','assistant','global','ada','Ada',1);")?;
+            tx.execute("INSERT INTO member_name(author,display_name) VALUES(?1,'Here')", [&holder])?;
+            Ok(())
+        }).unwrap();
+        store.begin_hub_enable(&id, &holder).unwrap();
+        let plan = store.hub_enable_plan().unwrap().unwrap();
+        let snapshot: HubSnapshot = serde_json::from_str(&plan.preimage).unwrap();
+        assert_eq!(
+            snapshot.image.claims[0].holder.as_deref(),
+            Some(holder.as_str())
+        );
+        let entry = RemoteEntry {
+            position: 1,
+            entry_id: "11".repeat(16),
+            author: holder.clone(),
+            signer: "test".into(),
+            key_id: "test".into(),
+            envelope_version: 1,
+            kind: "snapshot".into(),
+            entry: vec![],
+        };
+        let before = store.generation().unwrap();
+        store
+            .install_hub_snapshot(&snapshot, &[(entry, 0)], &holder)
+            .unwrap();
+        assert_eq!(store.hub_log_base().unwrap(), Some(0));
+        assert!(store.hub_snapshot_applied(0).unwrap());
+        assert!(store
+            .agent_changes(before, None)
+            .unwrap()
+            .entries
+            .is_empty());
+        assert!(store
+            .journal_tail(before, 30)
+            .unwrap()
+            .entries
+            .iter()
+            .all(|row| row.op != HUB_SNAPSHOT));
+        assert!(store.verify().unwrap().ok);
+        store.rebuild().unwrap();
+        assert_eq!(store.read(hub_tables).unwrap(), snapshot.tables);
+        assert!(store.verify().unwrap().ok);
+    }
 
     #[test]
     fn without_agents_refuses_existing_agents_even_without_a_cutover_marker() {

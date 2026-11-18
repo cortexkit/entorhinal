@@ -51,6 +51,7 @@ CREATE TABLE hub_attempt (
     expected INTEGER NOT NULL CHECK(expected >= 0),
     value BLOB NOT NULL,
     step TEXT NOT NULL,
+    continuation TEXT NULL,
     outcome TEXT NULL,
     outcome_op_id TEXT NULL CHECK((outcome IS NULL) = (outcome_op_id IS NULL)),
     outcome_at_ms INTEGER NULL CHECK((outcome IS NULL) = (outcome_at_ms IS NULL))
@@ -65,6 +66,12 @@ CREATE TABLE hub_attempt_send (
     PRIMARY KEY(request_key, op_id)
 );
 CREATE INDEX hub_attempt_send_by_op ON hub_attempt_send(op_id);
+
+CREATE TABLE hub_local_reply (
+    request_key TEXT PRIMARY KEY NOT NULL,
+    params_digest TEXT NOT NULL,
+    reply TEXT NOT NULL
+);
 
 CREATE TABLE hub_anchor (
     box TEXT NOT NULL,
@@ -581,7 +588,7 @@ impl RegistryStore {
         self.read(|conn| {
             conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM registry_journal
-                               WHERE op='shared.snapshot' AND log_position>?1)",
+                                WHERE op IN ('shared.snapshot', 'hub.snapshot') AND log_position>?1)",
                 [base],
                 |r| r.get(0),
             )
@@ -628,6 +635,16 @@ impl RegistryStore {
         send: &HubAttemptSend,
         previous: Option<&HubAttempt>,
     ) -> Result<bool, RegistryError> {
+        self.persist_hub_attempt_with_local(write, send, previous, None)
+    }
+
+    pub fn persist_hub_attempt_with_local(
+        &self,
+        write: &HubAttemptWrite,
+        send: &HubAttemptSend,
+        previous: Option<&HubAttempt>,
+        continuation: Option<&crate::HubContinuation>,
+    ) -> Result<bool, RegistryError> {
         self.db
             .with_conn_fenced(|tx| {
                 let current = load_attempt(tx, &write.request_key)?;
@@ -639,9 +656,45 @@ impl RegistryStore {
                     return Ok(false);
                 }
                 save_attempt(tx, write, send)?;
+                if let Some(continuation) = continuation {
+                    tx.execute(
+                        "UPDATE hub_attempt SET continuation=?1 WHERE request_key=?2",
+                        params![
+                            serde_json::to_string(continuation).map_err(decode_error)?,
+                            write.request_key
+                        ],
+                    )?;
+                }
                 Ok(true)
             })
             .map_err(RegistryError::Store)
+    }
+
+    pub fn hub_local_reply(
+        &self,
+        key: &str,
+        digest: &str,
+    ) -> Result<Option<Vec<u8>>, RegistryError> {
+        let row = self.read(|conn| {
+            conn.query_row(
+                "SELECT params_digest,reply FROM hub_local_reply WHERE request_key=?1",
+                [key],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()
+        })?;
+        match row {
+            Some((saved, _)) if saved != digest => Err(crate::mutations::domain(
+                "request_key_conflict",
+                "request key has different arguments",
+            )),
+            Some((_, reply)) => Ok(Some(reply.into_bytes())),
+            None => Ok(None),
+        }
+    }
+
+    pub fn hub_local_time(&self, key: &str) -> Result<Option<i64>, RegistryError> {
+        self.read(|conn| conn.query_row("SELECT json_extract(continuation,'$.now') FROM hub_attempt WHERE request_key=?1 AND continuation IS NOT NULL", [key], |r| r.get(0)).optional())
     }
 
     /// Close requests matching an applied operation and its current target.

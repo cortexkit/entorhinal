@@ -589,6 +589,54 @@ struct BindPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreparedBinding {
+    pub(crate) root: String,
+    incarnation: String,
+    epoch: String,
+}
+
+impl PreparedBinding {
+    pub(crate) fn still_present(&self) -> bool {
+        matches!(disk_identity(Path::new(&self.root)), DiskIdentity::Token(token) if token == self.incarnation)
+    }
+
+    pub(crate) fn write(
+        &self,
+        tx: &Transaction<'_>,
+        project_id: &str,
+        actor: &str,
+        principal: &str,
+    ) -> Result<Option<(i64, Value)>, RegistryError> {
+        let current = active_binding(tx, &self.root)?;
+        if current.as_ref().is_some_and(|bound| {
+            bound.incarnation == self.incarnation && bound.project_id == project_id
+        }) {
+            return Ok(None);
+        }
+        let payload = BindPayload {
+            canonical_root: self.root.clone(),
+            project_id: project_id.into(),
+            incarnation: self.incarnation.clone(),
+            registration_epoch: self.epoch.clone(),
+            replaced_epoch: current.map(|bound| bound.epoch),
+        };
+        let value = serde_json::to_value(&payload)
+            .map_err(|error| domain("encode_failed", error.to_string()))?;
+        let seq = super::mutations::append(
+            tx,
+            "bind_root",
+            &value,
+            actor,
+            None,
+            super::now_unix_millis(),
+            principal,
+        )?;
+        apply_bind(tx, &payload, seq)?;
+        Ok(Some((seq, value)))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ApprovalPayload {
     canonical_root: String,
@@ -670,6 +718,23 @@ pub struct BindReport {
 }
 
 impl RegistryStore {
+    pub fn prepare_hub_binding(&self, root: &str) -> Result<PreparedBinding, RegistryError> {
+        let common = git_common_dir(Path::new(root))
+            .map_err(|reason| domain("root_identity_unverifiable", format!("{root}: {reason}")))?;
+        let incarnation = match read_token(&common) {
+            DiskIdentity::Token(token) => token,
+            DiskIdentity::NoToken => create_token(&common, &self.ids.hex(32)?)
+                .map_err(|reason| domain("root_identity_unverifiable", reason))?,
+            DiskIdentity::Unverifiable(reason) => {
+                return Err(domain("root_identity_unverifiable", reason))
+            }
+        };
+        Ok(PreparedBinding {
+            root: root.into(),
+            incarnation,
+            epoch: self.ids.hex(16)?,
+        })
+    }
     /// Turn root records on or off for this store's replies.
     pub fn set_root_records(&mut self, enabled: bool) {
         self.root_records = enabled;
@@ -778,72 +843,35 @@ impl super::JournalWriter<'_> {
     /// replaced gets a new binding; the old epoch is retired as `replaced` and
     /// its approval goes with it.
     pub fn bind_root(&self, canonical_root: &str, actor: &str) -> Result<Vec<u8>, RegistryError> {
-        let root = Path::new(canonical_root);
-        let common = git_common_dir(root).map_err(|reason| {
-            domain(
-                "root_identity_unverifiable",
-                format!("{canonical_root}: {reason}"),
-            )
-        })?;
-        let incarnation = match read_token(&common) {
-            DiskIdentity::Token(token) => token,
-            DiskIdentity::NoToken => create_token(&common, &self.ids.hex(32)?)
-                .map_err(|reason| domain("root_identity_unverifiable", reason))?,
-            DiskIdentity::Unverifiable(reason) => {
-                return Err(domain("root_identity_unverifiable", reason))
-            }
-        };
-        let epoch = self.ids.hex(16)?;
-        let root_key = canonical_root.to_string();
+        let binding = self.prepare_hub_binding(canonical_root)?;
         let actor = actor.to_string();
         self.mutation("bind_root", None, move |tx| {
             let project_id = tx
                 .query_row(
                     "SELECT project_id FROM project_root WHERE canonical_root = ?1",
-                    [&root_key],
+                    [&binding.root],
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?
                 .ok_or_else(|| {
-                    domain("not_found", format!("{root_key} is not a registered root"))
+                    domain(
+                        "not_found",
+                        format!("{} is not a registered root", binding.root),
+                    )
                 })?;
-            let current = active_binding(tx, &root_key)?;
-            if let Some(bound) = &current {
-                if bound.incarnation == incarnation && bound.project_id == project_id {
-                    let value =
-                        json!({"canonicalRoot": root_key, "registrationEpoch": bound.epoch});
-                    return Ok(Action {
-                        changed: false,
-                        seq: None,
-                        value: value.clone(),
-                        payload: value,
-                    });
-                }
-            }
-            let payload = BindPayload {
-                canonical_root: root_key.clone(),
-                project_id,
-                incarnation: incarnation.clone(),
-                registration_epoch: epoch.clone(),
-                replaced_epoch: current.map(|bound| bound.epoch),
-            };
-            let payload_value = serde_json::to_value(&payload)
-                .map_err(|error| domain("encode_failed", error.to_string()))?;
-            let seq = super::mutations::append(
-                tx,
-                "bind_root",
-                &payload_value,
-                &actor,
-                None,
-                super::now_unix_millis(),
-                self.principal,
-            )?;
-            apply_bind(tx, &payload, seq)?;
+            let written = binding.write(tx, &project_id, &actor, self.principal)?;
+            let current =
+                active_binding(tx, &binding.root)?.expect("binding was applied or already present");
+            let value = json!({"canonicalRoot": binding.root, "registrationEpoch": current.epoch});
+            let (seq, payload) = written.map_or_else(
+                || (None, value.clone()),
+                |(seq, payload)| (Some(seq), payload),
+            );
             Ok(Action {
-                changed: true,
-                seq: Some(seq),
-                value: json!({"canonicalRoot": root_key, "registrationEpoch": epoch}),
-                payload: payload_value,
+                changed: seq.is_some(),
+                seq,
+                value,
+                payload,
             })
         })
     }

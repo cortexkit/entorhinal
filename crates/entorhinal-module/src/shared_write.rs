@@ -3086,7 +3086,7 @@ impl ProjectsHandler {
         self.write_wait_inner(
             WireRequest {
                 method: "catalog.pin".into(),
-                params: Value::Null,
+                params: serde_json::to_value(&pins).map_err(invalid_params)?,
             },
             key,
             received,
@@ -3258,12 +3258,25 @@ impl ProjectsHandler {
                 .map_err(|error| HandlerError::new("storage_error", error.to_string()))?;
         }
         let store = self.with_store(|s| Ok(s.clone()))?;
+        let candidate = agent_write || shared_candidate(&request.method);
+        if candidate
+            && (store.hub_log_base()?.is_some()
+                || matches!(
+                    store.engram_freeze()?,
+                    Some(entorhinal_core::remote_apply::EngramFreeze::Applied { .. })
+                ))
+            && !self.residence().is_some_and(|residence| residence.ready())
+        {
+            return Err(HandlerError::new(
+                "hub_not_ready",
+                "hub snapshot and residence have not caught up",
+            ));
+        }
         if request.method == super::member::SET_NAME {
             let name = super::member::prepare(&store, request.params.clone())?;
             request.params = serde_json::to_value(name).expect("member name encodes");
         }
         let state = store.identity_log_status().map_err(storage_error)?.state;
-        let candidate = agent_write || shared_candidate(&request.method);
         let prepared = if agent_write {
             consent
         } else {
@@ -3278,7 +3291,22 @@ impl ProjectsHandler {
             ));
         }
         bootstrap_fence(&store, &state, &request)?;
-        let hub_create = if request.method == "agent.create" && self.hub_backend_selected() {
+        if store.hub_log_base()?.is_some() && request.method != "agent.create" {
+            if let Some(write) = &prepared {
+                let (key, digest) = hub_request(&request, write)?;
+                if let Some(key) = key {
+                    if let Some(reply) = store.hub_local_reply(&key, &digest)? {
+                        let reply = hub_reply(reply)?;
+                        return if request.method.starts_with("agent.") {
+                            self.attach_incarnation(reply)
+                        } else {
+                            Ok(reply)
+                        };
+                    }
+                }
+            }
+        }
+        let hub_create = if request.method == "agent.create" && store.hub_log_base()?.is_some() {
             let residence = self.residence().ok_or_else(|| {
                 HandlerError::new("hub_not_ready", "hub residence watch is not installed")
             })?;
@@ -3434,6 +3462,49 @@ impl ProjectsHandler {
         })?;
         // Re-read after the lock: enable/join can change state while we queue.
         let state = store.identity_log_status().map_err(storage_error)?.state;
+        if candidate && store.hub_log_base()?.is_some() {
+            drop(writer);
+            if !self.residence().is_some_and(|residence| residence.ready()) {
+                return Err(HandlerError::new(
+                    "hub_not_ready",
+                    "hub snapshot and residence have not caught up",
+                ));
+            }
+            let write = prepared.expect("shared write was decoded");
+            let result = self.hub_shared_write(
+                &store,
+                &request,
+                write,
+                &principal,
+                approval.as_ref(),
+                deadline,
+            );
+            let body = if let Some(guard) = &mut confirmation {
+                tokio::select! {
+                    biased;
+                    _ = guard.cancelled.wait_for(|closed| *closed) => return Err(agent_ops::OperatorConfirmError::Declined.into()),
+                    result = result => result,
+                }
+            } else {
+                result.await
+            }?;
+            return self.record_mutation(if request.method.starts_with("agent.") {
+                self.attach_incarnation(body)
+            } else {
+                Ok(body)
+            });
+        }
+        if candidate
+            && matches!(
+                store.engram_freeze()?,
+                Some(entorhinal_core::remote_apply::EngramFreeze::Applied { .. })
+            )
+        {
+            return Err(HandlerError::new(
+                "hub_not_ready",
+                "hub snapshot has not been applied",
+            ));
+        }
         if agent_write && matches!(state.as_str(), "enabling" | "joining") {
             return Err(HandlerError::new(
                 "identity_log_enabling",
@@ -3606,6 +3677,215 @@ impl ProjectsHandler {
         }
         unreachable!()
     }
+
+    async fn hub_shared_write(
+        &self,
+        store: &RegistryStore,
+        request: &WireRequest,
+        write: Write,
+        principal: &str,
+        approval: Option<&OperatorApproval>,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, HandlerError> {
+        let log = self.hub_shared_log.lock().unwrap().clone().ok_or_else(|| {
+            HandlerError::new("hub_not_ready", "hub identity writer is not installed")
+        })?;
+        let consent = match &write {
+            Write::Consent(_, consent) | Write::CatalogInstall(_, consent) => {
+                Some(consent.as_ref())
+            }
+            _ => None,
+        };
+        let (key, digest) = hub_request(request, &write)?;
+        let key = key.map_or_else(crate::hub_write::new_op_id, Ok)?;
+        if let Some(reply) = store.hub_local_reply(&key, &digest)? {
+            return hub_reply(reply);
+        }
+        let now = store.hub_local_time(&key)?.unwrap_or_else(self.clock);
+        let draws_agent = matches!(&write, Write::Consent(plan, _) if matches!(plan.tool.as_str(), "agents_hire" | "agents_create_head"));
+        let id = if draws_agent {
+            (self.agent_id_draw)()?
+        } else {
+            String::new()
+        };
+        let avatar = if draws_agent {
+            Some((self.agent_avatar_draw)()?)
+        } else {
+            None
+        };
+        let preview = |store: &RegistryStore, saved: Option<&Value>, entry_id: &str| {
+            let id = saved
+                .and_then(|body| body["agent_id"].as_str())
+                .unwrap_or(&id);
+            let avatar = saved
+                .and_then(|body| serde_json::from_value(body["row"]["avatar"].clone()).ok())
+                .or_else(|| avatar.clone());
+            let label = if let Write::Register(req) = &write {
+                req.label.as_deref()
+            } else {
+                None
+            };
+            preview_local(store, entry_id, consent, label, now, || {
+                write
+                    .clone()
+                    .run(store, principal, now, id, avatar, approval)
+            })
+        };
+        let attempt = store.hub_attempt(&key)?;
+        let (expected, body, continuation) = if let Some(attempt) = attempt {
+            let record = crate::fleet_record::UnverifiedRecord::parse(
+                &attempt.write.key,
+                &attempt.write.value,
+            )?;
+            (
+                attempt.write.expected,
+                json!({"op":record.header().kind}),
+                None,
+            )
+        } else {
+            log.catch_up(deadline).await?;
+            let expected = log.applied()?;
+            match preview(store, None, &crate::hub_write::new_op_id()?)? {
+                HubPreview::Local(reply) => return Ok(reply),
+                HubPreview::Shared(body, local) => (expected, body, Some(local)),
+            }
+        };
+        let replan = |store: &RegistryStore, saved: &Value, entry_id: &str| match preview(
+            store,
+            Some(saved),
+            entry_id,
+        ) {
+            Ok(HubPreview::Shared(body, local)) => {
+                Ok(crate::hub_write::Replanned::WithLocal(body, local))
+            }
+            Ok(HubPreview::Local(_)) => Ok(crate::hub_write::Replanned::Refused(
+                HandlerError::new("head_moved", "operation no longer needs a shared entry"),
+            )),
+            Err(error) => Ok(crate::hub_write::Replanned::Refused(error)),
+        };
+        hub_reply(
+            log.append_local(
+                &key,
+                &digest,
+                expected,
+                body,
+                continuation.as_deref(),
+                &replan,
+                deadline,
+            )
+            .await?,
+        )
+    }
+}
+
+fn hub_request(
+    request: &WireRequest,
+    write: &Write,
+) -> Result<(Option<String>, String), HandlerError> {
+    let consent = match write {
+        Write::Consent(_, commit) | Write::CatalogInstall(_, commit) => Some(commit.as_ref()),
+        _ => None,
+    };
+    let key = if let Some(commit) = consent {
+        let identity = &commit.request.identity;
+        Some(format!(
+            "consent:{}:{}:{}",
+            identity.agent_id, identity.tool, identity.request_key
+        ))
+    } else {
+        request.params["request_key"]
+            .as_str()
+            .or_else(|| request.params["requestKey"].as_str())
+            .map(str::to_owned)
+    };
+    let digest = crate::hub_write::params_digest(
+        &request.method,
+        &json!([request.params, consent.map(|c| &c.request.args_digest)]),
+    )?;
+    Ok((key, digest))
+}
+
+enum HubPreview {
+    Local(Vec<u8>),
+    Shared(Value, Box<entorhinal_core::HubContinuation>),
+}
+
+fn preview_local(
+    store: &RegistryStore,
+    entry_id: &str,
+    consent: Option<&entorhinal_core::agent::consent::ConsentCommit>,
+    label: Option<&str>,
+    now: i64,
+    apply: impl FnOnce() -> Result<Vec<u8>, HandlerError>,
+) -> Result<HubPreview, HandlerError> {
+    let captured = Arc::new(std::sync::Mutex::new(None));
+    let slot = captured.clone();
+    let result = store.preview_hub_write(
+        entry_id.to_owned(),
+        move |body, reply| {
+            *slot.lock().unwrap() = Some((body, reply));
+        },
+        apply,
+    );
+    let preview = captured.lock().unwrap().take();
+    match (preview, result) {
+        (Some((bytes, reply)), Err(_)) => {
+            let body = serde_json::from_slice(&bytes).map_err(invalid_params)?;
+            let result = &reply["result"];
+            let roots = result["projectId"].as_str().and_then(|id| {
+                let paths = |field: &str| {
+                    result[field]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                };
+                let mut roots = paths("roots");
+                if let Some(root) = result["root"].as_str() {
+                    roots.push(root.to_owned());
+                }
+                let parents = paths("derivedRootParents");
+                (!roots.is_empty() || !parents.is_empty()).then(|| entorhinal_core::HubRoots {
+                    project: id.into(),
+                    roots,
+                    parents,
+                })
+            });
+            Ok(HubPreview::Shared(
+                body,
+                Box::new(entorhinal_core::HubContinuation::prepare(
+                    store,
+                    entry_id,
+                    now,
+                    reply,
+                    roots,
+                    label,
+                    consent.cloned().map(Into::into),
+                )?),
+            ))
+        }
+        (None, Err(error)) => Err(error),
+        (None, Ok(reply)) => Ok(HubPreview::Local(reply)),
+        (Some(_), Ok(_)) => Err(HandlerError::new(
+            "storage_error",
+            "hub preview unexpectedly committed",
+        )),
+    }
+}
+
+fn hub_reply(bytes: Vec<u8>) -> Result<Vec<u8>, HandlerError> {
+    let value: Value = serde_json::from_slice(&bytes).map_err(invalid_params)?;
+    if let Some(error) = value.get("error") {
+        return Err(HandlerError::new(
+            error["code"].as_str().unwrap_or("storage_error"),
+            error["message"]
+                .as_str()
+                .unwrap_or("local continuation refused"),
+        ));
+    }
+    Ok(bytes)
 }
 
 fn preview_hub_create(

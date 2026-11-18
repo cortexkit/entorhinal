@@ -19,6 +19,7 @@ pub(crate) struct Worker {
     log: log_client::LogClient,
     records: super::record_client::RecordClient,
     hub_switch: Option<super::hub_switch::Switch>,
+    hub_runtime: super::hub_switch::Runtime,
     wake: Arc<tokio::sync::Notify>,
     writer: Arc<tokio::sync::Mutex<()>>,
     commits: Arc<tokio::sync::Notify>,
@@ -34,6 +35,7 @@ impl ProjectsHandler {
             log: self.log_client.clone(),
             records: self.record_client.clone(),
             hub_switch: self.hub_switch.clone(),
+            hub_runtime: super::hub_switch::Runtime::new(self),
             wake: self.catch_up_wake.clone(),
             writer: self.writer.clone(),
             commits: self.commits.clone(),
@@ -77,6 +79,9 @@ impl Drop for ProjectsHandler {
             task.abort();
         }
         if let Some(task) = self.catch_up_task.get_mut().unwrap().take() {
+            task.abort();
+        }
+        if let Some(task) = self.hub_tail_task.lock().unwrap().take() {
             task.abort();
         }
         if let Some(task) = self.role_refresh_task.get_mut().unwrap().take() {
@@ -186,33 +191,81 @@ impl Worker {
                 if store.is_foreign() {
                     continue;
                 }
-                let hub_base = store.hub_log_base();
-                if !matches!(hub_base, Ok(None)) {
-                    if matches!(hub_base, Ok(Some(_))) {
-                        if let Some(switch) = &self.hub_switch {
-                            let _ = switch.discover(&store, deadline).await;
+                let Ok(base) = store.hub_log_base() else {
+                    continue;
+                };
+                if let Some(base) = base {
+                    if let Some(switch) = &self.hub_switch {
+                        let result = switch
+                            .start_installed(&store, &self.hub_runtime, base, deadline)
+                            .await;
+                        log_switch_result(&mut switch_error, &result);
+                        if result.is_ok() {
+                            self.health.hub_switch_state.store(0, Ordering::Relaxed);
+                            break;
                         }
-                        self.health.hub_membership.store(1, Ordering::Release);
                     }
+                    continue;
+                }
+                if let (Some(switch), Ok(Some(_))) = (&self.hub_switch, store.hub_enable_plan()) {
+                    let result = switch
+                        .finish(&store, &self.hub_runtime, None, deadline)
+                        .await;
+                    self.observe_switch(&result);
+                    if result.is_ok() {
+                        self.wake.notify_one();
+                    }
+                    log_switch_result(&mut switch_error, &result);
                     continue;
                 }
                 if let (Some(switch), Ok(Some(EngramFreeze::Applied { .. }))) =
                     (&self.hub_switch, store.engram_freeze())
                 {
-                    let result = switch
-                        .advance(&store, &self.log, &self.records, deadline)
-                        .await;
+                    let result = async {
+                        let image = switch
+                            .advance(&store, &self.log, &self.records, deadline)
+                            .await?
+                            .ok_or_else(super::hub_switch::waiting)?;
+                        switch
+                            .finish(&store, &self.hub_runtime, Some(&image), deadline)
+                            .await
+                    }
+                    .await;
+                    self.observe_switch(&result);
+                    if result.is_ok() {
+                        self.wake.notify_one();
+                    }
                     log_switch_result(&mut gate_error, &result);
                     continue;
                 }
-                let selection = if let Some(switch) = &self.hub_switch {
+                let hub_head = if let Some(switch) = &self.hub_switch {
                     let discovery_deadline = deadline.min(Instant::now() + Duration::from_secs(5));
-                    let selected = switch.discover(&store, discovery_deadline).await;
-                    log_switch_result(&mut switch_error, &selected);
-                    selected.ok()
+                    let head = switch.head(discovery_deadline).await;
+                    log_switch_result(&mut switch_error, &head);
+                    head.ok()
                 } else {
                     None
                 };
+                if let (Some(switch), Some(head)) = (&self.hub_switch, hub_head) {
+                    if store
+                        .identity_log_status()
+                        .is_ok_and(|status| status.state == "disabled")
+                    {
+                        let result = if head > 0 {
+                            switch
+                                .finish(&store, &self.hub_runtime, None, deadline)
+                                .await
+                        } else {
+                            Err(super::hub_switch::waiting())
+                        };
+                        self.observe_switch(&result);
+                        if result.is_ok() {
+                            self.wake.notify_one();
+                        }
+                        log_switch_result(&mut gate_error, &result);
+                        continue;
+                    }
+                }
                 // Disabled stores never contact engram. An enabling store has
                 // snapshot parts saved in SQLite with their entry ids and bytes:
                 // retry those appends rather than import the log as if this
@@ -253,7 +306,7 @@ impl Worker {
                             if let Some(line) = outage.succeeded() {
                                 tracing::info!(target: "identity_log", "{line}");
                             }
-                            if selection == Some(super::hub_switch::Startup::Migrate) {
+                            if hub_head == Some(0) {
                                 if let Some(switch) = &self.hub_switch {
                                     let result = switch
                                         .advance(&store, &self.log, &self.records, deadline)
@@ -273,6 +326,15 @@ impl Worker {
                 }
             }
         }
+    }
+
+    fn observe_switch<T>(&self, result: &Result<T, HandlerError>) {
+        let state = match result.as_ref().err().map(|error| error.code.as_str()) {
+            Some("hub_switch_waiting") => 1,
+            Some("hub_migration_mismatch") => 2,
+            _ => 0,
+        };
+        self.health.hub_switch_state.store(state, Ordering::Relaxed);
     }
 
     pub(super) async fn publish_member_box(

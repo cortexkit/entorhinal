@@ -607,15 +607,7 @@ impl LogTransport for SubcTransport {
             .await
             .map_err(|error| {
                 warn_route_call_error(&engram_target(), method, &error);
-                match error {
-                    CallError::Module(body) => TransportError::Refusal {
-                        code: body.code,
-                        detail: body.detail,
-                        message: Some(body.message),
-                    },
-                    CallError::OutcomeUnknown(_) => TransportError::NoReply,
-                    _ => TransportError::Unavailable,
-                }
+                service_call_error(error)
             })
     }
 }
