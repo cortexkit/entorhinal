@@ -311,3 +311,71 @@ async fn ack_frame(
     frame(module, id, FrameType::Response).await;
     notice
 }
+
+#[tokio::test(start_paused = true)]
+async fn served_role_lease_v1_yield_records_match_published_files() {
+    use crate::role_leases::{tests::sample_holder, YIELD};
+
+    for (file, withdrawn) in [
+        ("yield-transferred.json", false),
+        ("yield-withdrawn.json", true),
+    ] {
+        let mut fixture = Fixture::new("served-role-yield").await;
+        let hub = sample_holder(Arc::get_mut(&mut fixture.handler.role_leases).unwrap());
+        let handler = Arc::new(std::mem::replace(
+            &mut fixture.handler,
+            ProjectsHandler::with_runtime(INCARNATION.into(), || 700),
+        ));
+        let served = handler.clone();
+        let mut module = ModuleHarness::start(move |_| ServedHandler(served), []).await;
+        let route = bind(&mut module, 1831, reserved("plexus"), None).await;
+        let watch = module
+            .send_request(route, request(WATCH, json!({"role":CONNECTOR})))
+            .await;
+        for (gen, holding) in [(0, false), (1, false), (1, true)] {
+            let notice = frame(&mut module, watch, FrameType::StreamData).await;
+            let notice = ack_frame(&mut module, route, CONNECTOR, &notice).await;
+            assert_eq!(notice["gen"], gen);
+            assert_eq!(notice["holding"], holding);
+        }
+        hub.request_sample_handback();
+        let notice = frame(&mut module, watch, FrameType::StreamData).await;
+        assert_eq!(
+            ack_frame(&mut module, route, CONNECTOR, &notice).await["handback"],
+            true
+        );
+
+        if withdrawn {
+            hub.withdraw_sample_handback();
+        }
+        let params = json!({"role":CONNECTOR,"gen":1});
+        let call = module
+            .send_request(route, request(YIELD, params.clone()))
+            .await;
+        loop {
+            let next = tokio::time::timeout(Duration::from_secs(2), module.next_frame())
+                .await
+                .unwrap()
+                .unwrap();
+            if next.header.corr == call {
+                assert_eq!(next.header.ty, FrameType::Response);
+                let value: Value = serde_json::from_slice(&next.body).unwrap();
+                assert_eq!(value["result"]["yielded"], !withdrawn);
+                publish(
+                    file,
+                    vec![output(
+                        YIELD,
+                        &params,
+                        &json!({"kind":"reserved","moduleId":"plexus"}),
+                        &[next],
+                    )],
+                );
+                break;
+            }
+            assert_eq!(next.header.corr, watch);
+            assert_eq!(next.header.ty, FrameType::StreamData);
+        }
+        module.shutdown().await;
+        crate::tests::stop_store_tasks(&handler).await;
+    }
+}

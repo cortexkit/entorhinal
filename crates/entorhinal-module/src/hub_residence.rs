@@ -32,6 +32,8 @@ pub(super) const TAKE: &str = "agent.take";
 const CREATE: &str = "agent.create";
 const CREATE_KV: &str = "residence.create";
 const BUDGET: Duration = Duration::from_secs(5);
+mod role_control;
+use role_control::role_key_name;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -96,6 +98,11 @@ trait Backend: Send + Sync {
     fn applied(&self) -> Result<u64, HandlerError>;
     fn writer_episode(&self) -> Result<u64, HandlerError>;
     async fn log_head(&self, deadline: Instant) -> Result<u64, HandlerError>;
+    async fn kv_entry(
+        &self,
+        key: &str,
+        deadline: Instant,
+    ) -> Result<Option<hub_write::KvEntry>, HandlerError>;
     async fn wait_through(&self, head: u64, deadline: Instant) -> Result<(), HandlerError>;
     async fn verify(
         &self,
@@ -138,6 +145,13 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Backend for IdentityLog<
     }
     async fn log_head(&self, deadline: Instant) -> Result<u64, HandlerError> {
         self.log_head(deadline).await
+    }
+    async fn kv_entry(
+        &self,
+        key: &str,
+        deadline: Instant,
+    ) -> Result<Option<hub_write::KvEntry>, HandlerError> {
+        self.kv_entry(key, deadline).await
     }
     async fn wait_through(&self, head: u64, deadline: Instant) -> Result<(), HandlerError> {
         crate::hub_identity_log::wait_for_applied(self, head, deadline).await
@@ -388,7 +402,9 @@ impl Residence {
         let mut watched = self.watched.write().unwrap();
         watched.initial = false;
         watched.incarnation += 1;
-        watched.revisions.retain(|key, _| !key.starts_with("role."));
+        watched
+            .revisions
+            .retain(|key, _| role_key_name(key).is_none());
         self.link.notify_waiters();
     }
 
@@ -401,7 +417,7 @@ impl Residence {
     }
 
     fn role_changed(&self, key: &str) {
-        if let Some((name, leases)) = key.strip_prefix("role.").zip(self.role_leases.upgrade()) {
+        if let Some((name, leases)) = role_key_name(key).zip(self.role_leases.upgrade()) {
             leases.changed(name);
         }
     }
@@ -414,7 +430,7 @@ impl Residence {
             tokio::select! {
                 event = feed.next_event() => match event {
                     FeedEvent::Connected | FeedEvent::Disconnected => {
-                        pending.retain(|key, _| !key.starts_with("role."));
+                        pending.retain(|key, _| role_key_name(key).is_none());
                         self.reset_role_watch();
                     }
                     FeedEvent::Item(KvDelivery::Empty) => self.finish_initial_watch(),
@@ -525,6 +541,10 @@ impl Residence {
                 return self.refuse(key, revision, "invalid_agent_id");
             }
             (agent, false)
+        } else if let Some(name) = role_key_name(key) {
+            return self
+                .observe_role_signal(key, name, value, revision, deadline)
+                .await;
         } else {
             return Ok(());
         };
@@ -718,7 +738,7 @@ impl Residence {
         deadline: Instant,
     ) -> Result<AcceptedKv, HandlerError> {
         check_kv_size(key, bytes.len())?;
-        let accepted = self.backend.verify(key, bytes, deadline).await?;
+        let mut accepted = self.backend.verify(key, bytes, deadline).await?;
         let body: role_leases::Record = serde_json::from_value(accepted.body.clone())
             .map_err(|error| bad_record(&error.to_string()))?;
         let previous = old
@@ -727,6 +747,21 @@ impl Residence {
             .map(serde_json::from_value::<role_leases::Record>)
             .transpose()
             .map_err(crate::invalid_params)?;
+        if body.forced
+            && previous.as_ref().is_some_and(|prior| {
+                prior.gen.checked_add(1) == Some(body.gen)
+                    && prior.holder.as_deref().is_some_and(|holder| {
+                        self.backend.current_member(holder, accepted.applied)
+                            == Some(prior.holder_ep)
+                    })
+            })
+        {
+            // A forced write can arrive before the membership entry closing
+            // the previous holder's episode reaches this computer's log tail.
+            let head = self.backend.log_head(deadline).await?;
+            self.backend.wait_through(head, deadline).await?;
+            accepted = self.backend.verify(key, bytes, deadline).await?;
+        }
         let header = accepted.record.header();
         let current = |holder: &str, episode| {
             self.backend.current_member(holder, accepted.applied) == Some(episode)
@@ -788,7 +823,8 @@ impl role_leases::Backend for Residence {
             local_episode: self.backend.writer_episode().ok(),
             holder_current: record.as_ref().is_some_and(|record| {
                 record.holder.as_deref().is_some_and(|holder| {
-                    self.backend.current_member(holder, applied) == Some(record.holder_ep)
+                    crate::hub_membership::box_id(holder)
+                        && self.backend.current_member(holder, applied) == Some(record.holder_ep)
                 })
             }),
             record,
@@ -799,12 +835,76 @@ impl role_leases::Backend for Residence {
         (&self.link, &self.commits)
     }
 
+    fn preferred(&self, role: &str) -> Result<Option<role_leases::Preferred>, HandlerError> {
+        self.cached_preference(role)
+    }
+
+    fn handback(
+        &self,
+        role: &str,
+        box_id: &str,
+    ) -> Result<Option<role_leases::CandidateRequest>, HandlerError> {
+        self.cached_handback(role, box_id)
+    }
+
+    async fn reread_offer(
+        &self,
+        role: &str,
+        target: &role_leases::Preferred,
+        gen: i64,
+        deadline: Instant,
+    ) -> Result<bool, HandlerError> {
+        self.reread_role_offer(role, target, gen, deadline).await
+    }
+
+    async fn read_handback_revision(
+        &self,
+        role: &str,
+        box_id: &str,
+        deadline: Instant,
+    ) -> Result<Option<u64>, HandlerError> {
+        self.live_handback_revision(role, box_id, deadline).await
+    }
+
+    async fn put_handback(
+        &self,
+        role: &str,
+        gen: i64,
+        deadline: Instant,
+    ) -> Result<(), HandlerError> {
+        self.request_role_handback(role, gen, deadline).await
+    }
+
+    async fn delete_handback(
+        &self,
+        role: &str,
+        box_id: &str,
+        revision: u64,
+        deadline: Instant,
+    ) -> Result<(), HandlerError> {
+        self.delete_role_handback(role, box_id, revision, deadline)
+            .await
+    }
+
     async fn write(
         &self,
         role: &str,
         change: &role_leases::Change,
         deadline: Instant,
     ) -> Result<role_leases::Confirmed, HandlerError> {
+        if let Some(expected) = change.vacancy_preference {
+            let competing = self
+                .live_preference(role, deadline)
+                .await?
+                .filter(|p| p.box_id != self.box_id)
+                .map_or(0, |p| p.revision);
+            if competing != expected {
+                return Err(HandlerError::new(
+                    "revision_moved",
+                    "the role preference changed",
+                ));
+            }
+        }
         let key = format!("role.{role}");
         let body = json!(change.body);
         let digest = hub_write::params_digest(change.step, &json!([key, change.expected, body]))?;

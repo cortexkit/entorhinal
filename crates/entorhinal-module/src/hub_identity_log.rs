@@ -355,6 +355,14 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
         self.link.transport.log_head(deadline).await
     }
 
+    pub(super) async fn kv_entry(
+        &self,
+        key: &str,
+        deadline: Instant,
+    ) -> Result<Option<hub_write::KvEntry>, HandlerError> {
+        self.link.transport.kv_entry(key, deadline).await
+    }
+
     pub(super) fn writer_episode(&self) -> Result<u64, HandlerError> {
         if self.membership_ready() {
             if let Some(episode) = self.membership.can_write(self.applied_sequence()?) {

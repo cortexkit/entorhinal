@@ -176,7 +176,13 @@ impl ProjectsHandler {
         self.admit_role_take(key)?;
         let input: RoleTakeInput = serde_json::from_value(params)
             .map_err(|e| HandlerError::new("invalid_request", e.to_string()))?;
-        if !valid_role(&input.role)
+        let hub = self.hub_backend_selected();
+        let valid = if hub {
+            super::role_leases::valid_role(&input.role)
+        } else {
+            valid_role(&input.role)
+        };
+        if !valid
             || input.expected_epoch < 0
             || input.expected_epoch == i64::MAX
             || input.request_id.len() != 32
@@ -189,6 +195,9 @@ impl ProjectsHandler {
                 "invalid_request",
                 "invalid role, epoch or request_id",
             ));
+        }
+        if hub {
+            return self.take_hub_role(input, key, received).await;
         }
         let store = self.with_store(|s| Ok(s.clone()))?;
         let attempt = store.role_take_attempt(&input)?;
