@@ -271,7 +271,10 @@ impl Drop for RouteSlot<'_> {
 }
 
 pub(super) fn is_watch(method: &str) -> bool {
-    matches!(method, IDENTITY | WHERE | CATALOG | SESSIONS)
+    matches!(
+        method,
+        IDENTITY | WHERE | CATALOG | SESSIONS | crate::role_leases::WATCH
+    )
 }
 
 fn decode<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, HandlerError> {
@@ -297,6 +300,16 @@ impl ProjectsHandler {
                     "module_draining",
                     "module is stopping; retry interrupted work after restart",
                 ));
+            }
+            if request.method == crate::role_leases::WATCH {
+                let role = self.admit_role_lease_watch(request.params, key)?;
+                let mut draining = self.draining.subscribe();
+                return tokio::select! {
+                    biased;
+                    _ = transport.ended() => Ok(()),
+                    _ = draining.wait_for(|stopping| *stopping) => Ok(()),
+                    result = self.serve_role_lease(transport, role, key) => result,
+                };
             }
             // Validate before consuming a slot, with exactly the existing read
             // contracts: no ambient fields and the same where_many id checks.

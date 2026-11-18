@@ -11,6 +11,9 @@ mod derived;
 #[path = "sessions_watch_tests.rs"]
 mod sessions;
 
+#[path = "role_lease_vectors.rs"]
+mod role_lease_vectors;
+
 struct Sink {
     sender: mpsc::UnboundedSender<Vec<u8>>,
     cancel: watch::Sender<bool>,
