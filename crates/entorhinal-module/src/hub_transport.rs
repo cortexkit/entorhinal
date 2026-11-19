@@ -35,6 +35,31 @@ use tokio::{
 
 use self::feed::Subscription;
 pub(super) use self::feed::{Feed, FeedEvent};
+
+#[cfg(test)]
+pub(super) fn test_tail_feed<S>(
+    health: Arc<HealthGauges>,
+    applied: u64,
+    mut open: impl FnMut(u64) -> S + Send + 'static,
+) -> Feed<LogDelivery>
+where
+    S: futures_util::Stream<Item = Option<LogDelivery>> + Send + 'static,
+{
+    Feed::log(health, applied, move |cursor| {
+        let stream = open(cursor.unwrap());
+        async move {
+            Ok(Subscription::new(
+                None,
+                stream.map(|delivery| {
+                    delivery
+                        .map(|delivery| (delivery.sequence, delivery))
+                        .ok_or_else(|| Failure::code("log_delivery:MissingHeartbeat"))
+                }),
+            ))
+        }
+    })
+    .with_durable_cursor()
+}
 use crate::{log_client::SubcConnector, HandlerError, HealthGauges};
 
 const DOMAIN: &str = "hub";
@@ -74,6 +99,7 @@ pub(super) struct Gauges {
     failures: AtomicU64,
     pub(super) kv_records_refused: AtomicU64,
     pub(super) epoch_held: AtomicU64,
+    writer_hold: std::sync::RwLock<Option<String>>,
 }
 
 impl Gauges {
@@ -88,6 +114,15 @@ impl Gauges {
         metrics["kvRecordsRefused"] = json!(self.kv_records_refused.load(Ordering::Relaxed));
         let epoch = self.epoch_held.load(Ordering::Relaxed);
         metrics["epochHeld"] = json!((epoch != 0).then_some(epoch));
+        if let Ok(hold) = self.writer_hold.try_read() {
+            if let Some(writer) = hold.as_ref() {
+                metrics["hubLogHold"] = json!({"code": "writer_unknown", "writer": writer});
+            }
+        }
+    }
+
+    pub(super) fn set_writer_hold(&self, writer: Option<String>) {
+        *self.writer_hold.write().unwrap() = writer;
     }
 
     fn reached(&self) {
@@ -264,14 +299,15 @@ impl Hub {
         })
     }
 
-    pub(super) fn epoch_watch(self: &Arc<Self>) -> Feed<kv::Entry> {
+    pub(super) fn epoch_watch(self: &Arc<Self>, own_box: String) -> Feed<kv::Entry> {
         let hub = self.clone();
         Feed::epoch(self.health.clone(), move |_| {
             let hub = hub.clone();
+            let own_box = own_box.clone();
             async move {
                 hub.open(Instant::now() + REQUEST_TIMEOUT)
                     .await?
-                    .watch(None)
+                    .epoch_watch(&own_box)
                     .await
             }
         })
@@ -317,6 +353,20 @@ pub(super) struct LogDelivery {
 }
 
 impl Binding {
+    async fn epoch_watch(self, own_box: &str) -> Result<Subscription<kv::Entry>, Failure> {
+        let kv = self.session.kv().await?;
+        let watch = kv
+            .watch_many_with_history([
+                "epoch".to_owned(),
+                "wrapreq.*".to_owned(),
+                format!("wrapjoin.{own_box}.*"),
+                format!("wrap.*.*.{own_box}"),
+            ])
+            .await
+            .map_err(|error| Failure::kind("kv_watch", error.kind()))?;
+        Ok(Subscription::new(self.changes, watch.map(map_kv_delivery)))
+    }
+
     async fn residence_watch(self) -> Result<Subscription<KvDelivery>, Failure> {
         let kv = self.session.kv().await?;
         let watch = kv
@@ -451,7 +501,13 @@ impl Session {
         deadline: Instant,
     ) -> Result<Option<Vec<u8>>, HandlerError> {
         self.confirm_hub(deadline, async {
-            match self.log().await?.direct_get(sequence).await {
+            // A direct get only needs the stream name, not a fresh STREAM.INFO.
+            let stream = self
+                .js
+                .get_stream_no_info(LOG_STREAM)
+                .await
+                .map_err(|error| Failure::kind("log_stream", error.kind()))?;
+            match stream.direct_get(sequence).await {
                 Ok(message) => Ok(Some(message.payload.to_vec())),
                 Err(error) if error.kind() == DirectGetErrorKind::NotFound => Ok(None),
                 Err(error) => Err(Failure::kind("log_entry", error.kind())),

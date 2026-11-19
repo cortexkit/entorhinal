@@ -13,10 +13,11 @@ use entorhinal_core::{
     remote_apply::{snapshot_part_info, snapshot_supersedes_through, RemoteEntry},
     RegistryStore,
 };
-use futures_util::future::BoxFuture;
+use futures_util::{future::BoxFuture, StreamExt};
 use serde_json::Value;
 use tokio::{
-    sync::Notify,
+    sync::{watch, Notify},
+    task::JoinSet,
     time::{timeout_at, Instant},
 };
 
@@ -50,7 +51,10 @@ pub(super) trait LogTransport: Transport + Send + Sync + 'static {
         }
     }
 
-    fn epoch_watch(self: &Arc<Self>) -> Option<Feed<async_nats::jetstream::kv::Entry>> {
+    fn epoch_watch(
+        self: &Arc<Self>,
+        _own_box: String,
+    ) -> Option<Feed<async_nats::jetstream::kv::Entry>> {
         None
     }
 }
@@ -60,8 +64,11 @@ impl LogTransport for Hub {
         self.tail(applied)
     }
 
-    fn epoch_watch(self: &Arc<Self>) -> Option<Feed<async_nats::jetstream::kv::Entry>> {
-        Some(self.epoch_watch())
+    fn epoch_watch(
+        self: &Arc<Self>,
+        own_box: String,
+    ) -> Option<Feed<async_nats::jetstream::kv::Entry>> {
+        Some(self.epoch_watch(own_box))
     }
 
     async fn join_keys(
@@ -254,6 +261,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
         };
         self.health.hub_membership.store(1, Ordering::Release);
         self.health.log_state.store(0, Ordering::Relaxed);
+        self.health.hub.set_writer_hold(None);
         crate::enable::refresh(&self.health, &self.store);
         tokio::spawn(tail.run(feed))
     }
@@ -342,6 +350,7 @@ pub(super) type LocalReplan<'a> =
 
 #[async_trait::async_trait]
 pub(super) trait SharedLog: Send + Sync {
+    fn start_installed_tail(&self) -> Result<tokio::task::JoinHandle<()>, HandlerError>;
     fn applied(&self) -> Result<u64, HandlerError>;
     async fn catch_up(&self, deadline: Instant) -> Result<(), HandlerError>;
     #[allow(clippy::too_many_arguments)]
@@ -359,6 +368,9 @@ pub(super) trait SharedLog: Send + Sync {
 
 #[async_trait::async_trait]
 impl<T: LogTransport, U: Trust + Send + Sync + 'static> SharedLog for IdentityLog<T, U> {
+    fn start_installed_tail(&self) -> Result<tokio::task::JoinHandle<()>, HandlerError> {
+        IdentityLog::start_installed_tail(self)
+    }
     fn applied(&self) -> Result<u64, HandlerError> {
         self.applied_sequence()
     }
@@ -417,11 +429,25 @@ pub(super) struct AcceptedKv {
 
 impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
     pub(super) fn epoch_watch(&self) -> Option<Feed<async_nats::jetstream::kv::Entry>> {
-        self.link.transport.epoch_watch()
+        self.link.transport.epoch_watch(self.box_id.to_string())
     }
 
     pub(super) fn peer_keys(&self) -> &dyn PeerKeysRead {
         self.link.peers.as_ref()
+    }
+
+    pub(super) fn anchor_changes(&self) -> watch::Receiver<u64> {
+        self.membership.changes()
+    }
+
+    pub(super) fn require_known_member(
+        &self,
+        box_id: &str,
+        episode: u64,
+        applied: u64,
+    ) -> Result<(), HandlerError> {
+        self.membership
+            .require_known_member(box_id, episode, applied)
     }
 
     pub(super) async fn write_epoch_step(
@@ -628,20 +654,28 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
                 Some(key) => key,
                 None => {
                     let head = self.link.transport.log_head(deadline).await?;
-                    self.membership.discover(head, deadline).await?;
+                    self.membership.discover_cached(head, deadline).await?;
+                    self.membership
+                        .kv_key(&record, applied.max(head), sight)?
+                        .ok_or_else(|| {
+                            crate::hub_membership::writer_unknown(&record.header().writer)
+                        })?;
                     wait_for_applied(self, head, deadline).await?;
                     self.membership
                         .kv_key(&record, self.applied_sequence()?, sight)?
-                        .ok_or_else(crate::hub_membership::unknown_key)?
+                        .ok_or_else(|| {
+                            crate::hub_membership::writer_unknown(&record.header().writer)
+                        })?
                 }
             };
+            let verified = record.verify(&key)?;
             if !self.membership_ready() {
                 return Err(HandlerError::new(
                     "hub_membership_stale",
                     "hub membership view is catching up",
                 ));
             }
-            record.verify(&key)?
+            verified
         };
         let applied = self.applied_sequence()?;
         let writer_current = record.header().kind != "wrapreq"
@@ -904,69 +938,127 @@ struct Tail<T, U> {
 
 impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
     async fn run(mut self, mut feed: Feed<LogDelivery>) {
-        let mut local_keys = tokio::time::interval(Duration::from_secs(5));
-        local_keys.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut connected = false;
+        let mut peers = self.link.peers.clone().peer_key_updates();
+        let (keys, mut key_updates) = watch::channel(());
+        let (caught_up, publications) = watch::channel(None);
+        // Dropping the tail also stops its two background tasks.
+        let mut tasks = JoinSet::new();
+        tasks.spawn(watch_own_key(self.link.signer.clone(), keys));
+        tasks.spawn(
+            KeyPublisher {
+                link: self.link.clone(),
+                store: self.store.clone(),
+                writer: self.writer.clone(),
+                base: self.base,
+                membership: self.membership.clone(),
+                epoch: self.epoch.clone(),
+            }
+            .run(publications),
+        );
+        let mut retry_at = None;
+        let mut own_retry_at = None;
+        let mut blocked = false;
+        let mut held = None;
         loop {
+            let anchor_change;
             tokio::select! {
-                biased;
-                event = feed.next_event() => match event {
+                event = feed.next_event(), if retry_at.is_none() => { anchor_change = Ok(false); match event {
                     FeedEvent::Disconnected => {
-                        connected = false;
                         self.connected_head = None;
-                        self.update_barrier();
+                        self.snapshot = Snapshot::default();
                     }
                     FeedEvent::Connected => {
-                        connected = true;
                         self.connected_head = None;
                         self.update_barrier();
-                        if let Err(error) = self.reconnect().await {
-                            if !self.retryable(&error) { self.stop(self.sequence() + 1, error); return; }
+                        match self.reconnect().await {
+                            Ok(()) => {
+                                blocked = false;
+                                if let Some(epoch) = &self.epoch { epoch.membership_changed.notify_one(); }
+                            }
+                            Err(error) if self.retryable(&error) => {
+                                retry_at = Some(Instant::now() + Duration::from_secs(1));
+                            }
+                            Err(error) => { self.stop(self.sequence() + 1, error); return; }
                         }
                     }
+                    // Keep polling for a reconnect, but do not apply anything
+                    // after the held entry. Reopening replays from the durable cursor.
+                    FeedEvent::Item(_) if blocked => {}
                     FeedEvent::Item(delivery) => {
                         let sequence = delivery.sequence;
-                        if self.connected_head.is_none() {
-                            loop {
-                                match self.reconnect().await {
-                                    Ok(()) => break,
-                                    Err(error) if self.retryable(&error) => tokio::time::sleep(Duration::from_secs(1)).await,
-                                    Err(error) => { self.stop(sequence, error); return; }
+                        match self.apply(delivery).await {
+                            Ok(committed) => {
+                                if committed { feed.applied(sequence); }
+                                if held == Some(sequence) {
+                                    held = None;
+                                    self.health.hub.set_writer_hold(None);
+                                    self.health.log_state.store(0, Ordering::Relaxed);
                                 }
                             }
-                        }
-                        match self.apply(delivery).await {
-                            Ok(true) => feed.applied(sequence),
-                            Ok(false) => {}
+                            Err(error) if error.code == "writer_unknown" => {
+                                self.health.hub.set_writer_hold(error.detail.as_ref()
+                                    .and_then(|detail| detail["writer"].as_str()).map(str::to_owned));
+                                self.health.log_state.store(9, Ordering::Relaxed);
+                                tracing::debug!(target: "identity_log", sequence, message = error.message, "hub identity-log tail held");
+                                held = Some(sequence);
+                                blocked = true;
+                                self.connected_head = None;
+                                self.commits.notify_waiters();
+                            }
                             Err(error) if self.retryable(&error) => {
-                                // A head or discovery read can lose the hub
-                                // while processing a delivery. Start over at
-                                // the durable cursor, never skip that entry.
-                                connected = false;
                                 self.connected_head = None;
                                 self.snapshot = Snapshot::default();
-                                self.update_barrier();
-                                feed = self.link.transport.tail(self.sequence()).with_durable_cursor();
-                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                retry_at = Some(Instant::now() + Duration::from_secs(1));
                             }
                             Err(error) => { self.stop(sequence, error); return; }
                         }
                     }
-                },
-                _ = local_keys.tick(), if connected => {
-                    let refreshed = if self.connected_head.is_none() { self.reconnect().await.map(|()| false) }
-                        else { self.membership.refresh(Instant::now() + READ_BUDGET).await };
-                    match refreshed {
-                        Ok(true) => if let Some(epoch) = &self.epoch { epoch.membership_changed.notify_one(); },
-                        Err(error) if !self.retryable(&error) => { self.stop(self.sequence() + 1, error); return; }
-                        _ => {}
+                }},
+                _ = async { tokio::time::sleep_until(retry_at.expect("scheduled replay")).await }, if retry_at.is_some() => {
+                    retry_at = None;
+                    feed.replay();
+                    anchor_change = Ok(false);
+                }
+                Some(update) = peers.next() => {
+                    anchor_change = match update {
+                        Ok(peers) => self.membership.refresh_peers(peers, Instant::now() + READ_BUDGET).await,
+                        Err(error) => Err(error),
+                    };
+                }
+                _ = async {
+                    tokio::select! {
+                        Ok(()) = key_updates.changed() => {},
+                        _ = async {
+                            match own_retry_at {
+                                Some(at) => tokio::time::sleep_until(at).await,
+                                None => std::future::pending().await,
+                            }
+                        } => {},
                     }
+                } => {
+                    anchor_change = self.membership.refresh_own(Instant::now() + READ_BUDGET).await;
+                    own_retry_at = anchor_change.as_ref().is_err_and(|error| self.retryable(error))
+                        .then(|| Instant::now() + Duration::from_secs(1));
                 }
             }
-            self.update_barrier();
-            if self.caught_up() {
-                self.publish_key().await;
+            match anchor_change {
+                Ok(true) => {
+                    if let Some(epoch) = &self.epoch {
+                        epoch.membership_changed.notify_one();
+                    }
+                    if blocked {
+                        self.snapshot = Snapshot::default();
+                        feed.replay();
+                    }
+                }
+                Err(error) if !self.retryable(&error) => {
+                    self.stop(self.sequence() + 1, error);
+                    return;
+                }
+                _ => {}
             }
+            self.update_barrier();
+            caught_up.send_replace(self.caught_up().then(|| self.sequence()));
         }
     }
 
@@ -981,11 +1073,14 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
                 | "credential_unavailable"
                 | "vault_unavailable"
                 | "epoch_key_unavailable"
+                | "storage_error"
+                | "local_identity_unavailable"
         )
     }
 
     fn stop(&self, sequence: u64, error: HandlerError) {
         self.set_barrier(false);
+        self.health.hub.set_writer_hold(None);
         let state = match error.code.as_str() {
             "hub_log_gap" => 4,
             "signature_invalid" | "member_episode_invalid" | "membership_discovery_unresolved" => 5,
@@ -1053,30 +1148,79 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
             }
         }
     }
+}
 
-    async fn publish_key(&self) {
-        let Some((episode, key)) = self.membership.publication(self.sequence()) else {
-            return;
-        };
-        if !self.store.hub_snapshot_applied(self.base).unwrap_or(false) {
-            return;
+async fn watch_own_key(signer: Arc<dyn CredentialResolver>, changes: watch::Sender<()>) {
+    let mut version = None;
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        if let Ok(Ok(mut watch)) =
+            tokio::time::timeout(READ_BUDGET, signer.watch_scoped(None)).await
+        {
+            while let Some(notice) = watch.next().await {
+                backoff = Duration::from_secs(1);
+                if version.as_ref() != Some(&notice.keys) {
+                    version = Some(notice.keys);
+                    changes.send_replace(());
+                }
+            }
         }
-        if let (Some(reader), Some(request)) = (
-            &self.epoch,
-            self.membership
-                .episode_join_request(&key.box_id, self.sequence()),
-        ) {
-            if !reader.admission_wrap_imported(&request).unwrap_or(false) {
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(60));
+    }
+}
+
+struct KeyPublisher<T, U> {
+    link: Arc<Link<T, U>>,
+    store: RegistryStore,
+    writer: Arc<tokio::sync::Mutex<()>>,
+    base: i64,
+    membership: Arc<Membership<T>>,
+    epoch: Option<Arc<EpochReader<T>>>,
+}
+
+impl<T: LogTransport, U: Trust + Send + Sync + 'static> KeyPublisher<T, U> {
+    async fn run(self, mut cursor: watch::Receiver<Option<u64>>) {
+        loop {
+            let sequence = *cursor.borrow_and_update();
+            if let Some(sequence) = sequence {
+                if self.publish_key(sequence).await {
+                    tokio::select! {
+                        _ = cursor.changed() => {},
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+                    }
+                    continue;
+                }
+            }
+            if cursor.changed().await.is_err() {
                 return;
             }
         }
+    }
+
+    // Return true when publication is deferred and should be retried.
+    async fn publish_key(&self, sequence: u64) -> bool {
+        let Some((episode, key)) = self.membership.publication(sequence) else {
+            return false;
+        };
+        if !self.store.hub_snapshot_applied(self.base).unwrap_or(false) {
+            return false;
+        }
+        if let (Some(reader), Some(request)) = (
+            &self.epoch,
+            self.membership.episode_join_request(&key.box_id, sequence),
+        ) {
+            if !reader.admission_wrap_imported(&request).unwrap_or(false) {
+                return true;
+            }
+        }
         let Ok(_guard) = self.writer.try_lock() else {
-            return;
+            return true;
         };
         let digest = entorhinal_catalog::sha256_hex(
             serde_json::to_vec(&key).expect("serializable member.key"),
         );
-        let request_key = format!("member.key:{}:{}:{digest}", key.box_id, self.sequence());
+        let request_key = format!("member.key:{}:{sequence}:{digest}", key.box_id);
         let trust = MemberTrust {
             epoch: self.link.trust.as_ref(),
             epoch_reader: self.epoch.as_deref(),
@@ -1097,7 +1241,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
                 &Step {
                     name: "member.key".into(),
                     key: LOG_KEY.into(),
-                    expected: self.sequence(),
+                    expected: sequence,
                     payload: Payload::Record {
                         kind: "member.key".into(),
                         body: serde_json::to_value(&key).expect("serializable member.key"),
@@ -1110,9 +1254,13 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
             .await;
         if let Err(error) = result {
             tracing::debug!(target: "identity_log", code = error.code, "hub member key not published yet");
+            return true;
         }
+        false
     }
+}
 
+impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
     // Returns true only when this delivery has moved the durable cursor.
     async fn apply(&mut self, delivery: LogDelivery) -> Result<bool, HandlerError> {
         let position = registry_position(self.base, delivery.sequence)?;
