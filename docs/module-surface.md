@@ -91,10 +91,11 @@ owning operation for data.
 | `profile` | `{"token":"…"}` | Unscoped `user.get`: exactly its content-derived change token. |
 | `role.connector_home` | `{"epoch":N}` | `role.read`: this machine's cached claim epoch for `connector_home`. |
 | `catalog.status` | `{"generation":N}` | `catalog.status_watch`: the process-local pinned-version status generation. |
+| `fleet_epoch` | `{"generation":N,"incarnation":"…"}` | `fleet.epoch_current`: advances when the verified committed hub epoch or highest committed epoch held here changes. |
 
-One background task publishes all five keys on startup, then only values that
+One background task publishes all six keys on startup, then only values that
 differ from its last successful puts. It wakes on committed journal writes,
-committed role-cache updates and catalog status changes. It uses a separate
+committed role-cache updates, catalog status changes and fleet epoch cache changes. It uses a separate
 SubcConsumer client connection and BusClient credentials, not the module's
 registered connection. A missing bucket or unavailable bus is retryable with
 1-second exponential backoff capped at 60 seconds: one warning starts the
@@ -433,9 +434,11 @@ are not open to every caller.
 
 ## Sessions, claims and roles
 
-Claims say which of the operator's machines holds an agent or a role. They are
-records in engram that entorhinal caches locally; every read here answers from
-the cache, so it works offline and never waits on engram.
+Claims say which of the operator's machines holds an agent or a role. Before
+cutover they are refreshed from engram; after `hub_ready`, the hub's
+`KV_residence` watch maintains the local cache. Every read here answers from the
+cache and never waits on either service. If the hub view is not ready or the
+watch is down, callers must not treat a stale claim as authority to act.
 
 `agent.register_session` accepts optional `role: "head" | "delegated"`.
 Omission stores `head`, including for existing bindings; any other value
@@ -468,9 +471,10 @@ stay on the computer that launched them and do not block a move.
 | `agent.fleet_identity_watch` | watch | any | Stream of changes to `agent.fleet_identity`. Opens with `{token?}` and sends `resync` or `changes` notices; on `resync`, read `agent.fleet_identity` once. |
 | `agent.where_watch` | watch | any | Stream of changes to whereabouts. Opens with `{agentIds?, cursor?}` and sends `resync` or `changes` notices carrying a cursor; on `resync`, read `agent.where_many` once. |
 | `catalog.status_watch` | watch | any | Pinned package status invalidations. Opens with `{token?}`; `changes` lists `{name, version}` identities whose state, blocking judgement or stale marker changed. `resync` requires rereading generation or context status. Tokens bind the process incarnation and local status generation. Shares the 16-watch cap and 192 KiB notice limit. |
-| `agent.refresh_claims` | mutate | Direct | Refresh live agents' cached claims from engram. |
+| `agent.refresh_claims` | mutate | Direct | Refresh live agents' cached claims from engram before cutover; hub claims arrive through the watch. |
 | `role.read` | query | any | Which machine holds a role, from the cached claim. |
-| `role.take` | mutate | Direct, with operator confirmation | Make this machine the role's holder. |
+| `role.fence` | query | any | Cached fence for curation; after cutover the fence token is the KV revision of `role.<name>`. |
+| `role.take` | mutate | Direct, with operator confirmation | Take a role or request handback. On the hub, setting the preferred machine while another current member holds the role replies `{epoch, held_here: false, handback_requested: true}`; a retry replays that outcome, not current possession. |
 | `agent.take` | mutate | Direct, with operator confirmation | On a ready hub, take an agent whose holder can no longer serve it: a removed computer, a computer's earlier membership (it was removed and later paired again, so its old claims lapsed), or a legacy Engram author not mapped to a hub member (`engram:<author>`). It also claims agents carried over from Engram that have no location record on the hub yet. Refuses `holder_is_member` for a current holder, `claim_pending` while the creator must write the first claim, `claim_integrity_failed` for a refused claim, `hub_not_ready` while the hub view catches up, and `caller_forbidden`, `operator_declined`, or `operator_presence_unavailable` when authorization or confirmation fails. |
 
 `node.self` reads one local read-only snapshot without contacting engram or
@@ -483,11 +487,32 @@ state reported by `identity_log.status`. `box_id` is this computer's daemon
 machine id (32 lowercase hex), present once HELLO_ACK provides it even when
 sharing is disabled.
 
-`agent.where` and each `agent.where_many` row include `holder_box` when the cached
-claim has a holder and that author has shared its daemon machine id. They omit
-it when the box is unknown; `holder` remains the engram author and `holder_name`
-remains the display name. A changed box mapping invalidates `agent.where_watch`
-just like a changed member name.
+After cutover, holder ids are daemon box ids, not transport fingerprints. Use
+the Callosum roster to map a box id to its current fingerprint. A migrated
+holder without a known box is `engram:<author>` and must not be dialed or
+looked up in the roster. Before cutover, `holder` is the engram author.
+`agent.where` and each `agent.where_many` row include `holder_box` when the box
+is known; `holder_name` remains the display name. A changed box mapping
+invalidates `agent.where_watch` just like a changed member name.
+
+Hub samples supplement the legacy vectors because both backends still serve
+clients during rollout: [single location](../test-vectors/agent-sessions-v1/where-hub.json),
+[batch locations](../test-vectors/agent-sessions-v1/where-many-hub.json), and
+[fleet identity](../test-vectors/agent-identity-reads-v1/fleet-identity-hub.json).
+Fleet identity identifies agents, not holders; join it to the locations by
+agent id. Plexus and Magic Context can pin the hub
+[role read](../test-vectors/role-claims-v1/read-hub.json),
+[handback reply](../test-vectors/role-claims-v1/handback-requested.json), and
+[fence](../test-vectors/role-claims-v1/fence-hub.json) examples.
+
+On the hub, service modules hold a `role.lease {role}` watch to be candidates.
+The holder renews every 20 s; act only within the confirmed monotonic window
+in the notice (`issued_at_ms + valid_for_ms`), at most 45 s from the renewal's
+send. Ack each notice via `role.lease.ack {role, seq}` within 5 s, and use
+`role.lease.release {role, gen}` after stopping or `role.lease.yield {role, gen}`
+after honoring a handback. Fence irreversible work by the lease `gen`; this
+is distinct from the changing KV revision returned by `role.fence`. A reader
+must not infer a live local lease from `role.read` or a successful `role.take`.
 
 `agent.session_residence` is intended for restoring a session from backup before
 making it writable. Its precedence is:
@@ -512,8 +537,7 @@ Only `here`, or `unclaimed` at epoch 0, permits making the restored session
 writable; `elsewhere` and `unknown` require read-only access. Residence is stricter
 than `agent.where`: the latter retains its existing status even for stale claims,
 refuses integrity-failed claims, and reports a positive-epoch claim without self
-identity as `held_elsewhere`. Neither read contacts engram; the periodic 30-second
-claim refresh supplies the local cache. Served examples are in
+identity as `held_elsewhere`. Neither read contacts engram or the hub. Served examples are in
 [`agent-session-residence-v1`](../test-vectors/agent-session-residence-v1/README.md).
 
 Registering a different `ref` for the same `(harness, session_id)`, `agent_id`
@@ -612,6 +636,7 @@ is [sharing.md](sharing.md).
 | Operation | Kind | Who | What it does |
 |---|---|---|---|
 | `identity_log.status` | query | any | Local log state, progress and pending writes, without contacting engram. |
+| `fleet.epoch_current {}` | query | any | Cached `{current?, highest_held?}`: the committed epoch named by the verified hub record and the highest committed epoch in this computer's vault. Pending mints do not count. Omit unknown members; reject unknown params with `invalid_request`. The read never contacts the hub or vault. Hold messages above `current` rather than dropping them: this computer's view can briefly lag another computer's rotation. |
 | `identity_log.enable {without_agents?}` | mutate | Direct | Enable the shared log, or join it. |
 | `member.set_name {display_name}` | mutate | Direct | Name this machine in the shared log. |
 

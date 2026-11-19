@@ -327,6 +327,13 @@ impl Worker {
                         generation: self.watches.catalog_generation(),
                     })?,
                 );
+                values.insert(
+                    "fleet_epoch",
+                    encode(&Generation {
+                        generation: self.health.fleet_epoch.generation(),
+                        incarnation: &self.incarnation,
+                    })?,
+                );
                 Ok(values)
             })
             .transpose()
@@ -342,10 +349,12 @@ impl Worker {
             let commits = self.commits.notified();
             let roles = self.role_changed.notified();
             let catalog = self.watches.catalog_changed().notified();
-            tokio::pin!(commits, roles, catalog);
+            let epoch = self.health.fleet_epoch.changed.notified();
+            tokio::pin!(commits, roles, catalog, epoch);
             commits.as_mut().enable();
             roles.as_mut().enable();
             catalog.as_mut().enable();
+            epoch.as_mut().enable();
             if self.store.strong_count() == 0 {
                 return;
             }
@@ -396,6 +405,7 @@ impl Worker {
                 _ = &mut commits => {},
                 _ = &mut roles => {},
                 _ = &mut catalog => {},
+                _ = &mut epoch => {},
                 // A new connection may face a bucket ck-bus re-provisioned empty,
                 // so every key is written again rather than trusting what this
                 // process last put.

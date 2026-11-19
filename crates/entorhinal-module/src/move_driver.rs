@@ -550,7 +550,7 @@ impl ProjectsHandler {
             let poll = async {
                 loop {
                     tokio::select! {
-                        _ = interval.tick() => {},
+                        _ = interval.tick(), if worker.health.hub_membership.load(Ordering::Acquire) == 0 => {},
                         _ = signals.notified() => {},
                         Some(result) = tasks.join_next_with_id(), if !tasks.is_empty() => {
                             owners.joined(&worker, result).await;

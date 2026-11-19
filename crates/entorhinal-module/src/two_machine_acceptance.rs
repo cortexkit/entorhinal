@@ -457,6 +457,36 @@ async fn move_root_to_new_project_is_one_shared_write_and_keeps_remote_checkout_
 }
 
 #[tokio::test(start_paused = true)]
+async fn hub_cutover_restart_never_calls_engram() {
+    let fail = Arc::new(FailConnector::default());
+    let mut m = Machine::new("hub-cutover-restart", fail.clone());
+    m.store().role_read("connector_home").unwrap();
+    m.store().apply_entry("fixture.cutover", "{}", "test", None, |tx| {
+        tx.execute("UPDATE identity_log_state SET state='enabled',hub_log_base=17,hub_ready=1,last_applied_position=17,last_seen_head=17", [])?;
+        tx.execute("INSERT INTO self_identity VALUES(1,?1,1)", ["ab".repeat(16)])?;
+        Ok(())
+    }).unwrap();
+    m.restart(fail.clone()).await;
+    m.handler.record_client = crate::record_client::RecordClient::new(fail.clone());
+    assert!(m.handler.hub_backend_selected());
+    m.handler.start_catch_up();
+    m.handler.start_role_refresh();
+    m.handler.start_claim_refresh();
+    m.handler.start_move_driver();
+    m.handler.role_refresh.notify_one();
+    m.handler.claim_refresh.signal();
+    m.handler.move_wake.notify_one();
+    for _ in 0..3 {
+        tokio::time::advance(Duration::from_secs(30)).await;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+    }
+    crate::tests::stop_store_tasks(&m.handler).await;
+    assert_eq!(fail.calls(), 0);
+}
+
+#[tokio::test(start_paused = true)]
 async fn disabled_workload_keeps_local_journal_and_never_connects() {
     let fail = Arc::new(FailConnector::default());
     let m = Machine::new("disabled-acceptance", fail.clone());

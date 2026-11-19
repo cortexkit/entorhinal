@@ -24,6 +24,7 @@ struct Leaf {
     gate: StdMutex<Option<Gate>>,
     sends: StdMutex<Vec<(u64, String, Vec<u8>)>>,
     reads: StdMutex<Vec<u64>>,
+    requests: StdMutex<Vec<String>>,
     refuse_kv: std::sync::atomic::AtomicBool,
     epoch_gate: StdMutex<Option<(String, Gate)>>,
 }
@@ -61,6 +62,7 @@ impl LogTransport for Leaf {
         prefix: &str,
         deadline: Instant,
     ) -> Result<Vec<String>, HandlerError> {
+        self.requests.lock().unwrap().push(format!("keys:{prefix}"));
         self.session().join_keys(prefix, deadline).await
     }
 }
@@ -72,10 +74,15 @@ impl Transport for Leaf {
         deadline: Instant,
     ) -> Result<Option<Vec<u8>>, HandlerError> {
         self.reads.lock().unwrap().push(position);
+        self.requests
+            .lock()
+            .unwrap()
+            .push(format!("log:{position}"));
         self.session().log_entry(position, deadline).await
     }
 
     async fn log_head(&self, deadline: Instant) -> Result<u64, HandlerError> {
+        self.requests.lock().unwrap().push("head".into());
         self.session().log_head(deadline).await
     }
 
@@ -84,6 +91,7 @@ impl Transport for Leaf {
         key: &str,
         deadline: Instant,
     ) -> Result<Option<KvEntry>, HandlerError> {
+        self.requests.lock().unwrap().push(format!("read:{key}"));
         Ok(self
             .session()
             .kv_entry(key, deadline)
@@ -100,6 +108,10 @@ impl Transport for Leaf {
         id: &str,
         deadline: Instant,
     ) -> Result<Option<u64>, HandlerError> {
+        self.requests
+            .lock()
+            .unwrap()
+            .push(format!("write:{}", write.key));
         if write.key != LOG_SUBJECT {
             if self.refuse_kv.load(Ordering::Acquire) {
                 return Err(unavailable("fixture stopped residence before send"));
@@ -240,6 +252,7 @@ async fn leaf(
         gate: StdMutex::default(),
         sends: StdMutex::default(),
         reads: StdMutex::default(),
+        requests: StdMutex::default(),
         refuse_kv: std::sync::atomic::AtomicBool::new(false),
         epoch_gate: StdMutex::default(),
     });

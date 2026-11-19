@@ -21,6 +21,119 @@ impl SnapshotClaims for Image {
     fn hub_ready(&self) -> bool {
         true
     }
+    fn role(&self, name: &str) -> Option<(Option<String>, i64)> {
+        self.0.get(&format!("role.{name}")).cloned()
+    }
+}
+
+const SAMPLE_SENTINEL: &str = "engram:11111111111111111111111111111111";
+
+async fn cutover_sample(handler: &ProjectsHandler, op: &str, params: Value) -> String {
+    let outcome = handler
+        .handle_served_request(&body(op, params.clone()), ROUTE)
+        .await;
+    let HandlerOutcome::Response(bytes) = outcome else {
+        panic!("sample {op} refused: {outcome:?}");
+    };
+    format!(
+        "  {{\"op\":{},\"request\":{},\"reply\":{}}}",
+        json!(op),
+        params,
+        String::from_utf8(bytes).unwrap()
+    )
+}
+
+#[tokio::test]
+async fn hub_cutover_holder_samples() {
+    let Some(mut rig) = IdentityRig::new().await else {
+        return;
+    };
+    let handler = &mut rig.b.handler;
+    handler.operator_confirmer = Arc::new(RoleConfirm::default());
+    bind(handler, subc_protocol::Principal::Direct);
+    let other = "agent_0000000000000041";
+    migrate_identity(&rig.b, MIGRATED, "Engram held");
+    migrate_identity(&rig.b, other, "Hub held");
+    let image = Arc::new(Image(HashMap::from([
+        (MIGRATED.into(), (Some(SAMPLE_SENTINEL.into()), 5)),
+        (other.into(), (Some(A.into()), 1)),
+        (
+            "role.dreamer.workspace_02".into(),
+            (Some(SAMPLE_SENTINEL.into()), 5),
+        ),
+    ])));
+    residence(&rig.b, image);
+    for (id, holder, gen) in [(MIGRATED, SAMPLE_SENTINEL, 5), (other, A, 1)] {
+        let mut seeded = record(B, holder, gen, false);
+        seeded["seeded"] = json!(true);
+        let revision = put(&rig, id, 0, B, seeded).await;
+        assert!(!applied(&rig.b, id, revision).await.integrity_failed);
+        until(|| ready_for(&rig.b, id)).await;
+    }
+    let handler = &rig.b.handler;
+    use crate::served_vectors::published_file;
+    let location = [other, MIGRATED];
+    let mut records = Vec::new();
+    for id in location {
+        records.push(cutover_sample(handler, "agent.where", json!({"agent_id":id})).await);
+    }
+    published_file("agent-sessions-v1", "where-hub.json", records);
+    published_file(
+        "agent-sessions-v1",
+        "where-many-hub.json",
+        vec![cutover_sample(handler, "agent.where_many", json!({"agentIds":location})).await],
+    );
+    published_file(
+        "agent-identity-reads-v1",
+        "fleet-identity-hub.json",
+        vec![cutover_sample(handler, "agent.fleet_identity", json!({})).await],
+    );
+
+    let role = "dreamer.global";
+    let key = format!("role.{role}");
+    let signed = fleet_record::prepare(
+        &ClaustrumCredentialResolver::with_target(rig.keys.clone(), 0),
+        rig.keys.as_ref(),
+        &Header {
+            kind: "role".into(),
+            key: key.clone(),
+            writer: A.into(),
+            writer_ep: 0,
+            entry_id: "56".repeat(16),
+        },
+        &json!({"v":1,"holder":A,"holder_ep":0,"writer":A,"gen":1,"lease_ms":60000}),
+    )
+    .await
+    .unwrap();
+    rig.kv
+        .update(&key, signed.into_bytes().into(), 0)
+        .await
+        .unwrap();
+    until(|| role_read(handler, role)["holder"] == A && role_read(handler, role)["stale"] == false)
+        .await;
+    let legacy_role = "dreamer.workspace_02";
+    let legacy_key = format!("role.{legacy_role}");
+    let signed = fleet_record::prepare(
+        &ClaustrumCredentialResolver::with_target(rig.keys.clone(), 0), rig.keys.as_ref(),
+        &Header { kind:"role".into(), key:legacy_key.clone(), writer:A.into(), writer_ep:0, entry_id:"57".repeat(16) },
+        &json!({"v":1,"holder":SAMPLE_SENTINEL,"holder_ep":0,"writer":A,"gen":5,"seeded":true,"lease_ms":60000}),
+    ).await.unwrap();
+    rig.kv
+        .update(&legacy_key, signed.into_bytes().into(), 0)
+        .await
+        .unwrap();
+    until(|| role_read(handler, legacy_role)["holder"] == SAMPLE_SENTINEL).await;
+    for (op, file) in [
+        ("role.read", "read-hub.json"),
+        ("role.fence", "fence-hub.json"),
+    ] {
+        let mut records = Vec::new();
+        for name in [role, legacy_role] {
+            records.push(cutover_sample(handler, op, json!({"role":name})).await);
+        }
+        published_file("role-claims-v1", file, records);
+    }
+    published_file("role-claims-v1", "handback-requested.json", vec![cutover_sample(handler, "role.take", json!({"role":role,"expected_epoch":1,"request_id":"23".repeat(16),"reason":"switch computers"})).await]);
 }
 
 #[derive(Default)]

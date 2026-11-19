@@ -72,6 +72,44 @@ impl Framed {
     }
 }
 
+#[test]
+fn hub_cutover_snapshot_sample() {
+    use entorhinal_core::enable_state::{HubImage, HubRole};
+    let snapshot = HubSnapshot {
+        engram_through: 17,
+        excluded: vec!["12".repeat(16)],
+        image: HubImage {
+            claims: vec![],
+            roles: vec![
+                HubRole {
+                    generation: 4,
+                    holder: Some("ab".repeat(16)),
+                    role: "connector_home".into(),
+                },
+                HubRole {
+                    generation: 7,
+                    holder: Some(format!("engram:{}", "cd".repeat(16))),
+                    role: "dreamer.global".into(),
+                },
+            ],
+        },
+        migration_id: "56".repeat(16),
+        tables: BTreeMap::new(),
+    };
+    assert!(valid_image(&snapshot));
+    let framed = Framed::new(&snapshot).unwrap();
+    assert_eq!(framed.bodies.len(), 1);
+    crate::served_vectors::published_file(
+        "hub-snapshot-v1",
+        "part.json",
+        vec![format!(
+            "  {{\"entry_id\":{},\"body\":{}}}",
+            json!(entry_id(&snapshot.migration_id, 0)),
+            framed.bodies[0]
+        )],
+    );
+}
+
 fn valid_image(snapshot: &HubSnapshot) -> bool {
     let ids = snapshot
         .tables

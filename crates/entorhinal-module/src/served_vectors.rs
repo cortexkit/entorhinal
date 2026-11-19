@@ -434,6 +434,9 @@ pub(crate) fn published_file(directory: &str, name: &str, records: Vec<String>) 
         .join(name);
     let served = format!("[\n{}\n]\n", records.join(",\n"));
     if std::env::var("ENTO_WRITE_SERVED_VECTORS").as_deref() == Ok("1") {
+        if std::fs::read(&path).is_ok_and(|old| old == served.as_bytes()) {
+            return;
+        }
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, served).unwrap();
         println!("wrote {directory}/{name}");

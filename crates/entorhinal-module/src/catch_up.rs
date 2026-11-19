@@ -173,13 +173,19 @@ impl Worker {
         let mut gate_error = None;
         let mut ticks = tokio::time::interval(INTERVAL);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut hub_retry = Some(Instant::now());
+        let mut backoff = Duration::from_secs(1);
         loop {
+            let installed = self.health.hub_membership.load(Ordering::Acquire) != 0;
             tokio::select! {
-                _ = ticks.tick() => {},
+                _ = ticks.tick(), if !installed => {},
                 _ = self.wake.notified() => {},
+                _ = async { tokio::time::sleep_until(hub_retry.expect("armed retry")).await },
+                    if installed && hub_retry.is_some() => {},
             }
             let deadline = Instant::now() + READ_DEADLINE;
             let Ok(writer) = timeout_at(deadline, self.writer.clone().lock_owned()).await else {
+                hub_retry = Some(Instant::now() + backoff);
                 continue;
             };
             let Some(slot) = self.store.upgrade() else {
@@ -195,16 +201,19 @@ impl Worker {
                     continue;
                 };
                 if let Some(base) = base {
-                    if let Some(switch) = &self.hub_switch {
-                        let result = switch
-                            .start_installed(&store, &self.hub_runtime, base, deadline)
-                            .await;
-                        log_switch_result(&mut switch_error, &result);
-                        if result.is_ok() {
-                            self.health.hub_switch_state.store(0, Ordering::Relaxed);
-                            break;
-                        }
+                    let Some(switch) = &self.hub_switch else {
+                        break;
+                    };
+                    let result = switch
+                        .start_installed(&store, &self.hub_runtime, base, deadline)
+                        .await;
+                    log_switch_result(&mut switch_error, &result);
+                    if result.is_ok() {
+                        self.health.hub_switch_state.store(0, Ordering::Relaxed);
+                        break;
                     }
+                    hub_retry = Some(Instant::now() + backoff);
+                    backoff = (backoff * 2).min(Duration::from_secs(60));
                     continue;
                 }
                 if let (Some(switch), Ok(Some(_))) = (&self.hub_switch, store.hub_enable_plan()) {

@@ -98,7 +98,10 @@ impl Worker {
             return Ok(RefreshCounts::default());
         };
         let agents = tokio::task::spawn_blocking(self.sql_operations.tracked(move || {
-            if store.is_foreign() || store.identity_log_status()?.state != "enabled" {
+            if store.is_foreign()
+                || store.hub_log_base()?.is_some()
+                || store.identity_log_status()?.state != "enabled"
+            {
                 return Ok(Vec::new());
             }
             store.live_claim_agents()
@@ -110,6 +113,9 @@ impl Worker {
         for chunk in agents.chunks(MANY_CAP) {
             let mut offset = 0;
             while offset < chunk.len() {
+                if self.health.hub_membership.load(Ordering::Acquire) != 0 {
+                    return Ok(counts);
+                }
                 let subjects: Vec<String> = chunk[offset..]
                     .iter()
                     .map(|id| format!("claim:{id}"))
@@ -226,6 +232,9 @@ impl Worker {
                 let conflicts =
                     tokio::task::spawn_blocking(self.sql_operations.tracked(move || {
                         let store = cache;
+                        if store.hub_log_base()?.is_some() {
+                            return Ok(0);
+                        }
                         watches.cache_claims(&store, &observations, now)
                     }))
                     .await

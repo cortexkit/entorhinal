@@ -368,7 +368,19 @@ async fn lease_renews_same_generation_every_twenty_seconds() {
     let renewals = hub.writes(RENEW);
     assert_eq!(renewals.len(), 2);
     assert_eq!(renewals[0], renewals[1]);
-    assert!(a.next().holding);
+    let notice = a.next();
+    assert!(notice.holding);
+    a.ack(&notice);
+    for count in 3..=5 {
+        tick(20_001).await;
+        let notice = a.next();
+        assert!(notice.holding);
+        a.ack(&notice);
+        assert_eq!(hub.writes(RENEW), vec![renewals[0].clone(); count]);
+    }
+    tick(9_996).await;
+    assert_eq!(hub.writes(RENEW).len(), 5);
+    assert_eq!(hub.writes(ACQUIRE).len(), 1);
 }
 
 #[tokio::test(start_paused = true)]

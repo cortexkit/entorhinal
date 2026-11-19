@@ -1,11 +1,11 @@
 # Identity log contract
 
 The identity log is how the operator's machines share projects, workspaces and
-agents. engram stores it: an append-only log that engram signs, encrypts and
-verifies, so entorhinal sends and receives plaintext entries. Each machine keeps a
-full copy of the shared state in its own store and answers every read from
-that copy. Folder paths, approvals and every kind of local authority stay on
-the machine that owns them.
+agents. After cutover it is the hub stream `HUB_IDLOG`, on `ck.fleet.idlog`.
+Entorhinal signs the envelope through the vault and seals its body under the
+fleet epoch key. Each machine verifies and replays entries into its own store
+and serves reads from that copy. Folder paths, approvals and every kind of
+local authority stay on the machine that owns them.
 
 The log is optional. A store starts with it disabled, and everything works on
 one machine without it. [sharing.md](sharing.md) is the operator guide.
@@ -16,6 +16,44 @@ Code: `crates/entorhinal-module/src/shared_write.rs` (writing),
 `crates/entorhinal-core/src/shared_entry.rs` (entry bodies),
 `remote_apply.rs` (applying received entries), `enable_state.rs`,
 `log_schema.rs` and `pending.rs` (local log state).
+
+## Hub operation and switch
+
+The shared log is separate from the hub KV bucket `KV_residence`. The log tail
+applies identity in order and stops at an unverifiable entry. The KV watch
+feeds `residence.<agent>`, `role.<name>`, move records and role handback
+requests into local state; an invalid record affects its own key, not the
+rest of the watch. A writer compares the expected log head or KV revision
+and checks the hub's fleet epoch before sending sealed bytes. If a reply is
+lost, it settles against the original position or revision rather than
+blindly writing again. A hub outage makes writes refuse, not queue for later;
+local reads remain available but cached claims may be stale.
+
+The switch is one-way. Paired legacy members advertise `hub/v1` and quiesce
+before the switch marker. The marker freezes legacy writes. The migrator
+drains and verifies the claim and role image, appends the shared snapshot,
+and seeds the hub records without lowering claim generations. Each computer
+waits for the verified snapshot and seed before persisting `hub_ready`.
+The [snapshot vector](../test-vectors/hub-snapshot-v1/README.md) pins the
+canonical plaintext part and its entry id.
+A new fleet can be initialized explicitly; discovery never initializes it.
+A restarted, switched computer resumes from the hub without contacting
+engram for shared state. Before switching, a computer keeps its legacy
+catch-up, claim and role refresh, and move inbox poll. After switching it
+tails/watches instead; failed subscriptions retry with capped backoff.
+
+Hub authors and holders are stable daemon box ids. A migrated holder with no
+known box keeps the sentinel `engram:<author>`; it is not a Callosum peer
+identifier. Agent residence is durable. A role is a lease: a holder's module
+must confirm it is still a candidate, observe its monotonic validity window,
+and fence irreversible work by the role generation. The only periodic hub
+requests are held-lease renewals, each a KV CAS and its fleet epoch read. See
+[the module surface](module-surface.md#sessions-claims-and-roles) for the
+consumer contract.
+
+The sections below describe the legacy engram transport and the shared-state
+rules it uses. Engram signs, encrypts and verifies the legacy log, so that
+transport sends and receives plaintext entry bodies.
 
 ## 1. Vocabulary
 

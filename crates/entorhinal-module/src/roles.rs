@@ -334,7 +334,7 @@ impl ProjectsHandler {
     }
 
     pub(super) fn start_role_refresh(&self) {
-        if self.health.origin.is_foreign() {
+        if self.health.origin.is_foreign() || self.hub_backend_selected() {
             return;
         }
         let mut task = self.role_refresh_task.lock().unwrap();
@@ -356,6 +356,9 @@ impl ProjectsHandler {
             ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! { _ = ticks.tick() => {}, _ = signal.notified() => {} }
+                if health.hub_membership.load(Ordering::Acquire) != 0 {
+                    return;
+                }
                 let roles = {
                     let Some(slot) = store.upgrade() else {
                         return;
@@ -378,6 +381,9 @@ impl ProjectsHandler {
                 for chunk in roles.chunks(MANY_CAP) {
                     let mut offset = 0;
                     while offset < chunk.len() {
+                        if health.hub_membership.load(Ordering::Acquire) != 0 {
+                            return;
+                        }
                         let subjects: Vec<_> = chunk[offset..]
                             .iter()
                             .map(|role| format!("role:{role}"))
@@ -449,6 +455,9 @@ impl ProjectsHandler {
                         let now = clock();
                         match tokio::task::spawn_blocking(sql_operations.tracked(move || {
                             let store = cache;
+                            if store.hub_log_base()?.is_some() {
+                                return Ok(0);
+                            }
                             store.cache_roles(&observations, now)
                         }))
                         .await
