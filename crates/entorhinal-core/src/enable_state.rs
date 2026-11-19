@@ -193,8 +193,10 @@ impl RegistryStore {
         self.read(read_hub_plan)
     }
 
-    /// Save the reviewed bytes before any network write. Reopening never relies
-    /// on a second capture of the local registry or a renewed presence approval.
+    /// Capture the local registry once and save that capture before any
+    /// network write. A resumed enable after a crash publishes exactly these
+    /// saved bytes; it never captures the registry again, so the snapshot
+    /// other computers receive can't change between attempts.
     pub fn begin_hub_enable(&self, enable_id: &str, box_id: &str) -> Result<(), RegistryError> {
         self.with_where_changes(|tx| {
             let mut tables = hub_tables(tx)?;
