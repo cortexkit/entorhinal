@@ -31,6 +31,7 @@ pub(crate) async fn run(worker: Worker) {
 }
 
 pub(crate) async fn tick(worker: &Worker) -> Result<(), HandlerError> {
+    // Scan committed checkpoints without taking the writer; only due releases write.
     let rows = worker
         .sql(|store| {
             if store.is_foreign() {

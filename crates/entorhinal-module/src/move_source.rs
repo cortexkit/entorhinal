@@ -9,7 +9,6 @@ use crate::{
     },
     hub_moves::{self, SeenMove, State as HubState},
     hub_residence::{MovePosition, MoveTransfer, Residence},
-    log_client::TransportError,
     move_driver::{
         backoff, digest_reason, participant_action, skipped_streams, PeerRefusal, RefusalLog,
         SkippedStreams, Worker, POLL,
@@ -255,6 +254,10 @@ impl Failure {
         detail
     }
     fn action(&self) -> Option<DriverAction> {
+        if self.op == "route.open" {
+            // No participant answered, so the participant refusal table doesn't apply.
+            return Some(DriverAction::Retry);
+        }
         self.module
             .as_ref()
             .and_then(|_| participant_action(&self.op, &self.code))
@@ -627,16 +630,7 @@ impl Source {
             .map_err(|e| {
                 let mut failure = Failure::new("route.open", "unavailable");
                 failure.module = Some(module.into());
-                if let TransportError::Refusal {
-                    code,
-                    detail,
-                    message,
-                } = e
-                {
-                    failure.code = code;
-                    failure.detail = detail.unwrap_or(Value::Null);
-                    failure.refuse(message);
-                }
+                failure.detail = json!({"error":format!("{e:?}")});
                 failure
             })?;
         let client = ParticipantClient::new(&Participant {
@@ -1646,7 +1640,7 @@ mod tests {
         fake_door::{Effect as DoorEffect, FakeDoor},
         fake_participant::{Effect as ParticipantEffect, FakeParticipant},
         fake_record::{FakeRecord, FakeRecordConnector},
-        log_client::{LogConnector, LogTransport},
+        log_client::{LogConnector, LogTransport, TransportError},
         participant_client::{PrepareReply, Refusal, Request},
         participant_discovery::ParticipantDiscovery,
         record_client::RecordClient,
@@ -1745,6 +1739,7 @@ mod tests {
     }
     struct Discovery {
         peers: BTreeMap<String, Arc<Peer>>,
+        open_failure: Arc<Mutex<Option<TransportError>>>,
     }
     #[async_trait]
     impl ParticipantDiscovery for Discovery {
@@ -1758,6 +1753,9 @@ mod tests {
             &self,
             module: &str,
         ) -> Result<Arc<dyn LogTransport>, TransportError> {
+            if let Some(error) = self.open_failure.lock().unwrap().take() {
+                return Err(error);
+            }
             Ok(self
                 .peers
                 .get(module)
@@ -1846,6 +1844,7 @@ mod tests {
         slot: Slot,
         worker: Worker,
         participants: Vec<Arc<FakeParticipant>>,
+        open_failure: Arc<Mutex<Option<TransportError>>>,
         release_gate: Arc<ReleaseGate>,
         door: FakeDoor,
         records: Arc<FakeRecord>,
@@ -1937,6 +1936,7 @@ mod tests {
                 lose: Arc::new(Mutex::new(None)),
                 race: Arc::new(Mutex::new(None)),
             });
+            let open_failure = Arc::default();
             let worker = Worker {
                 sql_operations: Arc::default(),
                 store: Arc::downgrade(&slot),
@@ -1945,7 +1945,10 @@ mod tests {
                     fake: door.clone(),
                     trace: trace.clone(),
                 })),
-                discovery: Arc::new(Discovery { peers }),
+                discovery: Arc::new(Discovery {
+                    peers,
+                    open_failure: Arc::clone(&open_failure),
+                }),
                 catalog: None,
                 health: Arc::new(HealthGauges::default()),
                 watches: Arc::default(),
@@ -1957,6 +1960,7 @@ mod tests {
                 slot,
                 worker,
                 participants,
+                open_failure,
                 release_gate,
                 door,
                 records,
@@ -2528,6 +2532,37 @@ mod tests {
                 .iter()
                 .all(|p| p.calls().iter().all(|r| !matches!(r, Request::Abort(_)))));
             assert!(f.door.calls().iter().all(|c| c.request.op() != "cut.abort"));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn move_session_regression_source_retries_participant_route_open() {
+        for error in [
+            TransportError::NoReply,
+            TransportError::Refusal {
+                code: "module_not_found".into(),
+                detail: None,
+                message: None,
+            },
+        ] {
+            let f = Fixture::new();
+            *f.open_failure.lock().unwrap() = Some(error);
+            let mut source = f.source();
+            let mut row = f.row();
+            let mut plan: Plan = serde_json::from_value(row.plan.clone()).unwrap();
+            let error = source.client("b").await.err().expect("route must fail");
+            let delay = source.failed(&mut row, &mut plan, error).await.unwrap();
+            let saved = f.row();
+            assert!(
+                saved.plan["_source"]["contract_violation"].is_null(),
+                "a failed participant route must retry, not hold: {:?}",
+                saved.hold
+            );
+            assert_eq!(delay, Some(backoff(1)));
+            assert_eq!(saved.attempts, 1);
+            assert!(saved.abort_requested.is_none());
+            assert_eq!(saved.hold.unwrap()["module_id"], "b");
+            assert!(source.client("b").await.is_ok());
         }
     }
 

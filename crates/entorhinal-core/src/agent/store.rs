@@ -600,11 +600,7 @@ fn required_key(request: &Mutation) -> Result<&str, AgentMutationError> {
 
 pub(super) fn require_cutover(conn: &Connection) -> Result<(), AgentMutationError> {
     if conn
-        .query_row(
-            "SELECT 1 FROM registry_journal WHERE op='agent.cutover' LIMIT 1",
-            [],
-            |_| Ok(()),
-        )
+        .query_row(RegistryStore::AGENT_CUTOVER_SQL, [], |_| Ok(()))
         .optional()?
         .is_none()
     {

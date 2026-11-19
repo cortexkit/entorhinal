@@ -1060,7 +1060,7 @@ impl Receiver {
                 ));
             }
         }
-        self.local_writers(plan).await
+        self.local_writers(plan, progress).await
     }
 
     /// The session bindings the source carried for this move, as this machine
@@ -1151,7 +1151,11 @@ impl Receiver {
             })
     }
 
-    async fn local_writers(&mut self, plan: &MoveRecord) -> Result<(), Failure> {
+    async fn local_writers(
+        &mut self,
+        plan: &MoveRecord,
+        progress: &Progress,
+    ) -> Result<(), Failure> {
         let refs: Vec<_> = plan
             .participants
             .iter()
@@ -1207,7 +1211,7 @@ impl Receiver {
                 ));
             }
         }
-        for p in &plan.participants {
+        for p in called(plan, progress) {
             let local: Vec<_> = p
                 .refs
                 .iter()
@@ -1352,7 +1356,7 @@ impl Receiver {
                 // Diverged asks each participant whether this machine has data past
                 // the cut. A host can write while that call is in flight, so recheck
                 // session-binding ownership and active local writers before import.
-                self.local_writers(plan).await?;
+                self.local_writers(plan, progress).await?;
                 self.catalog_preflight(plan).await?;
                 for p in called(plan, progress) {
                     if hub.is_some() && progress.hub_imported.contains(&p.module_id) {
@@ -1426,7 +1430,7 @@ impl Receiver {
             }
             Step::Claimed => {
                 self.apply_claim(row).await?;
-                self.local_writers(plan).await?;
+                self.local_writers(plan, progress).await?;
                 Self::step(row, progress, Step::Activating);
                 self.save(row, progress).await?;
             }

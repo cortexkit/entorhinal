@@ -1224,6 +1224,9 @@ impl RegistryStore {
         }
     }
 
+    pub(crate) const AGENT_CUTOVER_SQL: &str =
+        "SELECT 1 FROM registry_journal WHERE op='agent.cutover' LIMIT 1";
+
     // A refusal is returned inside `Ok`, which commits the transaction. That
     // is safe only because every check runs before the writes at the end,
     // so a refused registration has written nothing.
@@ -1236,11 +1239,7 @@ impl RegistryStore {
         let runner = session_lifecycle::registration_runner(request.runner)?;
         let role = session_lifecycle::registration_role(request.role)?;
         let cut_over = tx
-            .query_row(
-                "SELECT 1 FROM registry_journal WHERE op=?1 LIMIT 1",
-                [agent::IDENTITY_MARKER_OP],
-                |_| Ok(()),
-            )
+            .query_row(Self::AGENT_CUTOVER_SQL, [], |_| Ok(()))
             .optional()?
             .is_some();
         if !cut_over {

@@ -21,12 +21,11 @@ pub(crate) const HUB_LOCAL: &str = "hub.local_write";
 /// success instead of a conflict with its own earlier write. None of it is
 /// ever part of the shared entry.
 ///
-/// The two partial indexes serve bounded queries that would otherwise scan
-/// unrelated rows: the session retention prune selects only ended bindings,
-/// and the agent change marker and `agent.changes` feed select only identity
-/// operations from the journal. SQLite uses a partial index only when the
-/// query repeats its condition exactly, so the operation list must match
-/// `IDENTITY_CHANGE_OPS` in order; a query-plan test checks that it does.
+/// The partial indexes keep the session retention prune, identity change feed,
+/// and agent cutover checks from scanning unrelated rows. SQLite needs the
+/// query predicates to match: the identity op list must match
+/// `IDENTITY_CHANGE_OPS`, and a cutover check must name the literal marker op.
+/// The move history index serves an agent's moves in display order.
 pub(crate) const V27_LEGACY_REPLY_AND_QUERY_INDEXES: &str = r#"
 ALTER TABLE pending_entry ADD COLUMN continuation TEXT NULL;
 CREATE INDEX session_binding_ended
@@ -36,6 +35,10 @@ CREATE INDEX registry_journal_identity
     WHERE op IN ('agent.create','agent.rename','agent.update_tag','agent.set_labels',
                  'agent.set_avatar','agent.set_github_identity','agent.dispose',
                  'agent.merge','agent.import','agent.set_namespace');
+CREATE INDEX registry_journal_cutover
+    ON registry_journal(op) WHERE op='agent.cutover';
+CREATE INDEX agent_move_agent_history
+    ON agent_move(agent_id, created_at_ms, cut_id);
 "#;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
