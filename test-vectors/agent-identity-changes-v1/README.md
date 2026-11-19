@@ -11,7 +11,7 @@ not grant that identity access to a deployed SUBC router.
 
 The fixture registers three placed projects with empty roots lists (no local
 filesystem directories) and imports fixed ids
-through `agent.import` from `Reserved(prefrontal-core)`. One imported head
+through `agent.import` from `Reserved(prefrontal)`. One imported head
 stores its project id as its workspace and has a claim keyed on that project
 id. Another head stores its actual placement and already claims its name
 there. A live hiree belongs to a third placed project and stores no workspace.

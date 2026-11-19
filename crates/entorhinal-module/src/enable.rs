@@ -790,7 +790,7 @@ mod tests {
             self.marker();
             for i in 0..count {
                 let id = format!("agent_{i:016x}");
-                self.store().with_principal("reserved:prefrontal-core").agent_mutation_with_id("agent.create", json!({"role":"assistant","name":format!("Agent {i}"),"tag":"ok","request_key":format!("create-{i}")}), 10, Some(&id)).unwrap();
+                self.store().with_principal("reserved:prefrontal").agent_mutation_with_id("agent.create", json!({"role":"assistant","name":format!("Agent {i}"),"tag":"ok","request_key":format!("create-{i}")}), 10, Some(&id)).unwrap();
                 if label_size > 0 {
                     let mut row = self.store().agent_row(&id).unwrap().unwrap();
                     row.labels = vec!["x".repeat(label_size)];

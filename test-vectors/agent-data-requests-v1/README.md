@@ -34,7 +34,7 @@ it must not rehash, normalize, or replace an old ref with a new one. The binding
 Each JSON file is an array of sixteen records:
 
 - Two registry records contain the full `request` (`method` and `params`), the
-  core caller's principal (`reserved:prefrontal-core`), and the real handler's
+  core caller's principal (`reserved:prefrontal`), and the real handler's
   `reply`: `agent.register_session`, then `agent.session_for_ref`.
 - Five `side: "source"` records capture `agent_data.describe`, `busy`, `prepare`,
   `export`, and `release` from a completed move.
@@ -80,8 +80,8 @@ For example, the new-format source prepare request is:
 
 | File | SHA-256 |
 | --- | --- |
-| `old-format.json` | `aa083c07b863365334738b81bb3e269aee958e9a4da3862c97ee14c320362fa6` |
-| `new-format.json` | `70e10c5300246aad275739b272e1aed7f7d80e27ad3648a38a9d43130cebe28e` |
+| `old-format.json` | `83286afba3a2ac8a05edbb64807b466c275fe1fb9556a9bc78cba01bbd79ff81` |
+| `new-format.json` | `9e5f909b0e1af7d30791cbfbde4f163440214988e6d95d5d7282ec5459200b5e` |
 
 ## Reproduce and verify
 

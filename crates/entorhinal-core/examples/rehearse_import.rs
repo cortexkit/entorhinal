@@ -42,7 +42,7 @@ use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
 use entorhinal_core::RegistryStore;
 use serde_json::json;
 
-/// The principal the daemon records for writes core relays to entorhinal.
+/// The principal the daemon recorded when agent identity moved to entorhinal.
 const CORE_PRINCIPAL: &str = "reserved:prefrontal-core";
 
 fn main() -> ExitCode {

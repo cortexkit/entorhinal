@@ -1088,10 +1088,7 @@ mod tests {
                         assert!(error.detail.is_none());
                         assert!(error.message.contains(method));
                         if principal == Some(Principal::Direct) {
-                            assert!(
-                                error.message.contains("prefrontal-core")
-                                    && error.message.contains("relay")
-                            );
+                            assert!(error.message.contains("prefrontal's relay"));
                         }
                     }
                 }
@@ -1488,25 +1485,25 @@ mod tests {
             vec![
                 (
                     "agent.cutover".into(),
-                    "reserved:prefrontal-core".into(),
+                    "reserved:prefrontal".into(),
                     "module".into(),
                     NOW
                 ),
                 (
                     "agent.create".into(),
-                    "reserved:prefrontal-core".into(),
+                    "reserved:prefrontal".into(),
                     "module".into(),
                     NOW
                 ),
                 (
                     "agent.create".into(),
-                    "reserved:prefrontal-core".into(),
+                    "reserved:prefrontal".into(),
                     "module".into(),
                     NOW
                 ),
                 (
                     "agent.create".into(),
-                    "reserved:prefrontal-core".into(),
+                    "reserved:prefrontal".into(),
                     "operator:test".into(),
                     NOW
                 ),

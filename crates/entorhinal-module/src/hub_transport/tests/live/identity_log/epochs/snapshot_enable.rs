@@ -38,7 +38,7 @@ fn bootstrap(
         CORE,
         RouteAdmission::from_bind(
             Some(subc_protocol::Principal::Reserved {
-                module_id: "prefrontal-core".into(),
+                module_id: "prefrontal".into(),
             }),
             None,
         ),

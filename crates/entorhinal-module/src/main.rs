@@ -653,17 +653,7 @@ fn route_key(handle: &RouteHandle) -> RouteKey {
 /// The one module besides the operator that may change the registry: the
 /// executive registers repositories and writes the
 /// user's decisions.
-const WRITER_MODULE: &str = "prefrontal-core";
-
-/// The executive's module id after its rename. Until every machine has been
-/// cut over, the executive may reach this module under either id, so
-/// admission accepts both; the old id is dropped once the rename is done.
-const WRITER_MODULE_RENAMED: &str = "prefrontal";
-
-/// Whether `module_id` is the executive, under its current or renamed id.
-fn is_writer_module(module_id: &str) -> bool {
-    module_id == WRITER_MODULE || module_id == WRITER_MODULE_RENAMED
-}
+const WRITER_MODULE: &str = "prefrontal";
 
 /// Methods that change the registry or the liveness state derived from it.
 /// The daemon's channel-0 registry read for its settings gate; the reply is
@@ -826,7 +816,7 @@ fn authorize_write(method: &str, principal: Option<&Principal>) -> Result<(), Ha
             ));
         }
         return match principal {
-            Some(Principal::Reserved { module_id }) if is_writer_module(module_id) => Ok(()),
+            Some(Principal::Reserved { module_id }) if module_id == WRITER_MODULE => Ok(()),
             Some(Principal::Direct) => Err(HandlerError::new(
                 "direct_identity_write_not_admitted",
                 format!("'{method}' must be called through {WRITER_MODULE}'s relay; Direct agent identity writes are not admitted"),
@@ -842,7 +832,7 @@ fn authorize_write(method: &str, principal: Option<&Principal>) -> Result<(), Ha
     }
     match principal {
         Some(Principal::Direct) => Ok(()),
-        Some(Principal::Reserved { module_id }) if is_writer_module(module_id) => Ok(()),
+        Some(Principal::Reserved { module_id }) if module_id == WRITER_MODULE => Ok(()),
         other => Err(HandlerError {
             code: "write_not_permitted".to_string(),
             detail: None,
@@ -1074,7 +1064,7 @@ impl ProjectsHandler {
     /// Whether a request on this route may run `method`. A flow-scoped route may
     /// not write at all. Project writes are admitted from `Direct` (the `ck`
     /// command-line clients) or the executive, as before. Agent identity writes are admitted
-    /// here only from the executive (`reserved:prefrontal-core`): every local
+    /// here only from the executive (`reserved:prefrontal`): every local
     /// process, including an agent's shell, reaches entorhinal as `Direct`.
     /// The one way a `Direct` caller writes agent identity is `write_wait`,
     /// which, for five methods only, asks the operator to approve the exact
@@ -3355,33 +3345,31 @@ mod tests {
             } else {
                 assert!(direct.is_ok(), "{method} from direct");
             }
-            // The executive is admitted under its current and its renamed id.
-            for executive_id in [WRITER_MODULE, WRITER_MODULE_RENAMED] {
-                let executive = authorize_write(method, Some(&reserved(executive_id)));
-                if *method == store_origin::ADOPT
-                    || *method == "move_root_to_new_project"
-                    || *method == "identity_log.enable"
-                    || *method == hub_switch::EXCLUDE
-                    || *method == "placement.backfill"
-                    || catalog_ops::WRITES.contains(method)
-                    || *method == catalog_publish::PUBLISH
-                    || *method == catalog_seed::SEED
-                {
-                    assert_eq!(executive.unwrap_err().code, "write_not_permitted");
-                } else if matches!(
-                    *method,
-                    "agent.repair_workspaces"
-                        | "agent.apply_avatar_manifest"
-                        | "workspace.set_document"
-                ) {
-                    assert_eq!(executive.unwrap_err().code, "direct_caller_required");
-                } else {
-                    assert!(executive.is_ok(), "{method} from {executive_id}");
-                }
+            let executive = authorize_write(method, Some(&reserved(WRITER_MODULE)));
+            if *method == store_origin::ADOPT
+                || *method == "move_root_to_new_project"
+                || *method == "identity_log.enable"
+                || *method == hub_switch::EXCLUDE
+                || *method == "placement.backfill"
+                || catalog_ops::WRITES.contains(method)
+                || *method == catalog_publish::PUBLISH
+                || *method == catalog_seed::SEED
+            {
+                assert_eq!(executive.unwrap_err().code, "write_not_permitted");
+            } else if matches!(
+                *method,
+                "agent.repair_workspaces"
+                    | "agent.apply_avatar_manifest"
+                    | "workspace.set_document"
+            ) {
+                assert_eq!(executive.unwrap_err().code, "direct_caller_required");
+            } else {
+                assert!(executive.is_ok(), "{method} from {WRITER_MODULE}");
             }
             for refused in [
                 Some(reserved("aft")),
-                Some(reserved("prefrontal-core-x")),
+                Some(reserved("prefrontal-core")),
+                Some(reserved("prefrontal-x")),
                 Some(Principal::Unverified),
                 None,
             ] {
@@ -3796,11 +3784,46 @@ mod tests {
     }
 
     #[test]
+    fn the_handler_refuses_a_write_from_the_retired_prefrontal_name() {
+        let (dir, handler, _) = log_surface_handler("retired-prefrontal-admission");
+        let params = json!({"path":attach_checkout(&dir, "clone"),"actor":"operator"});
+        let request = || WireRequest {
+            method: "attach_root".into(),
+            params: params.clone(),
+        };
+        let old_route = (80, 1);
+        let current_route = (81, 1);
+        for (key, name) in [
+            (old_route, "prefrontal-core"),
+            (current_route, "prefrontal"),
+        ] {
+            handler
+                .route_admissions()
+                .insert(key, RouteAdmission::from_bind(Some(reserved(name)), None));
+        }
+
+        let before = handler.with_store(RegistryStore::generation).unwrap();
+        let Err(error) = handler.execute(request(), old_route) else {
+            panic!("the retired prefrontal name was admitted to attach_root");
+        };
+        assert_eq!(error.code, "write_not_permitted");
+        assert_eq!(
+            handler.with_store(RegistryStore::generation).unwrap(),
+            before
+        );
+        let reply: Value =
+            serde_json::from_slice(&handler.execute(request(), current_route).unwrap()).unwrap();
+        assert_eq!(reply["result"]["projectId"], "p");
+        drop(handler);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn attach_surface_writes_are_attributed_only_to_direct_and_core() {
         let (dir, handler, _) = log_surface_handler("attach-admission");
         for (index, principal, label) in [
             (0, Principal::Direct, "direct"),
-            (1, reserved(WRITER_MODULE), "reserved:prefrontal-core"),
+            (1, reserved(WRITER_MODULE), "reserved:prefrontal"),
         ] {
             let key = (70 + index, 1);
             handler
@@ -4016,7 +4039,7 @@ mod tests {
                 (32, 1),
                 reserved(WRITER_MODULE),
                 json!(["origin"]),
-                "reserved:prefrontal-core",
+                "reserved:prefrontal",
             ),
         ] {
             handler
@@ -4186,7 +4209,7 @@ mod tests {
     fn requests_attribute_all_project_and_secondary_binding_rows_to_the_bound_principal() {
         for (principal, expected) in [
             (Principal::Direct, "direct"),
-            (reserved(WRITER_MODULE), "reserved:prefrontal-core"),
+            (reserved(WRITER_MODULE), "reserved:prefrontal"),
         ] {
             let (dir, descriptor) = scratch_descriptor(expected);
             let dir = crate::tests::canonical_test_path(dir);

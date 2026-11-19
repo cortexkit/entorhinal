@@ -61,7 +61,7 @@ transfers agent identity authority from the core snapshot to entorhinal's store.
 The snapshot supplies fixed live agent ids and timestamps (`10`);
 it does not seed GitHub identities or terminal state. All three identities are
 set through `agent.set_github_identity` on the admitted
-`Reserved(prefrontal-core)` route. Retirement and merge also use real handler
+`Reserved(prefrontal)` route. Retirement and merge also use real handler
 writes on that route. The fixed serving clock is `700` and the process
 incarnation is `0123456789abcdef`. No temporary path or platform-specific path
 enters the captured replies.

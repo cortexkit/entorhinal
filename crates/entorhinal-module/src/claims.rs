@@ -603,7 +603,7 @@ mod tests {
             let resolver = FakeResolver::new();
             resolver.set(
                 ORCHESTRATOR_CAPABILITY,
-                ProviderResolution::Provider("prefrontal-core".into()),
+                ProviderResolution::Provider("prefrontal".into()),
             );
             handler.provider_resolver = resolver;
             *handler.store.lock().unwrap() = Some(RegistryStore::open(&descriptor).unwrap());
@@ -614,7 +614,7 @@ mod tests {
             );
             handler.route_admissions().insert(
                 HOST,
-                RouteAdmission::from_bind(Some(reserved("prefrontal-core")), None),
+                RouteAdmission::from_bind(Some(reserved("prefrontal")), None),
             );
             handler.route_admissions().insert(
                 OTHER,
@@ -1088,12 +1088,12 @@ mod tests {
         let resolver = FakeResolver::new();
         resolver.set(
             ORCHESTRATOR_CAPABILITY,
-            ProviderResolution::Provider("prefrontal-core".into()),
+            ProviderResolution::Provider("prefrontal".into()),
         );
         handler.provider_resolver = resolver;
         handler.route_admissions().insert(
             HOST,
-            RouteAdmission::from_bind(Some(reserved("prefrontal-core")), None),
+            RouteAdmission::from_bind(Some(reserved("prefrontal")), None),
         );
         assert_eq!(
             result(handler.handle_request(&body(WHERE, json!({"agent_id":id})), OTHER))["status"],

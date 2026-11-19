@@ -137,7 +137,7 @@ async fn seed_is_direct_only_and_has_no_confirmation() {
     let body = serde_json::to_vec(&json!({"method":SEED,"params":{"bundle_file":path}})).unwrap();
     for principal in [
         None,
-        Some(reserved("prefrontal-core")),
+        Some(reserved("prefrontal")),
         Some(reserved("other")),
         Some(Principal::Unverified),
     ] {

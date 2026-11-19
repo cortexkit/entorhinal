@@ -608,7 +608,7 @@ mod tests {
         assert_eq!(user["op"], "user.set");
         assert_eq!(user["value"], "Mira");
         assert_eq!(user["actor"], "Mira via core");
-        assert_eq!(user["principal"], "reserved:prefrontal-core");
+        assert_eq!(user["principal"], "reserved:prefrontal");
         assert_eq!(tap.fake.head(), 1);
         assert_eq!(f.pending(), 0);
         f.restart(connector(&tap));
@@ -1147,7 +1147,7 @@ mod tests {
         let resolver = crate::sessions::FakeResolver::new();
         resolver.set(
             crate::sessions::HOST_CAPABILITY,
-            crate::sessions::ProviderResolution::Provider("prefrontal-core".into()),
+            crate::sessions::ProviderResolution::Provider("prefrontal".into()),
         );
         f.handler.provider_resolver = resolver;
         let root = f.dir.join("repo");
@@ -2046,9 +2046,10 @@ mod tests {
                 serde_json::to_vec(&actual).unwrap(),
                 serde_json::to_vec(&expected).unwrap()
             );
-            assert!(actual.iter().all(|r| r.principal.as_deref()
-                == Some("reserved:prefrontal-core")
-                && !r.payload_json.contains("operator_confirmed")));
+            assert!(actual
+                .iter()
+                .all(|r| r.principal.as_deref() == Some("reserved:prefrontal")
+                    && !r.payload_json.contains("operator_confirmed")));
             let before = image(&f);
             for op in [
                 "agent.set_avatar",

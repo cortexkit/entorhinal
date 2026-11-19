@@ -726,7 +726,7 @@ mod tests {
             let resolver = FakeResolver::new();
             resolver.set(
                 ORCHESTRATOR_CAPABILITY,
-                ProviderResolution::Provider("prefrontal-core".into()),
+                ProviderResolution::Provider("prefrontal".into()),
             );
             let mut handler = ProjectsHandler::with_log_connector(
                 "0123456789abcdef".into(),
@@ -740,7 +740,7 @@ mod tests {
             *handler.store.lock().unwrap() = Some(RegistryStore::open(&descriptor).unwrap());
             for (key, principal) in [
                 (DIRECT, Principal::Direct),
-                (ORCH, reserved("prefrontal-core")),
+                (ORCH, reserved("prefrontal")),
                 (ENGRAM, reserved("engram")),
                 (OTHER, reserved("other")),
             ] {
