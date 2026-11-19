@@ -61,8 +61,11 @@ detail was supplied).
   present avatar, an unknown id, an unset avatar, a retired avatar, another
   present avatar, and a duplicate of the first id. Unknown/unset avatars are
   omitted, while retired avatars and duplicates are retained in request order.
+  Every entry includes the stored genome, type, optional version, and a
+  `fingerprint` that matches `avatar.fingerprint` in fleet identity for the
+  same stored avatar.
   The last three records refuse zero ids, 65 ids, and an empty-string id.
-- **`SHA256SUMS`**: SHA-256 hashes of the four JSON files, with filenames relative
+- **`SHA256SUMS`**: SHA-256 hashes of the JSON samples, with filenames relative
   to this directory.
 
 ## Reproduce and verify
@@ -74,9 +77,9 @@ ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked served
 ```
 
 On PowerShell, set `$env:ENTO_WRITE_SERVED_VECTORS = '1'` before the same cargo
-command, and remove that environment variable afterwards. Generation rewrites
-the four JSON files in this directory. To regenerate only the merged sample
-without rewriting previously published files, use:
+command, and remove that environment variable afterwards. This command
+regenerates the four non-hub JSON files in this directory. To regenerate only
+the merged sample without rewriting previously published files, use:
 
 ```sh
 ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked served_vectors::agent_resolve_merged_records_match_published_file -- --exact --nocapture
@@ -90,7 +93,8 @@ python3 - <<'PY'
 import hashlib
 from pathlib import Path
 root = Path('test-vectors/agent-identity-reads-v1')
-names = ['agent-resolve.json', 'agent-resolve-merged.json', 'avatar-read.json', 'fleet-identity.json']
+names = ['agent-resolve.json', 'agent-resolve-merged.json', 'avatar-read.json',
+         'fleet-identity.json', 'fleet-identity-hub.json']
 root.joinpath('SHA256SUMS').write_text(''.join(
     f'{hashlib.sha256(root.joinpath(name).read_bytes()).hexdigest()}  {name}\n'
     for name in names), encoding='utf-8')
@@ -120,10 +124,9 @@ cargo test --workspace --all-targets --locked served_vectors::agent_resolve_merg
 cargo nextest run --workspace --all-targets --locked -E 'test(served_vectors::agent_resolve_merged_records_match_published_file)'
 ```
 
-Fleet avatar fingerprints are the first 32 hexadecimal characters of BLAKE3
+Avatar fingerprints are the first 32 hexadecimal characters of BLAKE3
 over `genome + "\n" + type + "\n" + version`, with the version written in decimal
-and an empty string used for a missing version. The avatar-read operation
-returns the stored genome/type/version, not the fingerprint.
+and an empty string used for a missing version.
 
 ## Core v1.0 compatibility boundary
 
@@ -143,9 +146,10 @@ through the real `agent.import` operation:
 - `agent-avatar-unknown` maps to `agent_ffffffffffffffff` and remains unseeded.
 
 The test rejects mapping collisions and unsupported ids with explicit errors.
-Every vector runs through the real handler with mapped request ids. Because
-`avatar_read` echoes each requested id in `agentId`, only that reply field is
-mapped back before comparison. Genomes, types, versions, omissions, duplicates,
-and order remain unchanged: `avatars` must equal core's reply exactly, with
-only `generation` and `incarnation` allowed as extra top-level keys. The same
-strict reply-key assertion also runs in the served-record test.
+Every vector runs through the real handler with mapped request ids. The test
+maps each echoed `agentId` back and requires `fingerprint` as the only extra
+member in each entry: core no longer serves agent identity, and the fixture
+predates fingerprints on avatar reads. The remaining avatar members, omissions,
+duplicates, and order must match core exactly, with only `generation` and
+`incarnation` allowed as extra top-level keys. The served-record test checks
+the full replies, including fingerprints.

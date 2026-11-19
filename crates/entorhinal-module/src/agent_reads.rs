@@ -913,8 +913,9 @@ mod tests {
         let f = Fixture::new(true);
         f.project("P", Some("W"));
         // Expected keys come from core encoders, not entorhinal's own output.
-        // Runtime/persona fields are deliberately removed; agent_generation and
-        // the fleet pair are the only additions to inherited replies.
+        // Replies omit runtime keys such as `residence` and `wake_policy`.
+        // Entorhinal adds generation and incarnation, plus agent_generation
+        // or an avatar fingerprint where applicable.
         // Source: prefrontal 873870be8 crates/prefrontal-core-module/src/agent_registry_ops.rs:548-732,950-1001,3085-3422.
         let created = f.ok("agent.create", json!({"role":"hiree","name":"Alice","tag":"test","project_id":"P","request_key":"create","actor":null,"supervisor_agent_id":null}));
         fleet_keys(&created, &["agent"]);
@@ -1016,7 +1017,10 @@ mod tests {
                 f.fail(method, bad, "invalid_request");
             }
             if method == "agent.avatar_read" {
-                keys(&reply["avatars"][0], &["agentId", "genome", "type"]);
+                keys(
+                    &reply["avatars"][0],
+                    &["agentId", "fingerprint", "genome", "type"],
+                );
                 for field in [
                     "harness",
                     "session_id",

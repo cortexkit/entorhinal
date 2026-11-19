@@ -343,7 +343,7 @@ refuses `authority_not_cut_over`, before any prompt. After that:
 | `agent.resolve_name` | query | An agent by name within a workspace or the global namespace. |
 | `agent.list` | query | Agents filtered by role, project or workspace, paged by agent id. |
 | `agent.peer_roster` | query | A workspace's live heads: its workspace head and its projects' heads. |
-| `agent.avatar_read` | query | The avatars of up to 64 agents. |
+| `agent.avatar_read` | query | The avatars of up to 64 agents. Each entry includes a `fingerprint` computed from the returned avatar; it equals `avatar.fingerprint` in `agent.fleet_identity` for the same stored avatar. |
 | `agent.github_identity` | query | The GitHub identity bound to an agent; it names credentials and holds none. |
 | `agent.fleet_identity` | query | Live agents with their project and workspace placement. |
 | `agent.snapshot` | query | Every agent and name claim at one generation, to seed a copy. |
