@@ -331,7 +331,7 @@ fn fleet_record_refuses_ambiguous_or_noncanonical_envelopes() {
 #[tokio::test]
 async fn fleet_record_epoch_rpc_replays_vault_samples() {
     // Exact bodies from the claustrum (credential vault) repository's
-    // fleet-epoch-vectors-v1 tag, file
+    // fleet-epoch-vectors-v1.2 tag, file
     // crates/credentials-module/tests/fixtures/fleet-epoch-v1/cases.json.
     // The wire response wraps each body in a `result` field.
     let seal = r#"{"method":"fleet.epoch_seal","params":{"aad":"cmVjb3JkOmlkZW50aXR5Ojc","plaintext":"ZmxlZXQgc2FtcGxlIHBsYWludGV4dA"}}"#;
@@ -352,6 +352,10 @@ async fn fleet_record_epoch_rpc_replays_vault_samples() {
             request: seal.into(),
             response: r#"{"result":{"error":{"class":"transient","code":"store_error"}}}"#.into(),
         },
+        Call::Epoch {
+            request: r#"{"method":"fleet.epoch_open","params":{"aad":"","ciphertext":"AAAAAAAAAAAAAAAAAAAAAA","epoch":1,"nonce":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}"#.into(),
+            response: r#"{"result":{"error":{"class":"transient","code":"fleet_epoch_unavailable"}}}"#.into(),
+        },
     ]);
     let aad = b"record:identity:7";
     let plaintext = b"fleet sample plaintext";
@@ -368,6 +372,17 @@ async fn fleet_record_epoch_rpc_replays_vault_samples() {
     assert_eq!(
         epoch_vault.seal(aad, plaintext).await.unwrap_err().code,
         "vault_unavailable"
+    );
+    // Opening under an epoch this vault doesn't hold yet is a wait, not a
+    // damaged record: readers hold their place until the key arrives.
+    let unheld = SealedBody {
+        epoch: 1,
+        nonce: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+        ciphertext: "AAAAAAAAAAAAAAAAAAAAAA".into(),
+    };
+    assert_eq!(
+        epoch_vault.open(b"", &unheld).await.unwrap_err().code,
+        "epoch_key_unavailable"
     );
     vault.done();
 }
