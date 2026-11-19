@@ -285,8 +285,9 @@ struct Checkout {
     remotes: Result<Vec<GitRemote>, String>,
 }
 
-/// Shown only when a checkout was still missing after the last pass, which
-/// takes roots changing between every pass.
+/// Shown only when a root's checkout still hasn't been read after the final
+/// pass. Each pass reads the roots the previous snapshot named, so this needs
+/// the registered roots to change between every pass.
 const NOT_READ: &str = "checkout changed while it was being read; retry";
 
 impl Checkouts {
