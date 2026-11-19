@@ -414,6 +414,7 @@ impl Worker {
         let (_writer, result) = super::shared_write::ChangeWriter {
             log: &self.log,
             health: &self.health,
+            reply_key: None,
             #[cfg(test)]
             commit_hook: None,
         }

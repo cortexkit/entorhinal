@@ -100,7 +100,9 @@ fn script_free_version(registry: &FakeRegistry, version: &str) -> Value {
 }
 
 struct FakeConsumer {
-    store: RegistryStore,
+    /// The store's folder, where the package files it checks live. A path,
+    /// not a store handle, so the stand-in never keeps the store open.
+    folder: std::path::PathBuf,
     check_reply: Mutex<Value>,
     ready: AtomicBool,
     calls: Mutex<Vec<(String, Value)>>,
@@ -114,7 +116,7 @@ impl LogTransport for FakeConsumer {
             .push((method.into(), params.clone()));
         for p in params["packages"].as_array().unwrap() {
             let digest = p["archive_sha256"].as_str().unwrap();
-            let bytes = crate::catalog_blob::BlobStore::new(self.store.store_folder())
+            let bytes = crate::catalog_blob::BlobStore::new(&self.folder)
                 .unwrap()
                 .read_chunk(digest, 0, 1048576)
                 .unwrap();
@@ -267,7 +269,7 @@ impl Fixture {
             Ok(trust)
         });
         let consumer = Arc::new(FakeConsumer {
-            store,
+            folder: store.store_folder().to_owned(),
             check_reply: Mutex::new(json!({"ok":true,"card_section":"Verified skill section"})),
             ready: AtomicBool::new(true),
             calls: Mutex::default(),
@@ -869,6 +871,33 @@ async fn catalog_prepare_install_card_pins_ready_ack_active() {
         active
     );
     assert!(f.store().verify().unwrap().ok);
+}
+
+/// A catalog install card can stay pending for minutes. The install must hold
+/// no store handle while it waits: once the module closes its store, the file
+/// is free for another writer to open, and the abandoned install writes no pin.
+#[tokio::test]
+async fn catalog_install_card_wait_holds_no_store_handle() {
+    let f = Fixture::new().await;
+    let plan = f.prepare("held-card").await;
+    assert_eq!(plan["state"], "ready", "{plan}");
+    f.cingulate.script("consent.await", Effect::Hang);
+    let mut install = Box::pin(f.install(&plan));
+    loop {
+        tokio::select! {
+            _ = &mut install => panic!("the install must wait for its card"),
+            _ = tokio::task::yield_now() => {
+                if f.cingulate.calls().iter().any(|c| c.method == "consent.await") { break; }
+            }
+        }
+    }
+    drop(f.tools.handler.store.lock().unwrap().take());
+    let reopened = RegistryStore::open(&f.tools.descriptor)
+        .expect("a pending consent card must not hold the store open");
+    assert!(reopened.catalog_pins(&f.tools.agents[0]).unwrap().is_empty());
+    drop(reopened);
+    drop(install);
+    assert_eq!(f.cingulate.card_count(), 1);
 }
 
 #[tokio::test]
@@ -1963,7 +1992,7 @@ async fn catalog_losing_one_of_two_checked_consumers_holds_generation() {
     let f = Fixture::new().await;
     f.grant();
     let extra = Arc::new(FakeConsumer {
-        store: f.store(),
+        folder: f.store().store_folder().to_owned(),
         check_reply: Mutex::new(json!({"ok":true,"card_section":"Additional skill checks"})),
         ready: AtomicBool::new(true),
         calls: Mutex::default(),
@@ -2247,8 +2276,9 @@ async fn catalog_prefetch_sql_is_off_runtime_and_bounded() {
     f.consumers.consumer.ready.store(true, Ordering::SeqCst);
     f.consumers.consumer.calls.lock().unwrap().clear();
     let held = HeldSql::new(f.store()).await;
+    let store = f.store();
     let mut request = Box::pin(f.tools.handler.prefetch_catalog(
-        &f.consumers.consumer.store,
+        &store,
         &f.tools.agents[0],
         generation,
         Instant::now() + std::time::Duration::from_secs(110),

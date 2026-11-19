@@ -563,6 +563,39 @@ async fn tool_result_limits_hire_pages_reach_end() {
     assert!(bytes <= MAX_MODEL_VISIBLE_BYTES);
 }
 
+/// Listing a head's hires selects that head's hirees in SQL and loads only
+/// their rows. Another head's hiree is never loaded, so even a row that cannot
+/// be decoded does not stop the listing, as it did when every candidate page
+/// loaded every agent row.
+#[tokio::test]
+async fn hire_listing_loads_only_the_callers_hire_rows() {
+    let (f, fake) = fixture(2);
+    fake.script("consent.await", Effect::Answer("approve_always_project"));
+    let mut expected = Vec::new();
+    for (key, name) in [("first", "First"), ("second", "Second")] {
+        let reply = tool_result(f.call("agents_hire", hire(key, name)).await);
+        expected.push(reply["agent"]["agent_id"].as_str().unwrap().to_owned());
+    }
+    expected.sort();
+    sql(
+        &f,
+        &format!(
+            "INSERT INTO agent(agent_id,name,tag,labels_json,role,project_id,supervisor_agent_id,created_at_ms,updated_at_ms)
+             VALUES('agent_0000000000000000','Unreadable','t','not json','hiree','P','{}',1,1)",
+            f.agents[0]
+        ),
+    );
+    let page = tool_result(f.call("agents_list_hires", json!({})).await);
+    let listed = page["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|agent| agent["agent_id"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(listed, expected);
+    assert!(page.get("next").is_none(), "{page}");
+}
+
 #[tokio::test]
 async fn hire_card_grant_cap_and_own_retirement_acceptance() {
     let (f, fake) = fixture(2);
@@ -1059,6 +1092,37 @@ async fn same_key_concurrency_uses_one_card_and_a_single_terminal_commit() {
         .await;
     tool_result(reply);
     assert_eq!(f.counts()[3], 1);
+    assert_eq!(fake.card_count(), 1);
+}
+
+/// A hire card can stay pending for minutes. The call must hold no store
+/// handle while it waits: once the module closes its store, the file is free
+/// for another writer to open, and the abandoned call writes nothing.
+#[tokio::test]
+async fn hire_card_wait_holds_no_store_handle() {
+    let (f, fake) = fixture(2);
+    fake.script("consent.await", Effect::Hang);
+    let identity = RequestIdentity {
+        agent_id: f.agents[2].clone(),
+        tool: "agents_hire".into(),
+        request_key: "held-card".into(),
+    };
+    let mut call = Box::pin(f.call("agents_hire", hire("held-card", "Worker")));
+    loop {
+        tokio::select! {
+            _ = &mut call => panic!("the call must wait for its card"),
+            _ = tokio::task::yield_now() => {
+                if store(&f).consent_request(&identity).unwrap().is_some_and(|r| r.elicitation_id.is_some()) { break; }
+            }
+        }
+    }
+    let pending = f.counts();
+    drop(f.handler.store.lock().unwrap().take());
+    let reopened = RegistryStore::open(&f.descriptor)
+        .expect("a pending consent card must not hold the store open");
+    drop(reopened);
+    drop(call);
+    assert_eq!(f.counts(), pending);
     assert_eq!(fake.card_count(), 1);
 }
 

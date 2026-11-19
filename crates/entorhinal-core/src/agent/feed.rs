@@ -43,19 +43,32 @@ fn all_claims(conn: &Connection) -> rusqlite::Result<Vec<AgentNameClaim>> {
     Ok(claims)
 }
 
+/// The newest identity entry in the journal. Migration 27's
+/// `registry_journal_identity` index answers it without walking back over
+/// project-only entries.
+fn change_generation_sql() -> String {
+    format!(
+        "SELECT COALESCE(MAX(seq), 0) FROM registry_journal WHERE op IN ({})",
+        change_ops_sql()
+    )
+}
+
+/// One feed page: up to `?2` identity entries after cursor `?1`, read through
+/// the same partial index as [`change_generation_sql`].
+fn changes_page_sql() -> String {
+    format!(
+        "SELECT seq,op,payload_json FROM registry_journal WHERE seq>?1 AND op IN ({})
+          ORDER BY seq LIMIT ?2",
+        change_ops_sql()
+    )
+}
+
 impl RegistryStore {
     /// Newest identity entry the changes feed can serve, excluding project-only
     /// journal writes that advance the feed's scan cursor but carry no identity.
     pub fn agent_change_generation(&self) -> Result<i64, AgentMutationError> {
         self.read_agent(|conn| {
-            Ok(conn.query_row(
-                &format!(
-                    "SELECT COALESCE(MAX(seq), 0) FROM registry_journal WHERE op IN ({})",
-                    change_ops_sql()
-                ),
-                [],
-                |row| row.get(0),
-            )?)
+            Ok(conn.query_row(&change_generation_sql(), [], |row| row.get(0))?)
         })
     }
 
@@ -95,11 +108,7 @@ impl RegistryStore {
                     "cursor is above the journal head",
                 ));
             }
-            let mut statement = conn.prepare(&format!(
-                "SELECT seq,op,payload_json FROM registry_journal WHERE seq>?1 AND op IN ({})
-                  ORDER BY seq LIMIT ?2",
-                change_ops_sql()
-            ))?;
+            let mut statement = conn.prepare(&changes_page_sql())?;
             let entries = statement
                 .query_map(rusqlite::params![cursor, limit], |r| {
                     let seq: i64 = r.get(0)?;
@@ -787,5 +796,50 @@ mod tests {
             serde_json::to_value(f.store.agent_snapshot().unwrap()).unwrap(),
             before
         );
+    }
+
+    /// The change marker and the feed page both read the identity-only partial
+    /// index, so their work does not grow with project-only history. SQLite
+    /// uses that index only while its operation list repeats
+    /// `IDENTITY_CHANGE_OPS` exactly; this plan check fails if they diverge.
+    #[test]
+    fn identity_feed_queries_use_the_identity_journal_index() {
+        let f = fixture(true);
+        let a = create(&f, "A", "assistant", None, None);
+        for project in ["P1", "P2", "P3"] {
+            placed(&f, project, "W");
+        }
+        let plan = |sql: String, params: &[i64]| {
+            f.store
+                .read(|conn| {
+                    let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+                    let rows = statement
+                        .query_map(params_from_iter(params), |r| r.get::<_, String>(3))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(rows.join("\n"))
+                })
+                .unwrap()
+        };
+        for (sql, params) in [
+            (change_generation_sql(), &[][..]),
+            (changes_page_sql(), &[0, 10][..]),
+        ] {
+            let plan = plan(sql.clone(), params);
+            assert!(
+                plan.contains("USING INDEX registry_journal_identity")
+                    || plan.contains("USING COVERING INDEX registry_journal_identity"),
+                "{sql}\n{plan}"
+            );
+        }
+        let changes = f.store.agent_changes(0, None).unwrap();
+        assert_eq!(changes.entries.len(), 1);
+        assert_eq!(changes.entries[0].agent_id, a);
+        assert_eq!(
+            f.store.agent_change_generation().unwrap(),
+            changes.entries[0].seq
+        );
+        assert!(f.store.generation().unwrap() > changes.entries[0].seq);
+        assert!(f.store.verify().unwrap().ok);
+        assert!(f.store.rebuild().unwrap().replay.ok);
     }
 }

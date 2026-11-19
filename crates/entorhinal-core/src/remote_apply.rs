@@ -1040,6 +1040,7 @@ fn apply(tx: &Transaction<'_>, entry: &RemoteEntry) -> rusqlite::Result<i64> {
         |r| r.get(0),
     )?;
     crate::enable_state::finish_join_at_head(tx, head)?;
+    crate::pending::install_legacy_reply(tx, entry)?;
     tx.execute(
         "DELETE FROM pending_entry WHERE expected_head < ?1",
         [entry.position],

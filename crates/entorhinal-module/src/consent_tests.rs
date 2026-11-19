@@ -9,7 +9,7 @@ use std::path::PathBuf;
 struct Fixture {
     root: PathBuf,
     descriptor: cortexkit_store_types::StorageDescriptor,
-    store: Option<RegistryStore>,
+    store: Arc<Mutex<Option<RegistryStore>>>,
     fake: FakeCingulate,
     coordinator: ConsentCoordinator,
     stamp: ScopeStamp,
@@ -21,18 +21,22 @@ impl Fixture {
         Self {
             root,
             descriptor,
-            store: Some(store),
+            store: Arc::new(Mutex::new(Some(store))),
             fake: FakeCingulate::new(),
             coordinator: ConsentCoordinator::default(),
             stamp: stamp("agent-a", "head:a", 7),
         }
     }
-    fn store(&self) -> &RegistryStore {
-        self.store.as_ref().unwrap()
+    fn store(&self) -> RegistryStore {
+        self.store.lock().unwrap().clone().unwrap()
+    }
+    /// The weak store slot a consent wait holds, as the module passes it.
+    fn slot(&self) -> StoreSlot {
+        Arc::downgrade(&self.store)
     }
     fn reopen(&mut self) {
-        drop(self.store.take());
-        self.store = Some(RegistryStore::open(&self.descriptor).unwrap());
+        drop(self.store.lock().unwrap().take());
+        *self.store.lock().unwrap() = Some(RegistryStore::open(&self.descriptor).unwrap());
         self.coordinator = ConsentCoordinator::default();
     }
     fn row(&self, tool: &str, key: &str) -> ConsentRequest {
@@ -42,7 +46,7 @@ impl Fixture {
         self.coordinator
             .obtain(
                 ConsentCall {
-                    store: self.store(),
+                    store: self.slot(),
                     connector: &self.fake,
                     stamp: &self.stamp,
                     deadline: Instant::now() + CALL_BUDGET,
@@ -73,7 +77,7 @@ impl Fixture {
     }
     async fn capture(&self) -> CaptureReport {
         capture_feed(
-            self.store(),
+            &self.slot(),
             self.route().await.as_ref(),
             &Owner::from_stamp(&self.stamp).unwrap(),
             Instant::now() + CALL_BUDGET,
@@ -83,7 +87,7 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        self.store.take();
+        self.store.lock().unwrap().take();
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }
@@ -595,7 +599,7 @@ async fn reversed_retries_and_restart_preserve_other_answer_before_cumulative_ac
     let attempt = restarted
         .obtain(
             ConsentCall {
-                store: f.store(),
+                store: f.slot(),
                 connector: &f.fake,
                 stamp: &f.stamp,
                 deadline: Instant::now() + CALL_BUDGET,
@@ -648,7 +652,7 @@ async fn terminal_replay_ignores_ack_retention_and_epoch_but_awaiting_does_not()
         .coordinator
         .obtain(
             ConsentCall {
-                store: f.store(),
+                store: f.slot(),
                 connector: &f.fake,
                 stamp: &current_stamp,
                 deadline: Instant::now() + CALL_BUDGET,
@@ -669,7 +673,7 @@ async fn terminal_replay_ignores_ack_retention_and_epoch_but_awaiting_does_not()
         f.coordinator
             .obtain(
                 ConsentCall {
-                    store: f.store(),
+                    store: f.slot(),
                     connector: &f.fake,
                     stamp: &current_stamp,
                     deadline: Instant::now() + CALL_BUDGET,
@@ -689,7 +693,7 @@ async fn terminal_replay_ignores_ack_retention_and_epoch_but_awaiting_does_not()
         f.coordinator
             .obtain(
                 ConsentCall {
-                    store: f.store(),
+                    store: f.slot(),
                     connector: &f.fake,
                     stamp: &current_stamp,
                     deadline: Instant::now() + CALL_BUDGET,
@@ -755,7 +759,7 @@ async fn feed_hangs_share_deadline_and_do_not_change_committed_outcome() {
         let deadline = Instant::now() + CALL_BUDGET;
         let route = f.route().await;
         let report = capture_feed(
-            f.store(),
+            &f.slot(),
             route.as_ref(),
             &Owner::from_stamp(&f.stamp).unwrap(),
             deadline,
@@ -890,7 +894,7 @@ async fn lease_serializes_same_key_through_commit_but_not_two_tools_with_one_key
         f.coordinator
             .obtain(
                 ConsentCall {
-                    store: f.store(),
+                    store: f.slot(),
                     connector: &f.fake,
                     stamp: &f.stamp,
                     deadline: Instant::now() + CALL_BUDGET,
@@ -933,4 +937,34 @@ async fn lease_serializes_same_key_through_commit_but_not_two_tools_with_one_key
             .count(),
         2
     );
+}
+
+/// A consent wait holds the store slot weakly. Once the module has closed its
+/// store, the next SQL job refuses `store_unavailable`: no request row is
+/// recorded and no card is shown.
+#[tokio::test]
+async fn closed_store_refuses_store_unavailable_without_writing() {
+    let f = Fixture::new();
+    let row = f.row("agents_hire", "closed-store");
+    let closed = f.store.lock().unwrap().take().unwrap();
+    let outcome = f
+        .coordinator
+        .obtain(
+            ConsentCall {
+                store: f.slot(),
+                connector: &f.fake,
+                stamp: &f.stamp,
+                deadline: Instant::now() + CALL_BUDGET,
+                now_ms: &|| f.fake.now(),
+            },
+            &row,
+            &context(),
+        )
+        .await;
+    let Err(error) = outcome else {
+        panic!("a closed store must refuse the consent call");
+    };
+    assert_eq!(error.code, "store_unavailable");
+    assert!(closed.consent_request(&row.identity).unwrap().is_none());
+    assert_eq!(f.fake.card_count(), 0);
 }
