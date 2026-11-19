@@ -68,16 +68,15 @@ struct Outage {
 }
 
 impl Outage {
-    fn failed(&mut self, feed: &str, error: Failure) -> bool {
+    fn failed(&mut self, feed: &str, error: Failure) {
         self.failures += 1;
         if self.previous.as_ref() == Some(&error.0) {
-            return false;
+            return;
         }
         tracing::warn!(target: "hub_transport", feed, code = error.0, "hub subscription unavailable");
         #[cfg(test)]
         self.logged.push(format!("unavailable {}", error.0));
         self.previous = Some(error.0);
-        true
     }
 
     fn recovered(&mut self, feed: &str) {
@@ -104,8 +103,6 @@ pub(crate) struct Feed<T> {
     backoff: Duration,
     retry_at: Option<Instant>,
     outage: Outage,
-    live: bool,
-    pending: Option<T>,
 }
 
 pub(crate) enum FeedEvent<T> {
@@ -165,8 +162,6 @@ impl<T> Feed<T> {
             backoff: INITIAL_BACKOFF,
             retry_at: None,
             outage: Outage::default(),
-            live: false,
-            pending: None,
         }
     }
 
@@ -181,6 +176,11 @@ impl<T> Feed<T> {
         self.cursor = Some(sequence);
     }
 
+    pub(crate) fn replay(&mut self) {
+        self.set_live(false);
+        self.subscription = None;
+    }
+
     fn name(&self) -> &'static str {
         match self.kind {
             Kind::Kv => "residence_kv",
@@ -189,8 +189,7 @@ impl<T> Feed<T> {
         }
     }
 
-    fn set_live(&mut self, live: bool) {
-        self.live = live;
+    fn set_live(&self, live: bool) {
         let gauge = match self.kind {
             Kind::Kv => &self.health.hub.kv_watch_live,
             Kind::Log => &self.health.hub.log_tail_live,
@@ -199,10 +198,10 @@ impl<T> Feed<T> {
         gauge.store(live, Ordering::Relaxed);
     }
 
-    fn failed(&mut self, error: Failure) -> bool {
+    fn failed(&mut self, error: Failure) {
         self.set_live(false);
         self.health.hub.failed();
-        self.outage.failed(self.name(), error)
+        self.outage.failed(self.name(), error);
     }
 
     fn reached(&mut self) {
@@ -230,9 +229,6 @@ impl<T> Feed<T> {
     }
 
     pub(crate) async fn next_event(&mut self) -> FeedEvent<T> {
-        if let Some(item) = self.pending.take() {
-            return FeedEvent::Item(item);
-        }
         loop {
             if let Some(at) = self.retry_at {
                 sleep_until(at).await;
@@ -259,38 +255,22 @@ impl<T> Feed<T> {
                 .await
             {
                 Delivery::Item(Ok((sequence, item))) => {
-                    let recovered = !self.live;
                     self.reached();
                     if self.durable_cursor || self.cursor.is_none_or(|last| sequence > last) {
                         if !self.durable_cursor {
                             self.cursor = Some(sequence);
                         }
-                        if recovered {
-                            self.pending = Some(item);
-                            return FeedEvent::Connected;
-                        }
                         return FeedEvent::Item(item);
-                    } else if recovered {
-                        return FeedEvent::Connected;
                     }
                 }
-                Delivery::Item(Err(error)) => {
-                    // Keep polling so async-nats can repair the ordered stream
-                    // from its last delivery without reopening the watch here.
-                    if !self.failed(error) {
-                        // A closed client can emit the same error immediately
-                        // until credential maintenance replaces the connection.
-                        self.retry_at = Some(Instant::now() + INITIAL_BACKOFF);
-                    }
-                    return FeedEvent::Disconnected;
-                }
-                Delivery::Ended(error) => {
+                Delivery::Item(Err(error)) | Delivery::Ended(error) => {
+                    // An ordered consumer can stay open after an error without
+                    // replaying. Reopen from the cursor to restore the view.
                     self.retry_open(error);
                     return FeedEvent::Disconnected;
                 }
                 Delivery::Replaced => {
-                    self.set_live(false);
-                    self.subscription = None;
+                    self.replay();
                     return FeedEvent::Disconnected;
                 }
             }

@@ -35,7 +35,15 @@ CREATE INDEX registry_journal_identity
     ON registry_journal(seq)
     WHERE op IN ('agent.create','agent.rename','agent.update_tag','agent.set_labels',
                  'agent.set_avatar','agent.set_github_identity','agent.dispose',
-                 'agent.merge','agent.import','agent.set_namespace');
+                  'agent.merge','agent.import','agent.set_namespace');
+
+-- Keep signed membership candidates even when the local roster cannot verify
+-- them yet. The highest sequence is the scan cursor; a NULL row marks a
+-- cursor that ends on a non-membership entry.
+CREATE TABLE hub_membership_scan (
+    sequence INTEGER PRIMARY KEY CHECK(sequence > 0),
+    candidate BLOB NULL
+);
 "#;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

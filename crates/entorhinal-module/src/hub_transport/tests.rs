@@ -60,27 +60,31 @@ async fn hub_health_is_absent_for_unswitched_store_and_reads_stay_local() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn hub_watch_and_tail_keep_their_stream_on_transient_errors() {
+async fn hub_watch_and_tail_resume_their_cursor_after_transient_errors() {
     let health = Arc::new(HealthGauges::default());
     for log in [false, true] {
         let opens = Arc::new(AtomicU64::new(0));
         let count = opens.clone();
         let open = move |cursor| {
-            assert_eq!(cursor, log.then_some(15));
+            let attempt = count.fetch_add(1, Ordering::Relaxed);
             assert_eq!(
-                count.fetch_add(1, Ordering::Relaxed),
-                0,
-                "reopened after transient error"
+                cursor,
+                if attempt == 0 {
+                    log.then_some(15)
+                } else {
+                    Some(16)
+                }
             );
-            async {
-                Ok(Subscription::new(
-                    None,
-                    stream::iter([
+            async move {
+                let deliveries = match attempt {
+                    0 => [
+                        Ok((16, "before error")),
                         Err(Failure::code("MissingHeartbeat")),
-                        Err(Failure::code("Recreate")),
-                        Ok((16, "restored")),
-                    ]),
-                ))
+                    ],
+                    1 => [Ok((16, "already delivered")), Ok((17, "restored"))],
+                    _ => panic!("unexpected reopen"),
+                };
+                Ok(Subscription::new(None, stream::iter(deliveries)))
             }
         };
         let mut feed = if log {
@@ -88,13 +92,14 @@ async fn hub_watch_and_tail_keep_their_stream_on_transient_errors() {
         } else {
             Feed::kv(health.clone(), open)
         };
+        assert_eq!(feed.next().await, "before error");
         assert_eq!(feed.next().await, "restored");
-        assert_eq!(opens.load(Ordering::Relaxed), 1);
+        assert_eq!(opens.load(Ordering::Relaxed), 2);
         assert!(health.hub.connected.load(Ordering::Relaxed));
         assert_eq!(health.hub.log_tail_live.load(Ordering::Relaxed), log);
         assert_ne!(health.hub.kv_watch_live.load(Ordering::Relaxed), log);
     }
-    assert_eq!(health.hub.failures.load(Ordering::Relaxed), 4);
+    assert_eq!(health.hub.failures.load(Ordering::Relaxed), 2);
     assert!(!health.hub.log_tail_live.load(Ordering::Relaxed));
 }
 

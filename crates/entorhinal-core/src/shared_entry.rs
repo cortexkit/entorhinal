@@ -902,6 +902,7 @@ mod tests {
                     "hub_anchor",
                     // Reconstructed from hub journal rows, not transferred as snapshot rows.
                     "hub_membership",
+                    "hub_membership_scan",
                     "hub_held_epoch",
                     "hub_epoch_status",
                 ];

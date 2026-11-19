@@ -17,6 +17,53 @@ const B: &str = "fedcba9876543210fedcba9876543210";
 const C: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const BASE: i64 = 17;
 
+#[tokio::test]
+async fn hub_reader_regression_epoch_feed_only_receives_epoch_and_join_keys() {
+    let Some(rig) = IdentityRig::new().await else {
+        return;
+    };
+    let leaf = rig.a.leaf.clone();
+    let mut feed = Feed::epoch(leaf.health.clone(), move |_| {
+        let leaf = leaf.clone();
+        async move {
+            Binding {
+                session: leaf.session(),
+                changes: None,
+            }
+            .epoch_watch(A)
+            .await
+        }
+    });
+    assert!(matches!(
+        within(feed.next_event()).await,
+        FeedEvent::Connected
+    ));
+    for key in [
+        "role.connector_home",
+        "residence.agent_0000000000000042",
+        "epoch",
+    ] {
+        rig.kv.put(key, "record".into()).await.unwrap();
+    }
+    let request = format!("wrapreq.{B}");
+    rig.kv.put(&request, "request".into()).await.unwrap();
+    for key in [
+        format!("wrap.2.mint.{B}"),
+        format!("wrapjoin.{B}.request"),
+        format!("wrap.2.mint.{A}"),
+        format!("wrapjoin.{A}.request"),
+    ] {
+        rig.kv.put(&key, "wrap".into()).await.unwrap();
+    }
+    assert_eq!(within(feed.next()).await.key, "epoch");
+    assert_eq!(within(feed.next()).await.key, request);
+    assert_eq!(within(feed.next()).await.key, format!("wrap.2.mint.{A}"));
+    assert_eq!(
+        within(feed.next()).await.key,
+        format!("wrapjoin.{A}.request")
+    );
+}
+
 struct Leaf {
     box_id: BoxId,
     client: async_nats::Client,

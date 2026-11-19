@@ -99,7 +99,7 @@ impl Residence {
                 }
                 Ok(())
             }
-            Err(error) if timed_out(&error) => Err(error),
+            Err(error) if deferred(&error) => Err(error),
             Err(error) => self.refuse(key, revision, &error.code),
         }
     }
@@ -152,7 +152,7 @@ impl Residence {
             .and_then(|record| preference(&record))
         {
             Ok(body) => body,
-            Err(error) if timed_out(&error) => return Err(error),
+            Err(error) if deferred(&error) => return Err(error),
             Err(_) => return Ok(None),
         };
         Ok(self
