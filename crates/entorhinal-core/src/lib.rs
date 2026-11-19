@@ -1720,8 +1720,10 @@ struct Ancestor {
 
 impl ResolvePath {
     /// Canonicalize the query, then read its ancestors' `.git` entries and
-    /// devices, the nearest checkout's token and remotes, and the token of the
-    /// root an execution binding names.
+    /// devices, the nearest checkout's identity token
+    /// (`.git/cortexkit-root-incarnation`, which ties a folder to its
+    /// registered root) and git remotes, and the identity token of the root an
+    /// execution binding names.
     fn read(
         raw_path: &str,
         binding: Option<&ExecutionBinding>,

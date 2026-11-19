@@ -22,9 +22,12 @@ pub(crate) const HUB_LOCAL: &str = "hub.local_write";
 /// ever part of the shared entry.
 ///
 /// The partial indexes keep the session retention prune, identity change feed,
-/// and agent cutover checks from scanning unrelated rows. SQLite needs the
-/// query predicates to match: the identity op list must match
-/// `IDENTITY_CHANGE_OPS`, and a cutover check must name the literal marker op.
+/// and agent cutover checks from scanning unrelated rows. SQLite uses a
+/// partial index only when the query repeats its condition: the identity op
+/// list must match `IDENTITY_CHANGE_OPS`, and a check for the one-time
+/// `agent.cutover` journal entry (written when this store took over agent
+/// identity) must test `op='agent.cutover'` literally, not through a bound
+/// parameter.
 /// The move history index serves an agent's moves in display order.
 pub(crate) const V27_LEGACY_REPLY_AND_QUERY_INDEXES: &str = r#"
 ALTER TABLE pending_entry ADD COLUMN continuation TEXT NULL;
