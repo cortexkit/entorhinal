@@ -44,6 +44,34 @@ impl Drop for Rig {
     }
 }
 
+/// Drop stops the servers when a test fails normally, but not when the test
+/// process aborts (a stack overflow, a SIGKILL): Drop never runs, and the
+/// server outlives the test for hours. On Unix, a watcher subshell blocks
+/// reading a pipe whose only writer is this test process. The OS closes that
+/// pipe when the process dies however it dies, and the watcher then kills the
+/// server. `exec` keeps the server's pid as the child's pid, so the ports file
+/// name and `try_wait` still refer to the server itself. The pipe is passed on
+/// fd 3 because `sh` gives a background job `/dev/null` as its stdin, which
+/// would make the watcher's read return at once.
+#[cfg(unix)]
+fn nats_server_command(config: &std::path::Path) -> Command {
+    let mut command = Command::new("sh");
+    command
+        .arg("-c")
+        .arg(r#"exec 3<&0; ( read _ <&3; kill "$$" ) & exec nats-server -c "$1" </dev/null 3<&-"#)
+        .arg("sh")
+        .arg(config)
+        .stdin(Stdio::piped());
+    command
+}
+
+#[cfg(not(unix))]
+fn nats_server_command(config: &std::path::Path) -> Command {
+    let mut command = Command::new("nats-server");
+    command.arg("-c").arg(config);
+    command
+}
+
 impl Rig {
     fn new() -> Self {
         // The counter keeps names unique within this test process: macOS's clock
@@ -82,9 +110,7 @@ impl Rig {
         )
         .unwrap();
         self.children.push(
-            Command::new("nats-server")
-                .arg("-c")
-                .arg(&path)
+            nats_server_command(&path)
                 .stdout(Stdio::null())
                 .stderr(File::create(&log).unwrap())
                 .spawn()
