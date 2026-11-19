@@ -78,6 +78,7 @@ mod claims;
 mod cli;
 #[cfg(test)]
 mod fake_registry;
+mod fleet_epoch_current;
 mod liveness_bus;
 // Agent write execution asks for consent while holding the caller's tool call,
 // before committing any authorized mutation.
@@ -412,6 +413,7 @@ struct HealthGauges {
     bus_changes_puts: AtomicU64,
     bus_changes_failures: AtomicU64,
     bus_changes_connected: AtomicBool,
+    fleet_epoch: fleet_epoch_current::Cache,
     placement_facts_published: AtomicU64,
     placement_facts_unpublished: AtomicU64,
     origin: store_origin::Origin,
@@ -1733,6 +1735,7 @@ impl ProjectsHandler {
                 "catalog writes and blob reads require the asynchronous served path",
             )),
             "identity_log.status" => self.identity_log_status(),
+            fleet_epoch_current::METHOD => self.fleet_epoch_current(request.params),
             member::SET_NAME => {
                 let store = self.with_store(|s| Ok(s.clone()))?;
                 member::prepare(&store, request.params)?;
@@ -2419,6 +2422,7 @@ fn manifest() -> ModuleManifest {
                 management_operation("workspace.document", ManagementOperationKind::Query, "Read one accepted workspace document revision, latest when omitted."),
                 management_operation("context.project", ManagementOperationKind::Query, "Read resolved project memory policy, workspace document metadata and membership digest in one snapshot."),
                 management_operation("context.session", ManagementOperationKind::Query, "Read agent identity, memory/persona pins, catalog generations and cached whereabouts in one snapshot."),
+                management_operation(fleet_epoch_current::METHOD, ManagementOperationKind::Query, "Read the locally cached committed hub epoch and highest committed fleet key in this computer's vault."),
                 management_operation(catalog_ops::ADD, ManagementOperationKind::Mutate, "Add a machine-local HTTPS registry and pinned key (Direct only, operator confirmation)."),
                 management_operation(catalog_ops::REPIN, ManagementOperationKind::Mutate, "Append a replacement registry key (Direct only, operator confirmation)."),
                 management_operation(catalog_ops::REMOVE, ManagementOperationKind::Mutate, "Remove a registry, mappings and held state (Direct only, operator confirmation)."),
@@ -2631,9 +2635,9 @@ fn manifest() -> ModuleManifest {
             })).chain(std::iter::once(claims::REFRESH).map(|method| {
                 management_operation(method, ManagementOperationKind::Mutate, agent_operation_description(method))
             })).chain(std::iter::once(roles::READ).map(|method| {
-                management_operation(method, ManagementOperationKind::Query, "Read a cached role claim without waiting for engram.")
+                management_operation(method, ManagementOperationKind::Query, "Read a cached role claim without waiting for the hub or engram.")
             })).chain(std::iter::once(roles::FENCE).map(|method| {
-                management_operation(method, ManagementOperationKind::Query, "Read the role record's subject and version, the fence engram checks before admitting holder-only work.")
+                management_operation(method, ManagementOperationKind::Query, "Read the role fence: record subject and the hub KV revision or legacy engram version.")
             })).chain([
                 (role_leases::ACK, "Acknowledge a role lease notice on its watch route."),
                 (role_leases::RELEASE, "Release a role on its watch route after stopping work."),

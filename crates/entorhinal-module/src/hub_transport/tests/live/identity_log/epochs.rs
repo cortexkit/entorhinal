@@ -43,6 +43,8 @@ struct KeyState {
     commits: Vec<u64>,
     mint_exclusions: Vec<Vec<String>>,
     joins_served: Vec<String>,
+    fail_next_join_wrap: bool,
+    join_wrap_attempts: usize,
     joins_imported: Vec<Vec<u64>>,
 }
 
@@ -180,6 +182,13 @@ impl EpochControl for Vault {
             .iter()
             .any(|peer| { member_id == format!("fed-computer:{}", peer.fingerprint) }));
         let mut state = self.state.lock().unwrap();
+        state.join_wrap_attempts += 1;
+        if std::mem::take(&mut state.fail_next_join_wrap) {
+            return Err(HandlerError::new(
+                "fixture_wrap_unavailable",
+                "try the wrap again",
+            ));
+        }
         state.joins_served.push(member_id.into());
         let keys: Vec<_> = state.held.iter().map(|e| (*e, "x".repeat(96))).collect();
         let ct = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&keys).unwrap());
@@ -218,6 +227,12 @@ struct EpochNode {
 }
 
 impl EpochNode {
+    fn epoch_view(&self) -> Value {
+        serde_json::from_slice::<Value>(&self.node.handler.fleet_epoch_current(json!({})).unwrap())
+            .unwrap()["result"]
+            .clone()
+    }
+
     async fn new(
         rig: &IdentityRig,
         name: &str,
@@ -516,6 +531,8 @@ async fn hub_epoch_incomplete_minter_is_superseded_and_cleans_only_its_wraps() {
         return;
     };
     let (fleet, a, b) = devices(&rig).await;
+    assert_eq!(b.epoch_view(), json!({"current":1,"highest_held":1}));
+    let before_pending = b.node.handler.health.fleet_epoch.generation();
     roster(&fleet, &rig, &[A, B, D]);
     // The stand-in returns wraps in box order, so D's wrap lands first.
     kill_minter_at(&a, "wrap.2.", event(C, "200:9:8")).await;
@@ -535,6 +552,11 @@ async fn hub_epoch_incomplete_minter_is_superseded_and_cleans_only_its_wraps() {
         .unwrap()
         .is_none());
     assert_eq!(b.fence().await, 1);
+    assert_eq!(b.epoch_view(), json!({"current":1,"highest_held":1}));
+    assert_eq!(
+        b.node.handler.health.fleet_epoch.generation(),
+        before_pending
+    );
     let cold = EpochNode::new(&rig, "no-base", rig.b.leaf.clone(), fleet.clone(), None).await;
     assert_eq!(
         cold.node
@@ -560,11 +582,17 @@ async fn hub_epoch_incomplete_minter_is_superseded_and_cleans_only_its_wraps() {
     assert_eq!(active["removed"], old["removed"]);
     let _watch = a.watch();
     within(async {
-        while a.vault.state.lock().unwrap().imports.last() != Some(&2) {
+        while a.epoch_view() != json!({"current":2,"highest_held":2}) {
             sleep(Duration::from_millis(5)).await;
         }
     })
     .await;
+    assert_eq!(a.vault.state.lock().unwrap().imports.last(), Some(&2));
+    assert_eq!(b.epoch_view(), json!({"current":2,"highest_held":2}));
+    assert_eq!(
+        b.node.handler.health.fleet_epoch.generation(),
+        before_pending + 2
+    );
     assert!(rig
         .kv
         .get(format!("wrap.2.{old_mint}.{D}"))

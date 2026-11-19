@@ -1,0 +1,3 @@
+[
+  {"op":"agent.fleet_identity","request":{},"reply":{"result":{"agents":[{"agentId":"agent_0000000000000040","displayName":"Engram held","labels":[],"role":"assistant","tag":"test"},{"agentId":"agent_0000000000000041","displayName":"Hub held","labels":[],"role":"assistant","tag":"test"}],"generation":3,"incarnation":"fedcba9876543210fedcba9876543210","logPosition":17,"token":"fedcba9876543210fedcba9876543210:3","unchanged":false}}}
+]

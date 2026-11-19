@@ -378,10 +378,88 @@ async fn bus_changes_placement_remote_apply_wakes_publisher() {
 const KEYS: &[&str] = &[
     "agents",
     "catalog.status",
+    "fleet_epoch",
     "profile",
     "registry",
     "role.connector_home",
 ];
+
+#[tokio::test]
+async fn fleet_epoch_current_served_records_and_marker() {
+    let f = Fixture::new("fleet-epoch-current").await;
+    let mut publisher = Published::start(&f.handler, Arc::default());
+    let initial = publisher.take(KEYS).await;
+    assert_eq!(
+        initial["fleet_epoch"],
+        json!({"generation":0,"incarnation":INCARNATION})
+    );
+    publisher.idle().await;
+    let method = crate::fleet_epoch_current::METHOD;
+    let (record, reply) = f.record(method, json!({})).await;
+    assert_eq!(reply, json!({"result":{}}));
+    published_file("fleet-epoch-current-v1", "before-hub.json", vec![record]);
+
+    let cache = &f.handler.health.fleet_epoch;
+    cache.set_current(Some(2));
+    let (key, bytes) = timeout(Duration::from_secs(5), publisher.puts.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(key, "fleet_epoch");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).unwrap(),
+        json!({"generation":1,"incarnation":INCARNATION})
+    );
+    published_file(
+        "fleet-epoch-current-v1",
+        "marker-bump.json",
+        vec![format!(
+            "  {{\"key\":{},\"value_bytes\":{}}}",
+            json!(key),
+            json!(String::from_utf8(bytes).unwrap())
+        )],
+    );
+    let (record, reply) = f.record(method, json!({})).await;
+    assert_eq!(reply, json!({"result":{"current":2}}));
+    published_file("fleet-epoch-current-v1", "held-unknown.json", vec![record]);
+
+    cache.set_highest_held(Some(1));
+    assert_eq!(
+        publisher.take(&["fleet_epoch"]).await["fleet_epoch"]["generation"],
+        2
+    );
+    let (record, reply) = f.record(method, json!({})).await;
+    assert_eq!(reply, json!({"result":{"current":2,"highest_held":1}}));
+    published_file("fleet-epoch-current-v1", "held-behind.json", vec![record]);
+
+    cache.set_highest_held(Some(2));
+    assert_eq!(
+        publisher.take(&["fleet_epoch"]).await["fleet_epoch"]["generation"],
+        3
+    );
+    let (record, reply) = f.record(method, json!({})).await;
+    assert_eq!(reply, json!({"result":{"current":2,"highest_held":2}}));
+    published_file("fleet-epoch-current-v1", "held-current.json", vec![record]);
+
+    cache.set_current(None);
+    assert_eq!(
+        publisher.take(&["fleet_epoch"]).await["fleet_epoch"]["generation"],
+        4
+    );
+    let (record, reply) = f.record(method, json!({})).await;
+    assert_eq!(reply, json!({"result":{"highest_held":2}}));
+    published_file(
+        "fleet-epoch-current-v1",
+        "current-unknown.json",
+        vec![record],
+    );
+
+    let (record, reply) = f.record(method, json!({"unknown":true})).await;
+    assert_eq!(reply["code"], "invalid_request");
+    published_file("fleet-epoch-current-v1", "unknown-param.json", vec![record]);
+    publisher.quiet();
+    f.handler.stop_bus_changes().await;
+}
 
 #[tokio::test]
 async fn bus_changes_reconnect_rewrites_every_key() {
@@ -391,7 +469,7 @@ async fn bus_changes_reconnect_rewrites_every_key() {
     published.idle().await;
     published.quiet();
     // Nothing changed in the store, but the new connection may face an empty,
-    // re-provisioned bucket, so all five markers must be written again.
+    // re-provisioned bucket, so all six markers must be written again.
     published.control.reconnected.notify_one();
     assert_eq!(published.take(KEYS).await, first);
     published.idle().await;
@@ -561,7 +639,7 @@ async fn bus_changes_missing_bucket_retries_and_recovers_without_blocking_reads_
     published.idle().await;
     assert_eq!(published.control.attempts.load(Ordering::Relaxed), 2);
     let health = f.handler.health().await.metrics.unwrap();
-    assert_eq!(health["busChangesPuts"], 5);
+    assert_eq!(health["busChangesPuts"], 6);
     assert_eq!(health["busChangesFailures"], 1);
     assert_eq!(health["busChangesConnected"], true);
     f.handler.stop_bus_changes().await;

@@ -220,6 +220,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
                 link.vault.clone(),
                 box_id.to_string(),
                 base,
+                health.clone(),
             ))
         });
         Self {

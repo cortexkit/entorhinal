@@ -95,6 +95,55 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
         let _guard = timeout_at(deadline, self.changing.lock())
             .await
             .map_err(|_| busy())?;
+        let Some(current) = self.join_epoch(deadline).await? else {
+            return Ok(());
+        };
+        if self.join_self(&current, deadline).await? || self.log.writer_episode().is_err() {
+            return Ok(());
+        }
+        for peer in self.join_peers(deadline).await? {
+            if let Err(error) = self.serve_join(&peer, deadline).await {
+                tracing::debug!(
+                    code = error.code,
+                    box_id = peer.box_id,
+                    "fleet join response deferred"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) async fn join_work(
+        &self,
+        peer_box: Option<&str>,
+        deadline: Instant,
+    ) -> Result<(), HandlerError> {
+        let _guard = timeout_at(deadline, self.changing.lock())
+            .await
+            .map_err(|_| busy())?;
+        let Some(current) = self.join_epoch(deadline).await? else {
+            return Ok(());
+        };
+        match peer_box {
+            None => {
+                self.join_self(&current, deadline).await?;
+            }
+            Some(box_id) if self.log.writer_episode().is_ok() => {
+                if let Some(peer) = self
+                    .join_peers(deadline)
+                    .await?
+                    .iter()
+                    .find(|peer| peer.box_id == box_id)
+                {
+                    self.serve_join(peer, deadline).await?;
+                }
+            }
+            Some(_) => {}
+        }
+        Ok(())
+    }
+
+    async fn join_epoch(&self, deadline: Instant) -> Result<Option<Observed>, HandlerError> {
         let head = self.log.log_head(deadline).await?;
         if self
             .reader
@@ -104,40 +153,32 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
         {
             self.reader.membership.discover(head, deadline).await?;
         }
-        let Some(current) = self.reader.read(deadline).await? else {
-            // The initializer owns epoch 1; there is nothing to wrap yet.
-            return Ok(());
-        };
-        if current.epoch.committed_key().is_none() {
-            return Ok(());
-        }
-        if self.join_self(&current, deadline).await? || self.log.writer_episode().is_err() {
-            return Ok(());
-        }
+        // A join may receive only committed fleet keys, not a pending first mint.
+        Ok(self
+            .reader
+            .read(deadline)
+            .await?
+            .filter(|current| current.epoch.committed_key().is_some()))
+    }
+
+    async fn join_peers(&self, deadline: Instant) -> Result<Vec<PeerAnchor>, HandlerError> {
         let peers = timeout_at(deadline, self.log.peer_keys().peer_keys_read())
             .await
             .map_err(|_| busy())??;
-        for peer in &peers {
-            if peer.box_id == self.reader.own_box
-                || !box_id(&peer.box_id)
-                || !box_id(&peer.fingerprint)
-                || peers
-                    .iter()
-                    .filter(|other| other.box_id == peer.box_id)
-                    .count()
-                    != 1
-            {
-                continue;
-            }
-            if let Err(error) = self.serve_join(peer, deadline).await {
-                tracing::debug!(
-                    code = error.code,
-                    box_id = peer.box_id,
-                    "fleet join response deferred"
-                );
-            }
-        }
-        Ok(())
+        Ok(peers
+            .iter()
+            .filter(|peer| {
+                peer.box_id != self.reader.own_box
+                    && box_id(&peer.box_id)
+                    && box_id(&peer.fingerprint)
+                    && peers
+                        .iter()
+                        .filter(|other| other.box_id == peer.box_id)
+                        .count()
+                        == 1
+            })
+            .cloned()
+            .collect())
     }
 
     async fn join_self(&self, current: &Observed, deadline: Instant) -> Result<bool, HandlerError> {
@@ -245,9 +286,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
     }
 
     async fn join_held(&self, deadline: Instant) -> Result<BTreeSet<u64>, HandlerError> {
-        let status = timeout_at(deadline, self.reader.control().status())
-            .await
-            .map_err(|_| busy())??;
+        let status = self.reader.status(deadline).await?;
         self.tracked_epochs(status.held)
     }
 
@@ -359,7 +398,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
                     .map_err(|_| busy())?;
                 let vault = self.reader.control();
                 timeout_at(deadline, async {
-                    let status = vault.status().await?;
+                    let status = self.reader.status(deadline).await?;
                     if status.current != Some(epoch.epoch.e)
                         || !(1..=epoch.epoch.e).all(|e| status.held.contains(&e))
                     {
@@ -693,9 +732,21 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
         let vault = self.reader.control();
         let through = assembly.manifest.through_epoch;
         let held = timeout_at(deadline, async {
-            let before: BTreeSet<_> = vault.status().await?.held.into_iter().collect();
+            let before: BTreeSet<_> = self
+                .reader
+                .status(deadline)
+                .await?
+                .held
+                .into_iter()
+                .collect();
             let imported = vault.import(&assembly.wrap).await?;
-            let after: BTreeSet<_> = vault.status().await?.held.into_iter().collect();
+            let after: BTreeSet<_> = self
+                .reader
+                .status(deadline)
+                .await?
+                .held
+                .into_iter()
+                .collect();
             let expected = 1..=through;
             if imported.epochs.iter().any(|e| !expected.contains(e))
                 || after.difference(&before).any(|e| !expected.contains(e))

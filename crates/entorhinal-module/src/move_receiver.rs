@@ -132,11 +132,13 @@ fn pickup_row(record: &MoveRecord, entry: &PendingMove, version: i64, now: i64) 
 pub(crate) async fn poll_inbox(worker: &Worker) -> Result<(), HandlerError> {
     let own = worker
         .sql(|s| {
-            Ok(if s.identity_log_status()?.state == "enabled" {
-                s.persisted_self_author()?
-            } else {
-                None
-            })
+            Ok(
+                if s.hub_log_base()?.is_none() && s.identity_log_status()?.state == "enabled" {
+                    s.persisted_self_author()?
+                } else {
+                    None
+                },
+            )
         })
         .await?;
     let Some(own) = own else {

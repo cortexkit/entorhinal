@@ -23,14 +23,14 @@ use tokio::{
 
 use crate::{
     fleet_record::{
-        vault::{EpochControl, EpochVault, PendingMint},
+        vault::{EpochControl, EpochStatus, EpochVault, PendingMint},
         UnverifiedRecord, LOG_KEY,
     },
     hub_identity_log::{wait_for_applied, IdentityLog, LogTransport},
     hub_membership::{box_id, Membership, Removed, Sight},
     hub_transport::{Feed, FeedEvent},
     hub_write::{self, Payload, Step, Transport, Trust},
-    HandlerError,
+    HandlerError, HealthGauges,
 };
 
 const KEY: &str = "epoch";
@@ -762,9 +762,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
         current: Option<&Observed>,
         deadline: Instant,
     ) -> Result<(), HandlerError> {
-        let status = timeout_at(deadline, self.reader.control().status())
-            .await
-            .map_err(|_| busy())??;
+        let status = self.reader.status(deadline).await?;
         let saved = self.reader.store.hub_own_mint()?;
         let pending = status.pending.as_ref().cloned().or_else(|| {
             saved
@@ -795,6 +793,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
                 timeout_at(deadline, self.reader.control().commit(&mint))
                     .await
                     .map_err(|_| busy())??;
+                let _ = self.reader.status(deadline).await;
                 self.reader
                     .store
                     .record_hub_held_epochs(HubEpochSource::Mint(&mint.mint_id), &[mint.epoch])?;
@@ -900,20 +899,50 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
         let mut live = false;
         let mut observed = None;
         let mut retry_on_membership = false;
-        let mut join_tick = tokio::time::interval(Duration::from_secs(2));
-        join_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut joins = JoinQueue::default();
         loop {
             let timer = observed.as_ref().and_then(Observation::deadline);
+            let join = joins.next();
+            let join_deadline = join.as_ref().map(|(_, job)| job.at);
             let changed = tokio::select! {
                 biased;
                 event = feed.next_event() => match event {
-                    FeedEvent::Disconnected => { live = false; observed = None; retry_on_membership = false; false }
-                    FeedEvent::Connected => { live = true; observed = None; true }
-                    FeedEvent::Item(entry) => entry.key == KEY || entry.key.ends_with(&format!(".{}", self.reader.own_box)) && entry.key.starts_with("wrap."),
+                    FeedEvent::Disconnected => {
+                        live = false;
+                        observed = None;
+                        retry_on_membership = false;
+                        joins = JoinQueue::default();
+                        false
+                    }
+                    FeedEvent::Connected => { live = true; observed = None; joins.wake(None); true }
+                    FeedEvent::Item(entry) => {
+                        if entry.key == KEY {
+                            joins.wake_all();
+                        } else if let Some(peer) = entry.key.strip_prefix("wrapreq.").filter(|id| box_id(id)) {
+                            if peer == self.reader.own_box {
+                                joins.wake(None);
+                            } else if entry.operation == async_nats::jetstream::kv::Operation::Put {
+                                if joins.requests.insert(peer.to_owned(), entry.revision) != Some(entry.revision) {
+                                    let key = Some(peer.to_owned());
+                                    joins.pending.remove(&key);
+                                    joins.wake(key);
+                                }
+                            } else {
+                                joins.requests.remove(peer);
+                                joins.pending.remove(&Some(peer.to_owned()));
+                            }
+                        } else if entry.key.strip_prefix("wrapjoin.").and_then(|key| key.split('.').next()) == Some(&self.reader.own_box) {
+                            joins.wake(None);
+                        }
+                        entry.key == KEY || entry.key.ends_with(&format!(".{}", self.reader.own_box)) && entry.key.starts_with("wrap.")
+                    }
                 },
-                _ = self.reader.membership_changed.notified(), if live && retry_on_membership => {
-                    retry_on_membership = false;
-                    if let Some(watch) = observed.as_mut() { watch.retry(Instant::now()); }
+                _ = self.reader.membership_changed.notified(), if live => {
+                    joins.wake_all();
+                    if retry_on_membership {
+                        retry_on_membership = false;
+                        if let Some(watch) = observed.as_mut() { watch.retry(Instant::now()); }
+                    }
                     false
                 },
                 _ = async { tokio::time::sleep_until(timer.expect("armed timer")).await }, if live && timer.is_some() => {
@@ -926,10 +955,22 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
                     }
                     false
                 },
-                _ = self.reader.ready.notified(), if live && observed.is_none() => true,
-                _ = join_tick.tick(), if live => {
-                    if let Err(error) = self.joins(Instant::now() + BUDGET).await {
-                        tracing::debug!(code = error.code, "fleet join reconciliation deferred");
+                _ = self.reader.ready.notified(), if live => {
+                    joins.wake_all();
+                    observed.is_none()
+                },
+                _ = async { tokio::time::sleep_until(join_deadline.expect("scheduled join")).await },
+                    if live && join_deadline.is_some() => {
+                    let (peer, job) = join.expect("scheduled join");
+                    joins.pending.remove(&peer);
+                    if let Err(error) = self.join_work(peer.as_deref(), Instant::now() + BUDGET).await {
+                        tracing::debug!(code = error.code, box_id = peer.as_deref().unwrap_or(&self.reader.own_box), "fleet join reconciliation deferred");
+                        if !matches!(error.code.as_str(), "record_invalid" | "signature_invalid" | "member_episode_invalid") {
+                            joins.pending.insert(peer, JoinJob {
+                                at: Instant::now() + job.backoff,
+                                backoff: (job.backoff * 2).min(Duration::from_secs(300)),
+                            });
+                        }
                     }
                     false
                 },
@@ -942,7 +983,16 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
                             .is_none_or(|watch| watch.revision != current.revision)
                         {
                             let needs_recovery = current.epoch.state == State::Pending
-                                || !current.epoch.removed.is_empty();
+                                || current.epoch.removed.iter().any(|removal| {
+                                    self.log.applied_sequence().is_ok_and(|applied| {
+                                        !self.reader.membership.removal_applied(
+                                            &removal.box_id,
+                                            current.epoch.e,
+                                            removal.removal_id.as_deref(),
+                                            applied,
+                                        )
+                                    })
+                                });
                             observed = Some(Observation::new(
                                 current.revision,
                                 Instant::now(),
@@ -957,6 +1007,42 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
                     }
                 }
             }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct JoinJob {
+    at: Instant,
+    backoff: Duration,
+}
+
+#[derive(Default)]
+struct JoinQueue {
+    requests: BTreeMap<String, u64>,
+    // None is this computer's import/request job; each other box retries on its own schedule.
+    pending: BTreeMap<Option<String>, JoinJob>,
+}
+
+impl JoinQueue {
+    fn next(&self) -> Option<(Option<String>, JoinJob)> {
+        self.pending
+            .iter()
+            .min_by_key(|(_, job)| job.at)
+            .map(|(key, job)| (key.clone(), *job))
+    }
+
+    fn wake(&mut self, peer: Option<String>) {
+        self.pending.entry(peer).or_insert_with(|| JoinJob {
+            at: Instant::now(),
+            backoff: Duration::from_secs(1),
+        });
+    }
+
+    fn wake_all(&mut self) {
+        self.wake(None);
+        for peer in self.requests.keys().cloned().collect::<Vec<_>>() {
+            self.wake(Some(peer));
         }
     }
 }
@@ -1032,7 +1118,9 @@ pub(super) struct EpochReader<T> {
     pub own_box: String,
     pub base: i64,
     reading: Mutex<()>,
+    reading_status: Mutex<()>,
     importing: Mutex<()>,
+    health: Arc<HealthGauges>,
     pub ready: Notify,
     pub membership_changed: Notify,
 }
@@ -1045,6 +1133,7 @@ impl<T: Transport> EpochReader<T> {
         vault: Arc<dyn EpochVault>,
         own_box: String,
         base: i64,
+        health: Arc<HealthGauges>,
     ) -> Self {
         Self {
             transport,
@@ -1054,7 +1143,9 @@ impl<T: Transport> EpochReader<T> {
             own_box,
             base,
             reading: Mutex::new(()),
+            reading_status: Mutex::new(()),
             importing: Mutex::new(()),
+            health,
             ready: Notify::new(),
             membership_changed: Notify::new(),
         }
@@ -1064,6 +1155,23 @@ impl<T: Transport> EpochReader<T> {
         self.vault
             .control()
             .expect("epoch lifecycle requires a vault controller")
+    }
+
+    async fn status(&self, deadline: Instant) -> Result<EpochStatus, HandlerError> {
+        let _guard = timeout_at(deadline, self.reading_status.lock())
+            .await
+            .map_err(|_| busy())?;
+        let result = match timeout_at(deadline, self.control().status()).await {
+            Ok(result) => result,
+            Err(_) => Err(busy()),
+        };
+        self.health.fleet_epoch.set_highest_held(
+            result
+                .as_ref()
+                .ok()
+                .and_then(|status| status.held.iter().copied().max()),
+        );
+        result
     }
 
     fn applied(&self) -> Result<u64, HandlerError> {
@@ -1077,6 +1185,27 @@ impl<T: Transport> EpochReader<T> {
         let _guard = timeout_at(deadline, self.reading.lock())
             .await
             .map_err(|_| busy())?;
+        let observed = self.read_record(deadline).await;
+        match &observed {
+            Ok(entry) => self.health.fleet_epoch.set_current(
+                entry
+                    .as_ref()
+                    .and_then(|entry| entry.epoch.committed_key().map(|(e, _)| e)),
+            ),
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    "record_invalid" | "signature_invalid" | "member_episode_invalid"
+                ) =>
+            {
+                self.health.fleet_epoch.set_current(None);
+            }
+            Err(_) => {}
+        }
+        observed
+    }
+
+    async fn read_record(&self, deadline: Instant) -> Result<Option<Observed>, HandlerError> {
         let previous = self.store.hub_kv_cached(KEY)?;
         let Some(entry) = self.transport.kv_entry(KEY, deadline).await? else {
             return if previous.is_none() {
@@ -1237,6 +1366,7 @@ impl<T: Transport> EpochReader<T> {
             timeout_at(deadline, self.control().commit(&epoch.mint()))
                 .await
                 .map_err(|_| busy())??;
+            let _ = self.status(deadline).await;
             self.store.record_hub_own_mint(&HubOwnMint {
                 epoch: epoch.e,
                 mint_id: epoch.mint_id.clone(),
@@ -1277,6 +1407,7 @@ impl<T: Transport> EpochReader<T> {
             let imported = timeout_at(deadline, self.control().import(wrap))
                 .await
                 .map_err(|_| busy())??;
+            let _ = self.status(deadline).await;
             if imported.epochs.as_slice() != [epoch.e]
                 && !(imported.already_held && imported.epochs.is_empty())
             {

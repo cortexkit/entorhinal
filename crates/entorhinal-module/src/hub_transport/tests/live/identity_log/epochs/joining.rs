@@ -94,6 +94,68 @@ async fn rotate(node: &EpochNode, id: &str, removal: &str) {
 }
 
 #[tokio::test]
+async fn hub_cutover_idle_has_no_join_poll() {
+    let Some(rig) = IdentityRig::new().await else {
+        return;
+    };
+    let (_, a, _b) = devices(&rig).await;
+    snapshot(&a).await;
+    let _watch = a.watch();
+    within(async {
+        let key = format!("read:wrapreq.{A}");
+        while !a.node.leaf.requests.lock().unwrap().contains(&key) {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    sleep(Duration::from_millis(100)).await;
+    a.node.leaf.requests.lock().unwrap().clear();
+    // Use wall time for the real NATS sockets and cross two old poll deadlines.
+    sleep(Duration::from_millis(4_100)).await;
+    let requests = a.node.leaf.requests.lock().unwrap();
+    assert!(
+        requests.is_empty(),
+        "idle hub issued requests: {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn hub_cutover_wrap_request_wakes_and_retries_only_failure() {
+    let Some(rig) = IdentityRig::new().await else {
+        return;
+    };
+    let (_, a, b) = devices(&rig).await;
+    snapshot(&a).await;
+    let _watch = a.watch();
+    let req = "6f".repeat(16);
+    a.vault.state.lock().unwrap().fail_next_join_wrap = true;
+    install_request(&rig, &b, json!({"v":1,"request_id":req})).await;
+    let manifest = format!("wrapjoin.{B}.{req}");
+    // The first attempt is driven by the request delivery, not a tick. The
+    // failed attempt alone schedules the next one, one second later.
+    tokio::time::timeout(Duration::from_millis(800), async {
+        while a.vault.state.lock().unwrap().join_wrap_attempts == 0 {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(rig.kv.get(&manifest).await.unwrap().is_none());
+    within(async {
+        while rig.kv.get(&manifest).await.unwrap().is_none() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert_eq!(a.vault.state.lock().unwrap().join_wrap_attempts, 2);
+    sleep(Duration::from_millis(100)).await;
+    a.node.leaf.requests.lock().unwrap().clear();
+    sleep(Duration::from_millis(2_100)).await;
+    assert_eq!(a.vault.state.lock().unwrap().join_wrap_attempts, 2);
+    assert!(a.node.leaf.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn hub_join_wiped_removed_box_discovers_closure_and_publishes_its_new_episode_key() {
     let Some(rig) = IdentityRig::new().await else {
         return;
