@@ -1345,10 +1345,7 @@ mod tests {
         f.append(agents_part(&[unchanged, renamed.clone()], Some(1)), true)
             .await;
         f.catch().await.unwrap();
-        let Poll::Ready(subc_client_rs::HandlerOutcome::Response(body)) = waiter
-            .as_mut()
-            .poll(&mut Context::from_waker(Waker::noop()))
-        else {
+        let subc_client_rs::HandlerOutcome::Response(body) = woken(waiter.as_mut()).await else {
             panic!("import feed waiter was not woken");
         };
         let value: Value = serde_json::from_slice(&body).unwrap();
@@ -1526,6 +1523,21 @@ mod tests {
             .poll(&mut Context::from_waker(Waker::noop()))
             .is_pending());
     }
+    /// Await a parked `agent.changes` waiter. Its scans finish on the blocking
+    /// pool, so one poll is not enough; paused time must not move, so the
+    /// commit woke it, not its 25 s timeout.
+    async fn woken<F: Future>(future: Pin<&mut F>) -> F::Output {
+        let now = Instant::now();
+        let output = tokio::time::timeout(Duration::from_secs(60), future)
+            .await
+            .expect("the waiter never returned");
+        assert_eq!(
+            Instant::now(),
+            now,
+            "the waiter returned on its timeout, not on the commit"
+        );
+        output
+    }
     async fn finish<F: Future>(mut future: Pin<&mut F>) -> F::Output {
         let now = Instant::now();
         let output = loop {
@@ -1651,10 +1663,8 @@ mod tests {
         f.append(serde_json::from_slice(&entry.entry).unwrap(), false)
             .await;
         f.catch().await.unwrap();
-        let outcome = waiter
-            .as_mut()
-            .poll(&mut Context::from_waker(Waker::noop()));
-        let Poll::Ready(subc_client_rs::HandlerOutcome::Response(body)) = outcome else {
+        let outcome = woken(waiter.as_mut()).await;
+        let subc_client_rs::HandlerOutcome::Response(body) = outcome else {
             panic!("feed waiter did not wake on remote commit")
         };
         let value: Value = serde_json::from_slice(&body).unwrap();
