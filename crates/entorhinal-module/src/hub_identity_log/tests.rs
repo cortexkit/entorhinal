@@ -7,7 +7,7 @@ use super::*;
 use crate::{
     fleet_record::{self, Header},
     hub_membership::{
-        tests::{anchor, Roster},
+        tests::{anchor, ChangingRoster, Roster},
         PeerAnchor,
     },
     hub_write::{tests::TestKeys, KvEntry},
@@ -23,6 +23,12 @@ struct Positions {
     entries: Mutex<BTreeMap<u64, Vec<u8>>>,
     reads: Mutex<Vec<u64>>,
     hold: Mutex<Option<Arc<Notify>>>,
+    publish: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
 }
 
 impl LogTransport for Positions {
@@ -53,11 +59,20 @@ impl Transport for Positions {
     }
     async fn send(
         &self,
-        _: &HubAttemptWrite,
+        write: &HubAttemptWrite,
         _: &str,
         _: Instant,
     ) -> Result<Option<u64>, HandlerError> {
-        unreachable!()
+        let (started, release) = self
+            .publish
+            .lock()
+            .unwrap()
+            .take()
+            .expect("unexpected send");
+        assert_eq!(write.step, "member.key");
+        started.send(()).unwrap();
+        release.await.unwrap();
+        Ok(Some(write.expected + 1))
     }
 }
 
@@ -177,6 +192,222 @@ async fn signed_with(
 
 fn part(index: u64, count: u64) -> Value {
     json!({"op":SNAPSHOT,"snapshot_id":"snapshot","part":index,"parts":count,"tables":{}})
+}
+
+#[tokio::test]
+async fn hub_reader_regression_lagging_tail_does_not_refuse_an_unlisted_member() {
+    use crate::hub_transport::test_tail_feed;
+    use futures_util::stream;
+    let c = Arc::new(TestKeys::with_seed(41));
+    let c_signer = ClaustrumCredentialResolver::with_target(c.clone(), 0);
+    let (_a_dir, mut listed) = tail_with(0, A, vec![anchor(C, &c)]);
+    let (_b_dir, mut lagging) = tail_with(0, B, vec![]);
+    let peers = Arc::new(ChangingRoster(watch::channel(Vec::new()).0));
+    Arc::get_mut(&mut lagging.link).unwrap().peers = peers.clone();
+    lagging.membership = Arc::new(Membership::new(
+        lagging.link.transport.clone(),
+        lagging.store.clone(),
+        AnchorSource {
+            own_box: B.into(),
+            peers: peers.clone(),
+            signer: lagging.link.signer.clone(),
+        },
+    ));
+    let key = signed_with(
+        &c_signer,
+        listed.link.vault.as_ref(),
+        1,
+        (C, 0),
+        "member.key",
+        key_body(C, &c, &[&c]),
+        1,
+    )
+    .await;
+    for tail in [&mut listed, &mut lagging] {
+        put(tail, &key);
+        tail.reconnect().await.unwrap();
+    }
+    let delivery = move || LogDelivery {
+        sequence: 1,
+        bytes: key.bytes.clone(),
+    };
+    assert!(listed.apply(delivery()).await.unwrap());
+    assert_eq!(listed.membership.current_member_episode(C, 1), Some(0));
+    let error = lagging.apply(delivery()).await.unwrap_err();
+    assert_eq!(lagging.membership.current_member_episode(C, 1), None);
+    assert_eq!(error.code, "writer_unknown");
+    assert!(error.message.contains(C));
+
+    let successor = signed(&lagging, 2, 2, B, member(B)).await;
+    put(&lagging, &successor);
+    let health = lagging.health.clone();
+    Hub::new(crate::log_client::SubcConnector::default(), health.clone()).activate();
+    let store = lagging.store.clone();
+    let feed = test_tail_feed(health.clone(), 0, move |cursor| {
+        assert_eq!(cursor, 0, "the held entry was skipped");
+        stream::iter([
+            Some(delivery()),
+            Some(LogDelivery {
+                sequence: 2,
+                bytes: successor.bytes.clone(),
+            }),
+        ])
+        .chain(stream::pending())
+    });
+    let running = tokio::spawn(lagging.run(feed));
+    wait_until(|| health.log_state.load(Ordering::Relaxed) == 9).await;
+    let mut metrics = json!({});
+    health.hub.report(&mut metrics);
+    assert_eq!(
+        metrics["hubLogHold"],
+        json!({"code":"writer_unknown","writer":C})
+    );
+    assert_eq!(
+        store.identity_log_status().unwrap().last_applied_position,
+        0
+    );
+    peers.0.send_replace(vec![anchor(C, &c)]);
+    wait_until(|| store.identity_log_status().unwrap().last_applied_position == 2).await;
+    wait_until(|| health.hub_membership.load(Ordering::Acquire) == 2).await;
+    assert_eq!(health.log_state.load(Ordering::Relaxed), 0);
+    running.abort();
+    let _ = running.await;
+}
+
+async fn wait_until(mut ready: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !ready() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("tail did not reach expected state");
+}
+
+#[tokio::test(start_paused = true)]
+async fn hub_reader_regression_tail_reopens_and_restores_the_idle_barrier() {
+    use crate::hub_transport::test_tail_feed;
+    use futures_util::{stream, StreamExt};
+    let (_scratch, tail) = tail(0).await;
+    let health = tail.health.clone();
+    let (error, rx) = tokio::sync::oneshot::channel();
+    let (reopened, ready) = tokio::sync::oneshot::channel();
+    let mut rx = Some(rx);
+    let mut reopened = Some(reopened);
+    let feed = test_tail_feed(health.clone(), 0, move |cursor| {
+        assert_eq!(cursor, 0);
+        let rx = rx.take();
+        if rx.is_none() {
+            reopened.take().unwrap().send(()).unwrap();
+        }
+        stream::iter(rx)
+            .then(|error| async {
+                error.await.unwrap();
+                None
+            })
+            .chain(stream::pending())
+    });
+    let task = tokio::spawn(tail.run(feed));
+    while health.hub_membership.load(Ordering::Acquire) != 2 {
+        tokio::task::yield_now().await;
+    }
+    error.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), ready)
+        .await
+        .expect("idle tail did not reopen after heartbeat error")
+        .unwrap();
+    let barrier = async {
+        while health.hub_membership.load(Ordering::Acquire) != 2 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), barrier)
+        .await
+        .expect("idle tail did not restore its membership barrier");
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
+async fn hub_reader_regression_tail_retries_storage_failures() {
+    let (_scratch, tail) = tail(0).await;
+    assert!(tail.retryable(&HandlerError::new("storage_error", "store busy")));
+}
+
+#[tokio::test]
+async fn hub_reader_regression_member_key_publication_does_not_delay_apply() {
+    use crate::hub_transport::test_tail_feed;
+    use futures_util::stream;
+    let (_scratch, mut tail) = tail(0).await;
+    let snapshot = signed(&tail, 1, 1, A, part(1, 1)).await;
+    put(&tail, &snapshot);
+    assert!(tail.apply(snapshot).await.unwrap());
+
+    let (started, publishing) = tokio::sync::oneshot::channel();
+    let (_release, withheld) = tokio::sync::oneshot::channel();
+    *tail.link.transport.publish.lock().unwrap() = Some((started, withheld));
+    let (append, delivery) = tokio::sync::oneshot::channel();
+    let mut delivery = Some(delivery);
+    let feed = test_tail_feed(tail.health.clone(), 1, move |cursor| {
+        assert_eq!(cursor, 1);
+        stream::iter(delivery.take())
+            .then(|next| async { Some(next.await.unwrap()) })
+            .chain(stream::pending())
+    });
+    let next = signed(&tail, 2, 2, B, member(B)).await;
+    let transport = tail.link.transport.clone();
+    let store = tail.store.clone();
+    let task = tokio::spawn(tail.run(feed));
+    tokio::time::timeout(Duration::from_secs(5), publishing)
+        .await
+        .expect("local key publication did not start")
+        .unwrap();
+    transport
+        .entries
+        .lock()
+        .unwrap()
+        .insert(2, next.bytes.clone());
+    append
+        .send(next)
+        .unwrap_or_else(|_| panic!("tail dropped its feed"));
+    wait_until(|| store.identity_log_status().unwrap().last_applied_position == 2).await;
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
+async fn hub_reader_regression_membership_resumes_scan_from_the_durable_cursor() {
+    let (_scratch, tail) = tail(0).await;
+    let c = Arc::new(TestKeys::with_seed(41));
+    let key = signed_with(
+        &ClaustrumCredentialResolver::with_target(c.clone(), 0),
+        tail.link.vault.as_ref(),
+        1,
+        (C, 0),
+        "member.key",
+        key_body(C, &c, &[&c]),
+        1,
+    )
+    .await;
+    put(&tail, &key);
+    put(&tail, &signed(&tail, 2, 2, A, member(A)).await);
+    let deadline = Instant::now() + READ_BUDGET;
+    tail.membership.discover(2, deadline).await.unwrap();
+    tail.link.transport.reads.lock().unwrap().clear();
+    put(&tail, &signed(&tail, 3, 3, A, member(A)).await);
+    let restarted = Membership::new(
+        tail.link.transport.clone(),
+        tail.store.clone(),
+        AnchorSource {
+            own_box: A.into(),
+            peers: Arc::new(Roster(vec![anchor(C, &c)])),
+            signer: tail.link.signer.clone(),
+        },
+    );
+    restarted.discover(3, deadline).await.unwrap();
+    assert_eq!(*tail.link.transport.reads.lock().unwrap(), [3]);
+    let record = UnverifiedRecord::parse(LOG_KEY, &key.bytes).unwrap();
+    assert!(restarted.verify_log(record, 1, deadline).await.is_ok());
 }
 
 #[tokio::test]
@@ -436,7 +667,7 @@ async fn hub_membership_cold_join_verifies_rotated_removed_snapshot_signer_and_s
 }
 
 #[tokio::test]
-async fn hub_membership_unanchored_removal_chain_stops_at_its_first_entry() {
+async fn hub_membership_unanchored_removal_chain_cannot_verify_its_first_entry() {
     let a = Arc::new(TestKeys::with_seed(21));
     let b = Arc::new(TestKeys::with_seed(22));
     let (_scratch, mut tail) = tail_with(0, C, vec![]);
@@ -468,8 +699,7 @@ async fn hub_membership_unanchored_removal_chain_stops_at_its_first_entry() {
     }
     tail.reconnect().await.unwrap();
     let error = tail.apply(first).await.unwrap_err();
-    assert_eq!(error.code, "signature_invalid");
-    tail.stop(1, error);
+    assert_eq!(error.code, "writer_unknown");
     assert_eq!(
         tail.store
             .identity_log_status()
@@ -477,7 +707,6 @@ async fn hub_membership_unanchored_removal_chain_stops_at_its_first_entry() {
             .last_applied_position,
         0
     );
-    assert_eq!(tail.health.log_state.load(Ordering::Relaxed), 5);
 }
 
 #[tokio::test]
@@ -515,7 +744,7 @@ async fn hub_membership_holds_unknown_kv_until_its_arrival_head_is_scanned() {
     assert_eq!(*tail.link.transport.reads.lock().unwrap(), [1]);
     assert_eq!(tail.sequence(), 0);
     gate.notify_one();
-    assert_eq!(intake.await.unwrap_err().code, "signature_invalid");
+    assert_eq!(intake.await.unwrap_err().code, "writer_unknown");
     assert_eq!(tail.sequence(), 0);
 }
 

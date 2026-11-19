@@ -117,6 +117,11 @@ pub struct HubAnchor {
     pub public_key: Vec<u8>,
 }
 
+pub struct HubMembershipScan {
+    pub through: u64,
+    pub candidates: Vec<(u64, Vec<u8>)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HubOwnMint {
     pub epoch: u64,
@@ -508,7 +513,8 @@ impl RegistryStore {
                     "INSERT INTO hub_kv_cache(key,revision,accepted_revision,value,body,read_at_ms,integrity_failed)
                      VALUES(?1,?2,?2,?3,?4,?5,0)
                      ON CONFLICT(key) DO UPDATE SET revision=?2,accepted_revision=?2,value=?3,body=?4,read_at_ms=?5,integrity_failed=0
-                     WHERE revision<?2 OR (revision=?2 AND integrity_failed=0 AND value=?3)",
+                      WHERE revision<?2 OR (revision=?2 AND integrity_failed=0
+                        AND (accepted_revision IS NOT revision OR value=?3))",
                     params![key, revision, value, body.map(Value::to_string), now],
                 )? != 0;
                 if updated {
@@ -529,6 +535,21 @@ impl RegistryStore {
         .map_err(RegistryError::Store)
     }
 
+    /// A held revision is neither accepted nor refused. Keep the last accepted
+    /// value for judgement when replay or a roster change makes this one verifiable.
+    pub fn hold_hub_kv(&self, key: &str, revision: u64) -> Result<(), RegistryError> {
+        self.with_where_changes(|tx| {
+            tx.execute(
+                "INSERT INTO hub_kv_cache(key,revision,integrity_failed) VALUES(?1,?2,0)
+                 ON CONFLICT(key) DO UPDATE SET revision=?2,integrity_failed=0
+                 WHERE revision<?2",
+                params![key, revision],
+            )?;
+            Ok(())
+        })
+        .map_err(RegistryError::Store)
+    }
+
     pub fn open_hub_attempts(&self, step_prefix: &str) -> Result<Vec<HubAttempt>, RegistryError> {
         self.read(|conn| {
             let mut stmt = conn.prepare(OPEN_HUB_ATTEMPTS)?;
@@ -541,6 +562,55 @@ impl RegistryStore {
             }
             Ok(rows)
         })
+    }
+
+    pub fn hub_membership_scan(&self) -> Result<HubMembershipScan, RegistryError> {
+        self.read(|conn| {
+            let mut rows = conn
+                .prepare("SELECT sequence,candidate FROM hub_membership_scan ORDER BY sequence")?;
+            let mut scan = HubMembershipScan {
+                through: 0,
+                candidates: Vec::new(),
+            };
+            for row in rows.query_map([], |row| {
+                Ok((row.get::<_, u64>(0)?, row.get::<_, Option<Vec<u8>>>(1)?))
+            })? {
+                let (sequence, candidate) = row?;
+                scan.through = sequence;
+                if let Some(candidate) = candidate {
+                    scan.candidates.push((sequence, candidate));
+                }
+            }
+            Ok(scan)
+        })
+    }
+
+    pub fn checkpoint_hub_membership_scan(
+        &self,
+        through: u64,
+        candidates: &[(u64, Vec<u8>)],
+    ) -> Result<(), RegistryError> {
+        self.db
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "DELETE FROM hub_membership_scan WHERE candidate IS NULL AND sequence < ?1",
+                    [through],
+                )?;
+                for (sequence, value) in candidates {
+                    tx.execute(
+                        "INSERT INTO hub_membership_scan(sequence,candidate) VALUES(?1,?2)
+                     ON CONFLICT(sequence) DO NOTHING",
+                        params![sequence, value],
+                    )?;
+                }
+                tx.execute(
+                    "INSERT INTO hub_membership_scan(sequence,candidate) VALUES(?1,NULL)
+                 ON CONFLICT(sequence) DO NOTHING",
+                    [through],
+                )?;
+                Ok(())
+            })
+            .map_err(RegistryError::Store)
     }
 
     pub fn hub_anchors(&self) -> Result<Vec<HubAnchor>, RegistryError> {

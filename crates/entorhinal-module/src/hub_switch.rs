@@ -454,8 +454,16 @@ impl Switch {
         deadline: Instant,
     ) -> Result<(), HandlerError> {
         self.probe.activate();
-        if runtime.tail.lock().unwrap().is_some() {
-            return Ok(());
+        {
+            let mut tail = runtime.tail.lock().unwrap();
+            if tail.as_ref().is_some_and(|tail| !tail.is_finished()) {
+                return Ok(());
+            }
+            if let Some(log) = runtime.shared.lock().unwrap().as_ref() {
+                // Residence and epoch watches already use this membership view.
+                *tail = Some(log.start_installed_tail()?);
+                return Ok(());
+            }
         }
         let snapshot = store.installed_hub_snapshot()?;
         let log = self.identity_log(store, runtime, base, deadline).await?;

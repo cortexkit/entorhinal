@@ -13,7 +13,7 @@ use entorhinal_core::{claim_cache::HubClaimContext, hub_store::HubKvCached, Regi
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::{
-    sync::Notify,
+    sync::{watch, Notify},
     time::{timeout_at, Instant},
 };
 
@@ -110,6 +110,13 @@ pub(super) struct Runtime {
 trait Backend: Send + Sync {
     fn membership_ready(&self) -> bool;
     fn current_member(&self, holder: &str, applied: u64) -> Option<u64>;
+    fn require_known_member(
+        &self,
+        holder: &str,
+        episode: u64,
+        applied: u64,
+    ) -> Result<(), HandlerError>;
+    fn anchor_changes(&self) -> watch::Receiver<u64>;
     fn episode_closed(&self, holder: &str, episode: u64, applied: u64) -> bool;
     fn applied(&self) -> Result<u64, HandlerError>;
     fn writer_episode(&self) -> Result<u64, HandlerError>;
@@ -149,6 +156,17 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Backend for IdentityLog<
     }
     fn current_member(&self, holder: &str, applied: u64) -> Option<u64> {
         self.current_member_episode(holder, applied)
+    }
+    fn require_known_member(
+        &self,
+        holder: &str,
+        episode: u64,
+        applied: u64,
+    ) -> Result<(), HandlerError> {
+        self.require_known_member(holder, episode, applied)
+    }
+    fn anchor_changes(&self) -> watch::Receiver<u64> {
+        self.anchor_changes()
     }
     fn episode_closed(&self, holder: &str, episode: u64, applied: u64) -> bool {
         self.episode_closed(holder, episode, applied)
@@ -407,7 +425,7 @@ fn bad_record(message: &str) -> HandlerError {
 fn not_ready() -> HandlerError {
     HandlerError::new("hub_not_ready", "hub residence has not caught up")
 }
-fn timed_out(error: &HandlerError) -> bool {
+fn deferred(error: &HandlerError) -> bool {
     matches!(
         error.code.as_str(),
         "hub_unavailable"
@@ -416,6 +434,7 @@ fn timed_out(error: &HandlerError) -> bool {
             | "vault_unavailable"
             | "credential_unavailable"
             | "storage_error"
+            | "writer_unknown"
     )
 }
 
@@ -512,6 +531,7 @@ impl Residence {
 
     async fn watch(self: Arc<Self>, mut feed: Feed<KvDelivery>) {
         let mut pending: HashMap<String, HeldDelivery> = HashMap::new();
+        let mut anchors = self.backend.anchor_changes();
         let mut retry = tokio::time::interval(Duration::from_secs(1));
         retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -528,24 +548,29 @@ impl Residence {
                             let arrival_head = pending.remove(&entry.key)
                                 .filter(|old| old.entry.revision == entry.revision)
                                 .and_then(|old| old.arrival_head);
-                            self.observe_or_hold(HeldDelivery { entry, arrival_head }, &mut pending).await;
+                             self.observe_or_hold(HeldDelivery { entry, arrival_head, waiting_for_anchor: false, waiting_for_lease: false }, &mut pending).await;
                         }
                         if seen_current {
                             self.finish_initial_watch();
                         }
                     }
                 },
-                _ = retry.tick(), if !pending.is_empty() => {
-                    for entry in std::mem::take(&mut pending).into_values() {
+                Ok(()) = anchors.changed() => {
+                    let waiting: Vec<_> = pending.extract_if(|_, entry| entry.waiting_for_anchor).collect();
+                    for (_, entry) in waiting {
                         self.observe_or_hold(entry, &mut pending).await;
                     }
                 }
-                _ = self.commits.notified(), if pending.keys().any(|key| key.starts_with("role.")) => {
-                    let roles: Vec<_> = pending.keys().filter(|key| key.starts_with("role.")).cloned().collect();
-                    for role in roles {
-                        if let Some(entry) = pending.remove(&role) {
-                            self.observe_or_hold(entry, &mut pending).await;
-                        }
+                _ = retry.tick(), if pending.values().any(|entry| !entry.waiting_for_anchor) => {
+                    let retrying: Vec<_> = pending.extract_if(|_, entry| !entry.waiting_for_anchor).collect();
+                    for (_, entry) in retrying {
+                        self.observe_or_hold(entry, &mut pending).await;
+                    }
+                }
+                _ = self.commits.notified(), if pending.values().any(|entry| entry.waiting_for_lease) => {
+                    let roles: Vec<_> = pending.extract_if(|_, entry| entry.waiting_for_lease).collect();
+                    for (_, entry) in roles {
+                        self.observe_or_hold(entry, &mut pending).await;
                     }
                 }
             }
@@ -558,13 +583,26 @@ impl Residence {
         pending: &mut HashMap<String, HeldDelivery>,
     ) {
         let key = delivery.entry.key.clone();
-        let result = self
+        let mut result = self
             .observe_at(
                 &delivery.entry,
                 &mut delivery.arrival_head,
                 Instant::now() + BUDGET,
             )
             .await;
+        delivery.waiting_for_lease = result
+            .as_ref()
+            .is_err_and(|error| error.code == "role_lease_awaiting_expiry");
+        delivery.waiting_for_anchor = result
+            .as_ref()
+            .is_err_and(|error| error.code == "writer_unknown");
+        if delivery.waiting_for_anchor || delivery.waiting_for_lease {
+            if let Err(error) = self.store.hold_hub_kv(&key, delivery.entry.revision) {
+                delivery.waiting_for_anchor = false;
+                delivery.waiting_for_lease = false;
+                result = Err(error.into());
+            }
+        }
         let mut watched = self.watched.write().unwrap();
         if let Err(error) = result {
             // Losing the log or vault is not evidence that the value is bad.
@@ -626,7 +664,7 @@ impl Residence {
             if revision < old.revision || (revision == old.revision && old.integrity_failed) {
                 return Ok(());
             }
-            if revision == old.revision {
+            if revision == old.revision && old.accepted_revision == Some(revision) {
                 if old.value.as_deref() == Some(value)
                     && old.body.is_some() == (entry.operation == Operation::Put)
                 {
@@ -658,7 +696,7 @@ impl Residence {
                         .ok();
                     return Ok(());
                 }
-                Err(error) if timed_out(&error) => return Err(error),
+                Err(error) if deferred(&error) => return Err(error),
                 Err(error) => return self.refuse(key, revision, &error.code),
             }
         }
@@ -698,7 +736,7 @@ impl Residence {
                 }
                 Ok(())
             }
-            Err(error) if timed_out(&error) || error.code == "role_lease_awaiting_expiry" => {
+            Err(error) if deferred(&error) || error.code == "role_lease_awaiting_expiry" => {
                 Err(error)
             }
             Err(error) => self.refuse(key, revision, &error.code),
@@ -839,6 +877,22 @@ impl Residence {
             self.backend
                 .episode_closed(&header.writer, header.writer_ep, accepted.applied)
                 && consecutive.is_none();
+        if !writer_current && !historical {
+            self.backend.require_known_member(
+                &header.writer,
+                header.writer_ep,
+                accepted.applied,
+            )?;
+        }
+        if body.forced {
+            if let Some(prior) = consecutive {
+                self.backend.require_known_member(
+                    &prior.holder,
+                    prior.holder_ep,
+                    accepted.applied,
+                )?;
+            }
+        }
         if (!writer_current && !historical)
             || previous.as_ref().is_some_and(|old| old.gen >= body.gen)
         {
@@ -910,6 +964,24 @@ impl Residence {
         let historical =
             self.backend
                 .episode_closed(&header.writer, header.writer_ep, accepted.applied);
+        if !writer_current && !historical {
+            self.backend.require_known_member(
+                &header.writer,
+                header.writer_ep,
+                accepted.applied,
+            )?;
+        }
+        if body.forced {
+            if let Some(prior) = previous
+                .as_ref()
+                .filter(|prior| prior.gen.checked_add(1) == Some(body.gen))
+            {
+                if let Some(holder) = &prior.holder {
+                    self.backend
+                        .require_known_member(holder, prior.holder_ep, accepted.applied)?;
+                }
+            }
+        }
         let seed = self.snapshot.role(name);
         if !role_leases::accepts(
             &body,
@@ -1136,6 +1208,8 @@ impl role_leases::Backend for Residence {
 struct HeldDelivery {
     entry: Entry,
     arrival_head: Option<u64>,
+    waiting_for_anchor: bool,
+    waiting_for_lease: bool,
 }
 
 pub(super) fn committed_mint(epoch: &Value) -> Option<&str> {
@@ -1182,7 +1256,7 @@ impl LogReplan for CreateReplan<'_> {
     fn after_image(&self, saved: &Value) -> Result<Replanned, HandlerError> {
         match (self.preview)(&self.residence.store, Some(saved)) {
             Ok(body) => Ok(Replanned::Body(body)),
-            Err(error) if timed_out(&error) => Err(error),
+            Err(error) if deferred(&error) => Err(error),
             Err(error) => Ok(Replanned::Refused(error)),
         }
     }

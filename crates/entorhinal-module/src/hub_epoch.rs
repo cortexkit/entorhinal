@@ -900,6 +900,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
         let mut observed = None;
         let mut retry_on_membership = false;
         let mut awaiting_writer_key = false;
+        let mut anchors = self.reader.membership.changes();
         let mut joins = JoinQueue::default();
         loop {
             let timer = observed.as_ref().and_then(Observation::deadline);
@@ -947,6 +948,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
                     }
                     awaiting_writer_key
                 },
+                Ok(()) = anchors.changed(), if live => awaiting_writer_key,
                 _ = async { tokio::time::sleep_until(timer.expect("armed timer")).await }, if live && timer.is_some() => {
                     let watch = observed.as_mut().expect("armed observation");
                     watch.recovered = true;
@@ -1226,7 +1228,13 @@ impl<T: Transport> EpochReader<T> {
                 return Err(invalid("epoch register revision went backwards"));
             }
             if entry.revision == old.revision {
-                if !old.integrity_failed && old.value == entry.value {
+                if old.integrity_failed {
+                    return Err(invalid("epoch register failed integrity checks"));
+                }
+                if old.accepted_revision == Some(entry.revision) {
+                    if old.value != entry.value {
+                        return Err(invalid("epoch register failed integrity checks"));
+                    }
                     let epoch = serde_json::from_value(
                         old.body
                             .clone()
@@ -1238,7 +1246,6 @@ impl<T: Transport> EpochReader<T> {
                         epoch,
                     }));
                 }
-                return Err(invalid("epoch register failed integrity checks"));
             }
         }
         let decoded = async {
@@ -1294,14 +1301,15 @@ impl<T: Transport> EpochReader<T> {
             }))
         }
         .await;
-        if decoded.as_ref().is_err_and(|error: &HandlerError| {
-            matches!(
-                error.code.as_str(),
-                "record_invalid" | "signature_invalid" | "member_episode_invalid"
-            )
-        }) {
-            self.store
-                .record_hub_kv(KEY, entry.revision, None, crate::unix_millis())?;
+        if let Err(error) = &decoded {
+            match error.code.as_str() {
+                "writer_unknown" => self.store.hold_hub_kv(KEY, entry.revision)?,
+                "record_invalid" | "signature_invalid" | "member_episode_invalid" => {
+                    self.store
+                        .record_hub_kv(KEY, entry.revision, None, crate::unix_millis())?;
+                }
+                _ => {}
+            }
         }
         decoded
     }

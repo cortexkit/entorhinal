@@ -25,6 +25,30 @@ impl PeerKeysRead for Roster {
     }
 }
 
+pub(crate) struct ChangingRoster(pub watch::Sender<Vec<PeerAnchor>>);
+
+#[async_trait]
+impl PeerKeysRead for ChangingRoster {
+    async fn peer_keys_read(&self) -> Result<Vec<PeerAnchor>, HandlerError> {
+        Ok(self.0.borrow().clone())
+    }
+
+    async fn own_fingerprint(&self) -> Result<String, HandlerError> {
+        Ok("self-fingerprint".into())
+    }
+
+    fn peer_key_updates(
+        self: Arc<Self>,
+    ) -> BoxStream<'static, Result<Vec<PeerAnchor>, HandlerError>> {
+        stream::unfold(self.0.subscribe(), |mut roster| async {
+            roster.changed().await.ok()?;
+            let peers = roster.borrow_and_update().clone();
+            Some((Ok(peers), roster))
+        })
+        .boxed()
+    }
+}
+
 use crate::fleet_record::Header;
 use cortexkit_claustrum_client::ClaustrumCredentialResolver;
 use serde_json::json;

@@ -38,6 +38,12 @@ impl Backend for TestBackend {
     fn current_member(&self, holder: &str, applied: u64) -> Option<u64> {
         (!self.episode_closed(holder, 0, applied)).then_some(0)
     }
+    fn require_known_member(&self, _: &str, _: u64, _: u64) -> Result<(), HandlerError> {
+        Ok(())
+    }
+    fn anchor_changes(&self) -> watch::Receiver<u64> {
+        watch::channel(0).1
+    }
     fn episode_closed(&self, holder: &str, episode: u64, applied: u64) -> bool {
         holder == A && episode == 0 && applied >= 2
     }
@@ -296,6 +302,8 @@ async fn hub_audit_regression_role_acquisition_held_until_expiry_or_applied_remo
         let early = HeldDelivery {
             entry: f.role_entry(B, 2).await,
             arrival_head: None,
+            waiting_for_anchor: false,
+            waiting_for_lease: false,
         };
         let mut pending = HashMap::new();
         f.residence.observe_or_hold(early, &mut pending).await;

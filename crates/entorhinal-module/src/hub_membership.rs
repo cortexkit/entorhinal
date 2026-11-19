@@ -8,6 +8,7 @@ pub(super) mod tests;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, RwLock},
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -16,10 +17,14 @@ use entorhinal_core::{
     hub_store::{HubAnchor, MEMBERSHIP_OPS},
     RegistryStore,
 };
+use futures_util::{
+    stream::{self, BoxStream},
+    StreamExt,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
-    sync::Mutex,
+    sync::{watch, Mutex},
     time::{timeout_at, Instant},
 };
 
@@ -86,6 +91,14 @@ pub(super) fn unknown_key() -> HandlerError {
         "signature_invalid",
         "no trusted fleet record key for the writer episode",
     )
+}
+
+pub(super) fn writer_unknown(writer: &str) -> HandlerError {
+    HandlerError {
+        code: "writer_unknown".into(),
+        message: format!("no trusted fleet record key or current roster entry for writer {writer}"),
+        detail: Some(serde_json::json!({"writer":writer})),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -160,6 +173,17 @@ impl Event {
 struct Candidate {
     record: UnverifiedRecord,
     event: Event,
+}
+
+impl Candidate {
+    fn parse(bytes: &[u8]) -> Option<Self> {
+        if !UnverifiedRecord::membership_kind(bytes) {
+            return None;
+        }
+        let record = UnverifiedRecord::parse(LOG_KEY, bytes).ok()?;
+        let event = Event::decode(&record).ok()?;
+        Some(Self { record, event })
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -280,6 +304,24 @@ pub(super) trait PeerKeysRead: Send + Sync {
     async fn peer_keys_read(&self) -> Result<Vec<PeerAnchor>, HandlerError>;
     async fn own_fingerprint(&self) -> Result<String, HandlerError>;
 
+    // Replace this polling source with Callosum's peer-key watch when available.
+    fn peer_key_updates(
+        self: Arc<Self>,
+    ) -> BoxStream<'static, Result<Vec<PeerAnchor>, HandlerError>>
+    where
+        Self: 'static,
+    {
+        let every = Duration::from_secs(5);
+        let mut ticks = tokio::time::interval_at(Instant::now() + every, every);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        stream::unfold((self, ticks), |(source, mut ticks)| async move {
+            ticks.tick().await;
+            let peers = source.peer_keys_read().await;
+            Some((peers, (source, ticks)))
+        })
+        .boxed()
+    }
+
     async fn fleet_peers(&self) -> Result<Vec<(String, String)>, HandlerError> {
         Ok(self
             .peer_keys_read()
@@ -297,44 +339,53 @@ pub(super) struct AnchorSource {
 }
 
 impl AnchorSource {
+    async fn own_anchor(&self) -> Result<PeerAnchor, HandlerError> {
+        let (fingerprint, public) = tokio::try_join!(self.peers.own_fingerprint(), async {
+            self.signer
+                .public_key(fleet_record::CREDENTIAL_ID)
+                .await
+                .map_err(|error| {
+                    HandlerError::new(error.code(), "fleet record public key unavailable")
+                })
+        })?;
+        if public.algorithm != PublicKeyAlgorithm::Ed25519 {
+            return Err(invalid("fleet anchor is not Ed25519"));
+        }
+        Ok(PeerAnchor {
+            box_id: self.own_box.clone(),
+            fingerprint,
+            generation: None,
+            fleet_record_ed25519: Key {
+                version: public.key_id,
+                public: public.public_key_hex,
+            },
+        })
+    }
+
+    fn combine(
+        &self,
+        mut peers: Vec<PeerAnchor>,
+        own: PeerAnchor,
+    ) -> Result<Vec<PeerAnchor>, HandlerError> {
+        peers.retain(|peer| peer.box_id != self.own_box);
+        peers.push(own);
+        let mut boxes = BTreeSet::new();
+        if peers.iter().any(|peer| {
+            !box_id(&peer.box_id)
+                || peer.fingerprint.is_empty()
+                || !valid_key(&peer.fleet_record_ed25519)
+                || !boxes.insert(&peer.box_id)
+        }) {
+            return Err(invalid("invalid current fleet anchor reply"));
+        }
+        peers.sort_by(|left, right| left.box_id.cmp(&right.box_id));
+        Ok(peers)
+    }
+
     async fn read(&self, deadline: Instant) -> Result<Vec<PeerAnchor>, HandlerError> {
         timeout_at(deadline, async {
-            let (mut peers, fingerprint, public) = tokio::try_join!(
-                self.peers.peer_keys_read(),
-                self.peers.own_fingerprint(),
-                async {
-                    self.signer
-                        .public_key(fleet_record::CREDENTIAL_ID)
-                        .await
-                        .map_err(|error| {
-                            HandlerError::new(error.code(), "fleet record public key unavailable")
-                        })
-                }
-            )?;
-            if public.algorithm != PublicKeyAlgorithm::Ed25519 {
-                return Err(invalid("fleet anchor is not Ed25519"));
-            }
-            peers.retain(|peer| peer.box_id != self.own_box);
-            peers.push(PeerAnchor {
-                box_id: self.own_box.clone(),
-                fingerprint,
-                generation: None,
-                fleet_record_ed25519: Key {
-                    version: public.key_id,
-                    public: public.public_key_hex,
-                },
-            });
-            let mut boxes = BTreeSet::new();
-            if peers.iter().any(|peer| {
-                !box_id(&peer.box_id)
-                    || peer.fingerprint.is_empty()
-                    || !valid_key(&peer.fleet_record_ed25519)
-                    || !boxes.insert(&peer.box_id)
-            }) {
-                return Err(invalid("invalid current fleet anchor reply"));
-            }
-            peers.sort_by(|left, right| left.box_id.cmp(&right.box_id));
-            Ok(peers)
+            let (peers, own) = tokio::try_join!(self.peers.peer_keys_read(), self.own_anchor())?;
+            self.combine(peers, own)
         })
         .await
         .map_err(|_| HandlerError::new("hub_unavailable", "fleet anchor read timed out"))?
@@ -405,13 +456,24 @@ impl Proof {
         let episode = self.check_episode(record, sequence)?;
         if MEMBERSHIP_OPS.contains(&record.header().kind.as_str()) {
             Event::decode(record)?;
-            if self.verified.get(&sequence) != Some(&record.signing_id()) {
-                return Err(unknown_key());
-            }
         }
-        self.key(record, &episode, sequence)
-            .map(str::to_owned)
-            .ok_or_else(unknown_key)
+        let key = self.key(record, &episode, sequence).ok_or_else(|| {
+            if lookup(&self.anchors, &episode, record.key_version()).is_some()
+                || lookup(&self.history, &episode, record.key_version()).is_some()
+            {
+                // This key is known but cannot authorize an ordinary entry
+                // before its publication in the new episode.
+                unknown_key()
+            } else {
+                writer_unknown(&record.header().writer)
+            }
+        })?;
+        if MEMBERSHIP_OPS.contains(&record.header().kind.as_str())
+            && self.verified.get(&sequence) != Some(&record.signing_id())
+        {
+            return Err(unknown_key());
+        }
+        Ok(key.to_owned())
     }
 }
 
@@ -575,6 +637,7 @@ fn resolve(
 
 #[derive(Default)]
 struct Scan {
+    loaded: bool,
     through: u64,
     candidates: BTreeMap<u64, Candidate>,
 }
@@ -592,6 +655,7 @@ pub(super) struct Membership<T> {
     source: AnchorSource,
     scan: Mutex<Scan>,
     view: RwLock<View>,
+    changed: watch::Sender<u64>,
 }
 
 impl<T: Transport> Membership<T> {
@@ -602,19 +666,69 @@ impl<T: Transport> Membership<T> {
             source,
             scan: Mutex::default(),
             view: RwLock::default(),
+            changed: watch::channel(0).0,
         }
     }
 
     pub(super) async fn discover(&self, head: u64, deadline: Instant) -> Result<(), HandlerError> {
         let current = self.source.read(deadline).await?;
-        self.scan_with(head, current, deadline).await
+        self.scan_with(head, Some(current), deadline).await
     }
 
-    pub(super) async fn refresh(&self, deadline: Instant) -> Result<bool, HandlerError> {
-        let current = self.source.read(deadline).await?;
+    pub(super) fn changes(&self) -> watch::Receiver<u64> {
+        self.changed.subscribe()
+    }
+
+    pub(super) async fn discover_cached(
+        &self,
+        head: u64,
+        deadline: Instant,
+    ) -> Result<(), HandlerError> {
+        let initialized = self.view.read().unwrap().through.is_some();
+        if initialized {
+            self.scan_with(head, None, deadline).await
+        } else {
+            self.discover(head, deadline).await
+        }
+    }
+
+    pub(super) async fn refresh_peers(
+        &self,
+        peers: Vec<PeerAnchor>,
+        deadline: Instant,
+    ) -> Result<bool, HandlerError> {
+        let Some(mut own) = self.current_anchor(&self.source.own_box) else {
+            return Ok(false);
+        };
+        own.fingerprint = timeout_at(deadline, self.source.peers.own_fingerprint())
+            .await
+            .map_err(|_| {
+                HandlerError::new("hub_unavailable", "local fingerprint read timed out")
+            })??;
+        self.refresh_with(self.source.combine(peers, own)?, deadline)
+            .await
+    }
+
+    pub(super) async fn refresh_own(&self, deadline: Instant) -> Result<bool, HandlerError> {
+        let peers = self.view.read().unwrap().current.clone();
+        if peers.is_empty() {
+            return Ok(false);
+        }
+        let own = timeout_at(deadline, self.source.own_anchor())
+            .await
+            .map_err(|_| HandlerError::new("hub_unavailable", "local anchor read timed out"))??;
+        self.refresh_with(self.source.combine(peers, own)?, deadline)
+            .await
+    }
+
+    async fn refresh_with(
+        &self,
+        current: Vec<PeerAnchor>,
+        deadline: Instant,
+    ) -> Result<bool, HandlerError> {
         if self.view.read().unwrap().current != current {
             let head = self.transport.log_head(deadline).await?;
-            self.scan_with(head, current, deadline).await?;
+            self.scan_with(head, Some(current), deadline).await?;
             return Ok(true);
         }
         Ok(false)
@@ -623,36 +737,73 @@ impl<T: Transport> Membership<T> {
     async fn scan_with(
         &self,
         head: u64,
-        current: Vec<PeerAnchor>,
+        current: Option<Vec<PeerAnchor>>,
         deadline: Instant,
     ) -> Result<(), HandlerError> {
         let mut scan = timeout_at(deadline, self.scan.lock())
             .await
             .map_err(|_| HandlerError::new("hub_unavailable", "membership discovery busy"))?;
-        for sequence in scan.through.saturating_add(1)..=head {
-            let bytes = self
-                .transport
-                .log_entry(sequence, deadline)
-                .await?
-                .ok_or_else(|| {
-                    HandlerError::new(
-                        "hub_log_gap",
-                        format!("membership discovery missing sequence {sequence}"),
-                    )
-                })?;
-            // Only membership bodies are read. A malformed entry is still
-            // refused when the log reader applies entries in sequence.
-            if UnverifiedRecord::membership_kind(&bytes) {
-                if let Ok(record) = UnverifiedRecord::parse(LOG_KEY, &bytes) {
-                    if let Ok(event) = Event::decode(&record) {
-                        scan.candidates
-                            .insert(sequence, Candidate { record, event });
-                    }
+        if !scan.loaded {
+            let store = self.store.clone();
+            let saved = tokio::task::spawn_blocking(move || store.hub_membership_scan())
+                .await
+                .map_err(|error| HandlerError::new("storage_error", error.to_string()))??;
+            scan.through = saved.through;
+            for (sequence, bytes) in saved.candidates {
+                if let Some(candidate) = Candidate::parse(&bytes) {
+                    scan.candidates.insert(sequence, candidate);
                 }
             }
-            scan.through = sequence;
+            scan.loaded = true;
+        }
+        while scan.through < head {
+            let start = scan.through;
+            let end = head.min(start.saturating_add(128));
+            let mut through = start;
+            let mut parsed = Vec::new();
+            let mut raw = Vec::new();
+            let result = async {
+                for sequence in start + 1..=end {
+                    let bytes = self
+                        .transport
+                        .log_entry(sequence, deadline)
+                        .await?
+                        .ok_or_else(|| {
+                            HandlerError::new(
+                                "hub_log_gap",
+                                format!("membership discovery missing sequence {sequence}"),
+                            )
+                        })?;
+                    if let Some(candidate) = Candidate::parse(&bytes) {
+                        raw.push((sequence, bytes));
+                        parsed.push((sequence, candidate));
+                    }
+                    through = sequence;
+                }
+                Ok::<_, HandlerError>(())
+            }
+            .await;
+            if through > start {
+                let store = self.store.clone();
+                tokio::task::spawn_blocking(move || {
+                    store.checkpoint_hub_membership_scan(through, &raw)
+                })
+                .await
+                .map_err(|error| HandlerError::new("storage_error", error.to_string()))??;
+                scan.through = through;
+                scan.candidates.extend(parsed);
+            }
+            result?;
         }
         let through = scan.through;
+        let current = {
+            let view = self.view.read().unwrap();
+            let current = current.unwrap_or_else(|| view.current.clone());
+            if view.through == Some(through) && view.current == current {
+                return Ok(());
+            }
+            current
+        };
         let result = resolve(
             &scan.candidates,
             &self.store.hub_anchors()?,
@@ -662,11 +813,16 @@ impl<T: Transport> Membership<T> {
         match result {
             Ok((proof, scoped)) => {
                 self.store.persist_hub_anchors(&scoped)?;
-                *self.view.write().unwrap() = View {
+                let mut view = self.view.write().unwrap();
+                let changed = view.current != current || view.proof != proof;
+                *view = View {
                     proof,
                     current,
                     through: Some(through),
                 };
+                if changed {
+                    self.changed.send_modify(|generation| *generation += 1);
+                }
                 Ok(())
             }
             Err(error) => {
@@ -705,12 +861,14 @@ impl<T: Transport> Membership<T> {
         deadline: Instant,
     ) -> Result<(String, VerifiedRecord), HandlerError> {
         let mut key = self.log_key(&record, sequence);
-        if key
-            .as_ref()
-            .is_err_and(|error| error.code == "signature_invalid")
-        {
+        if key.as_ref().is_err_and(|error| {
+            matches!(
+                error.code.as_str(),
+                "writer_unknown" | "signature_invalid" | "member_episode_invalid"
+            )
+        }) {
             let head = self.transport.log_head(deadline).await?;
-            self.discover(head, deadline).await?;
+            self.discover_cached(head, deadline).await?;
             key = self.log_key(&record, sequence);
         }
         let key = key?;
@@ -725,7 +883,7 @@ impl<T: Transport> Membership<T> {
         lookup(&view.proof.anchors, &episode, record.key_version())
             .or_else(|| lookup(&view.proof.history, &episode, record.key_version()))
             .map(str::to_owned)
-            .ok_or_else(unknown_key)
+            .ok_or_else(|| writer_unknown(&header.writer))
     }
 
     pub(super) fn open_episode(&self, box_id: &str, applied: u64) -> Option<u64> {
@@ -749,6 +907,27 @@ impl<T: Transport> Membership<T> {
             .timeline
             .before(box_id, applied.saturating_add(1));
         state.closed.is_none().then_some(state.episode)
+    }
+
+    pub(super) fn require_known_member(
+        &self,
+        box_id: &str,
+        episode: u64,
+        applied: u64,
+    ) -> Result<(), HandlerError> {
+        let view = self.view.read().unwrap();
+        let state = view
+            .proof
+            .timeline
+            .before(box_id, applied.saturating_add(1));
+        if !self::box_id(box_id)
+            || view.current.iter().any(|peer| peer.box_id == box_id)
+            || episode < state.episode
+            || (episode == state.episode && state.closed.is_some())
+        {
+            return Ok(());
+        }
+        Err(writer_unknown(box_id))
     }
 
     pub(super) fn episode_closed(&self, box_id: &str, episode: u64, applied: u64) -> bool {
@@ -984,12 +1163,12 @@ impl<T: Transport> Membership<T> {
             None => {
                 // Hold this unverified value (don't apply or refuse it yet)
                 // while key discovery scans to the log head seen on its
-                // arrival; refuse the revision only if no key is found by then.
+                // arrival. The roster may still be missing the writer.
                 let head = self.transport.log_head(deadline).await?;
-                self.discover(head, deadline).await?;
+                self.discover_cached(head, deadline).await?;
                 (
                     self.kv_key(&record, applied.max(head), sight)?
-                        .ok_or_else(unknown_key)?,
+                        .ok_or_else(|| writer_unknown(&record.header().writer))?,
                     Some(head),
                 )
             }

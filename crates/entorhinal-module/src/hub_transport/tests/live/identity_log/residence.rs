@@ -9,7 +9,6 @@ use crate::{
 use std::{collections::HashMap, sync::atomic::AtomicUsize};
 
 const ROUTE: RouteKey = (20, 1);
-const D: &str = "dddddddddddddddddddddddddddddddd";
 const MIGRATED: &str = "agent_0000000000000040";
 
 #[derive(Default)]
@@ -177,6 +176,145 @@ fn residence(node: &Node, image: Arc<Image>) {
         .unwrap();
 }
 
+#[tokio::test]
+async fn hub_reader_regression_residence_replays_after_transient_watch_error() {
+    let Some(rig) = IdentityRig::new().await else {
+        return;
+    };
+    let agent = "agent_0000000000000042";
+    migrate_identity(&rig.b, agent, "Blip");
+    let image = Arc::new(Image(HashMap::from([(agent.into(), (Some(A.into()), 1))])));
+    let (inject, injected) = tokio::sync::oneshot::channel();
+    let leaf = rig.b.leaf.clone();
+    let mut injected = Some(injected);
+    let feed = Feed::kv(rig.b.handler.health.clone(), move |_| {
+        let leaf = leaf.clone();
+        let injected = injected.take();
+        async move {
+            let kv = leaf.session().kv().await?;
+            let watch = kv
+                .watch_with_history(">")
+                .await
+                .map_err(|error| Failure::kind("kv_watch", error.kind()))?;
+            let values = kv
+                .status()
+                .await
+                .map_err(|error| Failure::kind("kv_status", error.kind()))?
+                .values();
+            let empty =
+                futures_util::stream::iter((values == 0).then_some(Ok((0, KvDelivery::Empty))));
+            let entries = watch.map(|entry| {
+                map_kv_delivery(entry).map(|(revision, entry)| (revision, KvDelivery::Entry(entry)))
+            });
+            let errors = futures_util::stream::iter(injected).then(|injected| async {
+                injected.await.unwrap();
+                Err(Failure::code("kv_delivery:MissingHeartbeat"))
+            });
+            Ok(Subscription::new(
+                None,
+                empty.chain(futures_util::stream::select(entries, errors)),
+            ))
+        }
+    })
+    .with_durable_cursor();
+    rig.b
+        .handler
+        .activate_hub_residence(rig.b.log.clone(), feed, image)
+        .unwrap();
+    let mut seeded = record(B, A, 1, false);
+    seeded["seeded"] = json!(true);
+    let revision = put(&rig, agent, 0, B, seeded).await;
+    assert!(!applied(&rig.b, agent, revision).await.integrity_failed);
+    until(|| ready_for(&rig.b, agent)).await;
+    inject.send(()).unwrap();
+    until(|| !ready_for(&rig.b, agent)).await;
+    tokio::time::timeout(Duration::from_secs(5), until(|| ready_for(&rig.b, agent)))
+        .await
+        .expect("idle residence did not replay the already-verified claim");
+}
+
+#[tokio::test]
+async fn hub_reader_regression_residence_and_role_control_retry_when_writer_is_listed() {
+    use crate::hub_membership::tests::{anchor, ChangingRoster};
+    let Some(rig) = IdentityRig::new().await else {
+        return;
+    };
+    let roster = Arc::new(ChangingRoster(tokio::sync::watch::channel(Vec::new()).0));
+    let handler = handler(store(&rig._processes, "unlisted-writer"), B);
+    let leaf = rig.b.leaf.clone();
+    let log = Arc::new(
+        handler
+            .activate_hub_identity_log(
+                leaf.box_id.clone(),
+                Link {
+                    transport: leaf.clone(),
+                    trust: rig.keys.clone(),
+                    signer: Arc::new(ClaustrumCredentialResolver::with_target(
+                        rig.keys.clone(),
+                        0,
+                    )),
+                    vault: rig.keys.clone(),
+                    peers: roster.clone(),
+                },
+            )
+            .unwrap(),
+    );
+    let node = Node { handler, leaf, log };
+    let agent = "agent_0000000000000042";
+    migrate_identity(&node, agent, "Blip");
+    residence(
+        &node,
+        Arc::new(Image(HashMap::from([(agent.into(), (Some(C.into()), 1))]))),
+    );
+    let mut seeded = record(C, C, 1, false);
+    seeded["seeded"] = json!(true);
+    let revision = put(&rig, agent, 0, C, seeded).await;
+    let preference_key = "roleprefer.connector_home";
+    let signed = fleet_record::prepare(
+        &ClaustrumCredentialResolver::with_target(rig.keys.clone(), 0),
+        rig.keys.as_ref(),
+        &Header {
+            kind: "roleprefer".into(),
+            key: preference_key.into(),
+            writer: C.into(),
+            writer_ep: 0,
+            entry_id: "59".repeat(16),
+        },
+        &json!({"v":1,"box":C,"writer":C}),
+    )
+    .await
+    .unwrap();
+    let preference_revision = rig
+        .kv
+        .put(preference_key, signed.into_bytes().into())
+        .await
+        .unwrap();
+    let store = store_of(&node.handler);
+    let preference = || store.hub_kv_cached(preference_key).unwrap();
+    let held = applied(&node, agent, revision).await;
+    assert!(
+        !held.integrity_failed,
+        "an unlisted writer is not a forged claim"
+    );
+    assert_eq!(held.accepted_revision, None);
+    until(|| preference().is_some()).await;
+    assert!(
+        !preference().unwrap().integrity_failed,
+        "an unlisted writer is not a forged preference"
+    );
+    assert!(!ready_for(&node, agent));
+    roster.0.send_replace(vec![anchor(C, &rig.keys)]);
+    until(|| {
+        ready_for(&node, agent)
+            && preference().unwrap().accepted_revision == Some(preference_revision)
+    })
+    .await;
+    assert_eq!(
+        applied(&node, agent, revision).await.accepted_revision,
+        Some(revision)
+    );
+}
+
 async fn until(mut pred: impl FnMut() -> bool) {
     within(async {
         while !pred() {
@@ -260,6 +398,17 @@ fn session(node: &Node) -> Value {
 }
 
 async fn put(rig: &IdentityRig, agent: &str, revision: u64, writer: &str, record: Value) -> u64 {
+    put_residence(rig, agent, revision, writer, record, false).await
+}
+
+async fn put_residence(
+    rig: &IdentityRig,
+    agent: &str,
+    revision: u64,
+    writer: &str,
+    record: Value,
+    corrupt_signature: bool,
+) -> u64 {
     let key = format!("residence.{agent}");
     let signed = fleet_record::prepare(
         &ClaustrumCredentialResolver::with_target(rig.keys.clone(), 0),
@@ -275,10 +424,15 @@ async fn put(rig: &IdentityRig, agent: &str, revision: u64, writer: &str, record
     )
     .await
     .unwrap();
-    rig.kv
-        .update(key, signed.into_bytes().into(), revision)
-        .await
-        .unwrap()
+    let mut bytes = signed.into_bytes();
+    if corrupt_signature {
+        let mut envelope: Value = serde_json::from_slice(&bytes).unwrap();
+        envelope["sig"] = json!("0".repeat(128));
+        bytes = entorhinal_catalog::jcs::to_string(&envelope)
+            .unwrap()
+            .into_bytes();
+    }
+    rig.kv.update(key, bytes.into(), revision).await.unwrap()
 }
 
 fn record(writer: &str, holder: &str, gen: i64, forced: bool) -> Value {
@@ -549,7 +703,12 @@ async fn hub_residence_watch_refuses_forged_forced_values_and_continues_other_ke
             .collect(),
     ));
     residence(&rig.b, image);
-    for (i, writer, holder) in [(0, D, D), (1, B, A), (2, D, D), (3, B, A)] {
+    for (i, writer, holder, corrupt_signature) in [
+        (0, C, C, true),
+        (1, B, A, false),
+        (2, C, C, true),
+        (3, B, A, false),
+    ] {
         let id = &ids[i];
         let mut previous = 0;
         if i >= 2 {
@@ -558,7 +717,15 @@ async fn hub_residence_watch_refuses_forged_forced_values_and_continues_other_ke
             previous = put(&rig, id, 0, A, seeded.clone()).await;
             assert_eq!(applied(&rig.b, id, previous).await.body, Some(seeded));
         }
-        let forged = put(&rig, id, previous, writer, record(writer, holder, 2, true)).await;
+        let forged = put_residence(
+            &rig,
+            id,
+            previous,
+            writer,
+            record(writer, holder, 2, true),
+            corrupt_signature,
+        )
+        .await;
         let refused = applied(&rig.b, id, forged).await;
         assert!(
             refused.integrity_failed,
