@@ -21,11 +21,9 @@ pub(crate) const HUB_LOCAL: &str = "hub.local_write";
 /// success instead of a conflict with its own earlier write. None of it is
 /// ever part of the shared entry.
 ///
-/// The two partial indexes serve bounded queries that would otherwise scan
-/// unrelated rows: the session retention prune selects only ended bindings,
-/// and the agent change marker and `agent.changes` feed select only identity
-/// operations from the journal. SQLite uses a partial index only when the
-/// query repeats its condition exactly, so the operation list must match
+/// The partial indexes keep retention, change feeds, and attempt recovery
+/// from scanning unrelated rows. SQLite uses a partial index only when the
+/// query matches its condition, so the journal operation list must match
 /// `IDENTITY_CHANGE_OPS` in order; a query-plan test checks that it does.
 pub(crate) const V27_LEGACY_REPLY_AND_QUERY_INDEXES: &str = r#"
 ALTER TABLE pending_entry ADD COLUMN continuation TEXT NULL;
@@ -35,7 +33,8 @@ CREATE INDEX registry_journal_identity
     ON registry_journal(seq)
     WHERE op IN ('agent.create','agent.rename','agent.update_tag','agent.set_labels',
                  'agent.set_avatar','agent.set_github_identity','agent.dispose',
-                 'agent.merge','agent.import','agent.set_namespace');
+                  'agent.merge','agent.import','agent.set_namespace');
+CREATE INDEX hub_attempt_open ON hub_attempt(request_key, step) WHERE outcome IS NULL;
 "#;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

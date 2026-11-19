@@ -34,6 +34,8 @@ const CREATE_KV: &str = "residence.create";
 const BUDGET: Duration = Duration::from_secs(5);
 mod moves;
 mod role_control;
+#[cfg(test)]
+mod tests;
 pub(super) use moves::{Position as MovePosition, Transfer as MoveTransfer};
 use role_control::role_key_name;
 
@@ -208,6 +210,7 @@ struct Watched {
     initial: bool,
     incarnation: u64,
     revisions: HashMap<String, u64>,
+    role_seen: HashMap<String, (u64, u64)>,
     held: HashSet<String>,
     move_times: HashMap<String, i64>,
 }
@@ -537,6 +540,14 @@ impl Residence {
                         self.observe_or_hold(entry, &mut pending).await;
                     }
                 }
+                _ = self.commits.notified(), if pending.keys().any(|key| key.starts_with("role.")) => {
+                    let roles: Vec<_> = pending.keys().filter(|key| key.starts_with("role.")).cloned().collect();
+                    for role in roles {
+                        if let Some(entry) = pending.remove(&role) {
+                            self.observe_or_hold(entry, &mut pending).await;
+                        }
+                    }
+                }
             }
         }
     }
@@ -687,7 +698,9 @@ impl Residence {
                 }
                 Ok(())
             }
-            Err(error) if timed_out(&error) => Err(error),
+            Err(error) if timed_out(&error) || error.code == "role_lease_awaiting_expiry" => {
+                Err(error)
+            }
             Err(error) => self.refuse(key, revision, &error.code),
         }
     }
@@ -703,11 +716,17 @@ impl Residence {
             .store
             .record_hub_kv(key, revision, Some((value, body)), (self.clock)())?
         {
-            self.watched
-                .write()
-                .unwrap()
-                .revisions
-                .insert(key.into(), revision);
+            let mut watched = self.watched.write().unwrap();
+            watched.revisions.insert(key.into(), revision);
+            if key.starts_with("role.") {
+                let seen = watched
+                    .role_seen
+                    .entry(key.into())
+                    .or_insert((revision, self.role_clock_ms()));
+                if seen.0 != revision {
+                    *seen = (revision, self.role_clock_ms());
+                }
+            }
         }
         Ok(())
     }
@@ -903,7 +922,48 @@ impl Residence {
         ) {
             return Err(bad_record("role body is not authorized"));
         }
+        if let Some((prior, holder)) = previous
+            .as_ref()
+            .and_then(|prior| prior.holder.as_deref().map(|holder| (prior, holder)))
+        {
+            // A self-acquire is not an owner-authorized handback. Check the
+            // predecessor's local lease window, not the sender's clock or roster.
+            if !body.forced
+                && prior.gen.checked_add(1) == Some(body.gen)
+                && body.holder.as_deref() == Some(&header.writer)
+                && holder != header.writer
+                && !self
+                    .backend
+                    .episode_closed(holder, prior.holder_ep, accepted.applied)
+                && !self.role_lease_expired(key, old.and_then(|row| row.accepted_revision))
+            {
+                return Err(HandlerError::new(
+                    "role_lease_awaiting_expiry",
+                    "previous role lease has not expired here",
+                ));
+            }
+        }
         Ok(accepted)
+    }
+
+    fn role_clock_ms(&self) -> u64 {
+        self.role_leases
+            .upgrade()
+            .map_or_else(role_leases::monotonic_ms, |leases| leases.now())
+    }
+
+    fn role_lease_expired(&self, key: &str, revision: Option<u64>) -> bool {
+        let now = self.role_clock_ms();
+        let mut watched = self.watched.write().unwrap();
+        let revision = revision.expect("cached role body has an accepted revision");
+        let seen = watched
+            .role_seen
+            .entry(key.into())
+            .or_insert((revision, now));
+        if seen.0 != revision {
+            *seen = (revision, now);
+        }
+        now.saturating_sub(seen.1) >= role_leases::LEASE_MS
     }
 }
 
@@ -948,6 +1008,14 @@ impl role_leases::Backend for Residence {
                 record.holder.as_deref().is_some_and(|holder| {
                     crate::hub_membership::box_id(holder)
                         && self.backend.current_member(holder, applied) == Some(record.holder_ep)
+                })
+            }),
+            holder_removed: record.as_ref().is_some_and(|record| {
+                record.holder.as_deref().is_some_and(|holder| {
+                    crate::hub_membership::box_id(holder)
+                        && self
+                            .backend
+                            .episode_closed(holder, record.holder_ep, applied)
                 })
             }),
             record,
@@ -1227,12 +1295,25 @@ impl Residence {
         {
             Ok(landed) => landed,
             Err(error) => {
+                let kv = self
+                    .store
+                    .hub_attempt(request_key)?
+                    .filter(|row| row.write.step == CREATE_KV && row.write.params_digest == digest);
+                // The log proves this request created the agent, even if KV
+                // history can no longer establish what its first claim did.
+                if matches!(
+                    error.code.as_str(),
+                    "hub_write_superseded" | "hub_write_unsettled"
+                ) && kv.as_ref().is_some_and(|row| row.outcome.is_some())
+                {
+                    if let Some((generation, row)) = self.store.hub_created_agent(request_key)? {
+                        return encode_result(
+                            json!({"agent": row.digest(), "generation":generation}),
+                        );
+                    }
+                }
                 if error.code == "hub_unavailable" {
-                    if let Some(row) = self
-                        .store
-                        .hub_attempt(request_key)?
-                        .filter(|row| row.write.step == CREATE_KV)
-                    {
+                    if let Some(row) = kv {
                         let record = UnverifiedRecord::parse(&row.write.key, &row.write.value)?;
                         return Err(crate::hub_transport::unsettled(&record.header().entry_id));
                     }
@@ -1282,13 +1363,32 @@ impl Residence {
         for attempt in &open {
             // Do not start a log append that was never seen to land. Only
             // completion of an applied create is a restart obligation.
-            if attempt.write.step == log_step
-                && self
+            if attempt.write.step == log_step {
+                if self
                     .store
                     .hub_created_agent(&attempt.write.request_key)?
                     .is_none()
-            {
-                continue;
+                {
+                    continue;
+                }
+                let writer_ep = self.request_episode(Some(attempt))?;
+                if self
+                    .backend
+                    .episode_closed(&self.box_id, writer_ep, self.backend.applied()?)
+                {
+                    let error = HandlerError::new(
+                        "residence_create_episode_closed",
+                        "the agent was created but its writer episode closed before residence could be written",
+                    );
+                    if !hub_write::refuse_attempt(&self.store, attempt, error).await? {
+                        // A concurrent retry may have advanced to the KV step.
+                        unfinished |= self
+                            .store
+                            .hub_attempt(&attempt.write.request_key)?
+                            .is_some_and(|row| row.outcome.is_none());
+                    }
+                    continue;
+                }
             }
             if !ready {
                 unfinished = true;

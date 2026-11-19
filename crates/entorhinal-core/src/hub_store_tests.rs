@@ -18,6 +18,24 @@ fn descriptor(f: &Fixture, file: &str) -> StorageDescriptor {
 }
 
 #[test]
+fn hub_audit_regression_open_attempts_use_partial_index() {
+    let f = Fixture::new("hub-open-attempt-plan");
+    let store = RegistryStore::open(&descriptor(&f, "attempt-plan.db")).unwrap();
+    let plan = store
+        .read(|conn| {
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {OPEN_HUB_ATTEMPTS}"))?;
+            let rows = stmt.query_map(["continue:agent.create"], |row| row.get::<_, String>(3))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .unwrap();
+    assert!(
+        plan.iter()
+            .any(|line| line.contains("USING INDEX hub_attempt_open")),
+        "open attempts query plan: {plan:?}"
+    );
+}
+
+#[test]
 fn hub_epoch_store_retains_exact_mint_and_join_provenance() {
     let f = Fixture::new("hub-epoch-store");
     let descriptor = descriptor(&f, "provenance.db");

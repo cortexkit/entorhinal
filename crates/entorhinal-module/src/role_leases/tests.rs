@@ -8,11 +8,18 @@ const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const C: &str = "cccccccccccccccccccccccccccccccc";
 const ROUTE: RouteKey = (3, 1);
 
+#[cfg(target_os = "linux")]
+#[test]
+fn hub_audit_regression_linux_lease_clock_counts_suspend() {
+    assert_eq!(LEASE_CLOCK, rustix::time::ClockId::Boottime);
+}
+
 pub(crate) struct Hub {
     row: Mutex<(u64, Option<Record>)>,
     preferred: Mutex<Option<Preferred>>,
     requests: Mutex<HashMap<String, CandidateRequest>>,
     removed: Mutex<Vec<&'static str>>,
+    unlisted: Mutex<Vec<&'static str>>,
     signal_revision: AtomicU64,
     attempts: Mutex<Vec<(&'static str, u64)>>,
     landed: Mutex<Vec<(&'static str, Record)>>,
@@ -35,6 +42,7 @@ impl Hub {
             preferred: Mutex::default(),
             requests: Mutex::default(),
             removed: Mutex::default(),
+            unlisted: Mutex::default(),
             signal_revision: AtomicU64::new(1),
             landed: Mutex::default(),
             updates: Notify::new(),
@@ -70,7 +78,9 @@ impl Hub {
     }
 
     fn current(&self, box_id: &str) -> bool {
-        !box_id.starts_with("engram:") && !self.removed.lock().unwrap().contains(&box_id)
+        !box_id.starts_with("engram:")
+            && !self.removed.lock().unwrap().contains(&box_id)
+            && !self.unlisted.lock().unwrap().contains(&box_id)
     }
 
     pub(crate) fn request_sample_handback(&self) {
@@ -140,6 +150,10 @@ impl Backend for Peer {
                 .as_ref()
                 .and_then(|r| r.holder.as_deref())
                 .is_some_and(|holder| self.hub.current(holder)),
+            holder_removed: record
+                .as_ref()
+                .and_then(|r| r.holder.as_deref())
+                .is_some_and(|holder| self.hub.removed.lock().unwrap().contains(&holder)),
             record,
             ready: self.watching.load(Ordering::Relaxed),
             local_episode: Some(0),
@@ -291,6 +305,30 @@ async fn pump() {
 async fn tick(ms: u64) {
     tokio::time::advance(Duration::from_millis(ms)).await;
     pump().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn hub_audit_regression_role_take_requires_confirmed_removal_and_does_not_wait() {
+    let hub = Hub::new(Some(A), false);
+    hub.unlisted.lock().unwrap().push(A);
+    let mut candidate = ClientWatch::open(B, &hub, true).await;
+    candidate.ack_waiting().await;
+    // An unlisted holder is not a vacancy, even after a full lease interval.
+    tick(LEASE_MS).await;
+    assert!(hub.writes(ACQUIRE).is_empty());
+
+    hub.removed.lock().unwrap().push(A);
+    hub.updates.notify_waiters();
+    candidate.ack_waiting().await;
+    let writes = hub.writes(ACQUIRE);
+    assert_eq!(
+        writes.len(),
+        1,
+        "closed holder episode did not open the role immediately"
+    );
+    assert_eq!(writes[0].holder.as_deref(), Some(B));
+    assert_eq!(writes[0].gen, 2);
+    assert!(!writes[0].forced);
 }
 
 impl ClientWatch {
@@ -851,6 +889,7 @@ fn role_gen_high_water_carries_hub_observation_across_restart_and_local_takes() 
         record: Some(Record::new(A, 0, 2, false)),
         local_episode: Some(0),
         holder_current: true,
+        holder_removed: false,
     };
     let take = change(
         ACQUIRE,

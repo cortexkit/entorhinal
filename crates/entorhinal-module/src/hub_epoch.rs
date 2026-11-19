@@ -899,6 +899,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
         let mut live = false;
         let mut observed = None;
         let mut retry_on_membership = false;
+        let mut awaiting_writer_key = false;
         let mut joins = JoinQueue::default();
         loop {
             let timer = observed.as_ref().and_then(Observation::deadline);
@@ -911,6 +912,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
                         live = false;
                         observed = None;
                         retry_on_membership = false;
+                        awaiting_writer_key = false;
                         joins = JoinQueue::default();
                         false
                     }
@@ -943,7 +945,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
                         retry_on_membership = false;
                         if let Some(watch) = observed.as_mut() { watch.retry(Instant::now()); }
                     }
-                    false
+                    awaiting_writer_key
                 },
                 _ = async { tokio::time::sleep_until(timer.expect("armed timer")).await }, if live && timer.is_some() => {
                     let watch = observed.as_mut().expect("armed observation");
@@ -976,6 +978,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
                 },
             };
             if live && changed {
+                awaiting_writer_key = false;
                 match self.observe(Instant::now() + BUDGET).await {
                     Ok(Some(current)) => {
                         if observed
@@ -1003,6 +1006,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
                     }
                     Ok(None) => observed = None,
                     Err(error) => {
+                        awaiting_writer_key = error.code == "writer_unknown";
                         tracing::debug!(code = error.code, "fleet epoch observation deferred")
                     }
                 }
@@ -1195,7 +1199,10 @@ impl<T: Transport> EpochReader<T> {
             Err(error)
                 if matches!(
                     error.code.as_str(),
-                    "record_invalid" | "signature_invalid" | "member_episode_invalid"
+                    "record_invalid"
+                        | "signature_invalid"
+                        | "member_episode_invalid"
+                        | "writer_unknown"
                 ) =>
             {
                 self.health.fleet_epoch.set_current(None);
@@ -1427,6 +1434,159 @@ mod tests {
     const A: &str = "0123456789abcdef0123456789abcdef";
     const B: &str = "fedcba9876543210fedcba9876543210";
     const C: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    struct EpochOnly(Vec<u8>);
+
+    impl Transport for EpochOnly {
+        async fn log_entry(&self, _: u64, _: Instant) -> Result<Option<Vec<u8>>, HandlerError> {
+            Ok(None)
+        }
+        async fn log_head(&self, _: Instant) -> Result<u64, HandlerError> {
+            Ok(0)
+        }
+        async fn kv_entry(
+            &self,
+            key: &str,
+            _: Instant,
+        ) -> Result<Option<hub_write::KvEntry>, HandlerError> {
+            Ok((key == KEY).then(|| hub_write::KvEntry {
+                revision: 5,
+                value: Some(self.0.clone()),
+            }))
+        }
+        async fn send(
+            &self,
+            _: &entorhinal_core::hub_store::HubAttemptWrite,
+            _: &str,
+            _: Instant,
+        ) -> Result<Option<u64>, HandlerError> {
+            unreachable!()
+        }
+    }
+
+    #[derive(Default)]
+    struct LiveRoster(std::sync::Mutex<Vec<crate::hub_membership::PeerAnchor>>);
+
+    #[async_trait::async_trait]
+    impl crate::hub_membership::PeerKeysRead for LiveRoster {
+        async fn peer_keys_read(
+            &self,
+        ) -> Result<Vec<crate::hub_membership::PeerAnchor>, HandlerError> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+        async fn own_fingerprint(&self) -> Result<String, HandlerError> {
+            Ok("self-fingerprint".into())
+        }
+    }
+
+    async fn read_epoch_after_anchor_arrives(
+        bad_signature: bool,
+    ) -> (HandlerError, Result<Option<Observed>, HandlerError>) {
+        use crate::hub_write::tests::TestKeys;
+        use cortexkit_claustrum_client::ClaustrumCredentialResolver;
+
+        let (path, descriptor) = crate::tests::scratch_descriptor("epoch-anchor-arrives");
+        let store = RegistryStore::open(&descriptor).unwrap();
+        store.apply_entry("agent.cutover", "{}", "test", None, |tx| {
+            tx.execute("UPDATE identity_log_state SET state='enabled',hub_log_base=0,last_applied_position=0,last_seen_head=0", [])?;
+            Ok(())
+        }).unwrap();
+        let own = Arc::new(TestKeys::new());
+        let minter = Arc::new(TestKeys::with_seed(51));
+        let minter_signer = ClaustrumCredentialResolver::with_target(minter.clone(), 0);
+        let epoch = Epoch {
+            e: 1,
+            state: State::Committed,
+            minter: C.into(),
+            mint_id: URL_SAFE_NO_PAD.encode([5; 16]),
+            base_e: None,
+            base_mint_id: None,
+            base_recipients: BTreeSet::new(),
+            recipients: [C].map(str::to_owned).into(),
+            removed: vec![],
+        };
+        let mut bytes = crate::fleet_record::prepare(
+            &minter_signer,
+            own.as_ref(),
+            &crate::fleet_record::Header {
+                kind: KEY.into(),
+                key: KEY.into(),
+                writer: C.into(),
+                writer_ep: 0,
+                entry_id: "00000000000000000000000000000051".into(),
+            },
+            &json!(epoch),
+        )
+        .await
+        .unwrap()
+        .into_bytes();
+        let roster = Arc::new(LiveRoster::default());
+        if bad_signature {
+            let mut envelope: Value = serde_json::from_slice(&bytes).unwrap();
+            envelope["sig"] = json!("00".repeat(64));
+            bytes = entorhinal_catalog::jcs::to_string(&envelope)
+                .unwrap()
+                .into_bytes();
+            roster
+                .0
+                .lock()
+                .unwrap()
+                .push(crate::hub_membership::tests::anchor(C, &minter));
+        }
+        let transport = Arc::new(EpochOnly(bytes));
+        let membership = Arc::new(Membership::new(
+            transport.clone(),
+            store.clone(),
+            crate::hub_membership::AnchorSource {
+                own_box: A.into(),
+                peers: roster.clone(),
+                signer: Arc::new(ClaustrumCredentialResolver::with_target(own.clone(), 0)),
+            },
+        ));
+        let deadline = Instant::now() + BUDGET;
+        membership.discover(0, deadline).await.unwrap();
+        let reader = EpochReader::new(
+            transport,
+            membership.clone(),
+            store,
+            own,
+            A.into(),
+            0,
+            Arc::new(HealthGauges::default()),
+        );
+        let first = reader
+            .read(deadline)
+            .await
+            .err()
+            .expect("initial revision must not verify");
+        *roster.0.lock().unwrap() = vec![crate::hub_membership::tests::anchor(C, &minter)];
+        if !bad_signature {
+            membership.discover(0, deadline).await.unwrap();
+        }
+        let second = reader.read(deadline).await;
+        drop(reader);
+        drop(membership);
+        let _ = std::fs::remove_dir_all(&path);
+        (first, second)
+    }
+
+    #[tokio::test]
+    async fn hub_audit_regression_epoch_rereads_unchanged_revision_after_anchor_arrives() {
+        let (first, second) = read_epoch_after_anchor_arrives(false).await;
+        assert!(
+            second.as_ref().is_ok_and(Option::is_some),
+            "epoch register stays refused: {:?}",
+            second.err().map(|e| (e.code, e.message))
+        );
+        assert_eq!(first.code, "writer_unknown");
+    }
+
+    #[tokio::test]
+    async fn hub_audit_regression_epoch_keeps_bad_signature_refused() {
+        let (first, second) = read_epoch_after_anchor_arrives(true).await;
+        assert_eq!(first.code, "signature_invalid");
+        assert_eq!(second.err().unwrap().code, "record_invalid");
+    }
 
     fn pending() -> Epoch {
         Epoch {

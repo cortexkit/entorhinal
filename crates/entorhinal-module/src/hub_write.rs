@@ -3,7 +3,7 @@
 // This writer is used only when the registry selects the hub instead of engram.
 #![allow(dead_code)]
 
-use std::{future::Future, sync::OnceLock};
+use std::{cell::Cell, future::Future, sync::OnceLock};
 
 use cortexkit_claustrum_client::CredentialResolver;
 use entorhinal_catalog::jcs;
@@ -90,12 +90,23 @@ enum Outcome {
     Superseded {
         revision: u64,
     },
+    Unsettled {
+        reason: KvUncertainty,
+        revision: Option<u64>,
+    },
     HeadMoved,
     Refused {
         code: String,
         message: String,
         detail: Option<Value>,
     },
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum KvUncertainty {
+    KvHistoryUnavailable,
+    KvKeyAbsent,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -271,7 +282,7 @@ pub(super) struct Writer<'a, T, U> {
 
 enum Settlement {
     Landed(Landed),
-    Superseded(u64),
+    Unsettled(KvUncertainty, Option<u64>),
     HeadMoved,
     Resend,
 }
@@ -361,6 +372,16 @@ fn reply(outcome: HubAttemptOutcome) -> Result<Landed, HandlerError> {
             error.detail = Some(json!({"op_id": outcome.op_id, "revision": revision}));
             Err(error)
         }
+        Outcome::Unsettled { reason, revision } => {
+            let mut error = hub_transport::unsettled(&outcome.op_id);
+            error.message = "hub write outcome is unknown; re-read the key".into();
+            let mut detail = json!({"op_id": outcome.op_id, "reason": reason});
+            if let Some(revision) = revision {
+                detail["revision"] = json!(revision);
+            }
+            error.detail = Some(detail);
+            Err(error)
+        }
         Outcome::HeadMoved => Err(moved()),
         Outcome::Refused {
             code,
@@ -380,6 +401,60 @@ fn recorded(op_id: String, outcome: Outcome) -> HubAttemptOutcome {
         value: serde_json::to_value(outcome).expect("serializable hub outcome"),
         recorded_at_ms: crate::unix_millis(),
     }
+}
+
+const SETTLEMENTS_PER_PRUNE: usize = 64;
+
+thread_local! {
+    static UNTIL_PRUNE: Cell<usize> = const { Cell::new(1) };
+}
+
+async fn prune_after_settling(store: &RegistryStore, settled: usize) {
+    if settled == 0
+        || !UNTIL_PRUNE.with(|remaining| {
+            let old = remaining.get();
+            let due = settled >= old;
+            remaining.set(if due {
+                SETTLEMENTS_PER_PRUNE
+            } else {
+                old - settled
+            });
+            due
+        })
+    {
+        return;
+    }
+    // Prune on each writer thread's first settlement and at a bounded write
+    // cadence thereafter. An idle computer never wakes just for retention.
+    let store = store.clone();
+    let result =
+        tokio::task::spawn_blocking(move || store.prune_hub_attempts(crate::unix_millis())).await;
+    if !matches!(result, Ok(Ok(_))) {
+        tracing::warn!(?result, "could not prune settled hub attempts");
+    }
+}
+
+pub(super) async fn refuse_attempt(
+    store: &RegistryStore,
+    row: &HubAttempt,
+    HandlerError {
+        code,
+        message,
+        detail,
+    }: HandlerError,
+) -> Result<bool, HandlerError> {
+    let op_id = current_op_id(&row.write, row)?;
+    let outcome = recorded(
+        op_id,
+        Outcome::Refused {
+            code,
+            message,
+            detail,
+        },
+    );
+    let settled = store.record_hub_attempt_outcome(&row.write, &outcome)?;
+    prune_after_settling(store, usize::from(settled)).await;
+    Ok(settled)
 }
 
 pub(super) const CONTINUE: &str = "continue:";
@@ -488,8 +563,8 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
                         position: landed.position,
                     },
                 ),
-                Settlement::Superseded(revision) => {
-                    recorded(op_id, Outcome::Superseded { revision })
+                Settlement::Unsettled(reason, revision) => {
+                    recorded(op_id, Outcome::Unsettled { reason, revision })
                 }
                 Settlement::HeadMoved
                     if write.step.starts_with(SNAPSHOT)
@@ -542,6 +617,7 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
                 }
             };
             if self.store.record_hub_attempt_outcome(write, &terminal)? {
+                prune_after_settling(self.store, 1).await;
                 return reply(terminal);
             }
         }
@@ -926,12 +1002,12 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
             .map_err(|e| during_settlement(e, op_id))?;
         let delete = write.value.is_empty();
         let Some(entry) = current else {
-            return if delete {
-                Ok(landed(op_id.into(), None))
-            } else if write.expected == 0 {
+            return if write.expected == 0 {
                 Ok(Settlement::Resend)
             } else {
-                Err(pending())
+                // A missing predecessor cannot be retried at this revision.
+                // Absence does not prove that this attempt landed or lost.
+                Ok(Settlement::Unsettled(KvUncertainty::KvKeyAbsent, None))
             };
         };
         if entry.revision < write.expected {
@@ -950,7 +1026,13 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
                 }
             }
         }
-        Ok(Settlement::Superseded(entry.revision))
+        // KV keeps only the last value. A different op at a higher revision
+        // cannot distinguish a lost CAS from our write landing and then
+        // being overwritten. Close the attempt without asserting either.
+        Ok(Settlement::Unsettled(
+            KvUncertainty::KvHistoryUnavailable,
+            Some(entry.revision),
+        ))
     }
 
     fn matches_header(row: &HubAttempt, header: &Header) -> Result<bool, HandlerError> {
@@ -1045,7 +1127,7 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
                 position: Some(position),
             },
         );
-        Ok(self.store.record_hub_attempt_outcome_by_op(
+        let settled = self.store.record_hub_attempt_outcome_by_op(
             &header.key,
             position,
             &outcome,
@@ -1058,7 +1140,9 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
                             && current.step == matched.step
                     })
             },
-        )?)
+        )?;
+        prune_after_settling(self.store, settled).await;
+        Ok(settled)
     }
 }
 

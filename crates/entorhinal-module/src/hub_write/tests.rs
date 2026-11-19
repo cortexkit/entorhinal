@@ -410,7 +410,7 @@ async fn hub_write_rotation_reseals_lost_ack_log_and_kv_at_same_expected() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn hub_write_restart_second_cas_settles_superseded_without_a_write() {
+async fn hub_audit_regression_overwritten_cas_settles_as_unknown_without_a_write() {
     let f = Fixture::new("hub-cas-restart");
     let plan = step(RESIDENCE, 0, json!({"gen":1}));
     let op_id = {
@@ -448,8 +448,11 @@ async fn hub_write_restart_second_cas_settles_superseded_without_a_write() {
             .run(&REQUEST, &plan, None, deadline())
             .await
             .unwrap_err();
-        assert_eq!(error.code, "hub_write_superseded");
-        assert_eq!(error.detail, Some(json!({"op_id":op_id,"revision":2})));
+        assert_eq!(error.code, "hub_write_unsettled");
+        assert_eq!(
+            error.detail,
+            Some(json!({"op_id":op_id,"reason":"kv_history_unavailable","revision":2}))
+        );
         f.hub.lock().unwrap().offline = true;
     }
     let different = Request {
@@ -466,9 +469,84 @@ async fn hub_write_restart_second_cas_settles_superseded_without_a_write() {
     );
     assert_eq!(f.hub.lock().unwrap().sends.len(), 1);
     assert_eq!(f.hub.lock().unwrap().revision, 2);
+    assert!(row(&store).outcome.is_some());
+}
+
+#[tokio::test(start_paused = true)]
+async fn hub_audit_regression_positive_cas_on_purged_key_concludes() {
+    let f = Fixture::new("hub-purged-cas");
+    let store = f.store();
+    let transport = f.recorder(&store);
+    let writer = f.writer(&transport);
+    let initial = writer
+        .build(
+            &REQUEST,
+            &step(RESIDENCE, 0, json!({"gen":1})),
+            false,
+            None,
+            deadline(),
+        )
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(f.hub.lock().unwrap().commit(&initial).unwrap(), Some(1));
+    let plan = step(RESIDENCE, 1, json!({"gen":2}));
+    f.action(Action::HoldThroughDeadline);
+    let error = writer
+        .run(&REQUEST, &plan, None, deadline())
+        .await
+        .unwrap_err();
+    let op_id = row(&store).op_ids.pop().unwrap().op_id;
+    assert_unsettled(error, &op_id);
+    f.hub.lock().unwrap().kv.remove(RESIDENCE);
+    f.reconnect();
+    let error = writer
+        .run(&REQUEST, &plan, None, deadline())
+        .await
+        .unwrap_err();
+    assert!(
+        row(&store).outcome.is_some(),
+        "purged key left an open attempt"
+    );
+    assert_eq!(error.code, "hub_write_unsettled");
     assert_eq!(
-        row(&store).outcome.unwrap().value,
-        json!({"status":"superseded","revision":2})
+        error.detail,
+        Some(json!({"op_id":op_id,"reason":"kv_key_absent"}))
+    );
+    assert_eq!(f.hub.lock().unwrap().sends.len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn hub_audit_regression_settled_writes_prune_old_attempts() {
+    let f = Fixture::new("hub-prune-on-settle");
+    let store = f.store();
+    let transport = f.recorder(&store);
+    let writer = f.writer(&transport);
+    let old_step = step("residence.old", 0, json!({"gen":1}));
+    let (old, id) = writer
+        .build(&REQUEST, &old_step, false, None, deadline())
+        .await
+        .unwrap();
+    assert!(writer.save(&old, &id, None, None).unwrap());
+    let mut outcome = recorded(id, Outcome::Landed { position: Some(1) });
+    outcome.recorded_at_ms = 1;
+    assert!(store.record_hub_attempt_outcome(&old, &outcome).unwrap());
+    for i in 0..64 {
+        let request_key = format!("fresh-{i}");
+        let key = format!("residence.fresh-{i}");
+        let req = Request {
+            request_key: &request_key,
+            ..REQUEST
+        };
+        writer
+            .run(&req, &step(&key, 0, json!({"gen":1})), None, deadline())
+            .await
+            .unwrap();
+        assert!(store.hub_attempt(&request_key).unwrap().is_some());
+    }
+    assert!(
+        store.hub_attempt(REQUEST.request_key).unwrap().is_none(),
+        "settled writes did not schedule retention"
     );
 }
 
@@ -747,8 +825,11 @@ async fn hub_write_delete_settles_conditionally_without_deleting_newer_values() 
         let result = writer.run(&REQUEST, &delete, None, deadline()).await;
         if replacement {
             let error = result.unwrap_err();
-            assert_eq!(error.code, "hub_write_superseded");
-            assert_eq!(error.detail, Some(json!({"op_id":id,"revision":3})));
+            assert_eq!(error.code, "hub_write_unsettled");
+            assert_eq!(
+                error.detail,
+                Some(json!({"op_id":id,"reason":"kv_history_unavailable","revision":3}))
+            );
             assert!(f.hub.lock().unwrap().kv[&put.key].value.is_some());
         } else {
             assert_eq!(

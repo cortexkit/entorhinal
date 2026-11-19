@@ -56,9 +56,16 @@ fn consumer(role: &str) -> Option<&'static str> {
     }
 }
 
+// A suspended holder must not extend its acting window while other computers run.
+#[cfg(target_os = "linux")]
+const LEASE_CLOCK: rustix::time::ClockId = rustix::time::ClockId::Boottime;
+
+#[cfg(all(unix, not(target_os = "linux")))]
+const LEASE_CLOCK: rustix::time::ClockId = rustix::time::ClockId::Monotonic;
+
 #[cfg(unix)]
 pub(super) fn monotonic_ms() -> u64 {
-    let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    let now = rustix::time::clock_gettime(LEASE_CLOCK);
     (now.tv_sec as u64) * 1_000 + (now.tv_nsec as u64) / 1_000_000
 }
 
@@ -170,7 +177,7 @@ impl Leases {
         self.held.load(Ordering::Relaxed)
     }
 
-    fn now(&self) -> u64 {
+    pub(super) fn now(&self) -> u64 {
         (self.clock)()
     }
 
@@ -410,7 +417,6 @@ pub(super) fn accepts(
     // A first read or revision gap may expose a prior write from a computer
     // that has since been removed. It cannot replace a known predecessor.
     (writer_current || (historical && consecutive.is_none()))
-        && !replaced_removed
         && body.holder.as_deref().is_some_and(|holder| {
             box_id(holder)
                 && if holder == header.writer {
@@ -431,6 +437,7 @@ pub(super) struct Observation {
     pub record: Option<Record>,
     pub local_episode: Option<u64>,
     pub holder_current: bool,
+    pub holder_removed: bool,
 }
 
 impl Observation {
@@ -687,17 +694,18 @@ impl Leases {
                     ..View::default()
                 });
             }
-            if !current.ready {
+            if !current.ready || current.local_episode.is_none() {
                 last_seen = None;
                 if pending.as_ref().is_some_and(|op| op.step == ACQUIRE) {
                     pending = None;
                 }
             } else {
                 let preferred = backend.preferred(role)?;
-                let slot_free = current
-                    .record
-                    .as_ref()
-                    .is_none_or(|row| row.holder.is_none());
+                let slot_free = current.holder_removed
+                    || current
+                        .record
+                        .as_ref()
+                        .is_none_or(|row| row.holder.is_none());
                 let defer = preferred
                     .as_ref()
                     .filter(|p| slot_free && p.box_id != local);
