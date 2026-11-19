@@ -1667,6 +1667,7 @@ mod tests {
             "resolve_root_key",
             "preview_attach_root",
             "identity_log.status",
+            "fleet.epoch_current",
             "enumerate",
             "journal_tail",
             "trust",
