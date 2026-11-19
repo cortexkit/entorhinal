@@ -58,7 +58,7 @@ impl Fixture {
         *handler.store.lock().unwrap() = Some(store);
         for (key, principal) in [
             (DIRECT, Principal::Direct),
-            (CORE, reserved("prefrontal-core")),
+            (CORE, reserved(crate::WRITER_MODULE)),
             (PHONE, reserved("callosum")),
         ] {
             handler
@@ -119,35 +119,29 @@ async fn user_profile_route_admission_ignores_request_claims_and_forbids_flows()
         .await
         .unwrap();
     }
-    // The executive's renamed id reads the profile the same way.
-    let renamed = (703, 1);
-    f.handler.route_admissions().insert(
-        renamed,
-        RouteAdmission::from_bind(Some(reserved("prefrontal")), None),
-    );
-    f.call(renamed, GET, json!({})).await.unwrap();
     assert_eq!(f.count(), 0);
     let forbidden = (704, 1);
-    for principal in [None, Some(Principal::Unverified), Some(reserved("other"))] {
+    for principal in [
+        None,
+        Some(Principal::Unverified),
+        Some(reserved("other")),
+        Some(reserved("prefrontal-core")),
+    ] {
         f.handler
             .route_admissions()
             .insert(forbidden, RouteAdmission::from_bind(principal, None));
         for op in [GET, SET] {
             assert_eq!(
-                f.call(
-                    forbidden,
-                    op,
-                    json!({"principal":"reserved:prefrontal-core"})
-                )
-                .await
-                .unwrap_err(),
+                f.call(forbidden, op, json!({"principal":"reserved:prefrontal"}))
+                    .await
+                    .unwrap_err(),
                 "caller_forbidden"
             );
         }
     }
     for principal in [
         Principal::Direct,
-        reserved("prefrontal-core"),
+        reserved(crate::WRITER_MODULE),
         reserved("callosum"),
     ] {
         f.handler.route_admissions().insert(
@@ -279,7 +273,7 @@ async fn sample(f: &Fixture, name: &str, op: &str, request: Value) -> (String, V
         }
         _ => panic!("unexpected sample outcome"),
     };
-    let record = json!({"op":op,"request":request,"principal":{"kind":"reserved","moduleId":"prefrontal-core"},"reply":reply});
+    let record = json!({"op":op,"request":request,"principal":{"kind":"reserved","moduleId":crate::WRITER_MODULE},"reply":reply});
     let mut bytes = serde_json::to_vec_pretty(&record).unwrap();
     bytes.push(b'\n');
     (name.into(), bytes, decoded)
@@ -472,7 +466,7 @@ async fn user_profile_refuses_bad_shapes_keys_and_actor_values_before_confirmati
         set("name", json!("Mira"), ""),
         set("name", json!("Mira"), &"k".repeat(129)),
         set("name", json!("Mira"), "not\nprintable"),
-        json!({"field":"name","value":"Mira","request_key":"extra","principal":"reserved:prefrontal-core"}),
+        json!({"field":"name","value":"Mira","request_key":"extra","principal":"reserved:prefrontal"}),
     ] {
         assert_eq!(
             f.call(DIRECT, SET, request).await.unwrap_err(),
@@ -498,29 +492,17 @@ async fn user_profile_refuses_bad_shapes_keys_and_actor_values_before_confirmati
 #[tokio::test]
 async fn user_profile_time_zone_admission_and_exact_confirmation() {
     let f = Fixture::new(false);
-    for key in [CORE, PHONE] {
+    for (key, zone) in [(CORE, "Etc/GMT+3"), (PHONE, "UTC")] {
         let got = f
             .call(
                 key,
                 SET,
-                set("time_zone", json!("UTC"), &format!("relay-{}", key.0)),
+                set("time_zone", json!(zone), &format!("relay-{}", key.0)),
             )
             .await
             .unwrap();
-        assert_eq!(got["user"]["time_zone"], "UTC");
+        assert_eq!(got["user"]["time_zone"], zone);
     }
-    let renamed = (704, 1);
-    f.handler.route_admissions().insert(
-        renamed,
-        RouteAdmission::from_bind(Some(reserved("prefrontal")), None),
-    );
-    f.call(
-        renamed,
-        SET,
-        set("time_zone", json!("Etc/GMT+3"), "renamed"),
-    )
-    .await
-    .unwrap();
     assert_eq!(f.count(), 0);
     for (request, expected) in [
         (

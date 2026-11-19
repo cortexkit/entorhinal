@@ -1758,7 +1758,7 @@ pub(super) mod tests {
     async fn a_host_provider_other_than_the_executive_registers_as_host() {
         let f = Fixture::new("register-host", true);
         let agent = f.create("Hosted");
-        f.providers(provider("prefrontal-core"), provider("thalamus-harness"));
+        f.providers(provider("prefrontal"), provider("thalamus-harness"));
         f.bind(CALLER, Some(reserved("thalamus-harness")), false);
         let reply = result(
             f.register(CALLER, registration(&agent, "r1", "pi", "s1"))
@@ -1783,17 +1783,17 @@ pub(super) mod tests {
     async fn the_orchestrator_and_a_provider_of_both_register_as_orchestrator() {
         let f = Fixture::new("register-orchestrator", true);
         let agent = f.create("Worker");
-        f.providers(provider("prefrontal-core"), provider("thalamus-harness"));
+        f.providers(provider("prefrontal"), provider("thalamus-harness"));
         let reply = result(
             f.register(EXECUTIVE, registration(&agent, "r1", "pi", "s1"))
                 .await,
         );
         assert_eq!(reply["registered_by"], "orchestrator");
-        f.providers(provider("prefrontal-core"), provider("prefrontal-core"));
+        f.providers(provider("prefrontal"), provider("prefrontal"));
         f.handler
             .on_route_gone(&RouteHandle::detached(EXECUTIVE.0, EXECUTIVE.1))
             .await;
-        f.bind(EXECUTIVE, Some(reserved("prefrontal-core")), false);
+        f.bind(EXECUTIVE, Some(reserved("prefrontal")), false);
         let reply = result(
             f.register(EXECUTIVE, registration(&agent, "r2", "pi", "s2"))
                 .await,
@@ -1802,11 +1802,11 @@ pub(super) mod tests {
         // Being the sole provider of either capability alone is enough to
         // register: here the executive provides only the host capability and
         // is recorded as `host`.
-        f.providers(ProviderResolution::Unprovided, provider("prefrontal-core"));
+        f.providers(ProviderResolution::Unprovided, provider("prefrontal"));
         f.handler
             .on_route_gone(&RouteHandle::detached(EXECUTIVE.0, EXECUTIVE.1))
             .await;
-        f.bind(EXECUTIVE, Some(reserved("prefrontal-core")), false);
+        f.bind(EXECUTIVE, Some(reserved("prefrontal")), false);
         let reply = result(
             f.register(EXECUTIVE, registration(&agent, "r3", "pi", "s3"))
                 .await,
@@ -1823,7 +1823,7 @@ pub(super) mod tests {
         let agent = f.create("Unbound");
         let failures = [
             ProviderResolution::Unprovided,
-            ProviderResolution::Ambiguous(vec!["prefrontal-core".into(), "rogue".into()]),
+            ProviderResolution::Ambiguous(vec!["prefrontal".into(), "rogue".into()]),
             ProviderResolution::InvalidIdentifier,
             ProviderResolution::Transport("daemon gone".into()),
         ];
@@ -1863,7 +1863,7 @@ pub(super) mod tests {
         let f = Fixture::new("register-partial", true);
         let agent = f.create("Partial");
         f.providers(
-            ProviderResolution::Ambiguous(vec!["prefrontal-core".into(), "rogue".into()]),
+            ProviderResolution::Ambiguous(vec!["prefrontal".into(), "rogue".into()]),
             provider("thalamus-harness"),
         );
         f.bind(CALLER, Some(reserved("rogue")), false);
@@ -1915,7 +1915,7 @@ pub(super) mod tests {
             ),
             "orchestrator_unbound"
         );
-        f.providers(provider("prefrontal-core"), provider("thalamus-harness"));
+        f.providers(provider("prefrontal"), provider("thalamus-harness"));
         for principal in [
             Some(Principal::Direct),
             Some(reserved("aft")),
@@ -1942,7 +1942,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn registration_refuses_cutover_agent_ref_and_session_in_order() {
         let pre = Fixture::new("register-precutover", false);
-        pre.providers(provider("prefrontal-core"), ProviderResolution::Unprovided);
+        pre.providers(provider("prefrontal"), ProviderResolution::Unprovided);
         assert_eq!(
             code(
                 pre.register(EXECUTIVE, registration(UNKNOWN_AGENT, "r1", "pi", "s1"))
@@ -1952,7 +1952,7 @@ pub(super) mod tests {
         );
 
         let f = Fixture::new("register-order", true);
-        f.providers(provider("prefrontal-core"), ProviderResolution::Unprovided);
+        f.providers(provider("prefrontal"), ProviderResolution::Unprovided);
         let first = f.create("First");
         let second = f.create("Second");
         let retired = f.create("Retired");
@@ -1989,7 +1989,7 @@ pub(super) mod tests {
         );
         // The reference already belongs to another agent, whatever session
         // key is offered, and even once that session has ended.
-        f.resolver.set(HOST_CAPABILITY, provider("prefrontal-core"));
+        f.resolver.set(HOST_CAPABILITY, provider("prefrontal"));
         f.bus_sessions(&[]);
         for session_id in ["s1", "s9"] {
             let (code, detail) = refusal(
@@ -2028,7 +2028,7 @@ pub(super) mod tests {
     async fn re_registering_a_reference_updates_its_session_and_role() {
         let f = Fixture::new("register-again", true);
         let agent = f.create("Again");
-        f.providers(provider("prefrontal-core"), provider("thalamus-harness"));
+        f.providers(provider("prefrontal"), provider("thalamus-harness"));
         result(
             f.register(EXECUTIVE, registration(&agent, "r1", "pi", "s1"))
                 .await,
@@ -2062,7 +2062,7 @@ pub(super) mod tests {
     async fn the_sync_seam_refuses_registration_orchestrator_unbound() {
         let f = Fixture::new("register-sync", true);
         let agent = f.create("Seam");
-        f.providers(provider("prefrontal-core"), provider("thalamus-harness"));
+        f.providers(provider("prefrontal"), provider("thalamus-harness"));
         let params = registration(&agent, "r1", "pi", "s1");
         result(f.register(EXECUTIVE, params.clone()).await);
         let calls = f.resolver.calls();
@@ -2118,7 +2118,7 @@ pub(super) mod tests {
     async fn malformed_session_requests_are_invalid_request() {
         let f = Fixture::new("sessions-invalid", true);
         let agent = f.create("Shape");
-        f.providers(provider("prefrontal-core"), ProviderResolution::Unprovided);
+        f.providers(provider("prefrontal"), ProviderResolution::Unprovided);
         let long = |n: usize| "x".repeat(n);
         let mut bad_registrations = vec![
             json!({"agent_id":agent,"ref_kind":"pi","ref":"r1","harness":"pi"}),
@@ -2246,7 +2246,7 @@ pub(super) mod tests {
         let f = Fixture::new("for-session", true);
         let agent = f.create("Lookup");
         let other = f.create("Other Lookup");
-        f.providers(provider("prefrontal-core"), ProviderResolution::Unprovided);
+        f.providers(provider("prefrontal"), ProviderResolution::Unprovided);
         f.bind(CALLER, Some(reserved("anyone")), true);
         assert_eq!(
             code(f.sync(
@@ -2311,7 +2311,7 @@ pub(super) mod tests {
     async fn session_for_ref_returns_the_matching_binding_and_tracks_reregistration() {
         let f = Fixture::new("session-for-ref", true);
         let agent = f.create("ReverseLookup");
-        f.providers(provider("prefrontal-core"), ProviderResolution::Unprovided);
+        f.providers(provider("prefrontal"), ProviderResolution::Unprovided);
         assert_eq!(
             code(f.sync(
                 CALLER,
@@ -2389,7 +2389,7 @@ pub(super) mod tests {
     async fn session_for_ref_names_the_recorded_runner_and_omits_an_unrecorded_one() {
         let f = Fixture::new("session-for-ref-runner", true);
         let agent = f.create("RunnerLookup");
-        f.providers(provider("prefrontal-core"), ProviderResolution::Unprovided);
+        f.providers(provider("prefrontal"), ProviderResolution::Unprovided);
         let mut hosted = registration(&agent, "hosted", "broca", "s1");
         hosted["runner"] = json!("broca");
         result(f.register(EXECUTIVE, hosted).await);
@@ -2445,7 +2445,7 @@ pub(super) mod tests {
     async fn session_liveness_maps_every_state_in_request_order() {
         let f = Fixture::new("liveness-map", true);
         let agent = f.create("Live");
-        f.providers(provider("prefrontal-core"), provider("prefrontal-core"));
+        f.providers(provider("prefrontal"), provider("prefrontal"));
         for (session_ref, harness, session_id) in [
             ("active", "pi", "s-active"),
             ("idle", "pi", "s-idle"),
@@ -2520,7 +2520,7 @@ pub(super) mod tests {
     async fn registration_reuses_both_claimants_on_one_route() {
         let f = Fixture::new("register-cache", true);
         let agent = f.create("Cached");
-        f.providers(provider("prefrontal-core"), provider("prefrontal-core"));
+        f.providers(provider("prefrontal"), provider("prefrontal"));
         for (session_ref, session_id) in [("r1", "s1"), ("r2", "s2"), ("r3", "s3")] {
             let reply = result(
                 f.register(
@@ -2544,7 +2544,7 @@ pub(super) mod tests {
         let agent = f.create("Cached");
         f.providers(
             ProviderResolution::Transport("catalog unavailable".into()),
-            provider("prefrontal-core"),
+            provider("prefrontal"),
         );
         let reply = result(
             f.register(EXECUTIVE, registration(&agent, "r1", "pi", "s1"))
@@ -2564,7 +2564,7 @@ pub(super) mod tests {
             .clone();
         assert!(cache.host.is_none());
         assert!(cache.orchestrator.is_none());
-        f.providers(provider("prefrontal-core"), provider("prefrontal-core"));
+        f.providers(provider("prefrontal"), provider("prefrontal"));
         let reply = result(
             f.register(EXECUTIVE, registration(&agent, "r2", "pi", "s2"))
                 .await,
@@ -2586,7 +2586,7 @@ pub(super) mod tests {
             "orchestrator_unbound"
         );
         assert_eq!(f.resolver.calls(), 2);
-        f.providers(provider("prefrontal-core"), provider("thalamus-harness"));
+        f.providers(provider("prefrontal"), provider("thalamus-harness"));
         let reply = result(
             f.register(CALLER, registration(&agent, "r1", "pi", "s1"))
                 .await,
@@ -2743,7 +2743,7 @@ pub(super) mod tests {
     async fn provider_cache_fifty_routes_share_one_daemon_resolution() {
         let mut f = Fixture::new("process-provider-cache", false);
         f.resolver
-            .set(ORCHESTRATOR_CAPABILITY, provider("prefrontal-core"));
+            .set(ORCHESTRATOR_CAPABILITY, provider("prefrontal"));
         let gate = GateResolver::new(f.resolver.clone());
         let cache = Arc::new(CachedProviderResolver::new(gate.clone()));
         cache.invalidate(true);
@@ -2752,7 +2752,7 @@ pub(super) mod tests {
         let mut lookups = tokio::task::JoinSet::new();
         for route_id in 100..150 {
             let route = (route_id, 1);
-            f.bind(route, Some(reserved("prefrontal-core")), false);
+            f.bind(route, Some(reserved("prefrontal")), false);
             let f = f.clone();
             lookups.spawn(async move {
                 f.handler
@@ -2765,7 +2765,7 @@ pub(super) mod tests {
         assert_eq!(f.resolver.calls(), 1);
         gate.release.notify_one();
         while let Some(answer) = lookups.join_next().await {
-            assert_eq!(answer.unwrap(), provider("prefrontal-core"));
+            assert_eq!(answer.unwrap(), provider("prefrontal"));
         }
         assert_eq!(f.resolver.calls(), 1);
         assert_eq!(cache.cache_health().hits, 49);
@@ -2883,7 +2883,7 @@ pub(super) mod tests {
     async fn concurrent_session_write_first_use_shares_one_resolution() {
         let mut f = Fixture::new("session-cache-concurrent", false);
         f.resolver
-            .set(ORCHESTRATOR_CAPABILITY, provider("prefrontal-core"));
+            .set(ORCHESTRATOR_CAPABILITY, provider("prefrontal"));
         let gate = GateResolver::new(f.resolver.clone());
         f.handler.provider_resolver = gate.clone();
         let admission = f.handler.admission_for(EXECUTIVE);
@@ -2900,8 +2900,8 @@ pub(super) mod tests {
         let (first, second) = tokio::time::timeout(Duration::from_secs(1), both)
             .await
             .unwrap();
-        assert_eq!(first.orchestrator, provider("prefrontal-core"));
-        assert_eq!(second.orchestrator, provider("prefrontal-core"));
+        assert_eq!(first.orchestrator, provider("prefrontal"));
+        assert_eq!(second.orchestrator, provider("prefrontal"));
         assert_eq!(
             f.resolver.calls(),
             1,
@@ -2913,7 +2913,7 @@ pub(super) mod tests {
     async fn closing_a_route_during_resolution_cannot_repopulate_its_cache() {
         let mut f = Fixture::new("session-cache-inflight", false);
         f.resolver
-            .set(ORCHESTRATOR_CAPABILITY, provider("prefrontal-core"));
+            .set(ORCHESTRATOR_CAPABILITY, provider("prefrontal"));
         let gate = GateResolver::new(f.resolver.clone());
         f.handler.provider_resolver = gate.clone();
         let admission = f.handler.admission_for(EXECUTIVE);
@@ -2924,7 +2924,7 @@ pub(super) mod tests {
         f.handler
             .on_route_gone(&RouteHandle::detached(EXECUTIVE.0, EXECUTIVE.1))
             .await;
-        f.bind(EXECUTIVE, Some(reserved("prefrontal-core")), false);
+        f.bind(EXECUTIVE, Some(reserved("prefrontal")), false);
         gate.release.notify_one();
         assert_eq!(first.await.orchestrator, ProviderResolution::Unprovided);
         assert!(old.cached.lock().unwrap().orchestrator.is_none());
@@ -2941,7 +2941,7 @@ pub(super) mod tests {
                 .route_session_providers(END_SESSION, &admission)
                 .await
                 .orchestrator,
-            provider("prefrontal-core")
+            provider("prefrontal")
         );
         assert_eq!(f.resolver.calls(), 2);
     }
@@ -2950,7 +2950,7 @@ pub(super) mod tests {
     async fn session_write_resolution_timeout_is_not_cached() {
         let mut f = Fixture::new("session-cache-timeout", false);
         f.resolver
-            .set(ORCHESTRATOR_CAPABILITY, provider("prefrontal-core"));
+            .set(ORCHESTRATOR_CAPABILITY, provider("prefrontal"));
         let gate = GateResolver::new(f.resolver.clone());
         f.handler.provider_resolver = gate;
         let admission = f.handler.admission_for(EXECUTIVE);
@@ -2974,7 +2974,7 @@ pub(super) mod tests {
                 .route_session_providers(END_SESSION, &admission)
                 .await
                 .orchestrator,
-            provider("prefrontal-core")
+            provider("prefrontal")
         );
         assert_eq!(f.resolver.calls(), 2);
     }

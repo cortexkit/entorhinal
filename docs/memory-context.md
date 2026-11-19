@@ -26,7 +26,7 @@ spelling). No domain allowlist is imposed; third parties can supply names.
 Omission preserves an existing project's domain. Null means unset in storage.
 
 `project.set_domain {project_id, domain, request_key}` sets a domain or clears it
-with an explicit null. It is admitted from `reserved:prefrontal-core`, or Direct
+with an explicit null. It is admitted from `reserved:prefrontal`, or Direct
 after operator confirmation; all flow-scoped writes refuse. A domain changes the default
 memory behavior of every agent in its project, so a local shell cannot silently
 change it. Direct registration also prompts

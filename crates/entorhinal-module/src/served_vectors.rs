@@ -686,7 +686,7 @@ async fn agent_identity_pin_status_projection_roundtrips() {
     ));
     let store = fixture.handler.with_store(|s| Ok(s.clone())).unwrap();
     store
-        .with_principal("reserved:prefrontal-core")
+        .with_principal("reserved:prefrontal")
         .catalog_set_pins(
             entorhinal_core::catalog_agent::PinWriteRequest {
                 agent_id: ASSISTANT.into(),
@@ -1119,7 +1119,7 @@ async fn agent_resolve_records_match_published_file() {
         .unwrap()
         .as_mut()
         .unwrap()
-        .with_principal("reserved:prefrontal-core")
+        .with_principal("reserved:prefrontal")
         .agent_mutation_with_id(
             "agent.create",
             json!({"role":"hiree","name":"Neri","tag":"Research helper","project_id":"served-project","supervisor_agent_id":HEAD,"request_key":"resolve-hiree"}),
@@ -1175,7 +1175,7 @@ async fn agent_resolve_merged_records_match_published_file() {
         let writer = store
             .as_mut()
             .unwrap()
-            .with_principal("reserved:prefrontal-core");
+            .with_principal("reserved:prefrontal");
         // Fixed ids keep the records reproducible while real mutations enforce
         // name claims and write the merge's terminal state and journal entries.
         for (id, name) in [(MERGED, "Luma"), (SURVIVOR, "Sora")] {
@@ -4668,7 +4668,7 @@ const PINNED_SESSION_SAMPLES: [(&str, &str); 10] = [
     ),
     (
         "register-session.json",
-        "445d3a8fdf1671aeab797443d2041b5710281c22e9477679fb2eee03e9401f21",
+        "588c130a747d1fcbd4fac6d765ae09cac4ab15f8b54328e8562f64379dc90335",
     ),
     (
         "session-for-ref.json",
@@ -4696,11 +4696,11 @@ const PINNED_SESSION_SAMPLES: [(&str, &str); 10] = [
     ),
     (
         "end-session.json",
-        "efd3a0b6c6ac2463ec20e3be9ee26593ad3fd0a4a62c3457ad65f5e876ff6d18",
+        "7d03afb09ac7a666435b4f0e6d4c47ee5a9219ad0d222c7e7ff7eccad830aff1",
     ),
     (
         "register-session-runner.json",
-        "8ec0505594c6336a924595edf8af73304f1e2bd4d80f197b26b8e18628a4dca3",
+        "d339d3fb4f05b87b05a779be0a3898cc43f58a2f32ae45bfc7fa17216321745d",
     ),
 ];
 
@@ -5679,7 +5679,7 @@ async fn memory_context_v1_records_match_published_files() {
     ));
     let store = fixture.handler.with_store(|s| Ok(s.clone())).unwrap();
     store
-        .with_principal("reserved:prefrontal-core")
+        .with_principal("reserved:prefrontal")
         .catalog_set_pins(
             entorhinal_core::catalog_agent::PinWriteRequest {
                 agent_id: ASSISTANT.into(),

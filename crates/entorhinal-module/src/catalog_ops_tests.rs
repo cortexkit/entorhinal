@@ -98,7 +98,7 @@ async fn registry_direct_flow_decline_and_sync_guards() {
     let f = Fixture::new(Err(OperatorConfirmError::Declined));
     for principal in [
         None,
-        Some(reserved("prefrontal-core")),
+        Some(reserved("prefrontal")),
         Some(Principal::Unverified),
     ] {
         f.bind(principal, false);

@@ -987,7 +987,7 @@ impl JournalWriter<'_> {
     }
 
     /// Create a hire requested by a project head, subject to the project hire cap.
-    /// The operator, prefrontal-core relaying an operator's request, and journal
+    /// The operator, prefrontal relaying an operator's request, and journal
     /// replay use the identity mutation methods, which do not impose this limit.
     pub fn agents_hire(
         &self,

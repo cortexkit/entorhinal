@@ -6,7 +6,7 @@ a scratch store, fixed incarnation `0123456789abcdef` (the identifier for one
 module-process lifetime), fixed clock `700`, and
 made-up names, expertise, workspace and project ids. Setup registers two
 projects in `example-studio`; calls run sequentially as the
-`reserved:prefrontal-core` principal recorded for the route, without operator prompts.
+`reserved:prefrontal` principal recorded for the route, without operator prompts.
 
 Each JSON file contains `op`, `request`, `principal`, and `reply`. For successful
 calls, `reply.reply_bytes` is the exact UTF-8 handler response, including its

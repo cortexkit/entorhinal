@@ -243,7 +243,7 @@ async fn provider_admission_precedes_decode_and_never_prompts() {
         None,
         Some(reserved("plexus")),
         Some(reserved("callosum")),
-        Some(reserved("prefrontal-core")),
+        Some(reserved("prefrontal")),
         Some(Principal::Unverified),
     ] {
         f.bind(principal);
@@ -516,7 +516,7 @@ async fn audit_admission_is_operator_or_callosum_only_before_decode() {
         None,
         Some(Principal::Unverified),
         Some(reserved("cingulate")),
-        Some(reserved("prefrontal-core")),
+        Some(reserved("prefrontal")),
         Some(reserved("plexus")),
     ] {
         f.bind(principal);
@@ -624,7 +624,7 @@ async fn hire_cap_admission_validation_and_confirmation_guard_every_write() {
         Some(Principal::Unverified),
         Some(reserved("cingulate")),
         Some(reserved("callosum")),
-        Some(reserved("prefrontal-core")),
+        Some(reserved("prefrontal")),
     ] {
         f.bind(principal);
         assert_eq!(

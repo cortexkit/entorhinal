@@ -518,7 +518,7 @@ enabled, ready modules' `catalog-consumer` internal service. Each of the four ki
 capabilities above declares exactly that kind; no marker means no ownership of
 that kind. All declaring consumers of a needed kind must participate. Missing,
 unready or unroutable consumers refuse `consumer_unavailable` with the module named
-(skills require prefrontal-core when no skill consumer is declared).
+(skills require prefrontal when no skill consumer is declared).
 
 Alongside each kind capability (the `ck-catalog-consumer-<kind>/v1` declaration
 that claims a package kind), a consumer must declare in its manifest's
@@ -560,7 +560,7 @@ The composite consent card is the one approval request the operator sees for an
 install. It combines every participating consumer's card section into a single
 generic-consent request to Cingulate, the module that shows consent prompts to
 the operator: one fact per consumer, sorted by module id,
-with a human label such as `Skills (prefrontal-core)` and exactly the
+with a human label such as `Skills (prefrontal)` and exactly the
 consumer's section text. The exact `consent.request` method/params envelope is
 bounded to 1,310,720 bytes at prepare and again before requesting consent. An
 oversized card fails `card_too_large`, naming its consumers; nothing is truncated.
@@ -590,7 +590,7 @@ and token. No new consumer operation or ad hoc spelling conversion is introduced
 
 `catalog.agent_generation {agent_id}` and
 `catalog.ack_activation {agent_id, generation_id}` accept calls only from the
-`reserved:prefrontal-core` route, never from Direct or a flow-scoped route. The read returns
+`reserved:prefrontal` route, never from Direct or a flow-scoped route. The read returns
 `{active, ready}` with closure digests and `pin_digest`; ready includes only newer
 generations. Acknowledgement is idempotent and refuses a generation that is not
 ready or whose held status blocks activation. Both operations use local state

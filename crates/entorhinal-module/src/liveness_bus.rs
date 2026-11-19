@@ -19,14 +19,6 @@ use super::{HealthGauges, LivenessState, Ordering, ProjectsHandler, SessionKey};
 
 const MARKER: &str = "_reconciled";
 
-/// The executive's module ids, renamed id first. During the rename this
-/// module can open exactly one of the two buckets: the old one until ck-bus
-/// (the module that provisions buckets and issues bus logins) switches to the
-/// new names, then only the new one, and the old bucket is deleted. That
-/// switch revokes this module's login because its grants changed; the
-/// reconnect reopens the watch on the new bucket, so a frozen old bucket is
-/// never trusted after the rename.
-const BUCKET_OWNERS: [&str; 2] = ["prefrontal", "prefrontal-core"];
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
@@ -242,20 +234,13 @@ impl Source for BusSource {
         // Use the credentialed connection's inbox prefix and local JetStream;
         // the liveness bucket is on this machine, not a remote JetStream domain.
         let jetstream = async_nats::jetstream::new(client.connection().client());
-        let mut opened = Err(Failure::new("bucket", "no liveness bucket owner tried"));
-        for owner in BUCKET_OWNERS {
-            let bucket = names
-                .module_bucket_name(owner, "session-liveness")
-                .map_err(|e| Failure::new("bucket_name", e))?;
-            opened = jetstream
-                .get_key_value(bucket)
-                .await
-                .map_err(|e| Failure::new(format!("bucket:{:?}", e.kind()), e));
-            if opened.is_ok() {
-                break;
-            }
-        }
-        let kv = opened?;
+        let bucket = names
+            .module_bucket_name(super::WRITER_MODULE, "session-liveness")
+            .map_err(|e| Failure::new("bucket_name", e))?;
+        let kv = jetstream
+            .get_key_value(bucket)
+            .await
+            .map_err(|e| Failure::new(format!("bucket:{:?}", e.kind()), e))?;
         self.watch = Some(
             kv.watch_with_history(">")
                 .await

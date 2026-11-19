@@ -80,7 +80,7 @@ a bus outage never delays health or registry reads.
 Entorhinal writes the account-local `entorhinal.changes` KV bucket, whose
 physical name comes from `AccountNames::module_bucket_name("entorhinal", "changes")`.
 ck-bus provisions it with history 1, no TTL and a 512-byte value cap;
-prefrontal-core, Plexus and Magic Context have read access. The values are
+prefrontal, Plexus and Magic Context have read access. The values are
 revision hints only, never names, paths or rows. Watch a key, then re-read the
 owning operation for data.
 
@@ -129,7 +129,7 @@ Principals in the tables:
 | Name | Meaning |
 |---|---|
 | Direct | A local client such as `ck`. Every local process, including an agent's shell, connects as Direct. |
-| executive | `reserved:prefrontal-core`, the module that registers repositories and relays the operator's agent changes. |
+| executive | `reserved:prefrontal`, the module that registers repositories and relays the operator's agent changes. |
 | orchestrator, host | The daemon's sole provider of `agent-orchestrator/v1` or `agent-host/v1`, resolved per route. |
 | any | Every caller. |
 
@@ -227,7 +227,7 @@ Test: `projects_enumerate_control_op_matches_routed_enumerate`.
 
 | Operation | Kind | Who | What it does |
 |---|---|---|---|
-| `user.get` | query | Direct, `reserved:prefrontal-core`, `reserved:callosum` | Read the fleet profile, all scoped expertise, and optionally a project's effective expertise. |
+| `user.get` | query | Direct, `reserved:prefrontal`, `reserved:callosum` | Read the fleet profile, all scoped expertise, and optionally a project's effective expertise. |
 | `user.set` | mutate | Core and callosum without a prompt; Direct with operator confirmation | Set or clear one field, idempotently by request key. |
 
 Both operations refuse flows and all other principals with `caller_forbidden`;
@@ -425,8 +425,8 @@ a smaller package dependency set with fewer packages, checks or moves.
 | `permissions.revoke {id}` | mutate | Direct, `reserved:cingulate` | Revoke a grant without prompting. |
 | `agent.audit_list {since_ms?, limit?, cursor?}` | query | Direct, `reserved:callosum` | Page the local audit of agent tool writes. |
 | `agent.set_hire_cap {project_id, cap}` | mutate | Direct, with operator confirmation | Set this machine's hiring limit for a project. |
-| `catalog.agent_generation {agent_id}` | query | `reserved:prefrontal-core` only | Read the agent's active or degraded package generation and any newer ready ones, with exact pin digests, from local state. A generation is one installed set of the agent's pinned packages, where a pin fixes a package's exact version and digests. `ready` generations wait for core to activate them, `active` is the set in use, and `degraded` is an active set that hit an error such as a revoked pin. Optional `pinned_status` lists non-available pins; a degradation error identifies the revoked skill by name, version and reason. |
-| `catalog.ack_activation {agent_id, generation_id}` | mutate | `reserved:prefrontal-core` only | Idempotently activate a ready generation after core renders it. `activation_blocked` names a revoked/tombstoned pin; withdrawn pins remain usable. No network or consumer discovery. |
+| `catalog.agent_generation {agent_id}` | query | `reserved:prefrontal` only | Read the agent's active or degraded package generation and any newer ready ones, with exact pin digests, from local state. A generation is one installed set of the agent's pinned packages, where a pin fixes a package's exact version and digests. `ready` generations wait for core to activate them, `active` is the set in use, and `degraded` is an active set that hit an error such as a revoked pin. Optional `pinned_status` lists non-available pins; a degradation error identifies the revoked skill by name, version and reason. |
+| `catalog.ack_activation {agent_id, generation_id}` | mutate | `reserved:prefrontal` only | Idempotently activate a ready generation after core renders it. `activation_blocked` names a revoked/tombstoned pin; withdrawn pins remain usable. No network or consumer discovery. |
 
 Refusals: `permissions_operator_required`, `audit_operator_required`,
 `direct_caller_required`, `caller_forbidden`. These permission and catalog reads
@@ -464,7 +464,7 @@ stay on the computer that launched them and do not block a move.
 | `agent.session_for_harness {harness, session}` | query | any | Resolve a host session regardless of its runner, with exactly the same reply as `agent.session_for_runner`: `agent_id`, `runner` (null when unrecorded), `session`, `harness`, `ref_kind`, `ref`, `project_root`, `ended_at_ms`, `network`, `network_history` and `incarnation`, plus `heldOn` when data is on another machine. Requires a 1–32-byte harness and 1–256-byte session; unknown fields or malformed requests refuse `invalid_request`, and unknown sessions refuse `not_found`. |
 | `agent.for_session` | query | any | The agent and reference bound to a host session. |
 | `agent.session_for_ref` | query | any | The agent, host session and project root bound to a reference, with `runner` (the bare module id of the llm-runner hosting the session) only when the binding has one recorded; a binding without one omits the key rather than sending `null`. Re-registration must name a runner, including when the existing binding has none recorded. |
-| `agent.session_liveness` | query | any | `active`, `gone` or `unknown` for up to 256 references, in order, from the trusted `prefrontal-core.session-liveness` bus mirror; `unknown` while the watch is unavailable or unreconciled. See [session-liveness-contract.md](session-liveness-contract.md). |
+| `agent.session_liveness` | query | any | `active`, `gone` or `unknown` for up to 256 references, in order, from the trusted `prefrontal.session-liveness` bus mirror; `unknown` while the watch is unavailable or unreconciled. See [session-liveness-contract.md](session-liveness-contract.md). |
 | `agent.where` | query | any | Which machine holds an agent, from the cached claim, plus any blocked move's participant and ref explanation. |
 | `agent.where_many` | query | any | Cached claim results for 1–64 agent ids in request order; unknown agents are omitted. |
 | `node.self {}` | query | any | This machine's identity-log identity: `{author: string or null, display_name: string or null, box_id?: string, sharing: "disabled" or "enabling" or "joining" or "enabled"}` inside the usual `{result: ...}` envelope. Unknown params refuse `invalid_request`. |

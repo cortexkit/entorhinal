@@ -3,7 +3,7 @@
 These records come from entorhinal's real `ProjectsHandler`, through admitted
 routes and the serving request path. Project/workspace registration and the
 `agent.import` cutover are real handler requests; import runs with
-`Reserved(prefrontal-core)`. Reads run with `Reserved(phone)` (recorded as
+`Reserved(prefrontal)`. Reads run with `Reserved(phone)` (recorded as
 `{"kind":"reserved","moduleId":"phone"}`). The fixture binds this synthetic
 reader identity to exercise handler admission and dispatch. A deployed phone
 peer still needs permission from the SUBC router to call these operations;
@@ -45,7 +45,7 @@ detail was supplied).
     `merged_into: null`, and `gone: null`.
   Both agents are created with invented names and fixed ids through the store's
   real `agent.create` mutation, then merged through its real `agent.merge`
-  mutation, all as `reserved:prefrontal-core`. Reads go through the handler as
+  mutation, all as `reserved:prefrontal`. Reads go through the handler as
   `Reserved(phone)`. No terminal state is seeded with SQL. The separate file
   leaves the previously published `agent-resolve.json` bytes and checksum intact.
 - **`fleet-identity.json`**: a full `{}` read, the unchanged read using its

@@ -2,7 +2,7 @@
   "op": "user.get",
   "principal": {
     "kind": "reserved",
-    "moduleId": "prefrontal-core"
+    "moduleId": "prefrontal"
   },
   "reply": {
     "outcome": "response",

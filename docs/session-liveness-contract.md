@@ -5,7 +5,7 @@ how it answers others. Two operations and a bus bucket take part:
 
 - `agent.register_session` binds an agent's session reference to the host
   session running it.
-- `prefrontal-core.session-liveness` is the bus bucket entorhinal watches for
+- `prefrontal.session-liveness` is the bus bucket entorhinal watches for
   session states.
 - `agent.session_liveness` answers `active`, `gone` or `unknown` for session
   references.
@@ -77,7 +77,7 @@ Tests: `a_host_provider_other_than_the_executive_registers_as_host`,
 ## 3. The bucket
 
 Entorhinal uses its credentialed bus connection to watch the local
-`prefrontal-core.session-liveness` KV bucket in stream order, with history and
+`prefrontal.session-liveness` KV bucket in stream order, with history and
 tombstones. It never polls a session host.
 
 1. **Keys and values.** A session key is written as

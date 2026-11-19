@@ -3,7 +3,7 @@
 `records.json` contains ten sequential examples produced by the real
 `ProjectsHandler::handle_served_request`; blob reads use a daemon-stamped caller
 (`phone`) declared as a skill catalog consumer, while generation operations are
-admitted as `reserved:prefrontal-core` without a flow scope. `SHA256SUMS` covers
+admitted as `reserved:prefrontal` without a flow scope. `SHA256SUMS` covers
 this README and `records.json`.
 
 Each record has exactly:

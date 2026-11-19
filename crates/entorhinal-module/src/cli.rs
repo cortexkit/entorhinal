@@ -4086,7 +4086,7 @@ mod agent_tests {
             self.handler.with_store(|store| Ok(store.clone())).unwrap()
         }
         fn core_create(&self) -> String {
-            let bytes = self.store().with_principal("reserved:prefrontal-core").agent_mutation_with_id("agent.create", json!({"name":"Ada","role":"assistant","tag":"helper","request_key":"core-create"}), 700, Some(ID)).unwrap();
+            let bytes = self.store().with_principal("reserved:prefrontal").agent_mutation_with_id("agent.create", json!({"name":"Ada","role":"assistant","tag":"helper","request_key":"core-create"}), 700, Some(ID)).unwrap();
             let value: Value = serde_json::from_slice(&bytes).unwrap();
             value["result"]["agent"]["agent_id"]
                 .as_str()

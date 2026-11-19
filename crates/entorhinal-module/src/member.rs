@@ -90,7 +90,7 @@ mod tests {
             (
                 None,
                 Some(Principal::Reserved {
-                    module_id: "prefrontal-core".into(),
+                    module_id: "prefrontal".into(),
                 }),
                 "disabled",
                 json!({}),

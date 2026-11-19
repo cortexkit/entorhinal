@@ -71,10 +71,14 @@ impl Report {
             ),
             HandlerOutcome::Streamed => (json!({"unexpected_streamed_reply": true}), vec![]),
         };
-        self.local(name, json!({
-            "principal": if principal == DIRECT { "Direct" } else { "Reserved(prefrontal-core)" },
-            "body": request,
-        }), reply.clone());
+        self.local(
+            name,
+            json!({
+                "principal": if principal == DIRECT { "Direct" } else { "Reserved(prefrontal)" },
+                "body": request,
+            }),
+            reply.clone(),
+        );
         if !bytes.is_empty() {
             self.steps.last_mut().unwrap().reply["wire_utf8"] = json!(std::str::from_utf8(&bytes)?);
         }
@@ -365,7 +369,7 @@ async fn rehearse(report: &mut Report) -> RehearsalResult<()> {
         .await?;
     report.refusal(&direct, "direct_identity_write_not_admitted");
     unchanged(report, &a, g0).await?;
-    let params = json!({"snapshot_path": snapshot_copy, "actor": "prefrontal-core", "request_key": "cut-rehearsal-import"});
+    let params = json!({"snapshot_path": snapshot_copy, "actor": "prefrontal", "request_key": "cut-rehearsal-import"});
     let (imported, bytes) = report
         .call(
             &a,

@@ -588,7 +588,7 @@ async fn catalog_flow_prepare_install_generation_ack_and_blocking_status() {
             .find(|c| c.method == "consent.request")
             .unwrap()
             .params;
-        assert_eq!(card["facts"][0]["label"], "Flows (prefrontal-core)");
+        assert_eq!(card["facts"][0]["label"], "Flows (prefrontal)");
         assert_eq!(card["facts"][0]["value"], "Verified flow section");
         let read = result(
             f.op(
@@ -827,7 +827,7 @@ async fn catalog_prepare_install_card_pins_ready_ack_active() {
         .unwrap()
         .params;
     assert_eq!(card["facts"][0]["value"], "Verified skill section");
-    assert_eq!(card["facts"][0]["label"], "Skills (prefrontal-core)");
+    assert_eq!(card["facts"][0]["label"], "Skills (prefrontal)");
     assert_eq!(
         f.store().catalog_pins(&f.tools.agents[0]).unwrap()[0].archive_sha256,
         plan["closure"][0]["archive_sha256"]
@@ -1378,9 +1378,8 @@ async fn catalog_prepare_idempotence_validation_and_admission() {
     for principal in [
         subc_protocol::Principal::Direct,
         subc_protocol::Principal::Unverified,
-        // "prefrontal" is the executive's renamed id and is admitted; a near
-        // miss of either id is not.
-        crate::tests::reserved("prefrontal-core-x"),
+        crate::tests::reserved("prefrontal-core"),
+        crate::tests::reserved("prefrontal-x"),
         crate::tests::reserved("basal-ganglia"),
     ] {
         for op in [AGENT_GENERATION, ACK_ACTIVATION] {

@@ -17,7 +17,7 @@ It owns:
 
 All traffic goes through daemon routes; entorhinal opens no network ports. The only network traffic it starts itself is HTTPS to package registries.
 
-- **prefrontal-core (the executive)** registers repositories, relays agent identity changes, reads `agent.changes` into its replica, registers and ends sessions as the `agent-orchestrator/v1` provider, and writes the session-liveness bus bucket entorhinal watches.
+- **prefrontal (the executive)** registers repositories, relays agent identity changes, reads `agent.changes` into its replica, registers and ends sessions as the `agent-orchestrator/v1` provider, and writes the session-liveness bus bucket entorhinal watches.
 - **Any module** reads project and agent identity. Magic Context keys memories on project ids and reads `context.*`; Plexus reads role claims; the apps read fleet identity and locations through Callosum.
 - **The NATS hub** hosts `HUB_IDLOG` and `KV_residence`. Envelopes are signed using the vault and sealed under the fleet epoch key. Readers verify records before applying them locally.
 - **engram** hosts the legacy log and claim records before the switch (`agent-sync`: `identity_log.*`, `record.*`). Its session door still carries move data (`session-door`: `cut.*`), separate from move coordination on the hub.
@@ -76,18 +76,18 @@ Package files live outside SQLite, in a content-addressed folder beside the stor
 | Operation | Admitted from |
 |---|---|
 | Identity, project, session, location and context reads | any principal |
-| Project and workspace writes | `Direct` (the `ck` commands) or `reserved:prefrontal-core` |
-| Agent identity writes | `reserved:prefrontal-core`, or `Direct` after an operator presence prompt |
+| Project and workspace writes | `Direct` (the `ck` commands) or `reserved:prefrontal` |
+| Agent identity writes | `reserved:prefrontal`, or `Direct` after an operator presence prompt |
 | Operator-only writes (enabling sharing, store adoption, splitting a root, registry and publisher trust, publishing, seeding, role takes, hire caps) | `Direct`, most after a presence prompt |
 | `agent.move` | `Direct` after a presence prompt, the `agent-orchestrator/v1` provider (which relays moves the operator starts from the phone, with no prompt here), or `reserved:engram` for a lid-close move when the operator turned those on |
 | `agent.register_session` | the provider of `agent-orchestrator/v1` or `agent-host/v1`, resolved from the daemon per route and cached |
 | `agent.end_session`, `agent.set_session_network` | the provider of `agent-orchestrator/v1` |
-| `user.get` | `reserved:prefrontal-core`, `reserved:callosum` or `Direct` |
-| `user.set` | `reserved:prefrontal-core`, `reserved:callosum`, or `Direct` after a presence prompt |
+| `user.get` | `reserved:prefrontal`, `reserved:callosum` or `Direct` |
+| `user.set` | `reserved:prefrontal`, `reserved:callosum`, or `Direct` after a presence prompt |
 | `permissions.list`, `permissions.revoke` | `Direct` or `reserved:cingulate` |
 | `agent.audit_list` | `Direct` or `reserved:callosum` |
 | `catalog.read_blob` | a module that declares a catalog consumer capability |
-| `catalog.agent_generation`, `catalog.ack_activation` | `reserved:prefrontal-core` |
+| `catalog.agent_generation`, `catalog.ack_activation` | `reserved:prefrontal` |
 | Agent tools | the agent the route's scope stamp attests, with that agent's role |
 
 A route opened under a flow's scope refuses every write (`flow_scope_not_admitted`). These checks keep modules from changing the registry by mistake. They are not a security boundary against the operator's own processes, which can connect as `Direct` or open the store file.
@@ -115,7 +115,7 @@ All start after HELLO_ACK. Each holds the store weakly and takes a handle only f
 - **Hub log and KV**: tail `HUB_IDLOG` and watch `KV_residence`. Reconnects re-establish the streams and reconcile the local view before serving fresh claims. The only periodic hub requests during healthy idle operation are renewals for held role leases, each a CAS preceded by a fleet epoch read.
 - **Legacy sharing** (`catch_up.rs`, `claims.rs`, `roles.rs`): before `hub_ready`, catch-up and role refresh run every 30 s; claim refresh runs on startup, reconnect, registry changes and explicit refresh, with catch-up ticks retrying failures. None of these engram reads runs after cutover.
 - **Move driver** (`move_driver.rs`): drives open moves and releases finished cuts. It polls the engram inbox every 30 s only before cutover; afterward hub KV delivers new move records.
-- **Session liveness** (`liveness_bus.rs`): watches `prefrontal-core.session-liveness`, replays its rows and reconciliation marker, and clears and retries the mirror after an outage.
+- **Session liveness** (`liveness_bus.rs`): watches `prefrontal.session-liveness`, replays its rows and reconciliation marker, and clears and retries the mirror after an outage.
 - **Session upkeep** (`session_upkeep.rs`): writes end times from observed authoritative bucket deletes and prunes bindings that ended more than 30 days ago.
 - **Catalog status poll** (`catalog_poll.rs`): refreshes package status for the registry scopes agents' pins use, at startup and then hourly at a stored random offset, backing off up to 6 h after failures. Live flows requiring capabilities also refresh every ten minutes, retry failures after one minute (doubling to ten), and become stale after fifteen minutes without confirmation.
 - **Starter bundle seed** (`catalog_seed.rs`): seeds the content store once if a starter bundle is present and the store is empty.
@@ -127,7 +127,7 @@ All start after HELLO_ACK. Each holds the store weakly and takes a handle only f
 2. **Never hold the database across a network call, or on an async worker thread.** Database work that may wait for the writer runs on the blocking pool with a deadline shorter than the caller's timeout. Holding a store handle across an engram call kept SQLite files open on Windows, and running writes on async threads once starved every reader and the health check until the daemon restarted the module.
 3. **The journal is the truth for derived tables.** Anything `rebuild` would reproduce is written through a journal row carrying the exact values. Even a machine-local change that clears derived state is recorded as a journal op (`store.adopt`), so the journal alone still reproduces every derived table.
 4. **Paths and authority never travel.** Only the shared tables go to the identity log. Root paths, approvals, standing grants, hire caps and catalog trust stay on their machine, and nothing received from another machine authorizes a write here.
-5. **Core decodes strictly.** prefrontal-core refuses an unknown identity op in `agent.changes` and an unknown `via` on `resolve`. Before entorhinal emits a new value core reads, core must already accept it, tested against a sample entorhinal publishes under `test-vectors/`. Release 0.1.28 broke every worker launch by emitting `via: "worktree"` too early.
+5. **Core decodes strictly.** prefrontal refuses an unknown identity op in `agent.changes` and an unknown `via` on `resolve`. Before entorhinal emits a new value core reads, core must already accept it, tested against a sample entorhinal publishes under `test-vectors/`. Release 0.1.28 broke every worker launch by emitting `via: "worktree"` too early.
 6. **`Direct` is not the operator.** Every local process connects as `Direct`, agent shells included. Agent identity writes, profile writes and operator-only actions from `Direct` therefore need a presence prompt, and refuse `operator_presence_unavailable` where none exists (Linux).
 7. **A store from another machine is read-only.** The store records the daemon's machine id at first start. A store restored onto a different machine refuses every write (`store_from_another_machine`) and starts no background task acting as this machine until the operator adopts it with `ck projects adopt-store`.
 8. **Identity is not residence.** The identity log does not grant residence. Agent residence comes from its verified claim; role possession also needs a live lease notice. With sharing `disabled`, every live agent reads as unclaimed at epoch 0.

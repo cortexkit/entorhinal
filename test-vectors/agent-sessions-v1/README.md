@@ -6,9 +6,9 @@ the handler, including the `result` envelope; refusals contain the handler's
 `code`, `message`, and `detail` (`null` when no detail was supplied). Each
 `request` is the complete request frame `{method, params}`, not just its params.
 The recorded `principal` is the module ID stamped on the request route; it is not
-a capability name. The fixture's fake daemon catalog lists `prefrontal-core` as
+a capability name. The fixture's fake daemon catalog lists `prefrontal` as
 the provider of both `agent-host/v1` and `agent-orchestrator/v1`, and the
-registration route carries principal `prefrontal-core`. Admission compares the
+registration route carries principal `prefrontal`. Admission compares the
 caller principal with whichever module the catalog lists for either role; it
 does not compare against a fixed module name. Since one module provides both
 roles here, it is admitted as the orchestrator. Read calls use the reserved
@@ -299,34 +299,34 @@ a backfill makes the data local.
 | File | SHA-256 |
 | --- | --- |
 | `for-session.json` | `dd41914934a9b85b35670a815bef17de84752d8da7d05a1bf8833f3edbd1996b` |
-| `register-session.json` | `445d3a8fdf1671aeab797443d2041b5710281c22e9477679fb2eee03e9401f21` |
+| `register-session.json` | `588c130a747d1fcbd4fac6d765ae09cac4ab15f8b54328e8562f64379dc90335` |
 | `session-for-ref.json` | `3e9e99950c167a2b2c5b3315fca35d353f50bc29e8ad93afe616c15e7cb703f6` |
 | `where.json` | `faacea127dcaaa7181329562e4de553851aebf700358b3267864e894166b911e` |
 | `where-many.json` | `422b8592c531c3c22e161b7a926f3ac61df6155fca2a9660bb159b1a0054d565` |
 | `where-moving-receiver.json` | `cd7a4e475915787cf1a1680a05ad4421b3da19fe90a0a106c3b878b71064b9a6` |
 | `where-moving-source.json` | `87e6cf886a685406c0f7b51c9e372f2ac781a138372ea19ea926a0095df75bb1` |
 | `where-sharing-off.json` | `0b8fe82664439e2eb38e0816f900c08f7822bdfe29373a77579cfbbd080c6b63` |
-| `end-session.json` | `efd3a0b6c6ac2463ec20e3be9ee26593ad3fd0a4a62c3457ad65f5e876ff6d18` |
-| `register-session-runner.json` | `8ec0505594c6336a924595edf8af73304f1e2bd4d80f197b26b8e18628a4dca3` |
+| `end-session.json` | `7d03afb09ac7a666435b4f0e6d4c47ee5a9219ad0d222c7e7ff7eccad830aff1` |
+| `register-session-runner.json` | `d339d3fb4f05b87b05a779be0a3898cc43f58a2f32ae45bfc7fa17216321745d` |
 | `session-for-runner.json` | `b62878e6c91d98cc81ff0f993205edd4a88b5eaf49d649bab81feca02696203e` |
 | `sessions.json` | `e9b77127661e0352b508d923c5cd2e718c0b14c63662b8b2cb8e2f8b872f79e1` |
-| `set-session-network.json` | `d6bdd5717154e0c6b5d6675b9f6f03580be9e8cb41c2cf8ae5cd2925ffe831f9` |
-| `register-session-rekey.json` | `c3e7e23bcfe25718cccd77725774554d1032cb5cc2502bee27ac19aae2b09767` |
-| `sessions-held-on.json` | `ce3ab0bb16f03a0f7aa605805234c80b42e3f92b2d0e384dd15ac8a7e2af9caa` |
+| `set-session-network.json` | `f2e4ff6c3739bb925ea2dde0500b81ebd2037dba1854f08a36af6eb1b4a40274` |
+| `register-session-rekey.json` | `f6e3f17df91604b9d5fabbe41892552d66ea3a099dc299ad70bb159e8fd629ff` |
+| `sessions-held-on.json` | `12d112208ca459bd80dab2f1956a8ad1a4661e7d8f4210a64c6733199b8c5329` |
 | `sessions-open.json` | `01d785e934526b457d9f958ac94d8a0829526729e0f418e114ea8faab3a86af7` |
 | `session-lookup-cases.json` | `5e2a306b6a05bd4ab1c922c0c57541d16e3fb33c2c403a797fe5a34edb774107` |
-| `sessions-head-runners.json` | `d800ab54312a41b8de31b63f3909d1018a58922d5bb113a45807e76988b1eb1b` |
+| `sessions-head-runners.json` | `456de5746366ed03ada08c35716f042393fe5e3cac00a018db10687a6f72f99e` |
 | `node-self.json` | `bda136c8fd751a28a70d452f8cf4b48bf1700774fc5eeffde8abe39d96b38e08` |
 | `sessions-watch.json` | `980cd6b43063981601f7b7e325d9108f120aa8e075df67355a2d1b93efb0af1e` |
-| `register-session-head.json` | `ddeb70078b3404ab8d5f06c90a301fcc474ab4ff8fcedf508b16bfdecc3adf7c` |
-| `register-session-missing-runner.json` | `0743fc894172825942eebecea6d6d23625458caf82ef0f4ef2b4dfbc03b90e16` |
+| `register-session-head.json` | `38d4b5ac7070f44856422f535fb4ace19c7fe00c9d68c607d71db5a6b907a52f` |
+| `register-session-missing-runner.json` | `7267f45c056a0f4943d7a7f4008782b75d151095ecc8e2f046ed0714b6554d29` |
 | `where-box-unknown.json` | `ee3a137255a9521646bee703d734ad81e5a0c6972f6bfb493132087856a07b22` |
 | `where-holder-box.json` | `42ee303abd2a271d4f8ec5609ec73c401f5fdc3b389e2d1fd5115affef03c74a` |
 | `where-many-holder-box.json` | `1ade6493e2aa6ee6fec5cba2f616e8182ac030d874e807736cebf384af266759` |
 | `node-self-box.json` | `00bcf6099d11a10ce63c551c24cd49f6dfc536d1dd3169d9a4500f0605894efd` |
-| `register-session-delegated.json` | `39b69f33fb77b2b121ac0cf6033eae24aca28738aab90683e2e89618d856f345` |
+| `register-session-delegated.json` | `515608c3f46f5a8ac20a9dca47e7cd9d79cc13c43d2459434694b41bccf6660e` |
 | `sessions-delegated.json` | `b210b3e6b3e0530cf0cb0cf8be597a2ea76ef72dea342a7de3d294abb2511c16` |
-| `register-session-unknown-role.json` | `0fa48df18d199c86dd771ab81cad438d032900f8bcb2b93ec40fc6b2553e3721` |
+| `register-session-unknown-role.json` | `f238eded045694910731007b61e3af2842b244be9fc3b166e26725b9092f00ee` |
 
 ## Reproduce and verify
 
@@ -362,7 +362,7 @@ python3 - <<'PY'
 import hashlib
 from pathlib import Path
 root = Path('test-vectors/agent-sessions-v1')
-names = ['for-session.json', 'register-session.json', 'session-for-ref.json', 'where.json', 'where-many.json', 'where-moving-receiver.json', 'where-moving-source.json', 'where-sharing-off.json', 'end-session.json', 'register-session-runner.json', 'session-for-runner.json', 'sessions.json', 'set-session-network.json', 'register-session-rekey.json', 'sessions-held-on.json', 'sessions-open.json', 'session-lookup-cases.json', 'sessions-head-runners.json', 'session-for-harness.json', 'node-self.json', 'sessions-watch.json', 'register-session-head.json', 'register-session-missing-runner.json', 'where-box-unknown.json', 'where-holder-box.json', 'where-many-holder-box.json', 'node-self-box.json', 'register-session-delegated.json', 'sessions-delegated.json', 'register-session-unknown-role.json']
+names = ['for-session.json', 'register-session.json', 'session-for-ref.json', 'where.json', 'where-many.json', 'where-moving-receiver.json', 'where-moving-source.json', 'where-sharing-off.json', 'end-session.json', 'register-session-runner.json', 'session-for-runner.json', 'sessions.json', 'set-session-network.json', 'register-session-rekey.json', 'sessions-held-on.json', 'sessions-open.json', 'session-lookup-cases.json', 'sessions-head-runners.json', 'session-for-harness.json', 'node-self.json', 'sessions-watch.json', 'register-session-head.json', 'register-session-missing-runner.json', 'where-box-unknown.json', 'where-holder-box.json', 'where-many-holder-box.json', 'node-self-box.json', 'register-session-delegated.json', 'sessions-delegated.json', 'register-session-unknown-role.json', 'where-hub.json', 'where-many-hub.json']
 root.joinpath('SHA256SUMS').write_text(''.join(
     f'{hashlib.sha256(root.joinpath(name).read_bytes()).hexdigest()}  {name}\n'
     for name in names), encoding='utf-8')
@@ -419,7 +419,6 @@ ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked served
 
 Run the same command without `ENTO_WRITE_SERVED_VECTORS=1` to compare the
 handler's bytes against the published file. Its checksum is appended to
-`SHA256SUMS`; when using the refresh script above, append
-`'session-for-harness.json'` to `names` so the new entry is retained.
+`SHA256SUMS` and included in the refresh script above.
 
 SHA-256: `32ec4b73a8571b8d534b76c4858d4d0190063c8343fe5aea5f2630e50a2c9544`.

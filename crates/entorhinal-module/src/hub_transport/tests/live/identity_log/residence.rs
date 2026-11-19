@@ -315,7 +315,7 @@ async fn hub_residence_create_restarts_pending_and_preserves_session_precedence(
     bind(
         &rig.a.handler,
         subc_protocol::Principal::Reserved {
-            module_id: "prefrontal-core".into(),
+            module_id: "prefrontal".into(),
         },
     );
     rig.a.leaf.refuse_kv.store(true, Ordering::Release);
@@ -374,7 +374,7 @@ async fn hub_residence_create_restarts_pending_and_preserves_session_precedence(
     bind(
         &rig.a.handler,
         subc_protocol::Principal::Reserved {
-            module_id: "prefrontal-core".into(),
+            module_id: "prefrontal".into(),
         },
     );
     let replay = result(
@@ -423,7 +423,7 @@ async fn hub_residence_forced_take_removed_and_engram_holders() {
     bind(
         &rig.b.handler,
         subc_protocol::Principal::Reserved {
-            module_id: "prefrontal-core".into(),
+            module_id: "prefrontal".into(),
         },
     );
     assert_eq!(
