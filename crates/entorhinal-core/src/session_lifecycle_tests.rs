@@ -1221,5 +1221,12 @@ fn retention_prune_reads_the_ended_binding_index_after_migration() {
             .unwrap(),
         1
     );
-    assert_eq!(store.agent_sessions(AGENT, None, 100).unwrap().sessions.len(), 1);
+    assert_eq!(
+        store
+            .agent_sessions(AGENT, None, 100)
+            .unwrap()
+            .sessions
+            .len(),
+        1
+    );
 }

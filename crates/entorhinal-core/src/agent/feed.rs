@@ -67,9 +67,7 @@ impl RegistryStore {
     /// Newest identity entry the changes feed can serve, excluding project-only
     /// journal writes that advance the feed's scan cursor but carry no identity.
     pub fn agent_change_generation(&self) -> Result<i64, AgentMutationError> {
-        self.read_agent(|conn| {
-            Ok(conn.query_row(&change_generation_sql(), [], |row| row.get(0))?)
-        })
+        self.read_agent(|conn| Ok(conn.query_row(&change_generation_sql(), [], |row| row.get(0))?))
     }
 
     /// Read all rows, all claim history and the journal head in one transaction.

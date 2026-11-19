@@ -894,7 +894,10 @@ async fn catalog_install_card_wait_holds_no_store_handle() {
     drop(f.tools.handler.store.lock().unwrap().take());
     let reopened = RegistryStore::open(&f.tools.descriptor)
         .expect("a pending consent card must not hold the store open");
-    assert!(reopened.catalog_pins(&f.tools.agents[0]).unwrap().is_empty());
+    assert!(reopened
+        .catalog_pins(&f.tools.agents[0])
+        .unwrap()
+        .is_empty());
     drop(reopened);
     drop(install);
     assert_eq!(f.cingulate.card_count(), 1);

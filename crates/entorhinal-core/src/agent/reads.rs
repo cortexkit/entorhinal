@@ -1058,7 +1058,12 @@ pub(super) mod tests {
                     let id = agent["agent_id"].as_str().unwrap();
                     let row = f.store.agent_row(id).unwrap().unwrap();
                     if row.supervisor_agent_id.as_deref() == Some(head.as_str()) {
-                        expected.push((agent.clone(), id.to_owned(), cursor.clone(), next.is_some()));
+                        expected.push((
+                            agent.clone(),
+                            id.to_owned(),
+                            cursor.clone(),
+                            next.is_some(),
+                        ));
                     }
                 }
                 cursor = next;
