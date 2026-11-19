@@ -7,6 +7,7 @@ use std::{
 use cortexkit_agent_identity as aid;
 use cortexkit_project_identity as pid;
 use entorhinal_core::{
+    agent::{avatar_fingerprint, AgentAvatar},
     claim_cache::{CachedClaim, ClaimObservation},
     move_store::{AgentMove, MoveSide, MoveStep},
     RegistryStore,
@@ -416,7 +417,7 @@ fn assert_avatar_reply(actual: &Value, expected: &Value) {
     assert_eq!(actual["incarnation"], INCARNATION);
     assert_eq!(
         actual["avatars"], expected["avatars"],
-        "avatar triples differ"
+        "avatar entries differ"
     );
 }
 
@@ -1038,11 +1039,13 @@ async fn served_records_match_published_files() {
     let (all_record, all) = fixture
         .record("agent.avatar_read", json!({"agentIds":[HEAD,ASSISTANT]}))
         .await;
+    let head_fingerprint = &agents[0]["avatar"]["fingerprint"];
+    let assistant_fingerprint = &agents[1]["avatar"]["fingerprint"];
     assert_avatar_reply(
         &all["result"],
         &json!({"avatars":[
-            {"agentId":HEAD,"genome":"a".repeat(2048),"type":"creature.classic","version":2},
-            {"agentId":ASSISTANT,"genome":"b".repeat(2048),"type":"creature.classic"}
+            {"agentId":HEAD,"genome":"a".repeat(2048),"type":"creature.classic","version":2,"fingerprint":head_fingerprint},
+            {"agentId":ASSISTANT,"genome":"b".repeat(2048),"type":"creature.classic","fingerprint":assistant_fingerprint}
         ]}),
     );
     let (mixed_record, mixed) = fixture
@@ -1053,13 +1056,18 @@ async fn served_records_match_published_files() {
         .await;
     // Avatar reads preserve duplicates and also serve stored terminal avatars;
     // fleet identity, in contrast, lists only live agents.
+    let retired_fingerprint = avatar_fingerprint(&AgentAvatar {
+        genome: "c".repeat(2048),
+        avatar_type: Some("creature.classic".into()),
+        version: Some(1),
+    });
     assert_avatar_reply(
         &mixed["result"],
         &json!({"avatars":[
-            {"agentId":ASSISTANT,"genome":"b".repeat(2048),"type":"creature.classic"},
-            {"agentId":RETIRED,"genome":"c".repeat(2048),"type":"creature.classic","version":1},
-            {"agentId":HEAD,"genome":"a".repeat(2048),"type":"creature.classic","version":2},
-            {"agentId":ASSISTANT,"genome":"b".repeat(2048),"type":"creature.classic"}
+            {"agentId":ASSISTANT,"genome":"b".repeat(2048),"type":"creature.classic","fingerprint":assistant_fingerprint},
+            {"agentId":RETIRED,"genome":"c".repeat(2048),"type":"creature.classic","version":1,"fingerprint":retired_fingerprint},
+            {"agentId":HEAD,"genome":"a".repeat(2048),"type":"creature.classic","version":2,"fingerprint":head_fingerprint},
+            {"agentId":ASSISTANT,"genome":"b".repeat(2048),"type":"creature.classic","fingerprint":assistant_fingerprint}
         ]}),
     );
     let mut records = vec![all_record, mixed_record];
@@ -4815,9 +4823,16 @@ async fn avatar_read_matches_core_contract_v1_0() {
             *id = json!(mapped);
         }
         let mut actual = fixture.success(READER, "agent.avatar_read", request).await;
-        // Avatar reads echo the request id. Reverse only that echo, leaving
-        // genome, type, version, order, omissions, and reply keys untouched.
+        // Core no longer serves agent identity, so its frozen fixture has no
+        // fingerprint. Require that one extra member, then compare all legacy
+        // members exactly after reversing the id mapping.
         for avatar in actual["avatars"].as_array_mut().unwrap() {
+            let fingerprint = avatar.as_object_mut().unwrap().remove("fingerprint");
+            assert!(
+                fingerprint.as_ref().is_some_and(Value::is_string),
+                "core vector {}: avatar entry must include a fingerprint string",
+                vector["name"]
+            );
             let mapped = avatar["agentId"].as_str().unwrap();
             let id = original_ids.get(mapped).unwrap_or_else(|| {
                 panic!(

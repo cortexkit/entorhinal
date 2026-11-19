@@ -8,8 +8,8 @@ use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{json, Value};
 
 use super::{
-    claims::load_claims, normalize_agent_name, store::load_row, validate_project_id,
-    validate_workspace_id, AgentMutationError, AgentRow,
+    avatar_fingerprint, claims::load_claims, normalize_agent_name, store::load_row,
+    validate_project_id, validate_workspace_id, AgentAvatar, AgentMutationError, AgentRow,
 };
 use crate::RegistryStore;
 
@@ -273,7 +273,12 @@ impl RegistryStore {
                     // Source: prefrontal 873870be8 crates/prefrontal-core-module/src/agent_registry_ops.rs:3247-3276.
                     for id in &request.agent_ids {
                         if let Some(avatar) = load_row(conn, id)?.and_then(|row| row.avatar) {
-                            let mut value = json!({"agentId":id,"genome":avatar.genome,"type":avatar.avatar_type});
+                            let avatar = AgentAvatar {
+                                genome: avatar.genome,
+                                avatar_type: Some(avatar.avatar_type),
+                                version: avatar.version,
+                            };
+                            let mut value = json!({"agentId":id,"genome":avatar.genome,"type":avatar.avatar_type,"fingerprint":avatar_fingerprint(&avatar)});
                             if let Some(version) = avatar.version { value["version"] = json!(version); }
                             avatars.push(value);
                         }
@@ -811,6 +816,45 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn avatar_read_fingerprints_match_stored_avatars_and_fleet_identity() {
+        let f = fixture(true);
+        let a = create(&f, "Versioned", "assistant", None, None);
+        let b = create(&f, "Unversioned", "assistant", None, None);
+        for (id, genome, version) in [(&a, "a", Some(2)), (&b, "b", None)] {
+            call(
+                &f,
+                "agent.set_avatar",
+                json!({"agentId":id,"genome":genome.repeat(2048),"type":"creature.classic","version":version,"request_key":format!("avatar-{id}")}),
+            );
+        }
+        let fleet = result(
+            &f.store
+                .agent_fleet_identity(None, "0123456789abcdef")
+                .unwrap(),
+        );
+        let reply = read(&f, "agent.avatar_read", json!({"agentIds":[b,a]}));
+        let entries = reply["avatars"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        for (entry, id) in entries.iter().zip([b, a]) {
+            assert_eq!(entry["agentId"], id);
+            let stored = f.store.agent_row(&id).unwrap().unwrap().avatar.unwrap();
+            let expected = avatar_fingerprint(&AgentAvatar {
+                genome: stored.genome,
+                avatar_type: Some(stored.avatar_type),
+                version: stored.version,
+            });
+            let fleet_row = fleet["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["agentId"] == id)
+                .unwrap();
+            assert_eq!(entry["fingerprint"], expected, "avatar_read for {id}");
+            assert_eq!(entry["fingerprint"], fleet_row["avatar"]["fingerprint"]);
+        }
+    }
+
+    #[test]
     fn avatar_and_github_reads_pin_core_presence_and_agent_generation() {
         let f = fixture(true);
         placed(&f, "P", "W");
@@ -821,11 +865,16 @@ pub(super) mod tests {
             "agent.set_avatar",
             json!({"agentId":a,"genome":"a".repeat(2048),"type":"creature.classic","request_key":"avatar"}),
         );
+        let fingerprint = avatar_fingerprint(&AgentAvatar {
+            genome: "a".repeat(2048),
+            avatar_type: Some("creature.classic".into()),
+            version: None,
+        });
         assert_eq!(
             read(&f, "agent.avatar_read", json!({"agentIds":[b,"bad",a,a]})),
             json!({"avatars":[
-            {"agentId":a,"genome":"a".repeat(2048),"type":"creature.classic"},
-            {"agentId":a,"genome":"a".repeat(2048),"type":"creature.classic"}],"generation":f.store.generation().unwrap()})
+            {"agentId":a,"genome":"a".repeat(2048),"type":"creature.classic","fingerprint":fingerprint},
+            {"agentId":a,"genome":"a".repeat(2048),"type":"creature.classic","fingerprint":fingerprint}],"generation":f.store.generation().unwrap()})
         );
         for identity in [
             Value::Null,
