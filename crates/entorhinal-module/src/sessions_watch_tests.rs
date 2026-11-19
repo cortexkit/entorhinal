@@ -199,6 +199,54 @@ async fn sessions_watch_validates_like_sessions_and_ends_on_drain() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn sessions_watches_over_either_capacity_read_nothing_from_the_store() {
+    let f = seeded("sessions-watch-capacity-reads").await;
+    // Catalog watches hold slots without reading the store.
+    let routes = [READER, (60, 1), (61, 1), (62, 1)];
+    let mut sinks = Vec::new();
+    let mut receivers = Vec::new();
+    for _ in 0..routes.len() * 16 {
+        let (sink, receiver) = Sink::new();
+        sinks.push(sink);
+        receivers.push(receiver);
+    }
+    let catalog = request(CATALOG, json!({}));
+    let mut held = Vec::new();
+    for (index, sink) in sinks.iter().enumerate() {
+        let mut watch = Box::pin(f.handler.serve_watch(sink, &catalog, routes[index / 16]));
+        pending(watch.as_mut()).await;
+        held.push(watch);
+    }
+    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = reads.clone();
+    store(&f).set_read_hook(Some(Arc::new(move || {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    })));
+    // The 17th on a full route, then the 65th on a fresh route.
+    for route in [READER, (63, 1)] {
+        let (sink, _) = Sink::new();
+        let outcome = f
+            .handler
+            .serve_watch(&sink, &request(SESSIONS, json!({"agent_id":HEAD})), route)
+            .await;
+        assert!(
+            matches!(&outcome, HandlerOutcome::Error { code, .. } if code == "watch_capacity"),
+            "{route:?}"
+        );
+    }
+    store(&f).set_read_hook(None);
+    assert_eq!(
+        reads.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a refused watch must not read the store"
+    );
+    for (sink, watch) in sinks.iter().zip(held) {
+        sink.cancel.send_replace(true);
+        assert!(matches!(watch.await, HandlerOutcome::Streamed));
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn served_vectors_sessions_watch_records_match_published_file() {
     let mut s = Served::with_sessions("served-sessions-watch", true).await;
     let params = json!({"agent_id":HEAD,"open":true});

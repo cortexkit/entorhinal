@@ -973,7 +973,7 @@ async fn two_machines_converge_with_placement_and_agent_change_ops() {
 
 #[tokio::test(start_paused = true)]
 async fn restored_pre_enable_store_supersedes_and_three_members_converge() {
-    use std::task::{Context, Poll, Waker};
+    use std::task::{Context, Waker};
 
     const ADA: &str = "agent_0000000000000001";
     const LIN: &str = "agent_0000000000000002";
@@ -1130,12 +1130,20 @@ async fn restored_pre_enable_store_supersedes_and_three_members_converge() {
         before,
         "catch-up must wake the waiter before its timeout"
     );
-    let Poll::Ready(HandlerOutcome::Response(bytes)) = waiter
-        .as_mut()
-        .poll(&mut Context::from_waker(Waker::noop()))
+    // The waiter's scans finish on the blocking pool, so it is awaited, not
+    // polled once; paused time must not move, so the catch-up woke it.
+    let HandlerOutcome::Response(bytes) =
+        tokio::time::timeout(std::time::Duration::from_secs(60), waiter.as_mut())
+            .await
+            .expect("the parked agent.changes waiter never returned")
     else {
         panic!("supersede did not notify the parked agent.changes waiter")
     };
+    assert_eq!(
+        tokio::time::Instant::now(),
+        before,
+        "the waiter returned on its timeout, not on the catch-up"
+    );
     let waited: Value = serde_json::from_slice::<Value>(&bytes).unwrap()["result"].clone();
     let feed = b
         .call(

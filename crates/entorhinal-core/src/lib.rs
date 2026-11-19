@@ -505,25 +505,36 @@ impl RegistryStore {
         raw_path: &str,
         binding: Option<&ExecutionBinding>,
     ) -> Result<ResolveReply, RegistryError> {
-        self.read(|conn| Ok(self.resolve_in(conn, raw_path, binding)))?
+        let (path, mut checkouts) = self.resolve_path(raw_path, binding)?;
+        self.read_with_checkouts(&mut checkouts, |conn, checkouts| {
+            self.resolve_in(conn, &path, binding, checkouts)
+        })
+    }
+
+    /// Read from disk what resolving `raw_path` needs, before any snapshot.
+    pub(crate) fn resolve_path(
+        &self,
+        raw_path: &str,
+        binding: Option<&ExecutionBinding>,
+    ) -> Result<(ResolvePath, binding::Checkouts), RegistryError> {
+        // Only legacy resolution compares devices; the ancestor walk does not.
+        ResolvePath::read(raw_path, binding, !self.root_records)
     }
 
     pub(crate) fn resolve_in(
         &self,
         conn: &Connection,
-        raw_path: &str,
+        path: &ResolvePath,
         binding: Option<&ExecutionBinding>,
+        checkouts: &binding::Checkouts,
     ) -> Result<ResolveReply, RegistryError> {
         if self.root_records {
-            return self.resolve_walk_in(conn, raw_path, binding);
+            return self.resolve_walk_in(conn, path, binding, checkouts);
         }
-        let (canonical_path, path_exists) = canonical_query_path(Path::new(raw_path))?;
+        let canonical_path = path.canonical_path.clone();
+        let path_exists = path.path_exists;
         let query_path = PathBuf::from(&canonical_path);
-        let query_device = if path_exists {
-            device_id(&query_path)
-        } else {
-            None
-        };
+        let query_device = path.device(&query_path);
 
         let query = || -> rusqlite::Result<ResolveReply> {
             if let Some(project_id) = conn
@@ -565,7 +576,7 @@ impl RegistryStore {
                 // vanished registered parent is intentionally accepted by prefix
                 // matching, because the path registry remains the fallback truth.
                 if let (Some(query_device), Some(parent_device)) =
-                    (query_device, device_id(parent_path))
+                    (query_device, path.device(parent_path))
                 {
                     if query_device != parent_device {
                         continue;
@@ -585,7 +596,8 @@ impl RegistryStore {
 
             if let Some(reply) = self.reply_for_worktree(
                 conn,
-                &query_path,
+                path,
+                checkouts,
                 !path_exists,
                 self.generation_from_connection(conn)?,
             )? {
@@ -659,7 +671,9 @@ impl RegistryStore {
     /// Enumerate local projections and remote workspace references without
     /// materializing implicit projects or changing the journal head.
     pub fn enumerate(&self, workspace_id: Option<&str>) -> Result<EnumerateReply, RegistryError> {
-        self.read(|conn| {
+        // Root records read each root's checkout; the first pass names them.
+        let mut checkouts = binding::Checkouts::default();
+        self.read_with_checkouts(&mut checkouts, |conn, checkouts| {
             let workspaces = if let Some(workspace_id) = workspace_id {
                 conn.query_row(
                     "SELECT w.workspace_id, w.name, r.root FROM workspace w
@@ -723,6 +737,7 @@ impl RegistryStore {
                         } else {
                             None
                         },
+                        checkouts,
                     )?);
                 }
             } else {
@@ -746,6 +761,7 @@ impl RegistryStore {
                         implicit != 0,
                         "local".to_string(),
                         None,
+                        checkouts,
                     )?);
                 }
 
@@ -768,6 +784,7 @@ impl RegistryStore {
                         false,
                         "remote".to_string(),
                         Some(device_fingerprint),
+                        checkouts,
                     )?);
                 }
             }
@@ -862,6 +879,14 @@ impl RegistryStore {
         self.reader.read(query).map_err(RegistryError::from)
     }
 
+    /// Test seam: from now on run `hook` inside every read snapshot, while
+    /// that read holds its reader connection, so a test can park a query or
+    /// count reads. `None` removes it. Production code never sets one.
+    #[doc(hidden)]
+    pub fn set_read_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        self.reader.set_hook(hook);
+    }
+
     fn generation_from_connection(&self, conn: &Connection) -> rusqlite::Result<i64> {
         conn.query_row(
             "SELECT COALESCE(MAX(seq), 0) FROM registry_journal",
@@ -914,6 +939,7 @@ impl RegistryStore {
         project_id: &str,
         ref_kind: &str,
         device_fingerprint: Option<String>,
+        checkouts: &binding::Checkouts,
     ) -> rusqlite::Result<ProjectView> {
         let row = conn
             .query_row(
@@ -930,6 +956,7 @@ impl RegistryStore {
                 implicit != 0,
                 ref_kind.to_string(),
                 device_fingerprint,
+                checkouts,
             ),
             None => self.project_view_from_parts(
                 conn,
@@ -938,10 +965,12 @@ impl RegistryStore {
                 false,
                 ref_kind.to_string(),
                 device_fingerprint,
+                checkouts,
             ),
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn project_view_from_parts(
         &self,
         conn: &Connection,
@@ -950,6 +979,7 @@ impl RegistryStore {
         implicit: bool,
         ref_kind: String,
         device_fingerprint: Option<String>,
+        checkouts: &binding::Checkouts,
     ) -> rusqlite::Result<ProjectView> {
         let mut statement = conn.prepare(
             "SELECT canonical_root FROM project_root
@@ -968,7 +998,7 @@ impl RegistryStore {
             )
             .optional()?;
         let root_records = if self.root_records {
-            Some(binding::root_records(conn, &project_id)?)
+            Some(binding::root_records(conn, &project_id, checkouts)?)
         } else {
             None
         };
@@ -1667,6 +1697,100 @@ fn hex_prefix(bytes: &[u8]) -> String {
         output.push(HEX[(byte & 0x0f) as usize] as char);
     }
     output
+}
+
+/// What resolving one path needs from the filesystem, read before the read
+/// snapshot so no reader closure canonicalizes, stats or opens a file.
+pub(crate) struct ResolvePath {
+    pub(crate) canonical_path: String,
+    pub(crate) path_exists: bool,
+    /// The query folder and each of its ancestors, nearest first.
+    ancestors: Vec<Ancestor>,
+}
+
+struct Ancestor {
+    path: PathBuf,
+    /// The folder's device, read only when legacy resolution will compare
+    /// devices, which it does only for a query path that exists.
+    device: Option<u64>,
+    /// Whether the folder has a `.git` entry, and if so whether it is a file
+    /// (a worktree's pointer). Read up to the nearest folder that has one:
+    /// the ancestor walk and the worktree fallback both stop there.
+    git: Option<bool>,
+}
+
+impl ResolvePath {
+    /// Canonicalize the query, then read its ancestors' `.git` entries and
+    /// devices, the nearest checkout's token and remotes, and the token of the
+    /// root an execution binding names.
+    fn read(
+        raw_path: &str,
+        binding: Option<&ExecutionBinding>,
+        devices: bool,
+    ) -> Result<(Self, binding::Checkouts), RegistryError> {
+        let (canonical_path, path_exists) = canonical_query_path(Path::new(raw_path))?;
+        let mut checkouts = binding::Checkouts::default();
+        let mut ancestors = Vec::new();
+        let mut found_checkout = false;
+        for dir in Path::new(&canonical_path).ancestors() {
+            let git = if found_checkout {
+                None
+            } else {
+                let dot_git = dir.join(".git");
+                std::fs::symlink_metadata(&dot_git)
+                    .is_ok()
+                    .then(|| dot_git.is_file())
+            };
+            if git.is_some() {
+                found_checkout = true;
+                checkouts.probe(&dir.to_string_lossy());
+            }
+            ancestors.push(Ancestor {
+                path: dir.to_path_buf(),
+                device: if devices && path_exists {
+                    device_id(dir)
+                } else {
+                    None
+                },
+                git,
+            });
+        }
+        if let Some(binding) = binding {
+            checkouts.probe(&binding.root);
+        }
+        Ok((
+            Self {
+                canonical_path,
+                path_exists,
+                ancestors,
+            },
+            checkouts,
+        ))
+    }
+
+    /// The device of `path`, one of the query's ancestors.
+    fn device(&self, path: &Path) -> Option<u64> {
+        self.ancestors
+            .iter()
+            .find(|ancestor| ancestor.path == path)
+            .and_then(|ancestor| ancestor.device)
+    }
+
+    /// The query's ancestors, nearest first, with whether each has a `.git`
+    /// entry that is a file. `None` past the nearest checkout.
+    pub(crate) fn ancestors(&self) -> impl Iterator<Item = (&Path, Option<bool>)> {
+        self.ancestors
+            .iter()
+            .map(|ancestor| (ancestor.path.as_path(), ancestor.git))
+    }
+
+    /// The nearest folder at or above the query that has a `.git` entry.
+    pub(crate) fn nearest_checkout(&self) -> Option<&Path> {
+        self.ancestors
+            .iter()
+            .find(|ancestor| ancestor.git.is_some())
+            .map(|ancestor| ancestor.path.as_path())
+    }
 }
 
 fn canonical_query_path(path: &Path) -> Result<(String, bool), RegistryError> {

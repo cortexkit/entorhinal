@@ -2153,7 +2153,7 @@ mod tests {
     async fn background_enable_completion_publishes_generation_and_wakes_parked_feed() {
         use std::{
             future::Future,
-            task::{Context, Poll, Waker},
+            task::{Context, Waker},
         };
         let log = Arc::new(FakeLog::default());
         let f = Fixture::new("enable-background-feed", log.clone());
@@ -2179,12 +2179,20 @@ mod tests {
             before,
             "completion must precede the feed timeout"
         );
-        let Poll::Ready(HandlerOutcome::Response(bytes)) = waiter
-            .as_mut()
-            .poll(&mut Context::from_waker(Waker::noop()))
+        // The waiter's scans finish on the blocking pool, so it is awaited,
+        // not polled once; paused time must not move, so the commit woke it.
+        let HandlerOutcome::Response(bytes) =
+            tokio::time::timeout(Duration::from_secs(60), waiter.as_mut())
+                .await
+                .expect("the parked feed never returned")
         else {
             panic!("parked feed was not notified after background enable committed")
         };
+        assert_eq!(
+            Instant::now(),
+            before,
+            "the parked feed returned on its timeout, not on the commit"
+        );
         let reply: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(reply["result"]["cursor"], f.store().generation().unwrap());
         assert_eq!(

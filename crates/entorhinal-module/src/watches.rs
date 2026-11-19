@@ -62,6 +62,30 @@ pub(crate) struct Watches {
     catalog: Mutex<CatalogHistory>,
     catalog_changed: Notify,
     sessions_changed: broadcast::Sender<Arc<Vec<SessionChangeKey>>>,
+    /// The fleet at the newest journal generation any identity watch asked
+    /// for, shared by every identity watch. The lock is held across a build,
+    /// so watches woken by one commit wait for a single build.
+    fleet: tokio::sync::Mutex<Option<Arc<SharedFleet>>>,
+    #[cfg(test)]
+    pub(crate) fleet_builds: std::sync::atomic::AtomicUsize,
+}
+
+/// One fleet reply and its rows by agent id, built once for a journal
+/// generation of this process's incarnation and never changed after.
+pub(crate) struct SharedFleet {
+    generation: i64,
+    fleet: Value,
+    rows: BTreeMap<String, Value>,
+}
+
+impl SharedFleet {
+    fn new(fleet: Value) -> Self {
+        Self {
+            generation: fleet["generation"].as_i64().expect("fleet generation"),
+            rows: fleet_rows(&fleet),
+            fleet,
+        }
+    }
 }
 
 impl Default for Watches {
@@ -75,6 +99,9 @@ impl Default for Watches {
             catalog: Mutex::default(),
             catalog_changed: Notify::new(),
             sessions_changed: broadcast::channel(HISTORY_LIMIT).0,
+            fleet: tokio::sync::Mutex::new(None),
+            #[cfg(test)]
+            fleet_builds: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -329,24 +356,12 @@ impl ProjectsHandler {
                 None
             };
             let sessions = if request.method == SESSIONS {
-                let request: SessionsRequest = decode(request.params)?;
-                let watches = Arc::downgrade(&self.watches);
-                self.with_agent_store(|store| {
-                    store.set_session_change_listener(Arc::new(move |keys| {
-                        if let Some(watches) = watches.upgrade() {
-                            let _ = watches.sessions_changed.send(Arc::new(keys));
-                        }
-                    }));
-                    Ok(())
-                })?;
-                // Subscribe before the snapshot so a concurrent commit is either
-                // already visible there or queued for the next notice.
-                let receiver = self.watches.sessions_changed.subscribe();
-                let initial = self.sessions_resync(&request)?;
-                Some((request, receiver, initial))
+                Some(decode::<SessionsRequest>(request.params)?)
             } else {
                 None
             };
+            // Take both slots before any store read, so a refused watch costs
+            // no SQL.
             let _route_slot = self.watches.take_route_slot(key).ok_or_else(|| {
                 // Published in fleet-watch-v1's watch-capacity sample.
                 HandlerError::new(
@@ -362,6 +377,25 @@ impl ProjectsHandler {
             })?;
             self.health.watches_open.fetch_add(1, Ordering::Relaxed);
             let _slot = Slot(&self.health);
+            let sessions = match sessions {
+                Some(request) => {
+                    let watches = Arc::downgrade(&self.watches);
+                    self.with_agent_store(|store| {
+                        store.set_session_change_listener(Arc::new(move |keys| {
+                            if let Some(watches) = watches.upgrade() {
+                                let _ = watches.sessions_changed.send(Arc::new(keys));
+                            }
+                        }));
+                        Ok(())
+                    })?;
+                    // Subscribe before the snapshot so a concurrent commit is either
+                    // already visible there or queued for the next notice.
+                    let receiver = self.watches.sessions_changed.subscribe();
+                    let initial = self.sessions_resync(&request).await?;
+                    Some((request, receiver, initial))
+                }
+                None => None,
+            };
             if whereabouts.is_some() {
                 let watches = std::sync::Arc::downgrade(&self.watches);
                 self.with_agent_store(|store| {
@@ -497,17 +531,30 @@ impl ProjectsHandler {
                 (incarnation == self.incarnation && token == format!("{incarnation}:{generation}"))
                     .then_some(generation)
             });
-        let snapshot = self
-            .with_agent_store(|store| store.agent_fleet_watch_snapshot(&self.incarnation, since))?;
-        let mut previous = fleet_rows(&snapshot.fleet);
-        let resync = identity_resync(&snapshot.fleet);
-        match snapshot.resume {
+        let (mut previous, resume) = match since {
+            None => (self.shared_fleet().await?, None),
+            // Resuming needs the journal range read in the same snapshot as
+            // the fleet, so this one is built for this watch alone.
+            Some(since) => {
+                let incarnation = self.incarnation.clone();
+                let snapshot = self
+                    .read_blocking(IDENTITY, move |store| {
+                        store
+                            .agent_fleet_watch_snapshot(&incarnation, Some(since))
+                            .map_err(HandlerError::from)
+                    })
+                    .await?;
+                (Arc::new(SharedFleet::new(snapshot.fleet)), snapshot.resume)
+            }
+        };
+        let resync = identity_resync(&previous.fleet);
+        match resume {
             None => self.notice(transport, resync.clone(), resync).await?,
             Some(changed) if !changed.is_empty() => {
                 let agents = changed
                     .iter()
                     .filter_map(|(id, version)| {
-                        previous.get(id).cloned().map(|mut row| {
+                        previous.rows.get(id).cloned().map(|mut row| {
                             row["version"] = json!(version);
                             row
                         })
@@ -515,12 +562,12 @@ impl ProjectsHandler {
                     .collect::<Vec<_>>();
                 let removed = changed
                     .iter()
-                    .filter(|(id, _)| !previous.contains_key(*id))
+                    .filter(|(id, _)| !previous.rows.contains_key(*id))
                     .map(|(id, version)| json!({"agentId":id,"version":version}))
                     .collect::<Vec<_>>();
                 self.notice(
                     transport,
-                    identity_changes(&snapshot.fleet, agents, removed),
+                    identity_changes(&previous.fleet, agents, removed),
                     resync,
                 )
                 .await?;
@@ -534,14 +581,12 @@ impl ProjectsHandler {
             notified.set(self.commits.notified());
             notified.as_mut().enable();
             debounce(&self.commits).await;
-            let snapshot = self.with_agent_store(|store| {
-                store.agent_fleet_watch_snapshot(&self.incarnation, None)
-            })?;
-            let current = fleet_rows(&snapshot.fleet);
-            let generation = &snapshot.fleet["generation"];
+            let current = self.shared_fleet().await?;
+            let generation = &current.fleet["generation"];
             let agents = current
+                .rows
                 .iter()
-                .filter(|(id, row)| previous.get(*id) != Some(*row))
+                .filter(|(id, row)| previous.rows.get(*id) != Some(*row))
                 .map(|(_, row)| {
                     let mut row = row.clone();
                     row["version"] = generation.clone();
@@ -549,20 +594,51 @@ impl ProjectsHandler {
                 })
                 .collect::<Vec<_>>();
             let removed = previous
+                .rows
                 .keys()
-                .filter(|id| !current.contains_key(*id))
+                .filter(|id| !current.rows.contains_key(*id))
                 .map(|id| json!({"agentId":id,"version":generation}))
                 .collect::<Vec<_>>();
             if !agents.is_empty() || !removed.is_empty() {
                 self.notice(
                     transport,
-                    identity_changes(&snapshot.fleet, agents, removed),
-                    identity_resync(&snapshot.fleet),
+                    identity_changes(&current.fleet, agents, removed),
+                    identity_resync(&current.fleet),
                 )
                 .await?;
                 previous = current;
             }
         }
+    }
+
+    /// The fleet at the current journal generation, built at most once per
+    /// generation and shared by every identity watch. Each watch still keeps
+    /// its own previous fleet, diff and notices.
+    async fn shared_fleet(&self) -> Result<Arc<SharedFleet>, HandlerError> {
+        let mut cached = self.watches.fleet.lock().await;
+        let generation = self
+            .read_blocking(IDENTITY, |store| {
+                store.generation().map_err(HandlerError::from)
+            })
+            .await?;
+        if let Some(fleet) = cached.as_ref().filter(|f| f.generation == generation) {
+            return Ok(fleet.clone());
+        }
+        let incarnation = self.incarnation.clone();
+        let snapshot = self
+            .read_blocking(IDENTITY, move |store| {
+                store
+                    .agent_fleet_watch_snapshot(&incarnation, None)
+                    .map_err(HandlerError::from)
+            })
+            .await?;
+        #[cfg(test)]
+        self.watches
+            .fleet_builds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let fleet = Arc::new(SharedFleet::new(snapshot.fleet));
+        *cached = Some(fleet.clone());
+        Ok(fleet)
     }
 
     async fn where_watch(
@@ -640,15 +716,20 @@ impl ProjectsHandler {
         }
     }
 
-    fn sessions_resync(&self, request: &SessionsRequest) -> Result<Value, HandlerError> {
-        let page = self.with_agent_store(|store| {
-            store.agent_sessions_filtered(
-                &request.agent_id,
-                None,
-                crate::sessions::SESSIONS_LIMIT_DEFAULT,
-                request.open,
-            )
-        })?;
+    async fn sessions_resync(&self, request: &SessionsRequest) -> Result<Value, HandlerError> {
+        let (agent_id, open) = (request.agent_id.clone(), request.open);
+        let page = self
+            .read_blocking(SESSIONS, move |store| {
+                store
+                    .agent_sessions_filtered(
+                        &agent_id,
+                        None,
+                        crate::sessions::SESSIONS_LIMIT_DEFAULT,
+                        open,
+                    )
+                    .map_err(HandlerError::from)
+            })
+            .await?;
         Ok(if page.next.is_some() {
             json!({"kind":"resync","truncated":true})
         } else {
@@ -696,16 +777,25 @@ impl ProjectsHandler {
             if lagged {
                 self.notice(
                     transport,
-                    self.sessions_resync(&request)?,
+                    self.sessions_resync(&request).await?,
                     truncated.clone(),
                 )
                 .await?;
                 continue;
             }
             let keys = keys.into_iter().collect::<Vec<_>>();
-            let rows = self.with_agent_store(|store| {
-                Ok(store.changed_agent_sessions(&request.agent_id, &keys, request.open)?)
-            })?;
+            let (agent_id, open, changed) = (request.agent_id.clone(), request.open, keys.clone());
+            let rows = self
+                .read_blocking(SESSIONS, move |store| {
+                    store
+                        .changed_agent_sessions(&agent_id, &changed, open)
+                        .map_err(|error| {
+                            HandlerError::from(entorhinal_core::agent::AgentMutationError::from(
+                                error,
+                            ))
+                        })
+                })
+                .await?;
             let present = rows
                 .iter()
                 .filter_map(|row| Some((row.harness.clone()?, row.session.clone()?)))
