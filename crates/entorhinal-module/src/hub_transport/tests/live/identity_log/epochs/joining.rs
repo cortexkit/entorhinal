@@ -235,7 +235,10 @@ async fn hub_join_wiped_removed_box_discovers_closure_and_publishes_its_new_epis
             .err()
             .unwrap()
             .code,
-        "signature_invalid"
+        // The readmitted computer's new key isn't published in its new
+        // episode yet, so its record can't be checked yet: it is held as
+        // an unknown writer, not refused as forged.
+        "writer_unknown"
     );
     let _watch = wiped.watch();
     within(async {
