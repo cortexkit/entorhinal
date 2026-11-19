@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use serde_json::{json, Value};
 
 use super::{reads::all_rows, AgentAvatar, AgentMutationError, IDENTITY_CHANGE_OPS};
@@ -117,6 +117,14 @@ impl RegistryStore {
             return Ok(reply);
         }
         let mut agents = Vec::new();
+        // Every project's name, first canonical root and placed workspace, and
+        // every workspace's name, each in one query rather than one lookup per
+        // agent.
+        let projects = project_contexts(conn)?;
+        let workspaces = conn
+            .prepare("SELECT workspace_id,name FROM workspace")?
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
         // One result per live agent, even when its project has several roots.
         // Heads and hirees store no workspace: theirs is wherever their project
         // is placed, so it comes from project_workspace, and is absent while the
@@ -141,29 +149,21 @@ impl RegistryStore {
                 agent["avatar"] = value;
             }
             if let Some(id) = row.project_id {
-                let name: String =
-                    conn.query_row("SELECT name FROM project WHERE project_id=?1", [&id], |r| {
-                        r.get(0)
-                    })?;
-                let mut project = json!({"id":id,"name":name});
-                let root: Option<String> = conn.query_row("SELECT canonical_root FROM project_root WHERE project_id=?1 ORDER BY canonical_root LIMIT 1", [&id], |r| r.get(0)).optional()?;
-                if let Some(root) = root {
+                // An agent naming a project that does not exist is a storage
+                // fault, as when the name was read row by row.
+                let context = projects
+                    .get(&id)
+                    .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+                let mut project = json!({"id":id,"name":context.name});
+                if let Some(root) = &context.first_root {
                     project["canonicalRoot"] = json!(root);
                 }
                 agent["project"] = project;
-                let workspace: Option<(String,String)> = conn.query_row("SELECT w.workspace_id,w.name FROM project_workspace pw JOIN workspace w ON w.workspace_id=pw.workspace_id WHERE pw.project_id=?1", [&id], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
-                if let Some((id, name)) = workspace {
+                if let Some((id, name)) = &context.workspace {
                     agent["workspace"] = json!({"id":id,"name":name});
                 }
             } else if let Some(id) = row.workspace_id.as_deref() {
-                let name: Option<String> = conn
-                    .query_row(
-                        "SELECT name FROM workspace WHERE workspace_id=?1",
-                        [id],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
-                if let Some(name) = name {
+                if let Some(name) = workspaces.get(id) {
                     agent["workspace"] = json!({"id":id,"name":name});
                 }
             }
@@ -178,6 +178,43 @@ impl RegistryStore {
 pub struct FleetWatchSnapshot {
     pub fleet: Value,
     pub resume: Option<BTreeMap<String, i64>>,
+}
+
+/// What a fleet row shows about the project an agent belongs to.
+struct ProjectContext {
+    name: String,
+    first_root: Option<String>,
+    workspace: Option<(String, String)>,
+}
+
+fn project_contexts(conn: &Connection) -> rusqlite::Result<BTreeMap<String, ProjectContext>> {
+    conn.prepare(
+        "SELECT p.project_id, p.name,
+                (SELECT r.canonical_root FROM project_root r
+                 WHERE r.project_id=p.project_id ORDER BY r.canonical_root LIMIT 1),
+                w.workspace_id, w.name
+         FROM project p
+         LEFT JOIN project_workspace pw ON pw.project_id=p.project_id
+         LEFT JOIN workspace w ON w.workspace_id=pw.workspace_id",
+    )?
+    .query_map([], |r| {
+        let workspace = match (
+            r.get::<_, Option<String>>(3)?,
+            r.get::<_, Option<String>>(4)?,
+        ) {
+            (Some(id), Some(name)) => Some((id, name)),
+            _ => None,
+        };
+        Ok((
+            r.get::<_, String>(0)?,
+            ProjectContext {
+                name: r.get(1)?,
+                first_root: r.get(2)?,
+                workspace,
+            },
+        ))
+    })?
+    .collect()
 }
 
 #[cfg(test)]

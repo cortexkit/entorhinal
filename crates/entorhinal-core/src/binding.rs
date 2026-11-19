@@ -269,6 +269,107 @@ fn disk_identity(root: &Path) -> DiskIdentity {
     }
 }
 
+/// What a read needs to know about checkouts on disk, read with no snapshot
+/// held, so a slow or stalled disk never holds a reader connection. A query
+/// looks checkouts up here; one it needs but that was not read beforehand (a
+/// registered root it only learns from the snapshot) is recorded as missing,
+/// read after the snapshot ends, and the query runs again.
+#[derive(Default)]
+pub(crate) struct Checkouts {
+    read: std::collections::BTreeMap<String, Checkout>,
+    missing: std::cell::RefCell<std::collections::BTreeSet<String>>,
+}
+
+struct Checkout {
+    identity: DiskIdentity,
+    remotes: Result<Vec<GitRemote>, String>,
+}
+
+/// Shown only when a checkout was still missing after the last pass, which
+/// takes roots changing between every pass.
+const NOT_READ: &str = "checkout changed while it was being read; retry";
+
+impl Checkouts {
+    /// Facts for one checkout, read from disk now.
+    pub(crate) fn of(root: &str) -> Self {
+        let mut checkouts = Self::default();
+        checkouts.probe(root);
+        checkouts
+    }
+
+    /// Read one checkout's token and GitHub remotes from disk.
+    pub(crate) fn probe(&mut self, root: &str) {
+        let path = Path::new(root);
+        self.read
+            .entry(root.to_string())
+            .or_insert_with(|| Checkout {
+                identity: disk_identity(path),
+                remotes: github_remotes(path),
+            });
+    }
+
+    fn identity(&self, root: &str) -> DiskIdentity {
+        match self.read.get(root) {
+            Some(checkout) => checkout.identity.clone(),
+            None => {
+                self.missing.borrow_mut().insert(root.to_string());
+                DiskIdentity::Unverifiable(NOT_READ.to_string())
+            }
+        }
+    }
+
+    fn remotes(&self, root: &str) -> Result<Vec<GitRemote>, String> {
+        match self.read.get(root) {
+            Some(checkout) => checkout.remotes.clone(),
+            None => {
+                self.missing.borrow_mut().insert(root.to_string());
+                Err(NOT_READ.to_string())
+            }
+        }
+    }
+
+    /// The token of the checkout at `root`, when it has a well-formed one.
+    pub(crate) fn token(&self, root: &str) -> Option<String> {
+        match self.identity(root) {
+            DiskIdentity::Token(token) => Some(token),
+            _ => None,
+        }
+    }
+
+    fn take_missing(&mut self) -> std::collections::BTreeSet<String> {
+        std::mem::take(self.missing.get_mut())
+    }
+}
+
+/// How many snapshots a read with checkouts takes at most. The second pass
+/// reads the roots the first one found; only a root change between passes
+/// needs another.
+const CHECKOUT_PASSES: usize = 3;
+
+impl RegistryStore {
+    /// Run `query` in a read snapshot with checkout facts read from disk
+    /// beforehand, never inside the snapshot. A pass that needed a checkout
+    /// not read yet runs again once it has been read.
+    pub(crate) fn read_with_checkouts<T>(
+        &self,
+        checkouts: &mut Checkouts,
+        query: impl Fn(&Connection, &Checkouts) -> Result<T, RegistryError>,
+    ) -> Result<T, RegistryError> {
+        let mut passes = 0;
+        loop {
+            let reply = self.read(|conn| Ok(query(conn, checkouts)))??;
+            passes += 1;
+            let missing = checkouts.take_missing();
+            if missing.is_empty() || passes == CHECKOUT_PASSES {
+                return Ok(reply);
+            }
+            for root in missing {
+                checkouts.probe(&root);
+            }
+        }
+    }
+}
+
 /// Create the token file exclusively. If another writer got there first, its
 /// token is the checkout's identity and is returned instead.
 fn create_token(common: &Path, token: &str) -> Result<String, String> {
@@ -400,15 +501,31 @@ fn unapproved() -> Approval {
     }
 }
 
-/// The record for one registered root, with its identity checked against disk.
-fn root_record(conn: &Connection, root: &str) -> rusqlite::Result<RootRecord> {
-    let (remotes, remotes_error) = super::ownership::root_remotes(conn, root)?;
+/// The record for one registered root, with its identity checked against the
+/// checkout facts read from disk.
+fn root_record(
+    conn: &Connection,
+    root: &str,
+    checkouts: &Checkouts,
+) -> rusqlite::Result<RootRecord> {
+    // The same marking `ownership::root_remotes` applies, over remotes read
+    // before the snapshot instead of from disk inside it.
+    let (remotes, remotes_error) = match checkouts.remotes(root) {
+        Ok(mut remotes) => {
+            let names = super::ownership::effective_owned_names(conn, root)?;
+            for remote in &mut remotes {
+                remote.owned = names.contains(&remote.name);
+            }
+            (remotes, None)
+        }
+        Err(error) => (Vec::new(), Some(error)),
+    };
     let root_key = crate::root_keys::mapped_key(conn, root)?;
     let root_key_mismatch = root_key
         .as_ref()
         .map(|key| crate::root_keys::mismatch(key, &remotes));
     let binding = active_binding(conn, root)?;
-    let disk = disk_identity(Path::new(root));
+    let disk = checkouts.identity(root);
     let (identity, binding) = match (binding, &disk) {
         (None, DiskIdentity::Unverifiable(_)) => ("unverifiable", None),
         (None, _) => ("unbound", None),
@@ -443,6 +560,7 @@ fn root_record(conn: &Connection, root: &str) -> rusqlite::Result<RootRecord> {
 pub(crate) fn root_records(
     conn: &Connection,
     project_id: &str,
+    checkouts: &Checkouts,
 ) -> rusqlite::Result<Vec<RootRecord>> {
     let mut statement = conn.prepare(
         "SELECT canonical_root FROM project_root WHERE project_id = ?1 ORDER BY canonical_root",
@@ -450,7 +568,10 @@ pub(crate) fn root_records(
     let roots = statement
         .query_map([project_id], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    roots.iter().map(|root| root_record(conn, root)).collect()
+    roots
+        .iter()
+        .map(|root| root_record(conn, root, checkouts))
+        .collect()
 }
 
 /// A worktree inside an attached container. It carries its source root's
@@ -461,9 +582,10 @@ fn worktree_record(
     worktree: &str,
     source_root: Option<&str>,
     attached_epoch: Option<&str>,
+    checkouts: &Checkouts,
 ) -> rusqlite::Result<RootRecord> {
     let names = super::ownership::effective_owned_names(conn, source_root.unwrap_or(worktree))?;
-    let (mut remotes, remotes_error) = match github_remotes(Path::new(worktree)) {
+    let (mut remotes, remotes_error) = match checkouts.remotes(worktree) {
         Ok(remotes) => (remotes, None),
         Err(error) => (Vec::new(), Some(error)),
     };
@@ -491,7 +613,7 @@ fn worktree_record(
     if bound.epoch != epoch {
         return Ok(none("retired"));
     }
-    match disk_identity(Path::new(worktree)) {
+    match checkouts.identity(worktree) {
         DiskIdentity::Token(token) if token == bound.incarnation => {}
         DiskIdentity::Unverifiable(_) => return Ok(none("unverifiable")),
         _ => return Ok(none("replaced")),
@@ -514,10 +636,14 @@ fn worktree_record(
     })
 }
 
-fn binding_status(conn: &Connection, binding: &ExecutionBinding) -> rusqlite::Result<&'static str> {
+fn binding_status(
+    conn: &Connection,
+    binding: &ExecutionBinding,
+    checkouts: &Checkouts,
+) -> rusqlite::Result<&'static str> {
     if let Some(bound) = active_binding(conn, &binding.root)? {
         if bound.epoch == binding.registration_epoch && bound.incarnation == binding.incarnation {
-            return Ok(match disk_identity(Path::new(&binding.root)) {
+            return Ok(match checkouts.identity(&binding.root) {
                 DiskIdentity::Token(token) if token == binding.incarnation => "active",
                 DiskIdentity::Unverifiable(_) => "unknown",
                 _ => "replaced",
@@ -787,7 +913,8 @@ impl super::JournalWriter<'_> {
     /// keeps its epoch and approval, and unreadable identity must not be guessed.
     pub fn rebind_root(&self, root: &str, actor: &str) -> Result<Vec<u8>, RegistryError> {
         let root = RegistryStore::canonical_mutation_root(root)?;
-        let registered = self.read(|conn| {
+        let mut checkouts = Checkouts::of(&root);
+        let registered = self.read_with_checkouts(&mut checkouts, |conn, checkouts| {
             let project_id = conn
                 .query_row(
                     "SELECT project_id FROM project_root WHERE canonical_root = ?1",
@@ -795,15 +922,15 @@ impl super::JournalWriter<'_> {
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?;
-            project_id
+            Ok(project_id
                 .map(|project_id| {
-                    Ok((
+                    Ok::<_, rusqlite::Error>((
                         project_id,
-                        root_record(conn, &root)?,
+                        root_record(conn, &root, checkouts)?,
                         self.generation_from_connection(conn)?,
                     ))
                 })
-                .transpose()
+                .transpose()?)
         })?;
         let (project_id, record, generation) = registered
             .ok_or_else(|| domain("not_found", format!("{root} is not a registered root")))?;
@@ -830,7 +957,8 @@ impl super::JournalWriter<'_> {
         let reply = self.bind_root(&root, actor)?;
         let mut reply: serde_json::Value = serde_json::from_slice(&reply)
             .map_err(|error| domain("encode_failed", error.to_string()))?;
-        let current = self.read(|conn| root_record(conn, &root))?;
+        let checkouts = Checkouts::of(&root);
+        let current = self.read(|conn| root_record(conn, &root, &checkouts))?;
         reply["result"]["projectId"] = json!(project_id);
         reply["result"]["oldIdentity"] = json!(record.identity);
         reply["result"]["identity"] = json!(current.identity);
@@ -936,7 +1064,7 @@ impl super::JournalWriter<'_> {
         let root_key = canonical_query_path(Path::new(canonical_root))?.0;
         let actor = actor.to_string();
         self.mutation(op, None, move |tx| {
-            let record = root_record(tx, &root_key)?;
+            let record = root_record(tx, &root_key, &Checkouts::of(&root_key))?;
             let Some(epoch) = record.registration_epoch.clone() else {
                 return Err(domain(
                     if record.identity == "replaced" {
@@ -984,25 +1112,21 @@ impl super::JournalWriter<'_> {
 
 impl RegistryStore {
     /// Share project identity, but not root approval, with a checkout whose token
-    /// is held by a current registered binding. No filesystem result is cached:
+    /// is held by a current registered binding. The token is read from disk for
+    /// each request, before its snapshot, never cached across requests:
     /// rebinding a main checkout must immediately stop identifying old worktrees.
     pub(crate) fn reply_for_worktree(
         &self,
         conn: &Connection,
-        query: &Path,
+        path: &super::ResolvePath,
+        checkouts: &Checkouts,
         gone: bool,
         generation: i64,
     ) -> rusqlite::Result<Option<ResolveReply>> {
-        let Some(checkout) = query
-            .ancestors()
-            .find(|dir| fs::symlink_metadata(dir.join(".git")).is_ok())
-        else {
+        let Some(checkout) = path.nearest_checkout() else {
             return Ok(None);
         };
-        let Ok(common) = git_common_dir(checkout) else {
-            return Ok(None);
-        };
-        let DiskIdentity::Token(token) = read_token(&common) else {
+        let Some(token) = checkouts.token(&checkout.to_string_lossy()) else {
             return Ok(None);
         };
         let matched = conn
@@ -1021,7 +1145,7 @@ impl RegistryStore {
             return Ok(None);
         };
         let mut reply = self.reply_for_project(conn, &project_id, "worktree", gone, generation)?;
-        reply.canonical_root = Some(query.to_string_lossy().into_owned());
+        reply.canonical_root = Some(path.canonical_path.clone());
         reply.worktree_of = Some(root);
         Ok(Some(reply))
     }
@@ -1041,16 +1165,21 @@ impl RegistryStore {
         raw_path: &str,
         binding: Option<&ExecutionBinding>,
     ) -> Result<ResolveReply, RegistryError> {
-        self.read(|conn| Ok(self.resolve_walk_in(conn, raw_path, binding)))?
+        let (path, mut checkouts) = super::ResolvePath::read(raw_path, binding, false)?;
+        self.read_with_checkouts(&mut checkouts, |conn, checkouts| {
+            self.resolve_walk_in(conn, &path, binding, checkouts)
+        })
     }
 
     pub(crate) fn resolve_walk_in(
         &self,
         conn: &Connection,
-        raw_path: &str,
+        path: &super::ResolvePath,
         binding: Option<&ExecutionBinding>,
+        checkouts: &Checkouts,
     ) -> Result<ResolveReply, RegistryError> {
-        let (canonical_path, path_exists) = canonical_query_path(Path::new(raw_path))?;
+        let canonical_path = &path.canonical_path;
+        let path_exists = path.path_exists;
         let query = || -> rusqlite::Result<ResolveReply> {
             let generation = self.generation_from_connection(conn)?;
             let with_fields = |mut reply: ResolveReply,
@@ -1058,7 +1187,7 @@ impl RegistryStore {
                                source: Option<String>,
                                records: Vec<RootRecord>| {
                 let binding_status = match binding {
-                    Some(binding) => Some(binding_status(conn, binding)?),
+                    Some(binding) => Some(binding_status(conn, binding, checkouts)?),
                     None => None,
                 };
                 reply.canonical_root = Some(canonical_path.clone());
@@ -1071,9 +1200,8 @@ impl RegistryStore {
                 Ok(reply)
             };
             let containers = containers(conn)?;
-            let query = PathBuf::from(&canonical_path);
-            let mut dir = Some(query.as_path());
-            while let Some(current) = dir {
+            let query = PathBuf::from(canonical_path);
+            for (current, git) in path.ancestors() {
                 let key = current.to_string_lossy().into_owned();
                 if let Some(project_id) = conn
                     .query_row(
@@ -1086,11 +1214,10 @@ impl RegistryStore {
                     let via = if current == query { "root" } else { "walk" };
                     let reply =
                         self.reply_for_project(conn, &project_id, via, !path_exists, generation)?;
-                    let records = root_records(conn, &project_id)?;
+                    let records = root_records(conn, &project_id, checkouts)?;
                     return with_fields(reply, Some(key), None, records);
                 }
-                if fs::symlink_metadata(current.join(".git")).is_ok() {
-                    let is_worktree_pointer = current.join(".git").is_file();
+                if let Some(is_worktree_pointer) = git {
                     if let Some(container) = containers
                         .iter()
                         .filter(|container| {
@@ -1111,6 +1238,7 @@ impl RegistryStore {
                             &key,
                             container.source_root.as_deref(),
                             container.epoch.as_deref(),
+                            checkouts,
                         )?;
                         return with_fields(
                             reply,
@@ -1121,7 +1249,6 @@ impl RegistryStore {
                     }
                     break;
                 }
-                dir = current.parent();
             }
             if let Some(container) = containers
                 .iter()
@@ -1137,11 +1264,13 @@ impl RegistryStore {
                 )?;
                 return with_fields(reply, None, None, Vec::new());
             }
-            if let Some(reply) = self.reply_for_worktree(conn, &query, !path_exists, generation)? {
+            if let Some(reply) =
+                self.reply_for_worktree(conn, path, checkouts, !path_exists, generation)?
+            {
                 return Ok(reply);
             }
             let reply = ResolveReply {
-                project_id: implicit_project_id(&canonical_path),
+                project_id: implicit_project_id(canonical_path),
                 workspace_id: None,
                 workspace_root: None,
                 project_name: None,
@@ -1681,7 +1810,7 @@ impl super::JournalWriter<'_> {
         let actor = request.actor.clone().unwrap_or_else(|| "module".into());
         self.mutation("attach_derived_parent", None, move |tx| {
             let value = json!({"projectId": request.project_id, "root": request.root, "container": request.container, "registrationEpoch": request.registration_epoch});
-            let record = root_record(tx, &request.root)?;
+            let record = root_record(tx, &request.root, &Checkouts::of(&request.root))?;
             let owner = tx
                 .query_row("SELECT project_id FROM project_root WHERE canonical_root = ?1", [&request.root], |row| row.get::<_, String>(0))
                 .optional()?;
@@ -1993,6 +2122,43 @@ mod tests {
             let reply = f.store.resolve_with_binding(path, Some(&captured)).unwrap();
             assert_eq!(reply.via, "worktree");
             assert!(reply.root_fields.is_none());
+        }
+    }
+
+    #[test]
+    fn resolve_reads_the_disk_before_its_snapshot_never_inside_it() {
+        let mut f = store("disk-before-snapshot");
+        let root = repo(&f, "main", None);
+        register(&f, "pj-main", root.clone());
+        bind(&f, &root);
+        let missing = child_path(&root, &["created-during-snapshot"]);
+        let token_file = Path::new(&root).join(".git").join(INCARNATION_FILE);
+        let token = fs::read(&token_file).unwrap();
+        for root_records in [false, true] {
+            f.store.set_root_records(root_records);
+            // While the snapshot is held, create the queried folder and take
+            // the checkout's token away. Neither may change the reply: both
+            // were read before the snapshot began.
+            let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let (folder, file) = (missing.clone(), token_file.clone());
+            f.store.set_read_hook(Some(std::sync::Arc::new(move || {
+                if armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    fs::create_dir_all(&folder).unwrap();
+                    fs::remove_file(&file).unwrap();
+                }
+            })));
+            let reply = f.store.resolve(&missing).unwrap();
+            f.store.set_read_hook(None);
+            assert!(reply.gone, "existence was read before the snapshot");
+            if root_records {
+                assert_eq!(
+                    (reply.project_id.as_str(), reply.via.as_str()),
+                    ("pj-main", "walk")
+                );
+                assert_eq!(fields(&reply).root_records[0].identity, "bound");
+            }
+            fs::remove_dir(&missing).unwrap();
+            fs::write(&token_file, &token).unwrap();
         }
     }
 

@@ -1,14 +1,27 @@
-//! A WAL reader independent of the leased writer. Every query closure observes
-//! one committed snapshot, including its journal generation.
+//! A small fixed pool of WAL readers independent of the leased writer. Every
+//! query closure runs on one reader inside one transaction, so it observes one
+//! committed snapshot, including its journal generation. One slow read holds
+//! only its own reader; the others keep answering.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Condvar, Mutex};
 
 use cortexkit_store_types::{StorageBackend, StorageDescriptor};
 use rusqlite::{params_from_iter, types::Value, Connection, OpenFlags};
 
 use crate::RegistryError;
 
-pub(crate) struct ReadConnection(Mutex<Connection>);
+/// How many read-only connections a store opens. A burst of more reads than
+/// this waits for a free reader rather than opening another connection.
+pub(crate) const READERS: usize = 4;
+
+/// A test seam run inside every read snapshot while the read holds its reader.
+pub(crate) type ReadHook = Arc<dyn Fn() + Send + Sync>;
+
+pub(crate) struct ReadConnection {
+    idle: Mutex<Vec<Connection>>,
+    returned: Condvar,
+    hook: Mutex<Option<ReadHook>>,
+}
 
 impl ReadConnection {
     pub(crate) fn open(descriptor: &StorageDescriptor) -> Result<Self, RegistryError> {
@@ -17,29 +30,97 @@ impl ReadConnection {
                 "registry requires SQLite storage".into(),
             ));
         };
-        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        let journal_mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
-        if !journal_mode.eq_ignore_ascii_case("wal") {
-            return Err(RegistryError::Database(
-                "registry reads require SQLite WAL".into(),
-            ));
-        }
-        conn.execute_batch("PRAGMA query_only=ON; PRAGMA foreign_keys=ON;")?;
-        Ok(Self(Mutex::new(conn)))
+        let readers = (0..READERS)
+            .map(|_| open_reader(path))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            idle: Mutex::new(readers),
+            returned: Condvar::new(),
+            hook: Mutex::new(None),
+        })
     }
 
     pub(crate) fn read<T>(
         &self,
         query: impl FnOnce(&Connection) -> rusqlite::Result<T>,
     ) -> rusqlite::Result<T> {
-        let mut conn = self
-            .0
+        let mut reader = self.checkout();
+        let tx = reader.connection().transaction()?;
+        let hook = self
+            .hook
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let tx = conn.transaction()?;
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
         let result = query(&tx)?;
         tx.commit()?;
         Ok(result)
+    }
+
+    pub(crate) fn set_hook(&self, hook: Option<ReadHook>) {
+        *self
+            .hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+    }
+
+    /// Wait for a free reader. The returned guard puts it back when the read
+    /// ends, including when the query panics (its transaction rolls back first).
+    fn checkout(&self) -> Reader<'_> {
+        let mut idle = self
+            .idle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if let Some(connection) = idle.pop() {
+                return Reader {
+                    pool: self,
+                    connection: Some(connection),
+                };
+            }
+            idle = self
+                .returned
+                .wait(idle)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+}
+
+fn open_reader(path: &str) -> Result<Connection, RegistryError> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let journal_mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+    if !journal_mode.eq_ignore_ascii_case("wal") {
+        return Err(RegistryError::Database(
+            "registry reads require SQLite WAL".into(),
+        ));
+    }
+    conn.execute_batch("PRAGMA query_only=ON; PRAGMA foreign_keys=ON;")?;
+    Ok(conn)
+}
+
+struct Reader<'a> {
+    pool: &'a ReadConnection,
+    connection: Option<Connection>,
+}
+
+impl Reader<'_> {
+    fn connection(&mut self) -> &mut Connection {
+        self.connection.as_mut().expect("reader is checked out")
+    }
+}
+
+impl Drop for Reader<'_> {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            self.pool
+                .idle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(connection);
+            self.pool.returned.notify_one();
+        }
     }
 }
 
@@ -229,6 +310,87 @@ mod tests {
             }
         });
         assert_eq!(f.store.generation().unwrap(), 252);
+    }
+
+    #[test]
+    fn a_read_parked_inside_its_snapshot_leaves_the_other_readers_answering() {
+        let f = Fixture::new();
+        f.register("parked");
+        // Park the first read inside its snapshot, holding its reader.
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (parked_tx, parked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let hook_armed = armed.clone();
+        f.store.set_read_hook(Some(Arc::new(move || {
+            if hook_armed.swap(false, Ordering::SeqCst) {
+                parked_tx.send(()).unwrap();
+                let _ = release_rx.lock().unwrap().recv();
+            }
+        })));
+        thread::scope(|scope| {
+            let f = &f;
+            let parked = scope.spawn(move || f.store.generation().unwrap());
+            parked_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            // Every other kind of read still answers while it is parked.
+            let (done_tx, done_rx) = mpsc::channel();
+            scope.spawn(move || {
+                let resolved = f.store.resolve(&f.checkout).unwrap();
+                let enumerated = f.store.enumerate(None).unwrap();
+                let generation = f.store.generation().unwrap();
+                done_tx
+                    .send((resolved.project_name, enumerated.projects.len(), generation))
+                    .unwrap();
+            });
+            let answered = done_rx.recv_timeout(std::time::Duration::from_secs(10));
+            release_tx.send(()).unwrap();
+            assert_eq!(
+                answered.expect("reads answer while another read is parked"),
+                (Some("parked".to_string()), 1, 1)
+            );
+            assert_eq!(parked.join().unwrap(), 1);
+        });
+        f.store.set_read_hook(None);
+    }
+
+    #[test]
+    fn a_burst_of_reads_waits_for_a_free_reader_instead_of_opening_more() {
+        let f = Fixture::new();
+        // Park every read that enters a snapshot until the gate opens.
+        let entered = Arc::new(AtomicU64::new(0));
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let (hook_entered, hook_gate) = (entered.clone(), gate.clone());
+        f.store.set_read_hook(Some(Arc::new(move || {
+            hook_entered.fetch_add(1, Ordering::SeqCst);
+            let (open, opened) = &*hook_gate;
+            let mut open = open.lock().unwrap();
+            while !*open {
+                open = opened.wait(open).unwrap();
+            }
+        })));
+        thread::scope(|scope| {
+            let reads = (0..READERS + 1)
+                .map(|_| scope.spawn(|| f.store.generation().unwrap()))
+                .collect::<Vec<_>>();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while entered.load(Ordering::SeqCst) < READERS as u64 {
+                assert!(std::time::Instant::now() < deadline, "readers never filled");
+                thread::yield_now();
+            }
+            // The extra read has no reader to enter a snapshot on.
+            thread::sleep(std::time::Duration::from_millis(200));
+            assert_eq!(entered.load(Ordering::SeqCst), READERS as u64);
+            let (open, opened) = &*gate;
+            *open.lock().unwrap() = true;
+            opened.notify_all();
+            for read in reads {
+                assert_eq!(read.join().unwrap(), 0);
+            }
+        });
+        assert_eq!(entered.load(Ordering::SeqCst), READERS as u64 + 1);
+        f.store.set_read_hook(None);
     }
 
     #[test]

@@ -235,12 +235,7 @@ fn main() -> std::process::ExitCode {
 async fn serve_module(
     module_started_at: Instant,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let handler = ProjectsHandler::new_with_start(module_started_at)?;
-    let refusal = handler.hello_refusal.clone();
-    let confirmer = Arc::new(agent_ops::DaemonConfirmer::new(
-        handler.route_admissions.clone(),
-    ));
-    let handler = handler.with_operator_confirmer(confirmer.clone());
+    let (handler, refusal, confirmer) = served_handler(module_started_at)?;
     // The SDK reads `--subc` and `SUBC_MODULE_ID` exactly as `serve` does, but
     // returns the live handle. Install it before polling the serve future so no
     // request can need a confirmation before the confirmer has a connection.
@@ -248,6 +243,86 @@ async fn serve_module(
     confirmer.set_module_handle(handle);
     serve_until_refused(serving, &refusal).await?;
     Ok(())
+}
+
+/// Build the handler the module serves, as `serve_module` does: wrapped in
+/// the one `Arc` the SDK holds, with its self-handle installed.
+fn served_handler(
+    module_started_at: Instant,
+) -> Result<
+    (
+        ServedHandler,
+        Arc<HelloRefusal>,
+        Arc<agent_ops::DaemonConfirmer>,
+    ),
+    std::io::Error,
+> {
+    let handler = ProjectsHandler::new_with_start(module_started_at)?;
+    let refusal = handler.hello_refusal.clone();
+    let confirmer = Arc::new(agent_ops::DaemonConfirmer::new(
+        handler.route_admissions.clone(),
+    ));
+    let handler = handler.with_operator_confirmer(confirmer.clone());
+    Ok((handler.into_served(), refusal, confirmer))
+}
+
+/// The handler as the SDK serves it: the module's one `Arc` of
+/// `ProjectsHandler`, which also points back to it weakly (`this`). A served
+/// read upgrades that handle to run on the blocking pool with an owned
+/// handler; `spawn_blocking` cannot borrow one.
+struct ServedHandler(Arc<ProjectsHandler>);
+
+impl ProjectsHandler {
+    fn into_served(self) -> ServedHandler {
+        let handler = Arc::new(self);
+        // A fresh handler has no self-handle yet, so this cannot fail.
+        let _ = handler.this.set(Arc::downgrade(&handler));
+        ServedHandler(handler)
+    }
+}
+
+#[async_trait]
+impl ModuleHandler for ServedHandler {
+    async fn on_draining(
+        &self,
+        reason: subc_client_rs::RouteCloseReason,
+        deadline: std::time::SystemTime,
+    ) {
+        self.0.on_draining(reason, deadline).await;
+    }
+
+    fn control_ops(&self) -> Vec<String> {
+        self.0.control_ops()
+    }
+
+    async fn on_control_request(
+        &self,
+        op: &str,
+        body: Value,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Value, subc_protocol::ErrorBody> {
+        self.0.on_control_request(op, body, cancel).await
+    }
+
+    async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+        self.0.handle(ctx, body).await
+    }
+
+    async fn on_bind(&self, request: &RouteBindRequest) -> BindDecision {
+        self.0.on_bind(request).await
+    }
+
+    async fn on_route_gone(&self, handle: &RouteHandle) {
+        self.0.on_route_gone(handle).await;
+    }
+
+    async fn on_hello_ack(&self, ack: &ModuleHelloAckBody) {
+        self.0.on_hello_ack(ack).await;
+    }
+
+    async fn health(&self) -> HealthReport {
+        self.0.health().await
+    }
 }
 
 fn unicode_arguments(
@@ -615,6 +690,13 @@ struct ProjectsHandler {
     confirmation_admission_barrier: Option<Arc<tokio::sync::Barrier>>,
     #[cfg(test)]
     shared_commit_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// The module's own `Arc` of this handler, held weakly, so a served read
+    /// can hand an owned handler to the blocking pool. `into_served` installs
+    /// it; only handlers that unit tests build by value lack it.
+    this: std::sync::OnceLock<std::sync::Weak<ProjectsHandler>>,
+    /// Counts served reads running on the blocking pool, including ones whose
+    /// caller was refused at the deadline: draining waits for them.
+    served_reads: Arc<move_driver::SqlOperations>,
 }
 
 /// The parts of a route's bind stamp that decide what the route may do here.
@@ -1043,6 +1125,8 @@ impl ProjectsHandler {
             confirmation_admission_barrier: None,
             #[cfg(test)]
             shared_commit_hook: None,
+            this: std::sync::OnceLock::new(),
+            served_reads: Arc::default(),
         }
     }
 
@@ -1171,13 +1255,20 @@ impl ModuleHandler for ProjectsHandler {
     async fn on_draining(
         &self,
         _reason: subc_client_rs::RouteCloseReason,
-        _deadline: std::time::SystemTime,
+        deadline: std::time::SystemTime,
     ) {
         // Dropping an in-flight shared-write future closes its settlement
         // channel. The blocking worker rolls back while preserving the pending
         // entry for log-read recovery, rather than holding a batch open at stop.
         self.draining.send_replace(true);
         self.provider_resolver.stop().await;
+        // A served read refused at its deadline still runs to completion on
+        // the blocking pool, holding a store handle. Wait for those, but no
+        // longer than the daemon allows for draining.
+        let remaining = deadline
+            .duration_since(std::time::SystemTime::now())
+            .unwrap_or_default();
+        let _ = tokio::time::timeout(remaining, self.served_reads.wait()).await;
     }
 
     fn control_ops(&self) -> Vec<String> {
@@ -3271,6 +3362,19 @@ mod tests {
         // and the starter seed) that hold a store handle; Windows cannot delete a
         // scratch folder while one is still open.
         handler.catalog_sql.wait().await;
+        handler.served_reads.wait().await;
+    }
+
+    #[tokio::test]
+    async fn the_module_start_path_installs_the_served_self_handle() {
+        let (served, _, _) = served_handler(Instant::now()).unwrap();
+        let this = served
+            .0
+            .this
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .expect("serve_module's handler has its self-handle");
+        assert!(Arc::ptr_eq(&this, &served.0));
     }
 
     #[tokio::test]

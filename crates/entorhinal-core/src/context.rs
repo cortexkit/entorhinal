@@ -16,15 +16,21 @@ fn stamp(store: &RegistryStore, conn: &Connection, incarnation: &str) -> rusqlit
 }
 impl RegistryStore {
     pub fn context_project(&self, folder: &str, incarnation: &str) -> Result<Value, RegistryError> {
-        self.read(|conn| Ok(self.context_project_in(conn, folder, incarnation)))?
+        // Read the folder's checkout facts from disk before the snapshot, as
+        // `resolve` does, so no reader waits on the filesystem.
+        let (path, mut checkouts) = self.resolve_path(folder, None)?;
+        self.read_with_checkouts(&mut checkouts, |conn, checkouts| {
+            self.context_project_in(conn, &path, checkouts, incarnation)
+        })
     }
     fn context_project_in(
         &self,
         conn: &Connection,
-        folder: &str,
+        path: &crate::ResolvePath,
+        checkouts: &crate::binding::Checkouts,
         incarnation: &str,
     ) -> Result<Value, RegistryError> {
-        let resolved = self.resolve_in(conn, folder, None)?;
+        let resolved = self.resolve_in(conn, path, None, checkouts)?;
         #[cfg(test)]
         checkpoint();
         let domain: Option<Option<String>> = conn

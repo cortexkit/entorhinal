@@ -28,6 +28,40 @@ pub(super) const READ_METHODS: &[&str] = &[
 
 const WAIT_TIMEOUT: Duration = Duration::from_secs(25);
 
+/// How long a served read may run on the blocking pool before its caller is
+/// refused. Under the daemon's 30 s call timeout, so the caller hears a named,
+/// retryable refusal instead of timing out itself.
+pub(super) const SERVED_READ_DEADLINE: Duration = Duration::from_secs(20);
+
+/// Warns once if a served handler lacks its self-handle.
+static MISSING_SELF_HANDLE: std::sync::Once = std::sync::Once::new();
+
+#[cfg(test)]
+thread_local! {
+    /// Blocking-pool reads started on this thread whose results have not been
+    /// taken yet. A watch test polls a watch until this is zero, since the
+    /// watch's snapshot now finishes on another thread.
+    pub(super) static READS_IN_FLIGHT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts one read in `READS_IN_FLIGHT` while it lives.
+struct InFlight;
+
+impl InFlight {
+    fn start() -> Self {
+        #[cfg(test)]
+        READS_IN_FLIGHT.with(|count| count.set(count.get() + 1));
+        Self
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        READS_IN_FLIGHT.with(|count| count.set(count.get().saturating_sub(1)));
+    }
+}
+
 /// Separating the wait clock from row timestamps permits deterministic timeout
 /// tests without delaying the suite or making wall-clock jumps affect a poll.
 #[async_trait]
@@ -87,11 +121,79 @@ impl ProjectsHandler {
                 Err(error) => Err(error),
             }
         } else {
-            self.execute(request, key)
+            self.execute_off_runtime(request, key).await
         };
         match result {
             Ok(body) => subc_client_rs::HandlerOutcome::Response(body),
             Err(error) => error.into_outcome(),
+        }
+    }
+
+    /// Run one served request's synchronous handling, store reads included, on
+    /// the blocking pool, so a slow query or a stalled disk occupies a
+    /// blocking thread and one reader, never a runtime worker.
+    async fn execute_off_runtime(
+        &self,
+        request: WireRequest,
+        key: RouteKey,
+    ) -> Result<Vec<u8>, HandlerError> {
+        let Some(handler) = self.this.get().and_then(std::sync::Weak::upgrade) else {
+            // Only a handler a unit test built by value, without
+            // `into_served`, gets here; `serve_module` always installs the
+            // handle. Such tests keep the inline path.
+            MISSING_SELF_HANDLE.call_once(|| {
+                tracing::warn!(
+                    target: "store",
+                    "served handler has no self-handle; serving reads inline"
+                );
+            });
+            return self.execute(request, key);
+        };
+        let method = request.method.clone();
+        let job = tokio::task::spawn_blocking(
+            self.served_reads
+                .tracked(move || handler.execute(request, key)),
+        );
+        self.finish_read(&method, job).await
+    }
+
+    /// Run one store job on the blocking pool under the served-read deadline,
+    /// for reads that finish their reply on the async side.
+    pub(super) async fn read_blocking<T: Send + 'static>(
+        &self,
+        method: &str,
+        job: impl FnOnce(&RegistryStore) -> Result<T, HandlerError> + Send + 'static,
+    ) -> Result<T, HandlerError> {
+        let store = self.with_agent_store(|store| Ok(store.clone()))?;
+        let _in_flight = InFlight::start();
+        let job = tokio::task::spawn_blocking(self.served_reads.tracked(move || job(&store)));
+        self.finish_read(method, job).await
+    }
+
+    async fn finish_read<T>(
+        &self,
+        method: &str,
+        job: tokio::task::JoinHandle<Result<T, HandlerError>>,
+    ) -> Result<T, HandlerError> {
+        match tokio::time::timeout(SERVED_READ_DEADLINE, job).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => Err(HandlerError::new(
+                "storage_error",
+                format!("read did not finish: {error}"),
+            )),
+            Err(_) => {
+                // The read is abandoned, not cancelled: a blocking job cannot
+                // be stopped, so it runs to completion, still counted in
+                // `served_reads`, and draining waits for it.
+                tracing::warn!(target: "store", method, "served read passed its deadline");
+                Err(HandlerError::new(
+                    "read_timeout",
+                    format!(
+                        "'{method}' did not finish within {} s; retry",
+                        SERVED_READ_DEADLINE.as_secs()
+                    ),
+                ))
+            }
         }
     }
 
@@ -187,6 +289,27 @@ impl ProjectsHandler {
         self.with_agent_store(|store| store.agent_changes(request.cursor, request.limit))
     }
 
+    /// `scan_changes` with its store read on the blocking pool, for the
+    /// long-poll, which runs on the async side between scans.
+    async fn scan_changes_off_runtime(
+        &self,
+        request: &ChangesRequest,
+    ) -> Result<AgentChangesReply, HandlerError> {
+        if request.incarnation != self.incarnation {
+            return Err(HandlerError::new(
+                "snapshot_required",
+                "incarnation changed; take a new snapshot",
+            ));
+        }
+        let (cursor, limit) = (request.cursor, request.limit);
+        self.read_blocking("agent.changes", move |store| {
+            store
+                .agent_changes(cursor, limit)
+                .map_err(HandlerError::from)
+        })
+        .await
+    }
+
     async fn agent_changes_wait(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
         let request: ChangesRequest = decode(params)?;
         // Register before scanning: a commit between the scan and suspension
@@ -194,7 +317,7 @@ impl ProjectsHandler {
         let notified = self.commits.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        let mut reply = self.scan_changes(&request)?;
+        let mut reply = self.scan_changes_off_runtime(&request).await?;
         if !request.wait.unwrap_or(true)
             || reply.cursor != request.cursor
             || !reply.entries.is_empty()
@@ -210,12 +333,12 @@ impl ProjectsHandler {
             tokio::select! {
                 // Re-read even at the deadline: a concurrently committed entry
                 // wins over an empty timeout response.
-                _ = &mut timeout => return self.encode_read_result(self.scan_changes(&request)?),
+                _ = &mut timeout => return self.encode_read_result(self.scan_changes_off_runtime(&request).await?),
                 _ = &mut notified => {}
             }
             notified.set(self.commits.notified());
             notified.as_mut().enable();
-            reply = self.scan_changes(&request)?;
+            reply = self.scan_changes_off_runtime(&request).await?;
             if reply.cursor != request.cursor || !reply.entries.is_empty() {
                 return self.encode_read_result(reply);
             }
@@ -1334,19 +1457,35 @@ mod tests {
         }
     }
 
+    /// Poll until the call waits on something other than its own store reads,
+    /// which finish on the blocking pool, and check it is still waiting.
     async fn pending<F: Future>(future: &mut Pin<Box<F>>) {
-        assert!(
-            poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx).is_pending())).await,
-            "wait should remain held"
-        );
+        loop {
+            assert!(
+                poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx).is_pending())).await,
+                "wait should remain held"
+            );
+            if READS_IN_FLIGHT.with(std::cell::Cell::get) == 0 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
     }
 
+    /// Poll until the call returns. It may stay pending only while its own
+    /// store reads finish on the blocking pool, never on the clock or a
+    /// notification.
     async fn ready<F: Future>(future: &mut Pin<Box<F>>) -> F::Output {
-        poll_fn(|cx| match future.as_mut().poll(cx) {
-            Poll::Ready(value) => Poll::Ready(value),
-            Poll::Pending => panic!("call must return without clock advancing or polling again"),
-        })
-        .await
+        loop {
+            if let Poll::Ready(value) = poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx))).await {
+                return value;
+            }
+            assert!(
+                READS_IN_FLIGHT.with(std::cell::Cell::get) > 0,
+                "call must return without clock advancing or another wake-up"
+            );
+            tokio::task::yield_now().await;
+        }
     }
 
     #[tokio::test]
@@ -1503,6 +1642,100 @@ mod tests {
                 "invalid_request"
             );
         }
+    }
+
+    /// Park the first store read inside its snapshot, holding its reader,
+    /// until released. The wait is bounded so a regression that parks a
+    /// runtime worker fails the test instead of hanging it.
+    fn park_first_read(
+        store: &RegistryStore,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let armed = std::sync::atomic::AtomicBool::new(true);
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        store.set_read_hook(Some(Arc::new(move || {
+            if armed.swap(false, Ordering::SeqCst) {
+                parked_tx.send(()).unwrap();
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10));
+            }
+        })));
+        (parked_rx, release_tx)
+    }
+
+    /// The handler as the module serves it, with its self-handle installed.
+    fn served(f: &mut Fixture) -> Arc<ProjectsHandler> {
+        std::mem::replace(
+            &mut f.handler,
+            ProjectsHandler::with_runtime(INCARNATION.into(), || 700),
+        )
+        .into_served()
+        .0
+    }
+
+    async fn wait_parked(parked: std::sync::mpsc::Receiver<()>) {
+        tokio::task::spawn_blocking(move || parked.recv_timeout(Duration::from_secs(10)))
+            .await
+            .unwrap()
+            .expect("the read parked inside its snapshot");
+    }
+
+    #[tokio::test]
+    async fn a_parked_served_read_leaves_other_reads_and_health_answering_on_one_worker() {
+        assert_eq!(tokio::runtime::Handle::current().metrics().num_workers(), 1);
+        let mut f = Fixture::new(false);
+        let handler = served(&mut f);
+        let store = handler.store.lock().unwrap().clone().unwrap();
+        let (parked, release) = park_first_read(&store);
+        let request = body("enumerate", json!({}));
+        let mut enumerate = Box::pin(handler.handle_served_request(&request, READER));
+        assert!(
+            poll_fn(|cx| Poll::Ready(enumerate.as_mut().poll(cx).is_pending())).await,
+            "a served read must not run on the runtime worker"
+        );
+        wait_parked(parked).await;
+        let health = <ProjectsHandler as crate::ModuleHandler>::health(&handler).await;
+        assert_eq!(health.metrics.unwrap()["enumerateCount"], 0);
+        let resolved = success(
+            handler
+                .handle_served_request(&body("resolve", json!({"canonicalRoot":f.root})), READER)
+                .await,
+        );
+        assert_eq!(resolved["incarnation"], INCARNATION);
+        assert!(
+            poll_fn(|cx| Poll::Ready(enumerate.as_mut().poll(cx).is_pending())).await,
+            "the parked read is still parked"
+        );
+        release.send(()).unwrap();
+        assert_eq!(success(enumerate.await)["projects"], json!([]));
+        store.set_read_hook(None);
+        handler.served_reads.wait().await;
+        handler.store.lock().unwrap().take();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_served_read_past_its_deadline_is_refused_and_still_awaited() {
+        let mut f = Fixture::new(false);
+        let handler = served(&mut f);
+        let store = handler.store.lock().unwrap().clone().unwrap();
+        let (parked, release) = park_first_read(&store);
+        let request = body("enumerate", json!({}));
+        let mut enumerate = Box::pin(handler.handle_served_request(&request, READER));
+        assert!(poll_fn(|cx| Poll::Ready(enumerate.as_mut().poll(cx).is_pending())).await);
+        wait_parked(parked).await;
+        tokio::time::advance(SERVED_READ_DEADLINE).await;
+        assert_eq!(wire_error(enumerate.await).code, "read_timeout");
+        // The abandoned read still holds its reader and store handle; draining
+        // waits for it to finish.
+        let mut drained = Box::pin(handler.served_reads.wait());
+        assert!(poll_fn(|cx| Poll::Ready(drained.as_mut().poll(cx).is_pending())).await);
+        release.send(()).unwrap();
+        drained.await;
+        store.set_read_hook(None);
+        handler.store.lock().unwrap().take();
     }
 
     #[test]

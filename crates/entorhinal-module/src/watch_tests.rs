@@ -43,16 +43,25 @@ impl WatchTransport for Sink {
     }
 }
 
+/// Drive a watch until it waits on something other than its own store reads,
+/// which finish on the blocking pool, and check it has not ended.
 async fn pending(future: Pin<&mut impl Future>) {
     let mut future = future;
-    std::future::poll_fn(|cx| {
-        assert!(
-            future.as_mut().poll(cx).is_pending(),
-            "watch ended unexpectedly"
-        );
-        Poll::Ready(())
-    })
-    .await;
+    loop {
+        std::future::poll_fn(|cx| {
+            assert!(
+                future.as_mut().poll(cx).is_pending(),
+                "watch ended unexpectedly"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        if crate::agent_reads::READS_IN_FLIGHT.with(std::cell::Cell::get) == 0 {
+            return;
+        }
+        // A yield lets the blocking read finish without moving paused time.
+        tokio::task::yield_now().await;
+    }
 }
 
 fn request(method: &str, params: Value) -> Vec<u8> {
@@ -824,6 +833,59 @@ async fn identity_project_name_workspace_name_and_root_commits_wake_full_row_dif
     }
     sink.cancel.send_replace(true);
     assert!(matches!(watch.await, HandlerOutcome::Streamed));
+}
+
+/// Every identity watch woken by one commit shares one fleet build for the
+/// new generation, and each still sends its own notice.
+#[tokio::test(start_paused = true)]
+async fn identity_watches_share_one_fleet_build_per_generation() {
+    let f = seeded("watch-shared-fleet").await;
+    let builds = || {
+        f.handler
+            .watches
+            .fleet_builds
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let body = request(IDENTITY, json!({}));
+    let mut sinks = Vec::new();
+    let mut receivers = Vec::new();
+    for _ in 0..4 {
+        let (sink, receiver) = Sink::new();
+        sinks.push(sink);
+        receivers.push(receiver);
+    }
+    let mut watches = sinks
+        .iter()
+        .map(|sink| Box::pin(f.handler.serve_watch(sink, &body, READER)))
+        .collect::<Vec<_>>();
+    for watch in &mut watches {
+        pending(watch.as_mut()).await;
+    }
+    assert_eq!(
+        builds(),
+        1,
+        "watches opened at one generation share its fleet"
+    );
+    for receiver in &mut receivers {
+        assert_eq!(notice(receiver)["kind"], "resync");
+    }
+    f.success(
+        CORE,
+        "agent.rename",
+        json!({"agent_id":HEAD,"name":"Shared","request_key":"rename"}),
+    )
+    .await;
+    for watch in &mut watches {
+        debounce(watch.as_mut()).await;
+    }
+    assert_eq!(builds(), 2, "one commit costs one build, not one per watch");
+    let notices = receivers.iter_mut().map(notice).collect::<Vec<_>>();
+    assert_eq!(notices[0]["agents"][0]["displayName"], "Shared");
+    assert!(notices.iter().all(|changed| changed == &notices[0]));
+    for (sink, watch) in sinks.iter().zip(watches) {
+        sink.cancel.send_replace(true);
+        assert!(matches!(watch.await, HandlerOutcome::Streamed));
+    }
 }
 
 struct ServedHandler(Arc<ProjectsHandler>);
