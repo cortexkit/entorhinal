@@ -932,7 +932,13 @@ mod tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             self.handler.store.lock().unwrap().take();
-            std::fs::remove_dir_all(&self.dir).unwrap();
+            // A background task that is still finishing may hold the store
+            // open, and Windows then refuses the delete. Report it and leave
+            // the scratch folder: panicking in Drop would abort the test
+            // process.
+            if let Err(error) = std::fs::remove_dir_all(&self.dir) {
+                eprintln!("could not remove {}: {error}", self.dir.display());
+            }
         }
     }
     fn git(root: &Path, args: &[&str]) {
@@ -2289,6 +2295,10 @@ mod tests {
             f.handler.health().await.metrics.unwrap()["pendingWriteCount"],
             0
         );
+        // Enabling started background tasks that read the store on the
+        // blocking pool; on Windows the fixture can't delete the store folder
+        // while one of them still has it open.
+        crate::tests::stop_store_tasks(&f.handler).await;
     }
 
     #[tokio::test(start_paused = true)]
