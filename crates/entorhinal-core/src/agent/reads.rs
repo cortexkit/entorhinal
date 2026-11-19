@@ -136,6 +136,73 @@ pub(crate) fn resolve_in(
         "generation":generation}))
 }
 
+/// One of a head's live hires, as the hire listing tool pages them.
+#[derive(Debug, Clone)]
+pub struct HireEntry {
+    pub agent_id: String,
+    /// The row `agent.list` serves for this agent.
+    pub agent: Value,
+    /// The live hiree under any supervisor that comes just before this one,
+    /// after the starting cursor, or the starting cursor when there is none.
+    /// A page that has no room for this hire resumes from here.
+    pub resume: Option<String>,
+    /// Whether any live hiree, under any supervisor, comes after this one.
+    pub more: bool,
+}
+
+impl RegistryStore {
+    /// Up to `limit` live hirees supervised by `supervisor` whose agent id
+    /// follows `cursor`, in agent id order. The supervisor is matched in SQL,
+    /// so other heads' hires cost no row loads. `resume` and `more` describe
+    /// the neighbouring hirees of every supervisor, which is where the hire
+    /// listing tool's resume cursor has always pointed.
+    pub fn agent_hires(
+        &self,
+        supervisor: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<HireEntry>, AgentMutationError> {
+        if cursor == Some("") {
+            return Err(AgentMutationError::new(
+                "invalid_cursor",
+                "limit must be 1..=200 and cursor must not be empty",
+            ));
+        }
+        self.read_agent(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT a.agent_id,
+                        COALESCE((SELECT MAX(p.agent_id) FROM agent p
+                                   WHERE p.role='hiree' AND p.terminal_reason IS NULL
+                                     AND p.agent_id<a.agent_id AND (?2 IS NULL OR p.agent_id>?2)), ?2),
+                        EXISTS(SELECT 1 FROM agent n
+                                WHERE n.role='hiree' AND n.terminal_reason IS NULL AND n.agent_id>a.agent_id)
+                   FROM agent a
+                  WHERE a.role='hiree' AND a.terminal_reason IS NULL AND a.supervisor_agent_id=?1
+                    AND (?2 IS NULL OR a.agent_id>?2)
+                  ORDER BY a.agent_id LIMIT ?3",
+            )?;
+            let found = statement
+                .query_map(
+                    rusqlite::params![supervisor, cursor, limit as i64],
+                    |r| Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?)),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            found
+                .into_iter()
+                .map(|(agent_id, resume, more)| -> Result<HireEntry, AgentMutationError> {
+                    let row = load_row(conn, &agent_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+                    Ok(HireEntry {
+                        agent: row.digest(),
+                        agent_id,
+                        resume,
+                        more,
+                    })
+                })
+                .collect()
+        })
+    }
+}
+
 impl RegistryStore {
     pub(super) fn read_agent<T>(
         &self,
@@ -981,6 +1048,98 @@ pub(super) mod tests {
                 json!({"limit":null,"include_gone":null,"activated_only":null})
             ),
             read(&f, "agent.list", json!({}))
+        );
+    }
+
+    /// `agent_hires` selects one head's live hires in SQL. For each it reports
+    /// the neighbouring live hirees of every supervisor exactly as paging
+    /// `agent.list role=hiree limit=1` from the same cursor finds them, which
+    /// the hire listing tool's resume cursor and byte limit depend on.
+    #[test]
+    fn hires_by_supervisor_match_paging_every_hiree() {
+        let f = fixture(true);
+        placed(&f, "P", "W");
+        placed(&f, "Q", "W");
+        let head = create(&f, "Head", "head", Some("P"), None);
+        let other = create(&f, "Other", "head", Some("Q"), None);
+        let hire = |name: &str, supervisor: &str, project: &str| -> String {
+            call(
+                &f,
+                "agent.create",
+                json!({"name":name,"tag":"tag","role":"hiree","project_id":project,
+                    "supervisor_agent_id":supervisor,"request_key":format!("hire-{name}")}),
+            )["agent"]["agent_id"]
+                .as_str()
+                .unwrap()
+                .into()
+        };
+        let ids = [
+            hire("A", &other, "Q"),
+            hire("B", &head, "P"),
+            hire("C", &other, "Q"),
+            hire("D", &other, "Q"),
+            hire("E", &head, "P"),
+            hire("F", &head, "P"),
+            hire("G", &other, "Q"),
+            hire("H", &head, "P"),
+        ];
+        call(
+            &f,
+            "agent.dispose",
+            json!({"agent_id":ids[5],"request_key":"dispose-F"}),
+        );
+        let starts = std::iter::once(None)
+            .chain(ids.iter().cloned().map(Some))
+            .chain([Some(head.clone()), Some("agent_zzzz".into())]);
+        for start in starts {
+            let mut expected = Vec::new();
+            let mut cursor = start.clone();
+            loop {
+                let page = read(
+                    &f,
+                    "agent.list",
+                    json!({"role":"hiree","limit":1,"cursor":cursor}),
+                );
+                let next = page
+                    .get("next_cursor")
+                    .map(|next| next.as_str().unwrap().to_owned());
+                for agent in page["agents"].as_array().unwrap() {
+                    let id = agent["agent_id"].as_str().unwrap();
+                    let row = f.store.agent_row(id).unwrap().unwrap();
+                    if row.supervisor_agent_id.as_deref() == Some(head.as_str()) {
+                        expected.push((
+                            agent.clone(),
+                            id.to_owned(),
+                            cursor.clone(),
+                            next.is_some(),
+                        ));
+                    }
+                }
+                cursor = next;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            let actual = f
+                .store
+                .agent_hires(&head, start.as_deref(), 50)
+                .unwrap()
+                .into_iter()
+                .map(|hire| (hire.agent, hire.agent_id, hire.resume, hire.more))
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "from {start:?}");
+        }
+        let all = f.store.agent_hires(&head, None, 50).unwrap();
+        assert_eq!(
+            all.iter().map(|hire| &hire.agent_id).collect::<Vec<_>>(),
+            [&ids[1], &ids[4], &ids[7]]
+        );
+        assert_eq!(all[1].resume.as_ref(), Some(&ids[3]));
+        assert!(all[1].more && !all[2].more);
+        assert_eq!(f.store.agent_hires(&head, None, 1).unwrap().len(), 1);
+        assert_eq!(
+            f.store.agent_hires(&head, Some(""), 50).unwrap_err().code,
+            "invalid_cursor"
         );
     }
 }

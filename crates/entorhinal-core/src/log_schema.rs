@@ -208,12 +208,12 @@ mod tests {
             for sql in [
                 "INSERT INTO identity_log_state(id) VALUES(2)",
                 "UPDATE identity_log_state SET state='unknown'",
-                "INSERT INTO pending_entry VALUES('negative',-1)",
+                "INSERT INTO pending_entry(entry_id,expected_head) VALUES('negative',-1)",
             ] {
                 assert!(tx.execute(sql, []).is_err(), "accepted {sql}");
             }
-            tx.execute("INSERT INTO pending_entry VALUES('attempt',0)", [])?;
-            assert!(tx.execute("INSERT INTO pending_entry VALUES('attempt',1)", []).is_err());
+            tx.execute("INSERT INTO pending_entry(entry_id,expected_head) VALUES('attempt',0)", [])?;
+            assert!(tx.execute("INSERT INTO pending_entry(entry_id,expected_head) VALUES('attempt',1)", []).is_err());
             tx.execute("DELETE FROM pending_entry", [])?;
             tx.execute("INSERT INTO registry_journal(op,payload_json) VALUES('test','{}')", [])?;
             assert_eq!(tx.query_row(

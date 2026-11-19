@@ -138,74 +138,36 @@ impl ProjectsHandler {
             .agent_id
             .as_deref()
             .expect("admit_agent_tool established a nonempty stamped caller agent id");
-        let store = self.with_store(|s| Ok(s.clone()))?;
+        let mut store = self.with_store(|s| Ok(s.clone()))?;
         if !tool.writes {
+            // Read the caller's own hires by supervisor in SQL. Each entry also
+            // says whether any hiree follows it and which hiree precedes it,
+            // so the reply, its byte limit and its resume cursor match a walk
+            // over every live hiree one at a time.
+            let start = arguments.get("next").and_then(Value::as_str);
             let mut hires = Vec::new();
-            let mut cursor = arguments
-                .get("next")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            loop {
-                let body = store.agent_read(
-                    "agent.list",
-                    json!({"role":"hiree","limit":1,"cursor":cursor}),
-                )?;
-                let page = core_result(&body)?;
-                let agents = page["agents"].as_array().ok_or_else(|| {
-                    HandlerError::new("invalid_reply", "core agent.list reply has no agents array")
-                })?;
-                let next = match page.get("next_cursor") {
-                    None => None,
-                    Some(value) => Some(
-                        value
-                            .as_str()
-                            .filter(|cursor| !cursor.is_empty())
-                            .ok_or_else(|| {
-                                HandlerError::new(
-                                    "invalid_reply",
-                                    "core agent.list next_cursor must be a nonempty string",
-                                )
-                            })?
-                            .to_owned(),
-                    ),
-                };
-                for agent in agents {
-                    let id = agent["agent_id"]
-                        .as_str()
-                        .filter(|id| !id.is_empty())
-                        .ok_or_else(|| {
-                            HandlerError::new(
-                                "invalid_reply",
-                                "core agent.list row has no string agent_id",
-                            )
-                        })?;
-                    let row = store.agent_row(id)?;
-                    if row.is_some_and(|row| {
-                        row.status == "live" && row.supervisor_agent_id.as_deref() == Some(caller)
-                    }) {
-                        hires.push(agent.clone());
-                        let mut reply = json!({"agents":hires});
-                        if let Some(next) = &next {
-                            reply["next"] = json!(next);
-                        }
-                        if cortexkit_role_tool_provider::result::legacy_model_visible_bytes(&reply)
-                            > cortexkit_role_tool_provider::result::MAX_MODEL_VISIBLE_BYTES
-                        {
-                            hires.pop();
-                            if hires.is_empty() {
-                                return encode_tool_reply(reply);
-                            }
-                            // Resume before the row that did not fit, never after it.
-                            return encode_tool_reply(json!({"agents":hires,"next":cursor}));
-                        }
+            for hire in store.agent_hires(caller, start, 50)? {
+                let next = hire.more.then_some(hire.agent_id);
+                hires.push(hire.agent);
+                let mut reply = json!({"agents":hires});
+                if let Some(next) = &next {
+                    reply["next"] = json!(next);
+                }
+                if cortexkit_role_tool_provider::result::legacy_model_visible_bytes(&reply)
+                    > cortexkit_role_tool_provider::result::MAX_MODEL_VISIBLE_BYTES
+                {
+                    hires.pop();
+                    if hires.is_empty() {
+                        return encode_tool_reply(reply);
                     }
+                    // Resume before the row that did not fit, never after it.
+                    return encode_tool_reply(json!({"agents":hires,"next":hire.resume}));
                 }
-                cursor = next;
-                if cursor.is_none() {
+                let Some(next) = next else {
                     break;
-                }
+                };
                 if hires.len() == 50 {
-                    return encode_tool_reply(json!({"agents":hires,"next":cursor}));
+                    return encode_tool_reply(json!({"agents":hires,"next":next}));
                 }
             }
             return encode_tool_reply(json!({"agents":hires}));
@@ -343,11 +305,16 @@ impl ProjectsHandler {
                 target_label: target_label.into(),
                 target_scope: plan.target.clone(),
             };
+            let slot = std::sync::Arc::downgrade(&self.store);
+            // Hold no store handle while the card waits: the wait can last
+            // minutes, and a handle would keep the SQLite file open after the
+            // module closes the store. Open it again once the card settles.
+            drop(store);
             let obtained = self
                 .consent_coordinator
                 .obtain_leased(
                     ConsentCall {
-                        store: &store,
+                        store: slot.clone(),
                         connector: self.consent_connector.as_ref(),
                         stamp,
                         deadline,
@@ -359,6 +326,7 @@ impl ProjectsHandler {
                     lease,
                 )
                 .await;
+            store = crate::consent::open_store(&slot)?;
             attempt = Some(match obtained {
                 Ok(attempt) => attempt,
                 Err(error) => {

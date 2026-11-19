@@ -227,7 +227,7 @@ CREATE TABLE member_name (
 );
 "#;
 
-const MIGRATIONS: [Migration; 26] = [
+const MIGRATIONS: [Migration; 27] = [
     Migration {
         version: 1,
         statements: V1_SCHEMA,
@@ -331,6 +331,10 @@ const MIGRATIONS: [Migration; 26] = [
     Migration {
         version: 26,
         statements: hub_store::V26_HUB_STORE,
+    },
+    Migration {
+        version: 27,
+        statements: pending::V27_LEGACY_REPLY_AND_QUERY_INDEXES,
     },
 ];
 

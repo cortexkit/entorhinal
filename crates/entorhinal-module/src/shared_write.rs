@@ -959,6 +959,68 @@ mod tests {
         case(None, "ok").await;
     }
 
+    /// engram accepts a keyed `agent.create`, but neither its receipt nor any
+    /// resend answers before settlement expires, so the local transaction rolls
+    /// back and the caller hears `engram_outcome_unknown`. Catch-up later
+    /// installs the agent from the log. A retry with the same key must then
+    /// get the original success, not a name conflict with its own agent.
+    #[tokio::test(start_paused = true)]
+    async fn audit_legacy_accepted_receipt_preserves_request_key() {
+        let tap = Tap::new(0);
+        tap.fake.on_append(Action::Hold);
+        for _ in 0..30 {
+            tap.fake.on_append(Action::Hang);
+        }
+        let mut f = Fixture::new("legacy-accepted-receipt", connector(&tap));
+        f.handler.agent_id_draw = fixed_draw;
+        let received = Instant::now() - Duration::from_secs(18);
+        let bound = received + SETTLEMENT;
+        let result = {
+            let write = f.handler.write_wait(
+                WireRequest {
+                    method: "agent.create".into(),
+                    params: agent("accepted"),
+                },
+                ROUTE,
+                received,
+            );
+            tokio::pin!(write);
+            reach(write.as_mut(), tap.fake.wait_for_calls(2)).await;
+            assert_eq!(tap.fake.held_count(), 1);
+            tokio::time::advance(SEND_WAIT + TIMER_TICK).await;
+            pending(write.as_mut());
+            tokio::time::advance(RESEND_DELAY + TIMER_TICK).await;
+            reach(write.as_mut(), tap.fake.wait_for_calls(3)).await;
+            expire(write.as_mut(), &tap, bound).await
+        };
+        assert_eq!(result.unwrap_err().code, "engram_outcome_unknown");
+        assert_eq!(f.pending(), 1);
+        assert!(f.store().agent_snapshot().unwrap().agents.is_empty());
+        f.restart(connector(&tap));
+        f.handler.agent_id_draw = fixed_draw;
+        assert_eq!(tap.fake.release_next().unwrap(), 1);
+        f.handler
+            .catch_up(&f.store(), Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(f.pending(), 0);
+        assert_eq!(f.store().agent_snapshot().unwrap().agents.len(), 1);
+        let sends = tap.sends().len();
+        let body: Value = serde_json::from_slice(
+            &f.call("agent.create", agent("accepted"))
+                .await
+                .expect("a same-key retry after recovery returns the original reply"),
+        )
+        .unwrap();
+        assert_eq!(
+            body["result"]["agent"]["agent_id"],
+            "agent_0123456789abcdef"
+        );
+        assert_eq!(tap.sends().len(), sends, "the retry sent another entry");
+        assert_eq!(f.store().agent_snapshot().unwrap().agents.len(), 1);
+        assert!(f.store().verify().unwrap().ok);
+    }
+
     struct Warning(Arc<Mutex<String>>);
     impl tracing::Subscriber for Warning {
         fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
@@ -3604,6 +3666,29 @@ impl ProjectsHandler {
                 Ok(body)
             };
         }
+        // An earlier attempt with this key may have reached the log after its
+        // local transaction failed. Once catch-up applies that entry, its reply
+        // is kept under the key, and running the write again would conflict
+        // with the write's own earlier result. Look before the first catch-up
+        // and again after each one.
+        let reply_key = legacy_reply_key(&request, &write)?;
+        let recovered = |store: &RegistryStore| -> Result<Option<Vec<u8>>, HandlerError> {
+            let Some((key, digest)) = &reply_key else {
+                return Ok(None);
+            };
+            let Some(reply) = store.hub_local_reply(key, digest)? else {
+                return Ok(None);
+            };
+            let reply = hub_reply(reply)?;
+            if request.method.starts_with("agent.") {
+                self.attach_incarnation(reply).map(Some)
+            } else {
+                Ok(Some(reply))
+            }
+        };
+        if let Some(body) = recovered(&store)? {
+            return Ok(body);
+        }
         let now = (self.clock)();
         let settlement = if agent_write {
             (received + SETTLEMENT).min(deadline)
@@ -3614,6 +3699,9 @@ impl ProjectsHandler {
         };
         for retry in 0..=RETRIES {
             self.catch_up(&store, deadline).await?;
+            if let Some(body) = recovered(&store)? {
+                return Ok(body);
+            }
             let operation = write.clone();
             let principal = principal.clone();
             let stable_id = agent_id.clone();
@@ -3622,6 +3710,7 @@ impl ProjectsHandler {
             let (returned_writer, result) = ChangeWriter {
                 log: &self.log_client,
                 health: &self.health,
+                reply_key: reply_key.clone(),
                 #[cfg(test)]
                 commit_hook: self.shared_commit_hook.clone(),
             }
@@ -3779,6 +3868,31 @@ impl ProjectsHandler {
     }
 }
 
+/// The request key and argument digest under which a legacy shared write's
+/// reply is kept when the log accepts its entry after the local transaction
+/// failed. Only writes whose local path caches replies by request key take
+/// part: consent-card writes record their outcome on the consent request, and
+/// the root, member-name and avatar-manifest writes carry no request key.
+fn legacy_reply_key(
+    request: &WireRequest,
+    write: &Write,
+) -> Result<Option<(String, String)>, HandlerError> {
+    if matches!(
+        write,
+        Write::Consent(..)
+            | Write::CatalogInstall(..)
+            | Write::ManifestAvatar(..)
+            | Write::Add(_)
+            | Write::RefreshKey(_)
+            | Write::MoveRoot(_)
+            | Write::Member(_)
+    ) {
+        return Ok(None);
+    }
+    let (key, digest) = hub_request(request, write)?;
+    Ok(key.filter(|key| !key.is_empty()).map(|key| (key, digest)))
+}
+
 fn hub_request(
     request: &WireRequest,
     write: &Write,
@@ -3933,6 +4047,10 @@ fn preview_hub_create(
 pub(super) struct ChangeWriter<'a> {
     pub(super) log: &'a log_client::LogClient,
     pub(super) health: &'a Arc<HealthGauges>,
+    /// The request key and argument digest the write's reply is cached under,
+    /// kept with the pending attempt so a write the log accepted after its
+    /// local transaction failed still answers its retry with that reply.
+    pub(super) reply_key: Option<(String, String)>,
     #[cfg(test)]
     pub(super) commit_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -3961,15 +4079,17 @@ impl ChangeWriter<'_> {
         let (decision_tx, decision_rx) = std::sync::mpsc::channel();
         let worker_store = store.clone();
         let health = Arc::clone(self.health);
+        let reply_key = self.reply_key.clone();
         #[cfg(test)]
         let commit_hook = self.commit_hook.clone();
         let worker = tokio::task::spawn_blocking(move || {
             // Dropping the request must not release exclusion before this
             // worker has committed or rolled back its SQLite transaction.
             let mut bytes_tx = Some(bytes_tx);
-            let result = worker_store.shared_attempt(
+            let result = worker_store.shared_attempt_with_reply(
                 log_client::encode_hex(&id),
                 head,
+                reply_key,
                 move |bytes| {
                     // Preparation reaches this callback only after the pending
                     // row committed. Publish before the append can park.

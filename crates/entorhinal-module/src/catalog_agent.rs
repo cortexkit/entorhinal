@@ -687,8 +687,10 @@ impl ProjectsHandler {
             )).await
             }
             "catalog_install" => {
+                // The install may wait minutes for a consent card; it opens the
+                // store for each stretch of work instead of holding this handle.
+                drop(store);
                 self.install_catalog_plan(
-                    &store,
                     caller,
                     stamp,
                     arguments["plan_id"].as_str().expect("validated plan id"),
@@ -770,7 +772,6 @@ impl ProjectsHandler {
     }
     async fn install_catalog_plan(
         &self,
-        store: &RegistryStore,
         caller: &str,
         stamp: &subc_protocol::scope::ScopeStamp,
         id: &str,
@@ -782,6 +783,10 @@ impl ProjectsHandler {
             Authorization, ConsentCommit, ConsentRequest, ConsentWrite, RequestIdentity,
             RequestState,
         };
+        // Hold the store slot weakly, so the handle below can be released for
+        // the consent card wait and opened again once the card settles.
+        let slot = Arc::downgrade(&self.store);
+        let mut store = crate::consent::open_store(&slot)?;
         let identity = RequestIdentity {
             agent_id: caller.into(),
             tool: "catalog_install".into(),
@@ -809,7 +814,7 @@ impl ProjectsHandler {
                     HandlerError::new("consent_lost", "terminal request has no outcome")
                 })?;
                 if let Some(generation) = outcome["generation_id"].as_str() {
-                    self.prefetch_catalog(store, caller, generation, deadline)
+                    self.prefetch_catalog(&store, caller, generation, deadline)
                         .await?;
                 }
                 return replay(outcome);
@@ -845,7 +850,7 @@ impl ProjectsHandler {
             Err(e) if saved.is_some() => {
                 return self
                     .refuse_catalog_write(
-                        store,
+                        &store,
                         &row,
                         &Value::Null,
                         Authorization::Card {
@@ -873,7 +878,7 @@ impl ProjectsHandler {
             {
                 return self
                     .refuse_catalog_write(
-                        store,
+                        &store,
                         &row,
                         &target,
                         Authorization::Card {
@@ -953,23 +958,25 @@ impl ProjectsHandler {
                 target_label: id.into(),
                 target_scope: json!({"operation":op.as_str(),"target":plan.target}),
             };
-            attempt = Some(
-                self.consent_coordinator
-                    .obtain_leased(
-                        ConsentCall {
-                            store,
-                            connector: self.consent_connector.as_ref(),
-                            stamp,
-                            deadline,
-                            now_ms: &self.clock,
-                        },
-                        &row,
-                        &context,
-                        Some(&plan),
-                        lease,
-                    )
-                    .await?,
-            );
+            drop(store);
+            let obtained = self
+                .consent_coordinator
+                .obtain_leased(
+                    ConsentCall {
+                        store: slot.clone(),
+                        connector: self.consent_connector.as_ref(),
+                        stamp,
+                        deadline,
+                        now_ms: &self.clock,
+                    },
+                    &row,
+                    &context,
+                    Some(&plan),
+                    lease,
+                )
+                .await;
+            attempt = Some(obtained?);
+            store = crate::consent::open_store(&slot)?;
             match &attempt.as_ref().expect("attempt assigned above").decision {
                 ConsentDecision::Pending(id) => return Err(pending(id.clone())),
                 ConsentDecision::Replay(outcome) => return replay(outcome.clone()),
@@ -982,7 +989,7 @@ impl ProjectsHandler {
                 ConsentDecision::Refused(code) => {
                     return self
                         .refuse_catalog_write(
-                            store,
+                            &store,
                             &row,
                             &plan.target,
                             Authorization::Card {
@@ -1019,7 +1026,7 @@ impl ProjectsHandler {
                     serde_json::from_slice(&body).map_err(crate::invalid_params)?;
                 let outcome = envelope["result"].clone();
                 self.prefetch_catalog(
-                    store,
+                    &store,
                     caller,
                     outcome["generation_id"].as_str().ok_or_else(|| {
                         HandlerError::new("invalid_reply", "missing generation id")
@@ -1035,7 +1042,7 @@ impl ProjectsHandler {
                     "plan_stale" | "gone" | "invalid_reply" | "consent_lost"
                 ) =>
             {
-                self.refuse_catalog_write(store, &row, &plan.target, authorization, e, deadline)
+                self.refuse_catalog_write(&store, &row, &plan.target, authorization, e, deadline)
                     .await
             }
             Err(e) => Err(e),

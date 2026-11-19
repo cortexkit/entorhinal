@@ -11,6 +11,33 @@ use serde_json::{json, Value};
 
 pub(crate) const HUB_LOCAL: &str = "hub.local_write";
 
+/// Migration 27.
+///
+/// `pending_entry.continuation` keeps this machine's own half of a legacy
+/// shared write whose append may have reached the log: the request key, the
+/// digest of its arguments and the reply the rolled-back local transaction
+/// would have stored. When catch-up later applies that same entry, the reply is
+/// saved under the request key, so a retry with the same key gets the original
+/// success instead of a conflict with its own earlier write. None of it is
+/// ever part of the shared entry.
+///
+/// The two partial indexes serve bounded queries that would otherwise scan
+/// unrelated rows: the session retention prune selects only ended bindings,
+/// and the agent change marker and `agent.changes` feed select only identity
+/// operations from the journal. SQLite uses a partial index only when the
+/// query repeats its condition exactly, so the operation list must match
+/// `IDENTITY_CHANGE_OPS` in order; a query-plan test checks that it does.
+pub(crate) const V27_LEGACY_REPLY_AND_QUERY_INDEXES: &str = r#"
+ALTER TABLE pending_entry ADD COLUMN continuation TEXT NULL;
+CREATE INDEX session_binding_ended
+    ON session_binding(ended_at_ms) WHERE ended_at_ms IS NOT NULL;
+CREATE INDEX registry_journal_identity
+    ON registry_journal(seq)
+    WHERE op IN ('agent.create','agent.rename','agent.update_tag','agent.set_labels',
+                 'agent.set_avatar','agent.set_github_identity','agent.dispose',
+                 'agent.merge','agent.import','agent.set_namespace');
+"#;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HubContinuation {
     pub entry_id: String,
@@ -281,6 +308,24 @@ pub(crate) fn apply_hub_local(
 }
 use std::cell::RefCell;
 
+/// Save the reply of this machine's own legacy shared write when the entry it
+/// sent is applied from the log after its local transaction failed. Runs in
+/// the transaction that applies the entry, before that entry's pending row is
+/// cleared. A reply already saved under the same key is kept.
+pub(crate) fn install_legacy_reply(
+    tx: &Transaction<'_>,
+    entry: &crate::remote_apply::RemoteEntry,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT OR IGNORE INTO hub_local_reply(request_key,params_digest,reply)
+         SELECT json_extract(continuation,'$.request_key'),json_extract(continuation,'$.params_digest'),
+                json_extract(continuation,'$.reply')
+           FROM pending_entry WHERE entry_id=?1 AND expected_head+1=?2 AND continuation IS NOT NULL",
+        params![entry.entry_id, entry.position],
+    )?;
+    Ok(())
+}
+
 pub enum SharedSettlement {
     Commit(i64),
     Rollback {
@@ -295,6 +340,12 @@ struct Attempt {
     sent: bool,
     settle: Box<dyn FnMut(Vec<u8>) -> SharedSettlement>,
     preview: Option<Preview>,
+    /// The request key and argument digest the caller caches this write's
+    /// reply under, if any.
+    reply_key: Option<(String, String)>,
+    /// The key, digest and reply captured when the entry was handed to the
+    /// log, saved on the pending row if the local transaction then fails.
+    continuation: Option<String>,
 }
 type Preview = Box<dyn FnOnce(Vec<u8>, Value)>;
 thread_local! {
@@ -351,7 +402,24 @@ impl RegistryStore {
         settle: impl FnMut(Vec<u8>) -> SharedSettlement + 'static,
         operation: impl FnOnce() -> Result<Vec<u8>, E>,
     ) -> Result<Vec<u8>, E> {
-        self.shared_attempt_inner(id, head, settle, None, operation)
+        self.shared_attempt_inner(id, head, settle, None, None, operation)
+    }
+
+    /// [`Self::shared_attempt`] for a write whose reply the caller caches
+    /// under `reply_key`, a request key and the digest of its arguments. If
+    /// the entry may have reached the log but the local transaction fails, the
+    /// pending row keeps the key, digest and reply. Applying that entry from
+    /// the log later saves the reply in `hub_local_reply`, where the caller
+    /// looks before running a retry.
+    pub fn shared_attempt_with_reply<E: From<RegistryError>>(
+        &self,
+        id: String,
+        head: i64,
+        reply_key: Option<(String, String)>,
+        settle: impl FnMut(Vec<u8>) -> SharedSettlement + 'static,
+        operation: impl FnOnce() -> Result<Vec<u8>, E>,
+    ) -> Result<Vec<u8>, E> {
+        self.shared_attempt_inner(id, head, settle, None, reply_key, operation)
     }
 
     pub fn preview_hub_write<E: From<RegistryError>>(
@@ -365,6 +433,7 @@ impl RegistryStore {
             0,
             |_| unreachable!("hub preview always rolls back a shared change"),
             Some(Box::new(preview)),
+            None,
             operation,
         )
     }
@@ -375,6 +444,7 @@ impl RegistryStore {
         head: i64,
         settle: impl FnMut(Vec<u8>) -> SharedSettlement + 'static,
         preview: Option<Preview>,
+        reply_key: Option<(String, String)>,
         operation: impl FnOnce() -> Result<Vec<u8>, E>,
     ) -> Result<Vec<u8>, E> {
         let legacy = preview.is_none();
@@ -396,6 +466,8 @@ impl RegistryStore {
                 sent: false,
                 settle: Box::new(settle),
                 preview,
+                reply_key,
+                continuation: None,
             });
         });
         struct Reset;
@@ -408,7 +480,11 @@ impl RegistryStore {
         }
         let reset = Reset;
         let result = operation();
-        let sent = ATTEMPT.with(|slot| slot.borrow().as_ref().unwrap().sent);
+        let (sent, continuation) = ATTEMPT.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let attempt = slot.as_mut().unwrap();
+            (attempt.sent, attempt.continuation.take())
+        });
         drop(reset);
         if legacy && result.is_err() && !sent {
             self.db
@@ -417,6 +493,20 @@ impl RegistryStore {
                     Ok(())
                 })
                 .map_err(RegistryError::Store)?;
+        } else if legacy && result.is_err() {
+            if let Some(continuation) = continuation {
+                // The local transaction has rolled back, so its reply survives
+                // only here, on the pending row committed before it began.
+                self.db
+                    .with_conn_fenced(|tx| {
+                        tx.execute(
+                            "UPDATE pending_entry SET continuation=?1 WHERE entry_id=?2",
+                            params![continuation, id],
+                        )?;
+                        Ok(())
+                    })
+                    .map_err(RegistryError::Store)?;
+            }
         }
         result
     }
@@ -475,6 +565,21 @@ pub(crate) fn finish(tx: &Transaction<'_>, seq: Option<i64>) -> Result<(), Regis
             // Keeping the pending row lets later log reads check what happened;
             // the row alone neither resends the entry nor commits local changes.
             attempt.sent = true;
+            // Capture the reply this transaction stores under its request key,
+            // in case the transaction rolls back after the log accepted the
+            // entry. Agent tool writes made under a consent card pass no key:
+            // their outcome is recorded on the consent request instead.
+            if let Some((request_key, params_digest)) = &attempt.reply_key {
+                let reply: Option<String> = tx.query_row(
+                    "SELECT response_json FROM registry_journal WHERE seq=?1",
+                    [seq],
+                    |r| r.get(0),
+                )?;
+                attempt.continuation = reply.map(|reply| {
+                    json!({"request_key":request_key,"params_digest":params_digest,"reply":reply})
+                        .to_string()
+                });
+            }
             match (attempt.settle)(entry) {
                 SharedSettlement::Commit(position) => {
                     tx.execute("UPDATE registry_journal SET entry_id=?1,log_position=?2 WHERE seq=?3", params![attempt.id,position,seq])?;

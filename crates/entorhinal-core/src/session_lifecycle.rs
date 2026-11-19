@@ -42,6 +42,18 @@ CREATE INDEX session_binding_open_agent
 /// the computer that launched them when the head agent moves.
 pub const V24_SESSION_ROLE: &str = "ALTER TABLE session_binding ADD COLUMN role TEXT NOT NULL DEFAULT 'head' CHECK(role IN ('head','delegated'));";
 
+/// One retention batch: delete up to `?2` bindings that ended before `?1`,
+/// keeping every binding of an agent with an open move. Migration 27's
+/// `session_binding_ended` index lets it find candidates without reading the
+/// bindings that never ended.
+pub(crate) const PRUNE_ENDED_SQL: &str = "DELETE FROM session_binding WHERE rowid IN (
+     SELECT rowid FROM session_binding
+     WHERE ended_at_ms IS NOT NULL AND ended_at_ms < ?1
+       AND agent_id NOT IN (
+           SELECT agent_id FROM agent_move
+           WHERE step NOT IN ('released','aborted','done','taken_over'))
+      LIMIT ?2) RETURNING agent_id,harness,session_id";
+
 pub(crate) fn is_head_role(role: &str) -> bool {
     role == "head"
 }
@@ -325,15 +337,7 @@ impl RegistryStore {
             let deleted = self
                 .db
                 .with_conn_fenced(|tx| {
-                    let mut statement = tx.prepare(
-                        "DELETE FROM session_binding WHERE rowid IN (
-                             SELECT rowid FROM session_binding
-                             WHERE ended_at_ms IS NOT NULL AND ended_at_ms < ?1
-                               AND agent_id NOT IN (
-                                   SELECT agent_id FROM agent_move
-                                   WHERE step NOT IN ('released','aborted','done','taken_over'))
-                              LIMIT ?2) RETURNING agent_id,harness,session_id",
-                    )?;
+                    let mut statement = tx.prepare(PRUNE_ENDED_SQL)?;
                     let rows = statement
                         .query_map(params![cutoff, PRUNE_BATCH], |row| {
                             Ok((

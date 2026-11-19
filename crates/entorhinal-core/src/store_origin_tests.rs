@@ -75,7 +75,7 @@ fn seed_local(store: &RegistryStore) {
         UPDATE move_setting SET lid_close_moves=1;
         INSERT INTO session_binding(ref_kind,ref,agent_id,harness,session_id,project_root,registered_by,registered_at_ms,runner,ended_at_ms) VALUES('session','ref','agent','harness','session','/repo','host',1,'broca',NULL);
         INSERT INTO session_network VALUES('session','ref','no',1);
-        INSERT INTO pending_entry VALUES('pending',1);
+        INSERT INTO pending_entry(entry_id,expected_head) VALUES('pending',1);
         INSERT INTO consent_grant VALUES('grant','agent','hire','P',1,'card',NULL);
         INSERT INTO consent_request VALUES('agent','tool','key','digest','scope',1,1,'card','{}','awaiting',NULL);
         INSERT INTO consent_write_plan VALUES('agent','tool','key','{}');

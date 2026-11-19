@@ -5,7 +5,7 @@
 
 use std::{
     collections::HashSet,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
 };
 
 use cortexkit_role_tool_provider::catalog::composition_digest;
@@ -28,6 +28,20 @@ use crate::consent_client::{
 pub(super) const CARD_LIFETIME_MS: i64 = 600_000;
 pub(super) const AMBIGUOUS_LIFETIME_MS: i64 = 660_000;
 pub(super) const RETENTION_MS: i64 = 86_400_000;
+
+/// The handler's store slot, held weakly while a consent card is waiting.
+/// A card wait can last minutes, and a strong handle kept across it would hold
+/// the SQLite file open after the module closes its store. Each SQL job
+/// upgrades the slot for that job alone.
+pub(super) type StoreSlot = Weak<Mutex<Option<RegistryStore>>>;
+
+/// The open store for one SQL job, or `store_unavailable` when the module has
+/// closed it since the wait began, in which case the job writes nothing.
+pub(super) fn open_store(slot: &StoreSlot) -> Result<RegistryStore, AgentMutationError> {
+    slot.upgrade()
+        .and_then(|slot| slot.lock().unwrap_or_else(|e| e.into_inner()).clone())
+        .ok_or_else(|| domain_error("store_unavailable", "the store was closed during consent"))
+}
 
 fn domain_error(code: &str, message: &str) -> AgentMutationError {
     AgentMutationError {
@@ -221,7 +235,7 @@ impl Drop for RequestLease {
 }
 
 pub(super) struct ConsentCall<'a> {
-    pub store: &'a RegistryStore,
+    pub store: StoreSlot,
     pub connector: &'a dyn ConsentConnector,
     pub stamp: &'a ScopeStamp,
     pub deadline: Instant,
@@ -253,7 +267,7 @@ impl ConsentCoordinator {
         let card = render_card(row, context)?;
         let saved_row = row.clone();
         let plan = plan.cloned();
-        let (saved, inserted) = sql(call.store, call.deadline, move |store| {
+        let (saved, inserted) = sql(&call.store, call.deadline, move |store| {
             store.consent_transaction(|tx| {
                 let row = &saved_row;
                 let inserted = tx.request(&row.identity)?.is_none();
@@ -279,7 +293,6 @@ impl ConsentCoordinator {
         row: &ConsentRequest,
         context: &CardContext,
     ) -> Result<ConsentAttempt, AgentMutationError> {
-        let store = call.store;
         row.identity.validate()?;
         let owner = Owner::from_stamp(call.stamp)
             .map_err(|_| domain_error("caller_forbidden", "invalid scope epoch"))?;
@@ -292,7 +305,7 @@ impl ConsentCoordinator {
                 "request must use the stamped caller and scope",
             ));
         }
-        let saved = store.consent_request(&row.identity)?;
+        let saved = open_store(&call.store)?.consent_request(&row.identity)?;
         if saved
             .as_ref()
             .is_some_and(|saved| saved.args_digest != row.args_digest)
@@ -374,7 +387,7 @@ async fn resolve(
         Ok(Ok(route)) => route,
         _ if inserted => {
             let identity = row.identity.clone();
-            sql(call.store, call.deadline, move |store| {
+            sql(&call.store, call.deadline, move |store| {
                 store.consent_transaction(|tx| tx.delete_awaiting(&identity))
             })
             .await?;
@@ -420,7 +433,7 @@ async fn resolve_on_route(
                 };
                 let identity = row.identity.clone();
                 let saved_id = id.to_owned();
-                sql(call.store, call.deadline, move |store| {
+                sql(&call.store, call.deadline, move |store| {
                     store.consent_transaction(|tx| tx.set_elicitation(&identity, &saved_id))
                 })
                 .await?;
@@ -428,7 +441,7 @@ async fn resolve_on_route(
             }
             Err(ConsentError::Refused(code)) if code != "cancelled" => {
                 let identity = row.identity.clone();
-                sql(call.store, call.deadline, move |store| {
+                sql(&call.store, call.deadline, move |store| {
                     store.consent_transaction(|tx| tx.delete_awaiting(&identity))
                 })
                 .await?;
@@ -440,12 +453,12 @@ async fn resolve_on_route(
         }
     }
     let Some(id) = current.elicitation_id.as_deref() else {
-        let capture = capture_feed(call.store, route, owner, call.deadline).await;
+        let capture = capture_feed(&call.store, route, owner, call.deadline).await;
         if !capture.complete {
             return Ok(unresolved(row, (call.now_ms)()));
         }
         let identity = row.identity.clone();
-        let saved = sql(call.store, call.deadline, move |store| {
+        let saved = sql(&call.store, call.deadline, move |store| {
             store.consent_request(&identity)
         })
         .await?
@@ -600,7 +613,7 @@ pub(super) struct CaptureReport {
 /// terminal commit. Feed reads and acknowledgements share the tool call deadline;
 /// acknowledge only answers already saved, so reconnect cannot lose a decision.
 pub(super) async fn capture_feed(
-    store: &RegistryStore,
+    store: &StoreSlot,
     route: &dyn ConsentRoute,
     owner: &Owner,
     deadline: Instant,
@@ -706,11 +719,11 @@ mod tests;
 
 // Keep transactions out of async consent waits, including catalog installation.
 async fn sql<T: Send + 'static>(
-    store: &RegistryStore,
+    store: &StoreSlot,
     deadline: Instant,
     work: impl FnOnce(&RegistryStore) -> Result<T, AgentMutationError> + Send + 'static,
 ) -> Result<T, AgentMutationError> {
-    let store = store.clone();
+    let store = open_store(store)?;
     crate::catalog_sql::until(deadline, "consent SQL", move || {
         work(&store).map_err(crate::HandlerError::from)
     })
@@ -736,7 +749,7 @@ async fn inspect_record_wait(
     let row = row.clone();
     let record = record.clone();
     let now = (call.now_ms)();
-    sql(call.store, call.deadline, move |store| {
+    sql(&call.store, call.deadline, move |store| {
         inspect_record(store, &row, &record, now)
     })
     .await

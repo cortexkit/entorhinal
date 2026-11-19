@@ -1185,3 +1185,48 @@ fn migration_17_preserves_local_rows_and_indexes_open_only_pages() {
     assert!(plan.contains("session_binding_open_agent"), "{plan}");
     assert!(!plan.contains("TEMP B-TREE"), "{plan}");
 }
+
+/// The last migration adds the ended-binding index on a store that already
+/// holds bindings, and the retention prune reads it to find candidates
+/// instead of scanning every binding that never ended.
+#[test]
+fn retention_prune_reads_the_ended_binding_index_after_migration() {
+    let f = Fixture::with_migrations(&MIGRATIONS[..MIGRATIONS.len() - 1]);
+    f.bind(AGENT, "live", 20, Some("broca"), None);
+    f.bind(AGENT, "ended", 30, Some("broca"), Some(40));
+    let plan = |store: &RegistryStore| {
+        store
+            .read(|conn| {
+                let mut statement =
+                    conn.prepare(&format!("EXPLAIN QUERY PLAN {PRUNE_ENDED_SQL}"))?;
+                let rows = statement
+                    .query_map(params![0, PRUNE_BATCH], |r| r.get::<_, String>(3))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows.join("\n"))
+            })
+            .unwrap()
+    };
+    assert!(!plan(&f.store).contains("session_binding_ended"));
+    drop(f.store);
+    let store = RegistryStore::open(&f.descriptor).unwrap();
+    let plan = plan(&store);
+    assert!(
+        plan.contains("USING INDEX session_binding_ended")
+            || plan.contains("USING COVERING INDEX session_binding_ended"),
+        "{plan}"
+    );
+    assert_eq!(
+        store
+            .prune_ended_sessions(40 + SESSION_RETENTION_MS + 1)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .agent_sessions(AGENT, None, 100)
+            .unwrap()
+            .sessions
+            .len(),
+        1
+    );
+}
