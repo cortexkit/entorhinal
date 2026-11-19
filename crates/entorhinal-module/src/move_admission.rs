@@ -49,7 +49,10 @@ impl ProjectsHandler {
         let engram = matches!(&admission.principal, Some(Principal::Reserved { module_id }) if module_id == "engram");
         if engram {
             if !self
-                .with_store(RegistryStore::move_setting)?
+                .move_sql(received, |handler| {
+                    handler.with_store(RegistryStore::move_setting)
+                })
+                .await?
                 .lid_close_moves
             {
                 return Err(HandlerError::new(
@@ -74,27 +77,39 @@ impl ProjectsHandler {
         // The submitted target string, not its current resolved display name,
         // identifies a resend. A rename cannot redirect an admitted request.
         let request_body = json!({"agent_id":request.agent_id,"to":request.to});
-        if let Some(bytes) = self.move_replay(&request.request_key, &request_body)? {
+        if let Some(bytes) = self
+            .move_replay(received, &request.request_key, &request_body)
+            .await?
+        {
             return Ok(bytes);
         }
-        if self.with_store(RegistryStore::legacy_moves_paused)? {
-            return Err(crate::hub_switch::pending());
-        }
-        if !self.with_store(RegistryStore::move_authority_cut_over)? {
-            return Err(HandlerError::new(
-                "authority_not_cut_over",
-                "agent identity authority is not cut over",
-            ));
-        }
-        if self.with_store(RegistryStore::identity_log_status)?.state != "enabled" {
-            return Err(HandlerError::new(
-                "identity_log_disabled",
-                "moves require the identity log enabled",
-            ));
-        }
+        let agent_id = request.agent_id.clone();
         let agent = self
-            .with_store(|s| s.agent_row(&request.agent_id))?
-            .ok_or_else(|| HandlerError::new("unknown_agent", "unknown agent"))?;
+            .move_sql(received, move |handler| {
+                if handler.with_store(RegistryStore::legacy_moves_paused)? {
+                    return Err(crate::hub_switch::pending());
+                }
+                if !handler.with_store(RegistryStore::move_authority_cut_over)? {
+                    return Err(HandlerError::new(
+                        "authority_not_cut_over",
+                        "agent identity authority is not cut over",
+                    ));
+                }
+                if handler
+                    .with_store(RegistryStore::identity_log_status)?
+                    .state
+                    != "enabled"
+                {
+                    return Err(HandlerError::new(
+                        "identity_log_disabled",
+                        "moves require the identity log enabled",
+                    ));
+                }
+                handler
+                    .with_store(|s| s.agent_row(&agent_id))?
+                    .ok_or_else(|| HandlerError::new("unknown_agent", "unknown agent"))
+            })
+            .await?;
         if let Some(gone) = agent.gone() {
             return Err(HandlerError {
                 code: "gone".into(),
@@ -109,8 +124,15 @@ impl ProjectsHandler {
         } else {
             None
         };
-        let (mut claim_version, own) = self.move_claim(&request.agent_id, hub.as_deref()).await?;
-        let (peer, peer_name) = match self.with_agent_store(|s| s.resolve_move_member(&request.to))
+        let (mut claim_version, own) = self
+            .move_claim(received, &request.agent_id, hub.as_deref())
+            .await?;
+        let to = request.to.clone();
+        let (peer, peer_name) = match self
+            .move_sql(received, move |handler| {
+                handler.with_agent_store(|s| s.resolve_move_member(&to))
+            })
+            .await
         {
             Err(error)
                 if error.code == "unknown_member"
@@ -138,17 +160,25 @@ impl ProjectsHandler {
                 "target is this machine",
             ));
         }
-        if let Err(error) = self.move_open_check(&request.agent_id) {
+        if let Err(error) = self.move_open_check(received, &request.agent_id).await {
             if error.code == "move_in_progress" {
                 // Another resend can commit while claim refresh is awaiting its
                 // record read. Replay that key before refusing the occupied slot.
-                if let Some(bytes) = self.move_replay(&request.request_key, &request_body)? {
+                if let Some(bytes) = self
+                    .move_replay(received, &request.request_key, &request_body)
+                    .await?
+                {
                     return Ok(bytes);
                 }
             }
             return Err(error);
         }
-        let refs = self.with_store(|s| s.agent_bound_refs(&request.agent_id))?;
+        let agent_id = request.agent_id.clone();
+        let refs = self
+            .move_sql(received, move |handler| {
+                handler.with_store(|s| s.agent_bound_refs(&agent_id))
+            })
+            .await?;
         // Only live session refs count toward the cap; synthetic refs, including
         // the agent ref, do not consume a session slot.
         if refs.len() > 256 {
@@ -158,7 +188,12 @@ impl ProjectsHandler {
                 detail: Some(json!({"live_refs":refs.len(),"cap":256})),
             });
         }
-        let pins = self.with_store(|s| s.catalog_pins(&request.agent_id))?;
+        let agent_id = request.agent_id.clone();
+        let pins = self
+            .move_sql(received, move |handler| {
+                handler.with_store(|s| s.catalog_pins(&agent_id))
+            })
+            .await?;
         let pin_digest = if pins.is_empty() {
             None
         } else {
@@ -179,7 +214,12 @@ impl ProjectsHandler {
         // entorhinal serves that participant, and discovery refuses the move
         // when a participant is unready, so outside test fixtures that leave
         // entorhinal out of discovery every agent with bindings carries them.
-        let carry_bindings = self.with_store(|s| s.agent_has_bindings(&request.agent_id))?
+        let agent_id = request.agent_id.clone();
+        let carry_bindings = self
+            .move_sql(received, move |handler| {
+                handler.with_store(|s| s.agent_has_bindings(&agent_id))
+            })
+            .await?
             && available.iter().any(|p| p.module_id == "entorhinal");
         // With no pins and no bindings entorhinal has nothing to send and
         // stays out of the move, exactly as before bindings were carried.
@@ -242,7 +282,7 @@ impl ProjectsHandler {
                 });
             }
         }
-        self.move_idle(&refs, &plan).await?;
+        self.move_idle(received, &refs, &plan).await?;
         let mut confirmation = None;
         if direct {
             let mut guard = ConfirmationGuard::take(&self.confirmation_slot, key)?;
@@ -278,16 +318,17 @@ impl ProjectsHandler {
                 return Err(OperatorConfirmError::Declined.into());
             }
             let recheck = async {
-                let (version, refreshed_own) =
-                    self.move_claim(&request.agent_id, hub.as_deref()).await?;
+                let (version, refreshed_own) = self
+                    .move_claim(received, &request.agent_id, hub.as_deref())
+                    .await?;
                 if refreshed_own != own {
                     return Err(HandlerError::new(
                         "claim_integrity_failed",
                         "self author changed",
                     ));
                 }
-                self.move_open_check(&request.agent_id)?;
-                self.move_idle(&refs, &plan).await?;
+                self.move_open_check(received, &request.agent_id).await?;
+                self.move_idle(received, &refs, &plan).await?;
                 Ok::<_, HandlerError>(version)
             };
             let rechecked = tokio::select! {
@@ -299,8 +340,9 @@ impl ProjectsHandler {
                 Ok(version) => version,
                 Err(error) => {
                     if error.code == "move_in_progress" {
-                        if let Some(bytes) =
-                            self.move_replay(&request.request_key, &request_body)?
+                        if let Some(bytes) = self
+                            .move_replay(received, &request.request_key, &request_body)
+                            .await?
                         {
                             return Ok(bytes);
                         }
@@ -362,19 +404,35 @@ impl ProjectsHandler {
             created_at_ms: now,
             updated_at_ms: now,
         };
-        if confirmation.as_ref().is_some_and(|g| *g.cancelled.borrow()) {
-            return Err(OperatorConfirmError::Declined.into());
-        }
-        let _admission = self.legacy_move_admission.lock().unwrap();
-        if hub.is_none() && self.with_store(RegistryStore::legacy_moves_paused)? {
-            return Err(crate::hub_switch::pending());
-        }
-        let row = self.with_agent_store(|s| s.admit_agent_move(&row, &refs))?;
+        let legacy = hub.is_none();
+        let row = self
+            .move_sql(received, move |handler| {
+                let _admission = handler.legacy_move_admission.lock().unwrap();
+                if confirmation.as_ref().is_some_and(|g| *g.cancelled.borrow()) {
+                    return Err(OperatorConfirmError::Declined.into());
+                }
+                if legacy && handler.with_store(RegistryStore::legacy_moves_paused)? {
+                    return Err(crate::hub_switch::pending());
+                }
+                handler.with_agent_store(|s| s.admit_agent_move(&row, &refs))
+            })
+            .await?;
         reply(&row)
     }
 
-    fn move_replay(&self, key: &str, body: &Value) -> Result<Option<Vec<u8>>, HandlerError> {
-        let Some(row) = self.with_store(|s| s.agent_move_by_request_key(key))? else {
+    async fn move_replay(
+        &self,
+        received: Instant,
+        key: &str,
+        body: &Value,
+    ) -> Result<Option<Vec<u8>>, HandlerError> {
+        let key = key.to_owned();
+        let Some(row) = self
+            .move_sql(received, move |handler| {
+                handler.with_store(|s| s.agent_move_by_request_key(&key))
+            })
+            .await?
+        else {
             return Ok(None);
         };
         if row.request_body.as_ref() != Some(body) {
@@ -386,8 +444,12 @@ impl ProjectsHandler {
         reply(&row).map(Some)
     }
 
-    fn move_open_check(&self, agent_id: &str) -> Result<(), HandlerError> {
-        let rows = self.with_store(RegistryStore::list_open_agent_moves)?;
+    async fn move_open_check(&self, received: Instant, agent_id: &str) -> Result<(), HandlerError> {
+        let rows = self
+            .move_sql(received, |handler| {
+                handler.with_store(RegistryStore::list_open_agent_moves)
+            })
+            .await?;
         if let Some(row) = rows.iter().find(|row| row.agent_id == agent_id) {
             return Err(HandlerError {
                 code: "move_in_progress".into(),
@@ -403,6 +465,7 @@ impl ProjectsHandler {
 
     async fn move_claim(
         &self,
+        received: Instant,
         agent_id: &str,
         hub: Option<&crate::hub_residence::Residence>,
     ) -> Result<(i64, String), HandlerError> {
@@ -410,31 +473,39 @@ impl ProjectsHandler {
             return hub.move_origin(agent_id);
         }
         let refresh = self.wait_claim_refresh().await;
-        let cached = self
-            .with_store(|s| s.cached_agent_claim(agent_id))?
-            .ok_or_else(|| HandlerError::new("claim_stale", "claim was not refreshed"))?;
-        if cached.integrity_failed {
-            return Err(HandlerError::new(
-                "claim_integrity_failed",
-                "claim has an integrity mark",
-            ));
-        }
-        let counts =
-            refresh.map_err(|_| HandlerError::new("claim_stale", "claim refresh failed"))?;
-        if counts.failed != 0 || cached.stale {
-            return Err(HandlerError::new("claim_stale", "claim cache is stale"));
-        }
-        let own = self
-            .with_store(RegistryStore::persisted_self_author)?
-            .ok_or_else(|| HandlerError::new("claim_stale", "self author is unknown"))?;
-        if cached.epoch >= 1 && cached.holder.as_ref() != Some(&own) {
-            let location = self.with_agent_store(|s| s.agent_where(agent_id))?;
-            return Err(HandlerError {
-                code: "not_holder".into(),
-                message: "claim is held elsewhere".into(),
-                detail: Some(json!({"holder":location.holder,"holder_name":location.holder_name})),
-            });
-        }
+        let id = agent_id.to_owned();
+        let (cached, own) = self
+            .move_sql(received, move |handler| {
+                let cached = handler
+                    .with_store(|s| s.cached_agent_claim(&id))?
+                    .ok_or_else(|| HandlerError::new("claim_stale", "claim was not refreshed"))?;
+                if cached.integrity_failed {
+                    return Err(HandlerError::new(
+                        "claim_integrity_failed",
+                        "claim has an integrity mark",
+                    ));
+                }
+                let counts = refresh
+                    .map_err(|_| HandlerError::new("claim_stale", "claim refresh failed"))?;
+                if counts.failed != 0 || cached.stale {
+                    return Err(HandlerError::new("claim_stale", "claim cache is stale"));
+                }
+                let own = handler
+                    .with_store(RegistryStore::persisted_self_author)?
+                    .ok_or_else(|| HandlerError::new("claim_stale", "self author is unknown"))?;
+                if cached.epoch >= 1 && cached.holder.as_ref() != Some(&own) {
+                    let location = handler.with_agent_store(|s| s.agent_where(&id))?;
+                    return Err(HandlerError {
+                        code: "not_holder".into(),
+                        message: "claim is held elsewhere".into(),
+                        detail: Some(
+                            json!({"holder":location.holder,"holder_name":location.holder_name}),
+                        ),
+                    });
+                }
+                Ok((cached, own))
+            })
+            .await?;
         let read = self
             .record_client
             .read(&format!("claim:{agent_id}"))
@@ -497,14 +568,11 @@ fn freezes(plan: &[PlannedParticipant], runner: &str, reference: &MoveRef) -> bo
 impl ProjectsHandler {
     async fn move_idle(
         &self,
+        received: Instant,
         refs: &[MoveRef],
         plan: &[PlannedParticipant],
     ) -> Result<(), HandlerError> {
-        let refs_for_liveness: Vec<_> = refs
-            .iter()
-            .map(|r| (r.ref_kind.as_str(), r.reference.as_str()))
-            .collect();
-        let answers = self.read_move_liveness(&refs_for_liveness)?;
+        let answers = self.read_move_liveness(received, refs).await?;
         let mut busy = Vec::new();
         for (reference, answer) in refs.iter().zip(answers) {
             let (reason_code, reason) = match answer {

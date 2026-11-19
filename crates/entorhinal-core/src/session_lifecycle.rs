@@ -283,8 +283,9 @@ impl RegistryStore {
     }
 
     /// Stamp the end time on the open bindings of sessions the liveness feed
-    /// reported `gone`, in one transaction. A binding that already ended keeps
-    /// its first end time. Returns how many bindings were stamped.
+    /// reported `gone`, in one transaction. A newer registration supersedes
+    /// the stamp, and an already-ended binding keeps its first end time.
+    /// Returns how many bindings were stamped.
     pub fn stamp_gone_sessions(&self, stamps: &[GoneSession]) -> Result<usize, RegistryError> {
         let mut keys = Vec::new();
         let result = self
@@ -293,6 +294,7 @@ impl RegistryStore {
                 let mut statement = tx.prepare_cached(
                     "UPDATE session_binding SET ended_at_ms=?3
                      WHERE harness=?1 AND session_id=?2 AND ended_at_ms IS NULL
+                       AND registered_at_ms<=?3
                        AND (?4 IS NULL OR runner IS NULL OR runner=?4)",
                 )?;
                 let mut stamped = 0;

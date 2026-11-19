@@ -365,13 +365,17 @@ fn optional_skip_losses(
 
 pub(crate) type WhereMoveView = (Option<Value>, Vec<Value>, Vec<Value>, Vec<Value>);
 
+fn where_moves_sql() -> String {
+    format!(
+        "SELECT {MOVE_COLUMNS} FROM agent_move WHERE agent_id=?1 ORDER BY created_at_ms, cut_id"
+    )
+}
+
 pub(crate) fn where_moves(
     conn: &rusqlite::Connection,
     agent: &str,
 ) -> rusqlite::Result<WhereMoveView> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {MOVE_COLUMNS} FROM agent_move WHERE agent_id=?1 ORDER BY created_at_ms, cut_id"
-    ))?;
+    let mut stmt = conn.prepare(&where_moves_sql())?;
     let rows = stmt
         .query_map([agent], AgentMove::from_row)?
         .collect::<Result<Vec<_>, _>>()?;
@@ -541,11 +545,7 @@ impl RegistryStore {
     pub fn move_authority_cut_over(&self) -> Result<bool, RegistryError> {
         self.read(|conn| {
             Ok(conn
-                .query_row(
-                    "SELECT 1 FROM registry_journal WHERE op=?1 LIMIT 1",
-                    [crate::agent::IDENTITY_MARKER_OP],
-                    |_| Ok(()),
-                )
+                .query_row(Self::AGENT_CUTOVER_SQL, [], |_| Ok(()))
                 .optional()?
                 .is_some())
         })
@@ -957,16 +957,7 @@ impl RegistryStore {
     }
 
     pub fn agent_move(&self, cut_id: &str) -> Result<Option<AgentMove>, RegistryError> {
-        self.db
-            .with_conn_fenced(|conn| {
-                conn.query_row(
-                    &format!("SELECT {MOVE_COLUMNS} FROM agent_move WHERE cut_id=?1"),
-                    [cut_id],
-                    AgentMove::from_row,
-                )
-                .optional()
-            })
-            .map_err(RegistryError::Store)
+        self.agent_move_snapshot(cut_id)
     }
 
     /// Consume only this move's explicit operator request to retry a stuck abort.
@@ -991,43 +982,39 @@ impl RegistryStore {
     }
 
     pub fn move_status_view(&self, cut_id: &str) -> Result<Option<Value>, RegistryError> {
-        self.db
-            .with_conn_fenced(|conn| {
-                conn.query_row(
-                    &format!("SELECT {MOVE_COLUMNS} FROM agent_move WHERE cut_id=?1"),
-                    [cut_id],
-                    AgentMove::from_row,
-                )
-                .optional()?
-                .map(|row| public_move(conn, &row))
-                .transpose()
-            })
-            .map_err(RegistryError::Store)
+        self.read(|conn| {
+            conn.query_row(
+                &format!("SELECT {MOVE_COLUMNS} FROM agent_move WHERE cut_id=?1"),
+                [cut_id],
+                AgentMove::from_row,
+            )
+            .optional()?
+            .map(|row| public_move(conn, &row))
+            .transpose()
+        })
     }
 
     pub fn moves_view(&self) -> Result<Vec<Value>, RegistryError> {
-        self.db
-            .with_conn_fenced(|conn| {
-                let mut stmt = conn.prepare(&format!(
-                    "SELECT {MOVE_COLUMNS} FROM agent_move
+        self.read(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {MOVE_COLUMNS} FROM agent_move
                 WHERE step NOT IN ('released','aborted','done','taken_over')
                 ORDER BY created_at_ms, cut_id"
-                ))?;
-                let mut rows = stmt
-                    .query_map([], AgentMove::from_row)?
-                    .collect::<Result<Vec<_>, _>>()?;
-                let mut stmt = conn.prepare(&format!(
-                    "SELECT {MOVE_COLUMNS} FROM agent_move
+            ))?;
+            let mut rows = stmt
+                .query_map([], AgentMove::from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {MOVE_COLUMNS} FROM agent_move
                 WHERE step IN ('released','aborted','done','taken_over')
                 ORDER BY updated_at_ms DESC, cut_id DESC LIMIT 32"
-                ))?;
-                rows.extend(
-                    stmt.query_map([], AgentMove::from_row)?
-                        .collect::<Result<Vec<_>, _>>()?,
-                );
-                rows.iter().map(|row| public_move(conn, row)).collect()
-            })
-            .map_err(RegistryError::Store)
+            ))?;
+            rows.extend(
+                stmt.query_map([], AgentMove::from_row)?
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            rows.iter().map(|row| public_move(conn, row)).collect()
+        })
     }
 
     /// Look up agent_move.request_key independently of registry_journal.request_key;
@@ -1036,62 +1023,54 @@ impl RegistryStore {
         &self,
         request_key: &str,
     ) -> Result<Option<AgentMove>, RegistryError> {
-        self.db
-            .with_conn_fenced(|conn| {
-                conn.query_row(
-                    &format!("SELECT {MOVE_COLUMNS} FROM agent_move WHERE request_key=?1"),
-                    [request_key],
-                    AgentMove::from_row,
-                )
-                .optional()
-            })
-            .map_err(RegistryError::Store)
+        self.read(|conn| {
+            conn.query_row(
+                &format!("SELECT {MOVE_COLUMNS} FROM agent_move WHERE request_key=?1"),
+                [request_key],
+                AgentMove::from_row,
+            )
+            .optional()
+        })
     }
 
     pub fn list_agent_moves(&self) -> Result<Vec<AgentMove>, RegistryError> {
-        self.db
-            .with_conn_fenced(|conn| {
-                let mut stmt = conn.prepare(&format!(
-                    "SELECT {MOVE_COLUMNS} FROM agent_move ORDER BY created_at_ms, cut_id"
-                ))?;
-                let rows = stmt
-                    .query_map([], AgentMove::from_row)?
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(rows)
-            })
-            .map_err(RegistryError::Store)
+        self.read(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {MOVE_COLUMNS} FROM agent_move ORDER BY created_at_ms, cut_id"
+            ))?;
+            let rows = stmt
+                .query_map([], AgentMove::from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
     }
 
     pub fn list_open_agent_moves(&self) -> Result<Vec<AgentMove>, RegistryError> {
-        self.db
-            .with_conn_fenced(|conn| {
-                let mut stmt = conn.prepare(&format!(
-                    "SELECT {MOVE_COLUMNS} FROM agent_move
+        self.read(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {MOVE_COLUMNS} FROM agent_move
                  WHERE step NOT IN ('released','aborted','done','taken_over')
                  ORDER BY created_at_ms, cut_id"
-                ))?;
-                let rows = stmt
-                    .query_map([], AgentMove::from_row)?
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(rows)
-            })
-            .map_err(RegistryError::Store)
+            ))?;
+            let rows = stmt
+                .query_map([], AgentMove::from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
     }
 
     pub fn move_setting(&self) -> Result<MoveSetting, RegistryError> {
-        self.db
-            .with_conn_fenced(|conn| {
-                conn.query_row(
-                    "SELECT lid_close_moves FROM move_setting WHERE id=1",
-                    [],
-                    |row| {
-                        Ok(MoveSetting {
-                            lid_close_moves: row.get(0)?,
-                        })
-                    },
-                )
-            })
-            .map_err(RegistryError::Store)
+        self.read(|conn| {
+            conn.query_row(
+                "SELECT lid_close_moves FROM move_setting WHERE id=1",
+                [],
+                |row| {
+                    Ok(MoveSetting {
+                        lid_close_moves: row.get(0)?,
+                    })
+                },
+            )
+        })
     }
 
     pub fn set_move_setting(&self, setting: MoveSetting) -> Result<(), RegistryError> {
@@ -1122,6 +1101,8 @@ fn bound_refs(conn: &rusqlite::Connection, agent_id: &str) -> rusqlite::Result<V
     rows
 }
 
+// A write that changes a checkpoint loads it from that same transaction,
+// not from a reader snapshot that could race the update.
 pub(crate) fn load_move(conn: &rusqlite::Connection, cut_id: &str) -> rusqlite::Result<AgentMove> {
     conn.query_row(
         &format!("SELECT {MOVE_COLUMNS} FROM agent_move WHERE cut_id=?1"),
@@ -1130,6 +1111,8 @@ pub(crate) fn load_move(conn: &rusqlite::Connection, cut_id: &str) -> rusqlite::
     )
 }
 
+// Move admission and session registration check the open slots in the same
+// write transaction as their insert, so neither can race the other.
 fn open_moves(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<AgentMove>> {
     let mut stmt = conn.prepare(&format!("SELECT {MOVE_COLUMNS} FROM agent_move WHERE step NOT IN ('released','aborted','done','taken_over') ORDER BY cut_id"))?;
     let rows = stmt.query_map([], AgentMove::from_row)?.collect();
@@ -1312,6 +1295,62 @@ mod tests {
             tx.execute("UPDATE identity_log_state SET state='enabled' WHERE id=1", [])?;
             Ok(())
         }).unwrap();
+    }
+
+    #[test]
+    fn move_session_regression_where_searches_only_this_agents_moves_in_order() {
+        let f = Fixture::with_migrations(&crate::MIGRATIONS[..crate::MIGRATIONS.len() - 1]);
+        f.store.insert_agent_move(&view_row()).unwrap();
+        drop(f.store);
+        let store = RegistryStore::open(&f.descriptor).unwrap();
+        let plan = store
+            .read(|conn| {
+                let mut stmt =
+                    conn.prepare(&format!("EXPLAIN QUERY PLAN {}", where_moves_sql()))?;
+                let rows = stmt.query_map(["agent_00000001"], |row| row.get::<_, String>(3))?;
+                Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?.join("\n"))
+            })
+            .unwrap();
+        assert!(
+            plan.contains("SEARCH agent_move USING INDEX agent_move_agent_history"),
+            "agent.where reads one agent's moves: {plan}"
+        );
+        assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+    }
+
+    #[test]
+    fn move_session_regression_move_reads_do_not_wait_for_the_writer() {
+        let f = Fixture::new();
+        view_agent(&f);
+        let row = view_row();
+        f.store.insert_agent_move(&row).unwrap();
+        let StorageBackend::Sqlite { path } = &f.descriptor.backend else {
+            unreachable!()
+        };
+        let writer = rusqlite::Connection::open(path).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE; UPDATE agent_move SET updated_at_ms=77; UPDATE move_setting SET lid_close_moves=1;").unwrap();
+
+        let read = f
+            .store
+            .agent_move("cut")
+            .expect("reading an existing move must not need the writer");
+        assert_eq!(read.as_ref(), Some(&row));
+        assert_eq!(
+            f.store.move_status_view("cut").unwrap().unwrap()["cut_id"],
+            "cut"
+        );
+        assert_eq!(f.store.moves_view().unwrap().len(), 1);
+        assert_eq!(
+            f.store.agent_move_by_request_key("key-cut").unwrap(),
+            Some(row.clone())
+        );
+        assert_eq!(
+            f.store.list_agent_moves().unwrap(),
+            std::slice::from_ref(&row)
+        );
+        assert_eq!(f.store.list_open_agent_moves().unwrap(), [row]);
+        assert!(!f.store.move_setting().unwrap().lid_close_moves);
+        writer.execute_batch("ROLLBACK").unwrap();
     }
 
     #[test]

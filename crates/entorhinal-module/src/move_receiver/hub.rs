@@ -286,7 +286,7 @@ impl Receiver {
                 }
                 if row.step == Step::Claimed {
                     self.catalog_preflight(plan).await?;
-                    self.local_writers(plan).await?;
+                    self.local_writers(plan, progress).await?;
                     progress.hub_decision = Some(Decision::Activate);
                     Self::step(row, progress, Step::Activating);
                     self.save(row, progress).await?;

@@ -135,6 +135,29 @@ fn optional_move_losses() -> Value {
 }
 
 #[tokio::test(start_paused = true)]
+async fn move_session_regression_skipped_participant_with_local_binding_is_not_opened() {
+    let f = optional_move_pair().await;
+    f.b.store().apply_entry("fixture", "{}", "fixture", None, |tx| {
+        tx.execute(
+            "INSERT INTO session_binding(ref_kind,ref,agent_id,harness,session_id,project_root,registered_by,registered_at_ms)
+             VALUES('aft-session','ref-aft-session',?1,NULL,NULL,'','move',1)",
+            [AGENT],
+        )?;
+        Ok(())
+    }).unwrap();
+    let cut = f.published("optional-with-local-binding").await;
+    f.b.pickup().await;
+    drive(f.b.receiver(&cut).tick()).await.unwrap();
+    let row = f.b.row(&cut);
+    assert_eq!(
+        row.step,
+        MoveStep::Imported,
+        "skipped participant must not be opened: {:?}",
+        row.hold
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn optional_move_receiver_skips_sealed_items_and_keeps_the_decision_across_restart() {
     let mut f = optional_move_pair().await;
     let cut = f.published("optional-receiver").await;

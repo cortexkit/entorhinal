@@ -1429,11 +1429,21 @@ impl ProjectsHandler {
 
     /// Session liveness for move admission, in request order. A binding with
     /// no host session (no harness or session id) has nothing open to move.
-    pub(super) fn read_move_liveness(
+    pub(super) async fn read_move_liveness(
         &self,
-        refs: &[(&str, &str)],
+        received: tokio::time::Instant,
+        refs: &[entorhinal_core::move_record::MoveRef],
     ) -> Result<Vec<MoveLiveness>, HandlerError> {
-        let bindings = self.with_store(|store| store.session_bindings_for_refs(refs))?;
+        let refs = refs.to_vec();
+        let bindings = self
+            .move_sql(received, move |handler| {
+                let refs: Vec<_> = refs
+                    .iter()
+                    .map(|r| (r.ref_kind.as_str(), r.reference.as_str()))
+                    .collect();
+                handler.with_store(|store| store.session_bindings_for_refs(&refs))
+            })
+            .await?;
         let state = self
             .liveness
             .lock()
