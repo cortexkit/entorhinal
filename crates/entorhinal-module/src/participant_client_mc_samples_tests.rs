@@ -30,7 +30,7 @@ use crate::participant_discovery::{discover_participants, provider_role, Partici
 
 /// The SHA-256 of the published `SHA256SUMS`. Pinning the list itself means a
 /// changed sample fails even when its line in the list was edited to match.
-const SUMS_SHA256: &str = "605a1633fce46364db0add402f1bb56a4b199c5acedfa69fee6eeca4817bb48c";
+const SUMS_SHA256: &str = "3ab4d4ea6604fce96ecb73aa3e79d2ef9f2bf454b91122a0915a17f8405f8aa0";
 
 /// Files in the folder that are not samples: the README and the list are
 /// covered by `SHA256SUMS` (the README is, the list is pinned above), and
