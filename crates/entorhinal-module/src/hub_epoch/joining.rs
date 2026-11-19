@@ -153,7 +153,9 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
         {
             self.reader.membership.discover(head, deadline).await?;
         }
-        // A join may receive only committed fleet keys, not a pending first mint.
+        // A joining computer is sent only committed shared keys. A key a computer has
+        // just created stays pending until its hub record wins, and may still be
+        // discarded, so it is never wrapped for a joiner.
         Ok(self
             .reader
             .read(deadline)

@@ -110,7 +110,8 @@ async fn hub_cutover_idle_has_no_join_poll() {
     .await;
     sleep(Duration::from_millis(100)).await;
     a.node.leaf.requests.lock().unwrap().clear();
-    // Use wall time for the real NATS sockets and cross two old poll deadlines.
+    // Use wall time for the real NATS sockets. 4.1 s crosses two deadlines of the
+    // 2 s join timer this controller used to run, so a timer would show here.
     sleep(Duration::from_millis(4_100)).await;
     let requests = a.node.leaf.requests.lock().unwrap();
     assert!(
