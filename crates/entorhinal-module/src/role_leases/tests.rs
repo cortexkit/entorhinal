@@ -8,11 +8,18 @@ const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const C: &str = "cccccccccccccccccccccccccccccccc";
 const ROUTE: RouteKey = (3, 1);
 
+#[cfg(target_os = "linux")]
+#[test]
+fn hub_audit_regression_linux_lease_clock_counts_suspend() {
+    assert_eq!(LEASE_CLOCK, rustix::time::ClockId::Boottime);
+}
+
 pub(crate) struct Hub {
     row: Mutex<(u64, Option<Record>)>,
     preferred: Mutex<Option<Preferred>>,
     requests: Mutex<HashMap<String, CandidateRequest>>,
     removed: Mutex<Vec<&'static str>>,
+    unlisted: Mutex<Vec<&'static str>>,
     signal_revision: AtomicU64,
     attempts: Mutex<Vec<(&'static str, u64)>>,
     landed: Mutex<Vec<(&'static str, Record)>>,
@@ -22,6 +29,9 @@ pub(crate) struct Hub {
     delay: AtomicU64,
     missing_send: AtomicBool,
     reachable: AtomicBool,
+    unsettled_handback_delete: AtomicBool,
+    handback_deletes: AtomicU64,
+    handback_reads: AtomicU64,
 }
 
 impl Hub {
@@ -35,6 +45,7 @@ impl Hub {
             preferred: Mutex::default(),
             requests: Mutex::default(),
             removed: Mutex::default(),
+            unlisted: Mutex::default(),
             signal_revision: AtomicU64::new(1),
             landed: Mutex::default(),
             updates: Notify::new(),
@@ -43,6 +54,9 @@ impl Hub {
             delay: AtomicU64::new(0),
             missing_send: AtomicBool::new(false),
             reachable: AtomicBool::new(true),
+            unsettled_handback_delete: AtomicBool::new(false),
+            handback_deletes: AtomicU64::new(0),
+            handback_reads: AtomicU64::new(0),
         })
     }
 
@@ -70,7 +84,9 @@ impl Hub {
     }
 
     fn current(&self, box_id: &str) -> bool {
-        !box_id.starts_with("engram:") && !self.removed.lock().unwrap().contains(&box_id)
+        !box_id.starts_with("engram:")
+            && !self.removed.lock().unwrap().contains(&box_id)
+            && !self.unlisted.lock().unwrap().contains(&box_id)
     }
 
     pub(crate) fn request_sample_handback(&self) {
@@ -140,6 +156,10 @@ impl Backend for Peer {
                 .as_ref()
                 .and_then(|r| r.holder.as_deref())
                 .is_some_and(|holder| self.hub.current(holder)),
+            holder_removed: record
+                .as_ref()
+                .and_then(|r| r.holder.as_deref())
+                .is_some_and(|holder| self.hub.removed.lock().unwrap().contains(&holder)),
             record,
             ready: self.watching.load(Ordering::Relaxed),
             local_episode: Some(0),
@@ -186,6 +206,7 @@ impl Backend for Peer {
         box_id: &str,
         _: Instant,
     ) -> Result<Option<u64>, HandlerError> {
+        self.hub.handback_reads.fetch_add(1, Ordering::Relaxed);
         Ok(self.handback(role, box_id)?.map(|request| request.revision))
     }
 
@@ -209,6 +230,10 @@ impl Backend for Peer {
         revision: u64,
         _: Instant,
     ) -> Result<(), HandlerError> {
+        self.hub.handback_deletes.fetch_add(1, Ordering::Relaxed);
+        if self.hub.unsettled_handback_delete.load(Ordering::Relaxed) {
+            return Err(crate::hub_transport::unsettled("test-handback-delete"));
+        }
         let mut requests = self.hub.requests.lock().unwrap();
         if requests
             .get(box_id)
@@ -291,6 +316,33 @@ async fn pump() {
 async fn tick(ms: u64) {
     tokio::time::advance(Duration::from_millis(ms)).await;
     pump().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn hub_audit_regression_role_take_requires_confirmed_removal_and_does_not_wait() {
+    let hub = Hub::new(Some(A), false);
+    hub.unlisted.lock().unwrap().push(A);
+    let mut candidate = ClientWatch::open(B, &hub, true).await;
+    candidate.ack_waiting().await;
+    // An unlisted holder is not a vacancy, even after a full lease interval.
+    tick(LEASE_MS).await;
+    assert!(hub.writes(ACQUIRE).is_empty());
+
+    let hub = Hub::new(Some(A), false);
+    let mut candidate = ClientWatch::open(B, &hub, true).await;
+    candidate.ack_waiting().await;
+    hub.removed.lock().unwrap().push(A);
+    hub.updates.notify_waiters();
+    candidate.ack_waiting().await;
+    let writes = hub.writes(ACQUIRE);
+    assert_eq!(
+        writes.len(),
+        1,
+        "closed holder episode did not open the role immediately"
+    );
+    assert_eq!(writes[0].holder.as_deref(), Some(B));
+    assert_eq!(writes[0].gen, 2);
+    assert!(!writes[0].forced);
 }
 
 impl ClientWatch {
@@ -781,6 +833,51 @@ async fn lease_handback_timeout_taker_clears_preferred_holders_request() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn lease_handback_unsettled_cleanup_rereads_without_republishing() {
+    let hub = Hub::new(Some(A), false);
+    hub.prefer(A);
+    hub.unsettled_handback_delete.store(true, Ordering::Relaxed);
+    hub.requests.lock().unwrap().insert(
+        A.into(),
+        CandidateRequest {
+            revision: 7,
+            episode: 0,
+            gen: 1,
+        },
+    );
+    let mut candidate = ClientWatch::open(B, &hub, true).await;
+    candidate.ack_waiting().await;
+    tick(LEASE_MS).await;
+    candidate.ack_waiting().await;
+    assert_eq!(hub.writes(ACQUIRE).len(), 1);
+    assert_eq!(hub.handback_deletes.load(Ordering::Relaxed), 1);
+
+    tick(RETRY_MS).await;
+    assert_eq!(
+        hub.handback_deletes.load(Ordering::Relaxed),
+        1,
+        "unsettled guarded delete was published again"
+    );
+    let reads = hub.handback_reads.load(Ordering::Relaxed);
+    assert!(
+        reads >= 2,
+        "handback was not re-read after the unsettled delete"
+    );
+
+    hub.requests.lock().unwrap().get_mut(A).unwrap().revision = 8;
+    tick(RETRY_MS).await;
+    assert_eq!(hub.handback_reads.load(Ordering::Relaxed), reads + 1);
+    tick(RETRY_MS).await;
+    assert_eq!(
+        hub.handback_reads.load(Ordering::Relaxed),
+        reads + 1,
+        "obsolete cleanup was not forgotten"
+    );
+    assert_eq!(hub.handback_deletes.load(Ordering::Relaxed), 1);
+    assert_eq!(hub.requests.lock().unwrap()[A].revision, 8);
+}
+
+#[tokio::test(start_paused = true)]
 async fn lease_handback_vacancy_prefers_the_named_candidate() {
     let hub = Hub::new(None, false);
     hub.prefer(B);
@@ -851,6 +948,7 @@ fn role_gen_high_water_carries_hub_observation_across_restart_and_local_takes() 
         record: Some(Record::new(A, 0, 2, false)),
         local_episode: Some(0),
         holder_current: true,
+        holder_removed: false,
     };
     let take = change(
         ACQUIRE,

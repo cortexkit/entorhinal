@@ -46,7 +46,7 @@ impl Request {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
     v: u8,
@@ -558,6 +558,28 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
                 .await
             {
                 Ok(revision) => own_manifest = Some(revision),
+                Err(error) if error.code == "hub_write_unsettled" => {
+                    let Some(revision) = error.detail.as_ref().and_then(|d| d["revision"].as_u64())
+                    else {
+                        return Err(error);
+                    };
+                    let Some(current) = self
+                        .assemble(key, deadline)
+                        .await?
+                        .filter(|current| current.entry.revision >= revision)
+                    else {
+                        return Err(error);
+                    };
+                    // Reconcile with the signed manifest and parts that are
+                    // usable now, not with a guess about the earlier publish.
+                    if current.manifest == manifest {
+                        own_manifest = Some(current.entry.revision);
+                    } else if current.manifest.responder == *responder {
+                        // Part keys are scoped to the request and responder.
+                        // Deleting ours here would also delete the current response.
+                        return Err(error);
+                    }
+                }
                 Err(error) if raced(&error) => {}
                 Err(error) => return Err(error),
             }

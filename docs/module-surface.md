@@ -513,6 +513,12 @@ send. Ack each notice via `role.lease.ack {role, seq}` within 5 s, and use
 after honoring a handback. Fence irreversible work by the lease `gen`; this
 is distinct from the changing KV revision returned by `role.fence`. A reader
 must not infer a live local lease from `role.read` or a successful `role.take`.
+Once a member's removal is applied, the role lease held by that episode is void.
+A candidate can acquire it without waiting for expiry or an operator take. A
+computer that sees the replacement before the removal holds it until it applies
+the removal or its own timer for the previous lease expires. A computer missing
+only from the local roster does not count as removed. Operator takes remain
+available; agent residence still requires a move or a forced take.
 
 `agent.session_residence` is intended for restoring a session from backup before
 making it writable. Its precedence is:

@@ -34,6 +34,8 @@ const CREATE_KV: &str = "residence.create";
 const BUDGET: Duration = Duration::from_secs(5);
 mod moves;
 mod role_control;
+#[cfg(test)]
+mod tests;
 pub(super) use moves::{Position as MovePosition, Transfer as MoveTransfer};
 use role_control::role_key_name;
 
@@ -226,6 +228,7 @@ struct Watched {
     initial: bool,
     incarnation: u64,
     revisions: HashMap<String, u64>,
+    role_seen: HashMap<String, (u64, u64)>,
     held: HashSet<String>,
     move_times: HashMap<String, i64>,
 }
@@ -531,7 +534,15 @@ impl Residence {
         let mut anchors = self.backend.anchor_changes();
         let mut retry = tokio::time::interval(Duration::from_secs(1));
         retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // A removal can apply while the watch is judging a replacement.
+        let committed = self.commits.notified();
+        tokio::pin!(committed);
+        committed.as_mut().enable();
         loop {
+            let lease_retry = pending
+                .values()
+                .filter_map(|entry| entry.lease_retry_at)
+                .min();
             tokio::select! {
                 event = feed.next_event() => match event {
                     FeedEvent::Connected | FeedEvent::Disconnected => {
@@ -545,7 +556,7 @@ impl Residence {
                             let arrival_head = pending.remove(&entry.key)
                                 .filter(|old| old.entry.revision == entry.revision)
                                 .and_then(|old| old.arrival_head);
-                            self.observe_or_hold(HeldDelivery { entry, arrival_head, waiting_for_anchor: false }, &mut pending).await;
+                            self.observe_or_hold(HeldDelivery { entry, arrival_head, waiting_for_anchor: false, lease_retry_at: None }, &mut pending).await;
                         }
                         if seen_current {
                             self.finish_initial_watch();
@@ -558,9 +569,28 @@ impl Residence {
                         self.observe_or_hold(entry, &mut pending).await;
                     }
                 }
-                _ = retry.tick(), if pending.values().any(|entry| !entry.waiting_for_anchor) => {
-                    let retrying: Vec<_> = pending.extract_if(|_, entry| !entry.waiting_for_anchor).collect();
+                _ = retry.tick(), if pending.values().any(|entry| !entry.waiting_for_anchor && entry.lease_retry_at.is_none()) => {
+                    let retrying: Vec<_> = pending.extract_if(|_, entry| !entry.waiting_for_anchor && entry.lease_retry_at.is_none()).collect();
                     for (_, entry) in retrying {
+                        self.observe_or_hold(entry, &mut pending).await;
+                    }
+                }
+                _ = &mut committed, if lease_retry.is_some() => {
+                    committed.set(self.commits.notified());
+                    committed.as_mut().enable();
+                    let roles: Vec<_> = pending.extract_if(|_, entry| entry.lease_retry_at.is_some()).collect();
+                    for (_, entry) in roles {
+                        self.observe_or_hold(entry, &mut pending).await;
+                    }
+                }
+                _ = async {
+                    let remaining = lease_retry.expect("armed lease retry").saturating_sub(self.role_clock_ms());
+                    // The executor's time source can pause in suspend, unlike the lease clock.
+                    tokio::time::sleep(Duration::from_millis(remaining.min(1_000))).await;
+                }, if lease_retry.is_some() => {
+                    let now = self.role_clock_ms();
+                    let roles: Vec<_> = pending.extract_if(|_, entry| entry.lease_retry_at.is_some_and(|at| at <= now)).collect();
+                    for (_, entry) in roles {
                         self.observe_or_hold(entry, &mut pending).await;
                     }
                 }
@@ -581,12 +611,18 @@ impl Residence {
                 Instant::now() + BUDGET,
             )
             .await;
+        delivery.lease_retry_at = result.as_ref().err().and_then(|error| {
+            (error.code == "role_lease_awaiting_expiry")
+                .then(|| error.detail.as_ref()?.get("until_ms")?.as_u64())
+                .flatten()
+        });
         delivery.waiting_for_anchor = result
             .as_ref()
             .is_err_and(|error| error.code == "writer_unknown");
-        if delivery.waiting_for_anchor {
+        if delivery.waiting_for_anchor || delivery.lease_retry_at.is_some() {
             if let Err(error) = self.store.hold_hub_kv(&key, delivery.entry.revision) {
                 delivery.waiting_for_anchor = false;
+                delivery.lease_retry_at = None;
                 result = Err(error.into());
             }
         }
@@ -723,7 +759,9 @@ impl Residence {
                 }
                 Ok(())
             }
-            Err(error) if deferred(&error) => Err(error),
+            Err(error) if deferred(&error) || error.code == "role_lease_awaiting_expiry" => {
+                Err(error)
+            }
             Err(error) => self.refuse(key, revision, &error.code),
         }
     }
@@ -739,11 +777,17 @@ impl Residence {
             .store
             .record_hub_kv(key, revision, Some((value, body)), (self.clock)())?
         {
-            self.watched
-                .write()
-                .unwrap()
-                .revisions
-                .insert(key.into(), revision);
+            let mut watched = self.watched.write().unwrap();
+            watched.revisions.insert(key.into(), revision);
+            if key.starts_with("role.") {
+                let seen = watched
+                    .role_seen
+                    .entry(key.into())
+                    .or_insert((revision, self.role_clock_ms()));
+                if seen.0 != revision {
+                    *seen = (revision, self.role_clock_ms());
+                }
+            }
         }
         Ok(())
     }
@@ -973,7 +1017,54 @@ impl Residence {
         ) {
             return Err(bad_record("role body is not authorized"));
         }
+        if let Some((prior, holder)) = previous
+            .as_ref()
+            .and_then(|prior| prior.holder.as_deref().map(|holder| (prior, holder)))
+        {
+            // A self-acquire is not an owner-authorized handback. Check the
+            // predecessor's local lease window, not the sender's clock or roster.
+            if !body.forced
+                && prior.gen.checked_add(1) == Some(body.gen)
+                && body.holder.as_deref() == Some(&header.writer)
+                && holder != header.writer
+                && !self
+                    .backend
+                    .episode_closed(holder, prior.holder_ep, accepted.applied)
+            {
+                if let Some(until_ms) =
+                    self.role_lease_deadline(key, old.and_then(|row| row.accepted_revision))
+                {
+                    let mut error = HandlerError::new(
+                        "role_lease_awaiting_expiry",
+                        "previous role lease has not expired here",
+                    );
+                    error.detail = Some(json!({"until_ms": until_ms}));
+                    return Err(error);
+                }
+            }
+        }
         Ok(accepted)
+    }
+
+    fn role_clock_ms(&self) -> u64 {
+        self.role_leases
+            .upgrade()
+            .map_or_else(role_leases::monotonic_ms, |leases| leases.now())
+    }
+
+    fn role_lease_deadline(&self, key: &str, revision: Option<u64>) -> Option<u64> {
+        let now = self.role_clock_ms();
+        let mut watched = self.watched.write().unwrap();
+        let revision = revision.expect("cached role body has an accepted revision");
+        let seen = watched
+            .role_seen
+            .entry(key.into())
+            .or_insert((revision, now));
+        if seen.0 != revision {
+            *seen = (revision, now);
+        }
+        let until = seen.1.saturating_add(role_leases::LEASE_MS);
+        (until > now).then_some(until)
     }
 }
 
@@ -1018,6 +1109,14 @@ impl role_leases::Backend for Residence {
                 record.holder.as_deref().is_some_and(|holder| {
                     crate::hub_membership::box_id(holder)
                         && self.backend.current_member(holder, applied) == Some(record.holder_ep)
+                })
+            }),
+            holder_removed: record.as_ref().is_some_and(|record| {
+                record.holder.as_deref().is_some_and(|holder| {
+                    crate::hub_membership::box_id(holder)
+                        && self
+                            .backend
+                            .episode_closed(holder, record.holder_ep, applied)
                 })
             }),
             record,
@@ -1139,6 +1238,7 @@ struct HeldDelivery {
     entry: Entry,
     arrival_head: Option<u64>,
     waiting_for_anchor: bool,
+    lease_retry_at: Option<u64>,
 }
 
 pub(super) fn committed_mint(epoch: &Value) -> Option<&str> {
@@ -1298,12 +1398,25 @@ impl Residence {
         {
             Ok(landed) => landed,
             Err(error) => {
+                let kv = self
+                    .store
+                    .hub_attempt(request_key)?
+                    .filter(|row| row.write.step == CREATE_KV && row.write.params_digest == digest);
+                // The log proves this request created the agent, even if KV
+                // history can no longer establish what its first claim did.
+                if matches!(
+                    error.code.as_str(),
+                    "hub_write_superseded" | "hub_write_unsettled"
+                ) && kv.as_ref().is_some_and(|row| row.outcome.is_some())
+                {
+                    if let Some((generation, row)) = self.store.hub_created_agent(request_key)? {
+                        return encode_result(
+                            json!({"agent": row.digest(), "generation":generation}),
+                        );
+                    }
+                }
                 if error.code == "hub_unavailable" {
-                    if let Some(row) = self
-                        .store
-                        .hub_attempt(request_key)?
-                        .filter(|row| row.write.step == CREATE_KV)
-                    {
+                    if let Some(row) = kv {
                         let record = UnverifiedRecord::parse(&row.write.key, &row.write.value)?;
                         return Err(crate::hub_transport::unsettled(&record.header().entry_id));
                     }
@@ -1353,13 +1466,32 @@ impl Residence {
         for attempt in &open {
             // Do not start a log append that was never seen to land. Only
             // completion of an applied create is a restart obligation.
-            if attempt.write.step == log_step
-                && self
+            if attempt.write.step == log_step {
+                if self
                     .store
                     .hub_created_agent(&attempt.write.request_key)?
                     .is_none()
-            {
-                continue;
+                {
+                    continue;
+                }
+                let writer_ep = self.request_episode(Some(attempt))?;
+                if self
+                    .backend
+                    .episode_closed(&self.box_id, writer_ep, self.backend.applied()?)
+                {
+                    let error = HandlerError::new(
+                        "residence_create_episode_closed",
+                        "the agent was created but its writer episode closed before residence could be written",
+                    );
+                    if !hub_write::refuse_attempt(&self.store, attempt, error).await? {
+                        // A concurrent retry may have advanced to the KV step.
+                        unfinished |= self
+                            .store
+                            .hub_attempt(&attempt.write.request_key)?
+                            .is_some_and(|row| row.outcome.is_none());
+                    }
+                    continue;
+                }
             }
             if !ready {
                 unfinished = true;

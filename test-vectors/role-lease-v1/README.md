@@ -54,9 +54,10 @@ Direct and flow-scoped routes are never candidates.
 ## Acting window
 
 For `holding: true`, use the absolute deadline `issued_at_ms + valid_for_ms`,
-not receipt time plus the duration. Entorhinal uses **`CLOCK_MONOTONIC`** on
-Linux and macOS and **`GetTickCount64()`** on Windows, in milliseconds. The
-consumer must use the same OS clock, never wall time or Rust's `Instant`.
+not receipt time plus the duration. Entorhinal uses **`CLOCK_BOOTTIME`** on
+Linux so suspend counts as elapsed time, **`CLOCK_MONOTONIC`** on macOS, and
+**`GetTickCount64()`** on Windows, in milliseconds. The consumer must use the
+same OS clock, never wall time or Rust's `Instant`.
 Before each irreversible act, check the deadline and record `gen` (the role's
 ownership generation) in the module's journal. Refuse a generation older than
 the highest one the journal has seen for that role.

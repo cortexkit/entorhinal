@@ -371,6 +371,9 @@ fn save_attempt(
     Ok(())
 }
 
+const OPEN_HUB_ATTEMPTS: &str = "SELECT request_key FROM hub_attempt WHERE outcome IS NULL
+    AND substr(step,1,length(?1))=?1 ORDER BY request_key";
+
 impl RegistryStore {
     pub fn hub_created_agent(
         &self,
@@ -549,10 +552,7 @@ impl RegistryStore {
 
     pub fn open_hub_attempts(&self, step_prefix: &str) -> Result<Vec<HubAttempt>, RegistryError> {
         self.read(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT request_key FROM hub_attempt WHERE outcome IS NULL
-                   AND substr(step,1,length(?1))=?1 ORDER BY request_key",
-            )?;
+            let mut stmt = conn.prepare(OPEN_HUB_ATTEMPTS)?;
             let keys = stmt.query_map([step_prefix], |row| row.get::<_, String>(0))?;
             let mut rows = Vec::new();
             for key in keys {

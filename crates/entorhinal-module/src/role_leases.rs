@@ -56,9 +56,16 @@ fn consumer(role: &str) -> Option<&'static str> {
     }
 }
 
+// A suspended holder must not extend its acting window while other computers run.
+#[cfg(target_os = "linux")]
+const LEASE_CLOCK: rustix::time::ClockId = rustix::time::ClockId::Boottime;
+
+#[cfg(all(unix, not(target_os = "linux")))]
+const LEASE_CLOCK: rustix::time::ClockId = rustix::time::ClockId::Monotonic;
+
 #[cfg(unix)]
 pub(super) fn monotonic_ms() -> u64 {
-    let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    let now = rustix::time::clock_gettime(LEASE_CLOCK);
     (now.tv_sec as u64) * 1_000 + (now.tv_nsec as u64) / 1_000_000
 }
 
@@ -170,7 +177,7 @@ impl Leases {
         self.held.load(Ordering::Relaxed)
     }
 
-    fn now(&self) -> u64 {
+    pub(super) fn now(&self) -> u64 {
         (self.clock)()
     }
 
@@ -410,7 +417,6 @@ pub(super) fn accepts(
     // A first read or revision gap may expose a prior write from a computer
     // that has since been removed. It cannot replace a known predecessor.
     (writer_current || (historical && consecutive.is_none()))
-        && !replaced_removed
         && body.holder.as_deref().is_some_and(|holder| {
             box_id(holder)
                 && if holder == header.writer {
@@ -431,6 +437,7 @@ pub(super) struct Observation {
     pub record: Option<Record>,
     pub local_episode: Option<u64>,
     pub holder_current: bool,
+    pub holder_removed: bool,
 }
 
 impl Observation {
@@ -491,6 +498,12 @@ pub(super) struct CandidateRequest {
     pub revision: u64,
     pub gen: i64,
     pub episode: u64,
+}
+
+struct HandbackCleanup {
+    box_id: String,
+    revision: u64,
+    read_only: bool,
 }
 
 #[async_trait::async_trait]
@@ -668,7 +681,7 @@ impl Leases {
         let mut failed_since = None;
         let mut offered: Option<Preferred> = None;
         let mut expired_request: Option<(String, u64)> = None;
-        let mut cleanup: Option<(String, u64)> = None;
+        let mut cleanup: Option<HandbackCleanup> = None;
         let mut signal_retry = 0;
         loop {
             // Register for readiness changes before reading the snapshot.
@@ -687,17 +700,18 @@ impl Leases {
                     ..View::default()
                 });
             }
-            if !current.ready {
+            if !current.ready || current.local_episode.is_none() {
                 last_seen = None;
                 if pending.as_ref().is_some_and(|op| op.step == ACQUIRE) {
                     pending = None;
                 }
             } else {
                 let preferred = backend.preferred(role)?;
-                let slot_free = current
-                    .record
-                    .as_ref()
-                    .is_none_or(|row| row.holder.is_none());
+                let slot_free = current.holder_removed
+                    || current
+                        .record
+                        .as_ref()
+                        .is_none_or(|row| row.holder.is_none());
                 let defer = preferred
                     .as_ref()
                     .filter(|p| slot_free && p.box_id != local);
@@ -818,7 +832,13 @@ impl Leases {
                                 } else {
                                     // Acquisition alone never gives an acting window.
                                     renewal_due = 0;
-                                    cleanup = expired_request.take();
+                                    cleanup = expired_request.take().map(|(box_id, revision)| {
+                                        HandbackCleanup {
+                                            box_id,
+                                            revision,
+                                            read_only: false,
+                                        }
+                                    });
                                 }
                             }
                             Err(error) => {
@@ -857,16 +877,42 @@ impl Leases {
                     if cleanup.is_some() || update_request {
                         if now >= signal_retry {
                             let deadline = Instant::now() + Duration::from_secs(5);
-                            if let Some((box_id, revision)) = &cleanup {
-                                match backend
-                                    .delete_handback(role, box_id, *revision, deadline)
-                                    .await
-                                {
-                                    Ok(()) => cleanup = None,
-                                    Err(error) if error.code == "hub_write_superseded" => {
-                                        cleanup = None
+                            if let Some(stale) = &mut cleanup {
+                                let mut done = false;
+                                if !stale.read_only {
+                                    match backend
+                                        .delete_handback(
+                                            role,
+                                            &stale.box_id,
+                                            stale.revision,
+                                            deadline,
+                                        )
+                                        .await
+                                    {
+                                        Ok(()) => done = true,
+                                        Err(error) if error.code == "hub_write_superseded" => {
+                                            done = true
+                                        }
+                                        Err(error) if error.code == "hub_write_unsettled" => {
+                                            stale.read_only = true
+                                        }
+                                        Err(_) => {}
                                     }
-                                    Err(_) => {}
+                                }
+                                if stale.read_only {
+                                    // The unanswered delete may still land. Do not issue
+                                    // the same guarded delete with a new request key.
+                                    done = match backend
+                                        .read_handback_revision(role, &stale.box_id, deadline)
+                                        .await
+                                    {
+                                        Ok(None) => true,
+                                        Ok(Some(current)) => current > stale.revision,
+                                        Err(_) => false,
+                                    };
+                                }
+                                if done {
+                                    cleanup = None;
                                 }
                             } else if wants_handback {
                                 let _ = backend.put_handback(role, current.gen(), deadline).await;

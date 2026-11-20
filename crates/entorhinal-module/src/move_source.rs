@@ -1362,15 +1362,32 @@ impl Source {
                 Some((record, _)) if record.state == State::Aborted => {
                     if let Some(seen) = hub_seen {
                         let hub = self.hub()?;
+                        let mut reconciled = None;
                         if let Some((staged, _)) = &plan.source.handing {
                             let mut handing = staged.body.clone();
                             handing.state = HubState::Handing;
                             match hub.write_move(&handing, Some(staged)).await {
                                 Ok(_) => {}
                                 Err(error) if error.code == "hub_write_superseded" => {}
+                                Err(error) if error.code == "hub_write_unsettled" => {
+                                    // The current value does not say whether
+                                    // Handing ever landed. Continue only after
+                                    // re-reading a verified abort.
+                                    let revision =
+                                        error.detail.as_ref().and_then(|d| d["revision"].as_u64());
+                                    reconciled = self.read_hub_move(plan)?.filter(|current| {
+                                        revision
+                                            .is_some_and(|revision| current.revision >= revision)
+                                            && current.body.state == HubState::Aborted
+                                    });
+                                    if reconciled.is_none() {
+                                        return Err(hub_failure(error));
+                                    }
+                                }
                                 Err(error) => return Err(hub_failure(error)),
                             }
                         }
+                        let seen = reconciled.as_ref().unwrap_or(seen);
                         if !matches!(
                             hub.move_position(&seen.body).map_err(hub_failure)?,
                             MovePosition::Source | MovePosition::Returned
