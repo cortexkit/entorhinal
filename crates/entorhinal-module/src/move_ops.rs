@@ -73,6 +73,36 @@ fn unknown_move() -> HandlerError {
 }
 
 impl ProjectsHandler {
+    /// Bound each SQL step by the served-read budget and leave time to reply
+    /// before the caller's operator-confirmed move deadline.
+    pub(super) async fn move_sql<T: Send + 'static>(
+        &self,
+        received: Instant,
+        job: impl FnOnce(&Self) -> Result<T, HandlerError> + Send + 'static,
+    ) -> Result<T, HandlerError> {
+        let Some(handler) = self.this.get().and_then(std::sync::Weak::upgrade) else {
+            // By-value test handlers do not install a self-handle.
+            return job(self);
+        };
+        let deadline = (Instant::now() + super::agent_reads::SERVED_READ_DEADLINE)
+            .min(received + OPERATOR_BOUND);
+        let expired = || {
+            HandlerError::new(
+                "storage_error",
+                "move SQL deadline expired; retry to observe the committed state",
+            )
+        };
+        // An in-flight transaction cannot be cancelled. Keep it tracked for
+        // draining even if the caller is no longer waiting for its reply.
+        let result = crate::catalog_sql::run(self.served_reads.tracked(move || {
+            if Instant::now() >= deadline {
+                return Err(expired());
+            }
+            job(&handler)
+        }));
+        timeout_at(deadline, result).await.map_err(|_| expired())?
+    }
+
     pub(super) fn move_refs(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
         let request: RefsRequest = parse(params)?;
         let row = self
@@ -167,8 +197,12 @@ impl ProjectsHandler {
         }
         let request: AbortRequest = parse(params)?;
         require_key(&request.request_key)?;
+        let cut = request.cut_id.clone();
         let row = self
-            .with_store(|s| s.agent_move(&request.cut_id))?
+            .move_sql(received, move |handler| {
+                handler.with_store(|s| s.agent_move(&cut))
+            })
+            .await?
             .ok_or_else(unknown_move)?;
         if row.abort_stuck() && !direct {
             return Err(HandlerError::new(
@@ -188,7 +222,11 @@ impl ProjectsHandler {
         if row.step == entorhinal_core::move_store::MoveStep::Aborted
             || row.abort_requested.is_some() && !row.abort_stuck()
         {
-            return self.move_status(json!({"cut_id":row.cut_id}));
+            return self
+                .move_sql(received, move |handler| {
+                    handler.move_status(json!({"cut_id":row.cut_id}))
+                })
+                .await;
         }
         let guard = if direct {
             let verb = if row.abort_stuck() {
@@ -210,13 +248,20 @@ impl ProjectsHandler {
         } else {
             None
         };
-        if guard.as_ref().is_some_and(|g| *g.cancelled.borrow()) {
-            return Err(OperatorConfirmError::Declined.into());
-        }
-        self.with_agent_store(|s| s.request_agent_move_abort(&request.cut_id, (self.clock)()))?;
+        let cut = request.cut_id.clone();
+        self.move_sql(received, move |handler| {
+            if guard.as_ref().is_some_and(|g| *g.cancelled.borrow()) {
+                return Err(OperatorConfirmError::Declined.into());
+            }
+            handler.with_agent_store(|s| s.request_agent_move_abort(&cut, (handler.clock)()))
+        })
+        .await?;
         self.start_move_driver();
         self.move_wake.notify_waiters();
-        self.move_status(json!({"cut_id":request.cut_id}))
+        self.move_sql(received, move |handler| {
+            handler.move_status(json!({"cut_id":request.cut_id}))
+        })
+        .await
     }
 
     pub(super) async fn set_lid_close_moves(
@@ -238,8 +283,14 @@ impl ProjectsHandler {
         let setting = MoveSetting {
             lid_close_moves: request.enabled,
         };
-        if self.with_store(RegistryStore::move_setting)? != setting {
-            let _guard = self
+        if self
+            .move_sql(received, |handler| {
+                handler.with_store(RegistryStore::move_setting)
+            })
+            .await?
+            != setting
+        {
+            let guard = self
                 .confirm_move_control(
                     &format!(
                         "turn lid-close moves {} on this machine",
@@ -249,7 +300,13 @@ impl ProjectsHandler {
                     received,
                 )
                 .await?;
-            self.with_store(|s| s.set_move_setting(setting))?;
+            self.move_sql(received, move |handler| {
+                if *guard.cancelled.borrow() {
+                    return Err(OperatorConfirmError::Declined.into());
+                }
+                handler.with_store(|s| s.set_move_setting(setting))
+            })
+            .await?;
         }
         encode_result(setting)
     }
@@ -310,11 +367,17 @@ mod tests {
             _: RouteKey,
         ) -> Result<(), OperatorConfirmError> {
             self.summaries.lock().unwrap().push(summary.into());
+            let _ = crate::catalog_sql::tests::SQL_ENTERED.try_with(|entered| {
+                // Ignore the pre-confirmation read so the probe sees the write.
+                let entered = entered.notified();
+                tokio::pin!(entered);
+                let _ = crate::catalog_sql::tests::poll(entered.as_mut());
+            });
             self.answer
         }
     }
     struct Fixture {
-        handler: ProjectsHandler,
+        handler: Arc<ProjectsHandler>,
         prompt: Arc<Prompt>,
         dir: std::path::PathBuf,
     }
@@ -348,7 +411,7 @@ mod tests {
                 RouteAdmission::from_bind(Some(Principal::Direct), Some(&flow_stamp(Some("flow")))),
             );
             Self {
-                handler,
+                handler: Arc::new(handler),
                 prompt,
                 dir,
             }
@@ -412,6 +475,26 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 1,
         }
+    }
+
+    #[tokio::test]
+    async fn move_session_regression_lid_control_runs_on_the_blocking_pool() {
+        let f = Fixture::new(Ok(()));
+        f.handler.this.set(Arc::downgrade(&f.handler)).unwrap();
+        let body = serde_json::to_vec(&json!({
+            "method": SET_LID,
+            "params": {"enabled": true, "request_key": "lid"}
+        }))
+        .unwrap();
+        let (call, entered) =
+            crate::catalog_sql::tests::tracked(f.handler.handle_served_request(&body, DIRECT));
+        assert_eq!(result(call.await), json!({"lid_close_moves":true}));
+        let entered = entered.notified();
+        tokio::pin!(entered);
+        assert!(
+            crate::catalog_sql::tests::poll(entered.as_mut()).is_ready(),
+            "lid-close control did SQL inline instead of reaching a blocking worker"
+        );
     }
 
     #[tokio::test]

@@ -21,10 +21,14 @@ pub(crate) const HUB_LOCAL: &str = "hub.local_write";
 /// success instead of a conflict with its own earlier write. None of it is
 /// ever part of the shared entry.
 ///
-/// The partial indexes keep retention, change feeds, and attempt recovery
-/// from scanning unrelated rows. SQLite uses a partial index only when the
-/// query matches its condition, so the journal operation list must match
-/// `IDENTITY_CHANGE_OPS` in order; a query-plan test checks that it does.
+/// The partial indexes keep the session retention prune, identity change feed,
+/// agent cutover checks, and open attempt recovery from scanning unrelated rows. SQLite uses a
+/// partial index only when the query repeats its condition: the identity op
+/// list must match `IDENTITY_CHANGE_OPS`, and a check for the one-time
+/// `agent.cutover` journal entry (written when this store took over agent
+/// identity) must test `op='agent.cutover'` literally, not through a bound
+/// parameter.
+/// The move history index serves an agent's moves in display order.
 pub(crate) const V27_LEGACY_REPLY_AND_QUERY_INDEXES: &str = r#"
 ALTER TABLE pending_entry ADD COLUMN continuation TEXT NULL;
 CREATE INDEX session_binding_ended
@@ -34,7 +38,6 @@ CREATE INDEX registry_journal_identity
     WHERE op IN ('agent.create','agent.rename','agent.update_tag','agent.set_labels',
                  'agent.set_avatar','agent.set_github_identity','agent.dispose',
                  'agent.merge','agent.import','agent.set_namespace');
-CREATE INDEX hub_attempt_open ON hub_attempt(request_key, step) WHERE outcome IS NULL;
 
 -- Keep signed membership candidates even when the local roster cannot verify
 -- them yet. The highest sequence is the scan cursor; a NULL row marks a
@@ -43,6 +46,11 @@ CREATE TABLE hub_membership_scan (
     sequence INTEGER PRIMARY KEY CHECK(sequence > 0),
     candidate BLOB NULL
 );
+CREATE INDEX registry_journal_cutover
+    ON registry_journal(op) WHERE op='agent.cutover';
+CREATE INDEX agent_move_agent_history
+    ON agent_move(agent_id, created_at_ms, cut_id);
+CREATE INDEX hub_attempt_open ON hub_attempt(request_key, step) WHERE outcome IS NULL;
 "#;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

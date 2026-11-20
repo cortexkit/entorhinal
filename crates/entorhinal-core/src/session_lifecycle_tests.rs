@@ -156,6 +156,51 @@ fn registration<'a>(
 }
 
 #[test]
+fn move_session_regression_delayed_delete_keeps_new_registration_open() {
+    let f = Fixture::new();
+    let register = |now| {
+        f.store
+            .register_session(&registration("s", Some("broca"), now))
+            .unwrap();
+    };
+    register(700);
+    let queued_delete = GoneSession {
+        harness: "broca".into(),
+        session_id: "s".into(),
+        runner: Some("broca".into()),
+        ended_at_ms: 800,
+    };
+    register(900);
+    f.store.stamp_gone_sessions(&[queued_delete]).unwrap();
+    assert_eq!(
+        f.lifecycle("s").unwrap().1,
+        None,
+        "old DEL cannot end the new active registration"
+    );
+}
+
+#[test]
+fn move_session_regression_registration_uses_cutover_marker_index() {
+    let f = Fixture::with_migrations(&MIGRATIONS[..MIGRATIONS.len() - 1]);
+    drop(f.store);
+    let store = RegistryStore::open(&f.descriptor).unwrap();
+    let plan = store
+        .read(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                RegistryStore::AGENT_CUTOVER_SQL
+            ))?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(3))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?.join("\n"))
+        })
+        .unwrap();
+    assert!(
+        plan.contains("registry_journal_cutover"),
+        "session registration looks for a single journal marker: {plan}"
+    );
+}
+
+#[test]
 fn session_role_absent_and_migrated_rows_store_head() {
     let f = Fixture::with_migrations(&MIGRATIONS[..23]);
     f.bind(AGENT, "legacy", 1, Some("broca"), None);
