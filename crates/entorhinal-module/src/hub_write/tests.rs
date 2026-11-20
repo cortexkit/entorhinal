@@ -182,6 +182,8 @@ impl HubState {
 
 struct Recorder<'a> {
     store: &'a RegistryStore,
+    _slot: Arc<Mutex<Option<RegistryStore>>>,
+    sql: HubSql,
     hub: &'a Mutex<HubState>,
 }
 
@@ -285,15 +287,18 @@ impl Fixture {
     }
 
     fn recorder<'a>(&'a self, store: &'a RegistryStore) -> Recorder<'a> {
+        let slot = Arc::new(Mutex::new(Some(store.clone())));
         Recorder {
             store,
+            sql: HubSql::new(&slot, Arc::default()),
+            _slot: slot,
             hub: &self.hub,
         }
     }
 
     fn writer<'a>(&'a self, transport: &'a Recorder<'a>) -> Writer<'a, Recorder<'a>, TestKeys> {
         Writer {
-            store: transport.store,
+            sql: &transport.sql,
             transport,
             trust: &self.keys,
             signer: &self.signer,
@@ -527,7 +532,10 @@ async fn hub_audit_regression_settled_writes_prune_old_attempts() {
         .build(&REQUEST, &old_step, false, None, deadline())
         .await
         .unwrap();
-    assert!(writer.save(&old, &id, None, None).unwrap());
+    assert!(writer
+        .save(&old, &id, None, None, deadline())
+        .await
+        .unwrap());
     let mut outcome = recorded(id, Outcome::Landed { position: Some(1) });
     outcome.recorded_at_ms = 1;
     assert!(store.record_hub_attempt_outcome(&old, &outcome).unwrap());
@@ -607,6 +615,7 @@ async fn hub_write_agent_create_advances_same_row_and_watch_settles_by_op_after_
     assert_eq!(writer.record_applied(&old, 1, deadline()).await.unwrap(), 0);
     assert_eq!(row(&store), pending);
 
+    drop(transport);
     drop(store);
     let store = f.store();
     let transport = f.recorder(&store);
@@ -645,8 +654,13 @@ impl LogReplan for ReadyPlan {
         Box::pin(async { Ok(()) })
     }
 
-    fn after_image(&self, saved: &Value) -> Result<Replanned, HandlerError> {
-        Ok(Replanned::Body(saved.clone()))
+    fn after_image(
+        &self,
+        saved: Value,
+        _: String,
+        _: Instant,
+    ) -> BoxFuture<'_, Result<Replanned, HandlerError>> {
+        Box::pin(async move { Ok(Replanned::Body(saved)) })
     }
 }
 

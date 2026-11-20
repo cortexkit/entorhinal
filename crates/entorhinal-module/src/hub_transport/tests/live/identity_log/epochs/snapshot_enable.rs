@@ -51,7 +51,7 @@ fn bootstrap(
         })
     });
     let log = Arc::new(IdentityLog::new(
-        store,
+        handler.hub_sql(),
         handler.health.clone(),
         handler.writer.clone(),
         handler.commits.clone(),
@@ -75,9 +75,9 @@ fn bootstrap(
 }
 
 fn activate(handler: &ProjectsHandler, log: Arc<IdentityLog<Leaf, TestKeys>>, leaf: Arc<Leaf>) {
-    *handler.hub_tail_task.lock().unwrap() = Some(log.start_installed_tail().unwrap());
+    *handler.hub_tail_task.lock().unwrap() = Some(log.start_installed_tail_for_test().unwrap());
     *handler.hub_shared_log.lock().unwrap() = Some(log.clone());
-    let image = log.store.installed_hub_snapshot().unwrap().image;
+    let image = log.sql.test_store().installed_hub_snapshot().unwrap().image;
     let feed = Feed::kv(handler.health.clone(), move |_| {
         Binding {
             session: leaf.session(),
@@ -117,7 +117,7 @@ async fn hub_snapshot_enable_resumes_after_part_and_seed_and_empty_member_joins(
         return;
     };
     for node in [&rig.a, &rig.b] {
-        let tail = node.handler.catch_up_task.lock().unwrap().take().unwrap();
+        let tail = node.handler.hub_tail_task.lock().unwrap().take().unwrap();
         tail.abort();
         let _ = tail.await;
     }
@@ -131,9 +131,12 @@ async fn hub_snapshot_enable_resumes_after_part_and_seed_and_empty_member_joins(
         None,
         0,
     );
-    add_agents(&log.store, 100_000);
-    log.store.begin_hub_enable(&"6a".repeat(16), A).unwrap();
-    let image = plan(&log.store);
+    add_agents(&log.sql.test_store(), 100_000);
+    log.sql
+        .test_store()
+        .begin_hub_enable(&"6a".repeat(16), A)
+        .unwrap();
+    let image = plan(&log.sql.test_store());
 
     let (committed, arrived) = oneshot::channel();
     let (release, held) = oneshot::channel();
@@ -150,7 +153,7 @@ async fn hub_snapshot_enable_resumes_after_part_and_seed_and_empty_member_joins(
     let _ = partial.await;
     drop(release);
     assert_eq!(log.log_head(deadline()).await.unwrap(), 1);
-    assert_eq!(log.store.hub_log_base().unwrap(), None);
+    assert_eq!(log.sql.test_store().hub_log_base().unwrap(), None);
     drop(log);
     drop(a);
 
@@ -168,7 +171,7 @@ async fn hub_snapshot_enable_resumes_after_part_and_seed_and_empty_member_joins(
         format!("residence.{}", agent(1)),
         Gate::LoseAck(committed, held),
     ));
-    let image = plan(&log.store);
+    let image = plan(&log.sql.test_store());
     let partial = tokio::spawn({
         let log = log.clone();
         async move { transfer(&log, Some(&image), deadline()).await }
@@ -193,7 +196,7 @@ async fn hub_snapshot_enable_resumes_after_part_and_seed_and_empty_member_joins(
         .await
         .unwrap()
         .is_none());
-    assert_eq!(log.store.hub_log_base().unwrap(), None);
+    assert_eq!(log.sql.test_store().hub_log_base().unwrap(), None);
     drop(log);
     drop(a);
 
@@ -205,10 +208,10 @@ async fn hub_snapshot_enable_resumes_after_part_and_seed_and_empty_member_joins(
         Some(vault),
         0,
     );
-    let image = plan(&log.store);
+    let image = plan(&log.sql.test_store());
     assert!(transfer(&log, Some(&image), deadline()).await.unwrap());
     assert_eq!(log.log_head(deadline()).await.unwrap(), 2);
-    assert!(log.store.hub_enable_plan().unwrap().is_none());
+    assert!(log.sql.test_store().hub_enable_plan().unwrap().is_none());
     let (b, follower, _) = bootstrap(
         &rig,
         store(&rig._processes, "snapshot-b"),
@@ -218,7 +221,10 @@ async fn hub_snapshot_enable_resumes_after_part_and_seed_and_empty_member_joins(
         0,
     );
     assert!(transfer(&follower, None, deadline()).await.unwrap());
-    assert_eq!(follower.store.installed_hub_snapshot().unwrap(), image);
+    assert_eq!(
+        follower.sql.test_store().installed_hub_snapshot().unwrap(),
+        image
+    );
 
     let root = rig._processes.dir.join("new-checkout");
     fs::create_dir(&root).unwrap();
@@ -269,7 +275,13 @@ async fn hub_snapshot_enable_resumes_after_part_and_seed_and_empty_member_joins(
     activate(&a, log.clone(), rig.a.leaf.clone());
     activate(&b, follower.clone(), rig.b.leaf.clone());
     within(async {
-        while !a.residence().unwrap().ready() || !b.residence().unwrap().ready() {
+        // Placement approval binds the journal generation. Both devices must
+        // apply the initial key publications before the operator approves it.
+        while !a.residence().unwrap().ready()
+            || !b.residence().unwrap().ready()
+            || log.applied_sequence(deadline()).await.unwrap() < 4
+            || follower.applied_sequence(deadline()).await.unwrap() < 4
+        {
             sleep(Duration::from_millis(10)).await;
         }
     })
@@ -279,7 +291,8 @@ async fn hub_snapshot_enable_resumes_after_part_and_seed_and_empty_member_joins(
     assert_eq!(reply["projectId"], "new-project");
     within(async {
         while !follower
-            .store
+            .sql
+            .test_store()
             .enumerate(None)
             .unwrap()
             .projects
@@ -290,8 +303,11 @@ async fn hub_snapshot_enable_resumes_after_part_and_seed_and_empty_member_joins(
         }
     })
     .await;
-    assert_eq!(log.store.root_count("new-project").unwrap(), 1);
-    assert_eq!(follower.store.root_count("new-project").unwrap(), 0);
+    assert_eq!(log.sql.test_store().root_count("new-project").unwrap(), 1);
+    assert_eq!(
+        follower.sql.test_store().root_count("new-project").unwrap(),
+        0
+    );
     assert_eq!(result(a.handle_active_request(&req, ROUTE).await), reply);
     for (wire, route) in [(&rename, CORE), (&profile, CORE)] {
         let outcome = a.handle_active_request(wire, route).await;
@@ -309,25 +325,30 @@ async fn hub_snapshot_enable_resumes_after_part_and_seed_and_empty_member_joins(
         .await
         .unwrap();
     assert!(follower
-        .store
+        .sql
+        .test_store()
         .agent_snapshot()
         .unwrap()
         .agents
         .iter()
         .any(|row| row.agent_id == agent(1) && row.name == "Ada"));
-    assert_eq!(follower.store.catalog_pins(&agent(1)).unwrap(), pins.pins);
+    assert_eq!(
+        follower.sql.test_store().catalog_pins(&agent(1)).unwrap(),
+        pins.pins
+    );
     assert_eq!(
         result(b.handle_request(&body("user.get", json!({})), CORE))["user"]["name"],
         "Mira"
     );
     assert!(follower
-        .store
+        .sql
+        .test_store()
         .placement_read(Default::default(), "test")
         .unwrap()
         .facts
         .iter()
         .any(|fact| fact.project_id == "new-project"));
-    assert!(log.store.verify().unwrap().ok);
+    assert!(log.sql.test_store().verify().unwrap().ok);
 }
 
 fn migrated(store: &RegistryStore) -> HubSnapshot {
@@ -401,7 +422,7 @@ async fn hub_snapshot_migration_resumer_refuses_divergence_and_claims_gen_zero_o
         return;
     };
     for node in [&rig.a, &rig.b] {
-        let tail = node.handler.catch_up_task.lock().unwrap().take().unwrap();
+        let tail = node.handler.hub_tail_task.lock().unwrap().take().unwrap();
         tail.abort();
         let _ = tail.await;
     }
@@ -415,7 +436,7 @@ async fn hub_snapshot_migration_resumer_refuses_divergence_and_claims_gen_zero_o
         None,
         1,
     );
-    let image = migrated(&leader.store);
+    let image = migrated(&leader.sql.test_store());
     let (committed, arrived) = oneshot::channel();
     let (release, held) = oneshot::channel();
     *rig.a.leaf.gate.lock().unwrap() = Some(Gate::LoseAck(committed, held));
@@ -437,7 +458,7 @@ async fn hub_snapshot_migration_resumer_refuses_divergence_and_claims_gen_zero_o
         None,
         1,
     );
-    let mut image = migrated(&log.store);
+    let mut image = migrated(&log.sql.test_store());
     image.image.roles[0].generation += 1;
     assert_eq!(
         transfer(&log, Some(&image), deadline())
@@ -448,11 +469,11 @@ async fn hub_snapshot_migration_resumer_refuses_divergence_and_claims_gen_zero_o
     );
     assert_eq!(log.log_head(deadline()).await.unwrap(), 1);
     assert!(rig.b.leaf.sends.lock().unwrap().is_empty());
-    assert!(log.store.hub_log_base().unwrap().is_none());
+    assert!(log.sql.test_store().hub_log_base().unwrap().is_none());
 
     image.image.roles[0].generation -= 1;
     assert!(transfer(&log, Some(&image), deadline()).await.unwrap());
-    assert_eq!(log.store.hub_log_base().unwrap(), Some(1));
+    assert_eq!(log.sql.test_store().hub_log_base().unwrap(), Some(1));
     assert_eq!(log.log_head(deadline()).await.unwrap(), 2);
     assert_eq!(rig.b.leaf.sends.lock().unwrap()[0].0, 1);
     activate(&b, log.clone(), rig.b.leaf.clone());
@@ -490,7 +511,7 @@ async fn hub_snapshot_migration_resumer_refuses_divergence_and_claims_gen_zero_o
     result(b.handle_active_request(&take, ROUTE).await);
     within(async {
         loop {
-            let row = log.store.hub_kv_cached(&claim_key).unwrap();
+            let row = log.sql.test_store().hub_kv_cached(&claim_key).unwrap();
             if row
                 .and_then(|row| row.body)
                 .is_some_and(|body| body["gen"] == 1 && body["holder"] == B)
@@ -519,7 +540,7 @@ async fn hub_snapshot_registration_binding_recovers_after_publish_and_reports_re
         return;
     };
     for node in [&rig.a, &rig.b] {
-        let tail = node.handler.catch_up_task.lock().unwrap().take().unwrap();
+        let tail = node.handler.hub_tail_task.lock().unwrap().take().unwrap();
         tail.abort();
         let _ = tail.await;
     }
@@ -533,10 +554,15 @@ async fn hub_snapshot_registration_binding_recovers_after_publish_and_reports_re
         None,
         0,
     );
-    log.store.begin_hub_enable(&"7b".repeat(16), A).unwrap();
-    assert!(transfer(&log, Some(&plan(&log.store)), deadline())
-        .await
-        .unwrap());
+    log.sql
+        .test_store()
+        .begin_hub_enable(&"7b".repeat(16), A)
+        .unwrap();
+    assert!(
+        transfer(&log, Some(&plan(&log.sql.test_store())), deadline())
+            .await
+            .unwrap()
+    );
     activate(&handler, log.clone(), rig.a.leaf.clone());
     crate::hub_identity_log::wait_for_applied(&log, 2, deadline())
         .await
@@ -573,7 +599,7 @@ async fn hub_snapshot_registration_binding_recovers_after_publish_and_reports_re
         }
         drop(request);
         drop(release);
-        assert_eq!(log.store.root_count(project).unwrap(), 0);
+        assert_eq!(log.sql.test_store().root_count(project).unwrap(), 0);
         if replaced {
             fs::rename(&root, root.with_extension("old")).unwrap();
             git_checkout(&root);
@@ -583,7 +609,8 @@ async fn hub_snapshot_registration_binding_recovers_after_publish_and_reports_re
                 json!({"projectId":"recover","name":"recover","roots":[root]}),
             )
             .unwrap();
-            log.store
+            log.sql
+                .test_store()
                 .with_principal("test")
                 .register_at(request, 700)
                 .unwrap();
@@ -618,9 +645,10 @@ async fn hub_snapshot_registration_binding_recovers_after_publish_and_reports_re
             assert!(
                 matches!(handler.handle_active_request(&req, ROUTE).await, HandlerOutcome::Error { code, .. } if code == "root_conflict")
             );
-            assert_eq!(log.store.root_count(project).unwrap(), 0);
+            assert_eq!(log.sql.test_store().root_count(project).unwrap(), 0);
             assert!(log
-                .store
+                .sql
+                .test_store()
                 .enumerate(None)
                 .unwrap()
                 .projects
@@ -633,7 +661,11 @@ async fn hub_snapshot_registration_binding_recovers_after_publish_and_reports_re
         if replaced {
             assert_eq!(reply["unboundRoots"], json!([root]));
         } else {
-            let resolved = log.store.resolve(root.to_str().unwrap()).unwrap();
+            let resolved = log
+                .sql
+                .test_store()
+                .resolve(root.to_str().unwrap())
+                .unwrap();
             assert_eq!(resolved.project_id, project);
             assert_eq!(
                 resolved.root_fields.unwrap().root_records[0].identity,
@@ -644,7 +676,7 @@ async fn hub_snapshot_registration_binding_recovers_after_publish_and_reports_re
             result(handler.handle_active_request(&req, ROUTE).await),
             reply
         );
-        assert!(log.store.verify().unwrap().ok);
+        assert!(log.sql.test_store().verify().unwrap().ok);
     }
 }
 
@@ -657,7 +689,7 @@ async fn hub_snapshot_tool_consent_settles_after_publish_and_restart() {
         return;
     };
     for node in [&rig.a, &rig.b] {
-        let tail = node.handler.catch_up_task.lock().unwrap().take().unwrap();
+        let tail = node.handler.hub_tail_task.lock().unwrap().take().unwrap();
         tail.abort();
         let _ = tail.await;
     }
@@ -671,14 +703,23 @@ async fn hub_snapshot_tool_consent_settles_after_publish_and_restart() {
         None,
         0,
     );
-    add_agents(&log.store, 4);
-    log.store.begin_hub_enable(&"a1".repeat(16), A).unwrap();
-    assert!(transfer(&log, Some(&plan(&log.store)), deadline())
-        .await
-        .unwrap());
+    add_agents(&log.sql.test_store(), 4);
+    log.sql
+        .test_store()
+        .begin_hub_enable(&"a1".repeat(16), A)
+        .unwrap();
+    assert!(
+        transfer(&log, Some(&plan(&log.sql.test_store())), deadline())
+            .await
+            .unwrap()
+    );
     activate(&handler, log.clone(), rig.a.leaf.clone());
     within(async {
-        while !handler.residence().unwrap().ready() {
+        // Stop on the far side of the initial key publication, not between
+        // its append and apply; the next append must be the tool request.
+        while !handler.residence().unwrap().ready()
+            || log.applied_sequence(deadline()).await.unwrap() < 2
+        {
             sleep(Duration::from_millis(10)).await;
         }
     })
@@ -690,7 +731,8 @@ async fn hub_snapshot_tool_consent_settles_after_publish_and_restart() {
     let caller = agent(1);
     let tool = "projects_create_workspace";
     let plan = log
-        .store
+        .sql
+        .test_store()
         .precheck_consent_write(
             &caller,
             tool,
@@ -735,7 +777,12 @@ async fn hub_snapshot_tool_consent_settles_after_publish_and_restart() {
     }
     drop(request);
     drop(release);
-    assert!(log.store.consent_request(&identity).unwrap().is_none());
+    assert!(log
+        .sql
+        .test_store()
+        .consent_request(&identity)
+        .unwrap()
+        .is_none());
     handler.stop_hub_residence().await;
     drop(log);
     drop(handler);
@@ -758,7 +805,12 @@ async fn hub_snapshot_tool_consent_settles_after_publish_and_restart() {
         }
     })
     .await;
-    let recorded = log.store.consent_request(&identity).unwrap().unwrap();
+    let recorded = log
+        .sql
+        .test_store()
+        .consent_request(&identity)
+        .unwrap()
+        .unwrap();
     assert_eq!(recorded.state, RequestState::Applied);
     let mut reply: Value = serde_json::from_slice(
         &handler

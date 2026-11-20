@@ -644,6 +644,7 @@ struct ProjectsHandler {
     draining: tokio::sync::watch::Sender<bool>,
     catch_up_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     hub_residence: Arc<Mutex<Option<hub_residence::Running>>>,
+    hub_sql: Arc<move_driver::SqlOperations>,
     hub_tail_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     hub_shared_log: Arc<Mutex<Option<Arc<dyn hub_identity_log::SharedLog>>>>,
     hub_switch: Option<hub_switch::Switch>,
@@ -1085,6 +1086,7 @@ impl ProjectsHandler {
             draining: tokio::sync::watch::channel(false).0,
             catch_up_task: Mutex::new(None),
             hub_residence: Arc::default(),
+            hub_sql: Arc::default(),
             hub_tail_task: Arc::default(),
             hub_shared_log: Arc::default(),
             hub_switch,
@@ -1268,7 +1270,10 @@ impl ModuleHandler for ProjectsHandler {
         let remaining = deadline
             .duration_since(std::time::SystemTime::now())
             .unwrap_or_default();
-        let _ = tokio::time::timeout(remaining, self.served_reads.wait()).await;
+        let _ = tokio::time::timeout(remaining, async {
+            tokio::join!(self.served_reads.wait(), self.stop_hub_tasks());
+        })
+        .await;
     }
 
     fn control_ops(&self) -> Vec<String> {
@@ -2027,6 +2032,13 @@ impl ProjectsHandler {
 
     fn identity_log_status(&self) -> Result<Vec<u8>, HandlerError> {
         let reply = self.with_store(RegistryStore::identity_log_status)?;
+        self.encode_identity_log_status(reply)
+    }
+
+    fn encode_identity_log_status(
+        &self,
+        reply: entorhinal_core::IdentityLogStatus,
+    ) -> Result<Vec<u8>, HandlerError> {
         enable::refresh_status(&self.health, &reply);
         let mut reply = serde_json::to_value(reply).map_err(invalid_params)?;
         reply["state"] = json!(enable::status_state(&self.health));
@@ -3347,11 +3359,13 @@ mod tests {
             task.abort();
             let _ = task.await;
         }
+        handler.stop_hub_tail().await;
     }
 
     pub(super) async fn stop_store_tasks(handler: &ProjectsHandler) {
         handler.stop_liveness_bus().await;
         stop_catch_up(handler).await;
+        handler.stop_hub_residence().await;
         handler.stop_move_driver().await;
         handler.stop_claim_refresh().await;
         handler.stop_catalog_poll().await;

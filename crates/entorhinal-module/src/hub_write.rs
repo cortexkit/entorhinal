@@ -3,12 +3,17 @@
 // This writer is used only when the registry selects the hub instead of engram.
 #![allow(dead_code)]
 
-use std::{cell::Cell, future::Future, sync::OnceLock};
+use std::{
+    cell::Cell,
+    future::Future,
+    sync::{Arc, Mutex, OnceLock, Weak},
+    time::Duration,
+};
 
 use cortexkit_claustrum_client::CredentialResolver;
 use entorhinal_catalog::jcs;
 use entorhinal_core::{
-    hub_store::{HubAttempt, HubAttemptOutcome, HubAttemptSend, HubAttemptWrite},
+    hub_store::{HubAttempt, HubAttemptOutcome, HubAttemptSend, HubAttemptWrite, HubKvCached},
     RegistryStore,
 };
 use futures_util::future::BoxFuture;
@@ -20,11 +25,143 @@ use tokio::time::{timeout_at, Instant};
 use crate::{
     fleet_record::{self, vault::EpochVault, Header, UnverifiedRecord, VerifiedRecord, LOG_KEY},
     hub_transport::{self, Hub, Session},
+    move_driver::SqlOperations,
     HandlerError,
 };
 
 const MAX_LOG_REBASES: usize = 5;
 pub(super) const PROJECTION_SNAPSHOT_KIND: &str = "shared.snapshot";
+
+/// A hub task may own this across network waits. Only the SQL job owns a store.
+#[derive(Clone)]
+pub(super) struct HubSql {
+    slot: Weak<Mutex<Option<RegistryStore>>>,
+    operations: Arc<SqlOperations>,
+}
+
+impl HubSql {
+    pub(super) fn new(
+        slot: &Arc<Mutex<Option<RegistryStore>>>,
+        operations: Arc<SqlOperations>,
+    ) -> Self {
+        Self {
+            slot: Arc::downgrade(slot),
+            operations,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_store(&self) -> RegistryStore {
+        self.slot
+            .upgrade()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap()
+    }
+
+    pub(super) async fn wait(&self) {
+        self.operations.wait().await;
+    }
+
+    pub(super) fn available(&self) -> bool {
+        self.slot.strong_count() != 0
+    }
+
+    pub(super) async fn attempt(
+        &self,
+        key: &str,
+        deadline: Instant,
+    ) -> Result<Option<HubAttempt>, HandlerError> {
+        let key = key.to_owned();
+        self.run(deadline, "hub_attempt", move |store| {
+            Ok(store.hub_attempt(&key)?)
+        })
+        .await
+    }
+
+    pub(super) async fn cached(
+        &self,
+        key: &str,
+        deadline: Instant,
+    ) -> Result<Option<HubKvCached>, HandlerError> {
+        let key = key.to_owned();
+        self.run(deadline, "hub_kv_cached", move |store| {
+            Ok(store.hub_kv_cached(&key)?)
+        })
+        .await
+    }
+
+    pub(super) async fn run<R: Send + 'static>(
+        &self,
+        caller: Instant,
+        operation: &'static str,
+        work: impl FnOnce(&RegistryStore) -> Result<R, HandlerError> + Send + 'static,
+    ) -> Result<R, HandlerError> {
+        self.run_job(caller, operation, work, false).await
+    }
+
+    /// An ordered log apply must know whether an already-started job committed
+    /// before moving or replaying its cursor. Queued work still expires on time.
+    pub(super) async fn apply<R: Send + 'static>(
+        &self,
+        caller: Instant,
+        operation: &'static str,
+        work: impl FnOnce(&RegistryStore) -> Result<R, HandlerError> + Send + 'static,
+    ) -> Result<R, HandlerError> {
+        self.run_job(caller, operation, work, true).await
+    }
+
+    async fn run_job<R: Send + 'static>(
+        &self,
+        caller: Instant,
+        operation: &'static str,
+        work: impl FnOnce(&RegistryStore) -> Result<R, HandlerError> + Send + 'static,
+        finish_apply: bool,
+    ) -> Result<R, HandlerError> {
+        let now = Instant::now();
+        let remaining = caller.saturating_duration_since(now);
+        let deadline = now
+            + (remaining - remaining.min(Duration::from_millis(25)) / 2)
+                .min(Duration::from_secs(2));
+        let slot = self.slot.clone();
+        let mut job = tokio::task::spawn_blocking(self.operations.tracked(move || {
+            if Instant::now() >= deadline {
+                return Err(sql_timeout(operation));
+            }
+            let store = slot
+                .upgrade()
+                .and_then(|slot| slot.lock().unwrap().clone())
+                .ok_or_else(store_unavailable)?;
+            work(&store)
+        }));
+        match timeout_at(deadline, &mut job).await {
+            Ok(result) => result.map_err(|e| HandlerError::new("storage_error", e.to_string()))?,
+            Err(_) => {
+                job.abort(); // Cancels queued work, not a transaction already running.
+                if finish_apply {
+                    if let Ok(Ok(committed)) = job.await {
+                        return Ok(committed);
+                    }
+                }
+                Err(sql_timeout(operation))
+            }
+        }
+    }
+}
+
+pub(super) fn store_unavailable() -> HandlerError {
+    HandlerError::new("store_unavailable", "registry store is not open")
+}
+
+fn sql_timeout(operation: &str) -> HandlerError {
+    HandlerError {
+        code: "hub_sql_timeout".into(),
+        message: format!("{operation} deadline expired; retry to observe committed state"),
+        detail: Some(json!({"retryable": true})),
+    }
+}
 
 pub(super) struct Request<'a> {
     pub request_key: &'a str,
@@ -69,10 +206,12 @@ pub(super) trait LogReplan: Sync {
     /// operation is no longer valid there (a name now taken, a retired agent): the
     /// attempt then records that refusal as its final outcome and is never resent.
     /// An `Err` is a transient failure; the attempt stays open for a retry.
-    fn after_image(&self, saved: &Value) -> Result<Replanned, HandlerError>;
-    fn after_image_with_id(&self, saved: &Value, _id: &str) -> Result<Replanned, HandlerError> {
-        self.after_image(saved)
-    }
+    fn after_image(
+        &self,
+        saved: Value,
+        id: String,
+        deadline: Instant,
+    ) -> BoxFuture<'_, Result<Replanned, HandlerError>>;
 }
 
 pub(super) enum Replanned {
@@ -272,7 +411,7 @@ pub(super) trait Trust: Sync {
 }
 
 pub(super) struct Writer<'a, T, U> {
-    pub store: &'a RegistryStore,
+    pub sql: &'a HubSql,
     pub transport: &'a T,
     pub trust: &'a U,
     pub signer: &'a dyn CredentialResolver,
@@ -409,7 +548,7 @@ thread_local! {
     static UNTIL_PRUNE: Cell<usize> = const { Cell::new(1) };
 }
 
-async fn prune_after_settling(store: &RegistryStore, settled: usize) {
+async fn prune_after_settling(sql: &HubSql, settled: usize, deadline: Instant) {
     if settled == 0
         || !UNTIL_PRUNE.with(|remaining| {
             let old = remaining.get();
@@ -426,22 +565,25 @@ async fn prune_after_settling(store: &RegistryStore, settled: usize) {
     }
     // Prune on each writer thread's first settlement and at a bounded write
     // cadence thereafter. An idle computer never wakes just for retention.
-    let store = store.clone();
-    let result =
-        tokio::task::spawn_blocking(move || store.prune_hub_attempts(crate::unix_millis())).await;
-    if !matches!(result, Ok(Ok(_))) {
-        tracing::warn!(?result, "could not prune settled hub attempts");
+    if let Err(error) = sql
+        .run(deadline, "prune_hub_attempts", |store| {
+            Ok(store.prune_hub_attempts(crate::unix_millis())?)
+        })
+        .await
+    {
+        tracing::warn!(?error, "could not prune settled hub attempts");
     }
 }
 
 pub(super) async fn refuse_attempt(
-    store: &RegistryStore,
+    sql: &HubSql,
     row: &HubAttempt,
     HandlerError {
         code,
         message,
         detail,
     }: HandlerError,
+    deadline: Instant,
 ) -> Result<bool, HandlerError> {
     let op_id = current_op_id(&row.write, row)?;
     let outcome = recorded(
@@ -452,8 +594,13 @@ pub(super) async fn refuse_attempt(
             detail,
         },
     );
-    let settled = store.record_hub_attempt_outcome(&row.write, &outcome)?;
-    prune_after_settling(store, usize::from(settled)).await;
+    let write = row.write.clone();
+    let settled = sql
+        .run(deadline, "record_hub_attempt_outcome", move |store| {
+            Ok(store.record_hub_attempt_outcome(&write, &outcome)?)
+        })
+        .await?;
+    prune_after_settling(sql, usize::from(settled), deadline).await;
     Ok(settled)
 }
 
@@ -496,7 +643,7 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
         let mut resent = false;
         let mut sent = None;
         loop {
-            let Some(row) = self.store.hub_attempt(request.request_key)? else {
+            let Some(row) = self.sql.attempt(request.request_key, deadline).await? else {
                 let (write, op_id) = self
                     .build(
                         request,
@@ -506,7 +653,10 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
                         deadline,
                     )
                     .await?;
-                if self.save(&write, &op_id, None, continuation)? {
+                if self
+                    .save(&write, &op_id, None, continuation, deadline)
+                    .await?
+                {
                     sent = self.send(&write, &op_id, true, deadline).await?;
                 }
                 continue;
@@ -532,7 +682,13 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
                 self.settle(&row, &op_id, deadline).await?
             };
             // An apply may have won while settlement was reading the hub.
-            if self.store.hub_attempt(request.request_key)?.as_ref() != Some(&row) {
+            if self
+                .sql
+                .attempt(request.request_key, deadline)
+                .await?
+                .as_ref()
+                != Some(&row)
+            {
                 continue;
             }
             let terminal = match settlement {
@@ -545,9 +701,18 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
                     }
                     let (write, op_id) = self.build(request, &step, false, None, deadline).await?;
                     let send = Self::send_record(&op_id)?;
+                    let next_write = write.clone();
                     if self
-                        .store
-                        .advance_hub_attempt(&row, &landed.op_id, &write, &send)?
+                        .sql
+                        .run(deadline, "advance_hub_attempt", move |store| {
+                            Ok(store.advance_hub_attempt(
+                                &row,
+                                &landed.op_id,
+                                &next_write,
+                                &send,
+                            )?)
+                        })
+                        .await?
                     {
                         resent = false;
                         sent = self.send(&write, &op_id, true, deadline).await?;
@@ -606,7 +771,10 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
                         .resend(request, &row, &op_id, deadline)
                         .await
                         .map_err(|e| during_settlement(e, &op_id))?;
-                    if self.save(&write, &next_id, Some(&row), None)? {
+                    if self
+                        .save(&write, &next_id, Some(&row), None, deadline)
+                        .await?
+                    {
                         resent = true;
                         sent = self
                             .send(&write, &next_id, false, deadline)
@@ -616,8 +784,16 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
                     continue;
                 }
             };
-            if self.store.record_hub_attempt_outcome(write, &terminal)? {
-                prune_after_settling(self.store, 1).await;
+            let write = write.clone();
+            let outcome = terminal.clone();
+            if self
+                .sql
+                .run(deadline, "record_hub_attempt_outcome", move |store| {
+                    Ok(store.record_hub_attempt_outcome(&write, &outcome)?)
+                })
+                .await?
+            {
+                prune_after_settling(self.sql, 1, deadline).await;
                 return reply(terminal);
             }
         }
@@ -639,7 +815,19 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
         }
         let (value, op_id) = match &step.payload {
             Payload::Delete if step.key != LOG_KEY => {
-                let cached = self.store.hub_kv_cached(&step.key)?;
+                let key = step.key.clone();
+                let (cached, epoch) = self
+                    .sql
+                    .run(deadline, "hub_kv_cached", move |store| {
+                        let cached = store.hub_kv_cached(&key)?;
+                        let epoch = if key.starts_with("wrap.") {
+                            store.hub_kv_cached("epoch")?.and_then(|row| row.body)
+                        } else {
+                            None
+                        };
+                        Ok((cached, epoch))
+                    })
+                    .await?;
                 let last_body = cached
                     .as_ref()
                     .filter(|row| row.accepted_revision == Some(step.expected))
@@ -649,7 +837,6 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
                     .strip_prefix("wrap.")
                     .and_then(|wrap| wrap.split('.').nth(1))
                 {
-                    let epoch = self.store.hub_kv_cached("epoch")?.and_then(|row| row.body);
                     epoch
                         .as_ref()
                         .and_then(crate::hub_residence::committed_mint)
@@ -721,19 +908,28 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
         })
     }
 
-    fn save(
+    async fn save(
         &self,
         write: &HubAttemptWrite,
         op_id: &str,
         row: Option<&HubAttempt>,
         continuation: Option<&entorhinal_core::HubContinuation>,
+        deadline: Instant,
     ) -> Result<bool, HandlerError> {
-        Ok(self.store.persist_hub_attempt_with_local(
-            write,
-            &Self::send_record(op_id)?,
-            row,
-            continuation,
-        )?)
+        let send = Self::send_record(op_id)?;
+        let write = write.clone();
+        let row = row.cloned();
+        let continuation = continuation.cloned();
+        self.sql
+            .run(deadline, "persist_hub_attempt_with_local", move |store| {
+                Ok(store.persist_hub_attempt_with_local(
+                    &write,
+                    &send,
+                    row.as_ref(),
+                    continuation.as_ref(),
+                )?)
+            })
+            .await
     }
 
     async fn send(
@@ -744,6 +940,11 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
         deadline: Instant,
     ) -> Result<Option<(HubAttemptWrite, Settlement)>, HandlerError> {
         match self.transport.send(write, op_id, deadline).await {
+            Err(error) if error.code == "hub_write_unsettled" && Instant::now() >= deadline => {
+                // We already know the durable send ID. Do not replace its
+                // unknown-ack reply with a timeout from a read after the budget.
+                Err(error)
+            }
             Ok(position)
                 if !write.step.starts_with(SNAPSHOT)
                     && position
@@ -774,7 +975,7 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
                             matches!(error.code.as_str(), "head_moved" | "hub_write_unsettled")
                         })) =>
             {
-                let Some(row) = self.store.hub_attempt(&write.request_key)? else {
+                let Some(row) = self.sql.attempt(&write.request_key, deadline).await? else {
                     return Err(invalid_attempt());
                 };
                 if row.write != *write {
@@ -921,7 +1122,10 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
             return Err(invalid_attempt());
         }
         let op_id = new_op_id()?;
-        let (body, continuation) = match replan.after_image_with_id(&saved_body, &op_id)? {
+        let (body, continuation) = match replan
+            .after_image(saved_body, op_id.clone(), deadline)
+            .await?
+        {
             Replanned::Body(body) => (body, None),
             Replanned::WithLocal(body, continuation) => (body, Some(continuation)),
             Replanned::Refused(error) => return Ok(Rebase::Refused(error)),
@@ -940,7 +1144,10 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
         write.value = self.prepare(&header, &body, epoch, deadline).await?;
         write.expected = expected;
         Ok(
-            if self.save(&write, &op_id, Some(row), continuation.as_deref())? {
+            if self
+                .save(&write, &op_id, Some(row), continuation.as_deref(), deadline)
+                .await?
+            {
                 Rebase::Send(write, op_id)
             } else {
                 Rebase::RowChanged
@@ -1111,7 +1318,14 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
     ) -> Result<usize, HandlerError> {
         let header = record.header();
         let mut matches = Vec::new();
-        for row in self.store.hub_attempts_by_op(&header.entry_id)? {
+        let id = header.entry_id.clone();
+        let rows = self
+            .sql
+            .run(deadline, "hub_attempts_by_op", move |store| {
+                Ok(store.hub_attempts_by_op(&id)?)
+            })
+            .await?;
+        for row in rows {
             if row.outcome.is_none()
                 && !row.write.step.starts_with(CONTINUE)
                 && matches_position(&row.write, position)
@@ -1127,21 +1341,27 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
                 position: Some(position),
             },
         );
-        let settled = self.store.record_hub_attempt_outcome_by_op(
-            &header.key,
-            position,
-            &outcome,
-            |current, position| {
-                matches_position(current, position)
-                    && matches.iter().any(|matched| {
-                        current.request_key == matched.request_key
-                            && current.params_digest == matched.params_digest
-                            && current.expected == matched.expected
-                            && current.step == matched.step
-                    })
-            },
-        )?;
-        prune_after_settling(self.store, settled).await;
+        let key = header.key.clone();
+        let settled = self
+            .sql
+            .run(deadline, "record_hub_attempt_outcome_by_op", move |store| {
+                Ok(store.record_hub_attempt_outcome_by_op(
+                    &key,
+                    position,
+                    &outcome,
+                    |current, position| {
+                        matches_position(current, position)
+                            && matches.iter().any(|matched| {
+                                current.request_key == matched.request_key
+                                    && current.params_digest == matched.params_digest
+                                    && current.expected == matched.expected
+                                    && current.step == matched.step
+                            })
+                    },
+                )?)
+            })
+            .await?;
+        prune_after_settling(self.sql, settled, deadline).await;
         Ok(settled)
     }
 }

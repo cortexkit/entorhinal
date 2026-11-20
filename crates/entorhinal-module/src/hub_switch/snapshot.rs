@@ -270,13 +270,24 @@ pub(crate) async fn transfer<T: LogTransport, U: Trust + Send + Sync + 'static>(
             if expected.is_some_and(|image| *image != snapshot) {
                 return Err(mismatch("snapshot differs from the agreed local image"));
             }
-            if log.store.hub_enable_plan()?.is_some() {
+            if log
+                .sql
+                .run(deadline, "hub_enable_plan", |store| {
+                    Ok(store.hub_enable_plan()?.is_some())
+                })
+                .await?
+            {
                 Seeds::new(snapshot.image.clone())
                     .write(log, deadline)
                     .await?;
             }
-            log.store
-                .install_hub_snapshot(&snapshot, &prefix.parts, &log.box_id.to_string())?;
+            let box_id = log.box_id.to_string();
+            log.sql
+                .run(deadline, "install_hub_snapshot", move |store| {
+                    store.install_hub_snapshot(&snapshot, &prefix.parts, &box_id)?;
+                    Ok(())
+                })
+                .await?;
             return Ok(true);
         }
         let (Some(expected), Some(frame)) = (expected, frame.as_ref()) else {

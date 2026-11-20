@@ -61,7 +61,12 @@ async fn frame(module: &mut ModuleHarness, corr: u64, kind: FrameType) -> Frame 
         .unwrap()
         .unwrap();
     assert_eq!(frame.header.corr, corr);
-    assert_eq!(frame.header.ty, kind);
+    assert_eq!(
+        frame.header.ty,
+        kind,
+        "frame {corr}: {}",
+        String::from_utf8_lossy(&frame.body)
+    );
     frame
 }
 
@@ -182,6 +187,11 @@ async fn served_role_lease_v1_records_match_published_files() {
 
 #[tokio::test(start_paused = true)]
 async fn served_role_lease_v1_non_hub_records_match_published_files() {
+    // Tokio suppresses automatic clock jumps while blocking work is pending.
+    // Hold that inhibition across the entire exchange, including the gaps
+    // between a completed SQL job and delivery of its reply.
+    let (release_clock, clock_held) = tokio::sync::oneshot::channel::<()>();
+    let keep_clock = tokio::task::spawn_blocking(move || clock_held.blocking_recv());
     let mut fixture = Fixture::new("served-role-lease-non-hub").await;
     let start = tokio::time::Instant::now();
     let clock = Arc::new(AtomicU64::new(100_000));
@@ -201,9 +211,12 @@ async fn served_role_lease_v1_non_hub_records_match_published_files() {
     let m = json!({"kind":"reserved","moduleId":"magic-context"});
     let mut disabled = Vec::new();
 
-    // Capture the second notice causally: time is not advanced until the
-    // first notice has travelled through the route and been acknowledged.
+    // Capture the renewal only after the first notice is acknowledged and
+    // the driver has consumed the result of its independent first SQL pass.
     for (role, route, principal) in [(CONNECTOR, plexus, &p), (GLOBAL, mc, &m)] {
+        let pass = handler.role_leases.local_pass_complete.notified();
+        tokio::pin!(pass);
+        pass.as_mut().enable();
         let params = json!({"role":role});
         let corr = module
             .send_request(route, request(WATCH, params.clone()))
@@ -212,6 +225,8 @@ async fn served_role_lease_v1_non_hub_records_match_published_files() {
         let notice = ack_frame(&mut module, route, role, &first).await;
         assert_eq!(notice["holding"], true);
         assert_eq!(notice["gen"], 1);
+        pass.await;
+        handler.hub_sql.wait().await;
         clock.fetch_add(20_000, Ordering::Relaxed);
         tokio::time::advance(Duration::from_millis(20_001)).await;
         let renewed = frame(&mut module, corr, FrameType::StreamData).await;
@@ -316,6 +331,8 @@ async fn served_role_lease_v1_non_hub_records_match_published_files() {
     );
     assert!(start.elapsed() >= Duration::from_secs(40));
     module.shutdown().await;
+    release_clock.send(()).unwrap();
+    keep_clock.await.unwrap().unwrap();
     crate::tests::stop_store_tasks(&handler).await;
     handler.store.lock().unwrap().take();
     drop(store);

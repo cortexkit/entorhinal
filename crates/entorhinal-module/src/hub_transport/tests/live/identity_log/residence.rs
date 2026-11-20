@@ -121,7 +121,11 @@ async fn hub_cutover_holder_samples() {
         .update(&legacy_key, signed.into_bytes().into(), 0)
         .await
         .unwrap();
-    until(|| role_read(handler, legacy_role)["holder"] == SAMPLE_SENTINEL).await;
+    until(|| {
+        let read = role_read(handler, legacy_role);
+        read["holder"] == SAMPLE_SENTINEL && read["stale"] == false
+    })
+    .await;
     for (op, file) in [
         ("role.read", "read-hub.json"),
         ("role.fence", "fence-hub.json"),
@@ -318,6 +322,15 @@ async fn hub_reader_regression_residence_and_role_control_retry_when_writer_is_l
 async fn until(mut pred: impl FnMut() -> bool) {
     within(async {
         while !pred() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+}
+
+async fn until_async<F: std::future::Future<Output = bool>>(mut pred: impl FnMut() -> F) {
+    within(async {
+        while !pred().await {
             sleep(Duration::from_millis(10)).await;
         }
     })

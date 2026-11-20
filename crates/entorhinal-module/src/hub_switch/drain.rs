@@ -6,9 +6,7 @@ use crate::{
 pub(crate) use entorhinal_core::enable_state::{
     HubClaim as Claim, HubImage as ClaimsAndRoles, HubRole as Role, HubSnapshot as MigrationImage,
 };
-use entorhinal_core::{
-    remote_apply::MigrationMarker, shared_entry::MigrationSource, RegistryStore,
-};
+use entorhinal_core::{remote_apply::MigrationMarker, shared_entry::MigrationSource};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -190,31 +188,39 @@ async fn read_image(
 
 pub(super) async fn prepare(
     progress: &Mutex<Progress>,
-    store: &RegistryStore,
+    sql: &crate::hub_write::HubSql,
     records: &RecordClient,
     position: i64,
     marker_author: &str,
     marker: MigrationMarker,
+    deadline: tokio::time::Instant,
 ) -> Result<Option<MigrationImage>, HandlerError> {
-    let Some(author) = store.persisted_self_author()? else {
-        return Err(HandlerError::new(
-            "hub_switch_waiting",
-            "the local engram author is not known",
-        ));
-    };
-    let source = store.capture_migration_source(position, marker.excluded.clone())?;
-    // The marker changes the cursor, not the shared tables it authenticates.
-    if store.migration_tables_digest()? != marker.tables_digest {
-        return Err(super::snapshot::mismatch(
-            "the shared tables differ from the engram marker",
-        ));
-    }
-    if !source.included_authors().any(|member| member == author) {
-        return Err(HandlerError::new(
-            "hub_switch_excluded",
-            "the local member is excluded from the switch",
-        ));
-    }
+    let excluded = marker.excluded.clone();
+    let tables_digest = marker.tables_digest.clone();
+    let (author, source) = sql
+        .run(deadline, "capture_migration_source", move |store| {
+            let Some(author) = store.persisted_self_author()? else {
+                return Err(HandlerError::new(
+                    "hub_switch_waiting",
+                    "the local engram author is not known",
+                ));
+            };
+            let source = store.capture_migration_source(position, excluded)?;
+            // The marker changes the cursor, not the shared tables it authenticates.
+            if store.migration_tables_digest()? != tables_digest {
+                return Err(super::snapshot::mismatch(
+                    "the shared tables differ from the engram marker",
+                ));
+            }
+            if !source.included_authors().any(|member| member == author) {
+                return Err(HandlerError::new(
+                    "hub_switch_excluded",
+                    "the local member is excluded from the switch",
+                ));
+            }
+            Ok((author, source))
+        })
+        .await?;
     let keys: Vec<_> = source
         .agents()
         .map(Key::Claim)

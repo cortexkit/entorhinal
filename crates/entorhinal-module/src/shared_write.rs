@@ -3098,6 +3098,20 @@ fn bootstrap_fence(
     Ok(())
 }
 
+async fn hub_or_legacy_sql<R: Send + 'static>(
+    store: Option<&RegistryStore>,
+    hub: &crate::hub_write::HubSql,
+    deadline: Instant,
+    operation: &'static str,
+    work: impl FnOnce(&RegistryStore) -> Result<R, HandlerError> + Send + 'static,
+) -> Result<R, HandlerError> {
+    if let Some(store) = store {
+        work(store)
+    } else {
+        hub.run(deadline, operation, work).await
+    }
+}
+
 impl ProjectsHandler {
     pub(super) async fn avatar_manifest_entry_wait(
         &self,
@@ -3320,14 +3334,35 @@ impl ProjectsHandler {
                 })?
                 .map_err(|error| HandlerError::new("storage_error", error.to_string()))?;
         }
-        let store = self.with_store(|s| Ok(s.clone()))?;
         let candidate = agent_write || shared_candidate(&request.method);
-        if candidate
-            && (store.hub_log_base()?.is_some()
-                || matches!(
+        let hub_sql = self.hub_sql();
+        let early_deadline = received + DEADLINE;
+        let read_backend = |store: &RegistryStore| {
+            let hub = store.hub_log_base()?.is_some();
+            let frozen = !hub
+                && matches!(
                     store.engram_freeze()?,
                     Some(entorhinal_core::remote_apply::EngramFreeze::Applied { .. })
-                ))
+                );
+            Ok((hub, frozen))
+        };
+        let (hub, frozen) = if !candidate {
+            (false, false)
+        } else if self.hub_switch.is_none() && !self.hub_backend_selected() {
+            let store = self.with_store(|s| Ok(s.clone()))?;
+            read_backend(&store)?
+        } else {
+            hub_sql
+                .run(early_deadline, "shared_backend", read_backend)
+                .await?
+        };
+        let store = if hub {
+            None
+        } else {
+            Some(self.with_store(|s| Ok(s.clone()))?)
+        };
+        if candidate
+            && (hub || frozen)
             && !self.residence().is_some_and(|residence| residence.ready())
         {
             return Err(HandlerError::new(
@@ -3336,10 +3371,25 @@ impl ProjectsHandler {
             ));
         }
         if request.method == super::member::SET_NAME {
-            let name = super::member::prepare(&store, request.params.clone())?;
+            let params = request.params.clone();
+            let name = hub_or_legacy_sql(
+                store.as_ref(),
+                &hub_sql,
+                early_deadline,
+                "prepare_member_name",
+                move |store| super::member::prepare(store, params),
+            )
+            .await?;
             request.params = serde_json::to_value(name).expect("member name encodes");
         }
-        let state = store.identity_log_status().map_err(storage_error)?.state;
+        let state = hub_or_legacy_sql(
+            store.as_ref(),
+            &hub_sql,
+            early_deadline,
+            "identity_log_status",
+            |store| Ok(store.identity_log_status().map_err(storage_error)?.state),
+        )
+        .await?;
         let prepared = if agent_write {
             consent
         } else {
@@ -3353,12 +3403,31 @@ impl ProjectsHandler {
                 "identity log bootstrap is in progress",
             ));
         }
-        bootstrap_fence(&store, &state, &request)?;
-        if store.hub_log_base()?.is_some() && request.method != "agent.create" {
+        if matches!(state.as_str(), "enabling" | "joining") {
+            let req = WireRequest {
+                method: request.method.clone(),
+                params: request.params.clone(),
+            };
+            let state = state.clone();
+            hub_or_legacy_sql(
+                store.as_ref(),
+                &hub_sql,
+                early_deadline,
+                "bootstrap_fence",
+                move |store| bootstrap_fence(store, &state, &req),
+            )
+            .await?;
+        }
+        if hub && request.method != "agent.create" {
             if let Some(write) = &prepared {
                 let (key, digest) = hub_request(&request, write)?;
                 if let Some(key) = key {
-                    if let Some(reply) = store.hub_local_reply(&key, &digest)? {
+                    if let Some(reply) = hub_sql
+                        .run(early_deadline, "hub_local_reply", move |store| {
+                            Ok(store.hub_local_reply(&key, &digest)?)
+                        })
+                        .await?
+                    {
                         let reply = hub_reply(reply)?;
                         return if request.method.starts_with("agent.") {
                             self.attach_incarnation(reply)
@@ -3369,12 +3438,17 @@ impl ProjectsHandler {
                 }
             }
         }
-        let hub_create = if request.method == "agent.create" && store.hub_log_base()?.is_some() {
+        let hub_create = if request.method == "agent.create" && hub {
             let residence = self.residence().ok_or_else(|| {
                 HandlerError::new("hub_not_ready", "hub residence watch is not installed")
             })?;
-            let prepared = prepared.as_ref().expect("create is a shared write");
-            prepared.probe(&store, &request.method, &principal)?;
+            let write = prepared.clone().expect("create is a shared write");
+            let caller = principal.clone();
+            hub_sql
+                .run(early_deadline, "probe_agent_create", move |store| {
+                    write.probe(store, "agent.create", &caller)
+                })
+                .await?;
             let key = request.params["request_key"]
                 .as_str()
                 .filter(|key| !key.is_empty())
@@ -3382,7 +3456,7 @@ impl ProjectsHandler {
                     HandlerError::new("request_key_required", "request_key is required")
                 })?;
             let digest = crate::hub_write::params_digest(&request.method, &request.params)?;
-            if store.hub_attempt(key)?.is_some() {
+            if hub_sql.attempt(key, early_deadline).await?.is_some() {
                 return self.attach_incarnation(
                     Box::pin(residence.create(key, &digest, None, received + DEADLINE)).await?,
                 );
@@ -3395,23 +3469,33 @@ impl ProjectsHandler {
         let mut approval = None;
         let mut budget_start = received;
         if direct {
-            let precheck = if let Some(Write::PlacementBackfill(req)) = &prepared {
-                if let Some(body) =
-                    store.shared_request_cache("placement.backfill", req.request_key.as_deref())?
-                {
-                    AgentPrecheck::Cached(body)
-                } else {
-                    AgentPrecheck::Ready(store.placement_backfill_precheck()?)
-                }
-            } else if let Some(Write::User(req)) = &prepared {
-                store.precheck_user_confirmation(req)?
-            } else {
-                store.precheck_agent_confirmation(
-                    &request.method,
-                    request.params.clone(),
-                    (self.clock)(),
-                )?
-            };
+            let check = prepared.clone();
+            let method = request.method.clone();
+            let params = request.params.clone();
+            let clock = self.clock;
+            let precheck = hub_or_legacy_sql(
+                store.as_ref(),
+                &hub_sql,
+                early_deadline,
+                "precheck_operator_confirmation",
+                move |store| {
+                    Ok(if let Some(Write::PlacementBackfill(req)) = &check {
+                        if let Some(body) = store.shared_request_cache(
+                            "placement.backfill",
+                            req.request_key.as_deref(),
+                        )? {
+                            AgentPrecheck::Cached(body)
+                        } else {
+                            AgentPrecheck::Ready(store.placement_backfill_precheck()?)
+                        }
+                    } else if let Some(Write::User(req)) = &check {
+                        store.precheck_user_confirmation(req)?
+                    } else {
+                        store.precheck_agent_confirmation(&method, params, clock())?
+                    })
+                },
+            )
+            .await?;
             let summary = match precheck {
                 AgentPrecheck::Cached(body) => {
                     return if request.method.starts_with("agent.") {
@@ -3453,7 +3537,18 @@ impl ProjectsHandler {
             }
         } else if state == "enabled" {
             if let Some(write) = &prepared {
-                if let Some(body) = write.probe(&store, &request.method, &principal)? {
+                let write = write.clone();
+                let method = request.method.clone();
+                let caller = principal.clone();
+                if let Some(body) = hub_or_legacy_sql(
+                    store.as_ref(),
+                    &hub_sql,
+                    early_deadline,
+                    "probe_shared_write",
+                    move |store| write.probe(store, &method, &caller),
+                )
+                .await?
+                {
                     return if request.method.starts_with("agent.") {
                         self.attach_incarnation(body)
                     } else {
@@ -3478,7 +3573,7 @@ impl ProjectsHandler {
             };
             let now = (self.clock)();
             let write = prepared.expect("create is a shared write");
-            let preview = |store: &RegistryStore, saved: Option<&Value>| {
+            let preview = move |store: &RegistryStore, saved: Option<&Value>| {
                 let id = saved
                     .and_then(|body| body["agent_id"].as_str())
                     .unwrap_or(&agent_id);
@@ -3496,8 +3591,12 @@ impl ProjectsHandler {
                     )
                 })
             };
-            let create =
-                Box::pin(residence.create(&request_key, &digest, Some(&preview), deadline));
+            let create = Box::pin(residence.create(
+                &request_key,
+                &digest,
+                Some(Arc::new(preview)),
+                deadline,
+            ));
             let reply = if let Some(guard) = &mut confirmation {
                 tokio::select! {
                     biased;
@@ -3523,8 +3622,21 @@ impl ProjectsHandler {
             HandlerError::new("identity_log_contended", "writer lock deadline expired")
         })?;
         // Re-read after the lock: enable/join can change state while we queue.
-        let state = store.identity_log_status().map_err(storage_error)?.state;
-        if candidate && store.hub_log_base()?.is_some() {
+        let (state, hub) = hub_or_legacy_sql(
+            store.as_ref(),
+            &hub_sql,
+            deadline,
+            "shared_backend",
+            move |store| {
+                Ok((
+                    store.identity_log_status().map_err(storage_error)?.state,
+                    candidate && store.hub_log_base()?.is_some(),
+                ))
+            },
+        )
+        .await?;
+        if hub {
+            drop(store);
             drop(writer);
             if !self.residence().is_some_and(|residence| residence.ready()) {
                 return Err(HandlerError::new(
@@ -3534,14 +3646,8 @@ impl ProjectsHandler {
             }
             let write = prepared.expect("shared write was decoded");
             // Keep the hub-only future out of the local and legacy write state machine.
-            let result = Box::pin(self.hub_shared_write(
-                &store,
-                &request,
-                write,
-                &principal,
-                approval.as_ref(),
-                deadline,
-            ));
+            let result =
+                Box::pin(self.hub_shared_write(&request, write, &principal, approval, deadline));
             let body = if let Some(guard) = &mut confirmation {
                 tokio::select! {
                     biased;
@@ -3557,6 +3663,7 @@ impl ProjectsHandler {
                 Ok(body)
             });
         }
+        let store = store.ok_or_else(crate::hub_write::store_unavailable)?;
         if candidate
             && matches!(
                 store.engram_freeze()?,
@@ -3770,28 +3877,35 @@ impl ProjectsHandler {
 
     async fn hub_shared_write(
         &self,
-        store: &RegistryStore,
         request: &WireRequest,
         write: Write,
         principal: &str,
-        approval: Option<&OperatorApproval>,
+        approval: Option<OperatorApproval>,
         deadline: Instant,
     ) -> Result<Vec<u8>, HandlerError> {
         let log = self.hub_shared_log.lock().unwrap().clone().ok_or_else(|| {
             HandlerError::new("hub_not_ready", "hub identity writer is not installed")
         })?;
-        let consent = match &write {
-            Write::Consent(_, consent) | Write::CatalogInstall(_, consent) => {
-                Some(consent.as_ref())
-            }
-            _ => None,
-        };
         let (key, digest) = hub_request(request, &write)?;
         let key = key.map_or_else(crate::hub_write::new_op_id, Ok)?;
-        if let Some(reply) = store.hub_local_reply(&key, &digest)? {
+        let sql = self.hub_sql();
+        let lookup = key.clone();
+        let proof = digest.clone();
+        let (reply, saved_time) = sql
+            .run(deadline, "hub_local_reply", move |store| {
+                let reply = store.hub_local_reply(&lookup, &proof)?;
+                let time = if reply.is_none() {
+                    store.hub_local_time(&lookup)?
+                } else {
+                    None
+                };
+                Ok((reply, time))
+            })
+            .await?;
+        if let Some(reply) = reply {
             return hub_reply(reply);
         }
-        let now = store.hub_local_time(&key)?.unwrap_or_else(self.clock);
+        let now = saved_time.unwrap_or_else(self.clock);
         let draws_agent = matches!(&write, Write::Consent(plan, _) if matches!(plan.tool.as_str(), "agents_hire" | "agents_create_head"));
         let id = if draws_agent {
             (self.agent_id_draw)()?
@@ -3803,25 +3917,34 @@ impl ProjectsHandler {
         } else {
             None
         };
-        let preview = |store: &RegistryStore, saved: Option<&Value>, entry_id: &str| {
-            let id = saved
-                .and_then(|body| body["agent_id"].as_str())
-                .unwrap_or(&id);
-            let avatar = saved
-                .and_then(|body| serde_json::from_value(body["row"]["avatar"].clone()).ok())
-                .or_else(|| avatar.clone());
-            let label = if let Write::Register(req) = &write {
-                req.label.as_deref()
-            } else {
-                None
-            };
-            preview_local(store, entry_id, consent, label, now, || {
-                write
-                    .clone()
-                    .run(store, principal, now, id, avatar, approval)
-            })
-        };
-        let attempt = store.hub_attempt(&key)?;
+        let principal = principal.to_owned();
+        let preview = Arc::new(
+            move |store: &RegistryStore, saved: Option<&Value>, entry_id: &str| {
+                let consent = match &write {
+                    Write::Consent(_, consent) | Write::CatalogInstall(_, consent) => {
+                        Some(consent.as_ref())
+                    }
+                    _ => None,
+                };
+                let id = saved
+                    .and_then(|body| body["agent_id"].as_str())
+                    .unwrap_or(&id);
+                let avatar = saved
+                    .and_then(|body| serde_json::from_value(body["row"]["avatar"].clone()).ok())
+                    .or_else(|| avatar.clone());
+                let label = if let Write::Register(req) = &write {
+                    req.label.as_deref()
+                } else {
+                    None
+                };
+                preview_local(store, entry_id, consent, label, now, || {
+                    write
+                        .clone()
+                        .run(store, &principal, now, id, avatar, approval.as_ref())
+                })
+            },
+        );
+        let attempt = sql.attempt(&key, deadline).await?;
         let (expected, body, continuation) = if let Some(attempt) = attempt {
             let record = crate::fleet_record::UnverifiedRecord::parse(
                 &attempt.write.key,
@@ -3834,13 +3957,19 @@ impl ProjectsHandler {
             )
         } else {
             log.catch_up(deadline).await?;
-            let expected = log.applied()?;
-            match preview(store, None, &crate::hub_write::new_op_id()?)? {
+            let expected = log.applied(deadline).await?;
+            let preview = preview.clone();
+            match sql
+                .run(deadline, "preview_hub_write", move |store| {
+                    preview(store, None, &crate::hub_write::new_op_id()?)
+                })
+                .await?
+            {
                 HubPreview::Local(reply) => return Ok(reply),
                 HubPreview::Shared(body, local) => (expected, body, Some(local)),
             }
         };
-        let replan = |store: &RegistryStore, saved: &Value, entry_id: &str| match preview(
+        let replan = move |store: &RegistryStore, saved: &Value, entry_id: &str| match preview(
             store,
             Some(saved),
             entry_id,
@@ -3860,7 +3989,7 @@ impl ProjectsHandler {
                 expected,
                 body,
                 continuation.as_deref(),
-                &replan,
+                Arc::new(replan),
                 deadline,
             )
             .await?,

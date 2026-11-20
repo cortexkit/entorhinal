@@ -364,6 +364,7 @@ type DaemonLog = IdentityLog<Hub, BootstrapTrust>;
 
 #[derive(Clone)]
 pub(super) struct Runtime {
+    pub(super) sql: crate::hub_write::HubSql,
     health: Arc<HealthGauges>,
     writer: Arc<tokio::sync::Mutex<()>>,
     commits: Arc<tokio::sync::Notify>,
@@ -375,6 +376,7 @@ pub(super) struct Runtime {
 impl Runtime {
     pub(super) fn new(handler: &ProjectsHandler) -> Self {
         Self {
+            sql: handler.hub_sql(),
             health: handler.health.clone(),
             writer: handler.writer.clone(),
             commits: handler.commits.clone(),
@@ -407,7 +409,6 @@ impl Switch {
 
     async fn identity_log(
         &self,
-        store: &RegistryStore,
         runtime: &Runtime,
         base: i64,
         deadline: Instant,
@@ -430,7 +431,7 @@ impl Switch {
             crate::MODULE_ID,
         );
         Ok(Arc::new(IdentityLog::new(
-            store.clone(),
+            runtime.sql.clone(),
             runtime.health.clone(),
             runtime.writer.clone(),
             runtime.commits.clone(),
@@ -448,28 +449,34 @@ impl Switch {
 
     pub(super) async fn start_installed(
         &self,
-        store: &RegistryStore,
         runtime: &Runtime,
         base: i64,
         deadline: Instant,
     ) -> Result<(), HandlerError> {
         self.probe.activate();
         {
-            let mut tail = runtime.tail.lock().unwrap();
+            let tail = runtime.tail.lock().unwrap();
             if tail.as_ref().is_some_and(|tail| !tail.is_finished()) {
                 return Ok(());
             }
-            if let Some(log) = runtime.shared.lock().unwrap().as_ref() {
-                // Residence and epoch watches already use this membership view.
-                *tail = Some(log.start_installed_tail()?);
-                return Ok(());
-            }
         }
-        let snapshot = store.installed_hub_snapshot()?;
-        let log = self.identity_log(store, runtime, base, deadline).await?;
+        let existing = runtime.shared.lock().unwrap().clone();
+        if let Some(log) = existing {
+            // Residence and epoch watches already use this membership view.
+            let tail = log.start_installed_tail(deadline).await?;
+            *runtime.tail.lock().unwrap() = Some(tail);
+            return Ok(());
+        }
+        let snapshot = runtime
+            .sql
+            .run(deadline, "installed_hub_snapshot", |store| {
+                Ok(store.installed_hub_snapshot()?)
+            })
+            .await?;
+        let log = self.identity_log(runtime, base, deadline).await?;
         let seeds = Arc::new(snapshot::Seeds::new(snapshot.image));
         let (hub, _) = self.probe.transport().expect("daemon transport");
-        let tail = log.start_installed_tail()?;
+        let tail = log.start_installed_tail(deadline).await?;
         if let Err(error) =
             runtime
                 .residence
@@ -490,13 +497,16 @@ impl Switch {
 
     pub(super) async fn finish(
         &self,
-        store: &RegistryStore,
         runtime: &Runtime,
         image: Option<&MigrationImage>,
         deadline: Instant,
     ) -> Result<(), HandlerError> {
-        let local = store
-            .hub_enable_plan()?
+        let local = runtime
+            .sql
+            .run(deadline, "hub_enable_plan", |store| {
+                Ok(store.hub_enable_plan()?)
+            })
+            .await?
             .map(|plan| {
                 let snapshot: MigrationImage = serde_json::from_str(&plan.preimage)
                     .map_err(|_| snapshot::mismatch("invalid saved hub enable image"))?;
@@ -513,10 +523,15 @@ impl Switch {
             .transpose()?;
         let image = image.or(local.as_ref());
         if image.is_none() {
-            store.check_enable_preconditions(1)?;
+            runtime
+                .sql
+                .run(deadline, "check_enable_preconditions", |store| {
+                    Ok(store.check_enable_preconditions(1)?)
+                })
+                .await?;
         }
         let base = image.map_or(0, |image| image.engram_through);
-        let log = self.identity_log(store, runtime, base, deadline).await?;
+        let log = self.identity_log(runtime, base, deadline).await?;
         // Keep multipart verification and epoch recovery off the caller's stack.
         if !Box::pin(snapshot::transfer(&log, image, deadline)).await? {
             return Err(waiting());
@@ -526,46 +541,63 @@ impl Switch {
             .health
             .hub_membership
             .store(1, std::sync::atomic::Ordering::Release);
-        crate::enable::refresh(&runtime.health, store);
+        let health = runtime.health.clone();
+        runtime
+            .sql
+            .run(deadline, "identity_log_status", move |store| {
+                crate::enable::refresh(&health, store);
+                Ok(())
+            })
+            .await?;
         runtime.commits.notify_waiters();
         Ok(())
     }
 
     pub(super) async fn prepare_enable(
         &self,
-        store: &RegistryStore,
+        sql: &crate::hub_write::HubSql,
         deadline: Instant,
     ) -> Result<(), HandlerError> {
         let box_id = self.probe.local_box(deadline).await?;
-        store.begin_hub_enable(&crate::hub_write::new_op_id()?, &box_id)?;
-        Ok(())
+        sql.run(deadline, "begin_hub_enable", move |store| {
+            Ok(store.begin_hub_enable(&crate::hub_write::new_op_id()?, &box_id)?)
+        })
+        .await
     }
 
     /// The snapshot verifier can inspect exact stream sequences through this
     /// same hub transport, without consulting engram for backend discovery.
     pub(super) async fn discover(
         &self,
-        store: &RegistryStore,
+        sql: &crate::hub_write::HubSql,
         deadline: Instant,
     ) -> Result<Startup, HandlerError> {
-        if store.hub_log_base()?.is_some() {
+        if sql
+            .run(deadline, "hub_log_base", |store| {
+                Ok(store.hub_log_base()?.is_some())
+            })
+            .await?
+        {
             self.probe.activate();
             return Ok(Startup::Hub);
         }
         let head = self.probe.head(deadline).await?;
-        select(
-            store,
-            if head == 0 {
-                HubHistory::Empty
-            } else {
-                HubHistory::Unverified
-            },
-        )
+        sql.run(deadline, "select_hub_backend", move |store| {
+            select(
+                store,
+                if head == 0 {
+                    HubHistory::Empty
+                } else {
+                    HubHistory::Unverified
+                },
+            )
+        })
+        .await
     }
 
     pub(super) async fn advance(
         &self,
-        store: &RegistryStore,
+        sql: &crate::hub_write::HubSql,
         log: &LogClient,
         records: &RecordClient,
         deadline: Instant,
@@ -575,11 +607,26 @@ impl Switch {
                 position,
                 author,
                 body,
-            }) = store.engram_freeze()?
+            }) = sql
+                .run(
+                    deadline,
+                    "engram_freeze",
+                    |store| Ok(store.engram_freeze()?),
+                )
+                .await?
             {
-                return drain::prepare(&self.drain, store, records, position, &author, body).await;
+                return drain::prepare(
+                    &self.drain,
+                    sql,
+                    records,
+                    position,
+                    &author,
+                    body,
+                    deadline,
+                )
+                .await;
             }
-            self.gate(store, log, records, deadline).await?;
+            self.gate(sql, log, records, deadline).await?;
             Ok(None)
         })
         .await
@@ -588,23 +635,33 @@ impl Switch {
 
     async fn gate(
         &self,
-        store: &RegistryStore,
+        sql: &crate::hub_write::HubSql,
         log: &LogClient,
         records: &RecordClient,
         deadline: Instant,
     ) -> Result<(), HandlerError> {
-        let status = store.identity_log_status()?;
-        if status.state != "enabled" || status.last_applied_position != status.last_seen_head {
-            return Ok(());
-        }
-        let freeze = store.engram_freeze()?;
-        if matches!(&freeze, Some(EngramFreeze::Applied { .. })) {
-            return Ok(());
-        }
-        let Some(author) = store.persisted_self_author()? else {
-            return Ok(());
-        };
-        let Some(own_box) = store.own_member_box()? else {
+        let Some((status, freeze, author, own_box)) = sql
+            .run(deadline, "hub_switch_gate", |store| {
+                let status = store.identity_log_status()?;
+                if status.state != "enabled"
+                    || status.last_applied_position != status.last_seen_head
+                {
+                    return Ok(None);
+                }
+                let freeze = store.engram_freeze()?;
+                if matches!(&freeze, Some(EngramFreeze::Applied { .. })) {
+                    return Ok(None);
+                }
+                let Some(author) = store.persisted_self_author()? else {
+                    return Ok(None);
+                };
+                let Some(own_box) = store.own_member_box()? else {
+                    return Ok(None);
+                };
+                Ok(Some((status, freeze, author, own_box)))
+            })
+            .await?
+        else {
             return Ok(());
         };
         if self.probe.local_box(deadline).await? != own_box {
@@ -637,8 +694,11 @@ impl Switch {
 
         let reply = read(records, PROPOSAL).await?;
         let proposal = Proposal::from_reply(&reply)?;
-        let included: Vec<_> = store
-            .switch_members()?
+        let included: Vec<_> = sql
+            .run(deadline, "switch_members", |store| {
+                Ok(store.switch_members()?)
+            })
+            .await?
             .into_iter()
             .filter(|(_, id)| proposal.as_ref().is_none_or(|p| !p.excluded.contains(id)))
             .collect();
@@ -684,12 +744,16 @@ impl Switch {
             .await;
         };
 
-        {
-            let _lock = self.moves.lock().unwrap();
-            store.pause_legacy_moves()?;
-            if !store.list_open_agent_moves()?.is_empty() {
-                return Ok(());
-            }
+        let moves = self.moves.clone();
+        let open = sql
+            .run(deadline, "pause_legacy_moves", move |store| {
+                let _lock = moves.lock().unwrap();
+                store.pause_legacy_moves()?;
+                Ok(!store.list_open_agent_moves()?.is_empty())
+            })
+            .await?;
+        if open {
+            return Ok(());
         }
         let inbox = read(records, &format!("inbox:{author}")).await?;
         if !inbox.absent
@@ -705,7 +769,11 @@ impl Switch {
         let own = Quiet {
             v: 1,
             migration_id: proposal.migration_id.clone(),
-            roles: store.role_subjects()?.into_iter().collect(),
+            roles: sql
+                .run(deadline, "role_subjects", |store| {
+                    Ok(store.role_subjects()?.into_iter().collect())
+                })
+                .await?,
         };
         let subject = format!("hubquiet:{author}");
         let quiet = read(records, &subject).await?;
@@ -726,7 +794,7 @@ impl Switch {
             roles.extend(quiet.roles);
         }
         if read(records, PROPOSAL).await?.version != reply.version
-            || self.discover(store, deadline).await? != Startup::Migrate
+            || self.discover(sql, deadline).await? != Startup::Migrate
         {
             return Ok(());
         }
@@ -752,11 +820,15 @@ impl Switch {
                     expected_head,
                     entry_id,
                     body,
-                } = store.prepare_migration_marker(
-                    status.last_applied_position,
-                    entry_id,
-                    marker,
-                )?
+                } = sql
+                    .run(deadline, "prepare_migration_marker", move |store| {
+                        Ok(store.prepare_migration_marker(
+                            status.last_applied_position,
+                            entry_id,
+                            marker,
+                        )?)
+                    })
+                    .await?
                 else {
                     return Ok(());
                 };
@@ -844,19 +916,22 @@ impl ProjectsHandler {
                 .confirm_operator(&summary, route)
                 .await?;
             let _writer = self.writer.lock().await;
-            let store = self.with_store(|s| Ok(s.clone()))?;
-            if store.identity_log_status()?.state != "enabled" {
-                return Err(HandlerError::new(
-                    "identity_log_disabled",
-                    "switch exclusions require an enabled legacy log",
-                ));
-            }
-            if store.hub_log_base()?.is_some() || store.engram_freeze()?.is_some() {
-                return Err(pending());
-            }
-            if store.own_member_box()?.as_ref() == Some(&without)
-                || peers.lists_box(&without).await?
-            {
+            let own = self
+                .hub_sql()
+                .run(deadline, "validate_switch_exclusion", |store| {
+                    if store.identity_log_status()?.state != "enabled" {
+                        return Err(HandlerError::new(
+                            "identity_log_disabled",
+                            "switch exclusions require an enabled legacy log",
+                        ));
+                    }
+                    if store.hub_log_base()?.is_some() || store.engram_freeze()?.is_some() {
+                        return Err(pending());
+                    }
+                    Ok(store.own_member_box()?)
+                })
+                .await?;
+            if own.as_ref() == Some(&without) || peers.lists_box(&without).await? {
                 return Err(HandlerError::new(
                     "member_still_paired",
                     format!("remove {without} in Callosum before excluding it"),

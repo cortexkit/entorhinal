@@ -188,24 +188,29 @@ impl Worker {
                 hub_retry = Some(Instant::now() + backoff);
                 continue;
             };
-            let Some(slot) = self.store.upgrade() else {
+            let sql = &self.hub_runtime.sql;
+            if !sql.available() {
                 break;
+            }
+            let read_backend = |store: &RegistryStore| -> Result<_, HandlerError> {
+                Ok((store.is_foreign(), store.hub_log_base()?))
             };
-            let store = slot.lock().unwrap().clone();
-            drop(slot);
-            if let Some(store) = store {
-                if store.is_foreign() {
-                    continue;
-                }
-                let Ok(base) = store.hub_log_base() else {
-                    continue;
-                };
+            let backend = if self.hub_switch.is_some() {
+                sql.run(deadline, "hub_startup_state", read_backend).await
+            } else {
+                self.store
+                    .upgrade()
+                    .and_then(|slot| slot.lock().unwrap().clone())
+                    .ok_or_else(crate::hub_write::store_unavailable)
+                    .and_then(|store| read_backend(&store))
+            };
+            if let Ok((false, base)) = backend {
                 if let Some(base) = base {
                     let Some(switch) = &self.hub_switch else {
                         break;
                     };
                     let result = switch
-                        .start_installed(&store, &self.hub_runtime, base, deadline)
+                        .start_installed(&self.hub_runtime, base, deadline)
                         .await;
                     log_switch_result(&mut switch_error, &result);
                     if result.is_ok() {
@@ -216,10 +221,28 @@ impl Worker {
                     backoff = (backoff * 2).min(Duration::from_secs(60));
                     continue;
                 }
-                if let (Some(switch), Ok(Some(_))) = (&self.hub_switch, store.hub_enable_plan()) {
-                    let result = switch
-                        .finish(&store, &self.hub_runtime, None, deadline)
-                        .await;
+                let switch_state = if self.hub_switch.is_some() {
+                    match sql
+                        .run(deadline, "hub_switch_state", |store| {
+                            Ok((
+                                store.hub_enable_plan()?.is_some(),
+                                store.engram_freeze()?,
+                                store.identity_log_status()?.state,
+                            ))
+                        })
+                        .await
+                    {
+                        Ok(state) => Some(state),
+                        Err(error) => {
+                            log_switch_result(&mut switch_error, &Err::<(), _>(error));
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+                if let (Some(switch), Some((true, _, _))) = (&self.hub_switch, &switch_state) {
+                    let result = switch.finish(&self.hub_runtime, None, deadline).await;
                     self.observe_switch(&result);
                     if result.is_ok() {
                         self.wake.notify_one();
@@ -227,16 +250,16 @@ impl Worker {
                     log_switch_result(&mut switch_error, &result);
                     continue;
                 }
-                if let (Some(switch), Ok(Some(EngramFreeze::Applied { .. }))) =
-                    (&self.hub_switch, store.engram_freeze())
+                if let (Some(switch), Some((_, Some(EngramFreeze::Applied { .. }), _))) =
+                    (&self.hub_switch, &switch_state)
                 {
                     let result = async {
                         let image = switch
-                            .advance(&store, &self.log, &self.records, deadline)
+                            .advance(sql, &self.log, &self.records, deadline)
                             .await?
                             .ok_or_else(super::hub_switch::waiting)?;
                         switch
-                            .finish(&store, &self.hub_runtime, Some(&image), deadline)
+                            .finish(&self.hub_runtime, Some(&image), deadline)
                             .await
                     }
                     .await;
@@ -256,14 +279,12 @@ impl Worker {
                     None
                 };
                 if let (Some(switch), Some(head)) = (&self.hub_switch, hub_head) {
-                    if store
-                        .identity_log_status()
-                        .is_ok_and(|status| status.state == "disabled")
+                    if switch_state
+                        .as_ref()
+                        .is_some_and(|(_, _, state)| state == "disabled")
                     {
                         let result = if head > 0 {
-                            switch
-                                .finish(&store, &self.hub_runtime, None, deadline)
-                                .await
+                            switch.finish(&self.hub_runtime, None, deadline).await
                         } else {
                             Err(super::hub_switch::waiting())
                         };
@@ -275,6 +296,13 @@ impl Worker {
                         continue;
                     }
                 }
+                let Some(store) = self
+                    .store
+                    .upgrade()
+                    .and_then(|slot| slot.lock().unwrap().clone())
+                else {
+                    continue;
+                };
                 // Disabled stores never contact engram. An enabling store has
                 // snapshot parts saved in SQLite with their entry ids and bytes:
                 // retry those appends rather than import the log as if this
@@ -315,14 +343,23 @@ impl Worker {
                             if let Some(line) = outage.succeeded() {
                                 tracing::info!(target: "identity_log", "{line}");
                             }
+                            let mut store = Some(store);
                             if hub_head == Some(0) {
                                 if let Some(switch) = &self.hub_switch {
+                                    drop(store.take());
                                     let result = switch
-                                        .advance(&store, &self.log, &self.records, deadline)
+                                        .advance(sql, &self.log, &self.records, deadline)
                                         .await;
                                     log_switch_result(&mut gate_error, &result);
+                                    store = self
+                                        .store
+                                        .upgrade()
+                                        .and_then(|slot| slot.lock().unwrap().clone());
                                 }
                             }
+                            let Some(store) = store else {
+                                continue;
+                            };
                             if matches!(store.engram_freeze(), Ok(None)) {
                                 if let Err(error) =
                                     self.publish_member_box(&store, writer, deadline).await

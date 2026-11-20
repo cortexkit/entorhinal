@@ -74,6 +74,7 @@ struct Leaf {
     requests: StdMutex<Vec<String>>,
     refuse_kv: std::sync::atomic::AtomicBool,
     epoch_gate: StdMutex<Option<(String, Gate)>>,
+    head_gate: StdMutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
 }
 
 enum Gate {
@@ -130,6 +131,11 @@ impl Transport for Leaf {
 
     async fn log_head(&self, deadline: Instant) -> Result<u64, HandlerError> {
         self.requests.lock().unwrap().push("head".into());
+        let gate = self.head_gate.lock().unwrap().take();
+        if let Some((entered, release)) = gate {
+            entered.send(()).unwrap();
+            let _ = release.await;
+        }
         self.session().log_head(deadline).await
     }
 
@@ -299,6 +305,7 @@ async fn leaf(
         gate: StdMutex::default(),
         sends: StdMutex::default(),
         reads: StdMutex::default(),
+        head_gate: StdMutex::default(),
         requests: StdMutex::default(),
         refuse_kv: std::sync::atomic::AtomicBool::new(false),
         epoch_gate: StdMutex::default(),
@@ -313,17 +320,20 @@ async fn leaf(
 }
 
 fn store(rig: &Rig, name: &str) -> RegistryStore {
+    RegistryStore::open(&store_descriptor(rig, name)).unwrap()
+}
+
+fn store_descriptor(rig: &Rig, name: &str) -> StorageDescriptor {
     let dir = rig.dir.join(name);
     fs::create_dir_all(&dir).unwrap();
-    RegistryStore::open(&StorageDescriptor {
+    StorageDescriptor {
         module_id: crate::MODULE_ID.into(),
         storage_namespace: format!("{}-{name}", rig.dir.file_name().unwrap().to_string_lossy()),
         isolation: Isolation::Module,
         backend: StorageBackend::Sqlite {
             path: dir.join("store.db").to_str().unwrap().into(),
         },
-    })
-    .unwrap()
+    }
 }
 
 fn handler(store: RegistryStore, id: &str) -> ProjectsHandler {
@@ -391,6 +401,7 @@ async fn through(handler: &ProjectsHandler, sequence: u64) {
     }
 }
 
+#[derive(Clone)]
 struct AgentOperation {
     method: &'static str,
     params: Value,
@@ -450,7 +461,16 @@ impl AgentOperation {
     }
 
     fn plan<'a>(&'a self, node: &'a Node) -> Invocation<'a> {
-        let expected = node.log.applied_sequence().unwrap();
+        let expected = node
+            .log
+            .sql
+            .test_store()
+            .identity_log_status()
+            .map(|status| {
+                crate::hub_identity_log::hub_sequence(node.log.base, status.last_applied_position)
+                    .unwrap()
+            })
+            .unwrap();
         let store = node.handler.with_store(|store| Ok(store.clone())).unwrap();
         let body = self
             .preview(&store, self.time, self.new_id.as_deref())
@@ -478,18 +498,19 @@ impl Invocation<'_> {
     }
 
     async fn append_before(&self, deadline: Instant) -> Result<hub_write::Landed, HandlerError> {
-        let operation = self.operation;
+        let operation = self.operation.clone();
+        let request_key = operation.key().to_owned();
         let digest = hub_write::params_digest(operation.method, &operation.params).unwrap();
         self.log
             .append(
                 PlannedAppend {
-                    request_key: operation.key(),
+                    request_key: &request_key,
                     params_digest: &digest,
                     writer_ep: 0,
                     expected: self.expected,
                     body: self.body.clone(),
                 },
-                |store, saved| {
+                move |store, saved| {
                     let time = saved["row"]["updated_at_ms"].as_i64().unwrap();
                     let id = operation
                         .new_id
@@ -628,6 +649,91 @@ impl IdentityRig {
 mod epochs;
 mod residence;
 
+#[tokio::test(flavor = "current_thread")]
+async fn hub_tail_sql_does_not_delay_runtime_timer() {
+    let Some(rig) = IdentityRig::new().await else {
+        return;
+    };
+    let node = &rig.a;
+    let operation = AgentOperation::create(42, "Timer".into());
+    let invocation = operation.plan(node);
+    let entry_id = "00000000000000000000000000000042";
+    let signer = ClaustrumCredentialResolver::with_target(rig.keys.clone(), 0);
+    let bytes = crate::fleet_record::prepare(
+        &signer,
+        rig.keys.as_ref(),
+        &crate::fleet_record::Header {
+            kind: operation.method.into(),
+            key: LOG_SUBJECT.into(),
+            writer: A.into(),
+            writer_ep: 0,
+            entry_id: entry_id.into(),
+        },
+        &invocation.body,
+    )
+    .await
+    .unwrap()
+    .into_bytes();
+
+    let path = rig._processes.dir.join("box-a/store.db");
+    let (locked, waiting) = oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        locked.send(()).unwrap();
+        // Always release, even if an inline SQL apply stalls the runtime.
+        let _ = released.recv_timeout(Duration::from_millis(750));
+        conn.execute_batch("ROLLBACK").unwrap();
+    });
+    waiting.await.unwrap();
+    let (read, read_started) = oneshot::channel();
+    let read = StdMutex::new(Some(read));
+    let store = node.handler.with_store(|store| Ok(store.clone())).unwrap();
+    store.set_read_hook(Some(Arc::new(move || {
+        if let Some(read) = read.lock().unwrap().take() {
+            let _ = read.send(Instant::now());
+        }
+    })));
+    node.leaf
+        .session()
+        .append(bytes, 0, entry_id, Instant::now() + Duration::from_secs(5))
+        .await
+        .unwrap();
+    let started = within(read_started).await.unwrap();
+    tokio::time::sleep_until(started + Duration::from_millis(50)).await;
+    let elapsed = started.elapsed();
+    let _ = release.send(());
+    writer.join().unwrap();
+    store.set_read_hook(None);
+    assert!(
+        elapsed < Duration::from_millis(300),
+        "50 ms timer took {elapsed:?} while the hub tail applied an entry"
+    );
+    within(through(&node.handler, 1)).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hub_tail_network_wait_does_not_keep_handler_store_open() {
+    let Some(rig) = IdentityRig::new().await else {
+        return;
+    };
+    let node = handler(store(&rig._processes, "drop-during-head"), A);
+    let descriptor = store_descriptor(&rig._processes, "drop-during-head");
+    let (entered, waiting) = oneshot::channel();
+    let (release, released) = oneshot::channel();
+    *rig.a.leaf.head_gate.lock().unwrap() = Some((entered, released));
+    let log = activate(&node, rig.a.leaf.clone(), &rig.keys);
+    within(waiting).await.unwrap();
+    drop(node);
+    // No yield between drop and open: an abort has not yet dropped the tail future.
+    let reopened = RegistryStore::open(&descriptor)
+        .expect("the parked hub tail must not hold the writer lease");
+    drop(release);
+    drop(log);
+    drop(reopened);
+}
+
 #[tokio::test]
 async fn hub_identity_log_two_leaf_rig_applies_and_wakes_then_rebases_and_settles_lost_ack() {
     let Some(mut rig) = IdentityRig::new().await else {
@@ -742,13 +848,17 @@ async fn hub_identity_log_two_leaf_rig_applies_and_wakes_then_rebases_and_settle
         tokio::join!(lost_plan.append(), async {
             committed_rx.await.unwrap();
             tokio::join!(through(a, 4), through(b, 4));
-            // The apply hook may already have closed A's row. The writer still
-            // must read its exact position, not the stream's newer last entry.
-            let row = a
+            // With its ACK still withheld, only the tail can settle A's row.
+            // Wait for that settlement separately from the journal apply.
+            while a
                 .with_store(|store| store.hub_attempt("request-4"))
                 .unwrap()
-                .unwrap();
-            assert!(row.outcome.is_some());
+                .unwrap()
+                .outcome
+                .is_none()
+            {
+                sleep(Duration::from_millis(10)).await;
+            }
             let later = operations[4].plan(&rig.b).append().await.unwrap();
             release_tx.send(()).unwrap();
             later
@@ -894,7 +1004,7 @@ async fn hub_identity_log_rebase_deadline_leaves_attempt_open_without_a_second_s
         return;
     };
     let a = &rig.a;
-    let catch_up = a.handler.catch_up_task.lock().unwrap().take().unwrap();
+    let catch_up = a.handler.hub_tail_task.lock().unwrap().take().unwrap();
     catch_up.abort();
     assert!(catch_up.await.unwrap_err().is_cancelled());
 

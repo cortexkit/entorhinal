@@ -89,7 +89,8 @@ impl Residence {
         .await;
         match result {
             Ok(accepted) => {
-                self.accept(key, revision, bytes, Some(&accepted.body))?;
+                self.accept(key, revision, bytes, Some(&accepted.body), deadline)
+                    .await?;
                 if let Err(error) = self
                     .backend
                     .record_applied(&accepted.record, revision, deadline)
@@ -100,23 +101,45 @@ impl Residence {
                 Ok(())
             }
             Err(error) if deferred(&error) => Err(error),
-            Err(error) => self.refuse(key, revision, &error.code),
+            Err(error) => self.refuse(key, revision, &error.code, deadline).await,
         }
     }
 
-    fn cached_signal(&self, key: &str) -> Result<Option<HubKvCached>, HandlerError> {
+    pub(super) async fn raise_role_gen(
+        &self,
+        role: &str,
+        generation: i64,
+        deadline: Instant,
+    ) -> Result<(), HandlerError> {
+        let role = role.to_owned();
+        self.sql
+            .run(deadline, "observe_role_gen", move |store| {
+                Ok(store.observe_role_gen(&role, generation)?)
+            })
+            .await
+    }
+
+    async fn cached_signal(
+        &self,
+        key: &str,
+        deadline: Instant,
+    ) -> Result<Option<HubKvCached>, HandlerError> {
+        let row = self.sql.cached(key, deadline).await?;
         let watched = self.watched.read().unwrap();
         if !watched.initial || watched.held.contains(key) {
             return Ok(None);
         }
-        let row = self.store.hub_kv_cached(key)?;
         Ok(row.filter(|row| {
             !row.integrity_failed && watched.revisions.get(key) == Some(&row.revision)
         }))
     }
 
-    pub(super) fn cached_preference(&self, role: &str) -> Result<Option<Preferred>, HandlerError> {
-        let Some(row) = self.cached_signal(&preference_key(role))? else {
+    pub(super) async fn cached_preference(
+        &self,
+        role: &str,
+        deadline: Instant,
+    ) -> Result<Option<Preferred>, HandlerError> {
+        let Some(row) = self.cached_signal(&preference_key(role), deadline).await? else {
             return Ok(None);
         };
         let Some(body) = row.body else {
@@ -125,7 +148,7 @@ impl Residence {
         let body: Preference = serde_json::from_value(body).map_err(crate::invalid_params)?;
         Ok(self
             .backend
-            .current_member(&body.box_id, self.backend.applied()?)
+            .current_member(&body.box_id, self.backend.applied(deadline).await?)
             .map(|episode| Preferred {
                 revision: row.revision,
                 box_id: body.box_id,
@@ -157,7 +180,7 @@ impl Residence {
         };
         Ok(self
             .backend
-            .current_member(&body.box_id, self.backend.applied()?)
+            .current_member(&body.box_id, self.backend.applied(deadline).await?)
             .map(|episode| Preferred {
                 revision: row.revision,
                 box_id: body.box_id,
@@ -165,13 +188,14 @@ impl Residence {
             }))
     }
 
-    pub(super) fn cached_handback(
+    pub(super) async fn cached_handback(
         &self,
         role: &str,
         candidate: &str,
+        deadline: Instant,
     ) -> Result<Option<CandidateRequest>, HandlerError> {
         let key = handback_key(role, candidate);
-        let Some(row) = self.cached_signal(&key)? else {
+        let Some(row) = self.cached_signal(&key, deadline).await? else {
             return Ok(None);
         };
         let Some(body) = row.body else {
@@ -185,7 +209,7 @@ impl Residence {
         let episode = record.header().writer_ep;
         Ok((self
             .backend
-            .current_member(candidate, self.backend.applied()?)
+            .current_member(candidate, self.backend.applied(deadline).await?)
             == Some(episode))
         .then_some(CandidateRequest {
             revision: row.revision,
@@ -223,7 +247,7 @@ impl Residence {
             && request.record.header().writer_ep == target.episode
             && self
                 .backend
-                .current_member(&target.box_id, self.backend.applied()?)
+                .current_member(&target.box_id, self.backend.applied(deadline).await?)
                 == Some(target.episode))
     }
 
@@ -252,15 +276,16 @@ impl Residence {
             .kv_entry(&key, deadline)
             .await?
             .map_or(0, |row| row.revision);
-        let episode = self.backend.writer_episode()?;
-        let observed = self.role(role)?;
+        let episode = self.backend.writer_episode(deadline).await?;
+        let observed = self.role(role, deadline).await?;
         if !observed.ready
             || !observed.holder_current
             || observed.gen() != gen
             || observed.record.as_ref().and_then(|r| r.holder.as_deref())
                 == Some(self.box_id.as_str())
             || self
-                .cached_preference(role)?
+                .cached_preference(role, deadline)
+                .await?
                 .is_none_or(|p| p.box_id != self.box_id)
         {
             return Ok(());
@@ -287,8 +312,12 @@ impl Residence {
             expected: revision,
             payload: Payload::Delete,
         };
-        self.write_role_signal(&step, self.backend.writer_episode()?, deadline)
-            .await
+        self.write_role_signal(
+            &step,
+            self.backend.writer_episode(deadline).await?,
+            deadline,
+        )
+        .await
     }
 
     async fn write_role_signal(
@@ -324,7 +353,7 @@ impl Residence {
         digest: &str,
         deadline: Instant,
     ) -> Result<Vec<u8>, HandlerError> {
-        let saved = self.store.hub_attempt(&input.request_id)?;
+        let saved = self.sql.attempt(&input.request_id, deadline).await?;
         let (step, writer_ep, forced_gen) = if let Some(saved) = &saved {
             if saved.write.params_digest != digest {
                 return Err(HandlerError::new(
@@ -349,11 +378,11 @@ impl Residence {
             };
             (
                 resume_only(),
-                self.request_episode(Some(saved))?,
+                self.request_episode(Some(saved), deadline).await?,
                 forced_gen,
             )
         } else {
-            let current = self.role(&input.role)?;
+            let current = self.role(&input.role, deadline).await?;
             if !current.ready {
                 return Err(not_ready());
             }
@@ -366,13 +395,13 @@ impl Residence {
                     ),
                 });
             }
-            let writer_ep = self.backend.writer_episode()?;
+            let writer_ep = self.backend.writer_episode(deadline).await?;
             let forced = !current.holder_current
                 && current.record.as_ref().is_some_and(|r| r.holder.is_some());
             let (step, forced_gen) = if forced {
                 let gen = role_leases::next_gen(
                     current.gen(),
-                    self.store.role_gen_high_water(&input.role)?,
+                    self.role_high_water(&input.role, deadline).await?,
                 )?;
                 let mut record = role_leases::Record::new(&self.box_id, writer_ep, gen, false);
                 record.forced = true;
@@ -428,7 +457,7 @@ impl Residence {
         // A completed attempt retains its original step, so a preference
         // replay doesn't report that the role subsequently arrived here.
         encode_result(if let Some(gen) = forced_gen {
-            self.store.observe_role_gen(&input.role, gen)?;
+            self.raise_role_gen(&input.role, gen, deadline).await?;
             json!({"epoch": gen, "held_here": true})
         } else {
             json!({"epoch": input.expected_epoch, "held_here": false, "handback_requested": true})
@@ -448,7 +477,12 @@ impl ProjectsHandler {
             crate::roles::TAKE,
             &json!([input.role, input.expected_epoch, input.reason]),
         )?;
-        if service.store.hub_attempt(&input.request_id)?.is_some() {
+        if service
+            .sql
+            .attempt(&input.request_id, received + BUDGET)
+            .await?
+            .is_some()
+        {
             return service.take_role(&input, &digest, received + BUDGET).await;
         }
         let mut guard = ConfirmationGuard::take(&self.confirmation_slot, route)?;

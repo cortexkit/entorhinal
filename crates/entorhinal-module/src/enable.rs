@@ -436,27 +436,50 @@ impl ProjectsHandler {
             .map_err(|_| {
                 HandlerError::new("identity_log_contended", "writer lock deadline expired")
             })?;
-        let store = self.with_store(|s| Ok(s.clone()))?;
-        let result = if let Some(switch) = &self.hub_switch {
+        if let Some(switch) = &self.hub_switch {
             // Hub snapshot recovery is large; other requests share the RPC dispatcher.
-            Box::pin(self.enable_hub(
-                switch,
-                &store,
-                params.without_agents,
-                key,
-                received,
-                deadline,
-            ))
-            .await
-        } else {
-            self.enable_locked(
+            let result =
+                Box::pin(self.enable_hub(switch, params.without_agents, key, received, deadline))
+                    .await;
+            if let Err(error) = &result {
+                record_error(&self.health, error);
+            }
+            let health = self.health.clone();
+            let (status, installed) = self
+                .hub_sql()
+                .run(
+                    Instant::now() + Duration::from_secs(3),
+                    "identity_log_status",
+                    move |store| {
+                        let status = store.identity_log_status()?;
+                        refresh_status(&health, &status);
+                        health
+                            .generation
+                            .fetch_max(store.generation()?, Ordering::Relaxed);
+                        Ok((status, store.hub_log_base()?.is_some()))
+                    },
+                )
+                .await?;
+            self.commits.notify_waiters();
+            result?;
+            if installed || self.health.origin.daemon_id().is_some() {
+                self.catch_up_wake.notify_one();
+            }
+            if !installed {
+                self.start_claim_refresh();
+                self.claim_refresh.signal();
+            }
+            return self.encode_identity_log_status(status);
+        }
+        let store = self.with_store(|s| Ok(s.clone()))?;
+        let result = self
+            .enable_locked(
                 &store,
                 params.without_agents,
                 deadline,
                 &principal_label(admission.principal.as_ref()),
             )
-            .await
-        };
+            .await;
         refresh(&self.health, &store);
         self.health
             .generation
@@ -481,36 +504,49 @@ impl ProjectsHandler {
     async fn enable_hub(
         &self,
         switch: &hub_switch::Switch,
-        store: &RegistryStore,
         without_agents: bool,
         key: RouteKey,
         received: Instant,
         deadline: Instant,
     ) -> Result<(), HandlerError> {
-        if store.hub_log_base()?.is_some() {
+        let runtime = hub_switch::Runtime::new(self);
+        let sql = &runtime.sql;
+        let (installed, planned, state) = sql
+            .run(deadline, "hub_enable_state", |store| {
+                Ok((
+                    store.hub_log_base()?.is_some(),
+                    store.hub_enable_plan()?.is_some(),
+                    store.identity_log_status()?.state,
+                ))
+            })
+            .await?;
+        if installed {
             return Ok(());
         }
-        let runtime = hub_switch::Runtime::new(self);
-        if store.hub_enable_plan()?.is_some() {
-            return switch.finish(store, &runtime, None, deadline).await;
+        if planned {
+            return switch.finish(&runtime, None, deadline).await;
         }
-        match store.identity_log_status()?.state.as_str() {
+        match state.as_str() {
             "enabled" => return Ok(()),
             "enabling" => {
+                let store = self.with_store(|store| Ok(store.clone()))?;
                 return resume(
-                    store,
+                    &store,
                     &self.log_client,
                     &self.health,
                     deadline,
                     "entorhinal",
                 )
-                .await
+                .await;
             }
-            "joining" => return self.catch_up(store, deadline).await,
+            "joining" => {
+                let store = self.with_store(|store| Ok(store.clone()))?;
+                return self.catch_up(&store, deadline).await;
+            }
             _ => (),
         }
         if switch.head(deadline).await? > 0 {
-            return switch.finish(store, &runtime, None, deadline).await;
+            return switch.finish(&runtime, None, deadline).await;
         }
         let page = timeout_at(deadline, self.log_client.read(0, 1))
             .await
@@ -518,13 +554,20 @@ impl ProjectsHandler {
         let presence = match fresh_hub_enable(page, &self.health)? {
             FreshHubEnable::Enrolled => false,
             FreshHubEnable::JoinEngram(head) => {
-                store.check_enable_preconditions(head)?;
-                return self.catch_up(store, deadline).await;
+                sql.run(deadline, "check_enable_preconditions", move |store| {
+                    Ok(store.check_enable_preconditions(head)?)
+                })
+                .await?;
+                let store = self.with_store(|store| Ok(store.clone()))?;
+                return self.catch_up(&store, deadline).await;
             }
             FreshHubEnable::Confirm => true,
         };
-        store.check_enable_preconditions(0)?;
-        store.check_agent_import_preconditions(without_agents)?;
+        sql.run(deadline, "check_enable_preconditions", move |store| {
+            store.check_enable_preconditions(0)?;
+            Ok(store.check_agent_import_preconditions(without_agents)?)
+        })
+        .await?;
         let deadline = if presence {
             let mut confirmation =
                 agent_ops::ConfirmationGuard::take(&self.confirmation_slot, key)?;
@@ -544,11 +587,11 @@ impl ProjectsHandler {
             deadline
         };
         if switch.head(deadline).await? > 0 {
-            return switch.finish(store, &runtime, None, deadline).await;
+            return switch.finish(&runtime, None, deadline).await;
         }
-        switch.prepare_enable(store, deadline).await?;
+        switch.prepare_enable(sql, deadline).await?;
         self.catch_up_wake.notify_one();
-        switch.finish(store, &runtime, None, deadline).await
+        switch.finish(&runtime, None, deadline).await
     }
 
     async fn enable_locked(

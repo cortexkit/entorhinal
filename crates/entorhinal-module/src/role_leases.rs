@@ -113,6 +113,8 @@ pub(super) struct Leases {
     backend: watch::Sender<Option<Arc<dyn Backend>>>,
     #[cfg(test)]
     sample_views: HashMap<String, watch::Receiver<View>>,
+    #[cfg(test)]
+    pub(super) local_pass_complete: Notify,
 }
 
 impl Default for Leases {
@@ -125,6 +127,8 @@ impl Default for Leases {
             backend: watch::channel(None).0,
             #[cfg(test)]
             sample_views: HashMap::new(),
+            #[cfg(test)]
+            local_pass_complete: Notify::new(),
         }
     }
 }
@@ -509,12 +513,21 @@ struct HandbackCleanup {
 #[async_trait::async_trait]
 pub(super) trait Backend: Send + Sync {
     fn local_box(&self) -> &str;
-    fn role(&self, name: &str) -> Result<Observation, HandlerError>;
-    fn role_high_water(&self, _name: &str) -> Result<i64, HandlerError> {
+    async fn role(&self, name: &str, deadline: Instant) -> Result<Observation, HandlerError>;
+    async fn role_high_water(&self, _name: &str, _deadline: Instant) -> Result<i64, HandlerError> {
         Ok(0)
     }
-    fn preferred(&self, role: &str) -> Result<Option<Preferred>, HandlerError>;
-    fn handback(&self, role: &str, box_id: &str) -> Result<Option<CandidateRequest>, HandlerError>;
+    async fn preferred(
+        &self,
+        role: &str,
+        deadline: Instant,
+    ) -> Result<Option<Preferred>, HandlerError>;
+    async fn handback(
+        &self,
+        role: &str,
+        box_id: &str,
+        deadline: Instant,
+    ) -> Result<Option<CandidateRequest>, HandlerError>;
     fn link_events(&self) -> (&Notify, &Notify);
     async fn reread_offer(
         &self,
@@ -625,8 +638,9 @@ impl Leases {
                 }
             } else {
                 let changed = handler.role_cache_changed.notified();
+                let next_pass = Instant::now() + Duration::from_millis(RENEW_MS);
                 let now = self.now();
-                let next = handler.local_role_view(role, now, &mut local_gen);
+                let next = handler.local_role_view(role, now, &mut local_gen).await?;
                 let current = *notices.borrow();
                 let due = current
                     .until_ms
@@ -639,6 +653,8 @@ impl Leases {
                 {
                     notices.send_replace(next);
                 }
+                #[cfg(test)]
+                self.local_pass_complete.notify_waiters();
                 tokio::select! {
                     request = controls.recv() => {
                         if let Some(request) = request {
@@ -657,7 +673,7 @@ impl Leases {
                     }
                     _ = installed.changed() => {}
                     _ = changed, if role == "connector_home" => {}
-                    _ = tokio::time::sleep(Duration::from_millis(RENEW_MS)) => {}
+                    _ = tokio::time::sleep_until(next_pass) => {}
                 }
             }
         }
@@ -688,7 +704,8 @@ impl Leases {
             let link_changed = link.notified();
             let members_changed = membership.notified();
             let now = self.now();
-            let current = backend.role(role)?;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let current = backend.role(role, deadline).await?;
             let prior = *notices.borrow();
             let mut wake_at = None;
             let lapsed = prior.until_ms.is_some_and(|until| until <= now);
@@ -706,7 +723,7 @@ impl Leases {
                     pending = None;
                 }
             } else {
-                let preferred = backend.preferred(role)?;
+                let preferred = backend.preferred(role, deadline).await?;
                 let slot_free = current.holder_removed
                     || current
                         .record
@@ -721,7 +738,7 @@ impl Leases {
                     failed_since = None;
                 }
                 let mine = current.own(local);
-                let high_water = backend.role_high_water(role)?;
+                let high_water = backend.role_high_water(role, deadline).await?;
                 let needs_new_gen = mine && current.gen() < high_water;
                 let visible_gen = current.gen().max(high_water);
                 if !mine || current.gen() != prior.gen {
@@ -810,7 +827,7 @@ impl Leases {
                                 retry_at = 0;
                                 pending = None;
                                 if step == RENEW {
-                                    let read_back = backend.role(role)?;
+                                    let read_back = backend.role(role, deadline).await?;
                                     if read_back.ready
                                         && read_back.own(local)
                                         && read_back.gen() == gen
@@ -863,7 +880,7 @@ impl Leases {
                 // module has acknowledged its last notice: a waiting candidate may have
                 // no acting window, so it has nothing to acknowledge yet.
                 if current.revision >= wait_revision && allowed {
-                    let own_request = backend.handback(role, local)?;
+                    let own_request = backend.handback(role, local, deadline).await?;
                     let wants_handback = !mine
                         && current.holder_current
                         && preferred.as_ref().is_some_and(|p| p.box_id == local);
@@ -934,7 +951,8 @@ impl Leases {
                 {
                     if let Some(target) = preferred.filter(|p| p.box_id != local) {
                         if backend
-                            .handback(role, &target.box_id)?
+                            .handback(role, &target.box_id, deadline)
+                            .await?
                             .is_some_and(|request| {
                                 request.gen == current.gen() && request.episode == target.episode
                             })
@@ -983,7 +1001,7 @@ impl Leases {
                                     // Confirm a new renewal before extending the deadline.
                                     let mut view = *notices.borrow();
                                     view.handback = false;
-                                    let observed = backend.role(role)?;
+                                    let observed = backend.role(role, deadline).await?;
                                     if observed.ready && observed.own(local) && observed.gen() == request.gen {
                                         let renewal = change(RENEW, &observed, local, 0)?;
                                         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1044,7 +1062,8 @@ impl Leases {
         wait_revision: u64,
         target: &Preferred,
     ) -> Result<Option<u64>, HandlerError> {
-        let current = backend.role(role)?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let current = backend.role(role, deadline).await?;
         if !current.own(backend.local_box()) || current.gen() != gen {
             return Err(lease_gen_moved());
         }
@@ -1054,7 +1073,6 @@ impl Leases {
                 "role watch is not current",
             ));
         }
-        let deadline = Instant::now() + Duration::from_secs(5);
         if !backend.reread_offer(role, target, gen, deadline).await? {
             return Ok(None);
         }
@@ -1062,7 +1080,7 @@ impl Leases {
             TRANSFER,
             &current,
             backend.local_box(),
-            backend.role_high_water(role)?,
+            backend.role_high_water(role, deadline).await?,
         )?;
         transfer.body.holder = Some(target.box_id.clone());
         transfer.body.holder_ep = target.episode;
@@ -1082,7 +1100,7 @@ impl Leases {
     ) -> Result<(), HandlerError> {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let current = backend.role(role)?;
+            let current = backend.role(role, deadline).await?;
             if !current.ready {
                 return Err(HandlerError::new(
                     "hub_not_ready",
@@ -1115,50 +1133,75 @@ fn decode<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, HandlerErr
 }
 
 impl ProjectsHandler {
-    fn local_role_view(&self, role: &str, now: u64, grant: &mut Option<i64>) -> View {
+    async fn local_role_view(
+        &self,
+        role: &str,
+        now: u64,
+        grant: &mut Option<i64>,
+    ) -> Result<View, HandlerError> {
         if self.hub_backend_selected() || self.admit_store_write().is_err() {
-            return View::default();
+            return Ok(View::default());
         }
-        let local = |gen| View {
-            gen,
-            until_ms: Some(now.saturating_add(ACT_MS)),
-            handback: false,
-        };
-        self.with_store(|store| Ok(store.clone()))
-            .and_then(|store| {
-                let state = store.identity_log_status()?.state;
-                if state == "disabled"
-                    || (role.starts_with("dreamer.")
-                        && matches!(state.as_str(), "enabled" | "enabling" | "joining"))
-                {
-                    let high_water = store.role_gen_high_water(role)?;
-                    let gen = match *grant {
-                        Some(gen) if gen >= high_water => gen,
-                        _ => store.grant_local_role_gen(role)?,
+        let role = role.to_owned();
+        let prior = *grant;
+        let decision = self
+            .hub_sql()
+            .run(
+                Instant::now() + Duration::from_secs(5),
+                "local_role_view",
+                move |store| {
+                    let local = |gen| View {
+                        gen,
+                        until_ms: Some(now.saturating_add(ACT_MS)),
+                        handback: false,
                     };
-                    *grant = Some(gen);
-                    return Ok(local(gen));
-                }
-                *grant = None;
-                if role == "connector_home" && state == "enabled" {
-                    let read = store.role_read(role)?;
-                    let high_water = store.role_gen_high_water(role)?;
-                    if read.epoch > high_water {
-                        store.observe_role_gen(role, read.epoch)?;
+                    let state = store.identity_log_status()?.state;
+                    if state == "disabled"
+                        || (role.starts_with("dreamer.")
+                            && matches!(state.as_str(), "enabled" | "enabling" | "joining"))
+                    {
+                        let high_water = store.role_gen_high_water(&role)?;
+                        let gen = match prior {
+                            Some(gen) if gen >= high_water => gen,
+                            _ => store.grant_local_role_gen(&role)?,
+                        };
+                        return Ok((local(gen), Some(gen)));
                     }
-                    let gen = read.epoch.max(high_water);
-                    return Ok(if read.held_here && !read.stale {
-                        local(gen)
-                    } else {
-                        View {
-                            gen,
-                            ..View::default()
+                    if role == "connector_home" && state == "enabled" {
+                        let read = store.role_read(&role)?;
+                        let high_water = store.role_gen_high_water(&role)?;
+                        if read.epoch > high_water {
+                            store.observe_role_gen(&role, read.epoch)?;
                         }
-                    });
-                }
-                Ok(View::default())
-            })
-            .unwrap_or_default()
+                        let gen = read.epoch.max(high_water);
+                        return Ok((
+                            if read.held_here && !read.stale {
+                                local(gen)
+                            } else {
+                                View {
+                                    gen,
+                                    ..View::default()
+                                }
+                            },
+                            None,
+                        ));
+                    }
+                    Ok((View::default(), None))
+                },
+            )
+            .await;
+        match decision {
+            Ok((view, next)) => {
+                *grant = next;
+                Ok(view)
+            }
+            Err(error)
+                if matches!(error.code.as_str(), "hub_sql_timeout" | "store_unavailable") =>
+            {
+                Err(error)
+            }
+            Err(_) => Ok(View::default()),
+        }
     }
 
     fn admit_lease_role(&self, role: &str, key: RouteKey) -> Result<(), HandlerError> {
@@ -1317,6 +1360,7 @@ impl ProjectsHandler {
             View::default()
         } else {
             self.local_role_view(&role, self.role_leases.now(), &mut local_gen)
+                .await?
         };
         let (source, views) = watch::channel(initial);
         #[cfg(test)]

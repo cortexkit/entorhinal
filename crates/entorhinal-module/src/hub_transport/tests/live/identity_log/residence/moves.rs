@@ -100,8 +100,10 @@ impl Moving {
             json!({"v":1,"writer":A,"holder":A,"gen":1,"forced":false,"seeded":true}),
         )
         .await;
-        until(|| a.move_origin(MIGRATED).is_ok() && b.move_member(B).ok().flatten().is_some())
-            .await;
+        until_async(|| async {
+            a.move_origin(MIGRATED).await.is_ok() && b.move_member(B).await.ok().flatten().is_some()
+        })
+        .await;
         let author = |id: &str| {
             std::array::from_fn(|i| u8::from_str_radix(&id[2 * i..2 * i + 2], 16).unwrap())
         };
@@ -188,16 +190,22 @@ impl Moving {
             self.receiver.row(CUT).await.unwrap().step,
             MoveStep::Aborted
         );
-        assert_eq!(self.a.move_origin(MIGRATED).unwrap(), (1, A.into()));
+        assert_eq!(self.a.move_origin(MIGRATED).await.unwrap(), (1, A.into()));
     }
     async fn watch(&self, state: State) {
-        until(|| {
-            [&self.a, &self.b].iter().all(|hub| {
-                hub.watched_move(CUT)
+        until_async(|| async {
+            for hub in [&self.a, &self.b] {
+                if !hub
+                    .watched_move(CUT)
+                    .await
                     .ok()
                     .flatten()
                     .is_some_and(|record| record.body.state == state)
-            })
+                {
+                    return false;
+                }
+            }
+            true
         })
         .await;
     }
@@ -315,7 +323,7 @@ async fn hub_move_handed_abort_returns_residence_even_with_a_lost_reply() {
     f.source_tick().await;
     assert_eq!(f.source.row(CUT).await.unwrap().step, MoveStep::Aborted);
     assert_eq!(f.receiver.row(CUT).await.unwrap().step, MoveStep::Aborted);
-    assert_eq!(f.a.move_origin(MIGRATED).unwrap(), (3, A.into()));
+    assert_eq!(f.a.move_origin(MIGRATED).await.unwrap(), (3, A.into()));
     assert!(f.to.held().is_empty());
 }
 
@@ -332,9 +340,12 @@ async fn hub_move_receiver_completes_while_source_is_dead_after_transfer() {
     crashed.abort();
     assert!(crashed.await.unwrap_err().is_cancelled());
     f.watch(State::Handing).await;
-    until(|| {
-        let seen = f.b.watched_move(CUT).unwrap().unwrap();
-        matches!(f.b.move_position(&seen.body), Ok(MovePosition::Receiver))
+    until_async(|| async {
+        let seen = f.b.watched_move(CUT).await.unwrap().unwrap();
+        matches!(
+            f.b.move_position(&seen.body).await,
+            Ok(MovePosition::Receiver)
+        )
     })
     .await;
     f.receiver_tick().await;
@@ -380,7 +391,7 @@ async fn hub_move_receiver_abort_fences_a_held_handing_cas_after_source_restart(
     .await;
     f.receiver_tick().await;
     assert_eq!(f.receiver.row(CUT).await.unwrap().step, MoveStep::Aborted);
-    assert_eq!(f.a.move_origin(MIGRATED).unwrap(), (1, A.into()));
+    assert_eq!(f.a.move_origin(MIGRATED).await.unwrap(), (1, A.into()));
 }
 
 async fn put_move(
@@ -416,7 +427,7 @@ async fn hub_move_reader_refuses_wrong_side_and_changed_agent_without_advancing(
         return;
     };
     f.publish().await;
-    let published = f.a.watched_move(CUT).unwrap().unwrap();
+    let published = f.a.watched_move(CUT).await.unwrap().unwrap();
     let mut next = published.body.clone();
     next.state = State::Staged;
     let revision = put_move(&f.rig, published.revision, A, &next).await;
@@ -444,7 +455,7 @@ async fn hub_move_reader_refuses_wrong_side_and_changed_agent_without_advancing(
     let refused = store.hub_kv_cached(&key).unwrap().unwrap();
     assert!(refused.integrity_failed);
     assert_eq!(refused.body.unwrap()["agent_id"], MIGRATED);
-    assert!(f.b.move_member(A).unwrap().is_some());
+    assert!(f.b.move_member(A).await.unwrap().is_some());
 }
 
 #[tokio::test]
@@ -453,7 +464,7 @@ async fn hub_move_does_not_seal_when_a_required_export_has_no_target_provider() 
         return;
     };
     f.b.advertise_node(Vec::new(), true).await.unwrap();
-    until(|| f.a.watched_node(B).ok().flatten().is_some()).await;
+    until_async(|| async { f.a.watched_node(B).await.ok().flatten().is_some() }).await;
     f.source_tick().await;
     assert_eq!(f.source.row(CUT).await.unwrap().step, MoveStep::Exported);
     assert!(!f.from.frozen().is_empty());
@@ -467,7 +478,7 @@ async fn hub_move_does_not_seal_when_a_required_export_has_no_target_provider() 
     );
     assert_eq!(row.detail.unwrap()["detail"]["module"], "data");
     assert!(f.door.calls().is_empty());
-    assert!(f.a.watched_move(CUT).unwrap().is_none());
+    assert!(f.a.watched_move(CUT).await.unwrap().is_none());
     assert!(f.from.frozen().is_empty());
 }
 
@@ -498,7 +509,7 @@ async fn hub_move_stop_after_claim_holds_the_fork_without_activating() {
         MoveStep::Activating
     );
     assert!(f.to.held().is_empty());
-    assert_eq!(f.b.move_origin(MIGRATED).unwrap(), (2, B.into()));
+    assert_eq!(f.b.move_origin(MIGRATED).await.unwrap(), (2, B.into()));
 }
 
 #[tokio::test]
@@ -507,7 +518,7 @@ async fn hub_move_removed_source_in_handing_waits_for_a_forced_take() {
         return;
     };
     f.stage().await;
-    let staged = f.a.watched_move(CUT).unwrap().unwrap();
+    let staged = f.a.watched_move(CUT).await.unwrap().unwrap();
     let mut handing = staged.body.clone();
     handing.state = State::Handing;
     f.a.write_move(&handing, Some(&staged)).await.unwrap();
@@ -542,10 +553,10 @@ async fn hub_move_removed_source_in_handing_waits_for_a_forced_take() {
         )
         .await
         .unwrap();
-    until(|| matches!(f.b.move_member(A), Ok(None))).await;
+    until_async(|| async { matches!(f.b.move_member(A).await, Ok(None)) }).await;
     f.receiver_tick().await;
     assert_eq!(
-        f.b.watched_move(CUT).unwrap().unwrap().body.state,
+        f.b.watched_move(CUT).await.unwrap().unwrap().body.state,
         State::Handing
     );
     let revision = f
@@ -557,10 +568,12 @@ async fn hub_move_removed_source_in_handing_waits_for_a_forced_take() {
         .unwrap()
         .revision;
     put(&f.rig, MIGRATED, revision, B, record(B, B, 2, true)).await;
-    until(|| matches!(f.b.move_position(&handing), Ok(MovePosition::Forced))).await;
+    until_async(|| async { matches!(f.b.move_position(&handing).await, Ok(MovePosition::Forced)) })
+        .await;
     f.receiver_tick().await;
-    until(|| {
+    until_async(|| async {
         f.b.watched_move(CUT)
+            .await
             .ok()
             .flatten()
             .is_some_and(|seen| seen.body.state == State::Aborted)
@@ -578,7 +591,7 @@ async fn hub_move_reaps_terminal_revisions_at_the_source_and_fleet_deadlines() {
         return;
     };
     f.stage().await;
-    let staged = f.b.watched_move(CUT).unwrap().unwrap();
+    let staged = f.b.watched_move(CUT).await.unwrap().unwrap();
     let key = move_key(CUT);
     let created_ms = |entry: kv::Entry| (entry.created.unix_timestamp_nanos() / 1_000_000) as i64;
     let started = created_ms(f.rig.kv.entry(&key).await.unwrap().unwrap());
@@ -595,7 +608,7 @@ async fn hub_move_reaps_terminal_revisions_at_the_source_and_fleet_deadlines() {
     f.receiver_tick().await;
     f.source_tick().await;
     let ended = created_ms(f.rig.kv.entry(&key).await.unwrap().unwrap());
-    let aborted = f.a.watched_move(CUT).unwrap().unwrap();
+    let aborted = f.a.watched_move(CUT).await.unwrap().unwrap();
     f.a.reap_move(&aborted, true, ended + crate::hub_moves::HOUR - 1)
         .await
         .unwrap();
@@ -639,7 +652,7 @@ async fn hub_move_missing_hub_object_aborts_before_claim() {
     f.receiver_tick().await;
     assert_eq!(f.receiver.row(CUT).await.unwrap().step, MoveStep::Aborted);
     assert!(f.to.calls().is_empty());
-    assert_eq!(f.a.move_origin(MIGRATED).unwrap(), (1, A.into()));
+    assert_eq!(f.a.move_origin(MIGRATED).await.unwrap(), (1, A.into()));
 }
 
 #[tokio::test]
@@ -688,7 +701,7 @@ async fn hub_move_upload_failure_aborts_without_resealing() {
     assert_eq!(f.door_count(A, "cut.abort"), 1);
     assert!(f.from.frozen().is_empty());
     assert_eq!(row.record_version, 0);
-    assert!(f.a.watched_move(CUT).unwrap().is_none());
+    assert!(f.a.watched_move(CUT).await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -710,7 +723,7 @@ async fn hub_move_cut_store_full_aborts_at_seal() {
     assert_eq!(f.door_count(A, "cut.abort"), 1);
     assert!(f.from.frozen().is_empty());
     assert_eq!(row.record_version, 0);
-    assert!(f.a.watched_move(CUT).unwrap().is_none());
+    assert!(f.a.watched_move(CUT).await.unwrap().is_none());
 }
 
 #[tokio::test]
