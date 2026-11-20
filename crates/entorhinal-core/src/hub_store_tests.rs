@@ -25,7 +25,7 @@ fn hub_audit_regression_open_attempts_use_partial_index() {
         .read(|conn| {
             let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {OPEN_HUB_ATTEMPTS}"))?;
             let rows = stmt.query_map(["continue:agent.create"], |row| row.get::<_, String>(3))?;
-            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+            rows.collect::<rusqlite::Result<Vec<_>>>()
         })
         .unwrap();
     assert!(

@@ -317,6 +317,9 @@ async fn hub_audit_regression_role_take_requires_confirmed_removal_and_does_not_
     tick(LEASE_MS).await;
     assert!(hub.writes(ACQUIRE).is_empty());
 
+    let hub = Hub::new(Some(A), false);
+    let mut candidate = ClientWatch::open(B, &hub, true).await;
+    candidate.ack_waiting().await;
     hub.removed.lock().unwrap().push(A);
     hub.updates.notify_waiters();
     candidate.ack_waiting().await;

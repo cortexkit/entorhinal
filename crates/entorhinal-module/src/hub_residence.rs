@@ -534,7 +534,15 @@ impl Residence {
         let mut anchors = self.backend.anchor_changes();
         let mut retry = tokio::time::interval(Duration::from_secs(1));
         retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // A removal can apply while the watch is judging a replacement.
+        let committed = self.commits.notified();
+        tokio::pin!(committed);
+        committed.as_mut().enable();
         loop {
+            let lease_retry = pending
+                .values()
+                .filter_map(|entry| entry.lease_retry_at)
+                .min();
             tokio::select! {
                 event = feed.next_event() => match event {
                     FeedEvent::Connected | FeedEvent::Disconnected => {
@@ -548,7 +556,7 @@ impl Residence {
                             let arrival_head = pending.remove(&entry.key)
                                 .filter(|old| old.entry.revision == entry.revision)
                                 .and_then(|old| old.arrival_head);
-                             self.observe_or_hold(HeldDelivery { entry, arrival_head, waiting_for_anchor: false, waiting_for_lease: false }, &mut pending).await;
+                            self.observe_or_hold(HeldDelivery { entry, arrival_head, waiting_for_anchor: false, lease_retry_at: None }, &mut pending).await;
                         }
                         if seen_current {
                             self.finish_initial_watch();
@@ -561,14 +569,27 @@ impl Residence {
                         self.observe_or_hold(entry, &mut pending).await;
                     }
                 }
-                _ = retry.tick(), if pending.values().any(|entry| !entry.waiting_for_anchor) => {
-                    let retrying: Vec<_> = pending.extract_if(|_, entry| !entry.waiting_for_anchor).collect();
+                _ = retry.tick(), if pending.values().any(|entry| !entry.waiting_for_anchor && entry.lease_retry_at.is_none()) => {
+                    let retrying: Vec<_> = pending.extract_if(|_, entry| !entry.waiting_for_anchor && entry.lease_retry_at.is_none()).collect();
                     for (_, entry) in retrying {
                         self.observe_or_hold(entry, &mut pending).await;
                     }
                 }
-                _ = self.commits.notified(), if pending.values().any(|entry| entry.waiting_for_lease) => {
-                    let roles: Vec<_> = pending.extract_if(|_, entry| entry.waiting_for_lease).collect();
+                _ = &mut committed, if lease_retry.is_some() => {
+                    committed.set(self.commits.notified());
+                    committed.as_mut().enable();
+                    let roles: Vec<_> = pending.extract_if(|_, entry| entry.lease_retry_at.is_some()).collect();
+                    for (_, entry) in roles {
+                        self.observe_or_hold(entry, &mut pending).await;
+                    }
+                }
+                _ = async {
+                    let remaining = lease_retry.expect("armed lease retry").saturating_sub(self.role_clock_ms());
+                    // The executor's time source can pause in suspend, unlike the lease clock.
+                    tokio::time::sleep(Duration::from_millis(remaining.min(1_000))).await;
+                }, if lease_retry.is_some() => {
+                    let now = self.role_clock_ms();
+                    let roles: Vec<_> = pending.extract_if(|_, entry| entry.lease_retry_at.is_some_and(|at| at <= now)).collect();
                     for (_, entry) in roles {
                         self.observe_or_hold(entry, &mut pending).await;
                     }
@@ -590,16 +611,18 @@ impl Residence {
                 Instant::now() + BUDGET,
             )
             .await;
-        delivery.waiting_for_lease = result
-            .as_ref()
-            .is_err_and(|error| error.code == "role_lease_awaiting_expiry");
+        delivery.lease_retry_at = result.as_ref().err().and_then(|error| {
+            (error.code == "role_lease_awaiting_expiry")
+                .then(|| error.detail.as_ref()?.get("until_ms")?.as_u64())
+                .flatten()
+        });
         delivery.waiting_for_anchor = result
             .as_ref()
             .is_err_and(|error| error.code == "writer_unknown");
-        if delivery.waiting_for_anchor || delivery.waiting_for_lease {
+        if delivery.waiting_for_anchor || delivery.lease_retry_at.is_some() {
             if let Err(error) = self.store.hold_hub_kv(&key, delivery.entry.revision) {
                 delivery.waiting_for_anchor = false;
-                delivery.waiting_for_lease = false;
+                delivery.lease_retry_at = None;
                 result = Err(error.into());
             }
         }
@@ -1007,12 +1030,17 @@ impl Residence {
                 && !self
                     .backend
                     .episode_closed(holder, prior.holder_ep, accepted.applied)
-                && !self.role_lease_expired(key, old.and_then(|row| row.accepted_revision))
             {
-                return Err(HandlerError::new(
-                    "role_lease_awaiting_expiry",
-                    "previous role lease has not expired here",
-                ));
+                if let Some(until_ms) =
+                    self.role_lease_deadline(key, old.and_then(|row| row.accepted_revision))
+                {
+                    let mut error = HandlerError::new(
+                        "role_lease_awaiting_expiry",
+                        "previous role lease has not expired here",
+                    );
+                    error.detail = Some(json!({"until_ms": until_ms}));
+                    return Err(error);
+                }
             }
         }
         Ok(accepted)
@@ -1024,7 +1052,7 @@ impl Residence {
             .map_or_else(role_leases::monotonic_ms, |leases| leases.now())
     }
 
-    fn role_lease_expired(&self, key: &str, revision: Option<u64>) -> bool {
+    fn role_lease_deadline(&self, key: &str, revision: Option<u64>) -> Option<u64> {
         let now = self.role_clock_ms();
         let mut watched = self.watched.write().unwrap();
         let revision = revision.expect("cached role body has an accepted revision");
@@ -1035,7 +1063,8 @@ impl Residence {
         if seen.0 != revision {
             *seen = (revision, now);
         }
-        now.saturating_sub(seen.1) >= role_leases::LEASE_MS
+        let until = seen.1.saturating_add(role_leases::LEASE_MS);
+        (until > now).then_some(until)
     }
 }
 
@@ -1209,7 +1238,7 @@ struct HeldDelivery {
     entry: Entry,
     arrival_head: Option<u64>,
     waiting_for_anchor: bool,
-    waiting_for_lease: bool,
+    lease_retry_at: Option<u64>,
 }
 
 pub(super) fn committed_mint(epoch: &Value) -> Option<&str> {

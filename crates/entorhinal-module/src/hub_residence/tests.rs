@@ -303,7 +303,7 @@ async fn hub_audit_regression_role_acquisition_held_until_expiry_or_applied_remo
             entry: f.role_entry(B, 2).await,
             arrival_head: None,
             waiting_for_anchor: false,
-            waiting_for_lease: false,
+            lease_retry_at: None,
         };
         let mut pending = HashMap::new();
         f.residence.observe_or_hold(early, &mut pending).await;
@@ -311,6 +311,14 @@ async fn hub_audit_regression_role_acquisition_held_until_expiry_or_applied_remo
             pending.contains_key(ROLE_KEY),
             "accepted early acquisition without expiry or a removal"
         );
+        assert_eq!(
+            pending[ROLE_KEY].lease_retry_at,
+            Some(1_000 + role_leases::LEASE_MS)
+        );
+        let held = f.residence.store.hub_kv_cached(ROLE_KEY).unwrap().unwrap();
+        assert_eq!(held.revision, 2);
+        assert_eq!(held.accepted_revision, Some(1));
+        assert!(!held.integrity_failed);
         let at = if removed {
             f.backend.applied.store(2, Ordering::Relaxed);
             1_001
