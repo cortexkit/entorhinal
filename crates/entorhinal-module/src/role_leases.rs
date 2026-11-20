@@ -113,6 +113,8 @@ pub(super) struct Leases {
     backend: watch::Sender<Option<Arc<dyn Backend>>>,
     #[cfg(test)]
     sample_views: HashMap<String, watch::Receiver<View>>,
+    #[cfg(test)]
+    pub(super) local_pass_complete: Notify,
 }
 
 impl Default for Leases {
@@ -125,6 +127,8 @@ impl Default for Leases {
             backend: watch::channel(None).0,
             #[cfg(test)]
             sample_views: HashMap::new(),
+            #[cfg(test)]
+            local_pass_complete: Notify::new(),
         }
     }
 }
@@ -649,6 +653,8 @@ impl Leases {
                 {
                     notices.send_replace(next);
                 }
+                #[cfg(test)]
+                self.local_pass_complete.notify_waiters();
                 tokio::select! {
                     request = controls.recv() => {
                         if let Some(request) = request {
