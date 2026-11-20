@@ -102,7 +102,7 @@ async fn hub_cutover_idle_has_no_join_poll() {
     snapshot(&a).await;
     let _watch = a.watch();
     within(async {
-        let key = format!("read:wrapreq.{A}");
+        let key = format!("fence:wrapreq.{A}");
         while !a.node.leaf.requests.lock().unwrap().contains(&key) {
             sleep(Duration::from_millis(5)).await;
         }

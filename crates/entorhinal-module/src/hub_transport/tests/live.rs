@@ -251,6 +251,13 @@ async fn hub_transport_live_leaf_outage_resumes_and_never_queues_unsent_write() 
         )
         .await;
     let (proxy_port, link) = leaf_link(hub_ports.leaf.unwrap()).await;
+    let grant = cortexkit_bus_naming::federation::hub_module_grant(
+        &"0123456789abcdef0123456789abcdef".parse().unwrap(),
+        crate::MODULE_ID,
+    )
+    .unwrap();
+    let publish = serde_json::to_string(&grant.publish).unwrap();
+    let subscribe = serde_json::to_string(&grant.subscribe).unwrap();
     let leaf_ports = rig
         .start(
             "leaf",
@@ -260,8 +267,8 @@ async fn hub_transport_live_leaf_outage_resumes_and_never_queues_unsent_write() 
         leafnodes {{ remotes: [{{ url: "nats-leaf://127.0.0.1:{proxy_port}" }}] }}
         authorization {{ users: [{{ user: test, pass: test,
             permissions: {{
-                publish: ["$JS.hub.API.>", "ck.fleet.idlog", "$JS.FC.>"],
-                subscribe: ["{PREFIX}.>"]
+                 publish: {publish},
+                 subscribe: {subscribe}
             }}
         }}] }}
     "#
@@ -425,6 +432,21 @@ async fn hub_transport_live_leaf_outage_resumes_and_never_queues_unsent_write() 
         .await
         .unwrap_err();
     assert_eq!(stale.code, "revision_moved");
+    let current = session()
+        .kv_fence_entry("residence.alfa", deadline())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.revision, entry.revision);
+    assert_eq!(
+        current.value.as_deref(),
+        Some(b"changed during outage".as_slice())
+    );
+    assert!(session()
+        .kv_fence_entry("residence.unsent", deadline())
+        .await
+        .unwrap()
+        .is_none());
     assert_eq!(session().log_head(deadline()).await.unwrap(), 3);
     assert_eq!(
         session().log_entry(2, deadline()).await.unwrap().unwrap(),
@@ -468,4 +490,20 @@ async fn hub_transport_live_leaf_outage_resumes_and_never_queues_unsent_write() 
         (current.revision, current.operation),
         (marker.revision, kv::Operation::Delete)
     );
+    let deleted = session()
+        .kv_fence_entry(target, deadline())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((deleted.revision, deleted.value), (marker.revision, None));
+
+    kv.purge(target).await.unwrap();
+    let marker = within(watch.next()).await;
+    assert_eq!(marker.operation, kv::Operation::Purge);
+    let purged = session()
+        .kv_fence_entry(target, deadline())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((purged.revision, purged.value), (marker.revision, None));
 }

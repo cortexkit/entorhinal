@@ -254,11 +254,7 @@ pub(super) struct Landed {
     pub position: Option<u64>,
 }
 
-pub(super) struct KvEntry {
-    pub revision: u64,
-    // None is a delete or purge marker, not a never-written key.
-    pub value: Option<Vec<u8>>,
-}
+pub(super) use crate::hub_transport::KvEntry;
 
 pub(super) trait Transport {
     fn log_entry(
@@ -269,6 +265,11 @@ pub(super) trait Transport {
     fn log_head(&self, deadline: Instant)
         -> impl Future<Output = Result<u64, HandlerError>> + Send;
     fn kv_entry(
+        &self,
+        key: &str,
+        deadline: Instant,
+    ) -> impl Future<Output = Result<Option<KvEntry>, HandlerError>> + Send;
+    fn kv_fence_entry(
         &self,
         key: &str,
         deadline: Instant,
@@ -304,6 +305,14 @@ impl Transport for Session {
             value: (entry.operation == async_nats::jetstream::kv::Operation::Put)
                 .then(|| entry.value.to_vec()),
         }))
+    }
+
+    async fn kv_fence_entry(
+        &self,
+        key: &str,
+        deadline: Instant,
+    ) -> Result<Option<KvEntry>, HandlerError> {
+        self.kv_fence_entry(key, deadline).await
     }
 
     async fn send(
@@ -358,6 +367,17 @@ impl Transport for Hub {
         deadline: Instant,
     ) -> Result<Option<KvEntry>, HandlerError> {
         Transport::kv_entry(&self.session(deadline).await?, key, deadline).await
+    }
+
+    async fn kv_fence_entry(
+        &self,
+        key: &str,
+        deadline: Instant,
+    ) -> Result<Option<KvEntry>, HandlerError> {
+        self.session(deadline)
+            .await?
+            .kv_fence_entry(key, deadline)
+            .await
     }
 
     async fn send(
@@ -1204,7 +1224,7 @@ impl<T: Transport, U: Trust> Writer<'_, T, U> {
         }
         let current = self
             .transport
-            .kv_entry(&write.key, deadline)
+            .kv_fence_entry(&write.key, deadline)
             .await
             .map_err(|e| during_settlement(e, op_id))?;
         let delete = write.value.is_empty();

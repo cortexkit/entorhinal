@@ -121,7 +121,7 @@ trait Backend: Send + Sync {
     async fn applied(&self, deadline: Instant) -> Result<u64, HandlerError>;
     async fn writer_episode(&self, deadline: Instant) -> Result<u64, HandlerError>;
     async fn log_head(&self, deadline: Instant) -> Result<u64, HandlerError>;
-    async fn kv_entry(
+    async fn kv_fence_entry(
         &self,
         key: &str,
         deadline: Instant,
@@ -180,12 +180,12 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Backend for IdentityLog<
     async fn log_head(&self, deadline: Instant) -> Result<u64, HandlerError> {
         self.log_head(deadline).await
     }
-    async fn kv_entry(
+    async fn kv_fence_entry(
         &self,
         key: &str,
         deadline: Instant,
     ) -> Result<Option<hub_write::KvEntry>, HandlerError> {
-        self.kv_entry(key, deadline).await
+        self.kv_fence_entry(key, deadline).await
     }
     async fn wait_through(&self, head: u64, deadline: Instant) -> Result<(), HandlerError> {
         crate::hub_identity_log::wait_for_applied(self, head, deadline).await

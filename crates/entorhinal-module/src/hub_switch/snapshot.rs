@@ -382,7 +382,7 @@ impl Seeds {
         deadline: Instant,
     ) -> Result<(), HandlerError> {
         for key in &self.keys {
-            let existing = log.kv_entry(key, deadline).await?;
+            let existing = log.kv_fence_entry(key, deadline).await?;
             if existing.is_some_and(|entry| entry.value.is_some()) {
                 continue;
             }
@@ -422,7 +422,7 @@ impl Seeds {
                 Err(error)
                     if error.code == "hub_write_superseded"
                         && log
-                            .kv_entry(key, deadline)
+                            .kv_fence_entry(key, deadline)
                             .await?
                             .is_some_and(|entry| entry.value.is_some()) => {}
                 Err(error) => return Err(error),

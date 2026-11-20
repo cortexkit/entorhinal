@@ -613,12 +613,12 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
         self.link.transport.log_head(deadline).await
     }
 
-    pub(super) async fn kv_entry(
+    pub(super) async fn kv_fence_entry(
         &self,
         key: &str,
         deadline: Instant,
     ) -> Result<Option<hub_write::KvEntry>, HandlerError> {
-        self.link.transport.kv_entry(key, deadline).await
+        self.link.transport.kv_fence_entry(key, deadline).await
     }
 
     pub(super) async fn writer_episode(&self, deadline: Instant) -> Result<u64, HandlerError> {

@@ -57,6 +57,9 @@ impl Transport for Positions {
     async fn kv_entry(&self, _: &str, _: Instant) -> Result<Option<KvEntry>, HandlerError> {
         unreachable!()
     }
+    async fn kv_fence_entry(&self, _: &str, _: Instant) -> Result<Option<KvEntry>, HandlerError> {
+        unreachable!()
+    }
     async fn send(
         &self,
         write: &HubAttemptWrite,

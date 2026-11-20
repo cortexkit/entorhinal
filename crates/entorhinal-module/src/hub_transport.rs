@@ -14,18 +14,21 @@ use std::{
 
 use async_nats::{
     connection::State,
-    header::{NATS_EXPECTED_LAST_SEQUENCE, NATS_EXPECTED_LAST_SUBJECT_SEQUENCE, NATS_MESSAGE_ID},
+    header::{
+        NATS_EXPECTED_LAST_SEQUENCE, NATS_EXPECTED_LAST_SUBJECT_SEQUENCE, NATS_MARKER_REASON,
+        NATS_MESSAGE_ID,
+    },
     jetstream::{
         self,
         consumer::{push, DeliverPolicy},
         context::PublishErrorKind,
         kv,
-        stream::DirectGetErrorKind,
+        stream::{DirectGetErrorKind, LastRawMessageErrorKind},
     },
     HeaderMap, HeaderValue,
 };
 use cortexkit_bus_client::{BusClient, BusClientOptions, HubClient};
-use cortexkit_bus_naming::federation::BoxId;
+use cortexkit_bus_naming::federation::{BoxId, RESIDENCE_STREAM};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tokio::{
@@ -73,6 +76,12 @@ const MAX_KV_BYTES: i64 = 64 * 1024 * 1024;
 pub(super) enum KvDelivery {
     Empty,
     Entry(kv::Entry),
+}
+
+pub(super) struct KvEntry {
+    pub revision: u64,
+    // None is a delete or purge marker, not a never-written key.
+    pub value: Option<Vec<u8>>,
 }
 
 pub(super) fn check_kv_size(key: &str, len: usize) -> Result<(), HandlerError> {
@@ -538,6 +547,46 @@ impl Session {
         .await
     }
 
+    pub(super) async fn kv_fence_entry(
+        &self,
+        key: &str,
+        deadline: Instant,
+    ) -> Result<Option<KvEntry>, HandlerError> {
+        self.confirm_hub(deadline, async {
+            if !valid_kv_key(key) {
+                return Err(Failure::code("kv_fence_entry:InvalidKey"));
+            }
+            let stream = self
+                .js
+                .get_stream_no_info(RESIDENCE_STREAM)
+                .await
+                .map_err(|error| Failure::kind("kv_stream", error.kind()))?;
+            // Stream MSG.GET goes to the leader. A replica serving DIRECT.GET
+            // might still see the predecessor of a write that already landed.
+            let subject = format!("$KV.{BUCKET}.{key}");
+            match stream.get_last_raw_message_by_subject(&subject).await {
+                Ok(message) => {
+                    let deleted = match message.headers.get("KV-Operation") {
+                        Some(op) => matches!(op.as_str(), "DEL" | "PURGE"),
+                        None => message
+                            .headers
+                            .get(NATS_MARKER_REASON)
+                            .is_some_and(|reason| {
+                                matches!(reason.as_str(), "MaxAge" | "Purge" | "Remove")
+                            }),
+                    };
+                    Ok(Some(KvEntry {
+                        revision: message.sequence,
+                        value: (!deleted).then(|| message.payload.to_vec()),
+                    }))
+                }
+                Err(error) if error.kind() == LastRawMessageErrorKind::NoMessageFound => Ok(None),
+                Err(error) => Err(Failure::kind("kv_fence_entry", error.kind())),
+            }
+        })
+        .await
+    }
+
     pub(super) async fn join_keys(
         &self,
         prefix: &str,
@@ -584,12 +633,7 @@ impl Session {
         fenced_renewal: bool,
     ) -> Result<u64, HandlerError> {
         check_kv_size(key, bytes.len())?;
-        if !key.split('.').all(|token| {
-            !token.is_empty()
-                && token
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || b"-/_=".contains(&byte))
-        }) {
+        if !valid_kv_key(key) {
             return Err(HandlerError::new("invalid_params", "invalid hub KV key"));
         }
         let mut headers = HeaderMap::new();
@@ -742,6 +786,15 @@ impl Session {
             }
         }
     }
+}
+
+fn valid_kv_key(key: &str) -> bool {
+    key.split('.').all(|token| {
+        !token.is_empty()
+            && token
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-/_=".contains(&byte))
+    })
 }
 
 pub(super) fn unsettled(op_id: &str) -> HandlerError {

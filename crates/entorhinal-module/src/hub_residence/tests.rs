@@ -59,7 +59,7 @@ impl Backend for TestBackend {
     async fn wait_through(&self, _: u64, _: Instant) -> Result<(), HandlerError> {
         Ok(())
     }
-    async fn kv_entry(
+    async fn kv_fence_entry(
         &self,
         _: &str,
         _: Instant,

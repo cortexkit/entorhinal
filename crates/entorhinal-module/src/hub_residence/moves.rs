@@ -142,7 +142,7 @@ impl Residence {
                     false
                 } else if let Some(bytes) = self
                     .backend
-                    .kv_entry(&residence, deadline)
+                    .kv_fence_entry(&residence, deadline)
                     .await?
                     .and_then(|row| row.value)
                 {
@@ -236,7 +236,7 @@ impl Residence {
         let deadline = Instant::now() + BUDGET;
         let bytes = self
             .backend
-            .kv_entry(&key, deadline)
+            .kv_fence_entry(&key, deadline)
             .await?
             .and_then(|row| row.value)
             .ok_or_else(moves::conflict)?;
