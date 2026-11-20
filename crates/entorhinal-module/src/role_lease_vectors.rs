@@ -211,8 +211,10 @@ async fn served_role_lease_v1_non_hub_records_match_published_files() {
     let m = json!({"kind":"reserved","moduleId":"magic-context"});
     let mut disabled = Vec::new();
 
-    // Capture the renewal only after the first notice is acknowledged and
-    // the driver has consumed the result of its independent first SQL pass.
+    // Capture the renewal only after the first notice is acknowledged and the
+    // lease task (which reads its local role view on its own schedule, apart
+    // from the notice) has finished its first SQL pass; advancing time before
+    // that would race the pass's deadline.
     for (role, route, principal) in [(CONNECTOR, plexus, &p), (GLOBAL, mc, &m)] {
         let pass = handler.role_leases.local_pass_complete.notified();
         tokio::pin!(pass);
