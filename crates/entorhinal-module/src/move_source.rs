@@ -57,6 +57,8 @@ struct Progress {
     seal_state: Option<SealState>,
     #[serde(default)]
     handoff_state: Option<HandoffState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    release_holder_box: Option<String>,
     #[serde(default)]
     enforced: BTreeMap<String, bool>,
     #[serde(default)]
@@ -1591,6 +1593,19 @@ impl Source {
             .await
             .map_err(|e| Failure::door("cut.handoff", e))?;
         if plan.source.handoff_state != Some(handoff.state) {
+            // The first handoff checkpoint must precede any participant release.
+            // An existing checkpoint without a box means omit it, even on an
+            // older row: the participant may already have accepted that request.
+            if plan.source.handoff_state.is_none() && plan.source.enforced.is_empty() {
+                plan.source.release_holder_box = if plan.hub_gen.is_some() {
+                    Some(plan.to.clone())
+                } else {
+                    let target = plan.to.clone();
+                    self.worker
+                        .sql(move |store| store.member_box(&target))
+                        .await?
+                };
+            }
             row.attempts = 0;
             plan.source.retry_at_ms = 0;
             plan.source.handoff_state = Some(handoff.state);
@@ -1625,6 +1640,12 @@ impl Source {
             }
             let request = self.request(&participant)?;
             let release = ReleaseRequest::new(request.refs, request.cut_id, plan.to.clone());
+            let release = match &plan.source.release_holder_box {
+                Some(box_id) => release
+                    .with_holder_box(box_id.clone())
+                    .map_err(|_| Failure::new("agent_data.release", "plan_malformed"))?,
+                None => release,
+            };
             let reply = self
                 .client(&participant.module_id)
                 .await?
@@ -1683,13 +1704,14 @@ mod tests {
         HealthGauges,
     };
     use async_trait::async_trait;
-    use entorhinal_core::{move_record::MoveRef, RegistryStore};
+    use entorhinal_core::{move_record::MoveRef, remote_apply::RemoteEntry, RegistryStore};
     use std::sync::{Arc, Mutex, OnceLock};
     use subc_client_rs::{CatalogList, SupervisorListResponse};
 
     const CUT: &str = "00112233445566778899aabbccddeeff";
     const FROM: &str = "01010101010101010101010101010101";
     const TO: &str = "02020202020202020202020202020202";
+    const TO_BOX: &str = "abcdef0123456789abcdef0123456789";
     const AGENT: &str = "agent_0123456789abcdef";
     type Slot = Arc<Mutex<Option<RegistryStore>>>;
 
@@ -1736,16 +1758,16 @@ mod tests {
     }
     struct ReleaseGate {
         enabled: std::sync::atomic::AtomicBool,
+        after_apply: std::sync::atomic::AtomicBool,
         entered: tokio::sync::Semaphore,
-        resume: tokio::sync::Semaphore,
     }
 
     impl Default for ReleaseGate {
         fn default() -> Self {
             Self {
                 enabled: std::sync::atomic::AtomicBool::new(false),
+                after_apply: std::sync::atomic::AtomicBool::new(false),
                 entered: tokio::sync::Semaphore::new(0),
-                resume: tokio::sync::Semaphore::new(0),
             }
         }
     }
@@ -1759,15 +1781,18 @@ mod tests {
     impl LogTransport for Peer {
         async fn call(&self, method: &str, params: Value) -> Result<Vec<u8>, TransportError> {
             self.trace.call(method);
-            if method == "agent_data.release" {
-                if let Some(gate) = &self.release_gate {
-                    if gate.enabled.load(Ordering::Relaxed) {
-                        gate.entered.add_permits(1);
-                        gate.resume.acquire().await.unwrap().forget();
-                    }
-                }
+            let gate = self.release_gate.as_ref().filter(|gate| {
+                method == "agent_data.release" && gate.enabled.load(Ordering::Relaxed)
+            });
+            if let Some(gate) = gate.filter(|gate| !gate.after_apply.load(Ordering::Relaxed)) {
+                gate.entered.add_permits(1);
+                std::future::pending::<()>().await;
             }
             let result = self.participant.call(method, params).await;
+            if let Some(gate) = gate {
+                gate.entered.add_permits(1);
+                std::future::pending::<()>().await;
+            }
             self.trace.participant_called.notify_one();
             result
         }
@@ -2061,6 +2086,45 @@ mod tests {
                 TO,
             );
         }
+        fn set_member_box(&self, position: i64, box_id: &str) {
+            self.slot
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .apply_remote_entry(
+                    &RemoteEntry {
+                        position,
+                        entry_id: format!("{position:032x}"),
+                        author: TO.into(),
+                        signer: "02".repeat(16),
+                        key_id: "03".repeat(16),
+                        envelope_version: 1,
+                        kind: "change".into(),
+                        entry: serde_json::to_vec(
+                            &json!({"op":"member.set_box","author":TO,"box_id":box_id}),
+                        )
+                        .unwrap(),
+                    },
+                    None,
+                )
+                .unwrap();
+        }
+        fn activate(&self) {
+            self.claim();
+            self.state(State::Activated, TO);
+            self.cover_handoff();
+        }
+        fn cover_handoff(&self) {
+            self.door.script(
+                "cut.handoff",
+                DoorEffect::Handoff(crate::door_client::HandoffReply {
+                    state: HandoffState::Released,
+                    session_ref: None,
+                    code: None,
+                }),
+            );
+        }
         async fn step(&self, source: &mut Source) -> Option<Duration> {
             let delay = source.tick().await.unwrap();
             if let Some(delay) = delay {
@@ -2202,6 +2266,134 @@ mod tests {
             .iter()
             .any(|e| e.op == "cut.handoff" && e.record_version >= 2));
         assert_eq!(f.worker.health.moves_open.load(Ordering::Relaxed), 0);
+    }
+
+    fn release_calls(participant: &FakeParticipant) -> Vec<Value> {
+        participant
+            .wire_calls()
+            .into_iter()
+            .filter(|(method, _)| method == "agent_data.release")
+            .map(|(_, params)| params)
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn source_release_holder_box_carries_target_box_off_hub() {
+        let f = Fixture::new();
+        f.set_member_box(1, TO_BOX);
+        let mut source = f.source();
+        f.published(&mut source).await;
+        f.activate();
+        f.until(&mut source, Step::Released).await;
+
+        for participant in &f.participants {
+            let calls = release_calls(participant);
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0]["holder"], TO);
+            assert_eq!(calls[0]["holderBox"], TO_BOX);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn source_release_holder_box_carries_target_box_on_hub() {
+        let f = Fixture::new();
+        f.set_member_box(1, TO_BOX);
+        let mut source = f.source();
+        f.published(&mut source).await;
+        f.cover_handoff();
+
+        // Feed the verified hub activation directly. Only writing the final
+        // hub record needs a hub connection; the participant calls do not.
+        let mut row = f.row();
+        let mut plan = f.plan();
+        row.step = Step::Releasing;
+        plan.hub_gen = Some(1);
+        plan.source.sealed_cut = Some(crate::door_client::SealedCut {
+            manifest_sha256: "manifest".into(),
+            sealed_key: "sealed-key".into(),
+        });
+        let mut body = plan
+            .hub_record(CUT)
+            .unwrap_or_else(|e| panic!("{}", e.code));
+        body.state = HubState::Activated;
+        let seen = SeenMove {
+            body,
+            revision: 2,
+            writer: TO.into(),
+            writer_ep: 1,
+        };
+        let Err(error) = source
+            .release(
+                &mut row,
+                &mut plan,
+                Some((seen.body.participant_plan(), seen.revision)),
+                Some(&seen),
+            )
+            .await
+        else {
+            panic!("final record write needs the hub");
+        };
+        assert_eq!(error.code, "hub_not_ready");
+        for participant in &f.participants {
+            let calls = release_calls(participant);
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0]["holder"], TO);
+            assert_eq!(calls[0]["holderBox"], TO);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn source_release_holder_box_survives_restart_before_reply() {
+        for (initial_box, legacy) in [(Some(TO_BOX), false), (None, false), (Some(TO_BOX), true)] {
+            let f = Fixture::new();
+            let position = if let Some(box_id) = initial_box {
+                f.set_member_box(1, box_id);
+                2
+            } else {
+                1
+            };
+            let mut source = f.source();
+            f.published(&mut source).await;
+            f.activate();
+            if legacy {
+                // An old driver could send release after a pending handoff
+                // checkpoint if the subsequent door status reported coverage.
+                f.edit(|row| {
+                    row.step = Step::Releasing;
+                    row.plan["_source"]["handoff_state"] = json!(HandoffState::InProgress);
+                });
+            }
+
+            f.release_gate.after_apply.store(true, Ordering::Relaxed);
+            f.release_gate.enabled.store(true, Ordering::Relaxed);
+            let task = tokio::spawn(async move { source.tick().await });
+            f.release_gate.entered.acquire().await.unwrap().forget();
+            let participant = &f.participants[1];
+            let first = release_calls(participant);
+            assert_eq!(first.len(), 1);
+            assert_eq!(participant.tombstones().len(), 1);
+            let row = f.row();
+            assert!(row.plan["_source"]["enforced"].get("b").is_none());
+            if let Some(box_id) = initial_box.filter(|_| !legacy) {
+                assert_eq!(first[0]["holderBox"], box_id);
+                assert_eq!(row.plan["_source"]["release_holder_box"], box_id);
+            } else {
+                assert!(first[0].get("holderBox").is_none());
+                assert!(row.plan["_source"].get("release_holder_box").is_none());
+            }
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            f.release_gate.enabled.store(false, Ordering::Relaxed);
+
+            f.set_member_box(position, "fedcba9876543210fedcba9876543210");
+            let mut restarted = f.source();
+            f.until(&mut restarted, Step::Released).await;
+            assert_eq!(release_calls(participant), vec![first[0].clone(); 2]);
+            assert_eq!(
+                release_calls(&f.participants[2])[0].get("holderBox"),
+                first[0].get("holderBox")
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]
