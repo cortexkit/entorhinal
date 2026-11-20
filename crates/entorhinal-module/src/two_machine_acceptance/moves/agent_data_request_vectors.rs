@@ -8,6 +8,7 @@ const SESSION: &str = "session-example-001";
 const PROJECT_ROOT: &str = "/workspace/agent-data-example";
 const INCARNATION: &str = "0123456789abcdef";
 const KIND: &str = "opencode-session";
+const RECEIVER_BOX: &str = "abcdef0123456789abcdef0123456789";
 
 // The deprecated generator is needed to publish requests for stored legacy refs.
 #[allow(deprecated)]
@@ -71,8 +72,29 @@ async fn registered_session(machine: &Machine, reference: &str) -> Vec<String> {
     vec![registration, lookup]
 }
 
-async fn capture(reference: &str, abort: bool) -> Vec<String> {
+async fn capture(reference: &str, abort: bool, receiver_box: Option<&str>) -> Vec<String> {
     let mut pair = Pair::new(&[]).await;
+    if let Some(box_id) = receiver_box {
+        pair.a
+            .store()
+            .apply_remote_entry(
+                &entorhinal_core::remote_apply::RemoteEntry {
+                    position: 1,
+                    entry_id: "01".repeat(16),
+                    author: B.into(),
+                    signer: "02".repeat(16),
+                    key_id: "03".repeat(16),
+                    envelope_version: 1,
+                    kind: "change".into(),
+                    entry: serde_json::to_vec(
+                        &json!({"op":"member.set_box","author":B,"box_id":box_id}),
+                    )
+                    .unwrap(),
+                },
+                None,
+            )
+            .unwrap();
+    }
     let mut daemons = Vec::new();
     let mut wires = Vec::new();
     for (source, node) in [(true, &mut pair.a), (false, &mut pair.b)] {
@@ -169,6 +191,13 @@ async fn capture(reference: &str, abort: bool) -> Vec<String> {
             if !matches!(*op, "describe" | "busy") {
                 assert_eq!(request["params"]["cutId"], cut);
             }
+            if *op == "release" {
+                assert_eq!(request["params"]["holder"], B);
+                assert_eq!(
+                    request["params"].get("holderBox"),
+                    receiver_box.map(|id| json!(id)).as_ref()
+                );
+            }
             let request = String::from_utf8(bytes)
                 .unwrap()
                 .replace(&cut, normalized_cut);
@@ -219,11 +248,19 @@ fn served_vectors_agent_data_requests_v1() {
 async fn served_vectors_agent_data_requests_probe() {
     let mut sums = String::new();
     for (name, reference) in session_refs() {
-        let mut records = capture(&reference, false).await;
-        records.extend(capture(&reference, true).await);
+        let mut records = capture(&reference, false, None).await;
+        let aborted = capture(&reference, true, None).await;
+        records.extend(aborted.iter().cloned());
         let bytes = format!("[\n{}\n]\n", records.join(",\n"));
         publish(name, bytes.as_bytes());
         sums.push_str(&format!("{:x}  {name}\n", Sha256::digest(bytes.as_bytes())));
+        if name == "new-format.json" {
+            // Keep the two original samples and their published hashes unchanged.
+            let mut records = capture(&reference, false, Some(RECEIVER_BOX)).await;
+            records.extend(aborted);
+            let bytes = format!("[\n{}\n]\n", records.join(",\n"));
+            publish("with-holder-box.json", bytes.as_bytes());
+        }
     }
     publish("SHA256SUMS", sums.as_bytes());
 }
@@ -234,6 +271,9 @@ fn publish(name: &str, bytes: &[u8]) {
         .join(DIRECTORY)
         .join(name);
     if std::env::var("ENTO_WRITE_SERVED_VECTORS").as_deref() == Ok("1") {
+        if std::fs::read(&path).is_ok_and(|existing| existing == bytes) {
+            return;
+        }
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, bytes).unwrap();
         println!("wrote {DIRECTORY}/{name}");

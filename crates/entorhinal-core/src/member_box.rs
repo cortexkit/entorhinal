@@ -93,6 +93,11 @@ pub(crate) fn own_row(conn: &Connection) -> rusqlite::Result<Option<MemberBox>> 
 }
 
 impl RegistryStore {
+    /// Look up the box recorded for a member's shared-log author.
+    pub fn member_box(&self, author: &str) -> Result<Option<String>, RegistryError> {
+        self.read(|conn| lookup(conn, Some(author)))
+    }
+
     pub fn own_member_box(&self) -> Result<Option<String>, RegistryError> {
         Ok(self.read(own_row)?.map(|row| row.box_id))
     }
