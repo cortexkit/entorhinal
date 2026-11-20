@@ -4,7 +4,7 @@ async fn stop(node: &EpochNode) {
     let tail = node
         .node
         .handler
-        .catch_up_task
+        .hub_tail_task
         .lock()
         .unwrap()
         .take()
@@ -212,14 +212,17 @@ async fn hub_join_wiped_removed_box_discovers_closure_and_publishes_its_new_epis
     let body = read_body(&rig, &request).await;
     assert_ne!(body["request_id"], stale);
     assert_eq!(body["after_removal_id"], "600:permanent:12");
-    assert_eq!(wiped.node.log.applied_sequence().unwrap(), 0);
+    assert_eq!(
+        wiped.node.log.applied_sequence(deadline()).await.unwrap(),
+        0
+    );
     a.controller.joins(deadline()).await.unwrap();
     assert!(register(&rig).await["recipients"]
         .as_array()
         .unwrap()
         .contains(&json!(B)));
     assert_eq!(membership_records(&rig, "member.key", B).await.len(), 1);
-    assert!(wiped.node.log.writer_episode().is_err());
+    assert!(wiped.node.log.writer_episode(deadline()).await.is_err());
     let admitted = membership_records(&rig, "member.admitted", B).await;
     assert_eq!(admitted.len(), 1);
     assert_eq!(admitted[0].2["request_id"], body["request_id"]);
@@ -242,7 +245,7 @@ async fn hub_join_wiped_removed_box_discovers_closure_and_publishes_its_new_epis
     );
     let _watch = wiped.watch();
     within(async {
-        while wiped.node.log.writer_episode().ok() != Some(1) {
+        while wiped.node.log.writer_episode(deadline()).await.ok() != Some(1) {
             sleep(Duration::from_millis(10)).await;
         }
     })
@@ -302,7 +305,8 @@ async fn hub_join_wiped_paired_box_imports_256_epochs_from_one_manifest() {
     a.vault.state.lock().unwrap().held.extend(&epochs);
     a.node
         .log
-        .store
+        .sql
+        .test_store()
         .record_hub_held_epochs(
             entorhinal_core::hub_store::HubEpochSource::Join("all-epochs"),
             &epochs,
@@ -423,7 +427,7 @@ async fn hub_join_two_rotations_before_import_trigger_a_fresh_request() {
     wiped.controller.joins(deadline()).await.unwrap();
     assert_eq!(wiped.vault.state.lock().unwrap().joins_imported, [vec![1]]);
     assert!(!wiped.vault.state.lock().unwrap().held.contains(&2));
-    assert!(wiped.node.log.applied_sequence().unwrap() < middle);
+    assert!(wiped.node.log.applied_sequence(deadline()).await.unwrap() < middle);
     assert_ne!(
         first["request_id"],
         read_body(&rig, &key).await["request_id"]

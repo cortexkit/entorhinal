@@ -13,10 +13,7 @@ use std::{
 
 use async_trait::async_trait;
 use cortexkit_claustrum_client::{CredentialResolver, PublicKeyAlgorithm};
-use entorhinal_core::{
-    hub_store::{HubAnchor, MEMBERSHIP_OPS},
-    RegistryStore,
-};
+use entorhinal_core::hub_store::{HubAnchor, MEMBERSHIP_OPS};
 use futures_util::{
     stream::{self, BoxStream},
     StreamExt,
@@ -651,7 +648,7 @@ struct View {
 
 pub(super) struct Membership<T> {
     transport: Arc<T>,
-    store: RegistryStore,
+    sql: crate::hub_write::HubSql,
     source: AnchorSource,
     scan: Mutex<Scan>,
     view: RwLock<View>,
@@ -659,10 +656,14 @@ pub(super) struct Membership<T> {
 }
 
 impl<T: Transport> Membership<T> {
-    pub(super) fn new(transport: Arc<T>, store: RegistryStore, source: AnchorSource) -> Self {
+    pub(super) fn new(
+        transport: Arc<T>,
+        sql: crate::hub_write::HubSql,
+        source: AnchorSource,
+    ) -> Self {
         Self {
             transport,
-            store,
+            sql,
             source,
             scan: Mutex::default(),
             view: RwLock::default(),
@@ -744,10 +745,12 @@ impl<T: Transport> Membership<T> {
             .await
             .map_err(|_| HandlerError::new("hub_unavailable", "membership discovery busy"))?;
         if !scan.loaded {
-            let store = self.store.clone();
-            let saved = tokio::task::spawn_blocking(move || store.hub_membership_scan())
-                .await
-                .map_err(|error| HandlerError::new("storage_error", error.to_string()))??;
+            let saved = self
+                .sql
+                .run(deadline, "hub_membership_scan", |store| {
+                    Ok(store.hub_membership_scan()?)
+                })
+                .await?;
             scan.through = saved.through;
             for (sequence, bytes) in saved.candidates {
                 if let Some(candidate) = Candidate::parse(&bytes) {
@@ -784,12 +787,11 @@ impl<T: Transport> Membership<T> {
             }
             .await;
             if through > start {
-                let store = self.store.clone();
-                tokio::task::spawn_blocking(move || {
-                    store.checkpoint_hub_membership_scan(through, &raw)
-                })
-                .await
-                .map_err(|error| HandlerError::new("storage_error", error.to_string()))??;
+                self.sql
+                    .run(deadline, "checkpoint_hub_membership_scan", move |store| {
+                        Ok(store.checkpoint_hub_membership_scan(through, &raw)?)
+                    })
+                    .await?;
                 scan.through = through;
                 scan.candidates.extend(parsed);
             }
@@ -804,15 +806,18 @@ impl<T: Transport> Membership<T> {
             }
             current
         };
-        let result = resolve(
-            &scan.candidates,
-            &self.store.hub_anchors()?,
-            &current,
-            through,
-        );
+        let anchors = self
+            .sql
+            .run(deadline, "hub_anchors", |store| Ok(store.hub_anchors()?))
+            .await?;
+        let result = resolve(&scan.candidates, &anchors, &current, through);
         match result {
             Ok((proof, scoped)) => {
-                self.store.persist_hub_anchors(&scoped)?;
+                self.sql
+                    .run(deadline, "persist_hub_anchors", move |store| {
+                        Ok(store.persist_hub_anchors(&scoped)?)
+                    })
+                    .await?;
                 let mut view = self.view.write().unwrap();
                 let changed = view.current != current || view.proof != proof;
                 *view = View {

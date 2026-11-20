@@ -144,13 +144,13 @@ impl ProjectsHandler {
             result => result?,
         };
         let target = if let Some(hub) = &hub {
-            if hub.move_member(&peer)?.is_none() {
+            if hub.move_member(&peer).await?.is_none() {
                 return Err(HandlerError::new(
                     "unknown_member",
                     "target is not a current fleet member",
                 ));
             }
-            hub.watched_node(&peer)?
+            hub.watched_node(&peer).await?
         } else {
             None
         };
@@ -470,7 +470,7 @@ impl ProjectsHandler {
         hub: Option<&crate::hub_residence::Residence>,
     ) -> Result<(i64, String), HandlerError> {
         if let Some(hub) = hub {
-            return hub.move_origin(agent_id);
+            return hub.move_origin(agent_id).await;
         }
         let refresh = self.wait_claim_refresh().await;
         let id = agent_id.to_owned();

@@ -10,10 +10,7 @@ use std::{
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use entorhinal_core::{
-    hub_store::{HubEpochSource, HubOwnMint},
-    RegistryStore,
-};
+use entorhinal_core::hub_store::{HubEpochSource, HubOwnMint};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::{
@@ -315,7 +312,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
     async fn caught_up(&self, deadline: Instant) -> Result<u64, HandlerError> {
         let head = self.log.log_head(deadline).await?;
         wait_for_applied(&self.log, head, deadline).await?;
-        self.log.applied_sequence()
+        self.log.applied_sequence(deadline).await
     }
 
     async fn append_missing(
@@ -449,7 +446,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
         event: Option<(&DropBox, &str)>,
         deadline: Instant,
     ) -> Result<(), HandlerError> {
-        self.log.writer_episode()?;
+        self.log.writer_episode(deadline).await?;
         let applied = self.caught_up(deadline).await?;
         let own_box = &self.reader.own_box;
         let state = previous.map(|previous| &previous.epoch);
@@ -602,12 +599,17 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
             Ok(revision) => revision,
             Err(error) => return self.settle_lost_mint(&mint, error, deadline).await,
         };
-        self.reader.store.record_hub_own_mint(&HubOwnMint {
-            epoch: e,
-            mint_id: mint.mint_id.clone(),
-            committed: false,
-            revision,
-        })?;
+        self.reader
+            .record_own_mint(
+                HubOwnMint {
+                    epoch: e,
+                    mint_id: mint.mint_id.clone(),
+                    committed: false,
+                    revision,
+                },
+                deadline,
+            )
+            .await?;
         if let Some(old) =
             previous.filter(|old| old.epoch.state == State::Pending && old.epoch.minter == *own_box)
         {
@@ -671,8 +673,9 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
                     self.reader.ensure(&current, deadline).await?;
                     if let Some(attempt) = self
                         .reader
-                        .store
-                        .hub_attempt(&format!("epoch.pending:{}", mint.mint_id))?
+                        .sql
+                        .attempt(&format!("epoch.pending:{}", mint.mint_id), deadline)
+                        .await?
                     {
                         let own = UnverifiedRecord::parse(KEY, &attempt.write.value)?;
                         let own: Epoch = serde_json::from_value(
@@ -709,8 +712,9 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
     ) -> Result<(), HandlerError> {
         let Some(attempt) = self
             .reader
-            .store
-            .hub_attempt(&format!("epoch.pending:{}", mint.mint_id))?
+            .sql
+            .attempt(&format!("epoch.pending:{}", mint.mint_id), deadline)
+            .await?
         else {
             return Ok(());
         };
@@ -763,7 +767,11 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
         deadline: Instant,
     ) -> Result<(), HandlerError> {
         let status = self.reader.status(deadline).await?;
-        let saved = self.reader.store.hub_own_mint()?;
+        let saved = self
+            .reader
+            .sql
+            .run(deadline, "hub_own_mint", |store| Ok(store.hub_own_mint()?))
+            .await?;
         let pending = status.pending.as_ref().cloned().or_else(|| {
             saved
                 .as_ref()
@@ -795,16 +803,20 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
                     .map_err(|_| busy())??;
                 let _ = self.reader.status(deadline).await;
                 self.reader
-                    .store
-                    .record_hub_held_epochs(HubEpochSource::Mint(&mint.mint_id), &[mint.epoch])?;
-                self.reader
-                    .store
-                    .clear_hub_own_mint(mint.epoch, &mint.mint_id)?;
+                    .sql
+                    .run(deadline, "record_hub_held_epochs", move |store| {
+                        store.record_hub_held_epochs(
+                            HubEpochSource::Mint(&mint.mint_id),
+                            &[mint.epoch],
+                        )?;
+                        Ok(store.clear_hub_own_mint(mint.epoch, &mint.mint_id)?)
+                    })
+                    .await?;
                 return Ok(());
             }
         }
         let request_key = format!("epoch.pending:{}", mint.mint_id);
-        if let Some(attempt) = self.reader.store.hub_attempt(&request_key)? {
+        if let Some(attempt) = self.reader.sql.attempt(&request_key, deadline).await? {
             if attempt.outcome.is_none()
                 && attempt.write.expected == current.map_or(0, |entry| entry.revision)
             {
@@ -828,8 +840,11 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
         self.discard(&mint, deadline).await?;
         self.delete_wraps(&mint, deadline).await?;
         self.reader
-            .store
-            .clear_hub_own_mint(mint.epoch, &mint.mint_id)?;
+            .sql
+            .run(deadline, "clear_hub_own_mint", move |store| {
+                Ok(store.clear_hub_own_mint(mint.epoch, &mint.mint_id)?)
+            })
+            .await?;
         Ok(())
     }
 
@@ -847,7 +862,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
             // this mint. Its absence does not stop observation of the epoch.
             if current.epoch.recipients.contains(&self.reader.own_box)
                 && (current.epoch.minter == self.reader.own_box
-                    || self.reader.store.hub_has_epoch(1)?)
+                    || self.reader.has_epoch(1, deadline).await?)
             {
                 if let Err(error) = self.reader.ensure(current, deadline).await {
                     if error.code != "epoch_key_unavailable" {
@@ -855,7 +870,9 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
                     }
                 }
             }
-            if current.epoch.minter == self.reader.own_box && self.log.writer_episode().is_ok() {
+            if current.epoch.minter == self.reader.own_box
+                && self.log.writer_episode(deadline).await.is_ok()
+            {
                 self.append_missing(current, deadline).await?;
             }
         }
@@ -874,7 +891,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
         else {
             return Ok(());
         };
-        self.log.writer_episode()?;
+        self.log.writer_episode(deadline).await?;
         self.reconcile(Some(&current), deadline).await?;
         match current.epoch.state {
             State::Pending => {
@@ -903,6 +920,9 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
         let mut anchors = self.reader.membership.changes();
         let mut joins = JoinQueue::default();
         loop {
+            if !self.reader.sql.available() {
+                return;
+            }
             let timer = observed.as_ref().and_then(Observation::deadline);
             let join = joins.next();
             let join_deadline = join.as_ref().map(|(_, job)| job.at);
@@ -981,15 +1001,23 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
             };
             if live && changed {
                 awaiting_writer_key = false;
-                match self.observe(Instant::now() + BUDGET).await {
+                let deadline = Instant::now() + BUDGET;
+                match self.observe(deadline).await {
                     Ok(Some(current)) => {
                         if observed
                             .as_ref()
                             .is_none_or(|watch| watch.revision != current.revision)
                         {
+                            let applied = if current.epoch.state != State::Pending
+                                && !current.epoch.removed.is_empty()
+                            {
+                                self.log.applied_sequence(deadline).await.ok()
+                            } else {
+                                None
+                            };
                             let needs_recovery = current.epoch.state == State::Pending
                                 || current.epoch.removed.iter().any(|removal| {
-                                    self.log.applied_sequence().is_ok_and(|applied| {
+                                    applied.is_some_and(|applied| {
                                         !self.reader.membership.removal_applied(
                                             &removal.box_id,
                                             current.epoch.e,
@@ -1119,7 +1147,7 @@ struct Observed {
 pub(super) struct EpochReader<T> {
     pub transport: Arc<T>,
     pub membership: Arc<Membership<T>>,
-    pub store: RegistryStore,
+    pub sql: hub_write::HubSql,
     pub vault: Arc<dyn EpochVault>,
     pub own_box: String,
     pub base: i64,
@@ -1135,7 +1163,7 @@ impl<T: Transport> EpochReader<T> {
     pub(super) fn new(
         transport: Arc<T>,
         membership: Arc<Membership<T>>,
-        store: RegistryStore,
+        sql: hub_write::HubSql,
         vault: Arc<dyn EpochVault>,
         own_box: String,
         base: i64,
@@ -1144,7 +1172,7 @@ impl<T: Transport> EpochReader<T> {
         Self {
             transport,
             membership,
-            store,
+            sql,
             vault,
             own_box,
             base,
@@ -1180,11 +1208,42 @@ impl<T: Transport> EpochReader<T> {
         result
     }
 
-    fn applied(&self) -> Result<u64, HandlerError> {
-        crate::hub_identity_log::hub_sequence(
-            self.base,
-            self.store.identity_log_status()?.last_applied_position,
-        )
+    async fn applied(&self, deadline: Instant) -> Result<u64, HandlerError> {
+        crate::hub_identity_log::applied_sequence(&self.sql, self.base, deadline).await
+    }
+
+    async fn has_epoch(&self, epoch: u64, deadline: Instant) -> Result<bool, HandlerError> {
+        self.sql
+            .run(deadline, "hub_has_epoch", move |store| {
+                Ok(store.hub_has_epoch(epoch)?)
+            })
+            .await
+    }
+
+    async fn holds_epoch(
+        &self,
+        epoch: u64,
+        mint: &str,
+        deadline: Instant,
+    ) -> Result<bool, HandlerError> {
+        let mint = mint.to_owned();
+        self.sql
+            .run(deadline, "hub_holds_epoch", move |store| {
+                Ok(store.hub_holds_epoch(epoch, &mint)?)
+            })
+            .await
+    }
+
+    async fn record_own_mint(
+        &self,
+        mint: HubOwnMint,
+        deadline: Instant,
+    ) -> Result<(), HandlerError> {
+        self.sql
+            .run(deadline, "record_hub_own_mint", move |store| {
+                Ok(store.record_hub_own_mint(&mint)?)
+            })
+            .await
     }
 
     async fn read(&self, deadline: Instant) -> Result<Option<Observed>, HandlerError> {
@@ -1215,7 +1274,7 @@ impl<T: Transport> EpochReader<T> {
     }
 
     async fn read_record(&self, deadline: Instant) -> Result<Option<Observed>, HandlerError> {
-        let previous = self.store.hub_kv_cached(KEY)?;
+        let previous = self.sql.cached(KEY, deadline).await?;
         let Some(entry) = self.transport.kv_entry(KEY, deadline).await? else {
             return if previous.is_none() {
                 Ok(None)
@@ -1267,7 +1326,7 @@ impl<T: Transport> EpochReader<T> {
                 .membership
                 .verify_kv(
                     UnverifiedRecord::parse(KEY, bytes)?,
-                    self.applied()?,
+                    self.applied(deadline).await?,
                     sight,
                     deadline,
                 )
@@ -1289,12 +1348,19 @@ impl<T: Transport> EpochReader<T> {
             {
                 return Err(invalid("invalid epoch transition"));
             }
-            self.store.record_hub_kv(
-                KEY,
-                entry.revision,
-                Some((bytes, Some(body))),
-                crate::unix_millis(),
-            )?;
+            let bytes = bytes.clone();
+            let body = body.clone();
+            let revision = entry.revision;
+            self.sql
+                .run(deadline, "record_hub_kv", move |store| {
+                    Ok(store.record_hub_kv(
+                        KEY,
+                        revision,
+                        Some((&bytes, Some(&body))),
+                        crate::unix_millis(),
+                    )?)
+                })
+                .await?;
             Ok(Some(Observed {
                 revision: entry.revision,
                 epoch,
@@ -1302,11 +1368,21 @@ impl<T: Transport> EpochReader<T> {
         }
         .await;
         if let Err(error) = &decoded {
+            let revision = entry.revision;
             match error.code.as_str() {
-                "writer_unknown" => self.store.hold_hub_kv(KEY, entry.revision)?,
+                "writer_unknown" => {
+                    self.sql
+                        .run(deadline, "hold_hub_kv", move |store| {
+                            Ok(store.hold_hub_kv(KEY, revision)?)
+                        })
+                        .await?
+                }
                 "record_invalid" | "signature_invalid" | "member_episode_invalid" => {
-                    self.store
-                        .record_hub_kv(KEY, entry.revision, None, crate::unix_millis())?;
+                    self.sql
+                        .run(deadline, "record_hub_kv", move |store| {
+                            Ok(store.record_hub_kv(KEY, revision, None, crate::unix_millis())?)
+                        })
+                        .await?;
                 }
                 _ => {}
             }
@@ -1317,7 +1393,7 @@ impl<T: Transport> EpochReader<T> {
     pub(super) async fn fence(&self, deadline: Instant) -> Result<u64, HandlerError> {
         let observed = self.read(deadline).await?.ok_or_else(unavailable)?;
         let (e, mint) = observed.epoch.committed_key().ok_or_else(unavailable)?;
-        if !self.store.hub_holds_epoch(e, mint)? {
+        if !self.holds_epoch(e, mint, deadline).await? {
             // A pending value has no new committed key to import. The named
             // base is usable only with previously recorded provenance.
             if observed.epoch.state != State::Committed {
@@ -1325,8 +1401,8 @@ impl<T: Transport> EpochReader<T> {
             }
             self.ensure(&observed, deadline).await?;
         }
-        self.store
-            .hub_holds_epoch(e, mint)?
+        self.holds_epoch(e, mint, deadline)
+            .await?
             .then_some(e)
             .ok_or_else(unavailable)
     }
@@ -1336,24 +1412,29 @@ impl<T: Transport> EpochReader<T> {
         epoch: u64,
         deadline: Instant,
     ) -> Result<(), HandlerError> {
-        if !self.store.hub_has_epoch(epoch)? {
+        if !self.has_epoch(epoch, deadline).await? {
             // A box without its first epoch needs a join wrap, not just the
             // latest mint's key.
-            if !self.store.hub_has_epoch(1)? {
+            if !self.has_epoch(1, deadline).await? {
                 return Err(unavailable());
             }
             self.fence(deadline).await?;
-            if !self.store.hub_has_epoch(epoch)? {
+            if !self.has_epoch(epoch, deadline).await? {
                 return Err(unavailable());
             }
         }
         Ok(())
     }
 
-    pub(super) fn admission_wrap_imported(&self, request_id: &str) -> Result<bool, HandlerError> {
+    pub(super) async fn admission_wrap_imported(
+        &self,
+        request_id: &str,
+        deadline: Instant,
+    ) -> Result<bool, HandlerError> {
         if self
-            .store
-            .hub_attempt(&format!("join.request:{request_id}"))?
+            .sql
+            .attempt(&format!("join.request:{request_id}"), deadline)
+            .await?
             .is_none()
         {
             // A wiped box can restore keys with a new request in the same episode.
@@ -1361,8 +1442,9 @@ impl<T: Transport> EpochReader<T> {
         }
         let key = format!("wrapjoin.{}.{request_id}", self.own_box);
         Ok(self
-            .store
-            .hub_kv_cached(&key)?
+            .sql
+            .cached(&key, deadline)
+            .await?
             .is_some_and(|row| row.body.is_some()))
     }
 
@@ -1374,7 +1456,7 @@ impl<T: Transport> EpochReader<T> {
         let _guard = timeout_at(deadline, self.importing.lock())
             .await
             .map_err(|_| busy())?;
-        if self.store.hub_holds_epoch(epoch.e, &epoch.mint_id)? {
+        if self.holds_epoch(epoch.e, &epoch.mint_id, deadline).await? {
             return Ok(());
         }
         if epoch.minter == self.own_box {
@@ -1382,12 +1464,16 @@ impl<T: Transport> EpochReader<T> {
                 .await
                 .map_err(|_| busy())??;
             let _ = self.status(deadline).await;
-            self.store.record_hub_own_mint(&HubOwnMint {
-                epoch: epoch.e,
-                mint_id: epoch.mint_id.clone(),
-                committed: true,
-                revision: observed.revision,
-            })?;
+            self.record_own_mint(
+                HubOwnMint {
+                    epoch: epoch.e,
+                    mint_id: epoch.mint_id.clone(),
+                    committed: true,
+                    revision: observed.revision,
+                },
+                deadline,
+            )
+            .await?;
         } else {
             let key = wrap_key(epoch.e, &epoch.mint_id, &self.own_box);
             let entry = self
@@ -1400,7 +1486,7 @@ impl<T: Transport> EpochReader<T> {
                 .membership
                 .verify_kv(
                     UnverifiedRecord::parse(&key, &entry)?,
-                    self.applied()?,
+                    self.applied(deadline).await?,
                     Sight::FirstOrAfterGap,
                     deadline,
                 )
@@ -1429,8 +1515,13 @@ impl<T: Transport> EpochReader<T> {
                 return Err(invalid("vault imported a different fleet epoch"));
             }
         }
-        self.store
-            .record_hub_held_epochs(HubEpochSource::Mint(&epoch.mint_id), &[epoch.e])?;
+        let e = epoch.e;
+        let mint_id = epoch.mint_id.clone();
+        self.sql
+            .run(deadline, "record_hub_held_epochs", move |store| {
+                Ok(store.record_hub_held_epochs(HubEpochSource::Mint(&mint_id), &[e])?)
+            })
+            .await?;
         Ok(())
     }
 }
@@ -1494,7 +1585,7 @@ mod tests {
         use cortexkit_claustrum_client::ClaustrumCredentialResolver;
 
         let (path, descriptor) = crate::tests::scratch_descriptor("epoch-anchor-arrives");
-        let store = RegistryStore::open(&descriptor).unwrap();
+        let store = entorhinal_core::RegistryStore::open(&descriptor).unwrap();
         store.apply_entry("agent.cutover", "{}", "test", None, |tx| {
             tx.execute("UPDATE identity_log_state SET state='enabled',hub_log_base=0,last_applied_position=0,last_seen_head=0", [])?;
             Ok(())
@@ -1542,9 +1633,11 @@ mod tests {
                 .push(crate::hub_membership::tests::anchor(C, &minter));
         }
         let transport = Arc::new(EpochOnly(bytes));
+        let slot = Arc::new(std::sync::Mutex::new(Some(store)));
+        let sql = hub_write::HubSql::new(&slot, Arc::default());
         let membership = Arc::new(Membership::new(
             transport.clone(),
-            store.clone(),
+            sql.clone(),
             crate::hub_membership::AnchorSource {
                 own_box: A.into(),
                 peers: roster.clone(),
@@ -1556,7 +1649,7 @@ mod tests {
         let reader = EpochReader::new(
             transport,
             membership.clone(),
-            store,
+            sql,
             own,
             A.into(),
             0,
@@ -1574,6 +1667,7 @@ mod tests {
         let second = reader.read(deadline).await;
         drop(reader);
         drop(membership);
+        drop(slot);
         let _ = std::fs::remove_dir_all(&path);
         (first, second)
     }

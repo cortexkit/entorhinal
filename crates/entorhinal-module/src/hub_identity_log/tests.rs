@@ -76,9 +76,10 @@ impl Transport for Positions {
     }
 }
 
-struct Scratch(PathBuf);
+struct Scratch(PathBuf, Arc<std::sync::Mutex<Option<RegistryStore>>>);
 impl Drop for Scratch {
     fn drop(&mut self) {
+        self.1.lock().unwrap().take();
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
@@ -109,9 +110,11 @@ fn tail_with(
     let peers = Arc::new(Roster(current_peers));
     let signer = Arc::new(ClaustrumCredentialResolver::with_target(keys.clone(), 0));
     let transport = Arc::new(Positions::default());
+    let slot = Arc::new(std::sync::Mutex::new(Some(store)));
+    let sql = HubSql::new(&slot, Arc::default());
     let membership = Arc::new(Membership::new(
         transport.clone(),
-        store.clone(),
+        sql.clone(),
         AnchorSource {
             own_box: own_box.into(),
             peers: peers.clone(),
@@ -119,7 +122,7 @@ fn tail_with(
         },
     ));
     (
-        Scratch(path),
+        Scratch(path, slot),
         Tail {
             link: Arc::new(Link {
                 transport,
@@ -128,7 +131,7 @@ fn tail_with(
                 vault: keys,
                 peers,
             }),
-            store,
+            sql,
             health: Arc::new(HealthGauges::default()),
             commits: Arc::new(Notify::new()),
             base,
@@ -206,7 +209,7 @@ async fn hub_reader_regression_lagging_tail_does_not_refuse_an_unlisted_member()
     Arc::get_mut(&mut lagging.link).unwrap().peers = peers.clone();
     lagging.membership = Arc::new(Membership::new(
         lagging.link.transport.clone(),
-        lagging.store.clone(),
+        lagging.sql.clone(),
         AnchorSource {
             own_box: B.into(),
             peers: peers.clone(),
@@ -242,7 +245,7 @@ async fn hub_reader_regression_lagging_tail_does_not_refuse_an_unlisted_member()
     put(&lagging, &successor);
     let health = lagging.health.clone();
     Hub::new(crate::log_client::SubcConnector::default(), health.clone()).activate();
-    let store = lagging.store.clone();
+    let store = lagging.sql.test_store();
     let feed = test_tail_feed(health.clone(), 0, move |cursor| {
         assert_eq!(cursor, 0, "the held entry was skipped");
         stream::iter([
@@ -356,7 +359,7 @@ async fn hub_reader_regression_member_key_publication_does_not_delay_apply() {
     });
     let next = signed(&tail, 2, 2, B, member(B)).await;
     let transport = tail.link.transport.clone();
-    let store = tail.store.clone();
+    let store = tail.sql.test_store();
     let task = tokio::spawn(tail.run(feed));
     tokio::time::timeout(Duration::from_secs(5), publishing)
         .await
@@ -397,7 +400,7 @@ async fn hub_reader_regression_membership_resumes_scan_from_the_durable_cursor()
     put(&tail, &signed(&tail, 3, 3, A, member(A)).await);
     let restarted = Membership::new(
         tail.link.transport.clone(),
-        tail.store.clone(),
+        tail.sql.clone(),
         AnchorSource {
             own_box: A.into(),
             peers: Arc::new(Roster(vec![anchor(C, &c)])),
@@ -414,7 +417,7 @@ async fn hub_reader_regression_membership_resumes_scan_from_the_durable_cursor()
 async fn hub_identity_log_multipart_apply_is_atomic_and_redelivery_is_inert() {
     let (_dir, mut tail) = tail(17).await;
     let first = signed(&tail, 1, 1, A, part(1, 2)).await;
-    let generation = tail.store.generation().unwrap();
+    let generation = tail.sql.test_store().generation().unwrap();
     assert!(!tail
         .apply(LogDelivery {
             sequence: 1,
@@ -430,15 +433,17 @@ async fn hub_identity_log_multipart_apply_is_atomic_and_redelivery_is_inert() {
         .await
         .unwrap());
     assert_eq!(
-        tail.store
+        tail.sql
+            .test_store()
             .identity_log_status()
             .unwrap()
             .last_applied_position,
         17
     );
-    assert_eq!(tail.store.generation().unwrap(), generation);
+    assert_eq!(tail.sql.test_store().generation().unwrap(), generation);
     assert_eq!(
-        tail.store
+        tail.sql
+            .test_store()
             .journal_log_position(&format!("{:032x}", 1))
             .unwrap(),
         None
@@ -447,31 +452,34 @@ async fn hub_identity_log_multipart_apply_is_atomic_and_redelivery_is_inert() {
     let second = signed(&tail, 2, 2, B, part(2, 2)).await;
     assert!(tail.apply(second).await.unwrap());
     assert_eq!(
-        tail.store
+        tail.sql
+            .test_store()
             .identity_log_status()
             .unwrap()
             .last_applied_position,
         19
     );
     assert_eq!(
-        tail.store
+        tail.sql
+            .test_store()
             .journal_log_position(&format!("{:032x}", 1))
             .unwrap(),
         Some(18)
     );
     assert_eq!(
-        tail.store
+        tail.sql
+            .test_store()
             .journal_log_position(&format!("{:032x}", 2))
             .unwrap(),
         Some(19)
     );
-    let generation = tail.store.generation().unwrap();
+    let generation = tail.sql.test_store().generation().unwrap();
     let commits = tail.commits.clone();
     let mut notified = std::pin::pin!(commits.notified());
     notified.as_mut().enable();
     assert!(!tail.apply(first).await.unwrap());
     assert!(futures_util::poll!(notified.as_mut()).is_pending());
-    assert_eq!(tail.store.generation().unwrap(), generation);
+    assert_eq!(tail.sql.test_store().generation().unwrap(), generation);
 
     let conflict = signed(&tail, 1, 3, A, part(1, 2)).await;
     assert_eq!(
@@ -482,9 +490,10 @@ async fn hub_identity_log_multipart_apply_is_atomic_and_redelivery_is_inert() {
     assert_eq!(tail.apply(gap).await.unwrap_err().code, "hub_log_gap");
     let invalid = signed(&tail, 3, 3, A, member(B)).await;
     assert_eq!(tail.apply(invalid).await.unwrap_err().code, "apply_failed");
-    assert_eq!(tail.store.generation().unwrap(), generation);
+    assert_eq!(tail.sql.test_store().generation().unwrap(), generation);
     assert_eq!(
-        tail.store
+        tail.sql
+            .test_store()
             .identity_log_status()
             .unwrap()
             .last_applied_position,
@@ -509,7 +518,8 @@ async fn hub_identity_log_supersede_checks_the_entire_prefix_and_refuses_migrate
     );
     assert_eq!(
         migrated
-            .store
+            .sql
+            .test_store()
             .identity_log_status()
             .unwrap()
             .last_applied_position,
@@ -544,7 +554,8 @@ async fn hub_identity_log_supersede_checks_the_entire_prefix_and_refuses_migrate
         assert_eq!(*fresh.link.transport.reads.lock().unwrap(), [1]);
         assert_eq!(
             fresh
-                .store
+                .sql
+                .test_store()
                 .identity_log_status()
                 .unwrap()
                 .last_applied_position,
@@ -619,21 +630,23 @@ async fn hub_membership_cold_join_verifies_rotated_removed_snapshot_signer_and_s
         put(&tail, entry);
     }
 
-    let genesis = tail.store.generation().unwrap();
-    assert!(tail.store.hub_anchors().unwrap().is_empty());
+    let genesis = tail.sql.test_store().generation().unwrap();
+    assert!(tail.sql.test_store().hub_anchors().unwrap().is_empty());
     tail.reconnect().await.unwrap();
     tail.update_barrier();
     assert_eq!(tail.health.hub_membership.load(Ordering::Acquire), 1);
     assert_eq!(tail.sequence(), 0);
-    assert_eq!(tail.store.generation().unwrap(), genesis);
+    assert_eq!(tail.sql.test_store().generation().unwrap(), genesis);
     assert_eq!(
-        tail.store
+        tail.sql
+            .test_store()
             .journal_log_position(&format!("{:032x}", 1))
             .unwrap(),
         None
     );
     assert!(tail
-        .store
+        .sql
+        .test_store()
         .hub_anchors()
         .unwrap()
         .iter()
@@ -642,12 +655,13 @@ async fn hub_membership_cold_join_verifies_rotated_removed_snapshot_signer_and_s
     for entry in [first, keys, remove] {
         assert!(tail.apply(entry).await.unwrap());
     }
-    let verification = tail.store.verify().unwrap();
+    let verification = tail.sql.test_store().verify().unwrap();
     assert!(verification.ok, "{verification:?}");
-    tail.store.rebuild().unwrap();
-    assert!(tail.store.verify().unwrap().ok);
+    tail.sql.test_store().rebuild().unwrap();
+    assert!(tail.sql.test_store().verify().unwrap().ok);
     assert!(tail
-        .store
+        .sql
+        .test_store()
         .agent_changes(genesis, None)
         .unwrap()
         .entries
@@ -658,7 +672,8 @@ async fn hub_membership_cold_join_verifies_rotated_removed_snapshot_signer_and_s
     tail.stop(4, error);
     assert_eq!(tail.health.log_state.load(Ordering::Relaxed), 5);
     assert_eq!(
-        tail.store
+        tail.sql
+            .test_store()
             .identity_log_status()
             .unwrap()
             .last_applied_position,
@@ -701,7 +716,8 @@ async fn hub_membership_unanchored_removal_chain_cannot_verify_its_first_entry()
     let error = tail.apply(first).await.unwrap_err();
     assert_eq!(error.code, "writer_unknown");
     assert_eq!(
-        tail.store
+        tail.sql
+            .test_store()
             .identity_log_status()
             .unwrap()
             .last_applied_position,
@@ -771,8 +787,8 @@ async fn hub_membership_reconnect_resets_the_barrier_until_the_observed_head_is_
 async fn hub_membership_never_serves_legacy_holder_after_activation() {
     let (_scratch, tail) = tail(0).await;
     let handler = ProjectsHandler::with_runtime("membership-read".into(), || 700);
-    *handler.store.lock().unwrap() = Some(tail.store.clone());
-    tail.store.apply_entry("agent.cutover", "{}", "test", None, |tx| {
+    *handler.store.lock().unwrap() = Some(tail.sql.test_store());
+    tail.sql.test_store().apply_entry("agent.cutover", "{}", "test", None, |tx| {
         tx.execute("INSERT INTO agent(agent_id,name,tag,role,created_at_ms,updated_at_ms) VALUES('agent_16013c86','Test','','assistant',1,1)", [])?;
         tx.execute("INSERT INTO claim_cache(agent_id,holder,epoch,version,stale,integrity_failed,read_at_ms) VALUES('agent_16013c86','legacy-author',7,8,0,0,1)", [])?;
         tx.execute("INSERT INTO role_cache(role,holder,epoch,source,version,stale,integrity_failed,read_at_ms) VALUES('test','legacy-author',7,'cloud',8,0,0,1)", [])?;

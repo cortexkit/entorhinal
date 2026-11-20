@@ -40,7 +40,7 @@ fn cut_failure(op: &str, error: DoorError, claimed: bool) -> Failure {
 }
 
 impl Receiver {
-    pub(super) fn read_hub_move(
+    pub(super) async fn read_hub_move(
         &self,
         checkpoint: &SeenMove,
     ) -> Result<(Arc<Residence>, SeenMove), Failure> {
@@ -48,7 +48,7 @@ impl Receiver {
             .worker
             .hub()
             .ok_or_else(|| Failure::hold("hub_not_ready", json!({"op":"hub.move"})))?;
-        let seen = hub.watched_move(&self.cut)?.ok_or_else(conflict)?;
+        let seen = hub.watched_move(&self.cut).await?.ok_or_else(conflict)?;
         checkpoint.body.pin(&seen.body).map_err(|_| conflict())?;
         Ok((hub, seen))
     }
@@ -170,10 +170,10 @@ impl Receiver {
             self.save(row, progress).await?;
             return Ok(Duration::ZERO);
         }
-        let source_current = hub.move_member(&seen.body.source)? == Some(published.writer_ep);
+        let source_current = hub.move_member(&seen.body.source).await? == Some(published.writer_ep);
         let removed_early =
             !source_current && matches!(state, HubState::Published | HubState::Staged);
-        let position = hub.move_position(&seen.body);
+        let position = hub.move_position(&seen.body).await;
         let abort_without_residence =
             matches!(state, HubState::Published | HubState::Staged) && removed_early;
         let position = if abort_without_residence || state == HubState::Aborted {
@@ -264,7 +264,7 @@ impl Receiver {
                 HubState::Handing | HubState::Handed | HubState::Activated | HubState::Released,
             ) => {
                 if position != Some(MovePosition::Receiver)
-                    || !hub.move_receiver_holds(&seen.body)?
+                    || !hub.move_receiver_holds(&seen.body).await?
                 {
                     if position == Some(MovePosition::Source)
                         && (state == HubState::Handing
@@ -372,7 +372,7 @@ impl Receiver {
                     Some(MovePosition::Receiver) => {
                         if progress.hub_return.is_none() {
                             progress.hub_return =
-                                Some(hub.plan_transfer(&seen.body, Some(source_episode))?);
+                                Some(hub.plan_transfer(&seen.body, Some(source_episode)).await?);
                             self.save(row, progress).await?;
                         }
                     }

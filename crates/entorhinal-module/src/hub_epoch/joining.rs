@@ -98,7 +98,9 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
         let Some(current) = self.join_epoch(deadline).await? else {
             return Ok(());
         };
-        if self.join_self(&current, deadline).await? || self.log.writer_episode().is_err() {
+        if self.join_self(&current, deadline).await?
+            || self.log.writer_episode(deadline).await.is_err()
+        {
             return Ok(());
         }
         for peer in self.join_peers(deadline).await? {
@@ -128,7 +130,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
             None => {
                 self.join_self(&current, deadline).await?;
             }
-            Some(box_id) if self.log.writer_episode().is_ok() => {
+            Some(box_id) if self.log.writer_episode(deadline).await.is_ok() => {
                 if let Some(peer) = self
                     .join_peers(deadline)
                     .await?
@@ -208,8 +210,9 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
             Some(request)
                 if self
                     .reader
-                    .store
-                    .hub_attempt(&request.write_id())?
+                    .sql
+                    .attempt(&request.write_id(), deadline)
+                    .await?
                     .is_some()
                     && (request.after_removal_id.as_deref() == after
                         || (after.is_none()
@@ -233,7 +236,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
         };
         let revision = entry.expect("verified join request has revision").revision;
         let manifest_key = manifest_key(own, &request);
-        let saved = self.reader.store.hub_kv_cached(&manifest_key)?;
+        let saved = self.reader.sql.cached(&manifest_key, deadline).await?;
         let imported = saved
             .and_then(|row| row.body)
             .and_then(|body| Manifest::deserialize(body).ok())
@@ -280,7 +283,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
             self.request_join(None, revision, deadline).await?;
             return Ok(true);
         }
-        if self.log.writer_episode().is_err() {
+        if self.log.writer_episode(deadline).await.is_err() {
             return Ok(true);
         }
         self.clean_join(own, &key, revision, deadline).await?;
@@ -289,16 +292,17 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
 
     async fn join_held(&self, deadline: Instant) -> Result<BTreeSet<u64>, HandlerError> {
         let status = self.reader.status(deadline).await?;
-        self.tracked_epochs(status.held)
+        self.tracked_epochs(status.held, deadline).await
     }
 
-    fn tracked_epochs(
+    async fn tracked_epochs(
         &self,
         epochs: impl IntoIterator<Item = u64>,
+        deadline: Instant,
     ) -> Result<BTreeSet<u64>, HandlerError> {
         let mut held = BTreeSet::new();
         for e in epochs {
-            if self.reader.store.hub_has_epoch(e)? {
+            if self.reader.has_epoch(e, deadline).await? {
                 held.insert(e);
             }
         }
@@ -313,7 +317,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
     ) -> Result<(), HandlerError> {
         let (writer_ep, after_removal_id) = removed
             .map(|(episode, _, id)| (episode, id))
-            .unwrap_or((self.log.writer_episode().unwrap_or(0), None));
+            .unwrap_or((self.log.writer_episode(deadline).await.unwrap_or(0), None));
         let request = Request {
             v: 1,
             request_id: hub_write::new_op_id()?,
@@ -619,7 +623,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
             {
                 return Ok(());
             }
-            let applied = self.log.applied_sequence()?;
+            let applied = self.log.applied_sequence(deadline).await?;
             if self
                 .reader
                 .membership
@@ -735,7 +739,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
             .membership
             .verify_kv(
                 UnverifiedRecord::parse(key, bytes)?,
-                self.log.applied_sequence()?,
+                self.log.applied_sequence(deadline).await?,
                 Sight::FirstOrAfterGap,
                 deadline,
             )
@@ -784,21 +788,28 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
         })
         .await
         .map_err(|_| busy())??;
-        self.reader.store.record_hub_held_epochs(
-            HubEpochSource::Join(&request.request_id),
-            &(1..=through).collect::<Vec<_>>(),
-        )?;
-        let entry = &assembly.entry;
-        self.reader.store.record_hub_kv(
-            key,
-            entry.revision,
-            Some((
-                entry.value.as_ref().expect("manifest bytes"),
-                Some(&encode(&assembly.manifest)),
-            )),
-            crate::unix_millis(),
-        )?;
-        self.tracked_epochs(held)
+        let request_id = request.request_id.clone();
+        let revision = assembly.entry.revision;
+        let bytes = assembly.entry.value.clone().expect("manifest bytes");
+        let key = key.to_owned();
+        let manifest = encode(&assembly.manifest);
+        self.reader
+            .sql
+            .run(deadline, "record_hub_held_epochs", move |store| {
+                store.record_hub_held_epochs(
+                    HubEpochSource::Join(&request_id),
+                    &(1..=through).collect::<Vec<_>>(),
+                )?;
+                store.record_hub_kv(
+                    &key,
+                    revision,
+                    Some((&bytes, Some(&manifest))),
+                    crate::unix_millis(),
+                )?;
+                Ok(())
+            })
+            .await?;
+        self.tracked_epochs(held, deadline).await
     }
 
     async fn clean_join(

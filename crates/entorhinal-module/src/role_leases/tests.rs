@@ -148,7 +148,7 @@ impl Backend for Peer {
         self.local
     }
 
-    fn role(&self, _: &str) -> Result<Observation, HandlerError> {
+    async fn role(&self, _: &str, _: Instant) -> Result<Observation, HandlerError> {
         let (revision, record) = self.hub.row.lock().unwrap().clone();
         Ok(Observation {
             revision,
@@ -171,7 +171,7 @@ impl Backend for Peer {
         (&self.link, &self.hub.updates)
     }
 
-    fn preferred(&self, _: &str) -> Result<Option<Preferred>, HandlerError> {
+    async fn preferred(&self, _: &str, _: Instant) -> Result<Option<Preferred>, HandlerError> {
         Ok(self
             .hub
             .preferred
@@ -181,7 +181,12 @@ impl Backend for Peer {
             .filter(|p| self.hub.current(&p.box_id)))
     }
 
-    fn handback(&self, _: &str, box_id: &str) -> Result<Option<CandidateRequest>, HandlerError> {
+    async fn handback(
+        &self,
+        _: &str,
+        box_id: &str,
+        _: Instant,
+    ) -> Result<Option<CandidateRequest>, HandlerError> {
         Ok(self.hub.requests.lock().unwrap().get(box_id).cloned())
     }
 
@@ -190,13 +195,15 @@ impl Backend for Peer {
         role: &str,
         target: &Preferred,
         gen: i64,
-        _: Instant,
+        deadline: Instant,
     ) -> Result<bool, HandlerError> {
         Ok(self
-            .preferred(role)?
+            .preferred(role, deadline)
+            .await?
             .is_some_and(|p| p.box_id == target.box_id && p.episode == target.episode)
             && self
-                .handback(role, &target.box_id)?
+                .handback(role, &target.box_id, deadline)
+                .await?
                 .is_some_and(|r| r.gen == gen))
     }
 
@@ -204,10 +211,13 @@ impl Backend for Peer {
         &self,
         role: &str,
         box_id: &str,
-        _: Instant,
+        deadline: Instant,
     ) -> Result<Option<u64>, HandlerError> {
         self.hub.handback_reads.fetch_add(1, Ordering::Relaxed);
-        Ok(self.handback(role, box_id)?.map(|request| request.revision))
+        Ok(self
+            .handback(role, box_id, deadline)
+            .await?
+            .map(|request| request.revision))
     }
 
     async fn put_handback(&self, _: &str, gen: i64, _: Instant) -> Result<(), HandlerError> {
@@ -922,8 +932,8 @@ async fn lease_handback_vacancy_ignores_removed_preferred_box() {
     assert_eq!(hub.writes(ACQUIRE)[0].holder.as_deref(), Some(A));
 }
 
-#[test]
-fn role_gen_high_water_carries_hub_observation_across_restart_and_local_takes() {
+#[tokio::test]
+async fn role_gen_high_water_carries_hub_observation_across_restart_and_local_takes() {
     let (dir, descriptor) = crate::tests::scratch_descriptor("role-gen-high-water");
     let handler = ProjectsHandler::with_log_connector(
         "role-gen".into(),
@@ -933,13 +943,19 @@ fn role_gen_high_water_carries_hub_observation_across_restart_and_local_takes() 
     let store = entorhinal_core::RegistryStore::open(&descriptor).unwrap();
     *handler.store.lock().unwrap() = Some(store.clone());
     let mut grant = None;
-    let fresh = handler.local_role_view(ROLE, 1, &mut grant);
+    let fresh = handler.local_role_view(ROLE, 1, &mut grant).await.unwrap();
     assert_eq!(fresh.gen, 1);
-    let renewed = handler.local_role_view(ROLE, 10_000, &mut grant);
+    let renewed = handler
+        .local_role_view(ROLE, 10_000, &mut grant)
+        .await
+        .unwrap();
     assert_eq!(renewed.gen, 1);
     assert!(renewed.until_ms > fresh.until_ms);
     for _ in 0..2 {
-        handler.local_role_view(ROLE, 10_000, &mut None);
+        handler
+            .local_role_view(ROLE, 10_000, &mut None)
+            .await
+            .unwrap();
     }
     let observed = Observation {
         ready: true,
@@ -973,7 +989,14 @@ fn role_gen_high_water_carries_hub_observation_across_restart_and_local_takes() 
     drop(store);
     let restarted = entorhinal_core::RegistryStore::open(&descriptor).unwrap();
     *handler.store.lock().unwrap() = Some(restarted.clone());
-    assert_eq!(handler.local_role_view(ROLE, 20_000, &mut None).gen, 13);
+    assert_eq!(
+        handler
+            .local_role_view(ROLE, 20_000, &mut None)
+            .await
+            .unwrap()
+            .gen,
+        13
+    );
     assert_eq!(restarted.role_gen_high_water("dreamer.global").unwrap(), 0);
     handler.store.lock().unwrap().take();
     drop(restarted);

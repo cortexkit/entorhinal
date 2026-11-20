@@ -394,7 +394,7 @@ impl Source {
         let observed = if poll {
             self.last_poll = Some(tokio::time::Instant::now());
             let read = if plan.hub_gen.is_some() {
-                self.read_hub_move(&plan).map(|seen| {
+                self.read_hub_move(&plan).await.map(|seen| {
                     hub_seen = seen;
                     hub_seen
                         .as_ref()
@@ -707,8 +707,12 @@ impl Source {
         })
     }
 
-    fn read_hub_move(&self, plan: &Plan) -> Result<Option<SeenMove>, Failure> {
-        let seen = self.hub()?.watched_move(&self.cut).map_err(hub_failure)?;
+    async fn read_hub_move(&self, plan: &Plan) -> Result<Option<SeenMove>, Failure> {
+        let seen = self
+            .hub()?
+            .watched_move(&self.cut)
+            .await
+            .map_err(hub_failure)?;
         if let Some(seen) = &seen {
             plan.hub_record(&self.cut)?
                 .pin(&seen.body)
@@ -725,8 +729,13 @@ impl Source {
         Ok(seen)
     }
 
-    fn check_target(&self, plan: &Plan) -> Result<(), Failure> {
-        let Some(target) = self.hub()?.watched_node(&plan.to).map_err(hub_failure)? else {
+    async fn check_target(&self, plan: &Plan) -> Result<(), Failure> {
+        let Some(target) = self
+            .hub()?
+            .watched_node(&plan.to)
+            .await
+            .map_err(hub_failure)?
+        else {
             return Ok(());
         };
         for p in &plan.participants {
@@ -996,7 +1005,7 @@ impl Source {
                     }
                     if seen.body.state == HubState::Handed {
                         let hub = self.hub()?;
-                        let position = hub.move_position(&seen.body).map_err(hub_failure)?;
+                        let position = hub.move_position(&seen.body).await.map_err(hub_failure)?;
                         if position == MovePosition::Source {
                             let position = hub
                                 .move_live_position(&seen.body)
@@ -1049,7 +1058,7 @@ impl Source {
                 Err(error) => return Err(Failure::hub_seal("cut.status", error)),
             }
         } else {
-            self.check_target(plan)?;
+            self.check_target(plan).await?;
             row.seal_sent = true;
             self.save(row, plan, false).await?;
             if row.abort_requested.is_some() {
@@ -1123,7 +1132,10 @@ impl Source {
             if seen.body.state != HubState::Staged {
                 return Err(state_conflict());
             }
-            let transfer = hub.plan_transfer(&seen.body, None).map_err(hub_failure)?;
+            let transfer = hub
+                .plan_transfer(&seen.body, None)
+                .await
+                .map_err(hub_failure)?;
             plan.source.handing = Some((seen.clone(), transfer));
             self.save(row, plan, false).await?;
             if row.abort_requested.is_some() {
@@ -1376,11 +1388,12 @@ impl Source {
                                     // re-reading a verified abort.
                                     let revision =
                                         error.detail.as_ref().and_then(|d| d["revision"].as_u64());
-                                    reconciled = self.read_hub_move(plan)?.filter(|current| {
-                                        revision
-                                            .is_some_and(|revision| current.revision >= revision)
-                                            && current.body.state == HubState::Aborted
-                                    });
+                                    reconciled =
+                                        self.read_hub_move(plan).await?.filter(|current| {
+                                            revision.is_some_and(|revision| {
+                                                current.revision >= revision
+                                            }) && current.body.state == HubState::Aborted
+                                        });
                                     if reconciled.is_none() {
                                         return Err(hub_failure(error));
                                     }
@@ -1390,9 +1403,13 @@ impl Source {
                         }
                         let seen = reconciled.as_ref().unwrap_or(seen);
                         if !matches!(
-                            hub.move_position(&seen.body).map_err(hub_failure)?,
+                            hub.move_position(&seen.body).await.map_err(hub_failure)?,
                             MovePosition::Source | MovePosition::Returned
-                        ) || hub.move_member(&plan.from).map_err(hub_failure)?.is_none()
+                        ) || hub
+                            .move_member(&plan.from)
+                            .await
+                            .map_err(hub_failure)?
+                            .is_none()
                         {
                             return Err(state_conflict());
                         }

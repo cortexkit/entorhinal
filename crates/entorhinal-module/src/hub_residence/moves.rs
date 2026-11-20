@@ -22,18 +22,20 @@ impl Residence {
         &self.box_id
     }
 
-    pub(crate) fn move_member(&self, box_id: &str) -> Result<Option<u64>, HandlerError> {
+    pub(crate) async fn move_member(&self, box_id: &str) -> Result<Option<u64>, HandlerError> {
         if !self.ready() {
             return Err(not_ready());
         }
-        Ok(self.backend.current_member(box_id, self.backend.applied()?))
+        Ok(self
+            .backend
+            .current_member(box_id, self.backend.applied(Instant::now() + BUDGET).await?))
     }
 
-    fn move_cached(&self, key: &str) -> Result<Option<HubKvCached>, HandlerError> {
+    async fn move_cached(&self, key: &str) -> Result<Option<HubKvCached>, HandlerError> {
         if !self.ready() {
             return Err(not_ready());
         }
-        let row = self.store.hub_kv_cached(key)?;
+        let row = self.sql.cached(key, Instant::now() + BUDGET).await?;
         let watched = self.watched.read().unwrap();
         if !watched.initial || watched.held.contains(key) {
             return Err(not_ready());
@@ -49,9 +51,10 @@ impl Residence {
         Ok(row)
     }
 
-    pub(crate) fn watched_move(&self, cut: &str) -> Result<Option<SeenMove>, HandlerError> {
+    pub(crate) async fn watched_move(&self, cut: &str) -> Result<Option<SeenMove>, HandlerError> {
         let key = moves::move_key(cut);
-        self.move_cached(&key)?
+        self.move_cached(&key)
+            .await?
             .map(|row| {
                 let body = row.body.ok_or_else(moves::conflict)?;
                 let record =
@@ -66,7 +69,7 @@ impl Residence {
             .transpose()
     }
 
-    pub(crate) fn watched_moves(&self) -> Vec<SeenMove> {
+    pub(crate) async fn watched_moves(&self) -> Vec<SeenMove> {
         let cuts: Vec<_> = self
             .watched
             .read()
@@ -75,21 +78,25 @@ impl Residence {
             .keys()
             .filter_map(|key| key.strip_prefix("move.").map(str::to_owned))
             .collect();
-        cuts.iter()
-            .filter_map(|cut| self.watched_move(cut).ok().flatten())
-            .collect()
+        let mut seen = Vec::new();
+        for cut in cuts {
+            if let Ok(Some(entry)) = self.watched_move(&cut).await {
+                seen.push(entry);
+            }
+        }
+        seen
     }
 
-    pub(crate) fn watched_node(&self, box_id: &str) -> Result<Option<Node>, HandlerError> {
+    pub(crate) async fn watched_node(&self, box_id: &str) -> Result<Option<Node>, HandlerError> {
         let key = moves::node_key(box_id);
-        let Some(row) = self.move_cached(&key)? else {
+        let Some(row) = self.move_cached(&key).await? else {
             return Ok(None);
         };
         let Some(body) = row.body else {
             return Ok(None);
         };
         let writer = UnverifiedRecord::parse(&key, row.value.as_deref().unwrap_or_default())?;
-        if self.move_member(box_id)? != Some(writer.header().writer_ep) {
+        if self.move_member(box_id).await? != Some(writer.header().writer_ep) {
             return Ok(None);
         }
         Ok(Some(
@@ -126,8 +133,9 @@ impl Residence {
                         && r["cut_id"].as_str() == Some(body.cut_id.as_str())
                 };
                 let watched_transfer = self
-                    .store
-                    .hub_kv_cached(&residence)?
+                    .sql
+                    .cached(&residence, deadline)
+                    .await?
                     .and_then(|row| row.body)
                     .is_some_and(|r| has_transfer(&r));
                 if watched_transfer {
@@ -174,14 +182,15 @@ impl Residence {
         Ok(accepted)
     }
 
-    pub(crate) fn move_origin(&self, agent: &str) -> Result<(i64, String), HandlerError> {
-        let Some((record, _)) = self.move_residence(agent)? else {
+    pub(crate) async fn move_origin(&self, agent: &str) -> Result<(i64, String), HandlerError> {
+        let Some((record, _)) = self.move_residence(agent).await? else {
             return Err(HandlerError::new(
                 "not_holder",
                 "claim the agent before moving it",
             ));
         };
-        if record.holder != self.box_id || self.move_member(&self.box_id)? != Some(record.holder_ep)
+        if record.holder != self.box_id
+            || self.move_member(&self.box_id).await? != Some(record.holder_ep)
         {
             return Err(HandlerError::new(
                 "not_holder",
@@ -191,8 +200,8 @@ impl Residence {
         Ok((record.gen, self.box_id.clone()))
     }
 
-    fn move_residence(&self, agent: &str) -> Result<Option<(Record, u64)>, HandlerError> {
-        let Some(row) = self.move_cached(&key(agent))? else {
+    async fn move_residence(&self, agent: &str) -> Result<Option<(Record, u64)>, HandlerError> {
+        let Some(row) = self.move_cached(&key(agent)).await? else {
             return Ok(None);
         };
         let body = row.body.ok_or_else(moves::conflict)?;
@@ -202,20 +211,22 @@ impl Residence {
         )))
     }
 
-    pub(crate) fn move_position(&self, body: &Move) -> Result<Position, HandlerError> {
+    pub(crate) async fn move_position(&self, body: &Move) -> Result<Position, HandlerError> {
         let (r, _) = self
-            .move_residence(&body.agent_id)?
+            .move_residence(&body.agent_id)
+            .await?
             .ok_or_else(moves::conflict)?;
         position(body, &r)
     }
 
-    pub(crate) fn move_receiver_holds(&self, body: &Move) -> Result<bool, HandlerError> {
+    pub(crate) async fn move_receiver_holds(&self, body: &Move) -> Result<bool, HandlerError> {
         let (r, _) = self
-            .move_residence(&body.agent_id)?
+            .move_residence(&body.agent_id)
+            .await?
             .ok_or_else(moves::conflict)?;
         Ok(self.box_id == body.receiver
             && position(body, &r)? == Position::Receiver
-            && self.move_member(&r.holder)? == Some(r.holder_ep))
+            && self.move_member(&r.holder).await? == Some(r.holder_ep))
     }
 
     // The move and residence records can arrive in either order. A current
@@ -236,13 +247,14 @@ impl Residence {
         )
     }
 
-    pub(crate) fn plan_transfer(
+    pub(crate) async fn plan_transfer(
         &self,
         body: &Move,
         return_to_episode: Option<u64>,
     ) -> Result<Transfer, HandlerError> {
         let (previous, expected) = self
-            .move_residence(&body.agent_id)?
+            .move_residence(&body.agent_id)
+            .await?
             .ok_or_else(moves::conflict)?;
         let (sender, target, current) = if return_to_episode.is_some() {
             (&body.receiver, &body.source, Position::Receiver)
@@ -251,14 +263,14 @@ impl Residence {
         };
         if sender != &self.box_id
             || previous.holder != self.box_id
-            || self.move_member(sender)? != Some(previous.holder_ep)
+            || self.move_member(sender).await? != Some(previous.holder_ep)
             || position(body, &previous)? != current
         {
             return Err(moves::conflict());
         }
         let target_episode = match return_to_episode {
             Some(episode) => episode,
-            None => self.move_member(target)?.ok_or_else(|| {
+            None => self.move_member(target).await?.ok_or_else(|| {
                 HandlerError::new(
                     "participant_unavailable_on_target",
                     "move peer is not a current member",
@@ -342,7 +354,7 @@ impl Residence {
             request_key: &request_key,
             params_digest: &digest,
             writer: &self.box_id,
-            writer_ep: self.backend.writer_episode()?,
+            writer_ep: self.backend.writer_episode(Instant::now() + BUDGET).await?,
         };
         let result = self
             .backend
@@ -358,8 +370,8 @@ impl Residence {
         engram_hub_cuts: bool,
     ) -> Result<(), HandlerError> {
         let key = moves::node_key(&self.box_id);
-        let previous = self.move_cached(&key)?;
-        if self.watched_node(&self.box_id)?.is_some_and(|node| {
+        let previous = self.move_cached(&key).await?;
+        if self.watched_node(&self.box_id).await?.is_some_and(|node| {
             node.participants == participants && node.engram_hub_cuts == engram_hub_cuts
         }) {
             return Ok(());
@@ -368,7 +380,7 @@ impl Residence {
         // Reuse the recorded timestamp and payload on retry, including a restart.
         let request_key = format!("node.advertise:{}:{expected}", self.box_id);
         let deadline = Instant::now() + BUDGET;
-        let body = if let Some(attempt) = self.store.hub_attempt(&request_key)? {
+        let body = if let Some(attempt) = self.sql.attempt(&request_key, deadline).await? {
             self.backend
                 .verify(&key, &attempt.write.value, deadline)
                 .await?

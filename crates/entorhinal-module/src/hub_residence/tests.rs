@@ -47,14 +47,14 @@ impl Backend for TestBackend {
     fn episode_closed(&self, holder: &str, episode: u64, applied: u64) -> bool {
         holder == A && episode == 0 && applied >= 2
     }
-    fn applied(&self) -> Result<u64, HandlerError> {
+    async fn applied(&self, _: Instant) -> Result<u64, HandlerError> {
         Ok(self.applied.load(Ordering::Relaxed))
     }
-    fn writer_episode(&self) -> Result<u64, HandlerError> {
+    async fn writer_episode(&self, _: Instant) -> Result<u64, HandlerError> {
         Ok(0)
     }
     async fn log_head(&self, _: Instant) -> Result<u64, HandlerError> {
-        self.applied()
+        Ok(self.applied.load(Ordering::Relaxed))
     }
     async fn wait_through(&self, _: u64, _: Instant) -> Result<(), HandlerError> {
         Ok(())
@@ -74,7 +74,7 @@ impl Backend for TestBackend {
     ) -> Result<AcceptedKv, HandlerError> {
         let record = UnverifiedRecord::parse(key, bytes)?.verify(&self.keys.public_hex())?;
         let body = serde_json::from_slice(&record.open(self.keys.as_ref()).await?).unwrap();
-        let applied = self.applied()?;
+        let applied = self.applied.load(Ordering::Relaxed);
         Ok(AcceptedKv {
             writer_current: self.current_member(&record.header().writer, applied)
                 == Some(record.header().writer_ep),
@@ -106,6 +106,7 @@ impl Backend for TestBackend {
 
 struct Fixture {
     residence: Residence,
+    slot: Arc<std::sync::Mutex<Option<RegistryStore>>>,
     backend: Arc<TestBackend>,
     clock: Arc<AtomicU64>,
     _leases: Arc<role_leases::Leases>,
@@ -127,12 +128,13 @@ impl Fixture {
         let lease_clock = clock.clone();
         leases.sample_clock(move || lease_clock.load(Ordering::Relaxed));
         let leases = Arc::new(leases);
+        let slot = Arc::new(std::sync::Mutex::new(Some(store)));
         let residence = Residence {
             backend: backend.clone(),
             snapshot: Arc::new(Image),
             box_id: A.into(),
             base: 0,
-            store,
+            sql: HubSql::new(&slot, Arc::default()),
             health: Arc::new(HealthGauges::default()),
             commits: Arc::new(Notify::new()),
             watched: RwLock::default(),
@@ -143,6 +145,7 @@ impl Fixture {
         };
         Self {
             residence,
+            slot,
             backend,
             clock,
             _leases: leases,
@@ -204,7 +207,7 @@ impl Fixture {
             sent_at_ms: 1,
             process: "test".into(),
         };
-        let store = &self.residence.store;
+        let store = &self.residence.sql.test_store();
         assert!(store
             .persist_hub_attempt(&write, &send(CREATE_ID), None)
             .unwrap());
@@ -243,6 +246,7 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
+        self.slot.lock().unwrap().take();
         let _ = std::fs::remove_dir_all(&self.path);
     }
 }
@@ -260,7 +264,8 @@ async fn hub_audit_regression_closed_create_episode_concludes_recovery() {
     assert_eq!(f.backend.writes.load(Ordering::Relaxed), 0);
     let outcome = f
         .residence
-        .store
+        .sql
+        .test_store()
         .hub_attempt("create")
         .unwrap()
         .unwrap()
@@ -273,11 +278,18 @@ async fn hub_audit_regression_closed_create_episode_concludes_recovery() {
 async fn hub_audit_regression_create_reply_keeps_applied_agent_when_claim_is_unsettled() {
     let f = Fixture::new("settled-agent-create", "hub_write_unsettled");
     f.applied_create(CREATE_KV).await;
-    let saved = f.residence.store.hub_attempt("create").unwrap().unwrap();
+    let saved = f
+        .residence
+        .sql
+        .test_store()
+        .hub_attempt("create")
+        .unwrap()
+        .unwrap();
     hub_write::refuse_attempt(
-        &f.residence.store,
+        &f.residence.sql,
         &saved,
         HandlerError::new("hub_write_unsettled", "KV history unavailable"),
+        Instant::now() + BUDGET,
     )
     .await
     .unwrap();
@@ -315,7 +327,13 @@ async fn hub_audit_regression_role_acquisition_held_until_expiry_or_applied_remo
             pending[ROLE_KEY].lease_retry_at,
             Some(1_000 + role_leases::LEASE_MS)
         );
-        let held = f.residence.store.hub_kv_cached(ROLE_KEY).unwrap().unwrap();
+        let held = f
+            .residence
+            .sql
+            .test_store()
+            .hub_kv_cached(ROLE_KEY)
+            .unwrap()
+            .unwrap();
         assert_eq!(held.revision, 2);
         assert_eq!(held.accepted_revision, Some(1));
         assert!(!held.integrity_failed);
@@ -329,7 +347,13 @@ async fn hub_audit_regression_role_acquisition_held_until_expiry_or_applied_remo
         let early = pending.remove(ROLE_KEY).unwrap();
         f.residence.observe_or_hold(early, &mut pending).await;
         assert!(pending.is_empty());
-        let cached = f.residence.store.hub_kv_cached(ROLE_KEY).unwrap().unwrap();
+        let cached = f
+            .residence
+            .sql
+            .test_store()
+            .hub_kv_cached(ROLE_KEY)
+            .unwrap()
+            .unwrap();
         assert_eq!(cached.accepted_revision, Some(2));
         assert!(!cached.integrity_failed);
     }
@@ -350,7 +374,8 @@ async fn hub_audit_regression_role_acquisition_after_expiry_is_not_held() {
         .unwrap();
     assert_eq!(
         f.residence
-            .store
+            .sql
+            .test_store()
             .hub_kv_cached(ROLE_KEY)
             .unwrap()
             .unwrap()

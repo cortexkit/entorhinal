@@ -694,6 +694,7 @@ async fn reap_moves(worker: Worker) {
         };
         for seen in hub
             .watched_moves()
+            .await
             .into_iter()
             .filter(|seen| seen.body.state.terminal())
         {

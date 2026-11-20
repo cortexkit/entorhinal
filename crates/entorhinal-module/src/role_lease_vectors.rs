@@ -56,12 +56,25 @@ async fn bind(
 }
 
 async fn frame(module: &mut ModuleHarness, corr: u64, kind: FrameType) -> Frame {
-    let frame = tokio::time::timeout(Duration::from_secs(2), module.next_frame())
-        .await
-        .unwrap()
-        .unwrap();
+    // A paused runtime can skip ahead while a local role grant is on the
+    // blocking pool. Keep it runnable until the frame arrives, with a real
+    // timeout so a missing frame still fails the fixture.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let next = module.next_frame();
+    tokio::pin!(next);
+    let frame = loop {
+        tokio::select! {
+            frame = &mut next => break frame.unwrap(),
+            () = tokio::task::yield_now() => assert!(std::time::Instant::now() < deadline, "missing role lease frame {kind:?} for {corr}"),
+        }
+    };
     assert_eq!(frame.header.corr, corr);
-    assert_eq!(frame.header.ty, kind);
+    assert_eq!(
+        frame.header.ty,
+        kind,
+        "frame {corr}: {}",
+        String::from_utf8_lossy(&frame.body)
+    );
     frame
 }
 
@@ -182,6 +195,13 @@ async fn served_role_lease_v1_records_match_published_files() {
 
 #[tokio::test(start_paused = true)]
 async fn served_role_lease_v1_non_hub_records_match_published_files() {
+    // Only the fixture's explicit advances should move the paused clock.
+    // A request can be on the blocking pool before the first frame is polled.
+    let keep_clock = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
     let mut fixture = Fixture::new("served-role-lease-non-hub").await;
     let start = tokio::time::Instant::now();
     let clock = Arc::new(AtomicU64::new(100_000));
@@ -316,6 +336,8 @@ async fn served_role_lease_v1_non_hub_records_match_published_files() {
     );
     assert!(start.elapsed() >= Duration::from_secs(40));
     module.shutdown().await;
+    keep_clock.abort();
+    let _ = keep_clock.await;
     crate::tests::stop_store_tasks(&handler).await;
     handler.store.lock().unwrap().take();
     drop(store);

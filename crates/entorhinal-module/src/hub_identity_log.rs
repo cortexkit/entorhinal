@@ -27,7 +27,7 @@ use crate::{
     hub_membership::{AnchorSource, Membership, PeerKeysRead, Sight},
     hub_transport::{Feed, FeedEvent, Hub, LogDelivery},
     hub_write::{
-        self, LogReplan, Payload, Replanned, Step, Transport, Trust, Writer,
+        self, HubSql, LogReplan, Payload, Replanned, Step, Transport, Trust, Writer,
         PROJECTION_SNAPSHOT_KIND as SNAPSHOT,
     },
     HandlerError, HealthGauges, ProjectsHandler,
@@ -92,9 +92,9 @@ pub(super) struct Link<T, U> {
 }
 
 impl<T: LogTransport, U: Trust + Send + Sync + 'static> Link<T, U> {
-    fn writer<'a, V: Trust>(&'a self, store: &'a RegistryStore, trust: &'a V) -> Writer<'a, T, V> {
+    fn writer<'a, V: Trust>(&'a self, sql: &'a HubSql, trust: &'a V) -> Writer<'a, T, V> {
         Writer {
-            store,
+            sql,
             transport: &self.transport,
             trust,
             signer: self.signer.as_ref(),
@@ -108,7 +108,7 @@ struct MemberTrust<'a, T, U> {
     epoch: &'a U,
     epoch_reader: Option<&'a EpochReader<T>>,
     membership: &'a Membership<T>,
-    store: &'a RegistryStore,
+    sql: &'a HubSql,
     base: i64,
 }
 
@@ -136,10 +136,7 @@ impl<T: LogTransport, U: Trust> Trust for MemberTrust<'_, T, U> {
                 .await
                 .map(|(_, record)| record)
         } else {
-            let applied = hub_sequence(
-                self.base,
-                self.store.identity_log_status()?.last_applied_position,
-            )?;
+            let applied = applied_sequence(self.sql, self.base, deadline).await?;
             self.membership
                 .verify_kv(record, applied, Sight::FirstOrAfterGap, deadline)
                 .await
@@ -150,7 +147,7 @@ impl<T: LogTransport, U: Trust> Trust for MemberTrust<'_, T, U> {
 
 pub(super) struct IdentityLog<T, U> {
     link: Arc<Link<T, U>>,
-    pub(super) store: RegistryStore,
+    pub(super) sql: HubSql,
     health: Arc<HealthGauges>,
     writer: Arc<tokio::sync::Mutex<()>>,
     pub(super) commits: Arc<Notify>,
@@ -161,8 +158,32 @@ pub(super) struct IdentityLog<T, U> {
 }
 
 impl ProjectsHandler {
-    /// Cutover calls this after installing the base and stopping legacy
-    /// catch-up. The handler owns the tail task just as it owns legacy catch-up.
+    pub(super) fn hub_sql(&self) -> HubSql {
+        HubSql::new(&self.store, self.hub_sql.clone())
+    }
+
+    pub(super) async fn stop_hub_tasks(&self) {
+        // Stop activation before stopping the consumers it can install.
+        if self.hub_switch.is_some() {
+            let task = self.catch_up_task.lock().unwrap().take();
+            if let Some(task) = task {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+        tokio::join!(self.stop_hub_tail(), self.stop_hub_residence());
+    }
+
+    pub(super) async fn stop_hub_tail(&self) {
+        let task = self.hub_tail_task.lock().unwrap().take();
+        if let Some(task) = task {
+            task.abort();
+            let _ = task.await;
+        }
+        self.hub_sql.wait().await;
+    }
+
+    #[cfg(test)]
     pub(super) fn activate_hub_identity_log<T, U>(
         &self,
         box_id: BoxId,
@@ -172,21 +193,18 @@ impl ProjectsHandler {
         T: LogTransport,
         U: Trust + Send + Sync + 'static,
     {
-        let store = self.with_store(|store| Ok(store.clone()))?;
-        let base = store.hub_log_base()?.ok_or_else(|| {
+        let sql = self.hub_sql();
+        let base = sql.test_store().hub_log_base()?.ok_or_else(|| {
             HandlerError::new("hub_not_ready", "hub log base has not been installed")
         })?;
-        let applied = store.identity_log_status()?.last_applied_position;
-        let sequence = hub_sequence(base, applied)?;
-        let mut task = self.catch_up_task.lock().unwrap();
-        if task.is_some() || self.health.origin.is_foreign() {
+        if self.catch_up_task.lock().unwrap().is_some() || self.health.origin.is_foreign() {
             return Err(HandlerError::new(
                 "hub_not_ready",
                 "cannot start the hub identity-log tail",
             ));
         }
         let log = IdentityLog::new(
-            store,
+            sql,
             self.health.clone(),
             self.writer.clone(),
             self.commits.clone(),
@@ -194,14 +212,15 @@ impl ProjectsHandler {
             base,
             link,
         );
-        *task = Some(log.start_tail(applied, sequence));
+        let tail = log.start_installed_tail_for_test()?;
+        *self.hub_tail_task.lock().unwrap() = Some(tail);
         Ok(log)
     }
 }
 
 impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
     pub(super) fn new(
-        store: RegistryStore,
+        sql: HubSql,
         health: Arc<HealthGauges>,
         writer: Arc<tokio::sync::Mutex<()>>,
         commits: Arc<Notify>,
@@ -212,7 +231,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
         let link = Arc::new(link);
         let membership = Arc::new(Membership::new(
             link.transport.clone(),
-            store.clone(),
+            sql.clone(),
             AnchorSource {
                 own_box: box_id.to_string(),
                 peers: link.peers.clone(),
@@ -223,7 +242,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
             Arc::new(EpochReader::new(
                 link.transport.clone(),
                 membership.clone(),
-                store.clone(),
+                sql.clone(),
                 link.vault.clone(),
                 box_id.to_string(),
                 base,
@@ -232,7 +251,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
         });
         Self {
             link,
-            store,
+            sql,
             health,
             writer,
             commits,
@@ -247,7 +266,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
         let feed = self.link.transport.tail(sequence).with_durable_cursor();
         let tail = Tail {
             link: self.link.clone(),
-            store: self.store.clone(),
+            sql: self.sql.clone(),
             health: self.health.clone(),
             commits: self.commits.clone(),
             base: self.base,
@@ -262,12 +281,32 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
         self.health.hub_membership.store(1, Ordering::Release);
         self.health.log_state.store(0, Ordering::Relaxed);
         self.health.hub.set_writer_hold(None);
-        crate::enable::refresh(&self.health, &self.store);
         tokio::spawn(tail.run(feed))
     }
 
-    pub(super) fn start_installed_tail(&self) -> Result<tokio::task::JoinHandle<()>, HandlerError> {
-        let applied = self.store.identity_log_status()?.last_applied_position;
+    pub(super) async fn start_installed_tail(
+        &self,
+        deadline: Instant,
+    ) -> Result<tokio::task::JoinHandle<()>, HandlerError> {
+        let health = self.health.clone();
+        let applied = self
+            .sql
+            .run(deadline, "identity_log_status", move |store| {
+                let applied = store.identity_log_status()?.last_applied_position;
+                crate::enable::refresh(&health, store);
+                Ok(applied)
+            })
+            .await?;
+        Ok(self.start_tail(applied, hub_sequence(self.base, applied)?))
+    }
+
+    #[cfg(test)]
+    pub(super) fn start_installed_tail_for_test(
+        &self,
+    ) -> Result<tokio::task::JoinHandle<()>, HandlerError> {
+        let store = self.sql.test_store();
+        let applied = store.identity_log_status()?.last_applied_position;
+        crate::enable::refresh(&self.health, &store);
         Ok(self.start_tail(applied, hub_sequence(self.base, applied)?))
     }
 
@@ -286,12 +325,12 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
         let Some(epoch) = &self.epoch else {
             return Ok(());
         };
-        if !self.store.hub_has_epoch(1)? {
+        if !self.has_bootstrap_epoch(deadline).await? {
             // Computers paired at cutover can import the epoch key encrypted
             // for them when it was minted. A newly paired computer asks a
             // current member to encrypt the retained epoch keys for it.
             match epoch.fence(deadline).await {
-                Ok(_) if self.store.hub_has_epoch(1)? => return Ok(()),
+                Ok(_) if self.has_bootstrap_epoch(deadline).await? => return Ok(()),
                 Ok(_) => (),
                 Err(error) if error.code == "epoch_key_unavailable" => (),
                 Err(error) => return Err(error),
@@ -301,6 +340,14 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
             }
         }
         Ok(())
+    }
+
+    async fn has_bootstrap_epoch(&self, deadline: Instant) -> Result<bool, HandlerError> {
+        self.sql
+            .run(deadline, "hub_has_epoch", |store| {
+                Ok(store.hub_has_epoch(1)?)
+            })
+            .await
     }
 
     pub(super) async fn open_bootstrap_part(
@@ -345,13 +392,16 @@ pub(super) struct PlannedAppend<'a> {
     pub body: Value,
 }
 
-pub(super) type LocalReplan<'a> =
-    dyn Fn(&RegistryStore, &Value, &str) -> Result<Replanned, HandlerError> + Send + Sync + 'a;
+pub(super) type LocalReplan =
+    Arc<dyn Fn(&RegistryStore, &Value, &str) -> Result<Replanned, HandlerError> + Send + Sync>;
 
 #[async_trait::async_trait]
 pub(super) trait SharedLog: Send + Sync {
-    fn start_installed_tail(&self) -> Result<tokio::task::JoinHandle<()>, HandlerError>;
-    fn applied(&self) -> Result<u64, HandlerError>;
+    async fn start_installed_tail(
+        &self,
+        deadline: Instant,
+    ) -> Result<tokio::task::JoinHandle<()>, HandlerError>;
+    async fn applied(&self, deadline: Instant) -> Result<u64, HandlerError>;
     async fn catch_up(&self, deadline: Instant) -> Result<(), HandlerError>;
     #[allow(clippy::too_many_arguments)]
     async fn append_local(
@@ -361,18 +411,21 @@ pub(super) trait SharedLog: Send + Sync {
         expected: u64,
         body: Value,
         continuation: Option<&entorhinal_core::HubContinuation>,
-        replan: &LocalReplan<'_>,
+        replan: LocalReplan,
         deadline: Instant,
     ) -> Result<Vec<u8>, HandlerError>;
 }
 
 #[async_trait::async_trait]
 impl<T: LogTransport, U: Trust + Send + Sync + 'static> SharedLog for IdentityLog<T, U> {
-    fn start_installed_tail(&self) -> Result<tokio::task::JoinHandle<()>, HandlerError> {
-        IdentityLog::start_installed_tail(self)
+    async fn start_installed_tail(
+        &self,
+        deadline: Instant,
+    ) -> Result<tokio::task::JoinHandle<()>, HandlerError> {
+        IdentityLog::start_installed_tail(self, deadline).await
     }
-    fn applied(&self) -> Result<u64, HandlerError> {
-        self.applied_sequence()
+    async fn applied(&self, deadline: Instant) -> Result<u64, HandlerError> {
+        self.applied_sequence(deadline).await
     }
 
     async fn catch_up(&self, deadline: Instant) -> Result<(), HandlerError> {
@@ -386,10 +439,10 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> SharedLog for IdentityLo
         expected: u64,
         body: Value,
         continuation: Option<&entorhinal_core::HubContinuation>,
-        replan: &LocalReplan<'_>,
+        replan: LocalReplan,
         deadline: Instant,
     ) -> Result<Vec<u8>, HandlerError> {
-        let writer_ep = self.writer_episode()?;
+        let writer_ep = self.writer_episode(deadline).await?;
         let landed = self
             .append_inner(
                 PlannedAppend {
@@ -414,9 +467,16 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> SharedLog for IdentityLo
                     error
                 }
             })?;
-        self.store.hub_local_reply(key, digest)?.ok_or_else(|| {
-            HandlerError::new("storage_error", "hub tail applied without a local reply")
-        })
+        let key = key.to_owned();
+        let digest = digest.to_owned();
+        self.sql
+            .run(deadline, "hub_local_reply", move |store| {
+                Ok(store.hub_local_reply(&key, &digest)?)
+            })
+            .await?
+            .ok_or_else(|| {
+                HandlerError::new("storage_error", "hub tail applied without a local reply")
+            })
     }
 }
 
@@ -457,7 +517,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
         step: &Step,
         deadline: Instant,
     ) -> Result<hub_write::Landed, HandlerError> {
-        let writer_ep = self.writer_episode()?;
+        let writer_ep = self.writer_episode(deadline).await?;
         self.write_epoch_step_as(writer_ep, request_key, digest, step, deadline)
             .await
     }
@@ -504,11 +564,11 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
             epoch: self.link.trust.as_ref(),
             epoch_reader: self.epoch.as_deref(),
             membership: &self.membership,
-            store: &self.store,
+            sql: &self.sql,
             base: self.base,
         };
         self.link
-            .writer(&self.store, &trust)
+            .writer(&self.sql, &trust)
             .run(
                 &hub_write::Request {
                     request_key,
@@ -527,11 +587,16 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
         self.health.hub_membership.load(Ordering::Acquire) == 2
     }
 
-    pub(super) fn holder_current(&self, holder: &str, episode: u64) -> Result<bool, HandlerError> {
+    pub(super) async fn holder_current(
+        &self,
+        holder: &str,
+        episode: u64,
+        deadline: Instant,
+    ) -> Result<bool, HandlerError> {
         Ok(self.membership_ready()
             && self
                 .membership
-                .open_episode(holder, self.applied_sequence()?)
+                .open_episode(holder, self.applied_sequence(deadline).await?)
                 == Some(episode)
             && crate::hub_membership::box_id(holder))
     }
@@ -556,9 +621,19 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
         self.link.transport.kv_entry(key, deadline).await
     }
 
-    pub(super) fn writer_episode(&self) -> Result<u64, HandlerError> {
-        if self.membership_ready() || self.store.hub_log_base()?.is_none() {
-            if let Some(episode) = self.membership.can_write(self.applied_sequence()?) {
+    pub(super) async fn writer_episode(&self, deadline: Instant) -> Result<u64, HandlerError> {
+        if self.membership_ready()
+            || self
+                .sql
+                .run(deadline, "hub_log_base", |store| {
+                    Ok(store.hub_log_base()?.is_none())
+                })
+                .await?
+        {
+            if let Some(episode) = self
+                .membership
+                .can_write(self.applied_sequence(deadline).await?)
+            {
                 return Ok(episode);
             }
         }
@@ -581,9 +656,15 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
             .map_err(|_| {
                 HandlerError::new("identity_log_contended", "waiting for the hub writer")
             })?;
-        let row = self.store.hub_attempt(request.request_key)?;
+        let key = request.request_key.to_owned();
+        let row = self
+            .sql
+            .run(deadline, "hub_attempt", move |store| {
+                Ok(store.hub_attempt(&key)?)
+            })
+            .await?;
         if row.as_ref().is_none_or(|row| row.outcome.is_none())
-            && self.writer_episode()? != request.writer_ep
+            && self.writer_episode(deadline).await? != request.writer_ep
         {
             return Err(HandlerError::new(
                 "member_episode_invalid",
@@ -594,12 +675,12 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
             epoch: self.link.trust.as_ref(),
             epoch_reader: self.epoch.as_deref(),
             membership: &self.membership,
-            store: &self.store,
+            sql: &self.sql,
             base: self.base,
         };
         Writer {
             replan,
-            ..self.link.writer(&self.store, &trust)
+            ..self.link.writer(&self.sql, &trust)
         }
         .run(request, step, next, deadline)
         .await
@@ -615,11 +696,11 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
             epoch: self.link.trust.as_ref(),
             epoch_reader: self.epoch.as_deref(),
             membership: &self.membership,
-            store: &self.store,
+            sql: &self.sql,
             base: self.base,
         };
         self.link
-            .writer(&self.store, &trust)
+            .writer(&self.sql, &trust)
             .record_applied(record, revision, deadline)
             .await?;
         Ok(())
@@ -637,9 +718,16 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
             record.header().kind.as_str(),
             "epoch" | "wrap" | "wrapreq" | "wrapjoin"
         );
-        let applied = self.applied_sequence()?;
+        let applied = self.applied_sequence(deadline).await?;
         if let Some(epoch) = record.epoch() {
-            if let Some(old) = self.store.hub_kv_cached(key)?.and_then(|row| row.value) {
+            let owned_key = key.to_owned();
+            let old = self
+                .sql
+                .run(deadline, "hub_kv_cached", move |store| {
+                    Ok(store.hub_kv_cached(&owned_key)?.and_then(|row| row.value))
+                })
+                .await?;
+            if let Some(old) = old {
                 let previous = UnverifiedRecord::parse(key, &old)?.epoch();
                 reject_rollback(previous, Some(epoch))?;
             }
@@ -662,7 +750,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
                         })?;
                     wait_for_applied(self, head, deadline).await?;
                     self.membership
-                        .kv_key(&record, self.applied_sequence()?, sight)?
+                        .kv_key(&record, self.applied_sequence(deadline).await?, sight)?
                         .ok_or_else(|| {
                             crate::hub_membership::writer_unknown(&record.header().writer)
                         })?
@@ -677,7 +765,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
             }
             verified
         };
-        let applied = self.applied_sequence()?;
+        let applied = self.applied_sequence(deadline).await?;
         let writer_current = record.header().kind != "wrapreq"
             && self
                 .membership
@@ -700,7 +788,8 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
             .map_err(|_| HandlerError::new("hub_unavailable", "fleet KV open timed out"))??;
         let body = serde_json::from_slice(&body).map_err(crate::invalid_params)?;
         crate::hub_membership::validate_kv_body(&record, &body)?;
-        if !join && (!self.membership_ready() || self.applied_sequence()? != applied) {
+        if !join && (!self.membership_ready() || self.applied_sequence(deadline).await? != applied)
+        {
             return Err(HandlerError::new(
                 "hub_membership_stale",
                 "hub membership view is catching up",
@@ -714,11 +803,8 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
         })
     }
 
-    pub(super) fn applied_sequence(&self) -> Result<u64, HandlerError> {
-        hub_sequence(
-            self.base,
-            self.store.identity_log_status()?.last_applied_position,
-        )
+    pub(super) async fn applied_sequence(&self, deadline: Instant) -> Result<u64, HandlerError> {
+        applied_sequence(&self.sql, self.base, deadline).await
     }
 
     /// Retry at the same position with the saved body. A new position needs a
@@ -726,17 +812,25 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
     pub(super) async fn append(
         &self,
         plan: PlannedAppend<'_>,
-        replan: impl Fn(&RegistryStore, &Value) -> Result<Replanned, HandlerError> + Send + Sync,
+        replan: impl Fn(&RegistryStore, &Value) -> Result<Replanned, HandlerError>
+            + Send
+            + Sync
+            + 'static,
         deadline: Instant,
     ) -> Result<hub_write::Landed, HandlerError> {
-        self.append_inner(plan, |store, body, _| replan(store, body), None, deadline)
-            .await
+        self.append_inner(
+            plan,
+            Arc::new(move |store, body, _| replan(store, body)),
+            None,
+            deadline,
+        )
+        .await
     }
 
     async fn append_inner(
         &self,
         plan: PlannedAppend<'_>,
-        replan: impl Fn(&RegistryStore, &Value, &str) -> Result<Replanned, HandlerError> + Send + Sync,
+        replan: LocalReplan,
         local: Option<Option<&entorhinal_core::HubContinuation>>,
         deadline: Instant,
     ) -> Result<hub_write::Landed, HandlerError> {
@@ -761,7 +855,11 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
                 "hub identity-log tail has stopped",
             ));
         }
-        if self.membership.can_write(self.applied_sequence()?) != Some(plan.writer_ep) {
+        if self
+            .membership
+            .can_write(self.applied_sequence(deadline).await?)
+            != Some(plan.writer_ep)
+        {
             return Err(HandlerError::new(
                 "member_episode_invalid",
                 "local box cannot write in that membership episode",
@@ -771,7 +869,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
             epoch: self.link.trust.as_ref(),
             epoch_reader: self.epoch.as_deref(),
             membership: &self.membership,
-            store: &self.store,
+            sql: &self.sql,
             base: self.base,
         };
         let planner = Planner {
@@ -781,7 +879,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
         };
         let writer = Writer {
             replan: Some(&planner),
-            ..self.link.writer(&self.store, &trust)
+            ..self.link.writer(&self.sql, &trust)
         };
         let request = hub_write::Request {
             request_key: plan.request_key,
@@ -814,17 +912,16 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
     }
 }
 
-struct Planner<'a, T, U, F> {
+struct Planner<'a, T, U> {
     log: &'a IdentityLog<T, U>,
-    replan: F,
+    replan: LocalReplan,
     writer_ep: u64,
 }
 
-impl<T, U, F> LogReplan for Planner<'_, T, U, F>
+impl<T, U> LogReplan for Planner<'_, T, U>
 where
     T: LogTransport,
     U: Trust + Send + Sync + 'static,
-    F: Fn(&RegistryStore, &Value, &str) -> Result<Replanned, HandlerError> + Sync,
 {
     fn wait_for_head(
         &self,
@@ -834,27 +931,40 @@ where
         Box::pin(wait_for_applied(self.log, sequence, deadline))
     }
 
-    fn after_image(&self, saved: &Value) -> Result<Replanned, HandlerError> {
-        self.after_image_with_id(saved, "")
-    }
-
-    fn after_image_with_id(&self, saved: &Value, id: &str) -> Result<Replanned, HandlerError> {
-        if self.log.membership.can_write(self.log.applied_sequence()?) != Some(self.writer_ep) {
-            return Err(HandlerError::new(
-                "member_episode_invalid",
-                "local box cannot replan in that membership episode",
-            ));
-        }
-        let outcome = (self.replan)(&self.log.store, saved, id)?;
-        if let Replanned::Body(body) | Replanned::WithLocal(body, _) = &outcome {
-            if op(body)? != op(saved)? {
-                return Err(HandlerError::new(
-                    "record_invalid",
-                    "re-plan changed the identity-log operation",
-                ));
-            }
-        }
-        Ok(outcome)
+    fn after_image(
+        &self,
+        saved: Value,
+        id: String,
+        deadline: Instant,
+    ) -> BoxFuture<'_, Result<Replanned, HandlerError>> {
+        let replan = self.replan.clone();
+        let membership = self.log.membership.clone();
+        let writer_ep = self.writer_ep;
+        let base = self.log.base;
+        Box::pin(
+            self.log
+                .sql
+                .run(deadline, "replan_hub_write", move |store| {
+                    let applied =
+                        hub_sequence(base, store.identity_log_status()?.last_applied_position)?;
+                    if membership.can_write(applied) != Some(writer_ep) {
+                        return Err(HandlerError::new(
+                            "member_episode_invalid",
+                            "local box cannot replan in that membership episode",
+                        ));
+                    }
+                    let outcome = replan(store, &saved, &id)?;
+                    if let Replanned::Body(body) | Replanned::WithLocal(body, _) = &outcome {
+                        if op(body)? != op(&saved)? {
+                            return Err(HandlerError::new(
+                                "record_invalid",
+                                "re-plan changed the identity-log operation",
+                            ));
+                        }
+                    }
+                    Ok(outcome)
+                }),
+        )
     }
 }
 
@@ -876,7 +986,7 @@ pub(super) async fn wait_for_applied<T: LogTransport, U: Trust + Send + Sync + '
             let notified = log.commits.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if log.applied_sequence()? >= sequence {
+            if log.applied_sequence(deadline).await? >= sequence {
                 return Ok(());
             }
             if matches!(log.health.log_state.load(Ordering::Relaxed), 4..=6) {
@@ -887,6 +997,17 @@ pub(super) async fn wait_for_applied<T: LogTransport, U: Trust + Send + Sync + '
     })
     .await
     .map_err(|_| unavailable())?
+}
+
+pub(super) async fn applied_sequence(
+    sql: &HubSql,
+    base: i64,
+    deadline: Instant,
+) -> Result<u64, HandlerError> {
+    sql.run(deadline, "identity_log_status", move |store| {
+        hub_sequence(base, store.identity_log_status()?.last_applied_position)
+    })
+    .await
 }
 
 fn op(body: &Value) -> Result<&str, HandlerError> {
@@ -923,7 +1044,7 @@ struct Snapshot {
 
 struct Tail<T, U> {
     link: Arc<Link<T, U>>,
-    store: RegistryStore,
+    sql: HubSql,
     health: Arc<HealthGauges>,
     commits: Arc<Notify>,
     base: i64,
@@ -947,7 +1068,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
         tasks.spawn(
             KeyPublisher {
                 link: self.link.clone(),
-                store: self.store.clone(),
+                sql: self.sql.clone(),
                 writer: self.writer.clone(),
                 base: self.base,
                 membership: self.membership.clone(),
@@ -960,6 +1081,10 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
         let mut blocked = false;
         let mut held = None;
         loop {
+            if !self.sql.available() {
+                self.stop(self.sequence() + 1, hub_write::store_unavailable());
+                return;
+            }
             let anchor_change;
             tokio::select! {
                 event = feed.next_event(), if retry_at.is_none() => { anchor_change = Ok(false); match event {
@@ -1073,6 +1198,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
                 | "credential_unavailable"
                 | "vault_unavailable"
                 | "epoch_key_unavailable"
+                | "hub_sql_timeout"
                 | "storage_error"
                 | "local_identity_unavailable"
         )
@@ -1172,7 +1298,7 @@ async fn watch_own_key(signer: Arc<dyn CredentialResolver>, changes: watch::Send
 
 struct KeyPublisher<T, U> {
     link: Arc<Link<T, U>>,
-    store: RegistryStore,
+    sql: HubSql,
     writer: Arc<tokio::sync::Mutex<()>>,
     base: i64,
     membership: Arc<Membership<T>>,
@@ -1182,6 +1308,9 @@ struct KeyPublisher<T, U> {
 impl<T: LogTransport, U: Trust + Send + Sync + 'static> KeyPublisher<T, U> {
     async fn run(self, mut cursor: watch::Receiver<Option<u64>>) {
         loop {
+            if !self.sql.available() {
+                return;
+            }
             let sequence = *cursor.borrow_and_update();
             if let Some(sequence) = sequence {
                 if self.publish_key(sequence).await {
@@ -1203,14 +1332,28 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> KeyPublisher<T, U> {
         let Some((episode, key)) = self.membership.publication(sequence) else {
             return false;
         };
-        if !self.store.hub_snapshot_applied(self.base).unwrap_or(false) {
-            return false;
+        let deadline = Instant::now() + READ_BUDGET;
+        let base = self.base;
+        match self
+            .sql
+            .run(deadline, "hub_snapshot_applied", move |store| {
+                Ok(store.hub_snapshot_applied(base)?)
+            })
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(error) => return error.code != "store_unavailable",
         }
         if let (Some(reader), Some(request)) = (
             &self.epoch,
             self.membership.episode_join_request(&key.box_id, sequence),
         ) {
-            if !reader.admission_wrap_imported(&request).unwrap_or(false) {
+            if !reader
+                .admission_wrap_imported(&request, deadline)
+                .await
+                .unwrap_or(false)
+            {
                 return true;
             }
         }
@@ -1225,12 +1368,12 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> KeyPublisher<T, U> {
             epoch: self.link.trust.as_ref(),
             epoch_reader: self.epoch.as_deref(),
             membership: &self.membership,
-            store: &self.store,
+            sql: &self.sql,
             base: self.base,
         };
         let result = self
             .link
-            .writer(&self.store, &trust)
+            .writer(&self.sql, &trust)
             .run(
                 &hub_write::Request {
                     request_key: &request_key,
@@ -1249,7 +1392,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> KeyPublisher<T, U> {
                     },
                 },
                 None,
-                Instant::now() + READ_BUDGET,
+                deadline,
             )
             .await;
         if let Err(error) = result {
@@ -1263,6 +1406,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> KeyPublisher<T, U> {
 impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
     // Returns true only when this delivery has moved the durable cursor.
     async fn apply(&mut self, delivery: LogDelivery) -> Result<bool, HandlerError> {
+        let deadline = Instant::now() + READ_BUDGET;
         let position = registry_position(self.base, delivery.sequence)?;
         let next = self
             .snapshot
@@ -1278,7 +1422,14 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
         }
         let unverified = UnverifiedRecord::parse(LOG_KEY, &delivery.bytes)?;
         let id = &unverified.header().entry_id;
-        match self.store.journal_log_position(id)? {
+        let owned_id = id.clone();
+        match self
+            .sql
+            .run(deadline, "journal_log_position", move |store| {
+                Ok(store.journal_log_position(&owned_id)?)
+            })
+            .await?
+        {
             Some(stored) if stored == position && position <= self.applied => return Ok(false),
             Some(_) => return Err(position_conflict()),
             None if position <= self.applied => return Err(position_conflict()),
@@ -1295,7 +1446,6 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
         if next != Some(position) {
             return Err(position_conflict());
         }
-        let deadline = Instant::now() + READ_BUDGET;
         let version = unverified.key_version().to_owned();
         let membership =
             entorhinal_core::hub_store::MEMBERSHIP_OPS.contains(&unverified.header().kind.as_str());
@@ -1380,21 +1530,35 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
                 .iter()
                 .map(|record| record.header().writer_ep)
                 .collect::<Vec<_>>();
-            self.store
-                .apply_hub_remote_snapshot(&snapshot.entries, &episodes)?;
+            let health = self.health.clone();
+            let entries = self
+                .sql
+                .apply(deadline, "apply_hub_remote_snapshot", move |store| {
+                    store.apply_hub_remote_snapshot(&snapshot.entries, &episodes)?;
+                    refresh_committed(&health, store);
+                    Ok(snapshot.entries)
+                })
+                .await?;
             self.highest_epoch = snapshot
                 .records
                 .last()
                 .and_then(VerifiedRecord::epoch)
                 .or(self.highest_epoch);
             self.committed(position);
-            for (entry, record) in snapshot.entries.iter().zip(&snapshot.records) {
+            for (entry, record) in entries.iter().zip(&snapshot.records) {
                 self.settle_applied(record, hub_sequence(self.base, entry.position)?, deadline)
                     .await;
             }
         } else {
-            self.store
-                .apply_hub_remote_entry(&entry, header.writer_ep)?;
+            let health = self.health.clone();
+            let writer_ep = header.writer_ep;
+            self.sql
+                .apply(deadline, "apply_hub_remote_entry", move |store| {
+                    store.apply_hub_remote_entry(&entry, writer_ep)?;
+                    refresh_committed(&health, store);
+                    Ok(())
+                })
+                .await?;
             self.highest_epoch = record.epoch().or(self.highest_epoch);
             self.committed(position);
             if header.kind == "member.admitted" {
@@ -1457,12 +1621,6 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
     fn committed(&mut self, position: i64) {
         self.applied = position;
         self.update_barrier();
-        crate::enable::refresh(&self.health, &self.store);
-        if let Ok(generation) = self.store.generation() {
-            self.health
-                .generation
-                .fetch_max(generation, Ordering::Relaxed);
-        }
         self.commits.notify_waiters();
     }
 
@@ -1471,12 +1629,12 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
             epoch: self.link.trust.as_ref(),
             epoch_reader: self.epoch.as_deref(),
             membership: &self.membership,
-            store: &self.store,
+            sql: &self.sql,
             base: self.base,
         };
         if let Err(error) = self
             .link
-            .writer(&self.store, &trust)
+            .writer(&self.sql, &trust)
             .record_applied(record, sequence, deadline)
             .await
         {
@@ -1484,6 +1642,13 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
             // still be settled by its exact sequence on the caller's retry.
             tracing::warn!(target: "identity_log", sequence, code = error.code, "could not record outcome for an applied hub entry");
         }
+    }
+}
+
+fn refresh_committed(health: &HealthGauges, store: &RegistryStore) {
+    crate::enable::refresh(health, store);
+    if let Ok(generation) = store.generation() {
+        health.generation.fetch_max(generation, Ordering::Relaxed);
     }
 }
 

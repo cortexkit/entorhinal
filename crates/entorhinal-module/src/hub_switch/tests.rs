@@ -39,11 +39,14 @@ async fn hub_reader_regression_installed_switch_restarts_a_finished_tail() {
 
     #[async_trait::async_trait]
     impl SharedLog for Restart {
-        fn start_installed_tail(&self) -> Result<tokio::task::JoinHandle<()>, HandlerError> {
+        async fn start_installed_tail(
+            &self,
+            _: Instant,
+        ) -> Result<tokio::task::JoinHandle<()>, HandlerError> {
             Ok(tokio::spawn(std::future::pending()))
         }
 
-        fn applied(&self) -> Result<u64, HandlerError> {
+        async fn applied(&self, _: Instant) -> Result<u64, HandlerError> {
             unreachable!()
         }
 
@@ -58,7 +61,7 @@ async fn hub_reader_regression_installed_switch_restarts_a_finished_tail() {
             _: u64,
             _: Value,
             _: Option<&entorhinal_core::HubContinuation>,
-            _: &LocalReplan<'_>,
+            _: LocalReplan,
             _: Instant,
         ) -> Result<Vec<u8>, HandlerError> {
             unreachable!()
@@ -75,7 +78,7 @@ async fn hub_reader_regression_installed_switch_restarts_a_finished_tail() {
     let deadline = Instant::now() + Duration::from_secs(1);
     fixture
         .switch
-        .start_installed(&fixture.store(), &runtime, 0, deadline)
+        .start_installed(&runtime, 0, deadline)
         .await
         .unwrap();
     let id = runtime.tail.lock().unwrap().as_ref().unwrap().id();
@@ -85,7 +88,7 @@ async fn hub_reader_regression_installed_switch_restarts_a_finished_tail() {
     );
     fixture
         .switch
-        .start_installed(&fixture.store(), &runtime, 0, deadline)
+        .start_installed(&runtime, 0, deadline)
         .await
         .unwrap();
     let task = runtime.tail.lock().unwrap().take().unwrap();
@@ -158,7 +161,7 @@ impl Fixture {
     ) -> Result<Option<MigrationImage>, HandlerError> {
         self.switch
             .advance(
-                &self.store(),
+                &crate::hub_write::HubSql::new(&self.slot, Arc::default()),
                 &self.log.client().fenced(LegacyFence::new(&self.slot)),
                 records,
                 Instant::now() + Duration::from_secs(2),

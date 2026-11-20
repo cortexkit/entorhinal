@@ -24,7 +24,7 @@ use crate::{
     hub_identity_log::{AcceptedKv, IdentityLog, LogTransport},
     hub_membership::Sight,
     hub_transport::{check_kv_size, Feed, FeedEvent, KvDelivery},
-    hub_write::{self, LogReplan, Payload, Replanned, Step, Trust},
+    hub_write::{self, HubSql, LogReplan, Payload, Replanned, Step, Trust},
     role_leases, HandlerError, HealthGauges, ProjectsHandler, RouteKey,
 };
 
@@ -118,8 +118,8 @@ trait Backend: Send + Sync {
     ) -> Result<(), HandlerError>;
     fn anchor_changes(&self) -> watch::Receiver<u64>;
     fn episode_closed(&self, holder: &str, episode: u64, applied: u64) -> bool;
-    fn applied(&self) -> Result<u64, HandlerError>;
-    fn writer_episode(&self) -> Result<u64, HandlerError>;
+    async fn applied(&self, deadline: Instant) -> Result<u64, HandlerError>;
+    async fn writer_episode(&self, deadline: Instant) -> Result<u64, HandlerError>;
     async fn log_head(&self, deadline: Instant) -> Result<u64, HandlerError>;
     async fn kv_entry(
         &self,
@@ -171,11 +171,11 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Backend for IdentityLog<
     fn episode_closed(&self, holder: &str, episode: u64, applied: u64) -> bool {
         self.episode_closed(holder, episode, applied)
     }
-    fn applied(&self) -> Result<u64, HandlerError> {
-        self.applied_sequence()
+    async fn applied(&self, deadline: Instant) -> Result<u64, HandlerError> {
+        self.applied_sequence(deadline).await
     }
-    fn writer_episode(&self) -> Result<u64, HandlerError> {
-        self.writer_episode()
+    async fn writer_episode(&self, deadline: Instant) -> Result<u64, HandlerError> {
+        self.writer_episode(deadline).await
     }
     async fn log_head(&self, deadline: Instant) -> Result<u64, HandlerError> {
         self.log_head(deadline).await
@@ -238,7 +238,7 @@ pub(super) struct Residence {
     snapshot: Arc<dyn SnapshotClaims>,
     box_id: String,
     base: i64,
-    store: RegistryStore,
+    sql: HubSql,
     health: Arc<HealthGauges>,
     commits: Arc<Notify>,
     watched: RwLock<Watched>,
@@ -324,7 +324,7 @@ impl Runtime {
                 (controller as Arc<dyn crate::hub_epoch::RemovalIntake>, task)
             });
         let service = Arc::new(Residence {
-            store: log.store.clone(),
+            sql: log.sql.clone(),
             box_id: log.box_id.to_string(),
             base: log.base,
             commits: log.commits.clone(),
@@ -369,6 +369,7 @@ impl Runtime {
                 }
                 match seeds.write(&log, Instant::now() + BUDGET).await {
                     Ok(()) => return,
+                    Err(error) if error.code == "store_unavailable" => return,
                     Err(error) => tracing::debug!(code = error.code, "snapshot seed deferred"),
                 }
                 tokio::select! { _ = notified => {}, _ = tokio::time::sleep(Duration::from_secs(1)) => {} }
@@ -401,7 +402,6 @@ impl ProjectsHandler {
             .map(|running| running.service.clone())
     }
 
-    #[cfg(test)]
     pub(super) async fn stop_hub_residence(&self) {
         self.role_leases.attach(None);
         self.move_wake.attach_hub(None);
@@ -409,9 +409,22 @@ impl ProjectsHandler {
         if let Some(mut running) = running {
             running.watch.abort();
             running.recovery.abort();
+            if let Some(seed) = &running.seed {
+                seed.abort();
+            }
+            if let Some((_, epoch)) = &running.epochs {
+                epoch.abort();
+            }
             let _ = (&mut running.watch).await;
             let _ = (&mut running.recovery).await;
+            if let Some(seed) = &mut running.seed {
+                let _ = seed.await;
+            }
+            if let Some((_, epoch)) = &mut running.epochs {
+                let _ = epoch.await;
+            }
         }
+        self.hub_sql.wait().await;
     }
 }
 
@@ -434,6 +447,8 @@ fn deferred(error: &HandlerError) -> bool {
             | "vault_unavailable"
             | "credential_unavailable"
             | "storage_error"
+            | "hub_sql_timeout"
+            | "store_unavailable"
             | "writer_unknown"
     )
 }
@@ -503,6 +518,33 @@ pub(super) fn with_claim_context<R>(
 }
 
 impl Residence {
+    async fn agent_creator(
+        &self,
+        agent: &str,
+        through: i64,
+        deadline: Instant,
+    ) -> Result<Option<(String, u64)>, HandlerError> {
+        let agent = agent.to_owned();
+        self.sql
+            .run(deadline, "hub_agent_creator", move |store| {
+                Ok(store.hub_agent_creator_through(&agent, through)?)
+            })
+            .await
+    }
+
+    async fn created_agent(
+        &self,
+        request: &str,
+        deadline: Instant,
+    ) -> Result<Option<(i64, entorhinal_core::agent::AgentRow)>, HandlerError> {
+        let request = request.to_owned();
+        self.sql
+            .run(deadline, "hub_created_agent", move |store| {
+                Ok(store.hub_created_agent(&request)?)
+            })
+            .await
+    }
+
     fn reset_role_watch(&self) {
         let mut watched = self.watched.write().unwrap();
         watched.initial = false;
@@ -541,6 +583,9 @@ impl Residence {
         tokio::pin!(committed);
         committed.as_mut().enable();
         loop {
+            if !self.sql.available() {
+                return;
+            }
             let lease_retry = pending
                 .values()
                 .filter_map(|entry| entry.lease_retry_at)
@@ -606,12 +651,9 @@ impl Residence {
         pending: &mut HashMap<String, HeldDelivery>,
     ) {
         let key = delivery.entry.key.clone();
+        let deadline = Instant::now() + BUDGET;
         let mut result = self
-            .observe_at(
-                &delivery.entry,
-                &mut delivery.arrival_head,
-                Instant::now() + BUDGET,
-            )
+            .observe_at(&delivery.entry, &mut delivery.arrival_head, deadline)
             .await;
         delivery.lease_retry_at = result.as_ref().err().and_then(|error| {
             (error.code == "role_lease_awaiting_expiry")
@@ -622,10 +664,18 @@ impl Residence {
             .as_ref()
             .is_err_and(|error| error.code == "writer_unknown");
         if delivery.waiting_for_anchor || delivery.lease_retry_at.is_some() {
-            if let Err(error) = self.store.hold_hub_kv(&key, delivery.entry.revision) {
+            let held_key = key.clone();
+            let revision = delivery.entry.revision;
+            if let Err(error) = self
+                .sql
+                .run(deadline, "hold_hub_kv", move |store| {
+                    Ok(store.hold_hub_kv(&held_key, revision)?)
+                })
+                .await
+            {
                 delivery.waiting_for_anchor = false;
                 delivery.lease_retry_at = None;
-                result = Err(error.into());
+                result = Err(error);
             }
         }
         let mut watched = self.watched.write().unwrap();
@@ -684,7 +734,7 @@ impl Residence {
             Operation::Delete => b"DEL",
             Operation::Purge => b"PURGE",
         };
-        let old = self.store.hub_kv_cached(key)?;
+        let old = self.sql.cached(key, deadline).await?;
         if let Some(old) = &old {
             if revision < old.revision || (revision == old.revision && old.integrity_failed) {
                 return Ok(());
@@ -693,18 +743,21 @@ impl Residence {
                 if old.value.as_deref() == Some(value)
                     && old.body.is_some() == (entry.operation == Operation::Put)
                 {
-                    self.accept(key, revision, value, old.body.as_ref())?;
+                    self.accept(key, revision, value, old.body.as_ref(), deadline)
+                        .await?;
                 } else {
-                    self.refuse(key, revision, "revision_bytes_differ")?;
+                    self.refuse(key, revision, "revision_bytes_differ", deadline)
+                        .await?;
                 }
                 return Ok(());
             }
         }
         if entry.operation != Operation::Put {
-            if self.delete_allowed(key, old.as_ref())? {
-                self.accept(key, revision, value, None)?;
+            if self.delete_allowed(key, old.as_ref(), deadline).await? {
+                self.accept(key, revision, value, None, deadline).await?;
             } else {
-                self.refuse(key, revision, "delete_forbidden")?;
+                self.refuse(key, revision, "delete_forbidden", deadline)
+                    .await?;
             }
             return Ok(());
         }
@@ -714,7 +767,8 @@ impl Residence {
                 .await
             {
                 Ok(accepted) => {
-                    self.accept(key, revision, value, Some(&accepted.body))?;
+                    self.accept(key, revision, value, Some(&accepted.body), deadline)
+                        .await?;
                     self.backend
                         .record_applied(&accepted.record, revision, deadline)
                         .await
@@ -722,17 +776,21 @@ impl Residence {
                     return Ok(());
                 }
                 Err(error) if deferred(&error) => return Err(error),
-                Err(error) => return self.refuse(key, revision, &error.code),
+                Err(error) => return self.refuse(key, revision, &error.code, deadline).await,
             }
         }
         let (name, role) = if let Some(role) = key.strip_prefix("role.") {
             if !role_leases::valid_role(role) {
-                return self.refuse(key, revision, "invalid_role_name");
+                return self
+                    .refuse(key, revision, "invalid_role_name", deadline)
+                    .await;
             }
             (role, true)
         } else if let Some(agent) = key.strip_prefix("residence.") {
             if !entorhinal_core::agent::valid_agent_id(agent) {
-                return self.refuse(key, revision, "invalid_agent_id");
+                return self
+                    .refuse(key, revision, "invalid_agent_id", deadline)
+                    .await;
             }
             (agent, false)
         } else if let Some(name) = role_key_name(key) {
@@ -751,7 +809,8 @@ impl Residence {
         };
         match result {
             Ok(accepted) => {
-                self.accept(key, revision, value, Some(&accepted.body))?;
+                self.accept(key, revision, value, Some(&accepted.body), deadline)
+                    .await?;
                 if let Err(error) = self
                     .backend
                     .record_applied(&accepted.record, revision, deadline)
@@ -764,20 +823,35 @@ impl Residence {
             Err(error) if deferred(&error) || error.code == "role_lease_awaiting_expiry" => {
                 Err(error)
             }
-            Err(error) => self.refuse(key, revision, &error.code),
+            Err(error) => self.refuse(key, revision, &error.code, deadline).await,
         }
     }
 
-    fn accept(
+    async fn accept(
         &self,
         key: &str,
         revision: u64,
         value: &[u8],
         body: Option<&Value>,
+        deadline: Instant,
     ) -> Result<(), HandlerError> {
+        let saved_key = key.to_owned();
+        let value = value.to_vec();
+        let body = body.cloned();
+        let now = (self.clock)();
         if self
-            .store
-            .record_hub_kv(key, revision, Some((value, body)), (self.clock)())?
+            .sql
+            .run(deadline, "record_hub_kv", move |store| {
+                Ok(
+                    store.record_hub_kv(
+                        &saved_key,
+                        revision,
+                        Some((&value, body.as_ref())),
+                        now,
+                    )?,
+                )
+            })
+            .await?
         {
             let mut watched = self.watched.write().unwrap();
             watched.revisions.insert(key.into(), revision);
@@ -794,10 +868,21 @@ impl Residence {
         Ok(())
     }
 
-    fn refuse(&self, key: &str, revision: u64, code: &str) -> Result<(), HandlerError> {
+    async fn refuse(
+        &self,
+        key: &str,
+        revision: u64,
+        code: &str,
+        deadline: Instant,
+    ) -> Result<(), HandlerError> {
+        let saved_key = key.to_owned();
+        let now = (self.clock)();
         if self
-            .store
-            .record_hub_kv(key, revision, None, (self.clock)())?
+            .sql
+            .run(deadline, "record_hub_kv", move |store| {
+                Ok(store.record_hub_kv(&saved_key, revision, None, now)?)
+            })
+            .await?
         {
             self.watched.write().unwrap().revisions.remove(key);
             self.health
@@ -809,12 +894,21 @@ impl Residence {
         Ok(())
     }
 
-    fn delete_allowed(&self, key: &str, old: Option<&HubKvCached>) -> Result<bool, HandlerError> {
+    async fn delete_allowed(
+        &self,
+        key: &str,
+        old: Option<&HubKvCached>,
+        deadline: Instant,
+    ) -> Result<bool, HandlerError> {
         if let Some(mint) = key
             .strip_prefix("wrap.")
             .and_then(|rest| rest.split('.').nth(1))
         {
-            let epoch = self.store.hub_kv_cached("epoch")?.and_then(|row| row.body);
+            let epoch = self
+                .sql
+                .cached("epoch", deadline)
+                .await?
+                .and_then(|row| row.body);
             return Ok(epoch
                 .as_ref()
                 .and_then(committed_mint)
@@ -847,7 +941,7 @@ impl Residence {
             .map_err(crate::invalid_params)?;
         let ordinary_first = body.gen == 1 && !body.forced && body.seeded != Some(true);
         let mut creator = if ordinary_first {
-            self.store.hub_agent_creator(agent)?
+            self.agent_creator(agent, i64::MAX, deadline).await?
         } else {
             None
         };
@@ -878,7 +972,7 @@ impl Residence {
                     .ok()
                     .and_then(|head| self.base.checked_add(head))
                     .ok_or_else(|| bad_record("hub log head is out of range"))?;
-                creator = self.store.hub_agent_creator_through(agent, through)?;
+                creator = self.agent_creator(agent, through, deadline).await?;
             }
             seed = self.snapshot.claim(agent);
             accepted = self.backend.verify(key, bytes, deadline).await?;
@@ -1070,33 +1164,43 @@ impl Residence {
     }
 }
 
-#[async_trait]
-impl role_leases::Backend for Residence {
-    fn local_box(&self) -> &str {
-        &self.box_id
-    }
-
-    fn role_high_water(&self, name: &str) -> Result<i64, HandlerError> {
-        Ok(self.store.role_gen_high_water(name)?)
-    }
-
-    fn role(&self, name: &str) -> Result<role_leases::Observation, HandlerError> {
+impl Residence {
+    // Served role reads are already running inside the tracked read job.
+    pub(super) fn role_on_blocking(
+        &self,
+        store: &RegistryStore,
+        name: &str,
+    ) -> Result<role_leases::Observation, HandlerError> {
         let key = format!("role.{name}");
+        let row = store.hub_kv_cached(&key)?;
+        let applied = crate::hub_identity_log::hub_sequence(
+            self.base,
+            store.identity_log_status()?.last_applied_position,
+        )?;
+        self.role_observation(name, &key, row, applied, None)
+    }
+
+    fn role_observation(
+        &self,
+        name: &str,
+        key: &str,
+        row: Option<HubKvCached>,
+        applied: u64,
+        local_episode: Option<u64>,
+    ) -> Result<role_leases::Observation, HandlerError> {
         let watched = self.watched.read().unwrap();
-        let row = self.store.hub_kv_cached(&key)?;
         let revision = row.as_ref().map_or(0, |row| row.revision);
         let ready = self.ready_with(&watched)
-            && !watched.held.contains(&key)
+            && !watched.held.contains(key)
             && row.as_ref().map_or_else(
                 || self.snapshot.role(name).is_none_or(|(_, gen)| gen == 0),
-                |row| !row.integrity_failed && watched.revisions.get(&key) == Some(&revision),
+                |row| !row.integrity_failed && watched.revisions.get(key) == Some(&revision),
             );
         let record = row
             .and_then(|row| row.body)
             .map(serde_json::from_value::<role_leases::Record>)
             .transpose()
             .map_err(crate::invalid_params)?;
-        let applied = self.backend.applied()?;
         Ok(role_leases::Observation {
             ready,
             watch: (
@@ -1106,7 +1210,7 @@ impl role_leases::Backend for Residence {
                     .load(Ordering::Acquire),
             ),
             revision,
-            local_episode: self.backend.writer_episode().ok(),
+            local_episode,
             holder_current: record.as_ref().is_some_and(|record| {
                 record.holder.as_deref().is_some_and(|holder| {
                     crate::hub_membership::box_id(holder)
@@ -1124,21 +1228,58 @@ impl role_leases::Backend for Residence {
             record,
         })
     }
+}
+
+#[async_trait]
+impl role_leases::Backend for Residence {
+    fn local_box(&self) -> &str {
+        &self.box_id
+    }
+
+    async fn role_high_water(&self, name: &str, deadline: Instant) -> Result<i64, HandlerError> {
+        let name = name.to_owned();
+        self.sql
+            .run(deadline, "role_gen_high_water", move |store| {
+                Ok(store.role_gen_high_water(&name)?)
+            })
+            .await
+    }
+
+    async fn role(
+        &self,
+        name: &str,
+        deadline: Instant,
+    ) -> Result<role_leases::Observation, HandlerError> {
+        let key = format!("role.{name}");
+        let row = self.sql.cached(&key, deadline).await?;
+        let applied = self.backend.applied(deadline).await?;
+        let local_episode = match self.backend.writer_episode(deadline).await {
+            Ok(episode) => Some(episode),
+            Err(error) if error.code == "hub_not_ready" => None,
+            Err(error) => return Err(error),
+        };
+        self.role_observation(name, &key, row, applied, local_episode)
+    }
 
     fn link_events(&self) -> (&Notify, &Notify) {
         (&self.link, &self.commits)
     }
 
-    fn preferred(&self, role: &str) -> Result<Option<role_leases::Preferred>, HandlerError> {
-        self.cached_preference(role)
+    async fn preferred(
+        &self,
+        role: &str,
+        deadline: Instant,
+    ) -> Result<Option<role_leases::Preferred>, HandlerError> {
+        self.cached_preference(role, deadline).await
     }
 
-    fn handback(
+    async fn handback(
         &self,
         role: &str,
         box_id: &str,
+        deadline: Instant,
     ) -> Result<Option<role_leases::CandidateRequest>, HandlerError> {
-        self.cached_handback(role, box_id)
+        self.cached_handback(role, box_id, deadline).await
     }
 
     async fn reread_offer(
@@ -1225,10 +1366,11 @@ impl role_leases::Backend for Residence {
         let revision = landed
             .position
             .ok_or_else(|| bad_record("landed role write has no revision"))?;
-        self.store.observe_role_gen(role, change.body.gen)?;
+        self.raise_role_gen(role, change.body.gen, deadline).await?;
         let sent_ms = self
-            .store
-            .hub_attempt(&change.request_key)?
+            .sql
+            .attempt(&change.request_key, deadline)
+            .await?
             .map(|row| hub_write::landed_send_ms(&row, &landed))
             .transpose()?
             .flatten();
@@ -1267,12 +1409,12 @@ pub(super) fn delete_allowed_without_epoch(key: &str, last: Option<&Value>) -> b
 /// Runs the normal agent mutation, captures its log entry, and rolls back the
 /// transaction. A rebase uses the ID and timestamp from the persisted log entry
 /// and the avatar already drawn for the request.
-pub(super) type CreatePreview<'a> =
-    &'a (dyn Fn(&RegistryStore, Option<&Value>) -> Result<Value, HandlerError> + Send + Sync);
+pub(super) type CreatePreview =
+    Arc<dyn Fn(&RegistryStore, Option<&Value>) -> Result<Value, HandlerError> + Send + Sync>;
 
 struct CreateReplan<'a> {
     residence: &'a Residence,
-    preview: CreatePreview<'a>,
+    preview: CreatePreview,
 }
 
 impl LogReplan for CreateReplan<'_> {
@@ -1284,12 +1426,22 @@ impl LogReplan for CreateReplan<'_> {
         Box::pin(self.residence.backend.wait_through(head, deadline))
     }
 
-    fn after_image(&self, saved: &Value) -> Result<Replanned, HandlerError> {
-        match (self.preview)(&self.residence.store, Some(saved)) {
-            Ok(body) => Ok(Replanned::Body(body)),
-            Err(error) if deferred(&error) => Err(error),
-            Err(error) => Ok(Replanned::Refused(error)),
-        }
+    fn after_image(
+        &self,
+        saved: Value,
+        _id: String,
+        deadline: Instant,
+    ) -> futures_util::future::BoxFuture<'_, Result<Replanned, HandlerError>> {
+        let preview = self.preview.clone();
+        Box::pin(self.residence.sql.run(
+            deadline,
+            "replan_agent_create",
+            move |store| match preview(store, Some(&saved)) {
+                Ok(body) => Ok(Replanned::Body(body)),
+                Err(error) if deferred(&error) => Err(error),
+                Err(error) => Ok(Replanned::Refused(error)),
+            },
+        ))
     }
 }
 
@@ -1306,9 +1458,10 @@ fn resume_only() -> Step {
 }
 
 impl Residence {
-    fn request_episode(
+    async fn request_episode(
         &self,
         attempt: Option<&entorhinal_core::hub_store::HubAttempt>,
+        deadline: Instant,
     ) -> Result<u64, HandlerError> {
         if let Some(attempt) = attempt {
             let record = UnverifiedRecord::parse(&attempt.write.key, &attempt.write.value)?;
@@ -1319,7 +1472,7 @@ impl Residence {
             }
             Ok(record.header().writer_ep)
         } else {
-            self.backend.writer_episode()
+            self.backend.writer_episode(deadline).await
         }
     }
 
@@ -1328,7 +1481,7 @@ impl Residence {
         request_key: &str,
         digest: &str,
         attempt: Option<&entorhinal_core::hub_store::HubAttempt>,
-        preview: Option<CreatePreview<'_>>,
+        preview: Option<CreatePreview>,
         deadline: Instant,
     ) -> Result<hub_write::Landed, HandlerError> {
         if let Some(attempt) = attempt {
@@ -1341,13 +1494,20 @@ impl Residence {
         } else if !self.ready() {
             return Err(not_ready());
         }
-        let writer_ep = self.request_episode(attempt)?;
+        let writer_ep = self.request_episode(attempt, deadline).await?;
         let first = if attempt.is_some() {
             resume_only()
         } else {
-            let expected = self.backend.applied()?;
-            let body =
-                preview.ok_or_else(|| bad_record("create preview missing"))?(&self.store, None)?;
+            let expected = self.backend.applied(deadline).await?;
+            let preview = preview
+                .clone()
+                .ok_or_else(|| bad_record("create preview missing"))?;
+            let body = self
+                .sql
+                .run(deadline, "preview_agent_create", move |store| {
+                    preview(store, None)
+                })
+                .await?;
             Step {
                 name: CREATE.into(),
                 key: LOG_KEY.into(),
@@ -1390,10 +1550,10 @@ impl Residence {
         &self,
         request_key: &str,
         digest: &str,
-        preview: Option<CreatePreview<'_>>,
+        preview: Option<CreatePreview>,
         deadline: Instant,
     ) -> Result<Vec<u8>, HandlerError> {
-        let attempt = self.store.hub_attempt(request_key)?;
+        let attempt = self.sql.attempt(request_key, deadline).await?;
         let landed = match self
             .create_write(request_key, digest, attempt.as_ref(), preview, deadline)
             .await
@@ -1401,8 +1561,9 @@ impl Residence {
             Ok(landed) => landed,
             Err(error) => {
                 let kv = self
-                    .store
-                    .hub_attempt(request_key)?
+                    .sql
+                    .attempt(request_key, deadline)
+                    .await?
                     .filter(|row| row.write.step == CREATE_KV && row.write.params_digest == digest);
                 // The log proves this request created the agent, even if the
                 // KV bucket (which keeps one revision) can no longer show
@@ -1412,7 +1573,9 @@ impl Residence {
                     "hub_write_superseded" | "hub_write_unsettled"
                 ) && kv.as_ref().is_some_and(|row| row.outcome.is_some())
                 {
-                    if let Some((generation, row)) = self.store.hub_created_agent(request_key)? {
+                    if let Some((generation, row)) =
+                        self.created_agent(request_key, deadline).await?
+                    {
                         return encode_result(
                             json!({"agent": row.digest(), "generation":generation}),
                         );
@@ -1431,7 +1594,7 @@ impl Residence {
             let notified = self.commits.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if let Some((generation, row)) = self.store.hub_created_agent(request_key)? {
+            if let Some((generation, row)) = self.created_agent(request_key, deadline).await? {
                 return encode_result(json!({"agent": row.digest(), "generation":generation}));
             }
             timeout_at(deadline, notified)
@@ -1448,6 +1611,7 @@ impl Residence {
             notified.as_mut().enable();
             let unfinished = match self.recover_creates(&log_step).await {
                 Ok(unfinished) => unfinished,
+                Err(error) if error.code == "store_unavailable" => return,
                 Err(error) => {
                     tracing::warn!(target: "hub_residence", code = error.code, "could not read open residence attempts");
                     true
@@ -1462,35 +1626,46 @@ impl Residence {
     }
 
     async fn recover_creates(&self, log_step: &str) -> Result<bool, HandlerError> {
-        let mut open = self.store.open_hub_attempts(log_step)?;
-        open.extend(self.store.open_hub_attempts(CREATE_KV)?);
+        let deadline = Instant::now() + BUDGET;
+        let step = log_step.to_owned();
+        let open = self
+            .sql
+            .run(deadline, "open_hub_attempts", move |store| {
+                let mut open = store.open_hub_attempts(&step)?;
+                open.extend(store.open_hub_attempts(CREATE_KV)?);
+                Ok(open)
+            })
+            .await?;
         let mut unfinished = false;
         let ready = self.backend.membership_ready();
         for attempt in &open {
+            let deadline = Instant::now() + BUDGET;
             // Do not start a log append that was never seen to land. Only
             // completion of an applied create is a restart obligation.
             if attempt.write.step == log_step {
                 if self
-                    .store
-                    .hub_created_agent(&attempt.write.request_key)?
+                    .created_agent(&attempt.write.request_key, deadline)
+                    .await?
                     .is_none()
                 {
                     continue;
                 }
-                let writer_ep = self.request_episode(Some(attempt))?;
-                if self
-                    .backend
-                    .episode_closed(&self.box_id, writer_ep, self.backend.applied()?)
-                {
+                let writer_ep = self.request_episode(Some(attempt), deadline).await?;
+                if self.backend.episode_closed(
+                    &self.box_id,
+                    writer_ep,
+                    self.backend.applied(deadline).await?,
+                ) {
                     let error = HandlerError::new(
                         "residence_create_episode_closed",
                         "the agent was created but its writer episode closed before residence could be written",
                     );
-                    if !hub_write::refuse_attempt(&self.store, attempt, error).await? {
+                    if !hub_write::refuse_attempt(&self.sql, attempt, error, deadline).await? {
                         // A concurrent retry may have advanced to the KV step.
                         unfinished |= self
-                            .store
-                            .hub_attempt(&attempt.write.request_key)?
+                            .sql
+                            .attempt(&attempt.write.request_key, deadline)
+                            .await?
                             .is_some_and(|row| row.outcome.is_none());
                     }
                     continue;
@@ -1506,14 +1681,15 @@ impl Residence {
                     &attempt.write.params_digest,
                     Some(attempt),
                     None,
-                    Instant::now() + BUDGET,
+                    deadline,
                 )
                 .await
             {
                 tracing::debug!(target: "hub_residence", code = error.code, "residence create has not settled yet");
                 unfinished |= self
-                    .store
-                    .hub_attempt(&attempt.write.request_key)?
+                    .sql
+                    .attempt(&attempt.write.request_key, deadline)
+                    .await?
                     .is_some_and(|row| row.outcome.is_none());
             }
         }
@@ -1530,14 +1706,27 @@ struct TakeInput {
 }
 
 impl Residence {
-    fn take_plan(&self, agent: &str) -> Result<(u64, Record), HandlerError> {
-        let Some(row) = self.store.agent_row(agent)? else {
+    async fn take_plan(
+        &self,
+        agent: &str,
+        deadline: Instant,
+    ) -> Result<(u64, Record), HandlerError> {
+        let id = agent.to_owned();
+        let Some(row) = self
+            .sql
+            .run(
+                deadline,
+                "agent_row",
+                move |store| Ok(store.agent_row(&id)?),
+            )
+            .await?
+        else {
             return Err(HandlerError::new("unknown_agent", "unknown agent"));
         };
         if row.gone().is_some() {
             return Err(HandlerError::new("gone", "agent is gone"));
         }
-        let old = self.store.hub_kv_cached(&key(agent))?;
+        let old = self.sql.cached(&key(agent), deadline).await?;
         if old.as_ref().is_some_and(|old| old.integrity_failed) {
             return Err(HandlerError::new(
                 "claim_integrity_failed",
@@ -1547,9 +1736,13 @@ impl Residence {
         if !self.fresh(agent, old.as_ref().map(|old| old.revision)) {
             return Err(not_ready());
         }
-        let episode = self.backend.writer_episode()?;
+        let episode = self.backend.writer_episode(deadline).await?;
         let Some(old) = old else {
-            if self.store.hub_agent_creator(agent)?.is_some() {
+            if self
+                .agent_creator(agent, i64::MAX, deadline)
+                .await?
+                .is_some()
+            {
                 return Err(HandlerError::new(
                     "claim_pending",
                     "the creating computer must write this residence",
@@ -1565,7 +1758,7 @@ impl Residence {
                 .ok_or_else(|| bad_record("residence body missing"))?,
         )
         .map_err(crate::invalid_params)?;
-        let applied = self.backend.applied()?;
+        let applied = self.backend.applied(deadline).await?;
         if self.backend.current_member(&body.holder, applied) == Some(body.holder_ep) {
             return Err(HandlerError::new(
                 "holder_is_member",
@@ -1586,7 +1779,7 @@ impl Residence {
         observed: Option<(u64, Record)>,
         deadline: Instant,
     ) -> Result<Vec<u8>, HandlerError> {
-        let attempt = self.store.hub_attempt(&input.request_key)?;
+        let attempt = self.sql.attempt(&input.request_key, deadline).await?;
         if let Some(attempt) = &attempt {
             if attempt.write.params_digest != digest {
                 return Err(HandlerError::new(
@@ -1596,10 +1789,13 @@ impl Residence {
             }
         }
         let (step, writer_ep) = if attempt.is_some() {
-            (resume_only(), self.request_episode(attempt.as_ref())?)
+            (
+                resume_only(),
+                self.request_episode(attempt.as_ref(), deadline).await?,
+            )
         } else {
             let (revision, approved) = observed.ok_or_else(not_ready)?;
-            let (current, record) = self.take_plan(&input.agent_id)?;
+            let (current, record) = self.take_plan(&input.agent_id, deadline).await?;
             if revision != current || record.holder_ep != approved.holder_ep {
                 return Err(HandlerError::new(
                     "revision_moved",
@@ -1658,12 +1854,19 @@ impl ProjectsHandler {
         }
         let digest = hub_write::params_digest(TAKE, &json!({"agent_id":input.agent_id}))?;
         let service = self.residence().ok_or_else(not_ready)?;
-        if service.store.hub_attempt(&input.request_key)?.is_some() {
+        if service
+            .sql
+            .attempt(&input.request_key, received + BUDGET)
+            .await?
+            .is_some()
+        {
             return service
                 .write_take(&input, &digest, None, received + BUDGET)
                 .await;
         }
-        let plan = service.take_plan(&input.agent_id)?;
+        let plan = service
+            .take_plan(&input.agent_id, received + BUDGET)
+            .await?;
         let mut guard = ConfirmationGuard::take(&self.confirmation_slot, route)?;
         if !self.route_admissions().contains_key(&route) {
             return Err(OperatorConfirmError::Declined.into());

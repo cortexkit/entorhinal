@@ -142,7 +142,8 @@ impl ProjectsHandler {
         let Some(service) = self.residence() else {
             return Ok((read, 0));
         };
-        let observed = service.role(role)?;
+        let store = self.with_store(|s| Ok(s.clone()))?;
+        let observed = service.role_on_blocking(&store, role)?;
         read.stale = !observed.ready;
         read.known = observed.ready || observed.record.is_some();
         if let Some(record) = observed.record {
@@ -154,7 +155,6 @@ impl ProjectsHandler {
             read.holder = record.holder;
             read.source = Some("hub".into());
             if let Some(holder) = read.holder.as_deref() {
-                let store = self.with_store(|s| Ok(s.clone()))?;
                 read.holder_name = store
                     .resolve_move_member(holder)
                     .ok()

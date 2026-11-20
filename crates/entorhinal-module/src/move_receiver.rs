@@ -155,7 +155,7 @@ pub(crate) async fn poll_inbox(worker: &Worker) -> Result<(), HandlerError> {
 }
 
 pub(crate) async fn poll_hub(worker: &Worker, hub: &Residence) -> Result<(), HandlerError> {
-    for seen in hub.watched_moves() {
+    for seen in hub.watched_moves().await {
         let cut = seen.body.cut_id.clone();
         if seen.body.receiver != hub.move_box() || seen.body.state != HubState::Published {
             continue;
@@ -778,10 +778,10 @@ impl Receiver {
         // instead of being answered with another immediate abort pass.
         let mut cleaning = false;
         let result: Result<Duration, Failure> = async {
-            let hub = hub_plan
-                .as_ref()
-                .map(|p| self.read_hub_move(p))
-                .transpose()?;
+            let hub = match &hub_plan {
+                Some(plan) => Some(self.read_hub_move(plan).await?),
+                None => None,
+            };
             let hub = hub.as_ref().map(|(hub, seen)| (hub.as_ref(), seen));
             let (observed, version) = if let Some((_, seen)) = hub {
                 (seen.body.participant_plan(), seen.revision)

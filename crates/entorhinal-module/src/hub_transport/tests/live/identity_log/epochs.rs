@@ -374,7 +374,7 @@ fn roster(fleet: &Fleet, rig: &IdentityRig, boxes: &[&str]) {
 async fn devices(rig: &IdentityRig) -> (Arc<Fleet>, EpochNode, EpochNode) {
     for node in [&rig.a, &rig.b] {
         node.handler
-            .catch_up_task
+            .hub_tail_task
             .lock()
             .unwrap()
             .take()
@@ -419,7 +419,7 @@ async fn history(rig: &IdentityRig) -> Vec<Value> {
 }
 
 async fn admit(node: &EpochNode, box_id: &str, removal: &str) {
-    let head = node.node.log.applied_sequence().unwrap();
+    let head = node.node.log.applied_sequence(deadline()).await.unwrap();
     let body = json!({"box_id": box_id,"after_removal_id":removal,"request_id":"join-episode"});
     let landed = node
         .node
@@ -655,7 +655,7 @@ async fn hub_epoch_survivor_repairs_both_absorbed_removals_and_cold_rebuild_open
         Some(b.vault.clone()),
     )
     .await;
-    assert_eq!(cold.node.log.applied_sequence().unwrap(), 5);
+    assert_eq!(cold.node.log.applied_sequence(deadline()).await.unwrap(), 5);
     assert_eq!(cold.fence().await, 2);
 }
 
@@ -785,7 +785,8 @@ async fn hub_epoch_readers_refuse_rollback_without_rejecting_unchanged_old_kv() 
     .into_bytes();
     cold.node
         .log
-        .store
+        .sql
+        .test_store()
         .record_hub_kv(key, 5, Some((&new_kv, Some(&body))), 1)
         .unwrap();
     assert_eq!(
@@ -815,5 +816,5 @@ async fn hub_epoch_readers_refuse_rollback_without_rejecting_unchanged_old_kv() 
         }
     })
     .await;
-    assert_eq!(cold.node.log.applied_sequence().unwrap(), 2);
+    assert_eq!(cold.node.log.applied_sequence(deadline()).await.unwrap(), 2);
 }
