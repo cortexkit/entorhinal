@@ -338,6 +338,83 @@ async fn hub_reader_regression_tail_retries_storage_failures() {
 }
 
 #[tokio::test]
+async fn hub_membership_retries_an_unapplied_watch_roster_without_a_read() {
+    use crate::hub_transport::test_tail_feed;
+    use futures_util::stream::{self, BoxStream};
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    struct WatchRoster {
+        source: Arc<ChangingRoster>,
+        reads: AtomicUsize,
+        fail_once: AtomicBool,
+        failed: Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl PeerKeysRead for WatchRoster {
+        async fn peer_keys_read(&self) -> Result<Vec<PeerAnchor>, HandlerError> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.source.peer_keys_read().await
+        }
+
+        async fn own_fingerprint(&self) -> Result<String, HandlerError> {
+            if self.fail_once.swap(false, Ordering::Relaxed) {
+                self.failed.notify_one();
+                return Err(HandlerError::new("local_identity_unavailable", "retry"));
+            }
+            self.source.own_fingerprint().await
+        }
+
+        fn peer_key_updates(
+            self: Arc<Self>,
+        ) -> BoxStream<'static, Result<Vec<PeerAnchor>, HandlerError>> {
+            self.source.clone().peer_key_updates()
+        }
+    }
+
+    let (_scratch, mut tail) = tail_with(0, A, vec![]);
+    let peers = Arc::new(WatchRoster {
+        source: Arc::new(ChangingRoster(watch::channel(Vec::new()).0)),
+        reads: AtomicUsize::new(0),
+        fail_once: AtomicBool::new(false),
+        failed: Notify::new(),
+    });
+    Arc::get_mut(&mut tail.link).unwrap().peers = peers.clone();
+    let membership = Arc::new(Membership::new(
+        tail.link.transport.clone(),
+        tail.sql.clone(),
+        AnchorSource {
+            own_box: A.into(),
+            peers: peers.clone(),
+            signer: tail.link.signer.clone(),
+        },
+    ));
+    tail.membership = membership.clone();
+    let health = tail.health.clone();
+    Hub::new(crate::log_client::SubcConnector::default(), health.clone()).activate();
+    let feed = test_tail_feed(health.clone(), 0, |_| stream::pending());
+    let task = tokio::spawn(tail.run(feed));
+    wait_until(|| health.hub_membership.load(Ordering::Acquire) == 2).await;
+    assert_eq!(peers.reads.load(Ordering::Relaxed), 1, "initial discovery");
+
+    let new_peer = anchor(C, &TestKeys::with_seed(41));
+    peers.fail_once.store(true, Ordering::Relaxed);
+    peers.source.0.send_replace(vec![new_peer.clone()]);
+    tokio::time::timeout(Duration::from_secs(5), peers.failed.notified())
+        .await
+        .expect("the watch roster was not attempted");
+    assert!(membership.current_anchor(C).is_none());
+    wait_until(|| membership.current_anchor(C) == Some(new_peer.clone())).await;
+    assert_eq!(
+        peers.reads.load(Ordering::Relaxed),
+        1,
+        "no peer read on retry"
+    );
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
 async fn hub_reader_regression_member_key_publication_does_not_delay_apply() {
     use crate::hub_transport::test_tail_feed;
     use futures_util::stream;

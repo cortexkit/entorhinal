@@ -301,22 +301,13 @@ pub(super) trait PeerKeysRead: Send + Sync {
     async fn peer_keys_read(&self) -> Result<Vec<PeerAnchor>, HandlerError>;
     async fn own_fingerprint(&self) -> Result<String, HandlerError>;
 
-    // Replace this polling source with Callosum's peer-key watch when available.
     fn peer_key_updates(
         self: Arc<Self>,
     ) -> BoxStream<'static, Result<Vec<PeerAnchor>, HandlerError>>
     where
         Self: 'static,
     {
-        let every = Duration::from_secs(5);
-        let mut ticks = tokio::time::interval_at(Instant::now() + every, every);
-        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        stream::unfold((self, ticks), |(source, mut ticks)| async move {
-            ticks.tick().await;
-            let peers = source.peer_keys_read().await;
-            Some((peers, (source, ticks)))
-        })
-        .boxed()
+        poll_peer_keys(self, Instant::now() + PEER_POLL_PERIOD)
     }
 
     async fn fleet_peers(&self) -> Result<Vec<(String, String)>, HandlerError> {
@@ -327,6 +318,24 @@ pub(super) trait PeerKeysRead: Send + Sync {
             .map(|peer| (peer.box_id, peer.fingerprint))
             .collect())
     }
+}
+
+const PEER_POLL_PERIOD: Duration = Duration::from_secs(5);
+
+type PeerRoster = Result<Vec<PeerAnchor>, HandlerError>;
+
+fn poll_peer_keys<P: PeerKeysRead + ?Sized + 'static>(
+    source: Arc<P>,
+    first: Instant,
+) -> BoxStream<'static, PeerRoster> {
+    let mut ticks = tokio::time::interval_at(first, PEER_POLL_PERIOD);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    stream::unfold((source, ticks), |(source, mut ticks)| async move {
+        ticks.tick().await;
+        let peers = source.peer_keys_read().await;
+        Some((peers, (source, ticks)))
+    })
+    .boxed()
 }
 
 pub(super) struct AnchorSource {

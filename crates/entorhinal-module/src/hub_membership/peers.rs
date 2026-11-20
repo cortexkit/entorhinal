@@ -1,18 +1,34 @@
-use super::{box_id, fleet_record, Key, PeerAnchor, PeerKeysRead};
+use super::{
+    box_id, fleet_record, poll_peer_keys, Key, PeerAnchor, PeerKeysRead, PeerRoster,
+    PEER_POLL_PERIOD,
+};
 use crate::{
     log_client::{service_call_error, SubcConnector, TransportError},
     HandlerError,
 };
 use async_trait::async_trait;
+use futures_util::{
+    future::BoxFuture,
+    stream::{self, BoxStream},
+    FutureExt, StreamExt,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
-use subc_client_rs::{CallOptions, RouteHandle};
+use std::{sync::Arc, time::Duration};
+use subc_client_rs::{CallOptions, RouteHandle, SubscribeOptions, Subscription};
 use subc_protocol::{BindIdentity, RouteTarget};
+use tokio::time::{self, Instant};
 
 const METHOD: &str = "callosum.peer_keys_read";
+const WATCH: &str = "callosum.peer_keys_watch";
 const IDENTITY: &str = "callosum.identity_read";
+const WATCH_RETRY_MIN: Duration = Duration::from_secs(1);
+const WATCH_RETRY_MAX: Duration = Duration::from_secs(5 * 60);
+
+#[cfg(test)]
+#[path = "watch_tests.rs"]
+mod watch_tests;
 
 pub(in crate::hub_membership) fn key_id(bytes: &[u8]) -> String {
     entorhinal_catalog::hex(&Sha256::digest(bytes)[..8])
@@ -150,6 +166,14 @@ impl PeerKeysRead for Callosum {
         decode(&self.read().await?)
     }
 
+    fn peer_key_updates(self: Arc<Self>) -> BoxStream<'static, PeerRoster> {
+        stream::unfold((self, PeerUpdates::Starting), |(source, mut state)| async {
+            let roster = state.next(&source).await;
+            Some((roster, (source, state)))
+        })
+        .boxed()
+    }
+
     async fn own_fingerprint(&self) -> Result<String, HandlerError> {
         self.local
             .member_id(&self.connector)
@@ -178,6 +202,127 @@ impl PeerKeysRead for Callosum {
             })
             .collect())
     }
+}
+
+enum PeerUpdates {
+    Starting,
+    Watching(Subscription),
+    Polling {
+        reads: BoxStream<'static, PeerRoster>,
+        open: BoxFuture<'static, Option<OpenWatch>>,
+        next_delay: Duration,
+    },
+}
+
+type OpenWatch = (Subscription, Vec<PeerAnchor>);
+
+impl PeerUpdates {
+    async fn next(&mut self, source: &Arc<Callosum>) -> PeerRoster {
+        match self {
+            Self::Starting => {
+                if let Some((watch, peers)) = open_watch(source).await {
+                    *self = Self::Watching(watch);
+                    return Ok(peers);
+                }
+            }
+            Self::Watching(watch) => {
+                if let Some(peers) = next_notice(watch).await {
+                    return Ok(peers);
+                }
+            }
+            Self::Polling { .. } => {}
+        }
+        if !matches!(self, Self::Polling { .. }) {
+            *self = Self::Polling {
+                reads: poll_peer_keys(source.clone(), Instant::now()),
+                open: reopen_after(source.clone(), WATCH_RETRY_MIN),
+                next_delay: WATCH_RETRY_MIN * 2,
+            };
+        }
+        let Self::Polling {
+            reads,
+            open,
+            next_delay,
+        } = self
+        else {
+            unreachable!();
+        };
+        loop {
+            tokio::select! {
+                biased;
+                reopened = &mut *open => {
+                    if let Some((watch, peers)) = reopened {
+                        *self = Self::Watching(watch);
+                        return Ok(peers);
+                    }
+                    *open = reopen_after(source.clone(), *next_delay);
+                    *next_delay = (*next_delay * 2).min(WATCH_RETRY_MAX);
+                }
+                read = reads.next() => return read.expect("peer-key polling does not end"),
+            }
+        }
+    }
+}
+
+fn reopen_after(source: Arc<Callosum>, delay: Duration) -> BoxFuture<'static, Option<OpenWatch>> {
+    let retry_at = Instant::now() + delay;
+    async move {
+        time::sleep_until(retry_at).await;
+        open_watch(&source).await
+    }
+    .boxed()
+}
+
+async fn open_watch(source: &Callosum) -> Option<OpenWatch> {
+    // A request being sent does not mean the watch was accepted. Bound the
+    // wait for the initial roster so a silent provider cannot stall refreshes.
+    match time::timeout(PEER_POLL_PERIOD, async {
+        let consumer = source.connector.consumer().await.ok()?;
+        let mut watch = consumer
+            .subscribe(
+                target(),
+                bind_identity(),
+                request(WATCH),
+                SubscribeOptions::default(),
+            )
+            .await
+            .map_err(log_watch_error)
+            .ok()?;
+        let peers = next_notice(&mut watch).await?;
+        Some((watch, peers))
+    })
+    .await
+    {
+        Ok(watch) => watch,
+        Err(_) => {
+            tracing::warn!(method = WATCH, "timed out opening Callosum peer-key watch");
+            None
+        }
+    }
+}
+
+async fn next_notice(watch: &mut Subscription) -> Option<Vec<PeerAnchor>> {
+    let Some(bytes) = watch.events().recv().await else {
+        if let Err(error) = watch.closed().await {
+            log_watch_error(error);
+        }
+        return None;
+    };
+    match decode_reply(&bytes).and_then(|reply| decode(&reply)) {
+        Ok(peers) => Some(peers),
+        Err(error) => {
+            tracing::warn!(
+                method = WATCH,
+                code = error.code,
+                "discarding malformed Callosum peer-key notice"
+            );
+            None
+        }
+    }
+}
+
+fn log_watch_error(error: subc_client_rs::CallError) {
+    crate::log_client::warn_call_error("callosum", "management_surface", WATCH, &error);
 }
 
 impl Callosum {

@@ -1078,6 +1078,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
         );
         let mut retry_at = None;
         let mut own_retry_at = None;
+        let mut peer_retry = None;
         let mut blocked = false;
         let mut held = None;
         loop {
@@ -1098,6 +1099,8 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
                         match self.reconnect().await {
                             Ok(()) => {
                                 blocked = false;
+                                // Discovery just read the current roster.
+                                peer_retry = None;
                                 if let Some(epoch) = &self.epoch { epoch.membership_changed.notify_one(); }
                             }
                             Err(error) if self.retryable(&error) => {
@@ -1144,9 +1147,26 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
                     feed.replay();
                     anchor_change = Ok(false);
                 }
-                Some(update) = peers.next() => {
+                update = async {
+                    tokio::select! {
+                        biased;
+                        Some(update) = peers.next() => update,
+                        _ = async {
+                            match peer_retry.as_ref() {
+                                Some((at, _)) => tokio::time::sleep_until(*at).await,
+                                None => std::future::pending().await,
+                            }
+                        } => Ok(peer_retry.take().expect("scheduled peer refresh").1),
+                    }
+                } => {
                     anchor_change = match update {
-                        Ok(peers) => self.membership.refresh_peers(peers, Instant::now() + READ_BUDGET).await,
+                        Ok(peers) => {
+                            let result = self.membership.refresh_peers(peers.clone(), Instant::now() + READ_BUDGET).await;
+                            // A watch will not repeat an unchanged roster if applying it fails.
+                            peer_retry = result.as_ref().is_err_and(|error| self.retryable(error))
+                                .then(|| (Instant::now() + Duration::from_secs(1), peers));
+                            result
+                        }
                         Err(error) => Err(error),
                     };
                 }
