@@ -353,6 +353,7 @@ impl Residence {
         digest: &str,
         deadline: Instant,
     ) -> Result<Vec<u8>, HandlerError> {
+        self.health.hub.require_bucket()?;
         let saved = self.sql.attempt(&input.request_id, deadline).await?;
         let (step, writer_ep, forced_gen) = if let Some(saved) = &saved {
             if saved.write.params_digest != digest {
@@ -384,7 +385,7 @@ impl Residence {
         } else {
             let current = self.role(&input.role, deadline).await?;
             if !current.ready {
-                return Err(not_ready());
+                return Err(self.not_ready());
             }
             if current.gen() != input.expected_epoch {
                 return Err(HandlerError {
@@ -429,7 +430,7 @@ impl Residence {
                     .await?
                     .map_or(0, |entry| entry.revision);
                 if live != current.revision {
-                    return Err(not_ready());
+                    return Err(self.not_ready());
                 }
                 let record = Preference {
                     v: 1,
@@ -472,6 +473,7 @@ impl ProjectsHandler {
         route: RouteKey,
         received: Instant,
     ) -> Result<Vec<u8>, HandlerError> {
+        self.health.hub.require_bucket()?;
         let service = self.residence().ok_or_else(not_ready)?;
         let digest = hub_write::params_digest(
             crate::roles::TAKE,

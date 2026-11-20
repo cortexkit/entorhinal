@@ -24,7 +24,7 @@ impl Residence {
 
     pub(crate) async fn move_member(&self, box_id: &str) -> Result<Option<u64>, HandlerError> {
         if !self.ready() {
-            return Err(not_ready());
+            return Err(self.not_ready());
         }
         Ok(self
             .backend
@@ -33,19 +33,19 @@ impl Residence {
 
     async fn move_cached(&self, key: &str) -> Result<Option<HubKvCached>, HandlerError> {
         if !self.ready() {
-            return Err(not_ready());
+            return Err(self.not_ready());
         }
         let row = self.sql.cached(key, Instant::now() + BUDGET).await?;
         let watched = self.watched.read().unwrap();
         if !watched.initial || watched.held.contains(key) {
-            return Err(not_ready());
+            return Err(self.not_ready());
         }
         if let Some(row) = &row {
             if row.integrity_failed {
                 return Err(bad_record("fleet KV key has an integrity mark"));
             }
             if watched.revisions.get(key) != Some(&row.revision) {
-                return Err(not_ready());
+                return Err(self.not_ready());
             }
         }
         Ok(row)

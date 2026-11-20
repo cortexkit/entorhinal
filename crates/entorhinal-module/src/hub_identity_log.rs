@@ -25,7 +25,7 @@ use crate::{
     fleet_record::{vault::EpochVault, UnverifiedRecord, VerifiedRecord, LOG_KEY},
     hub_epoch::EpochReader,
     hub_membership::{AnchorSource, Membership, PeerKeysRead, Sight},
-    hub_transport::{Feed, FeedEvent, Hub, LogDelivery},
+    hub_transport::{Feed, FeedEvent, Hub, KvDelivery, LogDelivery},
     hub_write::{
         self, HubSql, LogReplan, Payload, Replanned, Step, Transport, Trust, Writer,
         PROJECTION_SNAPSHOT_KIND as SNAPSHOT,
@@ -37,6 +37,15 @@ const READ_BUDGET: Duration = Duration::from_secs(25);
 
 pub(super) trait LogTransport: Transport + Send + Sync + 'static {
     fn tail(self: &Arc<Self>, applied: u64) -> Feed<LogDelivery>;
+
+    fn kv_published_at(
+        &self,
+        _key: &str,
+        _revision: u64,
+        _deadline: Instant,
+    ) -> impl std::future::Future<Output = Result<Option<i64>, HandlerError>> + Send {
+        async { Ok(None) }
+    }
 
     fn join_keys(
         &self,
@@ -51,10 +60,7 @@ pub(super) trait LogTransport: Transport + Send + Sync + 'static {
         }
     }
 
-    fn epoch_watch(
-        self: &Arc<Self>,
-        _own_box: String,
-    ) -> Option<Feed<async_nats::jetstream::kv::Entry>> {
+    fn epoch_watch(self: &Arc<Self>, _own_box: String) -> Option<Feed<KvDelivery>> {
         None
     }
 }
@@ -64,11 +70,21 @@ impl LogTransport for Hub {
         self.tail(applied)
     }
 
-    fn epoch_watch(
-        self: &Arc<Self>,
-        own_box: String,
-    ) -> Option<Feed<async_nats::jetstream::kv::Entry>> {
+    fn epoch_watch(self: &Arc<Self>, own_box: String) -> Option<Feed<KvDelivery>> {
         Some(self.epoch_watch(own_box))
+    }
+
+    async fn kv_published_at(
+        &self,
+        key: &str,
+        revision: u64,
+        deadline: Instant,
+    ) -> Result<Option<i64>, HandlerError> {
+        self.require_bucket()?;
+        self.session(deadline)
+            .await?
+            .kv_published_at(key, revision, deadline)
+            .await
     }
 
     async fn join_keys(
@@ -76,10 +92,7 @@ impl LogTransport for Hub {
         prefix: &str,
         deadline: Instant,
     ) -> Result<Vec<String>, HandlerError> {
-        self.session(deadline)
-            .await?
-            .join_keys(prefix, deadline)
-            .await
+        self.list_bucket_keys(prefix, deadline).await
     }
 }
 
@@ -488,8 +501,20 @@ pub(super) struct AcceptedKv {
 }
 
 impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
-    pub(super) fn epoch_watch(&self) -> Option<Feed<async_nats::jetstream::kv::Entry>> {
+    pub(super) fn epoch_watch(&self) -> Option<Feed<KvDelivery>> {
         self.link.transport.epoch_watch(self.box_id.to_string())
+    }
+
+    pub(super) async fn kv_published_at(
+        &self,
+        key: &str,
+        revision: u64,
+        deadline: Instant,
+    ) -> Result<Option<i64>, HandlerError> {
+        self.link
+            .transport
+            .kv_published_at(key, revision, deadline)
+            .await
     }
 
     pub(super) fn peer_keys(&self) -> &dyn PeerKeysRead {
@@ -622,6 +647,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
     }
 
     pub(super) async fn writer_episode(&self, deadline: Instant) -> Result<u64, HandlerError> {
+        self.health.hub.require_bucket()?;
         if self.membership_ready()
             || self
                 .sql
@@ -651,6 +677,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
         replan: Option<&dyn LogReplan>,
         deadline: Instant,
     ) -> Result<hub_write::Landed, HandlerError> {
+        self.health.hub.require_bucket()?;
         let _guard = timeout_at(deadline, self.writer.lock())
             .await
             .map_err(|_| {
@@ -834,6 +861,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> IdentityLog<T, U> {
         local: Option<Option<&entorhinal_core::HubContinuation>>,
         deadline: Instant,
     ) -> Result<hub_write::Landed, HandlerError> {
+        self.health.hub.require_bucket()?;
         let kind = op(&plan.body)?.to_owned();
         let _guard = if local.is_none() {
             Some(
@@ -1089,6 +1117,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Tail<T, U> {
             let anchor_change;
             tokio::select! {
                 event = feed.next_event(), if retry_at.is_none() => { anchor_change = Ok(false); match event {
+                    FeedEvent::BucketReset => unreachable!("log feeds do not watch a bucket"),
                     FeedEvent::Disconnected => {
                         self.connected_head = None;
                         self.snapshot = Snapshot::default();

@@ -181,6 +181,108 @@ fn residence(node: &Node, image: Arc<Image>) {
 }
 
 #[tokio::test]
+async fn hub_bucket_reset_fences_both_feeds_and_keeps_verified_reads_stale() {
+    let Some(rig) = IdentityRig::new().await else {
+        return;
+    };
+    let (_issuer, connector) =
+        super::super::watch_credentials::start(&rig._processes.dir, rig.hub_port, B).await;
+    let handler = &rig.b.handler;
+    bind(handler, subc_protocol::Principal::Direct);
+    let hub = Hub::new(connector, handler.health.clone());
+    hub.activate();
+    let residence = handler
+        .activate_hub_residence(
+            rig.b.log.clone(),
+            hub.residence_watch(),
+            Arc::new(Image::default()),
+        )
+        .unwrap();
+    let mut epochs = hub.epoch_watch(B.into());
+    assert!(matches!(
+        within(epochs.next_event()).await,
+        FeedEvent::Connected
+    ));
+    assert!(matches!(
+        within(epochs.next_event()).await,
+        FeedEvent::Item(KvDelivery::CaughtUp)
+    ));
+
+    let role = "dreamer.global";
+    let key = format!("role.{role}");
+    let signed = fleet_record::prepare(
+        &ClaustrumCredentialResolver::with_target(rig.keys.clone(), 0),
+        rig.keys.as_ref(),
+        &Header {
+            kind: "role".into(),
+            key: key.clone(),
+            writer: A.into(),
+            writer_ep: 0,
+            entry_id: hub_write::new_op_id().unwrap(),
+        },
+        &json!({"v":1,"holder":A,"holder_ep":0,"writer":A,"gen":1,"lease_ms":60000}),
+    )
+    .await
+    .unwrap();
+    rig.kv.put(&key, signed.into_bytes().into()).await.unwrap();
+    until(|| role_read(handler, role)["stale"] == false && role_read(handler, role)["holder"] == A)
+        .await;
+    let store = store_of(handler);
+    let cached = store.hub_kv_cached(&key).unwrap().unwrap();
+    let admin = jetstream::new(
+        async_nats::connect(format!("127.0.0.1:{}", rig.hub_port))
+            .await
+            .unwrap(),
+    );
+    admin.delete_key_value(BUCKET).await.unwrap();
+    let replacement = admin
+        .create_key_value(kv::Config {
+            bucket: BUCKET.into(),
+            history: 1,
+            max_value_size: MAX_KV_VALUE,
+            max_bytes: MAX_KV_BYTES,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    replacement.delete(&key).await.unwrap();
+
+    let reset = tokio::time::timeout(Duration::from_secs(30), epochs.next_event())
+        .await
+        .unwrap();
+    assert!(matches!(reset, FeedEvent::BucketReset));
+    assert!(!residence.ready());
+    let read = role_read(handler, role);
+    assert_eq!(read["holder"], A);
+    assert_eq!(read["epoch"], 1);
+    assert_eq!(read["stale"], true);
+    assert_eq!(store.hub_kv_cached(&key).unwrap(), Some(cached));
+    assert_eq!(
+        error(role_take(handler, role, 1, "00000000000000000000000000000001").await),
+        BUCKET_RESET
+    );
+    let create = AgentOperation::create(99, "Reset blocked this write".into());
+    assert_eq!(
+        create.plan(&rig.b).append().await.unwrap_err().code,
+        BUCKET_RESET
+    );
+    assert_eq!(
+        rig.b
+            .log
+            .writer_episode(Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap_err()
+            .code,
+        BUCKET_RESET
+    );
+    let mut metrics = json!({});
+    handler.health.hub.report(&mut metrics);
+    assert_eq!(metrics["hubBucketResets"], 1);
+    assert_eq!(metrics["hubResetBucket"], BUCKET);
+    assert_eq!(metrics["hubKvWatchLive"], false);
+}
+
+#[tokio::test]
 async fn hub_reader_regression_residence_replays_after_transient_watch_error() {
     let Some(rig) = IdentityRig::new().await else {
         return;
@@ -205,18 +307,14 @@ async fn hub_reader_regression_residence_replays_after_transient_watch_error() {
                 .await
                 .map_err(|error| Failure::kind("kv_status", error.kind()))?
                 .values();
-            let empty =
-                futures_util::stream::iter((values == 0).then_some(Ok((0, KvDelivery::Empty))));
-            let entries = watch.map(|entry| {
-                map_kv_delivery(entry).map(|(revision, entry)| (revision, KvDelivery::Entry(entry)))
-            });
+            let entries = test_snapshot(watch, values == 0);
             let errors = futures_util::stream::iter(injected).then(|injected| async {
                 injected.await.unwrap();
                 Err(Failure::code("kv_delivery:MissingHeartbeat"))
             });
             Ok(Subscription::new(
                 None,
-                empty.chain(futures_util::stream::select(entries, errors)),
+                futures_util::stream::select(entries, errors),
             ))
         }
     })
@@ -800,6 +898,8 @@ async fn hub_residence_watch_refuses_forged_forced_values_and_continues_other_ke
     assert_eq!(refused_registration.code, "claim_integrity_failed");
     let landed = put(&rig, agent, tombstone, C, record(C, B, 4, false)).await;
     assert!(!applied(&rig.b, agent, landed).await.integrity_failed);
+    // The SQLite row commits before the watcher publishes its fresh revision.
+    until(|| ready_for(&rig.b, agent)).await;
     assert_eq!(session(&rig.b)["state"], "here");
     assert_eq!(
         rig.b

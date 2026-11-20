@@ -23,16 +23,16 @@ use async_nats::{
         consumer::{push, DeliverPolicy},
         context::PublishErrorKind,
         kv,
-        stream::{DirectGetErrorKind, LastRawMessageErrorKind},
+        stream::{DirectGetErrorKind, LastRawMessageErrorKind, RawMessageErrorKind},
     },
     HeaderMap, HeaderValue,
 };
-use cortexkit_bus_client::{BusClient, BusClientOptions, HubClient};
+use cortexkit_bus_client::{BucketItem, BusClient, BusClientOptions, Error as BusError, HubClient};
 use cortexkit_bus_naming::federation::{BoxId, RESIDENCE_STREAM};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tokio::{
-    sync::{watch, Mutex},
+    sync::{watch, Mutex, Notify},
     time::{timeout_at, Instant},
 };
 
@@ -69,13 +69,28 @@ const DOMAIN: &str = "hub";
 const LOG_STREAM: &str = "HUB_IDLOG";
 pub(super) const LOG_SUBJECT: &str = "ck.fleet.idlog";
 const BUCKET: &str = "residence";
+pub(super) const BUCKET_RESET: &str = "hub_bucket_reset";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_KV_VALUE: i32 = 16 * 1024;
 const MAX_KV_BYTES: i64 = 64 * 1024 * 1024;
 
+fn bucket_reset_error() -> HandlerError {
+    HandlerError::new(
+        BUCKET_RESET,
+        "hub bucket replaced; operator re-seed required",
+    )
+}
+
 pub(super) enum KvDelivery {
-    Empty,
-    Entry(kv::Entry),
+    CaughtUp,
+    Entry(WatchedEntry),
+}
+
+pub(super) struct WatchedEntry {
+    pub key: String,
+    pub revision: u64,
+    pub value: Vec<u8>,
+    pub operation: kv::Operation,
 }
 
 pub(super) struct KvEntry {
@@ -106,6 +121,8 @@ pub(super) struct Gauges {
     log_tail_live: AtomicBool,
     kv_watch_live: AtomicBool,
     failures: AtomicU64,
+    bucket_reset: AtomicBool,
+    reset_notified: Notify,
     pub(super) kv_records_refused: AtomicU64,
     pub(super) epoch_held: AtomicU64,
     writer_hold: std::sync::RwLock<Option<String>>,
@@ -118,8 +135,13 @@ impl Gauges {
         }
         metrics["hubConnected"] = json!(self.connected.load(Ordering::Relaxed));
         metrics["hubLogTailLive"] = json!(self.log_tail_live.load(Ordering::Relaxed));
-        metrics["hubKvWatchLive"] = json!(self.kv_watch_live.load(Ordering::Relaxed));
+        let reset = self.bucket_was_reset();
+        metrics["hubKvWatchLive"] = json!(!reset && self.kv_watch_live.load(Ordering::Relaxed));
         metrics["hubFailures"] = json!(self.failures.load(Ordering::Relaxed));
+        metrics["hubBucketResets"] = json!(u64::from(reset));
+        if reset {
+            metrics["hubResetBucket"] = json!(BUCKET);
+        }
         metrics["kvRecordsRefused"] = json!(self.kv_records_refused.load(Ordering::Relaxed));
         let epoch = self.epoch_held.load(Ordering::Relaxed);
         metrics["epochHeld"] = json!((epoch != 0).then_some(epoch));
@@ -132,6 +154,40 @@ impl Gauges {
 
     pub(super) fn set_writer_hold(&self, writer: Option<String>) {
         *self.writer_hold.write().unwrap() = writer;
+    }
+
+    /// A replacement restarts the KV revisions. They cannot be compared to the
+    /// revisions of the last verified claims and epoch records in SQLite. A
+    /// future operator re-seed must verify and install the new hub before
+    /// clearing this latch and restarting either watch. The latch is
+    /// process-local; a restart retains the verified records, not this flag.
+    fn mark_bucket_reset(&self) {
+        if !self.bucket_reset.swap(true, Ordering::AcqRel) {
+            self.kv_watch_live.store(false, Ordering::Relaxed);
+            tracing::warn!(target: "hub_transport", bucket = BUCKET, code = BUCKET_RESET,
+                "hub bucket replaced; operator re-seed required");
+            self.reset_notified.notify_waiters();
+        }
+    }
+
+    pub(super) fn bucket_was_reset(&self) -> bool {
+        self.bucket_reset.load(Ordering::Acquire)
+    }
+
+    pub(super) fn require_bucket(&self) -> Result<(), HandlerError> {
+        if self.bucket_was_reset() {
+            Err(bucket_reset_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn wait_for_bucket_reset(&self) {
+        let mut notified = std::pin::pin!(self.reset_notified.notified());
+        notified.as_mut().enable();
+        if !self.bucket_was_reset() {
+            notified.await;
+        }
     }
 
     fn reached(&self) {
@@ -159,7 +215,7 @@ impl Failure {
 
 pub(super) struct Hub {
     connector: SubcConnector,
-    bus: Mutex<Option<HubClient>>,
+    bus: Mutex<Option<Arc<HubClient>>>,
     local_bus: Mutex<Option<BusClient>>,
     health: Arc<HealthGauges>,
 }
@@ -218,7 +274,7 @@ impl Hub {
         }
     }
 
-    async fn binding(&self) -> Result<Binding, Failure> {
+    async fn hub_client(&self) -> Result<Arc<HubClient>, Failure> {
         let mut bus = self.bus.lock().await;
         if bus
             .as_ref()
@@ -227,13 +283,21 @@ impl Hub {
             *bus = None;
         }
         if bus.is_none() {
-            *bus = Some(
+            *bus = Some(Arc::new(
                 HubClient::connect(self.bus_consumer().await?, Self::bus_options())
                     .await
                     .map_err(Self::bus_failure)?,
-            );
+            ));
         }
-        let bus = bus.as_ref().expect("initialized bus client");
+        Ok(bus.as_ref().expect("initialized bus client").clone())
+    }
+
+    pub(super) fn require_bucket(&self) -> Result<(), HandlerError> {
+        self.health.hub.require_bucket()
+    }
+
+    async fn binding(&self) -> Result<Binding, Failure> {
+        let bus = self.hub_client().await?;
         let mut changes = bus.connection_changes();
         changes.borrow_and_update();
         let client = bus.client().map_err(Self::bus_failure)?;
@@ -295,45 +359,120 @@ impl Hub {
         }
     }
 
-    pub(super) fn watch(self: &Arc<Self>) -> Feed<kv::Entry> {
-        let hub = self.clone();
-        Feed::kv(self.health.clone(), move |cursor| {
-            let hub = hub.clone();
-            async move {
-                hub.open(Instant::now() + REQUEST_TIMEOUT)
-                    .await?
-                    .watch(cursor)
-                    .await
-            }
-        })
-    }
-
-    pub(super) fn epoch_watch(self: &Arc<Self>, own_box: String) -> Feed<kv::Entry> {
+    pub(super) fn epoch_watch(self: &Arc<Self>, own_box: String) -> Feed<KvDelivery> {
         let hub = self.clone();
         Feed::epoch(self.health.clone(), move |_| {
             let hub = hub.clone();
             let own_box = own_box.clone();
-            async move {
-                hub.open(Instant::now() + REQUEST_TIMEOUT)
-                    .await?
-                    .epoch_watch(&own_box)
-                    .await
-            }
+            async move { hub.bucket_watch(Some(own_box)).await }
         })
+        .with_durable_cursor()
     }
 
     pub(super) fn residence_watch(self: &Arc<Self>) -> Feed<KvDelivery> {
         let hub = self.clone();
         Feed::kv(self.health.clone(), move |_| {
             let hub = hub.clone();
-            async move {
-                hub.open(Instant::now() + REQUEST_TIMEOUT)
-                    .await?
-                    .residence_watch()
-                    .await
-            }
+            async move { hub.bucket_watch(None).await }
         })
         .with_durable_cursor()
+    }
+
+    async fn bucket_watch(
+        &self,
+        own_box: Option<String>,
+    ) -> Result<Subscription<KvDelivery>, Failure> {
+        let bus = timeout_at(Instant::now() + REQUEST_TIMEOUT, self.hub_client())
+            .await
+            .map_err(|_| Failure::code("bus_connect_timeout"))??;
+        if own_box.is_none() {
+            let js = bus.jetstream().map_err(Self::bus_failure)?;
+            let kv = js
+                .get_key_value(BUCKET)
+                .await
+                .map_err(|error| Failure::kind("kv_bucket", error.kind()))?;
+            check_bucket_config(&kv).await?;
+        }
+        let watch = bus.watch_bucket(BUCKET).await.map_err(bucket_failure)?;
+        let deliveries =
+            futures_util::stream::unfold((watch, own_box), |(mut watch, own_box)| async move {
+                let delivery = loop {
+                    let item = match watch.next().await {
+                        Ok(BucketItem::Put {
+                            key,
+                            revision,
+                            value,
+                        }) => KvDelivery::Entry(WatchedEntry {
+                            key,
+                            revision,
+                            value: value.to_vec(),
+                            operation: kv::Operation::Put,
+                        }),
+                        Ok(BucketItem::Delete { key, revision }) => {
+                            KvDelivery::Entry(WatchedEntry {
+                                key,
+                                revision,
+                                value: Vec::new(),
+                                operation: kv::Operation::Delete,
+                            })
+                        }
+                        Ok(BucketItem::CaughtUp) => break Ok((0, KvDelivery::CaughtUp)),
+                        Err(error) => break Err(bucket_failure(error)),
+                        Ok(_) => break Err(Failure::code("kv_unknown_bucket_item")),
+                    };
+                    let KvDelivery::Entry(entry) = &item else {
+                        unreachable!()
+                    };
+                    if own_box
+                        .as_deref()
+                        .is_none_or(|own| epoch_key(&entry.key, own))
+                    {
+                        break Ok((entry.revision, item));
+                    }
+                };
+                Some((delivery, (watch, own_box)))
+            });
+        // BucketWatch itself tracks replacements, which preserves its stream
+        // identity and lets it distinguish reconnection from bucket recreation.
+        Ok(Subscription::new(None, deliveries))
+    }
+
+    pub(super) async fn list_bucket_keys(
+        &self,
+        prefix: &str,
+        deadline: Instant,
+    ) -> Result<Vec<String>, HandlerError> {
+        let listing = async {
+            let client = self.hub_client().await?;
+            let mut watch = client.watch_bucket(BUCKET).await.map_err(bucket_failure)?;
+            let mut keys = std::collections::BTreeSet::new();
+            loop {
+                match watch.next().await.map_err(bucket_failure)? {
+                    BucketItem::Put { key, .. } if key.starts_with(prefix) => {
+                        keys.insert(key);
+                    }
+                    BucketItem::Delete { key, .. } if key.starts_with(prefix) => {
+                        keys.remove(&key);
+                    }
+                    BucketItem::CaughtUp => return Ok(keys.into_iter().collect()),
+                    BucketItem::Put { .. } | BucketItem::Delete { .. } => {}
+                    _ => return Err(Failure::code("kv_unknown_bucket_item")),
+                }
+            }
+        };
+        tokio::select! {
+            biased;
+            () = self.health.hub.wait_for_bucket_reset() => Err(bucket_reset_error()),
+            result = timeout_at(deadline, listing) => match result {
+                Ok(Ok(keys)) => Ok(keys),
+                Ok(Err(error)) if error.0 == BUCKET_RESET => {
+                    self.health.hub.mark_bucket_reset();
+                    Err(bucket_reset_error())
+                }
+                Ok(Err(error)) => Err(unavailable(&error.0)),
+                Err(_) => Err(unavailable("kv_keys_timeout")),
+            },
+        }
     }
 
     /// `applied` is a Hub stream sequence, not the registry's rebased position.
@@ -362,7 +501,8 @@ pub(super) struct LogDelivery {
 }
 
 impl Binding {
-    async fn epoch_watch(self, own_box: &str) -> Result<Subscription<kv::Entry>, Failure> {
+    #[cfg(test)]
+    async fn epoch_watch(self, own_box: &str) -> Result<Subscription<KvDelivery>, Failure> {
         let kv = self.session.kv().await?;
         let watch = kv
             .watch_many_with_history([
@@ -373,9 +513,10 @@ impl Binding {
             ])
             .await
             .map_err(|error| Failure::kind("kv_watch", error.kind()))?;
-        Ok(Subscription::new(self.changes, watch.map(map_kv_delivery)))
+        Ok(Subscription::new(self.changes, test_snapshot(watch, true)))
     }
 
+    #[cfg(test)]
     async fn residence_watch(self) -> Result<Subscription<KvDelivery>, Failure> {
         let kv = self.session.kv().await?;
         let watch = kv
@@ -384,32 +525,14 @@ impl Binding {
             .map_err(|error| Failure::kind("kv_watch", error.kind()))?;
         // Read the bucket state after installing the watch so a write between
         // binding and subscribing cannot be mistaken for an empty replay.
-        let status = self
-            .session
-            .kv()
-            .await?
-            .status()
-            .await
-            .map_err(|error| Failure::kind("kv_status", error.kind()))?;
-        let config = &status.info.config;
-        if status.history() != 1
-            || !status.max_age().is_zero()
-            || config.max_message_size != MAX_KV_VALUE
-            || config.max_bytes != MAX_KV_BYTES
-        {
-            return Err(Failure::code("kv_bucket_config_invalid"));
-        }
-        let empty = futures_util::stream::iter(
-            (status.values() == 0).then_some(Ok((0, KvDelivery::Empty))),
-        );
+        let values = check_bucket_config(&kv).await?;
         Ok(Subscription::new(
             self.changes,
-            empty.chain(watch.map(|event| {
-                map_kv_delivery(event).map(|(revision, entry)| (revision, KvDelivery::Entry(entry)))
-            })),
+            test_snapshot(watch, values == 0),
         ))
     }
 
+    #[cfg(test)]
     async fn watch(self, cursor: Option<u64>) -> Result<Subscription<kv::Entry>, Failure> {
         let kv = self.session.kv().await?;
         let watch = match cursor {
@@ -457,6 +580,82 @@ impl Binding {
     }
 }
 
+async fn check_bucket_config(kv: &kv::Store) -> Result<u64, Failure> {
+    let status = kv
+        .status()
+        .await
+        .map_err(|error| Failure::kind("kv_status", error.kind()))?;
+    let config = &status.info.config;
+    if status.history() != 1
+        || !status.max_age().is_zero()
+        || config.max_message_size != MAX_KV_VALUE
+        || config.max_bytes != MAX_KV_BYTES
+    {
+        return Err(Failure::code("kv_bucket_config_invalid"));
+    }
+    Ok(status.values())
+}
+
+fn bucket_failure(error: BusError) -> Failure {
+    match error {
+        BusError::BucketReset { .. } => Failure::code(BUCKET_RESET),
+        _ => Failure::code(&format!("kv_watch:{error}")),
+    }
+}
+
+fn epoch_key(key: &str, own_box: &str) -> bool {
+    if key == "epoch" {
+        return true;
+    }
+    let mut fields = key.split('.');
+    match (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) {
+        (Some("wrapreq"), Some(_), None, None, None) => true,
+        (Some("wrapjoin"), Some(owner), Some(_), None, None)
+        | (Some("wrap"), Some(_), Some(_), Some(owner), None) => owner == own_box,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+impl From<kv::Entry> for WatchedEntry {
+    fn from(entry: kv::Entry) -> Self {
+        Self {
+            key: entry.key,
+            revision: entry.revision,
+            value: entry.value.to_vec(),
+            operation: entry.operation,
+        }
+    }
+}
+
+#[cfg(test)]
+fn test_snapshot(
+    watch: kv::Watch,
+    empty: bool,
+) -> impl futures_util::Stream<Item = Result<(u64, KvDelivery), Failure>> + Send {
+    let mut caught_up = empty;
+    futures_util::stream::iter(empty.then_some(Ok((0, KvDelivery::CaughtUp)))).chain(
+        watch.flat_map(move |event| {
+            let mut boundary = None;
+            let entry = map_kv_delivery(event).map(|(revision, entry)| {
+                if !caught_up && entry.seen_current {
+                    caught_up = true;
+                    boundary = Some(Ok((0, KvDelivery::CaughtUp)));
+                }
+                (revision, KvDelivery::Entry(entry.into()))
+            });
+            futures_util::stream::iter([Some(entry), boundary].into_iter().flatten())
+        }),
+    )
+}
+
+#[cfg(test)]
 fn map_kv_delivery(
     event: Result<kv::Entry, kv::WatcherError>,
 ) -> Result<(u64, kv::Entry), Failure> {
@@ -587,6 +786,36 @@ impl Session {
         .await
     }
 
+    pub(super) async fn kv_published_at(
+        &self,
+        key: &str,
+        revision: u64,
+        deadline: Instant,
+    ) -> Result<Option<i64>, HandlerError> {
+        self.confirm_hub(deadline, async {
+            let stream = self
+                .js
+                .get_stream_no_info(RESIDENCE_STREAM)
+                .await
+                .map_err(|error| Failure::kind("kv_stream", error.kind()))?;
+            // The watch does not expose publish time. Read the exact revision
+            // so a later PUT cannot supply the reaper's clock for this record.
+            match stream.get_raw_message(revision).await {
+                Ok(message)
+                    if message.sequence == revision
+                        && message.subject.as_str() == format!("$KV.{BUCKET}.{key}") =>
+                {
+                    Ok(i64::try_from(message.time.unix_timestamp_nanos() / 1_000_000).ok())
+                }
+                Ok(_) => Err(Failure::code("kv_publish_time_wrong_entry")),
+                Err(error) if error.kind() == RawMessageErrorKind::NoMessageFound => Ok(None),
+                Err(error) => Err(Failure::kind("kv_publish_time", error.kind())),
+            }
+        })
+        .await
+    }
+
+    #[cfg(test)]
     pub(super) async fn join_keys(
         &self,
         prefix: &str,

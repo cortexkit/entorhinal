@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use async_nats::jetstream::kv::{Entry, Operation};
+use async_nats::jetstream::kv::Operation;
 use async_trait::async_trait;
 use entorhinal_core::{claim_cache::HubClaimContext, hub_store::HubKvCached, RegistryStore};
 use serde::{Deserialize, Serialize};
@@ -23,7 +23,7 @@ use crate::{
     fleet_record::{UnverifiedRecord, VerifiedRecord, LOG_KEY},
     hub_identity_log::{AcceptedKv, IdentityLog, LogTransport},
     hub_membership::Sight,
-    hub_transport::{check_kv_size, Feed, FeedEvent, KvDelivery},
+    hub_transport::{check_kv_size, Feed, FeedEvent, KvDelivery, WatchedEntry, BUCKET_RESET},
     hub_write::{self, HubSql, LogReplan, Payload, Replanned, Step, Trust},
     role_leases, HandlerError, HealthGauges, ProjectsHandler, RouteKey,
 };
@@ -126,6 +126,14 @@ trait Backend: Send + Sync {
         key: &str,
         deadline: Instant,
     ) -> Result<Option<hub_write::KvEntry>, HandlerError>;
+    async fn kv_published_at(
+        &self,
+        _key: &str,
+        _revision: u64,
+        _deadline: Instant,
+    ) -> Result<Option<i64>, HandlerError> {
+        Ok(None)
+    }
     async fn wait_through(&self, head: u64, deadline: Instant) -> Result<(), HandlerError>;
     async fn verify(
         &self,
@@ -151,6 +159,14 @@ trait Backend: Send + Sync {
 
 #[async_trait]
 impl<T: LogTransport, U: Trust + Send + Sync + 'static> Backend for IdentityLog<T, U> {
+    async fn kv_published_at(
+        &self,
+        key: &str,
+        revision: u64,
+        deadline: Instant,
+    ) -> Result<Option<i64>, HandlerError> {
+        self.kv_published_at(key, revision, deadline).await
+    }
     fn membership_ready(&self) -> bool {
         self.membership_ready()
     }
@@ -454,12 +470,21 @@ fn deferred(error: &HandlerError) -> bool {
 }
 
 impl Residence {
+    fn not_ready(&self) -> HandlerError {
+        self.health
+            .hub
+            .require_bucket()
+            .err()
+            .unwrap_or_else(not_ready)
+    }
+
     pub(super) fn ready(&self) -> bool {
         self.ready_with(&self.watched.read().unwrap())
     }
 
     fn ready_with(&self, watched: &Watched) -> bool {
-        self.snapshot.hub_ready()
+        !self.health.hub.bucket_was_reset()
+            && self.snapshot.hub_ready()
             && self.backend.membership_ready()
             && watched.initial
             && self
@@ -475,7 +500,8 @@ impl Residence {
         }
         let key = key(agent);
         let watched = self.watched.read().unwrap();
-        watched.initial
+        !self.health.hub.bucket_was_reset()
+            && watched.initial
             && !watched.held.contains(&key)
             && revision.is_none_or(|revision| watched.revisions.get(&key) == Some(&revision))
     }
@@ -592,21 +618,21 @@ impl Residence {
                 .min();
             tokio::select! {
                 event = feed.next_event() => match event {
+                    FeedEvent::BucketReset => {
+                        self.reset_role_watch();
+                        return;
+                    }
                     FeedEvent::Connected | FeedEvent::Disconnected => {
                         pending.retain(|key, _| role_key_name(key).is_none() && !key.starts_with("move.") && !key.starts_with("node."));
                         self.reset_role_watch();
                     }
-                    FeedEvent::Item(KvDelivery::Empty) => self.finish_initial_watch(),
+                    FeedEvent::Item(KvDelivery::CaughtUp) => self.finish_initial_watch(),
                     FeedEvent::Item(KvDelivery::Entry(entry)) => {
-                        let seen_current = entry.seen_current;
                         if pending.get(&entry.key).is_none_or(|old| old.entry.revision <= entry.revision) {
                             let arrival_head = pending.remove(&entry.key)
                                 .filter(|old| old.entry.revision == entry.revision)
                                 .and_then(|old| old.arrival_head);
                             self.observe_or_hold(HeldDelivery { entry, arrival_head, waiting_for_anchor: false, lease_retry_at: None }, &mut pending).await;
-                        }
-                        if seen_current {
-                            self.finish_initial_watch();
                         }
                     }
                 },
@@ -655,6 +681,22 @@ impl Residence {
         let mut result = self
             .observe_at(&delivery.entry, &mut delivery.arrival_head, deadline)
             .await;
+        let mut move_time = None;
+        if result.is_ok() && key.starts_with("move.") && delivery.entry.operation == Operation::Put
+        {
+            let accepted =
+                self.watched.read().unwrap().revisions.get(&key) == Some(&delivery.entry.revision);
+            if accepted {
+                match self
+                    .backend
+                    .kv_published_at(&key, delivery.entry.revision, deadline)
+                    .await
+                {
+                    Ok(time) => move_time = time,
+                    Err(error) => result = Err(error),
+                }
+            }
+        }
         delivery.lease_retry_at = result.as_ref().err().and_then(|error| {
             (error.code == "role_lease_awaiting_expiry")
                 .then(|| error.detail.as_ref()?.get("until_ms")?.as_u64())
@@ -691,10 +733,10 @@ impl Residence {
                 if delivery.entry.operation == Operation::Put
                     && watched.revisions.get(&key) == Some(&delivery.entry.revision)
                 {
-                    if let Ok(ms) =
-                        i64::try_from(delivery.entry.created.unix_timestamp_nanos() / 1_000_000)
-                    {
+                    if let Some(ms) = move_time {
                         watched.move_times.insert(key.clone(), ms);
+                    } else {
+                        watched.move_times.remove(&key);
                     }
                 } else if delivery.entry.operation != Operation::Put {
                     watched.move_times.remove(&key);
@@ -715,15 +757,16 @@ impl Residence {
     #[cfg(test)]
     pub(super) async fn observe(
         &self,
-        entry: &Entry,
+        entry: &async_nats::jetstream::kv::Entry,
         deadline: Instant,
     ) -> Result<(), HandlerError> {
-        self.observe_at(entry, &mut None, deadline).await
+        self.observe_at(&entry.clone().into(), &mut None, deadline)
+            .await
     }
 
     async fn observe_at(
         &self,
-        entry: &Entry,
+        entry: &WatchedEntry,
         arrival_head: &mut Option<u64>,
         deadline: Instant,
     ) -> Result<(), HandlerError> {
@@ -1255,7 +1298,7 @@ impl role_leases::Backend for Residence {
         let applied = self.backend.applied(deadline).await?;
         let local_episode = match self.backend.writer_episode(deadline).await {
             Ok(episode) => Some(episode),
-            Err(error) if error.code == "hub_not_ready" => None,
+            Err(error) if matches!(error.code.as_str(), "hub_not_ready" | BUCKET_RESET) => None,
             Err(error) => return Err(error),
         };
         self.role_observation(name, &key, row, applied, local_episode)
@@ -1327,6 +1370,7 @@ impl role_leases::Backend for Residence {
         change: &role_leases::Change,
         deadline: Instant,
     ) -> Result<role_leases::Confirmed, HandlerError> {
+        self.health.hub.require_bucket()?;
         if let Some(expected) = change.vacancy_preference {
             let competing = self
                 .live_preference(role, deadline)
@@ -1379,7 +1423,7 @@ impl role_leases::Backend for Residence {
 }
 
 struct HeldDelivery {
-    entry: Entry,
+    entry: WatchedEntry,
     arrival_head: Option<u64>,
     waiting_for_anchor: bool,
     lease_retry_at: Option<u64>,
@@ -1492,7 +1536,7 @@ impl Residence {
                 ));
             }
         } else if !self.ready() {
-            return Err(not_ready());
+            return Err(self.not_ready());
         }
         let writer_ep = self.request_episode(attempt, deadline).await?;
         let first = if attempt.is_some() {
@@ -1734,7 +1778,7 @@ impl Residence {
             ));
         }
         if !self.fresh(agent, old.as_ref().map(|old| old.revision)) {
-            return Err(not_ready());
+            return Err(self.not_ready());
         }
         let episode = self.backend.writer_episode(deadline).await?;
         let Some(old) = old else {
@@ -1749,7 +1793,7 @@ impl Residence {
                 ));
             }
             if self.snapshot.claim(agent) != Some((None, 0)) {
-                return Err(not_ready());
+                return Err(self.not_ready());
             }
             return Ok((0, Record::new(&self.box_id, episode, 1, false)));
         };
@@ -1852,6 +1896,7 @@ impl ProjectsHandler {
                 "invalid agent_id or request_key",
             ));
         }
+        self.health.hub.require_bucket()?;
         let digest = hub_write::params_digest(TAKE, &json!({"agent_id":input.agent_id}))?;
         let service = self.residence().ok_or_else(not_ready)?;
         if service

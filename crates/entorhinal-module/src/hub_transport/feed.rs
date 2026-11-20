@@ -9,7 +9,7 @@ use tokio::{
     time::{sleep_until, Instant},
 };
 
-use super::{Failure, HealthGauges, Ordering};
+use super::{Failure, HealthGauges, Ordering, BUCKET_RESET};
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
@@ -108,6 +108,7 @@ pub(crate) struct Feed<T> {
 pub(crate) enum FeedEvent<T> {
     Connected,
     Disconnected,
+    BucketReset,
     Item(T),
 }
 
@@ -229,6 +230,23 @@ impl<T> Feed<T> {
     }
 
     pub(crate) async fn next_event(&mut self) -> FeedEvent<T> {
+        if matches!(self.kind, Kind::Kv | Kind::Epoch) {
+            let health = self.health.clone();
+            tokio::select! {
+                biased;
+                () = health.hub.wait_for_bucket_reset() => {
+                    self.subscription = None;
+                    self.set_live(false);
+                    FeedEvent::BucketReset
+                }
+                event = self.next_event_inner() => event,
+            }
+        } else {
+            self.next_event_inner().await
+        }
+    }
+
+    async fn next_event_inner(&mut self) -> FeedEvent<T> {
         loop {
             if let Some(at) = self.retry_at {
                 sleep_until(at).await;
@@ -240,6 +258,10 @@ impl<T> Feed<T> {
                         self.subscription = Some(subscription);
                         self.reached();
                         return FeedEvent::Connected;
+                    }
+                    Err(error) if error.0 == BUCKET_RESET => {
+                        self.health.hub.mark_bucket_reset();
+                        return FeedEvent::BucketReset;
                     }
                     Err(error) => {
                         self.retry_open(error);
@@ -262,6 +284,11 @@ impl<T> Feed<T> {
                         }
                         return FeedEvent::Item(item);
                     }
+                }
+                Delivery::Item(Err(error)) if error.0 == BUCKET_RESET => {
+                    self.subscription = None;
+                    self.health.hub.mark_bucket_reset();
+                    return FeedEvent::BucketReset;
                 }
                 Delivery::Item(Err(error)) | Delivery::Ended(error) => {
                     // An ordered consumer can stay open after an error without

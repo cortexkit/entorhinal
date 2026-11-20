@@ -5,6 +5,7 @@ use entorhinal_core::hub_store::{HubAttemptSend, HubAttemptWrite};
 
 use super::*;
 use crate::{fleet_record::Header, hub_write::tests::TestKeys};
+use async_nats::jetstream::kv::Entry;
 
 const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -312,7 +313,7 @@ async fn hub_audit_regression_role_acquisition_held_until_expiry_or_applied_remo
             .await
             .unwrap();
         let early = HeldDelivery {
-            entry: f.role_entry(B, 2).await,
+            entry: f.role_entry(B, 2).await.into(),
             arrival_head: None,
             waiting_for_anchor: false,
             lease_retry_at: None,
