@@ -145,14 +145,16 @@ impl Transport for Leaf {
         deadline: Instant,
     ) -> Result<Option<KvEntry>, HandlerError> {
         self.requests.lock().unwrap().push(format!("read:{key}"));
-        Ok(self
-            .session()
-            .kv_entry(key, deadline)
-            .await?
-            .map(|entry| KvEntry {
-                revision: entry.revision,
-                value: (entry.operation == kv::Operation::Put).then(|| entry.value.to_vec()),
-            }))
+        Transport::kv_entry(&self.session(), key, deadline).await
+    }
+
+    async fn kv_fence_entry(
+        &self,
+        key: &str,
+        deadline: Instant,
+    ) -> Result<Option<KvEntry>, HandlerError> {
+        self.requests.lock().unwrap().push(format!("fence:{key}"));
+        self.session().kv_fence_entry(key, deadline).await
     }
 
     async fn send(

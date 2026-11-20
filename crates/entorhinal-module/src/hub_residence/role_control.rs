@@ -162,7 +162,7 @@ impl Residence {
         deadline: Instant,
     ) -> Result<Option<Preferred>, HandlerError> {
         let key = preference_key(role);
-        let Some(row) = self.backend.kv_entry(&key, deadline).await? else {
+        let Some(row) = self.backend.kv_fence_entry(&key, deadline).await? else {
             return Ok(None);
         };
         let Some(value) = row.value else {
@@ -228,8 +228,8 @@ impl Residence {
         let prefer_key = preference_key(role);
         let request_key = handback_key(role, &target.box_id);
         let (prefer, request) = tokio::try_join!(
-            self.backend.kv_entry(&prefer_key, deadline),
-            self.backend.kv_entry(&request_key, deadline),
+            self.backend.kv_fence_entry(&prefer_key, deadline),
+            self.backend.kv_fence_entry(&request_key, deadline),
         )?;
         let (Some(prefer), Some(request)) = (
             prefer.and_then(|entry| entry.value),
@@ -259,7 +259,7 @@ impl Residence {
     ) -> Result<Option<u64>, HandlerError> {
         Ok(self
             .backend
-            .kv_entry(&handback_key(role, candidate), deadline)
+            .kv_fence_entry(&handback_key(role, candidate), deadline)
             .await?
             .and_then(|entry| entry.value.map(|_| entry.revision)))
     }
@@ -273,7 +273,7 @@ impl Residence {
         let key = handback_key(role, &self.box_id);
         let revision = self
             .backend
-            .kv_entry(&key, deadline)
+            .kv_fence_entry(&key, deadline)
             .await?
             .map_or(0, |row| row.revision);
         let episode = self.backend.writer_episode(deadline).await?;
@@ -418,14 +418,14 @@ impl Residence {
                 let key = preference_key(&input.role);
                 let revision = self
                     .backend
-                    .kv_entry(&key, deadline)
+                    .kv_fence_entry(&key, deadline)
                     .await?
                     .map_or(0, |entry| entry.revision);
                 // This write uses a different key from the role. Check the
                 // role's live revision rather than relying on the preference write's revision check.
                 let live = self
                     .backend
-                    .kv_entry(&format!("role.{}", input.role), deadline)
+                    .kv_fence_entry(&format!("role.{}", input.role), deadline)
                     .await?
                     .map_or(0, |entry| entry.revision);
                 if live != current.revision {

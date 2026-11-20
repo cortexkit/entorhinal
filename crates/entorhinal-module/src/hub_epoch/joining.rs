@@ -196,7 +196,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
         }
         let after = removed.as_ref().and_then(|(_, _, id)| id.as_deref());
         let key = request_key(own);
-        let entry = self.reader.transport.kv_entry(&key, deadline).await?;
+        let entry = self.reader.transport.kv_fence_entry(&key, deadline).await?;
         let Some(anchor) = timeline.current_anchor(own) else {
             return Ok(true);
         };
@@ -339,7 +339,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
     async fn serve_join(&self, peer: &PeerAnchor, deadline: Instant) -> Result<(), HandlerError> {
         let box_id = &peer.box_id;
         let key = request_key(box_id);
-        let Some(entry) = self.reader.transport.kv_entry(&key, deadline).await? else {
+        let Some(entry) = self.reader.transport.kv_fence_entry(&key, deadline).await? else {
             return Ok(());
         };
         let Some(bytes) = &entry.value else {
@@ -384,7 +384,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
         if self
             .reader
             .transport
-            .kv_entry(&manifest, deadline)
+            .kv_fence_entry(&manifest, deadline)
             .await?
             .is_none()
         {
@@ -492,7 +492,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
         Ok(self
             .reader
             .transport
-            .kv_entry(&request_key(box_id), deadline)
+            .kv_fence_entry(&request_key(box_id), deadline)
             .await?
             .is_some_and(|entry| entry.revision == revision && entry.value.is_some()))
     }
@@ -527,7 +527,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
             let expected = self
                 .reader
                 .transport
-                .kv_entry(&part, deadline)
+                .kv_fence_entry(&part, deadline)
                 .await?
                 .map_or(0, |entry| entry.revision);
             self.put(
@@ -844,7 +844,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
         deadline: Instant,
     ) -> Result<(), HandlerError> {
         for key in keys {
-            if let Some(entry) = self.reader.transport.kv_entry(&key, deadline).await? {
+            if let Some(entry) = self.reader.transport.kv_fence_entry(&key, deadline).await? {
                 if entry.value.is_some() {
                     self.delete_join(&key, entry.revision, deadline).await?;
                 }

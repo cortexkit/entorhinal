@@ -736,7 +736,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
             .filter(|id| *id != &self.reader.own_box)
         {
             let key = wrap_key(epoch.e, &epoch.mint_id, id);
-            let Some(entry) = self.reader.transport.kv_entry(&key, deadline).await? else {
+            let Some(entry) = self.reader.transport.kv_fence_entry(&key, deadline).await? else {
                 continue;
             };
             if entry.value.is_none() {
@@ -1275,7 +1275,7 @@ impl<T: Transport> EpochReader<T> {
 
     async fn read_record(&self, deadline: Instant) -> Result<Option<Observed>, HandlerError> {
         let previous = self.sql.cached(KEY, deadline).await?;
-        let Some(entry) = self.transport.kv_entry(KEY, deadline).await? else {
+        let Some(entry) = self.transport.kv_fence_entry(KEY, deadline).await? else {
             return if previous.is_none() {
                 Ok(None)
             } else {
@@ -1544,6 +1544,13 @@ mod tests {
             Ok(0)
         }
         async fn kv_entry(
+            &self,
+            _: &str,
+            _: Instant,
+        ) -> Result<Option<hub_write::KvEntry>, HandlerError> {
+            unreachable!("the epoch register must be read from the leader")
+        }
+        async fn kv_fence_entry(
             &self,
             key: &str,
             _: Instant,

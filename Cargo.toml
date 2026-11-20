@@ -11,7 +11,7 @@ subc-protocol = "0.37.4"
 subc-transport = "0.18.0"
 
 cortexkit-bus-client = "0.1.10"
-cortexkit-bus-naming = "0.5.5"
+cortexkit-bus-naming = "0.5.7"
 cortexkit-bus-nats = "0.5.5"
 cortexkit-paths = "0.1.1"
 cortexkit-store = { version = "0.2.4", features = ["sqlite"] }

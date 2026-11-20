@@ -139,6 +139,8 @@ enum Action {
 struct HubState {
     logs: Vec<Vec<u8>>,
     kv: HashMap<String, KvEntry>,
+    replica: HashMap<String, KvEntry>,
+    direct_reads: usize,
     revision: u64,
     offline: bool,
     held: Option<HubAttemptWrite>,
@@ -201,6 +203,15 @@ impl Transport for Recorder<'_> {
     }
 
     async fn kv_entry(&self, key: &str, _: Instant) -> Result<Option<KvEntry>, HandlerError> {
+        let mut hub = self.hub.lock().unwrap();
+        hub.direct_reads += 1;
+        Ok(hub.replica.get(key).map(|entry| KvEntry {
+            revision: entry.revision,
+            value: entry.value.clone(),
+        }))
+    }
+
+    async fn kv_fence_entry(&self, key: &str, _: Instant) -> Result<Option<KvEntry>, HandlerError> {
         let hub = self.hub.lock().unwrap();
         hub.check_link()?;
         Ok(hub.kv.get(key).map(|entry| KvEntry {
@@ -412,6 +423,61 @@ async fn hub_write_rotation_reseals_lost_ack_log_and_kv_at_same_expected() {
             assert_eq!(hub.sends[1].0, second.write);
         }
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn hub_write_kv_settlement_uses_leader_instead_of_stale_replica() {
+    let f = Fixture::new("hub-kv-leader");
+    let store = f.store();
+    let transport = f.recorder(&store);
+    let writer = f.writer(&transport);
+    let previous = writer
+        .run(
+            &Request {
+                request_key: "seed",
+                ..REQUEST
+            },
+            &step(RESIDENCE, 0, json!({"gen": 1})),
+            None,
+            deadline(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(previous.position, Some(1));
+    {
+        let mut hub = f.hub.lock().unwrap();
+        let old = &hub.kv[RESIDENCE];
+        let replica_entry = KvEntry {
+            revision: old.revision,
+            value: old.value.clone(),
+        };
+        hub.replica.insert(RESIDENCE.to_owned(), replica_entry);
+    }
+    let plan = step(RESIDENCE, 1, json!({"gen": 2}));
+    f.action(Action::CommitLoseAck);
+    let error = writer
+        .run(&REQUEST, &plan, None, deadline())
+        .await
+        .unwrap_err();
+    let op_id = row(&store).op_ids.pop().unwrap().op_id;
+    assert_unsettled(error, &op_id);
+
+    // The leader is temporarily unreachable but a replica still answers.
+    let retry = writer
+        .run(&REQUEST, &plan, None, deadline())
+        .await
+        .unwrap_err();
+    assert_unsettled(retry, &op_id);
+    assert!(row(&store).outcome.is_none());
+
+    f.reconnect();
+    let landed = writer.run(&REQUEST, &plan, None, deadline()).await.unwrap();
+    assert_eq!(landed.op_id, op_id);
+    assert_eq!(landed.position, Some(2));
+    let hub = f.hub.lock().unwrap();
+    assert_eq!(hub.replica[RESIDENCE].revision, 1);
+    assert_eq!(hub.direct_reads, 0, "settlement must never read a replica");
+    assert_eq!(hub.sends.len(), 2, "settlement must not resend the CAS");
 }
 
 #[tokio::test(start_paused = true)]
