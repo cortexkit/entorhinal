@@ -14,8 +14,128 @@ use tokio::{
 use super::*;
 
 mod identity_log;
+mod watch_credentials;
 
 const PREFIX: &str = "ckdel.0123456789abcdef0123456789abcdef.entorhinal";
+
+#[tokio::test]
+async fn liveness_bus_ignores_foreign_bucket_traffic_and_keeps_reading() {
+    if Command::new("nats-server").arg("-v").output().is_err() {
+        eprintln!("nats-server not installed; skipping live liveness watch");
+        return;
+    }
+    let mut rig = Rig::new();
+    let ports = rig
+        .start(
+            "local",
+            &format!("jetstream {{ store_dir: {:?} }}", rig.dir.join("local")),
+            false,
+        )
+        .await;
+    let box_id = "0123456789abcdef0123456789abcdef";
+    let (_issuer, connector) = watch_credentials::start(&rig.dir, ports.client, box_id).await;
+    let admin = jetstream::new(
+        async_nats::connect(format!("127.0.0.1:{}", ports.client))
+            .await
+            .unwrap(),
+    );
+    let name = cortexkit_bus_naming::AccountNames::derive(&format!("box_{box_id}"))
+        .unwrap()
+        .module_bucket_name(crate::WRITER_MODULE, "session-liveness")
+        .unwrap();
+    let bucket = admin
+        .create_key_value(kv::Config {
+            bucket: name.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let foreign = admin
+        .create_key_value(kv::Config {
+            bucket: "foreign".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let handler = crate::ProjectsHandler::with_runtime("live-liveness".into(), || 7);
+    handler.start_liveness_bus_with(connector);
+    bucket
+        .put("_reconciled", r#"{"bootId":"fixture","sessions":0}"#.into())
+        .await
+        .unwrap();
+    within(async {
+        while !handler
+            .health
+            .liveness_bus_authoritative
+            .load(Ordering::Relaxed)
+        {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+
+    // This foreign tombstone would revoke authority if it were read as a
+    // session-liveness update. A later valid PUT proves the reader is alive.
+    foreign.delete("_reconciled").await.unwrap();
+    bucket
+        .put(
+            "session",
+            r#"{"harness":"broca","sessionId":"s","lastActivityMs":7,"state":"active"}"#.into(),
+        )
+        .await
+        .unwrap();
+    within(async {
+        while handler.health.liveness_bus_sessions.load(Ordering::Relaxed) != 1 {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(handler
+        .health
+        .liveness_bus_authoritative
+        .load(Ordering::Relaxed));
+    assert_eq!(
+        handler.health.liveness_bus_failures.load(Ordering::Relaxed),
+        0
+    );
+    admin.delete_key_value(&name).await.unwrap();
+    let replacement = admin
+        .create_key_value(kv::Config {
+            bucket: name,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    within(async {
+        while handler
+            .health
+            .liveness_bus_authoritative
+            .load(Ordering::Relaxed)
+            || handler.health.liveness_bus_sessions.load(Ordering::Relaxed) != 0
+        {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    replacement
+        .put(
+            "_reconciled",
+            r#"{"bootId":"replacement","sessions":0}"#.into(),
+        )
+        .await
+        .unwrap();
+    within(async {
+        while !handler
+            .health
+            .liveness_bus_authoritative
+            .load(Ordering::Relaxed)
+        {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    handler.stop_liveness_bus().await;
+}
 
 #[derive(serde::Deserialize)]
 struct PortsFile {

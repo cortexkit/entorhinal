@@ -366,6 +366,7 @@ impl Transport for Hub {
         key: &str,
         deadline: Instant,
     ) -> Result<Option<KvEntry>, HandlerError> {
+        self.require_bucket()?;
         Transport::kv_entry(&self.session(deadline).await?, key, deadline).await
     }
 
@@ -374,6 +375,7 @@ impl Transport for Hub {
         key: &str,
         deadline: Instant,
     ) -> Result<Option<KvEntry>, HandlerError> {
+        self.require_bucket()?;
         self.session(deadline)
             .await?
             .kv_fence_entry(key, deadline)
@@ -386,6 +388,7 @@ impl Transport for Hub {
         op_id: &str,
         deadline: Instant,
     ) -> Result<Option<u64>, HandlerError> {
+        self.require_bucket()?;
         if !write.value.is_empty()
             && UnverifiedRecord::parse(&write.key, &write.value)?
                 .header()
@@ -397,10 +400,9 @@ impl Transport for Hub {
                 "fleet record writer does not match the bus box ID",
             ));
         }
-        self.session(deadline)
-            .await?
-            .send(write, op_id, deadline)
-            .await
+        let session = self.session(deadline).await?;
+        self.require_bucket()?;
+        session.send(write, op_id, deadline).await
     }
 }
 

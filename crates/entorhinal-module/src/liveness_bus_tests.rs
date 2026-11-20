@@ -236,18 +236,14 @@ impl Control {
         self.event(Event::Next).await;
     }
     async fn apply(&mut self, update: Update) {
-        self.deliver(update, false).await;
+        self.deliver(Delivery::Update(update)).await;
     }
     async fn complete(&mut self, update: Update) {
-        self.deliver(update, true).await;
+        self.apply(update).await;
+        self.deliver(Delivery::CaughtUp).await;
     }
-    async fn deliver(&mut self, update: Update, seen_current: bool) {
-        self.updates
-            .send(Ok(Delivery {
-                update,
-                seen_current,
-            }))
-            .unwrap();
+    async fn deliver(&mut self, delivery: Delivery) {
+        self.updates.send(Ok(delivery)).unwrap();
         self.event(Event::Next).await;
     }
 }
@@ -308,6 +304,7 @@ async fn liveness_bus_empty_bucket_waits_for_marker_on_first_delivery() {
     let mut control = start(&handler);
     control.event(Event::Open).await;
     control.ready().await;
+    control.deliver(Delivery::CaughtUp).await;
     assert!(!handler
         .health
         .liveness_bus_authoritative
@@ -316,10 +313,10 @@ async fn liveness_bus_empty_bucket_waits_for_marker_on_first_delivery() {
         handler.liveness.lock().unwrap().read(&key),
         Read::Unknown(None)
     ));
-    // An empty watch emits no row. Its first later delivery carries
-    // seen_current=true, which supplies the replay boundary with that row.
+    // The empty snapshot is caught up, but cannot establish authority until
+    // the writer publishes its reconciliation marker.
     control
-        .complete(Update::Put(
+        .apply(Update::Put(
             MARKER.into(),
             br#"{"bootId":"empty","sessions":0}"#.to_vec(),
         ))
@@ -402,6 +399,68 @@ async fn liveness_bus_watch_error_clears_rewatches_and_replays_marker() {
         .health
         .liveness_bus_connected
         .load(Ordering::Relaxed));
+}
+
+#[tokio::test]
+async fn liveness_bus_reset_clears_authority_until_marker_and_caught_up_without_ending_sessions() {
+    use crate::sessions::tests::{provider, registration, result, Fixture, EXECUTIVE};
+    let f = Fixture::new("bus-reset", true);
+    f.providers(
+        provider(crate::WRITER_MODULE),
+        provider(crate::WRITER_MODULE),
+    );
+    let agent = f.create("Bus reset");
+    result(
+        f.register(EXECUTIVE, registration(&agent, "r", "broca", "s"))
+            .await,
+    );
+    result(
+        f.register(EXECUTIVE, registration(&agent, "r2", "broca", "s2"))
+            .await,
+    );
+    let read = || f.handler.read_session_liveness(&[("pi", "r")]).unwrap()[0].state;
+    f.handler.start_session_upkeep();
+    let mut control = start(&f.handler);
+    control.event(Event::Open).await;
+    control.ready().await;
+    control.apply(put("opaque", "broca", "s", "active")).await;
+    control.complete(marker()).await;
+    assert_eq!(read(), "active");
+
+    control.deliver(Delivery::Reset).await;
+    assert_eq!(read(), "unknown");
+    control.apply(marker()).await;
+    assert_eq!(read(), "unknown", "the marker alone cannot end replay");
+    control.deliver(Delivery::CaughtUp).await;
+    assert_eq!(read(), "gone", "the replacement bucket has only the marker");
+
+    // Even a later tombstone for the old key cannot end a binding based on
+    // a PUT that belonged to the previous bucket.
+    control.apply(Update::Delete("opaque".into())).await;
+    control.apply(put("new", "broca", "s2", "active")).await;
+    control.apply(Update::Delete("new".into())).await;
+    let ended = |session: &str| {
+        f.handler
+            .with_store(|store| Ok(store.agent_sessions_filtered(&agent, None, 10, false)?))
+            .unwrap()
+            .sessions
+            .into_iter()
+            .find(|row| row.session.as_deref() == Some(session))
+            .unwrap()
+            .ended_at_ms
+    };
+    let done = &f.handler.session_upkeep.stamps_done;
+    loop {
+        let mut notified = std::pin::pin!(done.notified());
+        notified.as_mut().enable();
+        if ended("s2").is_some() {
+            break;
+        }
+        notified.await;
+    }
+    assert_eq!(ended("s"), None);
+    f.handler.stop_liveness_bus().await;
+    f.handler.stop_session_upkeep().await;
 }
 
 #[tokio::test]

@@ -25,7 +25,7 @@ use crate::{
     },
     hub_identity_log::{wait_for_applied, IdentityLog, LogTransport},
     hub_membership::{box_id, Membership, Removed, Sight},
-    hub_transport::{Feed, FeedEvent},
+    hub_transport::{Feed, FeedEvent, KvDelivery},
     hub_write::{self, Payload, Step, Transport, Trust},
     HandlerError, HealthGauges,
 };
@@ -904,15 +904,11 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
         }
     }
 
-    pub(super) async fn watch(&self, feed: Feed<async_nats::jetstream::kv::Entry>) {
+    pub(super) async fn watch(&self, feed: Feed<KvDelivery>) {
         self.watch_for(feed, RECOVERY).await;
     }
 
-    pub(super) async fn watch_for(
-        &self,
-        mut feed: Feed<async_nats::jetstream::kv::Entry>,
-        recovery_delay: Duration,
-    ) {
+    pub(super) async fn watch_for(&self, mut feed: Feed<KvDelivery>, recovery_delay: Duration) {
         let mut live = false;
         let mut observed = None;
         let mut retry_on_membership = false;
@@ -929,6 +925,7 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
             let changed = tokio::select! {
                 biased;
                 event = feed.next_event() => match event {
+                    FeedEvent::BucketReset => return,
                     FeedEvent::Disconnected => {
                         live = false;
                         observed = None;
@@ -937,8 +934,9 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
                         joins = JoinQueue::default();
                         false
                     }
-                    FeedEvent::Connected => { live = true; observed = None; joins.wake(None); true }
-                    FeedEvent::Item(entry) => {
+                    FeedEvent::Connected => false,
+                    FeedEvent::Item(KvDelivery::CaughtUp) => { live = true; observed = None; joins.wake(None); true }
+                    FeedEvent::Item(KvDelivery::Entry(entry)) => {
                         if entry.key == KEY {
                             joins.wake_all();
                         } else if let Some(peer) = entry.key.strip_prefix("wrapreq.").filter(|id| box_id(id)) {
@@ -1247,9 +1245,11 @@ impl<T: Transport> EpochReader<T> {
     }
 
     async fn read(&self, deadline: Instant) -> Result<Option<Observed>, HandlerError> {
+        self.health.hub.require_bucket()?;
         let _guard = timeout_at(deadline, self.reading.lock())
             .await
             .map_err(|_| busy())?;
+        self.health.hub.require_bucket()?;
         let observed = self.read_record(deadline).await;
         match &observed {
             Ok(entry) => self.health.fleet_epoch.set_current(

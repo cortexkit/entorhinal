@@ -8,11 +8,8 @@ use std::{
     time::Duration,
 };
 
-use async_nats::jetstream::kv::{Operation, Watch};
 use async_trait::async_trait;
-use cortexkit_bus_client::{BusClient, BusClientOptions};
-use cortexkit_bus_naming::AccountNames;
-use futures_util::StreamExt;
+use cortexkit_bus_client::{BucketItem, BucketWatch, BusClient, BusClientOptions, Error};
 use serde::Deserialize;
 
 use super::{HealthGauges, LivenessState, Ordering, ProjectsHandler, SessionKey};
@@ -158,9 +155,10 @@ pub(super) enum Update {
     Delete(String),
 }
 
-pub(super) struct Delivery {
-    update: Update,
-    seen_current: bool,
+pub(super) enum Delivery {
+    Update(Update),
+    CaughtUp,
+    Reset,
 }
 
 #[derive(Debug)]
@@ -194,7 +192,7 @@ struct BusSource {
     connector: super::log_client::SubcConnector,
     client: Option<BusClient>,
     changes: Option<tokio::sync::watch::Receiver<u64>>,
-    watch: Option<Watch>,
+    watch: Option<BucketWatch>,
 }
 
 #[async_trait]
@@ -229,42 +227,34 @@ impl Source for BusSource {
             self.client = Some(client);
         }
         let client = self.client.as_ref().expect("connected bus client");
-        let names =
-            AccountNames::derive(client.acct()).map_err(|e| Failure::new("bucket_name", e))?;
-        // Use the credentialed connection's inbox prefix and local JetStream;
-        // the liveness bucket is on this machine, not a remote JetStream domain.
-        let jetstream = async_nats::jetstream::new(client.connection().client());
-        let bucket = names
-            .module_bucket_name(super::WRITER_MODULE, "session-liveness")
+        let bucket = client
+            .bucket(super::WRITER_MODULE, "session-liveness")
             .map_err(|e| Failure::new("bucket_name", e))?;
-        let kv = jetstream
-            .get_key_value(bucket)
-            .await
-            .map_err(|e| Failure::new(format!("bucket:{:?}", e.kind()), e))?;
-        self.watch = Some(
-            kv.watch_with_history(">")
-                .await
-                .map_err(|e| Failure::new(format!("watch:{:?}", e.kind()), e))?,
-        );
+        self.watch = Some(bucket.watch().await.map_err(|e| Failure::new("watch", e))?);
         Ok(())
     }
 
     async fn next(&mut self) -> Result<Delivery, Failure> {
         let changes = self.changes.as_mut().expect("connected change receiver");
         tokio::select! {
+            biased;
             result = changes.changed() => {
                 if result.is_err() { self.client = None; self.changes = None; }
                 Err(Failure::new("connection_changed", "bus connection replaced"))
             }
-            entry = self.watch.as_mut().expect("opened watch").next() => {
-                let entry = entry.ok_or_else(|| Failure::new("watch_ended", "bus watch ended"))?
-                    .map_err(|e| Failure::new(format!("watch:{:?}", e.kind()), e))?;
-                let update = match entry.operation {
-                    Operation::Put => Update::Put(entry.key, entry.value.to_vec()),
-                    Operation::Delete | Operation::Purge => Update::Delete(entry.key),
-                };
-                Ok(Delivery { update, seen_current: entry.seen_current })
-            }
+            item = self.watch.as_mut().expect("opened watch").next() => match item {
+                Ok(BucketItem::Put { key, value, .. }) => Ok(Delivery::Update(Update::Put(key, value.to_vec()))),
+                // BucketWatch also reports PURGE as Delete, but prefrontal only
+                // uses DEL and never purges this bucket.
+                Ok(BucketItem::Delete { key, .. }) => Ok(Delivery::Update(Update::Delete(key))),
+                Ok(BucketItem::CaughtUp) => Ok(Delivery::CaughtUp),
+                Err(Error::BucketReset { bucket }) => {
+                    tracing::warn!(target: "liveness", bucket, "bus liveness bucket replaced; replaying before trusting sessions");
+                    Ok(Delivery::Reset)
+                }
+                Err(error) => Err(Failure::new("watch", error)),
+                Ok(_) => Err(Failure::new("watch", "unknown bucket item")),
+            },
         }
     }
 }
@@ -299,10 +289,18 @@ impl Worker {
 
     fn apply(&self, delivery: Delivery) -> Result<bool, Failure> {
         let mut state = self.liveness.lock().unwrap_or_else(|e| e.into_inner());
-        let deleted = state.bus.apply(delivery.update)?;
-        if delivery.seen_current {
-            state.bus.finish_replay();
-        }
+        let deleted = match delivery {
+            Delivery::Update(update) => state.bus.apply(update)?,
+            Delivery::CaughtUp => {
+                state.bus.finish_replay();
+                None
+            }
+            Delivery::Reset => {
+                state.bus.clear();
+                state.bus.watch_started();
+                None
+            }
+        };
         if let Some(key) =
             deleted.filter(|key| state.bus.authoritative() && matches!(state.read(key), Read::Gone))
         {
@@ -375,13 +373,19 @@ impl ProjectsHandler {
     }
 
     pub(super) fn start_liveness_bus(&self) {
+        self.start_liveness_bus_with(super::log_client::SubcConnector::from_args(
+            std::env::args_os().skip(1),
+        ));
+    }
+
+    pub(super) fn start_liveness_bus_with(&self, connector: super::log_client::SubcConnector) {
         if self.health.origin.is_foreign() {
             return;
         }
         let mut task = self.liveness_bus_task.lock().unwrap();
         if task.is_none() {
             let source = BusSource {
-                connector: super::log_client::SubcConnector::from_args(std::env::args_os().skip(1)),
+                connector,
                 ..BusSource::default()
             };
             *task = Some(tokio::spawn(self.liveness_bus_worker().run(source)));

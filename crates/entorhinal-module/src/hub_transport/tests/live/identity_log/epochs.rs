@@ -324,13 +324,18 @@ impl EpochNode {
 
     fn watch(&self) -> WatchTask {
         let leaf = self.node.leaf.clone();
-        let feed = Feed::kv(self.node.handler.health.clone(), move |cursor| {
-            Binding {
-                session: leaf.session(),
-                changes: None,
+        let feed = Feed::epoch(self.node.handler.health.clone(), move |_| {
+            let leaf = leaf.clone();
+            async move {
+                Binding {
+                    session: leaf.session(),
+                    changes: None,
+                }
+                .epoch_watch(&leaf.box_id.to_string())
+                .await
             }
-            .watch(cursor)
-        });
+        })
+        .with_durable_cursor();
         let controller = self.controller.clone();
         WatchTask(tokio::spawn(async move {
             controller.watch_for(feed, Duration::from_millis(750)).await;

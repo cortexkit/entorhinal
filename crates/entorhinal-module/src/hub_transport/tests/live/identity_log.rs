@@ -55,13 +55,15 @@ async fn hub_reader_regression_epoch_feed_only_receives_epoch_and_join_keys() {
     ] {
         rig.kv.put(&key, "wrap".into()).await.unwrap();
     }
-    assert_eq!(within(feed.next()).await.key, "epoch");
-    assert_eq!(within(feed.next()).await.key, request);
-    assert_eq!(within(feed.next()).await.key, format!("wrap.2.mint.{A}"));
-    assert_eq!(
-        within(feed.next()).await.key,
-        format!("wrapjoin.{A}.request")
-    );
+    assert!(matches!(within(feed.next()).await, KvDelivery::CaughtUp));
+    for key in [
+        "epoch".into(),
+        request,
+        format!("wrap.2.mint.{A}"),
+        format!("wrapjoin.{A}.request"),
+    ] {
+        assert!(matches!(within(feed.next()).await, KvDelivery::Entry(entry) if entry.key == key));
+    }
 }
 
 struct Leaf {
@@ -94,6 +96,16 @@ impl Leaf {
 }
 
 impl LogTransport for Leaf {
+    async fn kv_published_at(
+        &self,
+        key: &str,
+        revision: u64,
+        deadline: Instant,
+    ) -> Result<Option<i64>, HandlerError> {
+        self.session()
+            .kv_published_at(key, revision, deadline)
+            .await
+    }
     fn tail(self: &Arc<Self>, applied: u64) -> Feed<LogDelivery> {
         let leaf = self.clone();
         Feed::log(self.health.clone(), applied, move |cursor| {
@@ -544,6 +556,7 @@ struct IdentityRig {
     keys: Arc<TestKeys>,
     stream: jetstream::stream::Stream,
     kv: kv::Store,
+    hub_port: u16,
     leaf_port: u16,
     _processes: Rig,
 }
@@ -642,6 +655,7 @@ impl IdentityRig {
             keys,
             stream,
             kv,
+            hub_port: hub_ports.client,
             leaf_port,
             _processes: rig,
         })
