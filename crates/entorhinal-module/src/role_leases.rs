@@ -500,6 +500,12 @@ pub(super) struct CandidateRequest {
     pub episode: u64,
 }
 
+struct HandbackCleanup {
+    box_id: String,
+    revision: u64,
+    read_only: bool,
+}
+
 #[async_trait::async_trait]
 pub(super) trait Backend: Send + Sync {
     fn local_box(&self) -> &str;
@@ -675,7 +681,7 @@ impl Leases {
         let mut failed_since = None;
         let mut offered: Option<Preferred> = None;
         let mut expired_request: Option<(String, u64)> = None;
-        let mut cleanup: Option<(String, u64)> = None;
+        let mut cleanup: Option<HandbackCleanup> = None;
         let mut signal_retry = 0;
         loop {
             // Register for readiness changes before reading the snapshot.
@@ -826,7 +832,13 @@ impl Leases {
                                 } else {
                                     // Acquisition alone never gives an acting window.
                                     renewal_due = 0;
-                                    cleanup = expired_request.take();
+                                    cleanup = expired_request.take().map(|(box_id, revision)| {
+                                        HandbackCleanup {
+                                            box_id,
+                                            revision,
+                                            read_only: false,
+                                        }
+                                    });
                                 }
                             }
                             Err(error) => {
@@ -865,16 +877,42 @@ impl Leases {
                     if cleanup.is_some() || update_request {
                         if now >= signal_retry {
                             let deadline = Instant::now() + Duration::from_secs(5);
-                            if let Some((box_id, revision)) = &cleanup {
-                                match backend
-                                    .delete_handback(role, box_id, *revision, deadline)
-                                    .await
-                                {
-                                    Ok(()) => cleanup = None,
-                                    Err(error) if error.code == "hub_write_superseded" => {
-                                        cleanup = None
+                            if let Some(stale) = &mut cleanup {
+                                let mut done = false;
+                                if !stale.read_only {
+                                    match backend
+                                        .delete_handback(
+                                            role,
+                                            &stale.box_id,
+                                            stale.revision,
+                                            deadline,
+                                        )
+                                        .await
+                                    {
+                                        Ok(()) => done = true,
+                                        Err(error) if error.code == "hub_write_superseded" => {
+                                            done = true
+                                        }
+                                        Err(error) if error.code == "hub_write_unsettled" => {
+                                            stale.read_only = true
+                                        }
+                                        Err(_) => {}
                                     }
-                                    Err(_) => {}
+                                }
+                                if stale.read_only {
+                                    // The unanswered delete may still land. Do not issue
+                                    // the same guarded delete with a new request key.
+                                    done = match backend
+                                        .read_handback_revision(role, &stale.box_id, deadline)
+                                        .await
+                                    {
+                                        Ok(None) => true,
+                                        Ok(Some(current)) => current > stale.revision,
+                                        Err(_) => false,
+                                    };
+                                }
+                                if done {
+                                    cleanup = None;
                                 }
                             } else if wants_handback {
                                 let _ = backend.put_handback(role, current.gen(), deadline).await;

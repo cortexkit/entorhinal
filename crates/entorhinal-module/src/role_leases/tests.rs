@@ -29,6 +29,9 @@ pub(crate) struct Hub {
     delay: AtomicU64,
     missing_send: AtomicBool,
     reachable: AtomicBool,
+    unsettled_handback_delete: AtomicBool,
+    handback_deletes: AtomicU64,
+    handback_reads: AtomicU64,
 }
 
 impl Hub {
@@ -51,6 +54,9 @@ impl Hub {
             delay: AtomicU64::new(0),
             missing_send: AtomicBool::new(false),
             reachable: AtomicBool::new(true),
+            unsettled_handback_delete: AtomicBool::new(false),
+            handback_deletes: AtomicU64::new(0),
+            handback_reads: AtomicU64::new(0),
         })
     }
 
@@ -200,6 +206,7 @@ impl Backend for Peer {
         box_id: &str,
         _: Instant,
     ) -> Result<Option<u64>, HandlerError> {
+        self.hub.handback_reads.fetch_add(1, Ordering::Relaxed);
         Ok(self.handback(role, box_id)?.map(|request| request.revision))
     }
 
@@ -223,6 +230,10 @@ impl Backend for Peer {
         revision: u64,
         _: Instant,
     ) -> Result<(), HandlerError> {
+        self.hub.handback_deletes.fetch_add(1, Ordering::Relaxed);
+        if self.hub.unsettled_handback_delete.load(Ordering::Relaxed) {
+            return Err(crate::hub_transport::unsettled("test-handback-delete"));
+        }
         let mut requests = self.hub.requests.lock().unwrap();
         if requests
             .get(box_id)
@@ -819,6 +830,51 @@ async fn lease_handback_timeout_taker_clears_preferred_holders_request() {
     b.ack_waiting().await;
     assert_eq!(hub.writes(ACQUIRE)[0].holder.as_deref(), Some(B));
     assert!(hub.requests.lock().unwrap().get(A).is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn lease_handback_unsettled_cleanup_rereads_without_republishing() {
+    let hub = Hub::new(Some(A), false);
+    hub.prefer(A);
+    hub.unsettled_handback_delete.store(true, Ordering::Relaxed);
+    hub.requests.lock().unwrap().insert(
+        A.into(),
+        CandidateRequest {
+            revision: 7,
+            episode: 0,
+            gen: 1,
+        },
+    );
+    let mut candidate = ClientWatch::open(B, &hub, true).await;
+    candidate.ack_waiting().await;
+    tick(LEASE_MS).await;
+    candidate.ack_waiting().await;
+    assert_eq!(hub.writes(ACQUIRE).len(), 1);
+    assert_eq!(hub.handback_deletes.load(Ordering::Relaxed), 1);
+
+    tick(RETRY_MS).await;
+    assert_eq!(
+        hub.handback_deletes.load(Ordering::Relaxed),
+        1,
+        "unsettled guarded delete was published again"
+    );
+    let reads = hub.handback_reads.load(Ordering::Relaxed);
+    assert!(
+        reads >= 2,
+        "handback was not re-read after the unsettled delete"
+    );
+
+    hub.requests.lock().unwrap().get_mut(A).unwrap().revision = 8;
+    tick(RETRY_MS).await;
+    assert_eq!(hub.handback_reads.load(Ordering::Relaxed), reads + 1);
+    tick(RETRY_MS).await;
+    assert_eq!(
+        hub.handback_reads.load(Ordering::Relaxed),
+        reads + 1,
+        "obsolete cleanup was not forgotten"
+    );
+    assert_eq!(hub.handback_deletes.load(Ordering::Relaxed), 1);
+    assert_eq!(hub.requests.lock().unwrap()[A].revision, 8);
 }
 
 #[tokio::test(start_paused = true)]

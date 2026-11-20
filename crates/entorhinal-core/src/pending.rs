@@ -21,9 +21,9 @@ pub(crate) const HUB_LOCAL: &str = "hub.local_write";
 /// success instead of a conflict with its own earlier write. None of it is
 /// ever part of the shared entry.
 ///
-/// The partial indexes keep the session retention prune, identity change feed,
-/// agent cutover checks, and open attempt recovery from scanning unrelated rows. SQLite uses a
-/// partial index only when the query repeats its condition: the identity op
+/// The partial indexes keep session retention, identity change feeds, agent
+/// cutover checks, and open attempt recovery from scanning unrelated rows.
+/// SQLite uses a partial index only when the query repeats its condition: the identity op
 /// list must match `IDENTITY_CHANGE_OPS`, and a check for the one-time
 /// `agent.cutover` journal entry (written when this store took over agent
 /// identity) must test `op='agent.cutover'` literally, not through a bound
