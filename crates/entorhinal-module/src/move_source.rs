@@ -255,7 +255,8 @@ impl Failure {
     }
     fn action(&self) -> Option<DriverAction> {
         if self.op == "route.open" {
-            // No participant answered, so the participant refusal table doesn't apply.
+            // No participant answered, so there is no participant refusal to map to a
+            // driver action: retry.
             return Some(DriverAction::Retry);
         }
         self.module

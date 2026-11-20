@@ -534,7 +534,9 @@ impl Residence {
         let mut anchors = self.backend.anchor_changes();
         let mut retry = tokio::time::interval(Duration::from_secs(1));
         retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // A removal can apply while the watch is judging a replacement.
+        // The log can apply a computer's removal while this watch is still
+        // judging a role record that replaces that computer as holder, so
+        // re-judge the record when a commit arrives.
         let committed = self.commits.notified();
         tokio::pin!(committed);
         committed.as_mut().enable();
@@ -1402,8 +1404,9 @@ impl Residence {
                     .store
                     .hub_attempt(request_key)?
                     .filter(|row| row.write.step == CREATE_KV && row.write.params_digest == digest);
-                // The log proves this request created the agent, even if KV
-                // history can no longer establish what its first claim did.
+                // The log proves this request created the agent, even if the
+                // KV bucket (which keeps one revision) can no longer show
+                // whether its first residence write landed.
                 if matches!(
                     error.code.as_str(),
                     "hub_write_superseded" | "hub_write_unsettled"
