@@ -882,17 +882,21 @@ async fn hub_membership_never_serves_legacy_holder_after_activation() {
         [location, role]
             .map(|bytes| serde_json::from_slice::<Value>(&bytes).unwrap()["result"].clone())
     };
-    for value in read() {
-        assert_eq!(value["holder"], "legacy-author");
-    }
+    // The installed store must not read a legacy agent claim even before hub
+    // selection. The role cache still supplies its holder until selection.
+    let unclaimed = json!({"known":false,"status":"unclaimed","holder":null,
+        "holder_name":null,"epoch":0,"cut_id":null,"read_at_ms":null,"stale":true});
+    let [location, role] = read();
+    assert_eq!(location, unclaimed);
+    assert_eq!(role["holder"], "legacy-author");
     for state in [1, 2] {
         handler
             .health
             .hub_membership
             .store(state, Ordering::Release);
-        for value in read() {
-            assert_eq!(value["stale"], true);
-            assert!(value["holder"].is_null());
-        }
+        let [location, role] = read();
+        assert_eq!(location, unclaimed);
+        assert_eq!(role["stale"], true);
+        assert!(role["holder"].is_null());
     }
 }

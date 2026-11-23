@@ -459,10 +459,9 @@ fn agent_identity_vector(directory: &str, name: &str) -> bool {
         ) | (
             "agent-sessions-v1",
             "where.json"
-                | "where-many.json"
+                | "where-hub.json"
+                | "where-many-hub.json"
                 | "where-sharing-off.json"
-                | "where-moving-source.json"
-                | "where-moving-receiver.json"
                 | "session-for-ref.json"
                 | "session-for-runner.json"
                 | "session-for-harness.json"
@@ -634,13 +633,9 @@ fn agent_identity_published_records_roundtrip_exactly() {
         ("memory-context-v1", "context-session.json"),
         ("memory-context-v1", "context-session-populated.json"),
         ("agent-sessions-v1", "where.json"),
-        ("agent-sessions-v1", "where-many.json"),
+        ("agent-sessions-v1", "where-hub.json"),
+        ("agent-sessions-v1", "where-many-hub.json"),
         ("agent-sessions-v1", "where-sharing-off.json"),
-        ("agent-sessions-v1", "where-moving-source.json"),
-        ("agent-sessions-v1", "where-moving-receiver.json"),
-        ("agent-sessions-v1", "where-holder-box.json"),
-        ("agent-sessions-v1", "where-box-unknown.json"),
-        ("agent-sessions-v1", "where-many-holder-box.json"),
         ("agent-sessions-v1", "session-for-ref.json"),
         ("agent-sessions-v1", "session-for-runner.json"),
         ("agent-sessions-v1", "session-for-harness.json"),
@@ -4530,7 +4525,9 @@ async fn session_for_harness_records_match_published_file() {
 /// existing records kept their bytes.
 /// `register-session.json` was re-pinned when its requests gained the required
 /// runner; every reply kept its bytes.
-const PINNED_SESSION_SAMPLES: [(&str, &str); 10] = [
+/// `where.json` was re-pinned when the legacy claim-cache records were removed.
+/// Its unclaimed and unknown-agent records kept their bytes.
+const PINNED_SESSION_SAMPLES: [(&str, &str); 7] = [
     (
         "for-session.json",
         "dd41914934a9b85b35670a815bef17de84752d8da7d05a1bf8833f3edbd1996b",
@@ -4545,19 +4542,7 @@ const PINNED_SESSION_SAMPLES: [(&str, &str); 10] = [
     ),
     (
         "where.json",
-        "faacea127dcaaa7181329562e4de553851aebf700358b3267864e894166b911e",
-    ),
-    (
-        "where-many.json",
-        "422b8592c531c3c22e161b7a926f3ac61df6155fca2a9660bb159b1a0054d565",
-    ),
-    (
-        "where-moving-receiver.json",
-        "cd7a4e475915787cf1a1680a05ad4421b3da19fe90a0a106c3b878b71064b9a6",
-    ),
-    (
-        "where-moving-source.json",
-        "87e6cf886a685406c0f7b51c9e372f2ac781a138372ea19ea926a0095df75bb1",
+        "cb9931afebf82037605a860ec4133a67782b3a3ac61904469a3a0a97c03d10e4",
     ),
     (
         "where-sharing-off.json",
