@@ -88,7 +88,7 @@ fn hub_store_migration_preserves_legacy_progress_and_requires_snapshot_for_downg
         .db
         .with_conn_fenced(|tx| {
             tx.execute_batch(
-                "UPDATE identity_log_state SET state='enabled',last_applied_position=17,last_seen_head=19;
+                "UPDATE identity_log_state SET last_applied_position=17,last_seen_head=19;
                  INSERT INTO agent_move(cut_id,agent_id,side,peer,step,plan,record_version,
                     seal_sent,attempts,created_at_ms,updated_at_ms)
                  VALUES('old-cut','agent','receiver','source','done','{}',7,0,1,10,20);",

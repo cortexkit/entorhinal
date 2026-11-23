@@ -824,18 +824,39 @@ mod tests {
         // absent claim is a verified "unclaimed". Core's head registration
         // accepts exactly this shape.
         assert_eq!(serde_json::to_string(&f.store.agent_where(ID).unwrap()).unwrap(),"{\"known\":true,\"status\":\"unclaimed\",\"holder\":null,\"holder_name\":null,\"epoch\":0,\"cut_id\":null,\"read_at_ms\":null,\"stale\":false}");
-        // In every other sharing state only a verified engram read counts.
-        for state in ["enabling", "joining", "enabled"] {
+        // Without a selected backend, an absent claim is unknown while
+        // enabling or after the hub snapshot is installed.
+        for (state, enable_id, base) in [
+            ("enabling", Some("native-plan"), None),
+            ("enabled", None, Some(0)),
+        ] {
             f.store
                 .db
                 .with_conn_fenced(|tx| {
-                    tx.execute("UPDATE identity_log_state SET state=?1 WHERE id=1", [state])?;
+                    tx.execute(
+                        "UPDATE identity_log_state SET state=?1,enable_id=?2,hub_log_base=?3 WHERE id=1",
+                        rusqlite::params![state, enable_id, base],
+                    )?;
                     Ok(())
                 })
                 .unwrap();
             assert_eq!(serde_json::to_string(&f.store.agent_where(ID).unwrap()).unwrap(),"{\"known\":false,\"status\":\"unclaimed\",\"holder\":null,\"holder_name\":null,\"epoch\":0,\"cut_id\":null,\"read_at_ms\":null,\"stale\":true}", "{state}");
         }
-        f.observe(present(1, OTHER, false));
+        let key = format!("residence.{ID}");
+        let observe = |revision, holder| {
+            let body =
+                serde_json::json!({"holder":holder,"holder_ep":1,"gen":revision,"cut_id":"cut"});
+            f.store
+                .record_hub_kv(&key, revision, Some((b"value", Some(&body))), 9)
+                .unwrap();
+        };
+        let context = HubClaimContext {
+            local_box: SELF,
+            fresh: &|_, _| true,
+            holder_current: &|holder, episode, _| holder == OTHER && episode == 1,
+            seed_expected: &|_| false,
+        };
+        observe(1, OTHER);
         f.store
             .db
             .with_conn_fenced(|tx| {
@@ -843,19 +864,20 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let row = f.store.agent_where(ID).unwrap();
+        let row = f.store.hub_agent_where(ID, &context).unwrap();
         assert_eq!(row.status, "held_elsewhere");
         assert_eq!(row.holder_name.as_deref(), Some("Studio"));
-        f.observe(present(2, SELF, false));
+        observe(2, SELF);
         let descriptor = f.descriptor.clone();
         drop(f.store);
         let store = RegistryStore::open(&descriptor).unwrap();
-        assert_eq!(store.agent_where(ID).unwrap().status, "held_here");
-        store
-            .cache_agent_claims(&[(ID.into(), ClaimObservation::IntegrityFailed)], 11)
-            .unwrap();
         assert_eq!(
-            store.agent_where(ID).unwrap_err().code,
+            store.hub_agent_where(ID, &context).unwrap().status,
+            "held_here"
+        );
+        store.record_hub_kv(&key, 3, None, 11).unwrap();
+        assert_eq!(
+            store.hub_agent_where(ID, &context).unwrap_err().code,
             "claim_integrity_failed"
         );
         drop(store);

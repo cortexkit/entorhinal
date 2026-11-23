@@ -240,7 +240,7 @@ mod tests {
     }
 
     #[test]
-    fn s3_fault_after_apply_reopen_persists_identity_and_rebuild_is_cell_identical() {
+    fn hub_fault_after_apply_reopen_persists_writer_and_rebuild_is_cell_identical() {
         use crate::{
             remote_apply::RemoteEntry,
             shared_entry::{canonical_bytes, MemberName},
@@ -250,7 +250,10 @@ mod tests {
         let store = RegistryStore::open(&descriptor).unwrap();
         store
             .apply_entry("identity_log.enable", "{}", "test", None, |tx| {
-                tx.execute("UPDATE identity_log_state SET state='enabled'", [])?;
+                tx.execute(
+                    "UPDATE identity_log_state SET state='enabled',hub_log_base=0",
+                    [],
+                )?;
                 Ok(())
             })
             .unwrap();
@@ -267,14 +270,30 @@ mod tests {
                 &json!({"op":"member.set_name","author":author,"display_name":"Studio"}),
             ),
         };
-        let fault = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            store.apply_remote_entry(&entry, Some(&author)).unwrap();
-            panic!("injected fault after apply");
+        struct InjectedFault;
+        let fault = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            store.apply_hub_remote_entry(&entry, 2).unwrap();
+            std::panic::panic_any(InjectedFault);
         }));
-        assert!(fault.is_err());
-        drop(store);
+        assert!(fault.unwrap_err().is::<InjectedFault>());
         let store = RegistryStore::open(&descriptor).unwrap();
-        assert_eq!(store.persisted_self_author().unwrap(), Some(author.clone()));
+        let writer = store
+            .read(|conn| {
+                conn.query_row(
+                    "SELECT w.box,w.episode,m.display_name FROM hub_log_writer w
+                 JOIN member_name m ON m.author=w.box WHERE w.position=1 AND w.entry_id='name-1'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, u64>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+            })
+            .unwrap();
+        assert_eq!(writer, (author.clone(), 2, "Studio".into()));
         assert_eq!(
             store.identity_log_status().unwrap().last_applied_position,
             1

@@ -66,7 +66,7 @@ fn enable(f: &Fixture) {
         .db
         .with_conn_fenced(|tx| {
             tx.execute(
-                "UPDATE identity_log_state SET state='enabled' WHERE id=1",
+                "UPDATE identity_log_state SET state='enabled',hub_log_base=0 WHERE id=1",
                 [],
             )?;
             crate::mutations::append(
