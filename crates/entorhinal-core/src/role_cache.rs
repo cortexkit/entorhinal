@@ -158,14 +158,25 @@ impl RegistryStore {
             .map_err(RegistryError::Store)
     }
 
-    pub fn grant_local_role_gen(&self, role: &str) -> Result<i64, RegistryError> {
+    pub fn grant_local_role_gen(
+        &self,
+        role: &str,
+        watch_is_open: impl FnOnce() -> bool,
+    ) -> Result<Option<i64>, RegistryError> {
         self.db
             .with_conn_fenced(|tx| {
-                let gen = gen_high_water(tx, role)?
+                let high_water = gen_high_water(tx, role)?;
+                // A blocking refresh can outlive its watch. Check after the
+                // read so it cannot mint from a hub generation recorded after
+                // the watch closed.
+                if !watch_is_open() {
+                    return Ok(None);
+                }
+                let gen = high_water
                     .checked_add(1)
                     .ok_or(rusqlite::Error::InvalidQuery)?;
                 raise_gen(tx, role, gen)?;
-                Ok(gen)
+                Ok(Some(gen))
             })
             .map_err(RegistryError::Store)
     }

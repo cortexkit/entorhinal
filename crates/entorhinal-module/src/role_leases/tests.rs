@@ -942,18 +942,22 @@ async fn role_gen_high_water_carries_hub_observation_across_restart_and_local_ta
     );
     let store = entorhinal_core::RegistryStore::open(&descriptor).unwrap();
     *handler.store.lock().unwrap() = Some(store.clone());
+    let watch_open = Arc::new(AtomicBool::new(true));
     let mut grant = None;
-    let fresh = handler.local_role_view(ROLE, 1, &mut grant).await.unwrap();
+    let fresh = handler
+        .local_role_view(ROLE, 1, &mut grant, &watch_open)
+        .await
+        .unwrap();
     assert_eq!(fresh.gen, 1);
     let renewed = handler
-        .local_role_view(ROLE, 10_000, &mut grant)
+        .local_role_view(ROLE, 10_000, &mut grant, &watch_open)
         .await
         .unwrap();
     assert_eq!(renewed.gen, 1);
     assert!(renewed.until_ms > fresh.until_ms);
     for _ in 0..2 {
         handler
-            .local_role_view(ROLE, 10_000, &mut None)
+            .local_role_view(ROLE, 10_000, &mut None, &watch_open)
             .await
             .unwrap();
     }
@@ -991,7 +995,7 @@ async fn role_gen_high_water_carries_hub_observation_across_restart_and_local_ta
     *handler.store.lock().unwrap() = Some(restarted.clone());
     assert_eq!(
         handler
-            .local_role_view(ROLE, 20_000, &mut None)
+            .local_role_view(ROLE, 20_000, &mut None, &watch_open)
             .await
             .unwrap()
             .gen,

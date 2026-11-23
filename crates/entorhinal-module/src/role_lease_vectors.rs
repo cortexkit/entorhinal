@@ -341,6 +341,65 @@ async fn served_role_lease_v1_non_hub_records_match_published_files() {
     let _ = std::fs::remove_dir_all(fresh_dir);
 }
 
+#[tokio::test]
+async fn canceled_local_role_lease_refresh_does_not_consume_post_cancel_generation() {
+    let mut fixture = Fixture::new("canceled-local-role-lease-refresh").await;
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let (resume, paused) = tokio::sync::oneshot::channel();
+    let gate = std::sync::Mutex::new(Some((entered, paused)));
+    Arc::get_mut(&mut fixture.handler.role_leases)
+        .unwrap()
+        .sample_before_local_refresh(move || {
+            let gate = gate.lock().unwrap().take();
+            if let Some((entered, paused)) = gate {
+                let _ = entered.send(());
+                let _ = paused.blocking_recv();
+            }
+        });
+    let handler = Arc::new(std::mem::replace(
+        &mut fixture.handler,
+        ProjectsHandler::with_runtime(INCARNATION.into(), || 700),
+    ));
+    let store = handler.store.lock().unwrap().clone().unwrap();
+    let served = handler.clone();
+    let mut module = ModuleHarness::start(move |_| ServedHandler(served), []).await;
+    let mc = bind(&mut module, 1822, reserved("magic-context"), None).await;
+
+    let params = json!({"role":GLOBAL});
+    let corr = module
+        .send_request(mc, request(WATCH, params.clone()))
+        .await;
+    let first = frame(&mut module, corr, FrameType::StreamData).await;
+    assert_eq!(ack_frame(&mut module, mc, GLOBAL, &first).await["gen"], 1);
+    started.await.unwrap();
+
+    // End the stream and record the hub generation while the old watch's
+    // refresh is still running, but before it can read or write SQLite.
+    module.cancel_request(mc, corr).await;
+    frame(&mut module, corr, FrameType::StreamEnd).await;
+    store
+        .record_hub_kv(
+            "role.dreamer.global",
+            1,
+            Some((b"verified role", Some(&json!({"gen":12})))),
+            700,
+        )
+        .unwrap();
+    resume.send(()).unwrap();
+    handler.hub_sql.wait().await;
+    let after_cancel = store.role_gen_high_water(GLOBAL).unwrap();
+
+    let corr = module.send_request(mc, request(WATCH, params)).await;
+    let regrant = frame(&mut module, corr, FrameType::StreamData).await;
+    let notice = ack_frame(&mut module, mc, GLOBAL, &regrant).await;
+    assert_eq!(notice["gen"], 13);
+    assert_eq!(notice["holding"], true);
+    assert_eq!(after_cancel, 12, "the closed watch must not mint a gen");
+    module.shutdown().await;
+    crate::tests::stop_store_tasks(&handler).await;
+    handler.store.lock().unwrap().take();
+}
+
 async fn ack_frame(
     module: &mut ModuleHarness,
     route: RouteHandle,

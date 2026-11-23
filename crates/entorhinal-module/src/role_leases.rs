@@ -4,7 +4,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -98,6 +98,7 @@ struct Notice {
 
 struct Client {
     route: RouteKey,
+    watch_open: Arc<AtomicBool>,
     awaiting: Mutex<Option<(u64, u64)>>,
     acked: Notify,
     changed: Notify,
@@ -115,6 +116,8 @@ pub(super) struct Leases {
     sample_views: HashMap<String, watch::Receiver<View>>,
     #[cfg(test)]
     pub(super) local_pass_complete: Notify,
+    #[cfg(test)]
+    before_local_refresh: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Default for Leases {
@@ -129,6 +132,8 @@ impl Default for Leases {
             sample_views: HashMap::new(),
             #[cfg(test)]
             local_pass_complete: Notify::new(),
+            #[cfg(test)]
+            before_local_refresh: None,
         }
     }
 }
@@ -137,6 +142,7 @@ struct Registration<'a> {
     leases: &'a Leases,
     role: String,
     holding: bool,
+    watch_open: Arc<AtomicBool>,
 }
 
 impl Registration<'_> {
@@ -152,6 +158,7 @@ impl Registration<'_> {
 
 impl Drop for Registration<'_> {
     fn drop(&mut self) {
+        self.watch_open.store(false, Ordering::Release);
         self.holding(false);
         self.leases.clients.lock().unwrap().remove(&self.role);
         if let Some(backend) = self.leases.backend.borrow().clone() {
@@ -195,6 +202,11 @@ impl Leases {
         self.sample_views.insert(role.into(), view);
     }
 
+    #[cfg(test)]
+    pub(super) fn sample_before_local_refresh(&mut self, hook: impl Fn() + Send + Sync + 'static) {
+        self.before_local_refresh = Some(Arc::new(hook));
+    }
+
     fn register(
         &self,
         role: String,
@@ -203,8 +215,10 @@ impl Leases {
     ) -> Result<(Arc<Client>, Registration<'_>), HandlerError> {
         use std::collections::hash_map::Entry;
 
+        let watch_open = Arc::new(AtomicBool::new(true));
         let client = Arc::new(Client {
             route,
+            watch_open: watch_open.clone(),
             awaiting: Mutex::default(),
             acked: Notify::new(),
             changed: Notify::new(),
@@ -226,6 +240,7 @@ impl Leases {
                 leases: self,
                 role,
                 holding: false,
+                watch_open,
             },
         ))
     }
@@ -640,7 +655,9 @@ impl Leases {
                 let changed = handler.role_cache_changed.notified();
                 let next_pass = Instant::now() + Duration::from_millis(RENEW_MS);
                 let now = self.now();
-                let next = handler.local_role_view(role, now, &mut local_gen).await?;
+                let next = handler
+                    .local_role_view(role, now, &mut local_gen, &client.watch_open)
+                    .await?;
                 let current = *notices.borrow();
                 let due = current
                     .until_ms
@@ -1138,18 +1155,26 @@ impl ProjectsHandler {
         role: &str,
         now: u64,
         grant: &mut Option<i64>,
+        watch_open: &Arc<AtomicBool>,
     ) -> Result<View, HandlerError> {
         if self.hub_backend_selected() || self.admit_store_write().is_err() {
             return Ok(View::default());
         }
         let role = role.to_owned();
         let prior = *grant;
+        let watch_open = Arc::clone(watch_open);
+        #[cfg(test)]
+        let before_local_refresh = self.role_leases.before_local_refresh.clone();
         let decision = self
             .hub_sql()
             .run(
                 Instant::now() + Duration::from_secs(5),
                 "local_role_view",
                 move |store| {
+                    #[cfg(test)]
+                    if let Some(hook) = before_local_refresh.filter(|_| prior.is_some()) {
+                        hook();
+                    }
                     let local = |gen| View {
                         gen,
                         until_ms: Some(now.saturating_add(ACT_MS)),
@@ -1161,11 +1186,13 @@ impl ProjectsHandler {
                             && matches!(state.as_str(), "enabled" | "enabling" | "joining"))
                     {
                         let high_water = store.role_gen_high_water(&role)?;
-                        let gen = match prior {
-                            Some(gen) if gen >= high_water => gen,
-                            _ => store.grant_local_role_gen(&role)?,
+                        let next = match prior {
+                            Some(gen) if gen >= high_water => Some(gen),
+                            _ => store.grant_local_role_gen(&role, || {
+                                watch_open.load(Ordering::Acquire)
+                            })?,
                         };
-                        return Ok((local(gen), Some(gen)));
+                        return Ok((next.map_or_else(View::default, local), next));
                     }
                     if role == "connector_home" && state == "enabled" {
                         let read = store.role_read(&role)?;
@@ -1359,8 +1386,13 @@ impl ProjectsHandler {
         let initial = if self.role_leases.backend.borrow().is_some() {
             View::default()
         } else {
-            self.local_role_view(&role, self.role_leases.now(), &mut local_gen)
-                .await?
+            self.local_role_view(
+                &role,
+                self.role_leases.now(),
+                &mut local_gen,
+                &client.watch_open,
+            )
+            .await?
         };
         let (source, views) = watch::channel(initial);
         #[cfg(test)]
