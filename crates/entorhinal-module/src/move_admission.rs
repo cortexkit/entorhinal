@@ -3,7 +3,6 @@
 
 use super::{
     agent_ops::{ConfirmationGuard, OperatorConfirmError},
-    claim_codec::AgentClaim,
     encode_result,
     participant_client::{self, AgentRef, PlannedParticipant},
     participant_discovery::discover_participants,
@@ -86,9 +85,6 @@ impl ProjectsHandler {
         let agent_id = request.agent_id.clone();
         let agent = self
             .move_sql(received, move |handler| {
-                if handler.with_store(RegistryStore::legacy_moves_paused)? {
-                    return Err(crate::hub_switch::pending());
-                }
                 if !handler.with_store(RegistryStore::move_authority_cut_over)? {
                     return Err(HandlerError::new(
                         "authority_not_cut_over",
@@ -117,16 +113,13 @@ impl ProjectsHandler {
                 detail: Some(gone),
             });
         }
-        let hub = if self.hub_backend_selected() {
-            Some(self.residence().ok_or_else(|| {
-                HandlerError::new("hub_not_ready", "hub move watch is not installed")
-            })?)
-        } else {
-            None
-        };
-        let (mut claim_version, own) = self
-            .move_claim(received, &request.agent_id, hub.as_deref())
-            .await?;
+        if !self.hub_backend_selected() {
+            return Err(HandlerError::new("hub_not_ready", "hub move backend is not selected"));
+        }
+        let hub = self.residence().ok_or_else(|| {
+            HandlerError::new("hub_not_ready", "hub move watch is not installed")
+        })?;
+        let (mut claim_version, own) = hub.move_origin(&request.agent_id).await?;
         let to = request.to.clone();
         let (peer, peer_name) = match self
             .move_sql(received, move |handler| {
@@ -136,24 +129,19 @@ impl ProjectsHandler {
         {
             Err(error)
                 if error.code == "unknown_member"
-                    && hub.is_some()
                     && crate::hub_membership::box_id(&request.to) =>
             {
                 (request.to.clone(), request.to.clone())
             }
             result => result?,
         };
-        let target = if let Some(hub) = &hub {
-            if hub.move_member(&peer).await?.is_none() {
-                return Err(HandlerError::new(
-                    "unknown_member",
-                    "target is not a current fleet member",
-                ));
-            }
-            hub.watched_node(&peer).await?
-        } else {
-            None
-        };
+        if hub.move_member(&peer).await?.is_none() {
+            return Err(HandlerError::new(
+                "unknown_member",
+                "target is not a current fleet member",
+            ));
+        }
+        let target = hub.watched_node(&peer).await?;
         if peer == own {
             return Err(HandlerError::new(
                 "invalid_request",
@@ -162,8 +150,8 @@ impl ProjectsHandler {
         }
         if let Err(error) = self.move_open_check(received, &request.agent_id).await {
             if error.code == "move_in_progress" {
-                // Another resend can commit while claim refresh is awaiting its
-                // record read. Replay that key before refusing the occupied slot.
+                // Another resend can commit while the hub reads residence.
+                // Replay that key before refusing the occupied slot.
                 if let Some(bytes) = self
                     .move_replay(received, &request.request_key, &request_body)
                     .await?
@@ -318,9 +306,7 @@ impl ProjectsHandler {
                 return Err(OperatorConfirmError::Declined.into());
             }
             let recheck = async {
-                let (version, refreshed_own) = self
-                    .move_claim(received, &request.agent_id, hub.as_deref())
-                    .await?;
+                let (version, refreshed_own) = hub.move_origin(&request.agent_id).await?;
                 if refreshed_own != own {
                     return Err(HandlerError::new(
                         "claim_integrity_failed",
@@ -372,10 +358,7 @@ impl ProjectsHandler {
         getrandom::getrandom(&mut random)
             .map_err(|e| HandlerError::new("storage_error", e.to_string()))?;
         let now = (self.clock)();
-        let mut move_plan = json!({"agent_id":agent.agent_id,"from":own,"to":peer,"claim_version":claim_version,"participants":participants});
-        if hub.is_some() {
-            move_plan["hub_gen"] = json!(claim_version);
-        }
+        let mut move_plan = json!({"agent_id":agent.agent_id,"from":own,"to":peer,"claim_version":claim_version,"hub_gen":claim_version,"participants":participants});
         if let Some(digest) = pin_digest {
             move_plan["pin_digest"] = json!(digest);
         }
@@ -404,15 +387,10 @@ impl ProjectsHandler {
             created_at_ms: now,
             updated_at_ms: now,
         };
-        let legacy = hub.is_none();
         let row = self
             .move_sql(received, move |handler| {
-                let _admission = handler.legacy_move_admission.lock().unwrap();
                 if confirmation.as_ref().is_some_and(|g| *g.cancelled.borrow()) {
                     return Err(OperatorConfirmError::Declined.into());
-                }
-                if legacy && handler.with_store(RegistryStore::legacy_moves_paused)? {
-                    return Err(crate::hub_switch::pending());
                 }
                 handler.with_agent_store(|s| s.admit_agent_move(&row, &refs))
             })
@@ -461,97 +439,6 @@ impl ProjectsHandler {
             return Err(HandlerError::new("move_cap", "four moves are already open"));
         }
         Ok(())
-    }
-
-    async fn move_claim(
-        &self,
-        received: Instant,
-        agent_id: &str,
-        hub: Option<&crate::hub_residence::Residence>,
-    ) -> Result<(i64, String), HandlerError> {
-        if let Some(hub) = hub {
-            return hub.move_origin(agent_id).await;
-        }
-        let refresh = self.wait_claim_refresh().await;
-        let id = agent_id.to_owned();
-        let (cached, own) = self
-            .move_sql(received, move |handler| {
-                let cached = handler
-                    .with_store(|s| s.cached_agent_claim(&id))?
-                    .ok_or_else(|| HandlerError::new("claim_stale", "claim was not refreshed"))?;
-                if cached.integrity_failed {
-                    return Err(HandlerError::new(
-                        "claim_integrity_failed",
-                        "claim has an integrity mark",
-                    ));
-                }
-                let counts = refresh
-                    .map_err(|_| HandlerError::new("claim_stale", "claim refresh failed"))?;
-                if counts.failed != 0 || cached.stale {
-                    return Err(HandlerError::new("claim_stale", "claim cache is stale"));
-                }
-                let own = handler
-                    .with_store(RegistryStore::persisted_self_author)?
-                    .ok_or_else(|| HandlerError::new("claim_stale", "self author is unknown"))?;
-                if cached.epoch >= 1 && cached.holder.as_ref() != Some(&own) {
-                    let location = handler.with_agent_store(|s| s.agent_where(&id))?;
-                    return Err(HandlerError {
-                        code: "not_holder".into(),
-                        message: "claim is held elsewhere".into(),
-                        detail: Some(
-                            json!({"holder":location.holder,"holder_name":location.holder_name}),
-                        ),
-                    });
-                }
-                Ok((cached, own))
-            })
-            .await?;
-        let read = self
-            .record_client
-            .read(&format!("claim:{agent_id}"))
-            .await
-            .map_err(|_| HandlerError::new("claim_stale", "claim read failed"))?;
-        if read.stale || read.self_author != own {
-            return Err(HandlerError::new(
-                "claim_stale",
-                "claim read disagrees with cache",
-            ));
-        }
-        let claim = if read.absent {
-            None
-        } else {
-            Some(
-                AgentClaim::decode(
-                    agent_id,
-                    read.body
-                        .as_deref()
-                        .ok_or_else(|| HandlerError::new("claim_stale", "claim body missing"))?,
-                )
-                .map_err(|_| {
-                    HandlerError::new("claim_integrity_failed", "claim body is invalid")
-                })?,
-            )
-        };
-        let agrees = if cached.epoch == 0 {
-            claim.as_ref().is_none_or(|c| c.epoch == 0)
-        } else {
-            claim.as_ref().is_some_and(|c| {
-                c.epoch == cached.epoch && c.holder == cached.holder && c.cut_id == cached.cut_id
-            })
-        };
-        if !agrees {
-            return Err(HandlerError::new(
-                "claim_stale",
-                "claim read disagrees with cache",
-            ));
-        }
-        let version = i64::try_from(read.version).map_err(|_| {
-            HandlerError::new(
-                "claim_integrity_failed",
-                "claim version exceeds local range",
-            )
-        })?;
-        Ok((version, own))
     }
 }
 
