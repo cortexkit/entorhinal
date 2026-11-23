@@ -2,7 +2,6 @@
 //! and ref set recorded at admission, never a fresh daemon discovery result.
 
 use crate::{
-    claim_codec::AgentClaim,
     door_client::{
         CutItem, CutRequest as DoorCut, DoorError, HandoffState, HubStatusReply, SealRequest,
         SealState, StatusReply,
@@ -17,21 +16,19 @@ use crate::{
         AgentRef, ClientError, CutRequest, ParticipantClient, Refs, ReleaseRequest,
     },
     participant_discovery::Participant,
-    record_client::{CasRequest, CasSettlement, RecordError, RecordReply},
     HandlerError,
 };
 use cortexkit_role_agent_data::{errors::DriverAction, refs::CutId};
 use entorhinal_core::{
-    claim_cache::{CachedClaim, ClaimObservation},
     move_record::{
-        self as wire, ExternalRef, InboxRecord, MoveParticipant, MoveReason, MoveRecord,
-        MoveRecordState as State, PendingMove,
+        self as wire, ExternalRef, MoveParticipant, MoveReason, MoveRecord,
+        MoveRecordState as State,
     },
-    move_store::{AgentMove, MoveSide, MoveStep as Step},
+    move_store::{AgentMove, MoveStep as Step},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::BTreeMap, sync::atomic::Ordering, time::Duration};
+use std::{collections::BTreeMap, time::Duration};
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Progress {
@@ -136,6 +133,12 @@ impl Plan {
 
 fn state_conflict() -> Failure {
     hub_failure(hub_moves::conflict())
+}
+
+fn record_unavailable() -> Failure {
+    let mut failure = Failure::new("record.read", "unavailable");
+    failure.diagnostic = true;
+    failure
 }
 
 fn hub_failure(error: HandlerError) -> Failure {
@@ -293,14 +296,6 @@ impl From<HandlerError> for Failure {
         failure
     }
 }
-impl From<RecordError> for Failure {
-    fn from(e: RecordError) -> Self {
-        let mut failure = Self::new("record.read", e.code());
-        failure.diagnostic = true;
-        failure
-    }
-}
-
 pub(crate) struct Source {
     worker: Worker,
     cut: String,
@@ -388,6 +383,12 @@ impl Source {
         }
         let mut plan: Plan = serde_json::from_value(row.plan.clone())
             .map_err(|e| HandlerError::new("plan_malformed", e.to_string()))?;
+        if plan.hub_gen.is_none() {
+            return Err(HandlerError::new(
+                "plan_malformed",
+                "hub move generation is missing",
+            ));
+        }
         // Poll the shared move record even during a long backoff. Reads that
         // fail signature, author, or persisted-plan checks cannot advance the row.
         let watching = matches!(row.step, Step::Sealed | Step::Published | Step::Releasing);
@@ -395,16 +396,12 @@ impl Source {
         let mut hub_seen = None;
         let observed = if poll {
             self.last_poll = Some(tokio::time::Instant::now());
-            let read = if plan.hub_gen.is_some() {
-                self.read_hub_move(&plan).await.map(|seen| {
-                    hub_seen = seen;
-                    hub_seen
-                        .as_ref()
-                        .map(|seen| (seen.body.participant_plan(), seen.revision))
-                })
-            } else {
-                self.read_move(&plan).await
-            };
+            let read = self.read_hub_move(&plan).await.map(|seen| {
+                hub_seen = seen;
+                hub_seen
+                    .as_ref()
+                    .map(|seen| (seen.body.participant_plan(), seen.revision))
+            });
             match read {
                 Ok(record) => record,
                 Err(error) => return self.failed(&mut row, &mut plan, error).await,
@@ -659,47 +656,6 @@ impl Source {
         ))
     }
 
-    async fn read_move(&self, plan: &Plan) -> Result<Option<(MoveRecord, u64)>, Failure> {
-        let subject = format!("move:{}", self.cut);
-        let reply = self.worker.records.read(&subject).await?;
-        if reply.stale {
-            return Err(RecordError::refusal("unavailable", None).into());
-        }
-        if i64::try_from(reply.version).is_err() {
-            let mut failure = Failure::new("record.read", "record_version_unknown");
-            failure.diagnostic = true;
-            return Err(failure);
-        }
-        if reply.absent {
-            return Ok(None);
-        }
-        let verified = wire::decode_move_record(
-            &subject,
-            reply.body.as_deref().unwrap_or_default(),
-        )
-        .and_then(|record| {
-            wire::check_record_author(&record, reply.author.as_deref().unwrap_or_default())?;
-            wire::check_pinned_plan(&plan.record(&self.cut), &record)?;
-            if plan
-                .source
-                .skipped
-                .as_ref()
-                .is_some_and(|skipped| *skipped != record.skipped)
-            {
-                return Err(wire::CodecError::PlanMismatch);
-            }
-            Ok(record)
-        });
-        match verified {
-            Ok(record) => Ok(Some((record, reply.version))),
-            Err(e) => {
-                let mut error = Failure::new("record.read", e.code());
-                error.diagnostic = true;
-                Err(error)
-            }
-        }
-    }
-
     fn hub(&self) -> Result<std::sync::Arc<Residence>, Failure> {
         self.worker.hub().ok_or_else(|| {
             hub_failure(HandlerError::new(
@@ -824,8 +780,7 @@ impl Source {
             let result = client.export(&self.request(&participant)?).await;
             match result {
                 Ok(export) => {
-                    if plan.hub_gen.is_some()
-                        && !export.items.is_empty()
+                    if !export.items.is_empty()
                         && !plan
                             .source
                             .exports_with_items
@@ -860,20 +815,10 @@ impl Source {
         observed: Option<(MoveRecord, u64)>,
         hub_seen: Option<&SeenMove>,
     ) -> Result<Duration, Failure> {
-        if !self.resumed
-            && (row.step == Step::Exported && (!row.seal_sent || plan.hub_gen.is_none())
-                || row.step == Step::Sealed && plan.hub_gen.is_none())
-        {
+        if !self.resumed && row.step == Step::Exported && !row.seal_sent {
             self.freeze_export(row, plan).await?;
             if row.abort_requested.is_some() {
                 return Ok(Duration::ZERO);
-            }
-            if row.seal_sent {
-                self.worker
-                    .door
-                    .seal(&self.seal_request(plan))
-                    .await
-                    .map_err(|e| Failure::door("cut.seal", e))?;
             }
             self.resumed = true;
         }
@@ -889,37 +834,14 @@ impl Source {
                 Ok(Duration::ZERO)
             }
             Step::Exported => {
-                let status = if plan.hub_gen.is_some() {
-                    self.seal_hub(row, plan).await?
-                } else if !row.seal_sent {
-                    row.seal_sent = true;
-                    self.save(row, plan, false).await?;
-                    self.worker
-                        .door
-                        .seal(&self.seal_request(plan))
-                        .await
-                        .map_err(|e| Failure::door("cut.seal", e))?
-                } else {
-                    // seal_sent is durable before the send, so it does not prove the
-                    // door received the request. Repeat the identical seal to recover.
-                    self.worker
-                        .door
-                        .seal(&self.seal_request(plan))
-                        .await
-                        .map_err(|e| Failure::door("cut.seal", e))?;
-                    self.worker
-                        .door
-                        .status(&self.door_cut())
-                        .await
-                        .map_err(|e| Failure::door("cut.status", e))?
-                };
+                let status = self.seal_hub(row, plan).await?;
                 if plan.source.seal_state != Some(status.state) {
                     row.attempts = 0;
                     plan.source.retry_at_ms = 0;
                 }
                 plan.source.seal_state = Some(status.state);
                 match status.state {
-                    SealState::Sealed if plan.hub_gen.is_some() => {
+                    SealState::Sealed => {
                         let (Some(manifest_sha256), Some(sealed_key)) =
                             (status.manifest_sha256, status.sealed_key)
                         else {
@@ -932,11 +854,6 @@ impl Source {
                             manifest_sha256,
                             sealed_key,
                         });
-                        Self::change_step(row, plan, Step::Sealed);
-                        self.save(row, plan, false).await?;
-                        Ok(Duration::ZERO)
-                    }
-                    SealState::Published if plan.hub_gen.is_none() => {
                         Self::change_step(row, plan, Step::Sealed);
                         self.save(row, plan, false).await?;
                         Ok(Duration::ZERO)
@@ -964,35 +881,9 @@ impl Source {
                 }
             }
             Step::Sealed => {
-                if plan.hub_gen.is_some() {
-                    if hub_seen.is_none() {
-                        self.publish_hub(row, plan).await?;
-                    }
-                    plan.source
-                        .published_at_ms
-                        .get_or_insert_with(|| (self.worker.clock)());
-                    Self::change_step(row, plan, Step::Published);
-                    self.save(row, plan, false).await?;
-                    return Ok(Duration::ZERO);
+                if hub_seen.is_none() {
+                    self.publish_hub(row, plan).await?;
                 }
-                if observed.is_none() {
-                    let (_, inbox) = self.inbox(&plan.to).await?;
-                    if inbox.pending.len() >= wire::INBOX_CAP
-                        && !inbox.pending.iter().any(|p| p.cut_id == self.cut)
-                    {
-                        row.abort_requested =
-                            Some(json!({"reason":"receiver_inbox_full","detail":null}));
-                        self.save(row, plan, false).await?;
-                        return Ok(Duration::ZERO);
-                    }
-                    if let CasSettlement::Landed(version) =
-                        self.cas(plan, None, 0, &plan.record(&self.cut)).await?
-                    {
-                        row.record_version = version as i64;
-                        self.save(row, plan, false).await?;
-                    }
-                }
-                self.append_inbox(plan).await?;
                 plan.source
                     .published_at_ms
                     .get_or_insert_with(|| (self.worker.clock)());
@@ -1048,7 +939,7 @@ impl Source {
         SealRequest {
             cut_id: self.cut.clone(),
             items: plan.source.items.clone(),
-            receiver: plan.hub_gen.map(|_| plan.to.clone()),
+            receiver: Some(plan.to.clone()),
         }
     }
 
@@ -1183,92 +1074,6 @@ impl Source {
         }
     }
 
-    async fn cas(
-        &self,
-        plan: &Plan,
-        from: Option<State>,
-        version: u64,
-        body: &MoveRecord,
-    ) -> Result<CasSettlement, Failure> {
-        wire::check_transition(from, body.state, MoveSide::Source)
-            .map_err(|e| Failure::new("record.cas", e.code()))?;
-        let subject = format!("move:{}", self.cut);
-        let request = CasRequest {
-            subject: subject.clone(),
-            expected_version: version,
-            body: wire::encode_move_record(&subject, body)
-                .map_err(|e| Failure::new("record.cas", e.code()))?,
-            write_id: wire::move_write_id(&self.cut, MoveSide::Source, body.state),
-        };
-        self.worker
-            .records
-            .cas_settled(&request, &plan.from, |bytes| {
-                wire::decode_move_record(&subject, bytes).map_err(|e| e.code())
-            })
-            .await
-            .map_err(Failure::from)
-    }
-
-    async fn inbox(&self, peer: &str) -> Result<(RecordReply, InboxRecord), Failure> {
-        let reply = self.worker.records.read(&format!("inbox:{peer}")).await?;
-        if reply.stale {
-            return Err(RecordError::refusal("unavailable", None).into());
-        }
-        let inbox = if reply.absent {
-            InboxRecord::default()
-        } else {
-            wire::decode_inbox_record(reply.body.as_deref().unwrap_or_default()).map_err(|e| {
-                let mut failure = Failure::new("inbox.read", e.code());
-                failure.diagnostic = true;
-                failure
-            })?
-        };
-        Ok((reply, inbox))
-    }
-
-    async fn append_inbox(&self, plan: &Plan) -> Result<(), Failure> {
-        // Re-read the verified move before each inbox append retry. Once the
-        // receiver advances it beyond published, no inbox notification is needed,
-        // including when the previous append landed but its reply was lost.
-        for _ in 0..8 {
-            let Some((record, _)) = self.read_move(plan).await? else {
-                return Err(Failure::new("record.read", "unavailable"));
-            };
-            if record.state != State::Published {
-                return Ok(());
-            }
-            let (reply, inbox) = self.inbox(&plan.to).await?;
-            if inbox.pending.iter().any(|p| p.cut_id == self.cut) {
-                return Ok(());
-            }
-            let appended = wire::append_inbox(
-                &inbox,
-                PendingMove {
-                    cut_id: self.cut.clone(),
-                    from: plan.from.clone(),
-                    agent_id: plan.agent_id.clone(),
-                },
-            )
-            .map_err(|e| Failure::new("inbox.append", e.code()))?;
-            let mut write_id = [0; 16];
-            getrandom::getrandom(&mut write_id)
-                .map_err(|_| Failure::new("inbox.append", "unavailable"))?;
-            let request = CasRequest {
-                subject: format!("inbox:{}", plan.to),
-                expected_version: reply.version,
-                body: wire::encode_inbox_record(&appended)
-                    .map_err(|e| Failure::new("inbox.append", e.code()))?,
-                write_id,
-            };
-            match self.worker.records.cas(&request).await {
-                Ok(_) => return Ok(()),
-                Err(e) if e.code() == "version_moved" || e.code() == "unavailable" => continue,
-                Err(e) => return Err(e.into()),
-            }
-        }
-        Err(RecordError::refusal("unavailable", None).into())
-    }
-
     async fn refuse_abort(
         &self,
         row: &mut AgentMove,
@@ -1345,78 +1150,61 @@ impl Source {
                 return Ok(POLL);
             }
             match observed {
-                Some((record, version))
+                Some((record, _))
                     if record.state == State::Published
                         || hub_seen.is_some_and(|seen| seen.body.state == HubState::Staged) =>
                 {
                     let aborted = wire::aborted_record(&record, reason, row.detail.as_ref());
-                    if let Some(seen) = hub_seen {
-                        let mut next = seen.body.clone();
-                        next.state = HubState::Aborted;
-                        next.reason = aborted.reason;
-                        next.detail = aborted.detail;
-                        match self.hub()?.write_move(&next, Some(seen)).await {
-                            Ok(_) => {}
-                            Err(error) if error.code == "hub_write_superseded" => {}
-                            Err(error) => return Err(hub_failure(error)),
-                        }
-                        return Ok(POLL);
+                    let seen = hub_seen.ok_or_else(state_conflict)?;
+                    let mut next = seen.body.clone();
+                    next.state = HubState::Aborted;
+                    next.reason = aborted.reason;
+                    next.detail = aborted.detail;
+                    match self.hub()?.write_move(&next, Some(seen)).await {
+                        Ok(_) => {}
+                        Err(error) if error.code == "hub_write_superseded" => {}
+                        Err(error) => return Err(hub_failure(error)),
                     }
-                    let settlement = self
-                        .cas(plan, Some(State::Published), version, &aborted)
-                        .await?;
-                    if let CasSettlement::Landed(version) = settlement {
-                        row.record_version = version as i64;
-                        self.save(row, plan, false).await?;
-                    }
-                    // The receiver may stage the move while we attempt to abort it.
-                    // Re-read and verify the writer and persisted plan before cleanup;
-                    // the body we tried to write is not proof that the abort landed.
-                    return Ok(Duration::ZERO);
+                    return Ok(POLL);
                 }
                 Some((record, _)) if record.state == State::Aborted => {
-                    if let Some(seen) = hub_seen {
-                        let hub = self.hub()?;
-                        let mut reconciled = None;
-                        if let Some((staged, _)) = &plan.source.handing {
-                            let mut handing = staged.body.clone();
-                            handing.state = HubState::Handing;
-                            match hub.write_move(&handing, Some(staged)).await {
-                                Ok(_) => {}
-                                Err(error) if error.code == "hub_write_superseded" => {}
-                                Err(error) if error.code == "hub_write_unsettled" => {
-                                    // The current value does not say whether
-                                    // Handing ever landed. Continue only after
-                                    // re-reading a verified abort.
-                                    let revision =
-                                        error.detail.as_ref().and_then(|d| d["revision"].as_u64());
-                                    reconciled =
-                                        self.read_hub_move(plan).await?.filter(|current| {
-                                            revision.is_some_and(|revision| {
-                                                current.revision >= revision
-                                            }) && current.body.state == HubState::Aborted
-                                        });
-                                    if reconciled.is_none() {
-                                        return Err(hub_failure(error));
-                                    }
+                    let seen = hub_seen.ok_or_else(state_conflict)?;
+                    let hub = self.hub()?;
+                    let mut reconciled = None;
+                    if let Some((staged, _)) = &plan.source.handing {
+                        let mut handing = staged.body.clone();
+                        handing.state = HubState::Handing;
+                        match hub.write_move(&handing, Some(staged)).await {
+                            Ok(_) => {}
+                            Err(error) if error.code == "hub_write_superseded" => {}
+                            Err(error) if error.code == "hub_write_unsettled" => {
+                                // The current value does not say whether
+                                // Handing ever landed. Continue only after
+                                // re-reading a verified abort.
+                                let revision =
+                                    error.detail.as_ref().and_then(|d| d["revision"].as_u64());
+                                reconciled = self.read_hub_move(plan).await?.filter(|current| {
+                                    revision.is_some_and(|revision| current.revision >= revision)
+                                        && current.body.state == HubState::Aborted
+                                });
+                                if reconciled.is_none() {
+                                    return Err(hub_failure(error));
                                 }
-                                Err(error) => return Err(hub_failure(error)),
                             }
+                            Err(error) => return Err(hub_failure(error)),
                         }
-                        let seen = reconciled.as_ref().unwrap_or(seen);
-                        if !matches!(
-                            hub.move_position(&seen.body).await.map_err(hub_failure)?,
-                            MovePosition::Source | MovePosition::Returned
-                        ) || hub
-                            .move_member(&plan.from)
-                            .await
-                            .map_err(hub_failure)?
-                            .is_none()
-                        {
-                            return Err(state_conflict());
-                        }
-                    } else {
-                        self.apply_claim(row, false).await?;
+                    }
+                    let seen = reconciled.as_ref().unwrap_or(seen);
+                    if !matches!(
+                        hub.move_position(&seen.body).await.map_err(hub_failure)?,
+                        MovePosition::Source | MovePosition::Returned
+                    ) || hub
+                        .move_member(&plan.from)
+                        .await
+                        .map_err(hub_failure)?
+                        .is_none()
+                    {
+                        return Err(state_conflict());
                     }
                     if row.seal_sent {
                         self.abort_door_cut().await?;
@@ -1431,7 +1219,7 @@ impl Source {
                     return Ok(Duration::ZERO);
                 }
                 None if row.step == Step::Published => {
-                    return Err(RecordError::refusal("unavailable", None).into())
+                    return Err(record_unavailable());
                 }
                 None => {}
             }
@@ -1509,62 +1297,6 @@ impl Source {
         Ok(())
     }
 
-    async fn apply_claim(&self, row: &AgentMove, require_present: bool) -> Result<(), Failure> {
-        let reply = self
-            .worker
-            .records
-            .read(&format!("claim:{}", row.agent_id))
-            .await?;
-        if reply.stale {
-            return Err(RecordError::refusal("unavailable", None).into());
-        }
-        let observation = if reply.absent && !require_present {
-            ClaimObservation::Absent {
-                stale: false,
-                self_author: reply.self_author,
-            }
-        } else {
-            let claim =
-                AgentClaim::decode(&row.agent_id, reply.body.as_deref().unwrap_or_default())
-                    .map_err(|code| {
-                        let mut failure = Failure::new("claim.read", code);
-                        failure.diagnostic = true;
-                        failure
-                    })?;
-            // A shared abort record says the move was cancelled. For a claimed
-            // agent, only a claim held here permits this machine to resume writes;
-            // keep participant data read-only while another machine holds it.
-            if !require_present
-                && claim.epoch >= 1
-                && claim.holder.as_deref() != Some(&reply.self_author)
-            {
-                return Err(Failure::new("claim.read", "claim_moved"));
-            }
-            let version = i64::try_from(reply.version)
-                .map_err(|_| Failure::new("claim.read", "claim_version_unknown"))?;
-            ClaimObservation::Present {
-                claim: CachedClaim {
-                    holder: claim.holder,
-                    epoch: claim.epoch,
-                    cut_id: claim.cut_id,
-                    version,
-                    read_at_ms: 0,
-                    stale: false,
-                    integrity_failed: false,
-                },
-                self_author: reply.self_author,
-            }
-        };
-        let observations = vec![(row.agent_id.clone(), observation)];
-        let now = (self.worker.clock)();
-        let conflicts = self.worker.cache_claims(observations, now).await?;
-        self.worker
-            .health
-            .self_author_conflicts
-            .fetch_add(conflicts as u64, Ordering::Relaxed);
-        Ok(())
-    }
-
     async fn release(
         &mut self,
         row: &mut AgentMove,
@@ -1572,8 +1304,8 @@ impl Source {
         observed: Option<(MoveRecord, u64)>,
         hub_seen: Option<&SeenMove>,
     ) -> Result<Duration, Failure> {
-        let Some((record, version)) = observed else {
-            return Err(RecordError::refusal("unavailable", None).into());
+        let Some((record, _)) = observed else {
+            return Err(record_unavailable());
         };
         if record.state == State::Released {
             Self::change_step(row, plan, Step::Released);
@@ -1582,9 +1314,6 @@ impl Source {
         }
         if record.state != State::Activated {
             return Err(Failure::new("record.read", "invalid_state"));
-        }
-        if hub_seen.is_none() {
-            self.apply_claim(row, true).await?;
         }
         let handoff = self
             .worker
@@ -1597,14 +1326,7 @@ impl Source {
             // An existing checkpoint without a box means omit it, even on an
             // older row: the participant may already have accepted that request.
             if plan.source.handoff_state.is_none() && plan.source.enforced.is_empty() {
-                plan.source.release_holder_box = if plan.hub_gen.is_some() {
-                    Some(plan.to.clone())
-                } else {
-                    let target = plan.to.clone();
-                    self.worker
-                        .sql(move |store| store.member_box(&target))
-                        .await?
-                };
+                plan.source.release_holder_box = Some(plan.to.clone());
             }
             row.attempts = 0;
             plan.source.retry_at_ms = 0;
@@ -1631,7 +1353,7 @@ impl Source {
             }
         }
         for participant in plan.participants.clone() {
-            if plan.hub_gen.is_some() && plan.source.enforced.contains_key(&participant.module_id) {
+            if plan.source.enforced.contains_key(&participant.module_id) {
                 continue;
             }
             if participant.optional && record.skipped.binary_search(&participant.module_id).is_ok()
@@ -1660,2032 +1382,16 @@ impl Source {
                 .or_insert(reply.enforced);
             self.save(row, plan, false).await?;
         }
-        let mut released = record;
-        released.state = State::Released;
-        if let Some(seen) = hub_seen {
-            let mut body = seen.body.clone();
-            body.state = HubState::Released;
-            row.record_version = self
-                .hub()?
-                .write_move(&body, Some(seen))
-                .await
-                .map_err(hub_failure)? as i64;
-            Self::change_step(row, plan, Step::Released);
-            self.save(row, plan, true).await?;
-            return Ok(Duration::ZERO);
-        }
-        match self
-            .cas(plan, Some(State::Activated), version, &released)
-            .await?
-        {
-            CasSettlement::Landed(version) => {
-                row.record_version = version as i64;
-                Self::change_step(row, plan, Step::Released);
-                self.save(row, plan, true).await?;
-            }
-            CasSettlement::Moved(_) => {}
-        }
+        let seen = hub_seen.ok_or_else(state_conflict)?;
+        let mut body = seen.body.clone();
+        body.state = HubState::Released;
+        row.record_version = self
+            .hub()?
+            .write_move(&body, Some(seen))
+            .await
+            .map_err(hub_failure)? as i64;
+        Self::change_step(row, plan, Step::Released);
+        self.save(row, plan, true).await?;
         Ok(Duration::ZERO)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        fake_door::{Effect as DoorEffect, FakeDoor},
-        fake_participant::{Effect as ParticipantEffect, FakeParticipant},
-        fake_record::{FakeRecord, FakeRecordConnector},
-        log_client::{LogConnector, LogTransport, TransportError},
-        participant_client::{PrepareReply, Refusal, Request},
-        participant_discovery::ParticipantDiscovery,
-        record_client::RecordClient,
-        tests::scratch_descriptor,
-        HealthGauges,
-    };
-    use async_trait::async_trait;
-    use entorhinal_core::{move_record::MoveRef, remote_apply::RemoteEntry, RegistryStore};
-    use std::sync::{Arc, Mutex, OnceLock};
-    use subc_client_rs::{CatalogList, SupervisorListResponse};
-
-    const CUT: &str = "00112233445566778899aabbccddeeff";
-    const FROM: &str = "01010101010101010101010101010101";
-    const TO: &str = "02020202020202020202020202020202";
-    const TO_BOX: &str = "abcdef0123456789abcdef0123456789";
-    const AGENT: &str = "agent_0123456789abcdef";
-    type Slot = Arc<Mutex<Option<RegistryStore>>>;
-
-    fn clock() -> i64 {
-        static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
-        tokio::time::Instant::now()
-            .into_std()
-            .saturating_duration_since(*EPOCH.get_or_init(std::time::Instant::now))
-            .as_millis() as i64
-    }
-
-    #[derive(Debug, Clone)]
-    struct Event {
-        op: String,
-        step: Step,
-        seal_sent: bool,
-        record_version: i64,
-    }
-    struct Trace {
-        slot: std::sync::Weak<Mutex<Option<RegistryStore>>>,
-        events: Mutex<Vec<Event>>,
-        participant_called: tokio::sync::Notify,
-    }
-    impl Trace {
-        fn call(&self, op: &str) {
-            let row = self
-                .slot
-                .upgrade()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .agent_move(CUT)
-                .unwrap()
-                .unwrap();
-            self.events.lock().unwrap().push(Event {
-                op: op.into(),
-                step: row.step,
-                seal_sent: row.seal_sent,
-                record_version: row.record_version,
-            });
-        }
-    }
-    struct ReleaseGate {
-        enabled: std::sync::atomic::AtomicBool,
-        after_apply: std::sync::atomic::AtomicBool,
-        entered: tokio::sync::Semaphore,
-    }
-
-    impl Default for ReleaseGate {
-        fn default() -> Self {
-            Self {
-                enabled: std::sync::atomic::AtomicBool::new(false),
-                after_apply: std::sync::atomic::AtomicBool::new(false),
-                entered: tokio::sync::Semaphore::new(0),
-            }
-        }
-    }
-
-    struct Peer {
-        participant: Arc<FakeParticipant>,
-        trace: Arc<Trace>,
-        release_gate: Option<Arc<ReleaseGate>>,
-    }
-    #[async_trait]
-    impl LogTransport for Peer {
-        async fn call(&self, method: &str, params: Value) -> Result<Vec<u8>, TransportError> {
-            self.trace.call(method);
-            let gate = self.release_gate.as_ref().filter(|gate| {
-                method == "agent_data.release" && gate.enabled.load(Ordering::Relaxed)
-            });
-            if let Some(gate) = gate.filter(|gate| !gate.after_apply.load(Ordering::Relaxed)) {
-                gate.entered.add_permits(1);
-                std::future::pending::<()>().await;
-            }
-            let result = self.participant.call(method, params).await;
-            if let Some(gate) = gate {
-                gate.entered.add_permits(1);
-                std::future::pending::<()>().await;
-            }
-            self.trace.participant_called.notify_one();
-            result
-        }
-    }
-    struct Discovery {
-        peers: BTreeMap<String, Arc<Peer>>,
-        open_failure: Arc<Mutex<Option<TransportError>>>,
-    }
-    #[async_trait]
-    impl ParticipantDiscovery for Discovery {
-        async fn supervisor_list(&self) -> Result<SupervisorListResponse, TransportError> {
-            panic!("resume must not rediscover")
-        }
-        async fn catalog_list(&self) -> Result<CatalogList, TransportError> {
-            panic!("resume must not rediscover")
-        }
-        async fn open_participant(
-            &self,
-            module: &str,
-        ) -> Result<Arc<dyn LogTransport>, TransportError> {
-            if let Some(error) = self.open_failure.lock().unwrap().take() {
-                return Err(error);
-            }
-            Ok(self
-                .peers
-                .get(module)
-                .expect("only pinned participants may be called")
-                .clone())
-        }
-    }
-    type RecordRace = Arc<Mutex<Option<(Vec<u8>, String)>>>;
-
-    struct Records {
-        fake: Arc<FakeRecord>,
-        trace: Arc<Trace>,
-        lose: Arc<Mutex<Option<String>>>,
-        race: RecordRace,
-    }
-    #[async_trait]
-    impl LogConnector for Records {
-        async fn connect(&self) -> Result<Arc<dyn LogTransport>, TransportError> {
-            Ok(Arc::new(RecordPeer {
-                fake: self.fake.clone(),
-                trace: self.trace.clone(),
-                lose: self.lose.clone(),
-                race: self.race.clone(),
-            }))
-        }
-    }
-    struct RecordPeer {
-        fake: Arc<FakeRecord>,
-        trace: Arc<Trace>,
-        lose: Arc<Mutex<Option<String>>>,
-        race: RecordRace,
-    }
-    #[async_trait]
-    impl LogTransport for RecordPeer {
-        async fn call(&self, method: &str, params: Value) -> Result<Vec<u8>, TransportError> {
-            self.trace.call(method);
-            if method == "record.cas" {
-                if params["subject"] == format!("move:{CUT}") {
-                    if let Some((body, author)) = self.race.lock().unwrap().take() {
-                        self.fake.put(
-                            &format!("move:{CUT}"),
-                            params["expected_version"].as_u64().unwrap() + 1,
-                            body,
-                            &author,
-                        );
-                    }
-                }
-                let mut lose = self.lose.lock().unwrap();
-                if lose
-                    .as_ref()
-                    .is_some_and(|subject| params["subject"] == subject.as_str())
-                {
-                    lose.take();
-                    self.fake.drop_reply.store(true, Ordering::Relaxed);
-                }
-            }
-            self.fake.call(method, params).await
-        }
-    }
-    struct Door {
-        fake: FakeDoor,
-        trace: Arc<Trace>,
-    }
-    #[async_trait]
-    impl LogConnector for Door {
-        async fn connect(&self) -> Result<Arc<dyn LogTransport>, TransportError> {
-            Ok(Arc::new(DoorPeer {
-                fake: self.fake.clone(),
-                trace: self.trace.clone(),
-            }))
-        }
-    }
-    struct DoorPeer {
-        fake: FakeDoor,
-        trace: Arc<Trace>,
-    }
-    #[async_trait]
-    impl LogTransport for DoorPeer {
-        async fn call(&self, method: &str, params: Value) -> Result<Vec<u8>, TransportError> {
-            self.trace.call(method);
-            self.fake.handle("reserved:entorhinal", method, params)
-        }
-    }
-
-    struct Fixture {
-        slot: Slot,
-        worker: Worker,
-        participants: Vec<Arc<FakeParticipant>>,
-        open_failure: Arc<Mutex<Option<TransportError>>>,
-        release_gate: Arc<ReleaseGate>,
-        door: FakeDoor,
-        records: Arc<FakeRecord>,
-        record_pipe: Arc<Records>,
-        trace: Arc<Trace>,
-        dir: std::path::PathBuf,
-        descriptor: cortexkit_store_types::StorageDescriptor,
-    }
-    impl Fixture {
-        fn new() -> Self {
-            let _ = clock();
-            let (dir, descriptor) = scratch_descriptor("move-source");
-            let store = RegistryStore::open(&descriptor).unwrap();
-            let plan = json!({"agent_id":AGENT,"from":FROM,"to":TO,"claim_version":0,
-            "participants":[
-                {"module_id":"a","refs":[{"ref_kind":"session","ref":"ra"}],"external":[]},
-                {"module_id":"b","refs":[{"ref_kind":"session","ref":"rb"}],"external":[]},
-                {"module_id":"c","refs":[{"ref_kind":"session","ref":"rc"}],"external":[]}
-            ]});
-            store
-                .insert_agent_move(&AgentMove {
-                    cut_id: CUT.into(),
-                    agent_id: AGENT.into(),
-                    side: MoveSide::Source,
-                    peer: TO.into(),
-                    step: Step::Preparing,
-                    plan,
-                    request_body: Some(json!({"agent_id":AGENT,"to":TO})),
-                    record_version: 0,
-                    claim_version: Some(0),
-                    claim_take_body: None,
-                    claim_take_version: None,
-                    claim_landed_version: None,
-                    seal_sent: false,
-                    abort_requested: None,
-                    hold: None,
-                    cut_accept: None,
-                    reason: None,
-                    detail: None,
-                    request_key: Some("move".into()),
-                    attempts: 0,
-                    activated_at_ms: None,
-                    created_at_ms: clock(),
-                    updated_at_ms: clock(),
-                })
-                .unwrap();
-            let slot = Arc::new(Mutex::new(Some(store)));
-            let trace = Arc::new(Trace {
-                slot: Arc::downgrade(&slot),
-                events: Mutex::new(vec![]),
-                participant_called: tokio::sync::Notify::new(),
-            });
-            let door = FakeDoor::new([1; 16]);
-            let records = FakeRecord::new([1; 16]);
-            let mut peers = BTreeMap::new();
-            let mut participants = vec![];
-            let release_gate = Arc::new(ReleaseGate::default());
-            for (index, module) in ["a", "b", "c"].into_iter().enumerate() {
-                let reference = format!("r{module}");
-                let participant = Arc::new(FakeParticipant::new(
-                    &["session"],
-                    vec![AgentRef::new("session", &reference)],
-                ));
-                let session_ref = format!("{:032x}", index + 16);
-                let item = CutItem {
-                    session_ref: session_ref.clone(),
-                    stream: format!("reserved:{module}"),
-                    end_offset: 42,
-                    digest: "a".repeat(64),
-                };
-                door.set_stream(item.clone());
-                let prepare: PrepareReply = serde_json::from_value(json!({"items":[{
-                    "ref_kind":"session","ref":reference,"sessionRef":session_ref,"stream":item.stream,
-                    "endOffset":42,"digest":item.digest,"format":"v1","frozen":true}],"external":[]})).unwrap();
-                participant.set_prepare(prepare);
-                peers.insert(
-                    module.into(),
-                    Arc::new(Peer {
-                        participant: participant.clone(),
-                        trace: trace.clone(),
-                        release_gate: (module == "b").then(|| release_gate.clone()),
-                    }),
-                );
-                participants.push(participant);
-            }
-            let record_pipe = Arc::new(Records {
-                fake: records.clone(),
-                trace: trace.clone(),
-                lose: Arc::new(Mutex::new(None)),
-                race: Arc::new(Mutex::new(None)),
-            });
-            let open_failure = Arc::default();
-            let worker = Worker {
-                sql_operations: Arc::default(),
-                store: Arc::downgrade(&slot),
-                records: RecordClient::new(record_pipe.clone()),
-                door: crate::door_client::DoorClient::new(Arc::new(Door {
-                    fake: door.clone(),
-                    trace: trace.clone(),
-                })),
-                discovery: Arc::new(Discovery {
-                    peers,
-                    open_failure: Arc::clone(&open_failure),
-                }),
-                catalog: None,
-                health: Arc::new(HealthGauges::default()),
-                writer: Arc::new(tokio::sync::Mutex::new(())),
-                clock,
-                wake: Arc::new(crate::move_driver::MoveWake::default()),
-            };
-            Self {
-                slot,
-                worker,
-                participants,
-                open_failure,
-                release_gate,
-                door,
-                records,
-                record_pipe,
-                trace,
-                dir,
-                descriptor,
-            }
-        }
-        fn source(&self) -> Source {
-            Source::new(self.worker.clone(), CUT.into())
-        }
-        fn row(&self) -> AgentMove {
-            self.slot
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .agent_move(CUT)
-                .unwrap()
-                .unwrap()
-        }
-        fn edit(&self, edit: impl FnOnce(&mut AgentMove)) {
-            let mut row = self.row();
-            edit(&mut row);
-            self.slot
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .update_agent_move(&row)
-                .unwrap();
-        }
-        fn plan(&self) -> Plan {
-            serde_json::from_value(self.row().plan).unwrap()
-        }
-        fn state(&self, state: State, author: &str) {
-            let mut record = self.plan().record(CUT);
-            record.state = state;
-            if state == State::Aborted {
-                record.reason = Some(MoveReason::Operator);
-            }
-            self.records.put(
-                &format!("move:{CUT}"),
-                self.row().record_version.max(1) as u64 + 1,
-                wire::encode_move_record(&format!("move:{CUT}"), &record).unwrap(),
-                author,
-            );
-        }
-        fn claim(&self) {
-            self.records.put(
-                &format!("claim:{AGENT}"),
-                1,
-                serde_json::to_vec(&AgentClaim {
-                    v: 1,
-                    agent_id: AGENT.into(),
-                    holder: Some(TO.into()),
-                    epoch: 1,
-                    cut_id: Some(CUT.into()),
-                    reason: None,
-                })
-                .unwrap(),
-                TO,
-            );
-        }
-        fn set_member_box(&self, position: i64, box_id: &str) {
-            self.slot
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .apply_remote_entry(
-                    &RemoteEntry {
-                        position,
-                        entry_id: format!("{position:032x}"),
-                        author: TO.into(),
-                        signer: "02".repeat(16),
-                        key_id: "03".repeat(16),
-                        envelope_version: 1,
-                        kind: "change".into(),
-                        entry: serde_json::to_vec(
-                            &json!({"op":"member.set_box","author":TO,"box_id":box_id}),
-                        )
-                        .unwrap(),
-                    },
-                    None,
-                )
-                .unwrap();
-        }
-        fn activate(&self) {
-            self.claim();
-            self.state(State::Activated, TO);
-            self.cover_handoff();
-        }
-        fn cover_handoff(&self) {
-            self.door.script(
-                "cut.handoff",
-                DoorEffect::Handoff(crate::door_client::HandoffReply {
-                    state: HandoffState::Released,
-                    session_ref: None,
-                    code: None,
-                }),
-            );
-        }
-        async fn step(&self, source: &mut Source) -> Option<Duration> {
-            let delay = source.tick().await.unwrap();
-            if let Some(delay) = delay {
-                tokio::time::advance(delay).await;
-            }
-            delay
-        }
-        async fn until(&self, source: &mut Source, step: Step) {
-            for _ in 0..20 {
-                if self.row().step == step {
-                    return;
-                }
-                self.step(source).await;
-            }
-            panic!("did not reach {step:?}: {:?}", self.row());
-        }
-        async fn published(&self, source: &mut Source) {
-            self.door
-                .script("cut.status", DoorEffect::Seal(SealState::Published, None));
-            self.until(source, Step::Published).await;
-        }
-        fn abort(&self) {
-            self.edit(|row| row.abort_requested = Some(json!({"reason":"operator","detail":null})));
-        }
-    }
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            *self.slot.lock().unwrap() = None;
-            let _ = std::fs::remove_dir_all(&self.dir);
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn source_reconnect_polls_once_waiting_and_mid_poll() {
-        use crate::log_client::LogConnector;
-        for mid_poll in [false, true] {
-            let mut f = Fixture::new();
-            // A stored contract violation prevents participant calls, but a
-            // published source still reads move:<cut> each tick. That isolates
-            // the retry loop's reconnect and timer behavior from move progress.
-            f.edit(|row| {
-                row.step = Step::Published;
-                row.plan["_source"] = json!({"contract_violation":true});
-            });
-            let probe = crate::move_driver::reconnect_test::Connector::new(
-                f.records.clone(),
-                format!("move:{CUT}"),
-                mid_poll,
-            );
-            let connector = Arc::new(crate::move_driver::ReconnectConnector {
-                inner: probe.clone(),
-                wake: f.worker.wake.clone(),
-            });
-            connector.connect().await.unwrap();
-            f.worker.records = RecordClient::new(connector.clone());
-            let task = tokio::spawn(f.source().run());
-            probe.check_polling(&connector, mid_poll).await;
-            task.abort();
-            assert!(task.await.unwrap_err().is_cancelled());
-            f.worker.sql_operations.wait().await;
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn source_records_each_step_before_next_call_and_releases_three_participants() {
-        let f = Fixture::new();
-        let mut source = f.source();
-        f.published(&mut source).await;
-        let events = f.trace.events.lock().unwrap().clone();
-        assert_eq!(
-            events
-                .iter()
-                .filter(|e| e.op == "agent_data.prepare")
-                .count(),
-            3
-        );
-        assert!(events
-            .iter()
-            .filter(|e| e.op == "agent_data.export")
-            .all(|e| e.step == Step::Preparing));
-        assert!(events
-            .iter()
-            .filter(|e| e.op == "cut.seal")
-            .all(|e| e.step == Step::Exported && e.seal_sent));
-        assert_eq!(f.row().record_version, 1);
-        assert_eq!(f.worker.health.moves_open.load(Ordering::Relaxed), 1);
-        let inbox = f.worker.records.read(&format!("inbox:{TO}")).await.unwrap();
-        assert_eq!(
-            wire::decode_inbox_record(inbox.body.as_ref().unwrap())
-                .unwrap()
-                .pending
-                .len(),
-            1
-        );
-        f.claim();
-        f.state(State::Activated, TO);
-        f.door.script(
-            "cut.handoff",
-            DoorEffect::Handoff(crate::door_client::HandoffReply {
-                state: HandoffState::Released,
-                session_ref: None,
-                code: None,
-            }),
-        );
-        f.until(&mut source, Step::Released).await;
-        for participant in &f.participants {
-            assert_eq!(
-                participant.tombstones().values().collect::<Vec<_>>(),
-                vec![&TO.to_owned()]
-            );
-            assert!(participant.frozen().is_empty());
-        }
-        let record = f.worker.records.read(&format!("move:{CUT}")).await.unwrap();
-        assert_eq!(
-            wire::decode_move_record(&format!("move:{CUT}"), record.body.as_ref().unwrap())
-                .unwrap()
-                .state,
-            State::Released
-        );
-        assert_eq!(
-            f.slot
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .cached_agent_claim(AGENT)
-                .unwrap()
-                .unwrap()
-                .holder
-                .as_deref(),
-            Some(TO)
-        );
-        let events = f.trace.events.lock().unwrap();
-        assert!(events
-            .iter()
-            .filter(|e| e.op == "cut.handoff" || e.op == "agent_data.release")
-            .all(|e| e.step == Step::Releasing));
-        assert!(events
-            .iter()
-            .any(|e| e.op == "cut.handoff" && e.record_version >= 2));
-        assert_eq!(f.worker.health.moves_open.load(Ordering::Relaxed), 0);
-    }
-
-    fn release_calls(participant: &FakeParticipant) -> Vec<Value> {
-        participant
-            .wire_calls()
-            .into_iter()
-            .filter(|(method, _)| method == "agent_data.release")
-            .map(|(_, params)| params)
-            .collect()
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn source_release_holder_box_carries_target_box_off_hub() {
-        let f = Fixture::new();
-        f.set_member_box(1, TO_BOX);
-        let mut source = f.source();
-        f.published(&mut source).await;
-        f.activate();
-        f.until(&mut source, Step::Released).await;
-
-        for participant in &f.participants {
-            let calls = release_calls(participant);
-            assert_eq!(calls.len(), 1);
-            assert_eq!(calls[0]["holder"], TO);
-            assert_eq!(calls[0]["holderBox"], TO_BOX);
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn source_release_holder_box_carries_target_box_on_hub() {
-        let f = Fixture::new();
-        f.set_member_box(1, TO_BOX);
-        let mut source = f.source();
-        f.published(&mut source).await;
-        f.cover_handoff();
-
-        // Feed the verified hub activation directly. Only writing the final
-        // hub record needs a hub connection; the participant calls do not.
-        let mut row = f.row();
-        let mut plan = f.plan();
-        row.step = Step::Releasing;
-        plan.hub_gen = Some(1);
-        plan.source.sealed_cut = Some(crate::door_client::SealedCut {
-            manifest_sha256: "manifest".into(),
-            sealed_key: "sealed-key".into(),
-        });
-        let mut body = plan
-            .hub_record(CUT)
-            .unwrap_or_else(|e| panic!("{}", e.code));
-        body.state = HubState::Activated;
-        let seen = SeenMove {
-            body,
-            revision: 2,
-            writer: TO.into(),
-            writer_ep: 1,
-        };
-        let Err(error) = source
-            .release(
-                &mut row,
-                &mut plan,
-                Some((seen.body.participant_plan(), seen.revision)),
-                Some(&seen),
-            )
-            .await
-        else {
-            panic!("final record write needs the hub");
-        };
-        assert_eq!(error.code, "hub_not_ready");
-        for participant in &f.participants {
-            let calls = release_calls(participant);
-            assert_eq!(calls.len(), 1);
-            assert_eq!(calls[0]["holder"], TO);
-            assert_eq!(calls[0]["holderBox"], TO);
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn source_release_holder_box_survives_restart_before_reply() {
-        for (initial_box, legacy) in [(Some(TO_BOX), false), (None, false), (Some(TO_BOX), true)] {
-            let f = Fixture::new();
-            let position = if let Some(box_id) = initial_box {
-                f.set_member_box(1, box_id);
-                2
-            } else {
-                1
-            };
-            let mut source = f.source();
-            f.published(&mut source).await;
-            f.activate();
-            if legacy {
-                // An old driver could send release after a pending handoff
-                // checkpoint if the subsequent door status reported coverage.
-                f.edit(|row| {
-                    row.step = Step::Releasing;
-                    row.plan["_source"]["handoff_state"] = json!(HandoffState::InProgress);
-                });
-            }
-
-            f.release_gate.after_apply.store(true, Ordering::Relaxed);
-            f.release_gate.enabled.store(true, Ordering::Relaxed);
-            let task = tokio::spawn(async move { source.tick().await });
-            f.release_gate.entered.acquire().await.unwrap().forget();
-            let participant = &f.participants[1];
-            let first = release_calls(participant);
-            assert_eq!(first.len(), 1);
-            assert_eq!(participant.tombstones().len(), 1);
-            let row = f.row();
-            assert!(row.plan["_source"]["enforced"].get("b").is_none());
-            if let Some(box_id) = initial_box.filter(|_| !legacy) {
-                assert_eq!(first[0]["holderBox"], box_id);
-                assert_eq!(row.plan["_source"]["release_holder_box"], box_id);
-            } else {
-                assert!(first[0].get("holderBox").is_none());
-                assert!(row.plan["_source"].get("release_holder_box").is_none());
-            }
-            task.abort();
-            assert!(task.await.unwrap_err().is_cancelled());
-            f.release_gate.enabled.store(false, Ordering::Relaxed);
-
-            f.set_member_box(position, "fedcba9876543210fedcba9876543210");
-            let mut restarted = f.source();
-            f.until(&mut restarted, Step::Released).await;
-            assert_eq!(release_calls(participant), vec![first[0].clone(); 2]);
-            assert_eq!(
-                release_calls(&f.participants[2])[0].get("holderBox"),
-                first[0].get("holderBox")
-            );
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn source_activated_wrong_author_never_releases() {
-        let f = Fixture::new();
-        let mut source = f.source();
-        f.published(&mut source).await;
-        f.claim();
-        f.state(State::Activated, FROM);
-        f.step(&mut source).await;
-        assert_eq!(f.row().step, Step::Published);
-        assert!(f.participants.iter().all(|p| p.tombstones().is_empty()));
-        assert!(f
-            .door
-            .calls()
-            .iter()
-            .all(|c| c.request.op() != "cut.handoff"));
-        assert_eq!(f.plan().source.errors[0]["code"], "author_mismatch");
-        assert_eq!(f.worker.health.move_errors.load(Ordering::Relaxed), 1);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn source_activated_changed_plan_never_releases() {
-        let f = Fixture::new();
-        let mut source = f.source();
-        f.published(&mut source).await;
-        f.claim();
-        let mut record = f.plan().record(CUT);
-        record.state = State::Activated;
-        record.participants[0].refs.push(MoveRef {
-            ref_kind: "session".into(),
-            reference: "zz".into(),
-        });
-        f.records.put(
-            &format!("move:{CUT}"),
-            2,
-            wire::encode_move_record(&format!("move:{CUT}"), &record).unwrap(),
-            TO,
-        );
-        f.step(&mut source).await;
-        assert_eq!(f.row().step, Step::Published);
-        assert!(f
-            .door
-            .calls()
-            .iter()
-            .all(|c| c.request.op() != "cut.handoff"));
-        assert_eq!(f.plan().source.errors[0]["code"], "plan_mismatch");
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn source_abort_cleans_every_preboundary_checkpoint_with_and_without_a_record() {
-        for (step, seal_sent, present) in [
-            (Step::Preparing, false, false),
-            (Step::Preparing, true, false),
-            (Step::Exported, false, false),
-            (Step::Exported, true, false),
-            (Step::Sealed, true, false),
-            (Step::Sealed, true, true),
-            (Step::Published, true, true),
-        ] {
-            let f = Fixture::new();
-            let mut source = f.source();
-            if present {
-                f.published(&mut source).await;
-            } else if seal_sent || step != Step::Preparing {
-                f.until(&mut source, Step::Exported).await;
-            }
-            f.edit(|r| {
-                r.step = step;
-                r.seal_sent = seal_sent;
-            });
-            f.abort();
-            f.until(&mut source, Step::Aborted).await;
-            assert_eq!(f.row().reason.as_deref(), Some("operator"));
-            assert!(f
-                .participants
-                .iter()
-                .all(|p| p.frozen().is_empty() && p.staged().is_empty()));
-            if seal_sent {
-                assert!(f.door.cut(CUT).unwrap().aborted);
-            }
-            if present {
-                let reply = f.worker.records.read(&format!("move:{CUT}")).await.unwrap();
-                assert_eq!(
-                    wire::decode_move_record(&format!("move:{CUT}"), reply.body.as_ref().unwrap())
-                        .unwrap()
-                        .state,
-                    State::Aborted
-                );
-            }
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn source_peer_abort_applies_claim_before_door_and_participant_cleanup() {
-        let f = Fixture::new();
-        let mut source = f.source();
-        f.published(&mut source).await;
-        let claim = AgentClaim {
-            v: 1,
-            agent_id: AGENT.into(),
-            holder: Some(FROM.into()),
-            epoch: 2,
-            cut_id: None,
-            reason: None,
-        };
-        f.records.put(
-            &format!("claim:{AGENT}"),
-            2,
-            serde_json::to_vec(&claim).unwrap(),
-            TO,
-        );
-        f.state(State::Aborted, TO);
-        f.until(&mut source, Step::Aborted).await;
-        let cached = f
-            .slot
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .cached_agent_claim(AGENT)
-            .unwrap()
-            .unwrap();
-        assert_eq!(cached.holder.as_deref(), Some(FROM));
-        assert_eq!(cached.epoch, 2);
-        assert!(f.participants.iter().all(|p| p.frozen().is_empty()));
-        let events = f.trace.events.lock().unwrap();
-        let door_abort = events.iter().position(|e| e.op == "cut.abort").unwrap();
-        let participant_abort = events
-            .iter()
-            .position(|e| e.op == "agent_data.abort")
-            .unwrap();
-        assert!(door_abort < participant_abort);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn source_shared_abort_cannot_unfreeze_while_receiver_holds_claim() {
-        let f = Fixture::new();
-        let mut source = f.source();
-        f.published(&mut source).await;
-        let claim = AgentClaim {
-            v: 1,
-            agent_id: AGENT.into(),
-            holder: Some(TO.into()),
-            epoch: 1,
-            cut_id: Some(CUT.into()),
-            reason: None,
-        };
-        f.records.put(
-            &format!("claim:{AGENT}"),
-            1,
-            serde_json::to_vec(&claim).unwrap(),
-            TO,
-        );
-        f.state(State::Aborted, TO);
-        source.tick().await.unwrap();
-        assert_eq!(f.row().step, Step::Published);
-        assert!(
-            f.participants.iter().all(|p| !p.frozen().is_empty()),
-            "shared abort must not unfreeze participants while the receiver holds the claim"
-        );
-        assert_eq!(f.row().hold.unwrap()["code"], "claim_moved");
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn source_unknown_abort_reason_and_corrupt_persisted_refs_do_not_panic() {
-        let f = Fixture::new();
-        let mut source = f.source();
-        f.published(&mut source).await;
-        let mut record = f.plan().record(CUT);
-        record.state = State::Aborted;
-        record.reason = Some(MoveReason::Other("future_peer_reason".into()));
-        f.records.put(
-            &format!("move:{CUT}"),
-            4,
-            wire::encode_move_record(&format!("move:{CUT}"), &record).unwrap(),
-            TO,
-        );
-        f.until(&mut source, Step::Aborted).await;
-        assert_eq!(f.row().reason.as_deref(), Some("future_peer_reason"));
-        let mut participant = f.plan().participants[0].clone();
-        let duplicate = participant.refs[0].clone();
-        participant.refs.push(duplicate);
-        assert_eq!(
-            source.request(&participant).unwrap_err().code,
-            "invalid_refs"
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn source_digest_mismatch_abort_stuck_frozen_retries_once_on_restart() {
-        for published in [false, true] {
-            let f = Fixture::new();
-            let mut source = f.source();
-            if published {
-                f.published(&mut source).await;
-            } else {
-                f.until(&mut source, Step::Exported).await;
-            }
-            f.abort();
-            for _ in 0..2 {
-                f.participants[1].script(
-                    "agent_data.abort",
-                    ParticipantEffect::Refuse(crate::move_driver::digest_refusal("abort")),
-                );
-            }
-            for _ in 0..3 {
-                f.step(&mut source).await;
-                if f.row().hold.is_some() {
-                    break;
-                }
-            }
-            let row = f.row();
-            assert_eq!(
-                row.step,
-                if published {
-                    Step::Published
-                } else {
-                    Step::Exported
-                }
-            );
-            let hold = row.hold.unwrap();
-            assert_eq!(hold["state"], "stuck");
-            assert_eq!(hold["module_id"], "b");
-            assert_eq!(hold["op"], "agent_data.abort");
-            assert_eq!(hold["code"], "digest_mismatch");
-            assert_eq!(hold["reason"], "undo_digest_mismatch");
-            assert_eq!(row.detail.unwrap(), hold);
-            assert!(f.plan().source.contract_violation.is_none());
-            assert!(!f.participants[1].frozen().is_empty());
-            assert!(!f.participants[2].frozen().is_empty());
-            let aborts = || {
-                f.participants[1]
-                    .calls()
-                    .iter()
-                    .filter(|r| matches!(r, Request::Abort(_)))
-                    .count()
-            };
-            assert_eq!(aborts(), 1);
-            let calls = f
-                .participants
-                .iter()
-                .map(|p| p.calls().len())
-                .sum::<usize>();
-            for _ in 0..3 {
-                f.step(&mut source).await;
-            }
-            assert_eq!(
-                calls,
-                f.participants
-                    .iter()
-                    .map(|p| p.calls().len())
-                    .sum::<usize>()
-            );
-            let mut restarted = f.source();
-            f.step(&mut restarted).await;
-            assert_eq!(aborts(), 2);
-            for _ in 0..3 {
-                f.step(&mut restarted).await;
-            }
-            assert_eq!(aborts(), 2);
-            assert!(!f.participants[1].frozen().is_empty());
-            assert!(!f.row().step.is_terminal());
-            assert_eq!(f.row().hold.unwrap()["reason"], "undo_digest_mismatch");
-            restarted.retry_held_abort();
-            f.until(&mut restarted, Step::Aborted).await;
-            assert_eq!(aborts(), 3);
-            assert!(f.participants.iter().all(|p| p.frozen().is_empty()));
-            assert!(f.row().hold.is_none());
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn operator_abort_retry_wakes_only_the_requested_stuck_cut_once() {
-        let f = Fixture::new();
-        let mut source = f.source();
-        f.until(&mut source, Step::Exported).await;
-        f.abort();
-        for _ in 0..2 {
-            f.participants[1].script(
-                "agent_data.abort",
-                ParticipantEffect::Refuse(crate::move_driver::digest_refusal("abort")),
-            );
-        }
-        f.step(&mut source).await;
-        assert!(f.row().abort_stuck());
-        let other_cut = "99999999999999999999999999999999";
-        let mut other = f.row();
-        other.cut_id = other_cut.into();
-        other.agent_id = "other-agent".into();
-        other.request_key = None;
-        f.worker
-            .sql(move |store| store.insert_agent_move(&other))
-            .await
-            .unwrap();
-        let mut other_source = Source::new(f.worker.clone(), other_cut.into());
-        other_source.abort_held = true;
-        let first = tokio::spawn(source.run());
-        let second = tokio::spawn(other_source.run());
-        let cut = f.row().cut_id;
-        f.slot
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .request_agent_move_abort(&cut, 99)
-            .unwrap();
-        f.worker.wake.notify_waiters();
-        tokio::time::timeout(Duration::from_secs(300), async {
-            loop {
-                let notified = f.trace.participant_called.notified();
-                if f.participants[1]
-                    .calls()
-                    .iter()
-                    .filter(|r| matches!(r, Request::Abort(_)))
-                    .count()
-                    == 2
-                {
-                    break;
-                }
-                notified.await;
-            }
-        })
-        .await
-        .expect("the requested owner retries abort");
-        let aborts: Vec<_> = f.participants[1]
-            .calls()
-            .into_iter()
-            .filter_map(|r| match r {
-                Request::Abort(r) => Some(r.cut_id.to_string()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(aborts, vec![f.row().cut_id.clone(), f.row().cut_id]);
-        assert!(f.worker.row(other_cut).await.unwrap().abort_stuck());
-        assert!(!f.worker.consume_abort_retry(other_cut).await.unwrap());
-        first.abort();
-        second.abort();
-        let _ = first.await;
-        let _ = second.await;
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn source_abort_at_staged_or_later_is_cleared_and_never_unfreezes() {
-        for state in [State::Staged, State::Claimed, State::Activated] {
-            let f = Fixture::new();
-            let mut source = f.source();
-            f.published(&mut source).await;
-            f.claim();
-            f.state(state, TO);
-            f.abort();
-            f.door
-                .script("cut.handoff", DoorEffect::Refuse("unavailable".into()));
-            f.step(&mut source).await;
-            let row = f.row();
-            assert!(row.abort_requested.is_none());
-            assert_eq!(row.detail.as_ref().unwrap()["code"], "invalid_state");
-            assert_eq!(row.detail.as_ref().unwrap()["state"], state.as_str());
-            let mut restarted = f.source();
-            f.step(&mut restarted).await;
-            assert!(f
-                .participants
-                .iter()
-                .all(|p| p.calls().iter().all(|r| !matches!(r, Request::Abort(_)))));
-            assert!(f.door.calls().iter().all(|c| c.request.op() != "cut.abort"));
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn move_session_regression_source_retries_participant_route_open() {
-        for error in [
-            TransportError::NoReply,
-            TransportError::Refusal {
-                code: "module_not_found".into(),
-                detail: None,
-                message: None,
-            },
-        ] {
-            let f = Fixture::new();
-            *f.open_failure.lock().unwrap() = Some(error);
-            let mut source = f.source();
-            let mut row = f.row();
-            let mut plan: Plan = serde_json::from_value(row.plan.clone()).unwrap();
-            let error = source.client("b").await.err().expect("route must fail");
-            let delay = source.failed(&mut row, &mut plan, error).await.unwrap();
-            let saved = f.row();
-            assert!(
-                saved.plan["_source"]["contract_violation"].is_null(),
-                "a failed participant route must retry, not hold: {:?}",
-                saved.hold
-            );
-            assert_eq!(delay, Some(backoff(1)));
-            assert_eq!(saved.attempts, 1);
-            assert!(saved.abort_requested.is_none());
-            assert_eq!(saved.hold.unwrap()["module_id"], "b");
-            assert!(source.client("b").await.is_ok());
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn source_missing_driver_action_holds_without_abort_or_retry_after_restart() {
-        let f = Fixture::new();
-        let mut source = f.source();
-        let mut row = f.row();
-        let mut plan: Plan = serde_json::from_value(row.plan.clone()).unwrap();
-        // An unknown op produces the same missing-action signal as a future
-        // DriverAction variant, which cannot be constructed outside its crate.
-        let error = Failure::participant(
-            "agent_data.future",
-            "b",
-            ClientError::Refused(Refusal {
-                code: "participant_failed".into(),
-                detail: None,
-                message: None,
-            }),
-        );
-        assert!(error.action().is_none());
-        source.failed(&mut row, &mut plan, error).await.unwrap();
-        let held = f.row();
-        assert_eq!(held.step, row.step);
-        assert!(held.abort_requested.is_none());
-        assert_eq!(held.attempts, 0);
-        assert!(held.plan["_source"]["contract_violation"].is_object());
-        assert_eq!(held.hold.unwrap()["module_id"], "b");
-        let counts: Vec<_> = f.participants.iter().map(|p| p.calls().len()).collect();
-        f.step(&mut source).await;
-        let mut restarted = f.source();
-        f.step(&mut restarted).await;
-        assert_eq!(f.row().step, held.step);
-        assert!(f.row().abort_requested.is_none());
-        assert_eq!(f.row().attempts, 0);
-        assert_eq!(
-            f.participants
-                .iter()
-                .map(|p| p.calls().len())
-                .collect::<Vec<_>>(),
-            counts
-        );
-    }
-    #[tokio::test(start_paused = true)]
-    async fn source_participant_failed_prepare_and_export_abort_with_participant_named() {
-        for op in ["agent_data.prepare", "agent_data.export"] {
-            let f = Fixture::new();
-            let mut source = f.source();
-            f.participants[1].script(
-                op,
-                ParticipantEffect::Refuse(Refusal {
-                    code: "participant_failed".into(),
-                    detail: Some(json!({"reason":"participant storage is corrupt"})),
-                    message: None,
-                }),
-            );
-            f.until(&mut source, Step::Aborted).await;
-            let row = f.row();
-            assert_eq!(row.reason.as_deref(), Some("participant_refused"));
-            let detail = row.detail.unwrap();
-            assert_eq!(detail["module_id"], "b");
-            assert_eq!(detail["op"], op);
-            assert_eq!(detail["code"], "participant_failed");
-            assert_eq!(detail["detail"]["reason"], "participant storage is corrupt");
-            assert!(row.plan["_source"]["contract_violation"].is_null());
-            let reply = f.worker.records.read(&format!("move:{CUT}")).await.unwrap();
-            assert!(reply.body.is_none());
-            assert!(f.door.calls().is_empty());
-        }
-    }
-    #[tokio::test(start_paused = true)]
-    async fn source_prepare_busy_retries_eight_times_with_paused_exponential_backoff() {
-        let f = Fixture::new();
-        let mut source = f.source();
-        for _ in 0..9 {
-            f.participants[0].script(
-                "agent_data.prepare",
-                ParticipantEffect::Refuse(Refusal {
-                    code: "busy".into(),
-                    detail: Some(json!({"refs":["ra"]})),
-                    message: None,
-                }),
-            );
-        }
-        // Record the delay only from ticks that made a prepare call. A tick
-        // can also finish a bookkeeping step without calling the participant
-        // and return at once; counting that tick as an attempt made this test
-        // fail when it ran alone in a fresh process.
-        let prepares = |f: &Fixture| {
-            f.participants[0]
-                .calls()
-                .iter()
-                .filter(|r| matches!(r, Request::Prepare(_)))
-                .count()
-        };
-        let mut delays = vec![];
-        // Bounded, so a tick that never reaches prepare fails here, not hangs.
-        for _ in 0..30 {
-            if delays.len() == 9 {
-                break;
-            }
-            let before = prepares(&f);
-            let delay = source.tick().await.unwrap().unwrap();
-            if prepares(&f) > before {
-                delays.push(delay.as_secs());
-            }
-            tokio::time::advance(backoff(f.row().attempts)).await;
-        }
-        assert_eq!(delays, vec![1, 2, 4, 8, 16, 30, 30, 30, 0]);
-        assert_eq!(f.row().attempts, 8);
-        f.until(&mut source, Step::Aborted).await;
-        assert_eq!(f.row().reason.as_deref(), Some("participant_refused"));
-        assert_eq!(f.row().detail.unwrap()["code"], "busy");
-        assert_eq!(
-            f.participants[0]
-                .calls()
-                .iter()
-                .filter(|r| matches!(r, Request::Prepare(_)))
-                .count(),
-            9
-        );
-        assert!(f.door.calls().is_empty());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn source_retryable_refusals_cap_backoff_and_unknown_codes_abort_by_name() {
-        for code in [
-            "cut_not_ready",
-            "unavailable",
-            "handoff_not_covered",
-            "future_code",
-            "busy",
-        ] {
-            let f = Fixture::new();
-            let mut source = f.source();
-            f.until(&mut source, Step::Exported).await;
-            f.door.script("cut.seal", DoorEffect::Refuse(code.into()));
-            f.step(&mut source).await;
-            if ["cut_not_ready", "unavailable", "handoff_not_covered"].contains(&code) {
-                assert!(f.row().abort_requested.is_none());
-                assert_eq!(f.row().hold.unwrap()["code"], code);
-            } else {
-                f.until(&mut source, Step::Aborted).await;
-                assert_eq!(f.row().reason.as_deref(), Some("door_refused"));
-                assert_eq!(f.row().detail.unwrap()["code"], code);
-            }
-        }
-        assert_eq!(backoff(10), Duration::from_secs(300));
-        assert_eq!(backoff(i64::MAX), Duration::from_secs(300));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn source_size_guard_aborts_before_export_or_seal() {
-        let f = Fixture::new();
-        let mut source = f.source();
-        f.participants[0].set_prepare(
-            serde_json::from_value(json!({"items":[],"external":[{
-            "ref_kind":"session","ref":"ra","note":"n".repeat(wire::MOVE_BODY_CAP),"check":null}]}))
-            .unwrap(),
-        );
-        f.until(&mut source, Step::Aborted).await;
-        assert_eq!(f.row().reason.as_deref(), Some("move_too_large"));
-        assert!(f
-            .participants
-            .iter()
-            .all(|p| p.calls().iter().all(|r| !matches!(r, Request::Export(_)))));
-        assert!(f.door.calls().is_empty());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn source_inbox_full_aborts_without_publication() {
-        let f = Fixture::new();
-        let mut source = f.source();
-        let inbox = InboxRecord {
-            v: 1,
-            pending: (0..64)
-                .map(|i| PendingMove {
-                    cut_id: format!("{i:032x}"),
-                    from: FROM.into(),
-                    agent_id: format!("other-{i}"),
-                })
-                .collect(),
-        };
-        f.records.put(
-            &format!("inbox:{TO}"),
-            1,
-            wire::encode_inbox_record(&inbox).unwrap(),
-            TO,
-        );
-        f.door
-            .script("cut.status", DoorEffect::Seal(SealState::Published, None));
-        f.until(&mut source, Step::Aborted).await;
-        assert_eq!(f.row().reason.as_deref(), Some("receiver_inbox_full"));
-        assert!(
-            f.worker
-                .records
-                .read(&format!("move:{CUT}"))
-                .await
-                .unwrap()
-                .absent
-        );
-        assert!(f.participants.iter().all(|p| p.frozen().is_empty()));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn source_restart_reuses_exact_plan_items_and_cut_at_every_checkpoint() {
-        for step in [
-            Step::Preparing,
-            Step::Exported,
-            Step::Sealed,
-            Step::Published,
-            Step::Releasing,
-        ] {
-            let f = Fixture::new();
-            let mut source = f.source();
-            if matches!(step, Step::Published | Step::Releasing) {
-                f.published(&mut source).await;
-            } else {
-                f.until(&mut source, Step::Exported).await;
-                if step == Step::Sealed {
-                    f.door
-                        .script("cut.status", DoorEffect::Seal(SealState::Published, None));
-                    f.until(&mut source, Step::Sealed).await;
-                }
-            }
-            f.edit(|row| {
-                row.step = step;
-                if step == Step::Exported {
-                    row.seal_sent = true;
-                }
-            });
-            let original = f.plan();
-            drop(source);
-            let mut source = f.source();
-            if step != Step::Releasing {
-                f.published(&mut source).await;
-            }
-            let recovered = f.plan();
-            assert_eq!(recovered.participants, original.participants);
-            assert_eq!(recovered.source.items, original.source.items);
-            f.claim();
-            f.state(State::Activated, TO);
-            f.door.script(
-                "cut.handoff",
-                DoorEffect::Handoff(crate::door_client::HandoffReply {
-                    state: HandoffState::Released,
-                    session_ref: None,
-                    code: None,
-                }),
-            );
-            f.until(&mut source, Step::Released).await;
-            for p in &f.participants {
-                let prepares: Vec<_> = p
-                    .calls()
-                    .into_iter()
-                    .filter(|r| matches!(r, Request::Prepare(_)))
-                    .collect();
-                assert!(prepares.iter().all(|r| r == &prepares[0]));
-            }
-            let cut = f.door.cut(CUT).unwrap();
-            assert_eq!(cut.items, original.source.items);
-            assert_eq!(cut.handoff.state, HandoffState::Released);
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn source_lost_participant_and_door_replies_settle_without_duplicate_effects() {
-        for op in [
-            "agent_data.prepare",
-            "agent_data.export",
-            "agent_data.release",
-            "agent_data.abort",
-        ] {
-            let f = Fixture::new();
-            let mut source = f.source();
-            for p in &f.participants {
-                p.script(op, ParticipantEffect::LoseReply(TransportError::NoReply));
-            }
-            f.door
-                .script("cut.seal", DoorEffect::LoseReply(TransportError::NoReply));
-            f.published(&mut source).await;
-            if op == "agent_data.abort" {
-                f.door
-                    .script("cut.abort", DoorEffect::LoseReply(TransportError::NoReply));
-                f.abort();
-                f.until(&mut source, Step::Aborted).await;
-                assert!(f.participants.iter().all(|p| p.frozen().is_empty()));
-            } else {
-                f.claim();
-                f.state(State::Activated, TO);
-                f.door.script(
-                    "cut.handoff",
-                    DoorEffect::Handoff(crate::door_client::HandoffReply {
-                        state: HandoffState::Released,
-                        session_ref: None,
-                        code: None,
-                    }),
-                );
-                f.door.script(
-                    "cut.handoff",
-                    DoorEffect::LoseReply(TransportError::NoReply),
-                );
-                f.until(&mut source, Step::Released).await;
-                for p in &f.participants {
-                    assert_eq!(p.tombstones().len(), 1);
-                }
-            }
-            for p in &f.participants {
-                let requests: Vec<_> = p
-                    .calls()
-                    .into_iter()
-                    .filter(|r| r.op().method() == op)
-                    .collect();
-                assert!(requests.len() >= 2);
-                assert!(requests.iter().all(|r| r == &requests[0]));
-                assert!(p.calls().iter().any(|r| matches!(r, Request::Status(_))));
-            }
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn source_lost_publication_inbox_abort_and_release_cas_replies_are_idempotent() {
-        for target in ["publish", "inbox", "abort", "release"] {
-            let f = Fixture::new();
-            let mut source = f.source();
-            if target == "publish" {
-                *f.record_pipe.lose.lock().unwrap() = Some(format!("move:{CUT}"));
-            }
-            if target == "inbox" {
-                *f.record_pipe.lose.lock().unwrap() = Some(format!("inbox:{TO}"));
-            }
-            f.published(&mut source).await;
-            assert_eq!(f.row().record_version, 1);
-            let inbox = f.worker.records.read(&format!("inbox:{TO}")).await.unwrap();
-            assert_eq!(
-                wire::decode_inbox_record(inbox.body.as_ref().unwrap())
-                    .unwrap()
-                    .pending
-                    .len(),
-                1
-            );
-            *f.record_pipe.lose.lock().unwrap() = Some(format!("move:{CUT}"));
-            if target == "abort" {
-                f.abort();
-                f.until(&mut source, Step::Aborted).await;
-                assert_eq!(f.row().record_version, 2);
-            } else {
-                f.claim();
-                f.state(State::Activated, TO);
-                f.door.script(
-                    "cut.handoff",
-                    DoorEffect::Handoff(crate::door_client::HandoffReply {
-                        state: HandoffState::Released,
-                        session_ref: None,
-                        code: None,
-                    }),
-                );
-                f.until(&mut source, Step::Released).await;
-                assert_eq!(f.row().record_version, 3);
-            }
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn source_release_enforcement_is_persisted_per_module_across_a_mid_release_restart() {
-        let f = Fixture::new();
-        let mut source = f.source();
-        f.published(&mut source).await;
-        f.participants[0].set_enforced(false);
-        f.participants[1].set_enforced(true);
-        f.claim();
-        f.state(State::Activated, TO);
-        f.door.script(
-            "cut.handoff",
-            DoorEffect::Handoff(crate::door_client::HandoffReply {
-                state: HandoffState::Released,
-                session_ref: None,
-                code: None,
-            }),
-        );
-        f.release_gate.enabled.store(true, Ordering::Relaxed);
-        let task = tokio::spawn(async move { source.tick().await });
-        f.release_gate.entered.acquire().await.unwrap().forget();
-        assert_eq!(f.row().step, Step::Releasing);
-        assert_eq!(f.row().plan["_source"]["enforced"], json!({"a":false}));
-        assert!(f.participants[1]
-            .calls()
-            .iter()
-            .all(|r| !matches!(r, Request::Release(_))));
-        task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
-        f.release_gate.enabled.store(false, Ordering::Relaxed);
-        f.participants[0].set_enforced(true);
-        let mut restarted = f.source();
-        f.until(&mut restarted, Step::Released).await;
-        assert_eq!(
-            f.row().plan["_source"]["enforced"],
-            json!({"a":false,"b":true,"c":true})
-        );
-        assert_eq!(
-            f.participants[0]
-                .calls()
-                .iter()
-                .filter(|r| matches!(r, Request::Release(_)))
-                .count(),
-            2
-        );
-        assert!(f.row().hold.is_none());
-        assert_eq!(f.worker.health.move_errors.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn source_release_contract_violation_stops_calls_without_retry_even_after_restart() {
-        let f = Fixture::new();
-        let mut source = f.source();
-        f.published(&mut source).await;
-        f.claim();
-        f.state(State::Activated, TO);
-        f.door.script(
-            "cut.handoff",
-            DoorEffect::Handoff(crate::door_client::HandoffReply {
-                state: HandoffState::Released,
-                session_ref: None,
-                code: None,
-            }),
-        );
-        f.participants[1].script(
-            "agent_data.release",
-            ParticipantEffect::Refuse(Refusal {
-                code: "cut_not_ready".into(),
-                detail: Some(json!({"note":"not allowed for release"})),
-                message: None,
-            }),
-        );
-        f.step(&mut source).await;
-        let row = f.row();
-        assert_eq!(row.step, Step::Releasing);
-        assert_eq!(row.attempts, 0);
-        assert!(row.abort_requested.is_none());
-        assert_eq!(row.detail.as_ref().unwrap()["contract_violation"], true);
-        assert_eq!(row.detail.as_ref().unwrap()["module_id"], "b");
-        assert_eq!(row.detail.as_ref().unwrap()["code"], "cut_not_ready");
-        assert_eq!(row.plan["_source"]["enforced"], json!({"a":true}));
-        assert_eq!(row.plan["_source"]["errors"][0]["contract_violation"], true);
-        assert_eq!(f.worker.health.move_errors.load(Ordering::Relaxed), 1);
-        let counts: Vec<_> = f.participants.iter().map(|p| p.calls().len()).collect();
-        for _ in 0..3 {
-            f.step(&mut source).await;
-        }
-        let mut restarted = f.source();
-        f.step(&mut restarted).await;
-        assert_eq!(
-            f.participants
-                .iter()
-                .map(|p| p.calls().len())
-                .collect::<Vec<_>>(),
-            counts
-        );
-        assert_eq!(
-            f.participants[1]
-                .calls()
-                .iter()
-                .filter(|r| matches!(r, Request::Release(_)))
-                .count(),
-            1
-        );
-        assert!(f.participants[2]
-            .calls()
-            .iter()
-            .all(|r| !matches!(r, Request::Release(_))));
-        let reply = f.worker.records.read(&format!("move:{CUT}")).await.unwrap();
-        assert_eq!(
-            wire::decode_move_record(&format!("move:{CUT}"), reply.body.as_ref().unwrap())
-                .unwrap()
-                .state,
-            State::Activated
-        );
-    }
-
-    #[test]
-    fn participant_contract_violations_are_never_retryable_by_code() {
-        for code in ["unavailable", "cut_not_ready", "handoff_not_covered"] {
-            let violation = Failure::participant(
-                "agent_data.release",
-                "a",
-                ClientError::ContractViolation {
-                    op: "agent_data.release",
-                    code: code.into(),
-                    detail: None,
-                    message: None,
-                },
-            );
-            assert!(!violation.retryable());
-            assert_eq!(violation.detail()["contract_violation"], true);
-        }
-        let unavailable = Failure::participant(
-            "agent_data.release",
-            "a",
-            ClientError::Refused(Refusal {
-                code: "unavailable".into(),
-                detail: None,
-                message: None,
-            }),
-        );
-        assert!(unavailable.retryable());
-        assert_eq!(unavailable.detail()["contract_violation"], false);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn source_releasing_refusals_hold_and_claim_failures_do_not_release() {
-        let f = Fixture::new();
-        let mut source = f.source();
-        f.published(&mut source).await;
-        f.state(State::Activated, TO);
-        f.records
-            .error(&format!("claim:{AGENT}"), Some("unavailable"));
-        f.step(&mut source).await;
-        assert_eq!(f.row().step, Step::Releasing);
-        assert!(f
-            .door
-            .calls()
-            .iter()
-            .all(|c| c.request.op() != "cut.handoff"));
-        f.records.error(&format!("claim:{AGENT}"), None);
-        f.claim();
-        f.door
-            .script("cut.handoff", DoorEffect::Refuse("future_code".into()));
-        f.step(&mut source).await;
-        assert_eq!(f.row().step, Step::Releasing);
-        assert_eq!(f.row().hold.unwrap()["code"], "future_code");
-        assert!(f.row().abort_requested.is_none());
-        f.door.script(
-            "cut.handoff",
-            DoorEffect::Handoff(crate::door_client::HandoffReply {
-                state: HandoffState::TakenOver,
-                session_ref: None,
-                code: None,
-            }),
-        );
-        f.until(&mut source, Step::Released).await;
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn source_abort_cas_losing_to_staging_never_cleans_participants() {
-        let f = Fixture::new();
-        let mut source = f.source();
-        f.published(&mut source).await;
-        let mut staged = f.plan().record(CUT);
-        staged.state = State::Staged;
-        *f.record_pipe.race.lock().unwrap() = Some((
-            wire::encode_move_record(&format!("move:{CUT}"), &staged).unwrap(),
-            TO.into(),
-        ));
-        f.abort();
-        f.step(&mut source).await;
-        f.step(&mut source).await;
-        assert!(f.row().abort_requested.is_none());
-        assert_eq!(f.row().detail.unwrap()["code"], "invalid_state");
-        assert!(f
-            .participants
-            .iter()
-            .all(|p| p.calls().iter().all(|r| !matches!(r, Request::Abort(_)))));
-        assert!(f.door.calls().iter().all(|c| c.request.op() != "cut.abort"));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn source_abort_waits_for_unknown_prepare_to_settle_even_after_restart() {
-        for restart in [false, true] {
-            let f = Fixture::new();
-            let mut source = f.source();
-            f.participants[0].script(
-                "agent_data.prepare",
-                ParticipantEffect::LoseReply(TransportError::NoReply),
-            );
-            f.participants[0].script(
-                "agent_data.status",
-                ParticipantEffect::FailBefore(TransportError::Unavailable),
-            );
-            f.step(&mut source).await;
-            assert!(f.plan().source.pending.is_some());
-            assert!(!f.participants[0].frozen().is_empty());
-            f.abort();
-            if restart {
-                source = f.source();
-            }
-            f.until(&mut source, Step::Aborted).await;
-            assert!(f.participants.iter().all(|p| p.frozen().is_empty()));
-            let calls = f.participants[0].calls();
-            let abort = calls
-                .iter()
-                .position(|r| matches!(r, Request::Abort(_)))
-                .unwrap();
-            assert!(matches!(calls[abort - 1], Request::Prepare(_)));
-            assert!(calls[..abort]
-                .iter()
-                .any(|r| matches!(r, Request::Status(_))));
-            assert!(calls.iter().all(|r| !matches!(r, Request::Export(_))));
-            assert!(f.row().abort_requested.is_none());
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn source_failed_or_aborted_seal_records_door_refused_and_cleans_up() {
-        for state in [SealState::Failed, SealState::Aborted] {
-            let f = Fixture::new();
-            let mut source = f.source();
-            f.until(&mut source, Step::Exported).await;
-            f.door.script(
-                "cut.seal",
-                DoorEffect::Seal(state, Some(json!({"cause":"bad stream"}))),
-            );
-            f.until(&mut source, Step::Aborted).await;
-            assert_eq!(f.row().reason.as_deref(), Some("door_refused"));
-            let detail = f.row().detail.unwrap();
-            assert_eq!(detail["op"], "cut.status");
-            assert_eq!(
-                detail["code"],
-                if state == SealState::Failed {
-                    "failed"
-                } else {
-                    "aborted"
-                }
-            );
-            assert!(f.participants.iter().all(|p| p.frozen().is_empty()));
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn source_abort_keeps_row_open_until_claim_cache_can_be_applied() {
-        let f = Fixture::new();
-        let mut source = f.source();
-        f.published(&mut source).await;
-        f.state(State::Aborted, TO);
-        f.records
-            .error(&format!("claim:{AGENT}"), Some("unavailable"));
-        f.step(&mut source).await;
-        assert_eq!(f.row().step, Step::Published);
-        assert!(f.participants.iter().all(|p| !p.frozen().is_empty()));
-        assert!(f.door.calls().iter().all(|c| c.request.op() != "cut.abort"));
-        f.records.error(&format!("claim:{AGENT}"), None);
-        f.until(&mut source, Step::Aborted).await;
-    }
-
-    #[allow(
-        clippy::await_holding_lock,
-        reason = "holding the store mutex deliberately proves health does not acquire it"
-    )]
-    #[tokio::test(start_paused = true)]
-    async fn source_hung_remote_call_holds_no_store_and_health_is_lock_free() {
-        let f = Fixture::new();
-        let mut source = f.source();
-        f.published(&mut source).await;
-        // The recording wrapper reads SQLite to capture checkpoints. Use the
-        // raw fake here so removing the store tests only the driver's ownership.
-        source.worker.records = RecordClient::new(Arc::new(FakeRecordConnector(f.records.clone())));
-        f.records.hung.store(true, Ordering::Relaxed);
-        let calls = f.records.calls.load(Ordering::Relaxed);
-        let task = tokio::spawn(async move { source.tick().await });
-        f.records.wait_for_calls(calls + 1).await;
-        *f.slot.lock().unwrap() = None;
-        let reopened = RegistryStore::open(&f.descriptor).unwrap();
-        let mut handler = crate::ProjectsHandler::with_runtime("test".into(), clock);
-        handler.health = f.worker.health.clone();
-        let locked = handler.store.lock().unwrap();
-        let health = subc_client_rs::ModuleHandler::health(&handler).await;
-        assert_eq!(health.metrics.unwrap()["movesOpen"], 1);
-        drop(locked);
-        drop(reopened);
-        task.abort();
-    }
-
-    /// The door ops this move sent, in order, read from the transport trace.
-    /// The trace records every call before the fake door validates it, so a
-    /// seal the door refuses for its shape still appears here.
-    fn door_ops(f: &Fixture) -> Vec<String> {
-        f.trace
-            .events
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|event| event.op.starts_with("cut."))
-            .map(|event| event.op.clone())
-            .collect()
-    }
-
-    /// Every participant prepares no items, so the cut is empty. The fake door,
-    /// like engram, refuses an empty `cut.seal` with `invalid_request` every
-    /// time it is sent.
-    fn empty_cut(f: &Fixture) {
-        for participant in &f.participants {
-            participant
-                .set_prepare(serde_json::from_value(json!({"items":[],"external":[]})).unwrap());
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn source_refused_seal_aborts_without_resealing_or_aborting_the_door() {
-        let f = Fixture::new();
-        empty_cut(&f);
-        let mut source = f.source();
-        f.until(&mut source, Step::Exported).await;
-        f.step(&mut source).await;
-        let row = f.row();
-        assert!(row.abort_requested.is_some());
-        assert_eq!(
-            f.plan().source.seal_refused.as_deref(),
-            Some("invalid_request")
-        );
-        f.until(&mut source, Step::Aborted).await;
-        let row = f.row();
-        assert_eq!(row.reason.as_deref(), Some("door_refused"));
-        assert_eq!(row.detail.as_ref().unwrap()["op"], "cut.seal");
-        assert_eq!(row.detail.as_ref().unwrap()["code"], "invalid_request");
-        // The refused seal is the only door call: cleanup neither repeats it
-        // nor aborts a cut the door never held.
-        assert_eq!(door_ops(&f), ["cut.seal"]);
-        assert!(f.door.cut(CUT).is_none());
-        for participant in &f.participants {
-            assert!(participant.frozen().is_empty());
-            assert!(participant
-                .calls()
-                .iter()
-                .any(|r| matches!(r, Request::Abort(_))));
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn source_refused_seal_cleanup_skips_the_door_after_a_mid_cleanup_restart() {
-        let f = Fixture::new();
-        empty_cut(&f);
-        f.participants[1].script(
-            "agent_data.abort",
-            ParticipantEffect::Refuse(Refusal {
-                code: "unavailable".into(),
-                detail: None,
-                message: None,
-            }),
-        );
-        let mut source = f.source();
-        f.until(&mut source, Step::Exported).await;
-        f.step(&mut source).await;
-        assert!(f.row().abort_requested.is_some());
-        // Cleanup aborts participant a, then b refuses, so the cleanup stops
-        // part way with a retry scheduled.
-        f.step(&mut source).await;
-        assert_eq!(f.row().step, Step::Exported);
-        assert_eq!(f.plan().source.aborted, ["a"]);
-        drop(source);
-        let mut restarted = f.source();
-        f.until(&mut restarted, Step::Aborted).await;
-        assert_eq!(f.row().reason.as_deref(), Some("door_refused"));
-        assert_eq!(door_ops(&f), ["cut.seal"]);
-        assert!(f.participants.iter().all(|p| p.frozen().is_empty()));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn source_unknown_seal_outcome_cleanup_still_reseals_then_aborts_the_door() {
-        let f = Fixture::new();
-        let mut source = f.source();
-        f.until(&mut source, Step::Exported).await;
-        // The door creates the cut but both replies are lost, so the client
-        // reports an unknown outcome while the door holds a pending cut.
-        for _ in 0..2 {
-            f.door
-                .script("cut.seal", DoorEffect::LoseReply(TransportError::NoReply));
-        }
-        f.step(&mut source).await;
-        assert!(f.row().abort_requested.is_none());
-        assert!(f.door.cut(CUT).is_some_and(|cut| !cut.aborted));
-        let before = door_ops(&f).len();
-        f.abort();
-        f.until(&mut source, Step::Aborted).await;
-        assert_eq!(f.plan().source.seal_refused, None);
-        let cleanup: Vec<_> = door_ops(&f)
-            .split_off(before)
-            .into_iter()
-            .filter(|op| op == "cut.seal" || op == "cut.abort")
-            .collect();
-        assert_eq!(cleanup, ["cut.seal", "cut.abort"]);
-        assert!(f.door.cut(CUT).unwrap().aborted);
-        assert!(f.participants.iter().all(|p| p.frozen().is_empty()));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn source_cleanup_reseal_refused_for_a_cut_the_door_never_received_skips_abort() {
-        let f = Fixture::new();
-        let mut source = f.source();
-        f.until(&mut source, Step::Exported).await;
-        // Both sends fail before the door sees them: the outcome is unknown to
-        // the driver, and the door holds no cut.
-        for _ in 0..2 {
-            f.door
-                .script("cut.seal", DoorEffect::FailBefore(TransportError::NoReply));
-        }
-        f.step(&mut source).await;
-        assert!(f.door.cut(CUT).is_none());
-        f.abort();
-        f.door.script(
-            "cut.seal",
-            DoorEffect::RefuseWithMessage("cut_end_mismatch".into(), "the stream moved".into()),
-        );
-        f.until(&mut source, Step::Aborted).await;
-        assert_eq!(
-            f.plan().source.seal_refused.as_deref(),
-            Some("cut_end_mismatch")
-        );
-        assert!(door_ops(&f).iter().all(|op| op != "cut.abort"));
-        assert!(f.door.cut(CUT).is_none());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn source_cleanup_treats_a_door_abort_not_found_as_already_gone() {
-        let f = Fixture::new();
-        let mut source = f.source();
-        f.until(&mut source, Step::Exported).await;
-        for _ in 0..2 {
-            f.door
-                .script("cut.seal", DoorEffect::LoseReply(TransportError::NoReply));
-        }
-        f.step(&mut source).await;
-        f.abort();
-        f.door
-            .script("cut.abort", DoorEffect::Refuse("not_found".into()));
-        f.until(&mut source, Step::Aborted).await;
-        assert_eq!(
-            door_ops(&f).iter().filter(|op| *op == "cut.abort").count(),
-            1
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn source_refusals_log_once_per_code_and_keep_the_message_in_detail() {
-        let f = Fixture::new();
-        let mut source = f.source();
-        f.until(&mut source, Step::Exported).await;
-        for _ in 0..3 {
-            f.door.script(
-                "cut.seal",
-                DoorEffect::RefuseWithMessage("cut_not_ready".into(), "streams settling".into()),
-            );
-        }
-        f.door.script(
-            "cut.seal",
-            DoorEffect::RefuseWithMessage("invalid_request".into(), "engram says no".into()),
-        );
-        f.until(&mut source, Step::Aborted).await;
-        let row = f.row();
-        assert_eq!(row.detail.as_ref().unwrap()["code"], "invalid_request");
-        assert_eq!(row.detail.as_ref().unwrap()["message"], "engram says no");
-        // Three retried refusals and the permanent one reached the driver.
-        assert_eq!(
-            door_ops(&f).iter().filter(|op| *op == "cut.seal").count(),
-            4
-        );
-        let lines = &source.refusals.lines;
-        assert_eq!(lines.len(), 2, "{lines:?}");
-        for (line, code, message) in [
-            (&lines[0], "cut_not_ready", "streams settling"),
-            (&lines[1], "invalid_request", "engram says no"),
-        ] {
-            assert!(line.contains(&format!("cut={CUT:?}")), "{line}");
-            assert!(line.contains("op=\"cut.seal\""), "{line}");
-            assert!(line.contains(&format!("code={code:?}")), "{line}");
-            assert!(line.contains(&format!("message={message:?}")), "{line}");
-            for item in &f.plan().source.items {
-                assert!(!line.contains(&item.session_ref), "{line}");
-            }
-        }
-    }
-
-    #[test]
-    fn participant_refusal_message_is_kept_in_the_stored_detail() {
-        let refused = Failure::participant(
-            "agent_data.prepare",
-            "a",
-            ClientError::Refused(Refusal {
-                code: "busy".into(),
-                detail: None,
-                message: Some("index rebuilding".into()),
-            }),
-        );
-        assert!(refused.refused());
-        assert_eq!(refused.detail()["message"], "index rebuilding");
-        let violation = Failure::participant(
-            "agent_data.release",
-            "a",
-            ClientError::ContractViolation {
-                op: "agent_data.release",
-                code: "busy".into(),
-                detail: None,
-                message: Some("not now".into()),
-            },
-        );
-        assert!(violation.refused());
-        assert_eq!(violation.detail()["message"], "not now");
-        let lost = Failure::participant("agent_data.prepare", "a", ClientError::OutcomeUnknown);
-        assert!(!lost.refused());
-        assert!(lost.detail().get("message").is_none());
     }
 }

@@ -89,16 +89,6 @@ impl ProjectsHandler {
     }
 }
 impl CatalogMove {
-    #[cfg(test)]
-    pub(crate) fn with_test_root(mut self, root: String) -> Self {
-        self.root = Some(root);
-        self
-    }
-    #[cfg(test)]
-    pub(crate) fn with_test_timeout(mut self, timeout: Duration) -> Self {
-        self.request_timeout = timeout;
-        self
-    }
     fn store(&self) -> Result<RegistryStore, HandlerError> {
         self.store
             .upgrade()

@@ -107,11 +107,6 @@ impl RegistryStore {
         self.read(read_freeze)
     }
 
-    pub fn legacy_moves_paused(&self) -> Result<bool, RegistryError> {
-        self.read(|conn| conn.query_row(
-            "SELECT hub_log_base IS NULL AND (hub_quieting=1 OR engram_frozen IS NOT NULL) FROM identity_log_state WHERE id=1", [], |r| r.get(0)))
-    }
-
     pub fn pause_legacy_moves(&self) -> Result<(), RegistryError> {
         self.db
             .with_conn_fenced(|tx| {

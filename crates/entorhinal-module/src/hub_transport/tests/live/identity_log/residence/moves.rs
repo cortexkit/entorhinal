@@ -66,12 +66,10 @@ fn worker(node: &Node, door: &FakeDoor, peer: Arc<FakeParticipant>) -> Worker {
     Worker {
         store: Arc::downgrade(&handler.store),
         sql_operations: Arc::new(SqlOperations::default()),
-        records: handler.record_client.clone(),
         door: door.client(),
         discovery: Arc::new(Discovery(daemon, peer)),
         catalog: None,
         health: handler.health.clone(),
-        writer: handler.writer.clone(),
         clock: crate::unix_millis,
         wake: handler.move_wake.clone(),
     }
@@ -282,6 +280,9 @@ async fn hub_move_restarts_through_the_full_handoff() {
         Some(B)
     );
     assert!(f.to.held().contains(&AgentRef::new("agent", MIGRATED)));
+    assert!(f.from.wire_calls().iter().any(|(method, params)| {
+        method == "agent_data.release" && params["holder"] == B && params["holderBox"] == B
+    }));
     let calls = f.door.calls();
     assert!(calls.iter().any(
         |call| matches!(&call.request, DoorRequest::Seal(s) if s.receiver.as_deref() == Some(B))

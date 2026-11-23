@@ -236,12 +236,6 @@ fn join(method: &str, refs: &[Ref], closure: Value, carried: Value) -> Value {
 }
 
 impl SessionMove {
-    #[cfg(test)]
-    pub(crate) fn with_fault(mut self, fault: SourceFault) -> Self {
-        self.fault = fault;
-        self
-    }
-
     fn store(&self) -> Result<RegistryStore, HandlerError> {
         self.store
             .upgrade()

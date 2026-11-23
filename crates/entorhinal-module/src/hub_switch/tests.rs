@@ -247,12 +247,10 @@ async fn hub_switch_requires_every_verified_readiness_and_current_quiet() {
         assert_eq!(error.code, "hub_switch_members_not_ready");
         assert_eq!(error.detail, Some(json!({"boxes":[BOX_B]})));
         assert_eq!(f.log.head(), 0);
-        assert!(!f.store().legacy_moves_paused().unwrap());
     }
     f.put(&subject, 5, node(1, true, BOX_B), B);
     f.tick().await.unwrap();
     assert_eq!(f.log.head(), 0, "missing quiet must hold the marker");
-    assert!(f.store().legacy_moves_paused().unwrap());
     f.put(
         &format!("hubquiet:{B}"),
         1,
@@ -316,7 +314,6 @@ async fn hub_switch_nonterminal_move_blocks_quiet_and_marker() {
             VALUES ('cut','agent','source','peer','preparing','{}',0,0,0,1,1)")
     }).unwrap();
     f.tick().await.unwrap();
-    assert!(f.store().legacy_moves_paused().unwrap());
     assert!(
         f.record_client()
             .read(&format!("hubquiet:{A}"))

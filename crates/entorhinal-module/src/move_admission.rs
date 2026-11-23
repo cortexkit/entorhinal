@@ -114,11 +114,14 @@ impl ProjectsHandler {
             });
         }
         if !self.hub_backend_selected() {
-            return Err(HandlerError::new("hub_not_ready", "hub move backend is not selected"));
+            return Err(HandlerError::new(
+                "hub_not_ready",
+                "hub move backend is not selected",
+            ));
         }
-        let hub = self.residence().ok_or_else(|| {
-            HandlerError::new("hub_not_ready", "hub move watch is not installed")
-        })?;
+        let hub = self
+            .residence()
+            .ok_or_else(|| HandlerError::new("hub_not_ready", "hub move watch is not installed"))?;
         let (mut claim_version, own) = hub.move_origin(&request.agent_id).await?;
         let to = request.to.clone();
         let (peer, peer_name) = match self
@@ -128,8 +131,7 @@ impl ProjectsHandler {
             .await
         {
             Err(error)
-                if error.code == "unknown_member"
-                    && crate::hub_membership::box_id(&request.to) =>
+                if error.code == "unknown_member" && crate::hub_membership::box_id(&request.to) =>
             {
                 (request.to.clone(), request.to.clone())
             }
@@ -521,7 +523,6 @@ mod tests {
         fake_participant::FakeParticipant,
         fake_record::FakeRecord,
         log_client::{LogConnector, LogTransport, TransportError},
-        participant_client::{BusyRef, Request},
         participant_discovery::{provider_role, ParticipantDiscovery},
         record_client::RecordClient,
         sessions::{FakeResolver, ProviderResolution, ORCHESTRATOR_CAPABILITY},
@@ -530,22 +531,20 @@ mod tests {
     };
     use super::*;
     use async_trait::async_trait;
-    use std::sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
-    };
+    use std::sync::{Arc, Mutex};
     use subc_client_rs::{CatalogList, HandlerOutcome, SupervisorListResponse};
+
     const DIRECT: RouteKey = (80, 1);
     const ORCH: RouteKey = (81, 1);
     const ENGRAM: RouteKey = (82, 1);
     const OTHER: RouteKey = (83, 1);
     const TARGET: &str = "02020202020202020202020202020202";
 
+    #[derive(Default)]
     struct Prompt {
         summaries: Mutex<Vec<String>>,
-        outcome: Mutex<Result<(), OperatorConfirmError>>,
-        on_confirm: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     }
+
     #[async_trait]
     impl OperatorConfirmer for Prompt {
         async fn confirm_operator(
@@ -554,23 +553,24 @@ mod tests {
             _: RouteKey,
         ) -> Result<(), OperatorConfirmError> {
             self.summaries.lock().unwrap().push(summary.into());
-            if let Some(hook) = self.on_confirm.lock().unwrap().take() {
-                hook();
-            }
-            *self.outcome.lock().unwrap()
+            Ok(())
         }
     }
+
     struct AuditedRecords {
         record: Arc<FakeRecord>,
         calls: Mutex<Vec<(String, Value)>>,
     }
+
     struct RecordConnector(Arc<AuditedRecords>);
+
     #[async_trait]
     impl LogConnector for RecordConnector {
         async fn connect(&self) -> Result<Arc<dyn LogTransport>, TransportError> {
             Ok(self.0.clone())
         }
     }
+
     #[async_trait]
     impl LogTransport for AuditedRecords {
         async fn call(&self, method: &str, params: Value) -> Result<Vec<u8>, TransportError> {
@@ -581,21 +581,22 @@ mod tests {
             self.record.call(method, params).await
         }
     }
+
     struct Discovery {
         daemon: FakeDaemon,
         participant: Arc<FakeParticipant>,
-        gate: AtomicBool,
-        entered: tokio::sync::Semaphore,
-        release: tokio::sync::Semaphore,
     }
+
     #[async_trait]
     impl ParticipantDiscovery for Discovery {
         async fn supervisor_list(&self) -> Result<SupervisorListResponse, TransportError> {
             self.daemon.supervisor_list().await
         }
+
         async fn catalog_list(&self) -> Result<CatalogList, TransportError> {
             self.daemon.catalog_list().await
         }
+
         async fn open_participant(
             &self,
             module_id: &str,
@@ -604,36 +605,7 @@ mod tests {
             Ok(self.participant.clone())
         }
     }
-    // The gate sits at the participant call, not at a fake commit. Both racing
-    // operations still exercise their production SQLite transactions.
-    struct GatedDiscovery(Arc<Discovery>);
-    struct GatedParticipant(Arc<Discovery>);
-    #[async_trait]
-    impl ParticipantDiscovery for GatedDiscovery {
-        async fn supervisor_list(&self) -> Result<SupervisorListResponse, TransportError> {
-            self.0.supervisor_list().await
-        }
-        async fn catalog_list(&self) -> Result<CatalogList, TransportError> {
-            self.0.catalog_list().await
-        }
-        async fn open_participant(
-            &self,
-            module_id: &str,
-        ) -> Result<Arc<dyn LogTransport>, TransportError> {
-            self.0.daemon.open_participant(module_id).await?;
-            Ok(Arc::new(GatedParticipant(self.0.clone())))
-        }
-    }
-    #[async_trait]
-    impl LogTransport for GatedParticipant {
-        async fn call(&self, method: &str, params: Value) -> Result<Vec<u8>, TransportError> {
-            if method == "agent_data.busy" && self.0.gate.load(Ordering::Relaxed) {
-                self.0.entered.add_permits(1);
-                self.0.release.acquire().await.unwrap().forget();
-            }
-            self.0.participant.call(method, params).await
-        }
-    }
+
     fn snapshot() -> DaemonSnapshot {
         DaemonSnapshot::new(
             1,
@@ -646,38 +618,28 @@ mod tests {
             ],
         )
     }
+
     struct Fixture {
         handler: Arc<ProjectsHandler>,
         records: Arc<AuditedRecords>,
         discovery: Arc<Discovery>,
         prompt: Arc<Prompt>,
-        resolver: Arc<FakeResolver>,
         descriptor: cortexkit_store_types::StorageDescriptor,
         dir: std::path::PathBuf,
     }
+
     impl Fixture {
-        async fn new(stage: u8) -> Self {
+        async fn new(cut_over: bool) -> Self {
             let (dir, descriptor) = scratch_descriptor("move-admission");
-            let record = FakeRecord::new([1; 16]);
             let records = Arc::new(AuditedRecords {
-                record,
+                record: FakeRecord::new([1; 16]),
                 calls: Mutex::new(vec![]),
             });
             let discovery = Arc::new(Discovery {
                 daemon: FakeDaemon::new(snapshot()),
-                participant: Arc::new(FakeParticipant::new(
-                    &["session"],
-                    vec![AgentRef::new("session", "r")],
-                )),
-                gate: AtomicBool::new(false),
-                entered: tokio::sync::Semaphore::new(0),
-                release: tokio::sync::Semaphore::new(0),
+                participant: Arc::new(FakeParticipant::new(&["session"], vec![])),
             });
-            let prompt = Arc::new(Prompt {
-                summaries: Mutex::new(vec![]),
-                outcome: Mutex::new(Ok(())),
-                on_confirm: Mutex::new(None),
-            });
+            let prompt = Arc::new(Prompt::default());
             let resolver = FakeResolver::new();
             resolver.set(
                 ORCHESTRATOR_CAPABILITY,
@@ -689,9 +651,9 @@ mod tests {
                 Arc::new(FakeLog::default().with_author([1; 16])),
             );
             handler.record_client = RecordClient::new(Arc::new(RecordConnector(records.clone())));
-            handler.participant_discovery = Arc::new(GatedDiscovery(discovery.clone()));
+            handler.participant_discovery = discovery.clone();
             handler.operator_confirmer = prompt.clone();
-            handler.provider_resolver = resolver.clone();
+            handler.provider_resolver = resolver;
             *handler.store.lock().unwrap() = Some(RegistryStore::open(&descriptor).unwrap());
             for (key, principal) in [
                 (DIRECT, Principal::Direct),
@@ -708,11 +670,10 @@ mod tests {
                 records,
                 discovery,
                 prompt,
-                resolver,
                 descriptor,
                 dir,
             };
-            if stage >= 1 {
+            if cut_over {
                 let mut source = f.descriptor.clone();
                 source.backend = cortexkit_store_types::StorageBackend::Sqlite {
                     path: f.dir.join("snapshot.db").to_string_lossy().into_owned(),
@@ -733,34 +694,19 @@ mod tests {
                     ORCH,
                 ));
             }
-            if stage >= 2 {
-                result(f.call(DIRECT, "identity_log.enable", json!({})).await);
-            }
-            f.store()
-                .set_member_name(
-                    entorhinal_core::shared_entry::MemberName {
-                        author: TARGET.into(),
-                        display_name: "Studio".into(),
-                    },
-                    "fixture",
-                )
-                .unwrap();
-            if stage >= 2 {
-                // Check the empty-store refresh before measuring each move's
-                // record calls. The served enable does not refresh claims.
-                f.handler.wait_claim_refresh().await.unwrap();
-                f.records.calls.lock().unwrap().clear();
-            }
             f
         }
+
         fn store(&self) -> RegistryStore {
             self.handler.with_store(|s| Ok(s.clone())).unwrap()
         }
+
         async fn call(&self, key: RouteKey, method: &str, params: Value) -> HandlerOutcome {
             self.handler
                 .handle_served_request(&body(method, params), key)
                 .await
         }
+
         async fn create(&self) -> String {
             result(
                 self.call(
@@ -774,6 +720,25 @@ mod tests {
                 .unwrap()
                 .into()
         }
+
+        fn install_unselected_hub(&self) {
+            self.store()
+                .apply_entry("fixture.hub_state", "{}", "fixture", None, |tx| {
+                    tx.execute(
+                        "UPDATE identity_log_state SET state='enabled',hub_log_base=0 WHERE id=1",
+                        [],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO member_name(author,display_name) VALUES(?1,'Studio')",
+                        [TARGET],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(!self.handler.hub_backend_selected());
+            assert!(self.handler.residence().is_none());
+        }
+
         async fn move_(&self, key: RouteKey, id: &str) -> HandlerOutcome {
             self.call(
                 key,
@@ -782,47 +747,25 @@ mod tests {
             )
             .await
         }
-        fn register(
-            &self,
-            id: &str,
-            reference: &str,
-        ) -> Result<entorhinal_core::SessionBinding, entorhinal_core::agent::AgentMutationError>
-        {
-            self.store()
-                .register_session(&entorhinal_core::SessionRegistration {
-                    role: None,
-                    agent_id: id,
-                    ref_kind: "session",
-                    session_ref: reference,
-                    harness: "host",
-                    session_id: reference,
-                    project_root: Some("/project"),
-                    registered_by: "host",
-                    runner: Some("host"),
-                    network: None,
-                    now_ms: 700,
-                })
-        }
-        fn clear_calls(&self) {
-            self.records.calls.lock().unwrap().clear();
-        }
-        async fn gate_entered(&self, n: u32) {
-            self.discovery
-                .entered
-                .acquire_many(n)
-                .await
-                .unwrap()
-                .forget();
+
+        fn assert_no_side_effects(&self) {
+            assert!(self.records.calls.lock().unwrap().is_empty());
+            assert!(self.prompt.summaries.lock().unwrap().is_empty());
+            assert!(self.discovery.daemon.calls().is_empty());
+            assert!(self.store().list_agent_moves().unwrap().is_empty());
         }
     }
+
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
+
     fn body(method: &str, params: Value) -> Vec<u8> {
         serde_json::to_vec(&json!({"method":method,"params":params})).unwrap()
     }
+
     fn result(outcome: HandlerOutcome) -> Value {
         match outcome {
             HandlerOutcome::Response(bytes) => {
@@ -830,731 +773,6 @@ mod tests {
             }
             other => panic!("expected response: {other:?}"),
         }
-    }
-    #[tokio::test]
-    async fn served_arm_callers_confirmation_summary_and_writer_isolation() {
-        let f = Fixture::new(2).await;
-        let id = f.create().await;
-        assert!(super::super::MUTATING_METHODS.contains(&MOVE));
-        assert!(super::super::SELF_ADMITTED_METHODS.contains(&MOVE));
-        assert!(!super::super::agent_operation_description(MOVE).is_empty());
-        assert_eq!(
-            code(f.handler.handle_request(&body(MOVE, json!({})), DIRECT)),
-            "served_path_required"
-        );
-        f.handler.route_admissions().insert(
-            OTHER,
-            RouteAdmission::from_bind(Some(Principal::Direct), Some(&flow_stamp(Some("flow")))),
-        );
-        assert_eq!(code(f.move_(OTHER, &id).await), "flow_scope_not_admitted");
-        f.handler.route_admissions().insert(
-            OTHER,
-            RouteAdmission::from_bind(Some(reserved("other")), None),
-        );
-        assert_eq!(code(f.move_(OTHER, &id).await), "caller_forbidden");
-        assert_eq!(code(f.move_(ENGRAM, &id).await), "caller_forbidden");
-        *f.prompt.outcome.lock().unwrap() = Err(OperatorConfirmError::PresenceUnavailable);
-        assert_eq!(
-            code(f.move_(DIRECT, &id).await),
-            "operator_presence_unavailable"
-        );
-        assert_eq!(
-            *f.prompt.summaries.lock().unwrap(),
-            vec![format!("move agent \"ENTO\" (\"{id}\") to \"Studio\"")]
-        );
-        *f.prompt.outcome.lock().unwrap() = Ok(());
-        let generation = f.store().generation().unwrap();
-        let writer = f.handler.writer.lock().await;
-        let moved = result(
-            tokio::time::timeout(std::time::Duration::from_secs(5), f.move_(DIRECT, &id))
-                .await
-                .expect("move must not acquire writer"),
-        );
-        drop(writer);
-        assert_eq!(moved["step"], "preparing");
-        assert_eq!(f.store().generation().unwrap(), generation);
-        assert_eq!(
-            code(
-                f.register(&id, "new")
-                    .map(|_| HandlerOutcome::Response(vec![]))
-                    .unwrap_or_else(|e| HandlerError::from(e).into_outcome())
-            ),
-            "agent_moving"
-        );
-    }
-
-    #[tokio::test]
-    async fn engram_requires_setting_and_idle_while_orchestrator_never_prompts() {
-        for caller in [ENGRAM, ORCH] {
-            let f = Fixture::new(2).await;
-            let id = f.create().await;
-            f.store()
-                .set_move_setting(entorhinal_core::move_store::MoveSetting {
-                    lid_close_moves: true,
-                })
-                .unwrap();
-            result(f.move_(caller, &id).await);
-            assert!(f.prompt.summaries.lock().unwrap().is_empty());
-            if caller == ORCH {
-                assert_eq!(f.resolver.calls(), 1);
-            }
-        }
-        let f = Fixture::new(2).await;
-        let id = f.create().await;
-        f.register(&id, "r").unwrap();
-        f.store()
-            .set_move_setting(entorhinal_core::move_store::MoveSetting {
-                lid_close_moves: true,
-            })
-            .unwrap();
-        assert_eq!(code(f.move_(ENGRAM, &id).await), "agent_busy");
-        assert!(f.store().list_agent_moves().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn session_role_running_delegated_sessions_do_not_consume_cap_or_block_admission() {
-        let f = Fixture::new(2).await;
-        let id = f.create().await;
-        for n in 0..257 {
-            let reference = format!("delegated-{n}");
-            f.store()
-                .register_session(&entorhinal_core::SessionRegistration {
-                    agent_id: &id,
-                    ref_kind: "session",
-                    session_ref: &reference,
-                    harness: "host",
-                    session_id: &reference,
-                    project_root: Some("/project"),
-                    registered_by: "host",
-                    runner: Some("data"),
-                    role: Some("delegated"),
-                    network: None,
-                    now_ms: 700,
-                })
-                .unwrap();
-            f.discovery.participant.set_busy(
-                AgentRef::new("session", &reference),
-                BusyRef::new(BusyState::Busy),
-            );
-            let mut mirror = f.handler.liveness.lock().unwrap();
-            mirror
-                .bus
-                .apply(crate::liveness_bus::tests::put(
-                    &format!("host.{reference}"),
-                    "host",
-                    &reference,
-                    "active",
-                ))
-                .unwrap();
-            crate::liveness_bus::tests::reconcile(&mut mirror);
-        }
-        f.register(&id, "head").unwrap();
-        f.store().end_session("host", "head", None, 701).unwrap();
-        let moved = result(f.move_(ORCH, &id).await);
-        assert_eq!(moved["step"], "preparing");
-        let row = f.store().list_agent_moves().unwrap().pop().unwrap();
-        for participant in row.plan["participants"].as_array().unwrap() {
-            assert!(participant["refs"].as_array().unwrap().is_empty());
-        }
-    }
-
-    /// An idle session may move only when its own runner is the participant
-    /// that holds its ref, because that participant freezes it at `prepare`.
-    /// An active session, or an idle one whose runner is unknown or not in the
-    /// move, still refuses.
-    #[tokio::test]
-    async fn idle_session_moves_only_when_its_runner_is_the_freezing_participant() {
-        for (runner, state, admitted) in [
-            (Some("data"), "idle", true),
-            (None, "idle", false),
-            (Some("elsewhere"), "idle", false),
-            (Some("data"), "active", false),
-        ] {
-            let f = Fixture::new(2).await;
-            let id = f.create().await;
-            if let Some(runner) = runner {
-                f.store()
-                    .register_session(&entorhinal_core::SessionRegistration {
-                        role: None,
-                        agent_id: &id,
-                        ref_kind: "session",
-                        session_ref: "r",
-                        harness: "host",
-                        session_id: "r",
-                        project_root: Some("/project"),
-                        registered_by: "host",
-                        runner: Some(runner),
-                        network: None,
-                        now_ms: 700,
-                    })
-                    .unwrap();
-            } else {
-                f.store().apply_entry("fixture.legacy_session", "{}", "fixture", None, |tx| {
-                    tx.execute(
-                        "INSERT INTO session_binding(ref_kind,ref,agent_id,harness,session_id,project_root,registered_by,registered_at_ms)
-                         VALUES('session','r',?1,'host','r','/project','host',700)",
-                        [&id],
-                    )?;
-                    Ok(())
-                }).unwrap();
-            }
-            {
-                let mut mirror = f.handler.liveness.lock().unwrap();
-                mirror
-                    .bus
-                    .apply(crate::liveness_bus::tests::put(
-                        "host.r", "host", "r", state,
-                    ))
-                    .unwrap();
-                crate::liveness_bus::tests::reconcile(&mut mirror);
-            }
-            let outcome = f.move_(ORCH, &id).await;
-            if admitted {
-                result(outcome);
-            } else {
-                match outcome {
-                    HandlerOutcome::ErrorWithDetail { code, detail, .. } => {
-                        assert_eq!(code, "agent_busy", "{runner:?} {state}");
-                        assert_eq!(detail["refs"][0]["reason_code"], "session_active");
-                    }
-                    other => panic!("expected agent_busy for {runner:?} {state}: {other:?}"),
-                }
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn liveness_bus_move_admission_selects_bus_only_after_marker() {
-        for (bus_state, reconciled, admitted) in [
-            ("idle", true, true),
-            ("active", true, false),
-            ("idle", false, false),
-            ("active", false, false),
-        ] {
-            let f = Fixture::new(2).await;
-            let id = f.create().await;
-            f.store()
-                .register_session(&entorhinal_core::SessionRegistration {
-                    role: None,
-                    agent_id: &id,
-                    ref_kind: "session",
-                    session_ref: "r",
-                    harness: "host",
-                    session_id: "r",
-                    project_root: Some("/project"),
-                    registered_by: "host",
-                    runner: Some("data"),
-                    network: None,
-                    now_ms: 700,
-                })
-                .unwrap();
-            {
-                let mut state = f.handler.liveness.lock().unwrap();
-                state.bus.watch_started();
-                state.bus.finish_replay();
-                state.bus.apply(crate::liveness_bus::Update::Put("opaque".into(), serde_json::to_vec(&json!({
-                    "harness":"host","sessionId":"r","state":bus_state,"lastActivityMs":700,"projectId":null
-                })).unwrap())).unwrap();
-                if reconciled {
-                    state
-                        .bus
-                        .apply(crate::liveness_bus::Update::Put(
-                            "_reconciled".into(),
-                            br#"{"bootId":"move","sessions":1}"#.to_vec(),
-                        ))
-                        .unwrap();
-                }
-            }
-            let outcome = f.move_(ORCH, &id).await;
-            if admitted {
-                result(outcome);
-            } else {
-                match outcome {
-                    HandlerOutcome::ErrorWithDetail { code, detail, .. } => {
-                        assert_eq!(code, "agent_busy");
-                        assert_eq!(
-                            detail["refs"][0]["reason_code"],
-                            if reconciled {
-                                "session_active"
-                            } else {
-                                "liveness_unknown"
-                            }
-                        );
-                    }
-                    other => {
-                        panic!("expected busy for {bus_state}, reconciled={reconciled}: {other:?}")
-                    }
-                }
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn busy_refusal_is_read_only_and_names_liveness_and_participant_reasons() {
-        let f = Fixture::new(2).await;
-        let id = f.create().await;
-        f.register(&id, "r").unwrap();
-        let reference = AgentRef::new("session", "r");
-        f.discovery.participant.set_busy(
-            reference.clone(),
-            BusyRef::new(BusyState::Busy)
-                .with_reason_code("writing")
-                .with_reason("pending writes"),
-        );
-        let before = f.discovery.participant.held();
-        // Establish ownership explicitly before measuring the refused move's
-        // record calls. The move should only observe the existing claim.
-        f.handler.wait_claim_refresh().await.unwrap();
-        f.clear_calls();
-        let generation = f.store().generation().unwrap();
-        let outcome = f.move_(ORCH, &id).await;
-        match outcome {
-            HandlerOutcome::ErrorWithDetail { code, detail, .. } => {
-                assert_eq!(code, "agent_busy");
-                assert_eq!(detail["refs"][0]["reason_code"], "liveness_unknown");
-                assert_eq!(detail["refs"][1]["reason_code"], "writing");
-            }
-            other => panic!("expected detailed busy refusal: {other:?}"),
-        }
-        assert!(f.store().list_agent_moves().unwrap().is_empty());
-        assert_eq!(f.store().generation().unwrap(), generation);
-        assert_eq!(f.discovery.participant.held(), before);
-        assert!(f.discovery.participant.frozen().is_empty());
-        assert!(f.discovery.participant.staged().is_empty());
-        assert!(f.discovery.participant.tombstones().is_empty());
-        assert_eq!(
-            f.discovery.participant.calls(),
-            vec![
-                Request::Describe(participant_client::DescribeRequest::new()),
-                Request::Busy(participant_client::BusyRequest::new(
-                    cortexkit_role_agent_data::refs::Refs::new(vec![reference]).unwrap(),
-                ))
-            ]
-        );
-        let calls = f.records.calls.lock().unwrap();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].0, "record.read_many");
-        assert_eq!(
-            calls[1],
-            (
-                "record.read".into(),
-                json!({"subject":format!("claim:{id}")})
-            )
-        );
-        assert!(calls
-            .iter()
-            .all(|(method, params)| ["record.read", "record.read_many"]
-                .contains(&method.as_str())
-                && !params.to_string().contains("move:")
-                && !params.to_string().contains("inbox:")));
-    }
-
-    #[tokio::test]
-    async fn preconditions_refuse_in_order_with_named_codes() {
-        let f = Fixture::new(0).await;
-        assert_eq!(
-            code(f.move_(DIRECT, "unknown").await),
-            "authority_not_cut_over"
-        );
-        assert!(f.records.calls.lock().unwrap().is_empty());
-        let f = Fixture::new(1).await;
-        assert_eq!(
-            code(f.move_(DIRECT, "unknown").await),
-            "identity_log_disabled"
-        );
-        assert!(f.records.calls.lock().unwrap().is_empty());
-        let f = Fixture::new(2).await;
-        f.clear_calls();
-        assert_eq!(code(f.move_(ORCH, "unknown").await), "unknown_agent");
-        assert!(f.records.calls.lock().unwrap().is_empty());
-        let id = f.create().await;
-        f.records
-            .record
-            .error(&format!("claim:{id}"), Some("verify_failed"));
-        assert_eq!(code(f.move_(ORCH, &id).await), "claim_integrity_failed");
-        f.records
-            .record
-            .error(&format!("claim:{id}"), Some("unavailable"));
-        assert_eq!(
-            code(f.move_(ORCH, &id).await),
-            "claim_integrity_failed",
-            "unavailable cannot erase integrity mark"
-        );
-        f.records.record.error(&format!("claim:{id}"), None);
-        f.handler.wait_claim_refresh().await.unwrap();
-        f.records.record.offline.store(true, Ordering::Relaxed);
-        assert_eq!(code(f.move_(ORCH, &id).await), "claim_stale");
-        f.records.record.offline.store(false, Ordering::Relaxed);
-        f.records.record.put(
-            &format!("claim:{id}"),
-            1,
-            serde_json::to_vec(
-                &json!({"v":1,"agent_id":id,"holder":TARGET,"epoch":1,"cut_id":null,"reason":null}),
-            )
-            .unwrap(),
-            TARGET,
-        );
-        assert_eq!(code(f.move_(ORCH, &id).await), "not_holder");
-        // Keep the epoch-zero cache sentinel, but a populated holder prevents
-        // the initial-claim pass from replacing this raw version-two record.
-        f.records.record.put(
-            &format!("claim:{id}"),
-            2,
-            serde_json::to_vec(
-                &json!({"v":1,"agent_id":id,"holder":f.records.record.author,"epoch":0,"cut_id":null,"reason":null}),
-            )
-            .unwrap(),
-            TARGET,
-        );
-        assert_eq!(
-            code(
-                f.call(
-                    ORCH,
-                    MOVE,
-                    json!({"agent_id":id,"to":"no row","request_key":"move"})
-                )
-                .await
-            ),
-            "unknown_member"
-        );
-        f.store()
-            .set_member_name(
-                entorhinal_core::shared_entry::MemberName {
-                    author: f.records.record.author.clone(),
-                    display_name: "Self".into(),
-                },
-                "fixture",
-            )
-            .unwrap();
-        assert_eq!(
-            code(
-                f.call(
-                    ORCH,
-                    MOVE,
-                    json!({"agent_id":id,"to":"Self","request_key":"move"})
-                )
-                .await
-            ),
-            "invalid_request"
-        );
-        f.store()
-            .set_member_name(
-                entorhinal_core::shared_entry::MemberName {
-                    author: "03030303030303030303030303030303".into(),
-                    display_name: "Studio".into(),
-                },
-                "fixture",
-            )
-            .unwrap();
-        assert_eq!(code(f.move_(ORCH, &id).await), "invalid_request");
-        f.store()
-            .set_member_name(
-                entorhinal_core::shared_entry::MemberName {
-                    author: "03030303030303030303030303030303".into(),
-                    display_name: "Other machine".into(),
-                },
-                "fixture",
-            )
-            .unwrap();
-        f.discovery.daemon.restart(DaemonSnapshot::new(2, vec![json!({"module_id":"down","state":"stopped","enabled":true,"live":false,"health":"ok"})],vec![]));
-        assert_eq!(code(f.move_(ORCH, &id).await), "participant_unavailable");
-        f.discovery.daemon.restart(snapshot());
-        f.store()
-            .apply_entry("fixture", "{}", "fixture", None, |tx| {
-                tx.execute(
-                    "INSERT INTO session_binding(ref_kind,ref,agent_id,harness,session_id,project_root,registered_by,registered_at_ms) VALUES ('uncovered','r',?1,NULL,NULL,'','move',1)",
-                    [&id],
-                )?;
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(code(f.move_(ORCH, &id).await), "participant_unavailable");
-        f.store()
-            .apply_entry("fixture", "{}", "fixture", None, |tx| {
-                tx.execute("DELETE FROM session_binding WHERE agent_id=?1", [&id])?;
-                Ok(())
-            })
-            .unwrap();
-        let admitted = result(f.move_(ORCH, &id).await);
-        assert_eq!(
-            f.store()
-                .agent_move(admitted["cut_id"].as_str().unwrap())
-                .unwrap()
-                .unwrap()
-                .claim_version,
-            Some(2),
-            "epoch-zero cache version is not the raw record version"
-        );
-        assert_eq!(
-            code(
-                f.call(
-                    ORCH,
-                    MOVE,
-                    json!({"agent_id":id,"to":"Studio","request_key":"other"})
-                )
-                .await
-            ),
-            "move_in_progress"
-        );
-        let f = Fixture::new(2).await;
-        let id = f.create().await;
-        result(
-            f.call(
-                ORCH,
-                "agent.dispose",
-                json!({"agent_id":id,"request_key":"dispose"}),
-            )
-            .await,
-        );
-        assert_eq!(code(f.move_(ORCH, &id).await), "gone");
-    }
-
-    #[tokio::test]
-    async fn direct_rechecks_claim_open_moves_and_idle_after_confirmation() {
-        for check in [4, 6, 8] {
-            let f = Fixture::new(2).await;
-            let id = f.create().await;
-            if check == 8 {
-                f.store().apply_entry("fixture","{}","fixture",None,|tx| {tx.execute("INSERT INTO session_binding(ref_kind,ref,agent_id,harness,session_id,project_root,registered_by,registered_at_ms) VALUES ('session','r',?1,NULL,NULL,'','move',1)",[&id])?;Ok(())}).unwrap();
-            }
-            let store = f.store();
-            let record = f.records.record.clone();
-            let id_hook = id.clone();
-            let participant = f.discovery.participant.clone();
-            *f.prompt.on_confirm.lock().unwrap() = Some(Box::new(move || {
-                match check {
-                    4 => record.put(&format!("claim:{id_hook}"),1,serde_json::to_vec(&json!({"v":1,"agent_id":id_hook,"holder":TARGET,"epoch":1,"cut_id":null,"reason":null})).unwrap(),TARGET),
-                    6 => {
-                        let row = pending_row(&id_hook,"other");
-                        store.insert_agent_move(&row).unwrap();
-                    }
-                    _ => {
-                        participant.set_busy(
-                            AgentRef::new("session", "r"),
-                            BusyRef::new(BusyState::Unknown).with_reason_code("unknown"),
-                        );
-                    }
-                }
-            }));
-            assert_eq!(
-                code(f.move_(DIRECT, &id).await),
-                match check {
-                    4 => "not_holder",
-                    6 => "move_in_progress",
-                    _ => "agent_busy",
-                }
-            );
-            let calls = f.records.calls.lock().unwrap().clone();
-            assert_eq!(
-                calls
-                    .iter()
-                    .filter(|(m, _)| m == "record.read_many")
-                    .count(),
-                2,
-                "check {check}: {calls:?}"
-            );
-        }
-    }
-
-    fn pending_row(id: &str, key: &str) -> AgentMove {
-        AgentMove {
-            cut_id: format!("{key:0<32}"),
-            agent_id: id.into(),
-            side: MoveSide::Receiver,
-            peer: TARGET.into(),
-            step: MoveStep::PickedUp,
-            plan: json!({"participants":[]}),
-            request_body: None,
-            record_version: 1,
-            claim_version: Some(0),
-            claim_take_body: None,
-            claim_take_version: None,
-            claim_landed_version: None,
-            seal_sent: false,
-            abort_requested: None,
-            hold: None,
-            cut_accept: None,
-            reason: None,
-            detail: None,
-            request_key: None,
-            attempts: 0,
-            activated_at_ms: None,
-            created_at_ms: 700,
-            updated_at_ms: 700,
-        }
-    }
-
-    #[tokio::test]
-    async fn registration_races_real_admission_insert_from_both_orders() {
-        let f = Fixture::new(2).await;
-        let id = f.create().await;
-        f.discovery.gate.store(true, Ordering::Relaxed);
-        let handler = f.handler.clone();
-        let request = body(
-            MOVE,
-            json!({"agent_id":id,"to":"Studio","request_key":"move"}),
-        );
-        let task = tokio::spawn(async move { handler.handle_served_request(&request, ORCH).await });
-        f.gate_entered(1).await;
-        f.register(&id, "started-during-check").unwrap();
-        f.discovery.release.add_permits(1);
-        assert_eq!(code(task.await.unwrap()), "agent_busy");
-        assert!(f.store().list_agent_moves().unwrap().is_empty());
-
-        let f = Fixture::new(2).await;
-        let id = f.create().await;
-        result(f.move_(ORCH, &id).await);
-        assert_eq!(
-            f.register(&id, "started-after-check").unwrap_err().code,
-            "agent_moving"
-        );
-        assert!(f.store().agent_bound_refs(&id).unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn crash_before_commit_leaves_nothing_and_same_key_concurrent_resends_share_checkpoint() {
-        let f = Fixture::new(2).await;
-        let id = f.create().await;
-        f.discovery.gate.store(true, Ordering::Relaxed);
-        let request = body(
-            MOVE,
-            json!({"agent_id":id,"to":"Studio","request_key":"move"}),
-        );
-        let handler = f.handler.clone();
-        let request_for_task = request.clone();
-        let task =
-            tokio::spawn(
-                async move { handler.handle_served_request(&request_for_task, ORCH).await },
-            );
-        f.gate_entered(1).await;
-        task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
-        assert!(f.store().list_agent_moves().unwrap().is_empty());
-        assert!(f
-            .discovery
-            .participant
-            .calls()
-            .iter()
-            .all(|c| matches!(c, Request::Describe(_))));
-        let mut tasks = vec![];
-        for _ in 0..2 {
-            let handler = f.handler.clone();
-            let request = request.clone();
-            tasks.push(tokio::spawn(async move {
-                handler.handle_served_request(&request, ORCH).await
-            }));
-        }
-        f.gate_entered(2).await;
-        f.discovery.release.add_permits(2);
-        let first = result(tasks.remove(0).await.unwrap());
-        let second = result(tasks.remove(0).await.unwrap());
-        assert_eq!(first, second);
-        f.handler.stop_move_driver().await;
-        assert_eq!(f.store().list_agent_moves().unwrap().len(), 1);
-        let checkpoint = f
-            .store()
-            .agent_move(first["cut_id"].as_str().unwrap())
-            .unwrap()
-            .unwrap();
-        *f.handler.store.lock().unwrap() = None;
-        crate::tests::allow_legacy_store(&f.descriptor);
-        let restarted = RegistryStore::open(&f.descriptor).unwrap();
-        assert_eq!(restarted.list_open_agent_moves().unwrap(), vec![checkpoint]);
-        *f.handler.store.lock().unwrap() = Some(restarted);
-        f.handler.start_move_driver();
-        f.records.record.offline.store(true, Ordering::Relaxed);
-        assert_eq!(
-            result(f.handler.handle_served_request(&request, ORCH).await),
-            first,
-            "committed resend skips admission even after restart"
-        );
-        f.handler.stop_move_driver().await;
-    }
-
-    #[tokio::test]
-    async fn request_body_is_submitted_target_and_survives_target_rename() {
-        let f = Fixture::new(2).await;
-        let id = f.create().await;
-        let first = result(f.move_(ORCH, &id).await);
-        f.store()
-            .set_member_name(
-                entorhinal_core::shared_entry::MemberName {
-                    author: TARGET.into(),
-                    display_name: "Renamed".into(),
-                },
-                "fixture",
-            )
-            .unwrap();
-        let calls = f.records.calls.lock().unwrap().len();
-        assert_eq!(result(f.move_(ORCH, &id).await), first);
-        assert_eq!(f.records.calls.lock().unwrap().len(), calls);
-        assert_eq!(
-            code(
-                f.call(
-                    ORCH,
-                    MOVE,
-                    json!({"agent_id":id,"to":"Renamed","request_key":"move"})
-                )
-                .await
-            ),
-            "request_key_reused"
-        );
-        let f = Fixture::new(2).await;
-        let id = f.create().await;
-        *f.prompt.outcome.lock().unwrap() = Err(OperatorConfirmError::Declined);
-        assert_eq!(code(f.move_(DIRECT, &id).await), "operator_declined");
-        f.store()
-            .set_member_name(
-                entorhinal_core::shared_entry::MemberName {
-                    author: TARGET.into(),
-                    display_name: "Renamed".into(),
-                },
-                "fixture",
-            )
-            .unwrap();
-        assert_eq!(
-            code(f.move_(DIRECT, &id).await),
-            "unknown_member",
-            "uncommitted resends re-run target resolution"
-        );
-        assert!(f.store().list_agent_moves().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn open_cap_precedes_discovery_and_receiver_registration_fence_is_transactional() {
-        let f = Fixture::new(2).await;
-        let id = f.create().await;
-        for n in 0..4 {
-            f.store()
-                .insert_agent_move(&pending_row(&format!("other-{n}"), &format!("cut-{n}")))
-                .unwrap();
-        }
-        assert_eq!(code(f.move_(ORCH, &id).await), "move_cap");
-        assert!(f.discovery.daemon.calls().is_empty());
-        let f = Fixture::new(2).await;
-        let id = f.create().await;
-        let mut row = pending_row(&id, "cut");
-        row.plan = json!({"participants":[{"module_id":"data","refs":[{"ref_kind":"session","ref":"reserved"}]}]});
-        f.store().insert_agent_move(&row).unwrap();
-        for step in [
-            MoveStep::PickedUp,
-            MoveStep::Imported,
-            MoveStep::Staged,
-            MoveStep::Claimed,
-            MoveStep::Activating,
-        ] {
-            row.step = step;
-            f.store().update_agent_move(&row).unwrap();
-            assert_eq!(f.register(&id, "r").unwrap_err().code, "agent_moving");
-        }
-        let other_id = result(f.call(ORCH,"agent.create",json!({"name":"OTHER","role":"assistant","tag":"test","request_key":"create-other"})).await)["agent"]["agent_id"].as_str().unwrap().to_owned();
-        assert_eq!(
-            f.register(&other_id, "reserved").unwrap_err().code,
-            "agent_moving"
-        );
-        row.step = MoveStep::Activated;
-        f.store().update_agent_move(&row).unwrap();
-        f.register(&id, "r").unwrap();
     }
 
     fn code(outcome: HandlerOutcome) -> String {
@@ -1564,5 +782,158 @@ mod tests {
             }
             other => panic!("expected refusal: {other:?}"),
         }
+    }
+
+    fn existing_move(id: &str, key: &str, target: &str) -> AgentMove {
+        AgentMove {
+            cut_id: format!("{key:0<32}"),
+            agent_id: id.into(),
+            side: MoveSide::Source,
+            peer: TARGET.into(),
+            step: MoveStep::Preparing,
+            plan: json!({"agent_id":id,"from":"01".repeat(16),"to":TARGET,
+                "claim_version":1,"hub_gen":1,"participants":[]}),
+            request_body: Some(json!({"agent_id":id,"to":target})),
+            record_version: 0,
+            claim_version: Some(1),
+            claim_take_body: None,
+            claim_take_version: None,
+            claim_landed_version: None,
+            seal_sent: false,
+            abort_requested: None,
+            hold: None,
+            cut_accept: None,
+            reason: None,
+            detail: None,
+            request_key: Some(key.into()),
+            attempts: 0,
+            activated_at_ms: None,
+            created_at_ms: 700,
+            updated_at_ms: 700,
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_and_validation_precede_the_unselected_backend_refusal() {
+        let f = Fixture::new(true).await;
+        let id = f.create().await;
+        f.install_unselected_hub();
+        assert!(super::super::MUTATING_METHODS.contains(&MOVE));
+        assert!(super::super::SELF_ADMITTED_METHODS.contains(&MOVE));
+        assert!(!super::super::agent_operation_description(MOVE).is_empty());
+        assert_eq!(
+            code(f.handler.handle_request(&body(MOVE, json!({})), DIRECT)),
+            "served_path_required"
+        );
+        assert_eq!(code(f.move_(OTHER, &id).await), "caller_forbidden");
+        assert_eq!(code(f.move_(ENGRAM, &id).await), "caller_forbidden");
+        f.handler.route_admissions().insert(
+            OTHER,
+            RouteAdmission::from_bind(Some(Principal::Direct), Some(&flow_stamp(Some("flow")))),
+        );
+        assert_eq!(code(f.move_(OTHER, &id).await), "flow_scope_not_admitted");
+        for bad in [
+            json!({}),
+            json!({"agent_id":id,"to":"Studio","request_key":""}),
+            json!({"agent_id":id,"to":"Studio","request_key":"move","extra":true}),
+        ] {
+            assert_eq!(code(f.call(DIRECT, MOVE, bad).await), "invalid_request");
+        }
+        for caller in [DIRECT, ORCH] {
+            assert_eq!(code(f.move_(caller, &id).await), "hub_not_ready");
+        }
+        f.store()
+            .set_move_setting(entorhinal_core::move_store::MoveSetting {
+                lid_close_moves: true,
+            })
+            .unwrap();
+        assert_eq!(code(f.move_(ENGRAM, &id).await), "hub_not_ready");
+        f.assert_no_side_effects();
+    }
+
+    #[tokio::test]
+    async fn authority_identity_unknown_and_gone_keep_their_order() {
+        let f = Fixture::new(false).await;
+        assert_eq!(
+            code(f.move_(DIRECT, "unknown").await),
+            "authority_not_cut_over"
+        );
+        let f = Fixture::new(true).await;
+        assert_eq!(
+            code(f.move_(DIRECT, "unknown").await),
+            "identity_log_disabled"
+        );
+        let id = f.create().await;
+        f.install_unselected_hub();
+        assert_eq!(code(f.move_(ORCH, "unknown").await), "unknown_agent");
+        assert_eq!(code(f.move_(ORCH, &id).await), "hub_not_ready");
+        f.assert_no_side_effects();
+
+        let f = Fixture::new(true).await;
+        let id = f.create().await;
+        result(
+            f.call(
+                ORCH,
+                "agent.dispose",
+                json!({"agent_id":id,"request_key":"dispose"}),
+            )
+            .await,
+        );
+        f.install_unselected_hub();
+        assert_eq!(code(f.move_(ORCH, &id).await), "gone");
+        assert_eq!(code(f.move_(ORCH, "unknown").await), "unknown_agent");
+        f.assert_no_side_effects();
+    }
+
+    #[tokio::test]
+    async fn request_key_replay_precedes_selection_and_target_rename() {
+        let f = Fixture::new(true).await;
+        let id = f.create().await;
+        f.install_unselected_hub();
+        let row = existing_move(&id, "move", "Studio");
+        let expected = result(HandlerOutcome::Response(reply(&row).unwrap()));
+        f.store().insert_agent_move(&row).unwrap();
+        assert_eq!(result(f.move_(ORCH, &id).await), expected);
+        f.store()
+            .set_member_name(
+                entorhinal_core::shared_entry::MemberName {
+                    author: TARGET.into(),
+                    display_name: "Renamed".into(),
+                },
+                "fixture",
+            )
+            .unwrap();
+        assert_eq!(result(f.move_(ORCH, &id).await), expected);
+        assert_eq!(
+            code(
+                f.call(
+                    ORCH,
+                    MOVE,
+                    json!({"agent_id":id,"to":"Renamed","request_key":"move"}),
+                )
+                .await
+            ),
+            "request_key_reused"
+        );
+        assert_eq!(code(f.move_(OTHER, &id).await), "caller_forbidden");
+        assert!(f.records.calls.lock().unwrap().is_empty());
+        assert!(f.prompt.summaries.lock().unwrap().is_empty());
+        assert!(f.discovery.daemon.calls().is_empty());
+        assert_eq!(f.store().list_agent_moves().unwrap(), vec![row]);
+    }
+
+    #[tokio::test]
+    async fn selected_backend_without_residence_watch_is_not_ready() {
+        let f = Fixture::new(true).await;
+        let id = f.create().await;
+        f.install_unselected_hub();
+        f.handler
+            .health
+            .hub_membership
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        assert!(f.handler.hub_backend_selected());
+        assert!(f.handler.residence().is_none());
+        assert_eq!(code(f.move_(DIRECT, &id).await), "hub_not_ready");
+        f.assert_no_side_effects();
     }
 }

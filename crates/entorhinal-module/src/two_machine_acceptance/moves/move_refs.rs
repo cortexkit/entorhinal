@@ -1,25 +1,84 @@
-use super::*;
-use crate::tests::reserved;
+use crate::{
+    tests::{reserved, scratch_descriptor},
+    ProjectsHandler, RouteAdmission, RouteKey,
+};
+use entorhinal_core::{
+    move_store::{AgentMove, MoveSide, MoveStep},
+    RegistryStore,
+};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::path::PathBuf;
+use subc_client_rs::HandlerOutcome;
 
 const DIRECTORY: &str = "agent-move-refs-v1";
 const CUT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const UNKNOWN: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const AGENT: &str = "agent_0123456789abcdef";
 const READER: RouteKey = (920, 1);
 
-async fn record(node: &MoveMachine, cut: &str) -> (String, Value) {
-    node.machine.handler.route_admissions().insert(
+fn node(side: MoveSide) -> (ProjectsHandler, PathBuf) {
+    let (dir, descriptor) = scratch_descriptor("move-refs-vector");
+    let handler = ProjectsHandler::with_runtime("move-refs-vector".into(), || 800);
+    *handler.store.lock().unwrap() = Some(RegistryStore::open(&descriptor).unwrap());
+    handler.route_admissions().insert(
         READER,
         RouteAdmission::from_bind(Some(reserved("occipital")), None),
     );
+    handler
+        .store
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .insert_agent_move(&AgentMove {
+            cut_id: CUT.into(),
+            agent_id: AGENT.into(),
+            side,
+            peer: "02020202020202020202020202020202".into(),
+            step: if side == MoveSide::Source {
+                MoveStep::Published
+            } else {
+                MoveStep::PickedUp
+            },
+            plan: json!({"agent_id":AGENT,"from":"01".repeat(16),"to":"02".repeat(16),
+            "claim_version":1,"hub_gen":1,"participants":[
+                {"module_id":"whole-agent","refs":[{"ref_kind":"agent","ref":AGENT}],"external":[]},
+                {"module_id":"sessions","refs":[
+                    {"ref_kind":"session","ref":"z"},{"ref_kind":"pi","ref":"p"}
+                ],"external":[]},
+                {"module_id":"duplicate","refs":[{"ref_kind":"session","ref":"a"}],"external":[]},
+                {"module_id":"entorhinal","refs":[
+                    {"ref_kind":"package-closure","ref":"closure"},
+                    {"ref_kind":"session-bindings","ref":"bindings"}
+                ],"external":[]}
+            ]}),
+            request_body: None,
+            record_version: 1,
+            claim_version: Some(1),
+            claim_take_body: None,
+            claim_take_version: None,
+            claim_landed_version: None,
+            seal_sent: true,
+            abort_requested: None,
+            hold: None,
+            cut_accept: None,
+            reason: None,
+            detail: None,
+            request_key: None,
+            attempts: 0,
+            activated_at_ms: None,
+            created_at_ms: 800,
+            updated_at_ms: 800,
+        })
+        .unwrap();
+    (handler, dir)
+}
+
+async fn record(handler: &ProjectsHandler, cut: &str) -> (String, Value) {
     let params = json!({"cutId":cut});
     let request = serde_json::to_vec(&json!({"method":"agent.move_refs","params":params})).unwrap();
-    let reply = match node
-        .machine
-        .handler
-        .handle_served_request(&request, READER)
-        .await
-    {
+    let reply = match handler.handle_served_request(&request, READER).await {
         HandlerOutcome::Response(bytes) => String::from_utf8(bytes).unwrap(),
         HandlerOutcome::Error { code, message } => {
             json!({"code":code,"message":message,"detail":null}).to_string()
@@ -27,72 +86,32 @@ async fn record(node: &MoveMachine, cut: &str) -> (String, Value) {
         other => panic!("unexpected move_refs outcome: {other:?}"),
     };
     let decoded = serde_json::from_str(&reply).unwrap();
-    // Admission generates a random cut ID. Normalize only that string in
-    // captured bytes; successful handler replies stay otherwise verbatim.
     let record = format!(
         "  {{\"op\":\"agent.move_refs\",\"request\":{},\"principal\":{{\"kind\":\"reserved\",\"moduleId\":\"occipital\"}},\"reply\":{reply}}}",
         params,
     );
-    (
-        record.replace(cut, if cut == UNKNOWN { UNKNOWN } else { CUT }),
-        decoded,
-    )
+    (record, decoded)
 }
 
 #[tokio::test(start_paused = true)]
 async fn move_refs_records_match_published_files() {
-    let pair = super::agent_refs::pair_with_refs(
-        &[
-            ("whole-agent", &["agent"]),
-            ("sessions", &["session", "pi"]),
-            ("duplicate", &["session"]),
-        ],
-        &[
-            AgentRef::new("session", "z"),
-            AgentRef::new("session", "a"),
-            AgentRef::new("pi", "p"),
-        ],
-    )
-    .await;
-    let cut = pair.published("move-refs").await;
-    assert_eq!(
-        pair.a.row(&cut).plan["participants"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|p| p["module_id"] == "whole-agent")
-            .unwrap()["refs"],
-        json!([{"ref_kind":"agent","ref":AGENT}])
-    );
-    // Ending bindings after admission must not remove them from the cut.
-    pair.a
-        .store()
-        .apply_entry("fixture", "{}", "test", None, |tx| {
-            tx.execute(
-                "UPDATE session_binding SET ended_at_ms=800 WHERE agent_id=?1",
-                [AGENT],
-            )?;
-            Ok(())
-        })
-        .unwrap();
-    assert!(pair.a.store().agent_bound_refs(AGENT).unwrap().is_empty());
-    pair.b.pickup().await;
-    assert!(pair.b.store().agent_bound_refs(AGENT).unwrap().is_empty());
-    let (source, source_reply) = record(&pair.a, &cut).await;
-    let (receiver, receiver_reply) = record(&pair.b, &cut).await;
-    let expected = json!({"result":{"cutId":cut,"agentId":AGENT,"refs":[
+    let (source, source_dir) = node(MoveSide::Source);
+    let (receiver, receiver_dir) = node(MoveSide::Receiver);
+    let (source_record, source_reply) = record(&source, CUT).await;
+    let (receiver_record, receiver_reply) = record(&receiver, CUT).await;
+    let expected = json!({"result":{"cutId":CUT,"agentId":AGENT,"refs":[
         {"ref_kind":"pi","ref":"p"},
         {"ref_kind":"session","ref":"a"},
         {"ref_kind":"session","ref":"z"}
     ]}});
     assert_eq!(source_reply, expected);
     assert_eq!(receiver_reply, expected);
-    let (unknown, refusal) = record(&pair.b, UNKNOWN).await;
+    let (unknown, refusal) = record(&receiver, UNKNOWN).await;
     assert_eq!(refusal["code"], "unknown_move");
     let mut sums = String::new();
     for (name, record) in [
-        ("source.json", source),
-        ("receiver.json", receiver),
+        ("source.json", source_record),
+        ("receiver.json", receiver_record),
         ("unknown-cut.json", unknown),
     ] {
         let bytes = format!("[\n{record}\n]\n");
@@ -108,6 +127,8 @@ async fn move_refs_records_match_published_files() {
     } else {
         assert_eq!(std::fs::read_to_string(path).unwrap(), sums);
     }
-    pair.finish(&cut).await;
-    pair.clean();
+    drop(source);
+    drop(receiver);
+    std::fs::remove_dir_all(source_dir).unwrap();
+    std::fs::remove_dir_all(receiver_dir).unwrap();
 }

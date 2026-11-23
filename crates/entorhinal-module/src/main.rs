@@ -528,7 +528,6 @@ struct HealthGauges {
     claim_refreshed: AtomicU64,
     claim_failed: AtomicU64,
     claim_conflicts: AtomicU64,
-    claim_conflict_agents: Mutex<std::collections::HashSet<String>>,
     claim_version_unknown: AtomicU64,
     claim_subject_mismatch: AtomicU64,
     claim_malformed: AtomicU64,
@@ -653,7 +652,6 @@ struct ProjectsHandler {
     hub_tail_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     hub_shared_log: Arc<Mutex<Option<Arc<dyn hub_identity_log::SharedLog>>>>,
     hub_switch: Option<hub_switch::Switch>,
-    legacy_move_admission: Arc<Mutex<()>>,
     catch_up_wake: Arc<tokio::sync::Notify>,
     record_client: record_client::RecordClient,
     participant_discovery: Arc<dyn participant_discovery::ParticipantDiscovery>,
@@ -673,8 +671,6 @@ struct ProjectsHandler {
     door_client: door_client::DoorClient,
     move_wake: Arc<move_driver::MoveWake>,
     move_driver_task: Mutex<Option<move_driver::MoveDriver>>,
-    legacy_claim_pass: tokio::sync::Mutex<()>,
-    claim_refresh_sql: Arc<move_driver::SqlOperations>,
     /// The queue of session end stamps from observed bucket deletes, and the task
     /// that writes them and prunes long-ended bindings.
     session_upkeep: Arc<session_upkeep::SessionUpkeep>,
@@ -1033,10 +1029,6 @@ impl ProjectsHandler {
         let clock_origin = module_started_at;
         let request_clock =
             Arc::new(move || clock_origin.elapsed().as_micros().min(u64::MAX as u128) as u64);
-        let record_connector = Arc::new(move_driver::ReconnectConnector {
-            inner: record_connector,
-            wake: move_wake.clone(),
-        });
         let store = Arc::new(Mutex::new(None));
         let fence = hub_switch::LegacyFence::new(&store);
         let legacy_move_admission = Arc::new(Mutex::new(()));
@@ -1090,7 +1082,6 @@ impl ProjectsHandler {
             hub_tail_task: Arc::default(),
             hub_shared_log: Arc::default(),
             hub_switch,
-            legacy_move_admission,
             catch_up_wake: Arc::default(),
             record_client: record_client::RecordClient::new(record_connector).fenced(fence),
             participant_discovery,
@@ -1107,8 +1098,6 @@ impl ProjectsHandler {
             )),
             move_wake,
             move_driver_task: Mutex::new(None),
-            legacy_claim_pass: tokio::sync::Mutex::new(()),
-            claim_refresh_sql: Arc::default(),
             session_upkeep: Arc::default(),
             session_upkeep_task: Mutex::new(None),
             session_upkeep_sql: Arc::default(),
@@ -3354,7 +3343,6 @@ mod tests {
         stop_catch_up(handler).await;
         handler.stop_hub_residence().await;
         handler.stop_move_driver().await;
-        handler.claim_refresh_sql.wait().await;
         handler.stop_catalog_poll().await;
         handler.stop_session_upkeep().await;
         handler.stop_bus_changes().await;

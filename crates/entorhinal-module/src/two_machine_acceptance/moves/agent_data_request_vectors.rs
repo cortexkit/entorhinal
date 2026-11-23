@@ -1,4 +1,14 @@
-use super::*;
+use super::super::*;
+use crate::{
+    fake_daemon::{DaemonSnapshot, FakeDaemon, WireDaemon},
+    fake_participant::FakeParticipant,
+    participant_client::{AgentRef, CutRequest, ParticipantClient, Refs, ReleaseRequest},
+    participant_discovery::{
+        provider_role, Participant, ParticipantDiscovery, SubcParticipantDiscovery,
+    },
+    sessions::{FakeResolver, ProviderResolution, HOST_CAPABILITY, ORCHESTRATOR_CAPABILITY},
+};
+use cortexkit_role_agent_data::refs::CutId;
 use sha2::{Digest, Sha256};
 
 const DIRECTORY: &str = "agent-data-requests-v1";
@@ -8,6 +18,8 @@ const SESSION: &str = "session-example-001";
 const PROJECT_ROOT: &str = "/workspace/agent-data-example";
 const INCARNATION: &str = "0123456789abcdef";
 const KIND: &str = "opencode-session";
+const AGENT: &str = "agent_0123456789abcdef";
+const TO: &str = "02020202020202020202020202020202";
 const RECEIVER_BOX: &str = "abcdef0123456789abcdef0123456789";
 
 // The deprecated generator is needed to publish requests for stored legacy refs.
@@ -72,96 +84,119 @@ async fn registered_session(machine: &Machine, reference: &str) -> Vec<String> {
     vec![registration, lookup]
 }
 
-async fn capture(reference: &str, abort: bool, receiver_box: Option<&str>) -> Vec<String> {
-    let mut pair = Pair::new(&[]).await;
-    if let Some(box_id) = receiver_box {
-        pair.a
-            .store()
-            .apply_remote_entry(
-                &entorhinal_core::remote_apply::RemoteEntry {
-                    position: 1,
-                    entry_id: "01".repeat(16),
-                    author: B.into(),
-                    signer: "02".repeat(16),
-                    key_id: "03".repeat(16),
-                    envelope_version: 1,
-                    kind: "change".into(),
-                    entry: serde_json::to_vec(
-                        &json!({"op":"member.set_box","author":B,"box_id":box_id}),
-                    )
-                    .unwrap(),
-                },
-                None,
-            )
-            .unwrap();
-    }
-    let mut daemons = Vec::new();
-    let mut wires = Vec::new();
-    for (source, node) in [(true, &mut pair.a), (false, &mut pair.b)] {
-        node.machine.handler.incarnation = INCARNATION.into();
-        let resolver = FakeResolver::new();
-        for capability in [ORCHESTRATOR_CAPABILITY, crate::sessions::HOST_CAPABILITY] {
-            resolver.set(
-                capability,
-                ProviderResolution::Provider(WRITER_MODULE.into()),
-            );
-        }
-        node.machine.handler.provider_resolver = resolver;
-        let agent_ref = AgentRef::new(KIND, reference);
-        let participant = Arc::new(FakeParticipant::new(
-            &[KIND],
-            if source { vec![agent_ref] } else { vec![] },
-        ));
-        let stream = CutItem {
-            session_ref: "00000000000000000000000000000010".into(),
-            stream: format!("reserved:{RUNNER}"),
-            end_offset: 42,
-            digest: "a".repeat(64),
-        };
-        node.door.set_stream(stream.clone());
-        participant.set_prepare(
-            serde_json::from_value(json!({"items":[{
+async fn participant(
+    reference: &str,
+    source: bool,
+    connection_file: &Path,
+) -> (ParticipantClient, FakeDaemon, WireDaemon) {
+    let agent_ref = AgentRef::new(KIND, reference);
+    let participant = Arc::new(FakeParticipant::new(
+        &[KIND],
+        if source { vec![agent_ref] } else { vec![] },
+    ));
+    let stream = crate::door_client::CutItem {
+        session_ref: "00000000000000000000000000000010".into(),
+        stream: format!("reserved:{RUNNER}"),
+        end_offset: 42,
+        digest: "a".repeat(64),
+    };
+    participant.set_prepare(
+        serde_json::from_value(json!({"items":[{
             "ref_kind":KIND,"ref":reference,"sessionRef":stream.session_ref,
             "stream":stream.stream,"endOffset":42,"digest":stream.digest,
             "format":"v1","frozen":true
         }],"external":[]}))
-            .unwrap(),
+        .unwrap(),
+    );
+    let daemon = FakeDaemon::new(DaemonSnapshot::new(
+        1,
+        vec![json!({"module_id":RUNNER,"state":"running","enabled":true,"live":true,"health":"ok"})],
+        vec![json!({"module_id":RUNNER,"ready":true,"not_ready":null,"control_ops":[],"roles":[provider_role()],
+            "capabilities":{"provides":["agent-data/v1"],"requires":[],"must_never_reach":[]}})],
+    ))
+    .with_participant(participant);
+    let wire = WireDaemon::start(daemon.clone(), connection_file).await;
+    let connector = Arc::new(crate::log_client::SubcConnector::from_args([
+        std::ffi::OsString::from("--subc"),
+        connection_file.as_os_str().to_owned(),
+    ]));
+    let discovery = SubcParticipantDiscovery::new(connector);
+    let transport = drive(discovery.open_participant(RUNNER)).await.unwrap();
+    let client = ParticipantClient::new(&Participant {
+        module_id: RUNNER.into(),
+        transport,
+    });
+    (client, daemon, wire)
+}
+
+async fn capture(reference: &str, abort: bool, receiver_box: Option<&str>) -> Vec<String> {
+    let mut machine = Machine::new("agent-data-request-vector", Arc::new(FakeLog::default()));
+    machine.handler.clock = || 1000;
+    machine.handler.incarnation = INCARNATION.into();
+    let resolver = FakeResolver::new();
+    for capability in [ORCHESTRATOR_CAPABILITY, HOST_CAPABILITY] {
+        resolver.set(
+            capability,
+            ProviderResolution::Provider(WRITER_MODULE.into()),
         );
-        let daemon =
-            FakeDaemon::new(snapshot(&[(RUNNER, KIND)], true, true)).with_participant(participant);
-        let connection_file = node.machine.dir.join("participant-subc.json");
-        wires.push(crate::fake_daemon::WireDaemon::start(daemon.clone(), &connection_file).await);
-        let connector = Arc::new(crate::log_client::SubcConnector::from_args([
-            std::ffi::OsString::from("--subc"),
-            connection_file.into_os_string(),
-        ]));
-        node.machine.handler.participant_discovery = Arc::new(
-            crate::participant_discovery::SubcParticipantDiscovery::new(connector),
-        );
-        daemons.push(daemon);
     }
-    let mut records = registered_session(&pair.a.machine, reference).await;
-    // A completed session keeps its binding, but admission requires a fresh
-    // liveness answer that no session process is still running.
-    {
-        let mut liveness = pair.a.machine.handler.liveness.lock().unwrap();
-        crate::liveness_bus::tests::reconcile(&mut liveness);
-    }
-    let cut = pair.a.admit_to(B, "example-move").await.unwrap();
+    machine.handler.provider_resolver = resolver;
+    machine
+        .store()
+        .apply_entry("agent.cutover", "{}", "fixture", None, |_| Ok(()))
+        .unwrap();
+    machine
+        .store()
+        .apply_entry("fixture.agent", "{}", "fixture", None, |tx| {
+            tx.execute(
+                "INSERT INTO agent(agent_id,name,tag,role,created_at_ms,updated_at_ms) VALUES(?1,'Agent','R','assistant',1,1)",
+                [AGENT],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let mut records = registered_session(&machine, reference).await;
+    let (source, source_daemon, _source_wire) = participant(
+        reference,
+        true,
+        &machine.dir.join("source-participant.json"),
+    )
+    .await;
+    let (receiver, receiver_daemon, _receiver_wire) = participant(
+        reference,
+        false,
+        &machine.dir.join("receiver-participant.json"),
+    )
+    .await;
+    let cut = crate::hub_write::new_op_id().unwrap();
+    let request = CutRequest::new(
+        Refs::new(vec![AgentRef::new(KIND, reference)]).unwrap(),
+        CutId::new(cut.clone()).unwrap(),
+    );
+
+    drive(source.describe()).await.unwrap();
+    drive(source.busy(&[AgentRef::new(KIND, reference)]))
+        .await
+        .unwrap();
+    drive(source.prepare(&request)).await.unwrap();
+    drive(source.export(&request)).await.unwrap();
     if abort {
-        pair.a.source_until(&cut, MoveStep::Exported).await;
-        pair.a.abort(&cut);
-        pair.a.source_until(&cut, MoveStep::Aborted).await;
+        drive(source.abort(&request)).await.unwrap();
         records.clear();
     } else {
-        pair.a
-            .door
-            .script("cut.seal", DoorEffect::Seal(SealState::Published, None));
-        pair.a.source_until(&cut, MoveStep::Published).await;
-        pair.finish(&cut).await;
+        let release = ReleaseRequest::new(request.refs.clone(), request.cut_id.clone(), TO);
+        let release = if let Some(box_id) = receiver_box {
+            release.with_holder_box(box_id).unwrap()
+        } else {
+            release
+        };
+        drive(source.release(&release)).await.unwrap();
+        drive(receiver.describe()).await.unwrap();
+        drive(receiver.diverged(&request)).await.unwrap();
+        drive(receiver.import(&request)).await.unwrap();
+        drive(receiver.activate(&request)).await.unwrap();
     }
-    // Admission mints a random cut ID. Replace only that string in the captured
-    // bytes; never parse and re-encode a request to produce the published body.
+
     let normalized_cut = if abort {
         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     } else {
@@ -169,7 +204,7 @@ async fn capture(reference: &str, abort: bool, receiver_box: Option<&str>) -> Ve
     };
     for (side, daemon) in [if abort { "source-abort" } else { "source" }, "receiver"]
         .into_iter()
-        .zip(&daemons)
+        .zip([source_daemon, receiver_daemon])
     {
         let calls = daemon.request_bytes();
         let expected: &[&str] = match side {
@@ -192,7 +227,7 @@ async fn capture(reference: &str, abort: bool, receiver_box: Option<&str>) -> Ve
                 assert_eq!(request["params"]["cutId"], cut);
             }
             if *op == "release" {
-                assert_eq!(request["params"]["holder"], B);
+                assert_eq!(request["params"]["holder"], TO);
                 assert_eq!(
                     request["params"].get("holderBox"),
                     receiver_box.map(|id| json!(id)).as_ref()
@@ -255,7 +290,6 @@ async fn served_vectors_agent_data_requests_probe() {
         publish(name, bytes.as_bytes());
         sums.push_str(&format!("{:x}  {name}\n", Sha256::digest(bytes.as_bytes())));
         if name == "new-format.json" {
-            // Keep the two original samples and their published hashes unchanged.
             let mut records = capture(&reference, false, Some(RECEIVER_BOX)).await;
             records.extend(aborted);
             let bytes = format!("[\n{}\n]\n", records.join(",\n"));

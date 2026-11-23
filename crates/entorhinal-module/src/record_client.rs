@@ -171,12 +171,6 @@ pub(crate) struct CasRequest {
     pub write_id: [u8; 16],
 }
 
-#[derive(Debug)]
-pub(crate) enum CasSettlement {
-    Landed(u64),
-    Moved(RecordReply),
-}
-
 #[derive(Clone)]
 pub(crate) struct RecordClient {
     connector: Arc<dyn LogConnector>,
@@ -321,42 +315,6 @@ impl RecordClient {
         Ok((entries, page.next))
     }
 
-    /// Resend the exact attempt first. Once its receipt has aged out of the
-    /// 64-version window, only a verified subject read can establish whether it
-    /// landed. Compare decoded values, not encoding choices such as whitespace.
-    pub(crate) async fn cas_settled<T: PartialEq>(
-        &self,
-        request: &CasRequest,
-        author: &str,
-        decode: impl Fn(&[u8]) -> Result<T, &'static str>,
-    ) -> Result<CasSettlement, RecordError> {
-        match self.cas(request).await {
-            Ok(version) => Ok(CasSettlement::Landed(version)),
-            Err(error)
-                if error.code() == "version_moved" || matches!(error, RecordError::NoReply) =>
-            {
-                let reply = self.read(&request.subject).await?;
-                // A cached body cannot prove either success or loss of an unanswered write.
-                if reply.stale {
-                    return Err(RecordError::refusal("unavailable", None));
-                }
-                let expected =
-                    decode(&request.body).map_err(|code| RecordError::refusal(code, None))?;
-                let matches = reply
-                    .body
-                    .as_deref()
-                    .and_then(|body| decode(body).ok())
-                    .is_some_and(|body| body == expected);
-                if !reply.absent && reply.author.as_deref() == Some(author) && matches {
-                    Ok(CasSettlement::Landed(reply.version))
-                } else {
-                    Ok(CasSettlement::Moved(reply))
-                }
-            }
-            Err(error) => Err(error),
-        }
-    }
-
     pub(crate) async fn cas(&self, request: &CasRequest) -> Result<u64, RecordError> {
         self.cas_with_drain(request, false).await
     }
@@ -397,89 +355,4 @@ impl RecordClient {
 #[cfg(test)]
 pub(crate) fn wire_reply(reply: &RecordReply) -> Value {
     json!({"absent":reply.absent,"version":reply.version,"body":reply.body.as_ref().map(|b| encode_hex(b)),"author":reply.author,"self_author":reply.self_author,"stale":reply.stale})
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::log_client::{LogTransport, TransportError};
-    use async_trait::async_trait;
-
-    struct StalePeer {
-        reply: RecordReply,
-    }
-    #[async_trait]
-    impl LogConnector for StalePeer {
-        async fn connect(&self) -> Result<Arc<dyn LogTransport>, TransportError> {
-            Ok(Arc::new(Self {
-                reply: self.reply.clone(),
-            }))
-        }
-    }
-    #[async_trait]
-    impl LogTransport for StalePeer {
-        async fn call(&self, method: &str, _: Value) -> Result<Vec<u8>, TransportError> {
-            if method == CAS {
-                return Err(TransportError::Refusal {
-                    code: "version_moved".into(),
-                    detail: None,
-                    message: None,
-                });
-            }
-            assert_eq!(method, READ);
-            Ok(serde_json::to_vec(&json!({"result":wire_reply(&self.reply)})).unwrap())
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn stale_reads_never_settle_claim_role_or_move_cas() {
-        let author = "01010101010101010101010101010101";
-        for subject in [
-            "claim:agent_0123456789abcdef",
-            "role:assistant",
-            "move:0123456789abcdef0123456789abcdef",
-        ] {
-            for matching in [false, true] {
-                for stale in [false, true] {
-                    let body = if matching {
-                        b"{\"holder\":\"new\"}".to_vec()
-                    } else {
-                        b"{\"holder\":\"old\"}".to_vec()
-                    };
-                    let client = RecordClient::new(Arc::new(StalePeer {
-                        reply: RecordReply {
-                            absent: false,
-                            version: 2,
-                            body: Some(body),
-                            author: Some(author.into()),
-                            self_author: author.into(),
-                            stale,
-                        },
-                    }));
-                    let request = CasRequest {
-                        subject: subject.into(),
-                        expected_version: 1,
-                        body: b"{\"holder\":\"new\"}".to_vec(),
-                        write_id: [1; 16],
-                    };
-                    let result = client
-                        .cas_settled(&request, author, |b| {
-                            serde_json::from_slice::<Value>(b).map_err(|_| "malformed")
-                        })
-                        .await;
-                    if stale {
-                        assert_eq!(
-                            result.unwrap_err().code(),
-                            "unavailable",
-                            "{subject}/{matching}"
-                        );
-                    } else if matching {
-                        assert!(matches!(result, Ok(CasSettlement::Landed(2))));
-                    } else {
-                        assert!(matches!(result, Ok(CasSettlement::Moved(_))));
-                    }
-                }
-            }
-        }
-    }
 }

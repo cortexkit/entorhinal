@@ -317,7 +317,7 @@ impl Receiver {
             plan,
             progress,
             seen.body.participant_plan(),
-            Some((hub, seen)),
+            (hub, seen),
         )
         .await?;
         Ok(Duration::ZERO)
@@ -346,7 +346,7 @@ impl Receiver {
                     }
                     _ => {}
                 };
-                self.cleanup(row, plan, progress, true).await?;
+                self.cleanup(row, plan, progress).await?;
                 return Ok(Duration::ZERO);
             }
             HubState::Published | HubState::Staged => {

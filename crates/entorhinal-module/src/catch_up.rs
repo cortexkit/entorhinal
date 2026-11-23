@@ -1603,7 +1603,7 @@ mod tests {
         hub.activate();
         f.handler.hub_switch = Some(crate::hub_switch::Switch::new(
             hub,
-            f.handler.legacy_move_admission.clone(),
+            std::sync::Arc::new(std::sync::Mutex::new(())),
             f.handler.participant_discovery.clone(),
         ));
         f.handler.start_catch_up();
