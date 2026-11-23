@@ -19,7 +19,9 @@ use super::{move_driver::SqlOperations, HealthGauges, Ordering, ProjectsHandler}
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
-// Probe occasionally in case the daemon's catalog change notice was missed.
+// While ck-bus is disabled, a client waits for the daemon's catalog to change
+// before reconnecting. It still retries after this long, in case it missed a
+// catalog change notice.
 const CATALOG_WAIT_CAP: Duration = Duration::from_secs(15 * 60);
 type Values = BTreeMap<&'static str, Vec<u8>>;
 
