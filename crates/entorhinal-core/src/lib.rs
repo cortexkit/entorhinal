@@ -55,6 +55,8 @@ pub mod store_origin;
 pub mod user_profile;
 mod where_notify;
 pub use binding::*;
+#[cfg(feature = "legacy-store-for-tests")]
+pub use legacy_sharing::test_access::legacy_sharing_test_allow;
 pub use mutations::*;
 pub use ownership::{ResolveRemoteReply, ResolveRemoteStatus, SetOwnedRemotesRequest};
 pub use root_keys::{
@@ -447,13 +449,21 @@ impl RegistryStore {
             )));
         };
         let chain_max = migrations.iter().map(|m| m.version).max().unwrap_or(0);
-        legacy_sharing::probe(descriptor, path, chain_max)?;
+        #[cfg(feature = "legacy-store-for-tests")]
+        let check_legacy = !legacy_sharing::test_access::is_allowed(path.as_ref());
+        #[cfg(not(feature = "legacy-store-for-tests"))]
+        let check_legacy = true;
+        if check_legacy {
+            legacy_sharing::probe(descriptor, path, chain_max)?;
+        }
         let db = open_sqlite(descriptor).map_err(RegistryError::Store)?;
         // Another writer may have changed the store during the lease handoff.
-        legacy_sharing::refuse(
-            db.with_conn(|conn| legacy_sharing::is_legacy(conn, chain_max))
-                .map_err(RegistryError::Store)?,
-        )?;
+        if check_legacy {
+            legacy_sharing::refuse(
+                db.with_conn(|conn| legacy_sharing::is_legacy(conn, chain_max))
+                    .map_err(RegistryError::Store)?,
+            )?;
+        }
         let outcome = db
             .migrate(MIGRATION_NAMESPACE, migrations)
             .map_err(RegistryError::Store)?;

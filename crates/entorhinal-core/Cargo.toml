@@ -7,6 +7,9 @@ repository = "https://github.com/cortexkit/entorhinal"
 publish = false
 description = "Pure domain and journal-spine store for the ck-entorhinal registry."
 
+[features]
+legacy-store-for-tests = []
+
 [dependencies]
 entorhinal-catalog = { path = "../entorhinal-catalog" }
 blake3 = { workspace = true }
