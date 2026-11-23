@@ -37,6 +37,7 @@ pub(super) const PROJECTION_SNAPSHOT_KIND: &str = "shared.snapshot";
 pub(super) struct HubSql {
     slot: Weak<Mutex<Option<RegistryStore>>>,
     operations: Arc<SqlOperations>,
+    refusal: Option<Arc<crate::store_open::Refusal>>,
 }
 
 impl HubSql {
@@ -47,7 +48,13 @@ impl HubSql {
         Self {
             slot: Arc::downgrade(slot),
             operations,
+            refusal: None,
         }
+    }
+
+    pub(super) fn with_refusal(mut self, refusal: Arc<crate::store_open::Refusal>) -> Self {
+        self.refusal = Some(refusal);
+        self
     }
 
     #[cfg(test)]
@@ -126,14 +133,18 @@ impl HubSql {
             + (remaining - remaining.min(Duration::from_millis(25)) / 2)
                 .min(Duration::from_secs(2));
         let slot = self.slot.clone();
+        let refusal = self.refusal.clone();
         let mut job = tokio::task::spawn_blocking(self.operations.tracked(move || {
             if Instant::now() >= deadline {
                 return Err(sql_timeout(operation));
             }
-            let store = slot
-                .upgrade()
-                .and_then(|slot| slot.lock().unwrap().clone())
-                .ok_or_else(store_unavailable)?;
+            let store = match refusal {
+                Some(refusal) => refusal.lookup_weak(&slot, store_unavailable)?,
+                None => slot
+                    .upgrade()
+                    .and_then(|slot| slot.lock().unwrap().clone())
+                    .ok_or_else(store_unavailable)?,
+            };
             work(&store)
         }));
         match timeout_at(deadline, &mut job).await {

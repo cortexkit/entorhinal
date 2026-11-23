@@ -175,6 +175,11 @@ impl ProjectsHandler {
         HubSql::new(&self.store, self.hub_sql.clone())
     }
 
+    pub(super) fn served_hub_sql(&self) -> HubSql {
+        self.hub_sql()
+            .with_refusal(self.health.store_refusal.clone())
+    }
+
     pub(super) async fn stop_hub_tasks(&self) {
         // Stop activation before stopping the consumers it can install.
         if self.hub_switch.is_some() {

@@ -227,14 +227,9 @@ impl ProjectsHandler {
         &self,
         read: impl FnOnce(&RegistryStore) -> Result<T, entorhinal_core::agent::AgentMutationError>,
     ) -> Result<T, HandlerError> {
-        let guard = self
-            .store
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let store = guard.as_ref().cloned().ok_or_else(|| {
+        let store = self.health.store_refusal.lookup(&self.store, || {
             HandlerError::new("storage_unavailable", "agent identity storage is not ready")
         })?;
-        drop(guard);
         read(&store).map_err(HandlerError::from)
     }
 

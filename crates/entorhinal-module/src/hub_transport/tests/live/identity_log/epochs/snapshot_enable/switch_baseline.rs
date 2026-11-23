@@ -185,6 +185,7 @@ async fn fixture(record_to: Option<&Path>) {
     let leader_file = StoreFile::new("switch-existing");
     let image = switch_snapshot();
     freeze_leader(&leader_file.open(), &image);
+    entorhinal_core::legacy_sharing_test_allow(leader_file.path());
     let (mut a, leader, _) = bootstrap(
         &rig,
         leader_file.open(),

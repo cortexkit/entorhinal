@@ -212,6 +212,7 @@ mod tests {
         }
         fn restart(&mut self, connector: Arc<dyn LogConnector>) {
             self.handler.store.lock().unwrap().take();
+            crate::tests::allow_legacy_store(&self.descriptor);
             self.handler = Self::handler(&self.descriptor, connector);
         }
         fn store(&self) -> RegistryStore {
@@ -3335,7 +3336,7 @@ impl ProjectsHandler {
                 .map_err(|error| HandlerError::new("storage_error", error.to_string()))?;
         }
         let candidate = agent_write || shared_candidate(&request.method);
-        let hub_sql = self.hub_sql();
+        let hub_sql = self.served_hub_sql();
         let early_deadline = received + DEADLINE;
         let read_backend = |store: &RegistryStore| {
             let hub = store.hub_log_base()?.is_some();
@@ -3663,7 +3664,12 @@ impl ProjectsHandler {
                 Ok(body)
             });
         }
-        let store = store.ok_or_else(crate::hub_write::store_unavailable)?;
+        let store = store.ok_or_else(|| {
+            self.health
+                .store_refusal
+                .get()
+                .unwrap_or_else(crate::hub_write::store_unavailable)
+        })?;
         if candidate
             && matches!(
                 store.engram_freeze()?,
@@ -3888,7 +3894,7 @@ impl ProjectsHandler {
         })?;
         let (key, digest) = hub_request(request, &write)?;
         let key = key.map_or_else(crate::hub_write::new_op_id, Ok)?;
-        let sql = self.hub_sql();
+        let sql = self.served_hub_sql();
         let lookup = key.clone();
         let proof = digest.clone();
         let (reply, saved_time) = sql

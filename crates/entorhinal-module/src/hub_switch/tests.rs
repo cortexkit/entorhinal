@@ -188,6 +188,7 @@ impl Fixture {
     }
     fn restart(&self) {
         self.slot.lock().unwrap().take();
+        crate::tests::allow_legacy_store(&self.descriptor);
         *self.slot.lock().unwrap() = Some(RegistryStore::open(&self.descriptor).unwrap());
     }
     fn record_client(&self) -> RecordClient {

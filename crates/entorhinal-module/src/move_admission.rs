@@ -1573,6 +1573,7 @@ mod tests {
             .unwrap()
             .unwrap();
         *f.handler.store.lock().unwrap() = None;
+        crate::tests::allow_legacy_store(&f.descriptor);
         let restarted = RegistryStore::open(&f.descriptor).unwrap();
         assert_eq!(restarted.list_open_agent_moves().unwrap(), vec![checkpoint]);
         *f.handler.store.lock().unwrap() = Some(restarted);

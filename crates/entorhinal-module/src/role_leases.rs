@@ -1180,7 +1180,7 @@ impl ProjectsHandler {
         #[cfg(test)]
         let before_local_refresh = self.role_leases.before_local_refresh.clone();
         let decision = self
-            .hub_sql()
+            .served_hub_sql()
             .run(
                 Instant::now() + Duration::from_secs(5),
                 "local_role_view",

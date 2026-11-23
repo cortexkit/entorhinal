@@ -135,7 +135,17 @@ impl Machine {
         self.handler = Self::open(&self.descriptor, connector);
     }
 
-    fn restore(label: &str, snapshot: &Path, connector: Arc<dyn LogConnector>) -> Self {
+    async fn restart_legacy(&mut self, connector: Arc<dyn LogConnector>) {
+        crate::tests::allow_legacy_store(&self.descriptor);
+        self.restart(connector).await;
+    }
+
+    fn restore(
+        label: &str,
+        snapshot: &Path,
+        connector: Arc<dyn LogConnector>,
+        prepare_open: impl FnOnce(&StorageDescriptor),
+    ) -> Self {
         let (dir, descriptor) = crate::tests::scratch_descriptor(label);
         let StorageBackend::Sqlite { path } = &descriptor.backend else {
             unreachable!()
@@ -143,6 +153,7 @@ impl Machine {
         // The snapshot is a closed SQLite backup, not an open store whose WAL
         // might be missing. Restore it before opening the new handler.
         std::fs::copy(snapshot, path).unwrap();
+        prepare_open(&descriptor);
         let handler = Self::open(&descriptor, connector);
         Self {
             dir: crate::tests::canonical_test_path(dir),
@@ -1035,7 +1046,7 @@ async fn restored_pre_enable_store_supersedes_and_three_members_converge() {
         .is_pending());
     let before = tokio::time::Instant::now();
 
-    let a2 = Machine::restore("incident-a2", &backup, author_a.clone());
+    let a2 = Machine::restore("incident-a2", &backup, author_a.clone(), |_| {});
     assert_eq!(a2.shared(), before_shared);
     assert_eq!(a2.local(), before_local);
     assert_eq!(a2.rows("registry_journal"), before_journal);
@@ -1539,7 +1550,7 @@ async fn absent_engram_all_reads_startup_and_same_key_core_retry() {
         .unwrap();
     let id = created["agent"]["agent_id"].as_str().unwrap();
     let absent = Arc::new(Absent::default());
-    m.restart(absent.clone()).await;
+    m.restart_legacy(absent.clone()).await;
     assert_eq!(m.handler.health().await.status, HealthStatus::Ok);
     assert_eq!(
         absent.calls.load(Ordering::SeqCst),
@@ -1601,10 +1612,10 @@ async fn absent_engram_all_reads_startup_and_same_key_core_retry() {
         m.store().identity_log_status().unwrap().pending_write_count,
         0
     );
-    m.restart(log.clone()).await;
+    m.restart_legacy(log.clone()).await;
     let committed = m.bytes_on(CORE, "register", request.clone()).await.unwrap();
     let journal = m.rows("registry_journal");
-    m.restart(Arc::new(FailConnector::default())).await;
+    m.restart_legacy(Arc::new(FailConnector::default())).await;
     assert_eq!(
         m.bytes_on(CORE, "register", request).await.unwrap(),
         committed
@@ -1628,7 +1639,7 @@ async fn absent_engram_local_writes_keep_keys_and_workspace_timestamps() {
     let clone = m.repo("clone", &[("origin", "local/p")]);
     m.call("attach_root", json!({"path":clone})).await.unwrap();
     let fail = Arc::new(FailConnector::default());
-    m.restart(fail.clone()).await;
+    m.restart_legacy(fail.clone()).await;
     let shared = m.shared();
     let head = log.head();
     m.approve(&clone).await;
@@ -2204,6 +2215,7 @@ mod moves {
         async fn restart(&mut self) {
             self.machine.handler.stop_move_driver().await;
             self.machine.handler.store.lock().unwrap().take();
+            crate::tests::allow_legacy_store(&self.machine.descriptor);
             self.machine.handler = Machine::open_with_record(
                 &self.machine.descriptor,
                 self.log.clone(),
@@ -4628,7 +4640,7 @@ async fn avatar_batch_drain_interrupts_append_without_waiting_for_network_and_re
     // from the log, then resume only the remaining manifest entries.
     log.release_next().unwrap();
     b.catch_up().await;
-    a.restart(log.clone()).await;
+    a.restart_legacy(log.clone()).await;
     a.handler.operator_confirmer = Arc::new(crate::served_vectors::Approve {
         summaries: std::sync::Mutex::new(vec![]),
     });
@@ -4653,7 +4665,7 @@ async fn avatar_batch_drain_interrupts_append_without_waiting_for_network_and_re
 #[tokio::test(start_paused = true)]
 async fn cold_fleet_and_avatar_reads_do_not_wait_for_background_log_read() {
     let (mut a, b, log, _, id) = avatar_incident_pair().await;
-    a.restart(log.clone()).await;
+    a.restart_legacy(log.clone()).await;
     let calls = log.calls();
     log.on_read(crate::fake_log::Action::Hang);
     a.handler.start_catch_up();
@@ -4912,6 +4924,7 @@ async fn adopt_store_shared_restore_rejoins_with_new_author_and_installs_agents(
         "origin-restored",
         &backup,
         Arc::new(log.with_author([0x22; 16])),
+        crate::tests::allow_legacy_store,
     );
     let store = b.store();
     store

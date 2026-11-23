@@ -132,15 +132,27 @@ fn placement_commit(
     id: &str,
     action: impl Fn() -> Result<Vec<u8>, entorhinal_core::RegistryError>,
 ) {
-    let head = store.identity_log_status().unwrap().last_applied_position;
+    let author = "ab".repeat(16);
+    let preview = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let captured = preview.clone();
     store
-        .shared_attempt(
+        .preview_hub_write(
             id.into(),
-            head,
-            move |_| entorhinal_core::SharedSettlement::Commit(head + 1),
+            move |entry, _| *captured.lock().unwrap() = Some(entry),
             action,
         )
-        .unwrap();
+        .expect_err("preview rolls back before the hub entry is applied");
+    let entry = entorhinal_core::remote_apply::RemoteEntry {
+        position: store.identity_log_status().unwrap().last_applied_position + 1,
+        entry_id: id.into(),
+        author: author.clone(),
+        signer: author,
+        key_id: "key".into(),
+        envelope_version: 1,
+        kind: "change".into(),
+        entry: preview.lock().unwrap().take().expect("placement preview"),
+    };
+    store.apply_hub_remote_entry(&entry, 1).unwrap();
 }
 
 fn backfill(f: &Fixture) {
@@ -148,7 +160,7 @@ fn backfill(f: &Fixture) {
     store
         .apply_entry("identity_log.enable", "{}", "operator", None, |tx| {
             tx.execute(
-                "UPDATE identity_log_state SET state='enabled' WHERE id=1",
+                "UPDATE identity_log_state SET state='enabled', hub_log_base=0 WHERE id=1",
                 [],
             )?;
             tx.execute(

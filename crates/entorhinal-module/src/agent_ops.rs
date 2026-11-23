@@ -276,14 +276,9 @@ impl ProjectsHandler {
         principal: &str,
     ) -> Result<Vec<u8>, HandlerError> {
         let result = (|| {
-            let guard = self
-                .store
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let store = guard.as_ref().cloned().ok_or_else(|| {
+            let store = self.health.store_refusal.lookup(&self.store, || {
                 HandlerError::new("storage_unavailable", "agent identity storage is not ready")
             })?;
-            drop(guard);
             let writer = store.with_principal(principal);
             let body = if method == "agent.import" {
                 writer.agent_import(params, (self.clock)())

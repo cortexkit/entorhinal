@@ -532,6 +532,15 @@ fn run_with_directory(
     read: super::current_directory::CwdReader,
     stderr: &mut impl std::io::Write,
 ) -> ExitCode {
+    run_command(command, read, stderr, call)
+}
+
+fn run_command(
+    command: Command,
+    read: super::current_directory::CwdReader,
+    stderr: &mut impl std::io::Write,
+    call: impl Fn(Option<&Path>, &Command, &str, Value) -> Result<Value, (u8, String)>,
+) -> ExitCode {
     let cwd = match super::current_directory::read_current_directory(read) {
         Ok(cwd) => cwd,
         Err(error) => {
@@ -1691,22 +1700,46 @@ fn call(
                         method,
                         &error,
                     );
-                    match error {
-                        // A module refusal is the registry answering, and its code is
-                        // the answer: `not_found` and a store failure need different
-                        // reactions from the operator, so the code is surfaced verbatim
-                        // rather than folded into a transport message.
-                        subc_client_rs::CallError::Module(body) => {
-                            (EXIT_REFUSED, format!("{}: {}", body.code, body.message))
-                        }
-                        other => (EXIT_TRANSPORT, format!("call: {other}")),
-                    }
+                    management_call_failure(error)
                 })?;
             let envelope = serde_json::from_slice(&bytes)
                 .map_err(|error| (EXIT_TRANSPORT, format!("decode response: {error}")))?;
             unwrap_result(envelope)
         }
     })
+}
+
+fn management_call_failure(error: subc_client_rs::CallError) -> (u8, String) {
+    match error {
+        // Preserve the registry's code so the operator can distinguish a
+        // missing record from a store that could not open.
+        subc_client_rs::CallError::Module(body) => {
+            (EXIT_REFUSED, format!("{}: {}", body.code, body.message))
+        }
+        other => (EXIT_TRANSPORT, format!("call: {other}")),
+    }
+}
+
+#[cfg(test)]
+pub(super) fn log_status_against(
+    call: impl Fn(&str, Value) -> subc_protocol::ErrorBody,
+) -> (ExitCode, String) {
+    let Invocation::Command(command) = parse(Face::Projects, &["log".into(), "status".into()])
+    else {
+        panic!("expected log status command");
+    };
+    let mut stderr = Vec::new();
+    let exit = run_command(
+        command,
+        std::env::current_dir,
+        &mut stderr,
+        |_, _, method, params| {
+            Err(management_call_failure(subc_client_rs::CallError::Module(
+                call(method, params),
+            )))
+        },
+    );
+    (exit, String::from_utf8(stderr).unwrap())
 }
 
 fn placement_call_options(method: &str) -> subc_client_rs::CallOptions {

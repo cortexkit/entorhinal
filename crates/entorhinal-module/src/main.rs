@@ -154,6 +154,9 @@ mod sessions;
 mod shared_write;
 #[cfg(test)]
 mod sharing_baselines;
+mod store_open;
+#[cfg(test)]
+mod store_open_tests;
 mod store_origin;
 mod tool_provider;
 mod watches;
@@ -499,6 +502,7 @@ struct HealthGauges {
     catalog: catalog_poll::Gauges,
     store_ready: AtomicBool,
     store_failed: AtomicBool,
+    store_refusal: Arc<store_open::Refusal>,
     /// True while the open is being retried against a lease a predecessor
     /// still holds; health reports degraded rather than failing, so the
     /// daemon serves `module_warming` to callers instead of a fault.
@@ -1226,19 +1230,12 @@ impl ProjectsHandler {
         &self,
         operation: impl FnOnce(&RegistryStore) -> Result<T, RegistryError>,
     ) -> Result<T, HandlerError> {
-        let guard = self
-            .store
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let store = guard.as_ref().cloned().ok_or_else(|| HandlerError {
-            code: "storage_unavailable".to_string(),
-            message: "projects storage is not ready".to_string(),
-            detail: None,
+        let store = self.health.store_refusal.lookup(&self.store, || {
+            HandlerError::new("storage_unavailable", "projects storage is not ready")
         })?;
         // The slot protects installation only. SQLite's writer connection lock
         // still serializes whole mutation transactions; reads have a separate
         // connection and must not queue behind a writer holding that lock.
-        drop(guard);
         operation(&store).map_err(|error| HandlerError {
             code: match &error {
                 RegistryError::Domain { code, .. } => code.clone(),
@@ -1416,7 +1413,9 @@ impl ModuleHandler for ProjectsHandler {
                 &self.store,
                 &self.health,
                 &self.catalog_sql,
-                outcome.map_err(|error| format!("opening projects storage: {error}")),
+                outcome.map_err(|error| {
+                    store_open::OpenFailure::from_open("opening projects storage", error)
+                }),
                 self.module_started_at,
                 Instant::now,
             ),
@@ -1438,7 +1437,7 @@ impl ModuleHandler for ProjectsHandler {
     async fn health(&self) -> HealthReport {
         // Health is deliberately insulated from the store mutex and database. The
         // daemon's health path must remain responsive even when a domain request is
-        // blocked or the store has failed; only cached atomic gauges are read here.
+        // blocked or the store has failed; read only cached health state here.
         // Read "opening" first, with Acquire: the retry task clears it with
         // Release only after installing the store, so once it reads false, the
         // ready and failed flags below already show the installed outcome.
@@ -1462,8 +1461,13 @@ impl ModuleHandler for ProjectsHandler {
         };
         let detail = if opening {
             Some("projects storage lease is held by an exiting predecessor; retrying".to_string())
+        } else if !ready {
+            Some(self.health.store_refusal.get().map_or_else(
+                || "projects storage is not ready".to_string(),
+                |refusal| format!("store_failed: {}: {}", refusal.code, refusal.message),
+            ))
         } else {
-            (!ready).then(|| "projects storage is not ready".to_string())
+            None
         };
         let catalog = self.health.catalog.report();
         let providers = self.provider_resolver.cache_health();
@@ -2074,11 +2078,12 @@ impl ProjectsHandler {
         let unavailable =
             |message: &str| subc_protocol::ErrorBody::new("unavailable", message.to_string());
         let store = self
-            .store
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-            .ok_or_else(|| unavailable("store not open yet"))?;
+            .health
+            .store_refusal
+            .lookup(&self.store, || {
+                HandlerError::new("unavailable", "store not open yet")
+            })
+            .map_err(|error| subc_protocol::ErrorBody::new(error.code, error.message))?;
         let read = tokio::task::spawn_blocking(move || {
             let mut reply = store.enumerate(None)?;
             entorhinal_core::fill_file_ids(&mut reply);
@@ -2926,7 +2931,7 @@ fn install_store(
         store,
         health,
         catalog_sql,
-        outcome,
+        outcome.map_err(Into::into),
         Instant::now(),
         Instant::now,
     );
@@ -2937,7 +2942,7 @@ fn install_store_with_time(
     store: &Mutex<Option<RegistryStore>>,
     health: &HealthGauges,
     catalog_sql: &Arc<move_driver::SqlOperations>,
-    outcome: Result<RegistryStore, String>,
+    outcome: Result<RegistryStore, store_open::OpenFailure>,
     module_started_at: Instant,
     now: impl Fn() -> Instant,
 ) {
@@ -2988,6 +2993,7 @@ fn install_store_with_time(
                 );
                 health.ready_recorded.store(true, Ordering::Release);
             }
+            health.store_refusal.publish(None);
             health.store_ready.store(true, Ordering::Relaxed);
             health.store_failed.store(false, Ordering::Relaxed);
             *guard = Some(opened);
@@ -2999,7 +3005,12 @@ fn install_store_with_time(
             }
         }
         Err(error) => {
-            tracing::error!(target: "store", "{error}");
+            if let Some(refusal) = &error.refusal {
+                tracing::error!(target: "store", code = %refusal.code, "{}", error.log);
+            } else {
+                tracing::error!(target: "store", "{}", error.log);
+            }
+            health.store_refusal.publish(error.refusal);
             health.store_ready.store(false, Ordering::Relaxed);
             health.store_failed.store(true, Ordering::Relaxed);
             *guard = None;
@@ -3127,7 +3138,7 @@ fn enable_root_records(store: &mut RegistryStore) {
 async fn retry_open_while_lease_held(
     descriptor: &StorageDescriptor,
     retry_budget: Duration,
-) -> Result<RegistryStore, String> {
+) -> Result<RegistryStore, store_open::OpenFailure> {
     let started = Instant::now();
     let mut delay = LEASE_HELD_RETRY_FIRST_DELAY;
     loop {
@@ -3138,9 +3149,12 @@ async fn retry_open_while_lease_held(
             }
             outcome => {
                 return outcome.map_err(|error| {
-                    format!(
-                        "opening projects storage after {:.1}s: {error}",
-                        started.elapsed().as_secs_f64()
+                    store_open::OpenFailure::from_open(
+                        &format!(
+                            "opening projects storage after {:.1}s",
+                            started.elapsed().as_secs_f64()
+                        ),
+                        error,
                     )
                 })
             }
@@ -3795,6 +3809,19 @@ mod tests {
             );
             std::fs::remove_dir_all(path).unwrap();
         }
+    }
+
+    pub(super) fn sqlite_path(descriptor: &StorageDescriptor) -> &str {
+        let StorageBackend::Sqlite { path } = &descriptor.backend else {
+            panic!("expected a SQLite fixture")
+        };
+        path
+    }
+
+    // Keep the normal open check for other fixtures. Use this only when the
+    // test exercises sharing through engram instead of through the hub.
+    pub(super) fn allow_legacy_store(descriptor: &StorageDescriptor) {
+        entorhinal_core::legacy_sharing_test_allow(sqlite_path(descriptor));
     }
 
     pub(crate) fn hello_ack(descriptor: &StorageDescriptor) -> ModuleHelloAckBody {

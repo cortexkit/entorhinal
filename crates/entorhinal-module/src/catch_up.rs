@@ -955,6 +955,10 @@ mod tests {
             self.handler.with_store(|s| Ok(s.clone())).unwrap()
         }
         fn restart(&mut self, connector: Arc<dyn LogConnector>) {
+            crate::tests::allow_legacy_store(&self.descriptor);
+            self.reopen(connector);
+        }
+        fn reopen(&mut self, connector: Arc<dyn LogConnector>) {
             self.handler.store.lock().unwrap().take();
             self.handler = Self::handler(&self.descriptor, connector);
         }
@@ -1615,6 +1619,7 @@ mod tests {
         let f = Fixture::new("catch-background");
         // Exercise the real startup hook, not just the worker constructor.
         f.handler.store.lock().unwrap().take();
+        crate::tests::allow_legacy_store(&f.descriptor);
         let ack = subc_protocol::ModuleHelloAckBody {
             negotiated_ver: 1,
             subc_ops: vec![],
@@ -1652,7 +1657,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        disabled.restart(fail.clone());
+        disabled.reopen(fail.clone());
         disabled.handler.start_catch_up();
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(60)).await;
@@ -2153,6 +2158,7 @@ mod tests {
             let mut child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact","catch_up::tests::process_killed_before_and_after_local_commit_recovers_without_duplicates","--nocapture"])
                 .env("ENTORHINAL_CATCH_UP_CRASH_TEST",config.to_string())
+                .env("ENTORHINAL_LEGACY_STORE_TEST_PATH", crate::tests::sqlite_path(&f.descriptor))
                 .stdout(std::process::Stdio::piped()).spawn().unwrap();
             let output = child.stdout.take().unwrap();
             let mut lines = std::io::BufReader::new(output).lines();

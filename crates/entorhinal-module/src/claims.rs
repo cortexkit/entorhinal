@@ -1084,6 +1084,7 @@ mod tests {
             ProjectsHandler::with_log_connector("abcdef0123456789".into(), || 701, Arc::new(log));
         record.offline.store(true, Ordering::Relaxed);
         handler.record_client = RecordClient::new(Arc::new(FakeRecordConnector(record.clone())));
+        crate::tests::allow_legacy_store(&descriptor);
         *handler.store.lock().unwrap() = Some(RegistryStore::open(&descriptor).unwrap());
         let resolver = FakeResolver::new();
         resolver.set(
@@ -1185,6 +1186,7 @@ mod tests {
             DIRECT,
             RouteAdmission::from_bind(Some(Principal::Direct), None),
         );
+        crate::tests::allow_legacy_store(&f.descriptor);
         handler
             .on_hello_ack(&super::super::tests::hello_ack(&f.descriptor))
             .await;

@@ -917,7 +917,7 @@ impl ProjectsHandler {
                 .await?;
             let _writer = self.writer.lock().await;
             let own = self
-                .hub_sql()
+                .served_hub_sql()
                 .run(deadline, "validate_switch_exclusion", |store| {
                     if store.identity_log_status()?.state != "enabled" {
                         return Err(HandlerError::new(

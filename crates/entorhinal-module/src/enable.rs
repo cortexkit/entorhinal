@@ -446,7 +446,7 @@ impl ProjectsHandler {
             }
             let health = self.health.clone();
             let (status, installed) = self
-                .hub_sql()
+                .served_hub_sql()
                 .run(
                     Instant::now() + Duration::from_secs(3),
                     "identity_log_status",
@@ -760,6 +760,7 @@ mod tests {
         }
         fn restart(&mut self, log: Arc<dyn LogConnector>) {
             self.handler.store.lock().unwrap().take();
+            crate::tests::allow_legacy_store(&self.descriptor);
             self.handler = Self::handler(&self.descriptor, log);
         }
         fn fork(&self, label: &str, log: Arc<dyn LogConnector>) -> Self {

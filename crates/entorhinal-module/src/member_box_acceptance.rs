@@ -65,7 +65,7 @@ async fn member_box_startup_writes_once_and_where_acquires_box() {
     assert_eq!(before["status"], "held_elsewhere");
     assert!(before.get("holder_box").is_none());
 
-    a.restart(a_log.clone()).await;
+    a.restart_legacy(a_log.clone()).await;
     daemon(&a, A_BOX);
     let (calls, head) = (log.calls(), log.head());
     a.handler.start_catch_up();
@@ -91,7 +91,7 @@ async fn member_box_startup_writes_once_and_where_acquires_box() {
     b.clean_rebuild().await;
 
     // Same author and store, but a different verified daemon id after adoption.
-    a.restart(a_log).await;
+    a.restart_legacy(a_log).await;
     a.store().adopt_store(B_BOX, true, 800).unwrap();
     daemon(&a, B_BOX);
     let calls = log.calls();
@@ -311,7 +311,7 @@ async fn member_box_unknown_operation_retries_same_position_after_restart() {
     );
     assert_eq!(log.calls(), calls, "the old process must remain stalled");
 
-    b.restart(Arc::new(b_log)).await;
+    b.restart_legacy(Arc::new(b_log)).await;
     b.catch_up().await;
     assert_eq!(
         b.store()
