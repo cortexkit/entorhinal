@@ -33,6 +33,7 @@ mod memory;
 pub use memory::{SetProjectDomainRequest, SetWorkspaceDocumentRequest, WorkspaceDocument};
 pub mod enable_state;
 pub mod hub_store;
+mod legacy_sharing;
 mod log_schema;
 mod member_box;
 pub mod move_record;
@@ -440,7 +441,19 @@ impl RegistryStore {
         descriptor: &StorageDescriptor,
         migrations: &[Migration],
     ) -> Result<Self, RegistryError> {
+        let cortexkit_store_types::StorageBackend::Sqlite { path } = &descriptor.backend else {
+            return Err(RegistryError::Store(StoreError::UnsupportedBackend(
+                descriptor.backend.label().to_string(),
+            )));
+        };
+        let chain_max = migrations.iter().map(|m| m.version).max().unwrap_or(0);
+        legacy_sharing::probe(descriptor, path, chain_max)?;
         let db = open_sqlite(descriptor).map_err(RegistryError::Store)?;
+        // Another writer may have changed the store during the lease handoff.
+        legacy_sharing::refuse(
+            db.with_conn(|conn| legacy_sharing::is_legacy(conn, chain_max))
+                .map_err(RegistryError::Store)?,
+        )?;
         let outcome = db
             .migrate(MIGRATION_NAMESPACE, migrations)
             .map_err(RegistryError::Store)?;
@@ -455,11 +468,6 @@ impl RegistryStore {
                 outcome.recorded, outcome.chain_max
             )));
         }
-        let cortexkit_store_types::StorageBackend::Sqlite { path } = &descriptor.backend else {
-            return Err(RegistryError::Database(
-                "registry requires SQLite storage".into(),
-            ));
-        };
         let store_folder = std::path::Path::new(path)
             .parent()
             .ok_or_else(|| RegistryError::Database("store has no parent directory".into()))?
