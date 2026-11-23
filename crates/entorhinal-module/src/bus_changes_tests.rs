@@ -572,36 +572,6 @@ async fn bus_changes_startup_write_kinds_and_unchanged_wakes() {
 }
 
 #[tokio::test]
-async fn bus_changes_role_take_and_refresh_only_publish_cached_epoch() {
-    let f = RoleFixture::new("bus-role", false).await;
-    let mut published = Published::start(&f.handler, Arc::default());
-    published.take(KEYS).await;
-    published.idle().await;
-    let bytes = f.handler.take_role(json!({"role":"connector_home","expected_epoch":0,"reason":"home","request_id":"0123456789abcdef0123456789abcdef"}), ROLE_DIRECT, tokio::time::Instant::now()).await.unwrap();
-    assert_eq!(
-        serde_json::from_slice::<Value>(&bytes).unwrap()["result"]["epoch"],
-        1
-    );
-    assert_eq!(
-        published.take(&["role.connector_home"]).await["role.connector_home"],
-        json!({"epoch":1})
-    );
-    published.idle().await;
-    f.record.put("role:connector_home", 2, serde_json::to_vec(&json!({"v":1,"role":"connector_home","holder":ROLE_OTHER_AUTHOR,"epoch":2,"reason":"moved"})).unwrap(), ROLE_OTHER_AUTHOR);
-    f.refresh().await;
-    assert_eq!(
-        published.take(&["role.connector_home"]).await["role.connector_home"],
-        json!({"epoch":2})
-    );
-    published.idle().await;
-    f.refresh().await;
-    published.idle().await;
-    published.quiet();
-    f.handler.stop_bus_changes().await;
-    f.handler.stop_role_refresh().await;
-}
-
-#[tokio::test]
 async fn bus_changes_missing_bucket_retries_and_recovers_without_blocking_reads_or_health() {
     let f = Fixture::new("bus-outage").await;
     let control = Arc::new(Control::default());

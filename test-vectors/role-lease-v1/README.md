@@ -35,9 +35,6 @@ handler; an empty `StreamEnd` body is shown as `null`.
   a Direct caller (a local process the daemon admits without a module identity, such as a terminal command) and a flow-scoped caller (marked `flowScoped`) are refused.
 - `sharing-disabled.json`: both admitted consumers get generation 1 locally,
   including a fresh notice at the 20-second renewal.
-- `engram-sharing.json`: Plexus follows the Engram claim's epoch and stops
-  holding when the claim becomes stale. Magic Context holds locally even with
-  Engram sharing enabled.
 - `local-after-hub.json`: after observing hub generation 12, a new local grant
   to Magic Context uses generation 13.
 
@@ -72,10 +69,8 @@ The notice shape is the same in all sharing modes:
 
 1. **Sharing disabled:** An admitted role gets a new local generation, renewed
    every 20 seconds. It stops when its watch closes. No network writes occur.
-2. **Engram sharing (not on the hub):** `connector_home` holds only while the
-   cached `role.read` is `held_here` and not `stale`. Its `gen` is the claim's
-   epoch or the local high-water mark, whichever is higher.
-   `dreamer.*` still uses a local generation.
+2. **Hub not yet selected:** `dreamer.*` can still receive a local grant;
+   `connector_home` cannot hold until the hub backend is selected.
 3. **Hub mode:** The hub's role record arbitrates ownership. A candidate has
    no acting window before its first confirmed renewal. If the hub becomes
    unreachable, no renewal extends the window and the holder must stop by the

@@ -237,7 +237,6 @@ async fn foreign_store_starts_no_machine_background_work_and_health_is_lock_free
         f.handler.catch_up_task.lock().unwrap().is_none(),
         "foreign store must not start catch-up"
     );
-    assert!(f.handler.role_refresh_task.lock().unwrap().is_none());
     assert!(f.handler.move_driver_task.lock().unwrap().is_none());
     assert!(f.handler.catalog_poll_task.lock().unwrap().is_none());
     assert!(

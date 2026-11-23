@@ -479,9 +479,7 @@ async fn hub_cutover_restart_never_calls_engram() {
     m.handler.record_client = crate::record_client::RecordClient::new(fail.clone());
     assert!(m.handler.hub_backend_selected());
     m.handler.start_catch_up();
-    m.handler.start_role_refresh();
     m.handler.start_move_driver();
-    m.handler.role_refresh.notify_one();
     m.handler.move_wake.notify_one();
     for _ in 0..3 {
         tokio::time::advance(Duration::from_secs(30)).await;

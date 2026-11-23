@@ -198,6 +198,11 @@ impl Leases {
     }
 
     #[cfg(test)]
+    pub(super) fn sample_sequence(&self, last_emitted: u64) {
+        self.seq.store(last_emitted, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
     pub(super) fn sample_view(&mut self, role: &str, view: watch::Receiver<View>) {
         self.sample_views.insert(role.into(), view);
     }
@@ -666,7 +671,6 @@ impl Leases {
                     }
                 }
             } else {
-                let changed = handler.role_cache_changed.notified();
                 let next_pass = Instant::now() + Duration::from_millis(RENEW_MS);
                 let now = self.now();
                 let next = handler
@@ -703,7 +707,6 @@ impl Leases {
                         }
                     }
                     _ = installed.changed() => {}
-                    _ = changed, if role == "connector_home" => {}
                     _ = tokio::time::sleep_until(next_pass) => {}
                 }
             }
@@ -1207,25 +1210,6 @@ impl ProjectsHandler {
                             })?,
                         };
                         return Ok((next.map_or_else(View::default, local), next));
-                    }
-                    if role == "connector_home" && state == "enabled" {
-                        let read = store.role_read(&role)?;
-                        let high_water = store.role_gen_high_water(&role)?;
-                        if read.epoch > high_water {
-                            store.observe_role_gen(&role, read.epoch)?;
-                        }
-                        let gen = read.epoch.max(high_water);
-                        return Ok((
-                            if read.held_here && !read.stale {
-                                local(gen)
-                            } else {
-                                View {
-                                    gen,
-                                    ..View::default()
-                                }
-                            },
-                            None,
-                        ));
                     }
                     Ok((View::default(), None))
                 },

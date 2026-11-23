@@ -102,9 +102,6 @@ async fn seeded(label: &str) -> Fixture {
     seed_agent(&source, ASSISTANT, "Grace", None, false, false);
     drop(source);
     assert!(matches!(f.import().await, HandlerOutcome::Response(_)));
-    store(&f)
-        .cache_roles(&[("watch_fixture".into(), absent(false))], 700)
-        .unwrap();
     f
 }
 
@@ -118,13 +115,6 @@ fn fleet(f: &Fixture) -> Value {
 
 fn store(f: &Fixture) -> RegistryStore {
     f.handler.store.lock().unwrap().as_ref().unwrap().clone()
-}
-
-fn absent(stale: bool) -> ClaimObservation {
-    ClaimObservation::Absent {
-        stale,
-        self_author: "01010101010101010101010101010101".into(),
-    }
 }
 
 #[tokio::test(start_paused = true)]

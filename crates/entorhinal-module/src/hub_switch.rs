@@ -770,8 +770,8 @@ impl Switch {
             v: 1,
             migration_id: proposal.migration_id.clone(),
             roles: sql
-                .run(deadline, "role_subjects", |store| {
-                    Ok(store.role_subjects()?.into_iter().collect())
+                .run(deadline, "legacy_switch_quiet_roles", |store| {
+                    Ok(store.legacy_switch_quiet_roles()?)
                 })
                 .await?,
         };
@@ -960,6 +960,3 @@ impl ProjectsHandler {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-pub(crate) use tests::baseline_migration_image;

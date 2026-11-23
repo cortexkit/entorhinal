@@ -532,9 +532,6 @@ struct HealthGauges {
     claim_version_unknown: AtomicU64,
     claim_subject_mismatch: AtomicU64,
     claim_malformed: AtomicU64,
-    role_refresh_failed: AtomicBool,
-    #[cfg(test)]
-    role_refresh_done: tokio::sync::Notify,
     self_author_conflicts: AtomicU64,
     moves_open: AtomicU64,
     move_errors: AtomicU64,
@@ -637,7 +634,6 @@ struct ProjectsHandler {
     consent_coordinator: consent::ConsentCoordinator,
     consent_connector: Arc<dyn consent_client::ConsentConnector>,
     commits: Arc<tokio::sync::Notify>,
-    role_cache_changed: Arc<tokio::sync::Notify>,
     bus_changes_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     liveness_bus_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     bus_changes_sql: Arc<move_driver::SqlOperations>,
@@ -679,9 +675,6 @@ struct ProjectsHandler {
     move_driver_task: Mutex<Option<move_driver::MoveDriver>>,
     legacy_claim_pass: tokio::sync::Mutex<()>,
     claim_refresh_sql: Arc<move_driver::SqlOperations>,
-    role_refresh: Arc<tokio::sync::Notify>,
-    role_refresh_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    role_refresh_sql: Arc<move_driver::SqlOperations>,
     /// The queue of session end stamps from observed bucket deletes, and the task
     /// that writes them and prunes long-ended bindings.
     session_upkeep: Arc<session_upkeep::SessionUpkeep>,
@@ -1080,7 +1073,6 @@ impl ProjectsHandler {
                 )),
             }),
             commits: Arc::new(tokio::sync::Notify::new()),
-            role_cache_changed: Arc::default(),
             bus_changes_task: Mutex::new(None),
             liveness_bus_task: Mutex::new(None),
             bus_changes_sql: Arc::default(),
@@ -1117,9 +1109,6 @@ impl ProjectsHandler {
             move_driver_task: Mutex::new(None),
             legacy_claim_pass: tokio::sync::Mutex::new(()),
             claim_refresh_sql: Arc::default(),
-            role_refresh: Arc::new(tokio::sync::Notify::new()),
-            role_refresh_task: Mutex::new(None),
-            role_refresh_sql: Arc::default(),
             session_upkeep: Arc::default(),
             session_upkeep_task: Mutex::new(None),
             session_upkeep_sql: Arc::default(),
@@ -1374,7 +1363,6 @@ impl ModuleHandler for ProjectsHandler {
                 let store = Arc::clone(&self.store);
                 let health = Arc::clone(&self.health);
                 let retry_budget = self.lease_retry_budget;
-                let role_refresh = self.role_refresh.clone();
                 let move_wake = self.move_wake.clone();
                 let module_started_at = self.module_started_at;
                 let catalog_poll_wake = self.catalog_poll_wake.clone();
@@ -1396,7 +1384,6 @@ impl ModuleHandler for ProjectsHandler {
                     // counts against the module.
                     health.store_opening.store(false, Ordering::Release);
                     catch_up_wake.notify_one();
-                    role_refresh.notify_one();
                     move_wake.notify_one();
                     move_wake.notify_waiters();
                     catalog_poll_wake.notify_one();
@@ -1415,8 +1402,6 @@ impl ModuleHandler for ProjectsHandler {
         }
         self.start_catch_up();
         self.start_catalog_poll();
-        self.start_role_refresh();
-        self.role_refresh.notify_one();
         self.start_move_driver();
         self.move_wake.notify_one();
         self.move_wake.notify_waiters();
@@ -1492,7 +1477,7 @@ impl ModuleHandler for ProjectsHandler {
                     "lastError": enable::last_error(&self.health),
                     "lastErrorAt": enable::last_error_at(&self.health),
                     "logOwnEntriesAppliedFromLog": self.health.log_own_entries_applied.load(Ordering::Relaxed),
-                    "roleRefreshFailed": self.health.role_refresh_failed.load(Ordering::Relaxed),
+                    "roleRefreshFailed": false,
                     "claimRefreshed": self.health.claim_refreshed.load(Ordering::Relaxed),
                     "claimConflicts": self.health.claim_conflicts.load(Ordering::Relaxed),
                     "claimFailed": self.health.claim_failed.load(Ordering::Relaxed),
@@ -2947,11 +2932,6 @@ fn install_store_with_time(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let outcome = outcome.and_then(|opened| {
         health.origin.check(&opened)?;
-        if !opened.is_foreign() {
-            opened
-                .stale_roles()
-                .map_err(|error| format!("staling role cache: {error}"))?;
-        }
         Ok(opened)
     });
     match outcome {
@@ -3376,7 +3356,6 @@ mod tests {
         handler.stop_move_driver().await;
         handler.claim_refresh_sql.wait().await;
         handler.stop_catalog_poll().await;
-        handler.stop_role_refresh().await;
         handler.stop_session_upkeep().await;
         handler.stop_bus_changes().await;
         // Every store install starts blocking catalog jobs (the built-in registry

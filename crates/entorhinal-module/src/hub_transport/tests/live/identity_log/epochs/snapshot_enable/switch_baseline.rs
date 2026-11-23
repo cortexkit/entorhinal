@@ -1,7 +1,6 @@
 use super::*;
 use crate::sharing_baselines::{self as baseline, record, StoreFile};
 use entorhinal_core::{enable_state::HubRole, remote_apply::RemoteEntry, shared_entry::MemberName};
-use std::path::Path;
 
 const BASELINE_BASE: i64 = 17;
 const LEGACY: &str = "engram:11111111111111111111111111111111";
@@ -167,12 +166,8 @@ fn assert_position(file: &StoreFile, name: &str, position: u64, snapshot_end: i6
     assert_eq!(baseline::rows(&conn,&format!("SELECT COUNT(*) FROM registry_journal WHERE op='project.shared' AND log_position={}",BASELINE_BASE as u64 + position)), vec![vec![json!(1)]]);
 }
 
-async fn fixture(record_to: Option<&Path>) {
+async fn fixture() {
     let Some(rig) = IdentityRig::new().await else {
-        assert!(
-            record_to.is_none(),
-            "nats-server is required to record the Switch baseline"
-        );
         return;
     };
     for node in [&rig.a, &rig.b] {
@@ -258,20 +253,7 @@ async fn fixture(record_to: Option<&Path>) {
     for id in [agent(1), agent(2)] {
         record::session(&store, &id);
     }
-    let source = if let Some(dir) = record_to {
-        let path = dir.join("switch-observer.db");
-        record::cache(
-            &store,
-            &agent(1),
-            B,
-            LEGACY.strip_prefix("engram:").unwrap(),
-        );
-        record::pending(&store);
-        join_file.backup(&path);
-        path
-    } else {
-        baseline::artifacts().join("switch-observer.db")
-    };
+    let source = baseline::artifacts().join("switch-observer.db");
     drop(store);
     drop(follower);
     drop(joining);
@@ -422,18 +404,13 @@ async fn fixture(record_to: Option<&Path>) {
         ("restarted", restarted),
         ("readmitted", readmitted),
     ] {
-        let name = format!("switch-observer.{name}.jsonl");
-        if let Some(dir) = record_to {
-            fs::write(dir.join(name), bytes).unwrap();
-        } else {
-            let path = baseline::artifacts().join(name);
-            assert_eq!(
-                fs::read_to_string(&path).unwrap(),
-                bytes,
-                "{}",
-                path.display()
-            );
-        }
+        let path = baseline::artifacts().join(format!("switch-observer.{name}.jsonl"));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            bytes,
+            "{}",
+            path.display()
+        );
     }
     stop(&b).await;
     stop(&a).await;
@@ -458,13 +435,5 @@ fn check_observer_store(file: &StoreFile, snapshot_end: i64) {
 
 #[tokio::test]
 async fn sharing_baseline_switch_observers() {
-    fixture(None).await;
-}
-
-#[tokio::test]
-#[ignore = "one-shot recording of the original Switch observer"]
-async fn record_switch_observers() {
-    let dir = std::path::PathBuf::from(std::env::var_os("ENTORHINAL_RECORD_SWITCH").unwrap());
-    fs::create_dir(&dir).unwrap();
-    fixture(Some(&dir)).await;
+    fixture().await;
 }

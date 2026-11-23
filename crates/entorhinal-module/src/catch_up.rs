@@ -26,7 +26,6 @@ pub(crate) struct Worker {
     wake: Arc<tokio::sync::Notify>,
     writer: Arc<tokio::sync::Mutex<()>>,
     commits: Arc<tokio::sync::Notify>,
-    role_refresh: Arc<tokio::sync::Notify>,
 }
 
 impl ProjectsHandler {
@@ -41,7 +40,6 @@ impl ProjectsHandler {
             wake: self.catch_up_wake.clone(),
             writer: self.writer.clone(),
             commits: self.commits.clone(),
-            role_refresh: self.role_refresh.clone(),
         }
     }
 
@@ -83,9 +81,6 @@ impl Drop for ProjectsHandler {
             task.abort();
         }
         if let Some(task) = self.hub_tail_task.lock().unwrap().take() {
-            task.abort();
-        }
-        if let Some(task) = self.role_refresh_task.get_mut().unwrap().take() {
             task.abort();
         }
         if let Some(task) = self.session_upkeep_task.get_mut().unwrap().take() {
@@ -548,17 +543,8 @@ impl Worker {
         let mut authors = Vec::new();
         let mut self_authors = Vec::new();
         let mut snapshot = None;
-        let mut reconnect = self.health.log_state.load(Ordering::Relaxed) != 0;
         loop {
             let page = self.read(after, deadline).await?;
-            let retry_roles = self
-                .health
-                .role_refresh_failed
-                .swap(false, Ordering::Relaxed);
-            if reconnect || retry_roles {
-                self.role_refresh.notify_one();
-                reconnect = false;
-            }
             if page.head < after {
                 self.health.log_state.store(7, Ordering::Relaxed);
                 return Err(HandlerError::new(

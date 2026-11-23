@@ -213,7 +213,6 @@ struct Worker {
     health: Arc<HealthGauges>,
     incarnation: String,
     commits: Arc<Notify>,
-    role_changed: Arc<Notify>,
     watches: Arc<super::watches::Watches>,
     providers: Arc<dyn super::sessions::ProviderResolver>,
     sql: Arc<SqlOperations>,
@@ -230,7 +229,6 @@ impl ProjectsHandler {
             health: self.health.clone(),
             incarnation: self.incarnation.clone(),
             commits: self.commits.clone(),
-            role_changed: self.role_cache_changed.clone(),
             watches: self.watches.clone(),
             providers: self.provider_resolver.clone(),
             sql: self.bus_changes_sql.clone(),
@@ -411,12 +409,10 @@ impl Worker {
             // Register before reading so commits during SQL or a bus await are
             // observed on the next pass, including notify_waiters broadcasts.
             let commits = self.commits.notified();
-            let roles = self.role_changed.notified();
             let catalog = self.watches.catalog_changed().notified();
             let epoch = self.health.fleet_epoch.changed.notified();
-            tokio::pin!(commits, roles, catalog, epoch);
+            tokio::pin!(commits, catalog, epoch);
             commits.as_mut().enable();
-            roles.as_mut().enable();
             catalog.as_mut().enable();
             epoch.as_mut().enable();
             if self.store.strong_count() == 0 {
@@ -492,7 +488,6 @@ impl Worker {
             self.idle.notify_one();
             tokio::select! {
                 _ = &mut commits => {},
-                _ = &mut roles => {},
                 _ = &mut catalog => {},
                 _ = &mut epoch => {},
                 // A new connection may face a bucket ck-bus re-provisioned empty,
@@ -544,6 +539,30 @@ pub(super) mod tests {
     use crate::fake_daemon::{DaemonCall, DaemonSnapshot, FakeDaemon, WireDaemon};
     use tokio::sync::mpsc;
     use tokio::time::{timeout, Instant};
+
+    #[tokio::test]
+    async fn connector_home_marker_uses_core_role_epoch_and_skips_foreign_stores() {
+        let handler = ProjectsHandler::with_runtime("bus-role".into(), || 700);
+        let worker = handler.bus_changes_worker();
+        assert!(worker.snapshot().await.unwrap().is_none());
+
+        let file = crate::sharing_baselines::StoreFile::new("bus-role");
+        let store = file.open();
+        store.observe_role_gen("connector_home", 13).unwrap();
+        *handler.store.lock().unwrap() = Some(store.clone());
+        let values = worker.snapshot().await.unwrap().unwrap();
+        assert_eq!(values["role.connector_home"], br#"{"epoch":0}"#);
+
+        store
+            .check_store_origin(Some("first-machine"), 700)
+            .unwrap();
+        store
+            .check_store_origin(Some("second-machine"), 700)
+            .unwrap();
+        assert!(store.is_foreign());
+        assert!(worker.snapshot().await.unwrap().is_none());
+        handler.store.lock().unwrap().take();
+    }
 
     pub(crate) async fn disabled_ckbus(
         handler: &mut ProjectsHandler,

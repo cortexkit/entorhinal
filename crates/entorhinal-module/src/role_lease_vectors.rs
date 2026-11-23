@@ -242,76 +242,15 @@ async fn served_role_lease_v1_non_hub_records_match_published_files() {
     assert_eq!(handler.role_leases.held(), 0);
     publish("sharing-disabled.json", disabled);
 
-    // The published sharing samples each start from a fresh store.
-    let (fresh_dir, descriptor) = crate::tests::scratch_descriptor("served-role-lease-engram");
+    // A native enable in progress still grants local dreamer roles. Seed the
+    // high-water mark in a fresh store without depending on an engram claim.
+    let (fresh_dir, descriptor) = crate::tests::scratch_descriptor("served-role-lease-after-hub");
     let store = entorhinal_core::RegistryStore::open(&descriptor).unwrap();
-    *handler.store.lock().unwrap() = Some(store.clone());
     store
-        .apply_entry("fixture.lease", "{}", "fixture", None, |tx| {
-            tx.execute(
-                "UPDATE identity_log_state SET state='enabled' WHERE id=1",
-                [],
-            )?;
-            Ok(())
-        })
+        .begin_hub_enable(&"01".repeat(16), &"02".repeat(16))
         .unwrap();
-    let set_claim = |stale| {
-        store
-            .cache_roles(
-                &[(
-                    CONNECTOR.into(),
-                    ClaimObservation::Present {
-                        self_author: SELF_AUTHOR.into(),
-                        claim: CachedClaim {
-                            holder: Some(SELF_AUTHOR.into()),
-                            epoch: 12,
-                            cut_id: None,
-                            version: 36,
-                            read_at_ms: 700,
-                            stale,
-                            integrity_failed: false,
-                        },
-                    },
-                )],
-                700,
-            )
-            .unwrap();
-        handler.role_cache_changed.notify_waiters();
-    };
-    set_claim(false);
-    let params = json!({"role":CONNECTOR});
-    let corr = module
-        .send_request(plexus, request(WATCH, params.clone()))
-        .await;
-    let claim = frame(&mut module, corr, FrameType::StreamData).await;
-    let notice = ack_frame(&mut module, plexus, CONNECTOR, &claim).await;
-    assert_eq!(notice["gen"], 12);
-    assert_eq!(notice["holding"], true);
-    set_claim(true);
-    let stale = frame(&mut module, corr, FrameType::StreamData).await;
-    let notice = ack_frame(&mut module, plexus, CONNECTOR, &stale).await;
-    assert_eq!(notice["gen"], 12);
-    assert_eq!(notice["holding"], false);
-    module.cancel_request(plexus, corr).await;
-    frame(&mut module, corr, FrameType::StreamEnd).await;
-
+    *handler.store.lock().unwrap() = Some(store.clone());
     let dreamer = json!({"role":GLOBAL});
-    let corr = module
-        .send_request(mc, request(WATCH, dreamer.clone()))
-        .await;
-    let local = frame(&mut module, corr, FrameType::StreamData).await;
-    let notice = ack_frame(&mut module, mc, GLOBAL, &local).await;
-    assert_eq!(notice["gen"], 1);
-    assert_eq!(notice["holding"], true);
-    publish(
-        "engram-sharing.json",
-        vec![
-            output(WATCH, &params, &p, &[claim, stale]),
-            output(WATCH, &dreamer, &m, &[local]),
-        ],
-    );
-    module.cancel_request(mc, corr).await;
-    frame(&mut module, corr, FrameType::StreamEnd).await;
     store
         .record_hub_kv(
             "role.dreamer.global",
@@ -320,6 +259,8 @@ async fn served_role_lease_v1_non_hub_records_match_published_files() {
             700,
         )
         .unwrap();
+    // Pin the next published notice at sequence 8 regardless of earlier watches.
+    handler.role_leases.sample_sequence(7);
     let corr = module
         .send_request(mc, request(WATCH, dreamer.clone()))
         .await;

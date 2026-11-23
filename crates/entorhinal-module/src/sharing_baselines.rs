@@ -12,6 +12,7 @@ pub(crate) const BOX_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const DIRECT: RouteKey = (73, 1);
 const SESSIONS: RouteKey = (73, 2);
 const WRITER: RouteKey = (73, 3);
+const BASELINE_AGENT: &str = "agent_0000000000000001";
 const STORES: &[(&str, &str, Option<i64>)] = &[
     ("legacy-zero", "enabled", Some(3)),
     ("legacy-supersede", "enabled", Some(8)),
@@ -92,15 +93,6 @@ impl StoreFile {
 
     pub(crate) fn read(&self) -> Connection {
         Connection::open_with_flags(self.path(), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap()
-    }
-
-    pub(crate) fn backup(&self, target: &Path) {
-        self.read()
-            .execute("VACUUM INTO ?1", [target.to_str().unwrap()])
-            .unwrap();
-        for suffix in ["-wal", "-shm"] {
-            assert!(!Path::new(&format!("{}{suffix}", target.display())).exists());
-        }
     }
 }
 
@@ -380,7 +372,7 @@ pub(crate) fn check_store(file: &StoreFile, store: &RegistryStore, state: &str, 
     );
     assert_eq!(
         rows(&conn, "SELECT agent_id,epoch,version FROM claim_cache"),
-        vec![vec![json!(record::AGENT), json!(3), json!(5)]]
+        vec![vec![json!(BASELINE_AGENT), json!(3), json!(5)]]
     );
     assert_eq!(store.role_gen_high_water("connector_home").unwrap(), 13);
 }
@@ -540,6 +532,29 @@ async fn sharing_baseline_history_replies_and_prefixes() {
                     .replace(&old_where.to_string(), &new_where.to_string())
                     .replace(&old_with_box.to_string(), &new_where.to_string())
                     .replace(&old_residence.to_string(), &new_residence.to_string());
+                // The historical stores still contain the frozen observations.
+                // Startup no longer marks those rows stale; only their stale
+                // bit differs until the migration purges the cache.
+                expected = expected
+                    .split_inclusive('\n')
+                    .map(|line| {
+                        let row: Value = serde_json::from_str(line).unwrap();
+                        if matches!(row["method"].as_str(), Some("role.read" | "role.fence"))
+                            && matches!(
+                                row["params"]["role"].as_str(),
+                                Some("connector_home" | "local_role")
+                            )
+                            && row["reply"]["result"]["epoch"]
+                                .as_i64()
+                                .is_some_and(|e| e > 0)
+                        {
+                            assert_eq!(row["reply"]["result"]["stale"], true);
+                            line.replacen("\"stale\":true", "\"stale\":false", 1)
+                        } else {
+                            line.to_owned()
+                        }
+                    })
+                    .collect();
             }
             assert_eq!(expected, actual, "{}", path.display());
         }
