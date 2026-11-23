@@ -485,8 +485,10 @@ struct HealthGauges {
     liveness_bus_authoritative: AtomicBool,
     liveness_bus_sessions: AtomicU64,
     liveness_bus_failures: AtomicU64,
+    liveness_bus_parked: AtomicBool,
     bus_changes_puts: AtomicU64,
     bus_changes_failures: AtomicU64,
+    bus_changes_parked: AtomicBool,
     bus_changes_connected: AtomicBool,
     fleet_epoch: fleet_epoch_current::Cache,
     placement_facts_published: AtomicU64,
@@ -565,8 +567,12 @@ impl HealthGauges {
             json!(self.liveness_bus_authoritative.load(Ordering::Relaxed));
         metrics["livenessBusSessions"] = json!(self.liveness_bus_sessions.load(Ordering::Relaxed));
         metrics["livenessBusFailures"] = json!(self.liveness_bus_failures.load(Ordering::Relaxed));
+        metrics["livenessBusParkedCkbusNotExpectedBack"] =
+            json!(self.liveness_bus_parked.load(Ordering::Relaxed));
         metrics["busChangesPuts"] = json!(self.bus_changes_puts.load(Ordering::Relaxed));
         metrics["busChangesFailures"] = json!(self.bus_changes_failures.load(Ordering::Relaxed));
+        metrics["busChangesParkedCkbusNotExpectedBack"] =
+            json!(self.bus_changes_parked.load(Ordering::Relaxed));
         metrics["busChangesConnected"] = json!(self.bus_changes_connected.load(Ordering::Relaxed));
         metrics["placementFactsPublished"] =
             json!(self.placement_facts_published.load(Ordering::Relaxed));

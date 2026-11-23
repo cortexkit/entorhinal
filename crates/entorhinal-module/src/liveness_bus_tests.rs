@@ -1,6 +1,77 @@
 use super::*;
+use crate::bus_changes::tests::{
+    assert_disabled_ckbus_schedule, assert_wire_catalog_wakes, disabled_ckbus, RefusedCkbus,
+};
+use crate::fake_daemon::{DaemonSnapshot, FakeDaemon};
 use serde_json::json;
 use tokio::sync::mpsc;
+
+#[tokio::test]
+async fn liveness_bus_wire_refusal_and_catalog_notice() {
+    let (dir, _) = crate::tests::scratch_descriptor("liveness-bus-wire-ckbus");
+    let mut handler = ProjectsHandler::with_runtime("liveness-bus".into(), || 7);
+    let (daemon, _wire, connector) = disabled_ckbus(&mut handler, &dir).await;
+    let mut source = BusSource {
+        connector,
+        ..BusSource::default()
+    };
+    // Use a distinct credential cache key from live NATS tests.
+    let failure = source
+        .open_watch("entorhinal-wire-liveness")
+        .await
+        .unwrap_err();
+    assert_eq!(failure.kind, "connect");
+    assert!(failure.not_expected_back, "{failure:?}");
+    assert!(failure
+        .message
+        .contains(subc_protocol::error_codes::TARGET_UNAVAILABLE));
+    assert_wire_catalog_wakes(&handler, &daemon).await;
+    handler.provider_resolver.stop().await;
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[async_trait]
+impl Source for RefusedCkbus {
+    async fn watch_all(&mut self) -> Result<(), Failure> {
+        Err(Failure::connect(self.attempt()))
+    }
+
+    async fn next(&mut self) -> Result<Delivery, Failure> {
+        panic!("read requires working ck-bus")
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn liveness_bus_waits_for_catalog_when_ckbus_disabled() {
+    let mut handler = ProjectsHandler::with_runtime("liveness-bus".into(), || 7);
+    let daemon = FakeDaemon::new(DaemonSnapshot::new(1, vec![], vec![]));
+    handler.provider_resolver = Arc::new(daemon.clone());
+    let (attempts_tx, attempts) = mpsc::unbounded_channel();
+    let worker = handler.liveness_bus_worker();
+    let failed = worker.failed.clone();
+    *handler.liveness_bus_task.lock().unwrap() =
+        Some(tokio::spawn(worker.run(RefusedCkbus(attempts_tx))));
+    assert_disabled_ckbus_schedule(&daemon, &failed, attempts).await;
+    assert!(!handler
+        .health
+        .liveness_bus_authoritative
+        .load(Ordering::Relaxed));
+    assert!(matches!(
+        handler
+            .liveness
+            .lock()
+            .unwrap()
+            .read(&SessionKey::new("broca", "s")),
+        Read::Unknown(None)
+    ));
+    let metrics = subc_client_rs::ModuleHandler::health(&handler)
+        .await
+        .metrics
+        .unwrap();
+    assert_eq!(metrics["livenessBusParkedCkbusNotExpectedBack"], true);
+    assert_eq!(metrics["livenessBusFailures"], 3);
+    handler.stop_liveness_bus().await;
+}
 
 pub(crate) fn put(key: &str, harness: &str, session: &str, state: &str) -> Update {
     Update::Put(
@@ -203,13 +274,13 @@ enum Event {
 
 struct Fake {
     events: mpsc::UnboundedSender<Event>,
-    opens: mpsc::UnboundedReceiver<()>,
+    opens: mpsc::UnboundedReceiver<Result<(), Failure>>,
     updates: mpsc::UnboundedReceiver<Result<Delivery, Failure>>,
 }
 
 struct Control {
     events: mpsc::UnboundedReceiver<Event>,
-    opens: mpsc::UnboundedSender<()>,
+    opens: mpsc::UnboundedSender<Result<(), Failure>>,
     updates: mpsc::UnboundedSender<Result<Delivery, Failure>>,
     failed: Arc<tokio::sync::Notify>,
 }
@@ -218,8 +289,7 @@ struct Control {
 impl Source for Fake {
     async fn watch_all(&mut self) -> Result<(), Failure> {
         self.events.send(Event::Open).unwrap();
-        self.opens.recv().await.expect("permit fresh watch");
-        Ok(())
+        self.opens.recv().await.expect("scripted watch result")
     }
     async fn next(&mut self) -> Result<Delivery, Failure> {
         self.events.send(Event::Next).unwrap();
@@ -232,7 +302,7 @@ impl Control {
         assert_eq!(self.events.recv().await, Some(expected));
     }
     async fn ready(&mut self) {
-        self.opens.send(()).unwrap();
+        self.opens.send(Ok(())).unwrap();
         self.event(Event::Next).await;
     }
     async fn apply(&mut self, update: Update) {
@@ -265,6 +335,40 @@ fn start(handler: &ProjectsHandler) -> Control {
         updates,
         failed,
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn liveness_bus_retries_when_ckbus_expected_back() {
+    use tokio::time::{timeout, Instant};
+
+    let handler = ProjectsHandler::with_runtime("bus-backoff".into(), || 7);
+    let mut control = start(&handler);
+    control.event(Event::Open).await;
+    for (index, seconds) in [1, 2, 4, 8, 16, 32, 60, 60].into_iter().enumerate() {
+        let refusal = Error::RouteRefused {
+            code: "module_reloading".into(),
+            expected_back: Some(true),
+        };
+        control.opens.send(Err(Failure::connect(refusal))).unwrap();
+        control.failed.notified().await;
+        let failed_at = Instant::now();
+        assert_eq!(
+            handler.health.liveness_bus_failures.load(Ordering::Relaxed),
+            index as u64 + 1
+        );
+        assert!(!handler.health.liveness_bus_parked.load(Ordering::Relaxed));
+        assert!(timeout(
+            Duration::from_millis(seconds * 1000 - 1),
+            control.events.recv()
+        )
+        .await
+        .is_err());
+        timeout(Duration::from_millis(2), control.event(Event::Open))
+            .await
+            .unwrap();
+        assert_eq!(failed_at.elapsed(), Duration::from_secs(seconds));
+    }
+    handler.stop_liveness_bus().await;
 }
 
 #[tokio::test]

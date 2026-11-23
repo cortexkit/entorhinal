@@ -1,5 +1,5 @@
 use super::*;
-use crate::bus_changes::Sink;
+use crate::bus_changes::{Failure, Sink};
 use crate::ModuleHandler;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::{mpsc, Notify};
@@ -28,16 +28,16 @@ struct FakeSink {
 
 #[async_trait::async_trait]
 impl Sink for FakeSink {
-    async fn ready(&mut self) -> Result<(), String> {
+    async fn ready(&mut self) -> Result<(), Failure> {
         self.control.attempts.fetch_add(1, Ordering::Relaxed);
         self.control.attempted.notify_one();
         if self.control.fail.load(Ordering::Relaxed) {
-            return Err("bucket not provisioned".into());
+            return Err("bucket not provisioned".to_string().into());
         }
         Ok(())
     }
 
-    async fn put(&mut self, key: &str, value: Vec<u8>) -> Result<(), String> {
+    async fn put(&mut self, key: &str, value: Vec<u8>) -> Result<(), Failure> {
         if self.control.block.swap(false, Ordering::Relaxed) {
             self.control.entered.notify_one();
             self.control.release.notified().await;
@@ -50,14 +50,14 @@ impl Sink for FakeSink {
         self.control.reconnected.notified().await
     }
 
-    async fn publish(&mut self, fact_id: &str, body: Vec<u8>) -> Result<(), String> {
+    async fn publish(&mut self, fact_id: &str, body: Vec<u8>) -> Result<(), Failure> {
         self.events.send((fact_id.into(), body)).unwrap();
         self.control.publish_attempted.notify_one();
         if self.control.publish_block.swap(false, Ordering::Relaxed) {
             self.control.publish_release.notified().await;
         }
         if self.control.publish_fail.load(Ordering::Relaxed) {
-            return Err("EVENT unavailable".into());
+            return Err("EVENT unavailable".to_string().into());
         }
         Ok(())
     }

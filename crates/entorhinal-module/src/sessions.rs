@@ -126,6 +126,10 @@ impl ProviderResolution {
 pub(super) trait ProviderResolver: Send + Sync {
     async fn resolve_provider(&self, capability: &str) -> ProviderResolution;
 
+    fn catalog_changes(&self) -> Option<tokio::sync::watch::Receiver<Option<u64>>> {
+        None
+    }
+
     fn cache_health(&self) -> ProviderCacheHealth {
         ProviderCacheHealth::default()
     }
@@ -155,6 +159,7 @@ struct CachedProviderResolver {
     hits: AtomicU64,
     misses: AtomicU64,
     watch_live: AtomicBool,
+    catalog_changes: tokio::sync::watch::Sender<Option<u64>>,
 }
 
 impl CachedProviderResolver {
@@ -165,6 +170,7 @@ impl CachedProviderResolver {
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             watch_live: AtomicBool::new(false),
+            catalog_changes: tokio::sync::watch::channel(None).0,
         }
     }
 
@@ -174,6 +180,16 @@ impl CachedProviderResolver {
         state.live = live;
         state.answers.clear();
         self.watch_live.store(live, Ordering::Relaxed);
+    }
+
+    fn note_catalog_generation(&self, generation: u64) {
+        // The first notice establishes a baseline; losing the watch or
+        // resubscribing at the same generation is not a catalog change.
+        self.catalog_changes.send_if_modified(|previous| {
+            previous
+                .replace(generation)
+                .is_some_and(|old| old != generation)
+        });
     }
 }
 
@@ -281,6 +297,12 @@ impl ProviderResolver for SubcProviderResolver {
         self.cache.cache_health()
     }
 
+    fn catalog_changes(&self) -> Option<tokio::sync::watch::Receiver<Option<u64>>> {
+        let changes = self.cache.catalog_changes.subscribe();
+        self.start_watch();
+        Some(changes)
+    }
+
     async fn stop(&self) {
         self.stop.cancel();
         let task = self
@@ -340,15 +362,15 @@ async fn watch_providers(connection: &SubcProviderConnection, cache: &CachedProv
             let mut subscription = consumer.catalog_watch().await.map_err(|e| e.to_string())?;
             // The first notice is the subscription's acknowledgement, not a
             // separate ACK frame. Until it arrives, lookups must stay uncached.
-            tokio::select! {
+            let initial = tokio::select! {
                 biased;
                 _ = connection.reset_watch.notified() => return Err("consumer replaced".into()),
                 notice = subscription.next() => match notice {
-                    Ok(Some(_)) => {},
+                    Ok(Some(notice)) => notice,
                     Ok(None) => return Err("catalog watch ended".into()),
                     Err(error) => return Err(error.to_string()),
                 },
-            }
+            };
             {
                 let slot = connection.consumer.lock().await;
                 if !slot
@@ -358,6 +380,7 @@ async fn watch_providers(connection: &SubcProviderConnection, cache: &CachedProv
                     return Err("consumer replaced".into());
                 }
                 cache.invalidate(true);
+                cache.note_catalog_generation(initial.generation);
             }
             if outage {
                 tracing::info!("session provider catalog watch recovered");
@@ -369,7 +392,10 @@ async fn watch_providers(connection: &SubcProviderConnection, cache: &CachedProv
                     biased;
                     _ = connection.reset_watch.notified() => return Err("consumer replaced".into()),
                     notice = subscription.next() => match notice {
-                        Ok(Some(_)) => cache.invalidate(true),
+                        Ok(Some(notice)) => {
+                            cache.invalidate(true);
+                            cache.note_catalog_generation(notice.generation);
+                        }
                         Ok(None) => return Err("catalog watch ended".into()),
                         Err(error) => return Err(error.to_string()),
                     },

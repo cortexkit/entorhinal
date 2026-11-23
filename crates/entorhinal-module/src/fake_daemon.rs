@@ -59,6 +59,8 @@ pub(crate) struct FakeDaemon {
     participant: Option<Arc<crate::fake_participant::FakeParticipant>>,
     request_bytes: Arc<Mutex<Vec<Vec<u8>>>>,
     catalog_notices: tokio::sync::broadcast::Sender<Option<u64>>,
+    catalog_changes: tokio::sync::watch::Sender<Option<u64>>,
+    refuse_ckbus: bool,
 }
 
 impl FakeDaemon {
@@ -69,6 +71,8 @@ impl FakeDaemon {
             participant: None,
             request_bytes: Arc::default(),
             catalog_notices: tokio::sync::broadcast::channel(16).0,
+            catalog_changes: tokio::sync::watch::channel(None).0,
+            refuse_ckbus: false,
         }
     }
 
@@ -77,6 +81,11 @@ impl FakeDaemon {
         participant: Arc<crate::fake_participant::FakeParticipant>,
     ) -> Self {
         self.participant = Some(participant);
+        self
+    }
+
+    pub(crate) fn with_ckbus_disabled(mut self) -> Self {
+        self.refuse_ckbus = true;
         self
     }
 
@@ -94,7 +103,11 @@ impl FakeDaemon {
 
     /// `None` ends open catalog subscriptions; a generation sends a notice.
     pub(crate) fn catalog_notice(&self, generation: Option<u64>) {
-        self.catalog_notices.send(generation).unwrap();
+        let delivered = self.catalog_notices.send(generation).is_ok();
+        assert!(delivered || self.catalog_changes.receiver_count() != 0);
+        if generation.is_some() {
+            self.catalog_changes.send_replace(generation);
+        }
     }
 
     fn admit(&self, target: &RouteTarget, principal: &str) -> Result<(), TransportError> {
@@ -102,6 +115,15 @@ impl FakeDaemon {
             target: target.clone(),
             principal: principal.into(),
         });
+        if self.refuse_ckbus
+            && matches!(target, RouteTarget::ManagementSurface { module_id } if module_id == "ckbus")
+        {
+            return Err(TransportError::Refusal {
+                code: subc_protocol::error_codes::TARGET_UNAVAILABLE.into(),
+                detail: Some(json!({"state": "disabled", "expected_back": false})),
+                message: None,
+            });
+        }
         let RouteTarget::InternalService {
             module_id,
             service_id,
@@ -159,6 +181,17 @@ impl FakeDaemon {
             body,
         });
         serde_json::to_vec(&json!({"result": {}})).unwrap()
+    }
+}
+
+#[async_trait]
+impl crate::sessions::ProviderResolver for FakeDaemon {
+    async fn resolve_provider(&self, _: &str) -> crate::sessions::ProviderResolution {
+        crate::sessions::ProviderResolution::Unprovided
+    }
+
+    fn catalog_changes(&self) -> Option<tokio::sync::watch::Receiver<Option<u64>>> {
+        Some(self.catalog_changes.subscribe())
     }
 }
 
@@ -236,6 +269,9 @@ impl WireDaemon {
                     peer = peers.join_next(), if !peers.is_empty() => { peer.unwrap().unwrap(); },
                     accepted = listener.accept() => {
                         let (stream, _) = accepted.unwrap();
+                        if daemon.refuse_ckbus {
+                            stream.set_nodelay(true).unwrap();
+                        }
                         peers.spawn(serve_wire(daemon.clone(), info.clone(), stream));
                     },
                 }
@@ -346,11 +382,18 @@ async fn serve_wire(
                 }
                 "route.open" => {
                     let identity = request["identity"].as_object().unwrap();
-                    assert_eq!(identity["harness"], "ck-entorhinal");
-                    assert!(!identity.contains_key("project_root"));
-                    assert!(!identity.contains_key("project_id"));
                     let target: RouteTarget =
                         serde_json::from_value(request["target"].clone()).unwrap();
+                    let harness = if matches!(&target,
+                        RouteTarget::ManagementSurface { module_id } if module_id == "ckbus")
+                    {
+                        "bus-client"
+                    } else {
+                        "ck-entorhinal"
+                    };
+                    assert_eq!(identity["harness"], harness);
+                    assert!(!identity.contains_key("project_root"));
+                    assert!(!identity.contains_key("project_id"));
                     // The fake authenticates the launch identity just as the daemon
                     // does; a missing or substituted secret is never a module caller.
                     let principal = if request["consumer_identity"]

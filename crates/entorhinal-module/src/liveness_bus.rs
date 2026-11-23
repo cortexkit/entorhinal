@@ -165,6 +165,7 @@ pub(super) enum Delivery {
 pub(super) struct Failure {
     kind: String,
     message: String,
+    not_expected_back: bool,
 }
 
 impl Failure {
@@ -172,8 +173,17 @@ impl Failure {
         Self {
             kind: kind.into(),
             message: message.to_string(),
+            not_expected_back: false,
         }
     }
+
+    fn connect(error: Error) -> Self {
+        Self {
+            not_expected_back: super::bus_changes::ckbus_not_expected_back(&error),
+            ..Self::new("connect", error)
+        }
+    }
+
     fn decode(error: serde_json::Error) -> Self {
         Self::new("decode", error)
     }
@@ -195,9 +205,8 @@ struct BusSource {
     watch: Option<BucketWatch>,
 }
 
-#[async_trait]
-impl Source for BusSource {
-    async fn watch_all(&mut self) -> Result<(), Failure> {
+impl BusSource {
+    async fn open_watch(&mut self, module_id: &str) -> Result<(), Failure> {
         self.watch = None;
         if let Some(changes) = &mut self.changes {
             match changes.has_changed() {
@@ -219,10 +228,10 @@ impl Source for BusSource {
                 .map_err(|e| Failure::new("credential", format!("{e:?}")))?;
             let client = BusClient::connect(
                 consumer,
-                BusClientOptions::new(super::MODULE_ID).map_err(|e| Failure::new("options", e))?,
+                BusClientOptions::new(module_id).map_err(|e| Failure::new("options", e))?,
             )
             .await
-            .map_err(|e| Failure::new("connect", e))?;
+            .map_err(Failure::connect)?;
             self.changes = Some(client.connection_changes());
             self.client = Some(client);
         }
@@ -232,6 +241,13 @@ impl Source for BusSource {
             .map_err(|e| Failure::new("bucket_name", e))?;
         self.watch = Some(bucket.watch().await.map_err(|e| Failure::new("watch", e))?);
         Ok(())
+    }
+}
+
+#[async_trait]
+impl Source for BusSource {
+    async fn watch_all(&mut self) -> Result<(), Failure> {
+        self.open_watch(super::MODULE_ID).await
     }
 
     async fn next(&mut self) -> Result<Delivery, Failure> {
@@ -263,6 +279,7 @@ struct Worker {
     liveness: Arc<Mutex<LivenessState>>,
     health: Arc<HealthGauges>,
     upkeep: Arc<super::session_upkeep::SessionUpkeep>,
+    providers: Arc<dyn super::sessions::ProviderResolver>,
     clock: fn() -> i64,
     #[cfg(test)]
     failed: Arc<tokio::sync::Notify>,
@@ -318,7 +335,11 @@ impl Worker {
     async fn run(self, mut source: impl Source) {
         let mut backoff = INITIAL_BACKOFF;
         let mut outage: Option<(String, u64)> = None;
+        let mut daemon_catalog = self.providers.catalog_changes();
         loop {
+            if let Some(changes) = &mut daemon_catalog {
+                changes.mark_unchanged();
+            }
             self.clear();
             let result = async {
                 source.watch_all().await?;
@@ -343,15 +364,25 @@ impl Worker {
                 self.health
                     .liveness_bus_failures
                     .fetch_add(1, Ordering::Relaxed);
+                self.health
+                    .liveness_bus_parked
+                    .store(error.not_expected_back, Ordering::Relaxed);
                 #[cfg(test)]
                 self.failed.notify_one();
                 match &mut outage {
                     Some((kind, attempts)) if *kind == error.kind => *attempts += 1,
                     _ => {
                         tracing::warn!(target: "liveness", kind = error.kind, detail = error.message,
-                            previous = ?outage, "bus liveness unavailable; sessions are unknown (repeats are counted, not logged)");
+                            parked = error.not_expected_back, previous = ?outage, "bus liveness unavailable; sessions are unknown (repeats are counted, not logged)");
                         outage = Some((error.kind, 1));
                     }
+                }
+                if error.not_expected_back {
+                    super::bus_changes::wait_for_catalog(&mut daemon_catalog).await;
+                    self.health
+                        .liveness_bus_parked
+                        .store(false, Ordering::Relaxed);
+                    continue;
                 }
             }
             tokio::time::sleep(backoff).await;
@@ -366,6 +397,7 @@ impl ProjectsHandler {
             liveness: self.liveness.clone(),
             health: self.health.clone(),
             upkeep: self.session_upkeep.clone(),
+            providers: self.provider_resolver.clone(),
             clock: self.clock,
             #[cfg(test)]
             failed: Arc::default(),
