@@ -661,6 +661,62 @@ async fn hub_residence_create_restarts_pending_and_preserves_session_precedence(
 }
 
 #[tokio::test]
+async fn hub_residence_where_many_keeps_own_holder_during_restart() {
+    let Some(rig) = IdentityRig::new().await else {
+        return;
+    };
+    migrate_identity(&rig.a, MIGRATED, "Local agent");
+    let image = Arc::new(Image(HashMap::from([(
+        MIGRATED.into(),
+        (Some(A.into()), 1),
+    )])));
+    residence(&rig.a, image.clone());
+    let mut seeded = record(A, A, 1, false);
+    seeded["seeded"] = json!(true);
+    let revision = put(&rig, MIGRATED, 0, A, seeded).await;
+    assert!(!applied(&rig.a, MIGRATED, revision).await.integrity_failed);
+    until(|| ready_for(&rig.a, MIGRATED)).await;
+
+    let Node { handler, leaf, log } = rig.a;
+    handler.stop_hub_residence().await;
+    crate::tests::stop_catch_up(&handler).await;
+    drop((handler, log));
+
+    let (entered, waiting) = oneshot::channel();
+    let (release, released) = oneshot::channel();
+    *leaf.head_gate.lock().unwrap() = Some((entered, released));
+    let mut restarted = ProjectsHandler::with_runtime(A.into(), || 800);
+    restarted.feed_clock = Arc::new(FrozenFeedClock);
+    *restarted.store.lock().unwrap() = Some(store(&rig._processes, "box-a"));
+    let node = Node {
+        log: activate(&restarted, leaf.clone(), &rig.keys),
+        leaf,
+        handler: restarted,
+    };
+    within(waiting).await.unwrap();
+    residence(&node, image);
+    bind(&node.handler, subc_protocol::Principal::Direct);
+    let reply = result(
+        node.handler
+            .handle_served_request(
+                &body("agent.where_many", json!({"agentIds":[MIGRATED]})),
+                ROUTE,
+            )
+            .await,
+    );
+    assert!(!node.log.membership_ready());
+    let entry = &reply["agents"][0];
+    assert_eq!(entry["agent_id"], MIGRATED);
+    assert_eq!(entry["status"], "held_here");
+    assert_eq!(entry["known"], true);
+    assert_eq!(entry["epoch"], 1);
+    assert_eq!(entry["holder_box"], A);
+    assert_eq!(entry["stale"], true);
+    release.send(()).unwrap();
+    until(|| ready_for(&node, MIGRATED)).await;
+}
+
+#[tokio::test]
 async fn hub_residence_forced_take_removed_and_engram_holders() {
     let Some(mut rig) = IdentityRig::new().await else {
         return;

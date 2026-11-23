@@ -385,30 +385,48 @@ pub(crate) fn hub_claim_view(
     context: &HubClaimContext<'_>,
 ) -> rusqlite::Result<ClaimView> {
     let cached = crate::hub_store::kv_cached(conn, &format!("residence.{id}"))?;
+    let body = cached.as_ref().and_then(|row| row.body.as_ref());
+    let holder = body.and_then(|body| body["holder"].as_str());
+    if context.local_box.is_empty() && holder.is_some() {
+        return Ok(ClaimView {
+            known: false,
+            claim: unclaimed(0, true, false),
+            own: None,
+            read_at_ms: None,
+            holder_box: None,
+            hub: true,
+        });
+    }
     let revision = cached.as_ref().map(|row| row.revision);
     let integrity = cached.as_ref().is_some_and(|row| row.integrity_failed);
-    let body = cached.as_ref().and_then(|row| row.body.as_ref());
     let pending = body.is_none()
         && (crate::hub_store::agent_creator(conn, id, i64::MAX)?.is_some()
             || (context.seed_expected)(id));
     let mut claim = unclaimed(0, pending || !(context.fresh)(id, revision), integrity);
     let mut holder_box = None;
     if let Some(body) = body {
-        claim.holder = body["holder"].as_str().map(str::to_owned);
+        claim.holder = holder.map(str::to_owned);
         claim.epoch = body["gen"].as_i64().unwrap_or_default();
         claim.cut_id = body["cut_id"].as_str().map(str::to_owned);
-        let applied = conn.query_row(
-            "SELECT last_applied_position FROM identity_log_state WHERE id=1",
-            [],
-            |row| row.get(0),
-        )?;
-        holder_box = claim.holder.clone().filter(|holder| {
-            (context.holder_current)(
-                holder,
-                body["holder_ep"].as_u64().unwrap_or_default(),
-                applied,
-            )
-        });
+        // The local box knows its own ID even before the roster loads.
+        holder_box = if holder == Some(context.local_box) {
+            Some(context.local_box.to_owned())
+        } else {
+            let applied = conn.query_row(
+                "SELECT last_applied_position FROM identity_log_state WHERE id=1",
+                [],
+                |row| row.get(0),
+            )?;
+            holder
+                .filter(|holder| {
+                    (context.holder_current)(
+                        holder,
+                        body["holder_ep"].as_u64().unwrap_or_default(),
+                        applied,
+                    )
+                })
+                .map(str::to_owned)
+        };
     }
     Ok(ClaimView {
         known: cached.is_some() || !claim.stale,
@@ -618,6 +636,53 @@ mod tests {
             stale,
             self_author: SELF.into(),
         }
+    }
+
+    fn hub_startup_where(holder: &str, local_box: &str) -> Value {
+        let f = Fixture::new();
+        let body = serde_json::json!({"holder":holder,"holder_ep":1,"gen":1,"cut_id":"cut"});
+        f.store
+            .record_hub_kv(
+                &format!("residence.{ID}"),
+                1,
+                Some((b"value", Some(&body))),
+                9,
+            )
+            .unwrap();
+        let context = HubClaimContext {
+            local_box,
+            fresh: &|_, _| false,
+            holder_current: &|_, _, _| false,
+            seed_expected: &|_| false,
+        };
+        serde_json::to_value(f.store.hub_agent_where(ID, &context).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn hub_where_own_holder_before_membership_is_held_here_but_stale() {
+        assert_eq!(
+            hub_startup_where(SELF, SELF),
+            serde_json::json!({"known":true,"status":"held_here","holder":SELF,"holder_name":null,
+                "holder_box":SELF,"epoch":1,"cut_id":"cut","read_at_ms":9,"stale":true})
+        );
+    }
+
+    #[test]
+    fn hub_where_holder_with_unknown_local_box_is_unclaimed_and_stale() {
+        assert_eq!(
+            hub_startup_where(SELF, ""),
+            serde_json::json!({"known":false,"status":"unclaimed","holder":null,"holder_name":null,
+                "epoch":0,"cut_id":null,"read_at_ms":null,"stale":true})
+        );
+    }
+
+    #[test]
+    fn hub_where_other_holder_before_membership_is_held_elsewhere_without_holder_box() {
+        assert_eq!(
+            hub_startup_where(OTHER, SELF),
+            serde_json::json!({"known":true,"status":"held_elsewhere","holder":OTHER,"holder_name":null,
+                "epoch":1,"cut_id":"cut","read_at_ms":9,"stale":true})
+        );
     }
 
     #[test]
