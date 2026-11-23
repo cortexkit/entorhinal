@@ -11,6 +11,9 @@ use std::time::Duration;
 use tokio::time::{timeout_at, Instant};
 
 const INTERVAL: Duration = Duration::from_secs(30);
+// The probe asks ck-bus for a hub credential, and every probe is refused when ck-bus is disabled.
+const PROBE_BACKOFF_START: Duration = Duration::from_secs(30);
+const PROBE_BACKOFF_MAX: Duration = Duration::from_secs(15 * 60);
 pub(super) const READ_DEADLINE: Duration = Duration::from_secs(25);
 
 pub(crate) struct Worker {
@@ -175,6 +178,8 @@ impl Worker {
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut hub_retry = Some(Instant::now());
         let mut backoff = Duration::from_secs(1);
+        let mut next_probe = None;
+        let mut probe_backoff = PROBE_BACKOFF_START;
         loop {
             let installed = self.health.hub_membership.load(Ordering::Acquire) != 0;
             tokio::select! {
@@ -270,10 +275,21 @@ impl Worker {
                     log_switch_result(&mut gate_error, &result);
                     continue;
                 }
-                let hub_head = if let Some(switch) = &self.hub_switch {
+                let hub_head = if let Some(switch) = self
+                    .hub_switch
+                    .as_ref()
+                    .filter(|_| next_probe.is_none_or(|due| Instant::now() >= due))
+                {
                     let discovery_deadline = deadline.min(Instant::now() + Duration::from_secs(5));
                     let head = switch.head(discovery_deadline).await;
                     log_switch_result(&mut switch_error, &head);
+                    if head.is_ok() {
+                        next_probe = None;
+                        probe_backoff = PROBE_BACKOFF_START;
+                    } else {
+                        next_probe = Some(Instant::now() + probe_backoff);
+                        probe_backoff = (probe_backoff * 2).min(PROBE_BACKOFF_MAX);
+                    }
                     head.ok()
                 } else {
                     None
@@ -1647,6 +1663,50 @@ mod tests {
         // store open while Windows deletes the scratch folder.
         crate::tests::stop_store_tasks(&f.handler).await;
         crate::tests::stop_store_tasks(&disabled.handler).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn background_backs_off_failed_hub_probes_without_skipping_legacy_reads() {
+        let mut f = Fixture::new("catch-hub-probe-backoff");
+        // A missing connection file makes each real hub head probe fail before
+        // it contacts a daemon. Hub health counts one failure per attempt.
+        let connector = log_client::SubcConnector::from_args([
+            "--subc".into(),
+            f.dir.join("missing-subc.json").into_os_string(),
+        ]);
+        let hub = crate::hub_transport::Hub::new(connector, f.handler.health.clone());
+        hub.activate();
+        f.handler.hub_switch = Some(crate::hub_switch::Switch::new(
+            hub,
+            f.handler.legacy_move_admission.clone(),
+            f.handler.participant_discovery.clone(),
+        ));
+        f.handler.start_catch_up();
+
+        let mut metrics = json!({});
+        let mut probes = Vec::new();
+        for (tick, seconds) in (0..=1200).step_by(30).enumerate() {
+            if tick != 0 {
+                tokio::time::advance(Duration::from_secs(30)).await;
+            }
+            woken(std::pin::pin!(f.tap.fake.wait_for_calls(tick + 1))).await;
+            assert_eq!(f.tap.reads.lock().unwrap().len(), tick + 1, "at {seconds}s");
+            f.handler.health.hub.report(&mut metrics);
+            let failures = metrics["hubFailures"].as_u64().unwrap();
+            if failures != probes.len() as u64 {
+                assert_eq!(failures, probes.len() as u64 + 1, "at {seconds}s");
+                probes.push(seconds);
+            }
+        }
+
+        f.handler.catch_up_wake.notify_one();
+        woken(std::pin::pin!(f.tap.fake.wait_for_calls(42))).await;
+        assert_eq!(f.tap.reads.lock().unwrap().len(), 42);
+        f.handler.health.hub.report(&mut metrics);
+        crate::tests::stop_catch_up(&f.handler).await;
+
+        assert_eq!(probes, [0, 30, 90, 210, 450, 930]);
+        assert_eq!(metrics["hubFailures"], json!(6), "wake retried the probe");
     }
 
     #[tokio::test(start_paused = true)]
