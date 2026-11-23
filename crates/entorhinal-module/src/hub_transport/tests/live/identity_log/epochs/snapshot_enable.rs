@@ -114,6 +114,102 @@ fn plan(store: &RegistryStore) -> HubSnapshot {
 }
 
 #[tokio::test]
+async fn hub_join_preserves_admission_wrap_until_wiped_member_publishes_key() {
+    let Some(rig) = IdentityRig::new().await else {
+        return;
+    };
+    for node in [&rig.a, &rig.b] {
+        let tail = node.handler.hub_tail_task.lock().unwrap().take().unwrap();
+        tail.abort();
+        assert!(tail.await.unwrap_err().is_cancelled());
+    }
+    let fleet = Arc::new(Fleet::default());
+    roster(&fleet, &rig, &[A, B]);
+    let (a, leader, _) = bootstrap(
+        &rig,
+        store(&rig._processes, "admit-leader"),
+        rig.a.leaf.clone(),
+        fleet.clone(),
+        None,
+        0,
+    );
+    let store_a = leader.sql.test_store();
+    store_a.begin_hub_enable(&"4c".repeat(16), A).unwrap();
+    assert!(transfer(&leader, Some(&plan(&store_a)), deadline())
+        .await
+        .unwrap());
+    activate(&a, leader.clone(), rig.a.leaf.clone());
+    within(async {
+        while !leader.membership_ready() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+
+    let removal = "test-wiped-removal";
+    let responder = Controller::new(leader.clone()).unwrap();
+    roster(&fleet, &rig, &[A]);
+    responder
+        .deliver(&event(B, removal), deadline())
+        .await
+        .unwrap();
+    roster(&fleet, &rig, &[A, B]);
+    let (b, follower, vault) = bootstrap(
+        &rig,
+        store(&rig._processes, "admit-wiped"),
+        rig.b.leaf.clone(),
+        fleet,
+        None,
+        0,
+    );
+    let joiner = Controller::new(follower.clone()).unwrap();
+    joiner.joins(deadline()).await.unwrap();
+    let request = format!("wrapreq.{B}");
+    let bytes = rig.kv.get(&request).await.unwrap().unwrap();
+    let record = UnverifiedRecord::parse(&request, &bytes).unwrap();
+    let body = record.unsealed().unwrap();
+    assert_eq!(body["after_removal_id"], removal);
+    let request_id = body["request_id"].as_str().unwrap();
+    let manifest = format!("wrapjoin.{B}.{request_id}");
+    responder.joins(deadline()).await.unwrap();
+    assert!(rig.kv.get(&manifest).await.unwrap().is_some());
+    let head = leader.log_head(deadline()).await.unwrap();
+    let bytes = rig
+        .a
+        .leaf
+        .log_entry(head, deadline())
+        .await
+        .unwrap()
+        .unwrap();
+    let admission = UnverifiedRecord::parse(LOG_SUBJECT, &bytes).unwrap();
+    assert_eq!(admission.header().kind, "member.admitted");
+    assert_eq!(admission.unsealed().unwrap()["request_id"], request_id);
+
+    // Discovery can see the admission, but don't start the local log tail
+    // until the blank store has processed the join response and installed its base.
+    assert_eq!(follower.sql.test_store().hub_log_base().unwrap(), None);
+    assert_eq!(follower.applied_sequence(deadline()).await.unwrap(), 0);
+    joiner.joins(deadline()).await.unwrap();
+    assert_eq!(vault.state.lock().unwrap().joins_imported, [vec![1, 2]]);
+    assert!(
+        rig.kv.get(&manifest).await.unwrap().is_some(),
+        "the join manifest must survive until the new writer key is published"
+    );
+
+    assert!(transfer(&follower, None, deadline()).await.unwrap());
+    activate(&b, follower.clone(), rig.b.leaf.clone());
+    within(async {
+        while follower.writer_episode(deadline()).await.ok() != Some(1) {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    joiner.joins(deadline()).await.unwrap();
+    assert!(rig.kv.get(&manifest).await.unwrap().is_none());
+    assert!(rig.kv.get(&request).await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn hub_snapshot_enable_resumes_after_part_and_seed_and_empty_member_joins() {
     let Some(rig) = IdentityRig::new().await else {
         return;

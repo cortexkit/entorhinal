@@ -283,7 +283,23 @@ impl<T: LogTransport, U: Trust + Send + Sync + 'static> Controller<T, U> {
             self.request_join(None, revision, deadline).await?;
             return Ok(true);
         }
-        if self.log.writer_episode(deadline).await.is_err() {
+        // A blank store can report episode 0 before it has installed the snapshot.
+        // Keep the manifest until the local log tail has applied the admission
+        // and the key publication for the episode that discovery sees at the head.
+        let installed = self
+            .reader
+            .sql
+            .run(deadline, "hub_log_base", |store| {
+                Ok(store.hub_log_base()?.is_some())
+            })
+            .await?;
+        if !installed
+            || !self
+                .log
+                .writer_episode(deadline)
+                .await
+                .is_ok_and(|episode| timeline.open_episode(own, head) == Some(episode))
+        {
             return Ok(true);
         }
         self.clean_join(own, &key, revision, deadline).await?;
