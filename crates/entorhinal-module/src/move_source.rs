@@ -2011,7 +2011,6 @@ mod tests {
                 }),
                 catalog: None,
                 health: Arc::new(HealthGauges::default()),
-                watches: Arc::default(),
                 writer: Arc::new(tokio::sync::Mutex::new(())),
                 clock,
                 wake: Arc::new(crate::move_driver::MoveWake::default()),

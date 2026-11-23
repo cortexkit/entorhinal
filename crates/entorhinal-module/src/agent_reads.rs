@@ -356,7 +356,6 @@ mod tests {
     };
 
     use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
-    use entorhinal_core::claim_cache::{CachedClaim, ClaimObservation};
     use serde_json::json;
     use subc_client_rs::HandlerOutcome;
     use subc_protocol::{ErrorBody, Principal};
@@ -623,43 +622,17 @@ mod tests {
     }
 
     #[test]
-    fn node_self_sharing_on_uses_own_member_name_and_matches_where() {
+    fn node_self_sharing_on_uses_own_member_name() {
         let f = Fixture::new(true);
-        let agent = f.create("Node reader");
         f.sql("UPDATE identity_log_state SET state='enabled' WHERE id=1;
             INSERT INTO member_name(author,display_name) VALUES('1111111111111111','Other machine');
-            INSERT INTO member_name(author,display_name) VALUES('2222222222222222','Workshop machine');");
-        f.handler
-            .with_store(|store| {
-                store.cache_agent_claims(
-                    &[(
-                        agent.clone(),
-                        ClaimObservation::Present {
-                            claim: CachedClaim {
-                                holder: Some("2222222222222222".into()),
-                                epoch: 1,
-                                cut_id: None,
-                                version: 1,
-                                read_at_ms: 700,
-                                stale: false,
-                                integrity_failed: false,
-                            },
-                            self_author: "2222222222222222".into(),
-                        },
-                    )],
-                    700,
-                )
-            })
-            .unwrap();
+            INSERT INTO member_name(author,display_name) VALUES('2222222222222222','Workshop machine');
+            INSERT INTO self_identity(id,self_author,learned_at_ms) VALUES(1,'2222222222222222',700);");
         let reply = f.ok("node.self", json!({}));
         assert_eq!(
             reply,
             json!({"author":"2222222222222222","display_name":"Workshop machine","sharing":"enabled"})
         );
-        let location = f.ok("agent.where", json!({"agent_id":agent}));
-        assert_eq!(location["status"], "held_here");
-        assert_eq!(reply["author"], location["holder"]);
-        assert_eq!(reply["display_name"], location["holder_name"]);
     }
 
     #[test]

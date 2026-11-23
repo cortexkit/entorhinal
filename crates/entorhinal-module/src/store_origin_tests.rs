@@ -237,7 +237,6 @@ async fn foreign_store_starts_no_machine_background_work_and_health_is_lock_free
         f.handler.catch_up_task.lock().unwrap().is_none(),
         "foreign store must not start catch-up"
     );
-    assert!(f.handler.claim_refresh_task.lock().unwrap().is_none());
     assert!(f.handler.role_refresh_task.lock().unwrap().is_none());
     assert!(f.handler.move_driver_task.lock().unwrap().is_none());
     assert!(f.handler.catalog_poll_task.lock().unwrap().is_none());
@@ -299,23 +298,7 @@ async fn foreign_store_where_many_watch_and_role_never_hold_here() {
         1,
         "foreign reads must not enroll roles"
     );
-    let store = f.handler.with_store(|s| Ok(s.clone())).unwrap();
-    let mut claim = store.cached_agent_claim(&f.id).unwrap().unwrap();
-    claim.version += 1;
-    f.handler
-        .watches
-        .cache_claims(
-            &store,
-            &[(
-                f.id.clone(),
-                entorhinal_core::claim_cache::ClaimObservation::Present {
-                    claim,
-                    self_author: OLD.into(),
-                },
-            )],
-            4,
-        )
-        .unwrap();
+    f.handler.watches.resync_all();
     let watch = Watch::default();
     let body = serde_json::to_vec(&json!({"method":watches::WHERE,"params":{"agentIds":[f.id],"cursor":{"incarnation":"origin","seq":0}}})).unwrap();
     assert!(matches!(
@@ -328,8 +311,7 @@ async fn foreign_store_where_many_watch_and_role_never_hold_here() {
         frames[0].to_string()
     };
     assert!(!encoded.contains("held_here"));
-    assert!(encoded.contains("\"known\":false"), "{encoded}");
-    drop(store);
+    assert!(encoded.contains("\"kind\":\"resync\""), "{encoded}");
     f.stop().await;
 }
 

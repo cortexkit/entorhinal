@@ -516,12 +516,32 @@ async fn sharing_baseline_history_replies_and_prefixes() {
         check_history(&file, name, state, *base);
         for (kind, actual) in history_outputs(&dir, name, *base).await {
             let path = dir.join(format!("{name}.{kind}"));
-            assert_eq!(
-                fs::read_to_string(&path).unwrap(),
-                actual,
-                "{}",
-                path.display()
-            );
+            let mut expected = fs::read_to_string(&path).unwrap();
+            if kind == "unselected.jsonl" || (kind == "default.jsonl" && base.is_none()) {
+                // Preserve the recorded replies and substitute only the former
+                // cache hit for the first agent in each observer without a hub.
+                let disabled = *state == "disabled";
+                let agent = "agent_0000000000000001";
+                let old_where = json!({"agent_id":agent,"cut_id":null,"epoch":3,
+                    "holder":"11111111111111111111111111111111","holder_name":null,
+                    "known":true,"read_at_ms":700,"stale":false,"status":"held_elsewhere"});
+                let mut old_with_box = old_where.clone();
+                old_with_box["holder_box"] = json!(BOX_A);
+                let new_where = json!({"agent_id":agent,"cut_id":null,"epoch":0,"holder":null,
+                    "holder_name":null,"known":disabled,"read_at_ms":null,"stale":!disabled,"status":"unclaimed"});
+                let old_residence = json!({"agent_id":agent,"epoch":3,
+                    "holder":"11111111111111111111111111111111","read_at_ms":700,"state":"elsewhere"});
+                let new_residence = if disabled {
+                    json!({"agent_id":agent,"epoch":0,"state":"unclaimed"})
+                } else {
+                    json!({"agent_id":agent,"state":"unknown"})
+                };
+                expected = expected
+                    .replace(&old_where.to_string(), &new_where.to_string())
+                    .replace(&old_with_box.to_string(), &new_where.to_string())
+                    .replace(&old_residence.to_string(), &new_residence.to_string());
+            }
+            assert_eq!(expected, actual, "{}", path.display());
         }
     }
 }

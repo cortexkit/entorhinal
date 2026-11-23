@@ -3255,7 +3255,6 @@ impl ProjectsHandler {
             let store = self.with_store(|s| Ok(s.clone()))?;
             let now = (self.clock)();
             let clock = self.clock;
-            let refresh = self.claim_refresh.clone();
             let residence = self.residence();
             let hub_selected = self.hub_backend_selected();
             let worker = tokio::task::spawn_blocking(move || {
@@ -3276,7 +3275,6 @@ impl ProjectsHandler {
                             role,
                             now,
                             clock,
-                            &refresh,
                             context,
                         )
                     },
@@ -3718,7 +3716,6 @@ impl ProjectsHandler {
         };
         if state != "enabled" || !candidate {
             if agent_write {
-                let before = store.generation().map_err(storage_error)?;
                 let body = prepared.unwrap().run(
                     &store,
                     &principal,
@@ -3728,10 +3725,6 @@ impl ProjectsHandler {
                     None,
                 )?;
                 self.commits.notify_waiters();
-                if creating && store.generation().map_err(storage_error)? != before {
-                    drop(writer);
-                    self.refresh_claims_for_new_agent();
-                }
                 return self.record_mutation(Ok(body));
             }
             if approval.is_some() || creating {
@@ -3757,10 +3750,6 @@ impl ProjectsHandler {
                     {
                         tracing::warn!(target:"binding", "binding after confirmed register failed: {error}");
                     }
-                }
-                if creating && committed {
-                    drop(writer);
-                    self.refresh_claims_for_new_agent();
                 }
                 return self.record_mutation(if request.method.starts_with("agent.") {
                     self.attach_incarnation(body)
@@ -3870,12 +3859,6 @@ impl ProjectsHandler {
                 body = self.attach_incarnation(body)?;
             }
             self.commits.notify_waiters();
-            // Head-moved retries `continue` above, so only the attempt that
-            // committed reaches here and asks for one refresh.
-            if creating {
-                drop(writer);
-                self.refresh_claims_for_new_agent();
-            }
             return self.record_mutation(Ok(body));
         }
         unreachable!()

@@ -8,8 +8,6 @@ use crate::log_client::{LogConnector, LogTransport, TransportError};
 use rusqlite::{types::Value as Cell, Connection, OpenFlags};
 use std::{future::Future, path::Path, sync::atomic::AtomicUsize};
 
-#[path = "initial_claim_acceptance.rs"]
-mod initial_claims;
 #[path = "member_box_acceptance.rs"]
 mod member_boxes;
 
@@ -482,10 +480,8 @@ async fn hub_cutover_restart_never_calls_engram() {
     assert!(m.handler.hub_backend_selected());
     m.handler.start_catch_up();
     m.handler.start_role_refresh();
-    m.handler.start_claim_refresh();
     m.handler.start_move_driver();
     m.handler.role_refresh.notify_one();
-    m.handler.claim_refresh.signal();
     m.handler.move_wake.notify_one();
     for _ in 0..3 {
         tokio::time::advance(Duration::from_secs(30)).await;
@@ -652,27 +648,12 @@ async fn disabled_workload_keeps_local_journal_and_never_connects() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn s3_names_replicate_to_where_and_survive_supersede_for_late_joiner() {
-    use crate::{
-        fake_record::{FakeRecord, FakeRecordConnector},
-        record_client::RecordClient,
-    };
+async fn s3_names_and_boxes_survive_supersede_for_late_joiner() {
     let root = FakeLog::default();
     let a_log = Arc::new(root.with_author([0x11; 16]));
     let b_log = Arc::new(root.with_author([0x22; 16]));
-    let a_record = FakeRecord::new([0x11; 16]);
-    let b_record = FakeRecord::new([0x22; 16]);
-    b_record.offline.store(true, Ordering::Relaxed);
-    let a = Machine::new_with_record(
-        "name-a",
-        a_log.clone(),
-        RecordClient::new(Arc::new(FakeRecordConnector(a_record))),
-    );
-    let b = Machine::new_with_record(
-        "name-b",
-        b_log.clone(),
-        RecordClient::new(Arc::new(FakeRecordConnector(b_record.clone()))),
-    );
+    let a = Machine::new("name-a", a_log.clone());
+    let b = Machine::new("name-b", b_log);
     a.enable_without_agents().await;
     b.enable_without_agents().await;
     assert_eq!(
@@ -691,14 +672,12 @@ async fn s3_names_replicate_to_where_and_survive_supersede_for_late_joiner() {
     a.call("member.set_name", json!({"display_name":"  Studio  "}))
         .await
         .unwrap();
-    let created = a
-        .call(
-            "agent.create",
-            json!({"request_key":"named-agent","name":"Ada","tag":"test","role":"assistant"}),
-        )
-        .await
-        .unwrap();
-    let agent = created["agent"]["agent_id"].as_str().unwrap();
+    a.call(
+        "agent.create",
+        json!({"request_key":"named-agent","name":"Ada","tag":"test","role":"assistant"}),
+    )
+    .await
+    .unwrap();
     b.catch_up().await;
     assert_eq!(
         b.rows("member_name"),
@@ -707,23 +686,6 @@ async fn s3_names_replicate_to_where_and_survive_supersede_for_late_joiner() {
             Cell::Text("Studio".into())
         ]]
     );
-    let claim = serde_json::to_vec(&json!({"v":1,"agent_id":agent,"holder":"11".repeat(16),"epoch":1,"cut_id":null,"reason":null})).unwrap();
-    b_record.put(
-        &format!("claim:{agent}"),
-        1,
-        claim.clone(),
-        &"11".repeat(16),
-    );
-    b_record.offline.store(false, Ordering::Relaxed);
-    b.bytes_on(DIRECT, "agent.refresh_claims", json!({}))
-        .await
-        .unwrap();
-    let where_reply = b
-        .call("agent.where", json!({"agent_id":agent}))
-        .await
-        .unwrap();
-    assert_eq!(where_reply["status"], "held_elsewhere");
-    assert_eq!(where_reply["holder_name"], "Studio");
 
     // Populate the mapping through the shared writer before replacing the prefix.
     let studio_box = "ab".repeat(16);
@@ -759,91 +721,14 @@ async fn s3_names_replicate_to_where_and_survive_supersede_for_late_joiner() {
         value["member_box"],
         json!({"author":"11".repeat(16),"box_id":studio_box})
     );
-    let c_record = FakeRecord::new([0x33; 16]);
-    c_record.put(&format!("claim:{agent}"), 1, claim, &"11".repeat(16));
-    c_record.offline.store(true, Ordering::Relaxed);
-    let c = Machine::new_with_record(
-        "name-late",
-        Arc::new(root.with_author([0x33; 16])),
-        RecordClient::new(Arc::new(FakeRecordConnector(c_record.clone()))),
-    );
+    let c = Machine::new("name-late", Arc::new(root.with_author([0x33; 16])));
     c.enable_without_agents().await;
     assert_eq!(c.rows("member_name"), b.rows("member_name"));
     assert_eq!(c.rows("member_box"), b.rows("member_box"));
     assert_eq!(c.store().persisted_self_author().unwrap(), None);
-    c_record.offline.store(false, Ordering::Relaxed);
-    c.bytes_on(DIRECT, "agent.refresh_claims", json!({}))
-        .await
-        .unwrap();
-    assert_eq!(
-        c.call("agent.where", json!({"agent_id":agent}))
-            .await
-            .unwrap()["holder_name"],
-        "Studio"
-    );
     a.clean_rebuild().await;
     b.clean_rebuild().await;
     c.clean_rebuild().await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn agent_created_on_another_machine_has_its_claim_read_after_catch_up() {
-    use crate::{
-        fake_record::{FakeRecord, FakeRecordConnector},
-        record_client::RecordClient,
-    };
-    let root = FakeLog::default();
-    let a = Machine::new_with_record(
-        "remote-claim-a",
-        Arc::new(root.with_author([0x11; 16])),
-        RecordClient::new(Arc::new(FakeRecordConnector(FakeRecord::new([0x11; 16])))),
-    );
-    // B's record stand-in has no claim for the new agent, which reads as
-    // absent: a known, unclaimed agent once B's refresh has read it.
-    let b = Machine::new_with_record(
-        "remote-claim-b",
-        Arc::new(root.with_author([0x22; 16])),
-        RecordClient::new(Arc::new(FakeRecordConnector(FakeRecord::new([0x22; 16])))),
-    );
-    a.enable_without_agents().await;
-    b.enable_without_agents().await;
-    let created = a
-        .call(
-            "agent.create",
-            json!({"request_key":"remote-claim","name":"Ada","tag":"test","role":"assistant"}),
-        )
-        .await
-        .unwrap();
-    let agent = created["agent"]["agent_id"].as_str().unwrap();
-    // Wait out the refresh B's enable asked for, so the only pass that can
-    // finish after this point is one the catch-up below asks for.
-    b.bytes_on(DIRECT, "agent.refresh_claims", json!({}))
-        .await
-        .unwrap();
-    let refreshed = b.handler.health.claim_refresh_done.notified();
-    tokio::pin!(refreshed);
-    refreshed.as_mut().enable();
-    b.catch_up().await;
-    // The pass reads SQLite on a blocking thread, which a paused clock doesn't
-    // wait for, so keep this task runnable and bound the wait in real time.
-    let started = std::time::Instant::now();
-    loop {
-        tokio::select! {
-            biased;
-            () = &mut refreshed => break,
-            () = tokio::task::yield_now() => {}
-        }
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "applying a remote agent.create must schedule a claim refresh"
-        );
-    }
-    let where_reply = b
-        .call("agent.where", json!({"agent_id":agent}))
-        .await
-        .unwrap();
-    assert_eq!(where_reply["known"], true);
-    assert_eq!(where_reply["status"], "unclaimed");
 }
 
 #[tokio::test(start_paused = true)]
@@ -2206,7 +2091,6 @@ mod moves {
                 discovery: h.participant_discovery.clone(),
                 catalog: Some(Arc::new(h.catalog_move_context())),
                 health: h.health.clone(),
-                watches: h.watches.clone(),
                 writer: h.writer.clone(),
                 clock,
                 wake: h.move_wake.clone(),
@@ -2265,6 +2149,13 @@ mod moves {
         fn abort(&self, cut: &str) {
             self.store().request_agent_move_abort(cut, clock()).unwrap();
         }
+        fn cached_holder(&self) -> Option<String> {
+            self.store()
+                .cached_agent_claim(AGENT)
+                .unwrap()
+                .and_then(|claim| claim.holder)
+        }
+
         async fn where_(&self) -> Value {
             self.machine
                 .call("agent.where", json!({"agent_id":AGENT}))
@@ -2538,8 +2429,8 @@ mod moves {
         drive(f.a.machine.handler.wait_claim_refresh())
             .await
             .unwrap();
-        let claim = f.a.store().agent_where(AGENT).unwrap();
-        assert_eq!(claim.status, "held_here");
+        let claim = f.a.store().cached_agent_claim(AGENT).unwrap().unwrap();
+        assert_eq!(claim.holder.as_deref(), Some(A));
         assert_eq!(claim.epoch, 1);
         let cut = f.a.admit_to(B, "newly-claimed").await.unwrap();
         assert_eq!(f.a.row(&cut).claim_version, Some(1));
@@ -2575,10 +2466,7 @@ mod moves {
             "release must refresh the source claim cache to the receiver"
         );
         assert_eq!(source_cache.map(|claim| claim.epoch), Some(2));
-        let a_where = f.a.where_().await;
-        assert_eq!(a_where["status"], "held_elsewhere", "{a_where}");
-        assert_eq!(a_where["holder"], B);
-        assert_eq!(f.b.where_().await["status"], "held_here");
+        assert_eq!(f.b.cached_holder().as_deref(), Some(B));
         assert_eq!(
             f.a.register(AGENT, "pi-session", "new").unwrap_err().code,
             "held_elsewhere"
@@ -2660,7 +2548,7 @@ mod moves {
             f.b.discovery.peers["pi"].cut(&cut).unwrap().refs,
             BTreeSet::from([pi])
         );
-        assert_eq!(f.b.where_().await["status"], "held_here");
+        assert_eq!(f.b.cached_holder().as_deref(), Some(B));
         // The source reports no skip: it called broca as usual.
         let source =
             f.a.machine
@@ -2752,8 +2640,8 @@ mod moves {
         for item in f.a.door.cut(&cut).unwrap().items {
             assert!(f.a.door.admit(&item.session_ref).is_ok());
         }
-        assert_eq!(f.a.where_().await["status"], "held_here");
-        assert_eq!(f.b.where_().await["holder"], A);
+        assert_eq!(f.a.cached_holder().as_deref(), Some(A));
+        assert_eq!(f.b.cached_holder().as_deref(), Some(A));
     }
 
     fn put_claim(
@@ -2906,8 +2794,8 @@ mod moves {
                 serde_json::from_slice(f.b.claim().await.body.as_deref().unwrap()).unwrap();
             assert_eq!(body["holder"], A);
             assert_eq!(body["epoch"], if claimed { 3 } else { 1 });
-            assert_eq!(f.a.where_().await["status"], "held_here");
-            assert_eq!(f.b.where_().await["status"], "held_elsewhere");
+            assert_eq!(f.a.cached_holder().as_deref(), Some(A));
+            assert_eq!(f.b.cached_holder().as_deref(), Some(A));
             assert_eq!(
                 f.b.register(AGENT, "pi-session", "new").unwrap_err().code,
                 "held_elsewhere"
@@ -3751,8 +3639,7 @@ mod moves {
     async fn admission_registration_orders_same_key_and_unique_index_use_real_transactions() {
         for before_insert in [false, true] {
             let mut f = Pair::new(&[("pi", "pi-session")]).await;
-            // Gate admission's preflight read, not the refresh worker's read
-            // that establishes initial ownership before preflight can start.
+            // Establish ownership before gating the read in move admission.
             drive(f.a.machine.handler.wait_claim_refresh())
                 .await
                 .unwrap();

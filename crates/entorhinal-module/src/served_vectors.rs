@@ -2819,95 +2819,26 @@ async fn session_records_fixture(label: &str) -> SessionFixture {
 }
 
 #[tokio::test]
-async fn member_box_records_match_published_files() {
+async fn node_self_box_record_matches_published_file() {
     let fixture = session_records_fixture("served-member-box").await;
-    let box_id = "ab".repeat(16);
-    let holder = "22".repeat(16);
     fixture
         .store()
-        .apply_entry("fixture.holder", "{}", "fixture", None, |tx| {
-            tx.execute(
-                "UPDATE claim_cache SET holder=?1 WHERE agent_id=?2",
-                params![holder, WHERE_ELSEWHERE],
-            )?;
-            tx.execute(
-                "INSERT INTO member_name(author,display_name) VALUES(?1,'Other machine')",
-                [&holder],
-            )?;
+        .apply_entry("fixture.node_box", "{}", "fixture", None, |tx| {
             tx.execute(
                 "UPDATE self_identity SET self_author=?1 WHERE id=1",
                 ["11".repeat(16)],
-            )?;
-            tx.execute(
-                "UPDATE claim_cache SET holder=?1 WHERE agent_id=?2",
-                params!["11".repeat(16), WHERE_HERE],
             )?;
             tx.execute(
                 "INSERT INTO member_name(author,display_name) VALUES(?1,'This machine')",
                 ["11".repeat(16)],
             )?;
             tx.execute(
-                "UPDATE identity_log_state SET state='enabled' WHERE id=1",
+                "UPDATE identity_log_state SET state='enabled',hub_log_base=0 WHERE id=1",
                 [],
             )?;
             Ok(())
         })
         .unwrap();
-    let where_params = json!({"agent_id":WHERE_ELSEWHERE});
-    let (unknown, reply) = fixture
-        .record(
-            SESSION_READER,
-            READER_MODULE,
-            "agent.where",
-            where_params.clone(),
-        )
-        .await;
-    assert_eq!(reply["result"]["status"], "held_elsewhere");
-    assert!(reply["result"].get("holder_box").is_none());
-    published_file("agent-sessions-v1", "where-box-unknown.json", vec![unknown]);
-
-    fixture
-        .store()
-        .apply_remote_entry(
-            &entorhinal_core::remote_apply::RemoteEntry {
-                position: 1,
-                entry_id: "01".repeat(16),
-                author: holder.clone(),
-                signer: "02".repeat(16),
-                key_id: "03".repeat(16),
-                envelope_version: 1,
-                kind: "change".into(),
-                entry: serde_json::to_vec(
-                    &json!({"op":"member.set_box","author":holder,"box_id":box_id}),
-                )
-                .unwrap(),
-            },
-            None,
-        )
-        .unwrap();
-    let (known, reply) = fixture
-        .record(SESSION_READER, READER_MODULE, "agent.where", where_params)
-        .await;
-    assert_eq!(reply["result"]["status"], "held_elsewhere");
-    assert_eq!(reply["result"]["holder_box"], box_id);
-    published_file("agent-sessions-v1", "where-holder-box.json", vec![known]);
-
-    let (many, reply) = fixture
-        .record(
-            SESSION_READER,
-            READER_MODULE,
-            "agent.where_many",
-            json!({"agentIds":[WHERE_ELSEWHERE,WHERE_HERE]}),
-        )
-        .await;
-    assert_eq!(reply["result"]["agents"][0]["holder_box"], box_id);
-    assert!(reply["result"]["agents"][1].get("holder_box").is_none());
-    published_file(
-        "agent-sessions-v1",
-        "where-many-holder-box.json",
-        vec![many],
-    );
-
     let own_box = "cd".repeat(16);
     fixture
         .handler
@@ -3214,36 +3145,29 @@ async fn session_records_match_published_files() {
         "where-sharing-off.json",
         vec![sharing_off],
     );
-    // The remaining location replies describe a machine with sharing on, where only
-    // verified engram reads count and an unread claim is unknown.
+    // A native enable plan has no residence watch until after installation.
     fixture
         .store()
         .apply_entry("fixture.sharing_on", "{}", "fixture", None, |tx| {
             tx.execute(
-                "UPDATE identity_log_state SET state='enabled' WHERE id=1",
+                "UPDATE identity_log_state SET state='enabling',enable_id='sample-plan' WHERE id=1",
                 [],
             )?;
             Ok(())
         })
         .unwrap();
-    let mut where_records = Vec::new();
-    for (agent_id, status, holder_name) in [
-        (WHERE_UNCLAIMED, "unclaimed", Value::Null),
-        (WHERE_HERE, "held_here", json!("This machine")),
-        (WHERE_ELSEWHERE, "held_elsewhere", json!("Other machine")),
-    ] {
-        let (record, answer) = fixture
-            .record(
-                SESSION_READER,
-                READER_MODULE,
-                "agent.where",
-                json!({"agent_id":agent_id}),
-            )
-            .await;
-        assert_eq!(answer["result"]["status"], status);
-        assert_eq!(answer["result"]["holder_name"], holder_name);
-        where_records.push(record);
-    }
+    let (unclaimed, reply) = fixture
+        .record(
+            SESSION_READER,
+            READER_MODULE,
+            "agent.where",
+            json!({"agent_id":WHERE_UNCLAIMED}),
+        )
+        .await;
+    assert_eq!(
+        reply["result"],
+        json!({"known":false,"status":"unclaimed","holder":null,"holder_name":null,"epoch":0,"cut_id":null,"read_at_ms":null,"stale":true})
+    );
     let (unknown_agent, unknown_agent_reply) = fixture
         .record(
             SESSION_READER,
@@ -3253,31 +3177,11 @@ async fn session_records_match_published_files() {
         )
         .await;
     assert_eq!(unknown_agent_reply["code"], "unknown_agent");
-    where_records.push(unknown_agent);
-    published_file("agent-sessions-v1", "where.json", where_records);
-
-    let (where_many, where_many_reply) = fixture
-        .record(
-            SESSION_READER,
-            READER_MODULE,
-            "agent.where_many",
-            json!({"agentIds":[WHERE_ELSEWHERE,"agent_ffffffffffffffff",WHERE_HERE]}),
-        )
-        .await;
-    assert_eq!(
-        where_many_reply["result"]["agents"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|agent| agent["agent_id"].as_str().unwrap())
-            .collect::<Vec<_>>(),
-        [WHERE_ELSEWHERE, WHERE_HERE]
+    published_file(
+        "agent-sessions-v1",
+        "where.json",
+        vec![unclaimed, unknown_agent],
     );
-    assert_eq!(
-        where_many_reply["result"]["agents"][0]["status"],
-        "held_elsewhere"
-    );
-    published_file("agent-sessions-v1", "where-many.json", vec![where_many]);
 }
 
 /// Lookup edge cases use real registrations, including a new binding whose
@@ -4060,18 +3964,10 @@ fn session_role_round_trips_through_published_identity_types() {
 }
 
 #[tokio::test]
-async fn moving_agent_where_records_match_published_files() {
+async fn moving_agent_where_reports_checkpoints_and_waiting_ms() {
     const CUT_ID: &str = "cut-moving-agent";
-
-    for (side, name) in [
-        (MoveSide::Source, "where-moving-source.json"),
-        (MoveSide::Receiver, "where-moving-receiver.json"),
-    ] {
-        let label = match side {
-            MoveSide::Source => "served-where-moving-source",
-            MoveSide::Receiver => "served-where-moving-receiver",
-        };
-        let fixture = SessionFixture::new(label).await;
+    for side in [MoveSide::Source, MoveSide::Receiver] {
+        let fixture = SessionFixture::new("served-where-moving").await;
         let source = fixture.snapshot();
         seed_agent(&source, WHERE_MOVING, "Moving Agent", None, false, false);
         drop(source);
@@ -4087,41 +3983,7 @@ async fn moving_agent_where_records_match_published_files() {
             serde_json::from_slice::<Value>(&imported).unwrap()["result"]["agents_imported"],
             1
         );
-        fixture.cache_claims();
-        fixture
-            .store()
-            .apply_entry("fixture.sharing_on", "{}", "fixture", None, |tx| {
-                tx.execute(
-                    "UPDATE identity_log_state SET state='enabled' WHERE id=1",
-                    [],
-                )?;
-                Ok(())
-            })
-            .unwrap();
-
         let epoch = if side == MoveSide::Source { 1 } else { 2 };
-        let claim = CachedClaim {
-            holder: Some(SELF_AUTHOR.to_owned()),
-            epoch,
-            cut_id: (side == MoveSide::Receiver).then(|| CUT_ID.to_owned()),
-            version: epoch,
-            read_at_ms: 700,
-            stale: false,
-            integrity_failed: false,
-        };
-        fixture
-            .store()
-            .cache_agent_claims(
-                &[(
-                    WHERE_MOVING.to_owned(),
-                    ClaimObservation::Present {
-                        claim,
-                        self_author: SELF_AUTHOR.to_owned(),
-                    },
-                )],
-                700,
-            )
-            .unwrap();
 
         let mut row = AgentMove {
             cut_id: CUT_ID.into(),
@@ -4165,7 +4027,7 @@ async fn moving_agent_where_records_match_published_files() {
             assert!(store.update_agent_move(&row).unwrap());
         }
 
-        let (record, answer) = fixture
+        let (_, answer) = fixture
             .record(
                 SESSION_READER,
                 READER_MODULE,
@@ -4173,7 +4035,7 @@ async fn moving_agent_where_records_match_published_files() {
                 json!({"agent_id":WHERE_MOVING}),
             )
             .await;
-        assert_eq!(answer["result"]["status"], "held_here");
+        assert_eq!(answer["result"]["status"], "unclaimed");
         assert_eq!(
             answer["result"]["moving"]["side"],
             if side == MoveSide::Source {
@@ -4195,7 +4057,6 @@ async fn moving_agent_where_records_match_published_files() {
         } else {
             assert!(answer["result"]["moving"]["waiting_ms"].is_null());
         }
-        published_file("agent-sessions-v1", name, vec![record]);
     }
 }
 
@@ -5851,26 +5712,6 @@ async fn memory_context_v1_populated_records_match_published_file() {
         .unwrap();
     const CUT_ID: &str = "cut-context-remote";
     store
-        .cache_agent_claims(
-            &[(
-                ASSISTANT.into(),
-                ClaimObservation::Present {
-                    claim: CachedClaim {
-                        holder: Some(REMOTE_AUTHOR.into()),
-                        epoch: 2,
-                        cut_id: Some(CUT_ID.into()),
-                        version: 2,
-                        read_at_ms: 700,
-                        stale: false,
-                        integrity_failed: false,
-                    },
-                    self_author: LOCAL_AUTHOR.into(),
-                },
-            )],
-            700,
-        )
-        .unwrap();
-    store
         .insert_agent_move(&AgentMove {
             cut_id: CUT_ID.into(),
             agent_id: ASSISTANT.into(),
@@ -5909,11 +5750,9 @@ async fn memory_context_v1_populated_records_match_published_file() {
         ]),
         "session includes active and ready generations"
     );
-    assert_eq!(reply["result"]["where"]["status"], "held_elsewhere");
-    assert_eq!(reply["result"]["where"]["holder"], REMOTE_AUTHOR);
-    assert_eq!(reply["result"]["where"]["holder_name"], "Juniper laptop");
-    assert_eq!(reply["result"]["where"]["cut_id"], CUT_ID);
-    assert_eq!(reply["result"]["where"]["read_at_ms"], 700);
+    assert_eq!(reply["result"]["where"]["status"], "unclaimed");
+    assert_eq!(reply["result"]["where"]["epoch"], 0);
+    assert_eq!(reply["result"]["where"]["holder"], Value::Null);
     assert_eq!(reply["result"]["where"]["moving"]["step"], "releasing");
     let mut records = vec![record];
 

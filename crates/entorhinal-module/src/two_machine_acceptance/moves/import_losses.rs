@@ -73,7 +73,7 @@ async fn import_drops_show_as_completed_with_losses_and_survive_a_restart() {
         .unwrap();
     f.a.source_until(&cut, MoveStep::Released).await;
     f.b.receiver_until(&cut, MoveStep::Done).await;
-    assert_eq!(f.b.where_().await["status"], "held_here");
+    assert_eq!(f.b.cached_holder().as_deref(), Some(B));
     f.b.restart().await;
     let after = status(&f.b, &cut).await;
     assert_eq!(after["step"], "done");

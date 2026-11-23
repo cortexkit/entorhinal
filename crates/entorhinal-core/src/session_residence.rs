@@ -38,15 +38,14 @@ impl SessionResidence {
 }
 
 impl RegistryStore {
-    /// The binding, move, claim and machine identity share one read transaction.
-    /// No hosting evidence substitutes for a usable cached claim.
+    /// The binding, move and sharing state share one read transaction.
     pub fn session_residence(
         &self,
         runner: &str,
         session: &str,
     ) -> Result<SessionResidence, RegistryError> {
-        self.session_residence_with(runner, session, |conn, agent| {
-            claim_cache::load_claim_view(conn, agent, self.is_foreign())
+        self.session_residence_with(runner, session, |conn, _| {
+            claim_cache::load_claim_view(conn, self.is_foreign())
         })
     }
 

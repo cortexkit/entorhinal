@@ -465,10 +465,6 @@ impl ProjectsHandler {
             if installed || self.health.origin.daemon_id().is_some() {
                 self.catch_up_wake.notify_one();
             }
-            if !installed {
-                self.start_claim_refresh();
-                self.claim_refresh.signal();
-            }
             return self.encode_identity_log_status(status);
         }
         let store = self.with_store(|s| Ok(s.clone()))?;
@@ -496,8 +492,6 @@ impl ProjectsHandler {
         if self.health.origin.daemon_id().is_some() {
             self.catch_up_wake.notify_one();
         }
-        self.start_claim_refresh();
-        self.claim_refresh.signal();
         self.identity_log_status()
     }
 

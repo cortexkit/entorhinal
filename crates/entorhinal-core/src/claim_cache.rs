@@ -1,5 +1,6 @@
-//! Machine-local claim replicas. These transactions never append to the
-//! identity journal; a refresh is a local observation, not a shared write.
+//! Claim views come from the hub, or from local sharing state before the hub
+//! can supply a claim view.
+//! The remaining replica helpers are only for legacy moves and registration.
 
 use crate::{agent, RegistryError, RegistryStore};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -65,6 +66,7 @@ pub struct AgentWhere {
     pub move_diagnostics: Vec<Value>,
 }
 
+// Used by legacy moves and registration until their replica paths are removed.
 pub(crate) fn load_claim(conn: &Connection, id: &str) -> rusqlite::Result<Option<CachedClaim>> {
     conn.query_row(
         "SELECT holder,epoch,cut_id,version,read_at_ms,stale,integrity_failed FROM claim_cache WHERE agent_id=?1",
@@ -119,6 +121,8 @@ fn refusal(code: &str, detail: Option<serde_json::Value>) -> agent::AgentMutatio
     }
 }
 
+/// Legacy registration still refuses a session for a remotely held agent.
+/// Remove this check when registration no longer supports legacy claims.
 pub(crate) fn check_registration_claim(
     tx: &Transaction<'_>,
     id: &str,
@@ -233,6 +237,7 @@ pub(crate) fn decide(
     Some(next)
 }
 
+// Persists a replica for legacy moves and registration, not served claim views.
 fn apply(
     tx: &Transaction<'_>,
     id: &str,
@@ -260,8 +265,9 @@ fn apply(
 }
 
 impl RegistryStore {
-    /// Live agents with a binding stored here, including ended sessions. The
-    /// boolean distinguishes an open local session for conflict reporting.
+    /// Legacy move admission treats a binding stored here, even an ended one,
+    /// as evidence for claiming. The boolean identifies open sessions for
+    /// conflict reporting.
     pub fn local_claim_bindings(&self) -> Result<Vec<(String, bool)>, RegistryError> {
         self.read(|conn| {
             let mut stmt = conn.prepare(
@@ -279,7 +285,7 @@ impl RegistryStore {
         })
     }
 
-    /// The agent pass snapshots its subject set before any remote call.
+    /// Legacy move admission snapshots its subject set before any remote call.
     pub fn live_claim_agents(&self) -> Result<Vec<String>, RegistryError> {
         self.read(|conn| {
             let mut stmt = conn.prepare(
@@ -290,8 +296,8 @@ impl RegistryStore {
         })
     }
 
-    /// All replies in a page commit together. Returns the number of conflicting
-    /// self-author replies; no SQLite transaction spans a remote call.
+    /// Legacy moves commit all replies in a page together, without holding a
+    /// transaction during a remote call. Returns the self-author conflict count.
     pub fn cache_agent_claims(
         &self,
         observations: &[(String, ClaimObservation)],
@@ -307,6 +313,7 @@ impl RegistryStore {
         .map_err(RegistryError::Store)
     }
 
+    /// Legacy move admission checks the cached claim after refreshing it.
     pub fn cached_agent_claim(&self, id: &str) -> Result<Option<CachedClaim>, RegistryError> {
         self.read(|conn| load_claim(conn, id))
     }
@@ -334,10 +341,9 @@ impl RegistryStore {
         })
     }
 
-    /// A read snapshot joins the cache, identity and display name. Nulls are
-    /// retained on the wire so unknown values never masquerade as empty text.
+    /// Whereabouts based on local sharing state when no hub claim view is available.
     pub fn agent_where(&self, id: &str) -> Result<AgentWhere, agent::AgentMutationError> {
-        self.agent_where_with(id, |conn| load_claim_view(conn, id, self.is_foreign()))
+        self.agent_where_with(id, |conn| load_claim_view(conn, self.is_foreign()))
     }
 
     pub fn hub_agent_where(
@@ -463,16 +469,8 @@ impl ClaimView {
 }
 
 /// `agent.where` and `agent.session_residence` share the sharing fallback and holder comparison.
-pub(crate) fn load_claim_view(
-    conn: &Connection,
-    id: &str,
-    foreign: bool,
-) -> rusqlite::Result<ClaimView> {
-    let claim = if foreign { None } else { load_claim(conn, id)? };
-    // Claims live only in the shared log. While sharing has never
-    // been turned on, no other machine can hold this agent, so having no
-    // cached claim is a verified "unclaimed", not an unknown. Once
-    // sharing starts, only verified engram reads count.
+pub(crate) fn load_claim_view(conn: &Connection, foreign: bool) -> rusqlite::Result<ClaimView> {
+    // Only a local, disabled store can rule out a holder without a hub watch.
     let sharing_off = !foreign
         && conn
             .query_row(
@@ -481,15 +479,12 @@ pub(crate) fn load_claim_view(
                 |r| r.get::<_, bool>(0),
             )
             .optional()?
-            .unwrap_or(true);
-    let known = claim.is_some() || sharing_off;
-    let read_at_ms = claim.as_ref().map(|c| c.read_at_ms);
-    let claim = claim.unwrap_or_else(|| unclaimed(0, !sharing_off, false));
+            .unwrap_or(false);
     Ok(ClaimView {
-        known,
-        claim,
-        own: self_author(conn)?,
-        read_at_ms,
+        known: sharing_off,
+        claim: unclaimed(0, !sharing_off, false),
+        own: None,
+        read_at_ms: None,
         holder_box: None,
         hub: false,
     })
@@ -500,7 +495,7 @@ pub(crate) fn agent_where_in(
     id: &str,
     foreign: bool,
 ) -> Result<AgentWhere, agent::AgentMutationError> {
-    agent_where_with(conn, id, |conn| load_claim_view(conn, id, foreign))
+    agent_where_with(conn, id, |conn| load_claim_view(conn, foreign))
 }
 
 fn agent_where_with(
@@ -883,6 +878,33 @@ mod tests {
         drop(store);
     }
     #[test]
+    fn where_fallback_ignores_legacy_replica() {
+        let f = Fixture::new();
+        f.observe(present(1, SELF, false));
+        for (state, base, known) in [("disabled", None, true), ("enabled", Some(0), false)] {
+            f.store
+                .db
+                .with_conn_fenced(|tx| {
+                    tx.execute(
+                        "UPDATE identity_log_state SET state=?1,hub_log_base=?2 WHERE id=1",
+                        params![state, base],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            let row = f.store.agent_where(ID).unwrap();
+            assert_eq!(
+                (row.status, row.epoch, row.known, row.stale),
+                ("unclaimed", 0, known, !known)
+            );
+            assert_eq!(
+                (row.holder, row.holder_name, row.cut_id, row.read_at_ms),
+                (None, None, None, None)
+            );
+        }
+    }
+
+    #[test]
     fn register_claim_admission_checks_integrity_before_holder_and_binding() {
         let f = Fixture::new();
         f.register().unwrap();
@@ -912,7 +934,7 @@ mod tests {
         assert_eq!(f.register().unwrap_err().code, "claim_integrity_failed");
     }
     #[test]
-    fn holder_without_self_identity_is_elsewhere_and_never_assumed_here() {
+    fn registration_does_not_assume_a_holder_without_self_identity_is_here() {
         let f = Fixture::new();
         f.observe(present(1, SELF, false));
         f.store
@@ -922,7 +944,6 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert_eq!(f.store.agent_where(ID).unwrap().status, "held_elsewhere");
         assert_eq!(f.register().unwrap_err().code, "held_elsewhere");
         assert_eq!(
             f.store

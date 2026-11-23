@@ -393,7 +393,6 @@ pub(crate) struct Worker {
     pub(crate) discovery: Arc<dyn ParticipantDiscovery>,
     pub(crate) catalog: Option<Arc<crate::catalog_move::CatalogMove>>,
     pub(crate) health: Arc<HealthGauges>,
-    pub(crate) watches: Arc<crate::watches::Watches>,
     #[cfg(test)]
     pub(crate) writer: Arc<tokio::sync::Mutex<()>>,
     pub(crate) clock: fn() -> i64,
@@ -410,13 +409,13 @@ impl Worker {
             .and_then(Weak::upgrade)
     }
 
+    /// Keep replica observations for legacy moves only, not whereabouts watches.
     pub(crate) async fn cache_claims(
         &self,
         observations: Vec<(String, entorhinal_core::claim_cache::ClaimObservation)>,
         now: i64,
     ) -> Result<usize, HandlerError> {
-        let watches = self.watches.clone();
-        self.sql(move |store| watches.cache_claims(store, &observations, now))
+        self.sql(move |store| store.cache_agent_claims(&observations, now))
             .await
     }
 
@@ -527,7 +526,6 @@ impl ProjectsHandler {
             discovery: self.participant_discovery.clone(),
             catalog: Some(Arc::new(self.catalog_move_context())),
             health: self.health.clone(),
-            watches: self.watches.clone(),
             #[cfg(test)]
             writer: self.writer.clone(),
             clock: self.clock,
@@ -994,7 +992,6 @@ mod tests {
             discovery: handler.participant_discovery.clone(),
             catalog: None,
             health: handler.health.clone(),
-            watches: handler.watches.clone(),
             writer: handler.writer.clone(),
             clock: handler.clock,
             wake: handler.move_wake.clone(),
@@ -1098,7 +1095,6 @@ mod tests {
             discovery: handler.participant_discovery.clone(),
             catalog: None,
             health: handler.health.clone(),
-            watches: handler.watches.clone(),
             writer: handler.writer.clone(),
             clock: handler.clock,
             wake: handler.move_wake.clone(),

@@ -71,7 +71,6 @@ fn worker(node: &Node, door: &FakeDoor, peer: Arc<FakeParticipant>) -> Worker {
         discovery: Arc::new(Discovery(daemon, peer)),
         catalog: None,
         health: handler.health.clone(),
-        watches: handler.watches.clone(),
         writer: handler.writer.clone(),
         clock: crate::unix_millis,
         wake: handler.move_wake.clone(),

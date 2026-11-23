@@ -27,7 +27,6 @@ pub(crate) struct Worker {
     writer: Arc<tokio::sync::Mutex<()>>,
     commits: Arc<tokio::sync::Notify>,
     role_refresh: Arc<tokio::sync::Notify>,
-    claim_refresh: Arc<super::claims::RefreshQueue>,
 }
 
 impl ProjectsHandler {
@@ -43,7 +42,6 @@ impl ProjectsHandler {
             writer: self.writer.clone(),
             commits: self.commits.clone(),
             role_refresh: self.role_refresh.clone(),
-            claim_refresh: self.claim_refresh.clone(),
         }
     }
 
@@ -90,9 +88,6 @@ impl Drop for ProjectsHandler {
         if let Some(task) = self.role_refresh_task.get_mut().unwrap().take() {
             task.abort();
         }
-        if let Some(task) = self.claim_refresh_task.get_mut().unwrap().take() {
-            task.abort();
-        }
         if let Some(task) = self.session_upkeep_task.get_mut().unwrap().take() {
             task.abort();
         }
@@ -101,43 +96,6 @@ impl Drop for ProjectsHandler {
 
 fn storage(error: RegistryError) -> HandlerError {
     HandlerError::new("storage_error", error.to_string())
-}
-
-/// Asks for one claim refresh when a page of log entries made agents live
-/// here, so `agent.where` learns claims for agents created on other machines.
-/// It signals on drop, so entries committed earlier in a page still get their
-/// refresh when a later entry in that page fails to apply.
-struct NewAgents<'a> {
-    queue: &'a super::claims::RefreshQueue,
-    seen: bool,
-}
-
-impl Drop for NewAgents<'_> {
-    fn drop(&mut self) {
-        if self.seen {
-            self.queue.signal();
-        }
-    }
-}
-
-/// Whether a change entry adds an agent: a standalone create or import, or a
-/// placement that carries one. An entry that doesn't decode is not one; the
-/// apply that follows refuses it.
-fn creates_agent(entry: &RemoteEntry) -> bool {
-    let creating = |value: &serde_json::Value| {
-        matches!(
-            value.get("op").and_then(serde_json::Value::as_str),
-            Some("agent.create" | "agent.import")
-        )
-    };
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&entry.entry) else {
-        return false;
-    };
-    creating(&value)
-        || value
-            .get("agents")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|agents| agents.iter().any(creating))
 }
 
 fn remote(entry: log_client::LogEntry) -> Result<RemoteEntry, HandlerError> {
@@ -340,10 +298,7 @@ impl Worker {
                             "entorhinal",
                         )
                         .await;
-                        result.and_then(|()| {
-                            self.claim_refresh.signal();
-                            self.applied(&store)
-                        })
+                        result.and_then(|()| self.applied(&store))
                     } else {
                         self.run(&store, deadline).await
                     };
@@ -593,24 +548,16 @@ impl Worker {
         let mut authors = Vec::new();
         let mut self_authors = Vec::new();
         let mut snapshot = None;
-        let started_unenabled = store.identity_log_status().map_err(storage)?.state != "enabled";
         let mut reconnect = self.health.log_state.load(Ordering::Relaxed) != 0;
         loop {
             let page = self.read(after, deadline).await?;
-            let retry_refresh = self
-                .health
-                .claim_refresh_failed
-                .swap(false, Ordering::Relaxed);
             let retry_roles = self
                 .health
                 .role_refresh_failed
                 .swap(false, Ordering::Relaxed);
-            if reconnect || retry_refresh || retry_roles {
+            if reconnect || retry_roles {
                 self.role_refresh.notify_one();
-            }
-            if reconnect || retry_refresh {
                 reconnect = false;
-                self.claim_refresh.signal();
             }
             if page.head < after {
                 self.health.log_state.store(7, Ordering::Relaxed);
@@ -626,10 +573,6 @@ impl Worker {
                 store.observe_log_head(head).map_err(storage)?;
             }
             let page_start = after;
-            let mut new_agents = NewAgents {
-                queue: &self.claim_refresh,
-                seen: false,
-            };
             for entry in page.entries {
                 if entry.position != after + 1 || entry.position > page.head {
                     return Err(self.stalled(4, after + 1, "log gap"));
@@ -675,9 +618,6 @@ impl Worker {
                             )
                         })
                         .map_err(|e| self.stalled(6, position, e))?;
-                        // A snapshot replaces the agent table wholesale, so it
-                        // may bring agents this machine has never read claims for.
-                        new_agents.seen = true;
                         joining = false;
                         for author in self_authors.iter().flatten() {
                             self.identity_health(store, author)?;
@@ -697,11 +637,9 @@ impl Worker {
                         ));
                     }
                     let own = store.is_pending_entry(&entry.entry_id).map_err(storage)?;
-                    let creates = creates_agent(&entry);
                     store
                         .apply_remote_entry(&entry, self_author.as_deref())
                         .map_err(|e| self.stalled(6, position, e))?;
-                    new_agents.seen |= creates;
                     if let Some(author) = self_author {
                         self.identity_health(store, &author)?;
                     }
@@ -714,7 +652,6 @@ impl Worker {
                 }
                 after = position;
             }
-            drop(new_agents);
             if after == page.head {
                 if !parts.is_empty() {
                     // Reaching head without the remaining parts is not a gap,
@@ -728,9 +665,6 @@ impl Worker {
                 store.finish_join(head).map_err(storage)?;
                 super::enable::refresh(&self.health, store);
                 self.applied(store)?;
-                if started_unenabled {
-                    self.claim_refresh.signal();
-                }
                 return Ok(());
             }
             if after == page_start {

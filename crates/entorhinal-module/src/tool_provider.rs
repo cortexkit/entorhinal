@@ -323,26 +323,6 @@ impl ProjectsHandler {
                 "the stored agent role cannot use this tool",
             ));
         }
-        let (claim, own) = self.with_store(|store| {
-            Ok((
-                store.cached_agent_claim(id)?,
-                store.persisted_self_author()?,
-            ))
-        })?;
-        if let Some(claim) = claim {
-            if claim.integrity_failed {
-                return Err(HandlerError::new(
-                    "claim_integrity_failed",
-                    "cached agent claim failed verification",
-                ));
-            }
-            if claim.epoch >= 1 && (claim.holder.is_none() || claim.holder != own) {
-                return Err(HandlerError::new(
-                    "held_elsewhere",
-                    "the stamped agent is held by another machine",
-                ));
-            }
-        }
         Ok((admission, caller))
     }
 

@@ -2345,7 +2345,6 @@ mod tests {
                 discovery: discovery.clone(),
                 catalog: None,
                 health: Arc::new(crate::HealthGauges::default()),
-                watches: Arc::default(),
                 writer: Arc::new(tokio::sync::Mutex::new(())),
                 clock,
                 wake: Arc::new(crate::move_driver::MoveWake::default()),

@@ -71,8 +71,6 @@ impl ProjectsHandler {
         self.commits.notify_waiters();
         self.start_catch_up();
         self.start_catalog_poll();
-        self.start_claim_refresh();
-        self.claim_refresh.signal();
         self.start_role_refresh();
         self.role_refresh.notify_one();
         self.start_move_driver();

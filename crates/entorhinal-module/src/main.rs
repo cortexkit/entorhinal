@@ -525,7 +525,6 @@ struct HealthGauges {
     log_pending: AtomicI64,
     log_error: AtomicU64,
     log_error_at: AtomicI64,
-    claim_refresh_failed: AtomicBool,
     claim_refreshed: AtomicU64,
     claim_failed: AtomicU64,
     claim_conflicts: AtomicU64,
@@ -557,8 +556,6 @@ struct HealthGauges {
     watch_resyncs: AtomicU64,
     #[cfg(test)]
     watch_waiting: tokio::sync::Notify,
-    #[cfg(test)]
-    claim_refresh_done: tokio::sync::Notify,
 }
 
 impl HealthGauges {
@@ -680,8 +677,7 @@ struct ProjectsHandler {
     door_client: door_client::DoorClient,
     move_wake: Arc<move_driver::MoveWake>,
     move_driver_task: Mutex<Option<move_driver::MoveDriver>>,
-    claim_refresh: Arc<claims::RefreshQueue>,
-    claim_refresh_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    legacy_claim_pass: tokio::sync::Mutex<()>,
     claim_refresh_sql: Arc<move_driver::SqlOperations>,
     role_refresh: Arc<tokio::sync::Notify>,
     role_refresh_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -1114,13 +1110,12 @@ impl ProjectsHandler {
             catalog_poll_task: Mutex::new(None),
             catalog_poll_wake: Arc::default(),
             catalog_sql: Arc::default(),
-            claim_refresh: Arc::new(claims::RefreshQueue::default()),
             door_client: door_client::DoorClient::production(log_client::SubcConnector::from_args(
                 std::env::args_os().skip(1),
             )),
             move_wake,
             move_driver_task: Mutex::new(None),
-            claim_refresh_task: Mutex::new(None),
+            legacy_claim_pass: tokio::sync::Mutex::new(()),
             claim_refresh_sql: Arc::default(),
             role_refresh: Arc::new(tokio::sync::Notify::new()),
             role_refresh_task: Mutex::new(None),
@@ -1379,7 +1374,6 @@ impl ModuleHandler for ProjectsHandler {
                 let store = Arc::clone(&self.store);
                 let health = Arc::clone(&self.health);
                 let retry_budget = self.lease_retry_budget;
-                let claim_refresh = self.claim_refresh.clone();
                 let role_refresh = self.role_refresh.clone();
                 let move_wake = self.move_wake.clone();
                 let module_started_at = self.module_started_at;
@@ -1402,7 +1396,6 @@ impl ModuleHandler for ProjectsHandler {
                     // counts against the module.
                     health.store_opening.store(false, Ordering::Release);
                     catch_up_wake.notify_one();
-                    claim_refresh.signal();
                     role_refresh.notify_one();
                     move_wake.notify_one();
                     move_wake.notify_waiters();
@@ -1422,8 +1415,6 @@ impl ModuleHandler for ProjectsHandler {
         }
         self.start_catch_up();
         self.start_catalog_poll();
-        self.start_claim_refresh();
-        self.claim_refresh.signal();
         self.start_role_refresh();
         self.role_refresh.notify_one();
         self.start_move_driver();
@@ -1679,7 +1670,7 @@ impl ProjectsHandler {
         } else if request.method == hub_residence::TAKE {
             self.take_residence(request.params, key, received).await
         } else if request.method == claims::REFRESH {
-            self.refresh_agent_claims(request.params, key).await
+            self.refresh_agent_claims(request.params, key)
         } else if request.method == move_admission::MOVE {
             let result = self.admit_move(request.params, key, received).await;
             if result.is_ok() {
@@ -1796,7 +1787,6 @@ impl ProjectsHandler {
         // head also catches secondary bind_root commits and partial successes;
         // cached retries and volatile liveness updates don't wake idle readers.
         let mutating = MUTATING_METHODS.contains(&request.method.as_str());
-        let creates_agent = matches!(request.method.as_str(), "agent.create" | "agent.import");
         let before = mutating.then(|| self.with_store(RegistryStore::generation).ok());
         let result = match request.method.as_str() {
             user_profile::GET => self.user_get(request.params),
@@ -1977,11 +1967,6 @@ impl ProjectsHandler {
         };
         if mutating && before.flatten() != self.with_store(RegistryStore::generation).ok() {
             self.commits.notify_waiters();
-            // A request-key replay leaves the generation unchanged, so only a
-            // create or import that committed a new agent asks for a refresh.
-            if creates_agent {
-                self.refresh_claims_for_new_agent();
-            }
         }
         result
     }
@@ -3389,7 +3374,7 @@ mod tests {
         stop_catch_up(handler).await;
         handler.stop_hub_residence().await;
         handler.stop_move_driver().await;
-        handler.stop_claim_refresh().await;
+        handler.claim_refresh_sql.wait().await;
         handler.stop_catalog_poll().await;
         handler.stop_role_refresh().await;
         handler.stop_session_upkeep().await;

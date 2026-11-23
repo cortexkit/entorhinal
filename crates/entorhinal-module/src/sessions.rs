@@ -1067,15 +1067,7 @@ impl ProjectsHandler {
             self.residence().as_deref(),
             self.hub_backend_selected(),
             |context| {
-                register_session_on_store(
-                    &store,
-                    params,
-                    role,
-                    (self.clock)(),
-                    self.clock,
-                    &self.claim_refresh,
-                    context,
-                )
+                register_session_on_store(&store, params, role, (self.clock)(), self.clock, context)
             },
         )
     }
@@ -1089,7 +1081,6 @@ pub(super) fn register_session_on_store(
     role: SessionRole,
     now: i64,
     clock: fn() -> i64,
-    refresh: &crate::claims::RefreshQueue,
     claim: Option<&entorhinal_core::claim_cache::HubClaimContext<'_>>,
 ) -> Result<Vec<u8>, HandlerError> {
     let mut params = params;
@@ -1121,14 +1112,6 @@ pub(super) fn register_session_on_store(
     let binding = store
         .register_session_with_claim(&registration, claim)
         .map_err(HandlerError::from)?;
-    if claim.is_none()
-        && binding.held_on.is_none()
-        && store
-            .cached_agent_claim(&binding.agent_id)?
-            .is_none_or(|claim| claim.epoch == 0)
-    {
-        refresh.signal();
-    }
     // The reply is the binding as before; neither the runner nor the network
     // value is echoed, so the reply bytes callers decode strictly remain
     // unchanged when the required runner is recorded.

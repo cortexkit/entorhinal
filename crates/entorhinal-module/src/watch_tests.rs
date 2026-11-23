@@ -120,13 +120,6 @@ fn store(f: &Fixture) -> RegistryStore {
     f.handler.store.lock().unwrap().as_ref().unwrap().clone()
 }
 
-fn observe(f: &Fixture, id: &str, observation: ClaimObservation, now: i64) {
-    f.handler
-        .watches
-        .cache_claims(&store(f), &[(id.into(), observation)], now)
-        .unwrap();
-}
-
 fn absent(stale: bool) -> ClaimObservation {
     ClaimObservation::Absent {
         stale,
@@ -306,106 +299,6 @@ async fn watch_size_guard_resyncs_instead_of_oversize_or_split() {
             .load(std::sync::atomic::Ordering::Relaxed),
         1
     );
-    sink.cancel.send_replace(true);
-    assert!(matches!(watch.await, HandlerOutcome::Streamed));
-
-    store(&f)
-        .cache_roles(&[("watch_fixture".into(), absent(false))], 700)
-        .unwrap();
-    let body = request(WHERE, json!({"cursor":{"incarnation":INCARNATION,"seq":0}}));
-    let (sink, mut receiver) = Sink::new();
-    let watch = f.handler.serve_watch(&sink, &body, READER);
-    tokio::pin!(watch);
-    pending(watch.as_mut()).await;
-    let observations = (1..=1200)
-        .map(|i| (format!("agent_{i:016x}"), absent(false)))
-        .collect::<Vec<_>>();
-    f.handler
-        .watches
-        .cache_claims(&store(&f), &observations, 701)
-        .unwrap();
-    debounce(watch.as_mut()).await;
-    assert_eq!(
-        notice(&mut receiver),
-        json!({"kind":"resync","cursor":{"incarnation":INCARNATION,"seq":1}})
-    );
-    quiet(&mut receiver);
-    sink.cancel.send_replace(true);
-    assert!(matches!(watch.await, HandlerOutcome::Streamed));
-}
-
-#[tokio::test(start_paused = true)]
-async fn where_resume_filters_versions_stale_known_and_ring_overflow() {
-    let f = seeded("watch-where-ring").await;
-    let body = request(
-        WHERE,
-        json!({"agentIds":[HEAD],"cursor":{"incarnation":INCARNATION,"seq":0}}),
-    );
-    let (sink, mut receiver) = Sink::new();
-    let watch = f.handler.serve_watch(&sink, &body, READER);
-    tokio::pin!(watch);
-    pending(watch.as_mut()).await;
-    quiet(&mut receiver);
-    observe(&f, ASSISTANT, absent(false), 701);
-    debounce(watch.as_mut()).await;
-    quiet(&mut receiver);
-    observe(&f, HEAD, absent(false), 702);
-    debounce(watch.as_mut()).await;
-    let changed = notice(&mut receiver);
-    assert_eq!(
-        changed["cursor"],
-        json!({"incarnation":INCARNATION,"seq":2})
-    );
-    let mut expected = f
-        .success(READER, "agent.where_many", json!({"agentIds":[HEAD]}))
-        .await["agents"][0]
-        .clone();
-    expected["version"] = json!(2);
-    assert_eq!(changed["where"], json!([expected]));
-    observe(&f, HEAD, ClaimObservation::Unavailable, 703);
-    debounce(watch.as_mut()).await;
-    assert_eq!(notice(&mut receiver)["where"][0]["stale"], true);
-    observe(&f, HEAD, absent(false), 704);
-    observe(&f, HEAD, absent(false), 704);
-    debounce(watch.as_mut()).await;
-    let restored = notice(&mut receiver);
-    assert_eq!(restored["where"][0]["stale"], false);
-    assert_eq!(
-        restored["cursor"]["seq"], 4,
-        "identical transaction must not bump seq"
-    );
-    sink.cancel.send_replace(true);
-    assert!(matches!(watch.await, HandlerOutcome::Streamed));
-
-    for now in 705..=962 {
-        observe(&f, HEAD, absent(false), now);
-    }
-    for cursor in [
-        json!({"incarnation":INCARNATION,"seq":0}),
-        json!({"incarnation":INCARNATION,"seq":999999}),
-        json!({"incarnation":"foreign","seq":262}),
-    ] {
-        let (sink, mut receiver) = Sink::new();
-        let body = request(WHERE, json!({"cursor":cursor}));
-        let watch = f.handler.serve_watch(&sink, &body, READER);
-        tokio::pin!(watch);
-        pending(watch.as_mut()).await;
-        assert_eq!(
-            notice(&mut receiver),
-            json!({"kind":"resync","cursor":{"incarnation":INCARNATION,"seq":262}})
-        );
-        sink.cancel.send_replace(true);
-        assert!(matches!(watch.await, HandlerOutcome::Streamed));
-    }
-    let (sink, mut receiver) = Sink::new();
-    let body = request(
-        WHERE,
-        json!({"cursor":{"incarnation":INCARNATION,"seq":261}}),
-    );
-    let watch = f.handler.serve_watch(&sink, &body, READER);
-    tokio::pin!(watch);
-    pending(watch.as_mut()).await;
-    assert_eq!(notice(&mut receiver)["where"][0]["version"], 262);
     sink.cancel.send_replace(true);
     assert!(matches!(watch.await, HandlerOutcome::Streamed));
 }
@@ -683,47 +576,6 @@ async fn watch_validation_and_drain_refusal_match_existing_reads() {
             .load(std::sync::atomic::Ordering::Relaxed),
         0
     );
-}
-
-#[tokio::test(start_paused = true)]
-async fn where_known_changes_and_exact_ring_boundary_resume() {
-    let f = seeded("watch-where-known").await;
-    store(&f)
-        .apply_entry("fixture", "{}", "fixture", None, |tx| {
-            tx.execute(
-                "UPDATE identity_log_state SET state='enabled' WHERE id=1",
-                [],
-            )
-        })
-        .unwrap();
-    let unknown = f
-        .success(READER, "agent.where_many", json!({"agentIds":[HEAD]}))
-        .await;
-    assert_eq!(unknown["agents"][0]["known"], false);
-    observe(&f, HEAD, absent(false), 701);
-    let body = request(WHERE, json!({"cursor":{"incarnation":INCARNATION,"seq":0}}));
-    let (sink, mut receiver) = Sink::new();
-    let watch = f.handler.serve_watch(&sink, &body, READER);
-    tokio::pin!(watch);
-    pending(watch.as_mut()).await;
-    assert_eq!(notice(&mut receiver)["where"][0]["known"], true);
-    sink.cancel.send_replace(true);
-    assert!(matches!(watch.await, HandlerOutcome::Streamed));
-    for now in 702..=956 {
-        observe(&f, HEAD, absent(false), now);
-    }
-    let body = request(WHERE, json!({"cursor":{"incarnation":INCARNATION,"seq":0}}));
-    let (sink, mut receiver) = Sink::new();
-    let watch = f.handler.serve_watch(&sink, &body, READER);
-    tokio::pin!(watch);
-    pending(watch.as_mut()).await;
-    assert_eq!(
-        notice(&mut receiver)["where"][0]["version"],
-        256,
-        "oldest retained predecessor is resumable"
-    );
-    sink.cancel.send_replace(true);
-    assert!(matches!(watch.await, HandlerOutcome::Streamed));
 }
 
 #[tokio::test(start_paused = true)]
@@ -1120,21 +972,6 @@ async fn served_fleet_watch_v1_records_match_published_files() {
         "fleet-watch-v1",
         "where-resync.json",
         vec![record(WHERE, json!({}), &[first])],
-    );
-    s.cancel(corr).await;
-    let store = s.handler.store.lock().unwrap().as_ref().unwrap().clone();
-    s.handler
-        .watches
-        .cache_claims(&store, &[(HEAD.into(), absent(false))], 701)
-        .unwrap();
-    drop(store);
-    let params = json!({"agentIds":[HEAD],"cursor":{"incarnation":INCARNATION,"seq":0}});
-    let corr = s.start(WHERE, params.clone()).await;
-    let changed = s.frame(corr).await;
-    published_file(
-        "fleet-watch-v1",
-        "where-changes.json",
-        vec![record(WHERE, params, &[changed])],
     );
     s.cancel(corr).await;
 

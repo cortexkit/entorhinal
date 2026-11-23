@@ -859,11 +859,8 @@ mod tests {
                 )
                 .unwrap();
             if stage >= 2 {
-                // Enabling sharing queues a claim refresh of its own. Whether that
-                // pass reads before or after a test's first agent exists depends
-                // on blocking-pool scheduling, so on a slow machine it can add a
-                // read the test never made. Finish it here and forget its engram
-                // calls, so tests that count calls see only their own move's.
+                // Check the empty-store refresh before measuring each move's
+                // record calls. The served enable does not refresh claims.
                 f.handler.wait_claim_refresh().await.unwrap();
                 f.records.calls.lock().unwrap().clear();
             }
@@ -1218,8 +1215,8 @@ mod tests {
                 .with_reason("pending writes"),
         );
         let before = f.discovery.participant.held();
-        // Initial ownership is background work, not a side effect of refused
-        // move admission. Finish it before counting admission's record calls.
+        // Establish ownership explicitly before measuring the refused move's
+        // record calls. The move should only observe the existing claim.
         f.handler.wait_claim_refresh().await.unwrap();
         f.clear_calls();
         let generation = f.store().generation().unwrap();

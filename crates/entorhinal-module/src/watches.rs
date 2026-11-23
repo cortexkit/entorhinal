@@ -3,14 +3,15 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    sync::{atomic::Ordering, Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
 use async_trait::async_trait;
-use entorhinal_core::{
-    claim_cache::ClaimObservation, RegistryError, RegistryStore, SessionChangeKey,
-};
+use entorhinal_core::SessionChangeKey;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use subc_client_rs::{HandlerOutcome, RequestCtx};
@@ -35,18 +36,6 @@ const QUIET: Duration = Duration::from_millis(200);
 const CEILING: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
-struct WhereHistory {
-    seq: u64,
-    batches: VecDeque<WhereBatch>,
-}
-
-struct WhereBatch {
-    seq: u64,
-    entries: BTreeMap<String, Value>,
-    all_agents: bool,
-}
-
-#[derive(Default)]
 struct CatalogHistory {
     generation: u64,
     statuses: BTreeMap<(String, String), Value>,
@@ -56,8 +45,7 @@ struct CatalogHistory {
 pub(crate) struct Watches {
     slots: Semaphore,
     per_route: Mutex<BTreeMap<RouteKey, usize>>,
-    cache_writer: Mutex<()>,
-    history: Mutex<WhereHistory>,
+    where_seq: AtomicU64,
     changed: Notify,
     catalog: Mutex<CatalogHistory>,
     catalog_changed: Notify,
@@ -93,8 +81,7 @@ impl Default for Watches {
         Self {
             slots: Semaphore::new(WATCHES_TOTAL),
             per_route: Mutex::default(),
-            cache_writer: Mutex::new(()),
-            history: Mutex::new(WhereHistory::default()),
+            where_seq: AtomicU64::new(0),
             changed: Notify::new(),
             catalog: Mutex::default(),
             catalog_changed: Notify::new(),
@@ -139,71 +126,8 @@ impl Watches {
         self.catalog_changed.notify_waiters();
     }
     pub(crate) fn resync_all(&self) {
-        let mut history = self.history.lock().unwrap();
-        history.seq += 1;
-        let seq = history.seq;
-        history.batches.push_back(WhereBatch {
-            seq,
-            entries: BTreeMap::new(),
-            all_agents: true,
-        });
-        if history.batches.len() > HISTORY_LIMIT {
-            history.batches.pop_front();
-        }
-        drop(history);
+        self.where_seq.fetch_add(1, Ordering::Release);
         self.changed.notify_waiters();
-    }
-
-    /// Claim refresh, move source and move receiver all use this seam. Serialize observations without
-    /// holding the history mutex while SQLite may queue behind another writer.
-    /// The refresh and move workers already call this on their blocking pool.
-    pub(crate) fn cache_claims(
-        &self,
-        store: &RegistryStore,
-        observations: &[(String, ClaimObservation)],
-        now: i64,
-    ) -> Result<usize, RegistryError> {
-        let _writer = self.cache_writer.lock().unwrap();
-        let before = observations
-            .iter()
-            .map(|(id, _)| Ok((id.clone(), store.cached_agent_claim(id)?)))
-            .collect::<Result<BTreeMap<_, _>, RegistryError>>()?;
-        let conflicts = store.cache_agent_claims(observations, now)?;
-        let mut entries = BTreeMap::new();
-        for (id, old) in before {
-            if old != store.cached_agent_claim(&id)? {
-                // A refused whereabouts read (for example an integrity mark)
-                // cannot be represented as a where_many entry. Null is an
-                // internal resync marker and is never sent as an entry.
-                let row = store
-                    .agent_where(&id)
-                    .ok()
-                    .and_then(|row| serde_json::to_value(row).ok());
-                entries.insert(id, row.unwrap_or(Value::Null));
-            }
-        }
-        if !entries.is_empty() {
-            let mut history = self.history.lock().unwrap();
-            history.seq += 1;
-            let seq = history.seq;
-            for (id, row) in &mut entries {
-                if !row.is_null() {
-                    row["agent_id"] = json!(id);
-                    row["version"] = json!(seq);
-                }
-            }
-            history.batches.push_back(WhereBatch {
-                seq,
-                entries,
-                all_agents: false,
-            });
-            if history.batches.len() > HISTORY_LIMIT {
-                history.batches.pop_front();
-            }
-            drop(history);
-            self.changed.notify_waiters();
-        }
-        Ok(conflicts)
     }
 }
 
@@ -646,62 +570,19 @@ impl ProjectsHandler {
         transport: &impl WatchTransport,
         request: WhereRequest,
     ) -> Result<(), HandlerError> {
-        let ids = request
-            .agent_ids
-            .map(|ids| ids.into_iter().collect::<BTreeSet<_>>());
         let notified = self.watches.changed.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
         let mut cursor = request.cursor;
         loop {
-            let (seq, changes) = {
-                let history = self.watches.history.lock().unwrap();
-                let resumable = cursor.as_ref().is_some_and(|cursor| {
-                    cursor.incarnation == self.incarnation
-                        && cursor.seq <= history.seq
-                        && history
-                            .batches
-                            .front()
-                            .is_none_or(|first| cursor.seq >= first.seq - 1)
-                });
-                let mut changes = BTreeMap::new();
-                let mut safe = resumable;
-                if let Some(cursor) = &cursor {
-                    for batch in history
-                        .batches
-                        .iter()
-                        .filter(|batch| batch.seq > cursor.seq)
-                    {
-                        safe &= !batch.all_agents;
-                        for (id, row) in &batch.entries {
-                            if ids.as_ref().is_none_or(|ids| ids.contains(id)) {
-                                safe &= !row.is_null();
-                                changes.insert(id.clone(), row.clone());
-                            }
-                        }
-                    }
-                }
-                (history.seq, safe.then_some(changes))
-            };
-            let after = json!({"incarnation":self.incarnation,"seq":seq});
-            let resync = json!({"kind":"resync","cursor":after});
-            match changes {
-                None => self.notice(transport, resync.clone(), resync).await?,
-                Some(changes) if !changes.is_empty() => {
-                    let mut entries = changes.into_values().collect::<Vec<_>>();
-                    for row in &mut entries {
-                        if let Some(moving) = row.get_mut("moving") {
-                            crate::move_ops::elapsed(moving, (self.clock)());
-                        }
-                    }
-                    self.notice(
-                        transport,
-                        json!({"kind":"changes","cursor":after,"where":entries}),
-                        resync,
-                    )
-                    .await?;
-                }
-                Some(_) => {}
+            let seq = self.watches.where_seq.load(Ordering::Acquire);
+            let current = cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.incarnation == self.incarnation && cursor.seq == seq);
+            if !current {
+                let resync =
+                    json!({"kind":"resync","cursor":{"incarnation":self.incarnation,"seq":seq}});
+                self.notice(transport, resync.clone(), resync).await?;
             }
             cursor = Some(Cursor {
                 incarnation: self.incarnation.clone(),

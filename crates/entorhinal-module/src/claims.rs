@@ -1,6 +1,4 @@
-//! Agent claim refresh runs independently of catch-up. Remote calls finish
-//! before a short cache transaction, so neither readers nor session admission
-//! queue behind the shared-log writer while engram is unavailable.
+//! Served agent whereabouts and the legacy move admission claim check.
 
 use super::{
     claim_codec::AgentClaim,
@@ -15,7 +13,6 @@ use entorhinal_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::{atomic::Ordering, Arc, Mutex, Weak};
-use tokio::sync::{mpsc, oneshot};
 
 pub(crate) const REFRESH: &str = "agent.refresh_claims";
 pub(crate) const WHERE: &str = "agent.where";
@@ -48,41 +45,14 @@ pub(crate) struct RefreshCounts {
     pub refreshed: usize,
     pub failed: usize,
 }
-type Waiter = oneshot::Sender<Result<RefreshCounts, HandlerError>>;
 
-#[derive(Clone)]
-pub(crate) struct RefreshQueue {
-    sender: mpsc::UnboundedSender<Option<Waiter>>,
-    receiver: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Option<Waiter>>>>,
-}
-
-impl Default for RefreshQueue {
-    fn default() -> Self {
-        let (sender, receiver) = mpsc::unbounded_channel();
-        Self {
-            sender,
-            receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
-        }
-    }
-}
-
-impl RefreshQueue {
-    pub(crate) fn signal(&self) {
-        let _ = self.sender.send(None);
-    }
-}
-
-/// The refresh task outlives no handler: it holds the handler's store slot
-/// weakly, and takes a store handle only for the moment it reads or writes
-/// SQLite, never across a call to engram. So dropping the handler, or taking
-/// its store out, closes the database even while a refresh waits on a
-/// slow or hung engram reply.
+/// Only legacy move admission runs a pass. Do not keep the store open across a
+/// call to engram; an interrupted move must not prevent the store reopening.
 struct Worker {
     store: Weak<Mutex<Option<RegistryStore>>>,
     sql_operations: Arc<crate::move_driver::SqlOperations>,
     records: RecordClient,
     health: Arc<HealthGauges>,
-    watches: Arc<crate::watches::Watches>,
     clock: fn() -> i64,
 }
 
@@ -228,14 +198,13 @@ impl Worker {
                     return Ok(counts);
                 };
                 let now = (self.clock)();
-                let watches = self.watches.clone();
                 let conflicts =
                     tokio::task::spawn_blocking(self.sql_operations.tracked(move || {
                         let store = cache;
                         if store.hub_log_base()?.is_some() {
                             return Ok(0);
                         }
-                        watches.cache_claims(&store, &observations, now)
+                        store.cache_agent_claims(&observations, now)
                     }))
                     .await
                     .map_err(|e| HandlerError::new("storage_error", e.to_string()))??;
@@ -251,11 +220,6 @@ impl Worker {
         self.health
             .claim_failed
             .fetch_add(counts.failed as u64, Ordering::Relaxed);
-        self.health
-            .claim_refresh_failed
-            .store(counts.failed > 0, Ordering::Relaxed);
-        #[cfg(test)]
-        self.health.claim_refresh_done.notify_waiters();
         if reads_succeeded == 0 && counts.failed > 0 {
             return Err(HandlerError::new(
                 "engram_unavailable",
@@ -354,73 +318,6 @@ impl Worker {
 }
 
 impl ProjectsHandler {
-    pub(super) fn start_claim_refresh(&self) {
-        if self.health.origin.is_foreign() || self.hub_backend_selected() {
-            return;
-        }
-        let mut task = self.claim_refresh_task.lock().unwrap();
-        if task.is_some() {
-            return;
-        }
-        let receiver = self.claim_refresh.receiver.clone();
-        let worker = Worker {
-            store: Arc::downgrade(&self.store),
-            sql_operations: self.claim_refresh_sql.clone(),
-            records: self.record_client.clone(),
-            health: self.health.clone(),
-            watches: self.watches.clone(),
-            clock: self.clock,
-        };
-        *task = Some(tokio::spawn(async move {
-            let mut receiver = receiver.lock().await;
-            while let Some(first) = receiver.recv().await {
-                let mut waiters = first.into_iter().collect::<Vec<_>>();
-                // Coalesce queued requests before beginning a pass. Requests
-                // received during a pass remain queued for the following pass.
-                while let Ok(request) = receiver.try_recv() {
-                    waiters.extend(request);
-                }
-                let result = worker.pass().await;
-                if result.is_err() {
-                    worker
-                        .health
-                        .claim_refresh_failed
-                        .store(true, Ordering::Relaxed);
-                }
-                for waiter in waiters {
-                    let _ = waiter.send(match &result {
-                        Ok(counts) => Ok(*counts),
-                        Err(error) => Err(HandlerError {
-                            code: error.code.clone(),
-                            message: error.message.clone(),
-                            detail: error.detail.clone(),
-                        }),
-                    });
-                }
-            }
-        }));
-    }
-
-    #[cfg(test)]
-    pub(super) async fn stop_claim_refresh(&self) {
-        let task = self.claim_refresh_task.lock().unwrap().take();
-        if let Some(task) = task {
-            task.abort();
-            let _ = task.await;
-        }
-        self.claim_refresh_sql.wait().await;
-    }
-
-    /// Ask for a claim refresh after a new agent became live in the store, so
-    /// `agent.where` learns the agent's claim without an operator refresh.
-    /// This only enqueues a request for the refresh task: the write that
-    /// created the agent must not wait for engram before replying.
-    pub(super) fn refresh_claims_for_new_agent(&self) {
-        if !self.hub_backend_selected() {
-            self.claim_refresh.signal();
-        }
-    }
-
     pub(super) fn admit_claim_refresh(&self, key: RouteKey) -> Result<(), HandlerError> {
         let admission = self.admission_for(key);
         super::refuse_flow_write(REFRESH, admission.flow_id.as_deref())?;
@@ -433,7 +330,7 @@ impl ProjectsHandler {
         Ok(())
     }
 
-    pub(super) async fn refresh_agent_claims(
+    pub(super) fn refresh_agent_claims(
         &self,
         params: Value,
         key: RouteKey,
@@ -450,12 +347,17 @@ impl ProjectsHandler {
                 "claim refresh requires the identity log enabled",
             ));
         }
-        encode_result(self.wait_claim_refresh().await?)
+        if self.hub_backend_selected() {
+            return Err(HandlerError::new(
+                "hub_claims_watched",
+                "the hub residence watch refreshes claims",
+            ));
+        }
+        encode_result(RefreshCounts::default())
     }
 
-    /// Wait for a claim-refresh pass, including requests made while another pass
-    /// is running. Move admission needs the same refresh for module callers as
-    /// for operator routes with a Direct principal, so both check current ownership.
+    /// Legacy moves refresh ownership before inspecting the cached claim. This
+    /// check is deleted with legacy move admission; served reads never run it.
     pub(super) async fn wait_claim_refresh(&self) -> Result<RefreshCounts, HandlerError> {
         if self.hub_backend_selected() {
             return Err(HandlerError::new(
@@ -463,16 +365,16 @@ impl ProjectsHandler {
                 "the hub residence watch refreshes claims",
             ));
         }
-        self.start_claim_refresh();
-        let (sender, receiver) = oneshot::channel();
-        self.claim_refresh
-            .sender
-            .send(Some(sender))
-            .map_err(|_| HandlerError::new("storage_unavailable", "claim refresh stopped"))?;
-        let result = receiver
-            .await
-            .map_err(|_| HandlerError::new("storage_unavailable", "claim refresh stopped"))??;
-        Ok(result)
+        let _pass = self.legacy_claim_pass.lock().await;
+        Worker {
+            store: Arc::downgrade(&self.store),
+            sql_operations: self.claim_refresh_sql.clone(),
+            records: self.record_client.clone(),
+            health: self.health.clone(),
+            clock: self.clock,
+        }
+        .pass()
+        .await
     }
 
     pub(super) fn agent_where(&self, params: Value) -> Result<Vec<u8>, HandlerError> {
@@ -525,21 +427,15 @@ impl ProjectsHandler {
             }
             return Ok(value);
         }
-        let location = self.with_agent_store(|store| store.agent_where(agent_id));
-        // Cutover may start the log before it installs the residence watch.
-        // Never use the engram cache once the hub is selected.
-        if self.hub_backend_selected()
-            && (location.is_ok()
-                || location
-                    .as_ref()
-                    .is_err_and(|error| error.code == "claim_integrity_failed"))
-        {
+        let location = self.with_agent_store(|store| store.agent_where(agent_id))?;
+        // The log can be installed before the residence watch starts.
+        if self.hub_backend_selected() {
             return Ok(
                 serde_json::json!({"known":false,"status":"unclaimed","holder":null,
                 "holder_name":null,"epoch":0,"cut_id":null,"read_at_ms":null,"stale":true}),
             );
         }
-        let mut value = serde_json::to_value(location?).map_err(crate::invalid_params)?;
+        let mut value = serde_json::to_value(location).map_err(crate::invalid_params)?;
         if let Some(moving) = value.get_mut("moving") {
             crate::move_ops::elapsed(moving, (self.clock)());
         }
@@ -550,25 +446,18 @@ impl ProjectsHandler {
 #[cfg(test)]
 mod tests {
     use super::super::{
-        fake_log::{Action, FakeLog},
-        fake_record::{FakeRecord, FakeRecordConnector},
-        record_client::RecordClient,
-        sessions::{FakeResolver, ProviderResolution, ORCHESTRATOR_CAPABILITY},
         tests::{reserved, scratch_descriptor},
         RouteAdmission,
     };
     use super::*;
     use serde_json::json;
-    use subc_client_rs::{HandlerOutcome, ModuleHandler};
+    use subc_client_rs::HandlerOutcome;
     use subc_protocol::Principal;
     const DIRECT: RouteKey = (60, 1);
     const HOST: RouteKey = (61, 1);
     const OTHER: RouteKey = (62, 1);
     struct Fixture {
         handler: Arc<ProjectsHandler>,
-        record: Arc<FakeRecord>,
-        log: FakeLog,
-        descriptor: cortexkit_store_types::StorageDescriptor,
         dir: std::path::PathBuf,
     }
     fn body(method: &str, params: Value) -> Vec<u8> {
@@ -589,24 +478,14 @@ mod tests {
         }
     }
     impl Fixture {
-        async fn new(enabled: bool) -> Self {
+        fn new() -> Self {
             let (dir, descriptor) = scratch_descriptor("claims");
-            let log = FakeLog::default().with_author([1; 16]);
-            let record = FakeRecord::new([1; 16]);
-            let mut handler = ProjectsHandler::with_log_connector(
-                "0123456789abcdef".into(),
-                || 700,
-                Arc::new(log.clone()),
-            );
-            handler.record_client =
-                RecordClient::new(Arc::new(FakeRecordConnector(record.clone())));
-            let resolver = FakeResolver::new();
-            resolver.set(
-                ORCHESTRATOR_CAPABILITY,
-                ProviderResolution::Provider("prefrontal".into()),
-            );
-            handler.provider_resolver = resolver;
-            *handler.store.lock().unwrap() = Some(RegistryStore::open(&descriptor).unwrap());
+            let handler = ProjectsHandler::with_runtime("0123456789abcdef".into(), || 700);
+            let store = RegistryStore::open(&descriptor).unwrap();
+            store
+                .apply_entry("agent.cutover", "{}", "fixture", None, |_| Ok(()))
+                .unwrap();
+            *handler.store.lock().unwrap() = Some(store);
             handler.health.store_ready.store(true, Ordering::Relaxed);
             handler.route_admissions().insert(
                 DIRECT,
@@ -620,50 +499,18 @@ mod tests {
                 OTHER,
                 RouteAdmission::from_bind(Some(reserved("other")), None),
             );
-            let f = Self {
+            Self {
                 handler: Arc::new(handler),
-                record,
-                log,
-                descriptor,
                 dir,
-            };
-            if enabled {
-                result(
-                    f.call(
-                        DIRECT,
-                        "identity_log.enable",
-                        json!({"without_agents":true}),
-                    )
-                    .await,
-                );
-                assert_eq!(
-                    result(f.call(DIRECT, REFRESH, json!({})).await),
-                    json!({"refreshed":0,"failed":0})
-                );
             }
-            f
         }
         async fn call(&self, key: RouteKey, method: &str, params: Value) -> HandlerOutcome {
             self.handler
                 .handle_served_request(&body(method, params), key)
                 .await
         }
-        /// Create an agent through the served handler, then wait out the claim
-        /// refresh the create asks for, so a test's later record calls and
-        /// batches come only from the steps it takes itself.
-        async fn create(&self, n: usize) -> String {
-            let id = self.create_only(n).await;
-            self.handler.wait_claim_refresh().await.unwrap();
-            id
-        }
         async fn create_only(&self, n: usize) -> String {
             result(self.call(HOST,"agent.create",json!({"name":format!("Agent {n}"),"role":"assistant","tag":"test","request_key":format!("create-{n}")})).await)["agent"]["agent_id"].as_str().unwrap().into()
-        }
-        fn put(&self, id: &str, holder: &str, epoch: i64) {
-            self.record.put(&format!("claim:{id}"),1,serde_json::to_vec(&json!({"v":1,"agent_id":id,"holder":holder,"epoch":epoch,"cut_id":null,"reason":null})).unwrap(),holder);
-        }
-        async fn refresh(&self) -> Value {
-            result(self.call(DIRECT, REFRESH, json!({})).await)
         }
         fn where_(&self, id: &str) -> Value {
             result(
@@ -680,7 +527,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_admission_empty_disabled_and_sync_seam_are_closed() {
-        let f = Fixture::new(false).await;
+        let f = Fixture::new();
         assert_eq!(
             code(f.call(OTHER, REFRESH, json!({})).await),
             "caller_forbidden"
@@ -708,93 +555,13 @@ mod tests {
             code(f.call(DIRECT, REFRESH, json!({})).await),
             "flow_scope_not_admitted"
         );
-        let f = Fixture::new(true).await;
-        assert_eq!(f.refresh().await, json!({"refreshed":0,"failed":0}));
-        f.handler.stop_claim_refresh().await;
-        assert_eq!(f.refresh().await, json!({"refreshed":0,"failed":0}));
-        assert_eq!(f.record.calls.load(Ordering::Relaxed), 0);
-    }
-    #[tokio::test]
-    async fn created_agent_claim_is_read_without_a_manual_refresh() {
-        let f = Fixture::new(true).await;
-        // Fixture::new waited for its own refresh, so the only pass that can
-        // finish after this point is one the create asks for.
-        let refreshed = f.handler.health.claim_refresh_done.notified();
-        tokio::pin!(refreshed);
-        refreshed.as_mut().enable();
-        let id = f.create_only(1).await;
-        tokio::time::timeout(std::time::Duration::from_secs(10), refreshed)
-            .await
-            .expect("creating an agent must schedule a claim refresh");
-        let answer = f.where_(&id);
-        assert_eq!(answer["known"], true);
-        assert_eq!(answer["status"], "unclaimed");
-    }
-
-    #[tokio::test]
-    async fn refresh_batches_live_agents_at_64_and_where_never_calls_record() {
-        let f = Fixture::new(true).await;
-        let mut agents = Vec::new();
-        for n in 0..65 {
-            agents.push(f.create(n).await);
-        }
-        let own = f.record.author.clone();
-        f.put(&agents[0], &own, 1);
-        f.put(&agents[1], "02020202020202020202020202020202", 3);
-        f.record.batches.lock().unwrap().clear();
-        // The creates' refreshes cached every claim as absent. `agent.where`
-        // answers from that cache, not from the claims just written.
-        assert_eq!(f.where_(&agents[0])["status"], "unclaimed");
-        assert_eq!(f.refresh().await, json!({"refreshed":65,"failed":0}));
-        assert_eq!(
-            f.record
-                .batches
-                .lock()
-                .unwrap()
-                .iter()
-                .map(Vec::len)
-                .collect::<Vec<_>>(),
-            vec![64, 1]
-        );
-        let calls = f.record.calls.load(Ordering::Relaxed);
-        assert_eq!(f.where_(&agents[0])["status"], "held_here");
-        assert_eq!(f.where_(&agents[1])["status"], "held_elsewhere");
-        let unclaimed = f.where_(&agents[2]);
-        assert_eq!(unclaimed["known"], true);
-        assert_eq!(unclaimed["holder"], Value::Null);
-        assert_eq!(unclaimed["cut_id"], Value::Null);
-        assert_eq!(f.record.calls.load(Ordering::Relaxed), calls);
-        assert_eq!(
-            f.handler
-                .with_store(|s| s.cached_agent_claim(&agents[2]))
-                .unwrap()
-                .unwrap()
-                .version,
-            0
-        );
-        result(
-            f.call(
-                HOST,
-                "agent.dispose",
-                json!({"agent_id":agents[2],"request_key":"retire"}),
-            )
-            .await,
-        );
-        f.record.batches.lock().unwrap().clear();
-        assert_eq!(f.refresh().await["refreshed"], 64);
-        assert!(!f.record.batches.lock().unwrap()[0].contains(&format!("claim:{}", agents[2])));
     }
 
     #[tokio::test]
     async fn where_many_preserves_order_omits_unknown_and_matches_single_reply() {
-        let f = Fixture::new(true).await;
-        let first = f.create(1).await;
-        let second = f.create(2).await;
-        let own = f.record.author.clone();
-        f.put(&first, &own, 1);
-        f.put(&second, "02020202020202020202020202020202", 2);
-        f.refresh().await;
-        let calls = f.record.calls.load(Ordering::Relaxed);
+        let f = Fixture::new();
+        let first = f.create_only(1).await;
+        let second = f.create_only(2).await;
         let expected = f.where_(&first);
 
         let reply = result(
@@ -813,16 +580,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             [second.as_str(), first.as_str()]
         );
-        assert_eq!(agents[0]["status"], "held_elsewhere");
+        assert_eq!(agents[0]["status"], "unclaimed");
         let mut first_without_id = agents[1].clone();
         first_without_id.as_object_mut().unwrap().remove("agent_id");
         assert_eq!(first_without_id, expected);
-        assert_eq!(f.record.calls.load(Ordering::Relaxed), calls);
     }
 
     #[tokio::test]
     async fn where_many_refuses_duplicate_ids() {
-        let f = Fixture::new(false).await;
+        let f = Fixture::new();
         assert_eq!(
             code(
                 f.call(
@@ -838,7 +604,7 @@ mod tests {
 
     #[tokio::test]
     async fn where_many_accepts_64_and_refuses_invalid_shapes_and_65() {
-        let f = Fixture::new(false).await;
+        let f = Fixture::new();
         let ids = (0..64)
             .map(|n| format!("agent_{:016x}", 0x1000 + n))
             .collect::<Vec<_>>();
@@ -859,354 +625,5 @@ mod tests {
                 "invalid_request"
             );
         }
-    }
-    #[tokio::test]
-    async fn refresh_integrity_and_all_codec_errors_are_persisted_and_cleared() {
-        let f = Fixture::new(true).await;
-        let mut ids = Vec::new();
-        for n in 0..5 {
-            ids.push(f.create(n).await);
-        }
-        for id in &ids {
-            f.put(id, &f.record.author, 1);
-        }
-        f.refresh().await;
-        f.record
-            .error(&format!("claim:{}", ids[0]), Some("verify_failed"));
-        f.record
-            .error(&format!("claim:{}", ids[1]), Some("decrypt_failed"));
-        for (id, bytes) in [
-            (ids[2].clone(), b"{\"v\":2}".to_vec()),
-            (
-                ids[3].clone(),
-                serde_json::to_vec(&json!({"v":1,"agent_id":"other","epoch":0,"holder":null}))
-                    .unwrap(),
-            ),
-            (ids[4].clone(), b"bad".to_vec()),
-        ] {
-            f.record
-                .put(&format!("claim:{id}"), 2, bytes, &f.record.author);
-        }
-        assert_eq!(f.refresh().await, json!({"refreshed":0,"failed":5}));
-        for id in &ids {
-            assert_eq!(
-                code(
-                    f.handler
-                        .handle_request(&body(WHERE, json!({"agent_id":id})), OTHER)
-                ),
-                "claim_integrity_failed"
-            );
-        }
-        assert_eq!(
-            f.handler
-                .health
-                .claim_version_unknown
-                .load(Ordering::Relaxed),
-            1
-        );
-        assert_eq!(
-            f.handler
-                .health
-                .claim_subject_mismatch
-                .load(Ordering::Relaxed),
-            1
-        );
-        assert_eq!(f.handler.health.claim_malformed.load(Ordering::Relaxed), 1);
-        for id in &ids {
-            f.record.error(&format!("claim:{id}"), None);
-            f.record.put(&format!("claim:{id}"),3,serde_json::to_vec(&json!({"v":1,"agent_id":id,"holder":f.record.author,"epoch":1,"cut_id":null,"reason":null})).unwrap(),&f.record.author);
-        }
-        assert_eq!(f.refresh().await["refreshed"], 5);
-        for id in &ids {
-            assert_eq!(f.where_(id)["status"], "held_here");
-        }
-    }
-    #[tokio::test]
-    async fn refresh_conflict_is_health_error_and_does_not_replace_self_author() {
-        let f = Fixture::new(true).await;
-        let id = f.create(1).await;
-        f.put(&id, &f.record.author, 1);
-        f.refresh().await;
-        let other = FakeRecord::new([2; 16]);
-        let worker = Worker {
-            store: Arc::downgrade(&f.handler.store),
-            sql_operations: f.handler.claim_refresh_sql.clone(),
-            records: RecordClient::new(Arc::new(FakeRecordConnector(other))),
-            health: f.handler.health.clone(),
-            watches: f.handler.watches.clone(),
-            clock: f.handler.clock,
-        };
-        assert_eq!(worker.pass().await.unwrap().refreshed, 1);
-        assert_eq!(
-            f.handler
-                .with_store(RegistryStore::persisted_self_author)
-                .unwrap()
-                .as_deref(),
-            Some(f.record.author.as_str())
-        );
-        let health = f.handler.health().await;
-        assert_eq!(
-            health.metrics.unwrap()["claimError"],
-            "self_author_conflict"
-        );
-        assert_eq!(f.handler.health.log_state.load(Ordering::Relaxed), 0);
-    }
-    #[tokio::test(start_paused = true)]
-    async fn refresh_failure_reconnect_signals_exactly_one_pass_without_private_timer() {
-        let f = Fixture::new(true).await;
-        let id = f.create(1).await;
-        f.record.error(&format!("claim:{id}"), Some("unavailable"));
-        assert_eq!(
-            code(f.call(DIRECT, REFRESH, json!({})).await),
-            "engram_unavailable"
-        );
-        assert_eq!(f.handler.health.log_state.load(Ordering::Relaxed), 0);
-        let before = f.record.calls.load(Ordering::Relaxed);
-        f.record.error(&format!("claim:{id}"), None);
-        // The fake call counter advances before the blocking cache transaction
-        // commits. Wait for that commit before asserting the cache answer.
-        let committed = f.handler.health.claim_refresh_done.notified();
-        tokio::pin!(committed);
-        committed.as_mut().enable();
-        f.handler.start_catch_up();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            f.record.wait_for_calls(before + 1),
-        )
-        .await
-        .expect("the reconnect must schedule a refresh pass");
-        committed.await;
-        assert_eq!(f.record.calls.load(Ordering::Relaxed), before + 1);
-        let log_calls = f.log.calls();
-        tokio::time::advance(std::time::Duration::from_secs(30)).await;
-        f.log.wait_for_calls(log_calls + 1).await;
-        tokio::task::yield_now().await;
-        assert_eq!(f.record.calls.load(Ordering::Relaxed), before + 1);
-        assert_eq!(f.where_(&id)["known"], true);
-    }
-    #[tokio::test(start_paused = true)]
-    async fn refresh_received_during_inflight_waits_for_next_pass_without_duplication() {
-        let f = Fixture::new(true).await;
-        let id = f.create(1).await;
-        let base = f.record.calls.load(Ordering::Relaxed);
-        f.record.hung.store(true, Ordering::Relaxed);
-        let handler = f.handler.clone();
-        let first =
-            tokio::spawn(async move { handler.refresh_agent_claims(json!({}), DIRECT).await });
-        f.record.wait_for_calls(base + 1).await;
-        let handler = f.handler.clone();
-        let (sent, received) = oneshot::channel();
-        let second = tokio::spawn(async move {
-            sent.send(()).unwrap();
-            handler.refresh_agent_claims(json!({}), DIRECT).await
-        });
-        received.await.unwrap();
-        tokio::task::yield_now().await;
-        f.record.hung.store(false, Ordering::Relaxed);
-        tokio::time::advance(super::super::catch_up::READ_DEADLINE).await;
-        assert_eq!(first.await.unwrap().unwrap_err().code, "engram_unavailable");
-        let reply = second.await.unwrap().unwrap();
-        assert_eq!(
-            serde_json::from_slice::<Value>(&reply).unwrap()["result"],
-            json!({"refreshed":1,"failed":0})
-        );
-        assert_eq!(f.record.calls.load(Ordering::Relaxed), base + 2);
-        assert_eq!(f.where_(&id)["known"], true);
-    }
-    #[tokio::test(start_paused = true)]
-    async fn hung_catchup_and_record_do_not_block_registration_or_cached_reads() {
-        let f = Fixture::new(true).await;
-        let id = f.create(1).await;
-        let base = f.record.calls.load(Ordering::Relaxed);
-        f.record.hung.store(true, Ordering::Relaxed);
-        let h = f.handler.clone();
-        let refresh = tokio::spawn(async move { h.refresh_agent_claims(json!({}), DIRECT).await });
-        f.record.wait_for_calls(base + 1).await;
-        let calls = f.log.calls();
-        f.log.on_read(Action::Hang);
-        f.handler.start_catch_up();
-        f.log.wait_for_calls(calls + 1).await;
-        assert!(f.handler.writer.try_lock().is_err());
-        let params = json!({"agent_id":id,"ref_kind":"test","ref":"r","harness":"pi","session_id":"s","runner":"pi","project_root":"/project"});
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            f.call(HOST, "agent.register_session", params),
-        )
-        .await
-        .expect("registration must not wait on the writer");
-        assert_eq!(result(outcome)["agent_id"], id);
-        for (method, params) in [
-            (WHERE, json!({"agent_id":id})),
-            ("agent.resolve", json!({"agent_id":id})),
-            (
-                "agent.for_session",
-                json!({"harness":"pi","session_id":"s"}),
-            ),
-            (
-                "agent.session_liveness",
-                json!({"refs":[{"ref_kind":"test","ref":"r"}]}),
-            ),
-            ("enumerate", json!({})),
-            ("identity_log.status", json!({})),
-        ] {
-            result(
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(1),
-                    f.call(OTHER, method, params),
-                )
-                .await
-                .expect("read must not wait on the writer"),
-            );
-        }
-        assert!(f.handler.writer.try_lock().is_err());
-        f.handler.health().await;
-        tokio::time::advance(super::super::catch_up::READ_DEADLINE).await;
-        assert_eq!(
-            refresh.await.unwrap().unwrap_err().code,
-            "engram_unavailable"
-        );
-    }
-    #[tokio::test]
-    async fn cached_here_survives_restart_with_failed_records_and_verify_rebuild() {
-        let f = Fixture::new(true).await;
-        let id = f.create(1).await;
-        f.put(&id, &f.record.author, 1);
-        f.refresh().await;
-        assert!(f.handler.with_store(RegistryStore::verify).unwrap().ok);
-        f.handler.with_store(RegistryStore::rebuild).unwrap();
-        assert_eq!(f.where_(&id)["status"], "held_here");
-        let descriptor = f.descriptor.clone();
-        let record = f.record.clone();
-        let log = f.log.clone();
-        crate::tests::stop_store_tasks(&f.handler).await;
-        f.handler.store.lock().unwrap().take();
-        let mut handler =
-            ProjectsHandler::with_log_connector("abcdef0123456789".into(), || 701, Arc::new(log));
-        record.offline.store(true, Ordering::Relaxed);
-        handler.record_client = RecordClient::new(Arc::new(FakeRecordConnector(record.clone())));
-        crate::tests::allow_legacy_store(&descriptor);
-        *handler.store.lock().unwrap() = Some(RegistryStore::open(&descriptor).unwrap());
-        let resolver = FakeResolver::new();
-        resolver.set(
-            ORCHESTRATOR_CAPABILITY,
-            ProviderResolution::Provider("prefrontal".into()),
-        );
-        handler.provider_resolver = resolver;
-        handler.route_admissions().insert(
-            HOST,
-            RouteAdmission::from_bind(Some(reserved("prefrontal")), None),
-        );
-        assert_eq!(
-            result(handler.handle_request(&body(WHERE, json!({"agent_id":id})), OTHER))["status"],
-            "held_here"
-        );
-        let calls = record.calls.load(Ordering::Relaxed);
-        assert_eq!(result(handler.handle_served_request(&body("agent.register_session",json!({"agent_id":id,"ref_kind":"test","ref":"ref","harness":"pi","session_id":"s","runner":"pi","project_root":"/project"})),HOST).await)["agent_id"],id);
-        assert_eq!(record.calls.load(Ordering::Relaxed), calls);
-        drop(handler);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn hello_ack_startup_refreshes_persisted_live_agents() {
-        #[derive(Clone)]
-        struct ClaimBatchObserver {
-            peer: Arc<FakeRecord>,
-            completed: Arc<tokio::sync::Semaphore>,
-        }
-        #[async_trait::async_trait]
-        impl crate::log_client::LogConnector for ClaimBatchObserver {
-            async fn connect(
-                &self,
-            ) -> Result<Arc<dyn crate::log_client::LogTransport>, crate::log_client::TransportError>
-            {
-                Ok(Arc::new(self.clone()))
-            }
-        }
-        #[async_trait::async_trait]
-        impl crate::log_client::LogTransport for ClaimBatchObserver {
-            async fn call(
-                &self,
-                method: &str,
-                params: Value,
-            ) -> Result<Vec<u8>, crate::log_client::TransportError> {
-                let claims = method == "record.read_many"
-                    && params["subjects"].as_array().is_some_and(|subjects| {
-                        !subjects.is_empty()
-                            && subjects
-                                .iter()
-                                .all(|s| s.as_str().is_some_and(|s| s.starts_with("claim:")))
-                    });
-                let reply =
-                    crate::log_client::LogTransport::call(self.peer.as_ref(), method, params).await;
-                if claims && reply.is_ok() {
-                    self.completed.add_permits(1);
-                }
-                reply
-            }
-        }
-        let f = Fixture::new(true).await;
-        let id = f.create(1).await;
-        f.put(&id, &f.record.author, 1);
-        f.refresh().await;
-        crate::tests::stop_store_tasks(&f.handler).await;
-        f.handler.store.lock().unwrap().take();
-        let peer = FakeRecord::new([1; 16]);
-        let holder = "02020202020202020202020202020202";
-        peer.put(
-            &format!("claim:{id}"),
-            2,
-            serde_json::to_vec(
-                &json!({"v":1,"agent_id":id,"holder":holder,"epoch":2,"cut_id":null,"reason":null}),
-            )
-            .unwrap(),
-            holder,
-        );
-        let mut handler = ProjectsHandler::with_log_connector(
-            "abcdef0123456789".into(),
-            || 701,
-            Arc::new(f.log.clone()),
-        );
-        let completed = Arc::new(tokio::sync::Semaphore::new(0));
-        handler.record_client = RecordClient::new(Arc::new(ClaimBatchObserver {
-            peer: peer.clone(),
-            completed: completed.clone(),
-        }));
-        let claim_batches = || {
-            peer.batches
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|subjects| {
-                    !subjects.is_empty()
-                        && subjects.iter().all(|subject| subject.starts_with("claim:"))
-                })
-                .count()
-        };
-        handler.route_admissions().insert(
-            DIRECT,
-            RouteAdmission::from_bind(Some(Principal::Direct), None),
-        );
-        crate::tests::allow_legacy_store(&f.descriptor);
-        handler
-            .on_hello_ack(&super::super::tests::hello_ack(&f.descriptor))
-            .await;
-        // Startup also polls the move inbox. Only a completed claim batch
-        // proves that the claim refresher ran; unrelated peer reads do not.
-        tokio::time::timeout(std::time::Duration::from_secs(1), completed.acquire())
-            .await
-            .expect("startup must schedule a claim refresh")
-            .unwrap()
-            .forget();
-        assert_eq!(claim_batches(), 1);
-        handler
-            .refresh_agent_claims(json!({}), DIRECT)
-            .await
-            .unwrap();
-        assert_eq!(claim_batches(), 2);
-        assert_eq!(
-            result(handler.handle_request(&body(WHERE, json!({"agent_id":id})), OTHER))["holder"],
-            holder
-        );
-        drop(handler);
     }
 }

@@ -28,42 +28,14 @@ async fn barrier(log: &FakeLog, machine: &Machine, calls: usize) {
 }
 
 #[tokio::test(start_paused = true)]
-async fn member_box_startup_writes_once_and_where_acquires_box() {
+async fn member_box_startup_writes_once_and_replicates_box() {
     let log = FakeLog::default();
     let a_log = Arc::new(log.with_author([0x11; 16]));
     let b_log = Arc::new(log.with_author([0x22; 16]));
-    let b_records = FakeRecord::new([0x22; 16]);
     let mut a = Machine::new("member-box-holder", a_log.clone());
-    let b = Machine::new_with_record(
-        "member-box-reader",
-        b_log,
-        RecordClient::new(Arc::new(FakeRecordConnector(b_records.clone()))),
-    );
+    let b = Machine::new("member-box-reader", b_log);
     a.enable_without_agents().await;
     b.enable_without_agents().await;
-    let agent = a
-        .call(
-            "agent.create",
-            json!({"request_key":"member-box-agent","name":"Ada","tag":"test","role":"assistant"}),
-        )
-        .await
-        .unwrap()["agent"]["agent_id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    b.catch_up().await;
-    b_records.put(
-        &format!("claim:{agent}"), 1,
-        serde_json::to_vec(&json!({"v":1,"agent_id":agent,"holder":"11".repeat(16),"epoch":1,"cut_id":null,"reason":null})).unwrap(),
-        &"11".repeat(16),
-    );
-    b.bytes_on(DIRECT, "agent.refresh_claims", json!({}))
-        .await
-        .unwrap();
-    let params = json!({"agent_id":agent});
-    let before = b.call("agent.where", params.clone()).await.unwrap();
-    assert_eq!(before["status"], "held_elsewhere");
-    assert!(before.get("holder_box").is_none());
 
     a.restart_legacy(a_log.clone()).await;
     daemon(&a, A_BOX);
@@ -73,15 +45,6 @@ async fn member_box_startup_writes_once_and_where_acquires_box() {
     assert_eq!(log.head(), head + 1);
     assert_eq!(a.store().own_member_box().unwrap().as_deref(), Some(A_BOX));
     b.catch_up().await;
-    let mut expected = before;
-    expected["holder_box"] = json!(A_BOX);
-    assert_eq!(b.call("agent.where", params).await.unwrap(), expected);
-    assert_eq!(
-        b.call("agent.where_many", json!({"agentIds":[agent]}))
-            .await
-            .unwrap()["agents"][0]["holder_box"],
-        A_BOX
-    );
     let calls = log.calls();
     a.handler.catch_up_wake.notify_one();
     barrier(&log, &a, calls + 1).await;

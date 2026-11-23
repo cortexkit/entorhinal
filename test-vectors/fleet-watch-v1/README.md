@@ -16,13 +16,10 @@ sends `{"method":op,"params":request}` in one ordinary SUBC Request.
   requests. The first has no frames, causally checked after the handler enters
   its wait. Updating the tag then yields the second observation's changes frame.
 - `where-resync.json`: a missing cursor requires a full whereabouts read.
-- `where-changes.json`: resume from seq 0 yields one cached whereabouts entry,
-  including its process-local version. Unclaimed/known/null values retain the
-  `agent.where_many` encoding.
 - `watch-capacity.json`: the seventeenth watch, with eight identity watches and
   eight whereabouts watches already open, refuses with error code
   `watch_capacity` before starting.
-- `SHA256SUMS`: hashes of the six JSON files, relative to this directory.
+- `SHA256SUMS`: hashes of the five JSON files, relative to this directory.
 
 The incarnation is fixed to `0123456789abcdef`. Identity tokens/generations and
 whereabouts seqs are local to one process on one machine; do not compare them between
@@ -36,14 +33,9 @@ over 192 KiB becomes a single small `resync`; notices are never split. Identity
 resume is conservative: every journal entry in the bounded range must be an
 agent identity after-image; project/workspace/root entries force resync because
 they can change joined fleet fields without listing the affected agent ids.
-Whereabouts retains 256 changed cache transactions or derived-view invalidations; a cursor outside that
-ring (or from another incarnation) forces resync. A transaction increments seq
-once if at least one cached claim changes, including known/stale/read timestamp
-changes; unchanged transactions do not advance it. Member renames, learning the
-machine's own author identity, sharing-mode changes, agent liveness changes and move
-progress also advance seq with an all-agents resync marker. These fields are
-derived outside the claim cache; the core's post-commit listener invalidates the
-watch history without polling or adding engram calls.
+Whereabouts changes invalidate the cursor and produce `resync` notices. A
+cursor for the current process and sequence waits for the next invalidation.
+The core’s post-commit listener reports derived-view changes without polling.
 
 ## Reproduce and verify
 
