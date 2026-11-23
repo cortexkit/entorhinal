@@ -1902,6 +1902,26 @@ fn render(command: &Command, value: &Value) {
     }
 }
 
+#[cfg(test)]
+#[test]
+#[ignore = "child process used to capture the real renderer's stdout"]
+fn sharing_baseline_cli_render_child() {
+    let Some(input) = std::env::var_os("ENTORHINAL_BASELINE_STATUS") else {
+        return;
+    };
+    let Invocation::Command(command) = parse(Face::Projects, &["log", "status"].map(String::from))
+    else {
+        panic!("expected log status command");
+    };
+    let (method, params) = build(&command).expect("build status request");
+    assert_eq!(method, "identity_log.status");
+    assert_eq!(params, serde_json::json!({}));
+    render(
+        &command,
+        &serde_json::from_str(&input.into_string().unwrap()).unwrap(),
+    );
+}
+
 fn format_refresh_key(value: &Value) -> String {
     if value["noop"] == true {
         return "Nothing changed.".into();

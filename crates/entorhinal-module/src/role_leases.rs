@@ -203,6 +203,20 @@ impl Leases {
     }
 
     #[cfg(test)]
+    pub(crate) fn baseline_lease(&self, role: &str, gen: i64) -> impl Drop + '_ {
+        let (client, mut registration) = self
+            .register(role.into(), (73, 4), mpsc::channel(1).0)
+            .unwrap();
+        *client.view.lock().unwrap() = View {
+            gen,
+            until_ms: Some(self.now() + 1000),
+            handback: false,
+        };
+        registration.holding(true);
+        registration
+    }
+
+    #[cfg(test)]
     pub(super) fn sample_before_local_refresh(&mut self, hook: impl Fn() + Send + Sync + 'static) {
         self.before_local_refresh = Some(Arc::new(hook));
     }

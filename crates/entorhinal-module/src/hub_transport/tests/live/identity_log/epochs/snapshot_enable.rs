@@ -5,6 +5,8 @@ use crate::{
 };
 use entorhinal_core::enable_state::HubSnapshot;
 
+mod switch_baseline;
+
 const ROUTE: RouteKey = (125, 1);
 const CORE: RouteKey = (125, 2);
 

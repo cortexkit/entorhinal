@@ -152,6 +152,8 @@ mod session_move;
 mod session_upkeep;
 mod sessions;
 mod shared_write;
+#[cfg(test)]
+mod sharing_baselines;
 mod store_origin;
 mod tool_provider;
 mod watches;

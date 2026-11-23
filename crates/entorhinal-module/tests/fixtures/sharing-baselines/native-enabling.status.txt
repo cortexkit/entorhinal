@@ -1,0 +1,9 @@
+{
+  "incarnation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "lastAppliedPosition": 0,
+  "lastError": null,
+  "lastErrorAt": null,
+  "lastSeenHead": 0,
+  "pendingWriteCount": 0,
+  "state": "enabling"
+}

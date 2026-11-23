@@ -1,0 +1,269 @@
+[
+  {
+    "before_seq": 4,
+    "snapshot_op": "root_key.backfill",
+    "tables": {
+      "agent": [],
+      "agent_name_claim": [],
+      "catalog_pin": [],
+      "catalog_pin_set": [],
+      "derived_root_parent": [],
+      "hub_membership": [],
+      "member_box": [
+        [
+          "11111111111111111111111111111111",
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ]
+      ],
+      "member_name": [
+        [
+          "11111111111111111111111111111111",
+          "Aster's box"
+        ]
+      ],
+      "placement_fact": [],
+      "placement_state": [],
+      "project": [
+        [
+          "baseline_project",
+          "Baseline project",
+          0,
+          null,
+          700,
+          700,
+          null
+        ]
+      ],
+      "project_alias": [
+        [
+          "pj-implicit1-329f85ac6e6310f8",
+          "baseline_project",
+          700
+        ]
+      ],
+      "project_root": [
+        [
+          "/",
+          "baseline_project",
+          700,
+          null,
+          null
+        ]
+      ],
+      "project_root_key": [],
+      "project_workspace": [],
+      "retired_binding": [],
+      "root_approval": [],
+      "root_binding": [],
+      "root_owned_remotes": [],
+      "user_expertise": [],
+      "user_profile": [],
+      "workspace": [],
+      "workspace_document": [],
+      "workspace_member": [],
+      "workspace_root": []
+    }
+  },
+  {
+    "before_seq": 9,
+    "snapshot_op": "hub.snapshot",
+    "tables": {
+      "agent": [
+        [
+          "agent_0000000000000001",
+          "Aster",
+          1,
+          1,
+          "baseline",
+          "[]",
+          "assistant",
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          "Aster",
+          700,
+          700,
+          1
+        ]
+      ],
+      "agent_name_claim": [
+        [
+          1,
+          "agent_0000000000000001",
+          "assistant",
+          "global",
+          1,
+          "aster",
+          "Aster",
+          700,
+          null
+        ]
+      ],
+      "catalog_pin": [],
+      "catalog_pin_set": [],
+      "derived_root_parent": [],
+      "hub_membership": [],
+      "member_box": [
+        [
+          "11111111111111111111111111111111",
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ]
+      ],
+      "member_name": [
+        [
+          "11111111111111111111111111111111",
+          "Aster's box"
+        ]
+      ],
+      "placement_fact": [],
+      "placement_state": [],
+      "project": [
+        [
+          "baseline_project",
+          "Baseline project",
+          0,
+          null,
+          700,
+          700,
+          null
+        ]
+      ],
+      "project_alias": [
+        [
+          "pj-implicit1-329f85ac6e6310f8",
+          "baseline_project",
+          700
+        ]
+      ],
+      "project_root": [
+        [
+          "/",
+          "baseline_project",
+          700,
+          null,
+          null
+        ]
+      ],
+      "project_root_key": [],
+      "project_workspace": [],
+      "retired_binding": [],
+      "root_approval": [],
+      "root_binding": [],
+      "root_owned_remotes": [],
+      "user_expertise": [],
+      "user_profile": [],
+      "workspace": [],
+      "workspace_document": [],
+      "workspace_member": [],
+      "workspace_root": []
+    }
+  },
+  {
+    "before_seq": 10,
+    "snapshot_op": "hub.snapshot",
+    "tables": {
+      "agent": [
+        [
+          "agent_0000000000000001",
+          "Aster",
+          1,
+          1,
+          "baseline",
+          "[]",
+          "assistant",
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          "Aster",
+          700,
+          700,
+          1
+        ]
+      ],
+      "agent_name_claim": [
+        [
+          1,
+          "agent_0000000000000001",
+          "assistant",
+          "global",
+          1,
+          "aster",
+          "Aster",
+          700,
+          null
+        ]
+      ],
+      "catalog_pin": [],
+      "catalog_pin_set": [],
+      "derived_root_parent": [],
+      "hub_membership": [],
+      "member_box": [
+        [
+          "11111111111111111111111111111111",
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ]
+      ],
+      "member_name": [
+        [
+          "11111111111111111111111111111111",
+          "Aster's box"
+        ]
+      ],
+      "placement_fact": [],
+      "placement_state": [],
+      "project": [
+        [
+          "baseline_project",
+          "Baseline project",
+          0,
+          null,
+          700,
+          700,
+          null
+        ]
+      ],
+      "project_alias": [
+        [
+          "pj-implicit1-329f85ac6e6310f8",
+          "baseline_project",
+          700
+        ]
+      ],
+      "project_root": [
+        [
+          "/",
+          "baseline_project",
+          700,
+          null,
+          null
+        ]
+      ],
+      "project_root_key": [],
+      "project_workspace": [],
+      "retired_binding": [],
+      "root_approval": [],
+      "root_binding": [],
+      "root_owned_remotes": [],
+      "user_expertise": [],
+      "user_profile": [],
+      "workspace": [],
+      "workspace_document": [],
+      "workspace_member": [],
+      "workspace_root": []
+    }
+  }
+]

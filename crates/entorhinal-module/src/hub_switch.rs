@@ -960,3 +960,6 @@ impl ProjectsHandler {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) use tests::baseline_migration_image;

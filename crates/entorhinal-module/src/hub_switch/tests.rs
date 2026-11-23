@@ -15,6 +15,48 @@ const BOX_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const BOX_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const MIGRATION: &str = "cccccccccccccccccccccccccccccccc";
 
+pub(crate) async fn baseline_migration_image(
+    handler: &ProjectsHandler,
+    log: &FakeLog,
+    records: Arc<FakeRecord>,
+    excluded: &[&str],
+) -> MigrationImage {
+    // Supply the proposal as a verified Engram record, as if issued by the
+    // operator after removing the excluded peer from Callosum.
+    records.put(
+        PROPOSAL,
+        1,
+        serde_json::to_vec(&json!({"v":1,"migration_id":MIGRATION,"excluded":excluded})).unwrap(),
+        A,
+    );
+    let fence = LegacyFence::new(&handler.store);
+    let records = RecordClient::new(Arc::new(FakeRecordConnector(records))).fenced(fence.clone());
+    let switch = Switch {
+        probe: Arc::new(EmptyHub),
+        moves: Arc::default(),
+        drain: Default::default(),
+    };
+    let sql = handler.hub_sql();
+    let deadline = Instant::now() + Duration::from_secs(4);
+    assert!(switch
+        .advance(
+            &sql,
+            &log.client().fenced(fence.clone()),
+            &records,
+            deadline
+        )
+        .await
+        .unwrap()
+        .is_none());
+    let store = handler.with_store(|store| Ok(store.clone())).unwrap();
+    handler.catch_up(&store, deadline).await.unwrap();
+    switch
+        .advance(&sql, &log.client().fenced(fence), &records, deadline)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
 struct EmptyHub;
 
 #[async_trait::async_trait]
