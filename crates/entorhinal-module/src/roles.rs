@@ -164,14 +164,12 @@ mod tests {
     use super::*;
     use crate::{
         agent_ops::{OperatorConfirmError, OperatorConfirmer},
-        fake_record::{FakeRecord, FakeRecordConnector},
-        record_client::RecordClient,
         tests::{reserved, scratch_descriptor},
         RouteAdmission,
     };
     use entorhinal_core::RegistryStore;
     use serde_json::json;
-    use std::sync::{atomic::Ordering, Arc, Mutex};
+    use std::sync::{Arc, Mutex};
     use subc_client_rs::HandlerOutcome;
     use subc_protocol::Principal;
     const DIRECT: RouteKey = (80, 1);
@@ -193,7 +191,6 @@ mod tests {
     }
     struct Fixture {
         handler: Arc<ProjectsHandler>,
-        record: Arc<FakeRecord>,
         prompt: Arc<Prompt>,
         dir: std::path::PathBuf,
         descriptor: cortexkit_store_types::StorageDescriptor,
@@ -201,11 +198,9 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             let (dir, descriptor) = scratch_descriptor("roles");
-            let record = FakeRecord::new([1; 16]);
             let prompt = Arc::new(Prompt::default());
-            let mut h = ProjectsHandler::with_runtime("0123456789abcdef".into(), || 700)
+            let h = ProjectsHandler::with_runtime("0123456789abcdef".into(), || 700)
                 .with_operator_confirmer(prompt.clone());
-            h.record_client = RecordClient::new(Arc::new(FakeRecordConnector(record.clone())));
             super::super::install_store(
                 &h.store,
                 &h.health,
@@ -222,7 +217,6 @@ mod tests {
             );
             Self {
                 handler: Arc::new(h),
-                record,
                 prompt,
                 dir,
                 descriptor,
@@ -330,7 +324,6 @@ mod tests {
             }
             assert_eq!(code(f.call(DIRECT, TAKE, input()).await), expected);
             assert!(f.prompt.calls.lock().unwrap().is_empty());
-            assert_eq!(f.record.calls.load(Ordering::Relaxed), 0);
             assert_eq!(data_version(), before);
         }
         let bytes = serde_json::to_vec(&json!({"method":TAKE,"params":input()})).unwrap();
@@ -354,7 +347,6 @@ mod tests {
     async fn role_read_bytes_keep_unknown_null_fields_without_record_calls() {
         let f = Fixture::new();
         assert_eq!(f.handler.role_read(json!({"role":"x"})).unwrap(), br#"{"result":{"epoch":0,"held_here":false,"holder":null,"holder_name":null,"known":false,"role":"x","source":null,"stale":true}}"#);
-        assert_eq!(f.record.calls.load(Ordering::Relaxed), 0);
         assert_eq!(
             f.handler
                 .role_read(json!({"role":"x","extra":true}))
@@ -376,7 +368,6 @@ mod tests {
             result(f.call(DIRECT, FENCE, json!({"role":"x"})).await),
             json!({"role":"x","subject":"role:x","version":0,"epoch":0,"held_here":false,"holder":null,"stale":true})
         );
-        assert_eq!(f.record.calls.load(Ordering::Relaxed), 0);
         for bad in [json!({"role":"X"}), json!({"role":"x","extra":true})] {
             assert_eq!(
                 f.handler.role_fence(bad).unwrap_err().code,

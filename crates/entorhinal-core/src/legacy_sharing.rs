@@ -16,41 +16,6 @@ use crate::{RegistryError, MIGRATION_NAMESPACE};
 #[path = "legacy_sharing_tests.rs"]
 mod tests;
 
-#[cfg(feature = "legacy-store-for-tests")]
-pub(crate) mod test_access {
-    use std::{
-        collections::HashSet,
-        path::{Path, PathBuf},
-        sync::{Mutex, OnceLock},
-    };
-
-    pub(super) const CHILD_PATH_ENV: &str = "ENTORHINAL_LEGACY_STORE_TEST_PATH";
-    static ALLOWED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
-
-    /// Allow an old-way test fixture at the path in its storage descriptor.
-    /// This hook only keeps tests of engram sharing running while those paths
-    /// are being removed. When the last of those paths is deleted, remove this
-    /// hook and every use of it.
-    /// For a child process, set `ENTORHINAL_LEGACY_STORE_TEST_PATH` to that path
-    /// on the child command instead.
-    pub fn legacy_sharing_test_allow(path: impl AsRef<Path>) {
-        ALLOWED
-            .get_or_init(Mutex::default)
-            .lock()
-            .expect("legacy store test allowlist lock poisoned")
-            .insert(path.as_ref().to_path_buf());
-    }
-
-    pub(crate) fn is_allowed(path: &Path) -> bool {
-        ALLOWED.get().is_some_and(|allowed| {
-            allowed
-                .lock()
-                .expect("legacy store test allowlist lock poisoned")
-                .contains(path)
-        }) || std::env::var_os(CHILD_PATH_ENV).is_some_and(|allowed| Path::new(&allowed) == path)
-    }
-}
-
 pub(crate) fn probe(
     descriptor: &StorageDescriptor,
     path: &str,

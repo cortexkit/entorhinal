@@ -24,8 +24,6 @@ pub(super) fn health_state(state: u64) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fake_log::FailConnector;
-    use crate::log_client::LogConnector;
     use serde_json::json;
     use std::sync::{atomic::Ordering, Arc, Mutex};
     use std::{
@@ -93,9 +91,9 @@ mod tests {
         handler: ProjectsHandler,
     }
     impl Fixture {
-        fn new(label: &str, connector: Arc<dyn LogConnector>) -> Self {
+        fn new(label: &str) -> Self {
             let (dir, descriptor) = crate::tests::scratch_descriptor(label);
-            let handler = Self::handler(&descriptor, connector);
+            let handler = Self::handler(&descriptor);
             handler
                 .with_store(|s| s.apply_entry("agent.cutover", "{}", "test", None, |_| Ok(())))
                 .unwrap();
@@ -105,12 +103,8 @@ mod tests {
                 handler,
             }
         }
-        fn handler(
-            descriptor: &StorageDescriptor,
-            connector: Arc<dyn LogConnector>,
-        ) -> ProjectsHandler {
-            let mut handler =
-                ProjectsHandler::with_log_connector("0123456789abcdef".into(), || 700, connector);
+        fn handler(descriptor: &StorageDescriptor) -> ProjectsHandler {
+            let mut handler = ProjectsHandler::with_runtime("0123456789abcdef".into(), || 700);
             handler.agent_avatar_draw = fixed_avatar;
             *handler.store.lock().unwrap() = Some(RegistryStore::open(descriptor).unwrap());
             handler.health.store_ready.store(true, Ordering::Relaxed);
@@ -190,7 +184,7 @@ mod tests {
             })
         }
         {
-            let mut f = Fixture::new("create-avatars", Arc::new(FailConnector::default()));
+            let mut f = Fixture::new("create-avatars");
             f.handler.agent_avatar_draw = draw_agent_avatar;
             let created: Value =
                 serde_json::from_slice(&f.call("agent.create", agent("wild")).await.unwrap())
@@ -257,8 +251,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_agent_cache_retry_keeps_strict_decode_and_enabling_fence() {
-        let fail = Arc::new(FailConnector::default());
-        let f = Fixture::new("write-agent-cache", fail.clone());
+        let f = Fixture::new("write-agent-cache");
         f.call("agent.create", agent("cache")).await.unwrap();
         let mut malformed = agent("cache");
         malformed["residence"] = json!("removed-field");
@@ -275,13 +268,11 @@ mod tests {
                 .code,
             "identity_log_enabling"
         );
-        assert_eq!(fail.calls(), 0);
     }
 
     #[tokio::test(start_paused = true)]
     async fn local_writes_and_liveness_never_touch_engram_on_enabled_store() {
-        let fail = Arc::new(FailConnector::default());
-        let mut f = Fixture::new("write-local", fail.clone());
+        let mut f = Fixture::new("write-local");
         let resolver = crate::sessions::FakeResolver::new();
         resolver.set(
             crate::sessions::HOST_CAPABILITY,
@@ -357,7 +348,6 @@ mod tests {
             .unwrap();
         assert_eq!(f.store().enumerate(None).unwrap().projects.len(), 1);
         assert_eq!(f.pending(), 0);
-        assert_eq!(fail.calls(), 0);
     }
 
     mod confirmation {
@@ -502,7 +492,7 @@ mod tests {
         #[tokio::test]
         async fn confirmed_methods_pin_summaries_and_local_attribution() {
             {
-                let mut f = Fixture::new("confirmed-summaries", Arc::new(FailConnector::default()));
+                let mut f = Fixture::new("confirmed-summaries");
                 let prompt = Prompt::new(Some(Ok(())));
                 direct(&mut f, prompt.clone());
                 f.handler.agent_id_draw = stable_draw;
@@ -567,8 +557,7 @@ mod tests {
         #[tokio::test]
         async fn carrying_placement_prompts_exactly_and_cached_reply_is_unchanged() {
             {
-                let fail = Arc::new(FailConnector::default());
-                let mut f = Fixture::new("carry-confirmed", fail.clone());
+                let mut f = Fixture::new("carry-confirmed");
                 let prompt = Prompt::new(Some(Ok(())));
                 direct(&mut f, prompt.clone());
                 write(&f, "register", json!({"projectId":"empty","name":"Empty","roots":[],"workspaceId":"W1","requestKey":"empty"})).await.unwrap();
@@ -607,8 +596,7 @@ mod tests {
 
         #[tokio::test]
         async fn carrying_refusals_precede_prompt_and_sync_direct_requires_approval() {
-            let fail = Arc::new(FailConnector::default());
-            let mut f = Fixture::new("carry-refusals", fail.clone());
+            let mut f = Fixture::new("carry-refusals");
             let prompt = Prompt::new(Some(Ok(())));
             direct(&mut f, prompt.clone());
             let moving = placed_head(&f).await;
@@ -669,8 +657,7 @@ mod tests {
 
         #[tokio::test]
         async fn carrying_approval_rechecks_summary_under_writer_lock() {
-            let fail = Arc::new(FailConnector::default());
-            let mut f = Fixture::new("carry-stale", fail.clone());
+            let mut f = Fixture::new("carry-stale");
             let prompt = Prompt::new(None);
             direct(&mut f, prompt.clone());
             let moving = placed_head(&f).await;
@@ -700,8 +687,7 @@ mod tests {
                 OperatorConfirmError::PresenceUnavailable,
                 OperatorConfirmError::Unsupported,
             ] {
-                let mut f =
-                    Fixture::new("confirmation-refused", Arc::new(FailConnector::default()));
+                let mut f = Fixture::new("confirmation-refused");
                 let prompt = Prompt::new(Some(Err(error)));
                 direct(&mut f, prompt.clone());
                 let before = image(&f);
@@ -726,8 +712,7 @@ mod tests {
         #[tokio::test]
         async fn prechecks_replay_and_domain_refusals_do_not_wait_for_writer_or_prompt() {
             {
-                let mut f =
-                    Fixture::new("confirmation-precheck", Arc::new(FailConnector::default()));
+                let mut f = Fixture::new("confirmation-precheck");
                 let prompt = Prompt::new(Some(Ok(())));
                 direct(&mut f, prompt.clone());
                 let landed = write(&f, "agent.create", new_request("landed"))
@@ -837,10 +822,7 @@ mod tests {
                 );
                 assert_eq!(prompt.count(), 1);
             }
-            let f = Fixture::new(
-                "confirmation-default-unsupported",
-                Arc::new(FailConnector::default()),
-            );
+            let f = Fixture::new("confirmation-default-unsupported");
             bind(&f);
             state(&f, "disabled");
             let before = image(&f);
@@ -857,10 +839,7 @@ mod tests {
 
         #[tokio::test]
         async fn escaped_summary_cap_is_scalar_based_and_placement_is_pinned() {
-            let mut f = Fixture::new(
-                "confirmation-summary-cap",
-                Arc::new(FailConnector::default()),
-            );
+            let mut f = Fixture::new("confirmation-summary-cap");
             let prompt = Prompt::new(Some(Ok(())));
             direct(&mut f, prompt.clone());
             // Literal escaped prefix, followed by a multibyte tag and an
@@ -908,11 +887,8 @@ mod tests {
 
         #[tokio::test]
         async fn relay_bytes_are_unchanged_and_unconfirmed_seams_stay_closed() {
-            let mut f = Fixture::new("confirmation-relay", Arc::new(FailConnector::default()));
-            let mut baseline = Fixture::new(
-                "confirmation-relay-baseline",
-                Arc::new(FailConnector::default()),
-            );
+            let mut f = Fixture::new("confirmation-relay");
+            let mut baseline = Fixture::new("confirmation-relay-baseline");
             let prompt = Prompt::new(Some(Err(OperatorConfirmError::Declined)));
             direct(&mut f, prompt.clone());
             f.handler.agent_id_draw = stable_draw;
@@ -986,8 +962,7 @@ mod tests {
         #[tokio::test]
         async fn prompt_holds_no_locks_and_revalidation_catches_name_and_placement_changes() {
             for change in ["name", "placement"] {
-                let fail = Arc::new(FailConnector::default());
-                let mut f = Fixture::new("confirmation-unlocked", fail.clone());
+                let mut f = Fixture::new("confirmation-unlocked");
                 let prompt = Prompt::new(None);
                 direct(&mut f, prompt.clone());
                 let params = if change == "placement" {
@@ -1030,7 +1005,7 @@ mod tests {
 
         #[tokio::test(start_paused = true)]
         async fn busy_slot_survives_approval_and_releases_on_finish_drop_and_deadline() {
-            let mut f = Fixture::new("confirmation-busy", Arc::new(FailConnector::default()));
+            let mut f = Fixture::new("confirmation-busy");
             let prompt = Prompt::new(None);
             direct(&mut f, prompt.clone());
             let mut first = Box::pin(write(&f, "agent.create", new_request("first")));
@@ -1086,8 +1061,7 @@ mod tests {
         #[tokio::test]
         async fn route_closure_wins_ready_prompt_and_lock_and_admission_slot_gap() {
             for stage in ["prompt", "lock", "admission"] {
-                let fail = Arc::new(FailConnector::default());
-                let mut f = Fixture::new("confirmation-route-close", fail.clone());
+                let mut f = Fixture::new("confirmation-route-close");
                 let prompt = Prompt::new(None);
                 direct(&mut f, prompt.clone());
                 let barrier = Arc::new(tokio::sync::Barrier::new(2));
@@ -1115,7 +1089,7 @@ mod tests {
                 assert_eq!(first.await.unwrap_err().code, "operator_declined");
                 assert_eq!(prompt.count(), if stage == "admission" { 0 } else { 1 });
                 assert_eq!(image(&f), before);
-                assert_eq!(fail.calls(), 0);
+
                 f.handler.confirmation_admission_barrier = None;
                 bind(&f);
                 let count = prompt.count();
@@ -1130,10 +1104,7 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn approval_starts_stage_deadlines_and_late_approval_is_clamped() {
             for late in [false, true] {
-                let mut f = Fixture::new(
-                    "confirmation-stage-deadline",
-                    Arc::new(FailConnector::default()),
-                );
+                let mut f = Fixture::new("confirmation-stage-deadline");
                 let prompt = Prompt::new(None);
                 direct(&mut f, prompt.clone());
                 let received = Instant::now();
@@ -1162,10 +1133,7 @@ mod tests {
                 assert_eq!(image(&f), before);
             }
             // A late approval still gets a fresh write budget.
-            let mut f = Fixture::new(
-                "confirmation-delayed-success",
-                Arc::new(FailConnector::default()),
-            );
+            let mut f = Fixture::new("confirmation-delayed-success");
             let prompt = Prompt::new(None);
             direct(&mut f, prompt.clone());
             let mut first = Box::pin(write(&f, "agent.create", new_request("delayed")));
@@ -1235,11 +1203,7 @@ mod tests {
                 // handler's own `on_hello_ack` reopens the same file into the
                 // same shared slot, so the fixture's helpers read its writes.
                 f.handler.store.lock().unwrap().take();
-                let mut handler = ProjectsHandler::with_log_connector(
-                    "0123456789abcdef".into(),
-                    || 700,
-                    Arc::new(FailConnector::default()),
-                );
+                let mut handler = ProjectsHandler::with_runtime("0123456789abcdef".into(), || 700);
                 handler.store = f.handler.store.clone();
                 // Built as `serve_module` builds it: the confirmer shares the
                 // handler's route admissions and receives the live module
@@ -1333,7 +1297,7 @@ mod tests {
 
             #[tokio::test]
             async fn confirmed_direct_create_commits_with_the_exact_summary_and_route() {
-                let mut f = Fixture::new("served-confirmed", Arc::new(FailConnector::default()));
+                let mut f = Fixture::new("served-confirmed");
                 let (mut module, route, served) = start(&mut f, [OperatorAnswer::Confirmed]).await;
                 let generation = f.store().generation().unwrap();
                 let reply = create(&mut module, route).await;
@@ -1396,7 +1360,7 @@ mod tests {
                     ),
                 ] {
                     let label = format!("{answer:?}");
-                    let mut f = Fixture::new("served-refused", Arc::new(FailConnector::default()));
+                    let mut f = Fixture::new("served-refused");
                     let (mut module, route, served) = start(&mut f, [answer]).await;
                     let before = image(&f);
                     let body = error(&create(&mut module, route).await);
@@ -1421,7 +1385,7 @@ mod tests {
             /// receipt-relative bound expires before the SDK's 290-second one.
             #[tokio::test(start_paused = true)]
             async fn unanswered_prompt_is_withdrawn_at_the_operator_bound() {
-                let mut f = Fixture::new("served-unanswered", Arc::new(FailConnector::default()));
+                let mut f = Fixture::new("served-unanswered");
                 let (mut module, route, served) = start(&mut f, [OperatorAnswer::NoAnswer]).await;
                 let before = image(&f);
                 let sent = Instant::now();

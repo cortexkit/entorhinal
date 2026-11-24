@@ -519,12 +519,9 @@ mod tests {
     use super::super::{
         agent_ops::{OperatorConfirmError, OperatorConfirmer},
         fake_daemon::{DaemonSnapshot, FakeDaemon},
-        fake_log::FakeLog,
         fake_participant::FakeParticipant,
-        fake_record::FakeRecord,
-        log_client::{LogConnector, LogTransport, TransportError},
+        log_client::{LogTransport, TransportError},
         participant_discovery::{provider_role, ParticipantDiscovery},
-        record_client::RecordClient,
         sessions::{FakeResolver, ProviderResolution, ORCHESTRATOR_CAPABILITY},
         tests::{flow_stamp, reserved, scratch_descriptor},
         RouteAdmission,
@@ -554,31 +551,6 @@ mod tests {
         ) -> Result<(), OperatorConfirmError> {
             self.summaries.lock().unwrap().push(summary.into());
             Ok(())
-        }
-    }
-
-    struct AuditedRecords {
-        record: Arc<FakeRecord>,
-        calls: Mutex<Vec<(String, Value)>>,
-    }
-
-    struct RecordConnector(Arc<AuditedRecords>);
-
-    #[async_trait]
-    impl LogConnector for RecordConnector {
-        async fn connect(&self) -> Result<Arc<dyn LogTransport>, TransportError> {
-            Ok(self.0.clone())
-        }
-    }
-
-    #[async_trait]
-    impl LogTransport for AuditedRecords {
-        async fn call(&self, method: &str, params: Value) -> Result<Vec<u8>, TransportError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((method.into(), params.clone()));
-            self.record.call(method, params).await
         }
     }
 
@@ -621,7 +593,6 @@ mod tests {
 
     struct Fixture {
         handler: Arc<ProjectsHandler>,
-        records: Arc<AuditedRecords>,
         discovery: Arc<Discovery>,
         prompt: Arc<Prompt>,
         descriptor: cortexkit_store_types::StorageDescriptor,
@@ -631,10 +602,6 @@ mod tests {
     impl Fixture {
         async fn new(cut_over: bool) -> Self {
             let (dir, descriptor) = scratch_descriptor("move-admission");
-            let records = Arc::new(AuditedRecords {
-                record: FakeRecord::new([1; 16]),
-                calls: Mutex::new(vec![]),
-            });
             let discovery = Arc::new(Discovery {
                 daemon: FakeDaemon::new(snapshot()),
                 participant: Arc::new(FakeParticipant::new(&["session"], vec![])),
@@ -645,12 +612,7 @@ mod tests {
                 ORCHESTRATOR_CAPABILITY,
                 ProviderResolution::Provider("prefrontal".into()),
             );
-            let mut handler = ProjectsHandler::with_log_connector(
-                "0123456789abcdef".into(),
-                || 700,
-                Arc::new(FakeLog::default().with_author([1; 16])),
-            );
-            handler.record_client = RecordClient::new(Arc::new(RecordConnector(records.clone())));
+            let mut handler = ProjectsHandler::with_runtime("0123456789abcdef".into(), || 700);
             handler.participant_discovery = discovery.clone();
             handler.operator_confirmer = prompt.clone();
             handler.provider_resolver = resolver;
@@ -667,7 +629,6 @@ mod tests {
             }
             let f = Self {
                 handler: Arc::new(handler),
-                records,
                 discovery,
                 prompt,
                 descriptor,
@@ -749,7 +710,6 @@ mod tests {
         }
 
         fn assert_no_side_effects(&self) {
-            assert!(self.records.calls.lock().unwrap().is_empty());
             assert!(self.prompt.summaries.lock().unwrap().is_empty());
             assert!(self.discovery.daemon.calls().is_empty());
             assert!(self.store().list_agent_moves().unwrap().is_empty());
@@ -916,7 +876,6 @@ mod tests {
             "request_key_reused"
         );
         assert_eq!(code(f.move_(OTHER, &id).await), "caller_forbidden");
-        assert!(f.records.calls.lock().unwrap().is_empty());
         assert!(f.prompt.summaries.lock().unwrap().is_empty());
         assert!(f.discovery.daemon.calls().is_empty());
         assert_eq!(f.store().list_agent_moves().unwrap(), vec![row]);

@@ -2,7 +2,6 @@ use super::*;
 use crate::{
     agent_ops::{OperatorConfirmError, OperatorConfirmer},
     hub_switch::{Probe, Switch},
-    log_client::{LogClient, TransportError},
     sharing_baselines::{artifacts, StoreFile},
 };
 use tokio::sync::Notify;
@@ -35,21 +34,6 @@ impl RecordingConnector {
                 .all(|target| matches!(target.split('.').next().unwrap(), "consent" | "hub")),
             "unexpected outbound requests: {requests:?}"
         );
-    }
-}
-
-#[async_trait::async_trait]
-impl crate::log_client::LogConnector for RecordingConnector {
-    async fn connect(&self) -> Result<Arc<dyn crate::log_client::LogTransport>, TransportError> {
-        Ok(Arc::new(Self(self.0.clone())))
-    }
-}
-
-#[async_trait::async_trait]
-impl crate::log_client::LogTransport for RecordingConnector {
-    async fn call(&self, method: &str, _: Value) -> Result<Vec<u8>, TransportError> {
-        self.record(method.split('.').next().unwrap());
-        Err(TransportError::NoReply)
     }
 }
 
@@ -138,8 +122,6 @@ impl Machine {
             release: hold.then(Notify::new),
         });
         handler.operator_confirmer = prompt.clone();
-        handler.log_client = LogClient::new(requests.clone());
-        handler.record_client = crate::record_client::RecordClient::new(requests.clone());
         handler.hub_switch = Some(Switch::with_probe(Arc::new(LiveProbe {
             log: log.clone(),
             leaf: leaf.clone(),

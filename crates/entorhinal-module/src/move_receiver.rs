@@ -16,7 +16,7 @@ use crate::{
 use cortexkit_role_agent_data::errors::DriverAction;
 use cortexkit_role_agent_data::{busy::BusyState, diverged::DivergedState};
 use entorhinal_core::{
-    move_record::{self as wire, MoveReason, MoveRecord, MoveRecordState as State, PendingMove},
+    move_record::{self as wire, MoveReason, MoveRecord, MoveRecordState as State},
     move_store::{AgentMove, MoveSide, MoveStep as Step},
     session_carry::{is_binding_ref_kind, CarriedBinding, CarriedInstall, SESSION_BINDINGS_KIND},
     RegistryStore,
@@ -39,12 +39,12 @@ fn checked_version(version: u64) -> Result<i64, HandlerError> {
     i64::try_from(version).map_err(|_| error("record_version_unknown"))
 }
 
-fn pickup_row(record: &MoveRecord, entry: &PendingMove, version: i64, now: i64) -> AgentMove {
+fn pickup_row(record: &MoveRecord, peer: &str, version: i64, now: i64) -> AgentMove {
     AgentMove {
-        cut_id: entry.cut_id.clone(),
-        agent_id: entry.agent_id.clone(),
+        cut_id: record.cut_id.clone(),
+        agent_id: record.agent_id.clone(),
         side: MoveSide::Receiver,
-        peer: entry.from.clone(),
+        peer: peer.to_owned(),
         step: Step::PickedUp,
         plan: json!(record),
         request_body: None,
@@ -78,14 +78,9 @@ pub(crate) async fn poll_hub(worker: &Worker, hub: &Residence) -> Result<(), Han
             continue;
         }
         let plan = seen.body.participant_plan();
-        let pending = PendingMove {
-            cut_id: cut,
-            from: seen.writer.clone(),
-            agent_id: plan.agent_id.clone(),
-        };
         let mut row = pickup_row(
             &plan,
-            &pending,
+            &seen.writer,
             checked_version(seen.revision)?,
             (worker.clock)(),
         );

@@ -2,7 +2,6 @@
 //! invalidation through the serving handler on disposable closed SQLite copies.
 
 use super::*;
-use crate::fake_log::FailConnector;
 use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
 
@@ -99,11 +98,10 @@ impl Report {
 }
 
 fn open(descriptor: &StorageDescriptor) -> RehearsalResult<ProjectsHandler> {
-    let handler = ProjectsHandler::with_log_connector(
+    let handler = ProjectsHandler::with_runtime(
         crate::incarnation::new_incarnation()
             .map_err(|error| format!("cannot mint process incarnation: {error}"))?,
         unix_millis,
-        Arc::new(FailConnector::default()),
     );
     let mut store = RegistryStore::open(descriptor)?;
     store.set_root_records(true);

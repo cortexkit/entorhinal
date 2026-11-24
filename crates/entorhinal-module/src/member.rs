@@ -63,18 +63,14 @@ pub(crate) fn prepare(store: &RegistryStore, params: Value) -> Result<MemberName
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        fake_log::FakeLog, tests::scratch_descriptor, ProjectsHandler, RouteAdmission, WireRequest,
-    };
+    use crate::{tests::scratch_descriptor, ProjectsHandler, RouteAdmission, WireRequest};
     use serde_json::json;
-    use std::sync::Arc;
     use tokio::time::{timeout, Duration, Instant};
 
     #[tokio::test(start_paused = true)]
     async fn s3_name_refusals_precede_decode_writer_and_engram_in_order() {
         let (dir, descriptor) = scratch_descriptor("name-refusals");
-        let log = Arc::new(FakeLog::default());
-        let handler = ProjectsHandler::with_log_connector("names".into(), || 700, log.clone());
+        let handler = ProjectsHandler::with_runtime("names".into(), || 700);
         let store = RegistryStore::open(&descriptor).unwrap();
         *handler.store.lock().unwrap() = Some(store.clone());
         let route = (30, 1);
@@ -197,7 +193,6 @@ mod tests {
                     .code,
                 expected
             );
-            assert_eq!(log.calls(), 0);
             assert_eq!(store.identity_log_status().unwrap().pending_write_count, 0);
         }
         *handler.store.lock().unwrap() = None;

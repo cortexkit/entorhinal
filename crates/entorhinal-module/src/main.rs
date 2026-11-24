@@ -73,8 +73,6 @@ mod catalog_seed;
 mod catalog_sql;
 mod catalog_trust;
 mod catch_up;
-#[cfg(test)]
-mod claim_codec;
 mod claims;
 mod cli;
 #[cfg(test)]
@@ -103,6 +101,9 @@ mod fake_daemon;
 #[cfg(test)]
 #[allow(dead_code)]
 mod fake_door;
+#[cfg(test)]
+#[allow(dead_code)]
+mod fake_participant;
 mod fleet_record;
 mod hub_epoch;
 mod hub_identity_log;
@@ -115,6 +116,8 @@ mod hub_switch;
 mod hub_transport;
 mod hub_write;
 mod incarnation;
+#[allow(dead_code)]
+mod log_client;
 mod member;
 mod memory_context;
 mod move_admission;
@@ -123,22 +126,6 @@ mod move_ops;
 mod move_receiver;
 mod move_source;
 mod user_profile;
-// The client for engram's identity log. Only writes to shared state and
-// catch-up call it, and it opens its route on first use, so startup and every
-// read work with engram absent. It has no callers until the shared write path
-// lands, hence the dead-code allowances.
-#[cfg(test)]
-#[allow(dead_code)]
-mod fake_log;
-#[cfg(test)]
-#[allow(dead_code)]
-mod fake_participant;
-#[cfg(test)]
-mod fake_record;
-#[allow(dead_code)]
-mod log_client;
-#[cfg(test)]
-mod record_client;
 // Participant calls are invoked by the move driver, not at module startup.
 #[allow(dead_code)]
 mod participant_client;
@@ -644,8 +631,6 @@ struct ProjectsHandler {
     role_leases: Arc<role_leases::Leases>,
     /// Unit tests shorten this policy; production uses the ten-second default.
     lease_retry_budget: Duration,
-    #[allow(dead_code)]
-    log_client: log_client::LogClient,
     writer: Arc<tokio::sync::Mutex<()>>,
     draining: tokio::sync::watch::Sender<bool>,
     catch_up_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -655,8 +640,6 @@ struct ProjectsHandler {
     hub_shared_log: Arc<Mutex<Option<Arc<dyn hub_identity_log::SharedLog>>>>,
     hub_switch: Option<hub_switch::Switch>,
     catch_up_wake: Arc<tokio::sync::Notify>,
-    #[cfg(test)]
-    record_client: record_client::RecordClient,
     participant_discovery: Arc<dyn participant_discovery::ParticipantDiscovery>,
     catalog_agent: catalog_agent::CatalogAgent,
     catalog_publish: catalog_publish::Publisher,
@@ -991,37 +974,9 @@ impl ProjectsHandler {
         clock: fn() -> i64,
         module_started_at: Instant,
     ) -> Self {
-        Self::with_log_connector_started(
-            incarnation,
-            clock,
-            Arc::new(log_client::SubcConnector::from_args(
-                std::env::args_os().skip(1),
-            )),
-            module_started_at,
-        )
-    }
-
-    #[cfg(test)]
-    fn with_log_connector(
-        incarnation: String,
-        clock: fn() -> i64,
-        connector: Arc<dyn log_client::LogConnector>,
-    ) -> Self {
-        Self::with_log_connector_started(incarnation, clock, connector, Instant::now())
-    }
-
-    fn with_log_connector_started(
-        incarnation: String,
-        clock: fn() -> i64,
-        connector: Arc<dyn log_client::LogConnector>,
-        module_started_at: Instant,
-    ) -> Self {
         let route_admissions = Arc::new(Mutex::new(HashMap::new()));
         let operator_confirmer =
             Arc::new(agent_ops::DaemonConfirmer::new(route_admissions.clone()));
-        #[cfg(test)]
-        let record_connector: Arc<dyn log_client::LogConnector> =
-            Arc::new(record_client::UnavailableConnector);
         let move_wake = Arc::new(move_driver::MoveWake::default());
         let clock_origin = module_started_at;
         let request_clock =
@@ -1064,7 +1019,6 @@ impl ProjectsHandler {
             watches: Arc::default(),
             role_leases: Arc::default(),
             lease_retry_budget: LEASE_HELD_RETRY_BUDGET,
-            log_client: log_client::LogClient::new(connector),
             writer: Arc::new(tokio::sync::Mutex::new(())),
             draining: tokio::sync::watch::channel(false).0,
             catch_up_task: Mutex::new(None),
@@ -1074,8 +1028,6 @@ impl ProjectsHandler {
             hub_shared_log: Arc::default(),
             hub_switch,
             catch_up_wake: Arc::default(),
-            #[cfg(test)]
-            record_client: record_client::RecordClient::new(record_connector),
             participant_discovery,
             catalog_agent: catalog_agent::CatalogAgent::default(),
             catalog_publish: catalog_publish::Publisher::default(),
@@ -4053,9 +4005,7 @@ mod tests {
     #[tokio::test]
     async fn attach_surface_enable_is_direct_only_and_fails_closed() {
         let (dir, descriptor) = scratch_descriptor("enable-admission");
-        let fail = Arc::new(crate::fake_log::FailConnector::default());
-        let mut handler =
-            ProjectsHandler::with_log_connector("enable-test".into(), || 700, fail.clone());
+        let mut handler = ProjectsHandler::with_runtime("enable-test".into(), || 700);
         let prompts = Arc::new(crate::served_vectors::Approve {
             summaries: Mutex::default(),
         });
@@ -4104,7 +4054,6 @@ mod tests {
             }
         }
         assert!(prompts.summaries.lock().unwrap().is_empty());
-        assert_eq!(fail.calls(), 0);
         assert_eq!(
             handler
                 .with_store(RegistryStore::identity_log_status)

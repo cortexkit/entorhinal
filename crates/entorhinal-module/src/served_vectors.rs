@@ -8,7 +8,6 @@ use cortexkit_agent_identity as aid;
 use cortexkit_project_identity as pid;
 use entorhinal_core::{
     agent::{avatar_fingerprint, AgentAvatar},
-    claim_cache::{CachedClaim, ClaimObservation},
     move_store::{AgentMove, MoveSide, MoveStep},
     RegistryStore,
 };
@@ -1322,8 +1321,6 @@ const REF_OWNER: &str = "agent_0000000000000102";
 const CLAIMED_AGENT: &str = "agent_0000000000000103";
 const LEGACY_AGENT: &str = "agent_0000000000000104";
 const WHERE_UNCLAIMED: &str = "agent_0000000000000105";
-const WHERE_HERE: &str = "agent_0000000000000106";
-const WHERE_ELSEWHERE: &str = "agent_0000000000000107";
 const WHERE_MOVING: &str = "agent_0000000000000108";
 const SESSION_REF: &str = "0123456789abcdef0123456789abcdef";
 const OPENCODE_REF: &str = "abcdef0123456789abcdef0123456789";
@@ -1407,48 +1404,6 @@ impl SessionFixture {
 
     fn store(&self) -> RegistryStore {
         self.handler.store.lock().unwrap().as_ref().unwrap().clone()
-    }
-
-    fn cache_claims(&self) {
-        let store = self.store();
-        let observations = [
-            (CLAIMED_AGENT, OTHER_AUTHOR),
-            (WHERE_HERE, SELF_AUTHOR),
-            (WHERE_ELSEWHERE, OTHER_AUTHOR),
-        ]
-        .into_iter()
-        .map(|(agent_id, holder)| {
-            (
-                agent_id.to_owned(),
-                ClaimObservation::Present {
-                    claim: CachedClaim {
-                        holder: Some(holder.to_owned()),
-                        epoch: 1,
-                        cut_id: None,
-                        version: 1,
-                        read_at_ms: 700,
-                        stale: false,
-                        integrity_failed: false,
-                    },
-                    self_author: SELF_AUTHOR.to_owned(),
-                },
-            )
-        })
-        .collect::<Vec<_>>();
-        store.cache_agent_claims(&observations, 700).unwrap();
-        store
-            .apply_entry("fixture.member_names", "{}", "fixture", None, |tx| {
-                tx.execute(
-                    "INSERT INTO member_name(author,display_name) VALUES(?1,?2)",
-                    params![SELF_AUTHOR, "This machine"],
-                )?;
-                tx.execute(
-                    "INSERT INTO member_name(author,display_name) VALUES(?1,?2)",
-                    params![OTHER_AUTHOR, "Other machine"],
-                )?;
-                Ok(())
-            })
-            .unwrap();
     }
 
     fn seed_legacy_binding(&self) {
@@ -2673,8 +2628,6 @@ async fn session_records_fixture(label: &str) -> SessionFixture {
         (CLAIMED_AGENT, "Claimed Agent"),
         (LEGACY_AGENT, "Legacy Agent"),
         (WHERE_UNCLAIMED, "Unclaimed Agent"),
-        (WHERE_HERE, "Here Agent"),
-        (WHERE_ELSEWHERE, "Elsewhere Agent"),
     ] {
         seed_agent(&source, id, name, None, false, false);
     }
@@ -2685,9 +2638,8 @@ async fn session_records_fixture(label: &str) -> SessionFixture {
     };
     assert_eq!(
         serde_json::from_slice::<Value>(&imported).unwrap()["result"]["agents_imported"],
-        7
+        5
     );
-    fixture.cache_claims();
     fixture.seed_legacy_binding();
     fixture
 }
@@ -2699,7 +2651,7 @@ async fn node_self_box_record_matches_published_file() {
         .store()
         .apply_entry("fixture.node_box", "{}", "fixture", None, |tx| {
             tx.execute(
-                "UPDATE self_identity SET self_author=?1 WHERE id=1",
+                "INSERT INTO self_identity(id,self_author,learned_at_ms) VALUES(1,?1,700)",
                 ["11".repeat(16)],
             )?;
             tx.execute(
@@ -2800,6 +2752,18 @@ async fn session_records_match_published_files() {
         .await;
     assert_eq!(ref_collision_reply["code"], "ref_bound_elsewhere");
 
+    let remote_box = "22".repeat(16);
+    crate::hub_residence::install_observed_claim(&fixture.handler, CLAIMED_AGENT, &remote_box);
+    fixture
+        .store()
+        .apply_entry("fixture.member_name", "{}", "fixture", None, |tx| {
+            tx.execute(
+                "INSERT INTO member_name(author,display_name) VALUES(?1,?2)",
+                params![remote_box, "Other machine"],
+            )?;
+            Ok(())
+        })
+        .unwrap();
     let mut held_collision = registration.clone();
     held_collision["agent_id"] = json!(CLAIMED_AGENT);
     held_collision["ref"] = json!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
@@ -4402,8 +4366,9 @@ async fn session_for_harness_records_match_published_file() {
 /// `session-for-ref.json` was re-pinned when `agent.session_for_ref` began
 /// naming a recorded runner: it gained a record with a runner, and its
 /// existing records kept their bytes.
-/// `register-session.json` was re-pinned when its requests gained the required
-/// runner; every reply kept its bytes.
+/// `register-session.json` was re-pinned for the required runner, then for
+/// the hub box ID in the `held_elsewhere` refusal. All other replies kept
+/// their bytes.
 /// `where.json` was re-pinned when the legacy claim-cache records were removed.
 /// Its unclaimed and unknown-agent records kept their bytes.
 const PINNED_SESSION_SAMPLES: [(&str, &str); 7] = [
@@ -4413,7 +4378,7 @@ const PINNED_SESSION_SAMPLES: [(&str, &str); 7] = [
     ),
     (
         "register-session.json",
-        "588c130a747d1fcbd4fac6d765ae09cac4ab15f8b54328e8562f64379dc90335",
+        "b1eb60af93d2252c30545aa23a5d4570c79de995ac6523a4cf97b1ac3d94558f",
     ),
     (
         "session-for-ref.json",

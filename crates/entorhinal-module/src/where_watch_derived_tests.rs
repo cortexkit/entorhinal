@@ -49,7 +49,11 @@ async fn where_derived_sharing_and_liveness_resync() {
 async fn where_derived_move_progress_resyncs() {
     let f = seeded("where-derived-move").await;
     let store = store(&f);
-    let cached = store.cached_agent_claim(HEAD).unwrap();
+    crate::hub_residence::install_observed_claim(&f.handler, HEAD, OTHER);
+    let residence = f.handler.residence().unwrap();
+    let read = || residence.with_context(|context| store.hub_agent_where(HEAD, context).unwrap());
+    let before = read();
+    assert_eq!(before.status, "held_elsewhere");
     let body = request(
         WHERE,
         json!({"agentIds":[HEAD],"cursor":{"incarnation":INCARNATION,"seq":0}}),
@@ -65,10 +69,7 @@ async fn where_derived_move_progress_resyncs() {
     store.insert_agent_move(&row).unwrap();
     debounce(watch.as_mut()).await;
     resync(&mut receiver, 1);
-    assert_eq!(
-        store.agent_where(HEAD).unwrap().moving.unwrap()["step"],
-        "preparing"
-    );
+    assert_eq!(read().moving.unwrap()["step"], "preparing");
     row.step = MoveStep::Aborted;
     row.reason = Some("diverged".into());
     row.detail = Some(json!({"code":"different-history"}));
@@ -78,12 +79,15 @@ async fn where_derived_move_progress_resyncs() {
     assert!(store.update_agent_move(&row).unwrap());
     debounce(watch.as_mut()).await;
     resync(&mut receiver, 2);
-    let after = store.agent_where(HEAD).unwrap();
+    let after = read();
     assert!(after.moving.is_none());
     assert!(!after.move_diagnostics.is_empty());
     assert!(!after.move_errors.is_empty());
     assert!(!after.move_warnings.is_empty());
-    assert_eq!(store.cached_agent_claim(HEAD).unwrap(), cached);
+    assert_eq!(after.holder, before.holder);
+    assert_eq!(after.epoch, before.epoch);
+    assert_eq!(after.read_at_ms, before.read_at_ms);
+    assert_eq!(after.stale, before.stale);
     sink.cancel.send_replace(true);
     assert!(matches!(watch.await, HandlerOutcome::Streamed));
 }

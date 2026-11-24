@@ -24,6 +24,7 @@ pub(super) const LOG_KEY: &str = "ck.fleet.idlog";
 pub(super) const CREDENTIAL_ID: &str = "signing:fleet-record:1";
 const VERSION: u64 = 1;
 const SIGNING_PREFIX: &str = "ck-fleet-record/v1\n";
+const LOG_PLAINTEXT_CAP: usize = 256 * 1024;
 const VAULT_LIMIT: usize = 1024 * 1024;
 const MAX_ENVELOPE_BYTES: usize = VAULT_LIMIT - SIGNING_PREFIX.len() + 128 + ",\"sig\":\"\"".len();
 
@@ -186,7 +187,7 @@ pub(super) async fn prepare(
     let sealed = header.sealed()?;
     let plaintext = canonical(body)?;
     if plaintext.len() > VAULT_LIMIT
-        || (header.key == LOG_KEY && plaintext.len() > crate::log_client::ENTRY_DATA_CAP)
+        || (header.key == LOG_KEY && plaintext.len() > LOG_PLAINTEXT_CAP)
     {
         return Err(invalid("fleet record body exceeds the plaintext limit"));
     }
@@ -377,7 +378,7 @@ impl VerifiedRecord {
             Body::Sealed(body) => vault.open(self.header.aad()?.as_bytes(), body).await,
             Body::Unsealed(body) => Ok(canonical(body)?.into_bytes()),
         }?;
-        if self.header.key == LOG_KEY && plaintext.len() > crate::log_client::ENTRY_DATA_CAP {
+        if self.header.key == LOG_KEY && plaintext.len() > LOG_PLAINTEXT_CAP {
             return Err(invalid("fleet log body exceeds the plaintext limit"));
         }
         Ok(plaintext)

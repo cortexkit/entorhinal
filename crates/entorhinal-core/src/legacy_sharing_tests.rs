@@ -359,26 +359,6 @@ fn oldway_refusal_rechecks_before_migrating_after_the_probe() {
     }
 }
 
-#[cfg(feature = "legacy-store-for-tests")]
-#[test]
-fn oldway_refusal_test_hook_allows_only_the_registered_path() {
-    let registered = Fixture::at_version(PRE_REMOVAL);
-    let unregistered = Fixture::at_version(PRE_REMOVAL);
-    registered.update("state='enabled'");
-    unregistered.update("state='enabled'");
-    assert_probe_refuses(&registered);
-
-    crate::legacy_sharing_test_allow(&registered.path);
-    let store = registered.open().unwrap();
-    assert_eq!(store.identity_log_status().unwrap().state, "enabled");
-    assert_probe_refuses(&unregistered);
-
-    let mut child = Competitor::command(&unregistered.descriptor, "registry", "open");
-    child.env(test_access::CHILD_PATH_ENV, &unregistered.path);
-    Competitor::start(child, "registry").release();
-    assert_probe_refuses(&unregistered);
-}
-
 const COMPETITOR_READY: &str = "ENTORHINAL_COMPETITOR_HOLDS_STORE";
 
 struct Competitor(Child);

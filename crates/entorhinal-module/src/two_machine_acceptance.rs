@@ -1,8 +1,6 @@
 //! Serves local registry workloads through admitted routes and checks the journal directly.
 
 use super::*;
-use crate::fake_log::{FailConnector, FakeLog};
-use crate::log_client::LogConnector;
 use rusqlite::{types::Value as Cell, Connection, OpenFlags};
 use std::{future::Future, path::Path};
 
@@ -56,9 +54,9 @@ struct Machine {
 }
 
 impl Machine {
-    fn new(label: &str, connector: Arc<dyn LogConnector>) -> Self {
+    fn new(label: &str) -> Self {
         let (dir, descriptor) = crate::tests::scratch_descriptor(label);
-        let handler = Self::open(&descriptor, connector);
+        let handler = Self::open(&descriptor);
         Self {
             dir: crate::tests::canonical_test_path(dir),
             descriptor,
@@ -66,8 +64,8 @@ impl Machine {
         }
     }
 
-    fn open(descriptor: &StorageDescriptor, connector: Arc<dyn LogConnector>) -> ProjectsHandler {
-        let handler = ProjectsHandler::with_log_connector("acceptance".into(), || 700, connector);
+    fn open(descriptor: &StorageDescriptor) -> ProjectsHandler {
+        let handler = ProjectsHandler::with_runtime("acceptance".into(), || 700);
         let mut store = RegistryStore::open(descriptor).unwrap();
         store.set_root_records(true);
         install_store(
@@ -92,10 +90,10 @@ impl Machine {
         handler
     }
 
-    async fn restart(&mut self, connector: Arc<dyn LogConnector>) {
+    async fn restart(&mut self) {
         crate::tests::stop_store_tasks(&self.handler).await;
         self.handler.store.lock().unwrap().take();
-        self.handler = Self::open(&self.descriptor, connector);
+        self.handler = Self::open(&self.descriptor);
     }
 
     fn store(&self) -> RegistryStore {
@@ -278,16 +276,14 @@ fn repo(path: &Path, remotes: &[(&str, &str)]) {
 
 #[tokio::test(start_paused = true)]
 async fn hub_cutover_restart_never_calls_engram() {
-    let fail = Arc::new(FailConnector::default());
-    let mut m = Machine::new("hub-cutover-restart", fail.clone());
+    let mut m = Machine::new("hub-cutover-restart");
     m.store().role_read("connector_home").unwrap();
     m.store().apply_entry("fixture.cutover", "{}", "test", None, |tx| {
         tx.execute("UPDATE identity_log_state SET state='enabled',hub_log_base=17,hub_ready=1,last_applied_position=17,last_seen_head=17", [])?;
         tx.execute("INSERT INTO self_identity VALUES(1,?1,1)", ["ab".repeat(16)])?;
         Ok(())
     }).unwrap();
-    m.restart(fail.clone()).await;
-    m.handler.record_client = crate::record_client::RecordClient::new(fail.clone());
+    m.restart().await;
     assert!(m.handler.hub_backend_selected());
     m.handler.start_catch_up();
     m.handler.start_move_driver();
@@ -299,13 +295,11 @@ async fn hub_cutover_restart_never_calls_engram() {
         }
     }
     crate::tests::stop_store_tasks(&m.handler).await;
-    assert_eq!(fail.calls(), 0);
 }
 
 #[tokio::test(start_paused = true)]
 async fn disabled_workload_keeps_local_journal_and_never_connects() {
-    let fail = Arc::new(FailConnector::default());
-    let m = Machine::new("disabled-acceptance", fail.clone());
+    let m = Machine::new("disabled-acceptance");
     let root = m.repo("remote", &[("origin", "disabled/one")]);
     let second = m.repo("second", &[("origin", "disabled/two")]);
     let label = m.repo("label", &[]);
@@ -451,7 +445,6 @@ async fn disabled_workload_keeps_local_journal_and_never_connects() {
             "missing legacy op {op}"
         );
     }
-    assert_eq!(fail.calls(), 0);
     assert_eq!(m.store().identity_log_status().unwrap().state, "disabled");
     m.clean_rebuild().await;
 }

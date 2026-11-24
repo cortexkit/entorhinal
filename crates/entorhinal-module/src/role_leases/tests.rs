@@ -935,11 +935,7 @@ async fn lease_handback_vacancy_ignores_removed_preferred_box() {
 #[tokio::test]
 async fn role_gen_high_water_carries_hub_observation_across_restart_and_local_takes() {
     let (dir, descriptor) = crate::tests::scratch_descriptor("role-gen-high-water");
-    let handler = ProjectsHandler::with_log_connector(
-        "role-gen".into(),
-        || 1,
-        Arc::new(crate::fake_log::FakeLog::default()),
-    );
+    let handler = ProjectsHandler::with_runtime("role-gen".into(), || 1);
     let store = entorhinal_core::RegistryStore::open(&descriptor).unwrap();
     *handler.store.lock().unwrap() = Some(store.clone());
     let watch_open = Arc::new(AtomicBool::new(true));

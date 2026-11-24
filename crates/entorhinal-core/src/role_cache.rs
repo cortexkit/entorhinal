@@ -79,8 +79,8 @@ fn ensure_role(tx: &Transaction<'_>, role: &str) -> Result<(), AgentMutationErro
 }
 
 fn cached(conn: &Connection, role: &str) -> rusqlite::Result<Option<CachedClaim>> {
-    conn.query_row("SELECT holder,epoch,version,read_at_ms,stale,integrity_failed FROM role_cache WHERE role=?1 AND read_at_ms IS NOT NULL", [role], |r| {
-        Ok(CachedClaim { holder: r.get(0)?, epoch: r.get(1)?, cut_id: None, version: r.get(2)?, read_at_ms: r.get(3)?, stale: r.get(4)?, integrity_failed: r.get(5)? })
+    conn.query_row("SELECT holder,epoch,stale,integrity_failed FROM role_cache WHERE role=?1 AND read_at_ms IS NOT NULL", [role], |r| {
+        Ok(CachedClaim { holder: r.get(0)?, epoch: r.get(1)?, cut_id: None, stale: r.get(2)?, integrity_failed: r.get(3)? })
     }).optional()
 }
 

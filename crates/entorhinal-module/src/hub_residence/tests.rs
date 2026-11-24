@@ -105,6 +105,67 @@ impl Backend for TestBackend {
     }
 }
 
+/// Install a ready read-side service over one claim already accepted by the watch.
+pub(crate) fn install_observed_claim(handler: &ProjectsHandler, agent: &str, holder: &str) {
+    let store = handler.with_store(|s| Ok(s.clone())).unwrap();
+    store
+        .apply_entry("fixture.hub_claim", "{}", "test", None, |tx| {
+            tx.execute(
+                "UPDATE identity_log_state SET state='enabled', hub_log_base=0, hub_ready=1 WHERE id=1",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let key = key(agent);
+    let body = json!(Record::new(holder, 0, 1, false));
+    store
+        .record_hub_kv(
+            &key,
+            1,
+            Some((b"observed claim", Some(&body))),
+            (handler.clock)(),
+        )
+        .unwrap();
+    let service = Arc::new(Residence {
+        backend: Arc::new(TestBackend {
+            keys: Arc::new(TestKeys::new()),
+            applied: AtomicU64::new(1),
+            writes: AtomicU64::new(0),
+            reply_code: "unexpected_write",
+        }),
+        snapshot: Arc::new(Image),
+        box_id: A.into(),
+        base: 0,
+        sql: HubSql::new(&handler.store, handler.hub_sql.clone()),
+        health: handler.health.clone(),
+        commits: handler.commits.clone(),
+        watched: RwLock::new(Watched {
+            initial: true,
+            revisions: [(key, 1)].into(),
+            ..Watched::default()
+        }),
+        clock: handler.clock,
+        role_leases: Arc::downgrade(&handler.role_leases),
+        link: Notify::new(),
+        move_wake: Arc::downgrade(&handler.move_wake),
+    });
+    assert!(service.ready());
+    assert!(handler
+        .hub_residence
+        .lock()
+        .unwrap()
+        .replace(Running {
+            service,
+            watch: tokio::spawn(std::future::pending()),
+            recovery: tokio::spawn(std::future::pending()),
+            seed: None,
+            epochs: None,
+        })
+        .is_none());
+    handler.health.hub_membership.store(1, Ordering::Release);
+}
+
 struct Fixture {
     residence: Residence,
     slot: Arc<std::sync::Mutex<Option<RegistryStore>>>,

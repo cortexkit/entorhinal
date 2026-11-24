@@ -706,21 +706,7 @@ impl SessionMove {
 }
 
 fn unhex(text: &str) -> Result<Vec<u8>, HandlerError> {
-    if !text.len().is_multiple_of(2) {
-        return Err(invalid("invalid hexadecimal bytes"));
-    }
-    (0..text.len())
-        .step_by(2)
-        .map(|i| {
-            text.get(i..i + 2)
-                .filter(|pair| {
-                    pair.bytes()
-                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-                })
-                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
-                .ok_or_else(|| invalid("invalid hexadecimal bytes"))
-        })
-        .collect()
+    crate::log_client::decode_hex(text).map_err(|_| invalid("invalid hexadecimal bytes"))
 }
 
 fn cut_directory(store: &RegistryStore, cut: &str) -> PathBuf {

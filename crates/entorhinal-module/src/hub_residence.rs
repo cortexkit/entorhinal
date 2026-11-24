@@ -38,6 +38,8 @@ mod role_control;
 mod tests;
 pub(super) use moves::{Position as MovePosition, Transfer as MoveTransfer};
 use role_control::role_key_name;
+#[cfg(test)]
+pub(super) use tests::install_observed_claim;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

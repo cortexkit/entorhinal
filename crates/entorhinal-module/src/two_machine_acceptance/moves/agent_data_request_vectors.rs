@@ -130,7 +130,7 @@ async fn participant(
 }
 
 async fn capture(reference: &str, abort: bool, receiver_box: Option<&str>) -> Vec<String> {
-    let mut machine = Machine::new("agent-data-request-vector", Arc::new(FakeLog::default()));
+    let mut machine = Machine::new("agent-data-request-vector");
     machine.handler.clock = || 1000;
     machine.handler.incarnation = INCARNATION.into();
     let resolver = FakeResolver::new();

@@ -136,7 +136,7 @@ fn state_conflict() -> Failure {
 }
 
 fn record_unavailable() -> Failure {
-    let mut failure = Failure::new("record.read", "unavailable");
+    let mut failure = Failure::new("hub.move", "unavailable");
     failure.diagnostic = true;
     failure
 }
@@ -1313,7 +1313,7 @@ impl Source {
             return Ok(Duration::ZERO);
         }
         if record.state != State::Activated {
-            return Err(Failure::new("record.read", "invalid_state"));
+            return Err(Failure::new("hub.move", "invalid_state"));
         }
         let handoff = self
             .worker

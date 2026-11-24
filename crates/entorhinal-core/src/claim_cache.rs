@@ -1,6 +1,5 @@
 //! Claim views come from the hub, or from local sharing state before the hub
 //! can supply a claim view.
-//! The remaining replica helpers are only for legacy moves and registration.
 
 use crate::{agent, RegistryError, RegistryStore};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -8,33 +7,12 @@ use serde::Serialize;
 use serde_json::Value;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CachedClaim {
+pub(crate) struct CachedClaim {
     pub holder: Option<String>,
     pub epoch: i64,
     pub cut_id: Option<String>,
-    pub version: i64,
-    pub read_at_ms: i64,
     pub stale: bool,
     pub integrity_failed: bool,
-}
-
-/// Only verified replies supply a self author. Integrity failures supply no
-/// body; transport failures do not turn a never-read agent into a known one.
-#[derive(Clone, Debug)]
-pub enum ClaimObservation {
-    Present {
-        claim: CachedClaim,
-        self_author: String,
-    },
-    Absent {
-        stale: bool,
-        self_author: String,
-    },
-    IntegrityFailed,
-    CodecFailed {
-        self_author: String,
-    },
-    Unavailable,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -64,15 +42,6 @@ pub struct AgentWhere {
     pub move_warnings: Vec<Value>,
     #[serde(rename = "moveDiagnostics", skip_serializing_if = "Vec::is_empty")]
     pub move_diagnostics: Vec<Value>,
-}
-
-// Used by legacy moves and registration until their replica paths are removed.
-pub(crate) fn load_claim(conn: &Connection, id: &str) -> rusqlite::Result<Option<CachedClaim>> {
-    conn.query_row(
-        "SELECT holder,epoch,cut_id,version,read_at_ms,stale,integrity_failed FROM claim_cache WHERE agent_id=?1",
-        [id],
-        |row| Ok(CachedClaim { holder: row.get(0)?, epoch: row.get(1)?, cut_id: row.get(2)?, version: row.get(3)?, read_at_ms: row.get(4)?, stale: row.get(5)?, integrity_failed: row.get(6)? }),
-    ).optional()
 }
 
 pub(crate) fn self_author(conn: &Connection) -> rusqlite::Result<Option<String>> {
@@ -121,39 +90,6 @@ fn refusal(code: &str, detail: Option<serde_json::Value>) -> agent::AgentMutatio
     }
 }
 
-/// Legacy registration still refuses a session for a remotely held agent.
-/// Remove this check when registration no longer supports legacy claims.
-pub(crate) fn check_registration_claim(
-    tx: &Transaction<'_>,
-    id: &str,
-) -> Result<(), agent::AgentMutationError> {
-    if let Some(claim) = load_claim(tx, id)? {
-        if claim.integrity_failed {
-            return Err(refusal("claim_integrity_failed", None));
-        }
-        if claim.epoch >= 1 && (claim.holder.is_none() || claim.holder != self_author(tx)?) {
-            return Err(refusal(
-                "held_elsewhere",
-                Some(serde_json::json!({
-                    "holder": claim.holder,
-                    "holder_name": holder_name(tx, claim.holder.as_deref())?,
-                    "epoch": claim.epoch,
-                })),
-            ));
-        }
-    }
-    #[cfg(test)]
-    REGISTRATION_HOOK.with(|hook| {
-        if let Some(hook) = hook.borrow_mut().take() {
-            hook();
-        }
-    });
-    Ok(())
-}
-
-#[cfg(test)]
-thread_local! { static REGISTRATION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) }; }
-
 pub(crate) fn check_hub_registration(
     tx: &Transaction<'_>,
     id: &str,
@@ -177,147 +113,17 @@ pub(crate) fn check_hub_registration(
     Ok(())
 }
 
-fn unclaimed(now: i64, stale: bool, integrity_failed: bool) -> CachedClaim {
+fn unclaimed(stale: bool, integrity_failed: bool) -> CachedClaim {
     CachedClaim {
         holder: None,
         epoch: 0,
         cut_id: None,
-        version: 0,
-        read_at_ms: now,
         stale,
         integrity_failed,
     }
 }
 
-/// Implements the cache observation table: integrity errors retain the body and
-/// set the mark; older versions and stale absence retain newer bodies and marks;
-/// verified replacements and fresh absence clear the mark. Unavailable reads
-/// only stale an existing row. A never-read role supplies `None` as its old row.
-pub(crate) fn decide(
-    old: Option<CachedClaim>,
-    observation: &ClaimObservation,
-    now: i64,
-) -> Option<CachedClaim> {
-    let mut next = match observation {
-        ClaimObservation::IntegrityFailed | ClaimObservation::CodecFailed { .. } => {
-            let mut row = old.unwrap_or_else(|| unclaimed(now, true, true));
-            row.integrity_failed = true;
-            row
-        }
-        ClaimObservation::Unavailable => {
-            let mut row = old?;
-            row.stale = true;
-            row
-        }
-        ClaimObservation::Present { claim, .. } => match old {
-            Some(mut cached) if claim.version < cached.version => {
-                cached.stale = true;
-                cached
-            }
-            _ if claim.epoch == 0 => unclaimed(now, claim.stale, false),
-            _ => {
-                let mut row = claim.clone();
-                row.integrity_failed = false;
-                row
-            }
-        },
-        ClaimObservation::Absent { stale, .. } => match old {
-            Some(mut cached) if *stale && cached.version >= 1 => {
-                cached.stale = true;
-                cached
-            }
-            cached => unclaimed(
-                now,
-                *stale,
-                *stale && cached.is_some_and(|c| c.integrity_failed),
-            ),
-        },
-    };
-    next.read_at_ms = now;
-    Some(next)
-}
-
-// Persists a replica for legacy moves and registration, not served claim views.
-fn apply(
-    tx: &Transaction<'_>,
-    id: &str,
-    observation: &ClaimObservation,
-    now: i64,
-) -> rusqlite::Result<bool> {
-    let old = load_claim(tx, id)?;
-    let conflict = match observation {
-        ClaimObservation::Present { self_author, .. }
-        | ClaimObservation::Absent { self_author, .. }
-        | ClaimObservation::CodecFailed { self_author } => {
-            !learn_self_author(tx, self_author, now)?
-        }
-        _ => false,
-    };
-    let Some(next) = decide(old, observation, now) else {
-        return Ok(conflict);
-    };
-    tx.execute(
-        "INSERT INTO claim_cache(agent_id,holder,epoch,cut_id,version,read_at_ms,stale,integrity_failed) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
-         ON CONFLICT(agent_id) DO UPDATE SET holder=excluded.holder,epoch=excluded.epoch,cut_id=excluded.cut_id,version=excluded.version,read_at_ms=excluded.read_at_ms,stale=excluded.stale,integrity_failed=excluded.integrity_failed",
-        params![id, next.holder, next.epoch, next.cut_id, next.version, next.read_at_ms, next.stale, next.integrity_failed],
-    )?;
-    Ok(conflict)
-}
-
 impl RegistryStore {
-    /// Legacy move admission treats a binding stored here, even an ended one,
-    /// as evidence for claiming. The boolean identifies open sessions for
-    /// conflict reporting.
-    pub fn local_claim_bindings(&self) -> Result<Vec<(String, bool)>, RegistryError> {
-        self.read(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT a.agent_id, EXISTS(SELECT 1 FROM session_binding s
-                    WHERE s.agent_id=a.agent_id AND s.held_on IS NULL AND s.ended_at_ms IS NULL)
-                 FROM agent a WHERE a.terminal_reason IS NULL
-                    AND EXISTS(SELECT 1 FROM session_binding s
-                        WHERE s.agent_id=a.agent_id AND s.held_on IS NULL)
-                 ORDER BY a.agent_id",
-            )?;
-            let rows = stmt
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .collect();
-            rows
-        })
-    }
-
-    /// Legacy move admission snapshots its subject set before any remote call.
-    pub fn live_claim_agents(&self) -> Result<Vec<String>, RegistryError> {
-        self.read(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT agent_id FROM agent WHERE terminal_reason IS NULL ORDER BY agent_id",
-            )?;
-            let rows = stmt.query_map([], |row| row.get(0))?.collect();
-            rows
-        })
-    }
-
-    /// Legacy moves commit all replies in a page together, without holding a
-    /// transaction during a remote call. Returns the self-author conflict count.
-    pub fn cache_agent_claims(
-        &self,
-        observations: &[(String, ClaimObservation)],
-        now: i64,
-    ) -> Result<usize, RegistryError> {
-        self.with_where_changes(|tx| {
-            let mut conflicts = 0;
-            for (id, observation) in observations {
-                conflicts += usize::from(apply(tx, id, observation, now)?);
-            }
-            Ok(conflicts)
-        })
-        .map_err(RegistryError::Store)
-    }
-
-    /// Legacy move admission checks the cached claim after refreshing it.
-    pub fn cached_agent_claim(&self, id: &str) -> Result<Option<CachedClaim>, RegistryError> {
-        self.read(|conn| load_claim(conn, id))
-    }
-
     pub fn persisted_self_author(&self) -> Result<Option<String>, RegistryError> {
         self.read(self_author)
     }
@@ -396,7 +202,7 @@ pub(crate) fn hub_claim_view(
     if context.local_box.is_empty() && holder.is_some() {
         return Ok(ClaimView {
             known: false,
-            claim: unclaimed(0, true, false),
+            claim: unclaimed(true, false),
             own: None,
             read_at_ms: None,
             holder_box: None,
@@ -408,7 +214,7 @@ pub(crate) fn hub_claim_view(
     let pending = body.is_none()
         && (crate::hub_store::agent_creator(conn, id, i64::MAX)?.is_some()
             || (context.seed_expected)(id));
-    let mut claim = unclaimed(0, pending || !(context.fresh)(id, revision), integrity);
+    let mut claim = unclaimed(pending || !(context.fresh)(id, revision), integrity);
     let mut holder_box = None;
     if let Some(body) = body {
         claim.holder = holder.map(str::to_owned);
@@ -482,7 +288,7 @@ pub(crate) fn load_claim_view(conn: &Connection, foreign: bool) -> rusqlite::Res
             .unwrap_or(false);
     Ok(ClaimView {
         known: sharing_off,
-        claim: unclaimed(0, !sharing_off, false),
+        claim: unclaimed(!sharing_off, false),
         own: None,
         read_at_ms: None,
         holder_box: None,
@@ -579,36 +385,31 @@ mod tests {
                 _cleanup: crate::scratch_cleanup::ScratchCleanup(root),
             }
         }
-        fn observe(&self, observation: ClaimObservation) -> usize {
+        fn observe(&self, revision: u64, holder: &str) {
+            let body =
+                serde_json::json!({"holder":holder,"holder_ep":1,"gen":revision,"cut_id":"cut"});
             self.store
-                .cache_agent_claims(&[(ID.into(), observation)], 9)
-                .unwrap()
+                .record_hub_kv(
+                    &format!("residence.{ID}"),
+                    revision,
+                    Some((b"value", Some(&body))),
+                    9,
+                )
+                .unwrap();
         }
-        fn row(&self) -> CachedClaim {
-            self.store.cached_agent_claim(ID).unwrap().unwrap()
-        }
-        fn seed(&self, mark: bool) {
-            self.observe(present(5, SELF, false));
-            if mark {
-                self.observe(ClaimObservation::IntegrityFailed);
-            }
-        }
+
         fn register(&self) -> Result<crate::SessionBinding, agent::AgentMutationError> {
-            self.store.register_session(&registration())
+            self.store
+                .register_session_with_claim(&registration(), Some(&ready_context()))
         }
     }
-    fn present(version: i64, holder: &str, stale: bool) -> ClaimObservation {
-        ClaimObservation::Present {
-            self_author: SELF.into(),
-            claim: CachedClaim {
-                holder: Some(holder.into()),
-                epoch: version,
-                cut_id: Some("cut".into()),
-                version,
-                read_at_ms: 0,
-                stale,
-                integrity_failed: false,
-            },
+
+    fn ready_context() -> HubClaimContext<'static> {
+        HubClaimContext {
+            local_box: SELF,
+            fresh: &|_, _| true,
+            holder_current: &|_, episode, _| episode == 1,
+            seed_expected: &|_| false,
         }
     }
     fn registration() -> SessionRegistration<'static> {
@@ -626,13 +427,6 @@ mod tests {
             now_ms: 10,
         }
     }
-    fn absent(stale: bool) -> ClaimObservation {
-        ClaimObservation::Absent {
-            stale,
-            self_author: SELF.into(),
-        }
-    }
-
     fn hub_startup_where(holder: &str, local_box: &str) -> Value {
         let f = Fixture::new();
         let body = serde_json::json!({"holder":holder,"holder_ep":1,"gen":1,"cut_id":"cut"});
@@ -681,136 +475,16 @@ mod tests {
     }
 
     #[test]
-    fn integrity_present_keeps_body_and_sets_mark() {
-        let f = Fixture::new();
-        f.seed(false);
-        f.observe(ClaimObservation::IntegrityFailed);
-        let row = f.row();
-        assert_eq!(
-            (
-                row.version,
-                row.epoch,
-                row.holder.as_deref(),
-                row.read_at_ms,
-                row.integrity_failed
-            ),
-            (5, 5, Some(SELF), 9, true)
-        );
-    }
-    #[test]
-    fn integrity_none_creates_marked_unclaimed_version_zero() {
-        let f = Fixture::new();
-        f.observe(ClaimObservation::IntegrityFailed);
-        assert_eq!(f.row(), unclaimed(9, true, true));
-    }
-    #[test]
-    fn codec_refusal_sets_mark_and_learns_verified_reply_identity() {
-        let f = Fixture::new();
-        f.observe(ClaimObservation::CodecFailed {
-            self_author: SELF.into(),
-        });
-        assert_eq!(f.row(), unclaimed(9, true, true));
-        assert_eq!(
-            f.store.persisted_self_author().unwrap().as_deref(),
-            Some(SELF)
-        );
-        f.seed(false);
-        f.observe(ClaimObservation::CodecFailed {
-            self_author: SELF.into(),
-        });
-        assert_eq!(f.row().version, 5);
-        assert!(f.row().integrity_failed);
-    }
-    #[test]
-    fn verified_newer_equal_or_first_replaces_and_clears_mark() {
-        let f = Fixture::new();
-        f.observe(present(5, OTHER, true));
-        assert_eq!(f.row().holder.as_deref(), Some(OTHER));
-        f.observe(ClaimObservation::IntegrityFailed);
-        f.observe(present(5, SELF, false));
-        assert!(!f.row().integrity_failed);
-        assert!(!f.row().stale);
-        assert_eq!(f.row().holder.as_deref(), Some(SELF));
-        f.observe(present(6, OTHER, true));
-        assert_eq!(f.row().version, 6);
-        assert!(f.row().stale);
-    }
-    #[test]
-    fn verified_older_keeps_body_and_mark_and_becomes_stale() {
-        let f = Fixture::new();
-        f.seed(true);
-        f.observe(present(4, OTHER, false));
-        let row = f.row();
-        assert_eq!(row.version, 5);
-        assert_eq!(row.holder.as_deref(), Some(SELF));
-        assert!(row.integrity_failed && row.stale);
-        assert_eq!(row.read_at_ms, 9);
-    }
-    #[test]
-    fn stale_absent_preserves_positive_version_and_mark() {
-        let f = Fixture::new();
-        f.seed(true);
-        f.observe(absent(true));
-        let row = f.row();
-        assert_eq!(row.version, 5);
-        assert_eq!(row.holder.as_deref(), Some(SELF));
-        assert!(row.integrity_failed && row.stale);
-    }
-    #[test]
-    fn stale_absent_none_or_zero_stores_zero_and_keeps_mark() {
-        let f = Fixture::new();
-        f.observe(absent(true));
-        assert_eq!(f.row(), unclaimed(9, true, false));
-        f.observe(ClaimObservation::IntegrityFailed);
-        f.observe(absent(true));
-        assert_eq!(f.row(), unclaimed(9, true, true));
-    }
-    #[test]
-    fn confirmed_absent_resets_version_and_clears_mark() {
-        let f = Fixture::new();
-        f.seed(true);
-        f.observe(absent(false));
-        assert_eq!(f.row(), unclaimed(9, false, false));
-    }
-    #[test]
-    fn verified_epoch_zero_is_unclaimed_with_version_zero() {
-        let f = Fixture::new();
-        let mut observation = present(7, OTHER, false);
-        if let ClaimObservation::Present { claim, .. } = &mut observation {
-            claim.epoch = 0;
-        }
-        f.observe(observation);
-        assert_eq!(f.row(), unclaimed(9, false, false));
-        f.register().unwrap();
-    }
-    #[test]
-    fn transport_failure_keeps_unknown_or_marks_cached_body_stale() {
-        let f = Fixture::new();
-        f.observe(ClaimObservation::Unavailable);
-        assert!(f.store.cached_agent_claim(ID).unwrap().is_none());
-        f.seed(true);
-        f.observe(ClaimObservation::Unavailable);
-        assert_eq!(f.row().version, 5);
-        assert!(f.row().stale && f.row().integrity_failed);
-    }
-    #[test]
-    fn self_author_conflict_never_overwrites_identity_and_cache_never_journals() {
+    fn self_author_conflict_never_overwrites_identity_or_journals() {
         let f = Fixture::new();
         let generation = f.store.generation().unwrap();
-        assert_eq!(f.observe(absent(false)), 0);
-        assert_eq!(
-            f.observe(ClaimObservation::Absent {
-                stale: false,
-                self_author: OTHER.into()
-            }),
-            1
-        );
+        assert!(f.store.learn_verified_self_author(SELF, 9).unwrap());
+        assert!(!f.store.learn_verified_self_author(OTHER, 9).unwrap());
         assert_eq!(
             f.store.persisted_self_author().unwrap().as_deref(),
             Some(SELF)
         );
         assert_eq!(f.store.generation().unwrap(), generation);
-        assert_eq!(f.store.live_claim_agents().unwrap(), vec![ID]);
     }
     #[test]
     fn where_wire_nulls_known_status_integrity_and_restart() {
@@ -878,9 +552,16 @@ mod tests {
         drop(store);
     }
     #[test]
-    fn where_fallback_ignores_legacy_replica() {
+    fn where_fallback_ignores_residence_until_selected() {
         let f = Fixture::new();
-        f.observe(present(1, SELF, false));
+        f.observe(1, SELF);
+        assert_eq!(
+            f.store
+                .hub_agent_where(ID, &ready_context())
+                .unwrap()
+                .status,
+            "held_here"
+        );
         for (state, base, known) in [("disabled", None, true), ("enabled", Some(0), false)] {
             f.store
                 .db
@@ -907,44 +588,38 @@ mod tests {
     #[test]
     fn register_claim_admission_checks_integrity_before_holder_and_binding() {
         let f = Fixture::new();
+        assert_eq!(f.register().unwrap_err().code, "claim_unavailable");
+        f.observe(1, SELF);
         f.register().unwrap();
-        f.observe(present(1, SELF, false));
-        f.register().unwrap();
-        f.observe(present(2, OTHER, false));
+        f.observe(2, OTHER);
         let error = f.register().unwrap_err();
         assert_eq!(error.code, "held_elsewhere");
         assert_eq!(
             error.detail,
             Some(serde_json::json!({"holder":OTHER,"holder_name":null,"epoch":2}))
         );
-        f.observe(ClaimObservation::IntegrityFailed);
-        assert_eq!(f.register().unwrap_err().code, "claim_integrity_failed");
-        f.observe(absent(false));
-        f.register().unwrap();
-        f.observe(present(0, OTHER, false));
-        f.register().unwrap();
         f.store
-            .db
-            .with_conn_fenced(|tx| {
-                tx.execute("DELETE FROM self_identity", [])?;
-                Ok(())
-            })
+            .record_hub_kv(&format!("residence.{ID}"), 3, None, 10)
             .unwrap();
-        f.observe(ClaimObservation::IntegrityFailed);
         assert_eq!(f.register().unwrap_err().code, "claim_integrity_failed");
+        f.observe(4, SELF);
+        f.register().unwrap();
     }
     #[test]
-    fn registration_does_not_assume_a_holder_without_self_identity_is_here() {
+    fn registration_does_not_assume_a_holder_without_local_box_is_here() {
         let f = Fixture::new();
-        f.observe(present(1, SELF, false));
-        f.store
-            .db
-            .with_conn_fenced(|tx| {
-                tx.execute("DELETE FROM self_identity", [])?;
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(f.register().unwrap_err().code, "held_elsewhere");
+        f.observe(1, SELF);
+        let context = HubClaimContext {
+            local_box: "",
+            ..ready_context()
+        };
+        assert_eq!(
+            f.store
+                .register_session_with_claim(&registration(), Some(&context))
+                .unwrap_err()
+                .code,
+            "claim_unavailable"
+        );
         assert_eq!(
             f.store
                 .agent_where("agent_ffffffffffffffff")
@@ -964,41 +639,52 @@ mod tests {
             .unwrap();
         assert_eq!(f.store.agent_where(ID).unwrap_err().code, "gone");
         assert_eq!(f.register().unwrap_err().code, "gone");
-        assert!(f.store.live_claim_agents().unwrap().is_empty());
     }
     #[test]
     fn registration_snapshot_excludes_a_cache_write_started_after_claim_read() {
         let f = Fixture::new();
-        f.observe(absent(false));
+        f.observe(1, SELF);
         let writer = f.store.clone();
         let (start, started) = std::sync::mpsc::channel();
         let (done, completed) = std::sync::mpsc::channel();
 
-        // Hold the same write connection from before starting the competing
-        // refresh until registration commits; its claim snapshot stays absent.
+        // Start the competing hub observation while registration checks the
+        // already-read claim. It must wait for registration's transaction.
         let thread = f
             .store
             .db
             .with_conn_fenced(|tx| {
                 let thread = std::thread::spawn(move || {
                     start.send(()).unwrap();
+                    let body = serde_json::json!({"holder":OTHER,"holder_ep":1,"gen":2});
                     writer
-                        .cache_agent_claims(&[(ID.into(), present(1, OTHER, false))], 20)
+                        .record_hub_kv(
+                            &format!("residence.{ID}"),
+                            2,
+                            Some((b"new value", Some(&body))),
+                            20,
+                        )
                         .unwrap();
-                    let _ = done.send(());
+                    done.send(()).unwrap();
                 });
-                apply(tx, ID, &absent(false), 9)?;
-                REGISTRATION_HOOK.with(|hook| {
-                    *hook.borrow_mut() = Some(Box::new(move || {
-                        started.recv().unwrap();
-                        assert!(completed.try_recv().is_err());
-                    }));
-                });
+                let fresh = |_: &str, revision| {
+                    assert_eq!(revision, Some(1));
+                    started.recv().unwrap();
+                    assert!(matches!(
+                        completed.try_recv(),
+                        Err(std::sync::mpsc::TryRecvError::Empty)
+                    ));
+                    true
+                };
+                let context = HubClaimContext {
+                    fresh: &fresh,
+                    ..ready_context()
+                };
                 assert!(RegistryStore::register_session_in(
                     tx,
                     &registration(),
                     &mut Vec::new(),
-                    None
+                    Some(&context)
                 )
                 .is_ok());
                 Ok(thread)

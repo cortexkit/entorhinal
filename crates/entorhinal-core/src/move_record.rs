@@ -1,4 +1,4 @@
-//! Pure wire codecs and coordination rules for move and inbox records.
+//! Pure wire codecs and coordination rules for move records.
 //!
 //! Record states describe the shared CAS protocol, not the machine-local driver
 //! steps in `move_store`. No function here reads a store or performs a CAS.
@@ -16,7 +16,6 @@ pub const BODY_CAP: usize = 64 * 1024;
 pub const ABORT_RESERVE: usize = 4096;
 pub const MOVE_BODY_CAP: usize = BODY_CAP - ABORT_RESERVE;
 pub const DETAIL_CAP: usize = 2048;
-pub const INBOX_CAP: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -174,30 +173,6 @@ pub struct MoveRecord {
     pub detail: Option<Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PendingMove {
-    pub cut_id: String,
-    pub from: String,
-    pub agent_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct InboxRecord {
-    pub v: u64,
-    pub pending: Vec<PendingMove>,
-}
-
-impl Default for InboxRecord {
-    fn default() -> Self {
-        Self {
-            v: 1,
-            pending: Vec::new(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodecError {
     UnknownVersion,
@@ -210,8 +185,6 @@ pub enum CodecError {
     MalformedBody,
     MoveTooLarge,
     BodyTooLarge,
-    InboxFull,
-    InboxDuplicate,
     InvalidTransition,
     AuthorMismatch,
     PlanMismatch,
@@ -230,8 +203,6 @@ impl CodecError {
             Self::MalformedBody => "malformed_body",
             Self::MoveTooLarge => "move_too_large",
             Self::BodyTooLarge => "body_too_large",
-            Self::InboxFull => "inbox_full",
-            Self::InboxDuplicate => "inbox_duplicate",
             Self::InvalidTransition => "invalid_transition",
             Self::AuthorMismatch => "author_mismatch",
             Self::PlanMismatch => "plan_mismatch",
@@ -459,58 +430,6 @@ pub fn aborted_record(
     aborted
 }
 
-fn validate_inbox(inbox: &InboxRecord) -> Result<(), CodecError> {
-    check_version(inbox.v)?;
-    if inbox.pending.len() > INBOX_CAP {
-        return Err(CodecError::InboxFull);
-    }
-    let mut cuts = BTreeSet::new();
-    for entry in &inbox.pending {
-        if !valid_cut_id(&entry.cut_id) {
-            return Err(CodecError::MalformedBody);
-        }
-        if !cuts.insert(&entry.cut_id) {
-            return Err(CodecError::InboxDuplicate);
-        }
-    }
-    Ok(())
-}
-
-pub fn encode_inbox_record(inbox: &InboxRecord) -> Result<Vec<u8>, CodecError> {
-    validate_inbox(inbox)?;
-    let body = serde_json::to_vec(inbox).map_err(|_| CodecError::MalformedBody)?;
-    if body.len() > BODY_CAP {
-        return Err(CodecError::BodyTooLarge);
-    }
-    Ok(body)
-}
-
-pub fn decode_inbox_record(body: &[u8]) -> Result<InboxRecord, CodecError> {
-    wire_value(body)?;
-    let inbox = serde_json::from_slice(body).map_err(|_| CodecError::MalformedBody)?;
-    validate_inbox(&inbox)?;
-    Ok(inbox)
-}
-
-/// Content idempotency is by cut_id, including a resend to a full inbox.
-pub fn append_inbox(inbox: &InboxRecord, entry: PendingMove) -> Result<InboxRecord, CodecError> {
-    validate_inbox(inbox)?;
-    if inbox.pending.iter().any(|old| old.cut_id == entry.cut_id) {
-        return Ok(inbox.clone());
-    }
-    let mut appended = inbox.clone();
-    appended.pending.push(entry);
-    encode_inbox_record(&appended)?;
-    Ok(appended)
-}
-
-pub fn remove_inbox(inbox: &InboxRecord, cut_id: &str) -> Result<InboxRecord, CodecError> {
-    validate_inbox(inbox)?;
-    let mut removed = inbox.clone();
-    removed.pending.retain(|entry| entry.cut_id != cut_id);
-    Ok(removed)
-}
-
 /// `None` means there is no move record. The driver must settle the claim and
 /// persist its local activation boundary before activation; this table checks
 /// only the record's state and which side is writing.
@@ -618,7 +537,6 @@ mod tests {
     const SUBJECT: &str = "move:0123456789abcdef0123456789abcdef";
     const MOVE_FIXTURE: &str = r#"{"v":1,"cut_id":"0123456789abcdef0123456789abcdef","agent_id":"agent-a","from":"machine-a","to":"machine-b","state":"published","claim_version":3,"participants":[{"module_id":"alpha","refs":[{"ref_kind":"pi-session","ref":"session-a"}],"external":[{"ref_kind":"pi-session","ref":"session-a","note":"Copy the transcript","check":{"digest":"abc","row":7}}]},{"module_id":"beta","refs":[{"ref_kind":"pi-session","ref":"session-a"}],"external":[]}],"reason":null,"detail":null}"#;
     const OPTIONAL_MOVE_FIXTURE: &str = r#"{"v":1,"cut_id":"0123456789abcdef0123456789abcdef","agent_id":"agent-a","from":"machine-a","to":"machine-b","state":"staged","claim_version":3,"participants":[{"module_id":"alpha","refs":[{"ref_kind":"pi-session","ref":"session-a"}],"external":[{"ref_kind":"pi-session","ref":"session-a","note":"Copy the transcript","check":{"digest":"abc","row":7}}]},{"module_id":"beta","refs":[{"ref_kind":"pi-session","ref":"session-a"}],"external":[],"optional":true}],"skipped":["beta"],"reason":null,"detail":null}"#;
-    const INBOX_FIXTURE: &str = r#"{"v":1,"pending":[{"cut_id":"0123456789abcdef0123456789abcdef","from":"machine-a","agent_id":"agent-a"}]}"#;
 
     fn record() -> MoveRecord {
         MoveRecord {
@@ -776,14 +694,6 @@ mod tests {
         }
     }
 
-    fn entry(cut_id: &str) -> PendingMove {
-        PendingMove {
-            cut_id: cut_id.into(),
-            from: "machine-a".into(),
-            agent_id: "agent-a".into(),
-        }
-    }
-
     fn refuses(record: &MoveRecord, error: CodecError) {
         assert_eq!(encode_move_record(SUBJECT, record), Err(error));
         let body = serde_json::to_vec(record).unwrap();
@@ -873,7 +783,7 @@ mod tests {
         value.cut_id = "f".repeat(32);
         refuses(&value, CodecError::CutIdMismatch);
         assert_eq!(
-            decode_move_record("inbox:machine-a", MOVE_FIXTURE.as_bytes()),
+            decode_move_record("other:machine-a", MOVE_FIXTURE.as_bytes()),
             Err(CodecError::CutIdMismatch)
         );
         assert_eq!(CodecError::CutIdMismatch.code(), "cut_id_mismatch");
@@ -1057,10 +967,7 @@ mod tests {
 
     #[test]
     fn largest_admitted_body_always_has_room_for_an_abort() {
-        assert_eq!(
-            (BODY_CAP, MOVE_BODY_CAP, DETAIL_CAP, INBOX_CAP),
-            (65536, 61440, 2048, 64)
-        );
+        assert_eq!((BODY_CAP, MOVE_BODY_CAP, DETAIL_CAP), (65536, 61440, 2048));
         let mut largest = record();
         let base_len = encode_move_record(SUBJECT, &largest).unwrap().len();
         largest.participants[0].external[0]
@@ -1109,119 +1016,6 @@ mod tests {
             .note
             .push_str(&"x".repeat(65537 - len));
         refuses(&huge, CodecError::BodyTooLarge);
-    }
-
-    #[test]
-    fn inbox_wire_fixture_and_idempotent_content_edits() {
-        let empty = InboxRecord::default();
-        assert_eq!(
-            encode_inbox_record(&empty).unwrap(),
-            b"{\"v\":1,\"pending\":[]}"
-        );
-        let appended = append_inbox(&empty, entry(CUT)).unwrap();
-        assert!(empty.pending.is_empty());
-        assert_eq!(
-            encode_inbox_record(&appended).unwrap(),
-            INBOX_FIXTURE.as_bytes()
-        );
-        assert_eq!(
-            decode_inbox_record(INBOX_FIXTURE.as_bytes()),
-            Ok(appended.clone())
-        );
-        let mut resend = entry(CUT);
-        resend.agent_id = "ignored-on-resend".into();
-        assert_eq!(append_inbox(&appended, resend), Ok(appended.clone()));
-        let second = append_inbox(&appended, entry(&"f".repeat(32))).unwrap();
-        assert_eq!(
-            remove_inbox(&second, CUT).unwrap().pending,
-            vec![entry(&"f".repeat(32))]
-        );
-        assert_eq!(remove_inbox(&appended, CUT), Ok(empty.clone()));
-        assert_eq!(remove_inbox(&empty, CUT), Ok(empty));
-    }
-
-    #[test]
-    fn inbox_caps_at_64_and_allows_resend_when_full() {
-        let mut inbox = InboxRecord::default();
-        for i in 0..64 {
-            inbox = append_inbox(&inbox, entry(&format!("{i:032x}"))).unwrap();
-        }
-        assert_eq!(inbox.pending.len(), 64);
-        let bytes = encode_inbox_record(&inbox).unwrap();
-        assert_eq!(decode_inbox_record(&bytes), Ok(inbox.clone()));
-        assert_eq!(
-            append_inbox(&inbox, inbox.pending[0].clone()),
-            Ok(inbox.clone())
-        );
-        assert_eq!(append_inbox(&inbox, entry(CUT)), Err(CodecError::InboxFull));
-        let mut over = inbox;
-        over.pending.push(entry(CUT));
-        assert_eq!(encode_inbox_record(&over), Err(CodecError::InboxFull));
-        assert_eq!(
-            decode_inbox_record(&serde_json::to_vec(&over).unwrap()),
-            Err(CodecError::InboxFull)
-        );
-    }
-
-    #[test]
-    fn inbox_codec_refuses_unknown_malformed_duplicate_and_oversized_bodies() {
-        assert_eq!(
-            decode_inbox_record(b"{\"v\":2,\"pending\":[]}"),
-            Err(CodecError::UnknownVersion)
-        );
-        for body in [
-            "{}",
-            "null",
-            "invalid JSON",
-            "{\"v\":1}",
-            "{\"v\":1,\"pending\":null}",
-            "{\"v\":1,\"pending\":[],\"extra\":true}",
-        ] {
-            assert_eq!(
-                decode_inbox_record(body.as_bytes()),
-                Err(CodecError::MalformedBody)
-            );
-        }
-        let mut duplicate = InboxRecord {
-            v: 1,
-            pending: vec![entry(CUT), entry(CUT)],
-        };
-        assert_eq!(
-            encode_inbox_record(&duplicate),
-            Err(CodecError::InboxDuplicate)
-        );
-        assert_eq!(
-            decode_inbox_record(&serde_json::to_vec(&duplicate).unwrap()),
-            Err(CodecError::InboxDuplicate)
-        );
-        duplicate.pending.pop();
-        duplicate.v = 2;
-        assert_eq!(
-            encode_inbox_record(&duplicate),
-            Err(CodecError::UnknownVersion)
-        );
-        duplicate.v = 1;
-        duplicate.pending[0].cut_id = "bad".into();
-        assert_eq!(
-            encode_inbox_record(&duplicate),
-            Err(CodecError::MalformedBody)
-        );
-        let mut value: Value = serde_json::from_str(INBOX_FIXTURE).unwrap();
-        value["pending"][0]["extra"] = json!(true);
-        assert_eq!(
-            decode_inbox_record(&serde_json::to_vec(&value).unwrap()),
-            Err(CodecError::MalformedBody)
-        );
-        let mut huge = InboxRecord {
-            v: 1,
-            pending: vec![entry(CUT)],
-        };
-        huge.pending[0].from = "x".repeat(65536);
-        assert_eq!(encode_inbox_record(&huge), Err(CodecError::BodyTooLarge));
-        assert_eq!(
-            decode_inbox_record(&serde_json::to_vec(&huge).unwrap()),
-            Err(CodecError::BodyTooLarge)
-        );
     }
 
     #[test]

@@ -11,7 +11,6 @@ struct Fixture {
     handler: ProjectsHandler,
     descriptor: StorageDescriptor,
     dir: std::path::PathBuf,
-    log: crate::fake_log::FakeLog,
     id: String,
 }
 impl Fixture {
@@ -47,9 +46,7 @@ impl Fixture {
         )
         .unwrap();
         drop(conn);
-        let log = crate::fake_log::FakeLog::default();
-        let handler =
-            ProjectsHandler::with_log_connector("origin".into(), || 3, Arc::new(log.clone()));
+        let handler = ProjectsHandler::with_runtime("origin".into(), || 3);
         for (route, principal) in [
             (DIRECT, Principal::Direct),
             (
@@ -70,7 +67,6 @@ impl Fixture {
             handler,
             descriptor,
             dir,
-            log,
             id,
         }
     }
@@ -226,7 +222,6 @@ async fn foreign_store_refuses_every_write_class_before_decoding_or_confirmation
         error.detail.unwrap(),
         json!({"storeMachineId":OLD,"daemonMachineId":NEW})
     );
-    assert_eq!(f.log.calls(), 0);
     f.stop().await;
 }
 
@@ -243,7 +238,6 @@ async fn foreign_store_starts_no_machine_background_work_and_health_is_lock_free
         f.handler.session_upkeep_task.lock().unwrap().is_none(),
         "foreign store must not stamp or prune session bindings"
     );
-    assert_eq!(f.log.calls(), 0);
     let held = f.handler.store.lock().unwrap();
     let health = {
         use std::{
