@@ -1,37 +1,11 @@
 use super::*;
-use crate::role_leases::{View, ACK, WATCH};
+use crate::role_leases::{tests::lease_sample_record as output, View, ACK, WATCH};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const CONNECTOR: &str = "connector_home";
 const PROJECT: &str = "dreamer.pj-fern_01";
 const WORKSPACE: &str = "dreamer.workspace_02";
 const GLOBAL: &str = "dreamer.global";
-
-fn output(op: &str, params: &Value, principal: &Value, frames: &[Frame]) -> String {
-    let frames = frames
-        .iter()
-        .map(|frame| {
-            let kind = match frame.header.ty {
-                FrameType::StreamData => "StreamData",
-                FrameType::StreamEnd => "StreamEnd",
-                FrameType::Response => "Response",
-                FrameType::Error => "Error",
-                other => panic!("unexpected frame {other:?}"),
-            };
-            let body = if frame.body.is_empty() {
-                "null"
-            } else {
-                std::str::from_utf8(&frame.body).unwrap()
-            };
-            format!("{{\"type\":{},\"body\":{body}}}", json!(kind))
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    format!(
-        "  {{\"op\":{},\"request\":{params},\"principal\":{principal},\"frames\":[{frames}]}}",
-        json!(op)
-    )
-}
 
 async fn bind(
     module: &mut ModuleHarness,

@@ -482,7 +482,17 @@ usage: ck agents <verb> [args] [--subc <connection file>] [--json]
   --subc <path>              daemon connection file; defaults to discovery
   --json                     raw response instead of the rendered form"
             .to_string(),
-        Face::Roles => "ck roles — cached role claims and operator-confirmed takes\n\nusage: ck roles <verb> [args] [--subc <connection file>] [--json]\n\n  read <role>\n  take <role> --reason <text>\n\nRole names use lowercase letters, digits and underscores (1 to 64 bytes).\nTakes require operator confirmation; reads never wait on engram.".to_string(),
+        Face::Roles => format!("\
+ck roles — cached role claims and operator-confirmed takes
+
+usage: ck roles <verb> [args] [--subc <connection file>] [--json]
+
+  read <role>
+  take <role> --reason <text>
+
+Role names are 1 to {} ASCII bytes. Nonempty parts separated by dots may
+contain lowercase letters, digits, underscores and hyphens (e.g. dreamer.global).
+Takes require operator confirmation.", crate::role_leases::MAX_ROLE_BYTES),
         Face::Entorhinal => "\
 ck-entorhinal — the registry module (supervised by the subc daemon)
 
@@ -1123,13 +1133,11 @@ fn build_agents(command: &Command) -> Result<(String, Value), String> {
 }
 
 fn build_roles(command: &Command) -> Result<(String, Value), String> {
+    use crate::role_leases::valid_role;
+
     match (command.verb.as_str(), command.args.as_slice()) {
-        ("read", [role]) if entorhinal_core::role_cache::valid_role(role) => {
-            Ok(("role.read".into(), json!({"role":role})))
-        }
-        ("take", [role, flag, reason])
-            if flag == "--reason" && entorhinal_core::role_cache::valid_role(role) =>
-        {
+        ("read", [role]) if valid_role(role) => Ok(("role.read".into(), json!({"role":role}))),
+        ("take", [role, flag, reason]) if flag == "--reason" && valid_role(role) => {
             let mut bytes = [0; 16];
             getrandom::getrandom(&mut bytes).map_err(|e| format!("draw request id: {e}"))?;
             Ok((
@@ -4797,6 +4805,17 @@ mod role_tests {
             _ => panic!("expected command"),
         }
     }
+    #[test]
+    fn roles_cli_read_accepts_lease_role_names() {
+        for role in ["dreamer.global", "dreamer.pj-16a17c32f5e0199b"] {
+            assert_eq!(
+                build(&command(&["read", role])).unwrap(),
+                ("role.read".into(), json!({"role":role}))
+            );
+        }
+        assert!(build(&command(&["read", "dreamer..global"])).is_err());
+    }
+
     #[tokio::test]
     async fn roles_cli_reads_and_takes_with_cached_epoch_and_fresh_id() {
         let caller = Caller::default();

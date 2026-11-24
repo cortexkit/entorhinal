@@ -1,5 +1,6 @@
 use super::*;
 use std::sync::atomic::AtomicBool;
+use subc_client_rs::test_support::{Frame, FrameType};
 use tokio::{sync::Barrier, task::JoinHandle};
 
 const ROLE: &str = "connector_home";
@@ -7,6 +8,37 @@ const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const C: &str = "cccccccccccccccccccccccccccccccc";
 const ROUTE: RouteKey = (3, 1);
+
+pub(crate) fn lease_sample_record(
+    op: &str,
+    params: &Value,
+    principal: &Value,
+    frames: &[Frame],
+) -> String {
+    let frames = frames
+        .iter()
+        .map(|frame| {
+            let kind = match frame.header.ty {
+                FrameType::StreamData => "StreamData",
+                FrameType::StreamEnd => "StreamEnd",
+                FrameType::Response => "Response",
+                FrameType::Error => "Error",
+                other => panic!("unexpected frame {other:?}"),
+            };
+            let body = if frame.body.is_empty() {
+                "null"
+            } else {
+                std::str::from_utf8(&frame.body).unwrap()
+            };
+            format!("{{\"type\":{},\"body\":{body}}}", json!(kind))
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "  {{\"op\":{},\"request\":{params},\"principal\":{principal},\"frames\":[{frames}]}}",
+        json!(op)
+    )
+}
 
 #[cfg(target_os = "linux")]
 #[test]
