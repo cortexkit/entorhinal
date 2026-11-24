@@ -1198,4 +1198,120 @@ async fn lease_handback_role_take_preference_steers_a_vacant_role() {
     }).await;
 }
 
+#[tokio::test]
+async fn served_role_lease_v1_hub_first_take_matches_published_file() {
+    use crate::role_leases::{monotonic_ms, tests::lease_sample_record, ACK, WATCH};
+    use crate::{BindDecision, ModuleHandler, RequestCtx, RouteBindRequest, RouteHandle};
+    use subc_client_rs::test_support::{BindIdentity, FrameType, ModuleHarness, RouteTarget};
+
+    // The live rig has already opened the store. The in-process harness's
+    // HELLO_ACK does not supply a storage descriptor.
+    struct OpenStore(crate::ServedHandler);
+
+    #[async_trait::async_trait]
+    impl ModuleHandler for OpenStore {
+        async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+            self.0.handle(ctx, body).await
+        }
+
+        async fn on_bind(&self, request: &RouteBindRequest) -> BindDecision {
+            self.0.on_bind(request).await
+        }
+
+        async fn on_route_gone(&self, handle: &RouteHandle) {
+            self.0.on_route_gone(handle).await;
+        }
+    }
+
+    let Some(rig) = IdentityRig::new().await else {
+        return;
+    };
+    let role = "dreamer.pj-16a17c32f5e0199b";
+    residence(&rig.b, Arc::new(Image::default()));
+    until(|| role_read(&rig.b.handler, role)["stale"] == false).await;
+    let initial = role_read(&rig.b.handler, role);
+    assert_eq!(initial["epoch"], 0);
+    assert!(initial["holder"].is_null());
+    assert_eq!(initial["held_here"], false);
+
+    let served = OpenStore(rig.b.handler.into_served());
+    let mut module = ModuleHarness::start(move |_| served, []).await;
+    let route = module
+        .bind_route(
+            RouteBindRequest::new(
+                RouteHandle::detached(1816, 1),
+                RouteTarget::ManagementSurface {
+                    module_id: crate::MODULE_ID.into(),
+                },
+                BindIdentity::new("test", "lease-fixtures"),
+            )
+            .with_principal(crate::tests::reserved("magic-context")),
+        )
+        .await;
+    let principal = json!({"kind":"reserved","moduleId":"magic-context"});
+    let params = json!({"role":role});
+    let watch = module
+        .send_request(route, body(WATCH, params.clone()))
+        .await;
+    let mut records = Vec::new();
+    for (gen, holding, sample_issued, sample_valid) in [
+        (0, false, 100_000, 0),
+        (1, false, 101_000, 0),
+        (1, true, 101_100, 44_950),
+    ] {
+        let mut frame = within(module.next_frame()).await.unwrap();
+        assert_eq!(frame.header.corr, watch);
+        assert_eq!(
+            frame.header.ty,
+            FrameType::StreamData,
+            "{}",
+            String::from_utf8_lossy(&frame.body)
+        );
+        let notice: Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(notice["holding"], holding);
+        assert_eq!(notice["gen"], gen);
+        let issued = notice["issued_at_ms"].as_u64().unwrap();
+        let valid = notice["valid_for_ms"].as_u64().unwrap();
+        if holding {
+            let now = monotonic_ms();
+            assert!((1..=45_000).contains(&valid));
+            assert!((now + 1..=now + 45_000).contains(&(issued + valid)));
+        } else {
+            assert_eq!(valid, 0);
+        }
+
+        // The live hub uses the computer's boot clock. Pin only the clock fields.
+        frame.body = std::str::from_utf8(&frame.body)
+            .unwrap()
+            .replacen(
+                &format!("\"issued_at_ms\":{issued}"),
+                &format!("\"issued_at_ms\":{sample_issued}"),
+                1,
+            )
+            .replacen(
+                &format!("\"valid_for_ms\":{valid}"),
+                &format!("\"valid_for_ms\":{sample_valid}"),
+                1,
+            )
+            .into_bytes();
+        records.push(lease_sample_record(WATCH, &params, &principal, &[frame]));
+        if holding {
+            break;
+        }
+        let ack = json!({"role":role,"seq":notice["seq"]});
+        let call = module.send_request(route, body(ACK, ack.clone())).await;
+        let reply = within(module.next_frame()).await.unwrap();
+        assert_eq!(reply.header.corr, call);
+        assert_eq!(
+            reply.header.ty,
+            FrameType::Response,
+            "{}",
+            String::from_utf8_lossy(&reply.body)
+        );
+        records.push(lease_sample_record(ACK, &ack, &principal, &[reply]));
+    }
+    module.shutdown().await;
+    crate::served_vectors::published_file("role-lease-v1", "hub-first-take.json", records);
+}
+
 mod moves;

@@ -1,17 +1,28 @@
 # Served role lease v1
 
 These samples capture the real Entorhinal management handler through the
-`subc-client-rs` SDK's in-process `ModuleHarness`. The lease updates and the monotonic
-clock are simulated; the request admission, watch, acknowledgement and response
-paths are not. Each record names an `op`, the `request` params, the bound
-`principal` and observed `frames`. Send `{"method":op,"params":request}` on
-the management route. Frame bodies are the exact JSON bytes served by the
-handler; an empty `StreamEnd` body is shown as `null`.
+`subc-client-rs` SDK's in-process `ModuleHarness`. Some samples simulate lease
+updates and the monotonic clock; the request admission, watch, acknowledgement
+and response paths are real. Each record names an `op`, the `request` params,
+the bound `principal` and observed `frames`. Send
+`{"method":op,"params":request}` on the management route. Frame bodies are the
+exact JSON bytes served by the handler except where noted; an empty `StreamEnd`
+body is shown as `null`.
 
 - `holding.json`: Plexus may act for `connector_home` at the notice's `gen`
   while the acting window is live.
 - `not-holding.json`: Magic Context cannot act for the project role; the watch
   is open and it remains a candidate.
+- `hub-first-take.json`: On a live hub, the first notice for a vacant project
+  role is pending, not a refusal. The generation can change while the module
+  is still not holding. Ack every notice with `role.lease.ack {role, seq}`,
+  including each `holding: false`, and keep the same watch open. Act only on
+  `holding: true`, which normally arrives within about a second. It can take
+  up to 60 seconds while a preferred computer is given a chance to take the
+  role, or one lease length if a previous holder's lease must lapse. The sample
+  shows one watch and its ACK calls up to the first `holding: true`. Only
+  `issued_at_ms` and `valid_for_ms` are normalized for reproducibility: both
+  depend on the computer's own boot clock.
 - `lapsed.json`: Magic Context initially holds the workspace role. Nothing
   extends its acting window, so it stops acting at the deadline even though the
   stream is still open. The final `StreamEnd` is the test closing the watch,
@@ -84,8 +95,10 @@ From the repository root:
 ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked served_role_lease_v1_records_match_published_files -- --nocapture
 ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked served_role_lease_v1_non_hub_records_match_published_files -- --nocapture
 ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked served_role_lease_v1_yield_records_match_published_files -- --nocapture
+ENTO_WRITE_SERVED_VECTORS=1 cargo test --workspace --all-targets --locked served_role_lease_v1_hub_first_take_matches_published_file -- --nocapture
 ```
 
-Without `ENTO_WRITE_SERVED_VECTORS` the drift test byte-compares the served
+The live hub sample requires `nats-server` on `PATH`. Without
+`ENTO_WRITE_SERVED_VECTORS` the drift test byte-compares the served
 records with the published ones. Refresh `SHA256SUMS` in this folder after a
 reviewed fixture change (`shasum -a 256 *.json > SHA256SUMS`).
