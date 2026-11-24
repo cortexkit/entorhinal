@@ -278,7 +278,7 @@ fn validate_arguments(tool: AgentTool, arguments: &Map<String, Value>) -> Result
 impl ProjectsHandler {
     /// Re-read liveness and role on every call, including retries. A route bound
     /// before an agent's retirement must not preserve that agent's authority.
-    pub(super) fn admit_agent_tool(
+    pub(super) async fn admit_agent_tool(
         &self,
         tool: AgentTool,
         key: RouteKey,
@@ -323,6 +323,36 @@ impl ProjectsHandler {
                 "the stored agent role cannot use this tool",
             ));
         }
+        if let Some(residence) = self.residence() {
+            let id = id.to_owned();
+            let location = self
+                .read_blocking(tool.name, move |store| {
+                    residence
+                        .with_context(|context| store.hub_agent_where(&id, context))
+                        .map_err(|error| {
+                            if error.code == "claim_integrity_failed" {
+                                HandlerError::new(
+                                    "claim_integrity_failed",
+                                    "cached agent claim failed verification",
+                                )
+                            } else {
+                                error.into()
+                            }
+                        })
+                })
+                .await?;
+            if location.known
+                && !location.stale
+                && location.status == "held_elsewhere"
+                && location.holder.is_some()
+                && location.epoch >= 1
+            {
+                return Err(HandlerError::new(
+                    "held_elsewhere",
+                    "the stamped agent is held by another machine",
+                ));
+            }
+        }
         Ok((admission, caller))
     }
 
@@ -343,7 +373,7 @@ impl ProjectsHandler {
             };
         let tool = TOOLS.iter().find(|tool| tool.name == name).copied();
         let admission = if let Some(tool) = tool {
-            let (admission, _caller) = self.admit_agent_tool(tool, key)?;
+            let (admission, _caller) = self.admit_agent_tool(tool, key).await?;
             if tool.writes && tool.name != "catalog_install" {
                 validate_request_key(&value["arguments"])?;
             }
