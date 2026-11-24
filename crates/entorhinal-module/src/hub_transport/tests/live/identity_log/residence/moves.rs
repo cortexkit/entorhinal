@@ -12,10 +12,26 @@ use crate::{
     move_source::Source,
     participant_client::{AgentRef, Refusal},
     participant_discovery::{provider_role, ParticipantDiscovery},
+    sessions::{FakeResolver, ProviderResolution, ORCHESTRATOR_CAPABILITY},
+    RouteKey,
 };
 use entorhinal_core::move_store::{AgentMove, MoveSide, MoveStep};
 
 const CUT: &str = "aabb0123456789abcdef0123456789ab";
+const ADMIT: RouteKey = (930, 1);
+thread_local! { static CONTROLLED_NOW: std::cell::Cell<i64> = const { std::cell::Cell::new(0) }; }
+
+fn controlled_clock() -> i64 {
+    CONTROLLED_NOW.with(|now| now.get())
+}
+
+fn set_controlled_now(value: i64) {
+    CONTROLLED_NOW.with(|now| now.set(value));
+}
+
+fn advance_controlled(ms: i64) {
+    CONTROLLED_NOW.with(|now| now.set(now.get() + ms));
+}
 
 struct Moving {
     rig: IdentityRig,
@@ -77,6 +93,10 @@ fn worker(node: &Node, door: &FakeDoor, peer: Arc<FakeParticipant>) -> Worker {
 
 impl Moving {
     async fn new() -> Option<Self> {
+        Self::new_with_kinds(&["agent"]).await
+    }
+
+    async fn new_with_kinds(kinds: &[&str]) -> Option<Self> {
         let rig = IdentityRig::new().await?;
         for node in [&rig.a, &rig.b] {
             migrate_identity(node, MIGRATED, "move agent");
@@ -106,7 +126,7 @@ impl Moving {
         };
         let door = FakeDoor::new(author(A));
         let from = Arc::new(FakeParticipant::new(
-            &["agent"],
+            kinds,
             vec![AgentRef::new("agent", MIGRATED)],
         ));
         let item = crate::door_client::CutItem {
@@ -123,7 +143,7 @@ impl Moving {
         }],"external":[]}))
             .unwrap(),
         );
-        let to = Arc::new(FakeParticipant::new(&["agent"], vec![]));
+        let to = Arc::new(FakeParticipant::new(kinds, vec![]));
         let source = worker(&rig.a, &door, from.clone());
         let receiver = worker(&rig.b, &door.for_author(author(B)), to.clone());
         let now = crate::unix_millis();
@@ -296,6 +316,12 @@ async fn hub_move_restarts_through_the_full_handoff() {
             .count(),
         1
     );
+    let status = f.rig.b.handler.move_status(json!({"cut_id":CUT})).unwrap();
+    let status: Value = serde_json::from_slice(&status).unwrap();
+    assert!(status["result"].get("losses").is_none());
+    let listed = f.rig.b.handler.moves(json!({})).unwrap();
+    let listed: Value = serde_json::from_slice(&listed).unwrap();
+    assert!(listed["result"]["moves"][0].get("losses").is_none());
 }
 
 #[tokio::test]
@@ -468,6 +494,7 @@ async fn hub_move_does_not_seal_when_a_required_export_has_no_target_provider() 
     f.source_tick().await;
     assert_eq!(f.source.row(CUT).await.unwrap().step, MoveStep::Exported);
     assert!(!f.from.frozen().is_empty());
+    f.source_tick().await;
     f.source_tick().await;
     f.source_tick().await;
     let row = f.source.row(CUT).await.unwrap();
@@ -693,6 +720,7 @@ async fn hub_move_upload_failure_aborts_without_resealing() {
     assert!(!f.from.frozen().is_empty());
     f.source_tick().await;
     f.source_tick().await;
+    f.source_tick().await;
     let row = f.source.row(CUT).await.unwrap();
     assert_eq!(row.step, MoveStep::Aborted);
     assert_eq!(row.reason.as_deref(), Some("unavailable"));
@@ -713,6 +741,7 @@ async fn hub_move_cut_store_full_aborts_at_seal() {
         .script("cut.seal", DoorEffect::Refuse("cut_store_full".into()));
     f.source_tick().await;
     assert!(!f.from.frozen().is_empty());
+    f.source_tick().await;
     f.source_tick().await;
     f.source_tick().await;
     let row = f.source.row(CUT).await.unwrap();
@@ -737,6 +766,7 @@ async fn hub_move_key_unavailable_aborts_at_takeover() {
     poll_hub(&f.receiver, &f.b).await.unwrap();
     f.receiver_tick().await;
     f.finish_receiver_abort().await;
+    f.source_tick().await;
     f.source_tick().await;
     let row = f.source.row(CUT).await.unwrap();
     assert_eq!(row.step, MoveStep::Aborted);
@@ -826,4 +856,625 @@ async fn hub_move_cut_accepted_during_abort_holds_the_fork() {
     f.receiver_tick().await;
     assert_eq!(f.door_count(B, "cut.abort"), 1);
     assert_eq!(f.receiver.row(CUT).await.unwrap().step, MoveStep::Staged);
+}
+
+#[tokio::test]
+async fn hub_move_basal_import_drops_reach_move_status() {
+    let Some(f) = Moving::new().await else {
+        return;
+    };
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/basal-agent-data-v1/receiver-flows.json");
+    let samples: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let imported = samples
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|sample| sample["name"] == "import-with-drops")
+        .unwrap()["reply"]["result"]
+        .clone();
+    f.to.set_import(serde_json::from_value(imported).unwrap());
+
+    f.stage().await;
+    f.source_tick().await;
+    f.watch(State::Handed).await;
+    f.receiver_tick().await;
+    f.receiver_tick().await;
+    f.watch(State::Activated).await;
+    f.source_tick().await;
+    f.watch(State::Released).await;
+    f.receiver_tick().await;
+
+    let expected = json!([{
+        "participant":"data",
+        "session_ref":"d5acbf637b6119cbd2a2b3f32cc6f140",
+        "reason":"queued_event",
+        "count":1
+    }]);
+    assert_eq!(
+        json!(crate::move_receiver::import_losses(
+            &f.receiver.row(CUT).await.unwrap()
+        )),
+        expected
+    );
+    let bytes = f.rig.b.handler.move_status(json!({"cut_id":CUT})).unwrap();
+    let reply: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(reply["result"]["losses"], expected);
+}
+
+#[tokio::test]
+async fn hub_move_basal_local_advanced_aborts_as_diverged() {
+    let Some(f) = Moving::new().await else {
+        return;
+    };
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/basal-agent-data-v1/receiver-refusals.json");
+    let samples: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let error = samples
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|sample| sample["name"] == "import-flow-id-clash")
+        .unwrap()["error"]
+        .clone();
+    let body: subc_protocol::ErrorBody = serde_json::from_value(error).unwrap();
+    f.to.script(
+        "agent_data.import",
+        ParticipantEffect::Refuse(Refusal {
+            code: body.code.clone(),
+            detail: body.detail.clone(),
+            message: Some(body.message.clone()),
+        }),
+    );
+
+    f.publish().await;
+    poll_hub(&f.receiver, &f.b).await.unwrap();
+    f.receiver_tick().await;
+    f.receiver_tick().await;
+    f.watch(State::Aborted).await;
+    f.receiver_tick().await;
+    f.source_tick().await;
+
+    let receiver = f.receiver.row(CUT).await.unwrap();
+    assert_eq!(receiver.step, MoveStep::Aborted);
+    assert_eq!(receiver.reason.as_deref(), Some("diverged"));
+    let source = f.source.row(CUT).await.unwrap();
+    assert_eq!(source.step, MoveStep::Aborted);
+    assert_eq!(source.reason.as_deref(), Some("diverged"));
+    assert_eq!(source.detail.as_ref().unwrap()["module_id"], "data");
+    assert_eq!(source.detail.as_ref().unwrap()["op"], "agent_data.import");
+    assert_eq!(source.detail.as_ref().unwrap()["code"], "local_advanced");
+}
+
+#[tokio::test]
+async fn refused_cleanup_backs_off_doubling_to_the_cap_then_aborts() {
+    let Some(mut f) = Moving::new().await else {
+        return;
+    };
+    set_controlled_now(0);
+    f.receiver.clock = controlled_clock;
+    f.publish().await;
+    poll_hub(&f.receiver, &f.b).await.unwrap();
+    f.receiver_tick().await;
+    f.abort();
+    f.receiver_tick().await;
+    f.watch(State::Aborted).await;
+    for _ in 0..11 {
+        f.to.script(
+            "agent_data.abort",
+            ParticipantEffect::Refuse(Refusal {
+                code: "invalid_request".into(),
+                detail: None,
+                message: None,
+            }),
+        );
+    }
+
+    let abort_calls = || {
+        f.to.calls()
+            .iter()
+            .filter(|request| request.op().method() == "agent_data.abort")
+            .count()
+    };
+    let mut calls = Vec::new();
+    let mut driver = f.fresh_receiver();
+    for second in 0..1300 {
+        if f.receiver.row(CUT).await.unwrap().step == MoveStep::Aborted {
+            break;
+        }
+        let before = abort_calls();
+        driver.tick().await.unwrap();
+        for _ in before..abort_calls() {
+            calls.push(controlled_clock());
+        }
+        if second == 20 {
+            // A restarted driver reads the saved wait instead of starting over.
+            driver = f.fresh_receiver();
+        }
+        advance_controlled(1000);
+    }
+    let gaps: Vec<i64> = calls.windows(2).map(|w| w[1] - w[0]).collect();
+    assert_eq!(
+        gaps,
+        vec![
+            1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 128_000, 256_000, 300_000, 300_000
+        ],
+        "abort calls at {calls:?}"
+    );
+    assert_eq!(f.receiver.row(CUT).await.unwrap().step, MoveStep::Aborted);
+    f.source_tick().await;
+    assert_eq!(f.source.row(CUT).await.unwrap().step, MoveStep::Aborted);
+}
+
+#[tokio::test]
+async fn hub_move_prepare_refusals_retry_or_abort() {
+    // Eight transient busy answers recover without exporting before the retry.
+    let Some(mut f) = Moving::new().await else {
+        return;
+    };
+    set_controlled_now(0);
+    f.source.clock = controlled_clock;
+    for _ in 0..8 {
+        f.from.script(
+            "agent_data.prepare",
+            ParticipantEffect::Refuse(Refusal {
+                code: "busy".into(),
+                detail: None,
+                message: Some("still running".into()),
+            }),
+        );
+    }
+    for attempt in 0..8 {
+        f.source_tick().await;
+        assert_eq!(f.source.row(CUT).await.unwrap().step, MoveStep::Preparing);
+        assert!(!f
+            .from
+            .calls()
+            .iter()
+            .any(|call| call.op().method() == "agent_data.export"));
+        let delay = crate::move_driver::backoff(attempt + 1);
+        advance_controlled(delay.as_millis() as i64);
+    }
+    f.source_tick().await;
+    assert_eq!(f.source.row(CUT).await.unwrap().step, MoveStep::Exported);
+    assert_eq!(
+        f.from
+            .calls()
+            .iter()
+            .filter(|call| call.op().method() == "agent_data.prepare")
+            .count(),
+        9
+    );
+
+    // A terminal participant failure names the participant and never seals.
+    let Some(f) = Moving::new().await else {
+        return;
+    };
+    f.from.script(
+        "agent_data.prepare",
+        ParticipantEffect::Refuse(Refusal {
+            code: "participant_failed".into(),
+            detail: Some(json!({"reason":"fixture failed"})),
+            message: Some("keep this message".into()),
+        }),
+    );
+    f.source_tick().await;
+    f.source_tick().await;
+    let row = f.source.row(CUT).await.unwrap();
+    assert_eq!(row.step, MoveStep::Aborted);
+    assert_eq!(row.detail.as_ref().unwrap()["module_id"], "data");
+    assert_eq!(row.detail.as_ref().unwrap()["op"], "agent_data.prepare");
+    assert_eq!(row.detail.as_ref().unwrap()["message"], "keep this message");
+    assert!(!f
+        .door
+        .calls()
+        .iter()
+        .any(|call| call.request.op() == "cut.seal"));
+
+    // An out-of-contract refusal aborts instead of retrying after restart.
+    let Some(f) = Moving::new().await else {
+        return;
+    };
+    f.from.script(
+        "agent_data.prepare",
+        ParticipantEffect::Refuse(Refusal {
+            code: "future_unlisted_code".into(),
+            detail: None,
+            message: None,
+        }),
+    );
+    f.source_tick().await;
+    let before = f
+        .from
+        .calls()
+        .iter()
+        .filter(|call| call.op().method() == "agent_data.prepare")
+        .count();
+    f.fresh_source().tick().await.unwrap();
+    let row = f.source.row(CUT).await.unwrap();
+    assert_eq!(row.step, MoveStep::Aborted);
+    assert_eq!(
+        f.from
+            .calls()
+            .iter()
+            .filter(|call| call.op().method() == "agent_data.prepare")
+            .count(),
+        before
+    );
+}
+
+#[tokio::test]
+async fn hub_move_activation_failures_hold_the_fork_across_restart() {
+    for code in [
+        "participant_failed",
+        "digest_mismatch",
+        "local_advanced",
+        "future_unlisted_code",
+    ] {
+        let Some(f) = Moving::new().await else {
+            return;
+        };
+        f.stage().await;
+        f.source_tick().await;
+        f.watch(State::Handed).await;
+        f.receiver_tick().await;
+        f.to.script(
+            "agent_data.activate",
+            ParticipantEffect::Refuse(Refusal {
+                code: code.into(),
+                detail: None,
+                message: Some("activation failed".into()),
+            }),
+        );
+        f.receiver_tick().await;
+        let before = f.to.calls().len();
+        f.fresh_receiver().tick().await.unwrap();
+        let row = f.receiver.row(CUT).await.unwrap();
+        assert_eq!(row.step, MoveStep::Activating, "{code}");
+        assert!(
+            row.plan["_receiver"]["activation_fork"].is_object()
+                || row.plan["_receiver"]["contract_violation"].is_object(),
+            "{code}: {:?}",
+            row.plan
+        );
+        assert_eq!(f.to.calls().len(), before, "{code} retried activation");
+        assert_eq!(f.source.row(CUT).await.unwrap().step, MoveStep::Published);
+    }
+}
+
+fn configure_admission(f: &mut Moving) {
+    store_of(&f.rig.a.handler)
+        .apply_entry("fixture.clear_move", "{}", "fixture", None, |tx| {
+            tx.execute("DELETE FROM agent_move WHERE cut_id=?1", [CUT])?;
+            Ok(())
+        })
+        .unwrap();
+    let resolver = FakeResolver::new();
+    resolver.set(
+        ORCHESTRATOR_CAPABILITY,
+        ProviderResolution::Provider("prefrontal".into()),
+    );
+    f.rig.a.handler.provider_resolver = resolver;
+    f.rig.a.handler.participant_discovery = f.source.discovery.clone();
+    f.rig.a.handler.route_admissions().insert(
+        ADMIT,
+        crate::RouteAdmission::from_bind(Some(crate::tests::reserved("prefrontal")), None),
+    );
+    let mut liveness = f.rig.a.handler.liveness.lock().unwrap();
+    liveness.bus.watch_started();
+    liveness.bus.finish_replay();
+    crate::liveness_bus::tests::reconcile(&mut liveness);
+}
+
+async fn admit(f: &Moving, key: &str) -> Result<String, HandlerError> {
+    let bytes = f
+        .rig
+        .a
+        .handler
+        .admit_move(
+            json!({"agent_id":MIGRATED,"to":B,"request_key":key}),
+            ADMIT,
+            Instant::now(),
+        )
+        .await?;
+    let reply: Value = serde_json::from_slice(&bytes).unwrap();
+    Ok(reply["result"]["cut_id"].as_str().unwrap().into())
+}
+
+#[tokio::test]
+async fn hub_move_admission_routes_agent_ref_and_replays_key() {
+    let Some(mut f) = Moving::new().await else {
+        return;
+    };
+    f.from.set_optional();
+    configure_admission(&mut f);
+    let cut = admit(&f, "admitted").await.unwrap();
+    assert_eq!(admit(&f, "admitted").await.unwrap(), cut);
+    let row = store_of(&f.rig.a.handler)
+        .agent_move(&cut)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.request_key.as_deref(), Some("admitted"));
+    assert_eq!(row.plan["hub_gen"], 1);
+    assert_eq!(row.plan["participants"][0]["optional"], true);
+    assert_eq!(
+        row.plan["participants"][0]["refs"],
+        json!([{"ref_kind":"agent","ref":MIGRATED}])
+    );
+}
+
+#[tokio::test]
+async fn hub_move_live_session_ref_cap_is_256() {
+    for count in [256, 257] {
+        let Some(mut f) = Moving::new_with_kinds(&["session"]).await else {
+            return;
+        };
+        configure_admission(&mut f);
+        f.from = Arc::new(FakeParticipant::new(
+            &["session"],
+            (0..count)
+                .map(|index| AgentRef::new("session", format!("session-{index}")))
+                .collect(),
+        ));
+        f.source = worker(&f.rig.a, &f.door, f.from.clone());
+        f.rig.a.handler.participant_discovery = f.source.discovery.clone();
+        for index in 0..count {
+            let reference = format!("session-{index}");
+            store_of(&f.rig.a.handler)
+                .register_session(&entorhinal_core::SessionRegistration {
+                    role: None,
+                    agent_id: MIGRATED,
+                    ref_kind: "session",
+                    session_ref: &reference,
+                    harness: "host",
+                    session_id: &reference,
+                    project_root: None,
+                    registered_by: "host",
+                    runner: Some("data"),
+                    network: None,
+                    now_ms: 1000,
+                })
+                .unwrap();
+        }
+
+        let outcome = admit(&f, "ref-cap").await;
+        if count == 256 {
+            let cut = outcome.unwrap();
+            let row = store_of(&f.rig.a.handler)
+                .agent_move(&cut)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                row.plan["participants"][0]["refs"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                256
+            );
+        } else {
+            assert_eq!(outcome.unwrap_err().code, "live_ref_cap");
+            assert!(store_of(&f.rig.a.handler)
+                .list_agent_moves()
+                .unwrap()
+                .is_empty());
+            assert!(!f
+                .from
+                .calls()
+                .iter()
+                .any(|call| call.op().method() == "agent_data.busy"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn hub_move_oversized_prepare_aborts_before_export_or_seal() {
+    let Some(f) = Moving::new().await else {
+        return;
+    };
+    f.from.set_prepare(
+        serde_json::from_value(json!({"items":[],"external":[{
+            "ref_kind":"agent","ref":MIGRATED,
+            "note":"x".repeat(entorhinal_core::move_record::MOVE_BODY_CAP),
+            "check":{}
+        }]}))
+        .unwrap(),
+    );
+    f.source_tick().await;
+    f.source_tick().await;
+    let row = f.source.row(CUT).await.unwrap();
+    assert_eq!(row.step, MoveStep::Aborted);
+    assert!(!f
+        .from
+        .calls()
+        .iter()
+        .any(|call| call.op().method() == "agent_data.export"));
+    assert!(!f
+        .door
+        .calls()
+        .iter()
+        .any(|call| call.request.op() == "cut.seal"));
+}
+
+#[tokio::test]
+async fn hub_move_diverged_advanced_and_unknown_abort_before_import() {
+    for diverged in [
+        cortexkit_role_agent_data::diverged::DivergedState::Advanced,
+        cortexkit_role_agent_data::diverged::DivergedState::Unknown,
+    ] {
+        let Some(f) = Moving::new().await else {
+            return;
+        };
+        f.to.hold(AgentRef::new("agent", MIGRATED));
+        f.to.set_diverged(AgentRef::new("agent", MIGRATED), diverged);
+        f.publish().await;
+        poll_hub(&f.receiver, &f.b).await.unwrap();
+        f.receiver_tick().await;
+        f.receiver_tick().await;
+        f.watch(State::Aborted).await;
+        f.receiver_tick().await;
+        assert_eq!(f.receiver.row(CUT).await.unwrap().step, MoveStep::Aborted);
+        assert!(!f
+            .to
+            .calls()
+            .iter()
+            .any(|call| call.op().method() == "agent_data.import"));
+        f.source_tick().await;
+        assert_eq!(f.source.row(CUT).await.unwrap().step, MoveStep::Aborted);
+    }
+}
+
+#[tokio::test]
+async fn hub_move_import_refusal_retry_survives_restart() {
+    for code in ["external_not_present", "busy", "cut_not_ready"] {
+        let Some(mut f) = Moving::new().await else {
+            return;
+        };
+        set_controlled_now(0);
+        f.receiver.clock = controlled_clock;
+        let refused_op = if code == "external_not_present" {
+            "agent_data.diverged"
+        } else {
+            "agent_data.import"
+        };
+        f.to.script(
+            refused_op,
+            ParticipantEffect::Refuse(Refusal {
+                code: code.into(),
+                detail: None,
+                message: None,
+            }),
+        );
+        f.publish().await;
+        poll_hub(&f.receiver, &f.b).await.unwrap();
+        f.receiver_tick().await;
+        assert_eq!(f.receiver.row(CUT).await.unwrap().step, MoveStep::PickedUp);
+        advance_controlled(1000);
+        f.fresh_receiver().tick().await.unwrap();
+        let row = f.receiver.row(CUT).await.unwrap();
+        assert_eq!(
+            row.step,
+            MoveStep::Imported,
+            "{code}: receiver={:?} hold={:?}",
+            row.plan["_receiver"],
+            row.hold
+        );
+        let imports =
+            f.to.calls()
+                .iter()
+                .filter(|call| call.op().method() == "agent_data.import")
+                .count();
+        assert_eq!(
+            imports,
+            if code == "external_not_present" { 1 } else { 2 },
+            "{code}"
+        );
+        if code == "external_not_present" {
+            assert_eq!(
+                f.to.calls()
+                    .iter()
+                    .filter(|call| call.op().method() == "agent_data.diverged")
+                    .count(),
+                2
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn hub_move_admission_idle_session_requires_its_freezing_runner() {
+    for (runner, state, admitted) in [
+        (Some("data"), "idle", true),
+        (Some("data"), "active", false),
+        (None, "idle", false),
+        (Some("elsewhere"), "idle", false),
+    ] {
+        let Some(mut f) = Moving::new_with_kinds(&["session"]).await else {
+            return;
+        };
+        configure_admission(&mut f);
+        f.from = Arc::new(FakeParticipant::new(
+            &["session"],
+            vec![AgentRef::new("session", "r")],
+        ));
+        f.source = worker(&f.rig.a, &f.door, f.from.clone());
+        f.rig.a.handler.participant_discovery = f.source.discovery.clone();
+        store_of(&f.rig.a.handler)
+            .apply_entry("fixture.binding", "{}", "fixture", None, |tx| {
+                tx.execute(
+                    "INSERT INTO session_binding(ref_kind,ref,agent_id,harness,session_id,project_root,registered_by,registered_at_ms,runner) VALUES('session','r',?1,'host','r','/project','host',1000,?2)",
+                    rusqlite::params![MIGRATED, runner],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        {
+            let mut liveness = f.rig.a.handler.liveness.lock().unwrap();
+            liveness
+                .bus
+                .apply(crate::liveness_bus::tests::put(
+                    "host.r", "host", "r", state,
+                ))
+                .unwrap();
+            crate::liveness_bus::tests::reconcile(&mut liveness);
+        }
+        let outcome = admit(&f, "idle-session").await;
+        assert_eq!(outcome.is_ok(), admitted, "{runner:?} {state}: {outcome:?}");
+        assert_eq!(
+            store_of(&f.rig.a.handler).list_agent_moves().unwrap().len(),
+            usize::from(admitted)
+        );
+    }
+}
+
+#[tokio::test]
+async fn hub_move_activation_boundary_retries_without_abort() {
+    for code in [
+        "busy",
+        "external_not_present",
+        "unavailable",
+        "invalid_state",
+    ] {
+        let Some(mut f) = Moving::new().await else {
+            return;
+        };
+        set_controlled_now(0);
+        f.receiver.clock = controlled_clock;
+        f.stage().await;
+        f.source_tick().await;
+        f.watch(State::Handed).await;
+        f.receiver_tick().await;
+        f.to.script(
+            "agent_data.activate",
+            ParticipantEffect::Refuse(Refusal {
+                code: code.into(),
+                detail: None,
+                message: None,
+            }),
+        );
+        f.receiver_tick().await;
+        let row = f.receiver.row(CUT).await.unwrap();
+        assert_eq!(row.step, MoveStep::Activating, "{code}");
+        assert!(row.abort_requested.is_none(), "{code}");
+        assert_eq!(row.hold.as_ref().unwrap()["code"], code);
+        assert_eq!(row.plan["_receiver"]["retry_at_ms"], 1000);
+        let calls = f.to.calls().len();
+        f.fresh_receiver().tick().await.unwrap();
+        assert_eq!(
+            f.to.calls().len(),
+            calls,
+            "{code} retried before its deadline"
+        );
+        advance_controlled(1000);
+        f.fresh_receiver().tick().await.unwrap();
+        assert_eq!(
+            f.receiver.row(CUT).await.unwrap().step,
+            MoveStep::Activated,
+            "{code}"
+        );
+        assert!(!f
+            .to
+            .calls()
+            .iter()
+            .any(|call| call.op().method() == "agent_data.abort"));
+    }
 }

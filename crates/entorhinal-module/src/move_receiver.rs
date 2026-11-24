@@ -1356,3 +1356,369 @@ impl CutAccept {
         Ok(delay)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        fake_daemon::{DaemonSnapshot, FakeDaemon},
+        fake_door::FakeDoor,
+        fake_participant::FakeParticipant,
+        log_client::TransportError,
+        move_driver::{MoveWake, SqlOperations},
+        participant_discovery::{provider_role, ParticipantDiscovery},
+        tests::scratch_descriptor,
+        HealthGauges,
+    };
+    use std::path::PathBuf;
+
+    struct BusyDiscovery {
+        daemon: FakeDaemon,
+        participant: Arc<FakeParticipant>,
+    }
+
+    #[async_trait::async_trait]
+    impl ParticipantDiscovery for BusyDiscovery {
+        async fn supervisor_list(&self) -> Result<SupervisorListResponse, TransportError> {
+            self.daemon.supervisor_list().await
+        }
+        async fn catalog_list(&self) -> Result<CatalogList, TransportError> {
+            self.daemon.catalog_list().await
+        }
+        async fn open_participant(
+            &self,
+            _: &str,
+        ) -> Result<Arc<dyn crate::log_client::LogTransport>, TransportError> {
+            Ok(self.participant.clone())
+        }
+    }
+
+    struct Fixture {
+        worker: Worker,
+        liveness: Arc<Mutex<LivenessState>>,
+        row: AgentMove,
+        daemon: FakeDaemon,
+        slot: Arc<Mutex<Option<RegistryStore>>>,
+        _dir: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(plan: &MoveRecord) -> Self {
+            let (_dir, descriptor) = scratch_descriptor("receiver-kept-fixture");
+            let store = RegistryStore::open(&descriptor).unwrap();
+            let slot = Arc::new(Mutex::new(Some(store)));
+            let daemon = FakeDaemon::new(DaemonSnapshot::new(
+                1,
+                vec![
+                    json!({"module_id":"present","state":"running","enabled":true,"live":true,"health":"ok"}),
+                ],
+                vec![
+                    json!({"module_id":"present","ready":true,"roles":[provider_role()],"control_ops":[],
+                    "capabilities":{"provides":["agent-data/v1"],"requires":[]}}),
+                ],
+            ));
+            let worker = Worker {
+                store: Arc::downgrade(&slot),
+                sql_operations: Arc::new(SqlOperations::default()),
+                door: FakeDoor::new([2; 16]).client(),
+                discovery: Arc::new(daemon.clone()),
+                catalog: None,
+                health: Arc::new(HealthGauges::default()),
+                clock: || 1000,
+                wake: Arc::new(MoveWake::default()),
+            };
+            let row = AgentMove {
+                cut_id: "aabb0123456789abcdef0123456789ab".into(),
+                agent_id: "agent_0123456789abcdef".into(),
+                side: MoveSide::Receiver,
+                peer: "01".repeat(16),
+                step: Step::PickedUp,
+                plan: json!(plan),
+                request_body: None,
+                record_version: 1,
+                claim_version: Some(1),
+                claim_take_body: None,
+                claim_take_version: None,
+                claim_landed_version: None,
+                seal_sent: true,
+                abort_requested: None,
+                hold: None,
+                cut_accept: None,
+                reason: None,
+                detail: None,
+                request_key: None,
+                attempts: 0,
+                activated_at_ms: None,
+                created_at_ms: 1000,
+                updated_at_ms: 1000,
+            };
+            slot.lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .insert_agent_move(&row)
+                .unwrap();
+            Self {
+                worker,
+                liveness: Arc::new(Mutex::new(LivenessState::default())),
+                row,
+                daemon,
+                slot,
+                _dir,
+            }
+        }
+
+        fn receiver(&self) -> Receiver {
+            Receiver::new(
+                self.worker.clone(),
+                self.row.cut_id.clone(),
+                self.liveness.clone(),
+            )
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.slot.lock().unwrap().take();
+            let _ = std::fs::remove_dir_all(&self._dir);
+        }
+    }
+
+    fn plan(participants: Value) -> MoveRecord {
+        serde_json::from_value(json!({
+            "v":1,"cut_id":"aabb0123456789abcdef0123456789ab",
+            "agent_id":"agent_0123456789abcdef","from":"01".repeat(16),"to":"02".repeat(16),
+            "claim_version":1,"state":"published","participants":participants,
+            "reason":null,"detail":null
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn receiver_optional_absence_and_restart_keep_the_recorded_skip() {
+        let plan = plan(json!([
+            {"module_id":"optional","optional":true,"refs":[],"external":[]},
+            {"module_id":"itemless","refs":[{"ref_kind":"session","ref":"r"}],"external":[]},
+            {"module_id":"present","refs":[{"ref_kind":"session","ref":"p"}],"external":[]}
+        ]));
+        let f = Fixture::new(&plan);
+        let supervisor = f.worker.discovery.supervisor_list().await.unwrap();
+        let catalog = f.worker.discovery.catalog_list().await.unwrap();
+        let mut row = f.row.clone();
+        let mut progress = Progress {
+            hub_items: Some(Vec::new()),
+            ..Default::default()
+        };
+        f.receiver()
+            .decide_skipped_absent(&mut row, &plan, &mut progress, &supervisor, &catalog)
+            .await
+            .unwrap_or_else(|error| panic!("decide skipped participants: {}", error.code));
+        assert_eq!(
+            progress.skipped_absent,
+            Some(vec!["optional".into(), "itemless".into()])
+        );
+        assert_eq!(skipped_participants(&row), ["optional", "itemless"]);
+
+        // Reopening the driver uses the persisted decision, even if the participant appears.
+        let restored = f.receiver();
+        let mut restored_row = f.worker.row(&row.cut_id).await.unwrap();
+        let mut restored_progress: Progress =
+            serde_json::from_value(restored_row.plan["_receiver"].clone()).unwrap();
+        f.daemon.restart(DaemonSnapshot::new(
+            2,
+            vec![
+                json!({"module_id":"optional","state":"running","enabled":true,"live":true,"health":"ok"}),
+                json!({"module_id":"itemless","state":"running","enabled":true,"live":true,"health":"ok"}),
+            ],
+            vec![],
+        ));
+        let supervisor = f.worker.discovery.supervisor_list().await.unwrap();
+        let catalog = f.worker.discovery.catalog_list().await.unwrap();
+        restored
+            .decide_skipped_absent(
+                &mut restored_row,
+                &plan,
+                &mut restored_progress,
+                &supervisor,
+                &catalog,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("decide skipped participants: {}", error.code));
+        assert_eq!(
+            skipped_participants(&restored_row),
+            ["optional", "itemless"]
+        );
+    }
+
+    #[tokio::test]
+    async fn receiver_disabled_or_required_with_items_is_not_absent() {
+        let plan = plan(json!([
+            {"module_id":"disabled","refs":[],"external":[]},
+            {"module_id":"required","refs":[{"ref_kind":"session","ref":"r"}],"external":[]}
+        ]));
+        let f = Fixture::new(&plan);
+        f.daemon.restart(DaemonSnapshot::new(
+            2,
+            vec![json!({"module_id":"disabled","state":"stopped","enabled":false,"live":false,"health":"ok"})],
+            vec![json!({"module_id":"disabled","ready":false,"roles":[provider_role()],"control_ops":[],
+                "capabilities":{"provides":["agent-data/v1"],"requires":[]}})],
+        ));
+        let supervisor = f.worker.discovery.supervisor_list().await.unwrap();
+        let catalog = f.worker.discovery.catalog_list().await.unwrap();
+        let mut row = f.row.clone();
+        let mut progress = Progress {
+            hub_items: Some(vec![crate::door_client::CutItem {
+                session_ref: "11".repeat(16),
+                stream: "reserved:required".into(),
+                end_offset: 1,
+                digest: "a".repeat(64),
+            }]),
+            ..Default::default()
+        };
+        f.receiver()
+            .decide_skipped_absent(&mut row, &plan, &mut progress, &supervisor, &catalog)
+            .await
+            .unwrap_or_else(|error| panic!("decide skipped participants: {}", error.code));
+        assert_eq!(progress.skipped_absent, Some(Vec::new()));
+        assert!(skipped_participants(&row).is_empty());
+    }
+
+    #[test]
+    fn receiver_recorded_drops_are_replaced_and_an_empty_reply_clears_them() {
+        let mut progress = Progress::default();
+        let first: ImportReply = serde_json::from_value(json!({"items":[{
+            "sessionRef":"s","endOffset":1,"digest":"d",
+            "dropped":{"queued_event":2,"older":1}
+        }]}))
+        .unwrap();
+        progress.record_drops("data", &first);
+        assert_eq!(progress.dropped["data"]["s"]["queued_event"], 2);
+        let second: ImportReply = serde_json::from_value(json!({"items":[{
+            "sessionRef":"s","endOffset":2,"digest":"e","dropped":{"newer":1}
+        }]}))
+        .unwrap();
+        progress.record_drops("data", &second);
+        assert_eq!(progress.dropped["data"]["s"].len(), 1);
+        assert_eq!(progress.dropped["data"]["s"]["newer"], 1);
+        let empty = ImportReply::new(Vec::new());
+        progress.record_drops("data", &empty);
+        assert!(!progress.dropped.contains_key("data"));
+    }
+
+    #[tokio::test]
+    async fn corrupted_persisted_receiver_refs_return_a_named_error_without_panicking() {
+        let plan = plan(json!([{"module_id":"data","refs":[
+            {"ref_kind":"session","ref":"duplicate"},
+            {"ref_kind":"session","ref":"duplicate"}
+        ],"external":[]}]));
+        let f = Fixture::new(&plan);
+        let error = f.receiver().request(&plan.participants[0]);
+        assert_eq!(error.err().unwrap().code, "invalid_refs");
+    }
+
+    #[test]
+    fn receiver_row_without_a_recorded_skip_decodes_and_skips_nothing() {
+        let plan = plan(json!([]));
+        let f = Fixture::new(&plan);
+        let progress: Progress = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(progress.skipped_absent, None);
+        assert!(skipped_participants(&f.row).is_empty());
+    }
+    #[tokio::test]
+    async fn receiver_local_liveness_holds_only_already_bound_refs() {
+        let plan = plan(json!([{"module_id":"present",
+            "refs":[{"ref_kind":"session","ref":"r"}],"external":[]}]));
+        let mut f = Fixture::new(&plan);
+        f.worker.discovery = Arc::new(BusyDiscovery {
+            daemon: f.daemon.clone(),
+            participant: Arc::new(FakeParticipant::new(
+                &["session"],
+                vec![AgentRef::new("session", "r")],
+            )),
+        });
+        let store = f.slot.lock().unwrap().clone().unwrap();
+        store
+            .apply_entry("fixture.agent", "{}", "fixture", None, |tx| {
+                tx.execute(
+                    "INSERT INTO agent(agent_id,name,tag,role,created_at_ms,updated_at_ms) VALUES('agent_0123456789abcdef','Agent','R','assistant',1,1)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        store
+            .apply_entry("agent.cutover", "{}", "fixture", None, |_| Ok(()))
+            .unwrap();
+        store
+            .apply_entry("fixture.binding", "{}", "fixture", None, |tx| {
+                tx.execute(
+                    "INSERT INTO session_binding(ref_kind,ref,agent_id,harness,session_id,project_root,registered_by,registered_at_ms) VALUES('session','r','agent_0123456789abcdef','host','s','/project','move',1000)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let progress = Progress::default();
+        let error = f.receiver().local_writers(&plan, &progress).await;
+        assert_eq!(error.err().unwrap().code, "agent_busy");
+        crate::liveness_bus::tests::reconcile(&mut f.liveness.lock().unwrap());
+        f.receiver()
+            .local_writers(&plan, &progress)
+            .await
+            .unwrap_or_else(|error| panic!("local writer recheck: {}", error.code));
+    }
+    #[tokio::test]
+    async fn receiver_preconditions_abort_or_hold_with_named_codes() {
+        let plan = plan(json!([]));
+        let f = Fixture::new(&plan);
+        let mut row = f.row.clone();
+        let mut progress = Progress::default();
+        let error = f
+            .receiver()
+            .preconditions(&mut row, &plan, &mut progress)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.detail["code"], "authority_not_cut_over");
+        let store = f.slot.lock().unwrap().clone().unwrap();
+        store
+            .apply_entry("agent.cutover", "{}", "fixture", None, |_| Ok(()))
+            .unwrap();
+        let error = f
+            .receiver()
+            .preconditions(&mut row, &plan, &mut progress)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.detail["code"], "identity_log_disabled");
+        store
+            .apply_entry("fixture.hub", "{}", "fixture", None, |tx| {
+                tx.execute(
+                    "UPDATE identity_log_state SET state='enabled',hub_log_base=0 WHERE id=1",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let error = f
+            .receiver()
+            .preconditions(&mut row, &plan, &mut progress)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "unknown_agent");
+        store
+            .apply_entry("fixture.agent", "{}", "fixture", None, |tx| {
+                tx.execute(
+                    "INSERT INTO agent(agent_id,name,tag,role,created_at_ms,updated_at_ms) VALUES('agent_0123456789abcdef','Agent','R','assistant',1,1)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        f.receiver()
+            .preconditions(&mut row, &plan, &mut progress)
+            .await
+            .unwrap_or_else(|error| panic!("receiver preconditions: {}", error.code));
+    }
+}

@@ -1881,7 +1881,9 @@ async fn two_machines_carry_and_correct_once_and_refuse_forged_claim_owner() {
 
 mod moves {
     mod agent_data_request_vectors;
+    mod basal_samples;
     mod move_refs;
+    mod occipital_samples;
 }
 
 #[tokio::test(start_paused = true)]

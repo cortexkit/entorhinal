@@ -1395,3 +1395,468 @@ impl Source {
         Ok(Duration::ZERO)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        fake_daemon::{DaemonSnapshot, FakeDaemon},
+        fake_door::{Effect as DoorEffect, FakeDoor},
+        fake_participant::{Effect as ParticipantEffect, FakeParticipant},
+        log_client::TransportError,
+        move_driver::{MoveWake, SqlOperations},
+        participant_client::Refusal,
+        participant_discovery::{provider_role, ParticipantDiscovery},
+        tests::scratch_descriptor,
+        HealthGauges,
+    };
+    use entorhinal_core::{move_store::MoveSide, RegistryStore};
+    use std::sync::{Arc, Mutex};
+    use subc_client_rs::{CatalogList, SupervisorListResponse};
+
+    struct Fixture {
+        worker: Worker,
+        door: FakeDoor,
+        slot: Arc<Mutex<Option<RegistryStore>>>,
+        _dir: std::path::PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let (_dir, descriptor) = scratch_descriptor("source-failure");
+            let store = RegistryStore::open(&descriptor).unwrap();
+            let slot = Arc::new(Mutex::new(Some(store)));
+            let door = FakeDoor::new([1; 16]);
+            let worker = Worker {
+                store: Arc::downgrade(&slot),
+                sql_operations: Arc::new(SqlOperations::default()),
+                door: door.client(),
+                discovery: Arc::new(FakeDaemon::new(DaemonSnapshot::new(1, vec![], vec![]))),
+                catalog: None,
+                health: Arc::new(HealthGauges::default()),
+                clock: || 1000,
+                wake: Arc::new(MoveWake::default()),
+            };
+            let row = AgentMove {
+                cut_id: "aabb0123456789abcdef0123456789ab".into(),
+                agent_id: "agent_0123456789abcdef".into(),
+                side: MoveSide::Source,
+                peer: "02".repeat(16),
+                step: Step::Preparing,
+                plan: json!({"agent_id":"agent_0123456789abcdef","from":"01".repeat(16),
+                    "to":"02".repeat(16),"claim_version":1,"hub_gen":1,"participants":[]}),
+                request_body: None,
+                record_version: 0,
+                claim_version: Some(1),
+                claim_take_body: None,
+                claim_take_version: None,
+                claim_landed_version: None,
+                seal_sent: false,
+                abort_requested: None,
+                hold: None,
+                cut_accept: None,
+                reason: None,
+                detail: None,
+                request_key: None,
+                attempts: 0,
+                activated_at_ms: None,
+                created_at_ms: 1000,
+                updated_at_ms: 1000,
+            };
+            slot.lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .insert_agent_move(&row)
+                .unwrap();
+            Self {
+                worker,
+                door,
+                slot,
+                _dir,
+            }
+        }
+
+        fn source(&self) -> Source {
+            Source::new(
+                self.worker.clone(),
+                "aabb0123456789abcdef0123456789ab".into(),
+            )
+        }
+        fn row(&self) -> AgentMove {
+            self.slot
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .agent_move("aabb0123456789abcdef0123456789ab")
+                .unwrap()
+                .unwrap()
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.slot.lock().unwrap().take();
+            let _ = std::fs::remove_dir_all(&self._dir);
+        }
+    }
+
+    struct Discovery {
+        peers: BTreeMap<String, Arc<FakeParticipant>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ParticipantDiscovery for Discovery {
+        async fn supervisor_list(&self) -> Result<SupervisorListResponse, TransportError> {
+            Ok(DaemonSnapshot::new(
+                1,
+                self.peers
+                    .keys()
+                    .map(|id| json!({"module_id":id,"state":"running","enabled":true,"live":true,"health":"ok"}))
+                    .collect(),
+                vec![],
+            )
+            .supervisor)
+        }
+
+        async fn catalog_list(&self) -> Result<CatalogList, TransportError> {
+            Ok(DaemonSnapshot::new(
+                1,
+                vec![],
+                self.peers
+                    .keys()
+                    .map(|id| json!({"module_id":id,"ready":true,"roles":[provider_role()],"control_ops":[],
+                        "capabilities":{"provides":["agent-data/v1"],"requires":[]}}))
+                    .collect(),
+            )
+            .catalog)
+        }
+
+        async fn open_participant(
+            &self,
+            module_id: &str,
+        ) -> Result<Arc<dyn crate::log_client::LogTransport>, TransportError> {
+            Ok(self.peers[module_id].clone())
+        }
+    }
+
+    async fn release_fixture(
+        second_optional: bool,
+    ) -> (
+        Fixture,
+        Arc<FakeParticipant>,
+        Arc<FakeParticipant>,
+        SeenMove,
+    ) {
+        let mut f = Fixture::new();
+        let a = Arc::new(FakeParticipant::new(
+            &["agent"],
+            vec![AgentRef::new("agent", "agent_0123456789abcdef")],
+        ));
+        let b = Arc::new(FakeParticipant::new(
+            &["agent"],
+            vec![AgentRef::new("agent", "agent_0123456789abcdef")],
+        ));
+        f.worker.discovery = Arc::new(Discovery {
+            peers: BTreeMap::from([("a".into(), a.clone()), ("b".into(), b.clone())]),
+        });
+        let item = crate::door_client::CutItem {
+            session_ref: "11".repeat(16),
+            stream: "reserved:a".into(),
+            end_offset: 42,
+            digest: "a".repeat(64),
+        };
+        let mut row = f.row();
+        let mut plan: Plan = serde_json::from_value(row.plan.clone()).unwrap();
+        plan.participants = serde_json::from_value(json!([
+            {"module_id":"a","refs":[{"ref_kind":"agent","ref":"agent_0123456789abcdef"}],"external":[]},
+            {"module_id":"b","optional":second_optional,"refs":[{"ref_kind":"agent","ref":"agent_0123456789abcdef"}],"external":[]}
+        ]))
+        .unwrap();
+        plan.source.items = vec![item.clone()];
+        plan.source.sealed_cut = Some(crate::door_client::SealedCut {
+            manifest_sha256: "manifest".into(),
+            sealed_key: "sealed-key".into(),
+        });
+        row.step = Step::Releasing;
+        row.seal_sent = true;
+        row.record_version = 2;
+        row.plan = serde_json::to_value(&plan).unwrap();
+        f.slot
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .update_agent_move(&row)
+            .unwrap();
+        let participant_request = CutRequest::new(
+            Refs::new(vec![AgentRef::new("agent", "agent_0123456789abcdef")]).unwrap(),
+            CutId::new(row.cut_id.clone()).unwrap(),
+        );
+        for (module, peer) in [("a", &a), ("b", &b)] {
+            let client = ParticipantClient::new(&Participant {
+                module_id: module.into(),
+                transport: peer.clone(),
+            });
+            client.prepare(&participant_request).await.unwrap();
+            client.export(&participant_request).await.unwrap();
+        }
+        f.door.set_stream(item.clone());
+        f.door
+            .client()
+            .seal_hub(&SealRequest {
+                cut_id: row.cut_id.clone(),
+                items: vec![item],
+                receiver: Some("02".repeat(16)),
+            })
+            .await
+            .unwrap();
+        f.door.script(
+            "cut.handoff",
+            DoorEffect::Handoff(crate::door_client::HandoffReply {
+                state: HandoffState::Released,
+                session_ref: None,
+                code: None,
+            }),
+        );
+        let mut body = plan
+            .hub_record(&row.cut_id)
+            .unwrap_or_else(|error| panic!("hub record: {}", error.code));
+        body.state = HubState::Activated;
+        body.skipped = if second_optional {
+            vec!["b".into()]
+        } else {
+            vec![]
+        };
+        let seen = SeenMove {
+            body,
+            revision: 2,
+            writer: "02".repeat(16),
+            writer_ep: 1,
+        };
+        (f, a, b, seen)
+    }
+
+    #[tokio::test]
+    async fn source_missing_driver_action_holds_without_abort_or_retry_after_restart() {
+        let f = Fixture::new();
+        let mut row = f.row();
+        let mut plan: Plan = serde_json::from_value(row.plan.clone()).unwrap();
+        // An unknown op has the same missing-action signal as a future driver action.
+        let error = Failure::participant(
+            "agent_data.future",
+            "data",
+            ClientError::Refused(Refusal {
+                code: "participant_failed".into(),
+                detail: None,
+                message: None,
+            }),
+        );
+        assert!(error.action().is_none());
+        f.source()
+            .failed(&mut row, &mut plan, error)
+            .await
+            .unwrap_or_else(|error| panic!("source failure: {}", error.code));
+        let held = f.row();
+        assert_eq!(held.step, Step::Preparing);
+        assert!(held.abort_requested.is_none());
+        assert_eq!(held.attempts, 0);
+        assert!(held.plan["_source"]["contract_violation"].is_object());
+        assert_eq!(held.hold.unwrap()["module_id"], "data");
+    }
+
+    #[test]
+    fn participant_contract_violations_are_never_retryable_by_code() {
+        let violation = Failure::participant(
+            "agent_data.prepare",
+            "data",
+            ClientError::ContractViolation {
+                op: "agent_data.prepare",
+                code: "busy".into(),
+                detail: None,
+                message: None,
+            },
+        );
+        assert!(violation.contract_violation);
+        assert!(!violation.retryable());
+        let refused = Failure::participant(
+            "agent_data.prepare",
+            "data",
+            ClientError::Refused(Refusal {
+                code: "busy".into(),
+                detail: None,
+                message: None,
+            }),
+        );
+        assert!(!refused.contract_violation);
+        assert_eq!(refused.action(), Some(DriverAction::RetryLater));
+    }
+
+    #[test]
+    fn participant_refusal_message_is_kept_in_the_stored_detail() {
+        for (error, expected) in [
+            (
+                ClientError::Refused(Refusal {
+                    code: "busy".into(),
+                    detail: None,
+                    message: Some("still running".into()),
+                }),
+                Some("still running"),
+            ),
+            (
+                ClientError::ContractViolation {
+                    op: "agent_data.prepare",
+                    code: "busy".into(),
+                    detail: None,
+                    message: Some("bad reply".into()),
+                },
+                Some("bad reply"),
+            ),
+            (ClientError::OutcomeUnknown, None),
+        ] {
+            let failure = Failure::participant("agent_data.prepare", "data", error);
+            assert_eq!(failure.detail()["message"].as_str(), expected);
+        }
+    }
+    #[tokio::test]
+    async fn source_release_enforcement_is_persisted_per_module_across_a_mid_release_restart() {
+        let (f, a, b, seen) = release_fixture(false).await;
+        b.script(
+            "agent_data.release",
+            ParticipantEffect::Refuse(Refusal {
+                code: "unavailable".into(),
+                detail: None,
+                message: None,
+            }),
+        );
+        let mut row = f.row();
+        let mut plan: Plan = serde_json::from_value(row.plan.clone()).unwrap();
+        let observed = Some((seen.body.participant_plan(), seen.revision));
+        let error = f
+            .source()
+            .release(&mut row, &mut plan, observed.clone(), Some(&seen))
+            .await;
+        assert_eq!(error.err().unwrap().code, "unavailable");
+        let saved: Plan = serde_json::from_value(f.row().plan).unwrap();
+        assert!(saved.source.enforced.contains_key("a"));
+        assert!(!saved.source.enforced.contains_key("b"));
+        assert_eq!(
+            saved.source.release_holder_box.as_deref(),
+            Some(row.plan["to"].as_str().unwrap())
+        );
+
+        let mut row = f.row();
+        let mut plan: Plan = serde_json::from_value(row.plan.clone()).unwrap();
+        let error = f
+            .source()
+            .release(&mut row, &mut plan, observed, Some(&seen))
+            .await;
+        assert_eq!(error.err().unwrap().code, "hub_not_ready");
+        let a_calls: Vec<_> = a
+            .wire_calls()
+            .into_iter()
+            .filter(|(method, _)| method == "agent_data.release")
+            .collect();
+        let b_calls: Vec<_> = b
+            .wire_calls()
+            .into_iter()
+            .filter(|(method, _)| method == "agent_data.release")
+            .collect();
+        assert_eq!(a_calls.len(), 1);
+        assert_eq!(b_calls.len(), 2);
+        for (_, params) in a_calls.iter().chain(&b_calls) {
+            assert_eq!(params["holder"], row.plan["to"]);
+            assert_eq!(params["holderBox"], row.plan["to"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn optional_move_source_keeps_skipped_data_but_releases_required_no_items() {
+        let (f, a, b, seen) = release_fixture(true).await;
+        let mut row = f.row();
+        let mut plan: Plan = serde_json::from_value(row.plan.clone()).unwrap();
+        let observed = Some((seen.body.participant_plan(), seen.revision));
+        let error = f
+            .source()
+            .release(&mut row, &mut plan, observed, Some(&seen))
+            .await;
+        assert_eq!(error.err().unwrap().code, "hub_not_ready");
+        assert_eq!(
+            a.wire_calls()
+                .iter()
+                .filter(|(method, _)| method == "agent_data.release")
+                .count(),
+            1
+        );
+        assert!(!b
+            .wire_calls()
+            .iter()
+            .any(|(method, _)| method == "agent_data.release"));
+        assert!(b.tombstones().is_empty());
+    }
+    #[tokio::test]
+    async fn source_abort_waits_for_unknown_prepare_to_settle_even_after_restart() {
+        let (f, a, b, _) = release_fixture(false).await;
+        let mut row = f.row();
+        let mut plan: Plan = serde_json::from_value(row.plan.clone()).unwrap();
+        row.step = Step::Preparing;
+        row.seal_sent = false;
+        row.abort_requested = Some(json!({"reason":"operator","detail":null}));
+        plan.source.pending = Some(PendingCall {
+            module_id: "a".into(),
+            op: "agent_data.prepare".into(),
+        });
+        f.source()
+            .cleanup(&mut row, &mut plan, None, None)
+            .await
+            .unwrap_or_else(|error| panic!("source cleanup: {}", error.code));
+        assert_eq!(row.step, Step::Aborted);
+        let ops: Vec<_> = a
+            .calls()
+            .iter()
+            .map(|request| request.op().method())
+            .collect();
+        let status = ops
+            .iter()
+            .rposition(|op| *op == "agent_data.status")
+            .unwrap();
+        let prepare = ops
+            .iter()
+            .rposition(|op| *op == "agent_data.prepare")
+            .unwrap();
+        let abort = ops
+            .iter()
+            .rposition(|op| *op == "agent_data.abort")
+            .unwrap();
+        assert!(status < prepare && prepare < abort, "{ops:?}");
+        assert!(b
+            .calls()
+            .iter()
+            .any(|request| request.op().method() == "agent_data.abort"));
+    }
+    #[test]
+    fn source_refusals_log_once_per_code_and_keep_the_message_in_detail() {
+        let mut log = RefusalLog::default();
+        for _ in 0..2 {
+            log.note(
+                "cut",
+                "data",
+                "agent_data.prepare",
+                "busy",
+                Some("still running"),
+            );
+        }
+        log.note(
+            "cut",
+            "data",
+            "agent_data.prepare",
+            "participant_failed",
+            Some("failed safely"),
+        );
+        assert_eq!(log.lines.len(), 2);
+        assert!(log.lines[0].contains("still running"));
+        assert!(log.lines[1].contains("failed safely"));
+        assert!(!log.lines.join("\n").contains("session-secret"));
+    }
+}

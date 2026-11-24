@@ -885,4 +885,14 @@ mod tests {
             }
         }
     }
+    #[tokio::test(start_paused = true)]
+    async fn catalog_move_mutex_admission_is_bounded() {
+        let handler = crate::ProjectsHandler::with_runtime("catalog-move-admit".into(), || 0);
+        let context = handler.catalog_move_context();
+        let held = handler.catalog_move_lock.clone().lock_owned().await;
+        let error = context.admit().await.unwrap_err();
+        assert_eq!(error.code, "unavailable");
+        drop(held);
+        assert!(context.admit().await.is_ok());
+    }
 }
