@@ -20,15 +20,6 @@ async fn where_derived_sharing_and_liveness_resync() {
     tokio::pin!(watch);
     pending(watch.as_mut()).await;
     assert!(store.agent_where(HEAD).unwrap().known);
-    let plan = store.prepare_enable("derived-sharing", 700).unwrap();
-    store.begin_enable(&[], &plan.backfill).unwrap();
-    debounce(watch.as_mut()).await;
-    resync(&mut receiver, 1);
-    assert!(!store.agent_where(HEAD).unwrap().known);
-    store.abandon_enable().unwrap();
-    debounce(watch.as_mut()).await;
-    resync(&mut receiver, 2);
-    assert!(store.agent_where(HEAD).unwrap().known);
     f.success(
         CORE,
         "agent.rename",
@@ -44,8 +35,12 @@ async fn where_derived_sharing_and_liveness_resync() {
     )
     .await;
     debounce(watch.as_mut()).await;
-    resync(&mut receiver, 3);
+    resync(&mut receiver, 1);
     assert_eq!(store.agent_where(ASSISTANT).unwrap_err().code, "gone");
+    store.begin_hub_enable(&"ab".repeat(16), OTHER).unwrap();
+    debounce(watch.as_mut()).await;
+    resync(&mut receiver, 2);
+    assert!(!store.agent_where(HEAD).unwrap().known);
     sink.cancel.send_replace(true);
     assert!(matches!(watch.await, HandlerOutcome::Streamed));
 }

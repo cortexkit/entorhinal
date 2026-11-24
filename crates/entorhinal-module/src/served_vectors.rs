@@ -2103,17 +2103,23 @@ async fn project_root_keys_v1_records() -> [(&'static str, Vec<String>); 2] {
     // existing examples retain their generations and exact reply bytes.
     let fixture = SessionFixture::new("served-project-root-keys-v1").await;
     let store = fixture.store();
-    let plan = store.prepare_enable("project-root-keys-v1", 700).unwrap();
-    let parts = plan
-        .bodies
-        .into_iter()
-        .map(|data| entorhinal_core::enable_state::EnablePart {
-            entry_id: [1; 16],
-            data,
-        })
-        .collect::<Vec<_>>();
-    store.begin_enable(&parts, &plan.backfill).unwrap();
-    store.finish_enable(700, WRITER_MODULE, None).unwrap();
+    let holder = "ab".repeat(16);
+    store.begin_hub_enable(&"cd".repeat(16), &holder).unwrap();
+    let plan = store.hub_enable_plan().unwrap().unwrap();
+    let snapshot = serde_json::from_str(&plan.preimage).unwrap();
+    let part = entorhinal_core::remote_apply::RemoteEntry {
+        position: 1,
+        entry_id: "01".repeat(16),
+        author: holder.clone(),
+        signer: "test".into(),
+        key_id: "test".into(),
+        envelope_version: 1,
+        kind: "snapshot".into(),
+        entry: plan.preimage.into_bytes(),
+    };
+    store
+        .install_hub_snapshot(&snapshot, &[(part, 0)], &holder)
+        .unwrap();
 
     let remote = fixture.dir.join("remote-checkout");
     let label = fixture.dir.join("label-checkout");
@@ -5780,7 +5786,7 @@ async fn served_vectors_placement_facts_v1() {
     store
         .apply_entry("identity_log.enable", "{}", "operator", None, |tx| {
             tx.execute(
-                "UPDATE identity_log_state SET state='enabled' WHERE id=1",
+                "UPDATE identity_log_state SET state='enabled',hub_log_base=0 WHERE id=1",
                 [],
             )?;
             tx.execute(
@@ -5792,14 +5798,34 @@ async fn served_vectors_placement_facts_v1() {
         .unwrap();
     let commit = |id: &str, op: &dyn Fn() -> Result<Vec<u8>, entorhinal_core::RegistryError>| {
         let head = store.identity_log_status().unwrap().last_applied_position;
-        store
-            .shared_attempt(
-                id.into(),
-                head,
-                move |_| entorhinal_core::SharedSettlement::Commit(head + 1),
-                op,
-            )
-            .unwrap();
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let slot = captured.clone();
+        let result = store.preview_hub_write(
+            id.into(),
+            move |entry, _| {
+                *slot.lock().unwrap() = Some(entry);
+            },
+            op,
+        );
+        if let Some(entry) = captured.lock().unwrap().take() {
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .starts_with("hub_write_preview"));
+            let entry = entorhinal_core::remote_apply::RemoteEntry {
+                position: head + 1,
+                entry_id: id.into(),
+                author: "ab".repeat(16),
+                signer: "test".into(),
+                key_id: "test".into(),
+                envelope_version: 1,
+                kind: "change".into(),
+                entry,
+            };
+            store.apply_hub_remote_entry(&entry, 0).unwrap();
+        } else {
+            result.unwrap();
+        };
     };
     commit("backfill", &|| {
         store

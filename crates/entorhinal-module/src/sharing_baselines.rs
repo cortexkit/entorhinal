@@ -560,3 +560,26 @@ async fn sharing_baseline_history_replies_and_prefixes() {
         }
     }
 }
+
+#[test]
+fn sharing_baseline_verify_rejects_corrupt_migration_marker_rows() {
+    let source = artifacts().join("legacy-zero.db");
+    for (field, error) in [
+        ("entry=NULL", "is shared but carries no entry bytes"),
+        ("entry=X'7b'", "EOF while parsing an object"),
+        ("payload_json='{'", "EOF while parsing an object"),
+        ("created_at='unreadable'", "unreadable journal time"),
+    ] {
+        let file = StoreFile::copy(&source);
+        let store = file.open();
+        assert!(store.verify().unwrap().ok);
+        let conn = Connection::open(file.path()).unwrap();
+        assert_eq!(conn.execute(
+            &format!("UPDATE registry_journal SET {field} WHERE op='log.migrated' AND stream='shared'"),
+            [],
+        ).unwrap(), 1);
+        drop(conn);
+        let failed = store.verify().unwrap_err();
+        assert!(failed.to_string().contains(error), "{field}: {failed}");
+    }
+}

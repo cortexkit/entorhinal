@@ -386,27 +386,6 @@ pub fn validate_agent_extension(
 }
 
 impl RegistryStore {
-    // After adoption from another machine, inherited journal entries are not writes
-    // committed by this machine. Rejoining the shared log must apply them again.
-    pub fn has_committed_own_entry_at_position(&self) -> Result<bool, RegistryError> {
-        self.read(|conn| conn.query_row("SELECT EXISTS(SELECT 1 FROM registry_journal WHERE origin='here' AND stream='shared' AND seq > COALESCE((SELECT MAX(seq) FROM registry_journal WHERE op='store.adopt'),0) AND entry_id IS NOT NULL AND log_position=(SELECT last_applied_position FROM identity_log_state WHERE id=1))", [], |r| r.get(0)))
-    }
-
-    pub fn advance_own_entry(
-        &self,
-        entry: &RemoteEntry,
-        self_author: Option<&str>,
-    ) -> Result<(), RegistryError> {
-        self.with_where_changes(|tx| {
-            let committed: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM registry_journal WHERE entry_id=?1 AND origin='here' AND seq > COALESCE((SELECT MAX(seq) FROM registry_journal WHERE op='store.adopt'),0) AND log_position=?2)", params![entry.entry_id, entry.position], |r| r.get(0))?;
-            let position: i64 = tx.query_row("SELECT last_applied_position FROM identity_log_state WHERE id=1", [], |r| r.get(0))?;
-            if !committed || entry.position != position { return Err(invalid_entry("own entry is not the committed position")); }
-            learn_identity(tx, self_author)?;
-            tx.execute("UPDATE identity_log_state SET last_seen_head=MAX(last_seen_head,?1) WHERE id=1", [entry.position])?;
-            Ok(())
-        }).map_err(RegistryError::Store)
-    }
-
     pub fn set_member_name(
         &self,
         name: crate::shared_entry::MemberName,
@@ -458,7 +437,7 @@ impl RegistryStore {
         entries: &[RemoteEntry],
         self_author: Option<&str>,
     ) -> Result<i64, RegistryError> {
-        self.install_snapshot(entries, None, self_author, None)
+        self.install_snapshot(entries, self_author, None)
     }
 
     pub fn apply_hub_remote_snapshot(
@@ -472,27 +451,12 @@ impl RegistryStore {
                 "snapshot writer episodes are incomplete",
             ));
         }
-        self.install_snapshot(entries, None, None, Some(writer_episodes))
-    }
-
-    /// Commit the incoming shared rows, their journal entries and the joining
-    /// state together; if they reach the observed final log position, commit the
-    /// enabled state instead. A crash cannot leave imported identities committed
-    /// while the state is still disabled, which would incorrectly allow local
-    /// writes before the remaining log entries have been imported.
-    pub fn apply_join_snapshot(
-        &self,
-        entries: &[RemoteEntry],
-        head: i64,
-        self_author: Option<&str>,
-    ) -> Result<i64, RegistryError> {
-        self.install_snapshot(entries, Some(head), self_author, None)
+        self.install_snapshot(entries, None, Some(writer_episodes))
     }
 
     fn install_snapshot(
         &self,
         entries: &[RemoteEntry],
-        join_head: Option<i64>,
         self_author: Option<&str>,
         writer_episodes: Option<&[u64]>,
     ) -> Result<i64, RegistryError> {
@@ -576,26 +540,43 @@ impl RegistryStore {
                 if writer_episodes.is_none() {
                     match read_freeze(tx)? {
                         Some(EngramFreeze::Applied { .. }) => {
-                            return Err(invalid_entry("snapshot follows the engram migration marker"));
+                            return Err(invalid_entry(
+                                "snapshot follows the engram migration marker",
+                            ));
                         }
-                        Some(EngramFreeze::Pending { expected_head, .. }) if expected_head == position => {
+                        Some(EngramFreeze::Pending { expected_head, .. })
+                            if expected_head == position =>
+                        {
                             set_freeze(tx, None)?;
                         }
                         _ => {}
                     }
                 }
                 if supersedes {
-                    let had_name: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM member_name WHERE author=?1)", [&entries[0].author], |r| r.get(0))?;
+                    let had_name: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM member_name WHERE author=?1)",
+                        [&entries[0].author],
+                        |r| r.get(0),
+                    )?;
                     if had_name && merged.member_name.is_none() {
-                        return Err(invalid_entry("supersede invariant: snapshot drops member name"));
+                        return Err(invalid_entry(
+                            "supersede invariant: snapshot drops member name",
+                        ));
                     }
-                    if merged.member_box.is_none() && crate::member_box::lookup(tx, Some(&entries[0].author))?.is_some() {
-                        return Err(invalid_entry("supersede invariant: snapshot drops member box"));
+                    if merged.member_box.is_none()
+                        && crate::member_box::lookup(tx, Some(&entries[0].author))?.is_some()
+                    {
+                        return Err(invalid_entry(
+                            "supersede invariant: snapshot drops member box",
+                        ));
                     }
                     let before = crate::shared_entry::SharedState::capture(tx)?;
                     let history = stored_agent_entries(tx)?;
                     validate_agent_extension(&history, &merged.agents).map_err(|cause| {
-                        decode_error(serde_json::Error::io(std::io::Error::other(format!("supersede invariant: {cause} at position {}", entries.last().unwrap().position))))
+                        decode_error(serde_json::Error::io(std::io::Error::other(format!(
+                            "supersede invariant: {cause} at position {}",
+                            entries.last().unwrap().position
+                        ))))
                     })?;
                     // Deleting every shared row the snapshot lacks is safe
                     // only because catch-up already re-read log entries
@@ -603,12 +584,21 @@ impl RegistryStore {
                     // this snapshot's author. So these rows can only have
                     // come from that same machine, never from another.
                     merged.delete_absent(tx, &before)?;
-                    merged.agents.sort_by(|a, b| (a.row.status == "live", &a.agent_id).cmp(&(b.row.status == "live", &b.agent_id)));
-                    for agent in &mut merged.agents { agent.claims.sort_by_key(|claim| claim.claim_id); }
+                    merged.agents.sort_by(|a, b| {
+                        (a.row.status == "live", &a.agent_id)
+                            .cmp(&(b.row.status == "live", &b.agent_id))
+                    });
+                    for agent in &mut merged.agents {
+                        agent.claims.sort_by_key(|claim| claim.claim_id);
+                    }
                     // Only added or changed agents get an `agent.import`
                     // journal row. An unchanged agent would otherwise reach
                     // core again through `agent.changes` for no reason.
-                    merged.agents.retain(|agent| !history.iter().any(|old| old.row == agent.row && old.claims == agent.claims));
+                    merged.agents.retain(|agent| {
+                        !history
+                            .iter()
+                            .any(|old| old.row == agent.row && old.claims == agent.claims)
+                    });
                 }
                 let mut seq = 0;
                 for (i, entry) in entries.iter().enumerate() {
@@ -643,20 +633,16 @@ impl RegistryStore {
                     )?;
                 }
                 learn_identity(tx, self_author)?;
-                if let Some(head) = join_head {
-                    tx.execute("UPDATE identity_log_state SET state='joining',last_seen_head=?1 WHERE id=1 AND state='disabled'", [head])?;
-                    crate::enable_state::finish_join_at_head(tx, head)?;
-                }
                 Ok(seq)
             };
             install().inspect_err(|cause| *error.borrow_mut() = Some(cause.to_string()))
         })
-            .map_err(|cause| {
-                domain(
-                    "apply_failed",
-                    error.into_inner().unwrap_or_else(|| cause.to_string()),
-                )
-            })
+        .map_err(|cause| {
+            domain(
+                "apply_failed",
+                error.into_inner().unwrap_or_else(|| cause.to_string()),
+            )
+        })
     }
 
     /// Commit one complete change or assembled snapshot. A failure rolls back
@@ -1029,17 +1015,6 @@ fn apply(tx: &Transaction<'_>, entry: &RemoteEntry) -> rusqlite::Result<i64> {
         }
     };
     tx.execute("UPDATE identity_log_state SET last_applied_position=?1,last_seen_head=MAX(last_seen_head,?1) WHERE id=1", [entry.position])?;
-    let head: i64 = tx.query_row(
-        "SELECT last_seen_head FROM identity_log_state WHERE id=1",
-        [],
-        |r| r.get(0),
-    )?;
-    crate::enable_state::finish_join_at_head(tx, head)?;
-    crate::pending::install_legacy_reply(tx, entry)?;
-    tx.execute(
-        "DELETE FROM pending_entry WHERE expected_head < ?1",
-        [entry.position],
-    )?;
     // Foreign-key checks are deferred while rows are installed, so a violation
     // would otherwise surface only at commit, as a generic SQLite error. Check
     // now, so a received entry that leaves dangling references is refused with
@@ -1338,34 +1313,29 @@ mod tests {
         assert!(snapshot_part_info(&snapshot(1, name.clone())).is_err());
         assert!(f
             .store
-            .apply_join_snapshot(
-                &[snapshot(1, name.clone()), snapshot(2, Value::Null)],
-                2,
-                None
-            )
+            .apply_hub_remote_snapshot(&[snapshot(1, name), snapshot(2, Value::Null)], &[0, 0])
             .is_err());
         let name = json!({"author":"01".repeat(16),"display_name":"Studio"});
         assert!(snapshot_part_info(&snapshot(2, name.clone())).is_err());
         assert!(f
             .store
-            .apply_join_snapshot(
+            .apply_hub_remote_snapshot(
                 &[snapshot(1, Value::Null), snapshot(2, name.clone())],
-                2,
-                None
+                &[0, 0]
             )
             .is_err());
-        assert_eq!(f.store.persisted_self_author().unwrap(), None);
+        assert_eq!(
+            f.store.identity_log_status().unwrap().last_applied_position,
+            0
+        );
         f.store
-            .apply_join_snapshot(
-                &[snapshot(1, name), snapshot(2, Value::Null)],
-                2,
-                Some(&"01".repeat(16)),
-            )
+            .apply_hub_remote_snapshot(&[snapshot(1, name), snapshot(2, Value::Null)], &[0, 0])
             .unwrap();
         assert_eq!(
-            f.store.persisted_self_author().unwrap(),
-            Some("01".repeat(16))
+            f.store.identity_log_status().unwrap().last_applied_position,
+            2
         );
+        assert!(f.store.verify().unwrap().replay.ok);
     }
 
     fn register(f: &Fixture, id: &str, roots: Vec<String>, workspace: Option<&str>) {
@@ -1758,39 +1728,28 @@ mod tests {
     }
 
     #[test]
-    fn remote_settlement_keeps_attempts_for_current_and_future_heads() {
-        let f = Fixture::new("remote-pending-boundary");
+    fn hub_tail_advances_without_settling_historical_pending_entries() {
+        let f = Fixture::new("hub-legacy-pending");
         enable(&f);
-        // These durable rows represent unresolved appends after a restart. A
-        // reported head alone does not say which entry occupies any attempt's slot.
-        f.store.apply_entry("test-pending", "{}", "test", None, |tx| {
-            tx.execute("INSERT INTO pending_entry(entry_id,expected_head) VALUES('slot-one',0),('slot-two',1),('slot-three',2)", [])?;
-            Ok(())
-        }).unwrap();
-        f.store.observe_log_head(10).unwrap();
-        assert_eq!(
-            f.store.identity_log_status().unwrap().pending_write_count,
-            3
-        );
         f.store
-            .apply_remote_entry(&envelope(1, &empty_project(), false), None)
+            .apply_entry("test-pending", "{}", "test", None, |tx| {
+                tx.execute("UPDATE identity_log_state SET hub_log_base=0", [])?;
+                tx.execute(
+                    "INSERT INTO pending_entry(entry_id,expected_head) VALUES('historical',0)",
+                    [],
+                )?;
+                Ok(())
+            })
             .unwrap();
-        assert!(!f.store.is_pending_entry("slot-one").unwrap());
-        assert!(f.store.is_pending_entry("slot-two").unwrap());
-        assert!(f.store.is_pending_entry("slot-three").unwrap());
-        assert_eq!(
-            f.store.identity_log_status().unwrap().pending_write_count,
-            2
-        );
-        f.store
-            .apply_remote_entry(&envelope(2, &empty_project(), false), None)
-            .unwrap();
-        assert!(!f.store.is_pending_entry("slot-two").unwrap());
-        assert!(f.store.is_pending_entry("slot-three").unwrap());
-        assert_eq!(
-            f.store.identity_log_status().unwrap().pending_write_count,
-            1
-        );
+        for position in [1, 2] {
+            f.store
+                .apply_hub_remote_entry(&envelope(position, &empty_project(), false), 0)
+                .unwrap();
+            let status = f.store.identity_log_status().unwrap();
+            assert_eq!(status.last_applied_position, position);
+            assert_eq!(status.last_seen_head, position);
+            assert_eq!(status.pending_write_count, 1);
+        }
     }
 
     #[test]
@@ -1803,14 +1762,13 @@ mod tests {
         let params = json!({
             "request_key":"own-create", "name":"Own Agent", "tag":"tag", "role":"assistant"
         });
-        f.store
-            .shared_attempt(
-                "own-agent-entry".into(),
-                0,
-                |_| crate::pending::SharedSettlement::Commit(1),
-                || f.store.agent_mutation("agent.create", params, 50),
-            )
-            .unwrap();
+        f.store.agent_mutation("agent.create", params, 50).unwrap();
+        // Model a receipt committed by the old writer before this database
+        // was reopened. The retired writer is not needed to apply it again.
+        f.store.db.with_conn_fenced(|tx| {
+            tx.execute("UPDATE registry_journal SET entry_id='own-agent-entry',log_position=1 WHERE op='agent.create'", [])?;
+            Ok(())
+        }).unwrap();
         let (seq, bytes) = f.store.read(|conn| conn.query_row(
             "SELECT seq,entry FROM registry_journal WHERE entry_id='own-agent-entry' AND origin='here'", [],
             |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))

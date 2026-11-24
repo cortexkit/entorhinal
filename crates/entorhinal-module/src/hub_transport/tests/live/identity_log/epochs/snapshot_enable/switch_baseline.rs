@@ -1,6 +1,6 @@
 use super::*;
 use crate::sharing_baselines::{self as baseline, record, StoreFile};
-use entorhinal_core::{enable_state::HubRole, remote_apply::RemoteEntry, shared_entry::MemberName};
+use entorhinal_core::{enable_state::HubRole, shared_entry::MemberName};
 
 const BASELINE_BASE: i64 = 17;
 const LEGACY: &str = "engram:11111111111111111111111111111111";
@@ -56,34 +56,6 @@ fn prepare_handler(handler: &mut ProjectsHandler) {
         .health
         .hub_membership
         .store(1, std::sync::atomic::Ordering::Release);
-}
-
-fn freeze_leader(store: &RegistryStore, snapshot: &HubSnapshot) {
-    let author = LEGACY.strip_prefix("engram:").unwrap();
-    let entry = |position, kind: &str, body: Value| RemoteEntry {
-        position,
-        entry_id: format!("{:032x}", 100 + position),
-        author: author.into(),
-        signer: author.into(),
-        key_id: "legacy-key".into(),
-        envelope_version: 1,
-        kind: kind.into(),
-        entry: serde_json::to_vec(&body).unwrap(),
-    };
-    store.apply_join_snapshot(&[entry(1,"snapshot",json!({"op":"shared.snapshot","snapshot_id":"baseline","part":1,"parts":1,"tables":{}}))],1,Some(author)).unwrap();
-    for position in 2..BASELINE_BASE {
-        store
-            .apply_remote_entry(
-                &entry(
-                    position,
-                    "change",
-                    json!({"op":"project.shared","tables":{}}),
-                ),
-                Some(author),
-            )
-            .unwrap();
-    }
-    store.apply_remote_entry(&entry(BASELINE_BASE,"change",json!({"op":"log.migrated","hub":true,"migration_id":snapshot.migration_id,"excluded":snapshot.excluded,"roles":[HUB_ROLE],"tables_digest":store.migration_tables_digest().unwrap()})),Some(author)).unwrap();
 }
 
 async fn stop(handler: &ProjectsHandler) {
@@ -179,18 +151,30 @@ async fn fixture() {
     roster(&fleet, &rig, &[A, B]);
     let leader_file = StoreFile::new("switch-existing");
     let image = switch_snapshot();
-    freeze_leader(&leader_file.open(), &image);
-    entorhinal_core::legacy_sharing_test_allow(leader_file.path());
-    let (mut a, leader, _) = bootstrap(
+    // Publish the historical image directly. Both empty stores install the
+    // snapshot with its nonzero base and predecessor holders.
+    let (publishing, installer, leader_vault) = bootstrap(
         &rig,
         leader_file.open(),
         rig.a.leaf.clone(),
         fleet.clone(),
         None,
+        0,
+    );
+    assert!(transfer(&installer, Some(&image), deadline())
+        .await
+        .unwrap());
+    drop(installer);
+    drop(publishing);
+    let (mut a, leader, _) = bootstrap(
+        &rig,
+        leader_file.open(),
+        rig.a.leaf.clone(),
+        fleet.clone(),
+        Some(leader_vault),
         BASELINE_BASE,
     );
     prepare_handler(&mut a);
-    assert!(transfer(&leader, Some(&image), deadline()).await.unwrap());
     let parts = leader.log_head(deadline()).await.unwrap();
     assert!(parts > 0);
     let snapshot_end = BASELINE_BASE + parts as i64;

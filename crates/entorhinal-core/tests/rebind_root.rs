@@ -1,6 +1,7 @@
 use cortexkit_store::{Isolation, StorageBackend, StorageDescriptor};
 use entorhinal_core::{
-    enable_state::EnablePart, RegisterRequest, RegistryError, RegistryStore, SetOwnedRemotesRequest,
+    remote_apply::RemoteEntry, RefreshRootKeyRequest, RegisterRequest, RegistryError,
+    RegistryStore, SetOwnedRemotesRequest,
 };
 use serde_json::Value;
 use std::{
@@ -127,19 +128,27 @@ fn rebind_replaced_checkout_preserves_project_and_requires_approval() {
             ..Default::default()
         })
         .unwrap();
-    let plan = f.store.prepare_enable("rebind-test", 100).unwrap();
-    let parts: Vec<_> = plan
-        .bodies
-        .into_iter()
-        .enumerate()
-        .map(|(i, data)| EnablePart {
-            entry_id: [i as u8 + 1; 16],
-            data,
-        })
-        .collect();
-    f.store.begin_enable(&parts, &plan.backfill).unwrap();
+    let holder = "ab".repeat(16);
+    f.store.begin_hub_enable(&"cd".repeat(16), &holder).unwrap();
+    let plan = f.store.hub_enable_plan().unwrap().unwrap();
+    let snapshot = serde_json::from_str(&plan.preimage).unwrap();
+    let part = RemoteEntry {
+        position: 1,
+        entry_id: "10".repeat(16),
+        author: holder.clone(),
+        signer: "test".into(),
+        key_id: "test".into(),
+        envelope_version: 1,
+        kind: "snapshot".into(),
+        entry: plan.preimage.into_bytes(),
+    };
     f.store
-        .finish_enable(100, "direct", Some("machine"))
+        .install_hub_snapshot(&snapshot, &[(part, 0)], &holder)
+        .unwrap();
+    f.store
+        .refresh_root_key(RefreshRootKeyRequest {
+            root: f.root.clone(),
+        })
         .unwrap();
     let before = f.record();
     assert!(
@@ -181,7 +190,8 @@ fn rebind_replaced_checkout_preserves_project_and_requires_approval() {
     assert_eq!(noop["noop"], true);
     assert_eq!(noop["oldIdentity"], "bound");
     assert_eq!(f.store.generation().unwrap(), head);
-    assert!(f.store.verify().unwrap().ok);
+    let verify = f.store.verify().unwrap();
+    assert!(verify.ok, "{verify:?}");
     assert!(f.store.rebuild().unwrap().replay.ok);
     assert_eq!(f.record(), rebound);
     assert!(f.store.verify().unwrap().ok);

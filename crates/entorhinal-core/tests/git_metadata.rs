@@ -6,8 +6,8 @@ use std::{
 
 use cortexkit_store::{Isolation, StorageBackend, StorageDescriptor};
 use entorhinal_core::{
-    enable_state::EnablePart, AddRootRequest, RegisterRequest, RegistryStore, ResolveRemoteStatus,
-    SetOwnedRemotesRequest,
+    enable_state::HubSnapshot, remote_apply::RemoteEntry, AddRootRequest, RegisterRequest,
+    RegistryStore, ResolveRemoteStatus, SetOwnedRemotesRequest,
 };
 use rusqlite::Connection;
 use serde_json::Value;
@@ -78,12 +78,14 @@ impl Fixture {
     }
 
     fn enabled(&self, enabled: bool) {
-        // Isolate key selection from transport: no log publisher is needed to
-        // test registration while enabled or to prepare a disabled backfill.
+        // Test key selection without a log publisher or a saved enable plan.
         self.db
             .execute(
-                "UPDATE identity_log_state SET state=?1",
-                [if enabled { "enabled" } else { "disabled" }],
+                "UPDATE identity_log_state SET state=?1,hub_log_base=?2",
+                rusqlite::params![
+                    if enabled { "enabled" } else { "disabled" },
+                    enabled.then_some(0)
+                ],
             )
             .unwrap();
     }
@@ -103,49 +105,30 @@ impl Fixture {
         serde_json::to_value(&reply.root_fields.unwrap().root_records[0]).unwrap()
     }
 
-    fn finish_backfill(&self) {
-        let plan = self
-            .store
-            .prepare_enable("git-backfill", 987654321)
+    fn install_hub_snapshot(&self) {
+        let holder = "ab".repeat(16);
+        self.store
+            .begin_hub_enable(&"cd".repeat(16), &holder)
             .unwrap();
-        let encoded_keys: Vec<Value> = plan
-            .bodies
-            .iter()
-            .flat_map(|data| {
-                let image: Value = serde_json::from_slice(data).unwrap();
-                image["tables"]["project_root_key"]["upsert"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default()
-            })
-            .collect();
+        let plan = self.store.hub_enable_plan().unwrap().unwrap();
+        let image: HubSnapshot = serde_json::from_str(&plan.preimage).unwrap();
         let expected: Vec<Value> = self.keys().into_iter().map(|(project, kind, key, created_at)|
             serde_json::json!({"project_id":project,"kind":kind,"root_key":key,"created_at":created_at})).collect();
-        assert_eq!(encoded_keys, expected, "snapshot must carry the original key rows, not only leave the local database unchanged");
-        let backfill = serde_json::to_value(&plan.backfill).unwrap();
-        let expected_mappings: Vec<Value> = self
-            .mappings()
-            .into_iter()
-            .filter_map(|(root, kind, key)| {
-                Some(serde_json::json!({"canonical_root":root,"kind":kind?,"root_key":key?}))
-            })
-            .collect();
-        assert_eq!(
-            backfill["mappings"],
-            serde_json::json!(expected_mappings),
-            "backfill must publish the carried root associations"
-        );
-        let parts: Vec<_> = plan
-            .bodies
-            .into_iter()
-            .enumerate()
-            .map(|(i, data)| EnablePart {
-                entry_id: [i as u8 + 1; 16],
-                data,
-            })
-            .collect();
-        self.store.begin_enable(&parts, &plan.backfill).unwrap();
-        self.store.finish_enable(987654321, "direct", None).unwrap();
+        assert_eq!(serde_json::to_value(&image.tables["project_root_key"]).unwrap(), serde_json::json!(expected),
+            "snapshot must carry the original key rows, not only leave the local database unchanged");
+        let part = RemoteEntry {
+            position: 1,
+            entry_id: "01".repeat(16),
+            author: holder.clone(),
+            signer: "test".into(),
+            key_id: "test".into(),
+            envelope_version: 1,
+            kind: "snapshot".into(),
+            entry: plan.preimage.into_bytes(),
+        };
+        self.store
+            .install_hub_snapshot(&image, &[(part, 0)], &holder)
+            .unwrap();
     }
 }
 
@@ -258,7 +241,7 @@ fn unreadable_config_register_and_add_root_mint_no_key() {
 }
 
 #[test]
-fn unreadable_config_backfill_carries_key_rows_and_mappings() {
+fn unreadable_config_hub_snapshot_carries_key_rows_and_keeps_mappings() {
     let f = Fixture::new();
     f.enabled(true);
     let keyed = f.repo("a-keyed", "owner/carried");
@@ -274,19 +257,18 @@ fn unreadable_config_backfill_carries_key_rows_and_mappings() {
     f.register("U", &[&unkeyed], Some("no-fallback"));
     let before = (f.keys(), f.mappings());
     assert_eq!(before.0.len(), 1);
-    assert_ne!(before.0[0].3, 987654321);
     let _unreadable = Unreadable::config(&keyed);
     f.enabled(false);
-    f.finish_backfill();
+    f.install_hub_snapshot();
     assert_eq!(
         (f.keys(), f.mappings()),
         before,
-        "backfill must preserve carried rows, timestamps and mappings without minting keys"
+        "hub install must preserve carried rows, timestamps and local mappings"
     );
 }
 
 #[test]
-fn unreadable_config_backfill_deduplicates_shared_key_without_retimestamping() {
+fn unreadable_config_hub_snapshot_preserves_key_shared_by_two_roots() {
     for unreadable_name in ["a-first", "z-last"] {
         let f = Fixture::new();
         f.enabled(true);
@@ -302,25 +284,23 @@ fn unreadable_config_backfill_deduplicates_shared_key_without_retimestamping() {
         };
         let _unreadable = Unreadable::config(unreadable);
         f.enabled(false);
-        f.finish_backfill();
+        f.install_hub_snapshot();
         assert_eq!(
             (f.keys(), f.mappings()),
             before,
-            "carried row must win over a readable root with the same key in either root order"
+            "hub install must preserve one durable row and both local mappings"
         );
     }
 }
 
 #[test]
-fn unreadable_config_backfill_carry_detects_foreign_owner() {
+fn unreadable_config_existing_key_refuses_register_from_another_project() {
     let f = Fixture::new();
     f.enabled(true);
     let carried = f.repo("a-carried", "owner/collision");
     f.register("P", &[&carried], None);
     let _unreadable = Unreadable::config(&carried);
-    f.enabled(false);
     let foreign = f.repo("z-foreign", "owner/collision");
-    f.register("Q", &[&foreign], None);
     let before = (
         f.keys(),
         f.mappings(),
@@ -328,9 +308,13 @@ fn unreadable_config_backfill_carry_detects_foreign_owner() {
     );
     let error = f
         .store
-        .prepare_enable("collision", 100)
-        .err()
-        .expect("carried key must participate in owners collision check");
+        .register(RegisterRequest {
+            project_id: Some("Q".into()),
+            name: "Q".into(),
+            roots: vec![foreign],
+            ..Default::default()
+        })
+        .expect_err("a durable key must still prevent a new project from claiming it");
     assert!(error.to_string().starts_with("root_key_exists"), "{error}");
     assert_eq!(
         (

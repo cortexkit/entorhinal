@@ -383,13 +383,15 @@ fn backfill_summary(conn: &Connection) -> Result<String, RegistryError> {
 mod tests {
     use super::*;
     use crate::mutations::tests::{code, Fixture};
-    use crate::{AssignWorkspaceRequest, RegisterRequest, RemoveRequest, SharedSettlement};
+    use crate::remote_apply::RemoteEntry;
+    use crate::{AssignWorkspaceRequest, RegisterRequest, RemoveRequest};
+    use std::{cell::RefCell, rc::Rc};
 
     fn enable(f: &Fixture) {
         f.store
             .apply_entry("identity_log.enable", "{}", "operator", None, |tx| {
                 tx.execute(
-                    "UPDATE identity_log_state SET state='enabled' WHERE id=1",
+                    "UPDATE identity_log_state SET state='enabled',hub_log_base=0 WHERE id=1",
                     [],
                 )?;
                 tx.execute(
@@ -402,14 +404,32 @@ mod tests {
     }
     fn attempt(f: &Fixture, id: &str, run: impl FnOnce() -> Result<Vec<u8>, RegistryError>) {
         let head = f.store.identity_log_status().unwrap().last_applied_position;
-        f.store
-            .shared_attempt(
-                id.into(),
-                head,
-                move |_| SharedSettlement::Commit(head + 1),
-                run,
-            )
-            .unwrap();
+        let captured = Rc::new(RefCell::new(None));
+        let slot = captured.clone();
+        let result = f.store.preview_hub_write(
+            id.into(),
+            move |entry, _| {
+                *slot.borrow_mut() = Some(entry);
+            },
+            run,
+        );
+        let entry = captured.take();
+        if let Some(entry) = entry {
+            code(result.unwrap_err(), "hub_write_preview");
+            let entry = RemoteEntry {
+                position: head + 1,
+                entry_id: id.into(),
+                author: "ab".repeat(16),
+                signer: "test".into(),
+                key_id: "test".into(),
+                envelope_version: 1,
+                kind: "change".into(),
+                entry,
+            };
+            f.store.apply_hub_remote_entry(&entry, 0).unwrap();
+        } else {
+            result.unwrap();
+        }
     }
     fn facts(f: &Fixture) -> Vec<PlacementFact> {
         f.store

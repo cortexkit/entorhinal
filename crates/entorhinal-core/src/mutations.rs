@@ -13,7 +13,7 @@ use crate::agent::{AgentChangeEntry, AgentMutationError, AgentPrecheck, Placemen
 
 #[path = "pending.rs"]
 pub(crate) mod pending;
-pub use pending::{HubConsent, HubContinuation, HubRoots, SharedSettlement};
+pub use pending::{HubConsent, HubContinuation, HubRoots};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]

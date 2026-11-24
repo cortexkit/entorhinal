@@ -1,7 +1,5 @@
-//! Synchronous SQLite helpers for shared writes made by the asynchronous module.
-//! A worker thread keeps the transaction open while the module asks the log to
-//! append an entry. The module reports whether to commit or roll back; these
-//! helpers record unfinished attempts without making network calls themselves.
+//! Synchronous SQLite helpers for previewing hub writes and completing their
+//! local follow-up writes when the hub entry lands.
 
 use super::{cached, domain};
 use crate::{RegistryError, RegistryStore};
@@ -323,44 +321,9 @@ pub(crate) fn apply_hub_local(
 }
 use std::cell::RefCell;
 
-/// Save the reply of this machine's own legacy shared write when the entry it
-/// sent is applied from the log after its local transaction failed. Runs in
-/// the transaction that applies the entry, before that entry's pending row is
-/// cleared. A reply already saved under the same key is kept.
-pub(crate) fn install_legacy_reply(
-    tx: &Transaction<'_>,
-    entry: &crate::remote_apply::RemoteEntry,
-) -> rusqlite::Result<()> {
-    tx.execute(
-        "INSERT OR IGNORE INTO hub_local_reply(request_key,params_digest,reply)
-         SELECT json_extract(continuation,'$.request_key'),json_extract(continuation,'$.params_digest'),
-                json_extract(continuation,'$.reply')
-           FROM pending_entry WHERE entry_id=?1 AND expected_head+1=?2 AND continuation IS NOT NULL",
-        params![entry.entry_id, entry.position],
-    )?;
-    Ok(())
-}
-
-pub enum SharedSettlement {
-    Commit(i64),
-    Rollback {
-        sent: bool,
-        code: String,
-        message: String,
-    },
-}
-
 struct Attempt {
     id: String,
-    sent: bool,
-    settle: Box<dyn FnMut(Vec<u8>) -> SharedSettlement>,
     preview: Option<Preview>,
-    /// The request key and argument digest the caller caches this write's
-    /// reply under, if any.
-    reply_key: Option<(String, String)>,
-    /// The key, digest and reply captured when the entry was handed to the
-    /// log, saved on the pending row if the local transaction then fails.
-    continuation: Option<String>,
 }
 type Preview = Box<dyn FnOnce(Vec<u8>, Value)>;
 thread_local! {
@@ -405,84 +368,17 @@ impl RegistryStore {
         result
     }
 
-    /// Save the entry id and expected log head in a separate transaction before
-    /// running the operation. If the operation fails, delete this record only
-    /// when no append request for the entry could have been sent. Once a request
-    /// might have reached the log, keep the record for later log reads to check,
-    /// because the log may accept the entry even after the local write fails.
-    pub fn shared_attempt<E: From<RegistryError>>(
-        &self,
-        id: String,
-        head: i64,
-        settle: impl FnMut(Vec<u8>) -> SharedSettlement + 'static,
-        operation: impl FnOnce() -> Result<Vec<u8>, E>,
-    ) -> Result<Vec<u8>, E> {
-        self.shared_attempt_inner(id, head, settle, None, None, operation)
-    }
-
-    /// [`Self::shared_attempt`] for a write whose reply the caller caches
-    /// under `reply_key`, a request key and the digest of its arguments. If
-    /// the entry may have reached the log but the local transaction fails, the
-    /// pending row keeps the key, digest and reply. Applying that entry from
-    /// the log later saves the reply in `hub_local_reply`, where the caller
-    /// looks before running a retry.
-    pub fn shared_attempt_with_reply<E: From<RegistryError>>(
-        &self,
-        id: String,
-        head: i64,
-        reply_key: Option<(String, String)>,
-        settle: impl FnMut(Vec<u8>) -> SharedSettlement + 'static,
-        operation: impl FnOnce() -> Result<Vec<u8>, E>,
-    ) -> Result<Vec<u8>, E> {
-        self.shared_attempt_inner(id, head, settle, None, reply_key, operation)
-    }
-
     pub fn preview_hub_write<E: From<RegistryError>>(
         &self,
         id: String,
         preview: impl FnOnce(Vec<u8>, Value) + 'static,
         operation: impl FnOnce() -> Result<Vec<u8>, E>,
     ) -> Result<Vec<u8>, E> {
-        self.shared_attempt_inner(
-            id,
-            0,
-            |_| unreachable!("hub preview always rolls back a shared change"),
-            Some(Box::new(preview)),
-            None,
-            operation,
-        )
-    }
-
-    fn shared_attempt_inner<E: From<RegistryError>>(
-        &self,
-        id: String,
-        head: i64,
-        settle: impl FnMut(Vec<u8>) -> SharedSettlement + 'static,
-        preview: Option<Preview>,
-        reply_key: Option<(String, String)>,
-        operation: impl FnOnce() -> Result<Vec<u8>, E>,
-    ) -> Result<Vec<u8>, E> {
-        let legacy = preview.is_none();
-        if legacy {
-            self.db
-                .with_conn_fenced(|tx| {
-                    tx.execute(
-                        "INSERT INTO pending_entry(entry_id,expected_head) VALUES(?1,?2)",
-                        params![id, head],
-                    )?;
-                    Ok(())
-                })
-                .map_err(RegistryError::Store)?;
-        }
         ATTEMPT.with(|slot| {
             assert!(slot.borrow().is_none(), "nested shared attempt");
             *slot.borrow_mut() = Some(Attempt {
-                id: id.clone(),
-                sent: false,
-                settle: Box::new(settle),
-                preview,
-                reply_key,
-                continuation: None,
+                id,
+                preview: Some(Box::new(preview)),
             });
         });
         struct Reset;
@@ -493,57 +389,9 @@ impl RegistryStore {
                 });
             }
         }
-        let reset = Reset;
-        let result = operation();
-        let (sent, continuation) = ATTEMPT.with(|slot| {
-            let mut slot = slot.borrow_mut();
-            let attempt = slot.as_mut().unwrap();
-            (attempt.sent, attempt.continuation.take())
-        });
-        drop(reset);
-        if legacy && result.is_err() && !sent {
-            self.db
-                .with_conn_fenced(|tx| {
-                    tx.execute("DELETE FROM pending_entry WHERE entry_id=?1", [&id])?;
-                    Ok(())
-                })
-                .map_err(RegistryError::Store)?;
-        } else if legacy && result.is_err() {
-            if let Some(continuation) = continuation {
-                // The local transaction has rolled back, so its reply survives
-                // only here, on the pending row committed before it began.
-                self.db
-                    .with_conn_fenced(|tx| {
-                        tx.execute(
-                            "UPDATE pending_entry SET continuation=?1 WHERE entry_id=?2",
-                            params![continuation, id],
-                        )?;
-                        Ok(())
-                    })
-                    .map_err(RegistryError::Store)?;
-            }
-        }
-        result
+        let _reset = Reset;
+        operation()
     }
-
-    pub fn observe_log_head(&self, head: i64) -> Result<(), RegistryError> {
-        self.db.with_conn_fenced(|tx| {
-            tx.execute("UPDATE identity_log_state SET last_seen_head=MAX(last_seen_head,?1) WHERE id=1", [head])?;
-            Ok(())
-        }).map_err(RegistryError::Store)?;
-        Ok(())
-    }
-
-    pub fn is_pending_entry(&self, id: &str) -> Result<bool, RegistryError> {
-        self.read(|conn| {
-            conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM pending_entry WHERE entry_id=?1)",
-                [id],
-                |r| r.get(0),
-            )
-        })
-    }
-
     pub fn root_count(&self, project_id: &str) -> Result<i64, RegistryError> {
         self.read(|conn| {
             conn.query_row(
@@ -557,59 +405,46 @@ impl RegistryStore {
 
 pub(crate) fn finish(tx: &Transaction<'_>, seq: Option<i64>) -> Result<(), RegistryError> {
     ATTEMPT.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let Some(attempt) = slot.as_mut() else { return Ok(()); };
-        let entry: Option<Vec<u8>> = match seq {
-            Some(seq) => tx.query_row("SELECT entry FROM registry_journal WHERE seq=?1 AND stream='shared'", [seq], |r| r.get(0)).optional()?.flatten(),
-            None => None,
+        let Some(seq) = seq else {
+            return Ok(());
         };
-        if let Some(entry) = entry {
-            if entry.len() > 256 * 1024 {
-                return Err(domain("shared_entry_too_large", format!("shared entry is {} bytes; cap is 262144 bytes", entry.len())));
-            }
-            if let Some(preview) = attempt.preview.take() {
-                let reply: Option<String> = tx.query_row("SELECT response_json FROM registry_journal WHERE seq=?1", [seq], |r| r.get(0))?;
-                let reply = reply.as_deref().map(serde_json::from_str).transpose()
-                    .map_err(crate::shared_entry::decode_error)?.unwrap_or_else(|| json!({"result":{}}));
-                preview(entry, reply);
-                return Err(domain("hub_write_preview", "shared preview rolled back"));
-            }
-            // Mark the entry as possibly sent before asking the module for an
-            // answer. If its async request is cancelled or the worker exits
-            // before getting that answer, the log may already have accepted it.
-            // Keeping the pending row lets later log reads check what happened;
-            // the row alone neither resends the entry nor commits local changes.
-            attempt.sent = true;
-            // Capture the reply this transaction stores under its request key,
-            // in case the transaction rolls back after the log accepted the
-            // entry. Agent tool writes made under a consent card pass no key:
-            // their outcome is recorded on the consent request instead.
-            if let Some((request_key, params_digest)) = &attempt.reply_key {
-                let reply: Option<String> = tx.query_row(
-                    "SELECT response_json FROM registry_journal WHERE seq=?1",
-                    [seq],
-                    |r| r.get(0),
-                )?;
-                attempt.continuation = reply.map(|reply| {
-                    json!({"request_key":request_key,"params_digest":params_digest,"reply":reply})
-                        .to_string()
-                });
-            }
-            match (attempt.settle)(entry) {
-                SharedSettlement::Commit(position) => {
-                    tx.execute("UPDATE registry_journal SET entry_id=?1,log_position=?2 WHERE seq=?3", params![attempt.id,position,seq])?;
-                    tx.execute("UPDATE identity_log_state SET last_applied_position=?1,last_seen_head=MAX(last_seen_head,?1) WHERE id=1", [position])?;
-                    // Observing an occupied position proves every older attempt
-                    // lost its only possible slot, even when its reply was lost.
-                    tx.execute("DELETE FROM pending_entry WHERE expected_head < ?1", [position])?;
-                }
-                SharedSettlement::Rollback { sent, code, message } => {
-                    attempt.sent = sent;
-                    return Err(domain(&code, message));
-                }
-            }
+        let mut slot = slot.borrow_mut();
+        let Some(attempt) = slot.as_mut() else {
+            return Ok(());
+        };
+        let entry: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT entry FROM registry_journal WHERE seq=?1 AND stream='shared'",
+                [seq],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(entry) = entry else {
+            return Ok(());
+        };
+        if entry.len() > 256 * 1024 {
+            return Err(domain(
+                "shared_entry_too_large",
+                format!("shared entry is {} bytes; cap is 262144 bytes", entry.len()),
+            ));
         }
-        tx.execute("DELETE FROM pending_entry WHERE entry_id=?1", [&attempt.id])?;
-        Ok(())
+        let reply: Option<String> = tx.query_row(
+            "SELECT response_json FROM registry_journal WHERE seq=?1",
+            [seq],
+            |r| r.get(0),
+        )?;
+        let reply = reply
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(crate::shared_entry::decode_error)?
+            .unwrap_or_else(|| json!({"result":{}}));
+        let preview = attempt
+            .preview
+            .take()
+            .expect("hub preview already captured a shared write");
+        preview(entry, reply);
+        Err(domain("hub_write_preview", "shared preview rolled back"))
     })
 }

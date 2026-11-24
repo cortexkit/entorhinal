@@ -3,7 +3,7 @@
 
 use super::*;
 use entorhinal_core::agent::{AgentPrecheck, OperatorApproval};
-use entorhinal_core::{RegistryStore, SharedSettlement};
+use entorhinal_core::RegistryStore;
 use serde_json::Value;
 use std::time::Duration;
 use tokio::time::{timeout_at, Instant};
@@ -2625,21 +2625,13 @@ fn preview_hub_create(
             "hub identity log is not enabled",
         ));
     }
-    let result = store.shared_attempt(
+    let result = store.preview_hub_write(
         crate::hub_write::new_op_id()?,
-        status.last_applied_position,
-        move |bytes| {
-            *slot.lock().unwrap() = Some(bytes);
-            SharedSettlement::Rollback {
-                sent: false,
-                code: "hub_create_preview".into(),
-                message: "record the create after-image without committing locally".into(),
-            }
-        },
+        move |bytes, _| *slot.lock().unwrap() = Some(bytes),
         apply,
     );
     match result {
-        Err(error) if error.code == "hub_create_preview" => {
+        Err(error) if error.code == "hub_write_preview" => {
             let bytes = captured.lock().unwrap().take().ok_or_else(|| {
                 HandlerError::new("storage_error", "create preview has no after-image")
             })?;

@@ -7,7 +7,7 @@ use crate::{
 };
 use cortexkit_claustrum_client::ClaustrumCredentialResolver;
 use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
-use entorhinal_core::{hub_store::HubAttemptWrite, RegistryStore, SharedSettlement};
+use entorhinal_core::{hub_store::HubAttemptWrite, RegistryStore};
 use std::{future::pending, sync::Mutex as StdMutex};
 use subc_client_rs::HandlerOutcome;
 use tokio::sync::{oneshot, Barrier};
@@ -460,18 +460,9 @@ impl AgentOperation {
         // serialized log entry, then roll back without committing or publishing.
         let captured = Arc::new(StdMutex::new(None));
         let slot = captured.clone();
-        let head = store.identity_log_status()?.last_applied_position;
-        let response = store.shared_attempt(
+        let response = store.preview_hub_write(
             format!("test-preview-{}", self.key()),
-            head,
-            move |bytes| {
-                *slot.lock().unwrap() = Some(bytes);
-                SharedSettlement::Rollback {
-                    sent: false,
-                    code: "test_preview".into(),
-                    message: "capture without committing".into(),
-                }
-            },
+            move |bytes, _| *slot.lock().unwrap() = Some(bytes),
             || {
                 store
                     .with_principal("test")
@@ -480,7 +471,7 @@ impl AgentOperation {
             },
         );
         let error = response.expect_err("preview must not commit");
-        if error.code != "test_preview" {
+        if error.code != "hub_write_preview" {
             return Err(error);
         }
         let bytes = captured.lock().unwrap().take().unwrap();
