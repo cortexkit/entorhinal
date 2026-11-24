@@ -39,9 +39,11 @@ tool argument never names the caller. On every call, including retries:
    Otherwise `caller_forbidden`.
 2. The stamped agent must exist (`unknown_agent`), be live (`gone`), and have
    the tool's role (`role_forbidden`).
-3. If this machine's cached claim for the agent failed verification,
-   `claim_integrity_failed`; if it names another machine at epoch 1 or higher,
-   `held_elsewhere`. A standing grant does not override either.
+3. If the agent's hub location record failed verification,
+   `claim_integrity_failed`; if the hub has confirmed that another machine
+   holds the agent at epoch 1 or higher, `held_elsewhere`. A location this
+   machine has not yet confirmed (for example during startup) does not refuse.
+   A standing grant does not override either refusal.
 4. A write tool requires `request_key`: 1–128 bytes, each printable ASCII
    (`0x20`–`0x7e`); otherwise `invalid_request_key`. This is checked before
    any other argument.
@@ -56,6 +58,7 @@ that closes loses its authority.
 
 Tests: `every_tool_admits_only_its_table_role_before_key_or_arguments`,
 `bind_captures_scope_epoch_and_mode_and_route_gone_drops_authority`,
+`agent_tools_enforce_confirmed_hub_residence_even_with_standing_grants`,
 `every_write_validates_printable_ascii_request_keys_before_other_arguments`.
 
 ## 3. Requests
