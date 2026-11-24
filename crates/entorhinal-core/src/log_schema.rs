@@ -202,9 +202,9 @@ mod tests {
         let f = Fixture::new("log-schema-defaults");
         f.store.db.with_conn_fenced(|tx| {
             assert_eq!(tx.query_row(
-                "SELECT id,state,last_applied_position,last_seen_head,enable_parts,enable_backfill FROM identity_log_state",
-                [], |r| Ok((r.get::<_, i64>(0)?,r.get::<_, String>(1)?,r.get::<_, i64>(2)?,r.get::<_, i64>(3)?,r.get::<_, Option<String>>(4)?,r.get::<_, Option<String>>(5)?)),
-            )?, (1,"disabled".into(),0,0,None,None));
+                "SELECT id,state,last_applied_position,last_seen_head,enable_parts FROM identity_log_state",
+                [], |r| Ok((r.get::<_, i64>(0)?,r.get::<_, String>(1)?,r.get::<_, i64>(2)?,r.get::<_, i64>(3)?,r.get::<_, Option<String>>(4)?)),
+            )?, (1,"disabled".into(),0,0,None));
             for sql in [
                 "INSERT INTO identity_log_state(id) VALUES(2)",
                 "UPDATE identity_log_state SET state='unknown'",

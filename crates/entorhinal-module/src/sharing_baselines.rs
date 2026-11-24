@@ -1,8 +1,8 @@
-//! Frozen inputs and byte comparisons for the pre-migration sharing stores.
+//! Frozen sharing stores and byte comparisons across the schema upgrade.
 
 use super::*;
 use rusqlite::{types::ValueRef, Connection, OpenFlags};
-use std::{fs, path::Path};
+use std::{collections::BTreeMap, fs, path::Path};
 
 #[path = "sharing_baselines/record.rs"]
 pub(crate) mod record;
@@ -266,16 +266,17 @@ fn force_membership(handler: &ProjectsHandler, selected: bool) {
 
 async fn store_replies(source: &Path, installed: bool, forced: bool) -> String {
     let file = StoreFile::copy(source);
+    // Keep probing the recorded roles even after migration erases those rows.
+    let roles = rows(&file.read(), "SELECT role FROM role_cache ORDER BY role")
+        .into_iter()
+        .map(|row| row[0].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
     let handler = open_handler(&file, BOX_A);
     assert_eq!(handler.hub_backend_selected(), installed);
     assert!(handler.hub_residence.lock().unwrap().is_none());
     if forced {
         force_membership(&handler, false);
     }
-    let roles = rows(&file.read(), "SELECT role FROM role_cache ORDER BY role")
-        .into_iter()
-        .map(|row| row[0].as_str().unwrap().to_owned())
-        .collect::<Vec<_>>();
     let mut replies = served_reads(&handler, &file, &roles).await;
     let refresh = call(&handler, "agent.refresh_claims", json!({})).await;
     replies.push_str(&format!(
@@ -347,20 +348,30 @@ pub(crate) fn check_store(file: &StoreFile, store: &RegistryStore, state: &str, 
     let verify = store.verify().unwrap();
     assert!(verify.ok, "{verify:?}");
     let conn = file.read();
-    assert_eq!(
-        rows(
-            &conn,
-            "SELECT MAX(version) FROM cortexkit_schema_version WHERE namespace='projects'"
-        ),
-        vec![vec![json!(27)]]
-    );
+    assert_schema_version(&conn, 28);
     assert_eq!(
         rows(&conn, "SELECT COUNT(*) FROM identity_log_state"),
         vec![vec![json!(1)]]
     );
+    assert!(rows(&conn, "SELECT role FROM role_cache").is_empty());
+    assert_eq!(store.role_gen_high_water("connector_home").unwrap(), 13);
+}
+
+fn assert_schema_version(conn: &Connection, version: i64) {
     assert_eq!(
         rows(
-            &conn,
+            conn,
+            "SELECT MAX(version) FROM cortexkit_schema_version WHERE namespace='projects'"
+        ),
+        vec![vec![json!(version)]]
+    );
+}
+
+fn check_legacy_rows(conn: &Connection, name: &str) {
+    assert_schema_version(conn, 27);
+    assert_eq!(
+        rows(
+            conn,
             "SELECT role,source,epoch,version FROM role_cache WHERE role='connector_home'"
         ),
         vec![vec![
@@ -371,10 +382,50 @@ pub(crate) fn check_store(file: &StoreFile, store: &RegistryStore, state: &str, 
         ]]
     );
     assert_eq!(
-        rows(&conn, "SELECT agent_id,epoch,version FROM claim_cache"),
+        rows(conn, "SELECT agent_id,epoch,version FROM claim_cache"),
         vec![vec![json!(BASELINE_AGENT), json!(3), json!(5)]]
     );
-    assert_eq!(store.role_gen_high_water("connector_home").unwrap(), 13);
+    if name == "disabled" {
+        assert_eq!(
+            rows(
+                conn,
+                "SELECT source,epoch FROM role_cache WHERE role='local_role'"
+            ),
+            vec![vec![json!("local"), json!(1)]]
+        );
+        assert_eq!(
+            rows(
+                conn,
+                "SELECT source,epoch FROM role_cache WHERE role='enrolled'"
+            ),
+            vec![vec![Value::Null, json!(0)]]
+        );
+        assert_eq!(
+            rows(conn, "SELECT epoch FROM role_take_request"),
+            vec![vec![json!(1)]]
+        );
+    }
+    if name == "native-enabling" {
+        assert_eq!(
+            rows(conn, "SELECT enable_backfill FROM identity_log_state"),
+            vec![vec![Value::Null]]
+        );
+    }
+    if name == "native-installed" || name == "switch-observer" {
+        let pending = rows(conn, "SELECT continuation FROM pending_entry");
+        let [row] = pending.as_slice() else {
+            panic!("expected one pending write, got {pending:?}");
+        };
+        let continuation: Value = serde_json::from_str(row[0].as_str().unwrap()).unwrap();
+        assert_eq!(continuation["request_key"], "unanswered");
+        assert_eq!(continuation["params_digest"], "d0".repeat(32));
+        assert!(
+            serde_json::from_str::<Value>(continuation["reply"].as_str().unwrap())
+                .unwrap()
+                .get("result")
+                .is_some()
+        );
+    }
 }
 
 pub(crate) fn check_pending(file: &StoreFile, store: &RegistryStore) {
@@ -382,28 +433,118 @@ pub(crate) fn check_pending(file: &StoreFile, store: &RegistryStore) {
     assert_eq!(status.pending_write_count, 1);
     let found = rows(
         &file.read(),
-        "SELECT entry_id,expected_head,continuation FROM pending_entry",
+        "SELECT entry_id,expected_head FROM pending_entry",
     );
     let [row] = found.as_slice() else {
         panic!("expected one pending write, got {found:?}");
     };
     assert_eq!(row[0], "51".repeat(16));
     assert_eq!(row[1], status.last_applied_position);
-    let continuation: Value = serde_json::from_str(row[2].as_str().unwrap()).unwrap();
-    assert_eq!(continuation["request_key"], "unanswered");
-    assert_eq!(continuation["params_digest"], "d0".repeat(32));
-    assert!(
-        serde_json::from_str::<Value>(continuation["reply"].as_str().unwrap())
-            .unwrap()
-            .get("result")
-            .is_some()
-    );
+}
+
+fn projection(conn: &Connection, table: &str, columns: &[Vec<Value>]) -> Vec<Vec<Value>> {
+    let names = columns
+        .iter()
+        .map(|col| format!("\"{}\"", col[1].as_str().unwrap()))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut cells = rows(conn, &format!("SELECT {names} FROM \"{table}\""));
+    cells.sort_by_cached_key(|row| serde_json::to_string(row).unwrap());
+    cells
+}
+
+fn table_info(conn: &Connection, table: &str) -> Vec<Vec<Value>> {
+    rows(conn, &format!("PRAGMA table_info(\"{table}\")"))
+}
+
+fn schema(conn: &Connection) -> Vec<Vec<Value>> {
+    rows(
+        conn,
+        "SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name",
+    )
+}
+
+fn migrate_history(file: &StoreFile, name: &str) -> RegistryStore {
+    let conn = file.read();
+    check_legacy_rows(&conn, name);
+    let before_schema = schema(&conn);
+    let mut expected_schema = before_schema.clone();
+    expected_schema
+        .retain(|item| !matches!(item[2].as_str(), Some("role_take_request" | "claim_cache")));
+    let mut before = BTreeMap::new();
+    for item in &expected_schema {
+        if item[0] != "table" {
+            continue;
+        }
+        let table = item[1].as_str().unwrap();
+        let mut columns = table_info(&conn, table);
+        let old_count = columns.len();
+        let removed: &[&str] = match table {
+            "identity_log_state" => &["enable_backfill", "engram_frozen", "hub_quieting"],
+            "pending_entry" => &["continuation"],
+            _ => &[],
+        };
+        columns.retain(|col| !removed.contains(&col[1].as_str().unwrap()));
+        assert_eq!(
+            old_count - columns.len(),
+            removed.len(),
+            "{name}: V27 {table}"
+        );
+        for (index, col) in columns.iter_mut().enumerate() {
+            col[0] = json!(index);
+        }
+        let data = match table {
+            // Opening a writer advances the lease fence independently of migrations.
+            "cortexkit_fence" | "role_cache" => Vec::new(),
+            _ => projection(&conn, table, &columns),
+        };
+        before.insert(table.to_owned(), (columns, data));
+    }
+    drop(conn);
+
+    let store = file.open();
+    let conn = file.read();
+    let mut after_schema = schema(&conn);
+    // SQLite rewrites these two CREATE TABLE texts. Compare their retained
+    // columns below, but compare every other schema object byte-for-byte.
+    for items in [&mut expected_schema, &mut after_schema] {
+        for item in items {
+            if item[0] == "table"
+                && matches!(
+                    item[1].as_str(),
+                    Some("identity_log_state" | "pending_entry")
+                )
+            {
+                item[3] = Value::Null;
+            }
+        }
+    }
+    assert_eq!(after_schema, expected_schema, "{name}: migrated schema");
+    for (table, (columns, data)) in before {
+        assert_eq!(
+            table_info(&conn, &table),
+            columns,
+            "{name}: {table} columns"
+        );
+        if table == "cortexkit_fence" {
+            continue;
+        }
+        let mut actual = projection(&conn, &table, &columns);
+        if table == "cortexkit_schema_version" {
+            let count = actual.len();
+            actual.retain(|row| !(row[0] == "projects" && row[1] == 28));
+            assert_eq!(count - actual.len(), 1, "{name}: new migration row");
+        }
+        assert_eq!(actual, data, "{name}: {table} rows");
+    }
+    store
 }
 
 fn check_history(file: &StoreFile, name: &str, state: &str, base: Option<i64>) {
-    let store = file.open();
+    let store = migrate_history(file, name);
     check_store(file, &store, state, base);
     let conn = file.read();
+    check_rebuild(&conn, file.path());
     let enable = rows(&conn, "SELECT actor,payload_json,stream,entry FROM registry_journal WHERE op='identity_log.enable'");
     let expected = match name {
         "legacy-zero" => Some(("operator", "{}")),
@@ -454,19 +595,6 @@ fn check_history(file: &StoreFile, name: &str, state: &str, base: Option<i64>) {
             vec![vec![json!(2)]]
         );
     }
-    if name == "disabled" {
-        assert_eq!(
-            rows(
-                &conn,
-                "SELECT source,epoch FROM role_cache WHERE role='local_role'"
-            ),
-            vec![vec![json!("local"), json!(1)]]
-        );
-        assert_eq!(
-            rows(&conn, "SELECT epoch FROM role_take_request"),
-            vec![vec![json!(1)]]
-        );
-    }
     if name == "native-installed" {
         check_pending(file, &store);
         assert_eq!(rows(&conn, "SELECT request_key,expected,outcome FROM hub_attempt WHERE request_key='outstanding-hub-attempt'"), vec![vec![json!("outstanding-hub-attempt"), json!(83), Value::Null]]);
@@ -493,9 +621,33 @@ fn check_history(file: &StoreFile, name: &str, state: &str, base: Option<i64>) {
             serde_json::from_str::<Value>(&plan.preimage).unwrap()["engram_through"],
             0
         );
+    }
+}
+
+fn check_rebuild(expected: &Connection, source: &str) {
+    let empty = StoreFile::new("sharing-history-rebuild");
+    drop(empty.open());
+    let conn = Connection::open(empty.path()).unwrap();
+    let columns = table_info(expected, "registry_journal")
+        .iter()
+        .map(|column| column[1].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>()
+        .join(",");
+    conn.execute("ATTACH DATABASE ?1 AS history", [source])
+        .unwrap();
+    conn.execute(
+        &format!("INSERT INTO registry_journal ({columns}) SELECT {columns} FROM history.registry_journal ORDER BY seq"),
+        [],
+    ).unwrap();
+    drop(conn);
+    empty.open().rebuild().unwrap();
+    let rebuilt = empty.read();
+    for table in DERIVED {
+        let columns = table_info(expected, table);
         assert_eq!(
-            rows(&conn, "SELECT enable_backfill FROM identity_log_state"),
-            vec![vec![Value::Null]]
+            projection(&rebuilt, table, &columns),
+            projection(expected, table, &columns),
+            "rebuild of {table}"
         );
     }
 }
@@ -504,7 +656,9 @@ fn check_history(file: &StoreFile, name: &str, state: &str, base: Option<i64>) {
 async fn sharing_baseline_history_replies_and_prefixes() {
     let dir = artifacts();
     for (name, state, base) in STORES {
-        let file = StoreFile::copy(&dir.join(format!("{name}.db")));
+        let source = dir.join(format!("{name}.db"));
+        let frozen = fs::read(&source).unwrap();
+        let file = StoreFile::copy(&source);
         check_history(&file, name, state, *base);
         for (kind, actual) in history_outputs(&dir, name, *base).await {
             let path = dir.join(format!("{name}.{kind}"));
@@ -532,24 +686,28 @@ async fn sharing_baseline_history_replies_and_prefixes() {
                     .replace(&old_where.to_string(), &new_where.to_string())
                     .replace(&old_with_box.to_string(), &new_where.to_string())
                     .replace(&old_residence.to_string(), &new_residence.to_string());
-                // The historical stores still contain the frozen observations.
-                // Startup no longer marks those rows stale; only their stale
-                // bit differs until the migration purges the cache.
+                // Migration erases legacy role observations, so those two
+                // roles now read just like an unobserved role on the local path.
                 expected = expected
                     .split_inclusive('\n')
                     .map(|line| {
                         let row: Value = serde_json::from_str(line).unwrap();
-                        if matches!(row["method"].as_str(), Some("role.read" | "role.fence"))
-                            && matches!(
+                        if matches!(
                                 row["params"]["role"].as_str(),
                                 Some("connector_home" | "local_role")
                             )
-                            && row["reply"]["result"]["epoch"]
-                                .as_i64()
-                                .is_some_and(|e| e > 0)
                         {
-                            assert_eq!(row["reply"]["result"]["stale"], true);
-                            line.replacen("\"stale\":true", "\"stale\":false", 1)
+                            let role = row["params"]["role"].as_str().unwrap();
+                            let method = row["method"].as_str().unwrap();
+                            let result = match method {
+                                "role.read" => json!({"epoch":0,"held_here":false,"holder":null,
+                                    "holder_name":null,"known":false,"role":role,"source":null,"stale":true}),
+                                "role.fence" => json!({"epoch":0,"held_here":false,"holder":null,
+                                    "role":role,"stale":true,"subject":format!("role:{role}"),"version":0}),
+                                _ => panic!("unexpected method for {role}: {method}"),
+                            };
+                            let reply = json!({"result":result});
+                            format!("{{\"method\":\"{method}\",\"params\":{},\"reply\":{reply}}}\n", row["params"])
                         } else {
                             line.to_owned()
                         }
@@ -558,7 +716,29 @@ async fn sharing_baseline_history_replies_and_prefixes() {
             }
             assert_eq!(expected, actual, "{}", path.display());
         }
+        assert_eq!(fs::read(source).unwrap(), frozen);
     }
+}
+
+#[test]
+fn sharing_baseline_migration_preserves_observer_and_adoption_clears_pending() {
+    let source = artifacts().join("switch-observer.db");
+    let frozen = fs::read(&source).unwrap();
+    let file = StoreFile::copy(&source);
+    let store = migrate_history(&file, "switch-observer");
+    check_store(&file, &store, "enabled", Some(17));
+    check_pending(&file, &store);
+    assert_eq!(fs::read(source).unwrap(), frozen);
+
+    let source = artifacts().join("native-installed.db");
+    let file = StoreFile::copy(&source);
+    let store = file.open();
+    check_pending(&file, &store);
+    store.check_store_origin(Some(BOX_A), NOW).unwrap();
+    store
+        .adopt_store("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", false, NOW)
+        .unwrap();
+    assert_eq!(store.identity_log_status().unwrap().pending_write_count, 0);
 }
 
 #[test]

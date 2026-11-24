@@ -180,7 +180,7 @@ impl RegistryStore {
             }
             tx.execute(
                 "UPDATE identity_log_state SET state='enabled',hub_log_base=?1,last_applied_position=?2,last_seen_head=?2,
-                    hub_ready=0,hub_quieting=0,enable_id=NULL,enable_snapshot_digest=NULL,enable_parts=NULL WHERE id=1",
+                    hub_ready=0,enable_id=NULL,enable_snapshot_digest=NULL,enable_parts=NULL WHERE id=1",
                 params![base, final_position],
             )?;
             Ok(())

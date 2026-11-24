@@ -228,7 +228,17 @@ CREATE TABLE member_name (
 );
 "#;
 
-const MIGRATIONS: [Migration; 27] = [
+const V28_REMOVE_ENGRAM_STATE: &str = r#"
+DELETE FROM role_cache;
+DROP TABLE role_take_request;
+DROP TABLE claim_cache;
+ALTER TABLE identity_log_state DROP COLUMN enable_backfill;
+ALTER TABLE identity_log_state DROP COLUMN engram_frozen;
+ALTER TABLE identity_log_state DROP COLUMN hub_quieting;
+ALTER TABLE pending_entry DROP COLUMN continuation;
+"#;
+
+const MIGRATIONS: [Migration; 28] = [
     Migration {
         version: 1,
         statements: V1_SCHEMA,
@@ -336,6 +346,10 @@ const MIGRATIONS: [Migration; 27] = [
     Migration {
         version: 27,
         statements: pending::V27_LEGACY_REPLY_AND_QUERY_INDEXES,
+    },
+    Migration {
+        version: 28,
+        statements: V28_REMOVE_ENGRAM_STATE,
     },
 ];
 
@@ -2135,10 +2149,10 @@ mod tests {
     }
 
     /// A store last opened by a binary whose chain ends at migration 7 gains
-    /// the session, claim, role and member tables, with exactly these
+    /// the surviving session, role and member tables, with exactly these
     /// columns, when this binary opens it.
     #[test]
-    fn opening_a_v7_store_creates_every_session_and_claim_table() {
+    fn opening_a_v7_store_creates_surviving_session_role_and_member_tables() {
         let scratch = TestStore::new("v8-upgrade");
         let descriptor = legacy_descriptor(&scratch, "v7.db");
         let old = RegistryStore::open_with_migrations(&descriptor, &MIGRATIONS[..7]).unwrap();
@@ -2154,7 +2168,7 @@ mod tests {
         assert_eq!(missing, 0, "a V7 store has no session tables yet");
         drop(old);
         let store = RegistryStore::open(&descriptor).unwrap();
-        let expected: [(&str, &[&str]); 7] = [
+        let expected: [(&str, &[&str]); 5] = [
             (
                 "session_binding",
                 &[
@@ -2174,19 +2188,6 @@ mod tests {
                 ],
             ),
             (
-                "claim_cache",
-                &[
-                    "agent_id",
-                    "holder",
-                    "epoch",
-                    "cut_id",
-                    "version",
-                    "read_at_ms",
-                    "stale",
-                    "integrity_failed",
-                ],
-            ),
-            (
                 "role_cache",
                 &[
                     "role",
@@ -2197,19 +2198,6 @@ mod tests {
                     "version",
                     "read_at_ms",
                     "integrity_failed",
-                ],
-            ),
-            (
-                "role_take_request",
-                &[
-                    "request_id",
-                    "role",
-                    "expected_epoch",
-                    "reason",
-                    "expected_version",
-                    "body",
-                    "epoch",
-                    "created_at_ms",
                 ],
             ),
             ("self_identity", &["id", "self_author", "learned_at_ms"]),

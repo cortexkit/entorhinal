@@ -36,11 +36,6 @@ impl Fixture {
         conn.execute("INSERT INTO self_identity VALUES(1,?1,1)", [OLD])
             .unwrap();
         conn.execute(
-            "INSERT INTO claim_cache VALUES(?1,?2,1,NULL,1,1,0,0)",
-            rusqlite::params![id, OLD],
-        )
-        .unwrap();
-        conn.execute(
             "INSERT INTO role_cache VALUES('leader',?1,1,'cloud',0,1,1,0)",
             [OLD],
         )

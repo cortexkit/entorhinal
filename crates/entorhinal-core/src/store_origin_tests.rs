@@ -68,9 +68,7 @@ fn seed_local(store: &RegistryStore) {
         INSERT INTO retired_binding SELECT 'retired',canonical_root,project_id,incarnation,'replaced',1 FROM root_binding LIMIT 1;
         INSERT INTO workspace_root SELECT workspace_id,'/old/workspace',1 FROM workspace;
         INSERT INTO root_owned_remotes SELECT canonical_root,'["origin"]' FROM project_root;
-        INSERT INTO claim_cache VALUES('agent', 'old-author',1,NULL,1,1,0,0);
         INSERT INTO role_cache VALUES('leader','old-author',1,'cloud',0,1,1,0);
-        INSERT INTO role_take_request VALUES('req','leader',0,NULL,0,X'00',1,1);
         INSERT INTO agent_move(cut_id,agent_id,side,peer,step,plan,record_version,seal_sent,attempts,created_at_ms,updated_at_ms) VALUES('cut','agent','source','peer','preparing','{}',1,0,1,1,1);
         UPDATE move_setting SET lid_close_moves=1;
         INSERT INTO session_binding(ref_kind,ref,agent_id,harness,session_id,project_root,registered_by,registered_at_ms,runner,ended_at_ms) VALUES('session','ref','agent','harness','session','/repo','host',1,'broca',NULL);
@@ -126,9 +124,7 @@ fn adopt_store_clears_local_state_keeps_shared() {
     // This independent list makes omitting any cleared table observable.
     for table in [
         "self_identity",
-        "claim_cache",
         "role_cache",
-        "role_take_request",
         "agent_move",
         "session_network",
         "session_binding",

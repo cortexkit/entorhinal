@@ -1231,12 +1231,12 @@ fn migration_17_preserves_local_rows_and_indexes_open_only_pages() {
     assert!(!plan.contains("TEMP B-TREE"), "{plan}");
 }
 
-/// The last migration adds the ended-binding index on a store that already
+/// Migration 27 adds the ended-binding index on a store that already
 /// holds bindings, and the retention prune reads it to find candidates
 /// instead of scanning every binding that never ended.
 #[test]
 fn retention_prune_reads_the_ended_binding_index_after_migration() {
-    let f = Fixture::with_migrations(&MIGRATIONS[..MIGRATIONS.len() - 1]);
+    let f = Fixture::with_migrations(&MIGRATIONS[..26]);
     f.bind(AGENT, "live", 20, Some("broca"), None);
     f.bind(AGENT, "ended", 30, Some("broca"), Some(40));
     let plan = |store: &RegistryStore| {

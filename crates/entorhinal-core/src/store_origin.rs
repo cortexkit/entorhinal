@@ -34,9 +34,7 @@ pub(crate) fn clear_local_projections(
 /// precede their parents. Shared catalog pins are deliberately not included.
 pub(crate) const LOCAL_TABLES: &[&str] = &[
     "self_identity",
-    "claim_cache",
     "role_cache",
-    "role_take_request",
     "agent_move",
     "move_setting",
     "session_network",
@@ -122,7 +120,7 @@ impl RegistryStore {
                 // This table is created lazily by the catalog poller.
                 let poll_clock = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='catalog_poll_clock')", [], |r|r.get::<_,bool>(0))?;
                 if poll_clock { tx.execute("DELETE FROM catalog_poll_clock", [])?; }
-                tx.execute("UPDATE identity_log_state SET state='disabled',last_applied_position=0,last_seen_head=0,enable_parts=NULL,enable_backfill=NULL WHERE id=1", [])?;
+                tx.execute("UPDATE identity_log_state SET state='disabled',last_applied_position=0,last_seen_head=0,enable_parts=NULL WHERE id=1", [])?;
                 tx.execute("INSERT INTO registry_journal(op,payload_json,actor,created_at,principal,stream,origin) VALUES('store.adopt',?1,'operator',?2,'direct','local','here')", params![serde_json::json!({"storeMachineId":origin,"daemonMachineId":daemon,"resetShared":reset_shared}).to_string(),now])?;
             }
             tx.execute("DELETE FROM store_origin", [])?;

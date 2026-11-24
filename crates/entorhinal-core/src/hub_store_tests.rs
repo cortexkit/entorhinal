@@ -112,7 +112,7 @@ fn hub_store_migration_preserves_legacy_progress_and_requires_snapshot_for_downg
     store
         .read(|conn| {
             let flags = conn.query_row(
-                "SELECT hub_log_base,hub_ready,engram_frozen,enable_id,enable_snapshot_digest
+                "SELECT hub_log_base,hub_ready,enable_id,enable_snapshot_digest
                  FROM identity_log_state WHERE id=1",
                 [],
                 |r| {
@@ -121,11 +121,10 @@ fn hub_store_migration_preserves_legacy_progress_and_requires_snapshot_for_downg
                         r.get::<_, bool>(1)?,
                         r.get::<_, Option<String>>(2)?,
                         r.get::<_, Option<String>>(3)?,
-                        r.get::<_, Option<String>>(4)?,
                     ))
                 },
             )?;
-            assert_eq!(flags, (None, false, None, None, None));
+            assert_eq!(flags, (None, false, None, None));
             let move_state = conn.query_row(
                 "SELECT record_version,receiver_decision FROM agent_move WHERE cut_id='old-cut'",
                 [],
@@ -170,6 +169,48 @@ fn hub_store_migration_preserves_legacy_progress_and_requires_snapshot_for_downg
             |_| Ok(())
         ))
         .is_err());
+}
+
+#[test]
+fn hub_native_enable_and_join_after_v28_migration() {
+    let enable = Fixture::new("hub-enable-after-v28");
+    let join = Fixture::new("hub-join-after-v28");
+    let migrated = |f: &Fixture| {
+        let path = descriptor(f, "v27.db");
+        drop(RegistryStore::open_with_migrations(&path, &MIGRATIONS[..27]).unwrap());
+        RegistryStore::open(&path).unwrap()
+    };
+    let leader = migrated(&enable);
+    let follower = migrated(&join);
+    let leader_box = "ab".repeat(16);
+    let follower_box = "cd".repeat(16);
+    leader
+        .begin_hub_enable(&"ef".repeat(16), &leader_box)
+        .unwrap();
+    let plan = leader.hub_enable_plan().unwrap().unwrap();
+    let snapshot = serde_json::from_str(&plan.preimage).unwrap();
+    let parts = [(
+        crate::remote_apply::RemoteEntry {
+            position: 1,
+            entry_id: "11".repeat(16),
+            author: leader_box.clone(),
+            signer: "test".into(),
+            key_id: "test".into(),
+            envelope_version: 1,
+            kind: "snapshot".into(),
+            entry: vec![],
+        },
+        0,
+    )];
+    for (store, own) in [(&leader, leader_box), (&follower, follower_box)] {
+        store.install_hub_snapshot(&snapshot, &parts, &own).unwrap();
+        let status = store.identity_log_status().unwrap();
+        assert_eq!(status.state, "enabled");
+        assert_eq!(status.last_applied_position, 1);
+        assert_eq!(store.hub_log_base().unwrap(), Some(0));
+        assert!(store.hub_enable_plan().unwrap().is_none());
+        assert!(store.verify().unwrap().ok);
+    }
 }
 
 fn write(request_key: &str) -> HubAttemptWrite {

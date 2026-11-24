@@ -729,13 +729,11 @@ mod tests {
                     "agent_move",
                     "move_setting",
                     "sqlite_sequence",
-                    // Machine-local agent session, claim and role state.
+                    // Machine-local agent session and role state.
                     "session_binding",
                     "session_network",
-                    "claim_cache",
                     "role_cache",
                     "role_gen_high_water",
-                    "role_take_request",
                     "self_identity",
                     "store_origin",
                     // These machine-local consent and agent tables are never sent to other machines:

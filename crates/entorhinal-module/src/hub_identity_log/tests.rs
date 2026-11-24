@@ -870,7 +870,6 @@ async fn hub_membership_never_serves_legacy_holder_after_activation() {
     *handler.store.lock().unwrap() = Some(tail.sql.test_store());
     tail.sql.test_store().apply_entry("agent.cutover", "{}", "test", None, |tx| {
         tx.execute("INSERT INTO agent(agent_id,name,tag,role,created_at_ms,updated_at_ms) VALUES('agent_16013c86','Test','','assistant',1,1)", [])?;
-        tx.execute("INSERT INTO claim_cache(agent_id,holder,epoch,version,stale,integrity_failed,read_at_ms) VALUES('agent_16013c86','legacy-author',7,8,0,0,1)", [])?;
         tx.execute("INSERT INTO role_cache(role,holder,epoch,source,version,stale,integrity_failed,read_at_ms) VALUES('test','legacy-author',7,'cloud',8,0,0,1)", [])?;
         Ok(())
     }).unwrap();
@@ -882,8 +881,8 @@ async fn hub_membership_never_serves_legacy_holder_after_activation() {
         [location, role]
             .map(|bytes| serde_json::from_slice::<Value>(&bytes).unwrap()["result"].clone())
     };
-    // The installed store must not read a legacy agent claim even before hub
-    // selection. The role cache still supplies its holder until selection.
+    // The local role cache is visible before hub selection, but hub reads
+    // must not fall back to it while hub membership is loading or ready.
     let unclaimed = json!({"known":false,"status":"unclaimed","holder":null,
         "holder_name":null,"epoch":0,"cut_id":null,"read_at_ms":null,"stale":true});
     let [location, role] = read();
