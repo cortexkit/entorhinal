@@ -332,6 +332,92 @@ async fn hub_residence_where_watch_resyncs_on_hub_claim_sample() {
     );
 }
 
+#[tokio::test]
+async fn hub_residence_where_watch_resyncs_on_hub_member_metadata() {
+    let Some(rig) = IdentityRig::new().await else {
+        return;
+    };
+    migrate_identity(&rig.a, MIGRATED, "Remote agent");
+    residence(
+        &rig.a,
+        Arc::new(Image(HashMap::from([(
+            MIGRATED.into(),
+            (Some(B.into()), 1),
+        )]))),
+    );
+    let mut seeded = record(B, B, 1, false);
+    seeded["seeded"] = json!(true);
+    let revision = put(&rig, MIGRATED, 0, B, seeded).await;
+    assert!(!applied(&rig.a, MIGRATED, revision).await.integrity_failed);
+    until(|| ready_for(&rig.a, MIGRATED)).await;
+
+    store_of(&rig.b.handler)
+        .learn_verified_self_author(B, 700)
+        .unwrap();
+    *rig.b.handler.hub_shared_log.lock().unwrap() = Some(rig.b.log.clone());
+    residence(&rig.b, Arc::new(Image(HashMap::new())));
+    until(|| rig.b.handler.residence().unwrap().ready()).await;
+    bind(&rig.b.handler, subc_protocol::Principal::Direct);
+
+    let mut watch = WhereWatch::open(rig.a.handler).await;
+    let seq = |frame: Frame| {
+        serde_json::from_slice::<Value>(&frame.body).unwrap()["cursor"]["seq"]
+            .as_u64()
+            .unwrap()
+    };
+    let opening = seq(watch.resync().await);
+    let initial = result(where_(&watch.handler, MIGRATED));
+    assert_eq!(initial["status"], "held_elsewhere");
+    assert_eq!(initial["holder_box"], B);
+    assert_eq!(initial["holder_name"], Value::Null);
+
+    let outcome = rig
+        .b
+        .handler
+        .handle_served_request(
+            &body(crate::member::SET_NAME, json!({"display_name":"Workshop"})),
+            ROUTE,
+        )
+        .await;
+    assert!(
+        matches!(outcome, HandlerOutcome::Response(_)),
+        "{outcome:?}"
+    );
+    within(through(&watch.handler, 1)).await;
+    assert_eq!(
+        result(where_(&watch.handler, MIGRATED))["holder_name"],
+        "Workshop"
+    );
+    let named = seq(watch.resync().await);
+    assert!(named > opening);
+
+    // Send the box mapping separately so the name update cannot account for its resync.
+    let store = store_of(&watch.handler);
+    assert_eq!(store.member_box(B).unwrap(), None);
+    let entry = json!({"op":"member.set_box","author":B,"box_id":B});
+    let digest = hub_write::params_digest("member.set_box", &entry).unwrap();
+    let landed = rig
+        .b
+        .log
+        .append(
+            PlannedAppend {
+                request_key: "where-watch-member-box",
+                params_digest: &digest,
+                writer_ep: 0,
+                expected: 1,
+                body: entry,
+            },
+            |_, saved| Ok(Replanned::Body(saved.clone())),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    within(through(&watch.handler, landed.position.unwrap())).await;
+    assert_eq!(store.member_box(B).unwrap().as_deref(), Some(B));
+    assert!(seq(watch.resync().await) > named);
+    watch.module.shutdown().await;
+}
+
 #[derive(Default)]
 struct Confirm(AtomicUsize);
 
