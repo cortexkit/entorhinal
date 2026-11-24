@@ -200,7 +200,9 @@ async fn hub_residence_where_many_mixed_sample() {
     );
 }
 
-// The live rig has already opened the store; the harness's HELLO_ACK has no descriptor.
+// The live rig opens the store itself. The test harness's startup handshake
+// (HELLO_ACK) carries no storage descriptor, so the handler can't open it there;
+// this wrapper hands the harness the handler with its store already in place.
 struct OpenStore(crate::ServedHandler);
 
 #[async_trait::async_trait]

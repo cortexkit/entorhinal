@@ -16,8 +16,8 @@ sends `{"method":op,"params":request}` in one ordinary SUBC Request.
   requests. The first has no frames, causally checked after the handler enters
   its wait. Updating the tag then yields the second observation's changes frame.
 - `where-resync.json`: a missing cursor requires a full whereabouts read.
-- `where-watch-hub.json`: one live hub subscription opens with the phone's
-  empty params object (no cursor). The handler accepts it and immediately sends
+- `where-watch-hub.json`: one live hub subscription opens with an empty
+  params object (no cursor), as the phone and desktop clients send it. The handler accepts it and immediately sends
   `resync`. A signed residence update from the other computer changes the
   answering computer's read from `held_elsewhere` to `held_here`. The same
   subscription sends a second `resync` with an advanced cursor. Both frame
