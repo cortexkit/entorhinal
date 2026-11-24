@@ -54,7 +54,6 @@ rustix = { version = "1.1", features = ["time"] }
 windows-sys = { workspace = true, features = ["Win32_System_SystemInformation"] }
 
 [dev-dependencies]
-entorhinal-core = { path = "../entorhinal-core", features = ["legacy-store-for-tests"] }
 tracing-subscriber = "0.3"
 cortexkit-agent-identity = "0.1.4"
 cortexkit-project-identity = "0.1.5"

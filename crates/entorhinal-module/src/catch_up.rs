@@ -112,7 +112,7 @@ impl Worker {
                 continue;
             }
             let (planned, state) = match sql
-                .run(deadline, "hub_switch_state", |store| {
+                .run(deadline, "hub_catch_up_state", |store| {
                     Ok((
                         store.hub_enable_plan()?.is_some(),
                         store.identity_log_status()?.state,
@@ -127,7 +127,7 @@ impl Worker {
                 }
             };
             if planned {
-                let result = switch.finish(&self.hub_runtime, None, deadline).await;
+                let result = switch.finish(&self.hub_runtime, deadline).await;
                 self.observe_switch(&result);
                 if result.is_ok() {
                     self.wake.notify_one();
@@ -155,7 +155,7 @@ impl Worker {
             };
             if state == "disabled" {
                 let result = if head > 0 {
-                    switch.finish(&self.hub_runtime, None, deadline).await
+                    switch.finish(&self.hub_runtime, deadline).await
                 } else {
                     Err(super::hub_switch::waiting())
                 };

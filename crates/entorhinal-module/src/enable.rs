@@ -152,10 +152,10 @@ impl ProjectsHandler {
             return Ok(());
         }
         if planned {
-            return switch.finish(&runtime, None, deadline).await;
+            return switch.finish(&runtime, deadline).await;
         }
         if switch.head(deadline).await? > 0 {
-            return switch.finish(&runtime, None, deadline).await;
+            return switch.finish(&runtime, deadline).await;
         }
         sql.run(deadline, "check_enable_preconditions", move |store| {
             store.check_enable_preconditions(0)?;
@@ -177,10 +177,10 @@ impl ProjectsHandler {
         drop(confirmation);
         let deadline = Instant::now() + super::catch_up::READ_DEADLINE;
         if switch.head(deadline).await? > 0 {
-            return switch.finish(&runtime, None, deadline).await;
+            return switch.finish(&runtime, deadline).await;
         }
         switch.prepare_enable(sql, deadline).await?;
         self.catch_up_wake.notify_one();
-        switch.finish(&runtime, None, deadline).await
+        switch.finish(&runtime, deadline).await
     }
 }

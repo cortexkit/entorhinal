@@ -202,18 +202,6 @@ impl RegistryStore {
             role: read.role,
         })
     }
-
-    /// Roles to include in the legacy Switch quiet record. Remove this reader
-    /// with the Switch; served role operations do not enumerate the cache.
-    pub fn legacy_switch_quiet_roles(
-        &self,
-    ) -> Result<std::collections::BTreeSet<String>, RegistryError> {
-        self.read(|conn| {
-            let mut stmt = conn.prepare("SELECT role FROM role_cache ORDER BY role")?;
-            let rows = stmt.query_map([], |r| r.get(0))?.collect();
-            rows
-        })
-    }
 }
 
 fn gen_high_water(conn: &Connection, role: &str) -> rusqlite::Result<i64> {
@@ -318,7 +306,6 @@ mod tests {
         for i in 0..255 {
             f.store.role_read(&format!("role_{i}")).unwrap();
         }
-        assert_eq!(f.store.legacy_switch_quiet_roles().unwrap().len(), 256);
         assert_eq!(
             f.store.role_read("beyond").unwrap_err().code,
             "role_set_full"

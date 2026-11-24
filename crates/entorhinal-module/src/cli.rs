@@ -312,20 +312,6 @@ pub fn parse(face: Face, arguments: &[String]) -> Invocation {
             {
                 args.push(argument.clone());
             }
-            "--without"
-                if face == Face::Projects
-                    && verb.as_deref() == Some("log")
-                    && args.first().map(String::as_str) == Some("hub-switch") =>
-            {
-                let Some(value) = rest
-                    .next()
-                    .filter(|value| crate::hub_membership::box_id(value))
-                else {
-                    return Invocation::Refuse(format!("{argument} needs a 32-digit box ID"));
-                };
-                args.push(argument.clone());
-                args.push(value.clone());
-            }
             "--same-machine"
                 if face == Face::Projects && verb.as_deref() == Some("adopt-store") =>
             {
@@ -355,6 +341,14 @@ pub fn parse(face: Face, arguments: &[String]) -> Invocation {
                 return Invocation::Refuse(format!("unknown flag '{other}'\n\n{}", usage(face)));
             }
             other if verb.is_none() => verb = Some(other.to_string()),
+            other
+                if face == Face::Projects
+                    && verb.as_deref() == Some("log")
+                    && args.is_empty()
+                    && !matches!(other, "status" | "name" | "enable") =>
+            {
+                return Invocation::Refuse(format!("unknown log subcommand '{other}'"));
+            }
             other => args.push(other.to_string()),
         }
     }
@@ -428,7 +422,6 @@ usage: ck projects <verb> [args] [--subc <connection file>] [--json]
   log status              show local identity log state
   log name <display name> set this member's shared display name
   log enable [--without-agents]
-  log hub-switch --without <box>
                           enable or join the shared log (operator only);
                           skip agent import only when the fleet has no agents
 
@@ -807,13 +800,7 @@ fn build_at(command: &Command, cwd: &str) -> Result<(String, Value), String> {
                 ["enable", "--without-agents"] => {
                     ("identity_log.enable".into(), json!({"without_agents":true}))
                 }
-                ["hub-switch", "--without", box_id] => {
-                    (crate::hub_switch::EXCLUDE.into(), json!({"without":box_id}))
-                }
-                _ => return Err(
-                    "log needs status, enable, name <display name>, or hub-switch --without <box>"
-                        .into(),
-                ),
+                _ => return Err("log needs status, enable, or name <display name>".into()),
             }
         }
         (Face::Projects, "remove") => (
@@ -2949,27 +2936,32 @@ mod tests {
     }
 
     #[test]
-    fn hub_switch_cli_maps_exact_without_flag() {
+    fn projects_log_refuses_removed_subcommand_and_keeps_hub_commands() {
         let id = "f".repeat(32);
-        let Invocation::Command(command) =
-            parse_as(Face::Projects, &["log", "hub-switch", "--without", &id])
-        else {
-            panic!("hub-switch --without must parse");
-        };
-        assert_eq!(
-            build(&command).unwrap(),
-            (crate::hub_switch::EXCLUDE.into(), json!({"without":id}))
-        );
         for args in [
             &["log", "hub-switch"][..],
-            &["log", "hub-switch", "--without"],
-            &["log", "hub-switch", "--without", "box", "extra"],
+            &["log", "hub-switch", "--without", &id],
         ] {
             match parse_as(Face::Projects, args) {
-                Invocation::Command(command) => assert!(build(&command).is_err(), "{args:?}"),
-                Invocation::Refuse(_) => {}
-                _ => panic!("unexpected CLI result for {args:?}"),
+                Invocation::Refuse(message) => {
+                    assert_eq!(message, "unknown log subcommand 'hub-switch'");
+                }
+                _ => panic!("removed subcommand must be refused: {args:?}"),
             }
+        }
+        for (args, method, params) in [
+            (&["log", "status"][..], "identity_log.status", json!({})),
+            (&["log", "enable"], "identity_log.enable", json!({})),
+            (
+                &["log", "name", "Studio"],
+                "member.set_name",
+                json!({"display_name":"Studio"}),
+            ),
+        ] {
+            let Invocation::Command(command) = parse_as(Face::Projects, args) else {
+                panic!("log command must parse: {args:?}");
+            };
+            assert_eq!(build(&command).unwrap(), (method.into(), params));
         }
     }
 

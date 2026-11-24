@@ -223,10 +223,19 @@ async fn hub_avatar_manifest_resumes_after_second_write_refusal_without_duplicat
     let wire = body("agent.apply_avatar_manifest", params);
     *rig.a.leaf.refuse_log_kind_after.lock().unwrap() = Some(("agent.set_avatar", 1));
     let outcome = a.handler.handle_served_request(&wire, ROUTE).await;
-    let HandlerOutcome::ErrorWithDetail { detail, .. } = outcome else {
+    let HandlerOutcome::ErrorWithDetail {
+        code,
+        message,
+        detail,
+    } = outcome
+    else {
         panic!("expected second write to refuse: {outcome:?}")
     };
-    assert_eq!(detail["batch"]["written"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        detail["batch"]["written"].as_array().unwrap().len(),
+        1,
+        "{code}: {message}\n{detail}"
+    );
     assert_eq!(detail["batch"]["remaining"].as_array().unwrap().len(), 1);
     apply_through(&a, &b).await;
     assert_eq!(

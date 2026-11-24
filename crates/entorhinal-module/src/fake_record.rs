@@ -90,14 +90,6 @@ impl FakeRecord {
         })
     }
 
-    /// A second computer shares cloud records but has independent local copies
-    /// and pending-write state.
-    pub(crate) fn for_author(&self, author: [u8; 16]) -> Arc<Self> {
-        let mut peer = Self::new(author);
-        Arc::get_mut(&mut peer).unwrap().cloud = self.cloud.clone();
-        peer
-    }
-
     /// Preserve the highest confirmed record and any unanswered write on
     /// restart, so an offline read cannot silently regress (intent, Rules 4-5).
     pub(crate) fn restart(&self) -> Arc<Self> {

@@ -42,129 +42,7 @@ pub struct RemoteEntry {
     pub entry: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MigrationMarker {
-    pub op: String,
-    pub hub: bool,
-    pub migration_id: String,
-    pub excluded: Vec<String>,
-    pub roles: Vec<String>,
-    pub tables_digest: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "marker", rename_all = "snake_case")]
-pub enum EngramFreeze {
-    Pending {
-        expected_head: i64,
-        entry_id: [u8; 16],
-        body: MigrationMarker,
-    },
-    Applied {
-        position: i64,
-        author: String,
-        body: MigrationMarker,
-    },
-}
-
-fn read_freeze(conn: &rusqlite::Connection) -> rusqlite::Result<Option<EngramFreeze>> {
-    conn.query_row(
-        "SELECT engram_frozen FROM identity_log_state WHERE id=1",
-        [],
-        |row| row.get::<_, Option<String>>(0),
-    )?
-    .map(|body| serde_json::from_str(&body).map_err(decode_error))
-    .transpose()
-}
-
-fn set_freeze(tx: &Transaction<'_>, freeze: Option<&EngramFreeze>) -> rusqlite::Result<()> {
-    let body = freeze
-        .map(serde_json::to_string)
-        .transpose()
-        .map_err(decode_error)?;
-    tx.execute(
-        "UPDATE identity_log_state SET engram_frozen=?1 WHERE id=1",
-        [body],
-    )?;
-    Ok(())
-}
-
-fn migration_tables_digest(conn: &rusqlite::Connection) -> rusqlite::Result<String> {
-    use crate::shared_entry::SharedState;
-    let bytes = SharedState::capture(conn)?
-        .canonical_bytes()
-        .map_err(decode_error)?;
-    Ok(entorhinal_catalog::sha256_hex(bytes))
-}
-
-impl RegistryStore {
-    pub fn migration_tables_digest(&self) -> Result<String, RegistryError> {
-        self.read(migration_tables_digest)
-    }
-
-    pub fn engram_freeze(&self) -> Result<Option<EngramFreeze>, RegistryError> {
-        self.read(read_freeze)
-    }
-
-    pub fn pause_legacy_moves(&self) -> Result<(), RegistryError> {
-        self.db
-            .with_conn_fenced(|tx| {
-                tx.execute(
-                    "UPDATE identity_log_state SET hub_quieting=1 WHERE id=1",
-                    [],
-                )?;
-                Ok(())
-            })
-            .map_err(RegistryError::Store)
-    }
-
-    pub fn switch_members(&self) -> Result<Vec<(String, String)>, RegistryError> {
-        self.read(|conn| {
-            conn.prepare("SELECT author,box_id FROM member_box ORDER BY box_id,author")?
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect()
-        })
-    }
-
-    pub fn hub_enable_id(&self) -> Result<Option<String>, RegistryError> {
-        self.read(|conn| {
-            conn.query_row(
-                "SELECT enable_id FROM identity_log_state WHERE id=1",
-                [],
-                |r| r.get(0),
-            )
-        })
-    }
-
-    /// Persist the exact attempt before exposing the marker to engram.
-    pub fn prepare_migration_marker(
-        &self,
-        expected_head: i64,
-        entry_id: [u8; 16],
-        mut body: MigrationMarker,
-    ) -> Result<EngramFreeze, RegistryError> {
-        self.db.with_conn_fenced(|tx| {
-            if let Some(freeze) = read_freeze(tx)? {
-                return Ok(freeze);
-            }
-            let eligible: bool = tx.query_row(
-                "SELECT last_applied_position=?1 AND last_seen_head=?1 AND hub_log_base IS NULL AND state='enabled' FROM identity_log_state WHERE id=1",
-                [expected_head], |r| r.get(0),
-            )?;
-            if !eligible {
-                return Err(invalid_entry("migration marker no longer matches the local log head"));
-            }
-            body.tables_digest = migration_tables_digest(tx)?;
-            let freeze = EngramFreeze::Pending { expected_head, entry_id, body };
-            set_freeze(tx, Some(&freeze))?;
-            Ok(freeze)
-        }).map_err(RegistryError::Store)
-    }
-}
-
 enum Decoded {
-    Migrated(MigrationMarker),
     Project(ProjectEntry),
     Agent(Box<AgentChangeEntry>),
     Member(crate::shared_entry::MemberName),
@@ -537,21 +415,6 @@ impl RegistryStore {
                 }
                 // Run the same image validation before inserting any journal row.
                 merged.validate(tx)?;
-                if writer_episodes.is_none() {
-                    match read_freeze(tx)? {
-                        Some(EngramFreeze::Applied { .. }) => {
-                            return Err(invalid_entry(
-                                "snapshot follows the engram migration marker",
-                            ));
-                        }
-                        Some(EngramFreeze::Pending { expected_head, .. })
-                            if expected_head == position =>
-                        {
-                            set_freeze(tx, None)?;
-                        }
-                        _ => {}
-                    }
-                }
                 if supersedes {
                     let had_name: bool = tx.query_row(
                         "SELECT EXISTS(SELECT 1 FROM member_name WHERE author=?1)",
@@ -778,33 +641,6 @@ fn apply(tx: &Transaction<'_>, entry: &RemoteEntry) -> rusqlite::Result<i64> {
             ("change", "member.set_box") => {
                 Decoded::MemberBox(crate::member_box::decode(value, Some(&entry.author))?)
             }
-            ("change", "log.migrated") => {
-                let marker: MigrationMarker =
-                    serde_json::from_value(value).map_err(decode_error)?;
-                let legacy: bool = tx.query_row(
-                    "SELECT hub_log_base IS NULL FROM identity_log_state WHERE id=1",
-                    [],
-                    |r| r.get(0),
-                )?;
-                if !legacy
-                    || !marker.hub
-                    || !entorhinal_catalog::is_hex(&marker.migration_id, 32)
-                    || !marker
-                        .excluded
-                        .iter()
-                        .all(|id| entorhinal_catalog::is_hex(id, 32))
-                    || !marker.excluded.windows(2).all(|ids| ids[0] < ids[1])
-                    || !marker
-                        .roles
-                        .iter()
-                        .all(|role| crate::role_cache::valid_role(role))
-                    || !marker.roles.windows(2).all(|names| names[0] < names[1])
-                    || !entorhinal_catalog::is_hex(&marker.tables_digest, 64)
-                {
-                    return Err(invalid("invalid hub migration marker"));
-                }
-                Decoded::Migrated(marker)
-            }
             ("change", "catalog.pin") => {
                 let pins: crate::catalog_agent::CatalogPinSet =
                     serde_json::from_value(value).map_err(decode_error)?;
@@ -834,26 +670,6 @@ fn apply(tx: &Transaction<'_>, entry: &RemoteEntry) -> rusqlite::Result<i64> {
     if entry.position != position + 1 {
         return Err(invalid("entry is not the next log position"));
     }
-    if let Some(freeze) = read_freeze(tx)? {
-        let legacy: bool = tx.query_row(
-            "SELECT hub_log_base IS NULL FROM identity_log_state WHERE id=1",
-            [],
-            |r| r.get(0),
-        )?;
-        if legacy {
-            match freeze {
-                EngramFreeze::Applied { .. } => {
-                    return Err(invalid("entry follows the engram migration marker"))
-                }
-                EngramFreeze::Pending { expected_head, .. }
-                    if expected_head == position && !matches!(&decoded, Decoded::Migrated(_)) =>
-                {
-                    set_freeze(tx, None)?;
-                }
-                _ => {}
-            }
-        }
-    }
     let own: Option<i64> = tx
         .query_row(
             "SELECT seq FROM registry_journal WHERE entry_id=?1 AND origin='here' AND seq > COALESCE((SELECT MAX(seq) FROM registry_journal WHERE op='store.adopt'),0)",
@@ -868,20 +684,6 @@ fn apply(tx: &Transaction<'_>, entry: &RemoteEntry) -> rusqlite::Result<i64> {
         // the same snapshot. Validate those references against the final state.
         tx.execute_batch("PRAGMA defer_foreign_keys=ON;")?;
         match decoded {
-            Decoded::Migrated(body) => {
-                let payload = json!({"entry": body, "author": entry.author});
-                let seq = append(tx, "log.migrated", &payload, "log", None, 0, "entorhinal")?;
-                tag(tx, seq, entry, &payload)?;
-                set_freeze(
-                    tx,
-                    Some(&EngramFreeze::Applied {
-                        position: entry.position,
-                        author: entry.author.clone(),
-                        body,
-                    }),
-                )?;
-                seq
-            }
             Decoded::Membership(body) => {
                 let payload = json!({"position":entry.position,"author":entry.author,"signer":entry.signer,"key_id":entry.key_id});
                 let seq = append(tx, &entry.kind, &payload, "log", None, 0, "entorhinal")?;
@@ -1153,26 +955,24 @@ mod tests {
     }
 
     #[test]
-    fn hub_switch_marker_survives_verify_and_rebuild_without_leaking_to_feeds() {
+    fn historical_migration_marker_survives_verify_and_rebuild_without_leaking_to_feeds() {
         let f = Fixture::new("switch-marker-rebuild");
         enable(&f);
-        let digest = f.store.migration_tables_digest().unwrap();
         let before = f.store.generation().unwrap();
-        let marker = envelope(
-            1,
-            &json!({"op":"log.migrated","hub":true,
-            "migration_id":"ab".repeat(16),"excluded":[],"roles":[],"tables_digest":digest}),
-            false,
-        );
-        let seq = f.store.apply_remote_entry(&marker, None).unwrap();
+        let body = json!({"op":"log.migrated","hub":true,"migration_id":"ab".repeat(16),
+            "excluded":[],"roles":[],"tables_digest":"cd".repeat(32)});
+        let entry = envelope(1, &body, false);
+        // Seed the archived journal row directly; current writers no longer accept the marker.
+        let seq = f.store.with_where_changes(|tx| {
+            let payload = json!({"entry":body,"author":entry.author});
+            let seq = append(tx, "log.migrated", &payload, "log", None, 0, "entorhinal")?;
+            tag(tx, seq, &entry, &payload)?;
+            tx.execute("UPDATE identity_log_state SET last_applied_position=1,last_seen_head=1 WHERE id=1", [])?;
+            Ok(seq)
+        }).unwrap();
         assert!(seq > before);
         assert!(f.store.verify().unwrap().ok);
         assert!(f.store.rebuild().unwrap().replay.ok);
-        assert_eq!(f.store.migration_tables_digest().unwrap(), digest);
-        assert!(matches!(
-            f.store.engram_freeze().unwrap(),
-            Some(EngramFreeze::Applied { position: 1, .. })
-        ));
         assert!(f
             .store
             .agent_changes(before, None)

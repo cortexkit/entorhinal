@@ -486,49 +486,15 @@ async fn hub_snapshot_enable_resumes_after_part_and_seed_and_empty_member_joins(
     assert!(log.sql.test_store().verify().unwrap().ok);
 }
 
-fn migrated(store: &RegistryStore) -> HubSnapshot {
-    use entorhinal_core::{
-        enable_state::{HubClaim, HubImage, HubRole},
-        remote_apply::RemoteEntry,
-    };
-    add_agents(store, 100_000);
-    store
-        .apply_entry("identity_log.enable", "{}", "test", None, |tx| {
-            tx.execute("UPDATE identity_log_state SET state='enabled'", [])?;
-            Ok(())
-        })
-        .unwrap();
-    let id = "6b".repeat(16);
-    let mut excluded = vec!["7a".repeat(16)];
-    store
-        .apply_remote_entry(
-            &RemoteEntry {
-                position: 1,
-                entry_id: "66".repeat(16),
-                author: A.into(),
-                signer: String::new(),
-                key_id: String::new(),
-                envelope_version: 1,
-                kind: "change".into(),
-                entry: serde_json::to_vec(
-                    &json!({"op":"log.migrated","hub":true,"migration_id":id,"excluded":excluded,
-            "roles":["connector_home"],"tables_digest":store.migration_tables_digest().unwrap()}),
-                )
-                .unwrap(),
-            },
-            Some(A),
-        )
-        .unwrap();
-    let tables = store
-        .capture_migration_source(1, excluded.clone())
-        .unwrap()
-        .into_mapped_tables()
-        .unwrap();
+fn historical_snapshot(store: RegistryStore) -> HubSnapshot {
+    use entorhinal_core::enable_state::{HubClaim, HubImage, HubRole};
+    // Use a separate store for the tables so the observer can join an empty registry.
+    add_agents(&store, 100_000);
+    store.begin_hub_enable(&"6b".repeat(16), A).unwrap();
+    let local = plan(&store);
     HubSnapshot {
         engram_through: 1,
-        migration_id: id,
-        excluded: std::mem::take(&mut excluded),
-        tables,
+        excluded: vec!["7a".repeat(16)],
         image: HubImage {
             claims: vec![
                 HubClaim {
@@ -548,6 +514,7 @@ fn migrated(store: &RegistryStore) -> HubSnapshot {
                 holder: Some(A.into()),
             }],
         },
+        ..local
     }
 }
 
@@ -563,19 +530,22 @@ async fn hub_snapshot_migration_resumer_refuses_divergence_and_claims_gen_zero_o
     }
     let fleet = Arc::new(Fleet::default());
     roster(&fleet, &rig, &[A, B]);
+    let mut image = historical_snapshot(store(&rig._processes, "migration-image"));
     let (a, leader, _) = bootstrap(
         &rig,
         store(&rig._processes, "migration-a"),
         rig.a.leaf.clone(),
         fleet.clone(),
         None,
-        1,
+        0,
     );
-    let image = migrated(&leader.sql.test_store());
+    let preimage = image.preimage().unwrap();
+    let publisher_image = serde_json::from_str::<HubSnapshot>(&preimage).unwrap();
     let (committed, arrived) = oneshot::channel();
     let (release, held) = oneshot::channel();
     *rig.a.leaf.gate.lock().unwrap() = Some(Gate::LoseAck(committed, held));
-    let first = tokio::spawn(async move { transfer(&leader, Some(&image), deadline()).await });
+    let first =
+        tokio::spawn(async move { transfer(&leader, Some(&publisher_image), deadline()).await });
     within(async {
         arrived.await.unwrap();
     })
@@ -585,15 +555,14 @@ async fn hub_snapshot_migration_resumer_refuses_divergence_and_claims_gen_zero_o
     drop(release);
     drop(a);
 
-    let (b, log, _) = bootstrap(
+    let (b, log, vault) = bootstrap(
         &rig,
         store(&rig._processes, "migration-b"),
         rig.b.leaf.clone(),
-        fleet,
+        fleet.clone(),
         None,
-        1,
+        0,
     );
-    let mut image = migrated(&log.sql.test_store());
     image.image.roles[0].generation += 1;
     assert_eq!(
         transfer(&log, Some(&image), deadline())
@@ -611,6 +580,16 @@ async fn hub_snapshot_migration_resumer_refuses_divergence_and_claims_gen_zero_o
     assert_eq!(log.sql.test_store().hub_log_base().unwrap(), Some(1));
     assert_eq!(log.log_head(deadline()).await.unwrap(), 2);
     assert_eq!(rig.b.leaf.sends.lock().unwrap()[0].0, 1);
+    drop(log);
+    drop(b);
+    let (b, log, _) = bootstrap(
+        &rig,
+        store(&rig._processes, "migration-b"),
+        rig.b.leaf.clone(),
+        fleet,
+        Some(vault),
+        1,
+    );
     activate(&b, log.clone(), rig.b.leaf.clone());
     let service = b.residence().unwrap();
     assert!(

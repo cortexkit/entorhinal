@@ -251,16 +251,16 @@ impl Transport for Leaf {
         let record = UnverifiedRecord::parse(LOG_SUBJECT, &write.value).unwrap();
         assert_eq!(record.header().writer, self.box_id.to_string());
         assert_eq!(record.header().entry_id, id);
-        if let Some((kind, remaining)) = self.refuse_log_kind_after.lock().unwrap().as_mut() {
-            if record.header().kind == *kind {
-                if *remaining == 0 {
-                    return Err(HandlerError::new(
-                        "hub_write_refused",
-                        "fixture refused the next entry",
-                    ));
-                }
-                *remaining -= 1;
-            }
+        if self
+            .refuse_log_kind_after
+            .lock()
+            .unwrap()
+            .is_some_and(|(kind, remaining)| record.header().kind == kind && remaining == 0)
+        {
+            return Err(HandlerError::new(
+                "hub_write_refused",
+                "fixture refused the next entry",
+            ));
         }
         self.sends
             .lock()
@@ -274,6 +274,12 @@ impl Transport for Leaf {
             .session()
             .append(write.value.clone(), write.expected, id, deadline)
             .await?;
+        // Count successful appends, not attempts that must be retried at a new head.
+        if let Some((kind, remaining)) = self.refuse_log_kind_after.lock().unwrap().as_mut() {
+            if record.header().kind == *kind {
+                *remaining = remaining.saturating_sub(1);
+            }
+        }
         if let Some(Gate::LoseAck(committed, release)) = gate {
             // The real hub committed the publish. Withhold its acknowledgement
             // until the other computer has appended at the next position.

@@ -9,7 +9,7 @@ use serde_json::json;
 
 use crate::{
     mutations::{append, domain},
-    remote_apply::{EngramFreeze, RemoteEntry},
+    remote_apply::RemoteEntry,
     shared_entry::{
         decode_error, ProjectEntry, SharedRow, SharedState, TableChanges, AGENT_SHARED_TABLES,
         PROJECT_SHARED_TABLES,
@@ -139,21 +139,16 @@ impl RegistryStore {
             .filter(|n| *n != 0)
             .and_then(|n| base.checked_add(n))
             .ok_or_else(invalid_hub_snapshot)?;
-        let freeze = self.engram_freeze()?;
         self.with_where_changes(|tx| {
             let (state, cursor, old_base): (String, i64, Option<i64>) = tx.query_row(
                 "SELECT state,last_applied_position,hub_log_base FROM identity_log_state WHERE id=1",
                 [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )?;
-            let allowed = match (state.as_str(), freeze.as_ref(), read_hub_plan(tx)?) {
-                ("enabling", None, Some(plan)) => base == 0 && cursor == 0
+            let allowed = match (state.as_str(), read_hub_plan(tx)?) {
+                ("enabling", Some(plan)) => base == 0 && cursor == 0
                     && plan.enable_id == snapshot.migration_id && plan.snapshot_digest == digest
                     && plan.preimage == preimage,
-                ("enabled", Some(EngramFreeze::Applied { position, body, .. }), None) => {
-                    base == *position && cursor == base && body.migration_id == snapshot.migration_id
-                        && body.excluded == snapshot.excluded
-                }
-                ("disabled", None, None) => cursor == 0 && tx.query_row(
+                ("disabled", None) => cursor == 0 && tx.query_row(
                     "SELECT NOT EXISTS(SELECT 1 FROM agent) AND NOT EXISTS(SELECT 1 FROM project) AND NOT EXISTS(SELECT 1 FROM workspace)", [], |r| r.get(0),
                 )?,
                 _ => false,

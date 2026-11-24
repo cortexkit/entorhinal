@@ -73,6 +73,7 @@ mod catalog_seed;
 mod catalog_sql;
 mod catalog_trust;
 mod catch_up;
+#[cfg(test)]
 mod claim_codec;
 mod claims;
 mod cli;
@@ -136,6 +137,7 @@ mod fake_participant;
 mod fake_record;
 #[allow(dead_code)]
 mod log_client;
+#[cfg(test)]
 mod record_client;
 // Participant calls are invoked by the move driver, not at module startup.
 #[allow(dead_code)]
@@ -653,6 +655,7 @@ struct ProjectsHandler {
     hub_shared_log: Arc<Mutex<Option<Arc<dyn hub_identity_log::SharedLog>>>>,
     hub_switch: Option<hub_switch::Switch>,
     catch_up_wake: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
     record_client: record_client::RecordClient,
     participant_discovery: Arc<dyn participant_discovery::ParticipantDiscovery>,
     catalog_agent: catalog_agent::CatalogAgent,
@@ -763,7 +766,6 @@ const MUTATING_METHODS: &[&str] = &[
     "rebind_root",
     "attach_root",
     "identity_log.enable",
-    hub_switch::EXCLUDE,
     catalog_ops::ADD,
     catalog_ops::REPIN,
     catalog_ops::REMOVE,
@@ -862,7 +864,6 @@ fn authorize_write(method: &str, principal: Option<&Principal>) -> Result<(), Ha
         || method == "placement.backfill"
         || method == "move_root_to_new_project"
         || method == "identity_log.enable"
-        || method == hub_switch::EXCLUDE
         || catalog_ops::WRITES.contains(&method)
         || method == catalog_publish::PUBLISH
         || method == catalog_seed::SEED
@@ -1021,17 +1022,11 @@ impl ProjectsHandler {
         #[cfg(test)]
         let record_connector: Arc<dyn log_client::LogConnector> =
             Arc::new(record_client::UnavailableConnector);
-        #[cfg(not(test))]
-        let record_connector: Arc<dyn log_client::LogConnector> = Arc::new(
-            log_client::SubcConnector::from_args(std::env::args_os().skip(1)),
-        );
         let move_wake = Arc::new(move_driver::MoveWake::default());
         let clock_origin = module_started_at;
         let request_clock =
             Arc::new(move || clock_origin.elapsed().as_micros().min(u64::MAX as u128) as u64);
         let store = Arc::new(Mutex::new(None));
-        let fence = hub_switch::LegacyFence::new(&store);
-        let legacy_move_admission = Arc::new(Mutex::new(()));
         let participant_discovery: Arc<dyn participant_discovery::ParticipantDiscovery> = Arc::new(
             participant_discovery::SubcParticipantDiscovery::new(Arc::new(
                 log_client::SubcConnector::from_args(std::env::args_os().skip(1)),
@@ -1039,14 +1034,10 @@ impl ProjectsHandler {
         );
         let health = Arc::new(HealthGauges::default());
         let hub_switch = (!cfg!(test)).then(|| {
-            hub_switch::Switch::new(
-                hub_transport::Hub::new(
-                    log_client::SubcConnector::from_args(std::env::args_os().skip(1)),
-                    health.clone(),
-                ),
-                legacy_move_admission.clone(),
-                participant_discovery.clone(),
-            )
+            hub_switch::Switch::new(hub_transport::Hub::new(
+                log_client::SubcConnector::from_args(std::env::args_os().skip(1)),
+                health.clone(),
+            ))
         });
         Self {
             store,
@@ -1073,7 +1064,7 @@ impl ProjectsHandler {
             watches: Arc::default(),
             role_leases: Arc::default(),
             lease_retry_budget: LEASE_HELD_RETRY_BUDGET,
-            log_client: log_client::LogClient::new(connector).fenced(fence.clone()),
+            log_client: log_client::LogClient::new(connector),
             writer: Arc::new(tokio::sync::Mutex::new(())),
             draining: tokio::sync::watch::channel(false).0,
             catch_up_task: Mutex::new(None),
@@ -1083,7 +1074,8 @@ impl ProjectsHandler {
             hub_shared_log: Arc::default(),
             hub_switch,
             catch_up_wake: Arc::default(),
-            record_client: record_client::RecordClient::new(record_connector).fenced(fence),
+            #[cfg(test)]
+            record_client: record_client::RecordClient::new(record_connector),
             participant_discovery,
             catalog_agent: catalog_agent::CatalogAgent::default(),
             catalog_publish: catalog_publish::Publisher::default(),
@@ -1631,14 +1623,6 @@ impl ProjectsHandler {
                 .await
         } else if request.method == "identity_log.enable" {
             self.enable_log(request.params, key, received).await
-        } else if request.method == hub_switch::EXCLUDE {
-            match self.admit(hub_switch::EXCLUDE, key) {
-                Ok(_) => {
-                    self.exclude_switch_member(request.params, key, received)
-                        .await
-                }
-                Err(error) => Err(error),
-            }
         } else if request.method == roles::TAKE {
             self.take_role(request.params, key, received).await
         } else if request.method == hub_residence::TAKE {
@@ -2545,11 +2529,6 @@ fn manifest() -> ModuleManifest {
                     ManagementOperationKind::Mutate,
                     "Enable the shared identity log or join it (operator only).",
                 ),
-                management_operation(
-                    hub_switch::EXCLUDE,
-                    ManagementOperationKind::Mutate,
-                    "Exclude an unpaired computer from the hub switch (Direct only, with confirmation).",
-                ),
                 management_operation("placement.read", ManagementOperationKind::Query,
                     "Page shared project placement facts in insertion order (open to every principal)."),
                 management_operation("placement.backfill", ManagementOperationKind::Mutate,
@@ -3441,7 +3420,6 @@ mod tests {
             if *method == store_origin::ADOPT
                 || *method == "move_root_to_new_project"
                 || *method == "identity_log.enable"
-                || *method == hub_switch::EXCLUDE
                 || *method == "placement.backfill"
                 || catalog_ops::WRITES.contains(method)
                 || *method == catalog_publish::PUBLISH
@@ -3761,19 +3739,6 @@ mod tests {
             );
             std::fs::remove_dir_all(path).unwrap();
         }
-    }
-
-    pub(super) fn sqlite_path(descriptor: &StorageDescriptor) -> &str {
-        let StorageBackend::Sqlite { path } = &descriptor.backend else {
-            panic!("expected a SQLite fixture")
-        };
-        path
-    }
-
-    // Keep the normal open check for other fixtures. Use this only when the
-    // test exercises sharing through engram instead of through the hub.
-    pub(super) fn allow_legacy_store(descriptor: &StorageDescriptor) {
-        entorhinal_core::legacy_sharing_test_allow(sqlite_path(descriptor));
     }
 
     pub(crate) fn hello_ack(descriptor: &StorageDescriptor) -> ModuleHelloAckBody {

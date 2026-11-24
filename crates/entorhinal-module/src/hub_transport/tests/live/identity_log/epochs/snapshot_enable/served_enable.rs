@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     agent_ops::{OperatorConfirmError, OperatorConfirmer},
-    hub_switch::{MigrationImage, Probe, Switch},
+    hub_switch::{Probe, Switch},
     log_client::{LogClient, TransportError},
     sharing_baselines::{artifacts, StoreFile},
 };
@@ -102,13 +102,9 @@ impl Probe for LiveProbe {
         Ok(self.leaf.box_id.to_string())
     }
 
-    async fn hub_cuts(&self, _: Instant) -> Result<bool, HandlerError> {
-        unreachable!("native enable does not probe session cuts")
-    }
-
     async fn transfer_snapshot(
         &self,
-        image: Option<&MigrationImage>,
+        image: Option<&HubSnapshot>,
         deadline: Instant,
     ) -> Option<Result<bool, HandlerError>> {
         self.requests.record("hub");
